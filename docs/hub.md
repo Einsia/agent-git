@@ -1,75 +1,59 @@
 # AgentGitHub Hub
 
-PRD 的第二个交付物：**GitHub for Agent Contexts**。第一版是 **Registry + Sync**——
-不运行 Agent、不保存 secret，只做托管、同步、和「人可读 + agent 同接口拉取」。
+托管团队的 Agent Store(每个就是个 git 仓库,装原始 session),提供同步 + 网页浏览。
+一个自包含二进制 `agit-hub`,零重量级依赖(std TCP + shell out 到 git)。
 
-一个自包含的二进制 `agit-hub`，零重量级依赖（std 的 TCP + shell out 到 git）。
-
-## 是什么
-
-- **Registry**：托管一堆 Agent Store（bare git 仓库），在 `<root>/<name>.git`。
-- **Sync**：git smart-http。`agit -a push/pull http://host:port/<name>.git` 直接可用——
-  Hub 是**真正的 git 远端**（内部转交 `git http-backend`）。
-- **前端**：服务端渲染 HTML，人可直接阅读 —— 首页、每个 agent 的 Context 页（目标 / 带出处的
-  fact / 进度 / 历史）、搜索。
-- **API**：同样的数据以 JSON 暴露，agent 通过同一接口拉取。
+**第一版 = Registry + Sync,不运行 agent、不做语义合并、不保存 secret。**
+真正的合并在**消费者本地** `agit -a reconcile`(那里才有 LLM),Hub 只做只读渲染。
 
 ## 起
 
 ```sh
 ./build.sh --release
 
-agit-hub add payments-api          # 托管一个 agent（建 bare 仓库）
-agit-hub add docs-agent
-agit-hub serve --port 8177         # 启动，默认 root ~/.agit-hub
+agit-hub add payments          # 托管一个 agent(建 bare 仓库)
+agit-hub serve --port 8177     # 启动;默认数据目录 ~/.agit-hub
 ```
 
-打开 `http://localhost:8177/`。
+打开 `http://<机器>:8177/`。
 
-## 发布 context（Alice）
+## 发布(Alice)
 
 ```sh
 cd your-repo
-agit -a remote add origin http://localhost:8177/payments-api.git
-agit -a push -u origin main         # pre-push hook 先扫密钥，再走 git smart-http
+agit -a sync                                   # 先把本项目的 Claude session 镜像进来
+agit -a remote add origin http://<机器>:8177/payments.git
+agit -a push -u origin main                    # pre-push 先扫密钥,再走 git smart-http
 ```
 
-## 消费 context（同事，一条命令）
+## 消费(同事)
 
 ```sh
-cd their-repo
-agit clone http://localhost:8177/payments-api.git   # clone 到 .agit/agent + 装驱动
-agit -a verify                                       # 对着自己的代码基线复验
-agit -a why <subject>                                # 看出处链
-```
-
-或者 agent 走 JSON：
-
-```sh
-curl http://localhost:8177/api/agent/payments-api    # 结构化 AgentState
+agit clone http://<机器>:8177/payments.git     # 一条命令拉团队 Agent Store
+agit -a fetch origin
+agit -a reconcile origin/main                  # 本地:agent 读会话、合成 CLAUDE.md,真冲突才问你
 ```
 
 ## 端点
 
 | 路径 | 内容 |
 |---|---|
-| `GET /` | 首页：托管的 agent + 目标 + fact 数 |
-| `GET /agent/<name>` | Context 页；`?q=` 搜 fact |
-| `GET /api/agents` | JSON 列表 |
-| `GET /api/agent/<name>` | JSON AgentState（目标 + facts + 证据） |
-| `/<name>.git/...` | git smart-http（push/pull/clone） |
+| `GET /` | 首页:托管的 agent + session 数 + 最近活动 |
+| `GET /agent/<name>` | 会话列表:每条渲染成摘要(指令、结论、改动文件、工具次数);`?q=` 搜转录 |
+| `GET /agent/<name>/digest.md` | 会话摘要 markdown(只读;指向本地 reconcile 做真合并) |
+| `GET /api/agents` · `/api/agent/<name>` | JSON |
+| `/<name>.git/...` | git smart-http(push/pull/clone) |
 
-## 边界（第一版）
+## 为什么 Hub 不做合并
 
-- **只读渲染**：Hub 不重跑证据、不重算摘要——证据的新鲜度由**消费者** `agit -a verify`
-  对着自己的代码基线判定。这是有意的：Hub 不该假设它有那份代码。
-- **不存 secret**：靠发布侧的 pre-push hook 拦（PRD 要求 secret 不进 Hub）。
-- **权限 / 订阅**：PRD 列了，本版未做。当前匿名可读可推。
-- **URL 里的 host:port 暂时硬编码 localhost:8177**（页面上的发布/拉取提示）。多机部署时需参数化。
-- Windows 下 `git http-backend` 行为不同，未验证。
+合并要读会话、要判断语义 —— 那是 LLM 的活,得在**有代码、有模型**的消费者本地做。
+Hub 没有你的代码、按设计不跑 agent,所以只做:托管、同步、只读渲染。
+这也避免了"Hub 上跑一个 LLM 处理所有人上传的会话"这种既贵又危险(prompt 注入)的设计。
 
-## 还没做（Hub 侧）
+## 边界(第一版)
 
-- 权限模型、订阅、跨 revision 的网页 diff、full history 浏览
-- 多机 / 鉴权部署
-- 跨 Project 索引（一个 Project 引用多个外部 Agent）
+- **只读渲染**:Hub 不合并、不判冲突、不重算任何东西。
+- **不存 secret**:靠发布侧 pre-push hook 拦;但只拦已知格式(见 [风险分析](风险分析.md) §八)。
+- **权限 / 订阅 / 网页 diff**:未做,当前匿名可读可推。
+- **host:port 在页面提示里未参数化**(多机部署时要改)。
+- Windows 下 `git http-backend` 行为不同,未验证。
