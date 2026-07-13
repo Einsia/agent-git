@@ -22,9 +22,10 @@ pub fn adapter_list() -> Result<i32> {
     Ok(0)
 }
 
-/// `agit -a import [--from <runtime>] [<session>]`
+/// `agit -a import [--from <runtime>] [--summarize] [<session>]`
 /// 从 runtime session 抽取 AgentState 写进 Agent Store。用 adapter 的 export（runtime→AgentGit）。
-pub fn import_cmd(runtime: &str, session: Option<PathBuf>) -> Result<i32> {
+/// `--summarize` 额外调本机 claude 把证据池归纳成 fact。
+pub fn import_cmd(runtime: &str, session: Option<PathBuf>, summarize: bool) -> Result<i32> {
     let env_root = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
     let state = agent.join("state");
@@ -44,8 +45,16 @@ pub fn import_cmd(runtime: &str, session: Option<PathBuf>) -> Result<i32> {
     println!("  artifact  : {} 个", sum.artifacts);
     println!();
     println!("写入 {}", state.display());
-    println!("  证据池是 fact 的原材料。审阅后：");
-    println!("    agit -a add -A && agit -a commit -m '导入 {} 的 context'", ir.session_id);
+
+    if summarize {
+        match crate::summarize::run(&ir, &env_root, &state.join("facts")) {
+            Ok(n) => println!("  Summarizer：从证据池归纳出 {n} 条 fact（写入 state/facts/）"),
+            Err(e) => eprintln!("  Summarizer 跳过：{e:#}"),
+        }
+    } else {
+        println!("  证据池是 fact 的原材料。加 --summarize 让本机 claude 自动归纳，或用 agit -a new 手工提炼。");
+    }
+    println!("  审阅后：agit -a add -A && agit -a commit -m '导入 {} 的 context'", ir.session_id);
     Ok(0)
 }
 

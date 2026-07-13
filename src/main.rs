@@ -24,6 +24,7 @@ mod merge;
 mod passthrough;
 mod scan;
 mod scope;
+mod summarize;
 mod workspace;
 
 use scope::Scope;
@@ -80,8 +81,10 @@ fn dispatch(argv: Vec<String>) -> i32 {
         // ── Adapter：runtime ↔ AgentState ──
         "adapter" => commands::adapter_list(),
         "import" => {
-            let (rt, pos) = parse_runtime_arg(args, "--from");
-            commands::import_cmd(&rt, pos)
+            let summarize = args.iter().any(|a| a == "--summarize");
+            let filtered: Vec<String> = args.iter().filter(|a| *a != "--summarize").cloned().collect();
+            let (rt, pos) = parse_runtime_arg(&filtered, "--from");
+            commands::import_cmd(&rt, pos, summarize)
         }
         "export" => {
             let (rt, pos) = parse_runtime_arg(args, "--to");
