@@ -306,6 +306,16 @@ fn route(root: &Path, method: &str, path: &str, target: &str) -> (u16, &'static 
             let name = &p["/api/agent/".len()..];
             api_agent(root, name)
         }
+        // 从 Hub 直接取 Claude Code 就绪的 context
+        p if p.starts_with("/agent/") && p.ends_with("/claude.md") => {
+            let name = &p["/agent/".len()..p.len() - "/claude.md".len()];
+            let repo = repo_path(root, name);
+            if !has_head(&repo) {
+                (404, "text/plain; charset=utf-8", "no such agent".into())
+            } else {
+                (200, "text/markdown; charset=utf-8", claude_context(&repo, name))
+            }
+        }
         p if p.starts_with("/agent/") => {
             let name = &p["/agent/".len()..];
             let q = target.split_once('?').map(|(_, q)| q).unwrap_or("");
@@ -511,8 +521,9 @@ fn agent_page(root: &Path, name: &str, query: &str) -> String {
              <h3>目标</h3><pre>{goals}</pre>\
              <h3>进度</h3><pre>{progress}</pre>\
              <h3>历史</h3><ul class=hist>{hist}</ul>\
-             <h3>拉取</h3><pre>agit -a pull \\\n  http://localhost:8177/{name}.git main</pre>\
-             <p class=dim><a href=\"/api/agent/{name}\">JSON</a></p>\
+             <h3>拉取</h3><pre>agit clone \\\n  http://localhost:8177/{name}.git</pre>\
+             <h3>在 Claude Code 里复用</h3><pre>curl -s \\\n  http://localhost:8177/agent/{name}/claude.md \\\n  &gt;&gt; CLAUDE.md</pre>\
+             <p class=dim><a href=\"/agent/{name}/claude.md\">↓ claude.md</a> · <a href=\"/api/agent/{name}\">JSON</a></p>\
            </div>\
          </div>",
         name = esc(name),
@@ -521,6 +532,40 @@ fn agent_page(root: &Path, name: &str, query: &str) -> String {
         progress = esc(progress.trim()),
     );
     page(name, body)
+}
+
+/// 渲染 Claude Code 就绪的 context（供 `curl .../claude.md >> CLAUDE.md`）。
+/// Hub 不重算新鲜度 —— 消费者拉下来后用 `agit -a verify` 对自己的代码基线核实。
+fn claude_context(repo: &Path, name: &str) -> String {
+    let mut md = format!(
+        "<!-- agit:begin —— 来自 AgentGitHub / {name}，勿手改 -->\n\
+         # 继承的 Agent Context（agit · 来自团队 {name}）\n\n\
+         > 本仓库此前 agent 积累的上下文。每条事实带证据出处，可直接信任；\n\
+         > 代码可能已变，需核实时运行 `agit -a verify`。\n\n"
+    );
+    let goals = read_state_file(repo, "goals.md").unwrap_or_default();
+    let gb = goals.trim_start_matches("# 目标").trim();
+    if !gb.is_empty() {
+        md.push_str(&format!("## 目标\n\n{gb}\n\n"));
+    }
+    let mut fs = facts(repo);
+    fs.sort_by(|a, b| a.0.cmp(&b.0));
+    if !fs.is_empty() {
+        md.push_str("## 已知事实（带证据）\n\n");
+        for (subject, text) in &fs {
+            let f = parse_fact(subject, text);
+            md.push_str(&format!("- **{}** — {}\n", f.subject, f.body));
+            for e in &f.evidence {
+                md.push_str(&format!("  - 依据 `{e}`\n"));
+            }
+        }
+        md.push('\n');
+    }
+    md.push_str(&format!(
+        "---\n_复用：`agit clone http://localhost:8177/{name}.git` 后 `agit -a verify`。_\n\
+         <!-- agit:end -->\n"
+    ));
+    md
 }
 
 fn api_agents(root: &Path) -> String {

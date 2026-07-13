@@ -161,38 +161,111 @@ impl Adapter for ClaudeCode {
     }
 
     fn import(&self, state_dir: &Path, out: &Path) -> Result<()> {
-        // MVP：把 AgentState 汇成一份 runtime-neutral 的 markdown digest。
-        // Claude Code 可以把它作为一条 context 消息读入 —— 一条命令复用他人的 context。
-        let mut md = String::from("# 导入的 Agent Context\n\n");
-        for (title, file) in [
-            ("目标", "goals.md"),
-            ("约束", "constraints.md"),
-            ("进度", "progress.md"),
-            ("Artifact", "artifacts.md"),
-        ] {
-            let p = state_dir.join(file);
-            if let Ok(body) = std::fs::read_to_string(&p) {
-                md.push_str(&format!("## {title}\n\n{}\n\n", body.trim()));
-            }
-        }
-        let facts = state_dir.join("facts");
-        if facts.exists() {
-            md.push_str("## 已知事实（带证据）\n\n");
-            let mut entries: Vec<_> = std::fs::read_dir(&facts)?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
-                .collect();
-            entries.sort_by_key(|e| e.path());
-            for e in entries {
-                if let Ok(body) = std::fs::read_to_string(e.path()) {
-                    md.push_str(&body);
-                    md.push_str("\n\n");
-                }
-            }
-        }
+        // AgentGit → Claude Code：产出一段 CLAUDE.md 风格的 context。
+        // Claude Code 每个 session 自动加载项目根的 CLAUDE.md，所以这就是「复用」的落地：
+        // 下一个会话一开工就带着这些目标、带出处的结论、决定。
+        let md = render_claude_context(state_dir)?;
         std::fs::write(out, md)?;
         Ok(())
     }
+}
+
+/// 把 Agent Store 的 state/ 渲染成给 Claude Code 读的 context markdown。
+pub fn render_claude_context(state_dir: &Path) -> Result<String> {
+    let mut md = String::new();
+    md.push_str(
+        "# 继承的 Agent Context（由 agit 从既往会话提炼）\n\n\
+         > 这是本仓库此前 agent 工作积累的上下文。下面每条「已知事实」都带证据出处，\n\
+         > 你可以直接信任，但代码可能已经变化 —— 需要核实时运行 `agit -a verify`。\n\n",
+    );
+
+    let read = |f: &str| std::fs::read_to_string(state_dir.join(f)).unwrap_or_default();
+
+    let goals = read("goals.md");
+    if !goals.trim().is_empty() {
+        md.push_str(&format!("## 目标\n\n{}\n\n", goals.trim_start_matches("# 目标").trim()));
+    }
+    let cons = read("constraints.md");
+    if cons.trim().len() > "# 约束".len() {
+        md.push_str(&format!("## 约束\n\n{}\n\n", cons.trim_start_matches("# 约束").trim()));
+    }
+
+    // 已知事实（带证据）
+    let facts_dir = state_dir.join("facts");
+    let mut facts: Vec<(String, String)> = vec![];
+    if facts_dir.exists() {
+        collect_md(&facts_dir, &facts_dir, &mut facts);
+    }
+    facts.sort_by(|a, b| a.0.cmp(&b.0));
+    if !facts.is_empty() {
+        md.push_str("## 已知事实（带证据）\n\n");
+        for (subject, body) in &facts {
+            let (concl, evs) = split_fact(body);
+            md.push_str(&format!("- **{subject}** — {concl}\n"));
+            for e in evs {
+                md.push_str(&format!("  - 依据 `{e}`\n"));
+            }
+        }
+        md.push('\n');
+    }
+
+    let prog = read("progress.md");
+    let prog_body = prog.trim_start_matches("# 进度").trim();
+    if !prog_body.is_empty() && !prog_body.starts_with("_（抽取") {
+        md.push_str(&format!("## 进度\n\n{prog_body}\n\n"));
+    }
+
+    md.push_str(
+        "---\n_复用命令：`agit clone <hub-url>/<name>.git` 拉取，`agit -a verify` 核实新鲜度。_\n",
+    );
+    Ok(md)
+}
+
+fn collect_md(base: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_md(base, &p, out);
+        } else if p.extension().map(|x| x == "md").unwrap_or(false)
+            && !p.file_name().map(|f| f.to_string_lossy().starts_with('.')).unwrap_or(false)
+        {
+            if let Ok(body) = std::fs::read_to_string(&p) {
+                let subject = p
+                    .strip_prefix(base)
+                    .ok()
+                    .and_then(|r| r.to_str())
+                    .map(|s| s.trim_end_matches(".md").to_string())
+                    .unwrap_or_default();
+                out.push((subject, body));
+            }
+        }
+    }
+}
+
+/// 从一条 fact 文件里拆出 (结论正文, 证据 locator 列表)。
+fn split_fact(text: &str) -> (String, Vec<String>) {
+    let mut evs = vec![];
+    let mut body = text.trim().to_string();
+    if let Some(rest) = text.strip_prefix("---\n") {
+        if let Some((fm, b)) = rest.split_once("\n---\n") {
+            body = b.trim().lines().next().unwrap_or("").to_string();
+            let mut in_ev = false;
+            for line in fm.lines() {
+                if line.starts_with("evidence:") {
+                    in_ev = true;
+                } else if in_ev {
+                    let t = line.trim();
+                    if let Some(it) = t.strip_prefix("- ") {
+                        evs.push(it.trim().trim_matches('\'').to_string());
+                    } else if !t.is_empty() {
+                        in_ev = false;
+                    }
+                }
+            }
+        }
+    }
+    (body, evs)
 }
 
 fn collect_tool(b: &serde_json::Value, ir: &mut SessionIR) {

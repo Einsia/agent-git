@@ -7,7 +7,7 @@ use crate::extract;
 use crate::scan;
 use crate::scope::{self, Scope};
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 const FACTS_SUBDIR: &str = "state/facts";
@@ -58,22 +58,70 @@ pub fn import_cmd(runtime: &str, session: Option<PathBuf>, summarize: bool) -> R
     Ok(0)
 }
 
-/// `agit -a export [--to <runtime>] [<out>]`
-/// 把 AgentState 导出成 runtime 可复用的可移植摘要。用 adapter 的 import（AgentGit→runtime）。
+const CLAUDE_BEGIN: &str = "<!-- agit:begin —— 由 agit 管理，勿手改 -->";
+const CLAUDE_END: &str = "<!-- agit:end -->";
+
+/// `agit -a export [--to <runtime>] [<out-file>]`
+/// 把 AgentState 装回 runtime，让新会话带着这份 context。用 adapter 的 import（AgentGit→runtime）。
+///
+/// Claude Code：默认合并进项目根 CLAUDE.md 的受管区块（每个会话自动加载）；
+/// 或 给个位置参数写到独立文件。
 pub fn export_cmd(runtime: &str, out: Option<PathBuf>) -> Result<i32> {
     let agent = scope::root_for(Scope::Agent)?;
     let state = agent.join("state");
-    let out = out.unwrap_or_else(|| {
-        scope::env_root()
-            .map(|r| r.join(".agit/imported-context.md"))
-            .unwrap_or_else(|_| PathBuf::from("imported-context.md"))
-    });
-
+    let env = scope::env_root()?;
     let ad = adapter::get(runtime)?;
-    ad.import(&state, &out)?;
-    println!("已导出 AgentState → {}", out.display());
-    println!("  {} 可以把它作为一条 context 消息读入，一条命令复用他人的 context。", ad.name());
+
+    // 先让 adapter 产出 runtime 专属的 context 内容（写到临时文件再读回）
+    let tmp = env.join(".agit/.export-tmp.md");
+    if let Some(p) = tmp.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    ad.import(&state, &tmp)?;
+    let content = std::fs::read_to_string(&tmp).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+
+    match out {
+        // 显式文件
+        Some(p) => {
+            std::fs::write(&p, &content)?;
+            println!("已导出 {} context → {}", ad.name(), p.display());
+        }
+        // Claude Code 默认：合并进 CLAUDE.md 的受管区块
+        None if runtime.starts_with("claude") || runtime == "cc" => {
+            let claude_md = env.join("CLAUDE.md");
+            let block = format!("{CLAUDE_BEGIN}\n{}\n{CLAUDE_END}", content.trim());
+            let merged = merge_managed(&claude_md, &block)?;
+            std::fs::write(&claude_md, merged)?;
+            println!("已写入 {}（受管区块）", claude_md.display());
+            println!("  下一个 Claude Code 会话会自动加载它 —— 一开工就带着这份 context。");
+            println!("  也可直接喂给一次性会话： claude -p \"$(cat CLAUDE.md)\"");
+        }
+        // 其它 runtime 默认写独立文件
+        None => {
+            let p = env.join(".agit/agent-context.md");
+            std::fs::write(&p, &content)?;
+            println!("已导出 {} context → {}", ad.name(), p.display());
+        }
+    }
     Ok(0)
+}
+
+/// 把受管区块合并进一个可能已存在的文件：替换旧区块，或追加。
+fn merge_managed(path: &Path, block: &str) -> Result<String> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    if let (Some(b), Some(e)) = (existing.find(CLAUDE_BEGIN), existing.find(CLAUDE_END)) {
+        let end = e + CLAUDE_END.len();
+        let mut s = String::new();
+        s.push_str(&existing[..b]);
+        s.push_str(block);
+        s.push_str(&existing[end..]);
+        Ok(s)
+    } else if existing.trim().is_empty() {
+        Ok(format!("{block}\n"))
+    } else {
+        Ok(format!("{}\n\n{block}\n", existing.trim_end()))
+    }
 }
 
 /// 扫描某个 scope 里的密钥。默认扫 Agent Store 的 facts；--staged 只扫暂存的。
