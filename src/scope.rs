@@ -64,6 +64,24 @@ pub fn root_for(scope: Scope) -> Result<PathBuf> {
     }
 }
 
+/// 无论 cwd 在代码仓库还是 Agent Store 里，都返回 **Environment（代码仓库）** 的根。
+///
+/// fact 的证据 `file:` 指针相对 Environment 解析，但 merge driver 在 Agent Store 里运行、
+/// verify 可能从任一处调用 —— 都需要稳定地拿到代码仓库根。
+/// Agent Store 恒在 `<env>/.agit/agent`，据此回退两级。
+pub fn environment_root() -> Result<PathBuf> {
+    let top = env_root()?;
+    if top.ends_with(AGENT_DIR) {
+        Ok(top
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or(top))
+    } else {
+        Ok(top)
+    }
+}
+
 pub fn agent_exists() -> bool {
     agent_root()
         .map(|p| p.join(".git").exists())

@@ -11,7 +11,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-pub const CTX_DIR: &str = "ctx";
+/// fact 在 Agent Store 里的相对路径前缀。subject 即路径。
+pub const CTX_DIR: &str = "state/facts";
 
 // ─────────────────────────── Tier ───────────────────────────
 
@@ -381,7 +382,7 @@ mod tests {
     fn subject_path_roundtrip() {
         let s = "api/user/id-field-name";
         let p = subject_to_path(s).unwrap();
-        assert_eq!(p, PathBuf::from("ctx/api/user/id-field-name.md"));
+        assert_eq!(p, PathBuf::from("state/facts/api/user/id-field-name.md"));
         assert_eq!(path_to_subject(&p).as_deref(), Some(s));
     }
 

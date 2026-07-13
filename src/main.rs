@@ -17,6 +17,7 @@ mod commands;
 mod environment;
 mod evidence;
 mod extract;
+mod facts;
 mod gitx;
 mod init;
 mod merge;
@@ -87,13 +88,30 @@ fn dispatch(argv: Vec<String>) -> i32 {
             commands::export_cmd(&rt, pos)
         }
 
-        // ── v1 领域动词：迁移中 ──
-        "verify" | "why" | "new" | "resolve" => {
-            eprintln!(
-                "agit {cmd}：正在从 v1 的单库模型移植到 Agent Store（见 docs/architecture-v2.md）。\n\
-                 当前可用：agit init / agit [-a] <任意 git 命令> / agit -a scan / agit workspace。"
-            );
-            Ok(2)
+        // ── Agent Store 上的 fact 领域动词 ──
+        "new" => match parse_new(args) {
+            Ok(n) => facts::new_fact(&n.subject, &n.evidence, &n.message, n.tier, n.author),
+            Err(e) => {
+                eprintln!("agit: {e}");
+                Ok(2)
+            }
+        },
+        "verify" => facts::verify(args.iter().any(|a| a == "--rerun")),
+        "why" => match args.first() {
+            Some(s) => facts::why(s),
+            None => {
+                eprintln!("用法: agit -a why <subject>");
+                Ok(2)
+            }
+        },
+        "resolve" => {
+            let subject = args.first().cloned().unwrap_or_default();
+            let take = parse_flag_value(args, "--take").unwrap_or_default();
+            if subject.is_empty() || take.is_empty() {
+                eprintln!("用法: agit -a resolve <subject> --take ours|theirs");
+                return 2;
+            }
+            merge::resolve(&subject, &take)
         }
 
         // ── 其余一切：透明透传到对应库的 git ──
@@ -120,6 +138,84 @@ fn run_merge_driver(args: &[String]) -> anyhow::Result<i32> {
         std::path::Path::new(&args[2]),
         &args[3],
     )
+}
+
+struct NewArgs {
+    subject: String,
+    evidence: Vec<String>,
+    message: String,
+    tier: Option<claim::Tier>,
+    author: Option<String>,
+}
+
+/// 解析 `agit -a new <subject> -e <ev>... -m <msg> [--tier T] [--author A]`
+fn parse_new(args: &[String]) -> anyhow::Result<NewArgs> {
+    let mut n = NewArgs {
+        subject: String::new(),
+        evidence: vec![],
+        message: String::new(),
+        tier: None,
+        author: None,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-e" | "--evidence" => {
+                if i + 1 < args.len() {
+                    n.evidence.push(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    anyhow::bail!("-e 缺参数");
+                }
+            }
+            "-m" | "--message" => {
+                if i + 1 < args.len() {
+                    n.message = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    anyhow::bail!("-m 缺参数");
+                }
+            }
+            "--tier" => {
+                if i + 1 < args.len() {
+                    n.tier = Some(parse_tier(&args[i + 1])?);
+                    i += 2;
+                } else {
+                    anyhow::bail!("--tier 缺参数");
+                }
+            }
+            "--author" => {
+                if i + 1 < args.len() {
+                    n.author = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    anyhow::bail!("--author 缺参数");
+                }
+            }
+            s if n.subject.is_empty() => {
+                n.subject = s.to_string();
+                i += 1;
+            }
+            s => anyhow::bail!("多余参数: {s}"),
+        }
+    }
+    if n.subject.is_empty() {
+        anyhow::bail!("用法: agit -a new <subject> -e <证据> -m <结论>");
+    }
+    Ok(n)
+}
+
+fn parse_tier(s: &str) -> anyhow::Result<claim::Tier> {
+    match s {
+        "reversible" => Ok(claim::Tier::Reversible),
+        "compensable" => Ok(claim::Tier::Compensable),
+        "irreversible" => Ok(claim::Tier::Irreversible),
+        _ => anyhow::bail!("tier 只能是 reversible / compensable / irreversible"),
+    }
+}
+
+fn parse_flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
 }
 
 /// 解析 `--from/--to <runtime>` + 一个可选位置参数。runtime 默认 claude-code。

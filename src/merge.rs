@@ -1,6 +1,6 @@
 //! 语义合并：git 的三方树合并 + 我们的裁决。
 //!
-//! `.gitattributes` 里 `ctx/** merge=agit` 把 claim 路径绑到本驱动上。
+//! `.gitattributes` 里 `state/facts/** merge=agit` 把 claim 路径绑到本驱动上。
 //! 当且仅当同一条 claim 在两个分支上都被修改时，git 才会调用它，
 //! 并传入三个临时文件：%O 共同祖先、%A 我方（也是输出）、%B 对方。
 //!
@@ -9,7 +9,6 @@
 
 use crate::claim::{subject_to_path, Claim, Evidence, Tier};
 use crate::evidence::{claim_status, Status};
-use crate::gitx;
 use anyhow::{bail, Result};
 use std::path::Path;
 
@@ -62,8 +61,9 @@ fn assess(root: &Path, c: &Claim) -> SideVerdict {
 }
 
 /// merge driver 入口：`agit merge-file %O %A %B %P`
+/// 由 git 在 Agent Store 里调用；证据的 file: 指针相对 Environment 解析。
 pub fn driver(base: &Path, ours: &Path, theirs: &Path, path: &str) -> Result<i32> {
-    let root = gitx::repo_root().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let root = crate::scope::environment_root().unwrap_or_else(|_| Path::new(".").to_path_buf());
 
     let (bt, ot, tt) = (read(base), read(ours), read(theirs));
 
@@ -134,11 +134,11 @@ pub fn driver(base: &Path, ours: &Path, theirs: &Path, path: &str) -> Result<i32
                 ov.status.label(),
                 tv.status.label()
             ));
-            out.push_str(&format!("#   agit resolve {subject} --take {side}\n"));
+            out.push_str(&format!("#   agit -a resolve {subject} --take {side}\n"));
         }
         None => {
             out.push_str("# 无法自动判定：双方证据强度相同。需要人类裁决。\n");
-            out.push_str(&format!("#   agit resolve {subject} --take ours|theirs\n"));
+            out.push_str(&format!("#   agit -a resolve {subject} --take ours|theirs\n"));
         }
     }
     out.push_str(&format!(
@@ -149,9 +149,9 @@ pub fn driver(base: &Path, ours: &Path, theirs: &Path, path: &str) -> Result<i32
     Ok(1)
 }
 
-/// 从冲突文件里取出指定一侧，写回成一条干净的 claim。
+/// 从冲突文件里取出指定一侧，写回成一条干净的 claim。fact 住在 Agent Store。
 pub fn resolve(subject: &str, take: &str) -> Result<i32> {
-    let root = gitx::repo_root()?;
+    let root = crate::scope::root_for(crate::scope::Scope::Agent)?;
     let rel = subject_to_path(subject)?;
     let path = root.join(&rel);
 
@@ -180,7 +180,7 @@ pub fn resolve(subject: &str, take: &str) -> Result<i32> {
     let claim = Claim::parse(chosen)?;
     std::fs::write(&path, claim.render()?)?;
 
-    gitx::git(&["add", &rel.to_string_lossy()])?;
+    crate::scope::git_in(&root, &["add", &rel.to_string_lossy()])?;
     println!("已采纳 {take}：{}", rel.display());
     println!("  {}", claim.body.lines().next().unwrap_or(""));
     Ok(0)

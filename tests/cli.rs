@@ -220,6 +220,69 @@ fn agent_scan_finds_secret() {
 
 // ─────────────────────── 透传保真：退出码 ───────────────────────
 
+// ─────────── fact 领域动词 + 跨库证据解析 ───────────
+
+#[test]
+fn new_and_verify_resolve_evidence_across_stores() {
+    let r = Repo::new();
+    // fact 住 Agent Store，证据 file: 指向代码仓库（app.ts:1）
+    let (code, out, err) = r.agit(&["-a", "new", "api/id", "-e", "file:app.ts:1", "-m", "字段叫 x。"]);
+    assert_eq!(code, 0, "new 应成功: {err}{out}");
+    assert!(r.agent().join("state/facts/api/id.md").exists(), "fact 应落在 Agent Store");
+
+    // 从代码仓库 cwd 调 verify，证据应对齐到代码仓库 → FRESH
+    let (code, out, _) = r.agit(&["-a", "verify"]);
+    assert_eq!(code, 0, "证据新鲜时 verify 应 0:\n{out}");
+    assert!(out.contains("FRESH"));
+
+    // 改代码 → 跨库检测到 STALE
+    r.write("app.ts", "export const x = 999;\n");
+    let (code, out, _) = r.agit(&["-a", "verify"]);
+    assert_eq!(code, 1, "证据失效时 verify 应非零");
+    assert!(out.contains("STALE"), "{out}");
+}
+
+/// 关键：merge driver 由 git 在 Agent Store 里调用，但 file: 证据必须解析到 Environment。
+#[test]
+fn merge_driver_resolves_file_evidence_against_environment() {
+    let r = Repo::new();
+
+    // alice 分支：file 证据（活代码）
+    r.agit(&["-a", "checkout", "-b", "alice"]);
+    r.agit(&["-a", "new", "api/id", "-e", "file:app.ts:1", "-m", "字段叫 x（代码为证）。"]);
+    r.agit(&["-a", "add", "-A"]);
+    r.agit(&["-a", "commit", "-m", "alice"]);
+
+    // bob 分支：从 main 分出，doc 2019 证据（陈旧）
+    r.agit(&["-a", "checkout", "main"]);
+    r.agit(&["-a", "checkout", "-b", "bob"]);
+    r.write(
+        ".agit/agent/state/facts/api/id.md",
+        "---\nsubject: api/id\ntier: reversible\nauthor: bob\n\
+         created: 2026-07-13T00:00:00Z\nevidence:\n- 'doc:wiki.md@2019-01-01'\n---\n\n字段叫 y。\n",
+    );
+    r.agit(&["-a", "add", "-A"]);
+    r.agit(&["-a", "commit", "-m", "bob"]);
+
+    // alice 合并 bob → add/add 冲突，driver 触发
+    r.agit(&["-a", "checkout", "alice"]);
+    let (code, out, _) = r.agit(&["-a", "merge", "bob"]);
+    assert_ne!(code, 0, "应当冲突:\n{out}");
+
+    let conflict = std::fs::read_to_string(r.agent().join("state/facts/api/id.md")).unwrap();
+    // ours 的 file: 证据被解析到代码仓库 → FRESH；bob 的 2019 doc → STALE
+    assert!(conflict.contains("[FRESH]"), "file 证据应对齐代码仓库:\n{conflict}");
+    assert!(conflict.contains("[STALE]"), "2019 doc 应 STALE:\n{conflict}");
+    assert!(conflict.contains("建议采纳: ours"), "应建议活代码一侧:\n{conflict}");
+
+    // resolve 落在 Agent Store
+    let (code, _, err) = r.agit(&["-a", "resolve", "api/id", "--take", "ours"]);
+    assert_eq!(code, 0, "{err}");
+    let resolved = std::fs::read_to_string(r.agent().join("state/facts/api/id.md")).unwrap();
+    assert!(!resolved.contains("<<<<<<<"), "冲突标记应被剥除");
+    assert!(resolved.contains("字段叫 x"), "应采纳 ours");
+}
+
 #[test]
 fn passthrough_propagates_git_exit_code() {
     let r = Repo::new();
