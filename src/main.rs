@@ -12,12 +12,14 @@
 #![allow(dead_code)] // v1 领域模块（claim/evidence/merge）正在向 Agent Store 移植
 
 mod adapter;
+mod align;
 mod claim;
 mod commands;
 mod environment;
 mod evidence;
 mod extract;
 mod facts;
+mod llm;
 mod gitx;
 mod init;
 mod merge;
@@ -101,7 +103,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── Agent Store 上的 fact 领域动词 ──
         "new" => match parse_new(args) {
-            Ok(n) => facts::new_fact(&n.subject, &n.evidence, &n.message, n.tier, n.author),
+            Ok(n) => facts::new_fact(&n.subject, &n.evidence, &n.message, n.tier, n.author, n.force),
             Err(e) => {
                 eprintln!("agit: {e}");
                 Ok(2)
@@ -159,9 +161,10 @@ struct NewArgs {
     message: String,
     tier: Option<claim::Tier>,
     author: Option<String>,
+    force: bool,
 }
 
-/// 解析 `agit -a new <subject> -e <ev>... -m <msg> [--tier T] [--author A]`
+/// 解析 `agit -a new <subject> -e <ev>... -m <msg> [--tier T] [--author A] [--force]`
 fn parse_new(args: &[String]) -> anyhow::Result<NewArgs> {
     let mut n = NewArgs {
         subject: String::new(),
@@ -169,6 +172,7 @@ fn parse_new(args: &[String]) -> anyhow::Result<NewArgs> {
         message: String::new(),
         tier: None,
         author: None,
+        force: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -204,6 +208,10 @@ fn parse_new(args: &[String]) -> anyhow::Result<NewArgs> {
                 } else {
                     anyhow::bail!("--author 缺参数");
                 }
+            }
+            "--force" => {
+                n.force = true;
+                i += 1;
             }
             s if n.subject.is_empty() => {
                 n.subject = s.to_string();

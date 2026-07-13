@@ -33,6 +33,18 @@ fn all_facts(agent: &Path) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
+/// 已有 fact 的 (subject, 正文首行) —— 供 subject 对齐用。
+fn existing_facts(agent: &Path) -> Vec<(String, String)> {
+    all_facts(agent)
+        .into_iter()
+        .filter_map(|(path, subject)| {
+            let c = Claim::load(&path).ok()?;
+            let first = c.body.lines().next().unwrap_or("").to_string();
+            Some((subject, first))
+        })
+        .collect()
+}
+
 // ─────────────────────────── new ───────────────────────────
 
 pub fn new_fact(
@@ -41,6 +53,7 @@ pub fn new_fact(
     message: &str,
     tier: Option<Tier>,
     author: Option<String>,
+    force: bool,
 ) -> Result<i32> {
     let agent = agent_root()?;
     let env = scope::environment_root()?;
@@ -49,6 +62,20 @@ pub fn new_fact(
 
     if path.exists() {
         bail!("{} 已存在。编辑它，或先 agit -a rm。", rel.display());
+    }
+
+    // subject 语义对齐：这条新结论是不是已有某条的同义？（堵住「换个名字重复入库」）
+    if !force {
+        let existing = existing_facts(&agent);
+        if let crate::align::Alignment::Duplicate { subject: dup, how } =
+            crate::align::check(subject, message, &existing)
+        {
+            let by = if how == "llm" { crate::llm::backend_name() } else { "启发式" };
+            eprintln!("疑似重复：这条结论和已有的 `{dup}` 说的像是同一件事（{by} 判定）。");
+            eprintln!("  想补充/修正它 → 直接编辑 {}", subject_to_path(&dup)?.display());
+            eprintln!("  确实是另一条 → 加 --force 新建。");
+            return Ok(2);
+        }
     }
 
     // 证据相对 Environment 采集：读源、算摘要、denylist 拦截

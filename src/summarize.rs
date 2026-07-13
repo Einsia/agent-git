@@ -11,9 +11,7 @@ use crate::evidence;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 #[derive(Debug, Deserialize)]
 struct DraftFact {
@@ -106,26 +104,6 @@ fn build_prompt(ir: &SessionIR, pool: &Pool) -> String {
         }
     }
     p
-}
-
-fn call_claude(prompt: &str) -> Result<String> {
-    let mut child = Command::new("claude")
-        .arg("-p")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("无法启动 claude CLI —— 它在 PATH 里吗？（Summarizer 依赖本机 claude）")?;
-    child
-        .stdin
-        .take()
-        .context("claude stdin")?
-        .write_all(prompt.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        bail!("claude 调用失败:\n{}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// 从模型输出里抠出 JSON 数组（优先 ```json 块，否则第一个 [ 到最后一个 ]）。
@@ -240,7 +218,7 @@ pub fn run(ir: &SessionIR, env_root: &Path, facts_dir: &Path) -> Result<usize> {
     }
     let prompt = build_prompt(ir, &pool);
     eprintln!("调用本机 claude 归纳结论……（证据池 {} 文件 / {} 命令）", pool.files.len(), pool.cmds.len());
-    let reply = call_claude(&prompt)?;
+    let reply = crate::llm::ask(&prompt)?;
     let json = extract_json(&reply).context("模型没有输出可解析的 JSON 数组")?;
 
     let claims = validate_drafts(&json, &pool.files, &pool.cmds, env_root, "claude-summarizer");

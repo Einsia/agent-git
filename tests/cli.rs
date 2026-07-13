@@ -315,6 +315,45 @@ fn validate_flags_bad_facts_and_portable_emits_refs() {
     assert!(out.contains("v1-draft") && out.contains("agent_state_ref"), "{out}");
 }
 
+/// subject 语义对齐：换个名字说同一件事，应被拦（无 claude 时走确定性启发式）。
+#[test]
+fn new_blocks_semantic_duplicate_subject() {
+    let r = Repo::new();
+    // 关掉 LLM 后端，强制走确定性启发式，测试才不依赖 claude
+    let agit_no_llm = |args: &[&str]| {
+        let o = Command::new(BIN)
+            .args(args)
+            .current_dir(r.path())
+            .env("AGIT_LLM", "codex") // codex 后端 available()=false → 启发式
+            .output()
+            .unwrap();
+        (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stderr).to_string())
+    };
+
+    // 第一条
+    assert_eq!(
+        agit_no_llm(&["-a", "new", "api/user/id", "-e", "file:app.ts:1", "-m", "用户 标识 字段 user_id 主键"]).0,
+        0
+    );
+    r.agit(&["-a", "add", "-A"]);
+    r.agit(&["-a", "commit", "-m", "first"]);
+
+    // 同一父路径 + 高词重叠 → 启发式判为疑似重复，拦下
+    let (code, err) = agit_no_llm(&["-a", "new", "api/user/key", "-e", "file:app.ts:1", "-m", "用户 标识 字段 user_id 主键 相同"]);
+    assert_ne!(code, 0, "语义重复应被拦");
+    assert!(err.contains("疑似重复"), "{err}");
+    assert!(!r.agent().join("state/facts/api/user/key.md").exists(), "被拦的 fact 不该落盘");
+
+    // --force 可强制新建
+    let (code, _) = agit_no_llm(&["-a", "new", "api/user/key", "--force", "-e", "file:app.ts:1", "-m", "用户 标识 字段 user_id 主键 相同"]);
+    assert_eq!(code, 0, "--force 应放行");
+    assert!(r.agent().join("state/facts/api/user/key.md").exists());
+
+    // 真正不同的结论应放行
+    let (code, _) = agit_no_llm(&["-a", "new", "perf/n-plus-1", "-e", "file:app.ts:1", "-m", "订单列表有 N+1 查询"]);
+    assert_eq!(code, 0, "不相干的结论应放行");
+}
+
 #[test]
 fn passthrough_propagates_git_exit_code() {
     let r = Repo::new();
