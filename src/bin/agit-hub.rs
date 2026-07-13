@@ -126,33 +126,6 @@ fn has_head(repo: &Path) -> bool {
     git(repo, &["rev-parse", "HEAD"]).is_some()
 }
 
-/// state/facts/ 下所有 fact 的 (subject, 文件内容)。
-fn facts(repo: &Path) -> Vec<(String, String)> {
-    let mut out = vec![];
-    let Some(list) = git(repo, &["ls-tree", "-r", "--name-only", "HEAD", "state/facts/"]) else {
-        return out;
-    };
-    for path in list.lines() {
-        let path = path.trim();
-        if !path.ends_with(".md") || path.rsplit('/').next().map(|f| f.starts_with('.')).unwrap_or(false) {
-            continue;
-        }
-        let subject = path
-            .strip_prefix("state/facts/")
-            .and_then(|p| p.strip_suffix(".md"))
-            .unwrap_or(path)
-            .to_string();
-        if let Some(body) = git(repo, &["show", &format!("HEAD:{path}")]) {
-            out.push((subject, body));
-        }
-    }
-    out
-}
-
-fn read_state_file(repo: &Path, file: &str) -> Option<String> {
-    git(repo, &["show", &format!("HEAD:state/{file}")])
-}
-
 fn recent_log(repo: &Path, n: usize) -> Vec<(String, String)> {
     git(repo, &["log", &format!("-{n}"), "--format=%h%x09%s"])
         .map(|s| {
@@ -163,54 +136,101 @@ fn recent_log(repo: &Path, n: usize) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-// ─────────── 极简 frontmatter 解析（Hub 侧只读，不引 serde_yaml）───────────
+// ─────────── session dump:列出 + 解析成可读摘要 ───────────
 
-struct Fact {
-    subject: String,
-    body: String,
-    evidence: Vec<String>,
-    tier: String,
-    author: String,
+/// sessions/<runtime>/<id>.jsonl 的 (session_id, 内容)。跳过子 agent 的 jsonl。
+fn sessions(repo: &Path) -> Vec<(String, String)> {
+    let mut out = vec![];
+    let Some(list) = git(repo, &["ls-tree", "-r", "--name-only", "HEAD", "sessions/"]) else {
+        return out;
+    };
+    for path in list.lines() {
+        let path = path.trim();
+        // 只要顶层会话:sessions/<rt>/<id>.jsonl（正好 3 段）
+        let segs: Vec<&str> = path.split('/').collect();
+        if segs.len() != 3 || !path.ends_with(".jsonl") {
+            continue;
+        }
+        let id = segs[2].trim_end_matches(".jsonl").to_string();
+        if let Some(body) = git(repo, &["show", &format!("HEAD:{path}")]) {
+            out.push((id, body));
+        }
+    }
+    out
 }
 
-fn parse_fact(subject: &str, text: &str) -> Fact {
-    let mut evidence = vec![];
-    let mut tier = String::new();
-    let mut author = String::new();
-    let mut body = String::new();
+struct SessionDigest {
+    id: String,
+    branch: String,
+    prompts: Vec<String>,
+    texts: Vec<String>,
+    tools: usize,
+    files: Vec<String>,
+}
 
-    if let Some(rest) = text.strip_prefix("---\n") {
-        if let Some((fm, b)) = rest.split_once("\n---\n") {
-            body = b.trim().to_string();
-            let mut in_ev = false;
-            for line in fm.lines() {
-                if let Some(v) = line.strip_prefix("tier:") {
-                    tier = v.trim().to_string();
-                } else if let Some(v) = line.strip_prefix("author:") {
-                    author = v.trim().to_string();
-                } else if line.starts_with("evidence:") {
-                    in_ev = true;
-                } else if in_ev {
-                    let t = line.trim();
-                    if let Some(item) = t.strip_prefix("- ") {
-                        evidence.push(item.trim().trim_matches('\'').to_string());
-                    } else if !t.is_empty() && !t.starts_with('#') {
-                        in_ev = false;
-                    }
+/// 从一条 jsonl 转录里抽出可读摘要（Hub 只读、只解析,不运行 agent）。
+fn parse_session(id: &str, jsonl: &str) -> SessionDigest {
+    let mut d = SessionDigest {
+        id: id.to_string(),
+        branch: String::new(),
+        prompts: vec![],
+        texts: vec![],
+        tools: 0,
+        files: vec![],
+    };
+    for line in jsonl.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if d.branch.is_empty() {
+            if let Some(b) = v.get("gitBranch").and_then(|x| x.as_str()) {
+                if !b.is_empty() {
+                    d.branch = b.to_string();
                 }
             }
         }
+        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        let meta = v.get("isMeta").and_then(|x| x.as_bool()).unwrap_or(false);
+        let content = v.get("message").and_then(|m| m.get("content"));
+        match ty {
+            "user" if !meta => {
+                if let Some(s) = content.and_then(|c| c.as_str()) {
+                    let t = s.trim();
+                    if !t.is_empty() && !t.starts_with('<') {
+                        d.prompts.push(t.to_string());
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(arr) = content.and_then(|c| c.as_array()) {
+                    for b in arr {
+                        match b.get("type").and_then(|x| x.as_str()) {
+                            Some("text") => {
+                                if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
+                                    d.texts.push(t.to_string());
+                                }
+                            }
+                            Some("tool_use") => {
+                                d.tools += 1;
+                                let name = b.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                                if name == "Write" || name == "Edit" {
+                                    if let Some(f) = b.get("input").and_then(|i| i.get("file_path")).and_then(|x| x.as_str()) {
+                                        let f = f.rsplit('/').next().unwrap_or(f).to_string();
+                                        if !d.files.contains(&f) {
+                                            d.files.push(f);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
-    if body.is_empty() {
-        body = text.trim().to_string();
-    }
-    Fact {
-        subject: subject.to_string(),
-        body,
-        evidence,
-        tier,
-        author,
-    }
+    d
 }
 
 // ─────────────────────────── HTTP 服务 ───────────────────────────
@@ -306,14 +326,14 @@ fn route(root: &Path, method: &str, path: &str, target: &str) -> (u16, &'static 
             let name = &p["/api/agent/".len()..];
             api_agent(root, name)
         }
-        // 从 Hub 直接取 Claude Code 就绪的 context
-        p if p.starts_with("/agent/") && p.ends_with("/claude.md") => {
-            let name = &p["/agent/".len()..p.len() - "/claude.md".len()];
+        // 会话摘要（只读渲染;真正合并在本地 reconcile）
+        p if p.starts_with("/agent/") && p.ends_with("/digest.md") => {
+            let name = &p["/agent/".len()..p.len() - "/digest.md".len()];
             let repo = repo_path(root, name);
             if !has_head(&repo) {
                 (404, "text/plain; charset=utf-8", "no such agent".into())
             } else {
-                (200, "text/markdown; charset=utf-8", claude_context(&repo, name))
+                (200, "text/markdown; charset=utf-8", digest_md(&repo, name))
             }
         }
         p if p.starts_with("/agent/") => {
@@ -405,21 +425,6 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-fn evidence_state(loc: &str) -> (&'static str, &'static str) {
-    // Hub 不重跑、不重算 —— 只看 locator 形态给一个静态提示。
-    if loc.starts_with("file:") {
-        ("code", "代码")
-    } else if loc.starts_with("cmd:") {
-        ("cmd", "命令")
-    } else if loc.starts_with("doc:") {
-        ("doc", "文档")
-    } else if loc.starts_with("human:") {
-        ("human", "人工")
-    } else {
-        ("other", "其他")
-    }
-}
-
 fn home_page(root: &Path) -> String {
     let agents = list_agents(root);
     let mut cards = String::new();
@@ -428,29 +433,26 @@ fn home_page(root: &Path) -> String {
     }
     for name in &agents {
         let repo = repo_path(root, name);
-        let (nfacts, goal) = if has_head(&repo) {
-            let f = facts(&repo).len();
-            let goal = read_state_file(&repo, "goals.md")
-                .and_then(|g| g.lines().find(|l| l.trim_start().starts_with("- ")).map(|l| l.trim_start()[2..].to_string()))
-                .unwrap_or_default();
-            (f, goal)
+        let (n, last) = if has_head(&repo) {
+            let n = sessions(&repo).len();
+            let last = recent_log(&repo, 1).into_iter().next().map(|(_, s)| s).unwrap_or_default();
+            (n, last)
         } else {
             (0, "（空）".into())
         };
         cards.push_str(&format!(
             "<a class=card href=\"/agent/{n}\"><div class=name>{n}</div>\
-             <div class=goal>{g}</div><div class=meta>{f} 条 fact</div></a>",
+             <div class=goal>{l}</div><div class=meta>{c} 条 session</div></a>",
             n = esc(name),
-            g = esc(&goal),
-            f = nfacts,
+            l = esc(&last),
+            c = n,
         ));
     }
     let body = format!(
-        "<p class=lead>面向 Agent Context 的协作平台。每个 agent 是一个可版本化的 Context 库。</p>\
+        "<p class=lead>面向 Agent Context 的协作平台。每个 agent 托管它的原始会话(session)。</p>\
          <div class=grid>{cards}</div>\
          <p class=dim style=\"margin-top:2rem\">API： <a href=\"/api/agents\">/api/agents</a> · \
-         发布： <code>agit -a push http://{}/&lt;name&gt;.git</code></p>",
-        "localhost:8177"
+         发布： <code>agit -a push http://HOST:PORT/&lt;name&gt;.git</code></p>"
     );
     page("AgentGitHub", body)
 }
@@ -461,7 +463,7 @@ fn agent_page(root: &Path, name: &str, query: &str) -> String {
         return page("404", format!("<p>没有 agent <b>{}</b>。<a href=\"/\">← 首页</a></p>", esc(name)));
     }
     if !has_head(&repo) {
-        return page(name, format!("<h1>{}</h1><p class=dim>这个 Context 还是空的（尚未 push）。</p>", esc(name)));
+        return page(name, format!("<h1>{}</h1><p class=dim>还没有 session（尚未 push）。</p>", esc(name)));
     }
 
     let search = query
@@ -470,40 +472,42 @@ fn agent_page(root: &Path, name: &str, query: &str) -> String {
         .map(|q| q.replace('+', " "))
         .unwrap_or_default();
 
-    // 目标 / 进度
-    let goals = read_state_file(&repo, "goals.md").unwrap_or_default();
-    let progress = read_state_file(&repo, "progress.md").unwrap_or_default();
-
-    // facts
-    let mut fact_html = String::new();
+    let mut html = String::new();
     let mut shown = 0;
-    for (subject, text) in facts(&repo) {
-        if !search.is_empty() && !subject.contains(&search) && !text.contains(&search) {
+    for (id, jsonl) in sessions(&repo) {
+        if !search.is_empty() && !jsonl.contains(&search) {
             continue;
         }
         shown += 1;
-        let f = parse_fact(&subject, &text);
-        let mut evs = String::new();
-        for e in &f.evidence {
-            let (cls, label) = evidence_state(e);
-            evs.push_str(&format!("<li class=ev-{cls}><span class=tag>{label}</span> <code>{}</code></li>", esc(e)));
+        let d = parse_session(&id, &jsonl);
+        let mut prompts = String::new();
+        for p in d.prompts.iter().take(6) {
+            prompts.push_str(&format!("<li>{}</li>", esc(p.lines().next().unwrap_or(""))));
         }
-        fact_html.push_str(&format!(
-            "<div class=fact><div class=subject>{s}</div>\
-             <div class=body>{b}</div>\
-             <ul class=evidence>{evs}</ul>\
-             <div class=meta>tier {t} · {a}</div></div>",
-            s = esc(&f.subject),
-            b = esc(&f.body),
-            t = esc(&f.tier),
-            a = esc(&f.author),
+        let concl = d.texts.last().map(|t| {
+            let one: String = t.trim().chars().take(400).collect();
+            esc(&one)
+        }).unwrap_or_default();
+        let files = if d.files.is_empty() { String::new() } else {
+            format!("<div class=meta>改动文件：{}</div>", esc(&d.files.join(", ")))
+        };
+        html.push_str(&format!(
+            "<div class=fact><div class=subject>会话 {id}{br}</div>\
+             <div class=body>{concl}</div>\
+             <ul class=evidence>{prompts}</ul>\
+             {files}\
+             <div class=meta>{np} 条指令 · {nt} 段回复 · {tools} 次工具调用</div></div>",
+            id = esc(&d.id),
+            br = if d.branch.is_empty() { String::new() } else { format!("（分支 {}）", esc(&d.branch)) },
+            np = d.prompts.len(),
+            nt = d.texts.len(),
+            tools = d.tools,
         ));
     }
-    if fact_html.is_empty() {
-        fact_html = "<p class=dim>没有匹配的 fact。</p>".into();
+    if html.is_empty() {
+        html = "<p class=dim>没有匹配的 session。</p>".into();
     }
 
-    // history
     let mut hist = String::new();
     for (h, s) in recent_log(&repo, 12) {
         hist.push_str(&format!("<li><code>{}</code> {}</li>", esc(&h), esc(&s)));
@@ -512,59 +516,49 @@ fn agent_page(root: &Path, name: &str, query: &str) -> String {
     let body = format!(
         "<div class=crumb><a href=\"/\">AgentGitHub</a> / <b>{name}</b></div>\
          <h1>{name}</h1>\
-         <form class=search><input name=q placeholder=\"搜 fact…\" value=\"{sv}\"><button>搜</button></form>\
+         <form class=search><input name=q placeholder=\"搜会话内容…\" value=\"{sv}\"><button>搜</button></form>\
          <div class=cols>\
            <div class=main>\
-             <h2>已知事实 <span class=dim>({shown})</span></h2>{fact_html}\
+             <h2>会话 <span class=dim>({shown})</span></h2>{html}\
            </div>\
            <div class=side>\
-             <h3>目标</h3><pre>{goals}</pre>\
-             <h3>进度</h3><pre>{progress}</pre>\
              <h3>历史</h3><ul class=hist>{hist}</ul>\
-             <h3>拉取</h3><pre>agit clone \\\n  http://localhost:8177/{name}.git</pre>\
-             <h3>在 Claude Code 里复用</h3><pre>curl -s \\\n  http://localhost:8177/agent/{name}/claude.md \\\n  &gt;&gt; CLAUDE.md</pre>\
-             <p class=dim><a href=\"/agent/{name}/claude.md\">↓ claude.md</a> · <a href=\"/api/agent/{name}\">JSON</a></p>\
+             <h3>拉取并合并</h3><pre>agit clone \\\n  http://HOST:PORT/{name}.git\nagit -a reconcile origin/main</pre>\
+             <p class=dim><a href=\"/agent/{name}/digest.md\">↓ 会话摘要</a> · <a href=\"/api/agent/{name}\">JSON</a></p>\
            </div>\
          </div>",
         name = esc(name),
         sv = esc(&search),
-        goals = esc(goals.trim()),
-        progress = esc(progress.trim()),
     );
     page(name, body)
 }
 
-/// 渲染 Claude Code 就绪的 context（供 `curl .../claude.md >> CLAUDE.md`）。
-/// Hub 不重算新鲜度 —— 消费者拉下来后用 `agit -a verify` 对自己的代码基线核实。
-fn claude_context(repo: &Path, name: &str) -> String {
+/// 会话摘要 markdown（Hub 只做只读渲染，不运行 agent、不做语义合并）。
+/// 真正的合并靠消费者本地 `agit -a reconcile`。
+fn digest_md(repo: &Path, name: &str) -> String {
     let mut md = format!(
-        "<!-- agit:begin —— 来自 AgentGitHub / {name}，勿手改 -->\n\
-         # 继承的 Agent Context（agit · 来自团队 {name}）\n\n\
-         > 本仓库此前 agent 积累的上下文。每条事实带证据出处，可直接信任；\n\
-         > 代码可能已变，需核实时运行 `agit -a verify`。\n\n"
+        "# {name} 的会话摘要（AgentGitHub · 只读渲染）\n\n\
+         > 这是团队 agent 会话的摘要，供快速了解。**真正的合并请在本地：**\n\
+         > `agit clone …/{name}.git && agit -a reconcile origin/main`（由 agent 读全量会话、语义合并）。\n\n"
     );
-    let goals = read_state_file(repo, "goals.md").unwrap_or_default();
-    let gb = goals.trim_start_matches("# 目标").trim();
-    if !gb.is_empty() {
-        md.push_str(&format!("## 目标\n\n{gb}\n\n"));
-    }
-    let mut fs = facts(repo);
-    fs.sort_by(|a, b| a.0.cmp(&b.0));
-    if !fs.is_empty() {
-        md.push_str("## 已知事实（带证据）\n\n");
-        for (subject, text) in &fs {
-            let f = parse_fact(subject, text);
-            md.push_str(&format!("- **{}** — {}\n", f.subject, f.body));
-            for e in &f.evidence {
-                md.push_str(&format!("  - 依据 `{e}`\n"));
+    for (id, jsonl) in sessions(repo) {
+        let d = parse_session(&id, &jsonl);
+        md.push_str(&format!("## 会话 {}{}\n\n", d.id, if d.branch.is_empty() { String::new() } else { format!("（{}）", d.branch) }));
+        if !d.prompts.is_empty() {
+            md.push_str("要它做的：\n");
+            for p in d.prompts.iter().take(8) {
+                md.push_str(&format!("- {}\n", p.lines().next().unwrap_or("")));
             }
+        }
+        if let Some(t) = d.texts.last() {
+            let one: String = t.trim().chars().take(500).collect();
+            md.push_str(&format!("\n结论/进展：{one}\n"));
+        }
+        if !d.files.is_empty() {
+            md.push_str(&format!("\n改动文件：{}\n", d.files.join(", ")));
         }
         md.push('\n');
     }
-    md.push_str(&format!(
-        "---\n_复用：`agit clone http://localhost:8177/{name}.git` 后 `agit -a verify`。_\n\
-         <!-- agit:end -->\n"
-    ));
     md
 }
 
@@ -575,9 +569,9 @@ fn api_agents(root: &Path) -> String {
             let repo = repo_path(root, n);
             serde_json::json!({
                 "name": n,
-                "facts": if has_head(&repo) { facts(&repo).len() } else { 0 },
+                "sessions": if has_head(&repo) { sessions(&repo).len() } else { 0 },
                 "state_url": format!("/api/agent/{n}"),
-                "git": format!("http://localhost:8177/{n}.git"),
+                "git": format!("/{n}.git"),
             })
         })
         .collect();
@@ -589,18 +583,22 @@ fn api_agent(root: &Path, name: &str) -> (u16, &'static str, String) {
     if !repo.exists() {
         return (404, "application/json", "{\"error\":\"not found\"}".into());
     }
-    let facts_json: Vec<serde_json::Value> = facts(&repo)
+    let sess_json: Vec<serde_json::Value> = sessions(&repo)
         .iter()
-        .map(|(s, t)| {
-            let f = parse_fact(s, t);
-            serde_json::json!({"subject": f.subject, "body": f.body, "evidence": f.evidence, "tier": f.tier, "author": f.author})
+        .map(|(id, jsonl)| {
+            let d = parse_session(id, jsonl);
+            serde_json::json!({
+                "id": d.id, "branch": d.branch,
+                "prompts": d.prompts, "conclusion": d.texts.last(),
+                "tools": d.tools, "files": d.files,
+            })
         })
         .collect();
     let v = serde_json::json!({
         "agent": name,
-        "goals": read_state_file(&repo, "goals.md").unwrap_or_default(),
-        "facts": facts_json,
-        "git": format!("http://localhost:8177/{name}.git"),
+        "sessions": sess_json,
+        "git": format!("/{name}.git"),
+        "hint": "真正的合并在本地 agit -a reconcile;Hub 只做只读渲染。",
     });
     (200, "application/json", serde_json::to_string_pretty(&v).unwrap_or("{}".into()))
 }
