@@ -80,11 +80,15 @@ fn redact(s: &str) -> String {
 }
 
 pub fn scan_text(text: &str) -> Vec<Finding> {
+    scan_text_opts(text, true)
+}
+
+/// `entropy` 关掉泛化的高熵检测 —— 用于 session dump(jsonl):里面全是 UUID / requestId /
+/// base64 这类高熵但无害的串,熵检测会疯狂误报。session 只靠高精度的具体规则。
+pub fn scan_text_opts(text: &str, entropy: bool) -> Vec<Finding> {
     let mut out = Vec::new();
 
     for (i, line) in text.lines().enumerate() {
-        // 忽略我们自己写的 locator 行：`evidence: file:models/user.ts:4 #a937b4a5`
-        // 摘要是 8 位十六进制，不会触发规则，但连接串形态的 locator 可能误报。
         for rule in RULES.iter() {
             if let Some(m) = rule.re.find(line) {
                 out.push(Finding {
@@ -95,15 +99,16 @@ pub fn scan_text(text: &str) -> Vec<Finding> {
             }
         }
 
-        for m in HIGH_ENTROPY_CANDIDATE.find_iter(line) {
-            let tok = m.as_str();
-            // 十六进制摘要、git sha、base64 编码的普通文本熵都不够高。
-            if shannon_entropy(tok) > ENTROPY_THRESHOLD {
-                out.push(Finding {
-                    rule: "high-entropy-string",
-                    line: i + 1,
-                    excerpt: redact(tok),
-                });
+        if entropy {
+            for m in HIGH_ENTROPY_CANDIDATE.find_iter(line) {
+                let tok = m.as_str();
+                if shannon_entropy(tok) > ENTROPY_THRESHOLD {
+                    out.push(Finding {
+                        rule: "high-entropy-string",
+                        line: i + 1,
+                        excerpt: redact(tok),
+                    });
+                }
             }
         }
     }
@@ -113,5 +118,37 @@ pub fn scan_text(text: &str) -> Vec<Finding> {
 
 pub fn scan_file(path: &Path) -> Result<Vec<Finding>> {
     let text = std::fs::read_to_string(path)?;
-    Ok(scan_text(&text))
+    // .md(fact)用全套含熵检测;jsonl/json/txt(session dump)只用具体规则
+    let entropy = path.extension().map(|x| x == "md").unwrap_or(false);
+    Ok(scan_text_opts(&text, entropy))
+}
+
+/// 递归扫描一个目录树里的文本文件(.md/.jsonl/.json/.txt),打印命中,返回命中数。
+/// session dump 是 jsonl,里面可能带 agent 见过的密钥。
+pub fn scan_tree(root: &Path) -> Result<usize> {
+    let mut total = 0;
+    for e in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !e.file_type().is_file() {
+            continue;
+        }
+        let p = e.path();
+        let ext_ok = p
+            .extension()
+            .map(|x| matches!(x.to_str(), Some("md" | "jsonl" | "json" | "txt")))
+            .unwrap_or(false);
+        if !ext_ok {
+            continue;
+        }
+        for f in scan_file(p)? {
+            eprintln!(
+                "  {}:{}  [{}]  {}",
+                p.strip_prefix(root).unwrap_or(p).display(),
+                f.line,
+                f.rule,
+                f.excerpt
+            );
+            total += 1;
+        }
+    }
+    Ok(total)
 }

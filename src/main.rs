@@ -26,6 +26,7 @@ mod merge;
 mod passthrough;
 mod scan;
 mod scope;
+mod session;
 mod summarize;
 mod validate;
 mod workspace;
@@ -109,6 +110,10 @@ fn dispatch(argv: Vec<String>) -> i32 {
                 Ok(2)
             }
         },
+        "sync" => {
+            let (rt, _) = parse_runtime_arg(args, "--from");
+            session::sync(&rt)
+        }
         "verify" => facts::verify(args.iter().any(|a| a == "--rerun")),
         "validate" => validate::validate(),
         "portable" => validate::portable(args.first().map(PathBuf::from)),

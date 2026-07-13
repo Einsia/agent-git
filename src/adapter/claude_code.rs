@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 pub struct ClaudeCode;
 
 /// cwd → Claude Code 的 project slug：绝对路径里的 '/' 换成 '-'。
-fn slug_for(cwd: &Path) -> String {
+pub fn slug_for(cwd: &Path) -> String {
     cwd.to_string_lossy().replace('/', "-")
 }
 
-fn projects_dir() -> Result<PathBuf> {
+pub fn projects_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("读不到 $HOME")?;
     Ok(PathBuf::from(home).join(".claude/projects"))
 }

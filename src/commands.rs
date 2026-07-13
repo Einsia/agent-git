@@ -151,12 +151,18 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
         );
         out.lines().map(|p| root.join(p)).collect()
     } else {
-        let facts = root.join(FACTS_SUBDIR);
-        WalkDir::new(&facts)
+        // 扫整个 Agent Store 的文本文件:fact(.md)+ session dump(.jsonl 等)
+        WalkDir::new(&root)
             .into_iter()
+            .filter_entry(|e| e.file_name() != ".git")
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
-            .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|x| matches!(x.to_str(), Some("md" | "jsonl" | "json" | "txt")))
+                    .unwrap_or(false)
+            })
             .map(|e| e.path().to_path_buf())
             .collect()
     };
