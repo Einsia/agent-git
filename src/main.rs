@@ -25,6 +25,7 @@ mod passthrough;
 mod scan;
 mod scope;
 mod summarize;
+mod validate;
 mod workspace;
 
 use scope::Scope;
@@ -100,6 +101,8 @@ fn dispatch(argv: Vec<String>) -> i32 {
             }
         },
         "verify" => facts::verify(args.iter().any(|a| a == "--rerun")),
+        "validate" => validate::validate(),
+        "portable" => validate::portable(args.first().map(PathBuf::from)),
         "why" => match args.first() {
             Some(s) => facts::why(s),
             None => {

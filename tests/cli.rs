@@ -284,6 +284,38 @@ fn merge_driver_resolves_file_evidence_against_environment() {
 }
 
 #[test]
+fn validate_flags_bad_facts_and_portable_emits_refs() {
+    let r = Repo::new();
+    r.agit(&["-a", "new", "api/id", "-e", "file:app.ts:1", "-m", "ok"]);
+    assert_eq!(r.agit(&["-a", "validate"]).0, 0, "好 fact 应通过");
+
+    // 注入一条无证据的 fact → validate 报错
+    r.write(
+        ".agit/agent/state/facts/bad.md",
+        "---\nsubject: bad\ntier: reversible\nauthor: x\ncreated: 2026-07-13T00:00:00Z\nevidence: []\n---\n\nx\n",
+    );
+    let (code, _, err) = r.agit(&["-a", "validate"]);
+    assert_ne!(code, 0, "无证据 fact 应报错");
+    assert!(err.contains("无证据"), "{err}");
+
+    // 注入密钥 → validate 报错
+    std::fs::remove_file(r.path().join(".agit/agent/state/facts/bad.md")).unwrap();
+    r.write(
+        ".agit/agent/state/facts/leak.md",
+        "---\nsubject: leak\ntier: reversible\nauthor: x\ncreated: 2026-07-13T00:00:00Z\nevidence:\n- 'file:app.ts:1'\n---\n\nAKIAIOSFODNN7EXAMPLE\n",
+    );
+    let (code, _, err) = r.agit(&["-a", "validate"]);
+    assert_ne!(code, 0, "含密钥应报错");
+    assert!(err.contains("密钥"), "{err}");
+
+    // portable 输出 v1 refs
+    std::fs::remove_file(r.path().join(".agit/agent/state/facts/leak.md")).unwrap();
+    let (code, out, _) = r.agit(&["-a", "portable"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("v1-draft") && out.contains("agent_state_ref"), "{out}");
+}
+
+#[test]
 fn passthrough_propagates_git_exit_code() {
     let r = Repo::new();
     // 一条注定失败的 git 命令，退出码应原样透出（不是 agit 的 2）
