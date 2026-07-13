@@ -48,13 +48,9 @@ pub struct SessionIR {
 pub trait Adapter {
     fn name(&self) -> &'static str;
 
-    /// runtime session → 规范化 IR。确定性、不调模型。
+    /// runtime session → 规范化 IR。确定性、不调模型。reconcile 的 brief 靠它读会话。
     /// `session` 为 None 时由 adapter 自行定位当前项目的最新 session。
     fn export(&self, session: Option<&Path>, cwd: &Path) -> Result<SessionIR>;
-
-    /// AgentState（state/ 目录）→ 该 runtime 可消费的可移植摘要，写到 `out`。
-    /// MVP：产出一份 runtime-neutral 的 markdown digest。
-    fn import(&self, state_dir: &Path, out: &Path) -> Result<()>;
 
     /// 校验一个 session 文件对本 runtime 是否格式合法。
     fn validate(&self, session: &Path) -> Result<()>;
@@ -75,6 +71,6 @@ pub fn get(runtime: &str) -> Result<Box<dyn Adapter>> {
 pub fn list() -> Vec<(&'static str, &'static str)> {
     vec![
         ("claude-code", "Claude Code —— 解析 ~/.claude/projects/<slug>/<session>.jsonl（已实现）"),
-        ("codex", "Codex —— 接口已预留，export/import/validate 待实现（桩）"),
+        ("codex", "Codex —— 接口已预留，export/validate 待实现（桩）"),
     ]
 }

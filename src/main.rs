@@ -12,23 +12,15 @@
 #![allow(dead_code)] // v1 领域模块（claim/evidence/merge）正在向 Agent Store 移植
 
 mod adapter;
-mod align;
-mod claim;
 mod commands;
 mod environment;
-mod evidence;
-mod extract;
-mod facts;
-mod llm;
 mod gitx;
 mod init;
-mod merge;
+mod llm;
 mod passthrough;
 mod scan;
 mod scope;
 mod session;
-mod summarize;
-mod validate;
 mod workspace;
 
 use scope::Scope;
@@ -68,7 +60,6 @@ fn dispatch(argv: Vec<String>) -> i32 {
                 Ok(2)
             }
         },
-        "merge-file" => run_merge_driver(args),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(0)
@@ -89,50 +80,22 @@ fn dispatch(argv: Vec<String>) -> i32 {
             _ => commands::workspace_show(),
         },
 
-        // ── Adapter：runtime ↔ AgentState ──
-        "adapter" => commands::adapter_list(),
-        "import" => {
-            let summarize = args.iter().any(|a| a == "--summarize");
-            let filtered: Vec<String> = args.iter().filter(|a| *a != "--summarize").cloned().collect();
-            let (rt, pos) = parse_runtime_arg(&filtered, "--from");
-            commands::import_cmd(&rt, pos, summarize)
-        }
-        "export" => {
-            let (rt, pos) = parse_runtime_arg(args, "--to");
-            commands::export_cmd(&rt, pos)
-        }
-
-        // ── Agent Store 上的 fact 领域动词 ──
-        "new" => match parse_new(args) {
-            Ok(n) => facts::new_fact(&n.subject, &n.evidence, &n.message, n.tier, n.author, n.force),
-            Err(e) => {
-                eprintln!("agit: {e}");
-                Ok(2)
-            }
-        },
+        // ── session dump 管理（新模型的核心）──
         "sync" => {
             let (rt, _) = parse_runtime_arg(args, "--from");
             session::sync(&rt)
         }
-        "verify" => facts::verify(args.iter().any(|a| a == "--rerun")),
-        "validate" => validate::validate(),
-        "portable" => validate::portable(args.first().map(PathBuf::from)),
-        "why" => match args.first() {
-            Some(s) => facts::why(s),
-            None => {
-                eprintln!("用法: agit -a why <subject>");
-                Ok(2)
+        "reconcile" => {
+            let (rt, pos) = parse_runtime_arg(args, "--from");
+            match pos {
+                Some(r) => session::reconcile(&r.to_string_lossy(), &rt),
+                None => {
+                    eprintln!("用法: agit -a reconcile <ref>   （让 agent 把对面 <ref> 的 session 合进来）");
+                    Ok(2)
+                }
             }
-        },
-        "resolve" => {
-            let subject = args.first().cloned().unwrap_or_default();
-            let take = parse_flag_value(args, "--take").unwrap_or_default();
-            if subject.is_empty() || take.is_empty() {
-                eprintln!("用法: agit -a resolve <subject> --take ours|theirs");
-                return 2;
-            }
-            merge::resolve(&subject, &take)
         }
+        "adapter" => commands::adapter_list(),
 
         // ── 其余一切：透明透传到对应库的 git ──
         _ => passthrough::run(scope, rest),
@@ -147,102 +110,6 @@ fn dispatch(argv: Vec<String>) -> i32 {
     }
 }
 
-/// git 的 merge driver 入口：agit merge-file %O %A %B %P（由 Agent Store 的 config 调用）。
-fn run_merge_driver(args: &[String]) -> anyhow::Result<i32> {
-    if args.len() < 4 {
-        anyhow::bail!("merge-file 需要 %O %A %B %P 四个参数（由 git 调用，不是给人用的）");
-    }
-    merge::driver(
-        std::path::Path::new(&args[0]),
-        std::path::Path::new(&args[1]),
-        std::path::Path::new(&args[2]),
-        &args[3],
-    )
-}
-
-struct NewArgs {
-    subject: String,
-    evidence: Vec<String>,
-    message: String,
-    tier: Option<claim::Tier>,
-    author: Option<String>,
-    force: bool,
-}
-
-/// 解析 `agit -a new <subject> -e <ev>... -m <msg> [--tier T] [--author A] [--force]`
-fn parse_new(args: &[String]) -> anyhow::Result<NewArgs> {
-    let mut n = NewArgs {
-        subject: String::new(),
-        evidence: vec![],
-        message: String::new(),
-        tier: None,
-        author: None,
-        force: false,
-    };
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-e" | "--evidence" => {
-                if i + 1 < args.len() {
-                    n.evidence.push(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    anyhow::bail!("-e 缺参数");
-                }
-            }
-            "-m" | "--message" => {
-                if i + 1 < args.len() {
-                    n.message = args[i + 1].clone();
-                    i += 2;
-                } else {
-                    anyhow::bail!("-m 缺参数");
-                }
-            }
-            "--tier" => {
-                if i + 1 < args.len() {
-                    n.tier = Some(parse_tier(&args[i + 1])?);
-                    i += 2;
-                } else {
-                    anyhow::bail!("--tier 缺参数");
-                }
-            }
-            "--author" => {
-                if i + 1 < args.len() {
-                    n.author = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    anyhow::bail!("--author 缺参数");
-                }
-            }
-            "--force" => {
-                n.force = true;
-                i += 1;
-            }
-            s if n.subject.is_empty() => {
-                n.subject = s.to_string();
-                i += 1;
-            }
-            s => anyhow::bail!("多余参数: {s}"),
-        }
-    }
-    if n.subject.is_empty() {
-        anyhow::bail!("用法: agit -a new <subject> -e <证据> -m <结论>");
-    }
-    Ok(n)
-}
-
-fn parse_tier(s: &str) -> anyhow::Result<claim::Tier> {
-    match s {
-        "reversible" => Ok(claim::Tier::Reversible),
-        "compensable" => Ok(claim::Tier::Compensable),
-        "irreversible" => Ok(claim::Tier::Irreversible),
-        _ => anyhow::bail!("tier 只能是 reversible / compensable / irreversible"),
-    }
-}
-
-fn parse_flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
-}
 
 /// 解析 `--from/--to <runtime>` + 一个可选位置参数。runtime 默认 claude-code。
 fn parse_runtime_arg(args: &[String], flag: &str) -> (String, Option<PathBuf>) {
@@ -275,14 +142,18 @@ fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {
 }
 
 const USAGE: &str = "\
-agit —— 版本化 Agent Context + Environment 的 Git 兼容 CLI
+agit —— 版本化 agent 的原始 session,让团队协作 Agent Context
 
-  agit init                初始化 Agent Store 与配对基建
-  agit <git-args>          在代码仓库（Environment）上跑 git —— 透明
-  agit -a <git-args>       在 Agent Store 上跑同构操作（status/add/commit/log/diff/merge/…）
-  agit -a scan [--staged]  扫 AgentState 里的密钥
-  agit workspace [log]     看 Agent↔Environment 的配对（WorkspaceRevision）
+  agit init                在代码仓库旁建 Agent Store
+  agit -a sync             把本项目的 Claude session dump 镜像进 Agent Store
+  agit -a push / pull      和团队同步 session（Agent Store 就是 git 仓库）
+  agit -a reconcile <ref>  让 agent 读对面 <ref> 的 session、合成统一上下文,真冲突才问你
+  agit clone <url>         一条命令拉取团队 Agent Store
+  agit -a scan [--staged]  扫 session dump 里的密钥
+  agit workspace [log]     看 Agent↔Environment 的配对
+  agit adapter             列出 runtime adapter
 
-  scope 只认紧跟 agit 的第一个 token：
-    agit -a commit         Agent scope
-    agit commit -a         Environment scope（-a 是 git 的参数）";
+  agit <git-args>          在代码仓库（Environment）上透明跑 git
+  agit -a <git-args>       在 Agent Store 上跑同构 git
+
+  scope 只认紧跟 agit 的第一个 token：agit -a commit（agent）vs agit commit -a（代码,-a 是 git 参数）";

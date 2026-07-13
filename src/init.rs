@@ -5,8 +5,6 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-const GITATTR: &str = "state/facts/** merge=agit";
-
 pub fn run() -> Result<i32> {
     let env = scope::env_root().context("agit init 需要在一个 git 仓库（你的代码仓库）里运行")?;
     let agent = env.join(AGENT_DIR);
@@ -14,28 +12,18 @@ pub fn run() -> Result<i32> {
     // 1. Environment 侧：把 .agit/ 挡在代码历史之外
     ensure_gitignore(&env)?;
 
-    // 2. 建 Agent Store（独立 git 仓库）
+    // 2. 建 Agent Store（独立 git 仓库），装 session dump
     let fresh = !agent.join(".git").exists();
     if fresh {
         std::fs::create_dir_all(&agent)?;
         git(&agent, &["init", "-q", "-b", "main"])?;
-        // 让 agent 提交有个默认身份，独立于代码仓库
         let _ = git(&agent, &["config", "user.name", "agit"]);
         let _ = git(&agent, &["config", "user.email", "agit@local"]);
-        scaffold_state(&agent)?;
+        scaffold(&agent)?;
     }
 
-    // 3. AgentState 的合并驱动 —— 注册在 Agent Store 上（不是代码仓库）
+    // 3. 密钥 hook —— dump 全部 session 意味着转录里可能带 agent 见过的密钥
     let exe = std::env::current_exe().context("无法定位 agit 自身路径")?;
-    git(&agent, &["config", "merge.agit.name", "agit fact merge (evidence-aware)"])?;
-    git(
-        &agent,
-        &[
-            "config",
-            "merge.agit.driver",
-            &format!("{} merge-file %O %A %B %P", exe.display()),
-        ],
-    )?;
     install_hook(&agent, "pre-commit", &exe, "hook-scan --staged")?;
     install_hook(&agent, "pre-push", &exe, "hook-scan")?;
 
@@ -48,9 +36,9 @@ pub fn run() -> Result<i32> {
     println!("  Environment : {}", env.display());
     println!("  Agent Store : {}", agent.display());
     println!();
-    println!("  agit <git-args>       在代码仓库上跑 git（透明）");
-    println!("  agit -a <git-args>    在 Agent Store 上跑同构操作");
-    println!("  agit -a status        看 AgentState 的变化");
+    println!("  agit -a sync            把本项目的 Claude session dump 镜像进来");
+    println!("  agit -a push / pull     和团队同步 session");
+    println!("  agit -a reconcile <ref> 让 agent 把对面的 session 合进来（真冲突才问你）");
     Ok(0)
 }
 
@@ -70,19 +58,13 @@ fn ensure_gitignore(env: &Path) -> Result<()> {
     Ok(())
 }
 
-fn scaffold_state(agent: &Path) -> Result<()> {
-    std::fs::write(agent.join(".gitattributes"), format!("{GITATTR}\n"))?;
+fn scaffold(agent: &Path) -> Result<()> {
     std::fs::write(
         agent.join("agent.toml"),
-        "# Agent 身份：id、rules、skill、tool contract\nid = \"unnamed-agent\"\n",
+        "# Agent 身份\nid = \"unnamed-agent\"\n",
     )?;
-    let state = agent.join("state");
-    std::fs::create_dir_all(state.join("facts"))?;
-    std::fs::write(state.join("goals.md"), "# 目标\n")?;
-    std::fs::write(state.join("constraints.md"), "# 约束\n")?;
-    std::fs::write(state.join("progress.md"), "# 进度\n")?;
-    std::fs::write(state.join("artifacts.md"), "# Artifact 引用\n")?;
-    std::fs::write(state.join("facts/.gitkeep"), "")?;
+    std::fs::create_dir_all(agent.join("sessions"))?;
+    std::fs::write(agent.join("sessions/.gitkeep"), "")?;
     Ok(())
 }
 
