@@ -97,26 +97,21 @@ agit -a portable      # 导出 PortableState
 
 ## 演示
 
-七个动手 demo，各自建仓库、命令你自己敲。**先读 [`demo/README.md`](demo/README.md)。**
+一个大合集演示，一条叙事串起全部能力（Alice 抽取+发布 → Lin 消费+复用）。命令你自己敲。
 
 ```bash
-./demo/01-two-stores/setup.sh
+./demo/showcase/setup.sh                 # 搭台：Alice/Lin 的代码仓库 + 一个运行中的 Hub
 export PATH="/tmp/agit-demo/bin:$PATH"
-cd /tmp/agit-demo/01-two-stores
-# 照着 demo/01-two-stores/README.md 敲
+# 照着 demo/showcase/README.md 一幕一幕敲
 
-./demo/verify.sh      # 机器核对每份 README 没撒谎（64 命令 / 52 断言）
+./demo/showcase/rehearse.sh              # 上台前彩排一遍（非交互，16 项检查）
 ```
 
-| # | | PRD |
-|---|---|---|
-| 01 | 两个库 + scope 歧义 | 对象模型 |
-| 02 | 从 session 抽取 AgentState | ContextManagement |
-| 03 | fact 带证据、证据过期 | 事实+证据 |
-| 04 | 合并 + 证据裁决 | 团队协作 |
-| 05 | WorkspaceRevision 配对 + portable | JointVersionControl |
-| 06 | 密钥三道防线 | secret 不得进 Hub |
-| 07 | push/pull context | TeamExposure / Reuse |
+覆盖：两库模型、scope 路由与歧义、会话抽取、本机 claude 归纳、手写 fact、证据校验、
+**证据过期**、出处链、密钥防线、WorkspaceRevision 配对、schema 校验、PortableState、
+Hub 发布/浏览、**证据裁决合并**、一条命令消费、**装回 Claude Code 复用**、Hub claude.md 端点。
+
+详见 [`demo/README.md`](demo/README.md)。
 
 ## 安全
 

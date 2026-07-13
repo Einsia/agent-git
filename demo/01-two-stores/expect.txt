@@ -1,5 +1,0 @@
-Environment : /tmp/agit-demo/01-two-stores
-Agent Store : .*/.agit/agent
-Agent Store（.agit/agent）
-改代码
-改 context

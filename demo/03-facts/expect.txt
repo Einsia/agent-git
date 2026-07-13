@@ -1,8 +1,0 @@
-新建 fact  state/facts/api/user/id-field-name.md
-证据: file:models/user.ts:4 #
-FRESH
-证据全部新鲜
-STALE
-已变更（a937b4a5
-出处链
-v1-draft 校验

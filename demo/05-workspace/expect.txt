@@ -1,9 +1,0 @@
-agent_rev
-head_commit
-stash_tree
-agent:commit
-env:commit
-"dirty": true
-agit_version
-agent_state_ref
-workspace_revision_ref
