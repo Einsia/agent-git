@@ -58,6 +58,13 @@ fn dispatch(argv: Vec<String>) -> i32 {
     let result = match cmd {
         // ── 顶层原生命令（与 scope 无关）──
         "init" => init::run(),
+        "clone" => match args.first() {
+            Some(url) => commands::clone_agent(url),
+            None => {
+                eprintln!("用法: agit clone <hub-url>/<name>.git   （把团队 Agent Store 拉到本地并装好驱动）");
+                Ok(2)
+            }
+        },
         "merge-file" => run_merge_driver(args),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");

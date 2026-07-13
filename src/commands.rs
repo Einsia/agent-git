@@ -144,6 +144,32 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
     Ok(0)
 }
 
+/// `agit clone <url>` —— 把团队的 Agent Store 拉到 .agit/agent 并装好驱动/hook。
+/// 消费他人 context 的一条命令：clone + init（幂等）。
+pub fn clone_agent(url: &str) -> Result<i32> {
+    let env = scope::env_root()?;
+    let agent = env.join(scope::AGENT_DIR);
+    if agent.join(".git").exists() {
+        anyhow::bail!(
+            "{} 已存在。要换成远端的 context，先移除它，或直接 agit -a pull。",
+            agent.display()
+        );
+    }
+    std::fs::create_dir_all(agent.parent().unwrap())?;
+    let (code, _) = scope::git_in_status(
+        &env,
+        &["clone", "-q", url, &agent.to_string_lossy()],
+    );
+    if code != 0 {
+        anyhow::bail!("git clone {url} 失败");
+    }
+    println!("已拉取 Agent Store ← {url}");
+    // 装 driver / hook（init 幂等，会在已有 clone 上补装配置）
+    crate::init::run()?;
+    println!("\n看看拿到了什么： agit -a verify");
+    Ok(0)
+}
+
 /// 打印当前 WorkspaceRevision（Agent↔Environment 配对）。
 pub fn workspace_show() -> Result<i32> {
     let head = scope::workspace_dir()?.join("HEAD.json");

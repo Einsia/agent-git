@@ -149,12 +149,26 @@ cd /tmp/agit-demo/01-two-stores
 ./build.sh --release
 ```
 
+## AgentGitHub Hub
+
+PRD 的第二个交付物。`agit-hub` 是一个自包含的 Hub：托管 Agent Store（bare git 仓库）、
+git smart-http 同步、网页前端 + agent 拉取的 JSON API。
+
+```sh
+agit-hub add payments-api && agit-hub serve --port 8177   # 启动
+agit -a push http://localhost:8177/payments-api.git       # 发布 context
+agit clone http://localhost:8177/payments-api.git         # 一条命令消费
+```
+
+详见 [`docs/hub.md`](docs/hub.md)。
+
 ## 还没做
 
 - **场景 6（跨 Project 共用 Agent）**：需要多 Project 引用同一 Agent Store。
-- **AgentGitHub Hub**：CLI 阶段用普通 git remote 顶着；Hub 网页层单独做。
+- **Hub 的权限 / 订阅 / 网页 diff**：第一版是 Registry + Sync，这些未做。
 - **Codex adapter**：接口留桩，待样本。
 - **精确 schema**：`agit/v1-draft`，待 `codex-session-state-research.md` 收敛。
+- **ContextReuse 落到 runtime**：`agit -a export` 出可移植 digest；注入 runtime 续跑待定。
 
 ## License
 
