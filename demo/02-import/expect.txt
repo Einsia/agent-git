@@ -1,0 +1,9 @@
+claude-code
+codex
+从 claude-code session 抽取 AgentState
+2 条 file 证据已对齐基线
+只记不跑
+# 目标
+证据候选池
+runtime
+session_id

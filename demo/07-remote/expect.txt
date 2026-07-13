@@ -1,0 +1,6 @@
+latency/order-service/n-plus-1
+main -> main
+结论
+出处链
+\[FRESH\] file:services/order.ts:7-10
+证据全部新鲜

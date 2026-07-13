@@ -1,0 +1,7 @@
+denylist
+证据无法采集
+拒绝写入：fact 里含有疑似密钥
+发现疑似密钥
+aws-access-key-id
+退出码=1
+未发现密钥

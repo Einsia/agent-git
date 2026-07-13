@@ -1,8 +1,0 @@
-# verify.sh 会跑 README 里 ```console 块的每条命令，然后断言下面每条模式都出现在输出里。
-写入 .gitattributes: ctx/\*\* merge=agit
-安装 hook: pre-push
-安装 hook: pre-commit
-merge\.agit\.driver .* merge-file %O %A %B %P
-exec .*agit. scan
-尚未安装 agit 的 merge driver
-还没有 ctx/

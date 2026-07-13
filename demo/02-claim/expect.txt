@@ -1,9 +1,0 @@
-user_id: string;
-新建 claim  ctx/api/user/id-field-name.md
-证据: file:models/user.ts:4 #
-subject: api/user/id-field-name
-证据无法采集
-只有 10 行
-没有 ctx/bogus —— 被拒绝的 claim 不落盘
-tier: compensable
-tier: irreversible
