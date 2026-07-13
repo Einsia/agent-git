@@ -1,75 +1,57 @@
 #!/usr/bin/env bash
-# 大合集 demo 的舞台搭建。建两个开发者的代码仓库 + 启动 Hub + 注册 agent。
-# 不替你跑 agit init/import/... —— 那些是你上台要演的。
-#
-#   ./demo/showcase/setup.sh            搭台
-#   SUMMARIZE=1 ./demo/showcase/setup.sh   （无影响，标志给 rehearse 用）
+# 新模型 demo 的舞台:Alice / Bob 两个开发者的代码仓库,各带一条(伪造的)Claude 会话,
+# 外加一个团队远端。不替你跑 sync/push/reconcile —— 那些是你要演的。
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
-PORT="${HUB_PORT:-8180}"
-HUB_ROOT="$DEMO_HOME/hub-data"
-AGENT="payments-api"
 ALICE="$DEMO_HOME/showcase-alice"
-LIN="$DEMO_HOME/showcase-lin"
-HUB="$BIN_DIR/agit-hub"
+BOB="$DEMO_HOME/showcase-bob"
+ORIGIN="$DEMO_HOME/showcase-origin.git"
 
 _ensure_agit
-# 指向真实二进制，别指向 bin/ 里的软链（否则自指成环）
-HUB_BIN="$ROOT/target/release/agit-hub"
-[[ -x "$HUB_BIN" ]] || HUB_BIN="$ROOT/target/debug/agit-hub"
-ln -sf "$HUB_BIN" "$HUB"
-
 B=$'\033[1m'; G=$'\033[32m'; DIM=$'\033[2m'; N=$'\033[0m'
 
-# ── 建一个假支付服务代码仓库 ──
-seed_code() {
-  local dir="$1" who="$2"
-  rm -rf "$dir"; mkdir -p "$dir"; cd "$dir"
-  git init -q -b main .
-  git config user.name "$who"; git config user.email "$who@payments.io"; git config commit.gpgsign false
-  cp -r "$SEED/." "$dir/"
-  mv env.seed .env
-  printf '.env\nnode_modules/\n' > .gitignore
-  git add -A && git commit -qm "支付服务：初始代码"
+# 造一条 Claude 风格的会话 dump:$1=项目路径 $2=会话名 $3=用户话 $4=agent结论
+fake_session() {
+  local slug; slug=$(echo "$1" | sed 's|/|-|g')
+  local c="$HOME/.claude/projects/$slug"
+  mkdir -p "$c/$2/tool-results"
+  cat > "$c/$2.jsonl" <<EOF
+{"type":"mode","sessionId":"$2"}
+{"type":"user","cwd":"$1","gitBranch":"main","uuid":"u1","message":{"role":"user","content":"$3"}}
+{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"$4"}]}}
+EOF
+  echo "工具输出示例" > "$c/$2/tool-results/toolu_x.txt"
 }
 
-# ── Hub ──
-pkill -f "agit-hub serve.*$PORT" 2>/dev/null || true
-sleep 0.5
-rm -rf "$HUB_ROOT"
-"$HUB" add "$AGENT" --root "$HUB_ROOT" >/dev/null
-nohup "$HUB" serve --root "$HUB_ROOT" --port "$PORT" >/tmp/agit-showcase-hub.log 2>&1 &
-echo $! > /tmp/agit-showcase-hub.pid
-sleep 1
+seed_code() {
+  rm -rf "$1"; mkdir -p "$1"; cd "$1"
+  git init -q -b main .; git config user.name "$2"; git config user.email "$2@x"; git config commit.gpgsign false
+  printf 'export interface User {\n  id: number;\n  user_id: string;\n}\n' > models.ts
+  git add -A && git commit -qm '初始代码'
+}
 
-# ── Alice 的仓库 + 一份真实结构的 Claude Code 会话 ──
+rm -rf "$ORIGIN"; git init -q --bare -b main "$ORIGIN"
+
 seed_code "$ALICE" alice
-cat > "$ALICE/session.jsonl" <<EOF
-{"type":"mode","sessionId":"demo"}
-{"type":"user","cwd":"$ALICE","gitBranch":"main","uuid":"u1","message":{"role":"user","content":"用户标识字段叫什么？订单列表为什么慢？"}}
-{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"我读一下 models/user.ts 和 services/order.ts。"},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"$ALICE/models/user.ts","offset":4,"limit":1}}]}}
-{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"$ALICE/services/order.ts","offset":5,"limit":4}},{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"grep -n user_id models/user.ts"}}]}}
-{"type":"assistant","uuid":"a3","message":{"role":"assistant","content":[{"type":"text","text":"字段叫 user_id；OrderService.list 里对每个订单又查一次 items，是个 N+1。"},{"type":"tool_use","id":"t4","name":"Write","input":{"file_path":"$ALICE/notes.md","content":"x"}}]}}
-EOF
+fake_session "$ALICE" alice-sess "用户标识字段用什么？" "查清了:全库统一用 user_id 这个字段名,别的地方也都是它。"
 
-# ── Lin 的仓库（同样的代码，他会从 Hub 拉 Alice 的 context）──
-seed_code "$LIN" lin
+seed_code "$BOB" bob
+fake_session "$BOB" bob-sess "用户标识字段用什么？" "我决定改用 uid,更简洁。"
 
-# ── 提示 ──
 cat <<EOF
 
 ${B}舞台就绪。${N}
 
   ${G}export PATH="$BIN_DIR:\$PATH"${N}
 
-  Hub 已启动： ${G}http://localhost:$PORT/${N}   （日志 /tmp/agit-showcase-hub.log）
-  Alice 仓库： ${G}$ALICE${N}
-  Lin 仓库：   ${G}$LIN${N}
+  团队远端    ${G}$ORIGIN${N}
+  Alice 仓库  ${G}$ALICE${N}   （有一条会话:主张 user_id）
+  Bob 仓库    ${G}$BOB${N}   （有一条会话:主张 uid —— 和 Alice 冲突）
 
-${DIM}照着演示脚本一幕一幕敲：${N}
-  ${G}\$EDITOR demo/showcase/README.md${N}
+${DIM}照着讲稿一幕一幕敲:${N}
+  ${G}\$EDITOR demo/showcase/讲稿.md${N}
 
-${DIM}先进 Alice 的仓库开演：${N}
+${DIM}先进 Alice 的仓库:${N}
   ${G}cd $ALICE${N}
 EOF
