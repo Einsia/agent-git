@@ -1,0 +1,8 @@
+# 依赖树里有 crate 用了 edition2024（indexmap 2.14+ 等），需要较新的 cargo。
+# Ubuntu 22.04 的 apt 里是 rustc 1.75，读不了本仓库 Cargo.lock 的 v4 格式。
+#
+#   curl -sSf https://sh.rustup.rs | sh
+#   cargo build --release
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
