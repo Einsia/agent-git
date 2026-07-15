@@ -11,7 +11,8 @@
 //! 前端资源在编译期由 include_str! 嵌入（hub-ui/dist）。改前端后 `cd hub-ui && npm run build` 再 cargo build。
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -546,13 +547,46 @@ fn serve(root: &Path, port: u16, private: bool) {
 
     // 并发上限：每连接一线程，但用信号量封顶 —— 否则 N 个慢连接 = N 个线程/内存，unbounded。
     let sem = Arc::new(Semaphore::new(MAX_CONN));
+    // 每 IP 并发上限：单一来源的 slowloris 最多占 PER_IP_MAX 个槽，占不满全池、饿不死别的客户端。
+    let ipc: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     for stream in listener.incoming().flatten() {
+        let ip = stream.peer_addr().map(|a| a.ip()).ok();
+        // 先按 IP 准入：满了直接丢连接（drop 关闭），不占全局槽、不 spawn。
+        if let Some(ip) = ip {
+            let mut m = ipc.lock().unwrap();
+            let n = m.entry(ip).or_insert(0);
+            if *n >= PER_IP_MAX {
+                continue;
+            }
+            *n += 1;
+        }
+        let ipguard = ip.map(|ip| IpGuard { map: ipc.clone(), ip });
         let permit = Permit::acquire(sem.clone()); // 到顶就在这里挡住 accept，多余连接排在内核 backlog。
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            let _permit = permit; // 持有到线程结束；**即使 handle panic 也会在 drop 时归还**（不泄漏槽位）。
+            // 都持有到线程结束；**即使 handle panic 也会在 drop 时归还**（不泄漏槽位/IP 计数）。
+            let _permit = permit;
+            let _ipguard = ipguard;
             let _ = handle(stream, &root, private);
         });
+    }
+}
+
+/// 每 IP 的在途连接计数；drop 时减一（panic 安全）。
+struct IpGuard {
+    map: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -614,8 +648,13 @@ const MAX_LINE: u64 = 16 * 1024;
 const MAX_HEADERS_BYTES: usize = 64 * 1024;
 /// 并发处理线程上限（挡住 unbounded thread-per-connection）。
 const MAX_CONN: usize = 64;
+/// 单个 IP 的在途连接上限（挡住单一来源 slowloris 占满全池）。给全池的一半，留槽位给别人。
+const PER_IP_MAX: usize = 32;
 /// 从 accept 到读完请求头的整体墙钟上限（挡住 1 字节/<60s 的 slowloris 滴灌 —— 那能重置 per-read 超时）。
+/// 读头阶段的 socket 读超时也设成它 —— 于是阻塞在**请求行**那一次读上的连接也在此掐断（deadline 只在头循环顶检查，盖不住请求行读）。
 const HEADER_DEADLINE_SECS: u64 = 20;
+/// body（git push 的 pack）读超时更长：pack 持续流入，只在真卡住时触发。
+const BODY_TIMEOUT_SECS: u64 = 60;
 
 /// 只读请求行 + 头部，**不碰 body**。body 留在 reader 里，等鉴权通过、确实需要时再流式取。
 fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Req> {
@@ -655,9 +694,9 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Req> {
 }
 
 fn handle(mut stream: TcpStream, root: &Path, private: bool) -> std::io::Result<()> {
-    let t = Some(Duration::from_secs(60));
-    let _ = stream.set_read_timeout(t);
-    let _ = stream.set_write_timeout(t);
+    // 读头阶段：短读超时，任何一次阻塞读（含请求行）最多挂 HEADER_DEADLINE_SECS。
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(HEADER_DEADLINE_SECS)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(BODY_TIMEOUT_SECS)));
 
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(req) = read_head(&mut reader) else {
@@ -944,6 +983,9 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, root: &Pa
         None => (req.target.clone(), String::new()),
     };
     let ctype = req.header("content-type").unwrap_or("").to_string();
+
+    // 已鉴权，进入 body 传输：放宽读超时（pack 可能不小、跨网慢，但持续流入）。
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(BODY_TIMEOUT_SECS)));
 
     let mut child = match Command::new("git")
         .arg("http-backend")
