@@ -180,68 +180,26 @@ struct SessionDigest {
 }
 
 /// 从一条 jsonl 转录里抽出可读摘要（Hub 只读、只解析,不运行 agent）。
+/// **不再自带解析** —— 走库里唯一的 `parse_jsonl`,和 `agit` 的 adapter 同一份规则,
+/// 于是 prompt 过滤 / isCompactSummary 排除等修复对 Hub UI 也一并生效。
 fn parse_session(id: &str, jsonl: &str) -> SessionDigest {
-    let mut d = SessionDigest {
-        id: id.to_string(),
-        branch: String::new(),
-        prompts: vec![],
-        texts: vec![],
-        tools: 0,
-        files: vec![],
-    };
-    for line in jsonl.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if d.branch.is_empty() {
-            if let Some(b) = v.get("gitBranch").and_then(|x| x.as_str()) {
-                if !b.is_empty() {
-                    d.branch = b.to_string();
-                }
-            }
-        }
-        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-        let meta = v.get("isMeta").and_then(|x| x.as_bool()).unwrap_or(false);
-        let content = v.get("message").and_then(|m| m.get("content"));
-        match ty {
-            "user" if !meta => {
-                if let Some(s) = content.and_then(|c| c.as_str()) {
-                    let t = s.trim();
-                    if !t.is_empty() && !t.starts_with('<') {
-                        d.prompts.push(t.to_string());
-                    }
-                }
-            }
-            "assistant" => {
-                if let Some(arr) = content.and_then(|c| c.as_array()) {
-                    for b in arr {
-                        match b.get("type").and_then(|x| x.as_str()) {
-                            Some("text") => {
-                                if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
-                                    d.texts.push(t.to_string());
-                                }
-                            }
-                            Some("tool_use") => {
-                                d.tools += 1;
-                                let name = b.get("name").and_then(|x| x.as_str()).unwrap_or("");
-                                if name == "Write" || name == "Edit" {
-                                    if let Some(f) = b.get("input").and_then(|i| i.get("file_path")).and_then(|x| x.as_str()) {
-                                        let f = f.rsplit('/').next().unwrap_or(f).to_string();
-                                        if !d.files.contains(&f) {
-                                            d.files.push(f);
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            _ => {}
+    let ir = agit::adapter::claude_code::parse_jsonl(jsonl, id);
+    // 改动文件:Write/Edit 的路径取 basename,按出现顺序去重。
+    let mut files = Vec::new();
+    for w in &ir.writes {
+        let f = w.rsplit('/').next().unwrap_or(w).to_string();
+        if !files.contains(&f) {
+            files.push(f);
         }
     }
-    d
+    SessionDigest {
+        id: ir.session_id,
+        branch: ir.git_branch.unwrap_or_default(),
+        prompts: ir.prompts,
+        texts: ir.agent_texts,
+        tools: ir.tool_uses,
+        files,
+    }
 }
 
 // ─────────────────────────── HTTP 服务 ───────────────────────────
