@@ -1,15 +1,10 @@
-//! Runtime Adapter —— session → AgentState 的抽取，以及跨 runtime 的 import/export。
+//! Runtime Adapter —— 把一个 runtime 的原始 session 解析成 runtime-neutral 的 SessionIR。
 //!
-//! PRD：「Codex、ClaudeCode 等 runtime 只需实现 export、import 和 validate Adapter。」
+//! session 模型下,adapter 只做一件确定性的事:读 session 文件 → SessionIR。
+//! 唯一消费者是 `reconcile` 的 `brief()`(session.rs):从 IR 里取 prompt / 最后几段 agent 文本 /
+//! 改动文件,压成紧凑摘要喂给合并用的 LLM。
 //!
-//! 设计要点：抽取分两层。
-//!   1. 确定性层（本模块 + 各 adapter 的 export）：把 session 解析成 runtime-neutral 的
-//!      SessionIR，再确定性地导出能确定的部分 —— 目标（来自 prompt）、artifact（来自
-//!      Write/Edit）、**证据候选池**（来自 Read/Bash，且当场对齐到当前代码基线算摘要）。
-//!   2. 语义层（可插拔的 Summarizer，暂缺）：把证据池 + agent 文本归纳成「结论（fact）」
-//!      与「决定」。这一层需要模型，留一个清晰的 seam，MVP 不在闭环里跑它。
-//!
-//! 这样「模型编造出处」在构造上不可能：facts 的证据只能来自 Read/Bash 真实发生过的调用。
+//! （旧的"证据候选池 → Summarizer → fact"两层抽取已随 fact 模型删除;这里不再蒸馏结论。）
 
 pub mod claude_code;
 pub mod codex;
@@ -32,15 +27,15 @@ pub struct SessionIR {
     pub session_id: String,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
-    /// 真实用户 prompt（已剔除命令注入、caveat、工具结果）。
+    /// 真实用户 prompt（已剔除命令注入、caveat、工具结果）。brief 用。
     pub prompts: Vec<String>,
-    /// agent 读过的文件 —— 证据候选池的 file: 部分。
+    /// agent 读过的文件。当前 brief 不消费,保留以备摘要增强。
     pub reads: Vec<FileRead>,
-    /// agent 跑过的命令 —— 证据候选池的 cmd: 部分。
+    /// agent 跑过的命令。当前 brief 不消费,保留以备摘要增强。
     pub commands: Vec<String>,
-    /// agent 改动过的文件 —— artifact。
+    /// agent 改动过的文件 —— brief 里作为"改动的文件"列出。
     pub writes: Vec<String>,
-    /// assistant 的文本块 —— 交给 Summarizer 归纳进度/决定用。
+    /// assistant 的文本块 —— brief 取最后几段作为"结论/进展"。
     pub agent_texts: Vec<String>,
 }
 

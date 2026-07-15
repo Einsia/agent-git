@@ -1,6 +1,6 @@
 //! agit —— A Git-compatible CLI for versioning Agent Context + Environment.
 //!
-//! PRD 架构（docs/architecture-v2.md）：被版本化的对象是两个 git 库 + 一个配对。
+//! 架构（docs/architecture.md）：被版本化的对象是两个 git 库 + 一个配对。
 //!
 //!   agit <git-args>     = agit -e <git-args>  → 透明 git 作用在 Environment（代码仓库）
 //!   agit -a <git-args>                        → 同构操作作用在 Agent Store
@@ -9,7 +9,7 @@
 //!   agit -a commit   → Agent scope
 //!   agit commit -a   → Environment scope，-a 是 git commit 的参数
 
-#![allow(dead_code)] // v1 领域模块（claim/evidence/merge）正在向 Agent Store 移植
+#![allow(dead_code)] // SessionIR 的 reads/commands 等字段已解析但 brief 暂不消费（保留备用）
 
 mod adapter;
 mod commands;

@@ -1,6 +1,6 @@
 //! agit 原生动词（在透传之外、需要 agit 加值的命令）。
-//! v2 spine：先接 scan（hooks 需要）与 workspace。verify/why/new/resolve 的
-//! Agent-Store 版本在下一步移植（见 docs/architecture-v2.md）。
+//! session 模型下的原生命令：scan（密钥闸门）、workspace（配对）、clone、adapter、
+//! write_claude_block（reconcile 的产物落盘）。见 docs/architecture.md。
 
 use crate::adapter;
 use crate::scan;
