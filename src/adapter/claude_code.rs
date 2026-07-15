@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode;
 
-/// cwd → Claude Code 的 project slug：绝对路径里的 '/' 换成 '-'。
+/// cwd → Claude Code 的 project slug：绝对路径里的 '/' **和 '.'** 都换成 '-'。
+/// 核对真实目录:`/home/user/bolusi/.claude/worktrees` → `-home-user-bolusi--claude-worktrees`
+/// (`.claude` 的点也塌成 '-',故双连字符)。只换 '/' 会对任何含点的路径算出错误 slug、找不到目录。
 pub fn slug_for(cwd: &Path) -> String {
-    cwd.to_string_lossy().replace('/', "-")
+    cwd.to_string_lossy().replace(['/', '.'], "-")
 }
 
 pub fn projects_dir() -> Result<PathBuf> {
@@ -21,10 +23,41 @@ pub fn projects_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".claude/projects"))
 }
 
-/// 真实用户 prompt：字符串、非空、不以 '<' 开头（排除 caveat / 命令注入 / 工具标签）。
+/// Claude Code 会往转录里注入一批 XML 式标签（不是真实 prompt）。这些是已知的注入标签名。
+const INJECTED_TAGS: &[&str] = &[
+    "system-reminder",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-caveat",
+    "local-command-stdout",
+    "local-command-stderr",
+    "user-prompt-submit-hook",
+    "caveat",
+    "budget",
+    "session-start",
+    "important",
+    "policy",
+    "function_results",
+    "tool_use_error",
+];
+
+/// 真实用户 prompt：非空；若以 '<' 开头，仅当其后不是已知注入标签时才算真实。
+/// 旧逻辑一刀切"以 '<' 开头即丢"，把 `<div> 不渲染` 这类合法 prompt 也误杀了。
 fn is_real_prompt(s: &str) -> bool {
     let t = s.trim_start();
-    !t.is_empty() && !t.starts_with('<')
+    if t.is_empty() {
+        return false;
+    }
+    let Some(rest) = t.strip_prefix('<') else {
+        return true;
+    };
+    let tag: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    !INJECTED_TAGS.contains(&tag.as_str())
 }
 
 impl Adapter for ClaudeCode {
@@ -126,10 +159,16 @@ impl Adapter for ClaudeCode {
 
             let ty = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let is_meta = rec.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false);
+            // compaction 会写一条合成的 user 记录(isCompactSummary=true)当摘要 —— 它不是
+            // 真实用户 prompt,当成 prompt 会把压缩摘要混进 brief、污染合并输入。排除之。
+            let is_compact = rec
+                .get("isCompactSummary")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let content = rec.get("message").and_then(|m| m.get("content"));
 
             match ty {
-                "user" if !is_meta => {
+                "user" if !is_meta && !is_compact => {
                     if let Some(s) = content.and_then(|c| c.as_str()) {
                         if is_real_prompt(s) {
                             ir.prompts.push(s.trim().to_string());
@@ -195,4 +234,30 @@ fn collect_tool(b: &serde_json::Value, ir: &mut SessionIR) {
 fn dedup(v: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|x| seen.insert(x.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_collapses_dot_and_slash() {
+        // 真实:/home/user/bolusi/.claude/worktrees → -home-user-bolusi--claude-worktrees
+        assert_eq!(
+            slug_for(Path::new("/home/user/bolusi/.claude/worktrees")),
+            "-home-user-bolusi--claude-worktrees"
+        );
+        // 含点的普通路径也要塌成 '-',否则 sync 找不到目录
+        assert_eq!(slug_for(Path::new("/a/b.c/d")), "-a-b-c-d");
+    }
+
+    #[test]
+    fn real_prompt_keeps_angle_bracket_prose_drops_injected_tags() {
+        assert!(is_real_prompt("fix the bug"));
+        assert!(is_real_prompt("<div> 不渲染怎么办")); // 合法 prompt,不该丢
+        assert!(is_real_prompt("<= 是小于等于"));
+        assert!(!is_real_prompt("<system-reminder>...</system-reminder>"));
+        assert!(!is_real_prompt("<local-command-caveat>x"));
+        assert!(!is_real_prompt("   ")); // 空白
+    }
 }
