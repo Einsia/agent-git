@@ -68,6 +68,6 @@ pub fn get(runtime: &str) -> Result<Box<dyn Adapter>> {
 pub fn list() -> Vec<(&'static str, &'static str)> {
     vec![
         ("claude-code", "Claude Code —— 解析 ~/.claude/projects/<slug>/<session>.jsonl（已实现）"),
-        ("codex", "Codex —— 接口已预留，export/validate 待实现（桩）"),
+        ("codex", "Codex —— 解析 ~/.codex/sessions/*/rollout-*.jsonl（按 cwd 过滤项目）（已实现）"),
     ]
 }
