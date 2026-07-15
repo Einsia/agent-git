@@ -5,6 +5,13 @@
     <link rel="icon" href="/favicon.ico" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AgentGitHub</title>
+    <script>
+      // Apply the saved theme before first paint so light-mode users don't get a dark flash.
+      try {
+        var t = localStorage.getItem("agit-theme");
+        document.documentElement.classList.toggle("dark", t ? t === "dark" : true);
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

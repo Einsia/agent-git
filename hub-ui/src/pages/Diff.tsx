@@ -9,7 +9,12 @@ export function Diff() {
   const [params] = useSearchParams()
   const from = params.get("from") ?? ""
   const to = params.get("to") ?? ""
-  const { data, loading, error } = useAsync(() => api.diff(name, id, from, to), [name, id, from, to])
+  const missing = !from || !to
+  const { data, loading, error } = useAsync(
+    // Don't fire a doomed request when a revision is missing — show a clear message instead.
+    () => (missing ? Promise.resolve(null) : api.diff(name, id, from, to)),
+    [name, id, from, to]
+  )
 
   const empty =
     data &&
@@ -26,8 +31,13 @@ export function Diff() {
         revision diff <span className="font-mono text-xl">{id}</span>
       </h1>
 
-      {loading && <p className="py-6 text-muted-foreground">加载中…</p>}
-      {error && <p className="py-6 text-destructive">加载失败：{error}</p>}
+      {missing && (
+        <p className="mt-4 rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
+          缺少要比较的版本。请从某条 session 的 revision 列表里选「与上一版 diff」。
+        </p>
+      )}
+      {!missing && loading && <p className="py-6 text-muted-foreground">加载中…</p>}
+      {!missing && error && <p className="py-6 text-destructive">加载失败：{error}</p>}
 
       {data && (
         <>
