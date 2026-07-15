@@ -174,11 +174,24 @@ pub fn reconcile(reference: &str, runtime: &str) -> Result<i32> {
     let rt = normalize(runtime);
     let sdir = format!("{SESSIONS_SUBDIR}/{rt}");
 
-    // 1. 合并前，先算出对面带来的是哪些 session
-    let (_, diff) = scope::git_in_status(
+    // 0. 先确认 reference 存在 —— 否则 diff 静默返回空,会被误报成"已是最新",
+    //    真正的错误要等到下面 git merge 才炸出来,误导人。
+    let (rc, _) = scope::git_in_status(&agent, &["rev-parse", "--verify", "--quiet", reference]);
+    if rc != 0 {
+        bail!("Agent Store 里没有引用 `{reference}`。先 `agit -a fetch <remote>`,再用它的 ref（如 origin/main）。");
+    }
+
+    // 1. 合并前，先算出对面带来的是哪些 session。
+    //    **三点 diff**(merge-base..reference):只列对面相对共同祖先**新增**的 session。
+    //    两点 `HEAD reference` 会把"本地有、对面没有"的自己的 session 也列进来 —— 于是
+    //    用户自己的会话被误判成"对面拉进来的",provenance 整个反了(见回归测试)。
+    let (dc, diff) = scope::git_in_status(
         &agent,
-        &["diff", "--name-only", "HEAD", reference, "--", &sdir],
+        &["diff", "--name-only", &format!("HEAD...{reference}"), "--", &sdir],
     );
+    if dc != 0 {
+        bail!("算 incoming session 失败(git diff HEAD...{reference})。");
+    }
     let incoming: Vec<String> = diff
         .lines()
         .filter(|l| l.ends_with(".jsonl"))
