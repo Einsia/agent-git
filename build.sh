@@ -49,6 +49,11 @@ fi
 echo "cargo: $CARGO_BIN ($("$CARGO_BIN" --version | awk '{print $2}'))" >&2
 
 case "${1:-}" in
+  ui)   # 重建 Hub 前端（hub-ui/dist 被 agit-hub 用 include_str! 嵌进二进制）。
+        shift
+        cd hub-ui
+        [[ -d node_modules ]] || npm install
+        exec npm run build "$@" ;;
   test) shift; exec "$CARGO_BIN" test "$@" ;;
   *)    exec "$CARGO_BIN" build "$@" ;;
 esac
