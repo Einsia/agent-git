@@ -264,7 +264,9 @@ pub fn read_conversation(text: &str) -> ConversationIR {
         if let Some(rec) = &rec {
             if ir.cwd.is_none() {
                 if let Some(c) = rec.get("cwd").and_then(|v| v.as_str()) {
-                    ir.cwd = Some(c.to_string());
+                    if !c.is_empty() {
+                        ir.cwd = Some(c.to_string());
+                    }
                 }
             }
             if ir.git_branch.is_none() {
@@ -302,12 +304,22 @@ fn extract_claude_kinds(rec: &serde_json::Value) -> Vec<EventKind> {
                 }
             }
             Some(serde_json::Value::Array(arr)) => {
+                // 多模态 prompt:content 是 block 数组([{text},{image},…])。
+                // 既要抽 text 块当真实 prompt(否则带图的用户提问会被整条丢掉),也要抽 tool_result。
                 for b in arr {
-                    if b.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                        out.push(EventKind::ToolResult {
+                    match b.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                                if is_real_prompt(t) {
+                                    out.push(EventKind::UserPrompt(t.trim().to_string()));
+                                }
+                            }
+                        }
+                        Some("tool_result") => out.push(EventKind::ToolResult {
                             call_id: b.get("tool_use_id").and_then(|v| v.as_str()).map(String::from),
                             output: tool_result_text(b.get("content")),
-                        });
+                        }),
+                        _ => {}
                     }
                 }
             }
@@ -361,17 +373,16 @@ pub fn write_conversation(ir: &ConversationIR, opts: &ConvertOpts) -> String {
 }
 
 /// 同 vendor:逐行重放 raw,只把源 session id 换成新 id(+可选 cwd 覆盖),其余字节不动。
+/// 用引号锚定的 swap_quoted,避免子串/前缀误伤与空串炸开(见 convo::swap_quoted)。
 fn same_vendor_claude(ir: &ConversationIR, opts: &ConvertOpts) -> String {
     let mut lines = Vec::with_capacity(ir.events.len());
     for e in &ir.events {
         let mut raw = e.raw.clone();
-        if !ir.session_id.is_empty() && !opts.new_id.is_empty() {
-            raw = raw.replace(&ir.session_id, &opts.new_id);
+        if !opts.new_id.is_empty() {
+            raw = crate::convo::swap_quoted(&raw, &ir.session_id, &opts.new_id);
         }
         if let (Some(old), Some(new)) = (&ir.cwd, &opts.cwd) {
-            if old != new {
-                raw = raw.replace(old.as_str(), new.as_str());
-            }
+            raw = crate::convo::swap_quoted(&raw, old, new);
         }
         lines.push(raw);
     }
@@ -381,7 +392,7 @@ fn same_vendor_claude(ir: &ConversationIR, opts: &ConvertOpts) -> String {
 }
 
 /// 跨 vendor(codex → claude):从 kinds 合成 claude 记录,串起 parentUuid 链。
-/// 工具活动默认叙述成文本(--structured-tools 才发结构化 tool_use)。
+/// 工具活动叙述成文本(目标模型只需知道发生了什么,不重放外来工具 schema)。
 fn cross_to_claude(ir: &ConversationIR, opts: &ConvertOpts) -> String {
     let cwd = opts.cwd.clone().or_else(|| ir.cwd.clone()).unwrap_or_default();
     let branch = ir.git_branch.clone().unwrap_or_default();
@@ -458,13 +469,26 @@ mod tests {
     }
 
     #[test]
+    fn multimodal_user_prompt_text_is_captured() {
+        // user turn with an image attachment: content is a block array, not a string.
+        let src = "{\"type\":\"user\",\"sessionId\":\"S\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"should we write e2e tests?\"},{\"type\":\"image\",\"source\":{}}]}}\n";
+        let ir = read_conversation(src);
+        let has = ir
+            .events
+            .iter()
+            .flat_map(|e| &e.kinds)
+            .any(|k| matches!(k, EventKind::UserPrompt(p) if p == "should we write e2e tests?"));
+        assert!(has, "multimodal user text must not be dropped");
+    }
+
+    #[test]
     fn conversation_roundtrip_byte_faithful() {
         let src = "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"cwd\":\"/p\",\"gitBranch\":\"main\",\"message\":{\"role\":\"user\",\"content\":\"hi there\"}}\n\
                    {\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"abc\"},{\"type\":\"text\",\"text\":\"hello\"}]}}\n";
         let ir = read_conversation(src);
         assert_eq!(ir.session_id, "S1");
         // same-vendor replay with new_id == source id → no rewrite → byte-identical
-        let opts = ConvertOpts { cwd: None, structured_tools: false, new_id: "S1".into() };
+        let opts = ConvertOpts { cwd: None, new_id: "S1".into() };
         assert_eq!(write_conversation(&ir, &opts), src, "same-vendor replay must reproduce input");
         // semantic overlay: prompt + assistant text captured; thinking dropped
         let kinds: Vec<&EventKind> = ir.events.iter().flat_map(|e| e.kinds.iter()).collect();

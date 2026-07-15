@@ -87,11 +87,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── 跨 runtime 转会话(resume 到另一个 CLI)──
         "convert" => match parse_convert(args) {
-            Some((src, from, to, cwd, structured, write)) => {
-                commands::convert_cmd(&src, from, &to, cwd, structured, write)
+            Some((src, from, to, cwd, write)) => {
+                commands::convert_cmd(&src, from, &to, cwd, write)
             }
             None => {
-                eprintln!("用法: agit convert <src-session> --to claude-code|codex [--from RT] [--cwd 路径] [--structured-tools] [--write]");
+                eprintln!("用法: agit convert <src-session> --to claude-code|codex [--from RT] [--cwd 路径] [--write]");
                 Ok(2)
             }
         },
@@ -127,15 +127,14 @@ fn parse_runtime_arg(args: &[String], flag: &str) -> (String, Option<PathBuf>) {
     (runtime, positional)
 }
 
-/// convert 参数:位置参数 src + --to(必需)+ --from/--cwd/--structured-tools/--write。
+/// convert 参数:位置参数 src + --to(必需)+ --from/--cwd/--write。
 /// 返回 None 表示缺 src 或 --to。
-type ConvertArgs = (PathBuf, Option<String>, String, Option<String>, bool, bool);
+type ConvertArgs = (PathBuf, Option<String>, String, Option<String>, bool);
 fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
     let mut src = None;
     let mut from = None;
     let mut to = None;
     let mut cwd = None;
-    let mut structured = false;
     let mut write = false;
     let mut i = 0;
     while i < args.len() {
@@ -152,10 +151,6 @@ fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
                 cwd = args.get(i + 1).cloned();
                 i += 2;
             }
-            "--structured-tools" => {
-                structured = true;
-                i += 1;
-            }
             "--write" => {
                 write = true;
                 i += 1;
@@ -168,7 +163,7 @@ fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
             }
         }
     }
-    Some((src?, from, to?, cwd, structured, write))
+    Some((src?, from, to?, cwd, write))
 }
 
 fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {

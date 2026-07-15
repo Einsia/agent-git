@@ -377,7 +377,9 @@ pub fn read_conversation(text: &str) -> ConversationIR {
                         }
                         if ir.cwd.is_none() {
                             if let Some(c) = p.get("cwd").and_then(|v| v.as_str()) {
-                                ir.cwd = Some(c.to_string());
+                                if !c.is_empty() {
+                                    ir.cwd = Some(c.to_string());
+                                }
                             }
                         }
                         if ir.git_branch.is_none() {
@@ -468,13 +470,12 @@ fn same_vendor_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
     let mut lines = Vec::with_capacity(ir.events.len());
     for e in &ir.events {
         let mut raw = e.raw.clone();
-        if !ir.session_id.is_empty() && !opts.new_id.is_empty() {
-            raw = raw.replace(&ir.session_id, &opts.new_id);
+        // 引号锚定替换,避免子串/前缀误伤与空串炸开(见 convo::swap_quoted)。
+        if !opts.new_id.is_empty() {
+            raw = crate::convo::swap_quoted(&raw, &ir.session_id, &opts.new_id);
         }
         if let (Some(old), Some(new)) = (&ir.cwd, &opts.cwd) {
-            if old != new {
-                raw = raw.replace(old.as_str(), new.as_str());
-            }
+            raw = crate::convo::swap_quoted(&raw, old, new);
         }
         lines.push(raw);
     }
@@ -589,7 +590,7 @@ mod tests {
         let ir = read_conversation(src);
         assert_eq!(ir.session_id, "S1");
         assert_eq!(ir.cwd.as_deref(), Some("/p"));
-        let opts = ConvertOpts { cwd: None, structured_tools: false, new_id: "S1".into() };
+        let opts = ConvertOpts { cwd: None, new_id: "S1".into() };
         assert_eq!(write_conversation(&ir, &opts), src, "same-vendor replay must reproduce input");
         let kinds: Vec<&EventKind> = ir.events.iter().flat_map(|e| e.kinds.iter()).collect();
         assert!(kinds.iter().any(|k| matches!(k, EventKind::UserPrompt(p) if p == "do the thing")));

@@ -57,15 +57,13 @@ pub enum EventKind {
 pub struct ConvertOpts {
     /// 覆盖目标会话的 cwd(决定 resume 落到哪个项目)。默认沿用源 cwd。
     pub cwd: Option<String>,
-    /// 跨 vendor 时是否发结构化工具项(有 schema 不匹配/400 风险);默认 false = 叙述成文本。
-    pub structured_tools: bool,
     /// 分配给产物的新 session id(convert 决不复用源 id)。
     pub new_id: String,
 }
 
 impl Default for ConvertOpts {
     fn default() -> Self {
-        ConvertOpts { cwd: None, structured_tools: false, new_id: String::new() }
+        ConvertOpts { cwd: None, new_id: String::new() }
     }
 }
 
@@ -128,6 +126,16 @@ pub fn is_cross_vendor(src: &str, target: &str) -> bool {
     normalize_runtime(src) != normalize_runtime(target)
 }
 
+/// 同 vendor 重放时替换 id / cwd:把 raw 行里 **JSON 引号包裹**的 `"old"` 换成 `"new"`。
+/// 引号锚定 → 不会误伤把 old 当子串/前缀的其它内容(如 /a/app 命中 /a/application),
+/// old 为空或 old==new 时原样返回(避免 replace("", …) 的逐字符炸开)。
+pub fn swap_quoted(raw: &str, old: &str, new: &str) -> String {
+    if old.is_empty() || old == new {
+        return raw.to_string();
+    }
+    raw.replace(&format!("\"{old}\""), &format!("\"{new}\""))
+}
+
 /// 按 char 截断,超长加标记(不在字节中间切,避免 UTF-8 panic)。
 pub fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -146,7 +154,7 @@ mod tests {
 
     #[test]
     fn claude_to_codex_preserves_visible_drops_reasoning() {
-        let opts = ConvertOpts { cwd: None, structured_tools: false, new_id: "NEWID".into() };
+        let opts = ConvertOpts { cwd: None, new_id: "NEWID".into() };
         let ir = read_conversation("claude-code", CLAUDE_SRC).unwrap();
         let out = write_conversation("codex", &ir, &opts).unwrap();
         // visible content survives the cross-vendor hop
@@ -173,9 +181,24 @@ mod tests {
         let f = dir.path().join("rollout.jsonl");
         // only a session_meta, no turns
         std::fs::write(&f, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"S1\",\"cwd\":\"/p\"}}\n").unwrap();
-        let opts = ConvertOpts { cwd: None, structured_tools: false, new_id: "N".into() };
+        let opts = ConvertOpts { cwd: None, new_id: "N".into() };
         let err = convert(&f, "codex", "claude-code", &opts).unwrap_err();
         assert!(err.to_string().contains("可重建"), "{err}");
+    }
+
+    #[test]
+    fn swap_quoted_anchors_and_guards() {
+        // exact quoted value is replaced
+        assert_eq!(swap_quoted("{\"cwd\":\"/a/app\"}", "/a/app", "/a/x"), "{\"cwd\":\"/a/x\"}");
+        // a path that merely has old as a PREFIX must NOT be corrupted (the confirmed bug)
+        assert_eq!(
+            swap_quoted("{\"p\":\"/a/application/f\"}", "/a/app", "/a/x"),
+            "{\"p\":\"/a/application/f\"}"
+        );
+        // empty old → no-op (no replace("",…) between-every-char explosion)
+        assert_eq!(swap_quoted("{\"a\":\"b\"}", "", "/x"), "{\"a\":\"b\"}");
+        // old == new → no-op
+        assert_eq!(swap_quoted("x", "a", "a"), "x");
     }
 
     #[test]

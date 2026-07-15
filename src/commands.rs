@@ -200,13 +200,12 @@ fn infer_runtime(text: &str) -> Option<&'static str> {
     None
 }
 
-/// `agit convert <src> --to <rt> [--from <rt>] [--cwd P] [--structured-tools] [--write]`
+/// `agit convert <src> --to <rt> [--from <rt>] [--cwd P] [--write]`
 pub fn convert_cmd(
     src: &Path,
     from: Option<String>,
     to: &str,
     cwd_override: Option<String>,
-    structured_tools: bool,
     write: bool,
 ) -> Result<i32> {
     use crate::convo::{self, ConvertOpts};
@@ -223,19 +222,17 @@ pub fn convert_cmd(
     let new_id = convo::fresh_id("session");
     let opts = ConvertOpts {
         cwd: cwd_override,
-        structured_tools,
         new_id: new_id.clone(),
     };
     let (out, ir) = convo::convert(src, &from, to, &opts)?;
     let cross = convo::is_cross_vendor(&from, to);
 
-    // 目标 cwd(装到哪个项目下 / resume 落哪)
-    let cwd = opts
-        .cwd
-        .clone()
-        .or_else(|| ir.cwd.clone())
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir()?);
+    // 目标 cwd(装到哪个项目下 / resume 落哪)。current_dir() 惰性求值:只有源里也拿不到 cwd 时才调,
+    // 且它的失败不该在 cwd 已知时白白中断转换。
+    let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {
+        Some(c) => PathBuf::from(c),
+        None => std::env::current_dir()?,
+    };
 
     // 产物 = 敏感内容的新副本,落盘前高精度扫一遍(jsonl:关熵检测)
     let hits = scan::scan_text_opts(&out, false).len();
