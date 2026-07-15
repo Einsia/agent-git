@@ -68,13 +68,23 @@ fn scaffold(agent: &Path) -> Result<()> {
     Ok(())
 }
 
+/// POSIX sh 单引号转义:唯一的危险字符是 `'` 本身,用 `'\''` 打断再拼回。
+/// 双引号包裹挡不住路径里的 `$` / 反引号 / `"`;单引号里这些全是字面量。
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 fn install_hook(agent: &Path, name: &str, exe: &Path, args: &str) -> Result<()> {
     let hooks = agent.join(".git/hooks");
     std::fs::create_dir_all(&hooks)?;
     let p = hooks.join(name);
     std::fs::write(
         &p,
-        format!("#!/bin/sh\n# installed by agit\nexec \"{}\" {}\n", exe.display(), args),
+        format!(
+            "#!/bin/sh\n# installed by agit\nexec {} {}\n",
+            sh_single_quote(&exe.to_string_lossy()),
+            args
+        ),
     )?;
     #[cfg(unix)]
     {
