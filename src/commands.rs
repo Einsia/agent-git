@@ -168,12 +168,11 @@ pub fn clone_agent(url: &str) -> Result<i32> {
         );
     }
     std::fs::create_dir_all(agent.parent().unwrap())?;
-    let (code, _) = scope::git_in_status(
-        &env,
-        &["clone", "-q", url, &agent.to_string_lossy()],
-    );
+    // 继承 stdio：让 git 的进度可见、凭据 prompt 可答、失败时真实 stderr 直达终端。
+    // 捕获式 .output() 会吞掉这些 —— clone 是唯一走远端的地方，最不能瞎。
+    let code = scope::git_in_inherit(&env, &["clone", url, &agent.to_string_lossy()]);
     if code != 0 {
-        anyhow::bail!("git clone {url} 失败");
+        anyhow::bail!("git clone {url} 失败(退出码 {code})。上面的 git 报错是原因。");
     }
     println!("已拉取 Agent Store ← {url}");
     // 装 driver / hook（init 幂等，会在已有 clone 上补装配置）

@@ -117,3 +117,19 @@ pub fn git_in_status(root: &Path, args: &[&str]) -> (i32, String) {
         Err(_) => (-1, String::new()),
     }
 }
+
+/// 继承 stdio 版：git 的进度、交互式 credential prompt、真实 stderr 全部直达终端。
+/// 远端操作(clone/fetch)必须走它 —— 捕获 stdout 会吞掉 git 的报错、还挡死凭据输入。
+pub fn git_in_inherit(root: &Path, args: &[&str]) -> i32 {
+    use std::process::Stdio;
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map(|s| s.code().unwrap_or(-1))
+        .unwrap_or(-1)
+}
