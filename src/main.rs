@@ -80,13 +80,16 @@ fn dispatch(argv: Vec<String>) -> i32 {
             session::sync(&rt)
         }
         "reconcile" => {
-            let (rt, pos) = parse_runtime_arg(args, "--from");
-            match pos {
-                Some(r) => session::reconcile(&r.to_string_lossy(), &rt),
-                None => {
-                    eprintln!("用法: agit -a reconcile <ref>   （让 agent 把对面 <ref> 的 session 合进来）");
-                    Ok(2)
-                }
+            let (rt, reference, flags) = parse_reconcile(args);
+            if reference.is_none() && !flags.abort && !flags.cont {
+                eprintln!(
+                    "用法: agit -a reconcile <ref> [--dry-run]   （把对面 <ref> 的 session 合进来）\n\
+                     \x20     agit -a reconcile --continue        （定稿手动解决的冲突后继续）\n\
+                     \x20     agit -a reconcile --abort           （放弃进行中的合并）"
+                );
+                Ok(2)
+            } else {
+                session::reconcile(reference.as_deref(), &rt, flags)
             }
         }
         "adapter" => commands::adapter_list(),
@@ -115,6 +118,41 @@ fn dispatch(argv: Vec<String>) -> i32 {
     }
 }
 
+
+/// 解析 reconcile 参数：`--from <rt>` + `--dry-run/--abort/--continue` + 一个可选位置 <ref>。
+fn parse_reconcile(args: &[String]) -> (String, Option<String>, session::ReconcileFlags) {
+    let mut rt = "claude-code".to_string();
+    let mut reference = None;
+    let mut flags = session::ReconcileFlags::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" if i + 1 < args.len() => {
+                rt = args[i + 1].clone();
+                i += 2;
+            }
+            "--dry-run" => {
+                flags.dry_run = true;
+                i += 1;
+            }
+            "--abort" => {
+                flags.abort = true;
+                i += 1;
+            }
+            "--continue" => {
+                flags.cont = true;
+                i += 1;
+            }
+            other => {
+                if reference.is_none() && !other.starts_with('-') {
+                    reference = Some(other.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    (rt, reference, flags)
+}
 
 /// 解析 `--from/--to <runtime>` + 一个可选位置参数。runtime 默认 claude-code。
 fn parse_runtime_arg(args: &[String], flag: &str) -> (String, Option<PathBuf>) {
