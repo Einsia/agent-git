@@ -68,16 +68,42 @@ pub fn hook_scan(staged: bool) -> Result<i32> {
 }
 
 fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<i32> {
-    let targets: Vec<PathBuf> = if !paths.is_empty() {
-        paths.iter().map(|p| root.join(p)).collect()
-    } else if staged {
+    let mut total = 0;
+    let mut report = |name: &str, findings: Vec<scan::Finding>| {
+        for f in findings {
+            if total == 0 {
+                eprintln!("发现疑似密钥：");
+            }
+            eprintln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
+            total += 1;
+        }
+    };
+
+    if staged && paths.is_empty() {
+        // 关键:pre-commit 要扫的是**将要提交的内容**,即索引里的 blob,不是工作树。
+        // 旧代码从 `git diff --cached` 拿文件名却 read_to_string 工作树 —— 若 blob 已暂存、
+        // 工作树随后被改回干净版(git add -p / 暂存后再编辑转录去密钥),密钥照样进仓。
+        // `-z` 用 NUL 分隔且不做 octal 引用,特殊字符文件名也不漏。
         let (_, out) = scope::git_in_status(
             &root,
-            &["diff", "--cached", "--name-only", "--diff-filter=ACM"],
+            &["diff", "--cached", "--name-only", "-z", "--diff-filter=ACM"],
         );
-        out.lines().map(|p| root.join(p)).collect()
+        for name in out.split('\0').filter(|s| !s.is_empty()) {
+            let (code, content) = scope::git_in_status(&root, &["show", &format!(":{name}")]);
+            if code != 0 {
+                continue; // 无法取出该 blob(极少见),跳过而非中止
+            }
+            // 熵检测只对 .md 开;session dump(jsonl)满是 UUID,泛化熵会疯狂误报。
+            let entropy = name.ends_with(".md");
+            report(name, scan::scan_text_opts(&content, entropy));
+        }
+        return finish_scan(total, staged, 0);
+    }
+
+    let targets: Vec<PathBuf> = if !paths.is_empty() {
+        paths.iter().map(|p| root.join(p)).collect()
     } else {
-        // 扫整个 Agent Store 的文本文件:fact(.md)+ session dump(.jsonl 等)
+        // 扫整个 Agent Store 的文本文件:CLAUDE 派生(.md)+ session dump(.jsonl 等)
         WalkDir::new(&root)
             .into_iter()
             .filter_entry(|e| e.file_name() != ".git")
@@ -93,33 +119,26 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
             .collect()
     };
 
-    let mut total = 0;
     for t in &targets {
         if !t.exists() {
             continue;
         }
-        for f in scan::scan_file(t)? {
-            if total == 0 {
-                eprintln!("发现疑似密钥：");
-            }
-            eprintln!(
-                "  {}:{}  [{}]  {}",
-                t.strip_prefix(&root).unwrap_or(t).display(),
-                f.line,
-                f.rule,
-                f.excerpt
-            );
-            total += 1;
-        }
+        let rel = t.strip_prefix(&root).unwrap_or(t).display().to_string();
+        report(&rel, scan::scan_file(t)?);
     }
 
+    finish_scan(total, staged, targets.len())
+}
+
+/// scan_root 的收尾:统一"发现/未发现"的报告与退出码。
+fn finish_scan(total: usize, staged: bool, scanned: usize) -> Result<i32> {
     if total > 0 {
         eprintln!("\n{total} 处。AgentState 一旦 push，同事 pull 下来就带着它们。");
         eprintln!("修掉它。或者用 --no-verify 绕过这道 hook，显式承担后果。");
         return Ok(1);
     }
     if !staged {
-        println!("扫描 {} 个文件，未发现密钥。", targets.len());
+        println!("扫描 {scanned} 个文件，未发现密钥。");
     }
     Ok(0)
 }
