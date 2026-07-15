@@ -78,7 +78,8 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 
 struct Tok {
     name: String,
-    secret: String,
+    /// **只存 token 的 sha256 摘要**，不落明文 —— auth.json 被读走也不直接泄露可用凭据。
+    hash: String,
     write: bool,
 }
 
@@ -100,7 +101,7 @@ fn load_tokens(root: &Path) -> Vec<Tok> {
                 .filter_map(|t| {
                     Some(Tok {
                         name: t.get("name")?.as_str()?.to_string(),
-                        secret: t.get("secret")?.as_str()?.to_string(),
+                        hash: t.get("hash")?.as_str()?.to_string(),
                         write: t.get("access").and_then(|a| a.as_str()) == Some("write"),
                     })
                 })
@@ -117,16 +118,24 @@ fn token_cmd(root: &Path, args: &[String]) {
                 return;
             };
             let write = !args.iter().any(|a| a == "--read");
-            let secret = gen_secret();
+            // CSPRNG 拿不到就**报错退出**，绝不退回可预测的时间值来发凭据。
+            let secret = match gen_secret() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("拒绝发 token：{e}");
+                    return;
+                }
+            };
             let mut toks = load_tokens(root);
-            toks.push(Tok { name: name.clone(), secret: secret.clone(), write });
+            toks.push(Tok { name: name.clone(), hash: agit::convo::sha256_hex(&secret), write });
             if let Err(e) = save_tokens(root, &toks) {
                 eprintln!("写 auth.json 失败: {e}");
                 return;
             }
             println!("已发 token（{}）给 {name}", if write { "写" } else { "只读" });
             println!("  token: {secret}");
-            println!("  这串只显示这一次。git 提示输入用户名/密码时，密码填这个 token（用户名随意）。");
+            println!("  这串只显示这一次（服务器只存它的 sha256 摘要）。");
+            println!("  git 提示输入用户名/密码时，密码填这个 token（用户名随意）。");
         }
         Some("list") => {
             let toks = load_tokens(root);
@@ -142,32 +151,50 @@ fn token_cmd(root: &Path, args: &[String]) {
 }
 
 fn save_tokens(root: &Path, toks: &[Tok]) -> std::io::Result<()> {
-    std::fs::create_dir_all(root)?;
+    // auth.json 存的是凭据摘要，仍按机密对待：目录 0700、文件 0600，owner-only。
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(root).or_else(|e| {
+        if root.is_dir() { Ok(()) } else { Err(e) }
+    })?;
+    // 即便目录早已存在（mode 只在创建时生效），也把它收紧到 0700 —— 它装着凭据。
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
     let arr: Vec<serde_json::Value> = toks
         .iter()
-        .map(|t| serde_json::json!({"name": t.name, "secret": t.secret, "access": if t.write {"write"} else {"read"}}))
+        .map(|t| serde_json::json!({"name": t.name, "hash": t.hash, "access": if t.write {"write"} else {"read"}}))
         .collect();
     let body = serde_json::to_string_pretty(&serde_json::json!({ "tokens": arr })).unwrap_or("{}".into());
-    std::fs::write(auth_path(root), body)
+    // 从一开始就用 0600 打开（先写后 chmod 有窗口，且 fd 不受 chmod 影响）。
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(auth_path(root))?;
+    f.write_all(body.as_bytes())
 }
 
-/// 32 字节随机 → hex。优先 /dev/urandom；拿不到就退回时间+pid（弱，但至少不是常量）。
-fn gen_secret() -> String {
+/// 32 字节 CSPRNG → hex。拿不到 OS 熵就**报错**，绝不退回可预测的时间值来发凭据。
+fn gen_secret() -> std::io::Result<String> {
     let mut buf = [0u8; 32];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(&mut buf).is_ok() {
-            return hex(&buf);
-        }
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    hex(&nanos.to_le_bytes())
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(hex(&buf))
 }
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// 定长常数时间比较（token 摘要都是 64 位 hex；避免逐字节短路泄露信息）。
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 fn credentials(req: &Req) -> Vec<String> {
@@ -195,9 +222,10 @@ fn authorized(toks: &[Tok], private: bool, req: &Req, need_write: bool) -> bool 
     if !need_write && !private {
         return true;
     }
-    let cands = credentials(req);
+    // 把出示的凭据 hash 后与存的摘要常数时间比较（服务器不持有明文 token）。
+    let cand_hashes: Vec<String> = credentials(req).iter().map(|c| agit::convo::sha256_hex(c)).collect();
     toks.iter()
-        .any(|t| (!need_write || t.write) && cands.iter().any(|c| c == &t.secret))
+        .any(|t| (!need_write || t.write) && cand_hashes.iter().any(|h| ct_eq(h, &t.hash)))
 }
 
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
@@ -926,9 +954,10 @@ mod tests {
 
     #[test]
     fn write_op_needs_write_token() {
+        // 存的是摘要，不是明文 —— 校验时对出示的 token 做同样的 hash 再比。
         let toks = vec![
-            Tok { name: "r".into(), secret: "readonly".into(), write: false },
-            Tok { name: "w".into(), secret: "writekey".into(), write: true },
+            Tok { name: "r".into(), hash: agit::convo::sha256_hex("readonly"), write: false },
+            Tok { name: "w".into(), hash: agit::convo::sha256_hex("writekey"), write: true },
         ];
         let req = |auth: &str| Req {
             method: "POST".into(),
@@ -941,5 +970,7 @@ mod tests {
         assert!(authorized(&toks, false, &req(""), false));
         assert!(!authorized(&toks, true, &req(""), false));
         assert!(authorized(&toks, true, &req("Bearer readonly"), false));
+        // wrong token never authorizes
+        assert!(!authorized(&toks, true, &req("Bearer nope"), false));
     }
 }

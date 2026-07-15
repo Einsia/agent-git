@@ -227,6 +227,14 @@ pub fn narrate_call(name: &str, input: &Value) -> String {
     }
 }
 
+/// sha256(input) 的 hex。给 hub 存 token 摘要用(不落明文 secret)。
+pub fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(input.as_bytes());
+    hex::encode(h.finalize())
+}
+
 /// 生成一个新的、uuid 形状的 session id(8-4-4-4-12)。无 uuid crate:
 /// sha256(时间纳秒 + pid + salt) 取 16 字节,version nibble 置 7(uuidv7 形)。
 /// resume 只要求 id 形似 uuid 且唯一(spike 已核实),不校验真实 v7 时间戳。
