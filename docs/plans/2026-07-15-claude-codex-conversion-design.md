@@ -1,7 +1,31 @@
 # Claude ↔ Codex session interconversion — design
 
-Status: **design approved, Step-0 spike pending** (go/no-go gate).
+Status: **design approved; Step-0 spike done** — Claude-landing GO (proven), Codex-landing unverified (blocked on `codex login`).
 Date: 2026-07-15.
+
+## Step-0 spike results (2026-07-15)
+
+Both CLIs installed (`claude` at ~/.local/node/bin, `codex` at /snap/bin). Neither store
+uses a resume index that must be maintained: Codex has only `sessions/` (no
+`session_index.jsonl` on this machine); Claude's `history.jsonl` is typed-command history,
+not the resume index. **Both resume by scanning their session dir and resolving by id.**
+
+- **Claude — GO, proven end-to-end.** Copied a real session under a fresh uuid into a new
+  `~/.claude/projects/<slug>/` dir (no `history.jsonl` entry), then
+  `claude --resume <uuid> --print "reply LOADED"` → model replied **LOADED**. Confirms:
+  dir-scan, no index, contract = a valid jsonl at `projects/<slug>/<uuid>.jsonl`.
+- **Codex — unverified (auth blocker).** `codex exec resume <id> <prompt>` is the headless
+  path; sessions dir is dir-scanned (no index). But **codex is "Not logged in"**, so every
+  resumed turn 401s at `api.openai.com/v1/responses` *before* any history-dependent behavior
+  is observable. `--json` events (`thread.started`/`turn.started`/`error`) do not surface the
+  loaded input messages, and resume does **not** error on a nonexistent id (planted, bogus,
+  and a real existing session's id all behaved identically). So placement/resolution mechanics
+  work, but "does a hand-authored rollout's history actually load" could not be proven or
+  disproven without auth.
+
+**Verdict**: implement Claude-landing now (proven). Codex-landing: match the rollout contract
+statically from the 838 real samples; gate the resume smoke test on `codex login` and verify
+before claiming it works. Not a NO — an unverified GO.
 
 ## Goal
 
