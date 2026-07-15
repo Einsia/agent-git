@@ -70,7 +70,13 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── session dump 管理（新模型的核心）──
         "sync" => {
-            let (rt, _) = parse_runtime_arg(args, "--from");
+            // 位置参数当 runtime 简写：`agit -a sync codex` == `agit -a sync --from codex`。
+            // 之前把它解析出来又丢掉，用户以为在同步某个 runtime，实际静默跑了默认的 claude-code。
+            let (flag_rt, pos) = parse_runtime_arg(args, "--from");
+            let rt = match pos {
+                Some(p) => p.to_string_lossy().into_owned(),
+                None => flag_rt,
+            };
             session::sync(&rt)
         }
         "reconcile" => {
