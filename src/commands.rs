@@ -178,7 +178,7 @@ pub fn clone_agent(url: &str) -> Result<i32> {
     println!("已拉取 Agent Store ← {url}");
     // 装 driver / hook（init 幂等，会在已有 clone 上补装配置）
     crate::init::run()?;
-    println!("\n看看拿到了什么： agit -a verify");
+    println!("\n看看拿到了什么： agit -a log   （或 agit -a reconcile origin/main 合进本地上下文）");
     Ok(0)
 }
 
