@@ -48,6 +48,8 @@ fn install_codex(id: &str, cwd: &Path, bytes: &str) -> Result<ResumeHandle> {
     std::fs::write(&path, bytes)?;
     Ok(ResumeHandle {
         path,
-        resume_cmd: format!("(cd {} && codex resume {id})", cwd.display()),
+        // `codex exec resume <id>` —— 和模块 doc 记录的、spike 核实的动词一致。
+        // 之前印的 `codex resume` 不是 exec 子命令,照抄会 resume 失败。
+        resume_cmd: format!("(cd {} && codex exec resume {id})", cwd.display()),
     })
 }
