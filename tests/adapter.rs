@@ -1,4 +1,4 @@
-//! Adapter 测试:Claude Code session 解析(reconcile 的 brief 靠它),Codex 是显式桩。
+//! Adapter 测试:Claude Code / Codex 的 session 解析(reconcile 的 brief 靠它)。
 
 use std::path::Path;
 use std::process::Command;
@@ -48,11 +48,19 @@ fn adapter_list_shows_both_runtimes() {
     assert!(out.contains("claude-code") && out.contains("codex"));
 }
 
-/// Codex 走 sync 时显式报未实现,而不是静默。
+/// Codex sync 现已接上:即使本项目在 Codex 里没有会话,也正常返回(过滤出 0 条),
+/// 不再报"未实现"。HOME 指向空目录,保证 hermetic、不依赖本机真实 ~/.codex。
 #[test]
-fn codex_sync_reports_not_implemented() {
+fn codex_sync_is_implemented() {
     let r = Repo::new();
-    let (code, _, err) = r.agit(&["-a", "sync", "--from", "codex"]);
-    assert_ne!(code, 0, "codex 应显式报未接");
-    assert!(err.contains("还没接") || err.contains("codex"), "{err}");
+    let o = Command::new(BIN)
+        .args(["-a", "sync", "--from", "codex"])
+        .current_dir(r.path())
+        .env("HOME", r.path()) // 无 .codex/sessions → 匹配 0 条
+        .output()
+        .unwrap();
+    let code = o.status.code().unwrap_or(-1);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(code, 0, "codex sync 现应可用: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(out.contains("codex") && out.contains("过滤出 0 条"), "应镜像 codex(0 条): {out}");
 }

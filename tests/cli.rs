@@ -251,6 +251,61 @@ fn reconcile_does_not_mislabel_own_sessions_as_peer() {
     assert!(out.contains("已是最新") || out.contains("没带来新的"), "out={out}");
 }
 
+/// 回归:codex sync 按 session_meta.cwd 过滤 —— 只同步本项目的 rollout,
+/// 绝不把别项目的会话卷进来(隐私底线)。
+#[test]
+fn codex_sync_only_pulls_matching_project() {
+    let r = Repo::new();
+    let top = r.sh("git rev-parse --show-toplevel").trim().to_string();
+    let home = r.path().join("fakehome");
+    let day = home.join(".codex/sessions/2026/07/15");
+    std::fs::create_dir_all(&day).unwrap();
+    // 本项目的 rollout(cwd == 仓库根)
+    std::fs::write(
+        day.join("rollout-2026-07-15T00-00-00-aaaa-mine.jsonl"),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"mineid\",\"cwd\":\"{top}\",\"git\":{{\"branch\":\"main\"}}}}}}\n\
+             {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"MINE work\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    // 别项目的 rollout(不同 cwd)—— 不该被同步
+    std::fs::write(
+        day.join("rollout-2026-07-15T01-00-00-bbbb-other.jsonl"),
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"otherid\",\"cwd\":\"/some/other/proj\",\"git\":{\"branch\":\"x\"}}}\n\
+         {\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"OTHER secret\"}}\n",
+    )
+    .unwrap();
+    // fork/resume:第 1 条 session_meta 是本项目,第 2 条内嵌了**别项目**的父会话。
+    // 整份必须被跳过 —— 否则父会话的内容会泄漏进本项目的 store 再 push 给协作者。
+    std::fs::write(
+        day.join("rollout-2026-07-15T02-00-00-cccc-fork.jsonl"),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"forkid\",\"cwd\":\"{top}\",\"git\":{{\"branch\":\"main\"}}}}}}\n\
+             {{\"type\":\"session_meta\",\"payload\":{{\"id\":\"parentid\",\"cwd\":\"/some/other/proj\",\"git\":{{\"branch\":\"x\"}}}}}}\n\
+             {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"PARENT leaked secret\"}}}}\n"
+        ),
+    )
+    .unwrap();
+
+    let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["-a", "sync", "--from", "codex"]);
+    assert_eq!(code, 0, "codex sync 应成功: {err}");
+    assert!(out.contains("过滤出 1 条"), "应只匹配本项目 1 条(fork 那份要跳过):\n{out}");
+
+    let cdir = r.agent().join("sessions/codex");
+    assert!(cdir.join("mineid.jsonl").exists(), "本项目会话应落盘");
+    assert!(!cdir.join("otherid.jsonl").exists(), "别项目会话绝不该被同步");
+    assert!(!cdir.join("forkid.jsonl").exists(), "含异项目会话的 fork 整份都不该同步");
+    // 双保险:整个 codex 目录里不该出现别项目的内容
+    let mut all = String::new();
+    for e in std::fs::read_dir(&cdir).unwrap() {
+        all.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
+    }
+    assert!(all.contains("MINE work"));
+    assert!(!all.contains("OTHER secret"), "别项目内容泄漏了");
+    assert!(!all.contains("PARENT leaked secret"), "fork 里的父项目会话泄漏了");
+}
+
 // ─────────────────────── 透传保真 ───────────────────────
 
 #[test]
