@@ -1,7 +1,19 @@
 # Claude ↔ Codex session interconversion — design
 
-Status: **design approved; Step-0 spike done** — Claude-landing GO (proven), Codex-landing unverified (blocked on `codex login`).
+Status: **implemented; both directions verified end-to-end.**
 Date: 2026-07-15.
+
+## Acceptance results (2026-07-15)
+
+Both cross-vendor directions proven with real data through the real CLIs:
+- **codex → claude**: a real rollout → `agit convert --to claude-code --write` → `claude --resume`
+  → the model quoted the correct first prompt ("Generate a file named AGENTS.md…").
+- **claude → codex**: a real transcript → `agit convert --to codex --write` → `codex exec resume`
+  (official codex 0.144.4, ChatGPT login) → the model quoted the correct first prompt
+  ("Review this change for security vulnerabilities.").
+
+Plus: 200 real sessions round-trip byte-identical (reader completeness); unit + integration tests.
+The synthesized history genuinely loads and is read by the target model in both directions.
 
 ## Step-0 spike results (2026-07-15)
 
