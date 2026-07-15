@@ -107,6 +107,17 @@ fn list_agents(root: &Path) -> Vec<String> {
     out
 }
 
+/// 合法 agent 名:只允许 [A-Za-z0-9._-],禁止 `..`、前导 `.`、路径分隔符与 NUL。
+/// 名字来自 URL,直接拼进文件路径,不校验就是路径穿越（读到 root 之外的 git 仓库）。
+fn valid_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 fn repo_path(root: &Path, name: &str) -> PathBuf {
     root.join(format!("{name}.git"))
 }
@@ -267,19 +278,33 @@ struct Req {
     body: Vec<u8>,
 }
 
+/// 请求体上限。git push 的 pack 可以不小,给足余量;但必须有上限 ——
+/// 否则伪造的 Content-Length 会让我们预分配任意大小的 Vec,一条请求打崩整个进程。
+const MAX_BODY: usize = 512 * 1024 * 1024;
+/// 单行(请求行/头行)与头部总量上限,挡住无换行洪泛与 slowloris 的头部膨胀。
+const MAX_LINE: u64 = 16 * 1024;
+const MAX_HEADERS_BYTES: usize = 64 * 1024;
+
 fn read_request(stream: &mut TcpStream) -> Option<Req> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
+
+    // 请求行:限长读,避免无换行的巨流把 String 撑爆内存。
     let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
+    (&mut reader).take(MAX_LINE).read_line(&mut line).ok()?;
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
 
     let mut headers = vec![];
     let mut content_length = 0usize;
+    let mut headers_bytes = 0usize;
     loop {
         let mut h = String::new();
-        reader.read_line(&mut h).ok()?;
+        (&mut reader).take(MAX_LINE).read_line(&mut h).ok()?;
+        headers_bytes += h.len();
+        if headers_bytes > MAX_HEADERS_BYTES {
+            return None; // 头部过大
+        }
         let h = h.trim_end();
         if h.is_empty() {
             break;
@@ -292,18 +317,38 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
             headers.push((k, v));
         }
     }
-    let mut body = vec![0u8; content_length];
+
+    if content_length > MAX_BODY {
+        return None; // 声明的体超上限,拒绝(不预分配)
+    }
+    // 关键:按**实际到达的字节**增长缓冲,不按声明的长度预分配。
+    // 配合 socket 读超时,声明 512MiB 却不发数据的 slowloris 分配不到东西就被踢。
+    let mut body = Vec::new();
     if content_length > 0 {
-        reader.read_exact(&mut body).ok()?;
+        (&mut reader).take(content_length as u64).read_to_end(&mut body).ok()?;
+        if body.len() != content_length {
+            return None; // 体不完整(连接早断或超时)
+        }
     }
     Some(Req { method, target, headers, body })
 }
 
 fn handle(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
+    // 读/写超时:挡住"连上不发/发一半就挂"的 slowloris,每连接一线程时尤其重要。
+    let t = Some(std::time::Duration::from_secs(60));
+    let _ = stream.set_read_timeout(t);
+    let _ = stream.set_write_timeout(t);
+
     let Some(req) = read_request(&mut stream) else {
         return Ok(());
     };
     let path = req.target.split('?').next().unwrap_or("/").to_string();
+
+    // 路径穿越总闸:任何 `..` 段一律拒绝。既护住 HTML 路由的 repo_path,
+    // 也护住 git_http 转给 http-backend 的 PATH_INFO。
+    if path.split('/').any(|seg| seg == "..") {
+        return write_response(&mut stream, 400, "text/plain; charset=utf-8", b"bad request");
+    }
 
     // git smart-http：/<name>.git/info/refs、/<name>.git/git-(upload|receive)-pack
     if path.contains(".git/") {
@@ -327,17 +372,25 @@ fn route(root: &Path, method: &str, path: &str, target: &str) -> (u16, &'static 
             api_agent(root, name)
         }
         // 会话摘要（只读渲染;真正合并在本地 reconcile）
+        // strip_prefix/suffix 而非手算字节范围:`/agent/digest.md` 会同时匹配前后缀,
+        // 旧的 `&p[7..p.len()-10]` 在这种输入上 start>end 直接 panic。
         p if p.starts_with("/agent/") && p.ends_with("/digest.md") => {
-            let name = &p["/agent/".len()..p.len() - "/digest.md".len()];
+            let name = p
+                .strip_prefix("/agent/")
+                .and_then(|r| r.strip_suffix("/digest.md"))
+                .unwrap_or("");
             let repo = repo_path(root, name);
-            if !has_head(&repo) {
+            if !valid_agent_name(name) || !has_head(&repo) {
                 (404, "text/plain; charset=utf-8", "no such agent".into())
             } else {
                 (200, "text/markdown; charset=utf-8", digest_md(&repo, name))
             }
         }
         p if p.starts_with("/agent/") => {
-            let name = &p["/agent/".len()..];
+            let name = p.strip_prefix("/agent/").unwrap_or("");
+            if !valid_agent_name(name) {
+                return (404, "text/plain; charset=utf-8", "no such agent".into());
+            }
             let q = target.split_once('?').map(|(_, q)| q).unwrap_or("");
             (200, "text/html; charset=utf-8", agent_page(root, name, q))
         }
@@ -348,6 +401,7 @@ fn route(root: &Path, method: &str, path: &str, target: &str) -> (u16, &'static 
 fn write_response(stream: &mut TcpStream, status: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "OK",
@@ -639,3 +693,22 @@ pre{background:#f0f2f5;padding:.7rem;border-radius:8px;overflow:auto;font-size:.
 .hist{list-style:none;padding:0;margin:0;font-size:.82rem}.hist li{margin:.2rem 0}";
 
 const FAVICON: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>◆</text></svg>";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_name_rejects_traversal_and_seps() {
+        assert!(valid_agent_name("alice"));
+        assert!(valid_agent_name("team-store_2"));
+        assert!(valid_agent_name("a.b")); // 单个点合法
+        assert!(!valid_agent_name(""));
+        assert!(!valid_agent_name(".."));
+        assert!(!valid_agent_name("../etc/passwd"));
+        assert!(!valid_agent_name("a/b"));
+        assert!(!valid_agent_name(".hidden")); // 前导点
+        assert!(!valid_agent_name("a..b")); // 内嵌 ..
+        assert!(!valid_agent_name("a\0b"));
+    }
+}
