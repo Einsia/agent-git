@@ -65,6 +65,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
         "hook-scan" => commands::hook_scan(args.iter().any(|a| a == "--staged")),
         "workspace" => match args.first().map(|s| s.as_str()) {
             Some("log") => commands::workspace_log(),
+            Some("restore") => commands::workspace_restore(args.get(1).map(|s| s.as_str())),
             _ => commands::workspace_show(),
         },
 
@@ -233,6 +234,7 @@ agit —— 版本化 agent 的原始 session,让团队协作 Agent Context
   agit clone <url>         一条命令拉取团队 Agent Store
   agit -a scan [--staged]  扫 session dump 里的密钥
   agit workspace [log]     看 Agent↔Environment 的配对
+  agit workspace restore [N]  把两个库一起退回某条配对的联合状态
   agit adapter             列出 runtime adapter
   agit convert <src> --to <rt>  把一份 session 转成另一个 runtime 能 resume 的会话(--write 落盘)
 

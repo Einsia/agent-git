@@ -279,6 +279,88 @@ pub fn workspace_log() -> Result<i32> {
     Ok(0)
 }
 
+/// 读 workspace 日志为 (最新在前) 的 revision 列表。
+fn workspace_revisions() -> Result<Vec<serde_json::Value>> {
+    let log = scope::workspace_dir()?.join("log.jsonl");
+    if !log.exists() {
+        return Ok(vec![]);
+    }
+    let mut revs: Vec<serde_json::Value> = std::fs::read_to_string(log)?
+        .lines()
+        .filter_map(|l| serde_json::from_str(l.trim()).ok())
+        .collect();
+    revs.reverse(); // 最新在前
+    Ok(revs)
+}
+
+/// `agit workspace restore [<N|agent-rev>]` —— 把两个库一起退回某条 WorkspaceRevision 记录的
+/// 联合状态（JointVersionControl 的「撤销」半边）。无参时列出可选的 revision。
+pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
+    let revs = workspace_revisions()?;
+    if revs.is_empty() {
+        anyhow::bail!("还没有 WorkspaceRevision 可恢复。任一库 commit 后会自动生成。");
+    }
+
+    let short = |s: &str| s.chars().take(9).collect::<String>();
+    let Some(sel) = selector else {
+        // 没给选择器：列出可挑的联合状态（最新在前）。
+        println!("可恢复的联合状态（最新在前）：\n");
+        for (i, r) in revs.iter().enumerate() {
+            let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
+            let trig = r.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
+            let ar = r.get("agent_rev").and_then(|v| v.as_str()).unwrap_or("");
+            let ec = r.get("env").and_then(|e| e.get("head_commit")).and_then(|v| v.as_str()).unwrap_or("");
+            println!("  {:>2}. {ts}  {trig:14}  agent {} · env {}", i + 1, short(ar), short(ec));
+        }
+        println!("\n用 `agit workspace restore <编号>` 或 `restore <agent-rev 前缀>` 退回。");
+        return Ok(0);
+    };
+
+    // 选择器：纯数字 = 编号（1 = 最新）；否则按 agent_rev 前缀匹配。
+    let chosen = if let Ok(n) = sel.parse::<usize>() {
+        revs.get(n.wrapping_sub(1))
+    } else {
+        revs.iter().find(|r| {
+            r.get("agent_rev").and_then(|v| v.as_str()).map(|a| a.starts_with(sel)).unwrap_or(false)
+        })
+    };
+    let Some(rev) = chosen else {
+        anyhow::bail!("没有匹配 `{sel}` 的 WorkspaceRevision。`agit workspace restore` 看可选项。");
+    };
+
+    let agent_rev = rev.get("agent_rev").and_then(|v| v.as_str()).unwrap_or("");
+    let env_commit = rev
+        .get("env")
+        .and_then(|e| e.get("head_commit"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if env_commit.is_empty() {
+        anyhow::bail!("这条 revision 没有 env.head_commit，无法恢复。");
+    }
+
+    let env = scope::env_root()?;
+    println!("恢复联合状态 → env {} · agent {}", short(env_commit), short(agent_rev));
+    println!("（两个库都会 checkout 到该提交，进入 detached HEAD；git 会拒绝覆盖未提交改动。）\n");
+
+    // 先 Environment，后 Agent Store。任一失败即停，让用户看清 git 的真实报错。
+    println!("Environment:");
+    let ec = scope::git_in_inherit(&env, &["checkout", env_commit]);
+    if ec != 0 {
+        anyhow::bail!("Environment checkout 失败(退出码 {ec})。先提交或 stash 未保存改动。");
+    }
+    if !agent_rev.is_empty() {
+        if let Ok(agent) = scope::agent_root() {
+            println!("Agent Store:");
+            let ac = scope::git_in_inherit(&agent, &["checkout", agent_rev]);
+            if ac != 0 {
+                anyhow::bail!("Agent Store checkout 失败(退出码 {ac})。Environment 已回退，Agent Store 未动。");
+            }
+        }
+    }
+    println!("\n已回到该联合状态。要在此基础上继续，`agit checkout -b <分支>` / `agit -a checkout -b <分支>` 建分支。");
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

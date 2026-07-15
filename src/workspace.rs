@@ -38,14 +38,42 @@ fn agent_head() -> String {
     }
 }
 
+fn short(sha: &str) -> String {
+    sha.chars().take(9).collect()
+}
+
+/// 这次配对的连边：Agent↔Environment（当前配对本身）+ Agent↔Agent（若 agent HEAD 是 merge，
+/// 记下并入的父提交）。从 git 拓扑现算 —— 不再是永远空的占位，`workspace` 能看到真实的图。
+fn relations_for(agent_rev: &str, env: &EnvironmentRevision) -> Vec<String> {
+    let mut rels = vec![format!(
+        "agent~env:{}@{}",
+        if agent_rev.is_empty() { "∅".into() } else { short(agent_rev) },
+        short(&env.head_commit)
+    )];
+    if let Ok(root) = scope::agent_root() {
+        if root.join(".git").exists() {
+            // rev-list --parents -n1 HEAD → "HEAD p1 p2 …"；>2 段即 merge 提交。
+            let line = scope::git_in_status(&root, &["rev-list", "--parents", "-n", "1", "HEAD"]).1;
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() > 2 {
+                let parents: Vec<String> = toks[1..].iter().map(|p| short(p)).collect();
+                rels.push(format!("agent-merge:{}", parents.join("+")));
+            }
+        }
+    }
+    rels
+}
+
 /// 生成并追加一条 WorkspaceRevision。任一库 ref 移动后由 agit 自动调用。
 pub fn record(trigger: &str) -> Result<WorkspaceRevision> {
     let env = environment::capture_current()?;
+    let agent_rev = agent_head();
+    let relations = relations_for(&agent_rev, &env);
     let rev = WorkspaceRevision {
         trigger: trigger.to_string(),
-        agent_rev: agent_head(),
+        agent_rev,
         env,
-        relations: vec![],
+        relations,
     };
 
     let dir = scope::workspace_dir()?;
@@ -75,6 +103,7 @@ pub fn record(trigger: &str) -> Result<WorkspaceRevision> {
             "trigger": rev.trigger,
             "agent_rev": rev.agent_rev,
             "env": rev.env,
+            "relations": rev.relations,
         }))?,
     )?;
 
