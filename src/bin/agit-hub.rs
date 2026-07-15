@@ -14,6 +14,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const PER_PAGE: usize = 20;
 /// 带查询时最多扫多少条 session（挡住无界 git show）。超出会在响应里标记，不静默截断。
@@ -25,6 +27,11 @@ const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/d
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/app.css"));
 
 fn main() {
+    std::process::exit(run());
+}
+
+/// 返回进程退出码 —— 错误路径必须非零，脚本/CI 才能感知失败（别一律 exit 0）。
+fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("serve");
     let root = flag(&args, "--root").map(PathBuf::from).unwrap_or_else(default_root);
@@ -33,22 +40,31 @@ fn main() {
         "serve" => {
             let port: u16 = flag(&args, "--port").and_then(|p| p.parse().ok()).unwrap_or(8177);
             let private = args.iter().any(|a| a == "--private");
-            serve(&root, port, private);
+            serve(&root, port, private); // 只在 bind 失败时内部 exit(1)，正常不返回
+            0
         }
         "add" => match args.get(1).filter(|s| !s.starts_with("--")) {
             Some(n) => add_repo(&root, n),
-            None => eprintln!("用法: agit-hub add <name>"),
+            None => {
+                eprintln!("用法: agit-hub add <name>");
+                2
+            }
         },
         "list" => {
             for a in list_agents(&root) {
                 println!("{a}");
             }
+            0
         }
         "token" => token_cmd(&root, &args),
-        "-h" | "--help" => print_help(),
+        "-h" | "--help" => {
+            print_help();
+            0
+        }
         other => {
             eprintln!("未知子命令: {other}");
             print_help();
+            2
         }
     }
 }
@@ -110,12 +126,12 @@ fn load_tokens(root: &Path) -> Vec<Tok> {
         .unwrap_or_default()
 }
 
-fn token_cmd(root: &Path, args: &[String]) {
+fn token_cmd(root: &Path, args: &[String]) -> i32 {
     match args.get(1).map(|s| s.as_str()) {
         Some("add") => {
             let Some(name) = args.get(2).filter(|s| !s.starts_with("--")) else {
                 eprintln!("用法: agit-hub token add <name> [--write|--read]");
-                return;
+                return 2;
             };
             let write = !args.iter().any(|a| a == "--read");
             // CSPRNG 拿不到就**报错退出**，绝不退回可预测的时间值来发凭据。
@@ -123,19 +139,20 @@ fn token_cmd(root: &Path, args: &[String]) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("拒绝发 token：{e}");
-                    return;
+                    return 1;
                 }
             };
             let mut toks = load_tokens(root);
             toks.push(Tok { name: name.clone(), hash: agit::convo::sha256_hex(&secret), write });
             if let Err(e) = save_tokens(root, &toks) {
                 eprintln!("写 auth.json 失败: {e}");
-                return;
+                return 1;
             }
             println!("已发 token（{}）给 {name}", if write { "写" } else { "只读" });
             println!("  token: {secret}");
             println!("  这串只显示这一次（服务器只存它的 sha256 摘要）。");
             println!("  git 提示输入用户名/密码时，密码填这个 token（用户名随意）。");
+            0
         }
         Some("list") => {
             let toks = load_tokens(root);
@@ -145,8 +162,12 @@ fn token_cmd(root: &Path, args: &[String]) {
             for t in toks {
                 println!("{:<20} {}", t.name, if t.write { "write" } else { "read" });
             }
+            0
         }
-        _ => eprintln!("用法: agit-hub token add <name> [--write|--read] | agit-hub token list"),
+        _ => {
+            eprintln!("用法: agit-hub token add <name> [--write|--read] | agit-hub token list");
+            2
+        }
     }
 }
 
@@ -266,17 +287,20 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 
 // ─────────────────────────── Registry ───────────────────────────
 
-fn add_repo(root: &Path, name: &str) {
+fn add_repo(root: &Path, name: &str) -> i32 {
     if !valid_agent_name(name) {
         eprintln!("非法名字（只允许 [A-Za-z0-9._-]，禁止 .. 与前导点）: {name}");
-        return;
+        return 2;
     }
     let dir = root.join(format!("{name}.git"));
     if dir.exists() {
         eprintln!("已存在: {}", dir.display());
-        return;
+        return 1;
     }
-    std::fs::create_dir_all(&dir).unwrap();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("建目录失败: {e}");
+        return 1;
+    }
     let ok = Command::new("git")
         .args(["init", "-q", "--bare", "-b", "main"])
         .arg(&dir)
@@ -289,8 +313,10 @@ fn add_repo(root: &Path, name: &str) {
         println!("发布（需写 token，见 `agit-hub token add`）：");
         println!("  agit -a remote add origin http://localhost:8177/{name}.git");
         println!("  agit -a push -u origin main");
+        0
     } else {
         eprintln!("git init --bare 失败");
+        1
     }
 }
 
@@ -518,11 +544,49 @@ fn serve(root: &Path, port: u16, private: bool) {
         println!("  ⚠ 还没有写 token —— 当前谁也不能 push。`agit-hub token add <name> --write` 发一个。");
     }
 
+    // 并发上限：每连接一线程，但用信号量封顶 —— 否则 N 个慢连接 = N 个线程/内存，unbounded。
+    let sem = Arc::new(Semaphore::new(MAX_CONN));
     for stream in listener.incoming().flatten() {
+        let permit = Permit::acquire(sem.clone()); // 到顶就在这里挡住 accept，多余连接排在内核 backlog。
         let root = root.to_path_buf();
         std::thread::spawn(move || {
+            let _permit = permit; // 持有到线程结束；**即使 handle panic 也会在 drop 时归还**（不泄漏槽位）。
             let _ = handle(stream, &root, private);
         });
+    }
+}
+
+/// 计数信号量（std 无内置）：封顶并发处理线程数。
+struct Semaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Semaphore {
+    fn new(n: usize) -> Self {
+        Semaphore { permits: Mutex::new(n), cv: Condvar::new() }
+    }
+}
+
+/// 一个占用的槽位；drop 时归还（panic 安全 —— handle 崩了也不会漏掉一个 permit）。
+struct Permit(Arc<Semaphore>);
+
+impl Permit {
+    fn acquire(sem: Arc<Semaphore>) -> Permit {
+        let mut p = sem.permits.lock().unwrap();
+        while *p == 0 {
+            p = sem.cv.wait(p).unwrap();
+        }
+        *p -= 1;
+        drop(p);
+        Permit(sem)
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        *self.0.permits.lock().unwrap() += 1;
+        self.0.cv.notify_one();
     }
 }
 
@@ -530,7 +594,7 @@ struct Req {
     method: String,
     target: String,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    content_length: usize,
 }
 
 impl Req {
@@ -548,11 +612,16 @@ impl Req {
 const MAX_BODY: usize = 512 * 1024 * 1024;
 const MAX_LINE: u64 = 16 * 1024;
 const MAX_HEADERS_BYTES: usize = 64 * 1024;
+/// 并发处理线程上限（挡住 unbounded thread-per-connection）。
+const MAX_CONN: usize = 64;
+/// 从 accept 到读完请求头的整体墙钟上限（挡住 1 字节/<60s 的 slowloris 滴灌 —— 那能重置 per-read 超时）。
+const HEADER_DEADLINE_SECS: u64 = 20;
 
-fn read_request(stream: &mut TcpStream) -> Option<Req> {
-    let mut reader = BufReader::new(stream.try_clone().ok()?);
+/// 只读请求行 + 头部，**不碰 body**。body 留在 reader 里，等鉴权通过、确实需要时再流式取。
+fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Req> {
+    let deadline = Instant::now() + Duration::from_secs(HEADER_DEADLINE_SECS);
     let mut line = String::new();
-    (&mut reader).take(MAX_LINE).read_line(&mut line).ok()?;
+    reader.by_ref().take(MAX_LINE).read_line(&mut line).ok()?;
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
@@ -561,8 +630,11 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
     let mut content_length = 0usize;
     let mut headers_bytes = 0usize;
     loop {
+        if Instant::now() > deadline {
+            return None; // 整体读头超时 → 掐掉（配合并发上限，slowloris 滴灌撑不住一个线程槽）
+        }
         let mut h = String::new();
-        (&mut reader).take(MAX_LINE).read_line(&mut h).ok()?;
+        reader.by_ref().take(MAX_LINE).read_line(&mut h).ok()?;
         headers_bytes += h.len();
         if headers_bytes > MAX_HEADERS_BYTES {
             return None;
@@ -579,25 +651,16 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
             headers.push((k, v));
         }
     }
-    if content_length > MAX_BODY {
-        return None;
-    }
-    let mut body = Vec::new();
-    if content_length > 0 {
-        (&mut reader).take(content_length as u64).read_to_end(&mut body).ok()?;
-        if body.len() != content_length {
-            return None;
-        }
-    }
-    Some(Req { method, target, headers, body })
+    Some(Req { method, target, headers, content_length })
 }
 
 fn handle(mut stream: TcpStream, root: &Path, private: bool) -> std::io::Result<()> {
-    let t = Some(std::time::Duration::from_secs(60));
+    let t = Some(Duration::from_secs(60));
     let _ = stream.set_read_timeout(t);
     let _ = stream.set_write_timeout(t);
 
-    let Some(req) = read_request(&mut stream) else {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let Some(req) = read_head(&mut reader) else {
         return Ok(());
     };
     let path = req.target.split('?').next().unwrap_or("/").to_string();
@@ -609,20 +672,23 @@ fn handle(mut stream: TcpStream, root: &Path, private: bool) -> std::io::Result<
 
     let toks = load_tokens(root);
 
-    // git smart-http：鉴权后转交 http-backend。
+    // git smart-http：**先鉴权再读 body**。未授权的 push 直接 401，绝不把它的 pack 读进内存
+    // （否则匿名 POST 一个 512MB body 就能把进程撑爆 —— body-before-auth 的内存耗尽 DoS）。
     if path.contains(".git/") {
         let need_write = path.ends_with("/git-receive-pack") || req.query().contains("service=git-receive-pack");
         if !authorized(&toks, private, &req, need_write) {
             return respond_401(&mut stream, need_write);
         }
-        return git_http(&mut stream, root, &req);
+        if req.content_length > MAX_BODY {
+            return write_response(&mut stream, 413, "text/plain; charset=utf-8", b"payload too large");
+        }
+        return git_http(&mut stream, &mut reader, root, &req);
     }
 
-    // 前端静态资源（不鉴权也无妨，但 private 下一并要 token 更省事）。
+    // 非 git 路由不需要 body：非 GET 直接 405（不读 body），private 下要 token。
     if private && !authorized(&toks, private, &req, false) {
         return respond_401(&mut stream, false);
     }
-
     let (status, ctype, body) = route(root, &req, &path);
     write_response(&mut stream, status, ctype, body.as_bytes())
 }
@@ -860,15 +926,9 @@ fn param(query: &str, key: &str) -> Option<String> {
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _ => "OK",
-    };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reason(status),
         body.len()
     );
     stream.write_all(head.as_bytes())?;
@@ -878,7 +938,7 @@ fn write_response(stream: &mut TcpStream, status: u16, ctype: &str, body: &[u8])
 
 // ─────────────────────── git smart-http (sync) ───────────────────────
 
-fn git_http(stream: &mut TcpStream, root: &Path, req: &Req) -> std::io::Result<()> {
+fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, root: &Path, req: &Req) -> std::io::Result<()> {
     let (path, query) = match req.target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (req.target.clone(), String::new()),
@@ -893,7 +953,7 @@ fn git_http(stream: &mut TcpStream, root: &Path, req: &Req) -> std::io::Result<(
         .env("PATH_INFO", &path)
         .env("QUERY_STRING", &query)
         .env("CONTENT_TYPE", &ctype)
-        .env("CONTENT_LENGTH", req.body.len().to_string())
+        .env("CONTENT_LENGTH", req.content_length.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -902,18 +962,47 @@ fn git_http(stream: &mut TcpStream, root: &Path, req: &Req) -> std::io::Result<(
         Ok(c) => c,
         Err(_) => return write_response(stream, 500, "text/plain", "git http-backend 不可用".as_bytes()),
     };
-    child.stdin.take().unwrap().write_all(&req.body).ok();
+
+    // 把 body **流式**从 socket 灌进 http-backend stdin(不再整包 read_to_end 进 Vec)。
+    let mut stdin = child.stdin.take().unwrap();
+    let n = req.content_length.min(MAX_BODY) as u64;
+    let _ = std::io::copy(&mut reader.by_ref().take(n), &mut stdin);
+    drop(stdin); // 关 stdin 发 EOF，让 http-backend 收尾
     let out = child.wait_with_output()?;
 
+    // CGI 输出 = 头部 + 空行 + 体。规范化头部：拆出 git 的 Status: 作真状态；丢掉它的
+    // Content-Length（我们自己算）；每行只补一个 CRLF（别对已是 CRLF 的头再 \n→\r\n 造出 \r\r\n）。
     let raw = out.stdout;
     let sep = find_subslice(&raw, b"\r\n\r\n").map(|i| (i, 4)).or_else(|| find_subslice(&raw, b"\n\n").map(|i| (i, 2)));
-    let (headers, body) = match sep {
+    let (raw_headers, body) = match sep {
         Some((i, n)) => (&raw[..i], &raw[i + n..]),
         None => (&b""[..], &raw[..]),
     };
+    let mut status = 200u16;
+    let mut fwd = String::new();
+    for line in String::from_utf8_lossy(raw_headers).split('\n') {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim();
+            if key.eq_ignore_ascii_case("status") {
+                status = v.trim().split_whitespace().next().and_then(|c| c.parse().ok()).unwrap_or(200);
+                continue;
+            }
+            if key.eq_ignore_ascii_case("content-length") {
+                continue; // 我们自己算，避免重复
+            }
+            fwd.push_str(key);
+            fwd.push_str(": ");
+            fwd.push_str(v.trim());
+            fwd.push_str("\r\n");
+        }
+    }
     let head = format!(
-        "HTTP/1.1 200 OK\r\n{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        String::from_utf8_lossy(headers).replace('\n', "\r\n").trim_end(),
+        "HTTP/1.1 {status} {}\r\n{fwd}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        reason(status),
         body.len()
     );
     stream.write_all(head.as_bytes())?;
@@ -923,6 +1012,23 @@ fn git_http(stream: &mut TcpStream, root: &Path, req: &Req) -> std::io::Result<(
 
 fn find_subslice(h: &[u8], n: &[u8]) -> Option<usize> {
     h.windows(n.len()).position(|w| w == n)
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        _ => "OK",
+    }
 }
 
 const FAVICON: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>◆</text></svg>";
@@ -963,7 +1069,7 @@ mod tests {
             method: "POST".into(),
             target: "/x.git/git-receive-pack".into(),
             headers: vec![("Authorization".into(), auth.into())],
-            body: vec![],
+            content_length: 0,
         };
         assert!(!authorized(&toks, false, &req("Bearer readonly"), true));
         assert!(authorized(&toks, false, &req("Bearer writekey"), true));
