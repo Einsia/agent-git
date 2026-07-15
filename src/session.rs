@@ -94,11 +94,18 @@ fn mirror_into(src: &Path, dst: &Path, st: &mut Stats) -> Result<()> {
                     std::fs::copy(&sp, &dp)?;
                     st.added += 1;
                 }
-                Ok(dmeta) if dmeta.len() != smeta.len() => {
-                    std::fs::copy(&sp, &dp)?;
-                    st.updated += 1;
+                Ok(dmeta) => {
+                    // 大小**或** mtime 变了就重拷。只看大小会漏掉等长的原地改动
+                    // (且与本函数注释"大小+mtime"不符);拿不到 mtime 时保守重拷。
+                    let newer = match (smeta.modified(), dmeta.modified()) {
+                        (Ok(s), Ok(d)) => s > d,
+                        _ => true,
+                    };
+                    if dmeta.len() != smeta.len() || newer {
+                        std::fs::copy(&sp, &dp)?;
+                        st.updated += 1;
+                    }
                 }
-                Ok(_) => {} // 未变,跳过
             }
             st.total += 1;
             st.bytes += smeta.len();
