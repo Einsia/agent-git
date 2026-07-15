@@ -9,21 +9,9 @@
 //!   agit -a commit   → Agent scope
 //!   agit commit -a   → Environment scope，-a 是 git commit 的参数
 
-#![allow(dead_code)] // SessionIR 的 reads/commands 等字段已解析但 brief 暂不消费（保留备用）
-
-mod adapter;
-mod commands;
-mod environment;
-mod gitx;
-mod init;
-mod llm;
-mod passthrough;
-mod scan;
-mod scope;
-mod session;
-mod workspace;
-
-use scope::Scope;
+// 核心逻辑在 lib(crate `agit`),与 agit-hub 共享,避免两个 bin 各写一份解析而漂移。
+use agit::scope::Scope;
+use agit::{commands, init, passthrough, session};
 use std::path::PathBuf;
 use std::process::exit;
 

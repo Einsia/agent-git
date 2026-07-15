@@ -5,9 +5,17 @@ edition = "2021"
 description = "Git for agent context: version raw agent session dumps, sync with your team, LLM-merge on pull."
 license = "MIT"
 
+[lib]
+name = "agit"
+path = "src/lib.rs"
+
 [[bin]]
 name = "agit"
 path = "src/main.rs"
+
+[[bin]]
+name = "agit-hub"
+path = "src/bin/agit-hub.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

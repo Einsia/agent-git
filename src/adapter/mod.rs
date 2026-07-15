@@ -37,6 +37,8 @@ pub struct SessionIR {
     pub writes: Vec<String>,
     /// assistant 的文本块 —— brief 取最后几段作为"结论/进展"。
     pub agent_texts: Vec<String>,
+    /// tool_use 块总数（含未归类的工具）—— Hub 渲染"N 次工具调用"。
+    pub tool_uses: usize,
 }
 
 /// PRD 指定的三方法。Codex 与 ClaudeCode 都实现它。

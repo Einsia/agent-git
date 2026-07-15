@@ -124,81 +124,90 @@ impl Adapter for ClaudeCode {
         };
         self.validate(&path)?;
         let text = std::fs::read_to_string(&path)?;
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok(parse_jsonl(&text, &id))
+    }
+}
 
-        let mut ir = SessionIR {
-            runtime: "claude-code".into(),
-            session_id: path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            ..Default::default()
+/// 纯解析:一坨 Claude Code jsonl → SessionIR。不碰磁盘,无 IO。
+/// **唯一的转录解析实现** —— `export`(agit)和 Hub 渲染都走它,免得两处规则漂移
+/// (prompt 过滤、isCompactSummary 排除等只在这里改一次)。
+pub fn parse_jsonl(text: &str, session_id: &str) -> SessionIR {
+    let mut ir = SessionIR {
+        runtime: "claude-code".into(),
+        session_id: session_id.to_string(),
+        ..Default::default()
+    };
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
         };
 
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+        // 环境线索：取第一条带 cwd/gitBranch 的记录
+        if ir.cwd.is_none() {
+            if let Some(c) = rec.get("cwd").and_then(|v| v.as_str()) {
+                ir.cwd = Some(c.to_string());
             }
-            let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-
-            // 环境线索：取第一条带 cwd/gitBranch 的记录
-            if ir.cwd.is_none() {
-                if let Some(c) = rec.get("cwd").and_then(|v| v.as_str()) {
-                    ir.cwd = Some(c.to_string());
+        }
+        if ir.git_branch.is_none() {
+            if let Some(b) = rec.get("gitBranch").and_then(|v| v.as_str()) {
+                if !b.is_empty() {
+                    ir.git_branch = Some(b.to_string());
                 }
-            }
-            if ir.git_branch.is_none() {
-                if let Some(b) = rec.get("gitBranch").and_then(|v| v.as_str()) {
-                    if !b.is_empty() {
-                        ir.git_branch = Some(b.to_string());
-                    }
-                }
-            }
-
-            let ty = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let is_meta = rec.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false);
-            // compaction 会写一条合成的 user 记录(isCompactSummary=true)当摘要 —— 它不是
-            // 真实用户 prompt,当成 prompt 会把压缩摘要混进 brief、污染合并输入。排除之。
-            let is_compact = rec
-                .get("isCompactSummary")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let content = rec.get("message").and_then(|m| m.get("content"));
-
-            match ty {
-                "user" if !is_meta && !is_compact => {
-                    if let Some(s) = content.and_then(|c| c.as_str()) {
-                        if is_real_prompt(s) {
-                            ir.prompts.push(s.trim().to_string());
-                        }
-                    }
-                }
-                "assistant" => {
-                    if let Some(blocks) = content.and_then(|c| c.as_array()) {
-                        for b in blocks {
-                            match b.get("type").and_then(|v| v.as_str()) {
-                                Some("text") => {
-                                    if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
-                                        ir.agent_texts.push(t.to_string());
-                                    }
-                                }
-                                Some("tool_use") => collect_tool(b, &mut ir),
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                _ => {}
             }
         }
 
-        dedup(&mut ir.commands);
-        dedup(&mut ir.writes);
-        Ok(ir)
+        let ty = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let is_meta = rec.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false);
+        // compaction 会写一条合成的 user 记录(isCompactSummary=true)当摘要 —— 它不是
+        // 真实用户 prompt,当成 prompt 会把压缩摘要混进 brief、污染合并输入。排除之。
+        let is_compact = rec
+            .get("isCompactSummary")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let content = rec.get("message").and_then(|m| m.get("content"));
+
+        match ty {
+            "user" if !is_meta && !is_compact => {
+                if let Some(s) = content.and_then(|c| c.as_str()) {
+                    if is_real_prompt(s) {
+                        ir.prompts.push(s.trim().to_string());
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(blocks) = content.and_then(|c| c.as_array()) {
+                    for b in blocks {
+                        match b.get("type").and_then(|v| v.as_str()) {
+                            Some("text") => {
+                                if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                                    ir.agent_texts.push(t.to_string());
+                                }
+                            }
+                            Some("tool_use") => {
+                                ir.tool_uses += 1;
+                                collect_tool(b, &mut ir);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
+    dedup(&mut ir.commands);
+    dedup(&mut ir.writes);
+    ir
 }
 
 fn collect_tool(b: &serde_json::Value, ir: &mut SessionIR) {
