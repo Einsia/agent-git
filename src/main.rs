@@ -85,6 +85,17 @@ fn dispatch(argv: Vec<String>) -> i32 {
         }
         "adapter" => commands::adapter_list(),
 
+        // ── 跨 runtime 转会话(resume 到另一个 CLI)──
+        "convert" => match parse_convert(args) {
+            Some((src, from, to, cwd, structured, write)) => {
+                commands::convert_cmd(&src, from, &to, cwd, structured, write)
+            }
+            None => {
+                eprintln!("用法: agit convert <src-session> --to claude-code|codex [--from RT] [--cwd 路径] [--structured-tools] [--write]");
+                Ok(2)
+            }
+        },
+
         // ── 其余一切：透明透传到对应库的 git ──
         _ => passthrough::run(scope, rest),
     };
@@ -116,6 +127,50 @@ fn parse_runtime_arg(args: &[String], flag: &str) -> (String, Option<PathBuf>) {
     (runtime, positional)
 }
 
+/// convert 参数:位置参数 src + --to(必需)+ --from/--cwd/--structured-tools/--write。
+/// 返回 None 表示缺 src 或 --to。
+type ConvertArgs = (PathBuf, Option<String>, String, Option<String>, bool, bool);
+fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
+    let mut src = None;
+    let mut from = None;
+    let mut to = None;
+    let mut cwd = None;
+    let mut structured = false;
+    let mut write = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--to" => {
+                to = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--from" => {
+                from = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--cwd" => {
+                cwd = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--structured-tools" => {
+                structured = true;
+                i += 1;
+            }
+            "--write" => {
+                write = true;
+                i += 1;
+            }
+            other => {
+                if src.is_none() && !other.starts_with('-') {
+                    src = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+        }
+    }
+    Some((src?, from, to?, cwd, structured, write))
+}
+
 fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {
     let mut staged = false;
     let mut paths = Vec::new();
@@ -140,6 +195,7 @@ agit —— 版本化 agent 的原始 session,让团队协作 Agent Context
   agit -a scan [--staged]  扫 session dump 里的密钥
   agit workspace [log]     看 Agent↔Environment 的配对
   agit adapter             列出 runtime adapter
+  agit convert <src> --to <rt>  把一份 session 转成另一个 runtime 能 resume 的会话(--write 落盘)
 
   agit <git-args>          在代码仓库（Environment）上透明跑 git
   agit -a <git-args>       在 Agent Store 上跑同构 git

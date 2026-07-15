@@ -182,6 +182,86 @@ pub fn clone_agent(url: &str) -> Result<i32> {
     Ok(0)
 }
 
+// ─────────────────────── convert:跨 runtime 转会话 ───────────────────────
+
+/// 从源文件内容推断 runtime(session_meta=codex;sessionId/parentUuid=claude)。
+fn infer_runtime(text: &str) -> Option<&'static str> {
+    for line in text.lines().take(20) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+            return Some("codex");
+        }
+        if v.get("sessionId").is_some() || v.get("parentUuid").is_some() {
+            return Some("claude-code");
+        }
+    }
+    None
+}
+
+/// `agit convert <src> --to <rt> [--from <rt>] [--cwd P] [--structured-tools] [--write]`
+pub fn convert_cmd(
+    src: &Path,
+    from: Option<String>,
+    to: &str,
+    cwd_override: Option<String>,
+    structured_tools: bool,
+    write: bool,
+) -> Result<i32> {
+    use crate::convo::{self, ConvertOpts};
+
+    let text = std::fs::read_to_string(src)
+        .map_err(|e| anyhow::anyhow!("读源 session {} 失败: {e}", src.display()))?;
+    let from = match from {
+        Some(f) => f,
+        None => infer_runtime(&text)
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("认不出源 runtime,请显式 --from claude-code|codex"))?,
+    };
+
+    let new_id = convo::fresh_id("session");
+    let opts = ConvertOpts {
+        cwd: cwd_override,
+        structured_tools,
+        new_id: new_id.clone(),
+    };
+    let (out, ir) = convo::convert(src, &from, to, &opts)?;
+    let cross = convo::is_cross_vendor(&from, to);
+
+    // 目标 cwd(装到哪个项目下 / resume 落哪)
+    let cwd = opts
+        .cwd
+        .clone()
+        .or_else(|| ir.cwd.clone())
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+
+    // 产物 = 敏感内容的新副本,落盘前高精度扫一遍(jsonl:关熵检测)
+    let hits = scan::scan_text_opts(&out, false).len();
+
+    println!("convert {from} → {to}{}", if cross { "（跨 vendor:内容级,丢加密推理、叙述工具）" } else { "（同 vendor:字节级重放）" });
+    println!("  源       : {}", src.display());
+    println!("  新 id    : {new_id}");
+    println!("  回合/行  : {} events → {} 行", ir.events.len(), out.lines().count());
+    println!("  目标 cwd : {}", cwd.display());
+    if hits > 0 {
+        eprintln!("  ⚠ 产物里扫到 {hits} 处疑似密钥 —— 这是源会话见过的内容的新副本,注意别外泄。");
+    }
+
+    if !write {
+        let preview: String = out.lines().take(3).collect::<Vec<_>>().join("\n");
+        println!("\n  预览(前 3 行):\n{preview}");
+        println!("\n  —— dry-run,未落盘。加 --write 安装并给出 resume 命令。");
+        return Ok(0);
+    }
+
+    let h = crate::register::install(to, &new_id, &cwd, &out)?;
+    println!("\n  已写入: {}", h.path.display());
+    println!("  resume : {}", h.resume_cmd);
+    Ok(0)
+}
+
 /// 打印当前 WorkspaceRevision（Agent↔Environment 配对）。
 pub fn workspace_show() -> Result<i32> {
     let head = scope::workspace_dir()?.join("HEAD.json");
