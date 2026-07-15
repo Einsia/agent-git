@@ -73,10 +73,14 @@ const ENTROPY_THRESHOLD: f64 = 4.2;
 
 fn redact(s: &str) -> String {
     let s: String = s.chars().take(48).collect();
-    if s.len() <= 10 {
-        return "*".repeat(s.len());
+    let n = s.chars().count();
+    if n <= 10 {
+        return "*".repeat(n);
     }
-    format!("{}…{}", &s[..4], "*".repeat(6))
+    // 按 **char** 取前缀,不是 `&s[..4]` —— 后者在第 4 字节落在多字节 UTF-8 中间时 panic,
+    // 一条含 emoji/中日文的正常行就能让整轮扫描崩掉(而扫描是 commit/push 的安全闸门)。
+    let prefix: String = s.chars().take(4).collect();
+    format!("{prefix}…{}", "*".repeat(6))
 }
 
 pub fn scan_text(text: &str) -> Vec<Finding> {
@@ -114,6 +118,30 @@ pub fn scan_text_opts(text: &str, entropy: bool) -> Vec<Finding> {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_does_not_panic_on_multibyte_boundary() {
+        // 每个 € 占 3 字节:旧的 &s[..4] 会切在字符中间 panic。
+        let out = redact("€€€€€€€€€€€€");
+        assert!(out.starts_with('€'));
+        assert!(out.contains('…'));
+        // 混合:前缀多字节,同样不能 panic
+        let _ = redact("café_secret_value_1234");
+        // 短串走 '*' 分支,按 char 数
+        assert_eq!(redact("日本語"), "***");
+    }
+
+    #[test]
+    fn scan_text_survives_multibyte_lines() {
+        // 一行含多字节 + 一个真密钥,既不 panic,又要命中密钥。
+        let f = scan_text("日本語 password = caféSecret42x\nAKIAIOSFODNN7EXAMPLE\n");
+        assert!(f.iter().any(|x| x.rule == "aws-access-key-id"));
+    }
 }
 
 pub fn scan_file(path: &Path) -> Result<Vec<Finding>> {
