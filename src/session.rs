@@ -206,11 +206,20 @@ pub fn reconcile(reference: &str, runtime: &str) -> Result<i32> {
         .collect();
 
     // 2. 真正 git 合并（session 是不同 uuid，通常无文本冲突）
+    let before = scope::git_in_status(&agent, &["rev-parse", "HEAD"]).1;
     let (code, out) = scope::git_in_status(&agent, &["merge", "--no-edit", reference]);
     if code != 0 {
         // 非 session 文件的文本冲突：交回 git 处理，别硬来
         let _ = scope::git_in_status(&agent, &["merge", "--abort"]);
         bail!("git 层合并有文本冲突，先手动处理：\n{out}");
+    }
+    // merge 动了 Agent ref → 记一条 WorkspaceRevision(和 passthrough 的 git 一致;
+    // 原生动词不该绕过"任一 ref 移动即配对"的契约)。失败只提示,不拖垮 reconcile。
+    let after = scope::git_in_status(&agent, &["rev-parse", "HEAD"]).1;
+    if after != before {
+        if let Err(e) = crate::workspace::record(&crate::workspace::trigger_label(Scope::Agent, "merge")) {
+            eprintln!("agit: 已合并，但生成 WorkspaceRevision 失败: {e:#}");
+        }
     }
 
     if incoming.is_empty() {
