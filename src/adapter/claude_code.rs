@@ -245,6 +245,203 @@ fn dedup(v: &mut Vec<String>) {
     v.retain(|x| seen.insert(x.clone()));
 }
 
+// ─────────────────── ConversationIR:无损读写(convert 用)───────────────────
+
+use crate::convo::{narrate_call, truncate, ConversationIR, ConvertOpts, Event, EventKind};
+
+/// 合成 claude 记录用的 schema version(核对真实转录:2.1.207)。
+const CLAUDE_VERSION: &str = "2.1.207";
+
+/// claude jsonl → ConversationIR(逐字保留每行 + 语义叠加)。
+pub fn read_conversation(text: &str) -> ConversationIR {
+    let mut ir = ConversationIR {
+        source_runtime: "claude-code".into(),
+        ..Default::default()
+    };
+    for line in text.lines() {
+        let rec: Option<serde_json::Value> = serde_json::from_str(line.trim()).ok();
+        let (mut kinds, mut id, mut parent, mut ts) = (vec![], None, None, None);
+        if let Some(rec) = &rec {
+            if ir.cwd.is_none() {
+                if let Some(c) = rec.get("cwd").and_then(|v| v.as_str()) {
+                    ir.cwd = Some(c.to_string());
+                }
+            }
+            if ir.git_branch.is_none() {
+                if let Some(b) = rec.get("gitBranch").and_then(|v| v.as_str()) {
+                    if !b.is_empty() {
+                        ir.git_branch = Some(b.to_string());
+                    }
+                }
+            }
+            if ir.session_id.is_empty() {
+                if let Some(s) = rec.get("sessionId").and_then(|v| v.as_str()) {
+                    ir.session_id = s.to_string();
+                }
+            }
+            id = rec.get("uuid").and_then(|v| v.as_str()).map(String::from);
+            parent = rec.get("parentUuid").and_then(|v| v.as_str()).map(String::from);
+            ts = rec.get("timestamp").and_then(|v| v.as_str()).map(String::from);
+            kinds = extract_claude_kinds(rec);
+        }
+        ir.events.push(Event { raw: line.to_string(), kinds, id, parent_id: parent, timestamp: ts });
+    }
+    ir
+}
+
+fn extract_claude_kinds(rec: &serde_json::Value) -> Vec<EventKind> {
+    let ty = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let is_meta = rec.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false);
+    let content = rec.get("message").and_then(|m| m.get("content"));
+    let mut out = vec![];
+    match ty {
+        "user" if !is_meta => match content {
+            Some(serde_json::Value::String(s)) => {
+                if is_real_prompt(s) {
+                    out.push(EventKind::UserPrompt(s.trim().to_string()));
+                }
+            }
+            Some(serde_json::Value::Array(arr)) => {
+                for b in arr {
+                    if b.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                        out.push(EventKind::ToolResult {
+                            call_id: b.get("tool_use_id").and_then(|v| v.as_str()).map(String::from),
+                            output: tool_result_text(b.get("content")),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        },
+        "assistant" => {
+            if let Some(serde_json::Value::Array(arr)) = content {
+                for b in arr {
+                    match b.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                                if !t.trim().is_empty() {
+                                    out.push(EventKind::AssistantText(t.to_string()));
+                                }
+                            }
+                        }
+                        Some("tool_use") => out.push(EventKind::ToolCall {
+                            call_id: b.get("id").and_then(|v| v.as_str()).map(String::from),
+                            name: b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            input: b.get("input").cloned().unwrap_or(serde_json::Value::Null),
+                        }),
+                        _ => {} // thinking:加密,跨 vendor 丢弃(同 vendor 由 raw 保留)
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn tool_result_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|x| x.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// ConversationIR → claude jsonl。同 vendor 走 raw 重放(字节级),跨 vendor 走合成。
+pub fn write_conversation(ir: &ConversationIR, opts: &ConvertOpts) -> String {
+    if ir.source_runtime == "claude-code" {
+        same_vendor_claude(ir, opts)
+    } else {
+        cross_to_claude(ir, opts)
+    }
+}
+
+/// 同 vendor:逐行重放 raw,只把源 session id 换成新 id(+可选 cwd 覆盖),其余字节不动。
+fn same_vendor_claude(ir: &ConversationIR, opts: &ConvertOpts) -> String {
+    let mut lines = Vec::with_capacity(ir.events.len());
+    for e in &ir.events {
+        let mut raw = e.raw.clone();
+        if !ir.session_id.is_empty() && !opts.new_id.is_empty() {
+            raw = raw.replace(&ir.session_id, &opts.new_id);
+        }
+        if let (Some(old), Some(new)) = (&ir.cwd, &opts.cwd) {
+            if old != new {
+                raw = raw.replace(old.as_str(), new.as_str());
+            }
+        }
+        lines.push(raw);
+    }
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
+/// 跨 vendor(codex → claude):从 kinds 合成 claude 记录,串起 parentUuid 链。
+/// 工具活动默认叙述成文本(--structured-tools 才发结构化 tool_use)。
+fn cross_to_claude(ir: &ConversationIR, opts: &ConvertOpts) -> String {
+    let cwd = opts.cwd.clone().or_else(|| ir.cwd.clone()).unwrap_or_default();
+    let branch = ir.git_branch.clone().unwrap_or_default();
+    let ts = "2026-01-01T00:00:00.000Z"; // 合成时间戳;claude resume 不要求单调
+    let mut records: Vec<String> = vec![];
+    let mut parent: Option<String> = None;
+    let mut counter: u64 = 0;
+
+    let mut push = |records: &mut Vec<String>, parent: &mut Option<String>, role_user: bool, text: &str| {
+        counter += 1;
+        let uuid = crate::convo::fresh_id(&format!("cl{counter}"));
+        let msg = if role_user {
+            serde_json::json!({"role":"user","content":text})
+        } else {
+            serde_json::json!({"role":"assistant","content":[{"type":"text","text":text}]})
+        };
+        let rec = serde_json::json!({
+            "type": if role_user {"user"} else {"assistant"},
+            "uuid": uuid,
+            "parentUuid": parent.clone(),
+            "sessionId": opts.new_id,
+            "cwd": cwd,
+            "gitBranch": branch,
+            "timestamp": ts,
+            "version": CLAUDE_VERSION,
+            "userType": "external",
+            "isSidechain": false,
+            "message": msg,
+        });
+        records.push(rec.to_string());
+        *parent = Some(uuid);
+    };
+
+    if let Some(sp) = &ir.system_prompt {
+        let note = format!(
+            "[Resumed from a Codex session. Imported system instructions follow.]\n\n{}",
+            truncate(sp, 4000)
+        );
+        push(&mut records, &mut parent, true, &note);
+    }
+    for e in &ir.events {
+        for k in &e.kinds {
+            let (user, text) = match k {
+                EventKind::UserPrompt(s) => (true, s.clone()),
+                EventKind::AssistantText(s) => (false, s.clone()),
+                EventKind::ToolCall { name, input, .. } => (false, narrate_call(name, input)),
+                EventKind::ToolResult { output, .. } => (false, format!("[output] {}", truncate(output, 2000))),
+                EventKind::FileEdit { paths } => (false, format!("[edited: {}]", paths.join(", "))),
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            push(&mut records, &mut parent, user, &text);
+        }
+    }
+    let mut s = records.join("\n");
+    s.push('\n');
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +455,21 @@ mod tests {
         );
         // 含点的普通路径也要塌成 '-',否则 sync 找不到目录
         assert_eq!(slug_for(Path::new("/a/b.c/d")), "-a-b-c-d");
+    }
+
+    #[test]
+    fn conversation_roundtrip_byte_faithful() {
+        let src = "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"cwd\":\"/p\",\"gitBranch\":\"main\",\"message\":{\"role\":\"user\",\"content\":\"hi there\"}}\n\
+                   {\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"abc\"},{\"type\":\"text\",\"text\":\"hello\"}]}}\n";
+        let ir = read_conversation(src);
+        assert_eq!(ir.session_id, "S1");
+        // same-vendor replay with new_id == source id → no rewrite → byte-identical
+        let opts = ConvertOpts { cwd: None, structured_tools: false, new_id: "S1".into() };
+        assert_eq!(write_conversation(&ir, &opts), src, "same-vendor replay must reproduce input");
+        // semantic overlay: prompt + assistant text captured; thinking dropped
+        let kinds: Vec<&EventKind> = ir.events.iter().flat_map(|e| e.kinds.iter()).collect();
+        assert!(matches!(kinds[0], EventKind::UserPrompt(p) if p == "hi there"));
+        assert!(kinds.iter().any(|k| matches!(k, EventKind::AssistantText(t) if t == "hello")));
     }
 
     #[test]

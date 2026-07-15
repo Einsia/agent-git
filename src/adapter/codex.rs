@@ -349,6 +349,199 @@ fn dedup(v: &mut Vec<String>) {
     v.retain(|x| seen.insert(x.clone()));
 }
 
+// ─────────────────── ConversationIR:无损读写(convert 用)───────────────────
+
+use crate::convo::{narrate_call, truncate, ConversationIR, ConvertOpts, Event, EventKind};
+
+/// codex rollout → ConversationIR(逐字保留每行 + 语义叠加)。
+pub fn read_conversation(text: &str) -> ConversationIR {
+    let mut ir = ConversationIR {
+        source_runtime: "codex".into(),
+        ..Default::default()
+    };
+    for line in text.lines() {
+        let rec: Option<serde_json::Value> = serde_json::from_str(line.trim()).ok();
+        let mut kinds = vec![];
+        let mut ts = None;
+        if let Some(rec) = &rec {
+            ts = rec.get("timestamp").and_then(|v| v.as_str()).map(String::from);
+            let ty = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let p = rec.get("payload");
+            match ty {
+                "session_meta" => {
+                    if let Some(p) = p {
+                        if ir.session_id.is_empty() {
+                            if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
+                                ir.session_id = id.to_string();
+                            }
+                        }
+                        if ir.cwd.is_none() {
+                            if let Some(c) = p.get("cwd").and_then(|v| v.as_str()) {
+                                ir.cwd = Some(c.to_string());
+                            }
+                        }
+                        if ir.git_branch.is_none() {
+                            if let Some(b) = p.get("git").and_then(|g| g.get("branch")).and_then(|v| v.as_str()) {
+                                if !b.is_empty() {
+                                    ir.git_branch = Some(b.to_string());
+                                }
+                            }
+                        }
+                        if ir.system_prompt.is_none() {
+                            if let Some(bi) = p
+                                .get("base_instructions")
+                                .or_else(|| p.get("instructions"))
+                                .and_then(|v| v.as_str())
+                            {
+                                if !bi.is_empty() {
+                                    ir.system_prompt = Some(bi.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                "event_msg" => {
+                    let sub = p.and_then(|p| p.get("type")).and_then(|v| v.as_str()).unwrap_or("");
+                    let msg = p.and_then(|p| p.get("message")).and_then(|v| v.as_str());
+                    match sub {
+                        "user_message" => {
+                            if let Some(pr) = msg.and_then(clean_prompt) {
+                                kinds.push(EventKind::UserPrompt(pr));
+                            }
+                        }
+                        "agent_message" => {
+                            if let Some(m) = msg {
+                                if !m.trim().is_empty() {
+                                    kinds.push(EventKind::AssistantText(m.to_string()));
+                                }
+                            }
+                        }
+                        "patch_apply_end" => {
+                            let mut paths = vec![];
+                            if let Some(ch) = p.and_then(|p| p.get("changes")).and_then(|c| c.as_object()) {
+                                for k in ch.keys() {
+                                    paths.push(k.clone());
+                                }
+                            } else if let Some(so) = p.and_then(|p| p.get("stdout")).and_then(|v| v.as_str()) {
+                                patch_stdout_files(so, &mut paths);
+                            }
+                            if !paths.is_empty() {
+                                kinds.push(EventKind::FileEdit { paths });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "response_item" => {
+                    if p.and_then(|p| p.get("type")).and_then(|v| v.as_str()) == Some("function_call") {
+                        let name = p.and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                        if matches!(name, "shell" | "local_shell" | "shell_command" | "exec_command") {
+                            let args = p.and_then(|p| p.get("arguments")).and_then(|v| v.as_str()).unwrap_or("");
+                            if let Some(cmd) = extract_command(args) {
+                                kinds.push(EventKind::ToolCall {
+                                    call_id: p.and_then(|p| p.get("call_id")).and_then(|v| v.as_str()).map(String::from),
+                                    name: "shell".into(),
+                                    input: serde_json::json!({ "command": cmd }),
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        ir.events.push(Event { raw: line.to_string(), kinds, id: None, parent_id: None, timestamp: ts });
+    }
+    ir
+}
+
+/// ConversationIR → codex rollout。同 vendor 走 raw 重放,跨 vendor 走合成。
+pub fn write_conversation(ir: &ConversationIR, opts: &ConvertOpts) -> String {
+    if ir.source_runtime == "codex" {
+        same_vendor_codex(ir, opts)
+    } else {
+        cross_to_codex(ir, opts)
+    }
+}
+
+fn same_vendor_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
+    let mut lines = Vec::with_capacity(ir.events.len());
+    for e in &ir.events {
+        let mut raw = e.raw.clone();
+        if !ir.session_id.is_empty() && !opts.new_id.is_empty() {
+            raw = raw.replace(&ir.session_id, &opts.new_id);
+        }
+        if let (Some(old), Some(new)) = (&ir.cwd, &opts.cwd) {
+            if old != new {
+                raw = raw.replace(old.as_str(), new.as_str());
+            }
+        }
+        lines.push(raw);
+    }
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
+const CTS: &str = "2026-01-01T00:00:00.000Z"; // 合成时间戳
+
+fn resp_message(role: &str, ctype: &str, text: &str) -> String {
+    serde_json::json!({
+        "timestamp": CTS, "type": "response_item",
+        "payload": {"type":"message","role":role,"content":[{"type":ctype,"text":text}]}
+    })
+    .to_string()
+}
+fn ev_msg(sub: &str, text: &str) -> String {
+    serde_json::json!({
+        "timestamp": CTS, "type": "event_msg",
+        "payload": {"type":sub,"message":text}
+    })
+    .to_string()
+}
+
+/// 跨 vendor(claude → codex):合成一份 rollout。response_item 是 codex 重放读取的通道,
+/// event_msg 是 UI 通道 —— 两者都发,和真实 rollout 结构一致。工具活动默认叙述成文本。
+fn cross_to_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
+    let cwd = opts.cwd.clone().or_else(|| ir.cwd.clone()).unwrap_or_default();
+    let branch = ir.git_branch.clone().unwrap_or_default();
+    let mut lines = vec![serde_json::json!({
+        "timestamp": CTS, "type": "session_meta",
+        "payload": {
+            "id": opts.new_id, "timestamp": CTS, "cwd": cwd,
+            "originator": "agit-convert", "cli_version": "0.0.0",
+            "instructions": ir.system_prompt.clone(), "git": {"branch": branch}
+        }
+    })
+    .to_string()];
+
+    for e in &ir.events {
+        for k in &e.kinds {
+            let (role, ctype, sub, text) = match k {
+                EventKind::UserPrompt(s) => ("user", "input_text", "user_message", s.clone()),
+                EventKind::AssistantText(s) => ("assistant", "output_text", "agent_message", s.clone()),
+                EventKind::ToolCall { name, input, .. } => {
+                    ("assistant", "output_text", "agent_message", narrate_call(name, input))
+                }
+                EventKind::ToolResult { output, .. } => {
+                    ("assistant", "output_text", "agent_message", format!("[output] {}", truncate(output, 2000)))
+                }
+                EventKind::FileEdit { paths } => {
+                    ("assistant", "output_text", "agent_message", format!("[edited: {}]", paths.join(", ")))
+                }
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            lines.push(resp_message(role, ctype, &text));
+            lines.push(ev_msg(sub, &text));
+        }
+    }
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +579,21 @@ mod tests {
         assert!(ir.writes.contains(&"/proj/x/src/new.rs".to_string()), "{:?}", ir.writes);
         // every function_call counts (exec + shell_command + shell + write_stdin = 4)
         assert_eq!(ir.tool_uses, 4);
+    }
+
+    #[test]
+    fn conversation_roundtrip_byte_faithful() {
+        let src = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"S1\",\"cwd\":\"/p\",\"git\":{\"branch\":\"main\"}}}\n\
+                   {\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"do the thing\"}}\n\
+                   {\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}\n";
+        let ir = read_conversation(src);
+        assert_eq!(ir.session_id, "S1");
+        assert_eq!(ir.cwd.as_deref(), Some("/p"));
+        let opts = ConvertOpts { cwd: None, structured_tools: false, new_id: "S1".into() };
+        assert_eq!(write_conversation(&ir, &opts), src, "same-vendor replay must reproduce input");
+        let kinds: Vec<&EventKind> = ir.events.iter().flat_map(|e| e.kinds.iter()).collect();
+        assert!(kinds.iter().any(|k| matches!(k, EventKind::UserPrompt(p) if p == "do the thing")));
+        assert!(kinds.iter().any(|k| matches!(k, EventKind::ToolCall { .. })));
     }
 
     #[test]
