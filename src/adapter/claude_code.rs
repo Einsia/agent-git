@@ -294,10 +294,17 @@ pub fn read_conversation(text: &str) -> ConversationIR {
 fn extract_claude_kinds(rec: &serde_json::Value) -> Vec<EventKind> {
     let ty = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let is_meta = rec.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false);
+    // compaction 写的合成 user 记录(isCompactSummary=true)不是真实 prompt。同 vendor 靠 raw
+    // 保留它;但跨 vendor 从 kinds 重建时,若当成 UserPrompt 会把压缩摘要伪装成用户提问注入
+    // 目标会话(parse_jsonl 早已在 SessionIR 路径排除它,这里补上 ConversationIR 路径)。
+    let is_compact = rec
+        .get("isCompactSummary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let content = rec.get("message").and_then(|m| m.get("content"));
     let mut out = vec![];
     match ty {
-        "user" if !is_meta => match content {
+        "user" if !is_meta && !is_compact => match content {
             Some(serde_json::Value::String(s)) => {
                 if is_real_prompt(s) {
                     out.push(EventKind::UserPrompt(s.trim().to_string()));
@@ -479,6 +486,22 @@ mod tests {
             .flat_map(|e| &e.kinds)
             .any(|k| matches!(k, EventKind::UserPrompt(p) if p == "should we write e2e tests?"));
         assert!(has, "multimodal user text must not be dropped");
+    }
+
+    #[test]
+    fn compaction_summary_is_not_a_cross_vendor_prompt() {
+        // a compaction summary is a synthetic user record; on cross-vendor rebuild it must NOT
+        // resurface as a fake user prompt (same-vendor still keeps it verbatim via raw).
+        let src = "{\"type\":\"user\",\"isCompactSummary\":true,\"sessionId\":\"S\",\"message\":{\"role\":\"user\",\"content\":\"This session is a summary of prior work: we refactored auth.\"}}\n\
+                   {\"type\":\"user\",\"sessionId\":\"S\",\"message\":{\"role\":\"user\",\"content\":\"now add logout\"}}\n";
+        let ir = read_conversation(src);
+        let prompts: Vec<String> = ir
+            .events
+            .iter()
+            .flat_map(|e| &e.kinds)
+            .filter_map(|k| if let EventKind::UserPrompt(p) = k { Some(p.clone()) } else { None })
+            .collect();
+        assert_eq!(prompts, vec!["now add logout".to_string()], "compaction summary leaked as a prompt: {prompts:?}");
     }
 
     #[test]
