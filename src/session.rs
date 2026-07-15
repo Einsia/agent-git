@@ -7,7 +7,7 @@
 //!   memory/                   记忆
 //! `agit -a sync` 把这坨镜像进 Agent Store 的 sessions/<runtime>/,之后 commit/push/pull 照旧。
 
-use crate::adapter::{claude_code, Adapter, SessionIR};
+use crate::adapter::claude_code;
 use crate::scope::{self, Scope};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -37,17 +37,25 @@ pub fn sync(runtime: &str) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
     let rt = normalize(runtime);
-    let src = source_dir(runtime, &env)?;
     let dst = agent.join(SESSIONS_SUBDIR).join(&rt);
-
     std::fs::create_dir_all(&dst)?;
-    let stats = mirror(&src, &dst)?;
+
+    // runtime 的存储模型不同:Claude 按项目 slug 分目录(整棵镜像);Codex 按日期分目录、
+    // 各项目混在一起(按 session_meta.cwd 过滤出本项目的 rollout,只镜像这些)。
+    let (stats, source_desc) = match rt.as_str() {
+        "claude-code" => {
+            let src = source_dir(runtime, &env)?;
+            (mirror(&src, &dst)?, src.display().to_string())
+        }
+        "codex" => codex_collect(&env, &dst)?,
+        other => bail!("runtime `{other}` 的 session dump 还没接(见 src/session.rs)"),
+    };
 
     // 落盘前扫一遍密钥 —— dump 全部 session = agent cat 过的一切都在里面
     let hits = crate::scan::scan_tree(&dst)?;
 
     println!("已镜像 {} 的 session dump:", rt);
-    println!("  来源  : {}", src.display());
+    println!("  来源  : {source_desc}");
     println!("  写入  : {}", dst.display());
     println!("  文件  : {} 个({} 更新 / {} 新增),{} 字节", stats.total, stats.updated, stats.added, stats.bytes);
     if hits > 0 {
@@ -70,6 +78,40 @@ struct Stats {
     added: usize,
     updated: usize,
     bytes: u64,
+}
+
+/// Codex 同步:扫 ~/.codex/sessions,只把 **本项目**(session_meta.cwd == env 根)的 rollout
+/// 平铺进 dst/<id>.jsonl。按 cwd 过滤是隐私底线 —— 绝不把别项目的会话卷进来。
+fn codex_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
+    let rollouts = crate::adapter::codex::project_rollouts(env);
+    let mut st = Stats { total: 0, added: 0, updated: 0, bytes: 0 };
+    for (src, id) in &rollouts {
+        let dp = dst.join(format!("{id}.jsonl"));
+        let smeta = std::fs::metadata(src)?;
+        match std::fs::metadata(&dp) {
+            Err(_) => {
+                std::fs::copy(src, &dp)?;
+                st.added += 1;
+            }
+            Ok(dmeta) => {
+                let newer = match (smeta.modified(), dmeta.modified()) {
+                    (Ok(s), Ok(d)) => s > d,
+                    _ => true,
+                };
+                if dmeta.len() != smeta.len() || newer {
+                    std::fs::copy(src, &dp)?;
+                    st.updated += 1;
+                }
+            }
+        }
+        st.total += 1;
+        st.bytes += smeta.len();
+    }
+    let root = crate::adapter::codex::sessions_root()
+        .map(|r| r.display().to_string())
+        .unwrap_or_default();
+    let desc = format!("{root}（cwd={} 过滤出 {} 条）", env.display(), rollouts.len());
+    Ok((st, desc))
 }
 
 /// 递归镜像 src → dst(只按大小+mtime 判断是否需要覆盖,够用)。
@@ -121,8 +163,9 @@ fn mirror_into(src: &Path, dst: &Path, st: &mut Stats) -> Result<()> {
 // （写进 CLAUDE.md），只把**真正矛盾**的点列出来问用户。非确定性 —— 这是设计如此。
 
 /// 一条 session 的紧凑摘要（喂给 merge agent，避免把整条 6MB 转录塞进去）。
-fn brief(path: &Path, env: &Path) -> Option<String> {
-    let ir: SessionIR = claude_code::ClaudeCode.export(Some(path), env).ok()?;
+/// 按 runtime 选对应 adapter 解析,于是 codex 与 claude 的会话都能进同一份 brief。
+fn brief(path: &Path, env: &Path, rt: &str) -> Option<String> {
+    let ir = crate::adapter::get(rt).ok()?.export(Some(path), env).ok()?;
     let mut s = format!(
         "· 会话 {}{}\n",
         ir.session_id,
@@ -145,10 +188,19 @@ fn brief(path: &Path, env: &Path) -> Option<String> {
         }
     }
     if !ir.writes.is_empty() {
+        // env 下的写:显示相对路径;否则(如 codex 会话记的是另一机器的绝对路径)退回 basename,
+        // 否则 strip_prefix 失败会把所有 codex 改动文件都吞掉。
         let files: Vec<String> = ir
             .writes
             .iter()
-            .filter_map(|w| Path::new(w).strip_prefix(env).ok().map(|r| r.to_string_lossy().into_owned()))
+            .map(|w| {
+                let p = Path::new(w);
+                p.strip_prefix(env)
+                    .ok()
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .or_else(|| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| w.clone())
+            })
             .take(12)
             .collect();
         if !files.is_empty() {
@@ -235,7 +287,7 @@ pub fn reconcile(reference: &str, runtime: &str) -> Result<i32> {
     let (mut peer, mut local) = (Vec::new(), Vec::new());
     for p in &all {
         let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let b = brief(p, &env);
+        let b = brief(p, &env, &rt);
         if let Some(b) = b {
             if incoming_set.contains(&name) {
                 peer.push(b);
