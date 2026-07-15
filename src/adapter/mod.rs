@@ -61,7 +61,7 @@ pub fn get(runtime: &str) -> Result<Box<dyn Adapter>> {
     match runtime {
         "claude-code" | "claude" | "cc" => Ok(Box::new(claude_code::ClaudeCode)),
         "codex" => Ok(Box::new(codex::Codex)),
-        other => bail!("未知 runtime `{other}`。已注册: claude-code, codex（桩）"),
+        other => bail!("未知 runtime `{other}`。已注册: claude-code, codex"),
     }
 }
 
