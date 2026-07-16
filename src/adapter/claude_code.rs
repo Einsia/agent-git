@@ -11,11 +11,17 @@ use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode;
 
-/// cwd → Claude Code's project slug: both '/' **and '.'** in the absolute path become '-'.
-/// Verified against a real directory: `/home/user/bolusi/.claude/worktrees` → `-home-user-bolusi--claude-worktrees`
-/// (the dot in `.claude` also collapses to '-', hence the double hyphen). Swapping only '/' would compute the wrong slug for any path containing a dot and fail to find the directory.
+/// cwd → Claude Code's project slug: EVERY non-alphanumeric char in the absolute path becomes '-'.
+/// Claude Code slugifies by replacing anything that isn't [A-Za-z0-9], so '/', '.', '_', spaces, etc.
+/// all collapse to '-'. Verified against real directories:
+///   `/home/user/bolusi/.claude/worktrees` → `-home-user-bolusi--claude-worktrees` (dot → '-')
+///   `/home/user/_test/payments`           → `-home-user--test-payments`          (underscore → '-')
+/// Replacing only '/' and '.' would keep the underscore and fail to find the session directory.
 pub fn slug_for(cwd: &Path) -> String {
-    cwd.to_string_lossy().replace(['/', '.'], "-")
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 pub fn projects_dir() -> Result<PathBuf> {
@@ -466,7 +472,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slug_collapses_dot_and_slash() {
+    fn slug_collapses_non_alphanumeric() {
         // real: /home/user/bolusi/.claude/worktrees → -home-user-bolusi--claude-worktrees
         assert_eq!(
             slug_for(Path::new("/home/user/bolusi/.claude/worktrees")),
@@ -474,6 +480,12 @@ mod tests {
         );
         // a normal path containing a dot must also collapse to '-', otherwise sync won't find the directory
         assert_eq!(slug_for(Path::new("/a/b.c/d")), "-a-b-c-d");
+        // real bug: an underscore in the path is also collapsed by Claude Code, so agit must match.
+        // /home/user/_test/payments → -home-user--test-payments (NOT -home-user-_test-payments)
+        assert_eq!(
+            slug_for(Path::new("/home/user/_test/payments")),
+            "-home-user--test-payments"
+        );
     }
 
     #[test]
