@@ -222,26 +222,52 @@ root-commit key when `git rev-parse --is-shallow-repository`.
 
 ---
 
-## 7. Merge — two cases, neither is a code branch
+## 7. Merge — always "reconcile my memory with another memory"
 
-`agit -a merge <ref>` takes **another memory**. Never a code branch. (`feature-a` as an operand was my
-error: one agent that worked feature-a then feature-b has *one* memory that already spans both —
-nothing to reconcile. It correctly finds no divergent tail.)
+`agit -a merge <target>` takes **another memory**. Never a code branch. (`feature-a` as an operand was
+my error: one agent that worked feature-a then feature-b has *one* memory spanning both — nothing to
+reconcile, and it correctly finds no divergent tail.)
 
-### (a) Another **copy of the same agent** — the everyday case
-Shared history ⇒ a merge-base exists.
-```console
-$ agit -a merge origin/main     # a teammate advanced the same agent
+**One command, one concept.** A target is an **agent name** or a **ref** — both name a memory, so the
+UX must not split them (an earlier draft had `--agent frontend` vs `frontend/main`; that exposed our
+plumbing, and `frontend/main` also required a hidden `remote add` + `fetch` that dragged another agent's
+whole history into this store for no reason — the agent is already on disk at `~/.agit/agents/<aid>/`).
+
 ```
-→ three-dot tail → dialogue → **git merge** the stores. This is takeover/shared-agent (§8) reconciling.
-
-### (b) Another **agent** — PRD #2, 两个 agent
-No shared history ⇒ **no merge-base ⇒ never a git merge.**
-```console
-$ agit -a merge frontend/main   # the frontend agent, added as a remote
+agit -a merge <X>
+  ├─ X is a known agent name?   → that agent's store
+  ├─ X is a ref in my store?    → that ref
+  ├─ BOTH                       → selector; ask (scripts: --agent X / --ref X)
+  └─ neither                    → error + suggestions
 ```
-→ dialogue only. **Both agents stay intact.** Output = a resumable merged session + an archived
-transcript. You then merge the **code** yourself — exactly 「同步一下上下文，然后接着合并」.
+
+### Mode is decided by **identity**, not by git history
+
+`agent.toml` is committed **inside** the store, so the aid is readable at any target
+(`git show <ref>:agent.toml`, or the named agent's store directly):
+
+| | same aid (my agent, another copy) | different aid (a different agent) |
+|---|---|---|
+| example | `origin` — a teammate's push | `frontend` |
+| outcome | dialogue → **fuse**: git merge; one memory again | dialogue only → **both stay intact** |
+| PRD | #1 takeover / shared agent | #2 两个 agent → then 接着合并 the code |
+
+Deciding on the aid — not on whether a merge-base happens to exist — removes the guess entirely. It is
+also what fixes the silent no-op: today, no merge-base ⇒ `git diff A...B` exits 128 with **empty
+stdout**, which `sync.rs` reads as "no divergent tail" ⇒ exit 0, does nothing. Cross-agent must
+enumerate the peer's sessions two-dot instead, and never attempt a git merge.
+
+agit states the mode it chose:
+```console
+$ agit -a merge origin
+origin is this agent (agt_01J…) — reconciling, then merging the histories.
+
+$ agit -a merge frontend
+frontend is a different agent (agt_02X…) — reconciling by dialogue; histories stay separate.
+```
+
+Cross-agent output = a resumable merged session + an archived transcript; you then merge the **code**
+yourself — exactly 「同步一下上下文，然后接着合并」.
 
 **Today this path is a silent no-op** and must be fixed: with no merge-base, `git diff HEAD...other/main`
 exits 128 and prints **nothing on stdout**, which `sync.rs` reads as "no divergent tail" → exit 0, does
