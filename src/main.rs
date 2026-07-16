@@ -219,9 +219,9 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── resume: load a session into a runtime and continue (the universal loader) ──
         "resume" => match parse_resume(args) {
-            Some((src, as_rt, cwd, exec)) => commands::resume_cmd(&src, as_rt, cwd, exec),
+            Some((src, as_rt, cwd, env, exec)) => commands::resume_cmd(&src, as_rt, cwd, env, exec),
             None => {
-                eprintln!("usage: agit resume <src-session> [--as claude-code|codex] [--cwd PATH] [--exec]");
+                eprintln!("usage: agit resume <src-session> [--as claude-code|codex] [--env PATH] [--cwd PATH] [--exec]");
                 Ok(2)
             }
         },
@@ -279,12 +279,14 @@ fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
     Some((src?, from, to?, cwd, write))
 }
 
-/// resume arguments: positional src + --as <rt> / --cwd <path> / --exec. Returns None when src is missing.
-type ResumeArgs = (PathBuf, Option<String>, Option<String>, bool);
+/// resume arguments: positional src + --as <rt> / --cwd <path> / --env <path> / --exec.
+/// Returns None when src is missing.
+type ResumeArgs = (PathBuf, Option<String>, Option<String>, Option<String>, bool);
 fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
     let mut src = None;
     let mut as_rt = None;
     let mut cwd = None;
+    let mut env = None;
     let mut exec = false;
     let mut i = 0;
     while i < args.len() {
@@ -295,6 +297,10 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
             }
             "--cwd" => {
                 cwd = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--env" => {
+                env = args.get(i + 1).cloned();
                 i += 2;
             }
             "--exec" => {
@@ -309,7 +315,7 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
             }
         }
     }
-    Some((src?, as_rt, cwd, exec))
+    Some((src?, as_rt, cwd, env, exec))
 }
 
 /// Parse and run the dialogue merge (`agit -a merge <ref>`, alias `sync`): positional <ref> plus
@@ -380,7 +386,7 @@ agit — version an agent's raw session so teams can collaborate on Agent Contex
   agit harness [apply]     Show, or apply, the captured harness (MCP/skills/config); apply asks first (--force to skip)
   agit adapter             List runtime adapters
   agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist; --watch auto-converts both ways in the background)
-  agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime, --exec to launch)
+  agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime, --env <path> to run it against a different checkout, --exec to launch)
 
   agit <git-args>          Run git transparently on the code repository (Environment)
   agit -a <git-args>       Run isomorphic git on the Agent Store

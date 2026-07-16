@@ -463,7 +463,13 @@ pub fn convert_watch(interval_secs: u64) -> Result<i32> {
 /// `agit resume <src-session> [--as <rt>] [--cwd <path>] [--exec]` -- the universal loader: install a
 /// session so a runtime can resume it (converting across runtimes when `--as` differs from the source),
 /// then print or (with --exec) launch the resume command. A thin, first-class wrapper over convert/register.
-pub fn resume_cmd(src: &Path, as_rt: Option<String>, cwd_override: Option<String>, exec: bool) -> Result<i32> {
+pub fn resume_cmd(
+    src: &Path,
+    as_rt: Option<String>,
+    cwd_override: Option<String>,
+    env_override: Option<String>,
+    exec: bool,
+) -> Result<i32> {
     use crate::convo::{self, ConvertOpts};
 
     let text = std::fs::read_to_string(src)
@@ -472,6 +478,21 @@ pub fn resume_cmd(src: &Path, as_rt: Option<String>, cwd_override: Option<String
         .ok_or_else(|| anyhow::anyhow!("could not detect the source runtime; the file doesn't look like a claude-code or codex session"))?;
     // Default target = the source runtime (a plain resume, no conversion); --as forces a different one.
     let to = as_rt.unwrap_or_else(|| from.to_string());
+
+    // --env rebinds the Agent State to a DIFFERENT Environment than the one it ran in: the session is
+    // re-pointed at that checkout, so the same agent context can continue against another repo/clone.
+    let (cwd_override, rebound) = match env_override {
+        Some(e) => {
+            let p = std::fs::canonicalize(&e)
+                .map_err(|_| anyhow::anyhow!("no such environment path: {e}"))?;
+            let (rc, _) = crate::scope::git_in_status(&p, &["rev-parse", "--is-inside-work-tree"]);
+            if rc != 0 {
+                anyhow::bail!("{} is not a git repository — an Environment is a code repo", p.display());
+            }
+            (Some(p.to_string_lossy().into_owned()), Some(p))
+        }
+        None => (cwd_override, None),
+    };
 
     let new_id = install_id(&to, convo::peek_branch(&text).as_deref(), &text);
     let opts = ConvertOpts { cwd: cwd_override, new_id: new_id.clone() };
@@ -487,6 +508,13 @@ pub fn resume_cmd(src: &Path, as_rt: Option<String>, cwd_override: Option<String
     }
     let h = crate::register::install(&to, &new_id, &cwd, &out)?;
     println!("Installed → {}", h.path.display());
+    if let Some(envp) = &rebound {
+        let origin = ir.cwd.as_deref().unwrap_or("(unknown)");
+        println!("Environment: {}  (rebound from {origin})", envp.display());
+        eprintln!(
+            "  note: only the session's own cwd is rebound — absolute paths the agent wrote inside the\n         transcript still refer to the original checkout."
+        );
+    }
     println!("Resume: {}", h.resume_cmd);
 
     if exec {
