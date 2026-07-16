@@ -29,8 +29,20 @@ impl Repo {
     fn agent(&self) -> PathBuf {
         self.path().join(".agit/agent")
     }
+
+    /// Every process this suite spawns goes through here. agit resolves ~/.claude, ~/.codex and its own
+    /// home from the environment, so an un-isolated test reads — and can write — the developer's real
+    /// session stores. Per-invocation env only: `std::env::set_var` is process-global and would race
+    /// across parallel tests.
+    fn cmd(&self, program: &str) -> Command {
+        let mut c = Command::new(program);
+        c.current_dir(self.path())
+            .env("HOME", self.path())
+            .env("AGIT_HOME", self.path().join("agit-home"));
+        c
+    }
     fn sh(&self, cmd: &str) -> String {
-        let o = Command::new("sh").arg("-c").arg(cmd).current_dir(self.path()).output().unwrap();
+        let o = self.cmd("sh").arg("-c").arg(cmd).output().unwrap();
         String::from_utf8_lossy(&o.stdout).to_string()
     }
     fn write(&self, rel: &str, content: &str) {
@@ -39,16 +51,13 @@ impl Repo {
         std::fs::write(p, content).unwrap();
     }
     fn agit(&self, args: &[&str]) -> (i32, String, String) {
-        let o = Command::new(BIN).args(args).current_dir(self.path()).output().unwrap();
-        (
-            o.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&o.stdout).to_string(),
-            String::from_utf8_lossy(&o.stderr).to_string(),
-        )
+        self.agit_env(&[], args)
     }
+    /// `envs` is applied last, so a test that needs a specific HOME (a fake runtime dump) overrides the
+    /// isolated default rather than fighting it.
     fn agit_env(&self, envs: &[(&str, &str)], args: &[&str]) -> (i32, String, String) {
-        let mut c = Command::new(BIN);
-        c.args(args).current_dir(self.path());
+        let mut c = self.cmd(BIN);
+        c.args(args);
         for (k, v) in envs {
             c.env(k, v);
         }
@@ -60,15 +69,15 @@ impl Repo {
         )
     }
     fn git_env(&self, args: &[&str]) -> String {
-        let mut a = vec!["-C", self.path().to_str().unwrap()];
-        a.extend_from_slice(args);
-        String::from_utf8_lossy(&Command::new("git").args(&a).output().unwrap().stdout).trim().to_string()
+        self.git_at(self.path(), args)
     }
     fn git_agent(&self, args: &[&str]) -> String {
-        let ap = self.agent();
-        let mut a = vec!["-C", ap.to_str().unwrap()];
-        a.extend_from_slice(args);
-        String::from_utf8_lossy(&Command::new("git").args(&a).output().unwrap().stdout).trim().to_string()
+        self.git_at(&self.agent(), args)
+    }
+    fn git_at(&self, root: &Path, args: &[&str]) -> String {
+        let mut c = self.cmd("git");
+        c.arg("-C").arg(root).args(args);
+        String::from_utf8_lossy(&c.output().unwrap().stdout).trim().to_string()
     }
 }
 
@@ -95,6 +104,17 @@ fn init_is_idempotent() {
     let head1 = r.git_agent(&["rev-parse", "HEAD"]);
     assert_eq!(r.agit(&["init"]).0, 0);
     assert_eq!(r.git_agent(&["rev-parse", "HEAD"]), head1, "re-running init adds no new commit");
+}
+
+/// Isolation lock. This suite drives the real binary, which resolves ~/.claude, ~/.codex and its own
+/// home from the environment — un-isolated, `cargo test` reads (and could write) the developer's real
+/// session stores. agit's own "where did I look?" error is the proof of which HOME it used.
+#[test]
+fn spawned_agit_resolves_the_isolated_home_not_the_developers() {
+    let r = Repo::new();
+    let (_, _, err) = r.agit(&["-a", "snap", "--from", "claude-code"]);
+    let isolated = format!("{}/.claude/projects", r.path().display());
+    assert!(err.contains(&isolated), "snap should look under the isolated HOME ({isolated}), got:\n{err}");
 }
 
 // ─────────────────────── scope routing (key ambiguity) ───────────────────────
@@ -127,6 +147,65 @@ fn commit_dash_a_is_git_flag_not_scope() {
     assert_eq!(code, 0, "commit -a should act on the code repo: {err}");
     assert_eq!(r.git_env(&["log", "-1", "--format=%s"]), "code via -a");
     assert_eq!(r.git_agent(&["rev-list", "--count", "HEAD"]), agent_before, "should not touch the Agent Store");
+}
+
+// ─────────────────── `agit a` — the subcommand that replaces `-a` ───────────────────
+
+/// The whole point of the subcommand: `agit a <git-verb>` reaches the store exactly as `agit -a` did.
+#[test]
+fn agit_a_subcommand_runs_git_on_the_agent_store() {
+    let r = Repo::new();
+    for verb in ["a", "agent"] {
+        let (code, out, err) = r.agit(&[verb, "log", "-1", "--format=%s"]);
+        assert_eq!(code, 0, "`agit {verb} log` should reach the store: {err}");
+        assert_eq!(out.trim(), "agit: initialize Agent Store", "`agit {verb} log` should show the store's history, not the code repo's");
+    }
+}
+
+/// `track` is the management verb precisely so `add` stays git's. `agit a add -A` must stage in the store.
+#[test]
+fn agit_a_add_is_git_add_not_a_management_verb() {
+    let r = Repo::new();
+    r.write(".agit/agent/notes.md", "hi\n");
+    let (code, _, err) = r.agit(&["a", "add", "-A"]);
+    assert_eq!(code, 0, "`agit a add -A` must be git-add on the store: {err}");
+    assert_eq!(r.agit(&["a", "commit", "-m", "via subcommand"]).0, 0);
+    assert_eq!(r.git_agent(&["log", "-1", "--format=%s"]), "via subcommand");
+    assert_eq!(r.git_env(&["log", "-1", "--format=%s"]), "seed", "the code repo must not gain a commit");
+}
+
+/// `show` is git's; `info` is the management verb. Neither may be confused for the other.
+#[test]
+fn agit_a_info_is_management_while_show_stays_git() {
+    let r = Repo::new();
+    let (code, _, err) = r.agit(&["a", "info"]);
+    assert_ne!(code, 0, "`agit a info` is a management verb, not git");
+    assert!(err.contains("agit agent info"), "should be handled by agit, not handed to git: {err}");
+    assert!(!err.contains("not a git command"), "`info` must never reach git: {err}");
+
+    let (code, out, _) = r.agit(&["a", "show", "--stat", "--format=%s"]);
+    assert_eq!(code, 0, "`git show` must stay reachable through `agit a show`");
+    assert!(out.contains("agit: initialize Agent Store"), "`agit a show` should be git-show on the store: {out}");
+}
+
+/// Every closed-set verb is recognized, so none of them silently becomes a git invocation.
+#[test]
+fn management_verbs_are_a_closed_set_and_never_reach_git() {
+    let r = Repo::new();
+    for verb in ["list", "use", "new", "track", "info", "rename", "publish", "rebind", "import"] {
+        let (_, _, err) = r.agit(&["a", verb]);
+        assert!(err.contains(&format!("agit agent {verb}")), "`agit a {verb}` should be a management verb: {err}");
+    }
+}
+
+/// `-a` keeps working while the docs, demo scripts and install-shadow.sh still say it — silently.
+#[test]
+fn dash_a_remains_a_silent_deprecated_alias() {
+    let r = Repo::new();
+    let (code, out, err) = r.agit(&["-a", "log", "-1", "--format=%s"]);
+    assert_eq!(code, 0, "`agit -a log` must keep working: {err}");
+    assert_eq!(out.trim(), "agit: initialize Agent Store");
+    assert!(!err.to_lowercase().contains("deprecat"), "the alias must print nothing yet: {err}");
 }
 
 // ─────────────────────── WorkspaceRevision pairing ───────────────────────
@@ -267,6 +346,86 @@ fn codex_sync_only_pulls_matching_project() {
     assert!(all.contains("MINE work"));
     assert!(!all.contains("OTHER secret"), "another project's content leaked");
     assert!(!all.contains("PARENT leaked secret"), "the parent-project session inside the fork leaked");
+}
+
+// ─────────────────── runtime parity: claude-code and codex are peers ───────────────────
+
+/// Write a codex rollout owned by this project into `<home>/.codex/sessions/...`.
+fn seed_codex_rollout(r: &Repo, home: &Path, id: &str, msg: &str) {
+    let top = r.sh("git rev-parse --show-toplevel").trim().to_string();
+    let day = home.join(".codex/sessions/2026/07/15");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        day.join(format!("rollout-2026-07-15T00-00-00-{id}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{top}\",\"git\":{{\"branch\":\"main\"}}}}}}\n\
+             {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{msg}\"}}}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// The framing bug, as behaviour: claude was hard-coded as snap's default, so a codex-only project
+/// silently snapped nothing and failed with "has this project not been run in Claude Code yet?".
+/// With only codex sessions present, a bare `snap` must capture codex without being told.
+#[test]
+fn snap_captures_codex_without_being_told_when_it_is_the_only_runtime() {
+    let r = Repo::new();
+    let home = r.path().join("codexhome");
+    seed_codex_rollout(&r, &home, "onlycodex", "codex work");
+
+    let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
+    assert_eq!(code, 0, "a bare snap must find codex on its own: {err}{out}");
+    assert!(out.contains("codex"), "should report capturing codex: {out}");
+    assert!(r.agent().join("sessions/codex/onlycodex.jsonl").exists(), "codex session should be mirrored into the store");
+    assert!(!err.contains("Claude Code"), "must not fail over a runtime this project never used: {err}");
+}
+
+/// With no --from and both runtimes holding sessions, snap captures BOTH — it never silently picks one.
+#[test]
+fn snap_with_no_from_captures_both_runtimes() {
+    let r = Repo::new();
+    let home = r.path().join("bothhome");
+    seed_codex_rollout(&r, &home, "cx", "codex side");
+    // a claude transcript this project owns
+    let top = r.sh("git rev-parse --show-toplevel").trim().to_string();
+    let slug: String = top.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    let sdir = home.join(".claude/projects").join(&slug);
+    std::fs::create_dir_all(&sdir).unwrap();
+    std::fs::write(
+        sdir.join("cc.jsonl"),
+        format!("{{\"type\":\"user\",\"sessionId\":\"cc\",\"cwd\":\"{top}\",\"message\":{{\"content\":\"claude side\"}}}}\n"),
+    )
+    .unwrap();
+
+    let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
+    assert_eq!(code, 0, "snap should capture both: {err}");
+    assert!(r.agent().join("sessions/codex/cx.jsonl").exists(), "codex must be captured: {out}");
+    assert!(r.agent().join("sessions/claude-code/cc.jsonl").exists(), "claude-code must be captured: {out}");
+}
+
+/// No sessions in either runtime: the error names them as peers, alphabetically, and never singles
+/// claude out as the one that was missing.
+#[test]
+fn snap_with_no_sessions_anywhere_names_both_runtimes() {
+    let r = Repo::new();
+    let (code, _, err) = r.agit(&["a", "snap"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("claude-code, codex"), "should name both runtimes in one breath: {err}");
+}
+
+/// `harness apply` rewrites the project's own .mcp.json / .claude, so with both runtimes captured and
+/// no --from it must refuse and name them — not quietly apply claude's.
+#[test]
+fn harness_apply_refuses_to_guess_between_both_runtimes() {
+    let r = Repo::new();
+    for rt in ["claude-code", "codex"] {
+        r.write(&format!(".agit/agent/harness/{rt}/project/mcp.json"), "{}\n");
+    }
+    let (code, out, err) = r.agit(&["harness", "apply"]);
+    assert_ne!(code, 0, "must not pick a runtime on its own: {out}");
+    assert!(err.contains("claude-code") && err.contains("codex"), "should name both as peers: {err}");
+    assert!(err.contains("--from"), "should say how to disambiguate: {err}");
 }
 
 // ─────────────────────── passthrough fidelity ───────────────────────

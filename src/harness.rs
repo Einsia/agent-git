@@ -287,6 +287,14 @@ fn write_manifest(agent: &Path, rt: &str, report: &Report) -> Result<()> {
 
 const PH_PREFIX: &str = "${AGIT_SECRET:";
 
+/// The runtimes with a harness captured in the store, alphabetically.
+pub fn captured_runtimes(agent: &Path) -> Vec<&'static str> {
+    crate::session::RUNTIMES
+        .into_iter()
+        .filter(|rt| agent.join("harness").join(rt).join("project").is_dir())
+        .collect()
+}
+
 /// `agit harness show` — list what's captured in the local Agent Store.
 pub fn show(agent: &Path, runtime: &str) -> Result<i32> {
     let rt = norm(runtime);

@@ -22,8 +22,21 @@ impl Repo {
     fn path(&self) -> &Path {
         self.dir.path()
     }
+
+    /// Every process this suite spawns goes through here. agit resolves ~/.claude, ~/.codex and its own
+    /// home from the environment, so an un-isolated test reads — and can write — the developer's real
+    /// session stores. Per-invocation env only: `std::env::set_var` is process-global and would race
+    /// across parallel tests.
+    fn cmd(&self, program: &str) -> Command {
+        let mut c = Command::new(program);
+        c.current_dir(self.path())
+            .env("HOME", self.path())
+            .env("AGIT_HOME", self.path().join("agit-home"));
+        c
+    }
     fn sh(&self, c: &str) -> String {
-        String::from_utf8_lossy(&Command::new("sh").arg("-c").arg(c).current_dir(self.path()).output().unwrap().stdout).to_string()
+        let o = self.cmd("sh").arg("-c").arg(c).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).to_string()
     }
     fn write(&self, rel: &str, content: &str) {
         let p = self.path().join(rel);
@@ -31,7 +44,7 @@ impl Repo {
         std::fs::write(p, content).unwrap();
     }
     fn agit(&self, args: &[&str]) -> (i32, String, String) {
-        let o = Command::new(BIN).args(args).current_dir(self.path()).output().unwrap();
+        let o = self.cmd(BIN).args(args).output().unwrap();
         (
             o.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&o.stdout).to_string(),
@@ -49,19 +62,12 @@ fn adapter_list_shows_both_runtimes() {
 }
 
 /// Codex snap is wired up: even when this project has no sessions in Codex, it returns normally
-/// (matching 0 rollouts) rather than reporting "not implemented". HOME points at an empty dir to
-/// stay hermetic and not depend on the machine's real ~/.codex.
+/// (matching 0 rollouts) rather than reporting "not implemented". `Repo::cmd` points HOME at the
+/// isolated temp dir, which has no .codex/sessions → 0 rollouts, and never the machine's real ~/.codex.
 #[test]
 fn codex_snap_is_implemented() {
     let r = Repo::new();
-    let o = Command::new(BIN)
-        .args(["-a", "snap", "--from", "codex"])
-        .current_dir(r.path())
-        .env("HOME", r.path()) // no .codex/sessions → matches 0 rollouts
-        .output()
-        .unwrap();
-    let code = o.status.code().unwrap_or(-1);
-    let out = String::from_utf8_lossy(&o.stdout);
-    assert_eq!(code, 0, "codex snap should work now: {}", String::from_utf8_lossy(&o.stderr));
+    let (code, out, err) = r.agit(&["-a", "snap", "--from", "codex"]);
+    assert_eq!(code, 0, "codex snap should work now: {err}");
     assert!(out.contains("codex") && out.contains("matched 0 rollouts"), "should mirror codex (0 rollouts): {out}");
 }

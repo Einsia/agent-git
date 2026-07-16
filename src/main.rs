@@ -2,12 +2,15 @@
 //!
 //! Architecture (docs/architecture.md): the versioned objects are two git repos + one pairing.
 //!
-//!   agit <git-args>     = agit -e <git-args>  → transparent git acting on the Environment (code repository)
-//!   agit -a <git-args>                        → the isomorphic operation acting on the Agent Store
+//!   agit <git-args>        = agit -e <git-args>  → transparent git acting on the Environment (code repository)
+//!   agit agent <git-args>  (alias: agit a)       → the isomorphic operation acting on the Agent Store
 //!
-//! The scope switch only recognizes the first token immediately after agit. Any -a after the subcommand is passed to git as-is:
-//!   agit -a commit   → Agent scope
+//! The scope selector is only the first token immediately after agit; anything after the verb belongs to git:
+//!   agit a commit    → Agent scope
 //!   agit commit -a   → Environment scope, -a is an argument to git commit
+//!
+//! `agent`/`a` is a subcommand rather than a flag precisely so those two cannot be transposed. `-a` survives
+//! as a silent deprecated alias while the docs, demo scripts and install-shadow.sh still say it.
 
 // Core logic lives in the lib (crate `agit`), shared with agit-hub, so the two bins don't each write their own parsing and drift apart.
 use agit::scope::{self, Scope};
@@ -20,13 +23,36 @@ fn main() {
     exit(dispatch(argv));
 }
 
-/// Parse out (scope, remaining args). The scope can only be the first token immediately after agit.
+/// Parse out (scope, remaining args). The scope selector is only the first token immediately after agit.
+///
+/// `agent` (alias `a`) is a SUBCOMMAND, which is the point: a flag before the verb could be transposed,
+/// and `agit -a commit` (agent store) vs `agit commit -a` (code repo, git's stage-all) differ by one
+/// space. `agit a commit` cannot be written the wrong way round. `-a` / `-e` remain as silent deprecated
+/// aliases until the cutover removes them.
 fn split_scope(argv: &[String]) -> (Scope, &[String]) {
     match argv.first().map(|s| s.as_str()) {
-        Some("-a") => (Scope::Agent, &argv[1..]),
+        Some("agent" | "a" | "-a") => (Scope::Agent, &argv[1..]),
         Some("-e") => (Scope::Environment, &argv[1..]),
         _ => (Scope::Environment, argv),
     }
+}
+
+/// Agent-store management verbs — a CLOSED set (design doc §5). Everything outside it is handed to git
+/// on the store, so `agit a log`, `agit a commit`, `agit a push` and `agit a diff` all keep working.
+///
+/// The names deliberately avoid shadowing git's namespace: `track` not `add` (`git add` is far too
+/// common to lose), `info` not `show` (`git show` is a real verb). `merge` is a management verb too, but
+/// is dispatched separately above because it alone is implemented — and it shadows `git merge` on purpose.
+const AGENT_MGMT_VERBS: &[&str] = &[
+    "list", "use", "new", "track", "info", "rename", "publish", "rebind", "import",
+];
+
+/// Recognizing the management verbs is what keeps them away from git — `agit a info` must not become
+/// `git info` — so the routing lands and is testable ahead of the agent-identity feature that fills them in.
+fn agent_mgmt(verb: &str) -> anyhow::Result<i32> {
+    eprintln!("agit agent {verb}: not implemented yet — agent identity & handoff is still in design.");
+    eprintln!("  `agit agent …` (alias `agit a …`) runs git on the Agent Store today: agit a log · agit a add -A · agit a commit · agit a push");
+    Ok(2)
 }
 
 fn dispatch(argv: Vec<String>) -> i32 {
@@ -81,7 +107,9 @@ fn dispatch(argv: Vec<String>) -> i32 {
         // ── snap: mirror the runtime's session dump into the Agent Store (formerly named sync).
         //    --watch runs it continuously (fully automatic snap). ──
         "snap" => {
-            let mut rt = "claude-code".to_string();
+            // No default runtime: `--from` (or a bare positional) names one, otherwise snap captures
+            // every runtime that has sessions here. See session::snap.
+            let mut rt: Option<String> = None;
             let mut watch = false;
             let mut interval = 5u64;
             let mut harness = true;
@@ -89,7 +117,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
             while i < args.len() {
                 match args[i].as_str() {
                     "--from" if i + 1 < args.len() => {
-                        rt = args[i + 1].clone();
+                        rt = Some(args[i + 1].clone());
                         i += 2;
                     }
                     "--watch" => {
@@ -105,18 +133,19 @@ fn dispatch(argv: Vec<String>) -> i32 {
                         i += 1;
                     }
                     other => {
-                        // a bare positional is shorthand for the runtime: `agit -a snap codex`
+                        // a bare positional is shorthand for the runtime: `agit a snap codex`
                         if !other.starts_with('-') {
-                            rt = other.to_string();
+                            rt = Some(other.to_string());
                         }
                         i += 1;
                     }
                 }
             }
-            if watch {
-                session::snap_watch(&rt, interval)
-            } else {
-                session::sync(&rt, harness)
+            match (watch, rt) {
+                // The watcher polls one runtime's dump; unnamed, `agit watch` is the both-runtimes loop.
+                (true, Some(rt)) => session::snap_watch_checked(&rt, interval),
+                (true, None) => session::watch(interval, false, harness),
+                (false, rt) => session::snap(rt.as_deref(), harness),
             }
         }
 
@@ -176,14 +205,14 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── harness: show / apply the captured MCP + skills + config (part of Agent State) ──
         "harness" => {
-            let mut rt = "claude-code".to_string();
+            let mut rt: Option<String> = None;
             let mut force = false;
             let mut sub = "show".to_string();
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
                     "--from" if i + 1 < args.len() => {
-                        rt = args[i + 1].clone();
+                        rt = Some(args[i + 1].clone());
                         i += 2;
                     }
                     "--force" => {
@@ -197,13 +226,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
                     _ => i += 1,
                 }
             }
-            let roots = scope::root_for(Scope::Agent)
-                .and_then(|agent| scope::env_root().map(|env| (agent, env)));
-            match roots {
-                Ok((agent, env)) if sub == "apply" => harness::apply(&agent, &env, &rt, force),
-                Ok((agent, _)) => harness::show(&agent, &rt),
-                Err(e) => Err(e),
-            }
+            harness_cmd(&sub, rt.as_deref(), force)
         }
 
         // ── Convert a session across runtimes (resume it in another CLI); --watch = auto-convert worker ──
@@ -236,6 +259,9 @@ fn dispatch(argv: Vec<String>) -> i32 {
                 Ok(2)
             }
         },
+
+        // ── Agent-store management verbs, checked before passthrough so they never reach git ──
+        v if scope == Scope::Agent && AGENT_MGMT_VERBS.contains(&v) => agent_mgmt(v),
 
         // ── Everything else: transparently pass through to the corresponding repo's git ──
         _ => passthrough::run(scope, rest),
@@ -334,10 +360,43 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
     Some((src?, as_rt, cwd, env, exec, relocate))
 }
 
-/// Parse and run the dialogue merge (`agit -a merge <ref>`, alias `sync`): positional <ref> plus
+/// `agit harness [show|apply] [--from <rt>]` — which runtime's harness is resolved against what was
+/// actually captured, never defaulted.
+///
+/// The two halves answer ambiguity differently, and deliberately: `show` is read-only, so listing every
+/// captured runtime IS the answer; `apply` rewrites the project's own .mcp.json / .claude, so it acts on
+/// exactly one runtime and asks rather than guess.
+fn harness_cmd(sub: &str, rt: Option<&str>, force: bool) -> anyhow::Result<i32> {
+    let agent = scope::root_for(Scope::Agent)?;
+    let env = scope::env_root()?;
+    let captured = harness::captured_runtimes(&agent);
+    if sub == "apply" {
+        let rt = session::resolve_runtime(rt, &captured, "apply")?;
+        return harness::apply(&agent, &env, &rt, force);
+    }
+    match rt {
+        Some(r) => harness::show(&agent, &session::resolve_runtime(Some(r), &captured, "show")?),
+        None if captured.is_empty() => {
+            println!(
+                "No harness captured for {} yet. Run `agit a snap` to capture it.",
+                session::runtime_list()
+            );
+            Ok(0)
+        }
+        None => {
+            let mut code = 0;
+            for rt in captured {
+                code = harness::show(&agent, rt)?;
+            }
+            Ok(code)
+        }
+    }
+}
+
+/// Parse and run the dialogue merge (`agit a merge <ref>`, alias `sync`): positional <ref> plus
 /// --from <rt> / --both / --quick.
 fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
-    let mut rt = "claude-code".to_string();
+    let mut rt: Option<String> = None;
     let mut reference = None;
     let mut both = false;
     let mut quick = false;
@@ -345,7 +404,7 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
     while i < args.len() {
         match args[i].as_str() {
             "--from" if i + 1 < args.len() => {
-                rt = args[i + 1].clone();
+                rt = Some(args[i + 1].clone());
                 i += 2;
             }
             "--both" => {
@@ -365,9 +424,16 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
         }
     }
     match reference {
-        Some(r) => sync::run(&r, &rt, both, quick),
+        Some(r) => {
+            // The dialogue merge is one conversation, so it acts on exactly one runtime. Resolve it
+            // against the sessions actually in the store — running two LLM dialogues is not a
+            // meaningful "do both", so genuine ambiguity asks instead.
+            let agent = scope::root_for(Scope::Agent)?;
+            let rt = session::resolve_runtime(rt.as_deref(), &session::store_runtimes(&agent), "merge")?;
+            sync::run(&r, &rt, both, quick)
+        }
         None => {
-            eprintln!("usage: agit -a merge <ref> [--both] [--quick]   (reconcile this branch's agent with <ref>'s by dialogue; --quick skips the context handoff)");
+            eprintln!("usage: agit a merge <ref> [--from <runtime>] [--both] [--quick]   (reconcile this branch's agent with <ref>'s by dialogue; --quick skips the context handoff)");
             Ok(2)
         }
     }
@@ -389,15 +455,18 @@ fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {
 const USAGE: &str = "\
 agit — version an agent's raw session so teams can collaborate on Agent Context
 
+Runtimes are peers and there is no default: claude-code, codex. Commands that read sessions use the one
+you name with --from, else the only one present, else they ask.
+
   agit init [--store P]    Create an Agent Store next to the code repository (--store detaches it to P, so several repos share one agent's history)
-  agit -a snap [--watch]   Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store (--watch = auto-snap; --no-harness = sessions only)
-  agit -a push / pull      Sync sessions with the team (the Agent Store is just a git repo)
-  agit -a merge <ref>      Merge this branch's agent with <ref>'s by dialogue (alias: sync); only real conflicts prompt you
+  agit a snap [--watch]    Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store; captures every runtime with sessions here unless --from names one (--watch = auto-snap; --no-harness = sessions only)
+  agit a push / pull       Sync sessions with the team (the Agent Store is just a git repo)
+  agit a merge <ref>       Merge this branch's agent with <ref>'s by dialogue (alias: sync); only real conflicts prompt you
   agit clone <url>         Clone the team Agent Store in one command
-  agit -a scan [--staged]  Scan session dumps for secrets
+  agit a scan [--staged]   Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
   agit workspace restore [N]  Roll both repos back together to a pairing's joint state
-  agit watch [--daemon]    Hands-off: watch both runtimes, auto-snap + auto-convert both ways; --daemon runs it in the background forever (--stop / --status to manage)
+  agit watch [--daemon]    Hands-off: watch claude-code, codex, auto-snap + auto-convert both ways; --daemon runs it in the background forever (--stop / --status to manage)
   agit graph               Show the Workspace-State timeline + relation edges
   agit harness [apply]     Show, or apply, the captured harness (MCP/skills/config); apply asks first (--force to skip)
   agit adapter             List runtime adapters
@@ -405,6 +474,10 @@ agit — version an agent's raw session so teams can collaborate on Agent Contex
   agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime; --env <path> to run this agent against a different repo; --relocate if it's the same project moved; --exec to launch)
 
   agit <git-args>          Run git transparently on the code repository (Environment)
-  agit -a <git-args>       Run isomorphic git on the Agent Store
+  agit agent <git-args>    Run isomorphic git on the Agent Store — `agit a` is the alias (agit a log · agit a add -A · agit a commit · agit a push)
 
-  scope only recognizes the first token immediately after agit: agit -a commit (agent) vs agit commit -a (code, -a is a git argument)";
+  agit agent <verb>        Agent management, a closed set: list, use, new, track, info, rename, publish, rebind, import, merge.
+                           Anything else after `a` is git, so `agit a add -A` is git-add and `agit a show` is git-show.
+
+  `a` is a subcommand, so it cannot be transposed: agit a commit (agent store) vs agit commit -a (code repo, -a is git's stage-all).
+  The old `agit -a <args>` flag still works as a deprecated alias.";

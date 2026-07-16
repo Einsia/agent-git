@@ -14,6 +14,87 @@ use std::path::{Path, PathBuf};
 
 pub const SESSIONS_SUBDIR: &str = "sessions";
 
+/// The runtimes agit speaks. Peers — there is no first among them, so they are listed alphabetically
+/// wherever a user reads them, and no code path may fall back to one of them as a default.
+pub const RUNTIMES: [&str; 2] = ["claude-code", "codex"];
+
+/// The runtimes named the way the user should always see them: alphabetically, in one breath.
+pub fn runtime_list() -> String {
+    RUNTIMES.join(", ")
+}
+
+/// Whether a runtime holds any session **this project owns**.
+///
+/// Ownership is the cwd recorded in the transcript, the same rule the collectors use — the dump
+/// directory merely existing is not enough, since claude's slug dir can be occupied entirely by a
+/// colliding project.
+pub fn has_live_sessions(rt: &str, env: &Path) -> bool {
+    match rt {
+        "claude-code" => !claude_code::project_sessions(env).is_empty(),
+        "codex" => !crate::adapter::codex::project_rollouts(env).is_empty(),
+        _ => false,
+    }
+}
+
+/// The runtimes with sessions for this project, alphabetically.
+pub fn live_runtimes(env: &Path) -> Vec<&'static str> {
+    RUNTIMES.into_iter().filter(|rt| has_live_sessions(rt, env)).collect()
+}
+
+/// The runtimes with sessions for this project already in the Agent Store, alphabetically.
+pub fn store_runtimes(agent: &Path) -> Vec<&'static str> {
+    RUNTIMES
+        .into_iter()
+        .filter(|rt| {
+            std::fs::read_dir(agent.join(SESSIONS_SUBDIR).join(rt))
+                .map(|mut d| d.any(|e| e.map(|e| e.path().extension().is_some_and(|x| x == "jsonl")).unwrap_or(false)))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Resolve the one runtime a single-runtime command acts on. There is NO default: an explicit flag
+/// wins, else the only runtime actually present, else we ask. Picking a runtime because it is spelled
+/// "claude" is exactly the framing bug this exists to prevent, so ambiguity is never resolved silently.
+///
+/// `present` is the caller's notion of presence (live dumps for capture, the store for merge), and
+/// `what` completes the sentence "which runtime should agit …?".
+pub fn resolve_runtime(explicit: Option<&str>, present: &[&'static str], what: &str) -> Result<String> {
+    use std::io::{stdin, stdout, BufRead, IsTerminal, Write};
+    if let Some(r) = explicit {
+        let rt = normalize(r);
+        if !RUNTIMES.contains(&rt.as_str()) {
+            bail!("unknown runtime `{r}`. Registered: {}", runtime_list());
+        }
+        return Ok(rt);
+    }
+    match present {
+        [] => bail!("No {} sessions found to {what}.", runtime_list()),
+        [only] => Ok(only.to_string()),
+        many => {
+            let names = many.join(", ");
+            if !stdin().is_terminal() {
+                bail!("{names} all have sessions — say which with --from <runtime>.");
+            }
+            println!("Sessions exist for {names}. Which runtime should agit {what}?");
+            for (i, rt) in many.iter().enumerate() {
+                println!("  {}) {rt}", i + 1);
+            }
+            print!("Choice [1-{}]: ", many.len());
+            let _ = stdout().flush();
+            let mut line = String::new();
+            stdin().lock().read_line(&mut line).ok();
+            let pick = line.trim();
+            // accept either the number or the runtime's name
+            many.iter()
+                .position(|rt| *rt == pick)
+                .or_else(|| pick.parse::<usize>().ok().filter(|n| (1..=many.len()).contains(n)).map(|n| n - 1))
+                .map(|i| many[i].to_string())
+                .ok_or_else(|| anyhow::anyhow!("no runtime picked; rerun with --from <runtime> ({names})"))
+        }
+    }
+}
+
 /// Locate the runtime session dump directory for the current project.
 fn source_dir(runtime: &str, cwd: &Path) -> Result<PathBuf> {
     match runtime {
@@ -32,13 +113,49 @@ fn source_dir(runtime: &str, cwd: &Path) -> Result<PathBuf> {
     }
 }
 
-/// `agit -a snap [--from <runtime>]` — mirror the runtime's session dump into the Agent Store, once.
+/// `agit a snap [--from <runtime>]` — mirror session dumps into the Agent Store, once.
+///
+/// With no `--from` there is nothing to default to: claude-code and codex are peers, so snap captures
+/// BOTH (the shape `watch` already uses), skipping quietly whichever has no sessions for this project.
+/// An explicit `--from` is a different contract — the user named a runtime, so its absence is an error.
+pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
+    // Validate an explicit runtime BEFORE any filesystem walk: `--from bogus` used to reach the
+    // per-runtime path and die with a confusing "isn't wired up yet", and under `--watch` it became a
+    // silent permanent no-op — the watcher polls a runtime that can never exist. Fail-open on a typo is
+    // exactly what no-default-runtime exists to prevent, so every path funnels through one check.
+    if let Some(r) = runtime {
+        // through the SAME funnel: resolve_runtime returns on the explicit branch before reading
+        // `present`, so an unknown name fails here instead of dying later as "isn't wired up yet".
+        let r = resolve_runtime(Some(r), &[], "snap")?;
+        return sync(&r, capture_harness);
+    }
+    let env = scope::env_root()?;
+    let agent = scope::root_for(Scope::Agent)?;
+    let live = live_runtimes(&env);
+    if live.is_empty() {
+        bail!(
+            "No {} sessions found for this project.\n\
+             (has it been run in either yet? `agit adapter` lists the runtimes; `--from <runtime>` forces one.)",
+            runtime_list()
+        );
+    }
+    for rt in &live {
+        snap_one(rt, &env, &agent, capture_harness)?;
+    }
+    Ok(0)
+}
+
+/// `agit a snap --from <runtime>` — mirror one named runtime's dump into the Agent Store.
 /// `capture_harness` also captures the project's MCP/skills/config (redacting secrets); `--no-harness` skips it.
 pub fn sync(runtime: &str, capture_harness: bool) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
-    let rt = normalize(runtime);
-    let (stats, source_desc, hits, dst) = mirror_once(&rt, &env, &agent)?;
+    snap_one(&normalize(runtime), &env, &agent, capture_harness)
+}
+
+fn snap_one(rt: &str, env: &Path, agent: &Path, capture_harness: bool) -> Result<i32> {
+    let rt = normalize(rt);
+    let (stats, source_desc, hits, dst) = mirror_once(&rt, env, agent)?;
 
     println!("Mirrored the session dump for {}:", rt);
     println!("  source : {source_desc}");
@@ -51,7 +168,7 @@ pub fn sync(runtime: &str, capture_harness: bool) -> Result<i32> {
 
     // Capture the harness (MCP servers / skills / config) alongside the sessions, redacting secrets.
     if capture_harness {
-        match crate::harness::capture(&agent, &env, &rt) {
+        match crate::harness::capture(agent, env, &rt) {
             Ok(r) if r.files > 0 => {
                 println!(
                     "  harness: {} files ({} secret field(s) redacted)",
@@ -68,7 +185,7 @@ pub fn sync(runtime: &str, capture_harness: bool) -> Result<i32> {
         }
     }
 
-    println!("\n  Commit: agit -a add -A && agit -a commit -m 'snap {rt} sessions'");
+    println!("\n  Commit: agit a add -A && agit a commit -m 'snap {rt} sessions'");
     Ok(0)
 }
 
@@ -127,6 +244,13 @@ fn claude_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
 /// `agit -a snap --watch [--interval N]` — **fully automatic snap**: watch the runtime's session dump and,
 /// whenever it changes and then settles, mirror + auto-commit into the Agent Store. Runs until Ctrl-C.
 /// Runtime-agnostic; the pre-commit secret hook still applies (a snap carrying a secret is refused, with a warning).
+/// `snap --watch --from <rt>`: validate first. An unknown name here is the worst case — the loop runs
+/// forever polling a dump that cannot exist, reporting nothing, looking healthy.
+pub fn snap_watch_checked(runtime: &str, interval_secs: u64) -> Result<i32> {
+    let rt = resolve_runtime(Some(runtime), &[], "watch")?;
+    snap_watch(&rt, interval_secs)
+}
+
 pub fn snap_watch(runtime: &str, interval_secs: u64) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
@@ -322,13 +446,14 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
     let interval = Duration::from_secs(interval_secs.max(1));
-    let runtimes = ["claude-code", "codex"];
+    let runtimes = RUNTIMES;
     let mut last: HashMap<&str, String> = HashMap::new();
     let mut pending: HashMap<&str, bool> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut count = 0u64;
     println!(
-        "Watching claude-code + codex every {}s: auto-snap{}. Ctrl-C to stop.",
+        "Watching {} every {}s: auto-snap{}. Ctrl-C to stop.",
+        runtime_list(),
         interval.as_secs(),
         if do_convert { " + auto-convert both ways" } else { "" }
     );
@@ -520,5 +645,37 @@ mod claude_ownership_tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+    }
+}
+
+
+#[cfg(test)]
+mod resolve_runtime_tests {
+    use super::*;
+
+    /// The pure branches of the no-default-runtime rule. `[only]` is the highest-risk line in the
+    /// feature — it decides a runtime WITHOUT asking — so it is pinned here. (The `many` branch reads
+    /// stdin and is covered by the integration suite.)
+    #[test]
+    fn explicit_wins_and_an_unknown_name_fails_loudly() {
+        assert_eq!(resolve_runtime(Some("codex"), &[], "snap").unwrap(), "codex");
+        // aliases normalize; presence is irrelevant on the explicit branch
+        assert_eq!(resolve_runtime(Some("cc"), &[], "snap").unwrap(), "claude-code");
+        assert_eq!(resolve_runtime(Some("claude"), &["codex"], "snap").unwrap(), "claude-code");
+
+        let e = resolve_runtime(Some("bogus"), &["codex"], "snap").unwrap_err().to_string();
+        assert!(e.contains("bogus"), "{e}");
+        assert!(e.contains("claude-code") && e.contains("codex"), "the error must name the real runtimes: {e}");
+    }
+
+    #[test]
+    fn none_present_fails_and_the_only_one_present_is_chosen_without_asking() {
+        let e = resolve_runtime(None, &[], "snap").unwrap_err().to_string();
+        assert!(e.contains("claude-code") && e.contains("codex"), "{e}");
+
+        // exactly one present → chosen. NOT because it is claude: assert it for BOTH, so a silent
+        // claude default could never satisfy this test.
+        assert_eq!(resolve_runtime(None, &["codex"], "snap").unwrap(), "codex");
+        assert_eq!(resolve_runtime(None, &["claude-code"], "snap").unwrap(), "claude-code");
     }
 }
