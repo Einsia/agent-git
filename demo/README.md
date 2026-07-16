@@ -12,8 +12,8 @@ export PATH="/tmp/agit-demo/bin:$PATH"
 ```
 
 三幕:
-- **Alice** `agit -a sync`(镜像 Claude 的 session dump)→ `agit -a push`(发布,先扫密钥)
-- **Bob** `agit clone` → `agit -a sync` → `agit -a fetch`
+- **Alice** `agit -a snap`(镜像 Claude 的 session dump)→ `agit -a push`(发布,先扫密钥)
+- **Bob** `agit clone` → `agit -a snap` → `agit -a fetch`
 - **reconcile** `agit -a reconcile origin/main` —— agent 读两边会话、合成统一上下文写进 `CLAUDE.md`,
   只把真矛盾(`user_id` vs `uid`)拎出来问人
 
@@ -24,7 +24,7 @@ export PATH="/tmp/agit-demo/bin:$PATH"
 ## 核心模型
 
 - **不设计 fact/schema**。Claude Code 本来就把整个会话 dump 到 `~/.claude/projects/<项目>/`
-  (转录 jsonl + 子 agent + 工具结果),`agit -a sync` 把这坨镜像进 Agent Store。
+  (转录 jsonl + 子 agent + 工具结果),`agit -a snap` 把这坨镜像进 Agent Store。
 - **两个库**:你的代码仓库(Environment,原封不动)+ `.agit/agent`(Agent Store,独立 git 仓库,装 session)。
 - **协作靠 git**:Agent Store 就是 git 仓库,push/pull/clone 全白拿。
 - **合并靠 agent**:`reconcile` 让 LLM 读懂对面会话、合成统一上下文,真冲突才问人(非确定性,设计如此)。

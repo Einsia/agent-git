@@ -288,7 +288,7 @@ fn codex_sync_only_pulls_matching_project() {
     )
     .unwrap();
 
-    let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["-a", "sync", "--from", "codex"]);
+    let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["-a", "snap", "--from", "codex"]);
     assert_eq!(code, 0, "codex sync 应成功: {err}");
     assert!(out.contains("过滤出 1 条"), "应只匹配本项目 1 条(fork 那份要跳过):\n{out}");
 

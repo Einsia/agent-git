@@ -11,7 +11,7 @@
 
 // 核心逻辑在 lib(crate `agit`),与 agit-hub 共享,避免两个 bin 各写一份解析而漂移。
 use agit::scope::Scope;
-use agit::{commands, init, passthrough, session};
+use agit::{commands, init, passthrough, session, sync};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -69,16 +69,27 @@ fn dispatch(argv: Vec<String>) -> i32 {
             _ => commands::workspace_show(),
         },
 
-        // ── session dump 管理（新模型的核心）──
-        "sync" => {
-            // 位置参数当 runtime 简写：`agit -a sync codex` == `agit -a sync --from codex`。
-            // 之前把它解析出来又丢掉，用户以为在同步某个 runtime，实际静默跑了默认的 claude-code。
+        // ── snap：把 runtime 的 session dump 镜像进 Agent Store（旧名 sync）──
+        "snap" => {
+            // 位置参数当 runtime 简写：`agit -a snap codex` == `agit -a snap --from codex`。
             let (flag_rt, pos) = parse_runtime_arg(args, "--from");
             let rt = match pos {
                 Some(p) => p.to_string_lossy().into_owned(),
                 None => flag_rt,
             };
             session::sync(&rt)
+        }
+
+        // ── sync：用对话合并两个分叉的 agent 分支（两侧真 resume、只读对账，真冲突才问你）──
+        "sync" => {
+            let (rt, pos) = parse_runtime_arg(args, "--from");
+            match pos {
+                Some(r) => sync::run(&r.to_string_lossy(), &rt),
+                None => {
+                    eprintln!("用法: agit -a sync <ref>   （让本分支的 agent 和对面 <ref> 的 agent 对话合并）");
+                    Ok(2)
+                }
+            }
         }
         "reconcile" => {
             let (rt, reference, flags) = parse_reconcile(args);
@@ -228,9 +239,10 @@ const USAGE: &str = "\
 agit —— 版本化 agent 的原始 session,让团队协作 Agent Context
 
   agit init                在代码仓库旁建 Agent Store
-  agit -a sync             把本项目的 Claude session dump 镜像进 Agent Store
+  agit -a snap             把本项目的 Claude session dump 镜像进 Agent Store（旧名 sync）
   agit -a push / pull      和团队同步 session（Agent Store 就是 git 仓库）
-  agit -a reconcile <ref>  让 agent 读对面 <ref> 的 session、合成统一上下文,真冲突才问你
+  agit -a sync <ref>       让本分支的 agent 和对面 <ref> 的 agent 对话合并,真冲突才问你
+  agit -a reconcile <ref>  （旧）一次性读会话摘要合成统一上下文写进 CLAUDE.md
   agit clone <url>         一条命令拉取团队 Agent Store
   agit -a scan [--staged]  扫 session dump 里的密钥
   agit workspace [log]     看 Agent↔Environment 的配对

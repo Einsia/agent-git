@@ -54,7 +54,7 @@ fn adapter_list_shows_both_runtimes() {
 fn codex_sync_is_implemented() {
     let r = Repo::new();
     let o = Command::new(BIN)
-        .args(["-a", "sync", "--from", "codex"])
+        .args(["-a", "snap", "--from", "codex"])
         .current_dir(r.path())
         .env("HOME", r.path()) // 无 .codex/sessions → 匹配 0 条
         .output()

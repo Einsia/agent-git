@@ -18,7 +18,7 @@ export PATH="$BIN:$PATH"
 echo "${B}第一幕 · Alice sync + push${N}"
 cd "$ALICE"
 agit init >/dev/null && ok "init 两个库" || bad init
-agit -a sync >/dev/null 2>&1 && [[ -n "$(find .agit/agent/sessions -name '*.jsonl')" ]] && ok "sync 镜像了原始 session" || bad sync
+agit -a snap >/dev/null 2>&1 && [[ -n "$(find .agit/agent/sessions -name '*.jsonl')" ]] && ok "sync 镜像了原始 session" || bad sync
 # 注入真密钥,确认 push 前扫描拦得住
 printf '{"content":"AKIAIOSFODNN7EXAMPLE"}\n' >> .agit/agent/sessions/claude-code/alice-sess.jsonl
 agit -a add -A >/dev/null
@@ -33,7 +33,7 @@ agit -a push -u origin main >/dev/null 2>&1 && ok "push 到远端" || bad push
 echo "${B}第二幕 · Bob clone + sync${N}"
 cd "$BOB"
 agit clone "$ORIGIN" >/dev/null 2>&1 && ok "clone 团队 Agent Store" || bad clone
-agit -a sync >/dev/null 2>&1; agit -a add -A >/dev/null; ( cd .agit/agent && git commit -q -m bob )
+agit -a snap >/dev/null 2>&1; agit -a add -A >/dev/null; ( cd .agit/agent && git commit -q -m bob )
 agit -a fetch origin >/dev/null 2>&1 && ok "fetch 到 Alice 的会话" || bad fetch
 
 echo "${B}第三幕 · reconcile(agent 合并,真冲突才问人)${N}"
