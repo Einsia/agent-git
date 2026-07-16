@@ -38,6 +38,7 @@ pub fn hook_scan(staged: bool) -> Result<i32> {
 }
 
 fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<i32> {
+    let allow = scan::Allowlist::load(root);
     let mut total = 0;
     let mut report = |name: &str, findings: Vec<scan::Finding>| {
         for f in findings {
@@ -63,9 +64,9 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
             if code != 0 {
                 continue; // can't extract this blob (very rare), skip rather than abort
             }
-            // entropy detection is on only for .md; session dumps (jsonl) are full of UUIDs, so generalized entropy would fire wild false positives.
-            let entropy = name.ends_with(".md");
-            report(name, scan::scan_text_opts(&content, entropy));
+            // Entropy is on for everything now: jsonl is parsed and only STRING VALUES are scanned,
+            // with shape allowlists, so UUIDs/paths/requestIds no longer drown the signal (see scan.rs).
+            report(name, scan::scan_text_allow(&content, true, &allow));
         }
         return finish_scan(total, staged, 0);
     }
@@ -73,18 +74,13 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
     let targets: Vec<PathBuf> = if !paths.is_empty() {
         paths.iter().map(|p| root.join(p)).collect()
     } else {
-        // scan every text file in the Agent Store: CLAUDE-derived (.md) + session dumps (.jsonl etc.)
+        // Scan EVERY file in the Agent Store: an extension gate skipped .env/.pem/.key/.sh/.yaml and
+        // extensionless files, which hold secrets just as well. Binaries are detected by content in scan_file.
         WalkDir::new(&root)
             .into_iter()
             .filter_entry(|e| e.file_name() != ".git")
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map(|x| matches!(x.to_str(), Some("md" | "jsonl" | "json" | "txt")))
-                    .unwrap_or(false)
-            })
             .map(|e| e.path().to_path_buf())
             .collect()
     };
@@ -94,7 +90,7 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
             continue;
         }
         let rel = t.strip_prefix(&root).unwrap_or(t).display().to_string();
-        report(&rel, scan::scan_file(t)?);
+        report(&rel, scan::scan_file_allow(t, &allow)?);
     }
 
     finish_scan(total, staged, targets.len())
@@ -208,7 +204,7 @@ pub fn convert_cmd(
     };
 
     // The output = a new copy of sensitive content; scan it at high precision before writing to disk (jsonl: entropy detection off)
-    let hits = scan::scan_text_opts(&out, false).len();
+    let hits = scan::scan_text_opts(&out, true).len();
 
     println!("convert {from} → {to}{}", if cross { " (cross-vendor: content-level, drops encrypted reasoning and narrated tools)" } else { " (same vendor: byte-level replay)" });
     println!("  source   : {}", src.display());
@@ -519,7 +515,7 @@ pub fn resume_cmd(
         _ => out,
     };
 
-    let hits = scan::scan_text_opts(&out, false).len();
+    let hits = scan::scan_text_opts(&out, true).len();
     if hits > 0 {
         eprintln!("  ⚠ {hits} suspected secret(s) in the materialized session -- a fresh copy of what the source saw.");
     }
