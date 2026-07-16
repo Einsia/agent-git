@@ -38,7 +38,7 @@ pub fn run() -> Result<i32> {
     println!();
     println!("  agit -a snap            mirror this project's session dump in (add --watch to auto-snap continuously)");
     println!("  agit -a push / pull     sync sessions with your team");
-    println!("  agit -a sync <ref>      merge this branch's agent with the other side's conversation (only asks on real conflicts)");
+    println!("  agit -a merge <ref>      merge this branch's agent with the other side's conversation (only asks on real conflicts)");
     Ok(0)
 }
 

@@ -44,7 +44,7 @@ Claude session ──dump──> ~/.claude/projects/<slug>/
                           │  agit -a snap (mirror)
                           ▼
                    .agit/agent/sessions/<rt>/     ──push/pull (git)──> team / Hub
-                          │  agit -a sync <ref>
+                          │  agit -a merge <ref>
                           ▼
         both agents revive read-only, converse over the divergent tail
                           ▼
@@ -52,7 +52,7 @@ Claude session ──dump──> ~/.claude/projects/<slug>/
 ```
 
 The merged session is a real session, versioned like any other. You continue from it by
-resuming it in your runtime — `agit -a sync` prints the resume command (e.g.
+resuming it in your runtime — `agit -a merge` prints the resume command (e.g.
 `claude --resume <id>` / `codex exec resume <id>`). Nothing is distilled into a `CLAUDE.md`.
 
 ## Three layers — mind which is deterministic and which is not
@@ -69,7 +69,7 @@ Isolating the non-determinism in the top layer — and making its output a resum
 re-runnable session rather than a hand-maintained artifact — is the main lever for
 controlling risk (see [risk analysis](风险分析.md)).
 
-`agit -a sync <ref>` revives **both** agents (each side's latest session) read-only, each in
+`agit -a merge <ref>` revives **both** agents (each side's latest session) read-only, each in
 its own branch's git worktree with its own diff since the merge-base. The two agents converse
 over the divergent tail, resolving what they can by reading the code, and surface only the
 real conflicts — letting you decide each one interactively. Both claude-code and codex are

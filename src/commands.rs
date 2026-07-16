@@ -134,7 +134,7 @@ pub fn clone_agent(url: &str) -> Result<i32> {
     println!("Pulled Agent Store ← {url}");
     // install driver / hook (init is idempotent; it fills in config on an existing clone)
     crate::init::run()?;
-    println!("\nSee what you got: agit -a log   (or agit -a sync origin/main to merge conversations)");
+    println!("\nSee what you got: agit -a log   (or agit -a merge origin/main to merge conversations)");
     Ok(0)
 }
 

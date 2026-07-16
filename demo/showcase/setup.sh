@@ -4,7 +4,7 @@
 #   feature-b: an agent renamed the identity field `user_id` -> `uid`
 # The two are about to merge — and their change is a cross-cutting conflict.
 #
-# `agit -a sync` revives BOTH agents (read-only, each in its own branch's worktree) and lets them
+# `agit -a merge` revives BOTH agents (read-only, each in its own branch's worktree) and lets them
 # reconcile by reading the code. That needs REAL, resumable sessions, so we generate them with
 # `claude -p` when claude is present. Without claude, the branches/code are still staged and the
 # sync act is skipped.
@@ -80,12 +80,12 @@ cat <<EOF
 ${DIM}Follow the host script act by act:${N}
   ${G}\$EDITOR demo/showcase/讲稿.md${N}
 ${DIM}Then, from feature-a, reconcile the two agents by dialogue:${N}
-  ${G}cd $PROJ && agit -a sync bob${N}
+  ${G}cd $PROJ && agit -a merge bob${N}
 EOF
 else
 cat <<EOF
 
 ${Y}claude not found — the branches and code are staged, but the live sync act needs a real
-resumable session, so it's skipped. Install claude to run \`agit -a sync bob\`.${N}
+resumable session, so it's skipped. Install claude to run \`agit -a merge bob\`.${N}
 EOF
 fi

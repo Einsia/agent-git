@@ -121,7 +121,7 @@ export function Session() {
               <pre className="overflow-auto rounded-md border bg-muted p-3 font-mono text-[0.72rem] leading-relaxed">
 {`agit clone \\
   http://${location.host}/${name}.git
-agit -a sync origin/main`}
+agit -a merge origin/main`}
               </pre>
               <p className="mt-3 font-mono text-[0.72rem] text-muted-foreground">{data.commit.slice(0, 12)}</p>
             </aside>

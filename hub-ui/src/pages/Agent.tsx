@@ -95,7 +95,7 @@ export function Agent() {
           <pre className="overflow-auto rounded-md border bg-muted p-3 font-mono text-[0.72rem] leading-relaxed">
 {`agit clone \\
   http://${host}/${name}.git
-agit -a sync origin/main`}
+agit -a merge origin/main`}
           </pre>
           <h3 className="eyebrow mb-2 mt-6">commits</h3>
           <ul className="space-y-1 text-[0.8rem]">

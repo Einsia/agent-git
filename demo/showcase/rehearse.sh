@@ -32,7 +32,7 @@ git rev-parse --verify -q feature-a >/dev/null && git rev-parse --verify -q feat
 echo "${B}Act 3 · sync — the two agents reconcile by dialogue${N}"
 if command -v claude >/dev/null 2>&1 && git -C .agit/agent rev-parse --verify -q bob >/dev/null; then
   ok "both agents' sessions staged (store main = A, bob = B)"
-  OUT="$(agit -a sync bob 2>&1)"   # non-interactive: surfaces open conflicts and exits non-zero
+  OUT="$(agit -a merge bob 2>&1)"   # non-interactive: surfaces open conflicts and exits non-zero
   echo "$OUT" | grep -q "Two worktrees" && ok "each agent grounded in its own branch's worktree" || bad "worktrees"
   echo "$OUT" | grep -q "Merged state" && ok "produced a resumable merged session" || bad "merged state"
   echo "$OUT" | grep -qiE "CONFLICT|user_id|uid" && ok "surfaced the cross-cutting conflict (user_id vs uid)" || bad "conflict surfaced"

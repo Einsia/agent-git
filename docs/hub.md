@@ -6,7 +6,7 @@ heavyweight dependencies (std TCP + shelling out to git), and the frontend is a 
 embedded at build time (hub-ui/, see [hub-ui/README](../hub-ui/README.md)).
 
 **Hub = Registry + Sync + read-only rendering. It does not run agents and does not do semantic merges.**
-The real merge happens locally, on the consumer, with `agit -a sync` — that is where the code and the LLM live.
+The real merge happens locally, on the consumer, with `agit -a merge` — that is where the code and the LLM live.
 
 ## Getting started
 
@@ -52,10 +52,10 @@ agit -a push -u origin main                    # pre-push scans for secrets firs
 ```sh
 agit clone http://<host>:8177/payments.git     # one command to pull the team's Agent Store
 agit -a fetch origin
-agit -a sync origin/main                        # local: revive both agents, they reconcile by reading code, and only real conflicts prompt you — leaving a resumable merged session
+agit -a merge origin/main                        # local: revive both agents, they reconcile by reading code, and only real conflicts prompt you — leaving a resumable merged session
 ```
 
-`agit -a sync` works for both claude-code and codex sessions. The dialogue and synthesis it
+`agit -a merge` works for both claude-code and codex sessions. The dialogue and synthesis it
 runs use a local LLM backend, selected with `AGIT_LLM=claude` (default) / `AGIT_LLM=codex` /
 `AGIT_LLM_CMD="<cmd>"`.
 
@@ -84,7 +84,7 @@ whether to `sync` it against their own agent branch.
 ## Why the Hub does not merge
 
 Merging means reading the sessions and reasoning about their meaning — that is an LLM's job, and it
-belongs where the code and the model are: locally, on the consumer. `agit -a sync` revives both
+belongs where the code and the model are: locally, on the consumer. `agit -a merge` revives both
 agents (each read-only in its own branch's git worktree, with its own diff), lets them talk it out
 and resolve conflicts by reading the code, and surfaces only the real conflicts for you to decide.
 The Hub has neither your code nor, by design, a running agent, so it does only three things: hosting,
@@ -94,7 +94,7 @@ design of "run one LLM on the Hub to process everyone's uploaded sessions".
 ## Limits
 
 - **Read-only rendering**: the Hub does not merge, does not judge conflicts, does not recompute
-  anything. Merging still happens locally on the consumer via `agit -a sync`.
+  anything. Merging still happens locally on the consumer via `agit -a merge`.
 - **No secrets stored**: enforced by the publisher-side pre-push hook; but it only catches known
   formats (see [risk analysis](风险分析.md) §8).
 - **Auth granularity**: tokens are global (a write token can push to any repo); there is no
