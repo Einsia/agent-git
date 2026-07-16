@@ -267,3 +267,150 @@ fn mirror_into(src: &Path, dst: &Path, st: &mut Stats) -> Result<()> {
     }
     Ok(())
 }
+
+// ── unified watcher: watch BOTH runtimes' live dumps, auto-snap, auto-convert both ways ──
+
+/// `agit watch` — the fully hands-off loop. Watches both runtimes' live session dumps directly, and on
+/// each settle: auto-snaps (mirror + commit, harness included) and (unless --no-convert) auto-converts
+/// every session both ways so it's immediately resumable in either CLI. Foreground; Ctrl-C to stop.
+pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Result<i32> {
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
+    let env = scope::env_root()?;
+    let agent = scope::root_for(Scope::Agent)?;
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let runtimes = ["claude-code", "codex"];
+    let mut last: HashMap<&str, String> = HashMap::new();
+    let mut pending: HashMap<&str, bool> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut count = 0u64;
+    println!(
+        "Watching claude-code + codex every {}s: auto-snap{}. Ctrl-C to stop.",
+        interval.as_secs(),
+        if do_convert { " + auto-convert both ways" } else { "" }
+    );
+    loop {
+        for rt in runtimes {
+            let sig = source_path(rt, &env).map(|p| dir_signature(&p)).unwrap_or_default();
+            // first sight of a runtime counts as "changed" so pre-existing sessions get captured on start
+            let changed = last.get(rt).map(|l| l != &sig).unwrap_or(true);
+            if changed {
+                last.insert(rt, sig);
+                pending.insert(rt, true);
+            } else if pending.get(rt).copied().unwrap_or(false) {
+                pending.insert(rt, false);
+                match mirror_once(rt, &env, &agent) {
+                    Ok((stats, _, hits, _)) if stats.added + stats.updated > 0 => {
+                        if capture_harness {
+                            let _ = crate::harness::capture(&agent, &env, rt);
+                        }
+                        commit_snap(&agent, rt, hits, &mut count);
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("  snap {rt} failed: {e:#}"),
+                }
+            }
+        }
+        if do_convert {
+            crate::commands::convert_pass(&agent, &mut seen);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+fn watch_rundir() -> Result<PathBuf> {
+    // keep the pid/log inside the agent repo's .git so they're never tracked or scanned
+    Ok(scope::root_for(Scope::Agent)?.join(".git"))
+}
+
+fn read_pid(p: &Path) -> Option<u32> {
+    std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse().ok())
+}
+
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `agit watch --daemon` — spawn the watcher detached (own process group, stdio to a log inside the
+/// agent repo's .git) so it keeps running after the launching shell exits.
+pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Result<i32> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let env = scope::env_root()?;
+    let rundir = watch_rundir()?;
+    let logp = rundir.join("agit-watch.log");
+    let pidp = rundir.join("agit-watch.pid");
+    if let Some(pid) = read_pid(&pidp) {
+        if pid_alive(pid) {
+            println!("agit watch already running (pid {pid}). Stop it with: agit watch --stop");
+            return Ok(0);
+        }
+    }
+    let exe = std::env::current_exe().context("cannot locate the agit binary to spawn")?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&logp)?;
+    let log2 = log.try_clone()?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("watch").arg("--interval").arg(interval_secs.to_string());
+    if !do_convert {
+        cmd.arg("--no-convert");
+    }
+    if !capture_harness {
+        cmd.arg("--no-harness");
+    }
+    cmd.current_dir(&env) // child resolves the same repos from the project root
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log2)
+        .process_group(0); // new process group → survives the launching shell's SIGHUP
+    let child = cmd.spawn().context("failed to spawn the background watcher")?;
+    let pid = child.id();
+    std::fs::write(&pidp, pid.to_string())?;
+    println!("agit watch started in the background (pid {pid}).");
+    println!("  log:    {}", logp.display());
+    println!("  status: agit watch --status   ·   stop: agit watch --stop");
+    Ok(0)
+}
+
+/// `agit watch --stop` — kill the background watcher recorded for this project.
+pub fn watch_stop() -> Result<i32> {
+    let pidp = watch_rundir()?.join("agit-watch.pid");
+    match read_pid(&pidp) {
+        Some(pid) => {
+            let killed = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let _ = std::fs::remove_file(&pidp);
+            if killed {
+                println!("Stopped agit watch (pid {pid}).");
+            } else {
+                println!("No live process for pid {pid}; cleared the stale pidfile.");
+            }
+            Ok(0)
+        }
+        None => {
+            println!("No background watcher is recorded for this project.");
+            Ok(0)
+        }
+    }
+}
+
+/// `agit watch --status` — report whether the background watcher is running.
+pub fn watch_status() -> Result<i32> {
+    let rundir = watch_rundir()?;
+    match read_pid(&rundir.join("agit-watch.pid")) {
+        Some(pid) if pid_alive(pid) => {
+            println!("agit watch is running (pid {pid}).");
+            println!("  log: {}", rundir.join("agit-watch.log").display());
+        }
+        _ => println!("agit watch is not running for this project."),
+    }
+    Ok(0)
+}

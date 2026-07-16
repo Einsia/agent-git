@@ -120,6 +120,51 @@ fn dispatch(argv: Vec<String>) -> i32 {
         "adapter" => commands::adapter_list(),
         "graph" => commands::workspace_graph(),
 
+        // ── watch: fully hands-off — watch both runtimes' dumps, auto-snap + auto-convert both ways.
+        //    --daemon runs it forever in the background; --stop / --status manage it. ──
+        "watch" => {
+            let mut interval = 5u64;
+            let mut convert = true;
+            let mut harness = true;
+            let mut action = 0u8; // 0=run 1=daemon 2=stop 3=status
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--interval" if i + 1 < args.len() => {
+                        interval = args[i + 1].parse().unwrap_or(5);
+                        i += 2;
+                    }
+                    "--no-convert" => {
+                        convert = false;
+                        i += 1;
+                    }
+                    "--no-harness" => {
+                        harness = false;
+                        i += 1;
+                    }
+                    "--daemon" | "--background" => {
+                        action = 1;
+                        i += 1;
+                    }
+                    "--stop" => {
+                        action = 2;
+                        i += 1;
+                    }
+                    "--status" => {
+                        action = 3;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            match action {
+                1 => session::watch_daemon(interval, convert, harness),
+                2 => session::watch_stop(),
+                3 => session::watch_status(),
+                _ => session::watch(interval, convert, harness),
+            }
+        }
+
         // ── harness: show / apply the captured MCP + skills + config (part of Agent State) ──
         "harness" => {
             let mut rt = "claude-code".to_string();
@@ -330,6 +375,7 @@ agit — version an agent's raw session so teams can collaborate on Agent Contex
   agit -a scan [--staged]  Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
   agit workspace restore [N]  Roll both repos back together to a pairing's joint state
+  agit watch [--daemon]    Hands-off: watch both runtimes, auto-snap + auto-convert both ways; --daemon runs it in the background forever (--stop / --status to manage)
   agit graph               Show the Workspace-State timeline + relation edges
   agit harness [apply]     Show, or apply, the captured harness (MCP/skills/config); apply asks first (--force to skip)
   agit adapter             List runtime adapters

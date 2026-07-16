@@ -374,7 +374,33 @@ pub fn materialize(src: &Path, from: &str, to: &str, cwd_override: Option<String
         Some(c) => PathBuf::from(c),
         None => std::env::current_dir()?,
     };
-    crate::register::install(to, &new_id, &cwd, &out)
+    let h = crate::register::install(to, &new_id, &cwd, &out)?;
+    // Record that agit produced this id, so the watcher never re-converts its own output (which would
+    // otherwise feed back: A→B, then snap B, then B→A, forever).
+    mark_generated(&new_id);
+    Ok(h)
+}
+
+/// The id-registry of sessions agit itself materialized (one id per line, inside the agent repo's .git).
+fn generated_file(agent: &Path) -> PathBuf {
+    agent.join(".git").join("agit-generated")
+}
+
+fn mark_generated(id: &str) {
+    if let Ok(agent) = crate::scope::root_for(crate::scope::Scope::Agent) {
+        use std::io::Write;
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(generated_file(&agent))
+            .and_then(|mut f| writeln!(f, "{id}"));
+    }
+}
+
+fn load_generated(agent: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(generated_file(agent))
+        .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
+        .unwrap_or_default()
 }
 
 /// `agit convert --watch [--interval N]` — the auto-convert background worker. Watches the Agent Store's
@@ -382,43 +408,54 @@ pub fn materialize(src: &Path, from: &str, to: &str, cwd_override: Option<String
 /// installs it under its proper name — so any captured session is immediately resumable in either CLI
 /// (`codex exec resume <name>` / `claude --resume <id>`). Conversion is a pure deterministic transform
 /// (no model calls). Ctrl-C to stop.
+/// One cross-runtime conversion pass over the Agent Store: for each session not already converted
+/// (tracked by source-content hash in `seen`), materialize it into the OTHER runtime under its proper
+/// name. Shared by `convert --watch` and the unified `agit watch` loop.
+pub fn convert_pass(agent: &Path, seen: &mut std::collections::HashSet<String>) {
+    let generated = load_generated(agent);
+    for (from, to) in [("claude-code", "codex"), ("codex", "claude-code")] {
+        let dir = agent.join("sessions").join(from);
+        let files = walkdir::WalkDir::new(&dir)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false));
+        for e in files {
+            // never re-convert a session agit itself produced — that's the feedback-loop guard.
+            let stem = e.path().file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            if generated.contains(&stem) {
+                continue;
+            }
+            let content = match std::fs::read_to_string(e.path()) {
+                Ok(c) if !c.trim().is_empty() => c,
+                _ => continue,
+            };
+            // key on source content — an unchanged session converts once; once marked seen (even on
+            // error) it won't spin re-attempting the same input.
+            let key = format!("{from}->{to}:{}", &crate::convo::sha256_hex(&content)[..16]);
+            if !seen.insert(key) {
+                continue;
+            }
+            match materialize(e.path(), from, to, None) {
+                Ok(h) => println!("  ● {from}→{to}  {}", h.resume_cmd),
+                Err(err) => eprintln!("  ⚠ {from}→{to} {}: {err:#}", e.file_name().to_string_lossy()),
+            }
+        }
+    }
+}
+
 pub fn convert_watch(interval_secs: u64) -> Result<i32> {
-    use std::collections::HashSet;
     use std::time::Duration;
     let agent = crate::scope::root_for(crate::scope::Scope::Agent)?;
     let interval = Duration::from_secs(interval_secs.max(1));
-    let pairs = [("claude-code", "codex"), ("codex", "claude-code")];
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     println!(
         "Auto-converting sessions both ways (claude-code ↔ codex) every {}s. Ctrl-C to stop.",
         interval.as_secs()
     );
     loop {
-        for (from, to) in pairs {
-            let dir = agent.join("sessions").join(from);
-            let files = walkdir::WalkDir::new(&dir)
-                .max_depth(1)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
-                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false));
-            for e in files {
-                let content = match std::fs::read_to_string(e.path()) {
-                    Ok(c) if !c.trim().is_empty() => c,
-                    _ => continue,
-                };
-                // key on source content — a session already converted (unchanged) is skipped; once
-                // marked seen (even on error) it won't spin re-attempting the same input.
-                let key = format!("{from}->{to}:{}", &crate::convo::sha256_hex(&content)[..16]);
-                if !seen.insert(key) {
-                    continue;
-                }
-                match materialize(e.path(), from, to, None) {
-                    Ok(h) => println!("  ● {from}→{to}  {}", h.resume_cmd),
-                    Err(err) => eprintln!("  ⚠ {from}→{to} {}: {err:#}", e.file_name().to_string_lossy()),
-                }
-            }
-        }
+        convert_pass(&agent, &mut seen);
         std::thread::sleep(interval);
     }
 }
