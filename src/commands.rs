@@ -3,12 +3,12 @@
 //! See docs/architecture.md.
 
 use crate::adapter;
+use crate::agent;
 use crate::scan;
 use crate::scope::{self, Scope};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
 
 // ─────────────────────── Adapter: runtime ↔ AgentState ───────────────────────
 
@@ -365,9 +365,15 @@ pub fn workspace_graph() -> Result<i32> {
 
 // ─────────────────────── resume: load a session into a runtime and continue ───────────────────────
 
-/// Convert a session file to runtime `to` and install it into that runtime's native store so it can be
-/// resumed. Returns the resume handle. Shared by `convert --write`, `resume`, and the auto-convert worker.
-pub fn materialize(src: &Path, from: &str, to: &str, cwd_override: Option<String>) -> Result<crate::register::ResumeHandle> {
+/// Convert a session file to runtime `to`, install it into that runtime's native store so it can be
+/// resumed, and return the id it installed under with the resume handle. Shared by `start` and the
+/// auto-convert worker; both need the id, because it is the only key capture can attribute by (§6).
+pub fn materialize_id(
+    src: &Path,
+    from: &str,
+    to: &str,
+    cwd_override: Option<String>,
+) -> Result<(String, crate::register::ResumeHandle)> {
     use crate::convo::{self, ConvertOpts};
     let text = std::fs::read_to_string(src)?;
     let new_id = install_id(to, convo::peek_branch(&text).as_deref(), &text);
@@ -381,27 +387,34 @@ pub fn materialize(src: &Path, from: &str, to: &str, cwd_override: Option<String
     // Record that agit produced this id, so the watcher never re-converts its own output (which would
     // otherwise feed back: A→B, then snap B, then B→A, forever).
     mark_generated(&new_id);
-    Ok(h)
+    Ok((new_id, h))
 }
 
-/// The id-registry of sessions agit itself materialized (one id per line, inside the agent repo's .git).
-fn generated_file(agent: &Path) -> PathBuf {
-    agent.join(".git").join("agit-generated")
+/// The id-registry of sessions agit itself materialized (one id per line).
+///
+/// Machine-local, like the launch record and for the same reason: `materialize` mints an id long
+/// before capture decides which agent's store the session belongs to, and one store is shared by many
+/// environments. Keyed inside a single store, the guard below would miss every id routed elsewhere —
+/// and a missed guard is not a cosmetic loss, it is the A→B→A conversion loop running forever.
+fn generated_file(home: &Path) -> PathBuf {
+    home.join("generated")
 }
 
 fn mark_generated(id: &str) {
-    if let Ok(agent) = crate::scope::root_for(crate::scope::Scope::Agent) {
-        use std::io::Write;
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(generated_file(&agent))
-            .and_then(|mut f| writeln!(f, "{id}"));
-    }
+    let Ok(home) = scope::agit_home() else { return };
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(&home);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(generated_file(&home))
+        .and_then(|mut f| writeln!(f, "{id}"));
 }
 
-fn load_generated(agent: &Path) -> std::collections::HashSet<String> {
-    std::fs::read_to_string(generated_file(agent))
+fn load_generated() -> std::collections::HashSet<String> {
+    scope::agit_home()
+        .ok()
+        .and_then(|h| std::fs::read_to_string(generated_file(&h)).ok())
         .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
         .unwrap_or_default()
 }
@@ -414,8 +427,14 @@ fn load_generated(agent: &Path) -> std::collections::HashSet<String> {
 /// One cross-runtime conversion pass over the Agent Store: for each session not already converted
 /// (tracked by source-content hash in `seen`), materialize it into the OTHER runtime under its proper
 /// name. Shared by `convert --watch` and the unified `agit watch` loop.
-pub fn convert_pass(agent: &Path, seen: &mut std::collections::HashSet<String>) {
-    let generated = load_generated(agent);
+pub fn convert_pass(agent: &Path, env: &Path, seen: &mut std::collections::HashSet<String>) {
+    let generated = load_generated();
+    // Whose sessions these are. The converted copy is agit's own output on behalf of THIS agent, so it
+    // gets a launch record of its own: without one, capture reads it as hand-started and files it under
+    // the repo's DEFAULT agent — which lands one agent's transcript in another agent's store, and
+    // pushes it to that team. A legacy store has no identity to record, and needs none: it is the only
+    // store its sessions can go to.
+    let owner = agent::read_identity(agent).ok();
     for (from, to) in [("claude-code", "codex"), ("codex", "claude-code")] {
         let dir = agent.join("sessions").join(from);
         let files = walkdir::WalkDir::new(&dir)
@@ -440,8 +459,15 @@ pub fn convert_pass(agent: &Path, seen: &mut std::collections::HashSet<String>) 
             if !seen.insert(key) {
                 continue;
             }
-            match materialize(e.path(), from, to, None) {
-                Ok(h) => println!("  ● {from}→{to}  {}", h.resume_cmd),
+            match materialize_id(e.path(), from, to, None) {
+                Ok((new_id, h)) => {
+                    if let Some(o) = &owner {
+                        if let Err(err) = record_launch(&new_id, &o.aid, &o.name, env, to) {
+                            eprintln!("  ⚠ {from}→{to} launch record not written ({err:#}) — capture will attribute this copy by repo default.");
+                        }
+                    }
+                    println!("  ● {from}→{to}  {}", h.resume_cmd);
+                }
                 Err(err) => eprintln!("  ⚠ {from}→{to} {}: {err:#}", e.file_name().to_string_lossy()),
             }
         }
@@ -450,7 +476,10 @@ pub fn convert_pass(agent: &Path, seen: &mut std::collections::HashSet<String>) 
 
 pub fn convert_watch(interval_secs: u64) -> Result<i32> {
     use std::time::Duration;
-    let agent = crate::scope::root_for(crate::scope::Scope::Agent)?;
+    // Converting is not attribution — it makes THIS agent's sessions resumable in either CLI — so the
+    // resolved agent is the right answer, and capture no longer writes the store `-a` resolves to.
+    let agent = crate::session::convert_target()?;
+    let env = scope::env_root()?;
     let interval = Duration::from_secs(interval_secs.max(1));
     let mut seen = std::collections::HashSet::new();
     println!(
@@ -458,7 +487,7 @@ pub fn convert_watch(interval_secs: u64) -> Result<i32> {
         interval.as_secs()
     );
     loop {
-        convert_pass(&agent, &mut seen);
+        convert_pass(&agent, &env, &mut seen);
         std::thread::sleep(interval);
     }
 }
@@ -542,6 +571,560 @@ pub fn resume_cmd(
     Ok(0)
 }
 
+
+// ─────────────────────── The launch record (§6): whose session is this? ───────────────────────
+
+/// One launch: `session-id → {aid, env, runtime, started}`.
+///
+/// Why this exists at all: the runtime dumps per PROJECT (`~/.claude/projects/<cwd-slug>/`), not per
+/// agent, so two agents working in one repo write to the SAME folder. The active pointer cannot tell
+/// their sessions apart — attributing capture by it misfiles silently, into the wrong agent, and pushes
+/// a transcript to the wrong team. `agit start` launched the session, so it alone knows whose it is.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Launch {
+    pub session: String,
+    /// Identity, not the label: a rename must not orphan the record.
+    pub aid: String,
+    pub name: String,
+    pub env: String,
+    pub runtime: String,
+    pub started: String,
+}
+
+/// How a session was attributed to an agent. Capture must be able to SAY which — a guess reported as a
+/// fact is the failure mode this whole record exists to remove.
+pub enum Attribution {
+    /// `agit start` wrote a record: authoritative.
+    Launched(Launch),
+    /// No record (a plain `claude`/`codex` session) → the repo's default agent, reported as a fallback.
+    RepoDefault { aid: String, name: String },
+}
+
+impl Attribution {
+    pub fn aid(&self) -> &str {
+        match self {
+            Attribution::Launched(l) => &l.aid,
+            Attribution::RepoDefault { aid, .. } => aid,
+        }
+    }
+    pub fn name(&self) -> &str {
+        match self {
+            Attribution::Launched(l) => &l.name,
+            Attribution::RepoDefault { name, .. } => name,
+        }
+    }
+    /// The line capture prints. `None` when the record is authoritative — there is nothing to disclose.
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Attribution::Launched(_) => None,
+            Attribution::RepoDefault { name, .. } => Some(format!(
+                "not started by agit, so it has no launch record — filing it under this repo's default agent `{name}`. \
+                 Start it with `agit start --agent <name>` to attribute it exactly."
+            )),
+        }
+    }
+}
+
+/// Machine-local, spans repos: a session id is a UUID, so one file can never collide, and capture in any
+/// environment can read it. Append-only; the last record for an id wins.
+fn launches_file(home: &Path) -> PathBuf {
+    home.join("launches.jsonl")
+}
+
+fn record_launch_at(home: &Path, l: &Launch) -> Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(home)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(launches_file(home))?;
+    writeln!(f, "{}", serde_json::to_string(l)?)?;
+    Ok(())
+}
+
+fn lookup_launch_at(home: &Path, session: &str) -> Option<Launch> {
+    let text = std::fs::read_to_string(launches_file(home)).ok()?;
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Launch>(l.trim()).ok())
+        .filter(|l| l.session == session)
+        .next_back()
+}
+
+/// Write the launch record. Called by `start` BEFORE the runtime is exec'd: a session captured before
+/// its record exists is a session attributed by guesswork.
+pub fn record_launch(session: &str, aid: &str, name: &str, env: &Path, runtime: &str) -> Result<()> {
+    record_launch_at(
+        &scope::agit_home()?,
+        &Launch {
+            session: session.to_string(),
+            aid: aid.to_string(),
+            name: name.to_string(),
+            env: env.display().to_string(),
+            runtime: runtime.to_string(),
+            started: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        },
+    )
+}
+
+pub fn lookup_launch(session: &str) -> Option<Launch> {
+    lookup_launch_at(&scope::agit_home().ok()?, session)
+}
+
+/// Attribute a captured session to an agent: the launch record if there is one, else the repo's default
+/// — never the active pointer, which cannot tell two agents in one dump folder apart.
+pub fn attribute_session(session: &str) -> Result<Attribution> {
+    if let Some(l) = lookup_launch(session) {
+        return Ok(Attribution::Launched(l));
+    }
+    let a = agent::resolve(None)?;
+    Ok(Attribution::RepoDefault { aid: a.aid, name: a.name })
+}
+
+// ─────────────────────── start: the agent's latest session, here ───────────────────────
+
+/// A session in the store, wherever it was recorded.
+pub struct StoredSession {
+    pub path: PathBuf,
+    pub runtime: &'static str,
+    /// The environment it was recorded in (`sessions/<env-slug>/<rt>/`), when the store is partitioned.
+    pub env_slug: Option<String>,
+    /// When it last did anything, as the STORE records it: the `<id>.agit.json` sidecar, else the
+    /// transcript's own last timestamp. `None` only for a session that records no time at all.
+    pub last_activity: Option<chrono::DateTime<chrono::Utc>>,
+    pub mtime: std::time::SystemTime,
+}
+
+impl StoredSession {
+    /// What to show a user as "when". mtime is the fallback, not the source: see `latest_session`.
+    fn recency(&self) -> std::time::SystemTime {
+        self.last_activity.map(std::time::SystemTime::from).unwrap_or(self.mtime)
+    }
+}
+
+/// `<id>.jsonl` → `<id>.agit.json` — the sidecar snap writes beside every captured session (§6).
+pub fn sidecar_path(transcript: &Path) -> PathBuf {
+    transcript.with_extension("agit.json")
+}
+
+/// When a stored session last did anything, read from content **git preserves**: the sidecar first
+/// (one line, always there for anything snap captured), else the transcript's own last timestamp,
+/// which costs a scan but keeps a store written before sidecars existed orderable.
+fn recorded_activity(transcript: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let ts = sidecar_last_activity(transcript).or_else(|| crate::session::last_activity(transcript))?;
+    chrono::DateTime::parse_from_rfc3339(ts.trim())
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+fn sidecar_last_activity(transcript: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(sidecar_path(transcript)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("last_activity")?.as_str().map(str::to_string)
+}
+
+/// The agent's latest session from ANY environment.
+///
+/// Read from the store's files, **never from git-log topology**. Verified: `git log -1 --name-only`
+/// prints no file names at all on a merge commit (it prints the header and stops), so a log-derived
+/// leaf-finder returns nothing exactly after a merge or a pull — the moment `start` matters most.
+///
+/// A candidate's parent directory must BE the runtime dir, which holds for both the flat
+/// `sessions/<rt>/` layout and the partitioned `sessions/<env>/<rt>/` one, and excludes a session's
+/// sidecars (`<id>/subagents/*.jsonl`), which are not sessions.
+pub fn store_sessions(store: &Path) -> Vec<StoredSession> {
+    let mut out = Vec::new();
+    for e in WalkDir::new(store.join(crate::session::SESSIONS_SUBDIR))
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let p = e.path();
+        if p.extension().map(|x| x != "jsonl").unwrap_or(true) {
+            continue;
+        }
+        let Some(parent) = p.parent() else { continue };
+        let Some(rt) = crate::session::RUNTIMES
+            .into_iter()
+            .find(|rt| parent.file_name().map(|n| n == *rt).unwrap_or(false))
+        else {
+            continue;
+        };
+        let Some(mtime) = e.metadata().ok().and_then(|m| m.modified().ok()) else { continue };
+        let env_slug = parent
+            .parent()
+            .and_then(|g| g.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| n != crate::session::SESSIONS_SUBDIR);
+        out.push(StoredSession {
+            last_activity: recorded_activity(p),
+            path: p.to_path_buf(),
+            runtime: rt,
+            env_slug,
+            mtime,
+        });
+    }
+    out
+}
+
+/// The most recent session, ordered by what the store RECORDS — never by the filesystem.
+///
+/// git does not preserve mtimes: after the `git clone` that `agit a track` performs, every session
+/// carries the checkout time, identical to the nanosecond, so an mtime order collapses into whatever
+/// order the directory walk happened to produce. A session the store records a time for therefore
+/// always beats one it does not, and mtime only breaks a tie.
+pub fn latest_session(store: &Path) -> Option<StoredSession> {
+    store_sessions(store).into_iter().max_by_key(|s| (s.last_activity, s.mtime))
+}
+
+/// Roughly how long ago, for the header. Precision past "2h ago" is noise here.
+fn ago(t: std::time::SystemTime) -> String {
+    let Ok(d) = std::time::SystemTime::now().duration_since(t) else { return "just now".into() };
+    let s = d.as_secs();
+    match s {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", s / 60),
+        3600..=86399 => format!("{}h ago", s / 3600),
+        _ => format!("{}d ago", s / 86400),
+    }
+}
+
+/// `agit start [--agent X] [--as claude-code|codex]` — launch a real session in THIS repo already
+/// carrying the agent's context, with no file paths and no ids typed (§5.1).
+pub fn start_cmd(agent_sel: Option<&str>, as_rt: Option<&str>) -> Result<i32> {
+    let env = scope::env_root()?;
+    let ag = agent::resolve(agent_sel)?;
+    match latest_session(&ag.store) {
+        Some(s) => start_carrying(&ag, &env, s, as_rt),
+        None => start_fresh(&ag, &env, as_rt),
+    }
+}
+
+fn start_carrying(ag: &agent::Agent, env: &Path, s: StoredSession, as_rt: Option<&str>) -> Result<i32> {
+    // Explicit --as wins; otherwise the session's OWN runtime — a session knows what produced it. No
+    // default: the runtimes are peers (§5.3).
+    let rt = crate::session::resolve_runtime(as_rt, &[s.runtime], "start")?;
+
+    println!("┌ {} · {} · {rt}", ag.name, env.display());
+    let from = match &s.env_slug {
+        Some(e) => format!(" (from {e}, {})", ago(s.recency())),
+        None => format!(" ({})", ago(s.recency())),
+    };
+    println!("└ carrying its latest session{from}");
+
+    // Rebind cwd to this repo but KEEP the paths it recorded elsewhere: those are its real memory of
+    // that other codebase, not stale strings. That is `resume --env` without `--relocate` (which is only
+    // correct when the SAME project moved).
+    let (id, h) = materialize_id(&s.path, s.runtime, &rt, Some(env.display().to_string()))?;
+
+    // The record must exist before the runtime does. Its absence is not fatal — a session that captures
+    // to the default agent beats no session — but it is never silent.
+    if let Err(e) = record_launch(&id, &ag.aid, &ag.name, env, &rt) {
+        eprintln!("  ⚠ launch record not written ({e:#}) — capture will attribute this session by repo default.");
+    }
+    exec(&h.resume_cmd)
+}
+
+/// No sessions yet: start FRESH but bound to the agent, and say so.
+fn start_fresh(ag: &agent::Agent, env: &Path, as_rt: Option<&str>) -> Result<i32> {
+    let rt = crate::session::resolve_runtime(as_rt, &[], "start").map_err(|e| {
+        anyhow::anyhow!("{e}\n  `{}` has no sessions yet, so there is no runtime to continue in — name one: agit start --as claude-code|codex", ag.name)
+    })?;
+    let cli = if rt == "codex" { "codex" } else { "claude" };
+    println!("┌ {} · {} · {rt}", ag.name, env.display());
+    println!("└ no sessions yet — starting FRESH, bound to this agent.");
+    // The runtime mints the id, so there is nothing to write a launch record against yet: this session
+    // will be attributed to the repo's default agent when captured. Said, never assumed.
+    eprintln!(
+        "  note: a fresh session gets its id from {cli}, so it has no launch record — capture files it \
+         under this repo's default agent. Once it is snapped, `agit start --agent {}` carries it exactly.",
+        ag.name
+    );
+    exec_in(cli, env)
+}
+
+/// Launch the runtime directly. No shell, so the repo path needs no quoting: `env` comes from `git
+/// rev-parse --show-toplevel`, and under `sh -c` a path holding a space, `$`, a backtick or `;` would
+/// break the command or inject into it.
+fn exec_in(cli: &str, dir: &Path) -> Result<i32> {
+    let status = std::process::Command::new(cli)
+        .current_dir(dir)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to launch `{cli}` in {}: {e}", dir.display()))?;
+    Ok(status.code().unwrap_or(0))
+}
+
+fn exec(cmd: &str) -> Result<i32> {
+    let status = std::process::Command::new("sh").arg("-c").arg(cmd).status()?;
+    Ok(status.code().unwrap_or(0))
+}
+
+#[cfg(test)]
+mod launch_record_tests {
+    use super::*;
+
+    fn launch(session: &str, aid: &str, name: &str) -> Launch {
+        Launch {
+            session: session.into(),
+            aid: aid.into(),
+            name: name.into(),
+            env: "/code/web".into(),
+            runtime: "claude-code".into(),
+            started: "2026-07-16T00:00:00Z".into(),
+        }
+    }
+
+    /// The correctness core of multi-agent: two agents in ONE repo dump into the SAME folder, so the id
+    /// is the only thing that can tell their sessions apart.
+    #[test]
+    fn two_agents_in_one_repo_are_told_apart_by_session_id() {
+        let home = tempfile::tempdir().unwrap();
+        record_launch_at(home.path(), &launch("sess-frontend", "agt_01", "frontend")).unwrap();
+        record_launch_at(home.path(), &launch("sess-api", "agt_02", "api")).unwrap();
+
+        assert_eq!(lookup_launch_at(home.path(), "sess-frontend").unwrap().aid, "agt_01");
+        assert_eq!(lookup_launch_at(home.path(), "sess-api").unwrap().aid, "agt_02");
+        assert!(lookup_launch_at(home.path(), "never-launched").is_none(), "no record must not resolve to a neighbour");
+    }
+
+    #[test]
+    fn the_log_is_append_only_and_the_last_record_wins() {
+        let home = tempfile::tempdir().unwrap();
+        record_launch_at(home.path(), &launch("s", "agt_01", "frontend")).unwrap();
+        record_launch_at(home.path(), &launch("s", "agt_02", "api")).unwrap();
+        assert_eq!(lookup_launch_at(home.path(), "s").unwrap().aid, "agt_02", "re-launch supersedes");
+        assert_eq!(
+            std::fs::read_to_string(launches_file(home.path())).unwrap().lines().count(),
+            2,
+            "history is kept, not rewritten"
+        );
+    }
+
+    /// A record is authoritative and says nothing; a fallback must always disclose itself.
+    #[test]
+    fn attribution_by_default_agent_is_never_silent() {
+        let launched = Attribution::Launched(launch("s", "agt_01", "frontend"));
+        assert_eq!(launched.aid(), "agt_01");
+        assert!(launched.note().is_none(), "an authoritative record has nothing to disclose");
+
+        let fallback = Attribution::RepoDefault { aid: "agt_09".into(), name: "api".into() };
+        let note = fallback.note().expect("a guess MUST be reported");
+        assert!(note.contains("no launch record"), "{note}");
+        assert!(note.contains("api"), "the note must name the agent it filed under: {note}");
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        // Per-invocation identity only: a global git config would clobber the developer's real one.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn write(p: &Path, s: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, s).unwrap();
+    }
+
+    #[test]
+    /// The bug this keys on: git does not preserve mtimes. `agit a track` CLONES the store, and a clone
+    /// stamps every file at checkout time — verified identical to the nanosecond — so an mtime-ordered
+    /// leaf-finder returns whichever session WalkDir happened to hand back last. Recency must therefore
+    /// come from recorded CONTENT. This is acceptance criterion 3: bob clones and picks up alice's LATEST.
+    #[test]
+    fn recency_survives_a_clone_which_flattens_every_mtime() {
+        let src = tempfile::tempdir().unwrap();
+        let d = src.path();
+        git(d, &["init", "-q", "-b", "main", "."]);
+        let s = d.join("sessions/web/claude-code");
+
+        // `old` is genuinely older BY CONTENT, but is written second so that both write order and
+        // WalkDir order favour it — the test must not pass by luck.
+        write(
+            &s.join("new.jsonl"),
+            "{\"sessionId\":\"n\",\"timestamp\":\"2026-07-16T12:00:00Z\",\"type\":\"user\"}\n",
+        );
+        write(
+            &s.join("old.jsonl"),
+            "{\"sessionId\":\"o\",\"timestamp\":\"2020-01-01T00:00:00Z\",\"type\":\"user\"}\n",
+        );
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "sessions"]);
+
+        let dst = tempfile::tempdir().unwrap();
+        let clone = dst.path().join("c");
+        git(d, &["clone", "-q", ".", &clone.to_string_lossy()]);
+
+        // The premise, asserted rather than remembered: after a clone there is no recency left in the fs.
+        let m = |n: &str| {
+            std::fs::metadata(clone.join("sessions/web/claude-code").join(n)).unwrap().modified().unwrap()
+        };
+        assert_eq!(m("old.jsonl"), m("new.jsonl"), "a clone must flatten mtimes, or this test proves nothing");
+
+        let latest = latest_session(&clone).expect("a cloned store still has sessions");
+        assert!(
+            latest.path.ends_with("new.jsonl"),
+            "picked {:?} — ordering fell back to the filesystem, which a clone has erased",
+            latest.path
+        );
+    }
+
+    fn latest_session_spans_environments_and_ignores_sidecars() {
+        let store = tempfile::tempdir().unwrap();
+        let s = store.path().join("sessions");
+        // the partitioned layout (sessions/<env>/<rt>/) and the flat one both resolve
+        write(&s.join("web/claude-code/old.jsonl"), "{}\n");
+        write(&s.join("api/codex/new.jsonl"), "{}\n");
+        // a session's sidecars are not sessions
+        write(&s.join("api/codex/new/subagents/sub.jsonl"), "{}\n");
+        // and a merge transcript is not one either
+        write(&s.join("merges/a-b.md"), "# transcript\n");
+
+        // make ordering explicit rather than trusting write order
+        let newer = std::time::SystemTime::now();
+        let older = newer - std::time::Duration::from_secs(7200);
+        filetime(&s.join("web/claude-code/old.jsonl"), older);
+        filetime(&s.join("api/codex/new.jsonl"), newer);
+        filetime(&s.join("api/codex/new/subagents/sub.jsonl"), newer + std::time::Duration::from_secs(60));
+
+        let all = store_sessions(store.path());
+        assert_eq!(all.len(), 2, "only real sessions: {:?}", all.iter().map(|x| &x.path).collect::<Vec<_>>());
+
+        let latest = latest_session(store.path()).unwrap();
+        assert!(latest.path.ends_with("api/codex/new.jsonl"), "picked {:?}", latest.path);
+        assert_eq!(latest.runtime, "codex", "the runtime comes from the session, not a default");
+        assert_eq!(latest.env_slug.as_deref(), Some("api"), "an env-partitioned store reports where it ran");
+        // the newest FILE is a sidecar; it must not become the session we carry
+        assert!(!latest.path.to_string_lossy().contains("subagents"));
+    }
+
+    /// The regression the design calls out: `git log -1 --name-only` prints NOTHING on a merge commit,
+    /// so a log-derived leaf-finder finds nothing exactly after a merge/pull. Asserted here against real
+    /// git, so the trap stays proven rather than remembered.
+    #[test]
+    fn the_leaf_survives_a_merge_commit_because_it_is_not_read_from_git_log() {
+        let store = tempfile::tempdir().unwrap();
+        let d = store.path();
+        git(d, &["init", "-q", "-b", "main", "."]);
+        write(&d.join("sessions/claude-code/base.jsonl"), "{}\n");
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "base"]);
+
+        git(d, &["checkout", "-qb", "peer"]);
+        write(&d.join("sessions/claude-code/theirs.jsonl"), "{}\n");
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "theirs"]);
+
+        git(d, &["checkout", "-q", "main"]);
+        write(&d.join("sessions/claude-code/mine.jsonl"), "{}\n");
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "mine"]);
+        git(d, &["merge", "-q", "--no-ff", "peer", "-m", "merge peer"]);
+
+        // the trap, demonstrated in-repo: the merge commit names no files at all
+        assert!(git(d, &["log", "-1", "--format=", "--name-only", "HEAD"]).is_empty(), "git changed: a merge commit now names files");
+        assert!(!git(d, &["log", "-1", "--format=", "--name-only", "HEAD^"]).is_empty(), "a non-merge commit does name them");
+
+        // …and the leaf-finder is unaffected, because it reads the files.
+        let latest = latest_session(d).expect("a merge must not hide the agent's sessions");
+        assert_eq!(latest.runtime, "claude-code");
+        assert_eq!(store_sessions(d).len(), 3, "every session survives the merge");
+    }
+
+    fn filetime(p: &Path, t: std::time::SystemTime) {
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        f.set_modified(t).unwrap();
+    }
+
+    /// Acceptance criterion 3: bob clones the agent and picks up alice's LATEST session. `agit a track`
+    /// is a `git clone`, and git does not preserve mtimes — every file gets the checkout time — so an
+    /// mtime-ordered leaf-finder returns whatever the directory walk happened to hand back last.
+    /// Asserted against real git, so the trap stays proven rather than remembered.
+    #[test]
+    fn the_latest_session_survives_a_real_clone_because_recency_is_recorded_not_mtimed() {
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        git(&store, &["init", "-q", "-b", "main", "."]);
+
+        // alice's two sessions. `new` is the one bob must pick up.
+        let s = store.join("sessions/claude-code");
+        write(&s.join("old.jsonl"), "{\"timestamp\":\"2026-07-10T10:00:00.000Z\"}\n");
+        write(&s.join("old.agit.json"), "{\"last_activity\":\"2026-07-10T10:00:00.000Z\"}\n");
+        write(&s.join("new.jsonl"), "{\"timestamp\":\"2026-07-16T10:00:00.000Z\"}\n");
+        write(&s.join("new.agit.json"), "{\"last_activity\":\"2026-07-16T10:00:00.000Z\"}\n");
+        git(&store, &["add", "-A"]);
+        git(&store, &["commit", "-qm", "alice's sessions"]);
+        assert_eq!(latest_session(&store).unwrap().path.file_stem().unwrap(), "new");
+
+        // bob: `agit a track` → git clone.
+        let clone = d.path().join("clone");
+        let out = Command::new("git").args(["clone", "-q"]).arg(&store).arg(&clone).output().unwrap();
+        assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(store_sessions(&clone).len(), 2, "the clone must carry both sessions");
+
+        // The sidecars travelled (git carries content), so recency did too.
+        assert_eq!(
+            latest_session(&clone).expect("bob must find alice's sessions").path.file_stem().unwrap(),
+            "new"
+        );
+
+        // …and it is genuinely not the filesystem talking: hand the STALE session the newest mtime.
+        // After a checkout the mtimes carry no recency at all, so this is not a contrived ordering —
+        // it is simply one the filesystem is free to report.
+        let cs = clone.join("sessions/claude-code");
+        filetime(&cs.join("old.jsonl"), std::time::SystemTime::now());
+        filetime(&cs.join("new.jsonl"), std::time::SystemTime::now() - std::time::Duration::from_secs(7200));
+        let latest = latest_session(&clone).unwrap();
+        assert_eq!(latest.path.file_stem().unwrap(), "new", "mtime overruled the recorded activity: {:?}", latest.path);
+    }
+
+    /// A store captured before sidecars existed must still order: the transcript records its own time.
+    #[test]
+    fn recency_falls_back_to_the_transcripts_own_last_timestamp_when_there_is_no_sidecar() {
+        let d = tempfile::tempdir().unwrap();
+        let s = d.path().join("sessions/codex");
+        write(
+            &s.join("first.jsonl"),
+            "{\"timestamp\":\"2026-07-01T00:00:00.000Z\",\"type\":\"session_meta\"}\n\
+             {\"timestamp\":\"2026-07-02T00:00:00.000Z\",\"type\":\"event_msg\"}\n",
+        );
+        write(&s.join("second.jsonl"), "{\"timestamp\":\"2026-07-03T00:00:00.000Z\",\"type\":\"session_meta\"}\n");
+        // the filesystem says the opposite of what the transcripts say
+        filetime(&s.join("first.jsonl"), std::time::SystemTime::now());
+        filetime(&s.join("second.jsonl"), std::time::SystemTime::now() - std::time::Duration::from_secs(7200));
+
+        assert_eq!(
+            latest_session(d.path()).unwrap().path.file_stem().unwrap(),
+            "second",
+            "recency must come from the transcript, not from the file"
+        );
+        // the session's LAST activity, not its first
+        let all = store_sessions(d.path());
+        let first = all.iter().find(|x| x.path.ends_with("first.jsonl")).unwrap();
+        assert_eq!(first.last_activity.unwrap().to_rfc3339(), "2026-07-02T00:00:00+00:00");
+    }
+
+    /// A session that records no time at all must not outrank one that does — mtime is the last
+    /// resort, and after a clone it is pure noise.
+    #[test]
+    fn a_recorded_time_beats_a_session_that_records_none() {
+        let d = tempfile::tempdir().unwrap();
+        let s = d.path().join("sessions/claude-code");
+        write(&s.join("timed.jsonl"), "{\"timestamp\":\"2026-07-01T00:00:00.000Z\"}\n");
+        write(&s.join("untimed.jsonl"), "{\"type\":\"queue-operation\"}\n");
+        filetime(&s.join("untimed.jsonl"), std::time::SystemTime::now());
+        filetime(&s.join("timed.jsonl"), std::time::SystemTime::now() - std::time::Duration::from_secs(7200));
+
+        assert_eq!(latest_session(d.path()).unwrap().path.file_stem().unwrap(), "timed");
+    }
+}
 
 #[cfg(test)]
 mod install_id_tests {

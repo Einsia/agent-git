@@ -5,9 +5,11 @@
 //!   <uuid>/subagents/*.jsonl  subagent transcripts
 //!   <uuid>/tool-results/*.txt large tool results
 //!   memory/                   memory
-//! `agit -a sync` mirrors this blob into the Agent Store's sessions/<runtime>/, after which commit/push/pull work as usual.
+//! `agit a snap` mirrors this blob into sessions/<runtime>/ of the store belonging to the agent that
+//! PRODUCED each session (`route`) — the dump is per project, so one pass can feed several stores.
 
 use crate::adapter::claude_code;
+use crate::commands::Attribution;
 use crate::scope::{self, Scope};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -113,6 +115,137 @@ fn source_dir(runtime: &str, cwd: &Path) -> Result<PathBuf> {
     }
 }
 
+// ─────────────────── Capture: whose session is this, and which store does it go to? ───────────────────
+
+/// One store's share of a capture pass: the sessions attributed to the agent that owns it.
+struct Routed {
+    store: PathBuf,
+    /// The agent's current label. `None` = the legacy nested store, which carries no identity.
+    agent: Option<String>,
+    /// Disclosed once per pass rather than once per session.
+    note: Option<String>,
+    sessions: Vec<Owned>,
+}
+
+/// One captured session, and the agent `agit start` recorded as its author.
+struct Owned {
+    src: PathBuf,
+    id: String,
+    by: Option<Attribution>,
+}
+
+impl Routed {
+    /// The command that actually commits what was just written. `agit a` resolves the legacy nested
+    /// store, so it is the right hint for that store and the wrong one for any other.
+    fn commit_hint(&self, rt: &str) -> String {
+        match self.agent {
+            None => format!("agit a add -A && agit a commit -m 'snap {rt} sessions'"),
+            Some(_) => {
+                let s = self.store.display();
+                format!("git -C {s} add -A && git -C {s} commit -m 'snap {rt} sessions'")
+            }
+        }
+    }
+}
+
+/// A repo from before agent identity: nothing here names an agent, so there is nothing to attribute
+/// against and the legacy nested store is the only place its sessions can go. The cutover (§12, `agit a
+/// import`) deletes this branch; until then, refusing would strand every repo that predates identity.
+fn predates_identity(env: &Path) -> bool {
+    !env.join(crate::agent::BINDING_FILE).exists()
+        && std::env::var("AGIT_AGENT").map(|v| v.trim().is_empty()).unwrap_or(true)
+        && matches!(crate::agent::read_active(env), Ok(None))
+}
+
+/// Which store an attributed session goes to, and what to call its agent. `None` = a launch record
+/// naming an agent this machine no longer has: warned and skipped, since one dead record must not stop
+/// every other agent being captured.
+fn store_for(by: Option<&Attribution>, id: &str) -> Result<Option<(PathBuf, Option<String>)>> {
+    let Some(by) = by else {
+        return Ok(Some((scope::root_for(Scope::Agent)?, None)));
+    };
+    // The aid is the identity, so the store AND the current label both come from it: the record's name
+    // is a snapshot from launch time, and a rename must not orphan it.
+    match crate::agent::info(by.aid()) {
+        Ok(ag) => Ok(Some((ag.store, Some(ag.name)))),
+        Err(e) => {
+            eprintln!(
+                "  ⚠ {id} was launched by {} ({}), which this machine no longer has — not captured: {e:#}",
+                by.name(),
+                by.aid()
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Route this runtime's sessions to the store of the agent that produced each one.
+///
+/// This is what the launch record is for (§6). Both runtimes dump per PROJECT
+/// (`~/.claude/projects/<cwd-slug>/`), so two agents working in one repo write into the SAME folder.
+/// The active pointer cannot tell their sessions apart, so attributing by it misfiles silently — into
+/// the wrong agent, and from there to the wrong team. One pass therefore writes into as many stores as
+/// there are agents that worked here; collapsing it back to a single store is the bug.
+fn route(rt: &str, env: &Path) -> Result<(Vec<Routed>, String)> {
+    let (owned, source_desc) = live_sessions(rt, env)?;
+    let mut out: Vec<Routed> = Vec::new();
+    for (src, id) in owned {
+        // The launch record, else the repo's default agent — never the active pointer.
+        let by = match crate::commands::attribute_session(&id) {
+            Ok(a) => Some(a),
+            Err(_) if predates_identity(env) => None,
+            // Any other failure — an unknown $AGIT_AGENT, a binding whose id no longer matches its
+            // store — is a real error. Filing the transcript somewhere anyway is the silent misfiling
+            // this routing exists to stop, and one pushed to the wrong team cannot be recalled.
+            Err(e) => return Err(e),
+        };
+        let Some((store, agent)) = store_for(by.as_ref(), &id)? else { continue };
+        let i = match out.iter().position(|r| r.store == store) {
+            Some(i) => i,
+            None => {
+                out.push(Routed { store, agent, note: None, sessions: Vec::new() });
+                out.len() - 1
+            }
+        };
+        // One fallback anywhere in the group is worth disclosing, even if the first session had a record.
+        if out[i].note.is_none() {
+            out[i].note = by.as_ref().and_then(Attribution::note);
+        }
+        out[i].sessions.push(Owned { src, id, by });
+    }
+    Ok((out, source_desc))
+}
+
+/// This runtime's sessions that belong to this project: (transcript, session id), plus how to describe
+/// where they came from.
+fn live_sessions(rt: &str, env: &Path) -> Result<(Vec<(PathBuf, String)>, String)> {
+    match rt {
+        // Claude splits by project slug — which collides, so `project_sessions` decides ownership by
+        // each transcript's launch cwd: `/a/b.c`, `/a/b-c` and `/a/b/c` share ONE slug directory, and
+        // tree-mirroring it copied a *different* project's transcripts into this store, which a push
+        // then shipped to this project's teammates.
+        "claude-code" => {
+            // source_dir first: "this project has never run in Claude Code" is a better error than an
+            // empty list, and it names the HOME agit actually looked under.
+            let src = source_dir("claude-code", env)?;
+            let owned = claude_code::project_sessions(env);
+            let desc = format!("{} ({} owned sessions)", src.display(), owned.len());
+            Ok((owned, desc))
+        }
+        // Codex splits by date with every project mixed together, and a fork/resume rollout embeds the
+        // parent session of another project — `project_rollouts` skips the whole file when it sees one.
+        "codex" => {
+            let owned = crate::adapter::codex::project_rollouts(env);
+            let root = crate::adapter::codex::sessions_root()
+                .map(|r| r.display().to_string())
+                .unwrap_or_default();
+            let desc = format!("{root} (cwd={} matched {} rollouts)", env.display(), owned.len());
+            Ok((owned, desc))
+        }
+        other => bail!("session dump for runtime `{other}` isn't wired up yet (see src/session.rs)"),
+    }
+}
+
 /// `agit a snap [--from <runtime>]` — mirror session dumps into the Agent Store, once.
 ///
 /// With no `--from` there is nothing to default to: claude-code and codex are peers, so snap captures
@@ -130,7 +263,6 @@ pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
         return sync(&r, capture_harness);
     }
     let env = scope::env_root()?;
-    let agent = scope::root_for(Scope::Agent)?;
     let live = live_runtimes(&env);
     if live.is_empty() {
         bail!(
@@ -140,7 +272,7 @@ pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
         );
     }
     for rt in &live {
-        snap_one(rt, &env, &agent, capture_harness)?;
+        snap_one(rt, &env, capture_harness)?;
     }
     Ok(0)
 }
@@ -149,96 +281,142 @@ pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
 /// `capture_harness` also captures the project's MCP/skills/config (redacting secrets); `--no-harness` skips it.
 pub fn sync(runtime: &str, capture_harness: bool) -> Result<i32> {
     let env = scope::env_root()?;
-    let agent = scope::root_for(Scope::Agent)?;
-    snap_one(&normalize(runtime), &env, &agent, capture_harness)
+    snap_one(&normalize(runtime), &env, capture_harness)
 }
 
-fn snap_one(rt: &str, env: &Path, agent: &Path, capture_harness: bool) -> Result<i32> {
+fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
     let rt = normalize(rt);
-    let (stats, source_desc, hits, dst) = mirror_once(&rt, env, agent)?;
+    let (routed, source_desc) = route(&rt, env)?;
 
     println!("Mirrored the session dump for {}:", rt);
     println!("  source : {source_desc}");
-    println!("  target : {}", dst.display());
-    println!("  files  : {} files ({} updated / {} added), {} bytes", stats.total, stats.updated, stats.added, stats.bytes);
-    if hits > 0 {
-        eprintln!("  ⚠ Found {hits} likely secrets — the session transcript carries sensitive content the agent has seen.");
-        eprintln!("     This will be blocked again before push; run `agit -a scan` first to check, or clear it from the transcript.");
+    if routed.is_empty() {
+        println!("  (no sessions this project owns — nothing to mirror)");
+        return Ok(0);
     }
 
-    // Capture the harness (MCP servers / skills / config) alongside the sessions, redacting secrets.
-    if capture_harness {
-        match crate::harness::capture(agent, env, &rt) {
-            Ok(r) if r.files > 0 => {
-                println!(
-                    "  harness: {} files ({} secret field(s) redacted)",
-                    r.files,
-                    r.redactions.len()
-                );
-                for w in &r.warnings {
-                    eprintln!("  ⚠ {w}");
-                }
-            }
-            Ok(_) => {}
-            // Harness capture must never fail the snap — the session dump is already mirrored.
-            Err(e) => eprintln!("  ⚠ harness capture skipped: {e:#}"),
+    for r in &routed {
+        if let Some(n) = &r.note {
+            eprintln!("  note   : {n}");
         }
-    }
+        let (stats, hits, dst) = mirror_owned(&rt, env, r)?;
+        let who = match &r.agent {
+            Some(a) => format!("   ({a} · {} session(s))", r.sessions.len()),
+            None => String::new(),
+        };
+        println!("  target : {}{who}", dst.display());
+        println!("  files  : {} files ({} updated / {} added), {} bytes", stats.total, stats.updated, stats.added, stats.bytes);
+        if hits > 0 {
+            eprintln!("  ⚠ Found {hits} likely secrets — the session transcript carries sensitive content the agent has seen.");
+            eprintln!("     This will be blocked again before push; run `agit -a scan` first to check, or clear it from the transcript.");
+        }
 
-    println!("\n  Commit: agit a add -A && agit a commit -m 'snap {rt} sessions'");
+        // Capture the harness (MCP servers / skills / config) alongside the sessions, redacting
+        // secrets. The harness is project-scoped, so every agent that worked here carries its own
+        // copy — a store a teammate clones has to stand on its own.
+        if capture_harness {
+            match crate::harness::capture(&r.store, env, &rt) {
+                Ok(h) if h.files > 0 => {
+                    println!("  harness: {} files ({} secret field(s) redacted)", h.files, h.redactions.len());
+                    for w in &h.warnings {
+                        eprintln!("  ⚠ {w}");
+                    }
+                }
+                Ok(_) => {}
+                // Harness capture must never fail the snap — the session dump is already mirrored.
+                Err(e) => eprintln!("  ⚠ harness capture skipped: {e:#}"),
+            }
+        }
+        println!("\n  Commit: {}", r.commit_hint(&rt));
+    }
     Ok(0)
 }
 
-/// The mirror step shared by one-shot `snap` and the `--watch` loop: copy the runtime's dump into the
-/// Agent Store and secret-scan it. Returns (stats, human source description, secret hits, destination dir).
-fn mirror_once(rt: &str, env: &Path, agent: &Path) -> Result<(Stats, String, usize, PathBuf)> {
-    let dst = agent.join(SESSIONS_SUBDIR).join(rt);
-    std::fs::create_dir_all(&dst)?;
-    // Runtimes differ in storage model, but the ownership rule is the same for both: mirror ONLY this
-    // project's sessions, decided by the cwd recorded in the transcript. Claude splits by project slug
-    // (which collides — see claude_collect); Codex splits by date with all projects mixed.
-    let (stats, source_desc) = match rt {
-        "claude-code" => claude_collect(env, &dst)?,
-        "codex" => codex_collect(env, &dst)?,
-        other => bail!("session dump for runtime `{other}` isn't wired up yet (see src/session.rs)"),
-    };
-    let hits = crate::scan::scan_tree(&dst)?;
-    Ok((stats, source_desc, hits, dst))
-}
-
-/// Claude capture: mirror only the sessions this project owns out of `~/.claude/projects/<slug>/`.
+/// Mirror one agent's share of the dump into ITS store, and secret-scan what landed.
 ///
-/// `slug_for` collapses every non-alphanumeric char, so `/a/b.c`, `/a/b-c` and `/a/b/c` all share ONE
-/// slug directory. Tree-mirroring it copied a *different* project's transcripts into this Agent Store,
-/// and a push then shipped them to this project's teammates. Ownership comes from each transcript's
-/// launch cwd (`claude_code::project_sessions`), so a colliding neighbour is skipped.
-fn claude_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
-    let src = source_dir("claude-code", env)?;
-    let owned = claude_code::project_sessions(env);
+/// Runtimes differ in storage model, but the ownership rule is the same for both: mirror ONLY this
+/// project's sessions, decided by the cwd recorded in the transcript (`live_sessions`).
+fn mirror_owned(rt: &str, env: &Path, r: &Routed) -> Result<(Stats, usize, PathBuf)> {
+    let dst = r.store.join(SESSIONS_SUBDIR).join(rt);
+    std::fs::create_dir_all(&dst)?;
     let mut stats = Stats::default();
-    for (path, id) in &owned {
-        copy_if_changed(path, &dst.join(format!("{id}.jsonl")), &mut stats)?;
+    for o in &r.sessions {
+        let dp = dst.join(format!("{}.jsonl", o.id));
+        let copied = copy_if_changed(&o.src, &dp, &mut stats)?;
+        // The sidecar is a pure function of the transcript, so rewriting it unchanged would turn every
+        // watch tick into a commit. Building it re-reads the transcript, so do it only when one moved.
+        if copied || !crate::commands::sidecar_path(&dp).exists() {
+            write_sidecar(&dp, o, env, rt)?;
+        }
         // a session's sidecars (subagents/, tool-results/) live under a dir named for its id
-        let side = src.join(id);
-        if side.is_dir() {
-            let s = mirror(&side, &dst.join(id))?;
-            stats.total += s.total;
-            stats.added += s.added;
-            stats.updated += s.updated;
-            stats.bytes += s.bytes;
+        if let Some(side) = o.src.parent().map(|d| d.join(&o.id)).filter(|d| d.is_dir()) {
+            stats.absorb(mirror(&side, &dst.join(&o.id))?);
         }
     }
     // `memory/` hangs off the slug, not off any session, so under a collision it belongs to nobody in
     // particular and cannot be attributed. Carry it only when we have the slug dir to ourselves.
-    let mem = src.join("memory");
-    if mem.is_dir() && claude_code::slug_dir_is_exclusive(env) {
-        let s = mirror(&mem, &dst.join("memory"))?;
-        stats.total += s.total;
-        stats.added += s.added;
-        stats.updated += s.updated;
-        stats.bytes += s.bytes;
+    if rt == "claude-code" && !r.sessions.is_empty() {
+        let mem = source_dir("claude-code", env)?.join("memory");
+        if mem.is_dir() && claude_code::slug_dir_is_exclusive(env) {
+            stats.absorb(mirror(&mem, &dst.join("memory"))?);
+        }
     }
-    Ok((stats, format!("{} ({} owned sessions)", src.display(), owned.len())))
+    let hits = crate::scan::scan_tree(&dst)?;
+    Ok((stats, hits, dst))
+}
+
+/// What the store records about a captured session (§6). It exists so the facts `start` needs survive a
+/// clone: git carries content, but not mtimes, and not the launch record, which is machine-local.
+fn write_sidecar(dp: &Path, o: &Owned, env: &Path, rt: &str) -> Result<()> {
+    let mut v = serde_json::json!({
+        "env": env.display().to_string(),
+        "runtime": rt,
+        "last_activity": last_activity(&o.src),
+    });
+    if let Some(a) = &o.by {
+        v["aid"] = a.aid().into();
+        v["name"] = a.name().into();
+        // A guess must stay legible as a guess to whoever clones this store later.
+        v["attributed_by"] = match a {
+            Attribution::Launched(_) => "launch-record",
+            Attribution::RepoDefault { .. } => "repo-default",
+        }
+        .into();
+    }
+    let body = format!("{}\n", serde_json::to_string_pretty(&v)?);
+    let p = crate::commands::sidecar_path(dp);
+    if std::fs::read_to_string(&p).ok().as_deref() != Some(body.as_str()) {
+        std::fs::write(&p, body)?;
+    }
+    Ok(())
+}
+
+/// When a transcript last did anything: the last record carrying a timestamp. Both runtimes write a
+/// top-level RFC3339 `timestamp` on every record (verified against real dumps from each).
+pub(crate) fn last_activity(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).ok()?;
+    let mut last = None;
+    for line in std::io::BufReader::new(f).lines() {
+        let Ok(line) = line else { break };
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue; // leading records may be queue-operations / non-JSON
+        };
+        if let Some(t) = rec.get("timestamp").and_then(|v| v.as_str()).filter(|t| !t.is_empty()) {
+            last = Some(t.to_string());
+        }
+    }
+    last
+}
+
+/// The store the convert worker acts on when capture has not routed anything yet: the agent this repo
+/// resolves to, else the legacy nested store. Converting is not attribution — it makes THIS agent's
+/// sessions resumable in either CLI — so the resolved agent is the right answer here.
+pub fn convert_target() -> Result<PathBuf> {
+    match crate::agent::resolve(None) {
+        Ok(a) => Ok(a.store),
+        Err(_) => scope::root_for(Scope::Agent),
+    }
 }
 
 /// `agit -a snap --watch [--interval N]` — **fully automatic snap**: watch the runtime's session dump and,
@@ -253,7 +431,6 @@ pub fn snap_watch_checked(runtime: &str, interval_secs: u64, capture_harness: bo
 
 pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> Result<i32> {
     let env = scope::env_root()?;
-    let agent = scope::root_for(Scope::Agent)?;
     let rt = normalize(runtime);
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
     let watch = source_path(&rt, &env);
@@ -273,22 +450,34 @@ pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> R
             pending = true;
             last_sig = sig;
         } else if pending {
-            match mirror_once(&rt, &env, &agent) {
-                Ok((stats, _, hits, _)) if stats.added + stats.updated > 0 => {
-                    // --no-harness must mean the same thing here as it does for `--watch` with no
-                    // --from: one documented flag cannot have two behaviours decided by another flag.
-                    if capture_harness {
-                        let _ = crate::harness::capture(&agent, &env, &rt);
-                    }
-                    commit_snap(&agent, &rt, hits, &mut count)
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("  snap failed: {e:#}"),
+            // --no-harness must mean the same thing here as it does for `--watch` with no --from: one
+            // documented flag cannot have two behaviours decided by another flag.
+            if let Err(e) = capture_pass(&rt, &env, capture_harness, &mut count) {
+                eprintln!("  snap failed: {e:#}");
             }
             pending = false;
         }
         std::thread::sleep(interval);
     }
+}
+
+/// One settled capture: mirror + commit into every store that has sessions here (§6). Returns the
+/// stores it touched, so the convert worker keeps up with agents that appear while it runs.
+fn capture_pass(rt: &str, env: &Path, capture_harness: bool, count: &mut u64) -> Result<Vec<PathBuf>> {
+    let (routed, _) = route(rt, env)?;
+    for r in &routed {
+        match mirror_owned(rt, env, r) {
+            Ok((stats, hits, _)) if stats.added + stats.updated > 0 => {
+                if capture_harness {
+                    let _ = crate::harness::capture(&r.store, env, rt);
+                }
+                commit_snap(&r.store, rt, hits, count);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("  snap {rt} failed: {e:#}"),
+        }
+    }
+    Ok(routed.into_iter().map(|r| r.store).collect())
 }
 
 /// Stage + commit the mirrored dump. Nothing staged → no-op. Commit blocked by the pre-commit secret hook → warn.
@@ -356,16 +545,23 @@ struct Stats {
     bytes: u64,
 }
 
-/// Codex sync: scan ~/.codex/sessions and flatten only **this project's** rollouts
-/// (session_meta.cwd == env root) into dst/<id>.jsonl. Filtering by cwd is a privacy
-/// bottom line — never pull in another project's sessions.
-/// Copy one file if the destination is missing, a different size, or older. Shared by both runtimes'
-/// collectors. Missing mtimes are treated as "re-copy", which is the conservative direction.
-fn copy_if_changed(src: &Path, dp: &Path, st: &mut Stats) -> Result<()> {
+impl Stats {
+    fn absorb(&mut self, o: Stats) {
+        self.total += o.total;
+        self.added += o.added;
+        self.updated += o.updated;
+        self.bytes += o.bytes;
+    }
+}
+
+/// Copy one file if the destination is missing, a different size, or older; report whether it copied.
+/// Missing mtimes are treated as "re-copy", which is the conservative direction.
+fn copy_if_changed(src: &Path, dp: &Path, st: &mut Stats) -> Result<bool> {
     if let Some(parent) = dp.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let smeta = std::fs::metadata(src)?;
+    let mut copied = true;
     match std::fs::metadata(dp) {
         Err(_) => {
             std::fs::copy(src, dp)?;
@@ -379,25 +575,14 @@ fn copy_if_changed(src: &Path, dp: &Path, st: &mut Stats) -> Result<()> {
             if dmeta.len() != smeta.len() || newer {
                 std::fs::copy(src, dp)?;
                 st.updated += 1;
+            } else {
+                copied = false;
             }
         }
     }
     st.total += 1;
     st.bytes += smeta.len();
-    Ok(())
-}
-
-fn codex_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
-    let rollouts = crate::adapter::codex::project_rollouts(env);
-    let mut st = Stats::default();
-    for (src, id) in &rollouts {
-        copy_if_changed(src, &dst.join(format!("{id}.jsonl")), &mut st)?;
-    }
-    let root = crate::adapter::codex::sessions_root()
-        .map(|r| r.display().to_string())
-        .unwrap_or_default();
-    let desc = format!("{root} (cwd={} matched {} rollouts)", env.display(), rollouts.len());
-    Ok((st, desc))
+    Ok(copied)
 }
 
 /// Recursively mirror src → dst (decide whether to overwrite by size + mtime only, which is good enough).
@@ -451,13 +636,15 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
     let env = scope::env_root()?;
-    let agent = scope::root_for(Scope::Agent)?;
     let interval = Duration::from_secs(interval_secs.max(1));
     let runtimes = RUNTIMES;
     let mut last: HashMap<&str, String> = HashMap::new();
     let mut pending: HashMap<&str, bool> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut count = 0u64;
+    // The stores to auto-convert: what this repo resolves to now, plus every store a capture routes
+    // into. One agent's sessions must not stop converting because another agent also worked here.
+    let mut stores: Vec<PathBuf> = convert_target().into_iter().collect();
     println!(
         "Watching {} every {}s: auto-snap{}. Ctrl-C to stop.",
         runtime_list(),
@@ -474,20 +661,22 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
                 pending.insert(rt, true);
             } else if pending.get(rt).copied().unwrap_or(false) {
                 pending.insert(rt, false);
-                match mirror_once(rt, &env, &agent) {
-                    Ok((stats, _, hits, _)) if stats.added + stats.updated > 0 => {
-                        if capture_harness {
-                            let _ = crate::harness::capture(&agent, &env, rt);
+                match capture_pass(rt, &env, capture_harness, &mut count) {
+                    Ok(touched) => {
+                        for s in touched {
+                            if !stores.contains(&s) {
+                                stores.push(s);
+                            }
                         }
-                        commit_snap(&agent, rt, hits, &mut count);
                     }
-                    Ok(_) => {}
                     Err(e) => eprintln!("  snap {rt} failed: {e:#}"),
                 }
             }
         }
         if do_convert {
-            crate::commands::convert_pass(&agent, &mut seen);
+            for s in &stores {
+                crate::commands::convert_pass(s, &env, &mut seen);
+            }
         }
         std::thread::sleep(interval);
     }
@@ -591,6 +780,154 @@ pub fn watch_status() -> Result<i32> {
 }
 
 #[cfg(test)]
+pub(crate) mod testenv {
+    use std::path::Path;
+
+    /// $HOME drives the runtimes' dump dirs and $AGIT_HOME drives agit's stores. Both are
+    /// process-global, so every test that needs them takes THIS lock and puts them back: a leaked
+    /// $HOME points the next test at the developer's real sessions, and two locks are no lock at all.
+    pub fn with(home: &Path, agit_home: &Path, f: impl FnOnce()) {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = [var("HOME"), var("AGIT_HOME")];
+        std::env::set_var("HOME", home);
+        std::env::set_var("AGIT_HOME", agit_home);
+        f();
+        restore("HOME", &old[0]);
+        restore("AGIT_HOME", &old[1]);
+    }
+
+    fn var(k: &str) -> Option<String> {
+        std::env::var(k).ok()
+    }
+
+    fn restore(k: &str, v: &Option<String>) {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn transcript(cwd: &Path, ts: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"{}\",\"timestamp\":\"{ts}\",\"message\":{{\"content\":\"hi\"}}}}\n",
+            cwd.display()
+        )
+    }
+
+    /// Acceptance criterion 4: two agents at once in ONE repo, each capturing to its OWN store,
+    /// attributed by launch record.
+    ///
+    /// The correctness core of multi-agent. Both runtimes dump per PROJECT, so both agents' sessions
+    /// land in ONE folder and the session id is the only thing that can tell them apart. Attribution
+    /// by the active pointer would file both under whichever agent happened to be active — silently,
+    /// and then push one team's transcript to the other's remote.
+    #[test]
+    fn two_agents_in_one_repo_capture_into_their_own_stores() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::new_agent("frontend").unwrap();
+            let api = crate::agent::new_agent("api").unwrap();
+
+            // ONE dump folder: claude keys on the project's cwd slug, never on the agent.
+            let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
+            std::fs::create_dir_all(&slug).unwrap();
+            std::fs::write(slug.join("s-fe.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
+            std::fs::write(slug.join("s-api.jsonl"), transcript(&env, "2026-07-16T10:00:00.000Z")).unwrap();
+
+            crate::commands::record_launch("s-fe", &fe.aid, "frontend", &env, "claude-code").unwrap();
+            crate::commands::record_launch("s-api", &api.aid, "api", &env, "claude-code").unwrap();
+
+            let (routed, _) = route("claude-code", &env).unwrap();
+            assert_eq!(routed.len(), 2, "one pass must write into BOTH agents' stores, not collapse to one");
+            for r in &routed {
+                mirror_owned("claude-code", &env, r).unwrap();
+            }
+
+            let fe_sessions = fe.store.join("sessions/claude-code");
+            let api_sessions = api.store.join("sessions/claude-code");
+            assert!(fe_sessions.join("s-fe.jsonl").exists(), "frontend's session must land in frontend's store");
+            assert!(api_sessions.join("s-api.jsonl").exists(), "api's session must land in api's store");
+            assert!(!fe_sessions.join("s-api.jsonl").exists(), "MISFILED: api's transcript is in frontend's store");
+            assert!(!api_sessions.join("s-fe.jsonl").exists(), "MISFILED: frontend's transcript is in api's store");
+            // the store is keyed by aid, so the path on disk IS the attribution
+            assert!(fe.store.ends_with(&fe.aid) && api.store.ends_with(&api.aid));
+
+            // The sidecar carries identity and recency into the store, where a clone can still read
+            // them: the launch record is machine-local and never travels.
+            let side: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(fe_sessions.join("s-fe.agit.json")).unwrap()).unwrap();
+            assert_eq!(side["aid"], fe.aid);
+            assert_eq!(side["name"], "frontend");
+            assert_eq!(side["attributed_by"], "launch-record", "a record is authoritative and must say so");
+            assert_eq!(side["last_activity"], "2026-07-16T09:00:00.000Z");
+            assert_eq!(side["env"], env.display().to_string());
+        });
+    }
+
+    /// The convert worker installs its output as a NEW session in the project's dump folder. Without a
+    /// launch record of its own that copy reads as hand-started, so capture files it under the repo's
+    /// DEFAULT agent — converting `frontend`'s memory would deposit a copy of it in `api`'s store, and
+    /// `agit a push` would then hand it to api's team.
+    #[test]
+    fn a_converted_session_is_attributed_back_to_the_agent_it_came_from() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::new_agent("frontend").unwrap();
+            let d = fe.store.join("sessions/claude-code");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("s1.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
+
+            crate::commands::convert_pass(&fe.store, &env, &mut std::collections::HashSet::new());
+
+            let log = std::fs::read_to_string(agit_home.path().join("launches.jsonl"))
+                .expect("the converted copy must get a launch record of its own");
+            let recs: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            let codex = recs.iter().find(|r| r["runtime"] == "codex").expect("claude-code → codex must be recorded");
+            assert_eq!(codex["aid"], fe.aid, "agit's own output must be attributed to the agent it converted FROM");
+        });
+    }
+
+    /// The record's `name` is a snapshot from launch time, so a rename since then must not orphan it
+    /// or make capture report a label that no longer exists: the aid is the identity.
+    #[test]
+    fn a_stale_label_in_the_record_still_resolves_by_aid() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::new_agent("frontend").unwrap();
+            let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
+            std::fs::create_dir_all(&slug).unwrap();
+            std::fs::write(slug.join("s1.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
+            // launched as `web`, since renamed to `frontend`
+            crate::commands::record_launch("s1", &fe.aid, "web", &env, "claude-code").unwrap();
+
+            let (routed, _) = route("claude-code", &env).unwrap();
+            assert_eq!(routed.len(), 1);
+            assert_eq!(routed[0].store, fe.store, "the store is keyed by aid, so a rename never moves it");
+            assert_eq!(routed[0].agent.as_deref(), Some("frontend"), "the report must use the current label");
+        });
+    }
+}
+
+#[cfg(test)]
 mod claude_ownership_tests {
     use super::*;
 
@@ -629,7 +966,8 @@ mod claude_ownership_tests {
         .unwrap();
         std::fs::write(slug_dir.join("nocwd.jsonl"), "{\"type\":\"queue-operation\"}\n").unwrap();
 
-        temp_env(home.path(), || {
+        let agit_home = tempfile::tempdir().unwrap();
+        testenv::with(home.path(), agit_home.path(), || {
             let owned: Vec<String> = claude_code::project_sessions(&a).into_iter().map(|(_, id)| id).collect();
             assert!(owned.contains(&"mine.jsonl".replace(".jsonl", "")), "own session must be captured");
             assert!(owned.contains(&"drift".to_string()), "cd-drift must not lose ownership");
@@ -640,19 +978,6 @@ mod claude_ownership_tests {
         });
     }
 
-    /// $HOME drives claude's projects dir; set it only for the closure. Serialized because it is process-global.
-    fn temp_env(home: &Path, f: impl FnOnce()) {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("HOME").ok();
-        std::env::set_var("HOME", home);
-        f();
-        match old {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
-    }
 }
 
 
