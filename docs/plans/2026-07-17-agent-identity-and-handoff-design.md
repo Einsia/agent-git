@@ -369,19 +369,33 @@ history could know: a UUID-id rollout absent from codex's index **recalled** it;
 proper-name id answered from thin air with **exit 0**. A non-UUID thread id hard-errors — the only loud
 failure in the entire path.
 
-**codex names** (`codex resume <name>`) resolve via `~/.codex/state_5.sqlite`:
-`SELECT rollout_path FROM threads WHERE title = ? AND cwd = ? AND archived = 0 ORDER BY updated_at_ms DESC`.
-**No file fallback** — a dropped file is never name-resumable. Three traps:
-1. **The name self-destructs**: every resume re-upserts `title = excluded.title`, derived from the
-   rollout's **first user message**. A title set in SQL works *exactly once*.
-2. **The fix (proven)**: make the rollout's **first user message literally be the name** → the upsert
-   re-derives the same title forever, self-healing.
-3. **Everything else fails silently** (fresh empty session, exit 0).
+**codex names are NOT resumable — at all.** An earlier draft of this section proposed reaching
+name-resumption via the app-server RPC plus a self-healing synthetic first turn, and called the latter
+"proven". Both were re-tested against codex 0.144.4 and **both are false**. Four runs, each name-resume
+paired with a UUID control on the *same thread*, each asked for a codeword only its own history holds:
 
-**Decision:** set the name via codex's own **app-server RPC `thread/name/set {threadId, name}`** (not raw
-SQL — `state_5` is a generation counter with 40 checksummed migrations, several historically
-destructive), prepend the synthetic first turn, **verify by re-resolving**, and **fall back to UUID** on
-any mismatch. Names are opt-in; UUID always works.
+| thread     | how the name was set                | `codex exec resume <name>` | `codex exec resume <uuid>` |
+|------------|-------------------------------------|----------------------------|----------------------------|
+| `019f6c84` | app-server `thread/name/set`        | `NONE` (exit 0)            | `PANGOLIN73VAULT`          |
+| `019f6c83` | rollout's first user message *is* the name | `NONE` (exit 0)     | `NARWHAL31TUNDRA`          |
+
+The UUID controls recall the codeword, so the history is there and the sessions are sound; name-resume
+silently starts a **fresh, empty session and exits 0**. This is the failure mode agit exists to prevent,
+so the rule is unconditional: **the install id is ALWAYS a UUID.** There is no opt-in name path to fall
+back *from* — `install_id` (src/commands.rs) is the enforcement point.
+
+Why the earlier draft misread it: codex's v2 protocol carries `Thread.name` ("Optional user-facing thread
+title") and `Thread.preview` ("Usually the first user message") as **separate** fields. The first-user-
+message trick only ever writes `preview`; it leaves `name` null, which is why it never self-healed a name.
+`thread/name/set` does durably write `name` (it survives an app-server restart, and is distinct from
+`preview`) — it just has no bearing on what `resume` will resolve.
+
+**`thread/name/set` is still worth calling, for discoverability only.** Verified: invoking it on a rollout
+agit dropped on disk — a file codex has never indexed — both succeeds *and forces the thread into the
+index*, after which it appears in `codex resume`'s picker under agit's proper name. So a converted session
+becomes findable by a human under the name it deserves, while the UUID does the actual resumption. The
+app-server is flagged `[experimental]`, so this must **fail soft**: no app-server, no RPC, or an error →
+skip the label. It can never regress resumption, because resumption never depended on it.
 
 **claude names**: drop the file only — nothing to register. `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`,
 a `custom-title` record in the **tail 64KB** (re-appended on later writes), `isSidechain:false` on every
