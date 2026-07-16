@@ -116,11 +116,16 @@ you don't have to touch `PATH`.
 
 ## AgentGitHub Hub
 
-`agit-hub` hosts Agent Stores (bare git repos), git-smart-http sync, and web browsing. Push requires a
-**write token** (`agit-hub token add … --write`); with `serve --private`, reads need a token too. The
-frontend is a React SPA compiled into the binary (hub-ui/): every session has an event spine,
-provenance, permalinks, and a revision diff. See [`docs/hub.md`](docs/hub.md). After changing the
-frontend, rebuild it with `./build.sh ui`.
+`agit-hub` hosts Agent Stores (bare git repos), git-smart-http sync, and web browsing. The frontend is a
+React SPA compiled into the binary (hub-ui/): every session has an event spine, provenance, permalinks,
+and a revision diff. See [`docs/hub.md`](docs/hub.md). After changing the frontend, rebuild it with
+`./build.sh ui`.
+
+**Permissions are per agent**: each has an owner, a visibility (private/public), and members
+(read/write/admin). People sign in with a username and password (argon2id + a cookie session); git and
+scripts use tokens, which can be bound to a single agent, given a TTL, and revoked. Every entry point —
+including git smart-http — goes through one decision, `agit::hub::acl::decide`. Private by default, and
+the server binds loopback unless you explicitly expose it.
 
 ## Roadmap
 

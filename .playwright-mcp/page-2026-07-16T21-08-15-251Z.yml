@@ -1,0 +1,80 @@
+- generic [ref=f4e3]:
+  - banner [ref=f4e4]:
+    - generic [ref=f4e5]:
+      - link "◆ agit·hub" [ref=f4e6] [cursor=pointer]:
+        - /url: /
+      - navigation [ref=f4e7]:
+        - link "agents" [ref=f4e8] [cursor=pointer]:
+          - /url: /
+        - link "tokens" [ref=f4e9] [cursor=pointer]:
+          - /url: /tokens
+        - link "audit" [ref=f4e10] [cursor=pointer]:
+          - /url: /audit
+      - generic [ref=f4e11]:
+        - generic [ref=f4e12]: alice
+        - button "登出" [ref=f4e13] [cursor=pointer]
+        - button "切换主题" [ref=f4e17] [cursor=pointer]
+  - main [ref=f4e24]:
+    - generic [ref=f4e25]:
+      - generic [ref=f4e26]:
+        - paragraph [ref=f4e27]: 版本化的 agent 工作记忆
+        - heading "团队里每个 agent 的会话，可读、可信、可拉。" [level=1] [ref=f4e28]
+        - paragraph [ref=f4e29]: 每条 session 是一次 agent 工作的完整记录——它读过什么、跑过什么、下一步是什么。 在这里判断该不该把别人的上下文拉进自己的项目。
+        - generic [ref=f4e31]:
+          - generic [ref=f4e32]: prompt
+          - generic [ref=f4e34]: reply
+          - generic [ref=f4e36]: tool
+          - generic [ref=f4e38]: edit
+      - generic [ref=f4e40]:
+        - generic [ref=f4e41]:
+          - generic [ref=f4e42]:
+            - heading "Agents" [level=2] [ref=f4e43]
+            - generic [ref=f4e44]: "3"
+          - link "新建 agent" [ref=f4e45] [cursor=pointer]:
+            - /url: /new
+        - generic [ref=f4e47]:
+          - generic [ref=f4e48]: agent
+          - generic [ref=f4e49]: 最近活动
+          - generic [ref=f4e50]: 规模
+        - generic [ref=f4e51]:
+          - link "billing-agent private admin 2026-07-14refactor invoice retry 12 session" [ref=f4e52] [cursor=pointer]:
+            - /url: /agent/billing-agent
+            - generic [ref=f4e53]:
+              - generic [ref=f4e54]:
+                - generic [ref=f4e55]: billing-agent
+                - img "private" [ref=f4e56]
+              - generic [ref=f4e62]: admin
+            - generic [ref=f4e64]: 2026-07-14refactor invoice retry
+            - generic [ref=f4e65]:
+              - text: "12"
+              - generic [ref=f4e66]: session
+          - link "docs-agent public read 2026-07-10sync api reference 3 session" [ref=f4e67] [cursor=pointer]:
+            - /url: /agent/docs-agent
+            - generic [ref=f4e68]:
+              - generic [ref=f4e69]: docs-agent
+              - generic [ref=f4e74]:
+                - generic [ref=f4e75]: public
+                - generic [ref=f4e76]: read
+            - generic [ref=f4e77]: 2026-07-10sync api reference
+            - generic [ref=f4e78]:
+              - text: "3"
+              - generic [ref=f4e79]: session
+          - link "payments-agent public admin 空尚未 push 0 session" [ref=f4e80] [cursor=pointer]:
+            - /url: /agent/payments-agent
+            - generic [ref=f4e81]:
+              - generic [ref=f4e82]: payments-agent
+              - generic [ref=f4e87]:
+                - generic [ref=f4e88]: public
+                - generic [ref=f4e89]: admin
+            - generic [ref=f4e90]: 空尚未 push
+            - generic [ref=f4e91]:
+              - text: "0"
+              - generic [ref=f4e92]: session
+        - generic [ref=f4e93]:
+          - generic [ref=f4e94]:
+            - text: API
+            - link "/api/agents" [ref=f4e95] [cursor=pointer]:
+              - /url: /api/agents
+          - generic [ref=f4e96]:
+            - text: 发布
+            - code [ref=f4e97]: agit -a push http://127.0.0.1:8177/<name>.git

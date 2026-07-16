@@ -1,0 +1,24 @@
+- generic [ref=f5e3]:
+  - banner [ref=f5e4]:
+    - generic [ref=f5e5]:
+      - link "◆ agit·hub" [ref=f5e6] [cursor=pointer]:
+        - /url: /
+      - button "切换主题" [ref=f5e8] [cursor=pointer]
+  - main [ref=f5e15]:
+    - generic [ref=f5e46]:
+      - paragraph [ref=f5e47]: 登录
+      - heading "agit·hub" [level=1] [ref=f5e48]
+      - paragraph [ref=f5e49]: 会话记录是私有的。登录后只会看到你有权限的 agent。
+      - generic [ref=f5e50]:
+        - generic [ref=f5e51]:
+          - generic [ref=f5e52]: 用户名
+          - textbox "用户名" [ref=f5e53]: alice
+        - generic [ref=f5e54]:
+          - generic [ref=f5e55]: 密码
+          - textbox "密码" [ref=f5e56]: wrong
+        - alert [ref=f5e60]: 用户名或密码不对。
+        - button "登录" [ref=f5e59] [cursor=pointer]
+      - paragraph [ref=f5e57]:
+        - text: 脚本和 git 用 token，不用密码：登录后到
+        - code [ref=f5e58]: /tokens
+        - text: 建一个。

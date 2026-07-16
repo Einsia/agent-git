@@ -1,0 +1,117 @@
+- generic [ref=f3e3]:
+  - banner [ref=f3e4]:
+    - generic [ref=f3e5]:
+      - link "◆ agit·hub" [ref=f3e6] [cursor=pointer]:
+        - /url: /
+      - navigation [ref=f3e45]:
+        - link "agents" [ref=f3e46] [cursor=pointer]:
+          - /url: /
+        - link "tokens" [ref=f3e47] [cursor=pointer]:
+          - /url: /tokens
+        - link "audit" [ref=f3e48] [cursor=pointer]:
+          - /url: /audit
+      - generic [ref=f3e7]:
+        - generic [ref=f3e49]: alice
+        - button "登出" [ref=f3e50] [cursor=pointer]
+        - button "切换主题" [ref=f3e8] [cursor=pointer]
+  - main [ref=f3e15]:
+    - generic [ref=f3e59]:
+      - generic [ref=f3e60]:
+        - link "← payments-agent" [ref=f3e61] [cursor=pointer]:
+          - /url: /agent/payments-agent
+        - generic [ref=f3e62]:
+          - heading "payments-agent" [level=1] [ref=f3e63]
+          - generic [ref=f3e64]: public
+        - paragraph [ref=f3e68]: 设置
+      - generic [ref=f3e69]:
+        - paragraph [ref=f3e70]: 身份
+        - paragraph [ref=f3e71]: aid 是身份，改名不会变；名字只是标签。
+        - generic [ref=f3e72]:
+          - generic [ref=f3e73]:
+            - generic [ref=f3e74]: aid
+            - generic [ref=f3e75]:
+              - code [ref=f3e76]: agt_new-0000-0000-0000-000000000000
+              - button "复制" [ref=f3e77] [cursor=pointer]
+          - generic [ref=f3e81]:
+            - generic [ref=f3e82]: clone url
+            - generic [ref=f3e83]:
+              - code [ref=f3e84]: http://127.0.0.1:8177/payments-agent.git
+              - button "复制" [ref=f3e85] [cursor=pointer]
+          - generic [ref=f3e89]:
+            - generic [ref=f3e90]: owner
+            - generic [ref=f3e91]: alice
+          - generic [ref=f3e93]:
+            - generic [ref=f3e94]: size
+            - generic [ref=f3e95]: 4.6 MB
+          - generic [ref=f3e97]:
+            - generic [ref=f3e98]: sessions
+            - generic [ref=f3e99]: "0"
+          - generic [ref=f3e101]:
+            - generic [ref=f3e102]: runtimes
+            - generic [ref=f3e104]:
+              - generic [ref=f3e105]: claude-code
+              - generic [ref=f3e106]: codex
+      - generic [ref=f3e107]:
+        - paragraph [ref=f3e108]: 绑定代码仓库
+        - paragraph [ref=f3e109]: 放在代码仓库根目录的 .agit.toml，把这个仓库的会话记到该 agent 名下。
+        - generic [ref=f3e110]:
+          - generic [ref=f3e111]: "[agent] id = \"agt_new-0000-0000-0000-000000000000\" name = \"payments-agent\" remote = \"http://127.0.0.1:8177/payments-agent.git\""
+          - button "复制" [ref=f3e112] [cursor=pointer]
+      - generic [ref=f3e116]:
+        - paragraph [ref=f3e117]: 工作过的环境
+        - paragraph [ref=f3e118]: 这个 agent 的会话来自哪些代码仓库。
+        - generic [ref=f3e120]:
+          - code [ref=f3e121]: acme/billing
+          - generic [ref=f3e122]: 9 session
+          - generic [ref=f3e123]: 2026-07-14
+      - generic [ref=f3e124]:
+        - paragraph [ref=f3e125]: 分支
+        - generic [ref=f3e127]:
+          - code [ref=f3e133]: main
+          - code [ref=f3e134]: a1b2c3d
+          - generic [ref=f3e135]: 2026-07-14
+      - generic [ref=f3e136]:
+        - paragraph [ref=f3e137]: 成员
+        - paragraph [ref=f3e138]: private agent 只有 owner 和这里的人能读。
+        - generic [ref=f3e139]:
+          - generic [ref=f3e140]:
+            - generic [ref=f3e141]: alice
+            - generic [ref=f3e142]: owner
+          - generic [ref=f3e143]:
+            - generic [ref=f3e144]: bob
+            - generic [ref=f3e145]:
+              - combobox "bob 的角色" [ref=f3e146] [cursor=pointer]:
+                - option "read"
+                - option "write" [selected]
+                - option "admin"
+              - button "移除 bob" [ref=f3e147] [cursor=pointer]
+        - generic [ref=f3e151]:
+          - textbox "用户名" [ref=f3e152]
+          - combobox "新成员角色" [ref=f3e153] [cursor=pointer]:
+            - option "read" [selected]
+            - option "write"
+            - option "admin"
+          - button "添加" [disabled]
+      - generic [ref=f3e154]:
+        - paragraph [ref=f3e155]: 改名
+        - paragraph [ref=f3e156]: aid 不变，已有的 clone 需要改 remote。
+        - generic [ref=f3e157]:
+          - textbox [ref=f3e158]: payments-agent
+          - button "改名" [disabled]
+      - generic [ref=f3e159]:
+        - paragraph [ref=f3e160]: 可见性
+        - generic [ref=f3e161]:
+          - button "private" [ref=f3e162] [cursor=pointer]
+          - button "public" [ref=f3e166] [cursor=pointer]
+        - paragraph [ref=f3e170]: 现在任何能连上这台 hub 的人都能读它的全部会话内容。
+      - generic [ref=f3e171]:
+        - paragraph [ref=f3e172]: 危险操作
+        - paragraph [ref=f3e173]: 删除这个 agent
+        - paragraph [ref=f3e174]:
+          - text: 连同全部会话记录和历史一起删掉，不可恢复。已经 clone 出去的副本不受影响。 输入
+          - code [ref=f3e175]: payments-agent
+          - text: 确认。
+        - generic [ref=f3e176]:
+          - textbox "输入 agent 名字确认删除" [ref=f3e177]:
+            - /placeholder: payments-agent
+          - button "永久删除" [disabled]

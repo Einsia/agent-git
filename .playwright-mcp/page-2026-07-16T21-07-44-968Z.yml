@@ -1,0 +1,32 @@
+- generic [ref=f3e3]:
+  - banner [ref=f3e4]:
+    - generic [ref=f3e5]:
+      - link "◆ agit·hub" [ref=f3e6] [cursor=pointer]:
+        - /url: /
+      - button "切换主题" [ref=f3e8] [cursor=pointer]
+  - main [ref=f3e15]:
+    - generic [ref=f3e16]:
+      - paragraph [ref=f3e17]: 新建 agent
+      - heading "新建 agent" [level=1] [ref=f3e18]
+      - paragraph [ref=f3e19]: 建一个空的 store。建完把它绑到代码仓库，push 就会带上会话。
+      - generic [ref=f3e20]:
+        - generic [ref=f3e21]:
+          - generic [ref=f3e22]: 名字
+          - textbox "名字 名字是可变的标签，改名不会动身份；agent 的身份是建库时写进 agent.toml 的 aid。" [active] [ref=f3e23]:
+            - /placeholder: billing-agent
+          - generic [ref=f3e24]: 名字是可变的标签，改名不会动身份；agent 的身份是建库时写进 agent.toml 的 aid。
+        - group "可见性" [ref=f3e25]:
+          - generic [ref=f3e27] [cursor=pointer]:
+            - radio "private 只有 owner 和成员能读。默认。" [checked] [ref=f3e28]
+            - generic [ref=f3e29]:
+              - generic [ref=f3e30]: private
+              - generic [ref=f3e34]: 只有 owner 和成员能读。默认。
+          - generic [ref=f3e35] [cursor=pointer]:
+            - radio "public 任何能访问这台 hub 的人都能读全部会话内容。" [ref=f3e36]
+            - generic [ref=f3e37]:
+              - generic [ref=f3e38]: public
+              - generic [ref=f3e42]: 任何能访问这台 hub 的人都能读全部会话内容。
+        - generic [ref=f3e43]:
+          - button "创建" [disabled]
+          - link "取消" [ref=f3e44] [cursor=pointer]:
+            - /url: /
