@@ -31,11 +31,13 @@ fn normalize(runtime: &str) -> String {
     }
 }
 
-/// One side of the dialogue: its resumed session id, the tree it runs in, its diff since the ancestor.
+/// One side of the dialogue: its resumed session id, the tree it runs in, its diff since the ancestor,
+/// and a brief of its *other* same-branch sessions (a branch's work may span several sessions).
 struct Side {
     id: String,
     cwd: PathBuf,
     diff: String,
+    brief: String,
 }
 
 pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
@@ -63,22 +65,33 @@ pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    // 2. One representative session per side: A = latest local (not from the peer); B = latest incoming.
-    let a_path = latest_local_session(&agent, &rt, &incoming)
-        .context("no local session to represent A (does this branch have its own session yet?)")?;
-    let a_src = std::fs::read_to_string(&a_path)?;
-    let b_rel = incoming.last().unwrap();
-    let (rcb, b_src) = scope::git_in_status(&agent, &["show", &format!("{reference}:{b_rel}")]);
-    if rcb != 0 || b_src.trim().is_empty() {
-        bail!("could not read the peer session `{b_rel}`.");
+    // 2. Gather ALL of each side's sessions (a branch's work may span several). A = local (not from the
+    //    peer); B = the peer's incoming sessions from <ref>.
+    let a_all = local_sessions(&agent, &rt, &incoming);
+    if a_all.is_empty() {
+        bail!("no local session to represent A (does this branch have its own session yet?)");
+    }
+    let mut b_all: Vec<(String, String)> = Vec::new();
+    for rel in &incoming {
+        let (rc, content) = scope::git_in_status(&agent, &["show", &format!("{reference}:{rel}")]);
+        if rc == 0 && !content.trim().is_empty() {
+            b_all.push((rel.rsplit('/').next().unwrap_or(rel).to_string(), content));
+        }
+    }
+    if b_all.is_empty() {
+        bail!("could not read any peer session from `{reference}`.");
     }
 
-    // 3. Two worktrees + diffs (when both code branches are present in the repo and differ).
-    let branch_a = env_branch(&env).or_else(|| any_branch(&a_src));
-    let branch_b = branch_a.as_deref().and_then(|a| peer_branch(&b_src, a));
+    // 3. Branches, then pick the "voice" session per side (richest on that branch) + brief the rest.
+    let branch_a = env_branch(&env).or_else(|| a_all.iter().find_map(|(_, c)| any_branch(c)));
+    let branch_b = branch_a.as_deref().and_then(|a| b_all.iter().find_map(|(_, c)| peer_branch(c, a)));
+    let (a_voice, a_brief) = pick_side(&rt, &a_all, branch_a.as_deref());
+    let (b_voice, b_brief) = pick_side(&rt, &b_all, branch_b.as_deref());
+
+    // 4. Two worktrees + diffs (when both code branches are present in the repo and differ).
     let (mut a, mut b) = (
-        Side { id: convo::fresh_id("sync-a"), cwd: env.clone(), diff: String::new() },
-        Side { id: convo::fresh_id("sync-b"), cwd: env.clone(), diff: String::new() },
+        Side { id: convo::fresh_id("sync-a"), cwd: env.clone(), diff: String::new(), brief: a_brief },
+        Side { id: convo::fresh_id("sync-b"), cwd: env.clone(), diff: String::new(), brief: b_brief },
     );
     let mut worktrees: Vec<PathBuf> = Vec::new();
     let grounded = ground_on_worktrees(&env, &branch_a, &branch_b, &mut a, &mut b, &mut worktrees)?;
@@ -92,10 +105,13 @@ pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
         eprintln!("! Both code branches aren't in this repo (or share a name) — falling back to a single tree: the agents only see the current checkout, not each other's code.");
     }
 
-    // 4. Revive both sessions, bound to their own trees (never touching the user's real sessions).
-    install_copy(&rt, &a_src, &a.id, &a.cwd)?;
-    install_copy(&rt, &b_src, &b.id, &b.cwd)?;
-    eprintln!("Reviving both sessions (read-only): A={} … B={} …", &a.id[..8], &b.id[..8]);
+    // 5. Revive the voice session per side, bound to its own tree (never touching the user's real sessions).
+    install_copy(&rt, &a_voice, &a.id, &a.cwd)?;
+    install_copy(&rt, &b_voice, &b.id, &b.cwd)?;
+    eprintln!(
+        "Reviving both sessions (read-only): A={} ({} local) … B={} ({} incoming) …",
+        &a.id[..8], a_all.len(), &b.id[..8], b_all.len()
+    );
 
     // 5–6. Dialogue → synthesize → emit → inline resolution. Worktrees must stay alive through the
     // decision turn (which resumes A in its tree), so clean them up only after this whole block.
@@ -215,13 +231,13 @@ fn ground_on_worktrees(
 /// Run the dialogue, returning the full transcript. Split out so worktree cleanup can run unconditionally.
 fn run_dialogue(rt: &str, a: &Side, b: &Side) -> Result<Vec<(char, String)>> {
     let mut transcript: Vec<(char, String)> = Vec::new();
-    let mut msg = turn(rt, &a.cwd, &a.id, &open_prompt(&a.diff))?;
+    let mut msg = turn(rt, &a.cwd, &a.id, &open_prompt(&a.diff, &a.brief))?;
     println!("\nA → {msg}\n");
     transcript.push(('A', msg.clone()));
 
     let mut first_b = true;
     for _ in 0..MAX_ROUNDS {
-        let bp = if first_b { relay_first(&msg, &b.diff) } else { relay(&msg) };
+        let bp = if first_b { relay_first(&msg, &b.diff, &b.brief) } else { relay(&msg) };
         first_b = false;
         let bmsg = turn(rt, &b.cwd, &b.id, &bp)?;
         println!("B → {bmsg}\n");
@@ -339,17 +355,30 @@ fn diff_block(diff: &str) -> String {
     }
 }
 
-fn open_prompt(diff_a: &str) -> String {
+fn brief_block(brief: &str) -> String {
+    if brief.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{brief}")
+    }
+}
+
+fn open_prompt(diff_a: &str, brief_a: &str) -> String {
     format!(
         "You are agent A. You and another agent, B, each changed this repo from a common starting point, on \
-         separate branches, and are about to merge. Reconcile with B and find the real conflicts. {RULES}{}\n\n\
+         separate branches, and are about to merge. Reconcile with B and find the real conflicts. {RULES}{}{}\n\n\
          Start: briefly say what you changed since the fork, and ask B what they changed so you can check for conflicts.",
-        diff_block(diff_a)
+        diff_block(diff_a),
+        brief_block(brief_a)
     )
 }
 
-fn relay_first(other: &str, diff_b: &str) -> String {
-    format!("The other agent said: \"{other}\"\n\nRespond under the same rules. {RULES}{}", diff_block(diff_b))
+fn relay_first(other: &str, diff_b: &str, brief_b: &str) -> String {
+    format!(
+        "The other agent said: \"{other}\"\n\nRespond under the same rules. {RULES}{}{}",
+        diff_block(diff_b),
+        brief_block(brief_b)
+    )
 }
 
 fn relay(other: &str) -> String {
@@ -411,7 +440,8 @@ fn save_transcript(agent: &Path, rt: &str, a_id: &str, b_id: &str, transcript: &
     Ok(path)
 }
 
-fn latest_local_session(agent: &Path, rt: &str, incoming: &[String]) -> Option<PathBuf> {
+/// All local (not from the peer) sessions of this runtime, as (filename, content).
+fn local_sessions(agent: &Path, rt: &str, incoming: &[String]) -> Vec<(String, String)> {
     let incoming_names: std::collections::HashSet<&str> =
         incoming.iter().map(|p| p.rsplit('/').next().unwrap_or(p)).collect();
     let dir = agent.join("sessions").join(rt);
@@ -422,8 +452,48 @@ fn latest_local_session(agent: &Path, rt: &str, incoming: &[String]) -> Option<P
         .filter(|e| e.file_type().is_file())
         .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
         .filter(|e| !incoming_names.contains(e.file_name().to_string_lossy().as_ref()))
-        .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
-        .map(|e| e.path().to_path_buf())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            std::fs::read_to_string(e.path()).ok().map(|c| (name, c))
+        })
+        .collect()
+}
+
+/// Pick the "voice" session for a side and brief its other same-branch sessions.
+/// A branch's work may span several sessions; we resume the richest one and tell it about the rest
+/// (the diff remains the code ground-truth, so this only adds reasoning awareness, nothing lossy-critical).
+fn pick_side(rt: &str, sessions: &[(String, String)], branch: Option<&str>) -> (String, String) {
+    // Prefer sessions actually on this branch; if none match (branch unrecorded), consider them all.
+    let on_branch: Vec<&(String, String)> = match branch {
+        Some(b) => {
+            let f: Vec<&(String, String)> =
+                sessions.iter().filter(|(_, c)| any_branch(c).as_deref() == Some(b)).collect();
+            if f.is_empty() { sessions.iter().collect() } else { f }
+        }
+        None => sessions.iter().collect(),
+    };
+    // Voice = the richest (most lines) — a proxy for the most complete context.
+    let voice = on_branch.iter().max_by_key(|(_, c)| c.lines().count()).unwrap();
+    let others: Vec<&&(String, String)> = on_branch.iter().filter(|s| s.0 != voice.0).collect();
+
+    let mut brief = String::new();
+    if !others.is_empty() {
+        brief.push_str("Your earlier sessions on this branch (context — you are resuming the latest one):\n");
+        for (name, content) in others.iter().map(|s| (&s.0, &s.1)) {
+            let first = side_first_prompt(rt, content).unwrap_or_else(|| "(no prompt)".into());
+            brief.push_str(&format!("- {}: {}\n", &name[..name.len().min(8)], convo::truncate(&first, 120)));
+        }
+    }
+    (voice.1.clone(), brief)
+}
+
+/// The first real user prompt of a session (for the brief).
+fn side_first_prompt(rt: &str, content: &str) -> Option<String> {
+    let ir = match rt {
+        "codex" => crate::adapter::codex::parse_rollout(content, "x"),
+        _ => crate::adapter::claude_code::parse_jsonl(content, "x"),
+    };
+    ir.prompts.into_iter().next()
 }
 
 // ── git / worktree helpers ──
