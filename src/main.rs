@@ -111,6 +111,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
             let mut rt = "claude-code".to_string();
             let mut reference = None;
             let mut both = false;
+            let mut quick = false;
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -122,6 +123,10 @@ fn dispatch(argv: Vec<String>) -> i32 {
                         both = true;
                         i += 1;
                     }
+                    "--quick" => {
+                        quick = true;
+                        i += 1;
+                    }
                     other => {
                         if reference.is_none() && !other.starts_with('-') {
                             reference = Some(other.to_string());
@@ -131,9 +136,9 @@ fn dispatch(argv: Vec<String>) -> i32 {
                 }
             }
             match reference {
-                Some(r) => sync::run(&r, &rt, both),
+                Some(r) => sync::run(&r, &rt, both, quick),
                 None => {
-                    eprintln!("usage: agit -a sync <ref> [--both]   (reconcile this branch's agent with <ref>'s agent by dialogue)");
+                    eprintln!("usage: agit -a sync <ref> [--both] [--quick]   (reconcile this branch's agent with <ref>'s agent by dialogue; --quick skips the context handoff)");
                     Ok(2)
                 }
             }

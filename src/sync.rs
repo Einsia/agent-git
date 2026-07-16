@@ -19,8 +19,11 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Max dialogue rounds (one round = B replies once + A replies once).
-const MAX_ROUNDS: usize = 4;
+/// Max dialogue rounds (one round = B replies once + A replies once). Default mode opens with a
+/// mutual context handoff, so it needs headroom beyond the reconcile itself.
+const MAX_ROUNDS: usize = 6;
+/// `--quick`: skip the handoff, go straight to conflict-hunting with fewer rounds.
+const QUICK_ROUNDS: usize = 4;
 /// Cap on the diff (chars) fed to each agent.
 const DIFF_CAP: usize = 6000;
 
@@ -40,7 +43,7 @@ struct Side {
     brief: String,
 }
 
-pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
+pub fn run(reference: &str, runtime: &str, both: bool, quick: bool) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
     let rt = normalize(runtime);
@@ -116,7 +119,7 @@ pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
     // 5–6. Dialogue → synthesize → emit → inline resolution. Worktrees must stay alive through the
     // decision turn (which resumes A in its tree), so clean them up only after this whole block.
     let result = (|| -> Result<i32> {
-        let transcript = run_dialogue(&rt, &a, &b)?;
+        let transcript = run_dialogue(&rt, &a, &b, quick)?;
         let (resolved, open) = synthesize(&transcript)?;
         let archive = save_transcript(&agent, &rt, &a.id, &b.id, &transcript)?;
         println!("── sync result ──");
@@ -229,15 +232,18 @@ fn ground_on_worktrees(
 }
 
 /// Run the dialogue, returning the full transcript. Split out so worktree cleanup can run unconditionally.
-fn run_dialogue(rt: &str, a: &Side, b: &Side) -> Result<Vec<(char, String)>> {
+/// Default mode opens with a mutual context handoff (A briefs B on its whole working context, not just
+/// its diff; B hands its context back) before reconciling. `--quick` skips straight to conflict-hunting.
+fn run_dialogue(rt: &str, a: &Side, b: &Side, quick: bool) -> Result<Vec<(char, String)>> {
+    let rounds = if quick { QUICK_ROUNDS } else { MAX_ROUNDS };
     let mut transcript: Vec<(char, String)> = Vec::new();
-    let mut msg = turn(rt, &a.cwd, &a.id, &open_prompt(&a.diff, &a.brief))?;
+    let mut msg = turn(rt, &a.cwd, &a.id, &open_prompt(&a.diff, &a.brief, quick))?;
     println!("\nA → {msg}\n");
     transcript.push(('A', msg.clone()));
 
     let mut first_b = true;
-    for _ in 0..MAX_ROUNDS {
-        let bp = if first_b { relay_first(&msg, &b.diff, &b.brief) } else { relay(&msg) };
+    for _ in 0..rounds {
+        let bp = if first_b { relay_first(&msg, &b.diff, &b.brief, quick) } else { relay(&msg) };
         first_b = false;
         let bmsg = turn(rt, &b.cwd, &b.id, &bp)?;
         println!("B → {bmsg}\n");
@@ -363,19 +369,42 @@ fn brief_block(brief: &str) -> String {
     }
 }
 
-fn open_prompt(diff_a: &str, brief_a: &str) -> String {
+fn open_prompt(diff_a: &str, brief_a: &str, quick: bool) -> String {
+    if quick {
+        return format!(
+            "You are agent A. You and another agent, B, each changed this repo from a common starting point, on \
+             separate branches, and are about to merge. Reconcile with B and find the real conflicts. {RULES}{}{}\n\n\
+             Start: briefly say what you changed since the fork, and ask B what they changed so you can check for conflicts.",
+            diff_block(diff_a),
+            brief_block(brief_a)
+        );
+    }
     format!(
-        "You are agent A. You and another agent, B, each changed this repo from a common starting point, on \
-         separate branches, and are about to merge. Reconcile with B and find the real conflicts. {RULES}{}{}\n\n\
-         Start: briefly say what you changed since the fork, and ask B what they changed so you can check for conflicts.",
+        "You are agent A, handing your work off to another agent, B. You each worked from a common starting \
+         point on separate branches and are about to merge. This first turn is a HANDOFF, not a conflict hunt: \
+         brief B on your whole working context — what you were doing and WHY, the decisions you made and \
+         rejected, what's settled, and what's still open — not just your diff. Your diff is ground truth for \
+         WHAT changed, but the reasoning is the part B can't see. (For this handoff, up to ~8 sentences is fine.) \
+         End by asking B to hand their context back the same way. {RULES}{}{}",
         diff_block(diff_a),
         brief_block(brief_a)
     )
 }
 
-fn relay_first(other: &str, diff_b: &str, brief_b: &str) -> String {
+fn relay_first(other: &str, diff_b: &str, brief_b: &str, quick: bool) -> String {
+    if quick {
+        return format!(
+            "The other agent said: \"{other}\"\n\nRespond under the same rules. {RULES}{}{}",
+            diff_block(diff_b),
+            brief_block(brief_b)
+        );
+    }
     format!(
-        "The other agent said: \"{other}\"\n\nRespond under the same rules. {RULES}{}{}",
+        "You are agent B. Agent A handed off their working context:\n\"{other}\"\n\n\
+         First hand YOUR context back the same way — what you were doing and why, decisions made and rejected, \
+         what's settled and what's open — using your diff as ground truth. (Up to ~8 sentences is fine.) \
+         Then begin reconciling: raise anything that can't both be true, or would break at merge, as a \
+         'CONFLICT:' line. {RULES}{}{}",
         diff_block(diff_b),
         brief_block(brief_b)
     )
