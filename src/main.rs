@@ -111,43 +111,12 @@ fn dispatch(argv: Vec<String>) -> i32 {
             }
         }
 
-        // ── sync: merge two diverged agent branches by dialogue (both sides truly resume, read-only reconciliation, only real conflicts prompt you) ──
-        "sync" => {
-            let mut rt = "claude-code".to_string();
-            let mut reference = None;
-            let mut both = false;
-            let mut quick = false;
-            let mut i = 0;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--from" if i + 1 < args.len() => {
-                        rt = args[i + 1].clone();
-                        i += 2;
-                    }
-                    "--both" => {
-                        both = true;
-                        i += 1;
-                    }
-                    "--quick" => {
-                        quick = true;
-                        i += 1;
-                    }
-                    other => {
-                        if reference.is_none() && !other.starts_with('-') {
-                            reference = Some(other.to_string());
-                        }
-                        i += 1;
-                    }
-                }
-            }
-            match reference {
-                Some(r) => sync::run(&r, &rt, both, quick),
-                None => {
-                    eprintln!("usage: agit -a sync <ref> [--both] [--quick]   (reconcile this branch's agent with <ref>'s agent by dialogue; --quick skips the context handoff)");
-                    Ok(2)
-                }
-            }
-        }
+        // ── merge: reconcile two diverged agent branches by dialogue (the git-term verb; both sides
+        //    truly resume, read-only, only real conflicts prompt you). Only the Agent scope is the
+        //    semantic dialogue merge — `agit merge` / `git merge` on the code repo passes through to
+        //    git untouched. `sync` remains as a back-compat alias. ──
+        "merge" if scope == Scope::Agent => merge_cmd(args),
+        "sync" => merge_cmd(args),
         "adapter" => commands::adapter_list(),
         "graph" => commands::workspace_graph(),
 
@@ -289,6 +258,45 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
     Some((src?, as_rt, cwd, exec))
 }
 
+/// Parse and run the dialogue merge (`agit -a merge <ref>`, alias `sync`): positional <ref> plus
+/// --from <rt> / --both / --quick.
+fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
+    let mut rt = "claude-code".to_string();
+    let mut reference = None;
+    let mut both = false;
+    let mut quick = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" if i + 1 < args.len() => {
+                rt = args[i + 1].clone();
+                i += 2;
+            }
+            "--both" => {
+                both = true;
+                i += 1;
+            }
+            "--quick" => {
+                quick = true;
+                i += 1;
+            }
+            other => {
+                if reference.is_none() && !other.starts_with('-') {
+                    reference = Some(other.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    match reference {
+        Some(r) => sync::run(&r, &rt, both, quick),
+        None => {
+            eprintln!("usage: agit -a merge <ref> [--both] [--quick]   (reconcile this branch's agent with <ref>'s by dialogue; --quick skips the context handoff)");
+            Ok(2)
+        }
+    }
+}
+
 fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {
     let mut staged = false;
     let mut paths = Vec::new();
@@ -308,7 +316,7 @@ agit — version an agent's raw session so teams can collaborate on Agent Contex
   agit init                Create an Agent Store next to the code repository
   agit -a snap [--watch]   Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store (--watch = auto-snap; --no-harness = sessions only)
   agit -a push / pull      Sync sessions with the team (the Agent Store is just a git repo)
-  agit -a sync <ref>       Merge this branch's agent with <ref>'s agent by dialogue; only real conflicts prompt you
+  agit -a merge <ref>      Merge this branch's agent with <ref>'s by dialogue (alias: sync); only real conflicts prompt you
   agit clone <url>         Clone the team Agent Store in one command
   agit -a scan [--staged]  Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
