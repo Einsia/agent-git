@@ -69,15 +69,41 @@ fn dispatch(argv: Vec<String>) -> i32 {
             _ => commands::workspace_show(),
         },
 
-        // ── snap: mirror the runtime's session dump into the Agent Store (formerly named sync) ──
+        // ── snap: mirror the runtime's session dump into the Agent Store (formerly named sync).
+        //    --watch runs it continuously (fully automatic snap). ──
         "snap" => {
-            // A positional argument is shorthand for the runtime: `agit -a snap codex` == `agit -a snap --from codex`.
-            let (flag_rt, pos) = parse_runtime_arg(args, "--from");
-            let rt = match pos {
-                Some(p) => p.to_string_lossy().into_owned(),
-                None => flag_rt,
-            };
-            session::sync(&rt)
+            let mut rt = "claude-code".to_string();
+            let mut watch = false;
+            let mut interval = 5u64;
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--from" if i + 1 < args.len() => {
+                        rt = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--watch" => {
+                        watch = true;
+                        i += 1;
+                    }
+                    "--interval" if i + 1 < args.len() => {
+                        interval = args[i + 1].parse().unwrap_or(5);
+                        i += 2;
+                    }
+                    other => {
+                        // a bare positional is shorthand for the runtime: `agit -a snap codex`
+                        if !other.starts_with('-') {
+                            rt = other.to_string();
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            if watch {
+                session::snap_watch(&rt, interval)
+            } else {
+                session::sync(&rt)
+            }
         }
 
         // ── sync: merge two diverged agent branches by dialogue (both sides truly resume, read-only reconciliation, only real conflicts prompt you) ──
@@ -148,23 +174,6 @@ fn dispatch(argv: Vec<String>) -> i32 {
     }
 }
 
-
-/// Parse `--from/--to <runtime>` + one optional positional argument. The runtime defaults to claude-code.
-fn parse_runtime_arg(args: &[String], flag: &str) -> (String, Option<PathBuf>) {
-    let mut runtime = "claude-code".to_string();
-    let mut positional = None;
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == flag && i + 1 < args.len() {
-            runtime = args[i + 1].clone();
-            i += 2;
-        } else {
-            positional = Some(PathBuf::from(&args[i]));
-            i += 1;
-        }
-    }
-    (runtime, positional)
-}
 
 /// convert arguments: positional src + --to (required) + --from/--cwd/--write.
 /// Returns None when src or --to is missing.
@@ -255,7 +264,7 @@ const USAGE: &str = "\
 agit — version an agent's raw session so teams can collaborate on Agent Context
 
   agit init                Create an Agent Store next to the code repository
-  agit -a snap             Mirror this project's Claude session dump into the Agent Store (formerly named sync)
+  agit -a snap [--watch]   Mirror this project's session dump into the Agent Store (--watch = auto-snap on every change)
   agit -a push / pull      Sync sessions with the team (the Agent Store is just a git repo)
   agit -a sync <ref>       Merge this branch's agent with <ref>'s agent by dialogue; only real conflicts prompt you
   agit clone <url>         Clone the team Agent Store in one command

@@ -32,27 +32,12 @@ fn source_dir(runtime: &str, cwd: &Path) -> Result<PathBuf> {
     }
 }
 
-/// `agit -a sync [--from <runtime>]` — mirror the runtime's session dump into the Agent Store.
+/// `agit -a snap [--from <runtime>]` — mirror the runtime's session dump into the Agent Store, once.
 pub fn sync(runtime: &str) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
     let rt = normalize(runtime);
-    let dst = agent.join(SESSIONS_SUBDIR).join(&rt);
-    std::fs::create_dir_all(&dst)?;
-
-    // Runtimes differ in storage model: Claude splits directories by project slug (mirror the whole tree); Codex splits by date,
-    // with all projects mixed together (filter this project's rollouts by session_meta.cwd, mirror only those).
-    let (stats, source_desc) = match rt.as_str() {
-        "claude-code" => {
-            let src = source_dir(runtime, &env)?;
-            (mirror(&src, &dst)?, src.display().to_string())
-        }
-        "codex" => codex_collect(&env, &dst)?,
-        other => bail!("session dump for runtime `{other}` isn't wired up yet (see src/session.rs)"),
-    };
-
-    // Scan for secrets before writing to disk — dumping every session means everything the agent has cat'd is in here
-    let hits = crate::scan::scan_tree(&dst)?;
+    let (stats, source_desc, hits, dst) = mirror_once(&rt, &env, &agent)?;
 
     println!("Mirrored the session dump for {}:", rt);
     println!("  source : {source_desc}");
@@ -62,8 +47,113 @@ pub fn sync(runtime: &str) -> Result<i32> {
         eprintln!("  ⚠ Found {hits} likely secrets — the session transcript carries sensitive content the agent has seen.");
         eprintln!("     This will be blocked again before push; run `agit -a scan` first to check, or clear it from the transcript.");
     }
-    println!("\n  Commit: agit -a add -A && agit -a commit -m 'sync {rt} sessions'");
+    println!("\n  Commit: agit -a add -A && agit -a commit -m 'snap {rt} sessions'");
     Ok(0)
+}
+
+/// The mirror step shared by one-shot `snap` and the `--watch` loop: copy the runtime's dump into the
+/// Agent Store and secret-scan it. Returns (stats, human source description, secret hits, destination dir).
+fn mirror_once(rt: &str, env: &Path, agent: &Path) -> Result<(Stats, String, usize, PathBuf)> {
+    let dst = agent.join(SESSIONS_SUBDIR).join(rt);
+    std::fs::create_dir_all(&dst)?;
+    // Runtimes differ in storage model: Claude splits directories by project slug (mirror the whole tree);
+    // Codex splits by date with all projects mixed (filter this project's rollouts by session_meta.cwd).
+    let (stats, source_desc) = match rt {
+        "claude-code" => {
+            let src = source_dir(rt, env)?;
+            (mirror(&src, &dst)?, src.display().to_string())
+        }
+        "codex" => codex_collect(env, &dst)?,
+        other => bail!("session dump for runtime `{other}` isn't wired up yet (see src/session.rs)"),
+    };
+    let hits = crate::scan::scan_tree(&dst)?;
+    Ok((stats, source_desc, hits, dst))
+}
+
+/// `agit -a snap --watch [--interval N]` — **fully automatic snap**: watch the runtime's session dump and,
+/// whenever it changes and then settles, mirror + auto-commit into the Agent Store. Runs until Ctrl-C.
+/// Runtime-agnostic; the pre-commit secret hook still applies (a snap carrying a secret is refused, with a warning).
+pub fn snap_watch(runtime: &str, interval_secs: u64) -> Result<i32> {
+    let env = scope::env_root()?;
+    let agent = scope::root_for(Scope::Agent)?;
+    let rt = normalize(runtime);
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    let watch = source_path(&rt, &env);
+
+    println!("Auto-snapping {rt} on every change (settling window {interval_secs}s). Ctrl-C to stop.");
+    if watch.as_deref().map(|p| !p.exists()).unwrap_or(true) {
+        println!("  (waiting for {rt} sessions to appear…)");
+    }
+
+    let mut last_sig = String::new();
+    let mut pending = false;
+    let mut count: u64 = 0;
+    loop {
+        let sig = watch.as_deref().map(dir_signature).unwrap_or_default();
+        if sig != last_sig {
+            // changed since last check → wait one more tick for it to settle (debounce a burst of edits)
+            pending = true;
+            last_sig = sig;
+        } else if pending {
+            match mirror_once(&rt, &env, &agent) {
+                Ok((stats, _, hits, _)) if stats.added + stats.updated > 0 => commit_snap(&agent, &rt, hits, &mut count),
+                Ok(_) => {}
+                Err(e) => eprintln!("  snap failed: {e:#}"),
+            }
+            pending = false;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Stage + commit the mirrored dump. Nothing staged → no-op. Commit blocked by the pre-commit secret hook → warn.
+fn commit_snap(agent: &Path, rt: &str, hits: usize, count: &mut u64) {
+    let _ = scope::git_in_status(agent, &["add", "-A"]);
+    // `diff --cached --quiet` exits 1 when something is staged, 0 when nothing is.
+    if scope::git_in_status(agent, &["diff", "--cached", "--quiet"]).0 == 0 {
+        return;
+    }
+    let ts = now_iso();
+    let (rc, _) = scope::git_in_status(agent, &["commit", "-m", &format!("auto-snap {rt} {ts}")]);
+    if rc == 0 {
+        *count += 1;
+        println!("  ● snapped {ts}  (#{count})");
+    } else {
+        eprintln!(
+            "  ⚠ auto-snap not committed{} — mirrored to disk but the pre-commit hook refused it. `agit -a scan` to see.",
+            if hits > 0 { " (likely secrets)" } else { "" }
+        );
+        let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
+    }
+}
+
+/// Where a runtime's session dump for this project lives (no existence check — the watcher waits for it).
+fn source_path(rt: &str, env: &Path) -> Option<PathBuf> {
+    match rt {
+        "claude-code" => claude_code::projects_dir().ok().map(|d| d.join(claude_code::slug_for(env))),
+        "codex" => crate::adapter::codex::sessions_root().ok(),
+        _ => None,
+    }
+}
+
+/// A cheap change signature of a directory tree: sorted (path, size, mtime) of every file.
+fn dir_signature(dir: &Path) -> String {
+    let mut parts: Vec<String> = walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            let mt = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+            Some(format!("{}:{}:{mt}", e.path().display(), m.len()))
+        })
+        .collect();
+    parts.sort();
+    parts.join("|")
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 fn normalize(runtime: &str) -> String {
