@@ -213,43 +213,6 @@ fn staged_secret_blocked_even_after_worktree_cleaned() {
     assert!(!err.contains("clean"));
 }
 
-/// 回归:reconcile 用三点 diff 判定 incoming,不能把本地自己的 session 误当对面。
-/// peer 分支只有 alice;本地额外有 bob。合并 peer 时 bob 必须在【本地已有】侧。
-#[test]
-fn reconcile_does_not_mislabel_own_sessions_as_peer() {
-    let r = Repo::new();
-    let dir = ".agit/agent/sessions/claude-code";
-    r.write(
-        &format!("{dir}/alice.jsonl"),
-        "{\"type\":\"user\",\"message\":{\"content\":\"ALICE wants auth schema\"}}\n\
-         {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ALICE field user_id\"}]}}\n",
-    );
-    r.agit(&["-a", "add", "-A"]);
-    r.agit(&["-a", "commit", "-m", "alice"]);
-    r.git_agent(&["branch", "peer"]); // peer = 只有 alice
-    r.write(
-        &format!("{dir}/bob.jsonl"),
-        "{\"type\":\"user\",\"message\":{\"content\":\"BOB wants refund flow\"}}\n\
-         {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"BOB field uid\"}]}}\n",
-    );
-    r.agit(&["-a", "add", "-A"]);
-    r.agit(&["-a", "commit", "-m", "bob"]);
-
-    // stub LLM:tee 把发出去的 prompt 原样落盘,便于断言分类
-    let cap = r.path().join("prompt.txt");
-    let cmd = format!("tee {}", cap.to_str().unwrap());
-    let (code, out, err) = r.agit_env(&[("AGIT_LLM_CMD", &cmd)], &["-a", "reconcile", "peer"]);
-    assert_eq!(code, 0, "reconcile 应成功(无真冲突): out={out} err={err}");
-
-    let prompt = std::fs::read_to_string(&cap).unwrap();
-    let li = prompt.find("【本地已有的会话】").expect("缺本地段");
-    let pi = prompt.find("【对面拉进来的会话】").expect("缺对面段");
-    let (local, peer) = (&prompt[li..pi], &prompt[pi..]);
-    assert!(local.contains("BOB"), "Bob 自己的 session 应在本地侧\n{prompt}");
-    assert!(!peer.contains("BOB"), "Bob 自己的 session 不该被当成对面\n{prompt}");
-    // peer 是本地祖先 → 没有真正 incoming
-    assert!(out.contains("已是最新") || out.contains("没带来新的"), "out={out}");
-}
 
 /// 回归:codex sync 按 session_meta.cwd 过滤 —— 只同步本项目的 rollout,
 /// 绝不把别项目的会话卷进来(隐私底线)。

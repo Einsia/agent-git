@@ -38,7 +38,7 @@ pub fn run() -> Result<i32> {
     println!();
     println!("  agit -a sync            把本项目的 Claude session dump 镜像进来");
     println!("  agit -a push / pull     和团队同步 session");
-    println!("  agit -a reconcile <ref> 让 agent 把对面的 session 合进来（真冲突才问你）");
+    println!("  agit -a sync <ref>      让本分支 agent 和对面对话合并（真冲突才问你）");
     Ok(0)
 }
 
