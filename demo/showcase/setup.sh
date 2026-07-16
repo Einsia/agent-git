@@ -1,57 +1,91 @@
 #!/usr/bin/env bash
-# 新模型 demo 的舞台:Alice / Bob 两个开发者的代码仓库,各带一条(伪造的)Claude 会话,
-# 外加一个团队远端。不替你跑 sync/push/reconcile —— 那些是你要演的。
+# Stage for the sync showcase: one repo with two diverged agent branches.
+#   feature-a: an agent added a login rate limiter keyed on `user_id`
+#   feature-b: an agent renamed the identity field `user_id` -> `uid`
+# The two are about to merge — and their change is a cross-cutting conflict.
+#
+# `agit -a sync` revives BOTH agents (read-only, each in its own branch's worktree) and lets them
+# reconcile by reading the code. That needs REAL, resumable sessions, so we generate them with
+# `claude -p` when claude is present. Without claude, the branches/code are still staged and the
+# sync act is skipped.
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
-ALICE="$DEMO_HOME/showcase-alice"
-BOB="$DEMO_HOME/showcase-bob"
-ORIGIN="$DEMO_HOME/showcase-origin.git"
-
+PROJ="$DEMO_HOME/showcase"
 _ensure_agit
-B=$'\033[1m'; G=$'\033[32m'; DIM=$'\033[2m'; N=$'\033[0m'
+B=$'\033[1m'; G=$'\033[32m'; DIM=$'\033[2m'; Y=$'\033[33m'; N=$'\033[0m'
+slug(){ echo "$1" | sed 's/[/.]/-/g'; }
+gc(){ git -c user.name="$1" -c user.email="$1@payments.io" -c commit.gpgsign=false "${@:2}"; }
 
-# 造一条 Claude 风格的会话 dump:$1=项目路径 $2=会话名 $3=用户话 $4=agent结论
-fake_session() {
-  local slug; slug=$(echo "$1" | sed 's|/|-|g')
-  local c="$HOME/.claude/projects/$slug"
-  mkdir -p "$c/$2/tool-results"
-  cat > "$c/$2.jsonl" <<EOF
-{"type":"mode","sessionId":"$2"}
-{"type":"user","cwd":"$1","gitBranch":"main","uuid":"u1","message":{"role":"user","content":"$3"}}
-{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"$4"}]}}
-EOF
-  echo "工具输出示例" > "$c/$2/tool-results/toolu_x.txt"
-}
+rm -rf "$PROJ"; mkdir -p "$PROJ/src"; cd "$PROJ"
+gc dev init -q -b main .
+printf 'export function getUser(req){ return req.body.user_id; }\n' > src/auth.js
+gc dev add -A; gc dev commit -qm 'payments: base'
+BASE=$(git branch --show-current)
 
-seed_code() {
-  rm -rf "$1"; mkdir -p "$1"; cd "$1"
-  git init -q -b main .; git config user.name "$2"; git config user.email "$2@x"; git config commit.gpgsign false
-  printf 'export interface User {\n  id: number;\n  user_id: string;\n}\n' > models.ts
-  git add -A && git commit -qm '初始代码'
-}
+# feature-a: rate limiter keyed on user_id
+gc dev checkout -q -b feature-a
+printf 'export function getUser(req){ return req.body.user_id; }\nexport function loginKey(req){ return req.body.user_id; } // rate-limit bucket key\n' > src/auth.js
+gc dev add -A; gc dev commit -qm 'feature-a: login rate limiter on user_id'
 
-rm -rf "$ORIGIN"; git init -q --bare -b main "$ORIGIN"
+# feature-b: rename user_id -> uid
+gc dev checkout -q "$BASE"; gc dev checkout -q -b feature-b
+printf 'export function getUser(req){ return req.body.uid; }\n' > src/auth.js
+gc dev add -A; gc dev commit -qm 'feature-b: rename user_id -> uid'
 
-seed_code "$ALICE" alice
-fake_session "$ALICE" alice-sess "用户标识字段用什么？" "查清了:全库统一用 user_id 这个字段名,别的地方也都是它。"
+gc dev checkout -q feature-a
+"$AGIT" init >/dev/null
 
-seed_code "$BOB" bob
-fake_session "$BOB" bob-sess "用户标识字段用什么？" "我决定改用 uid,更简洁。"
+HAVE_CLAUDE=0
+if command -v claude >/dev/null 2>&1; then
+  HAVE_CLAUDE=1
+  CDIR="$HOME/.claude/projects/$(slug "$PROJ")"
+  rm -rf "$CDIR"   # fresh slug so we don't pick up sessions from earlier runs
+
+  # Generate two REAL, resumable sessions — one per branch — and capture each file deterministically.
+  claude -p "Record for later: on this branch you added loginKey() in src/auth.js, a login rate limiter that buckets requests on the user_id field. Reply 'ok'." >/dev/null 2>&1
+  A_JSONL="$(ls -t "$CDIR"/*.jsonl 2>/dev/null | head -1)"
+
+  gc dev checkout -q feature-b
+  claude -p "Record for later: on this branch you renamed the auth identity field from user_id to uid across src/auth.js. Reply 'ok'." >/dev/null 2>&1
+  B_JSONL="$(ls -t "$CDIR"/*.jsonl 2>/dev/null | grep -v "$(basename "$A_JSONL")" | head -1)"
+
+  # Build the Agent Store deterministically: main = agent A (feature-a), bob = agent B (feature-b).
+  gc dev checkout -q feature-a
+  S=".agit/agent/sessions/claude-code"
+  mkdir -p "$S"
+  cp "$A_JSONL" "$S/alice-session.jsonl"
+  gc dev -C .agit/agent add -A && gc dev -C .agit/agent commit -qm 'agent A: feature-a session' >/dev/null
+  gc dev -C .agit/agent checkout -q -b bob
+  cp "$B_JSONL" "$S/bob-session.jsonl"
+  gc dev -C .agit/agent add -A && gc dev -C .agit/agent commit -qm 'agent B: feature-b session' >/dev/null
+  gc dev -C .agit/agent checkout -q main
+fi
 
 cat <<EOF
 
-${B}舞台就绪。${N}
+${B}Stage ready.${N}
 
   ${G}export PATH="$BIN_DIR:\$PATH"${N}
 
-  团队远端    ${G}$ORIGIN${N}
-  Alice 仓库  ${G}$ALICE${N}   （有一条会话:主张 user_id）
-  Bob 仓库    ${G}$BOB${N}   （有一条会话:主张 uid —— 和 Alice 冲突）
-
-${DIM}照着讲稿一幕一幕敲:${N}
-  ${G}\$EDITOR demo/showcase/讲稿.md${N}
-
-${DIM}先进 Alice 的仓库:${N}
-  ${G}cd $ALICE${N}
+  Repo        ${G}$PROJ${N}
+  feature-a   an agent added a login rate limiter keyed on ${B}user_id${N}   (checked out now)
+  feature-b   an agent renamed the field ${B}user_id → uid${N}   (the cross-cutting conflict)
 EOF
+
+if [[ $HAVE_CLAUDE -eq 1 ]]; then
+cat <<EOF
+  Agent Store ${G}main${N} = agent A's session · ${G}bob${N} = agent B's session
+
+${DIM}Follow the host script act by act:${N}
+  ${G}\$EDITOR demo/showcase/host-script.md${N}
+${DIM}Then, from feature-a, reconcile the two agents by dialogue:${N}
+  ${G}cd $PROJ && agit -a sync bob${N}
+EOF
+else
+cat <<EOF
+
+${Y}claude not found — the branches and code are staged, but the live sync act needs a real
+resumable session, so it's skipped. Install claude to run \`agit -a sync bob\`.${N}
+EOF
+fi
