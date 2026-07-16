@@ -1,5 +1,5 @@
-//! v3 端到端:双库模型 + scope 路由 + WorkspaceRevision 配对 + session dump 的密钥防线。
-//! fact/evidence 那一套已废弃移除。
+//! v3 end-to-end: dual-repo model + scope routing + WorkspaceRevision pairing + secret defense for session dumps.
+//! The fact/evidence approach has been deprecated and removed.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,7 +19,7 @@ impl Repo {
         r.sh("git config commit.gpgsign false");
         r.write("app.ts", "export const x = 1;\n");
         r.sh("git add -A && git commit -qm seed");
-        assert_eq!(r.agit(&["init"]).0, 0, "init 应成功");
+        assert_eq!(r.agit(&["init"]).0, 0, "init should succeed");
         r
     }
 
@@ -72,19 +72,19 @@ impl Repo {
     }
 }
 
-// ─────────────────────────── init / 存储模型 ───────────────────────────
+// ─────────────────────────── init / storage model ───────────────────────────
 
 #[test]
 fn init_creates_agent_store_for_sessions() {
     let r = Repo::new();
-    assert!(r.agent().join(".git").exists(), "Agent Store 应是独立 git 仓库");
-    assert!(r.agent().join("sessions").exists(), "应有 sessions/ 骨架");
-    // 不再有 fact 那套
-    assert!(!r.agent().join("state/facts").exists(), "state/facts 应已移除");
-    assert!(r.git_env(&["config", "--get", "merge.agit.driver"]).is_empty(), "不再注册 fact merge driver");
-    // .agit/ 被代码仓库忽略
+    assert!(r.agent().join(".git").exists(), "Agent Store should be a standalone git repo");
+    assert!(r.agent().join("sessions").exists(), "should have the sessions/ skeleton");
+    // no more fact machinery
+    assert!(!r.agent().join("state/facts").exists(), "state/facts should have been removed");
+    assert!(r.git_env(&["config", "--get", "merge.agit.driver"]).is_empty(), "the fact merge driver is no longer registered");
+    // .agit/ is ignored by the code repo
     assert!(r.sh("git check-ignore .agit; echo $?").contains('0'));
-    // 密钥 hook 装好
+    // secret hooks are installed
     assert!(r.agent().join(".git/hooks/pre-commit").exists());
     assert!(r.agent().join(".git/hooks/pre-push").exists());
 }
@@ -94,17 +94,17 @@ fn init_is_idempotent() {
     let r = Repo::new();
     let head1 = r.git_agent(&["rev-parse", "HEAD"]);
     assert_eq!(r.agit(&["init"]).0, 0);
-    assert_eq!(r.git_agent(&["rev-parse", "HEAD"]), head1, "重跑 init 不新增提交");
+    assert_eq!(r.git_agent(&["rev-parse", "HEAD"]), head1, "re-running init adds no new commit");
 }
 
-// ─────────────────────── scope 路由（关键歧义）───────────────────────
+// ─────────────────────── scope routing (key ambiguity) ───────────────────────
 
 #[test]
 fn default_scope_is_transparent_git_on_code_repo() {
     let r = Repo::new();
     let (code, out, _) = r.agit(&["status", "--short"]);
     assert_eq!(code, 0);
-    assert!(!out.contains(".agit"), "agit status 不该暴露 .agit/：\n{out}");
+    assert!(!out.contains(".agit"), "agit status should not expose .agit/:\n{out}");
 }
 
 #[test]
@@ -114,22 +114,22 @@ fn agit_dash_a_targets_agent_store() {
     assert_eq!(r.agit(&["-a", "add", "-A"]).0, 0);
     assert_eq!(r.agit(&["-a", "commit", "-m", "agent scope"]).0, 0);
     assert_eq!(r.git_agent(&["log", "-1", "--format=%s"]), "agent scope");
-    assert_eq!(r.git_env(&["log", "-1", "--format=%s"]), "seed", "代码仓库不该多提交");
+    assert_eq!(r.git_env(&["log", "-1", "--format=%s"]), "seed", "the code repo should not gain an extra commit");
 }
 
-/// PRD 点名的歧义:`agit commit -a` 里的 -a 是 git 参数,不是 scope 开关。
+/// Ambiguity called out by the PRD: the -a in `agit commit -a` is a git flag, not a scope switch.
 #[test]
 fn commit_dash_a_is_git_flag_not_scope() {
     let r = Repo::new();
     let agent_before = r.git_agent(&["rev-list", "--count", "HEAD"]);
     r.write("app.ts", "export const x = 2;\n");
     let (code, _, err) = r.agit(&["commit", "-a", "-m", "code via -a"]);
-    assert_eq!(code, 0, "commit -a 应作用在代码仓库: {err}");
+    assert_eq!(code, 0, "commit -a should act on the code repo: {err}");
     assert_eq!(r.git_env(&["log", "-1", "--format=%s"]), "code via -a");
-    assert_eq!(r.git_agent(&["rev-list", "--count", "HEAD"]), agent_before, "不该碰 Agent Store");
+    assert_eq!(r.git_agent(&["rev-list", "--count", "HEAD"]), agent_before, "should not touch the Agent Store");
 }
 
-// ─────────────────────── WorkspaceRevision 配对 ───────────────────────
+// ─────────────────────── WorkspaceRevision pairing ───────────────────────
 
 #[test]
 fn agent_commit_generates_workspace_revision() {
@@ -138,7 +138,7 @@ fn agent_commit_generates_workspace_revision() {
     r.agit(&["-a", "add", "-A"]);
     r.agit(&["-a", "commit", "-m", "c"]);
     let head = r.path().join(".agit/workspace/HEAD.json");
-    assert!(head.exists(), "agent commit 后应生成 WorkspaceRevision");
+    assert!(head.exists(), "an agent commit should generate a WorkspaceRevision");
     let json = std::fs::read_to_string(&head).unwrap();
     assert!(json.contains("agent_rev") && json.contains("head_commit") && json.contains("stash_tree"));
     assert!(json.contains(&r.git_agent(&["rev-parse", "HEAD"])));
@@ -165,57 +165,57 @@ fn environment_state_captures_dirty_worktree() {
     assert!(json.contains("\"dirty\": true"), "{json}");
 }
 
-// ─────────────────── session dump 的密钥防线 ───────────────────
+// ─────────────────── secret defense for session dumps ───────────────────
 
 #[test]
 fn secret_in_session_blocked_by_precommit() {
     let r = Repo::new();
-    // 模拟 sync 后的 session dump,里面带一个真密钥
+    // simulate a post-sync session dump that carries a real secret
     r.write(
         ".agit/agent/sessions/claude-code/s.jsonl",
         "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n",
     );
     r.agit(&["-a", "add", "-A"]);
     let (code, _, err) = r.agit(&["-a", "commit", "-m", "leak"]);
-    assert_ne!(code, 0, "含密钥的 session 提交应被拦");
-    assert!(err.contains("疑似密钥") || err.contains("aws"), "{err}");
+    assert_ne!(code, 0, "committing a session that contains a secret should be blocked");
+    assert!(err.contains("suspected secrets") || err.contains("aws"), "{err}");
 }
 
 #[test]
 fn scan_covers_sessions_but_ignores_uuid_noise() {
     let r = Repo::new();
-    // 高熵 UUID/requestId 不该误报;真 AWS key 该报
+    // a high-entropy UUID/requestId should not false-positive; a real AWS key should be reported
     r.write(
         ".agit/agent/sessions/claude-code/s.jsonl",
         "{\"uuid\":\"7c48816b-6fa5-42f7-9fff-bbeea20ff632\",\"requestId\":\"req_a8Xk92mFqLp3\"}\n\
          {\"content\":\"AKIAIOSFODNN7EXAMPLE\"}\n",
     );
     let (code, _, err) = r.agit(&["-a", "scan"]);
-    assert_ne!(code, 0, "真密钥应报");
+    assert_ne!(code, 0, "a real secret should be reported");
     assert!(err.contains("aws-access-key-id"), "{err}");
-    assert!(!err.contains("high-entropy"), "session 里的 UUID/requestId 不该被熵检测误报:\n{err}");
+    assert!(!err.contains("high-entropy"), "a UUID/requestId inside a session should not be false-flagged by entropy detection:\n{err}");
 }
 
-/// 回归:pre-commit 必须扫**索引里的 blob**,不是工作树。
-/// 暂存带密钥的版本,再把工作树改回干净版(不 re-stage),提交仍须被拦 ——
-/// 否则密钥进了仓,而 hook 读的是干净的工作树、放行了(旧行为)。
+/// Regression: pre-commit must scan **the blob in the index**, not the working tree.
+/// Stage a version that carries a secret, then revert the working tree to a clean version (without re-staging); the commit must still be blocked --
+/// otherwise the secret lands in the repo while the hook reads the clean working tree and lets it through (the old behavior).
 #[test]
 fn staged_secret_blocked_even_after_worktree_cleaned() {
     let r = Repo::new();
     let p = ".agit/agent/sessions/claude-code/s.jsonl";
-    r.write(p, "{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}\n"); // 密钥版
-    r.agit(&["-a", "add", "-A"]); // 暂存密钥 blob
-    r.write(p, "{\"content\":\"clean\"}\n"); // 工作树改回干净,不 re-stage
+    r.write(p, "{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}\n"); // the secret version
+    r.agit(&["-a", "add", "-A"]); // stage the secret blob
+    r.write(p, "{\"content\":\"clean\"}\n"); // revert the working tree to clean, without re-staging
     let (code, _, err) = r.agit(&["-a", "commit", "-m", "sneaky"]);
-    assert_ne!(code, 0, "暂存的密钥即使工作树已清也应被拦: {err}");
-    assert!(err.contains("疑似密钥") || err.contains("aws"), "{err}");
-    // 且工作树的干净版不该有任何命中(证明扫的是索引,不是磁盘)
+    assert_ne!(code, 0, "a staged secret should be blocked even if the working tree is already clean: {err}");
+    assert!(err.contains("suspected secrets") || err.contains("aws"), "{err}");
+    // and the clean working-tree version should have no hits at all (proving we scan the index, not the disk)
     assert!(!err.contains("clean"));
 }
 
 
-/// 回归:codex sync 按 session_meta.cwd 过滤 —— 只同步本项目的 rollout,
-/// 绝不把别项目的会话卷进来(隐私底线)。
+/// Regression: codex sync filters by session_meta.cwd -- it syncs only this project's rollouts,
+/// and never pulls in another project's sessions (the privacy bottom line).
 #[test]
 fn codex_sync_only_pulls_matching_project() {
     let r = Repo::new();
@@ -223,7 +223,7 @@ fn codex_sync_only_pulls_matching_project() {
     let home = r.path().join("fakehome");
     let day = home.join(".codex/sessions/2026/07/15");
     std::fs::create_dir_all(&day).unwrap();
-    // 本项目的 rollout(cwd == 仓库根)
+    // this project's rollout (cwd == repo root)
     std::fs::write(
         day.join("rollout-2026-07-15T00-00-00-aaaa-mine.jsonl"),
         format!(
@@ -232,15 +232,15 @@ fn codex_sync_only_pulls_matching_project() {
         ),
     )
     .unwrap();
-    // 别项目的 rollout(不同 cwd)—— 不该被同步
+    // another project's rollout (different cwd) -- should not be synced
     std::fs::write(
         day.join("rollout-2026-07-15T01-00-00-bbbb-other.jsonl"),
         "{\"type\":\"session_meta\",\"payload\":{\"id\":\"otherid\",\"cwd\":\"/some/other/proj\",\"git\":{\"branch\":\"x\"}}}\n\
          {\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"OTHER secret\"}}\n",
     )
     .unwrap();
-    // fork/resume:第 1 条 session_meta 是本项目,第 2 条内嵌了**别项目**的父会话。
-    // 整份必须被跳过 —— 否则父会话的内容会泄漏进本项目的 store 再 push 给协作者。
+    // fork/resume: the 1st session_meta is this project, the 2nd embeds a parent session from **another project**.
+    // The whole file must be skipped -- otherwise the parent session's content leaks into this project's store and gets pushed to collaborators.
     std::fs::write(
         day.join("rollout-2026-07-15T02-00-00-cccc-fork.jsonl"),
         format!(
@@ -252,29 +252,29 @@ fn codex_sync_only_pulls_matching_project() {
     .unwrap();
 
     let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["-a", "snap", "--from", "codex"]);
-    assert_eq!(code, 0, "codex sync 应成功: {err}");
-    assert!(out.contains("过滤出 1 条"), "应只匹配本项目 1 条(fork 那份要跳过):\n{out}");
+    assert_eq!(code, 0, "codex sync should succeed: {err}");
+    assert!(out.contains("matched 1 rollouts"), "should match only this project's 1 rollout (the fork must be skipped):\n{out}");
 
     let cdir = r.agent().join("sessions/codex");
-    assert!(cdir.join("mineid.jsonl").exists(), "本项目会话应落盘");
-    assert!(!cdir.join("otherid.jsonl").exists(), "别项目会话绝不该被同步");
-    assert!(!cdir.join("forkid.jsonl").exists(), "含异项目会话的 fork 整份都不该同步");
-    // 双保险:整个 codex 目录里不该出现别项目的内容
+    assert!(cdir.join("mineid.jsonl").exists(), "this project's session should be written to disk");
+    assert!(!cdir.join("otherid.jsonl").exists(), "another project's session should never be synced");
+    assert!(!cdir.join("forkid.jsonl").exists(), "a fork that contains a foreign-project session should not be synced at all");
+    // double insurance: another project's content should not appear anywhere in the codex directory
     let mut all = String::new();
     for e in std::fs::read_dir(&cdir).unwrap() {
         all.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
     }
     assert!(all.contains("MINE work"));
-    assert!(!all.contains("OTHER secret"), "别项目内容泄漏了");
-    assert!(!all.contains("PARENT leaked secret"), "fork 里的父项目会话泄漏了");
+    assert!(!all.contains("OTHER secret"), "another project's content leaked");
+    assert!(!all.contains("PARENT leaked secret"), "the parent-project session inside the fork leaked");
 }
 
-// ─────────────────────── 透传保真 ───────────────────────
+// ─────────────────────── passthrough fidelity ───────────────────────
 
 #[test]
 fn passthrough_propagates_git_exit_code() {
     let r = Repo::new();
     let (code, _, _) = r.agit(&["rev-parse", "does-not-exist"]);
     assert_ne!(code, 0);
-    assert_ne!(code, 2, "透传应传播 git 的退出码");
+    assert_ne!(code, 2, "passthrough should propagate git's exit code");
 }

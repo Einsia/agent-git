@@ -1,4 +1,4 @@
-//! Adapter 测试:Claude Code / Codex 的 session 解析(reconcile 的 brief 靠它)。
+//! Adapter tests: session parsing for Claude Code / Codex (reconcile's brief relies on it).
 
 use std::path::Path;
 use std::process::Command;
@@ -48,19 +48,20 @@ fn adapter_list_shows_both_runtimes() {
     assert!(out.contains("claude-code") && out.contains("codex"));
 }
 
-/// Codex sync 现已接上:即使本项目在 Codex 里没有会话,也正常返回(过滤出 0 条),
-/// 不再报"未实现"。HOME 指向空目录,保证 hermetic、不依赖本机真实 ~/.codex。
+/// Codex snap is wired up: even when this project has no sessions in Codex, it returns normally
+/// (matching 0 rollouts) rather than reporting "not implemented". HOME points at an empty dir to
+/// stay hermetic and not depend on the machine's real ~/.codex.
 #[test]
-fn codex_sync_is_implemented() {
+fn codex_snap_is_implemented() {
     let r = Repo::new();
     let o = Command::new(BIN)
         .args(["-a", "snap", "--from", "codex"])
         .current_dir(r.path())
-        .env("HOME", r.path()) // 无 .codex/sessions → 匹配 0 条
+        .env("HOME", r.path()) // no .codex/sessions → matches 0 rollouts
         .output()
         .unwrap();
     let code = o.status.code().unwrap_or(-1);
     let out = String::from_utf8_lossy(&o.stdout);
-    assert_eq!(code, 0, "codex sync 现应可用: {}", String::from_utf8_lossy(&o.stderr));
-    assert!(out.contains("codex") && out.contains("过滤出 0 条"), "应镜像 codex(0 条): {out}");
+    assert_eq!(code, 0, "codex snap should work now: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(out.contains("codex") && out.contains("matched 0 rollouts"), "should mirror codex (0 rollouts): {out}");
 }
