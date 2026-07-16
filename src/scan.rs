@@ -1,9 +1,9 @@
-//! 密钥扫描。
+//! Secret scanning.
 //!
-//! 关键认知：**这道防线之所以必须存在，恰恰是因为 context 会被 push 和 clone。**
-//! Shepherd / Zed / Claude Code 都没有它，不是疏忽 —— 是它们不分享 context。
+//! Key insight: **this line of defense has to exist precisely because context gets pushed and cloned.**
+//! Shepherd / Zed / Claude Code don't have it, and that's not an oversight -- they don't share context.
 //!
-//! 扫描范围必须同时覆盖 claim 正文**和证据快照**，因为证据会把源文件内容抄进来。
+//! The scan must cover both the claim body **and the evidence snapshots**, because evidence copies source file contents in verbatim.
 
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -24,7 +24,7 @@ struct Rule {
 static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     let r = |name, pat: &str| Rule {
         name,
-        re: Regex::new(pat).expect("内置规则的正则必须可编译"),
+        re: Regex::new(pat).expect("the regex for a built-in rule must compile"),
     };
     vec![
         r("aws-access-key-id", r"\bAKIA[0-9A-Z]{16}\b"),
@@ -46,7 +46,7 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     ]
 });
 
-/// Shannon 熵。用来抓那些不匹配任何已知格式、但明显是随机密钥的长串。
+/// Shannon entropy. Used to catch long strings that match no known format but are clearly random secrets.
 fn shannon_entropy(s: &str) -> f64 {
     let n = s.len() as f64;
     if n == 0.0 {
@@ -77,8 +77,8 @@ fn redact(s: &str) -> String {
     if n <= 10 {
         return "*".repeat(n);
     }
-    // 按 **char** 取前缀,不是 `&s[..4]` —— 后者在第 4 字节落在多字节 UTF-8 中间时 panic,
-    // 一条含 emoji/中日文的正常行就能让整轮扫描崩掉(而扫描是 commit/push 的安全闸门)。
+    // Take the prefix by **char**, not `&s[..4]` -- the latter panics when the 4th byte lands in the middle of a multi-byte UTF-8 sequence,
+    // and a single normal line containing an emoji / CJK text would crash the whole scan (and the scan is the safety gate for commit/push).
     let prefix: String = s.chars().take(4).collect();
     format!("{prefix}…{}", "*".repeat(6))
 }
@@ -87,8 +87,8 @@ pub fn scan_text(text: &str) -> Vec<Finding> {
     scan_text_opts(text, true)
 }
 
-/// `entropy` 关掉泛化的高熵检测 —— 用于 session dump(jsonl):里面全是 UUID / requestId /
-/// base64 这类高熵但无害的串,熵检测会疯狂误报。session 只靠高精度的具体规则。
+/// `entropy` turns off the generic high-entropy detection -- used for session dumps (jsonl): they're full of UUIDs / requestIds /
+/// base64 and similar high-entropy but harmless strings, which the entropy check would flag as false positives like crazy. Sessions rely only on the high-precision specific rules.
 pub fn scan_text_opts(text: &str, entropy: bool) -> Vec<Finding> {
     let mut out = Vec::new();
 
@@ -126,19 +126,19 @@ mod tests {
 
     #[test]
     fn redact_does_not_panic_on_multibyte_boundary() {
-        // 每个 € 占 3 字节:旧的 &s[..4] 会切在字符中间 panic。
+        // Each € takes 3 bytes: the old &s[..4] would cut in the middle of a character and panic.
         let out = redact("€€€€€€€€€€€€");
         assert!(out.starts_with('€'));
         assert!(out.contains('…'));
-        // 混合:前缀多字节,同样不能 panic
+        // Mixed: multi-byte prefix, must also not panic
         let _ = redact("café_secret_value_1234");
-        // 短串走 '*' 分支,按 char 数
+        // Short strings take the '*' branch, counted by char
         assert_eq!(redact("日本語"), "***");
     }
 
     #[test]
     fn scan_text_survives_multibyte_lines() {
-        // 一行含多字节 + 一个真密钥,既不 panic,又要命中密钥。
+        // A line with multi-byte chars + a real secret: must neither panic nor miss the secret.
         let f = scan_text("日本語 password = caféSecret42x\nAKIAIOSFODNN7EXAMPLE\n");
         assert!(f.iter().any(|x| x.rule == "aws-access-key-id"));
     }
@@ -146,13 +146,13 @@ mod tests {
 
 pub fn scan_file(path: &Path) -> Result<Vec<Finding>> {
     let text = std::fs::read_to_string(path)?;
-    // .md(fact)用全套含熵检测;jsonl/json/txt(session dump)只用具体规则
+    // .md (facts) use the full set including entropy detection; jsonl/json/txt (session dumps) use only the specific rules
     let entropy = path.extension().map(|x| x == "md").unwrap_or(false);
     Ok(scan_text_opts(&text, entropy))
 }
 
-/// 递归扫描一个目录树里的文本文件(.md/.jsonl/.json/.txt),打印命中,返回命中数。
-/// session dump 是 jsonl,里面可能带 agent 见过的密钥。
+/// Recursively scan the text files (.md/.jsonl/.json/.txt) in a directory tree, print the hits, and return the hit count.
+/// Session dumps are jsonl, and may carry secrets the agent has seen.
 pub fn scan_tree(root: &Path) -> Result<usize> {
     let mut total = 0;
     for e in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {

@@ -1,6 +1,6 @@
-//! agit 原生动词（在透传之外、需要 agit 加值的命令）。
-//! session 模型下的原生命令：scan（密钥闸门）、workspace（配对）、clone、adapter、convert。
-//! 见 docs/architecture.md。
+//! agit native verbs (commands beyond passthrough where agit adds value).
+//! Native commands under the session model: scan (secret gate), workspace (pairing), clone, adapter, convert.
+//! See docs/architecture.md.
 
 use crate::adapter;
 use crate::scan;
@@ -10,23 +10,23 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 
-// ─────────────────────── Adapter：runtime ↔ AgentState ───────────────────────
+// ─────────────────────── Adapter: runtime ↔ AgentState ───────────────────────
 
 pub fn adapter_list() -> Result<i32> {
-    println!("已注册的 runtime adapter：");
+    println!("Registered runtime adapters:");
     for (name, desc) in adapter::list() {
         println!("  {name:<14} {desc}");
     }
     Ok(0)
 }
 
-/// 扫描某个 scope 里的密钥。默认扫 Agent Store 的 facts；--staged 只扫暂存的。
+/// Scan for secrets within a scope. Scans the Agent Store's facts by default; --staged scans only what is staged.
 pub fn scan_cmd(scope: Scope, staged: bool, paths: &[PathBuf]) -> Result<i32> {
     scan_root(&scope::root_for(scope)?, staged, paths)
 }
 
-/// hook 专用：扫描 cwd 所在的那个 git 仓库，不走 scope 发现。
-/// pre-commit/pre-push 在 Agent Store 里运行，cwd 就是它，直接扫它。
+/// hook-only: scan the git repo that cwd lives in, without going through scope discovery.
+/// pre-commit/pre-push run inside the Agent Store, so cwd is it, and we scan it directly.
 pub fn hook_scan(staged: bool) -> Result<i32> {
     let (_, top) = scope::git_in_status(std::path::Path::new("."), &["rev-parse", "--show-toplevel"]);
     let root = if top.is_empty() {
@@ -42,7 +42,7 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
     let mut report = |name: &str, findings: Vec<scan::Finding>| {
         for f in findings {
             if total == 0 {
-                eprintln!("发现疑似密钥：");
+                eprintln!("Found suspected secrets:");
             }
             eprintln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
             total += 1;
@@ -50,10 +50,10 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
     };
 
     if staged && paths.is_empty() {
-        // 关键:pre-commit 要扫的是**将要提交的内容**,即索引里的 blob,不是工作树。
-        // 旧代码从 `git diff --cached` 拿文件名却 read_to_string 工作树 —— 若 blob 已暂存、
-        // 工作树随后被改回干净版(git add -p / 暂存后再编辑转录去密钥),密钥照样进仓。
-        // `-z` 用 NUL 分隔且不做 octal 引用,特殊字符文件名也不漏。
+        // Key point: pre-commit must scan **what is about to be committed**, i.e. the blob in the index, not the working tree.
+        // The old code took the filename from `git diff --cached` but read_to_string'd the working tree -- if the blob is staged
+        // and the working tree is then reverted to a clean version (git add -p / editing the transcript to strip the secret after staging), the secret still lands in the repo.
+        // `-z` separates with NUL and does no octal quoting, so filenames with special characters aren't missed either.
         let (_, out) = scope::git_in_status(
             &root,
             &["diff", "--cached", "--name-only", "-z", "--diff-filter=ACM"],
@@ -61,9 +61,9 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
         for name in out.split('\0').filter(|s| !s.is_empty()) {
             let (code, content) = scope::git_in_status(&root, &["show", &format!(":{name}")]);
             if code != 0 {
-                continue; // 无法取出该 blob(极少见),跳过而非中止
+                continue; // can't extract this blob (very rare), skip rather than abort
             }
-            // 熵检测只对 .md 开;session dump(jsonl)满是 UUID,泛化熵会疯狂误报。
+            // entropy detection is on only for .md; session dumps (jsonl) are full of UUIDs, so generalized entropy would fire wild false positives.
             let entropy = name.ends_with(".md");
             report(name, scan::scan_text_opts(&content, entropy));
         }
@@ -73,7 +73,7 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
     let targets: Vec<PathBuf> = if !paths.is_empty() {
         paths.iter().map(|p| root.join(p)).collect()
     } else {
-        // 扫整个 Agent Store 的文本文件:CLAUDE 派生(.md)+ session dump(.jsonl 等)
+        // scan every text file in the Agent Store: CLAUDE-derived (.md) + session dumps (.jsonl etc.)
         WalkDir::new(&root)
             .into_iter()
             .filter_entry(|e| e.file_name() != ".git")
@@ -100,47 +100,47 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
     finish_scan(total, staged, targets.len())
 }
 
-/// scan_root 的收尾:统一"发现/未发现"的报告与退出码。
+/// scan_root wrap-up: unifies the "found/not found" report and exit code.
 fn finish_scan(total: usize, staged: bool, scanned: usize) -> Result<i32> {
     if total > 0 {
-        eprintln!("\n{total} 处。AgentState 一旦 push，同事 pull 下来就带着它们。");
-        eprintln!("修掉它。或者用 --no-verify 绕过这道 hook，显式承担后果。");
+        eprintln!("\n{total} of them. Once the AgentState is pushed, a teammate who pulls carries them along.");
+        eprintln!("Fix it. Or use --no-verify to bypass this hook and explicitly own the consequences.");
         return Ok(1);
     }
     if !staged {
-        println!("扫描 {scanned} 个文件，未发现密钥。");
+        println!("Scanned {scanned} files, no secrets found.");
     }
     Ok(0)
 }
 
-/// `agit clone <url>` —— 把团队的 Agent Store 拉到 .agit/agent 并装好驱动/hook。
-/// 消费他人 context 的一条命令：clone + init（幂等）。
+/// `agit clone <url>` -- pull the team's Agent Store into .agit/agent and install the drivers/hooks.
+/// A single command for consuming someone else's context: clone + init (idempotent).
 pub fn clone_agent(url: &str) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = env.join(scope::AGENT_DIR);
     if agent.join(".git").exists() {
         anyhow::bail!(
-            "{} 已存在。要换成远端的 context，先移除它，或直接 agit -a pull。",
+            "{} already exists. To swap in the remote context, remove it first, or just agit -a pull.",
             agent.display()
         );
     }
     std::fs::create_dir_all(agent.parent().unwrap())?;
-    // 继承 stdio：让 git 的进度可见、凭据 prompt 可答、失败时真实 stderr 直达终端。
-    // 捕获式 .output() 会吞掉这些 —— clone 是唯一走远端的地方，最不能瞎。
+    // Inherit stdio: keep git's progress visible, credential prompts answerable, and real stderr reaching the terminal on failure.
+    // A capturing .output() would swallow all of that -- clone is the one place that reaches the remote, where flying blind is least acceptable.
     let code = scope::git_in_inherit(&env, &["clone", url, &agent.to_string_lossy()]);
     if code != 0 {
-        anyhow::bail!("git clone {url} 失败(退出码 {code})。上面的 git 报错是原因。");
+        anyhow::bail!("git clone {url} failed (exit code {code}). The git error above is the reason.");
     }
-    println!("已拉取 Agent Store ← {url}");
-    // 装 driver / hook（init 幂等，会在已有 clone 上补装配置）
+    println!("Pulled Agent Store ← {url}");
+    // install driver / hook (init is idempotent; it fills in config on an existing clone)
     crate::init::run()?;
-    println!("\n看看拿到了什么： agit -a log   （或 agit -a sync origin/main 对话合并）");
+    println!("\nSee what you got: agit -a log   (or agit -a sync origin/main to merge conversations)");
     Ok(0)
 }
 
-// ─────────────────────── convert:跨 runtime 转会话 ───────────────────────
+// ─────────────────────── convert: convert sessions across runtimes ───────────────────────
 
-/// 从源文件内容推断 runtime(session_meta=codex;sessionId/parentUuid=claude)。
+/// Infer the runtime from the source file's content (session_meta=codex; sessionId/parentUuid=claude).
 fn infer_runtime(text: &str) -> Option<&'static str> {
     for line in text.lines().take(20) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -167,12 +167,12 @@ pub fn convert_cmd(
     use crate::convo::{self, ConvertOpts};
 
     let text = std::fs::read_to_string(src)
-        .map_err(|e| anyhow::anyhow!("读源 session {} 失败: {e}", src.display()))?;
+        .map_err(|e| anyhow::anyhow!("failed to read source session {}: {e}", src.display()))?;
     let from = match from {
         Some(f) => f,
         None => infer_runtime(&text)
             .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("认不出源 runtime,请显式 --from claude-code|codex"))?,
+            .ok_or_else(|| anyhow::anyhow!("can't recognize the source runtime, pass --from claude-code|codex explicitly"))?,
     };
 
     let new_id = convo::fresh_id("session");
@@ -183,43 +183,43 @@ pub fn convert_cmd(
     let (out, ir) = convo::convert(src, &from, to, &opts)?;
     let cross = convo::is_cross_vendor(&from, to);
 
-    // 目标 cwd(装到哪个项目下 / resume 落哪)。current_dir() 惰性求值:只有源里也拿不到 cwd 时才调,
-    // 且它的失败不该在 cwd 已知时白白中断转换。
+    // Target cwd (which project it installs under / where resume lands). current_dir() is evaluated lazily: called only when the source has no cwd either,
+    // and its failure shouldn't needlessly abort the conversion when the cwd is already known.
     let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {
         Some(c) => PathBuf::from(c),
         None => std::env::current_dir()?,
     };
 
-    // 产物 = 敏感内容的新副本,落盘前高精度扫一遍(jsonl:关熵检测)
+    // The output = a new copy of sensitive content; scan it at high precision before writing to disk (jsonl: entropy detection off)
     let hits = scan::scan_text_opts(&out, false).len();
 
-    println!("convert {from} → {to}{}", if cross { "（跨 vendor:内容级,丢加密推理、叙述工具）" } else { "（同 vendor:字节级重放）" });
-    println!("  源       : {}", src.display());
-    println!("  新 id    : {new_id}");
-    println!("  回合/行  : {} events → {} 行", ir.events.len(), out.lines().count());
-    println!("  目标 cwd : {}", cwd.display());
+    println!("convert {from} → {to}{}", if cross { " (cross-vendor: content-level, drops encrypted reasoning and narrated tools)" } else { " (same vendor: byte-level replay)" });
+    println!("  source   : {}", src.display());
+    println!("  new id   : {new_id}");
+    println!("  turns/ln : {} events → {} lines", ir.events.len(), out.lines().count());
+    println!("  dest cwd : {}", cwd.display());
     if hits > 0 {
-        eprintln!("  ⚠ 产物里扫到 {hits} 处疑似密钥 —— 这是源会话见过的内容的新副本,注意别外泄。");
+        eprintln!("  ⚠ scanned {hits} suspected secrets in the output -- a new copy of content the source session saw, so be careful not to leak it.");
     }
 
     if !write {
         let preview: String = out.lines().take(3).collect::<Vec<_>>().join("\n");
-        println!("\n  预览(前 3 行):\n{preview}");
-        println!("\n  —— dry-run,未落盘。加 --write 安装并给出 resume 命令。");
+        println!("\n  preview (first 3 lines):\n{preview}");
+        println!("\n  -- dry-run, nothing written. Add --write to install and print the resume command.");
         return Ok(0);
     }
 
     let h = crate::register::install(to, &new_id, &cwd, &out)?;
-    println!("\n  已写入: {}", h.path.display());
+    println!("\n  written: {}", h.path.display());
     println!("  resume : {}", h.resume_cmd);
     Ok(0)
 }
 
-/// 打印当前 WorkspaceRevision（Agent↔Environment 配对）。
+/// Print the current WorkspaceRevision (Agent↔Environment pairing).
 pub fn workspace_show() -> Result<i32> {
     let head = scope::workspace_dir()?.join("HEAD.json");
     if !head.exists() {
-        println!("还没有 WorkspaceRevision。任一库 commit 后会自动生成。");
+        println!("No WorkspaceRevision yet. One is generated automatically after either repo commits.");
         return Ok(0);
     }
     println!("{}", std::fs::read_to_string(head)?);
@@ -229,14 +229,14 @@ pub fn workspace_show() -> Result<i32> {
 pub fn workspace_log() -> Result<i32> {
     let log = scope::workspace_dir()?.join("log.jsonl");
     if !log.exists() {
-        println!("还没有 WorkspaceRevision。");
+        println!("No WorkspaceRevision yet.");
         return Ok(0);
     }
     print!("{}", std::fs::read_to_string(log)?);
     Ok(0)
 }
 
-/// 读 workspace 日志为 (最新在前) 的 revision 列表。
+/// Read the workspace log into a revision list (newest first).
 fn workspace_revisions() -> Result<Vec<serde_json::Value>> {
     let log = scope::workspace_dir()?.join("log.jsonl");
     if !log.exists() {
@@ -246,22 +246,22 @@ fn workspace_revisions() -> Result<Vec<serde_json::Value>> {
         .lines()
         .filter_map(|l| serde_json::from_str(l.trim()).ok())
         .collect();
-    revs.reverse(); // 最新在前
+    revs.reverse(); // newest first
     Ok(revs)
 }
 
-/// `agit workspace restore [<N|agent-rev>]` —— 把两个库一起退回某条 WorkspaceRevision 记录的
-/// 联合状态（JointVersionControl 的「撤销」半边）。无参时列出可选的 revision。
+/// `agit workspace restore [<N|agent-rev>]` -- roll both repos back together to the joint state recorded by
+/// a WorkspaceRevision (the "undo" half of JointVersionControl). With no argument, list the available revisions.
 pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
     let revs = workspace_revisions()?;
     if revs.is_empty() {
-        anyhow::bail!("还没有 WorkspaceRevision 可恢复。任一库 commit 后会自动生成。");
+        anyhow::bail!("No WorkspaceRevision to restore yet. One is generated automatically after either repo commits.");
     }
 
     let short = |s: &str| s.chars().take(9).collect::<String>();
     let Some(sel) = selector else {
-        // 没给选择器：列出可挑的联合状态（最新在前）。
-        println!("可恢复的联合状态（最新在前）：\n");
+        // No selector given: list the joint states to choose from (newest first).
+        println!("Restorable joint states (newest first):\n");
         for (i, r) in revs.iter().enumerate() {
             let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
             let trig = r.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
@@ -269,11 +269,11 @@ pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
             let ec = r.get("env").and_then(|e| e.get("head_commit")).and_then(|v| v.as_str()).unwrap_or("");
             println!("  {:>2}. {ts}  {trig:14}  agent {} · env {}", i + 1, short(ar), short(ec));
         }
-        println!("\n用 `agit workspace restore <编号>` 或 `restore <agent-rev 前缀>` 退回。");
+        println!("\nUse `agit workspace restore <number>` or `restore <agent-rev prefix>` to roll back.");
         return Ok(0);
     };
 
-    // 选择器：纯数字 = 编号（1 = 最新）；否则按 agent_rev 前缀匹配。
+    // Selector: a pure number = index (1 = newest); otherwise match by agent_rev prefix.
     let chosen = if let Ok(n) = sel.parse::<usize>() {
         revs.get(n.wrapping_sub(1))
     } else {
@@ -282,7 +282,7 @@ pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
         })
     };
     let Some(rev) = chosen else {
-        anyhow::bail!("没有匹配 `{sel}` 的 WorkspaceRevision。`agit workspace restore` 看可选项。");
+        anyhow::bail!("No WorkspaceRevision matching `{sel}`. Run `agit workspace restore` to see the options.");
     };
 
     let agent_rev = rev.get("agent_rev").and_then(|v| v.as_str()).unwrap_or("");
@@ -292,29 +292,29 @@ pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if env_commit.is_empty() {
-        anyhow::bail!("这条 revision 没有 env.head_commit，无法恢复。");
+        anyhow::bail!("This revision has no env.head_commit, so it can't be restored.");
     }
 
     let env = scope::env_root()?;
-    println!("恢复联合状态 → env {} · agent {}", short(env_commit), short(agent_rev));
-    println!("（两个库都会 checkout 到该提交，进入 detached HEAD；git 会拒绝覆盖未提交改动。）\n");
+    println!("Restoring joint state → env {} · agent {}", short(env_commit), short(agent_rev));
+    println!("(Both repos will checkout to that commit, entering detached HEAD; git will refuse to overwrite uncommitted changes.)\n");
 
-    // 先 Environment，后 Agent Store。任一失败即停，让用户看清 git 的真实报错。
+    // Environment first, then Agent Store. Stop on the first failure so the user sees git's real error.
     println!("Environment:");
     let ec = scope::git_in_inherit(&env, &["checkout", env_commit]);
     if ec != 0 {
-        anyhow::bail!("Environment checkout 失败(退出码 {ec})。先提交或 stash 未保存改动。");
+        anyhow::bail!("Environment checkout failed (exit code {ec}). Commit or stash your unsaved changes first.");
     }
     if !agent_rev.is_empty() {
         if let Ok(agent) = scope::agent_root() {
             println!("Agent Store:");
             let ac = scope::git_in_inherit(&agent, &["checkout", agent_rev]);
             if ac != 0 {
-                anyhow::bail!("Agent Store checkout 失败(退出码 {ac})。Environment 已回退，Agent Store 未动。");
+                anyhow::bail!("Agent Store checkout failed (exit code {ac}). Environment was already rolled back, Agent Store untouched.");
             }
         }
     }
-    println!("\n已回到该联合状态。要在此基础上继续，`agit checkout -b <分支>` / `agit -a checkout -b <分支>` 建分支。");
+    println!("\nBack at that joint state. To build on it, create a branch with `agit checkout -b <branch>` / `agit -a checkout -b <branch>`.");
     Ok(0)
 }
 

@@ -1,15 +1,15 @@
-//! agit —— A Git-compatible CLI for versioning Agent Context + Environment.
+//! agit — A Git-compatible CLI for versioning Agent Context + Environment.
 //!
-//! 架构（docs/architecture.md）：被版本化的对象是两个 git 库 + 一个配对。
+//! Architecture (docs/architecture.md): the versioned objects are two git repos + one pairing.
 //!
-//!   agit <git-args>     = agit -e <git-args>  → 透明 git 作用在 Environment（代码仓库）
-//!   agit -a <git-args>                        → 同构操作作用在 Agent Store
+//!   agit <git-args>     = agit -e <git-args>  → transparent git acting on the Environment (code repository)
+//!   agit -a <git-args>                        → the isomorphic operation acting on the Agent Store
 //!
-//! scope 开关只认紧跟 agit 的第一个 token。子命令之后的 -a 原样交给 git：
+//! The scope switch only recognizes the first token immediately after agit. Any -a after the subcommand is passed to git as-is:
 //!   agit -a commit   → Agent scope
-//!   agit commit -a   → Environment scope，-a 是 git commit 的参数
+//!   agit commit -a   → Environment scope, -a is an argument to git commit
 
-// 核心逻辑在 lib(crate `agit`),与 agit-hub 共享,避免两个 bin 各写一份解析而漂移。
+// Core logic lives in the lib (crate `agit`), shared with agit-hub, so the two bins don't each write their own parsing and drift apart.
 use agit::scope::Scope;
 use agit::{commands, init, passthrough, session, sync};
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ fn main() {
     exit(dispatch(argv));
 }
 
-/// 解析出 (scope, 剩余参数)。scope 只能是紧跟 agit 的第一个 token。
+/// Parse out (scope, remaining args). The scope can only be the first token immediately after agit.
 fn split_scope(argv: &[String]) -> (Scope, &[String]) {
     match argv.first().map(|s| s.as_str()) {
         Some("-a") => (Scope::Agent, &argv[1..]),
@@ -39,12 +39,12 @@ fn dispatch(argv: Vec<String>) -> i32 {
     let args = &rest[1..];
 
     let result = match cmd {
-        // ── 顶层原生命令（与 scope 无关）──
+        // ── Top-level native commands (independent of scope) ──
         "init" => init::run(),
         "clone" => match args.first() {
             Some(url) => commands::clone_agent(url),
             None => {
-                eprintln!("用法: agit clone <hub-url>/<name>.git   （把团队 Agent Store 拉到本地并装好驱动）");
+                eprintln!("usage: agit clone <hub-url>/<name>.git   (clone the team Agent Store locally and set up the driver)");
                 Ok(2)
             }
         },
@@ -57,7 +57,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
             Ok(0)
         }
 
-        // ── 需要 agit 加值的原生动词 ──
+        // ── Native verbs that agit adds value to ──
         "scan" => {
             let (staged, paths) = parse_scan(args);
             commands::scan_cmd(scope, staged, &paths)
@@ -69,9 +69,9 @@ fn dispatch(argv: Vec<String>) -> i32 {
             _ => commands::workspace_show(),
         },
 
-        // ── snap：把 runtime 的 session dump 镜像进 Agent Store（旧名 sync）──
+        // ── snap: mirror the runtime's session dump into the Agent Store (formerly named sync) ──
         "snap" => {
-            // 位置参数当 runtime 简写：`agit -a snap codex` == `agit -a snap --from codex`。
+            // A positional argument is shorthand for the runtime: `agit -a snap codex` == `agit -a snap --from codex`.
             let (flag_rt, pos) = parse_runtime_arg(args, "--from");
             let rt = match pos {
                 Some(p) => p.to_string_lossy().into_owned(),
@@ -80,7 +80,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
             session::sync(&rt)
         }
 
-        // ── sync：用对话合并两个分叉的 agent 分支（两侧真 resume、只读对账，真冲突才问你）──
+        // ── sync: merge two diverged agent branches by dialogue (both sides truly resume, read-only reconciliation, only real conflicts prompt you) ──
         "sync" => {
             let mut rt = "claude-code".to_string();
             let mut reference = None;
@@ -114,18 +114,18 @@ fn dispatch(argv: Vec<String>) -> i32 {
         }
         "adapter" => commands::adapter_list(),
 
-        // ── 跨 runtime 转会话(resume 到另一个 CLI)──
+        // ── Convert a session across runtimes (resume it in another CLI) ──
         "convert" => match parse_convert(args) {
             Some((src, from, to, cwd, write)) => {
                 commands::convert_cmd(&src, from, &to, cwd, write)
             }
             None => {
-                eprintln!("用法: agit convert <src-session> --to claude-code|codex [--from RT] [--cwd 路径] [--write]");
+                eprintln!("usage: agit convert <src-session> --to claude-code|codex [--from RT] [--cwd PATH] [--write]");
                 Ok(2)
             }
         },
 
-        // ── 其余一切：透明透传到对应库的 git ──
+        // ── Everything else: transparently pass through to the corresponding repo's git ──
         _ => passthrough::run(scope, rest),
     };
 
@@ -139,7 +139,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
 }
 
 
-/// 解析 `--from/--to <runtime>` + 一个可选位置参数。runtime 默认 claude-code。
+/// Parse `--from/--to <runtime>` + one optional positional argument. The runtime defaults to claude-code.
 fn parse_runtime_arg(args: &[String], flag: &str) -> (String, Option<PathBuf>) {
     let mut runtime = "claude-code".to_string();
     let mut positional = None;
@@ -156,8 +156,8 @@ fn parse_runtime_arg(args: &[String], flag: &str) -> (String, Option<PathBuf>) {
     (runtime, positional)
 }
 
-/// convert 参数:位置参数 src + --to(必需)+ --from/--cwd/--write。
-/// 返回 None 表示缺 src 或 --to。
+/// convert arguments: positional src + --to (required) + --from/--cwd/--write.
+/// Returns None when src or --to is missing.
 type ConvertArgs = (PathBuf, Option<String>, String, Option<String>, bool);
 fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
     let mut src = None;
@@ -209,20 +209,20 @@ fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {
 }
 
 const USAGE: &str = "\
-agit —— 版本化 agent 的原始 session,让团队协作 Agent Context
+agit — version an agent's raw session so teams can collaborate on Agent Context
 
-  agit init                在代码仓库旁建 Agent Store
-  agit -a snap             把本项目的 Claude session dump 镜像进 Agent Store（旧名 sync）
-  agit -a push / pull      和团队同步 session（Agent Store 就是 git 仓库）
-  agit -a sync <ref>       让本分支的 agent 和对面 <ref> 的 agent 对话合并,真冲突才问你
-  agit clone <url>         一条命令拉取团队 Agent Store
-  agit -a scan [--staged]  扫 session dump 里的密钥
-  agit workspace [log]     看 Agent↔Environment 的配对
-  agit workspace restore [N]  把两个库一起退回某条配对的联合状态
-  agit adapter             列出 runtime adapter
-  agit convert <src> --to <rt>  把一份 session 转成另一个 runtime 能 resume 的会话(--write 落盘)
+  agit init                Create an Agent Store next to the code repository
+  agit -a snap             Mirror this project's Claude session dump into the Agent Store (formerly named sync)
+  agit -a push / pull      Sync sessions with the team (the Agent Store is just a git repo)
+  agit -a sync <ref>       Merge this branch's agent with <ref>'s agent by dialogue; only real conflicts prompt you
+  agit clone <url>         Clone the team Agent Store in one command
+  agit -a scan [--staged]  Scan session dumps for secrets
+  agit workspace [log]     Show the Agent↔Environment pairing
+  agit workspace restore [N]  Roll both repos back together to a pairing's joint state
+  agit adapter             List runtime adapters
+  agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist)
 
-  agit <git-args>          在代码仓库（Environment）上透明跑 git
-  agit -a <git-args>       在 Agent Store 上跑同构 git
+  agit <git-args>          Run git transparently on the code repository (Environment)
+  agit -a <git-args>       Run isomorphic git on the Agent Store
 
-  scope 只认紧跟 agit 的第一个 token：agit -a commit（agent）vs agit commit -a（代码,-a 是 git 参数）";
+  scope only recognizes the first token immediately after agit: agit -a commit (agent) vs agit commit -a (code, -a is a git argument)";

@@ -1,48 +1,48 @@
-//! ConversationIR —— 无损的会话中间表示,专用于**格式转换**(convert)。
+//! ConversationIR — a lossless intermediate representation of a conversation, purpose-built for **format conversion** (convert).
 //!
-//! 与 SessionIR(有损摘要,给 reconcile 的 brief 用)刻意分开:convert 要能重建一份
-//! 目标 runtime 能 resume 的会话,不能靠一袋 prompt/命令字符串。
+//! Deliberately kept separate from SessionIR (a lossy summary used for reconcile's brief): convert must be able to rebuild a
+//! conversation that the target runtime can resume, not lean on a bag of prompt/command strings.
 //!
-//! 核心设计:每个 Event 同时带
-//!   - `raw`:**逐字的原始 jsonl 行**(不是 parse 回来的 Value —— serde_json 会打乱 key 顺序/格式)。
-//!            同 runtime 转换直接重放 raw → 字节级还原。
-//!   - `kinds`:语义叠加,只有跨 runtime 合成时才用。
+//! Core design: every Event carries both
+//!   - `raw`: the **verbatim original jsonl line** (not a re-parsed Value — serde_json would scramble key order/formatting).
+//!            Same-runtime conversion replays raw directly → byte-level restoration.
+//!   - `kinds`: a semantic overlay, used only when synthesizing across runtimes.
 //!
-//! 保真度分层:同 vendor = 字节级(重放 raw);跨 vendor = 内容级(从 kinds 重建可见回合,
-//! 丢加密 CoT、合成缺失的 system prompt、把工具活动叙述成文本)。见
-//! docs/plans/2026-07-15-claude-codex-conversion-design.md。
+//! Fidelity tiers: same vendor = byte-level (replay raw); cross vendor = content-level (rebuild the visible turns from kinds,
+//! drop the encrypted CoT, synthesize the missing system prompt, narrate tool activity as text). See
+//! docs/plans/2026-07-15-claude-codex-conversion-design.md.
 
 use crate::adapter::{claude_code, codex};
 use anyhow::{bail, Result};
 use serde_json::Value;
 use std::path::Path;
 
-/// 无损会话表示。
+/// Lossless conversation representation.
 #[derive(Debug, Default, Clone)]
 pub struct ConversationIR {
     pub source_runtime: String,
     pub session_id: String,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
-    /// codex 的 base_instructions;claude 无(转录里不含 system prompt)。
+    /// codex's base_instructions; claude has none (the transcript contains no system prompt).
     pub system_prompt: Option<String>,
     pub events: Vec<Event>,
 }
 
-/// 一条源记录:逐字 raw + 语义叠加。
+/// One source record: verbatim raw + semantic overlay.
 #[derive(Debug, Clone)]
 pub struct Event {
-    /// 逐字的原始 jsonl 行(用于同 vendor 字节级重放)。
+    /// The verbatim original jsonl line (used for same-vendor byte-level replay).
     pub raw: String,
-    /// 从这条记录抽出的语义项(可 0..n 个;reasoning/meta 等抽不出就为空)。
+    /// Semantic items extracted from this record (0..n; empty when nothing is extractable, e.g. reasoning/meta).
     pub kinds: Vec<EventKind>,
     pub id: Option<String>,
     pub parent_id: Option<String>,
     pub timestamp: Option<String>,
 }
 
-/// 跨 vendor 合成会消费的语义项。加密 reasoning、meta、token_count 等**不产生** kind
-/// (只活在 raw 里,跨 vendor 时被丢弃)。
+/// Semantic items consumed by cross-vendor synthesis. Encrypted reasoning, meta, token_count, etc. produce **no** kind
+/// (they live only in raw and are dropped when going cross-vendor).
 #[derive(Debug, Clone)]
 pub enum EventKind {
     UserPrompt(String),
@@ -52,12 +52,12 @@ pub enum EventKind {
     FileEdit { paths: Vec<String> },
 }
 
-/// convert 选项。
+/// convert options.
 #[derive(Debug, Clone)]
 pub struct ConvertOpts {
-    /// 覆盖目标会话的 cwd(决定 resume 落到哪个项目)。默认沿用源 cwd。
+    /// Override the target conversation's cwd (decides which project resume lands in). Defaults to the source cwd.
     pub cwd: Option<String>,
-    /// 分配给产物的新 session id(convert 决不复用源 id)。
+    /// The new session id assigned to the output (convert never reuses the source id).
     pub new_id: String,
 }
 
@@ -67,7 +67,7 @@ impl Default for ConvertOpts {
     }
 }
 
-/// runtime 名归一(和 adapter::get 的 key 对齐)。
+/// Normalize the runtime name (aligned with adapter::get's keys).
 pub fn normalize_runtime(rt: &str) -> &'static str {
     match rt {
         "claude" | "cc" | "claude-code" => "claude-code",
@@ -76,25 +76,25 @@ pub fn normalize_runtime(rt: &str) -> &'static str {
     }
 }
 
-/// 读一份源 session 文本 → ConversationIR。
+/// Read a source session's text → ConversationIR.
 pub fn read_conversation(runtime: &str, text: &str) -> Result<ConversationIR> {
     match normalize_runtime(runtime) {
         "claude-code" => Ok(claude_code::read_conversation(text)),
         "codex" => Ok(codex::read_conversation(text)),
-        _ => bail!("未知源 runtime `{runtime}`(支持 claude-code / codex)"),
+        _ => bail!("unknown source runtime `{runtime}` (supported: claude-code / codex)"),
     }
 }
 
-/// ConversationIR → 目标 runtime 的 session 文本。
+/// ConversationIR → the target runtime's session text.
 pub fn write_conversation(runtime: &str, ir: &ConversationIR, opts: &ConvertOpts) -> Result<String> {
     match normalize_runtime(runtime) {
         "claude-code" => Ok(claude_code::write_conversation(ir, opts)),
         "codex" => Ok(codex::write_conversation(ir, opts)),
-        _ => bail!("未知目标 runtime `{runtime}`(支持 claude-code / codex)"),
+        _ => bail!("unknown target runtime `{runtime}` (supported: claude-code / codex)"),
     }
 }
 
-/// 读源 → IR → 写目标。返回 (目标 session 文本, IR 供调用方拿 meta)。
+/// Read source → IR → write target. Returns (target session text, IR for the caller to grab meta).
 pub fn convert(
     src_path: &Path,
     src_runtime: &str,
@@ -102,33 +102,33 @@ pub fn convert(
     opts: &ConvertOpts,
 ) -> Result<(String, ConversationIR)> {
     let text = std::fs::read_to_string(src_path)
-        .map_err(|e| anyhow::anyhow!("读源 session {} 失败: {e}", src_path.display()))?;
+        .map_err(|e| anyhow::anyhow!("failed to read source session {}: {e}", src_path.display()))?;
     let ir = read_conversation(src_runtime, &text)?;
     if ir.events.is_empty() {
-        bail!("源 session 为空。");
+        bail!("source session is empty.");
     }
-    // 跨 vendor 靠重建可见回合;源里一个语义项都没有(如只有 session_meta 的残缺 rollout)
-    // 会合成出近乎空的会话、目标 CLI 拒绝 resume。提前拦下,给清楚的信息。
+    // Cross-vendor relies on rebuilding the visible turns; a source with zero semantic items (e.g. a truncated rollout with only session_meta)
+    // would synthesize a near-empty conversation that the target CLI refuses to resume. Catch it early and give a clear message.
     if is_cross_vendor(src_runtime, target_runtime) {
         let semantic: usize = ir.events.iter().map(|e| e.kinds.len()).sum();
         if semantic == 0 {
-            bail!("源里没有可重建的可见回合(prompt/回复/工具);无法跨 vendor 转换。");
+            bail!("the source has no visible turns to rebuild (prompt/reply/tool); cannot convert cross-vendor.");
         }
     }
-    // 不在这里改写 ir.cwd —— 同 vendor 重放要拿**原始** cwd 才能字符串替换。
-    // 目标 cwd 由 writer 从 opts.cwd 决定(缺省沿用 ir.cwd)。
+    // Don't rewrite ir.cwd here — same-vendor replay needs the **original** cwd to do the string substitution.
+    // The target cwd is decided by the writer from opts.cwd (defaulting to ir.cwd).
     let out = write_conversation(target_runtime, &ir, opts)?;
     Ok((out, ir))
 }
 
-/// 是否跨 vendor(源与目标 runtime 不同)。
+/// Whether this is cross-vendor (source and target runtime differ).
 pub fn is_cross_vendor(src: &str, target: &str) -> bool {
     normalize_runtime(src) != normalize_runtime(target)
 }
 
-/// 同 vendor 重放时替换 id / cwd:把 raw 行里 **JSON 引号包裹**的 `"old"` 换成 `"new"`。
-/// 引号锚定 → 不会误伤把 old 当子串/前缀的其它内容(如 /a/app 命中 /a/application),
-/// old 为空或 old==new 时原样返回(避免 replace("", …) 的逐字符炸开)。
+/// Replace id / cwd during same-vendor replay: swap the **JSON-quote-wrapped** `"old"` in the raw line for `"new"`.
+/// Quote-anchored → won't clobber other content that has old as a substring/prefix (e.g. /a/app matching /a/application),
+/// returns unchanged when old is empty or old == new (avoids the char-by-char explosion of replace("", …)).
 pub fn swap_quoted(raw: &str, old: &str, new: &str) -> String {
     if old.is_empty() || old == new {
         return raw.to_string();
@@ -136,7 +136,7 @@ pub fn swap_quoted(raw: &str, old: &str, new: &str) -> String {
     raw.replace(&format!("\"{old}\""), &format!("\"{new}\""))
 }
 
-/// 按 char 截断,超长加标记(不在字节中间切,避免 UTF-8 panic)。
+/// Truncate by char, appending a marker when too long (never cutting mid-byte, to avoid a UTF-8 panic).
 pub fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -183,7 +183,7 @@ mod tests {
         std::fs::write(&f, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"S1\",\"cwd\":\"/p\"}}\n").unwrap();
         let opts = ConvertOpts { cwd: None, new_id: "N".into() };
         let err = convert(&f, "codex", "claude-code", &opts).unwrap_err();
-        assert!(err.to_string().contains("可重建"), "{err}");
+        assert!(err.to_string().contains("rebuild"), "{err}");
     }
 
     #[test]
@@ -211,8 +211,8 @@ mod tests {
     }
 }
 
-/// 把一次工具调用叙述成一行文本(跨 vendor 默认路径:目标模型只需知道发生了什么,不重放)。
-/// 同时认 claude(Bash/Read/Write/Edit)与 codex(shell/exec_command/…)的工具名。
+/// Narrate a single tool call as one line of text (the default cross-vendor path: the target model only needs to know what happened, not replay it).
+/// Recognizes tool names from both claude (Bash/Read/Write/Edit) and codex (shell/exec_command/…).
 pub fn narrate_call(name: &str, input: &Value) -> String {
     let get = |k: &str| input.get(k).and_then(|v| v.as_str());
     match name {
@@ -227,7 +227,7 @@ pub fn narrate_call(name: &str, input: &Value) -> String {
     }
 }
 
-/// sha256(input) 的 hex。给 hub 存 token 摘要用(不落明文 secret)。
+/// The hex of sha256(input). Used by the hub to store a token digest (never persisting the plaintext secret).
 pub fn sha256_hex(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -235,9 +235,9 @@ pub fn sha256_hex(input: &str) -> String {
     hex::encode(h.finalize())
 }
 
-/// 生成一个新的、uuid 形状的 session id(8-4-4-4-12)。无 uuid crate:
-/// sha256(时间纳秒 + pid + salt) 取 16 字节,version nibble 置 7(uuidv7 形)。
-/// resume 只要求 id 形似 uuid 且唯一(spike 已核实),不校验真实 v7 时间戳。
+/// Generate a new, uuid-shaped session id (8-4-4-4-12). No uuid crate:
+/// sha256(time nanos + pid + salt) taking 16 bytes, with the version nibble set to 7 (uuidv7 shape).
+/// resume only requires the id to look like a uuid and be unique (verified by the spike), it doesn't validate a real v7 timestamp.
 pub fn fresh_id(salt: &str) -> String {
     use sha2::{Digest, Sha256};
     let nanos = std::time::SystemTime::now()
@@ -250,7 +250,7 @@ pub fn fresh_id(salt: &str) -> String {
     h.update(salt.as_bytes());
     let d = h.finalize();
     let hex = hex::encode(&d[..16]);
-    // 形如 xxxxxxxx-xxxx-7xxx-8xxx-xxxxxxxxxxxx
+    // Shaped like xxxxxxxx-xxxx-7xxx-8xxx-xxxxxxxxxxxx
     format!(
         "{}-{}-7{}-8{}-{}",
         &hex[0..8],

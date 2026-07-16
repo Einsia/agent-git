@@ -1,13 +1,13 @@
-//! 可插拔的 LLM CLI 后端 —— agit 里所有「需要模型」的地方都走这里。
+//! Pluggable LLM CLI backend -- every place in agit that "needs a model" routes through here.
 //!
-//! 当前唯一消费者是 `reconcile` 的语义合并（session.rs）：读两边会话的 brief、
-//! 合成统一上下文、判真冲突。存储/同步/文件层合并全是确定性的 git，只有这一层调模型。
+//! The only consumer right now is the semantic merge in `reconcile` (session.rs): it reads both sessions' briefs,
+//! synthesizes a unified context, and judges real conflicts. Storage/sync/file-level merging is all deterministic git; only this layer calls a model.
 //!
-//! 后端选择（留给 Codex 的口子）：
-//!   1. `AGIT_LLM_CMD="<任意命令>"`  —— 立刻可用；命令从 stdin 读 prompt、stdout 出结果。
-//!                                      例：export AGIT_LLM_CMD="codex exec -"
-//!   2. `AGIT_LLM=claude`（默认）    —— 本机 `claude -p`
-//!   3. `AGIT_LLM=codex`            —— 预留：拿到 codex 的非交互调用方式后在此填入
+//! Backend selection (the hook left for Codex):
+//!   1. `AGIT_LLM_CMD="<any command>"`  -- works immediately; the command reads the prompt from stdin and writes the result to stdout.
+//!                                      e.g. export AGIT_LLM_CMD="codex exec -"
+//!   2. `AGIT_LLM=claude` (default)    -- local `claude -p`
+//!   3. `AGIT_LLM=codex`            -- reserved: fill in here once we have codex's non-interactive invocation
 
 use anyhow::{bail, Context, Result};
 use std::io::Write;
@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 enum Backend {
     Claude,
     Codex,
-    /// AGIT_LLM_CMD：整条命令，经 `sh -c` 执行，prompt 走 stdin。
+    /// AGIT_LLM_CMD: the whole command, run via `sh -c`, with the prompt fed through stdin.
     Cmd(String),
 }
 
@@ -29,7 +29,7 @@ fn backend() -> Backend {
     match std::env::var("AGIT_LLM").unwrap_or_default().as_str() {
         "codex" => Backend::Codex,
         "claude" | "" => Backend::Claude,
-        other => Backend::Cmd(other.to_string()), // 当成命令名，如 "ollama run llama3"
+        other => Backend::Cmd(other.to_string()), // treat as a command name, e.g. "ollama run llama3"
     }
 }
 
@@ -42,7 +42,7 @@ fn which(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 当前后端是否真的可用（据此决定「有模型就语义对齐，没有就退回确定性合并」）。
+/// Whether the current backend is actually available (used to decide "align semantically if a model exists, otherwise fall back to deterministic merge").
 pub fn available() -> bool {
     match backend() {
         Backend::Claude => which("claude"),
@@ -59,16 +59,16 @@ pub fn backend_name() -> &'static str {
     }
 }
 
-/// 把 prompt 喂给后端，返回它的文本回复。
+/// Feed the prompt to the backend and return its text reply.
 pub fn ask(prompt: &str) -> Result<String> {
-    // codex exec 会往 stdout 流式打一堆 reasoning/事件；`-o <file>` 只落最终回复。
-    // 单独处理，拿到干净文本（否则 reconcile 解析尾部的 ```json 块会被 chrome 干扰）。
+    // codex exec streams a bunch of reasoning/events to stdout; `-o <file>` writes only the final reply.
+    // Handle it separately to get clean text (otherwise the trailing ```json block that reconcile parses gets polluted by the chrome).
     if let Backend::Codex = backend() {
         return ask_codex(prompt);
     }
     let (program, args): (&str, Vec<String>) = match backend() {
         Backend::Claude => ("claude", vec!["-p".into()]),
-        Backend::Codex => unreachable!("codex 已在上面处理"),
+        Backend::Codex => unreachable!("codex is handled above"),
         Backend::Cmd(c) => ("sh", vec!["-c".into(), c]),
     };
 
@@ -78,21 +78,21 @@ pub fn ask(prompt: &str) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("启动 LLM 后端失败：{program}（它在 PATH 里吗？）"))?;
+        .with_context(|| format!("failed to start LLM backend: {program} (is it on PATH?)"))?;
     child
         .stdin
         .take()
-        .context("拿不到后端 stdin")?
+        .context("could not get the backend's stdin")?
         .write_all(prompt.as_bytes())?;
     let out = child.wait_with_output()?;
     if !out.status.success() {
-        bail!("LLM 后端返回非零");
+        bail!("LLM backend returned non-zero");
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// `codex exec` 后端：prompt 走 stdin，最终回复用 `-o <file>` 落到临时文件后读回。
-/// `--skip-git-repo-check` 让它在任意目录都能跑；沙箱只读即可（纯文本合成，不需要它动文件）。
+/// `codex exec` backend: the prompt goes through stdin, and the final reply is written to a temp file via `-o <file>` and read back.
+/// `--skip-git-repo-check` lets it run in any directory; a read-only sandbox is fine (pure text synthesis, it doesn't need to touch files).
 fn ask_codex(prompt: &str) -> Result<String> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -109,18 +109,18 @@ fn ask_codex(prompt: &str) -> Result<String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("启动 codex 失败（它在 PATH 里吗？装 @openai/codex）")?;
+        .context("failed to start codex (is it on PATH? install @openai/codex)")?;
     child
         .stdin
         .take()
-        .context("拿不到 codex stdin")?
+        .context("could not get codex's stdin")?
         .write_all(prompt.as_bytes())?;
     let status = child.wait()?;
 
     let reply = std::fs::read_to_string(&out_file).ok();
     let _ = std::fs::remove_file(&out_file);
     if !status.success() {
-        bail!("codex exec 返回非零");
+        bail!("codex exec returned non-zero");
     }
-    reply.filter(|s| !s.trim().is_empty()).context("codex exec 没有产生回复")
+    reply.filter(|s| !s.trim().is_empty()).context("codex exec produced no reply")
 }

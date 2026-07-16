@@ -1,14 +1,14 @@
-//! agit-hub —— AgentGitHub：托管团队的 Agent Store，人可读（React SPA）、agent 可拉（JSON API）。
+//! agit-hub — AgentGitHub: hosts a team's Agent Store, human-readable (React SPA) and agent-pullable (JSON API).
 //!
-//! 形态：一个自包含的 HTTP 服务，托管一堆 Agent Store（bare git 仓库）。
-//!   - Registry：扫描 hub root 下的 <name>.git
-//!   - Sync：git smart-http，`agit -a push/pull http://host:port/<name>.git` 直接可用
-//!   - 鉴权：push 必须带**写 token**（关掉"谁都能推、谁都能污染"的口子）；
-//!            `serve --private` 时读也要 token。见 `agit-hub token`。
-//!   - 前端：hub-ui（Vite + React + Tailwind + shadcn）编译进二进制，SPA 消费下面的 JSON API。
-//!   - API：/api/agents、/api/agent/<name>（分页+搜索）、/session/<id>（含 provenance/revision）、/diff。
+//! Shape: a self-contained HTTP service hosting a bunch of Agent Stores (bare git repos).
+//!   - Registry: scans for <name>.git under the hub root
+//!   - Sync: git smart-http; `agit -a push/pull http://host:port/<name>.git` works directly
+//!   - Auth: push must carry a **write token** (closes the "anyone can push, anyone can pollute" hole);
+//!            with `serve --private`, reads also require a token. See `agit-hub token`.
+//!   - Frontend: hub-ui (Vite + React + Tailwind + shadcn) is compiled into the binary; the SPA consumes the JSON API below.
+//!   - API: /api/agents, /api/agent/<name> (paging + search), /session/<id> (with provenance/revision), /diff.
 //!
-//! 前端资源在编译期由 include_str! 嵌入（hub-ui/dist）。改前端后 `cd hub-ui && npm run build` 再 cargo build。
+//! Frontend assets are embedded at compile time via include_str! (hub-ui/dist). After changing the frontend, run `cd hub-ui && npm run build` then cargo build.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::collections::HashMap;
@@ -19,10 +19,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const PER_PAGE: usize = 20;
-/// 带查询时最多扫多少条 session（挡住无界 git show）。超出会在响应里标记，不静默截断。
+/// When a query is present, the max number of sessions to scan (guards against unbounded git show). Overflow is flagged in the response, not silently truncated.
 const SEARCH_SCAN_CAP: usize = 400;
 
-// ── 编译期嵌入的前端（hub-ui/dist）──
+// ── Frontend embedded at compile time (hub-ui/dist) ──
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/index.html"));
 const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/app.js"));
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/app.css"));
@@ -31,7 +31,7 @@ fn main() {
     std::process::exit(run());
 }
 
-/// 返回进程退出码 —— 错误路径必须非零，脚本/CI 才能感知失败（别一律 exit 0）。
+/// Returns the process exit code — error paths must be non-zero so scripts/CI can detect failure (don't always exit 0).
 fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("serve");
@@ -41,13 +41,13 @@ fn run() -> i32 {
         "serve" => {
             let port: u16 = flag(&args, "--port").and_then(|p| p.parse().ok()).unwrap_or(8177);
             let private = args.iter().any(|a| a == "--private");
-            serve(&root, port, private); // 只在 bind 失败时内部 exit(1)，正常不返回
+            serve(&root, port, private); // only exits internally with exit(1) on bind failure; otherwise never returns
             0
         }
         "add" => match args.get(1).filter(|s| !s.starts_with("--")) {
             Some(n) => add_repo(&root, n),
             None => {
-                eprintln!("用法: agit-hub add <name>");
+                eprintln!("Usage: agit-hub add <name>");
                 2
             }
         },
@@ -63,7 +63,7 @@ fn run() -> i32 {
             0
         }
         other => {
-            eprintln!("未知子命令: {other}");
+            eprintln!("Unknown subcommand: {other}");
             print_help();
             2
         }
@@ -72,13 +72,13 @@ fn run() -> i32 {
 
 fn print_help() {
     println!(
-        "agit-hub —— AgentGitHub (Registry + Sync)\n\n\
-         agit-hub serve [--port 8177] [--private] [--root ~/.agit-hub]   启动 Hub\n\
-         agit-hub add <name> [--root ...]                     新建一个 Agent Store 仓库\n\
-         agit-hub list [--root ...]                           列出已托管的 agent\n\
-         agit-hub token add <name> [--write|--read]           发一个访问 token（push 必须带写 token）\n\
-         agit-hub token list                                  列出 token（只显示名字与权限）\n\n\
-         托管的仓库是 bare git。发布： agit -a push http://HOST:PORT/<name>.git（带写 token）"
+        "agit-hub — AgentGitHub (Registry + Sync)\n\n\
+         agit-hub serve [--port 8177] [--private] [--root ~/.agit-hub]   Start the Hub\n\
+         agit-hub add <name> [--root ...]                     Create a new Agent Store repo\n\
+         agit-hub list [--root ...]                           List hosted agents\n\
+         agit-hub token add <name> [--write|--read]           Issue an access token (push requires a write token)\n\
+         agit-hub token list                                  List tokens (name and permission only)\n\n\
+         Hosted repos are bare git. Publish: agit -a push http://HOST:PORT/<name>.git (with a write token)"
     );
 }
 
@@ -91,11 +91,11 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
 }
 
-// ─────────────────────────── 鉴权（token） ───────────────────────────
+// ─────────────────────────── Auth (token) ───────────────────────────
 
 struct Tok {
     name: String,
-    /// **只存 token 的 sha256 摘要**，不落明文 —— auth.json 被读走也不直接泄露可用凭据。
+    /// **Stores only the token's sha256 digest**, never the plaintext — even if auth.json is read, no usable credential leaks directly.
     hash: String,
     write: bool,
 }
@@ -131,34 +131,34 @@ fn token_cmd(root: &Path, args: &[String]) -> i32 {
     match args.get(1).map(|s| s.as_str()) {
         Some("add") => {
             let Some(name) = args.get(2).filter(|s| !s.starts_with("--")) else {
-                eprintln!("用法: agit-hub token add <name> [--write|--read]");
+                eprintln!("Usage: agit-hub token add <name> [--write|--read]");
                 return 2;
             };
             let write = !args.iter().any(|a| a == "--read");
-            // CSPRNG 拿不到就**报错退出**，绝不退回可预测的时间值来发凭据。
+            // If the CSPRNG is unavailable, **error out** — never fall back to a predictable time-based value to mint a credential.
             let secret = match gen_secret() {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("拒绝发 token：{e}");
+                    eprintln!("Refusing to issue token: {e}");
                     return 1;
                 }
             };
             let mut toks = load_tokens(root);
             toks.push(Tok { name: name.clone(), hash: agit::convo::sha256_hex(&secret), write });
             if let Err(e) = save_tokens(root, &toks) {
-                eprintln!("写 auth.json 失败: {e}");
+                eprintln!("Failed to write auth.json: {e}");
                 return 1;
             }
-            println!("已发 token（{}）给 {name}", if write { "写" } else { "只读" });
+            println!("Issued token ({}) to {name}", if write { "write" } else { "read-only" });
             println!("  token: {secret}");
-            println!("  这串只显示这一次（服务器只存它的 sha256 摘要）。");
-            println!("  git 提示输入用户名/密码时，密码填这个 token（用户名随意）。");
+            println!("  This string is shown only once (the server stores only its sha256 digest).");
+            println!("  When git prompts for a username/password, put this token in the password field (username can be anything).");
             0
         }
         Some("list") => {
             let toks = load_tokens(root);
             if toks.is_empty() {
-                println!("还没有 token。`agit-hub token add <name> --write` 发一个。");
+                println!("No tokens yet. Issue one with `agit-hub token add <name> --write`.");
             }
             for t in toks {
                 println!("{:<20} {}", t.name, if t.write { "write" } else { "read" });
@@ -166,26 +166,26 @@ fn token_cmd(root: &Path, args: &[String]) -> i32 {
             0
         }
         _ => {
-            eprintln!("用法: agit-hub token add <name> [--write|--read] | agit-hub token list");
+            eprintln!("Usage: agit-hub token add <name> [--write|--read] | agit-hub token list");
             2
         }
     }
 }
 
 fn save_tokens(root: &Path, toks: &[Tok]) -> std::io::Result<()> {
-    // auth.json 存的是凭据摘要，仍按机密对待：目录 0700、文件 0600，owner-only。
+    // auth.json stores credential digests, but still treat it as secret: dir 0700, file 0600, owner-only.
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(root).or_else(|e| {
         if root.is_dir() { Ok(()) } else { Err(e) }
     })?;
-    // 即便目录早已存在（mode 只在创建时生效），也把它收紧到 0700 —— 它装着凭据。
+    // Even if the dir already exists (mode only applies at creation), tighten it to 0700 — it holds credentials.
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
     let arr: Vec<serde_json::Value> = toks
         .iter()
         .map(|t| serde_json::json!({"name": t.name, "hash": t.hash, "access": if t.write {"write"} else {"read"}}))
         .collect();
     let body = serde_json::to_string_pretty(&serde_json::json!({ "tokens": arr })).unwrap_or("{}".into());
-    // 从一开始就用 0600 打开（先写后 chmod 有窗口，且 fd 不受 chmod 影响）。
+    // Open with 0600 from the start (write-then-chmod leaves a window, and an open fd isn't affected by chmod).
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -195,7 +195,7 @@ fn save_tokens(root: &Path, toks: &[Tok]) -> std::io::Result<()> {
     f.write_all(body.as_bytes())
 }
 
-/// 32 字节 CSPRNG → hex。拿不到 OS 熵就**报错**，绝不退回可预测的时间值来发凭据。
+/// 32 bytes of CSPRNG → hex. If OS entropy is unavailable, **error out** — never fall back to a predictable time-based value to mint a credential.
 fn gen_secret() -> std::io::Result<String> {
     let mut buf = [0u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
@@ -206,7 +206,7 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// 定长常数时间比较（token 摘要都是 64 位 hex；避免逐字节短路泄露信息）。
+/// Fixed-length constant-time comparison (token digests are all 64-char hex; avoids leaking info via per-byte short-circuit).
 fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -244,7 +244,7 @@ fn authorized(toks: &[Tok], private: bool, req: &Req, need_write: bool) -> bool 
     if !need_write && !private {
         return true;
     }
-    // 把出示的凭据 hash 后与存的摘要常数时间比较（服务器不持有明文 token）。
+    // Hash the presented credential and constant-time compare against the stored digest (the server holds no plaintext token).
     let cand_hashes: Vec<String> = credentials(req).iter().map(|c| agit::convo::sha256_hex(c)).collect();
     toks.iter()
         .any(|t| (!need_write || t.write) && cand_hashes.iter().any(|h| ct_eq(h, &t.hash)))
@@ -290,16 +290,16 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 
 fn add_repo(root: &Path, name: &str) -> i32 {
     if !valid_agent_name(name) {
-        eprintln!("非法名字（只允许 [A-Za-z0-9._-]，禁止 .. 与前导点）: {name}");
+        eprintln!("Illegal name (only [A-Za-z0-9._-] allowed; no .. and no leading dot): {name}");
         return 2;
     }
     let dir = root.join(format!("{name}.git"));
     if dir.exists() {
-        eprintln!("已存在: {}", dir.display());
+        eprintln!("Already exists: {}", dir.display());
         return 1;
     }
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("建目录失败: {e}");
+        eprintln!("Failed to create directory: {e}");
         return 1;
     }
     let ok = Command::new("git")
@@ -310,13 +310,13 @@ fn add_repo(root: &Path, name: &str) -> i32 {
         .unwrap_or(false);
     if ok {
         let _ = Command::new("git").arg("-C").arg(&dir).args(["config", "http.receivepack", "true"]).status();
-        println!("已托管 {name}  →  {}", dir.display());
-        println!("发布（需写 token，见 `agit-hub token add`）：");
+        println!("Now hosting {name}  →  {}", dir.display());
+        println!("Publish (needs a write token, see `agit-hub token add`):");
         println!("  agit -a remote add origin http://localhost:8177/{name}.git");
         println!("  agit -a push -u origin main");
         0
     } else {
-        eprintln!("git init --bare 失败");
+        eprintln!("git init --bare failed");
         1
     }
 }
@@ -335,7 +335,7 @@ fn list_agents(root: &Path) -> Vec<String> {
     out
 }
 
-/// 合法 agent 名:只允许 [A-Za-z0-9._-]，禁止 `..`、前导 `.`、路径分隔符与 NUL。
+/// Valid agent name: only [A-Za-z0-9._-] allowed; no `..`, no leading `.`, no path separators, no NUL.
 fn valid_agent_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
@@ -347,7 +347,7 @@ fn repo_path(root: &Path, name: &str) -> PathBuf {
     root.join(format!("{name}.git"))
 }
 
-// ─────────────────────── git 读取（bare 仓库）───────────────────────
+// ─────────────────────── git reads (bare repo) ───────────────────────
 
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git").arg("-C").arg(repo).args(args).output().ok()?;
@@ -368,7 +368,7 @@ fn recent_log(repo: &Path, n: usize) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// 最近一次提交的相对时间 + 主题，首页用它（便宜，单次 git log）。
+/// Relative time + subject of the latest commit; used by the home page (cheap, a single git log).
 fn last_activity(repo: &Path) -> (String, String) {
     git(repo, &["log", "-1", "--format=%cr\x1f%s"])
         .and_then(|s| s.trim().split_once('\x1f').map(|(a, b)| (a.to_string(), b.to_string())))
@@ -405,7 +405,7 @@ fn load_session(repo: &Path, path: &str, at: Option<&str>) -> Option<String> {
     git(repo, &["show", &format!("{}:{path}", at.unwrap_or("HEAD"))])
 }
 
-// ─────────── session 解析（跨 runtime，走 agit 库） ───────────
+// ─────────── session parsing (cross-runtime, via the agit library) ───────────
 
 struct SessionDigest {
     id: String,
@@ -492,7 +492,7 @@ fn session_revisions(repo: &Path, path: &str) -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
-/// session 的事件脊线：有序 kinds → 'p'/'a'/'t'/'e' 串（SPA 渲染成波形）。跨 runtime 走 ConversationIR。
+/// The session's event spine: ordered kinds → a 'p'/'a'/'t'/'e' string (the SPA renders it as a waveform). Cross-runtime via ConversationIR.
 fn spine_string(runtime: &str, jsonl: &str) -> String {
     use agit::convo::EventKind;
     let Ok(ir) = agit::convo::read_conversation(runtime, jsonl) else {
@@ -523,7 +523,7 @@ fn clip(s: &str, n: usize) -> String {
     s.trim().chars().take(n).collect()
 }
 
-// ─────────────────────────── HTTP 服务 ───────────────────────────
+// ─────────────────────────── HTTP service ───────────────────────────
 
 fn serve(root: &Path, port: u16, private: bool) {
     std::fs::create_dir_all(root).ok();
@@ -531,27 +531,27 @@ fn serve(root: &Path, port: u16, private: bool) {
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("绑定 {addr} 失败: {e}");
+            eprintln!("Failed to bind {addr}: {e}");
             std::process::exit(1);
         }
     };
     let n_write = load_tokens(root).iter().filter(|t| t.write).count();
-    println!("AgentGitHub 运行中");
-    println!("  前端:  http://localhost:{port}/");
+    println!("AgentGitHub running");
+    println!("  frontend:  http://localhost:{port}/");
     println!("  root:  {}", root.display());
-    println!("  托管:  {} 个 agent", list_agents(root).len());
-    println!("  鉴权:  push 需写 token（{n_write} 个已配）；读{}", if private { "需 token（--private）" } else { "开放" });
+    println!("  hosting:  {} agent(s)", list_agents(root).len());
+    println!("  auth:  push needs a write token ({n_write} configured); reads {}", if private { "need a token (--private)" } else { "are open" });
     if n_write == 0 {
-        println!("  ⚠ 还没有写 token —— 当前谁也不能 push。`agit-hub token add <name> --write` 发一个。");
+        println!("  ⚠ No write token yet — right now nobody can push. Issue one with `agit-hub token add <name> --write`.");
     }
 
-    // 并发上限：每连接一线程，但用信号量封顶 —— 否则 N 个慢连接 = N 个线程/内存，unbounded。
+    // Concurrency cap: one thread per connection, but capped with a semaphore — otherwise N slow connections = N threads/memory, unbounded.
     let sem = Arc::new(Semaphore::new(MAX_CONN));
-    // 每 IP 并发上限：单一来源的 slowloris 最多占 PER_IP_MAX 个槽，占不满全池、饿不死别的客户端。
+    // Per-IP concurrency cap: a slowloris from a single source can grab at most PER_IP_MAX slots, so it can't fill the whole pool or starve other clients.
     let ipc: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     for stream in listener.incoming().flatten() {
         let ip = stream.peer_addr().map(|a| a.ip()).ok();
-        // 先按 IP 准入：满了直接丢连接（drop 关闭），不占全局槽、不 spawn。
+        // Admit by IP first: if full, drop the connection (close on drop), taking no global slot and not spawning.
         if let Some(ip) = ip {
             let mut m = ipc.lock().unwrap();
             let n = m.entry(ip).or_insert(0);
@@ -561,10 +561,10 @@ fn serve(root: &Path, port: u16, private: bool) {
             *n += 1;
         }
         let ipguard = ip.map(|ip| IpGuard { map: ipc.clone(), ip });
-        let permit = Permit::acquire(sem.clone()); // 到顶就在这里挡住 accept，多余连接排在内核 backlog。
+        let permit = Permit::acquire(sem.clone()); // when full, this blocks accept here; excess connections wait in the kernel backlog.
         let root = root.to_path_buf();
         std::thread::spawn(move || {
-            // 都持有到线程结束；**即使 handle panic 也会在 drop 时归还**（不泄漏槽位/IP 计数）。
+            // Both are held until the thread ends; **even if handle panics they're returned on drop** (no leaked slot/IP count).
             let _permit = permit;
             let _ipguard = ipguard;
             let _ = handle(stream, &root, private);
@@ -572,7 +572,7 @@ fn serve(root: &Path, port: u16, private: bool) {
     }
 }
 
-/// 每 IP 的在途连接计数；drop 时减一（panic 安全）。
+/// In-flight connection count per IP; decremented on drop (panic-safe).
 struct IpGuard {
     map: Arc<Mutex<HashMap<IpAddr, usize>>>,
     ip: IpAddr,
@@ -590,7 +590,7 @@ impl Drop for IpGuard {
     }
 }
 
-/// 计数信号量（std 无内置）：封顶并发处理线程数。
+/// Counting semaphore (std has none built in): caps the number of concurrent handler threads.
 struct Semaphore {
     permits: Mutex<usize>,
     cv: Condvar,
@@ -602,7 +602,7 @@ impl Semaphore {
     }
 }
 
-/// 一个占用的槽位；drop 时归还（panic 安全 —— handle 崩了也不会漏掉一个 permit）。
+/// One occupied slot; returned on drop (panic-safe — even if handle crashes, no permit is leaked).
 struct Permit(Arc<Semaphore>);
 
 impl Permit {
@@ -646,17 +646,17 @@ impl Req {
 const MAX_BODY: usize = 512 * 1024 * 1024;
 const MAX_LINE: u64 = 16 * 1024;
 const MAX_HEADERS_BYTES: usize = 64 * 1024;
-/// 并发处理线程上限（挡住 unbounded thread-per-connection）。
+/// Cap on concurrent handler threads (guards against unbounded thread-per-connection).
 const MAX_CONN: usize = 64;
-/// 单个 IP 的在途连接上限（挡住单一来源 slowloris 占满全池）。给全池的一半，留槽位给别人。
+/// Cap on in-flight connections per IP (guards against a single-source slowloris filling the whole pool). Set to half the pool, leaving slots for others.
 const PER_IP_MAX: usize = 32;
-/// 从 accept 到读完请求头的整体墙钟上限（挡住 1 字节/<60s 的 slowloris 滴灌 —— 那能重置 per-read 超时）。
-/// 读头阶段的 socket 读超时也设成它 —— 于是阻塞在**请求行**那一次读上的连接也在此掐断（deadline 只在头循环顶检查，盖不住请求行读）。
+/// Overall wall-clock cap from accept to finishing the request headers (guards against a 1-byte/<60s slowloris drip — which could reset the per-read timeout).
+/// The socket read timeout during the header phase is also set to this — so a connection blocked on that single **request-line** read is cut off here too (the deadline is only checked at the top of the header loop, so it doesn't cover the request-line read).
 const HEADER_DEADLINE_SECS: u64 = 20;
-/// body（git push 的 pack）读超时更长：pack 持续流入，只在真卡住时触发。
+/// The body (git push pack) read timeout is longer: the pack streams in continuously, so this only fires when truly stuck.
 const BODY_TIMEOUT_SECS: u64 = 60;
 
-/// 只读请求行 + 头部，**不碰 body**。body 留在 reader 里，等鉴权通过、确实需要时再流式取。
+/// Reads only the request line + headers, **never touching the body**. The body stays in the reader, streamed later once auth passes and it's actually needed.
 fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Req> {
     let deadline = Instant::now() + Duration::from_secs(HEADER_DEADLINE_SECS);
     let mut line = String::new();
@@ -670,7 +670,7 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Req> {
     let mut headers_bytes = 0usize;
     loop {
         if Instant::now() > deadline {
-            return None; // 整体读头超时 → 掐掉（配合并发上限，slowloris 滴灌撑不住一个线程槽）
+            return None; // overall header-read timeout → cut off (combined with the concurrency cap, a slowloris drip can't hold a thread slot)
         }
         let mut h = String::new();
         reader.by_ref().take(MAX_LINE).read_line(&mut h).ok()?;
@@ -694,7 +694,7 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Req> {
 }
 
 fn handle(mut stream: TcpStream, root: &Path, private: bool) -> std::io::Result<()> {
-    // 读头阶段：短读超时，任何一次阻塞读（含请求行）最多挂 HEADER_DEADLINE_SECS。
+    // Header phase: short read timeout; any single blocking read (including the request line) hangs at most HEADER_DEADLINE_SECS.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(HEADER_DEADLINE_SECS)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(BODY_TIMEOUT_SECS)));
 
@@ -704,15 +704,15 @@ fn handle(mut stream: TcpStream, root: &Path, private: bool) -> std::io::Result<
     };
     let path = req.target.split('?').next().unwrap_or("/").to_string();
 
-    // 路径穿越总闸：任何 `..` 段一律拒绝。
+    // Path-traversal master gate: reject any `..` segment outright.
     if path.split('/').any(|seg| seg == "..") {
         return write_response(&mut stream, 400, "text/plain; charset=utf-8", b"bad request");
     }
 
     let toks = load_tokens(root);
 
-    // git smart-http：**先鉴权再读 body**。未授权的 push 直接 401，绝不把它的 pack 读进内存
-    // （否则匿名 POST 一个 512MB body 就能把进程撑爆 —— body-before-auth 的内存耗尽 DoS）。
+    // git smart-http: **authenticate before reading the body**. An unauthorized push gets a 401 straight away; never read its pack into memory
+    // (otherwise an anonymous POST with a 512MB body could blow up the process — a body-before-auth memory-exhaustion DoS).
     if path.contains(".git/") {
         let need_write = path.ends_with("/git-receive-pack") || req.query().contains("service=git-receive-pack");
         if !authorized(&toks, private, &req, need_write) {
@@ -724,7 +724,7 @@ fn handle(mut stream: TcpStream, root: &Path, private: bool) -> std::io::Result<
         return git_http(&mut stream, &mut reader, root, &req);
     }
 
-    // 非 git 路由不需要 body：非 GET 直接 405（不读 body），private 下要 token。
+    // Non-git routes need no body: non-GET gets a 405 straight away (no body read); under private, a token is required.
     if private && !authorized(&toks, private, &req, false) {
         return respond_401(&mut stream, false);
     }
@@ -734,9 +734,9 @@ fn handle(mut stream: TcpStream, root: &Path, private: bool) -> std::io::Result<
 
 fn respond_401(stream: &mut TcpStream, need_write: bool) -> std::io::Result<()> {
     let msg = if need_write {
-        "需要写 token 才能 push。管理员用 `agit-hub token add <name> --write` 发放；git 密码处填该 token。"
+        "A write token is required to push. An admin issues one with `agit-hub token add <name> --write`; put that token in the git password field."
     } else {
-        "这个 Hub 是私有的，需要 token。git 密码处填 token；浏览器会弹出登录框。"
+        "This Hub is private and requires a token. Put the token in the git password field; the browser will show a login prompt."
     };
     let head = format!(
         "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"agit-hub\"\r\n\
@@ -752,18 +752,18 @@ fn route(root: &Path, req: &Req, path: &str) -> (u16, &'static str, String) {
     if req.method != "GET" {
         return (405, "text/plain; charset=utf-8", "method not allowed".into());
     }
-    // 前端资源。
+    // Frontend assets.
     match path {
         "/assets/app.js" => return (200, "application/javascript; charset=utf-8", APP_JS.into()),
         "/assets/app.css" => return (200, "text/css; charset=utf-8", APP_CSS.into()),
         "/favicon.ico" => return (200, "image/svg+xml", FAVICON.into()),
         _ => {}
     }
-    // JSON API。
+    // JSON API.
     if let Some(rest) = path.strip_prefix("/api/") {
         return api(root, req, rest);
     }
-    // 其余一切 → SPA（前端自己按 URL 渲染 home/agent/session/diff）。
+    // Everything else → SPA (the frontend renders home/agent/session/diff from the URL itself).
     (200, "text/html; charset=utf-8", INDEX_HTML.into())
 }
 
@@ -831,7 +831,7 @@ fn api_agent(root: &Path, name: &str, query: &str) -> (u16, &'static str, String
     let pageno: usize = param(query, "page").and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
     let refs = session_refs(&repo);
 
-    // 命中集合：无搜索 = 直接分页（只 git show 当页）；有搜索 = 扫内容（有上限）。
+    // Hit set: no search = paginate directly (git show only the current page); with search = scan content (capped).
     let (window, total): (Vec<&SessionRef>, usize) = if search.is_empty() {
         let start = (pageno - 1) * PER_PAGE;
         (refs.iter().skip(start).take(PER_PAGE).collect(), refs.len())
@@ -950,7 +950,7 @@ fn api_diff(repo: &Path, id: &str, query: &str) -> (u16, &'static str, String) {
     }))
 }
 
-/// a 里有、b 里没有的元素（保序去重，取首行）。
+/// Elements in a but not in b (order-preserving dedup, first line only).
 fn diff_list(a: &[String], b: &[String]) -> Vec<String> {
     let bset: std::collections::HashSet<&String> = b.iter().collect();
     let mut seen = std::collections::HashSet::new();
@@ -984,7 +984,7 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, root: &Pa
     };
     let ctype = req.header("content-type").unwrap_or("").to_string();
 
-    // 已鉴权，进入 body 传输：放宽读超时（pack 可能不小、跨网慢，但持续流入）。
+    // Authenticated; entering body transfer: relax the read timeout (the pack can be large and slow over the network, but streams in continuously).
     let _ = stream.set_read_timeout(Some(Duration::from_secs(BODY_TIMEOUT_SECS)));
 
     let mut child = match Command::new("git")
@@ -1002,18 +1002,18 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, root: &Pa
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return write_response(stream, 500, "text/plain", "git http-backend 不可用".as_bytes()),
+        Err(_) => return write_response(stream, 500, "text/plain", "git http-backend unavailable".as_bytes()),
     };
 
-    // 把 body **流式**从 socket 灌进 http-backend stdin(不再整包 read_to_end 进 Vec)。
+    // **Stream** the body from the socket into http-backend's stdin (no longer read_to_end the whole thing into a Vec).
     let mut stdin = child.stdin.take().unwrap();
     let n = req.content_length.min(MAX_BODY) as u64;
     let _ = std::io::copy(&mut reader.by_ref().take(n), &mut stdin);
-    drop(stdin); // 关 stdin 发 EOF，让 http-backend 收尾
+    drop(stdin); // closing stdin sends EOF, letting http-backend wrap up
     let out = child.wait_with_output()?;
 
-    // CGI 输出 = 头部 + 空行 + 体。规范化头部：拆出 git 的 Status: 作真状态；丢掉它的
-    // Content-Length（我们自己算）；每行只补一个 CRLF（别对已是 CRLF 的头再 \n→\r\n 造出 \r\r\n）。
+    // CGI output = headers + blank line + body. Normalize the headers: pull out git's Status: as the real status; drop its
+    // Content-Length (we compute our own); append exactly one CRLF per line (don't turn an already-CRLF header into \r\r\n via \n→\r\n).
     let raw = out.stdout;
     let sep = find_subslice(&raw, b"\r\n\r\n").map(|i| (i, 4)).or_else(|| find_subslice(&raw, b"\n\n").map(|i| (i, 2)));
     let (raw_headers, body) = match sep {
@@ -1034,7 +1034,7 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, root: &Pa
                 continue;
             }
             if key.eq_ignore_ascii_case("content-length") {
-                continue; // 我们自己算，避免重复
+                continue; // we compute our own, avoiding duplication
             }
             fwd.push_str(key);
             fwd.push_str(": ");
@@ -1102,7 +1102,7 @@ mod tests {
 
     #[test]
     fn write_op_needs_write_token() {
-        // 存的是摘要，不是明文 —— 校验时对出示的 token 做同样的 hash 再比。
+        // Stores the digest, not the plaintext — at check time, hash the presented token the same way then compare.
         let toks = vec![
             Tok { name: "r".into(), hash: agit::convo::sha256_hex("readonly"), write: false },
             Tok { name: "w".into(), hash: agit::convo::sha256_hex("writekey"), write: true },

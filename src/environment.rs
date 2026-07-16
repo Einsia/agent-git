@@ -1,10 +1,10 @@
-//! EnvironmentState 捕获。
+//! EnvironmentState capture.
 //!
 //! EnvironmentState = repo identity + HEAD commit + stash
-//! 其中 stash **必须覆盖 staged / unstaged / untracked**（PRD 明确要求）——
-//! 因为 Agent 的判断是基于当时那个工作树的，脱离基线的结论不可信。
+//! where the stash **must cover staged / unstaged / untracked** (an explicit PRD requirement) --
+//! because the Agent's judgment is based on the working tree as it was at that moment, and conclusions detached from that baseline can't be trusted.
 //!
-//! 实现全程走 plumbing + 临时 GIT_INDEX_FILE，绝不动用户的工作区和暂存区。
+//! The implementation works entirely through plumbing + a temporary GIT_INDEX_FILE, and never touches the user's working directory or staging area.
 
 use crate::scope;
 use anyhow::{Context, Result};
@@ -14,13 +14,13 @@ use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentRevision {
-    /// 仓库身份：优先 origin remote URL，退回首个提交的 hash（无 remote 时也能对齐）。
+    /// Repository identity: prefer the origin remote URL, fall back to the first commit's hash (so it still aligns when there is no remote).
     pub repo_identity: String,
-    /// HEAD 指向的提交。
+    /// The commit that HEAD points to.
     pub head_commit: String,
-    /// 覆盖 staged+unstaged+untracked 的工作树快照 tree 对象。工作树干净时与 HEAD^{tree} 相同。
+    /// Working-tree snapshot tree object covering staged+unstaged+untracked. Identical to HEAD^{tree} when the working tree is clean.
     pub stash_tree: String,
-    /// 工作树是否有未提交改动（stash_tree ≠ HEAD 的 tree）。
+    /// Whether the working tree has uncommitted changes (stash_tree ≠ HEAD's tree).
     pub dirty: bool,
 }
 
@@ -30,7 +30,7 @@ fn git_out(root: &Path, args: &[&str]) -> Result<String> {
         .arg(root)
         .args(args)
         .output()
-        .context("无法执行 git")?;
+        .context("failed to run git")?;
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
@@ -40,7 +40,7 @@ fn repo_identity(root: &Path) -> String {
             return url;
         }
     }
-    // 无 remote：用首个提交的 hash 作为稳定身份
+    // No remote: use the first commit's hash as a stable identity
     git_out(root, &["rev-list", "--max-parents=0", "HEAD"])
         .map(|s| {
             s.lines()
@@ -51,12 +51,12 @@ fn repo_identity(root: &Path) -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
-/// 构造一个覆盖 staged+unstaged+untracked 的 tree，不碰用户的 index / worktree。
+/// Build a tree covering staged+unstaged+untracked without touching the user's index / worktree.
 fn snapshot_tree(root: &Path) -> Result<String> {
     let tmp = tempfile::Builder::new()
         .prefix("agit-index-")
         .tempfile()
-        .context("无法创建临时 index")?;
+        .context("failed to create temporary index")?;
     let idx = tmp.path().to_string_lossy().to_string();
 
     let run = |args: &[&str]| -> Result<String> {
@@ -66,10 +66,10 @@ fn snapshot_tree(root: &Path) -> Result<String> {
             .args(args)
             .env("GIT_INDEX_FILE", &idx)
             .output()
-            .context("无法执行 git")?;
+            .context("failed to run git")?;
         if !out.status.success() {
             anyhow::bail!(
-                "git {} 失败: {}",
+                "git {} failed: {}",
                 args.join(" "),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
@@ -77,9 +77,9 @@ fn snapshot_tree(root: &Path) -> Result<String> {
         Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     };
 
-    // 从 HEAD 起（无提交则空 index），再把工作树里所有跟踪修改 + untracked 加进来。
+    // Start from HEAD (empty index if there are no commits), then add every tracked change + untracked file from the working tree.
     let _ = run(&["read-tree", "HEAD"]);
-    // --all 含未跟踪；受 .gitignore 约束（被忽略的密钥文件不会进快照）。
+    // --all includes untracked files; subject to .gitignore (ignored secret files won't enter the snapshot).
     run(&["add", "--all", "."])?;
     run(&["write-tree"])
 }
@@ -96,7 +96,7 @@ pub fn capture(root: &Path) -> Result<EnvironmentRevision> {
     })
 }
 
-/// 捕获当前 Environment（默认从 cwd 的代码仓库）。
+/// Capture the current Environment (defaults to the repository at cwd).
 pub fn capture_current() -> Result<EnvironmentRevision> {
     capture(&scope::env_root()?)
 }

@@ -1,9 +1,9 @@
-//! 把合成的 session 文本落进目标 runtime 的 session store,使其可被原生 CLI resume。
+//! Write the synthesized session text into the target runtime's session store so it can be resumed by the native CLI.
 //!
-//! spike 已核实(2026-07-15,见 docs/plans):两个 CLI 都**扫目录 + 按 id 解析**,无需维护索引。
-//!   - Claude:`~/.claude/projects/<slug>/<uuid>.jsonl`,`claude --resume <uuid>`。已端到端验证。
-//!   - Codex :`~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl`,`codex exec resume <uuid>`。
-//!            放置/解析机制成立;"history 是否真载入"待 `codex login` 后验收。
+//! Spike verified (2026-07-15, see docs/plans): both CLIs **scan the directory + resolve by id**, so there's no index to maintain.
+//!   - Claude: `~/.claude/projects/<slug>/<uuid>.jsonl`, `claude --resume <uuid>`. Verified end-to-end.
+//!   - Codex : `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl`, `codex exec resume <uuid>`.
+//!            The place/resolve mechanism works; "whether history is really loaded" awaits acceptance after `codex login`.
 
 use crate::adapter::claude_code;
 use crate::convo::normalize_runtime;
@@ -15,17 +15,17 @@ pub struct ResumeHandle {
     pub resume_cmd: String,
 }
 
-/// 落盘并返回 (路径, resume 命令)。
+/// Write to disk and return (path, resume command).
 pub fn install(runtime: &str, id: &str, cwd: &Path, bytes: &str) -> Result<ResumeHandle> {
     match normalize_runtime(runtime) {
         "claude-code" => install_claude(id, cwd, bytes),
         "codex" => install_codex(id, cwd, bytes),
-        _ => bail!("未知目标 runtime `{runtime}`"),
+        _ => bail!("unknown target runtime `{runtime}`"),
     }
 }
 
 fn home() -> Result<PathBuf> {
-    Ok(PathBuf::from(std::env::var("HOME").context("读不到 $HOME")?))
+    Ok(PathBuf::from(std::env::var("HOME").context("could not read $HOME")?))
 }
 
 fn install_claude(id: &str, cwd: &Path, bytes: &str) -> Result<ResumeHandle> {
@@ -41,15 +41,15 @@ fn install_claude(id: &str, cwd: &Path, bytes: &str) -> Result<ResumeHandle> {
 }
 
 fn install_codex(id: &str, cwd: &Path, bytes: &str) -> Result<ResumeHandle> {
-    // date-partitioned;具体日期无所谓 —— resume 递归扫 sessions/ 并按 id 解析。
+    // date-partitioned; the exact date doesn't matter -- resume recursively scans sessions/ and resolves by id.
     let dir = home()?.join(".codex/sessions/2026/01/01");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"));
     std::fs::write(&path, bytes)?;
     Ok(ResumeHandle {
         path,
-        // `codex exec resume <id>` —— 和模块 doc 记录的、spike 核实的动词一致。
-        // 之前印的 `codex resume` 不是 exec 子命令,照抄会 resume 失败。
+        // `codex exec resume <id>` -- the verb matches the module doc and what the spike verified.
+        // The `codex resume` we printed before is not an exec subcommand; copying it verbatim makes resume fail.
         resume_cmd: format!("(cd {} && codex exec resume {id})", cwd.display()),
     })
 }

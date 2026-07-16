@@ -1,11 +1,11 @@
-//! 原始 session dump 管理（新模型:不蒸馏 fact,直接版本化 agent 的完整会话)。
+//! Raw session dump management (new model: don't distill facts, version the agent's full session directly).
 //!
-//! Claude Code 自己把整个会话 dump 到 ~/.claude/projects/<slug>/:
-//!   <uuid>.jsonl              完整转录
-//!   <uuid>/subagents/*.jsonl  子 agent 转录
-//!   <uuid>/tool-results/*.txt 大工具结果
-//!   memory/                   记忆
-//! `agit -a sync` 把这坨镜像进 Agent Store 的 sessions/<runtime>/,之后 commit/push/pull 照旧。
+//! Claude Code dumps its entire session into ~/.claude/projects/<slug>/ on its own:
+//!   <uuid>.jsonl              full transcript
+//!   <uuid>/subagents/*.jsonl  subagent transcripts
+//!   <uuid>/tool-results/*.txt large tool results
+//!   memory/                   memory
+//! `agit -a sync` mirrors this blob into the Agent Store's sessions/<runtime>/, after which commit/push/pull work as usual.
 
 use crate::adapter::claude_code;
 use crate::scope::{self, Scope};
@@ -14,25 +14,25 @@ use std::path::{Path, PathBuf};
 
 pub const SESSIONS_SUBDIR: &str = "sessions";
 
-/// 定位当前项目的 runtime session dump 目录。
+/// Locate the runtime session dump directory for the current project.
 fn source_dir(runtime: &str, cwd: &Path) -> Result<PathBuf> {
     match runtime {
         "claude-code" | "claude" | "cc" => {
             let dir = claude_code::projects_dir()?.join(claude_code::slug_for(cwd));
             if !dir.exists() {
                 bail!(
-                    "找不到本项目的 Claude Code session 目录:{}\n\
-                     (这个项目还没在 Claude Code 里跑过?)",
+                    "Could not find the Claude Code session directory for this project: {}\n\
+                     (has this project not been run in Claude Code yet?)",
                     dir.display()
                 );
             }
             Ok(dir)
         }
-        other => bail!("runtime `{other}` 的 session dump 还没接(见 src/session.rs)"),
+        other => bail!("session dump for runtime `{other}` isn't wired up yet (see src/session.rs)"),
     }
 }
 
-/// `agit -a sync [--from <runtime>]` —— 把 runtime 的 session dump 镜像进 Agent Store。
+/// `agit -a sync [--from <runtime>]` — mirror the runtime's session dump into the Agent Store.
 pub fn sync(runtime: &str) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
@@ -40,29 +40,29 @@ pub fn sync(runtime: &str) -> Result<i32> {
     let dst = agent.join(SESSIONS_SUBDIR).join(&rt);
     std::fs::create_dir_all(&dst)?;
 
-    // runtime 的存储模型不同:Claude 按项目 slug 分目录(整棵镜像);Codex 按日期分目录、
-    // 各项目混在一起(按 session_meta.cwd 过滤出本项目的 rollout,只镜像这些)。
+    // Runtimes differ in storage model: Claude splits directories by project slug (mirror the whole tree); Codex splits by date,
+    // with all projects mixed together (filter this project's rollouts by session_meta.cwd, mirror only those).
     let (stats, source_desc) = match rt.as_str() {
         "claude-code" => {
             let src = source_dir(runtime, &env)?;
             (mirror(&src, &dst)?, src.display().to_string())
         }
         "codex" => codex_collect(&env, &dst)?,
-        other => bail!("runtime `{other}` 的 session dump 还没接(见 src/session.rs)"),
+        other => bail!("session dump for runtime `{other}` isn't wired up yet (see src/session.rs)"),
     };
 
-    // 落盘前扫一遍密钥 —— dump 全部 session = agent cat 过的一切都在里面
+    // Scan for secrets before writing to disk — dumping every session means everything the agent has cat'd is in here
     let hits = crate::scan::scan_tree(&dst)?;
 
-    println!("已镜像 {} 的 session dump:", rt);
-    println!("  来源  : {source_desc}");
-    println!("  写入  : {}", dst.display());
-    println!("  文件  : {} 个({} 更新 / {} 新增),{} 字节", stats.total, stats.updated, stats.added, stats.bytes);
+    println!("Mirrored the session dump for {}:", rt);
+    println!("  source : {source_desc}");
+    println!("  target : {}", dst.display());
+    println!("  files  : {} files ({} updated / {} added), {} bytes", stats.total, stats.updated, stats.added, stats.bytes);
     if hits > 0 {
-        eprintln!("  ⚠ 扫到 {hits} 处疑似密钥 —— session 转录里带着 agent 见过的敏感内容。");
-        eprintln!("     push 前会再拦一次;先 `agit -a scan` 看看,或从转录里清掉。");
+        eprintln!("  ⚠ Found {hits} likely secrets — the session transcript carries sensitive content the agent has seen.");
+        eprintln!("     This will be blocked again before push; run `agit -a scan` first to check, or clear it from the transcript.");
     }
-    println!("\n  提交: agit -a add -A && agit -a commit -m 'sync {rt} sessions'");
+    println!("\n  Commit: agit -a add -A && agit -a commit -m 'sync {rt} sessions'");
     Ok(0)
 }
 
@@ -80,8 +80,9 @@ struct Stats {
     bytes: u64,
 }
 
-/// Codex 同步:扫 ~/.codex/sessions,只把 **本项目**(session_meta.cwd == env 根)的 rollout
-/// 平铺进 dst/<id>.jsonl。按 cwd 过滤是隐私底线 —— 绝不把别项目的会话卷进来。
+/// Codex sync: scan ~/.codex/sessions and flatten only **this project's** rollouts
+/// (session_meta.cwd == env root) into dst/<id>.jsonl. Filtering by cwd is a privacy
+/// bottom line — never pull in another project's sessions.
 fn codex_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
     let rollouts = crate::adapter::codex::project_rollouts(env);
     let mut st = Stats { total: 0, added: 0, updated: 0, bytes: 0 };
@@ -110,11 +111,11 @@ fn codex_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
     let root = crate::adapter::codex::sessions_root()
         .map(|r| r.display().to_string())
         .unwrap_or_default();
-    let desc = format!("{root}（cwd={} 过滤出 {} 条）", env.display(), rollouts.len());
+    let desc = format!("{root} (cwd={} matched {} rollouts)", env.display(), rollouts.len());
     Ok((st, desc))
 }
 
-/// 递归镜像 src → dst(只按大小+mtime 判断是否需要覆盖,够用)。
+/// Recursively mirror src → dst (decide whether to overwrite by size + mtime only, which is good enough).
 fn mirror(src: &Path, dst: &Path) -> Result<Stats> {
     let mut st = Stats { total: 0, added: 0, updated: 0, bytes: 0 };
     mirror_into(src, dst, &mut st)?;
@@ -123,7 +124,7 @@ fn mirror(src: &Path, dst: &Path) -> Result<Stats> {
 
 fn mirror_into(src: &Path, dst: &Path, st: &mut Stats) -> Result<()> {
     std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src).with_context(|| format!("读 {}", src.display()))? {
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
         let entry = entry?;
         let sp = entry.path();
         let dp = dst.join(entry.file_name());
@@ -137,8 +138,8 @@ fn mirror_into(src: &Path, dst: &Path, st: &mut Stats) -> Result<()> {
                     st.added += 1;
                 }
                 Ok(dmeta) => {
-                    // 大小**或** mtime 变了就重拷。只看大小会漏掉等长的原地改动
-                    // (且与本函数注释"大小+mtime"不符);拿不到 mtime 时保守重拷。
+                    // Re-copy if size **or** mtime changed. Checking size alone would miss same-length in-place edits
+                    // (and would contradict this function's "size + mtime" comment); when mtime is unavailable, re-copy conservatively.
                     let newer = match (smeta.modified(), dmeta.modified()) {
                         (Ok(s), Ok(d)) => s > d,
                         _ => true,

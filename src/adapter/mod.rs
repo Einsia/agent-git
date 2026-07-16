@@ -1,10 +1,10 @@
-//! Runtime Adapter —— 把一个 runtime 的原始 session 解析成 runtime-neutral 的 SessionIR。
+//! Runtime Adapter — parses a runtime's raw session into a runtime-neutral SessionIR.
 //!
-//! session 模型下,adapter 只做一件确定性的事:读 session 文件 → SessionIR。
-//! 唯一消费者是 `reconcile` 的 `brief()`(session.rs):从 IR 里取 prompt / 最后几段 agent 文本 /
-//! 改动文件,压成紧凑摘要喂给合并用的 LLM。
+//! Under the session model, an adapter does exactly one deterministic thing: read the session file → SessionIR.
+//! The only consumer is `reconcile`'s `brief()` (session.rs): it pulls the prompt / last few agent text blocks /
+//! changed files out of the IR and compresses them into a compact summary fed to the merge LLM.
 //!
-//! （旧的"证据候选池 → Summarizer → fact"两层抽取已随 fact 模型删除;这里不再蒸馏结论。）
+//! (The old two-stage extraction "evidence candidate pool → Summarizer → fact" was removed along with the fact model; we no longer distill conclusions here.)
 
 pub mod claude_code;
 pub mod codex;
@@ -12,7 +12,7 @@ pub mod codex;
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
-/// 一条 Read 调用（agent 实际看过的文件片段）。
+/// A single Read call (a file fragment the agent actually looked at).
 #[derive(Debug, Clone)]
 pub struct FileRead {
     pub path: String,
@@ -20,54 +20,54 @@ pub struct FileRead {
     pub limit: Option<usize>,
 }
 
-/// runtime-neutral 的规范化 session。每个 adapter 的 export 先产出它。
+/// A runtime-neutral, normalized session. Each adapter's export produces it first.
 #[derive(Debug, Default)]
 pub struct SessionIR {
     pub runtime: String,
     pub session_id: String,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
-    /// 真实用户 prompt（已剔除命令注入、caveat、工具结果）。brief 用。
+    /// Real user prompts (command injection, caveats, and tool results already stripped out). Used by brief.
     pub prompts: Vec<String>,
-    /// agent 读过的文件。当前 brief 不消费,保留以备摘要增强。
+    /// Files the agent read. Not consumed by brief today; kept for future summary enrichment.
     pub reads: Vec<FileRead>,
-    /// agent 跑过的命令。当前 brief 不消费,保留以备摘要增强。
+    /// Commands the agent ran. Not consumed by brief today; kept for future summary enrichment.
     pub commands: Vec<String>,
-    /// agent 改动过的文件 —— brief 里作为"改动的文件"列出。
+    /// Files the agent modified — listed in brief as "changed files".
     pub writes: Vec<String>,
-    /// assistant 的文本块 —— brief 取最后几段作为"结论/进展"。
+    /// The assistant's text blocks — brief takes the last few as "conclusions/progress".
     pub agent_texts: Vec<String>,
-    /// tool_use 块总数（含未归类的工具）—— Hub 渲染"N 次工具调用"。
+    /// Total number of tool_use blocks (including uncategorized tools) — Hub renders "N tool calls".
     pub tool_uses: usize,
 }
 
-/// PRD 指定的三方法。Codex 与 ClaudeCode 都实现它。
+/// The three methods specified by the PRD. Both Codex and ClaudeCode implement it.
 pub trait Adapter {
     fn name(&self) -> &'static str;
 
-    /// runtime session → 规范化 IR。确定性、不调模型。reconcile 的 brief 靠它读会话。
-    /// `session` 为 None 时由 adapter 自行定位当前项目的最新 session。
+    /// runtime session → normalized IR. Deterministic, no model calls. reconcile's brief relies on it to read the conversation.
+    /// When `session` is None, the adapter locates the current project's latest session itself.
     fn export(&self, session: Option<&Path>, cwd: &Path) -> Result<SessionIR>;
 
-    /// 校验一个 session 文件对本 runtime 是否格式合法。
+    /// Validate whether a session file is well-formed for this runtime.
     fn validate(&self, session: &Path) -> Result<()>;
 
-    /// 定位当前项目的默认（最新）session。没有 session 概念的 adapter 可返回错误。
+    /// Locate the current project's default (latest) session. Adapters with no session concept may return an error.
     fn locate_default(&self, cwd: &Path) -> Result<PathBuf>;
 }
 
-/// 按名字取 adapter。新 runtime 在这里登记。
+/// Get an adapter by name. New runtimes register here.
 pub fn get(runtime: &str) -> Result<Box<dyn Adapter>> {
     match runtime {
         "claude-code" | "claude" | "cc" => Ok(Box::new(claude_code::ClaudeCode)),
         "codex" => Ok(Box::new(codex::Codex)),
-        other => bail!("未知 runtime `{other}`。已注册: claude-code, codex"),
+        other => bail!("unknown runtime `{other}`. Registered: claude-code, codex"),
     }
 }
 
 pub fn list() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("claude-code", "Claude Code —— 解析 ~/.claude/projects/<slug>/<session>.jsonl（已实现）"),
-        ("codex", "Codex —— 解析 ~/.codex/sessions/*/rollout-*.jsonl（按 cwd 过滤项目）（已实现）"),
+        ("claude-code", "Claude Code — parses ~/.claude/projects/<slug>/<session>.jsonl (implemented)"),
+        ("codex", "Codex — parses ~/.codex/sessions/*/rollout-*.jsonl (filters projects by cwd) (implemented)"),
     ]
 }

@@ -1,19 +1,19 @@
-//! Codex adapter —— 解析 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`。
+//! Codex adapter — parses `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 //!
-//! 真实结构（本机核对 838 份 rollout,2025–2026）：每行 `{timestamp, type, payload}`。
-//!   type=session_meta   payload:{id, cwd, git:{branch}}   —— 项目归属藏在这里
-//!   type=event_msg      payload.type=user_message  → 真实用户 prompt(可能 <task>…</task> 包裹)
-//!                       payload.type=agent_message → assistant 最终文本
-//!                       payload.type=patch_apply_end → payload.changes 的 key 是被改的文件
-//!   type=response_item  payload.type=function_call：
+//! Real structure (verified against 838 rollouts on this machine, 2025–2026): each line is `{timestamp, type, payload}`.
+//!   type=session_meta   payload:{id, cwd, git:{branch}}   — project ownership is hidden here
+//!   type=event_msg      payload.type=user_message  → real user prompt (may be wrapped in <task>…</task>)
+//!                       payload.type=agent_message → assistant's final text
+//!                       payload.type=patch_apply_end → keys of payload.changes are the modified files
+//!   type=response_item  payload.type=function_call:
 //!                         name=shell        args {"command":["bash","-lc","<script>"]}   (2025)
 //!                         name=shell_command args {"command":"<cmd>"}                     (string)
-//!                         name=exec_command  args {"cmd":"<cmd>"}                          (主流)
-//!                         name=reasoning     加密 CoT,无明文,跳过
+//!                         name=exec_command  args {"cmd":"<cmd>"}                          (mainstream)
+//!                         name=reasoning     encrypted CoT, no plaintext, skip
 //!
-//! 与 Claude 的差异:Claude 按项目 slug 分目录;Codex 按**日期**分目录、各项目混在一起,
-//! 且 fork/resume 会把**另一个项目**的父会话内嵌进同一份 rollout。所以项目归属必须
-//! 扫**全部** session_meta —— 出现任一异项目 cwd 就整份跳过(见 id_if_owned,隐私底线)。
+//! Difference from Claude: Claude splits directories by project slug; Codex splits by **date**, mixing all projects together,
+//! and fork/resume embeds the parent session of **another project** into the same rollout. So project ownership must
+//! scan **all** session_meta — if any foreign-project cwd appears, skip the whole file (see id_if_owned, the privacy backstop).
 
 use super::{Adapter, SessionIR};
 use anyhow::{bail, Context, Result};
@@ -22,13 +22,13 @@ use std::path::{Path, PathBuf};
 
 pub struct Codex;
 
-/// ~/.codex/sessions 根。
+/// The ~/.codex/sessions root.
 pub fn sessions_root() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("读不到 $HOME")?;
+    let home = std::env::var("HOME").context("cannot read $HOME")?;
     Ok(PathBuf::from(home).join(".codex/sessions"))
 }
 
-/// 递归列出所有 rollout-*.jsonl。
+/// Recursively list all rollout-*.jsonl.
 fn all_rollouts(root: &Path) -> Vec<PathBuf> {
     walkdir::WalkDir::new(root)
         .into_iter()
@@ -45,11 +45,11 @@ fn all_rollouts(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// 一条 rollout 是否**完全属于**目标项目 → Some(session_id),否则 None。
+/// Whether a rollout **fully belongs** to the target project → Some(session_id), otherwise None.
 ///
-/// 隐私底线:fork/resume 的 rollout 会内嵌另一个项目的父会话(其 session_meta.cwd 不同)。
-/// 只要扫到任一 cwd != target 就返回 None、整份跳过 —— 绝不把他项目的会话 copy 进来。
-/// 逐行读(BufRead,内存有界);扫到异项目 cwd 立即短路,非本项目文件通常读到第一行就返回。
+/// Privacy backstop: a fork/resume rollout embeds the parent session of another project (whose session_meta.cwd differs).
+/// As soon as any cwd != target is found, return None and skip the whole file — never copy another project's session in.
+/// Read line by line (BufRead, bounded memory); short-circuit as soon as a foreign-project cwd is seen; files not from this project usually return on the first line.
 fn id_if_owned(path: &Path, target: &str) -> Option<String> {
     let f = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(f);
@@ -79,8 +79,8 @@ fn id_if_owned(path: &Path, target: &str) -> Option<String> {
                     );
                 }
             }
-            Some(_) => return None, // 异项目会话在同一份 rollout 里 → 整份跳过
-            None => {}              // session_meta 无 cwd,忽略这条(不算匹配也不算异项目)
+            Some(_) => return None, // a foreign-project session in the same rollout → skip the whole file
+            None => {}              // session_meta has no cwd, ignore this one (neither a match nor a foreign project)
         }
     }
     if matched {
@@ -90,10 +90,10 @@ fn id_if_owned(path: &Path, target: &str) -> Option<String> {
     }
 }
 
-/// rollout 文件名里的 session uuid（末尾那段 UUID），作为兜底 id。
+/// The session uuid in the rollout filename (the trailing UUID), used as a fallback id.
 fn file_id(path: &Path) -> String {
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    // rollout-<ISO8601>-<uuid>：uuid 是最后 5 段（8-4-4-4-12）
+    // rollout-<ISO8601>-<uuid>: the uuid is the last 5 segments (8-4-4-4-12)
     let parts: Vec<&str> = stem.split('-').collect();
     if parts.len() >= 5 {
         parts[parts.len() - 5..].join("-")
@@ -102,8 +102,8 @@ fn file_id(path: &Path) -> String {
     }
 }
 
-/// 属于某个项目（所有 session_meta.cwd == 该项目根）的 rollout：返回 (源文件, 目标 session_id)。
-/// session.rs 的 codex 同步用它,只镜像**完全属于**本项目的会话。
+/// Rollouts belonging to a project (all session_meta.cwd == that project root): returns (source file, target session_id).
+/// Used by session.rs's codex sync; mirrors only sessions that **fully belong** to this project.
 pub fn project_rollouts(cwd: &Path) -> Vec<(PathBuf, String)> {
     let Ok(root) = sessions_root() else {
         return vec![];
@@ -126,7 +126,7 @@ impl Adapter for Codex {
     fn locate_default(&self, cwd: &Path) -> Result<PathBuf> {
         let root = sessions_root()?;
         if !root.exists() {
-            bail!("找不到 Codex session 目录:{}（这台机器上跑过 Codex 吗?）", root.display());
+            bail!("Codex session directory not found: {} (has Codex ever run on this machine?)", root.display());
         }
         let want = cwd.to_string_lossy();
         let latest = all_rollouts(&root)
@@ -139,13 +139,13 @@ impl Adapter for Codex {
                     .unwrap_or(std::time::UNIX_EPOCH)
             });
         latest.with_context(|| {
-            format!("{} 下没有 cwd={} 的 Codex rollout（这个项目在 Codex 里跑过吗?）", root.display(), want)
+            format!("no Codex rollout under {} with cwd={} (has this project ever run in Codex?)", root.display(), want)
         })
     }
 
     fn validate(&self, session: &Path) -> Result<()> {
         let f = std::fs::File::open(session)
-            .with_context(|| format!("读不到 {}", session.display()))?;
+            .with_context(|| format!("cannot read {}", session.display()))?;
         let reader = std::io::BufReader::new(f);
         let mut saw_json = false;
         for line in reader.lines().take(40) {
@@ -155,7 +155,7 @@ impl Adapter for Codex {
                 continue;
             }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                bail!("含非 JSON 行，不像 Codex rollout（.jsonl）");
+                bail!("contains a non-JSON line; does not look like a Codex rollout (.jsonl)");
             };
             saw_json = true;
             if matches!(
@@ -168,7 +168,7 @@ impl Adapter for Codex {
         if saw_json {
             Ok(())
         } else {
-            bail!("空 rollout")
+            bail!("empty rollout")
         }
     }
 
@@ -183,8 +183,8 @@ impl Adapter for Codex {
     }
 }
 
-/// 纯解析:一坨 Codex rollout jsonl → SessionIR。不碰磁盘。
-/// **唯一的 Codex 解析实现**（和 claude_code::parse_jsonl 对称）。
+/// Pure parsing: a blob of Codex rollout jsonl → SessionIR. Does not touch disk.
+/// **The only Codex parsing implementation** (symmetric with claude_code::parse_jsonl).
 pub fn parse_rollout(text: &str, fallback_id: &str) -> SessionIR {
     let mut ir = SessionIR {
         runtime: "codex".into(),
@@ -237,7 +237,7 @@ pub fn parse_rollout(text: &str, fallback_id: &str) -> SessionIR {
                         }
                     }
                     "patch_apply_end" => {
-                        // 现代 Codex 把文件改动记在这里:payload.changes 的 key 是路径。
+                        // Modern Codex records file changes here: keys of payload.changes are paths.
                         if let Some(ch) = p.and_then(|p| p.get("changes")).and_then(|c| c.as_object()) {
                             for k in ch.keys() {
                                 ir.writes.push(k.clone());
@@ -256,7 +256,7 @@ pub fn parse_rollout(text: &str, fallback_id: &str) -> SessionIR {
                     if matches!(name, "shell" | "local_shell" | "shell_command" | "exec_command") {
                         let args = p.and_then(|p| p.get("arguments")).and_then(|v| v.as_str()).unwrap_or("");
                         if let Some(cmd) = extract_command(args) {
-                            patch_files(&cmd, &mut ir.writes); // 老式 apply_patch heredoc 兜底
+                            patch_files(&cmd, &mut ir.writes); // fallback for old-style apply_patch heredoc
                             ir.commands.push(cmd);
                         }
                     }
@@ -273,8 +273,8 @@ pub fn parse_rollout(text: &str, fallback_id: &str) -> SessionIR {
 
 const INJECTED: &[&str] = &["<environment_context", "<user_instructions", "<heartbeat", "<system"];
 
-/// event_msg/user_message → 真实 prompt。解开 `<task>…</task>` 包裹(StarryOS 等 harness 会这样发),
-/// 只丢弃已知的注入式标签(environment_context / heartbeat 等),不再一刀切"以 '<' 开头即丢"。
+/// event_msg/user_message → real prompt. Unwraps the `<task>…</task>` wrapper (harnesses like StarryOS send it this way),
+/// only drops known injected tags (environment_context / heartbeat, etc.), no longer blanket-dropping "anything starting with '<'".
 fn clean_prompt(s: &str) -> Option<String> {
     let t = s.trim();
     if t.is_empty() {
@@ -290,8 +290,8 @@ fn clean_prompt(s: &str) -> Option<String> {
     Some(t.to_string())
 }
 
-/// shell / shell_command / exec_command 的 arguments(JSON 串)→ 实际命令。
-/// 键名两种:exec_command 用 "cmd"(string);shell/shell_command 用 "command"(array 或 string)。
+/// The arguments (JSON string) of shell / shell_command / exec_command → the actual command.
+/// Two key names: exec_command uses "cmd" (string); shell/shell_command uses "command" (array or string).
 fn extract_command(args_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
     let cmd = v.get("cmd").or_else(|| v.get("command"))?;
@@ -312,7 +312,7 @@ fn extract_command(args_json: &str) -> Option<String> {
     }
 }
 
-/// 老式:shell 脚本里内嵌 `apply_patch` heredoc → 抽出被改文件（best-effort）。
+/// Old-style: an `apply_patch` heredoc embedded in a shell script → extract the modified files (best-effort).
 fn patch_files(script: &str, out: &mut Vec<String>) {
     if !script.contains("apply_patch") {
         return;
@@ -327,7 +327,7 @@ fn patch_files(script: &str, out: &mut Vec<String>) {
     }
 }
 
-/// patch_apply_end 无结构化 changes 时,退回解析 stdout 的 "A/M/D <path>" 行。
+/// When patch_apply_end has no structured changes, fall back to parsing "A/M/D <path>" lines from stdout.
 fn patch_stdout_files(stdout: &str, out: &mut Vec<String>) {
     for line in stdout.lines() {
         let l = line.trim();
@@ -349,11 +349,11 @@ fn dedup(v: &mut Vec<String>) {
     v.retain(|x| seen.insert(x.clone()));
 }
 
-// ─────────────────── ConversationIR:无损读写(convert 用)───────────────────
+// ─────────────────── ConversationIR: lossless read/write (used by convert) ───────────────────
 
 use crate::convo::{narrate_call, truncate, ConversationIR, ConvertOpts, Event, EventKind};
 
-/// codex rollout → ConversationIR(逐字保留每行 + 语义叠加)。
+/// codex rollout → ConversationIR (preserves every line verbatim + semantic overlay).
 pub fn read_conversation(text: &str) -> ConversationIR {
     let mut ir = ConversationIR {
         source_runtime: "codex".into(),
@@ -457,7 +457,7 @@ pub fn read_conversation(text: &str) -> ConversationIR {
     ir
 }
 
-/// ConversationIR → codex rollout。同 vendor 走 raw 重放,跨 vendor 走合成。
+/// ConversationIR → codex rollout. Same vendor uses raw replay; cross-vendor uses synthesis.
 pub fn write_conversation(ir: &ConversationIR, opts: &ConvertOpts) -> String {
     if ir.source_runtime == "codex" {
         same_vendor_codex(ir, opts)
@@ -470,7 +470,7 @@ fn same_vendor_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
     let mut lines = Vec::with_capacity(ir.events.len());
     for e in &ir.events {
         let mut raw = e.raw.clone();
-        // 引号锚定替换,避免子串/前缀误伤与空串炸开(见 convo::swap_quoted)。
+        // Quote-anchored replacement, to avoid substring/prefix collateral damage and empty-string blowups (see convo::swap_quoted).
         if !opts.new_id.is_empty() {
             raw = crate::convo::swap_quoted(&raw, &ir.session_id, &opts.new_id);
         }
@@ -484,7 +484,7 @@ fn same_vendor_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
     s
 }
 
-const CTS: &str = "2026-01-01T00:00:00.000Z"; // 合成时间戳
+const CTS: &str = "2026-01-01T00:00:00.000Z"; // synthetic timestamp
 
 fn resp_message(role: &str, ctype: &str, text: &str) -> String {
     serde_json::json!({
@@ -501,8 +501,8 @@ fn ev_msg(sub: &str, text: &str) -> String {
     .to_string()
 }
 
-/// 跨 vendor(claude → codex):合成一份 rollout。response_item 是 codex 重放读取的通道,
-/// event_msg 是 UI 通道 —— 两者都发,和真实 rollout 结构一致。工具活动默认叙述成文本。
+/// Cross-vendor (claude → codex): synthesize a rollout. response_item is the channel codex reads on replay,
+/// event_msg is the UI channel — emit both, matching the real rollout structure. Tool activity is narrated as text by default.
 fn cross_to_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
     let cwd = opts.cwd.clone().or_else(|| ir.cwd.clone()).unwrap_or_default();
     let branch = ir.git_branch.clone().unwrap_or_default();
@@ -547,8 +547,8 @@ fn cross_to_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
 mod tests {
     use super::*;
 
-    // 现代格式:<task> prompt、exec_command(cmd 键)、shell_command(command string)、
-    // patch_apply_end(changes)、以及一个非命令工具(write_stdin)只计入 tool_uses。
+    // Modern format: <task> prompt, exec_command (cmd key), shell_command (command string),
+    // patch_apply_end (changes), plus a non-command tool (write_stdin) that only counts toward tool_uses.
     const ROLLOUT: &str = r#"
 {"type":"session_meta","payload":{"id":"sess-1","cwd":"/proj/x","git":{"branch":"feature"}}}
 {"type":"event_msg","payload":{"type":"user_message","message":"<task>\nImplement the refund flow\n</task>"}}
