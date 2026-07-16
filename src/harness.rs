@@ -195,6 +195,232 @@ fn write_manifest(agent: &Path, rt: &str, report: &Report) -> Result<()> {
     Ok(())
 }
 
+// ── restore (phase 3): apply a captured harness back into the project ──
+
+const PH_PREFIX: &str = "${AGIT_SECRET:";
+
+/// `agit harness show` — list what's captured in the local Agent Store.
+pub fn show(agent: &Path, runtime: &str) -> Result<i32> {
+    let rt = norm(runtime);
+    let src = agent.join("harness").join(&rt).join("project");
+    if !src.is_dir() {
+        println!("No captured harness for {rt}. Run `agit -a snap` to capture it.");
+        return Ok(0);
+    }
+    let (servers, skills, commands, secrets) = summarize(agent, &rt, &src);
+    println!("Captured harness ({rt}, project scope):");
+    println!("  MCP servers : {servers}");
+    println!("  skills      : {skills}");
+    println!("  commands    : {commands}");
+    println!("  secrets     : {secrets} redacted field(s) to provide on apply");
+    println!("\n  Apply into this project: agit harness apply");
+    Ok(0)
+}
+
+/// `agit harness apply` — union-merge the captured harness into the current project, asking first
+/// (decision 3) and resolving each redacted secret from its env var, else prompting at a TTY.
+pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool) -> Result<i32> {
+    use std::io::{stdin, stdout, IsTerminal, Write};
+    let rt = norm(runtime);
+    let src = agent.join("harness").join(&rt).join("project");
+    if !src.is_dir() {
+        println!("No captured harness for {rt} to apply.");
+        return Ok(0);
+    }
+    let (servers, skills, commands, secrets) = summarize(agent, &rt, &src);
+    println!("Captured harness ({rt}): {servers} MCP servers, {skills} skills, {commands} commands, {secrets} secret(s) to provide.");
+
+    // Ask (decision 3): applying rewrites local .mcp.json / .claude — never silent.
+    if !force {
+        if !stdin().is_terminal() {
+            println!("Not applying: rerun at a terminal, or pass --force to apply non-interactively.");
+            return Ok(0);
+        }
+        print!("Apply to this project? [y/N] ");
+        let _ = stdout().flush();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut stdin().lock(), &mut line).ok();
+        if !matches!(line.trim(), "y" | "Y" | "yes") {
+            println!("Skipped.");
+            return Ok(0);
+        }
+    }
+
+    let mut applied = Vec::new();
+    let mut skipped = Vec::new();
+    let mut unresolved = Vec::new();
+
+    // MCP: union-merge servers into the project's .mcp.json, then resolve secret placeholders.
+    let src_mcp = src.join("mcp.json");
+    if src_mcp.is_file() {
+        let merged = merge_mcp(&std::fs::read_to_string(&src_mcp)?, &env.join(".mcp.json"), &mut skipped)?;
+        let mut v: Value = serde_json::from_str(&merged)?;
+        resolve_secrets(&mut v, &mut unresolved);
+        std::fs::write(env.join(".mcp.json"), serde_json::to_string_pretty(&v)? + "\n")?;
+        applied.push(".mcp.json".to_string());
+    }
+
+    // Prose + trees: add what the project is missing; never clobber an existing local copy.
+    apply_missing_file(&src.join("CLAUDE.md"), &env.join("CLAUDE.md"), "CLAUDE.md", &mut applied, &mut skipped)?;
+    apply_missing_tree(&src.join("skills"), &env.join(".claude/skills"), "skills", &mut applied, &mut skipped)?;
+    apply_missing_tree(&src.join("commands"), &env.join(".claude/commands"), "commands", &mut applied, &mut skipped)?;
+
+    // settings.json can carry hooks (executable). Never auto-apply — surface it.
+    if src.join("settings.json").is_file() {
+        skipped.push("settings.json (may contain hooks that run commands — review and apply manually)".into());
+    }
+
+    println!("\nApplied: {}", if applied.is_empty() { "(nothing)".into() } else { applied.join(", ") });
+    for s in &skipped {
+        println!("  skipped: {s}");
+    }
+    for u in &unresolved {
+        eprintln!("  ⚠ secret not provided: {u} — left as a placeholder in .mcp.json (set ${u} or edit it in)");
+    }
+    Ok(if unresolved.is_empty() { 0 } else { 1 })
+}
+
+fn norm(runtime: &str) -> String {
+    match runtime {
+        "claude" | "cc" | "claude-code" => "claude-code".into(),
+        other => other.to_string(),
+    }
+}
+
+fn summarize(agent: &Path, rt: &str, src: &Path) -> (usize, usize, usize, usize) {
+    let servers = std::fs::read_to_string(src.join("mcp.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("mcpServers").and_then(|m| m.as_object()).map(|m| m.len()))
+        .unwrap_or(0);
+    let skills = count_dirs(&src.join("skills"));
+    let commands = count_files(&src.join("commands"));
+    let secrets = std::fs::read_to_string(agent.join("harness").join(rt).join("manifest.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("redactions").and_then(|r| r.as_array()).map(|a| a.len()))
+        .unwrap_or(0);
+    (servers, skills, commands, secrets)
+}
+
+fn count_dirs(p: &Path) -> usize {
+    std::fs::read_dir(p).map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count()).unwrap_or(0)
+}
+fn count_files(p: &Path) -> usize {
+    std::fs::read_dir(p).map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().is_file()).count()).unwrap_or(0)
+}
+
+/// Union-merge captured mcpServers into the project's .mcp.json. Adds missing servers, keeps local,
+/// and flags a same-name-different-definition conflict (keeping the local one) into `conflicts`.
+pub fn merge_mcp(captured: &str, local_path: &Path, conflicts: &mut Vec<String>) -> Result<String> {
+    let cap: Value = serde_json::from_str(captured).context("captured mcp.json is not valid JSON")?;
+    let mut local: Value = if local_path.is_file() {
+        serde_json::from_str(&std::fs::read_to_string(local_path)?).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    let local_servers = local
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("mcpServers is not an object")?;
+    if let Some(cap_servers) = cap.get("mcpServers").and_then(|m| m.as_object()) {
+        for (name, def) in cap_servers {
+            match local_servers.get(name) {
+                None => {
+                    local_servers.insert(name.clone(), def.clone());
+                }
+                Some(existing) if existing == def => {}
+                Some(_) => conflicts.push(format!("MCP server '{name}' differs from local — kept local")),
+            }
+        }
+    }
+    Ok(serde_json::to_string_pretty(&local)? + "\n")
+}
+
+/// Replace every `${AGIT_SECRET:NAME}` placeholder: env var NAME wins; else prompt at a TTY; else record
+/// NAME as unresolved and leave the placeholder in place.
+fn resolve_secrets(v: &mut Value, unresolved: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => m.values_mut().for_each(|c| resolve_secrets(c, unresolved)),
+        Value::Array(a) => a.iter_mut().for_each(|c| resolve_secrets(c, unresolved)),
+        Value::String(s) => {
+            if let Some(name) = s.strip_prefix(PH_PREFIX).and_then(|r| r.strip_suffix('}')) {
+                let name = name.to_string();
+                if let Some(val) = resolve_one(&name) {
+                    *s = val;
+                } else if !unresolved.contains(&name) {
+                    unresolved.push(name);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_one(name: &str) -> Option<String> {
+    use std::io::{stdin, stdout, IsTerminal, Write};
+    if let Ok(v) = std::env::var(name) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    if stdin().is_terminal() {
+        print!("  secret {name} = ");
+        let _ = stdout().flush();
+        let mut line = String::new();
+        if std::io::BufRead::read_line(&mut stdin().lock(), &mut line).is_ok() {
+            let t = line.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn apply_missing_file(src: &Path, dst: &Path, label: &str, applied: &mut Vec<String>, skipped: &mut Vec<String>) -> Result<()> {
+    if !src.is_file() {
+        return Ok(());
+    }
+    if dst.exists() {
+        skipped.push(format!("{label} (already present)"));
+        return Ok(());
+    }
+    if let Some(p) = dst.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    std::fs::copy(src, dst)?;
+    applied.push(label.to_string());
+    Ok(())
+}
+
+fn apply_missing_tree(src: &Path, dst: &Path, label: &str, applied: &mut Vec<String>, skipped: &mut Vec<String>) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    let mut added = 0;
+    for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
+        let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
+        let target = dst.join(rel);
+        if target.exists() {
+            skipped.push(format!("{label}/{} (already present)", rel.display()));
+            continue;
+        }
+        if let Some(p) = target.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::copy(entry.path(), &target)?;
+        added += 1;
+    }
+    if added > 0 {
+        applied.push(format!("{label} (+{added})"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +474,49 @@ mod tests {
         let doc = r#"{ "mcpServers": { "fs": { "command": "mcp-fs", "args": ["--root", "/tmp"] } } }"#;
         let (_out, reds) = redact_json_doc(doc, "mcp.json").unwrap();
         assert!(reds.is_empty());
+    }
+
+    #[test]
+    fn merge_mcp_unions_new_and_keeps_local_on_conflict() {
+        let dir = std::env::temp_dir().join(format!("agit-merge-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = dir.join(".mcp.json");
+        std::fs::write(&local, r#"{"mcpServers":{"github":{"command":"LOCAL"}}}"#).unwrap();
+
+        let captured = r#"{"mcpServers":{"github":{"command":"npx"},"fs":{"command":"mcp-fs"}}}"#;
+        let mut conflicts = Vec::new();
+        let out = merge_mcp(captured, &local, &mut conflicts).unwrap();
+
+        assert!(out.contains("LOCAL")); // local github kept
+        assert!(out.contains("mcp-fs")); // fs added
+        assert!(!out.contains("\"npx\"")); // captured github NOT overwritten
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].contains("github"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn merge_mcp_with_no_local_takes_captured() {
+        let captured = r#"{"mcpServers":{"fs":{"command":"mcp-fs"}}}"#;
+        let mut conflicts = Vec::new();
+        let out = merge_mcp(captured, Path::new("/no/such/file.json"), &mut conflicts).unwrap();
+        assert!(out.contains("mcp-fs"));
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn resolve_secrets_from_env_and_records_unresolved() {
+        std::env::set_var("AGIT_TEST_TOKEN_XZ", "resolved-value-1");
+        let mut v = json!({ "env": {
+            "TOK": "${AGIT_SECRET:AGIT_TEST_TOKEN_XZ}",
+            "MISS": "${AGIT_SECRET:AGIT_UNSET_VAR_QQ}"
+        }});
+        let mut unresolved = Vec::new();
+        resolve_secrets(&mut v, &mut unresolved);
+        assert_eq!(v["env"]["TOK"], json!("resolved-value-1"));
+        assert!(unresolved.contains(&"AGIT_UNSET_VAR_QQ".to_string()));
+        // the unresolved one keeps its placeholder
+        assert!(v["env"]["MISS"].as_str().unwrap().starts_with(PH_PREFIX));
+        std::env::remove_var("AGIT_TEST_TOKEN_XZ");
     }
 }

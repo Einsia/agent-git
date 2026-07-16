@@ -10,8 +10,8 @@
 //!   agit commit -a   → Environment scope, -a is an argument to git commit
 
 // Core logic lives in the lib (crate `agit`), shared with agit-hub, so the two bins don't each write their own parsing and drift apart.
-use agit::scope::Scope;
-use agit::{commands, init, passthrough, session, sync};
+use agit::scope::{self, Scope};
+use agit::{commands, harness, init, passthrough, session, sync};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -151,6 +151,38 @@ fn dispatch(argv: Vec<String>) -> i32 {
         "adapter" => commands::adapter_list(),
         "graph" => commands::workspace_graph(),
 
+        // ── harness: show / apply the captured MCP + skills + config (part of Agent State) ──
+        "harness" => {
+            let mut rt = "claude-code".to_string();
+            let mut force = false;
+            let mut sub = "show".to_string();
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--from" if i + 1 < args.len() => {
+                        rt = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--force" => {
+                        force = true;
+                        i += 1;
+                    }
+                    other if !other.starts_with('-') => {
+                        sub = other.to_string();
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            let roots = scope::root_for(Scope::Agent)
+                .and_then(|agent| scope::env_root().map(|env| (agent, env)));
+            match roots {
+                Ok((agent, env)) if sub == "apply" => harness::apply(&agent, &env, &rt, force),
+                Ok((agent, _)) => harness::show(&agent, &rt),
+                Err(e) => Err(e),
+            }
+        }
+
         // ── Convert a session across runtimes (resume it in another CLI) ──
         "convert" => match parse_convert(args) {
             Some((src, from, to, cwd, write)) => {
@@ -282,6 +314,7 @@ agit — version an agent's raw session so teams can collaborate on Agent Contex
   agit workspace [log]     Show the Agent↔Environment pairing
   agit workspace restore [N]  Roll both repos back together to a pairing's joint state
   agit graph               Show the Workspace-State timeline + relation edges
+  agit harness [apply]     Show, or apply, the captured harness (MCP/skills/config); apply asks first (--force to skip)
   agit adapter             List runtime adapters
   agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist)
   agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime, --exec to launch)
