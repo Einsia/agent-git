@@ -39,20 +39,23 @@ agit init                     # 建 Agent Store;clone 后需重跑
 ## 用
 
 ```bash
-agit -a sync                          # 把本项目的 Claude session dump 镜像进来
+agit -a sync                          # 把本项目的 Claude session dump 镜像进来(sync codex 换 runtime)
 agit -a add -A && agit -a commit -m '...'
 agit -a push                          # 发布给团队(push 前扫密钥)
 
 agit clone <url>                      # 同事:一条命令拉团队 Agent Store
 agit -a fetch origin
 agit -a reconcile origin/main         # agent 读对面会话、合成 CLAUDE.md,真冲突才问你
+agit -a reconcile origin/main --dry-run   # 只预览合成结果,不合并、不写盘
+#   文本冲突时保留合并中状态 → 改好后 agit -a reconcile --continue / 或 --abort 放弃
 
+agit convert <src> --to codex|claude-code # 把一份 session 转成另一个 runtime 能 resume 的会话
+agit workspace                        # Agent↔Environment 配对;workspace restore [N] 退回某个联合状态
 agit -a scan                          # 扫 session dump 里的密钥
-agit workspace                        # Agent↔Environment 配对
 agit adapter                          # 列出 runtime adapter
 ```
 
-原生动词就这些:`init` / `sync` / `reconcile` / `clone` / `scan` / `workspace` / `adapter`。
+原生动词:`init` / `sync` / `reconcile` / `convert` / `clone` / `scan` / `workspace` / `adapter`。
 其余一切原样透传 git(两个 scope 都是)。`agit` 不替代 `git`。
 
 > **scope 歧义**:`agit -a commit`(agent 库)vs `agit commit -a`(代码库,`-a` 是 git 参数)。
@@ -71,17 +74,21 @@ export PATH="/tmp/agit-demo/bin:$PATH"
 三幕:Alice `sync`+`push` → Bob `clone`+`sync`+`fetch` → `reconcile`(agent 合并,真冲突才问人)。
 见 [`demo/README.md`](demo/README.md)。
 
-## 换 LLM 后端(给 Codex 留的口子)
+## 换 LLM 后端
 
 `reconcile` 用到的模型统一走 `src/llm.rs`,后端可插拔:
 
 ```sh
 export AGIT_LLM=claude               # 默认,本机 claude -p
-export AGIT_LLM_CMD="codex exec -"   # 任意从 stdin 读 prompt 的 CLI,现在就能接
+export AGIT_LLM=codex                # 本机 codex exec(已接,不再是桩)
+export AGIT_LLM_CMD="<从 stdin 读 prompt 的任意命令>"   # 覆盖一切
 ```
 
-Codex 的 session dump 解析留了桩(`agit adapter` 可见),拿到格式即可填 `src/adapter/codex.rs`
-+ `src/session.rs` 的 `source_dir`。
+没有可用后端时,`reconcile` 不再报错退出,而是退回**确定性机械合并**(两边会话的机械并集,
+不做语义去重/冲突识别),离线也能出一份统一上下文。
+
+Codex 已是一等公民:它的 session dump(`~/.codex/sessions/`)也能 `agit -a sync codex`、
+`reconcile`、`convert`(`agit adapter` 里两个 runtime 都标「已实现」)。
 
 ## 安全
 
@@ -97,12 +104,16 @@ Codex 的 session dump 解析留了桩(`agit adapter` 可见),拿到格式即可
 
 ## AgentGitHub Hub
 
-`agit-hub` 托管 Agent Store(bare git 仓库)、git smart-http 同步、网页浏览。见 [`docs/hub.md`](docs/hub.md)。
+`agit-hub` 托管 Agent Store(bare git 仓库)、git smart-http 同步、网页浏览。
+push 需**写 token**(`agit-hub token add … --write`),`serve --private` 时读也要 token。
+前端是编译进二进制的 React SPA(hub-ui/):每条 session 有事件脊线、provenance、permalink、revision diff。
+见 [`docs/hub.md`](docs/hub.md)。改前端后 `./build.sh ui` 重编。
 
 ## 开发
 
 ```bash
-./build.sh test               # 13 green:两库/scope/配对/session 密钥/透传/adapter
+./build.sh test               # 38 green:scope/配对/密钥/透传/adapter/转换/reconcile 模式/hub 鉴权
+./build.sh ui                 # 重编 Hub 前端(hub-ui → dist,被 agit-hub 内嵌)
 ./build.sh --release
 ```
 
