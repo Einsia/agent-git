@@ -86,7 +86,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
             match pos {
                 Some(r) => sync::run(&r.to_string_lossy(), &rt),
                 None => {
-                    eprintln!("用法: agit -a sync <ref>   （让本分支的 agent 和对面 <ref> 的 agent 对话合并）");
+                    eprintln!("usage: agit -a sync <ref>   (reconcile this branch's agent with <ref>'s agent by dialogue)");
                     Ok(2)
                 }
             }
