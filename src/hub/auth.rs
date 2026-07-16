@@ -1,18 +1,21 @@
-//! 认证 —— 把"出示的凭据"变成"这是谁"（`Caller`）。**只回答身份，不回答权限**：
-//! 能不能做某件事由 `acl::decide` 说了算，那是另一个函数、另一组测试。
+//! Authentication — turning "the credential presented" into "who this is" (`Caller`). It answers
+//! **identity only, never permission**: whether something may be done is `acl::decide`'s call, in a
+//! different function with a different set of tests.
 //!
-//! 两条路：
-//!   - cookie 会话：给人用（浏览器）。
-//!   - bearer/basic token：给 git 与脚本用。token 认出来的 Caller 会带上 `TokenGrant` 上界。
+//! Two paths:
+//!   - cookie sessions: for humans (browsers).
+//!   - bearer/basic tokens: for git and scripts. A Caller recognized via a token carries a
+//!     `TokenGrant` upper bound.
 //!
-//! 认不出来 = 匿名，不是报错 —— public agent 本来就允许匿名读。
+//! Unrecognized = anonymous, not an error — public agents allow anonymous reads by design.
 
 use super::acl::{Caller, Scope, TokenGrant};
 use super::kdf;
 use super::session::Sessions;
 use super::store::{Store, User};
 
-/// 认证结果。`token_id` 是命中的 token —— 调用方拿它更新 last_used。
+/// The authentication result. `token_id` is the token that matched — the caller uses it to update
+/// last_used.
 pub struct Authn {
     pub caller: Caller,
     pub token_id: Option<String>,
@@ -24,13 +27,16 @@ impl Authn {
     }
 }
 
-/// cookie sid + 出示的 token 候选（Authorization 头里可能有用户名/密码两段）→ Caller。
+/// cookie sid + the presented token candidates (the Authorization header may carry both a username
+/// and a password slot) → Caller.
 ///
-/// 会话优先：浏览器同时带 cookie 和 Authorization 时，以本人会话为准（token 只会更窄）。
+/// The session wins: when a browser sends both a cookie and Authorization, the user's own session
+/// decides (a token can only ever be narrower).
 pub fn authenticate(store: &Store, sessions: &Sessions, sid: Option<&str>, secrets: &[String]) -> Authn {
     if let Some(sid) = sid {
         if let Some(username) = sessions.lookup(sid) {
-            // 会话还在、用户被删了 → 会话作废。删号必须当场失效，不能等 TTL 到期。
+            // Session alive but the user is gone → the session is void. Deleting an account must
+            // take effect at once, not wait for the TTL to run out.
             if let Some(u) = store.user(&username) {
                 return Authn { caller: user_caller(&u, None), token_id: None };
             }
@@ -39,20 +45,23 @@ pub fn authenticate(store: &Store, sessions: &Sessions, sid: Option<&str>, secre
     }
 
     for secret in secrets {
-        // 服务器只有摘要：把出示的明文做同样的 hash 再常数时间比。
+        // The server only holds digests: hash the presented plaintext the same way, then compare in
+        // constant time.
         let presented = crate::convo::sha256_hex(secret);
         for t in store.tokens() {
             if !kdf::ct_eq(&presented, &t.hash) {
                 continue;
             }
-            // 摘要对上了，但这个 token 未必能用：无主（老的全站 token）、过期、scope 认不出来。
+            // The digest matched, but the token may still be unusable: ownerless (an old host-wide
+            // token), expired, or an unrecognized scope.
             if !t.usable() {
                 return Authn::anonymous();
             }
             let (Some(owner), Some(scope)) = (t.owner.as_deref(), Scope::parse(&t.scope)) else {
                 return Authn::anonymous();
             };
-            // 属主没了 → token 跟着死。否则删号之后他的 token 还能用。
+            // Owner gone → the token dies with them. Otherwise a deleted account's tokens keep
+            // working.
             let Some(u) = store.user(owner) else {
                 return Authn::anonymous();
             };
@@ -68,8 +77,9 @@ fn user_caller(u: &User, token: Option<TokenGrant>) -> Caller {
     Caller { user: Some(u.username.clone()), is_admin: u.is_admin, token }
 }
 
-/// 登录：用户名 + 密码 → User。用户不存在时**也走一遍 KDF**，否则响应快慢会把
-/// "这个用户名存不存在"直接告诉外面（用户枚举）。
+/// Login: username + password → User. When the user does not exist it **still runs the KDF**;
+/// otherwise the response time would tell the outside world whether a username exists (user
+/// enumeration).
 pub fn verify_login(store: &Store, username: &str, password: &str) -> Option<User> {
     match store.user(username) {
         Some(u) => kdf::verify_password(password, &u.salt, &u.kdf, &u.pw_hash).then_some(u),
@@ -80,14 +90,16 @@ pub fn verify_login(store: &Store, username: &str, password: &str) -> Option<Use
     }
 }
 
-/// 用户不存在时用来烧掉同等 CPU 的假盐。它不保护任何东西，只为让两条路径耗时接近。
+/// A dummy salt for burning the same CPU when the user does not exist. It protects nothing; it only
+/// keeps the two paths close in cost.
 const DUMMY_SALT_HEX: &str = "00000000000000000000000000000000";
 
-/// last_used 至少隔这么久才写一次。每个请求都写 = 每个请求一次 fsync + 抢锁，
-/// 而这个字段只是"最近用过吗"，精确到分钟足够。
+/// last_used is written at most once per this interval. Writing on every request would mean an
+/// fsync plus lock contention per request, and the field only says "used recently?" — minute
+/// granularity is plenty.
 const TOUCH_EVERY_SECS: i64 = 60;
 
-/// 更新 token 的 last_used（限频）。写失败不影响请求本身。
+/// Update a token's last_used (throttled). A failed write does not affect the request itself.
 pub fn touch_token(store: &Store, id: &str) {
     let now = chrono::Utc::now();
     let fresh = store
@@ -142,7 +154,7 @@ mod tests {
             .unwrap();
     }
 
-    /// 发一个 token，返回明文。
+    /// Issue a token, returning the plaintext.
     fn issue(store: &Store, id: &str, owner: Option<&str>, agent: Option<&str>, scope: &str, expires: Option<&str>) -> String {
         let secret = kdf::gen_secret().unwrap();
         store
@@ -178,7 +190,7 @@ mod tests {
         let sid = f.sessions.create("alice").unwrap();
         let a = authenticate(&f.store, &f.sessions, Some(&sid), &[]);
         assert_eq!(a.caller.user.as_deref(), Some("alice"));
-        assert!(a.caller.token.is_none(), "会话不该带 token 上界");
+        assert!(a.caller.token.is_none(), "a session must not carry a token upper bound");
     }
 
     #[test]
@@ -192,12 +204,13 @@ mod tests {
 
     #[test]
     fn session_for_a_deleted_user_is_dead() {
-        // 会话表在内存里、用户表在磁盘上 —— 删了号，旧会话必须当场失效。
+        // The session table is in memory, the user table on disk — delete the account and the old
+        // session must die on the spot.
         let f = fixture();
         let sid = f.sessions.create("ghost").unwrap();
         let a = authenticate(&f.store, &f.sessions, Some(&sid), &[]);
         assert!(a.caller.user.is_none());
-        assert_eq!(f.sessions.lookup(&sid), None, "顺手撤掉");
+        assert_eq!(f.sessions.lookup(&sid), None, "revoked along the way");
     }
 
     #[test]
@@ -214,7 +227,7 @@ mod tests {
         let a = authenticate(&f.store, &f.sessions, None, &[secret]);
         assert_eq!(a.caller.user.as_deref(), Some("alice"));
         assert_eq!(a.token_id.as_deref(), Some("tok_1"));
-        let g = a.caller.token.expect("token 认出来就必须带上界");
+        let g = a.caller.token.expect("a recognized token must carry its upper bound");
         assert_eq!(g.agent.as_deref(), Some("proj"));
         assert_eq!(g.scope, Scope::Write);
     }
@@ -231,8 +244,9 @@ mod tests {
 
     #[test]
     fn legacy_ownerless_token_authenticates_nobody() {
-        // 老 auth.json 的 token 没有属主 —— 那正是"一个 token = 整个 host"的模型。
-        // 新模型认不出身份，一律当匿名，不静默继承任何权限。
+        // Tokens in the old auth.json have no owner — that was exactly the "one token = the whole
+        // host" model. The new model cannot derive an identity from them, so they are anonymous;
+        // no permission is silently inherited.
         let f = fixture();
         let secret = issue(&f.store, "tok_legacy", None, None, "write", None);
         let a = authenticate(&f.store, &f.sessions, None, &[secret]);
@@ -271,7 +285,8 @@ mod tests {
 
     #[test]
     fn basic_auth_username_slot_also_works() {
-        // git 会把 token 填在密码位、用户名随便填 —— 两段都当候选试。
+        // git puts the token in the password slot and anything in the username — try both slots as
+        // candidates.
         let f = fixture();
         let secret = issue(&f.store, "tok_1", Some("alice"), None, "read", None);
         let a = authenticate(&f.store, &f.sessions, None, &["git".to_string(), secret]);
@@ -288,7 +303,7 @@ mod tests {
         assert!(a.caller.token.is_none());
     }
 
-    // ── 登录 ──
+    // ── Login ──
 
     #[test]
     fn login_checks_the_password() {
@@ -321,7 +336,7 @@ mod tests {
 
     #[test]
     fn touch_is_throttled() {
-        // 刚写过就再 touch 一次 —— 不该再写（值不变即证明没重写）。
+        // touch again right after a write — it must not write again (an unchanged value proves it).
         let f = fixture();
         issue(&f.store, "tok_1", Some("alice"), None, "read", None);
         f.store

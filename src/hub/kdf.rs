@@ -1,32 +1,35 @@
-//! 口令派生与随机数 —— Hub 里所有"机密"的算术都在这。
+//! Password derivation and randomness — all of the Hub's "secret" arithmetic lives here.
 //!
-//! 密码**不是** sha256。sha256 是给 token 用的：token 是 32 字节 CSPRNG，本身就没得猜，
-//! 摘要只为"库被读走也不直接泄露可用凭据"。密码是人选的、熵很低，必须上带盐的慢 KDF ——
-//! 这里用 argon2id（内存硬，挡 GPU/ASIC 批量爆破）。
+//! Passwords are **not** sha256. sha256 is for tokens: a token is 32 CSPRNG bytes, unguessable on
+//! its own, and the digest only buys "reading the store does not hand out usable credentials".
+//! Passwords are human-chosen and low-entropy, so they demand a salted slow KDF — argon2id here
+//! (memory-hard, which blunts bulk GPU/ASIC cracking).
 //!
-//! 参数跟着 hash 一起存（`kdf` 字段，形如 `argon2id$v=19$m=19456,t=2,p=1`），于是以后调参
-//! 不会把老用户锁在门外：验的时候按**存的**参数算。
+//! The parameters are stored alongside the hash (the `kdf` field, shaped like
+//! `argon2id$v=19$m=19456,t=2,p=1`), so retuning them later will not lock existing users out:
+//! verification computes with the **stored** parameters.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use std::io::Read;
 
-/// 派生出的 hash 长度（字节）。
+/// Length of the derived hash (bytes).
 const HASH_LEN: usize = 32;
-/// 盐长度（字节）。argon2 要求 >= 8。
+/// Salt length (bytes). argon2 requires >= 8.
 const SALT_LEN: usize = 16;
 
-/// 当前默认参数下的 kdf 标识。新用户按它存。
+/// The kdf id for the current default parameters. New users are stored with it.
 pub fn current_kdf_id() -> String {
     let p = default_params();
     format!("argon2id$v=19$m={},t={},p={}", p.m_cost(), p.t_cost(), p.p_cost())
 }
 
-/// OWASP 对 argon2id 的推荐档（19 MiB / 2 轮 / 1 并行）。
+/// OWASP's recommended argon2id tier (19 MiB / 2 passes / 1 lane).
 fn default_params() -> Params {
     Params::default()
 }
 
-/// `argon2id$v=19$m=19456,t=2,p=1` → 可用的 Argon2 实例。认不出来就 None（宁可拒绝，不猜）。
+/// `argon2id$v=19$m=19456,t=2,p=1` → a usable Argon2 instance. Unrecognized → None (refuse rather
+/// than guess).
 fn argon2_from_kdf(kdf: &str) -> Option<Argon2<'static>> {
     let mut it = kdf.split('$');
     if it.next()? != "argon2id" {
@@ -51,11 +54,11 @@ fn argon2_from_kdf(kdf: &str) -> Option<Argon2<'static>> {
     Some(Argon2::new(Algorithm::Argon2id, version, params))
 }
 
-/// 按给定 kdf 参数与盐派生密码 hash（hex）。参数认不出来 → None。
+/// Derive the password hash (hex) with the given kdf parameters and salt. Unrecognized params → None.
 pub fn hash_password(password: &str, salt_hex: &str, kdf: &str) -> Option<String> {
     let salt = hex::decode(salt_hex).ok()?;
     if salt.len() < 8 {
-        return None; // 盐太短 = 彩虹表又活了；宁可失败
+        return None; // A too-short salt brings rainbow tables back to life; fail instead
     }
     let a = argon2_from_kdf(kdf)?;
     let mut out = [0u8; HASH_LEN];
@@ -63,7 +66,8 @@ pub fn hash_password(password: &str, salt_hex: &str, kdf: &str) -> Option<String
     Some(hex::encode(out))
 }
 
-/// 验密码：用**存的**盐与参数重算，常数时间比。任何一步认不出来 → false（不放行）。
+/// Verify a password: recompute with the **stored** salt and parameters, compare in constant time.
+/// Anything unrecognized along the way → false (no admission).
 pub fn verify_password(password: &str, salt_hex: &str, kdf: &str, expected_hex: &str) -> bool {
     match hash_password(password, salt_hex, kdf) {
         Some(got) => ct_eq(&got, expected_hex),
@@ -71,12 +75,13 @@ pub fn verify_password(password: &str, salt_hex: &str, kdf: &str, expected_hex: 
     }
 }
 
-/// 新盐（hex）。
+/// A fresh salt (hex).
 pub fn gen_salt() -> std::io::Result<String> {
     Ok(hex::encode(random_bytes::<SALT_LEN>()?))
 }
 
-/// 32 字节 CSPRNG → hex。拿不到 OS 熵就**报错**，绝不退回可预测的时间值来发凭据。
+/// 32 CSPRNG bytes → hex. If OS entropy is unavailable this **errors**; it never falls back to a
+/// predictable time-derived value to mint credentials.
 pub fn gen_secret() -> std::io::Result<String> {
     Ok(hex::encode(random_bytes::<32>()?))
 }
@@ -87,7 +92,8 @@ fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
     Ok(buf)
 }
 
-/// 定长常数时间比较（这里比的都是等长 hex 摘要；避免逐字节短路泄露信息）。
+/// Fixed-length constant-time comparison (everything compared here is an equal-length hex digest;
+/// avoids leaking information by short-circuiting byte by byte).
 pub fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -116,7 +122,7 @@ mod tests {
 
     #[test]
     fn hash_is_not_a_bare_sha256() {
-        // 回归闸：万一有人"简化"回 sha256(password)，这里会响。
+        // Regression gate: if anyone "simplifies" this back to sha256(password), this fires.
         let salt = "00112233445566778899aabbccddeeff";
         let h = hash_password("hunter2", salt, &current_kdf_id()).unwrap();
         assert_ne!(h, crate::convo::sha256_hex("hunter2"));
@@ -125,7 +131,8 @@ mod tests {
 
     #[test]
     fn salt_changes_the_hash() {
-        // 同密码 + 不同盐 → 不同 hash：这是"一张彩虹表打穿整库"的解药。
+        // Same password + different salt → different hash: the antidote to one rainbow table
+        // cracking the whole store.
         let kdf = current_kdf_id();
         let a = hash_password("hunter2", &gen_salt().unwrap(), &kdf).unwrap();
         let b = hash_password("hunter2", &gen_salt().unwrap(), &kdf).unwrap();
@@ -134,12 +141,14 @@ mod tests {
 
     #[test]
     fn stored_params_are_used_not_the_current_default() {
-        // 老 hash 用老参数存 —— 调默认参数不该把老用户锁在门外。
+        // Old hashes are stored with old parameters — retuning the defaults must not lock existing
+        // users out.
         let salt = gen_salt().unwrap();
         let weak = "argon2id$v=19$m=8,t=1,p=1";
         let h = hash_password("hunter2", &salt, weak).unwrap();
         assert!(verify_password("hunter2", &salt, weak, &h));
-        // 用当前默认参数去验老 hash 必然对不上（证明参数确实参与了运算）。
+        // Verifying an old hash with the current defaults must fail (proves the params really do
+        // feed the computation).
         assert!(!verify_password("hunter2", &salt, &current_kdf_id(), &h));
     }
 

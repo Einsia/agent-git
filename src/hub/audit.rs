@@ -1,33 +1,36 @@
-//! 只追加的审计日志：谁、什么时候、对哪个 agent、做了什么。
+//! Append-only audit log: who, when, against which agent, did what.
 //!
-//! JSONL，一行一条，`O_APPEND` 打开 —— 内核保证每次 write 落在文件末尾，多线程并发追加
-//! 不会互相截断（前提是一次 write 写完一整行，所以这里先把整行拼好再写一次）。
+//! JSONL, one record per line, opened with `O_APPEND` — the kernel guarantees every write lands at
+//! end of file, so concurrent appends from several threads never truncate each other (provided one
+//! write emits one whole line, which is why the line is assembled first and written once).
 //!
-//! 只追加意味着**没有删除接口**：轮转/归档交给外面的 logrotate。Hub 自己不会回头改它。
-//! 被拒绝的请求也记 —— "谁试过但没进去"往往比"谁进去了"更有价值。
+//! Append-only means there is **no delete interface**: rotation and archival are logrotate's job,
+//! outside. The Hub never goes back and edits it. Denied requests get recorded too — "who tried and
+//! did not get in" is often worth more than "who got in".
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// 查询时最多回看的字节数。日志无限长，但"最近发生了什么"只需要看尾巴。
+/// Most bytes a query looks back over. The log grows without bound, but "what happened recently"
+/// only needs the tail.
 const TAIL_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub when: String,
-    /// 用户名；匿名请求写 "anonymous"。
+    /// Username; anonymous requests record "anonymous".
     pub actor: String,
-    /// 动作名，见下面的常量。
+    /// Action name, see the constants below.
     pub action: String,
-    /// 相关 agent；跟具体 agent 无关的动作（login 等）为 null。
+    /// The agent involved; null for actions unrelated to a specific agent (login and friends).
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
     pub detail: String,
 }
 
-// 动作名 —— 固定字符串，前端/grep 都靠它。
+// Action names — fixed strings; the frontend and grep both depend on them.
 pub const LOGIN: &str = "login";
 pub const LOGIN_FAILED: &str = "login.failed";
 pub const LOGOUT: &str = "logout";
@@ -48,7 +51,8 @@ pub fn log_path(root: &Path) -> PathBuf {
     root.join("audit.log")
 }
 
-/// 追加一条。写失败**不打断请求**（审计坏了不该让 Hub 罢工），但会往 stderr 喊一声。
+/// Append one record. A failed write **does not interrupt the request** (a broken audit log should
+/// not take the Hub down), but it does shout on stderr.
 pub fn append(root: &Path, actor: &str, action: &str, agent: Option<&str>, detail: &str) {
     let e = Entry {
         when: super::store::now_iso(),
@@ -58,21 +62,22 @@ pub fn append(root: &Path, actor: &str, action: &str, agent: Option<&str>, detai
         detail: detail.to_string(),
     };
     if let Err(err) = try_append(root, &e) {
-        eprintln!("审计日志写不进去（{}）: {err}", log_path(root).display());
+        eprintln!("cannot write the audit log ({}): {err}", log_path(root).display());
     }
 }
 
 fn try_append(root: &Path, e: &Entry) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     super::store::ensure_root(root)?;
-    // 一次拼好一整行再写一次：O_APPEND + 单次 write = 并发追加不交错。
+    // Assemble the whole line, then write it once: O_APPEND + a single write = concurrent appends
+    // that do not interleave.
     let mut line = serde_json::to_string(e).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push('\n');
     let mut f = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(log_path(root))?;
     f.write_all(line.as_bytes())
 }
 
-/// 读尾巴：按 agent 过滤，最多 limit 条，最新的在前。
+/// Read the tail: filtered by agent, at most limit records, newest first.
 pub fn query(root: &Path, agent: Option<&str>, limit: usize) -> Vec<Entry> {
     let Some(text) = read_tail(&log_path(root)) else {
         return vec![];
@@ -85,12 +90,13 @@ pub fn query(root: &Path, agent: Option<&str>, limit: usize) -> Vec<Entry> {
             None => true,
         })
         .collect();
-    out.reverse(); // 最新的在前
+    out.reverse(); // newest first
     out.truncate(limit);
     out
 }
 
-/// 只读末尾 TAIL_BYTES，并丢掉可能被切断的第一行。日志涨到几个 G 也不会把它整个读进内存。
+/// Read only the trailing TAIL_BYTES and drop the possibly-severed first line. A log that grows to
+/// several GB never gets pulled into memory whole.
 fn read_tail(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
@@ -103,7 +109,7 @@ fn read_tail(path: &Path) -> Option<String> {
     f.read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf).into_owned();
     match truncated {
-        // 从中间切进去的第一行多半是半截，丢掉。
+        // Seeking into the middle usually lands mid-line, so drop that first half-line.
         true => text.split_once('\n').map(|(_, rest)| rest.to_string()),
         false => Some(text),
     }
@@ -122,7 +128,7 @@ mod tests {
 
         let all = query(d.path(), None, 10);
         assert_eq!(all.len(), 3);
-        assert_eq!(all[0].action, LOGIN, "最新的在前");
+        assert_eq!(all[0].action, LOGIN, "newest first");
         assert_eq!(all[2].action, AGENT_CREATE);
 
         let only_x = query(d.path(), Some("x"), 10);
@@ -130,7 +136,7 @@ mod tests {
         assert_eq!(only_x[0].actor, "alice");
         assert_eq!(only_x[0].detail, "visibility=private");
 
-        assert_eq!(query(d.path(), None, 2).len(), 2, "limit 生效");
+        assert_eq!(query(d.path(), None, 2).len(), 2, "limit takes effect");
         assert!(query(d.path(), Some("nope"), 10).is_empty());
     }
 
@@ -150,7 +156,7 @@ mod tests {
         let first = std::fs::read_to_string(log_path(d.path())).unwrap();
         append(d.path(), "bob", LOGIN, None, "two");
         let second = std::fs::read_to_string(log_path(d.path())).unwrap();
-        assert!(second.starts_with(&first), "老行必须原样留在开头");
+        assert!(second.starts_with(&first), "old lines must stay verbatim at the front");
         assert_eq!(second.lines().count(), 2);
     }
 
@@ -162,12 +168,12 @@ mod tests {
 
     #[test]
     fn detail_with_newline_cannot_forge_a_row() {
-        // detail 是用户可控的（agent 名、用户名）。JSON 编码会把换行转义掉,
-        // 否则 "\n{...}" 就能往审计里伪造一整条记录。
+        // detail is user-controlled (agent names, usernames). JSON encoding escapes the newline
+        // away; otherwise "\n{...}" could forge a whole record into the audit log.
         let d = tempfile::tempdir().unwrap();
         append(d.path(), "eve", LOGIN, None, "x\n{\"actor\":\"root\",\"action\":\"login\"}");
         let raw = std::fs::read_to_string(log_path(d.path())).unwrap();
-        assert_eq!(raw.lines().count(), 1, "一条就是一条，不能被换行拆成两条");
+        assert_eq!(raw.lines().count(), 1, "one record is one record; a newline must not split it in two");
         let q = query(d.path(), None, 10);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].actor, "eve");

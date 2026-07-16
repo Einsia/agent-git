@@ -1,24 +1,31 @@
-//! agit-hub —— AgentGitHub：托管团队的 Agent Store，人可读（React SPA）、agent 可拉（JSON API）。
+//! agit-hub — AgentGitHub: hosts the team's Agent Stores, readable by people (React SPA) and
+//! pullable by agents (JSON API).
 //!
-//! 形态：一个自包含的 HTTP 服务，托管一堆 Agent Store（bare git 仓库）。
-//!   - Registry：扫描 hub root 下的 <name>.git，元数据在 agents.json（owner/可见性/成员）
-//!   - Sync：git smart-http，`agit -a push/pull http://host:port/<name>.git` 直接可用
-//!   - 身份：`aid`（`agt_<uuid>`）由客户端铸造、提交在 store 里的 agent.toml —— Hub 只读不写。
-//!           改名不改身份；Hub 上的 name 只是个可变标签。
-//!   - 鉴权：**每个 agent 各自的 ACL**（owner + 成员 read/write/admin + public/private），
-//!           人走 cookie 会话，git/脚本走 token（可绑定单个 agent、可过期、可撤销）。
-//!           所有入口 —— 含 git smart-http —— 都过同一个判定：`agit::hub::acl::decide`。
-//!   - 前端：hub-ui（Vite + React + Tailwind + shadcn）编译进二进制，SPA 消费下面的 JSON API。
+//! Shape: one self-contained HTTP service hosting a pile of Agent Stores (bare git repos).
+//!   - Registry: scans <name>.git under the hub root; metadata lives in agents.json (owner/visibility/members)
+//!   - Sync: git smart-http, so `agit -a push/pull http://host:port/<name>.git` just works
+//!   - Identity: `aid` (`agt_<uuid>`) is minted by the client and committed to agent.toml inside the
+//!               store — the Hub only reads it, never writes it. A rename does not change identity;
+//!               the name on the Hub is just a mutable label.
+//!   - Authz: **a separate ACL per agent** (owner + members read/write/admin + public/private).
+//!            People use cookie sessions; git/scripts use tokens (bindable to a single agent,
+//!            expirable, revocable). Every entry point — git smart-http included — goes through
+//!            the same decision: `agit::hub::acl::decide`.
+//!   - Frontend: hub-ui (Vite + React + Tailwind + shadcn) compiled into the binary; the SPA
+//!               consumes the JSON API below.
 //!
-//! 这一层只做 HTTP 的解析与搬运；"谁能做什么"全在 `agit::hub` 里（纯函数 + 单测）。
+//! This layer only parses and shuttles HTTP; "who may do what" lives entirely in `agit::hub`
+//! (pure functions + unit tests).
 //!
-//! 前端资源在编译期由 include_str! 嵌入（hub-ui/dist）。改前端后 `cd hub-ui && npm run build` 再 cargo build。
+//! Frontend assets are embedded at compile time via include_str! (hub-ui/dist). After changing the
+//! frontend, run `cd hub-ui && npm run build` before cargo build.
 //!
-//! 安全默认值（都是刻意的，改之前先想清楚）：
-//!   - 只听 127.0.0.1。要对外必须显式 `--host`，且没有 TLS 时还要 `--insecure` 才肯起。
-//!   - 新建 agent 一律 private。公开是显式动作。
-//!   - 密码用 argon2id（带盐），不是 sha256。token 只存 sha256 摘要。
-//!   - 代理后的真实 IP 只在显式 `--trusted-proxy` 之后才认 X-Forwarded-For。
+//! Security defaults (all deliberate — think it through before changing them):
+//!   - Listens on 127.0.0.1 only. Going public needs an explicit `--host`, and without TLS it also
+//!     needs `--insecure` before it will start.
+//!   - New agents are always private. Going public is an explicit act.
+//!   - Passwords use argon2id (salted), not sha256. Tokens are stored as sha256 digests only.
+//!   - The real IP behind a proxy honours X-Forwarded-For only after an explicit `--trusted-proxy`.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -36,10 +43,11 @@ use agit::hub::store::{AgentMeta, Member, Store, TokenRec, User};
 use agit::hub::{audit, auth, identity, kdf, session as websession, store};
 
 const PER_PAGE: usize = 20;
-/// 带查询时最多扫多少条 session（挡住无界 git show）。超出会在响应里标记，不静默截断。
+/// How many sessions a query may scan at most (stops an unbounded git show). Going over is flagged
+/// in the response rather than silently truncated.
 const SEARCH_SCAN_CAP: usize = 400;
 
-// ── 编译期嵌入的前端（hub-ui/dist）──
+// ── Frontend embedded at compile time (hub-ui/dist) ──
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/index.html"));
 const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/app.js"));
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/app.css"));
@@ -48,7 +56,8 @@ fn main() {
     std::process::exit(run());
 }
 
-/// 返回进程退出码 —— 错误路径必须非零，脚本/CI 才能感知失败（别一律 exit 0）。
+/// Returns the process exit code — error paths must be non-zero so scripts/CI can notice the
+/// failure (don't just exit 0 everywhere).
 fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("serve");
@@ -65,7 +74,7 @@ fn run() -> i32 {
             0
         }
         other => {
-            eprintln!("未知子命令: {other}");
+            eprintln!("unknown subcommand: {other}");
             print_help();
             2
         }
@@ -74,20 +83,20 @@ fn run() -> i32 {
 
 fn print_help() {
     println!(
-        "agit-hub —— AgentGitHub (Registry + Sync)\n\n\
+        "agit-hub — AgentGitHub (Registry + Sync)\n\n\
          agit-hub serve [--host 127.0.0.1] [--port 8177] [--root ~/.agit-hub]\n\
-                        [--tls] [--insecure] [--trusted-proxy IP,IP]      启动 Hub\n\
-         agit-hub user add <name> [--admin]                   建用户（交互式问密码）\n\
-         agit-hub user list                                   列出用户\n\
-         agit-hub add <name> [--owner <user>] [--public]      新建 Agent Store（默认 private）\n\
-         agit-hub list                                        列出已托管的 agent\n\
+                        [--tls] [--insecure] [--trusted-proxy IP,IP]      start the Hub\n\
+         agit-hub user add <name> [--admin]                   add a user (asks for the password)\n\
+         agit-hub user list                                   list users\n\
+         agit-hub add <name> [--owner <user>] [--public]      new Agent Store (private by default)\n\
+         agit-hub list                                        list hosted agents\n\
          agit-hub token add <name> [--user <owner>] [--agent <name>]\n\
-                            [--read|--write] [--ttl-days N]   发一个访问 token\n\
-         agit-hub token list                                  列出 token（只显示摘要信息）\n\
-         agit-hub token rm <id>                               吊销一个 token\n\n\
-         第一步：agit-hub user add <你> --admin\n\
-         托管的仓库是 bare git。发布： agit -a push http://HOST:PORT/<name>.git（带写 token）\n\n\
-         默认只听 127.0.0.1。对外服务要 --host 0.0.0.0，且没有 TLS 时必须再加 --insecure。"
+                            [--read|--write] [--ttl-days N]   issue an access token\n\
+         agit-hub token list                                  list tokens (metadata only)\n\
+         agit-hub token rm <id>                               revoke a token\n\n\
+         First step: agit-hub user add <you> --admin\n\
+         Hosted repos are bare git. Publish with: agit -a push http://HOST:PORT/<name>.git (with a write token)\n\n\
+         Listens on 127.0.0.1 only by default. Serving the network needs --host 0.0.0.0, and without TLS also --insecure."
     );
 }
 
@@ -104,7 +113,7 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-/// 第一个不以 `--` 开头的位置参数（跳过前 skip 个 token）。
+/// The first positional argument not starting with `--` (skipping the first `skip` tokens).
 fn positional(args: &[String], skip: usize) -> Option<&String> {
     args.iter().skip(skip).find(|s| !s.starts_with("--"))
 }
@@ -116,20 +125,21 @@ fn user_cmd(root: &Path, args: &[String]) -> i32 {
     match args.get(1).map(|s| s.as_str()) {
         Some("add") => {
             let Some(name) = positional(args, 2) else {
-                eprintln!("用法: agit-hub user add <name> [--admin]");
+                eprintln!("usage: agit-hub user add <name> [--admin]");
                 return 2;
             };
             let username = store::normalize_username(name);
             if !store::valid_username(&username) {
-                eprintln!("非法用户名（2-32 位小写 [a-z0-9._-]，不许前导点）: {name}");
+                eprintln!("invalid username (2-32 lowercase [a-z0-9._-], no leading dot): {name}");
                 return 2;
             }
             if store.user(&username).is_some() {
-                eprintln!("用户已存在: {username}");
+                eprintln!("user already exists: {username}");
                 return 1;
             }
             let is_admin = has_flag(args, "--admin");
-            // 密码只从 tty/stdin 读，**绝不从 argv 拿** —— argv 会进 ps、进 shell history。
+            // The password is read from the tty/stdin only, **never from argv** — argv shows up in
+            // ps and in shell history.
             let password = match read_new_password() {
                 Ok(p) => p,
                 Err(e) => {
@@ -140,29 +150,29 @@ fn user_cmd(root: &Path, args: &[String]) -> i32 {
             let salt = match kdf::gen_salt() {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("拿不到系统熵，拒绝建用户：{e}");
+                    eprintln!("no system entropy available, refusing to create the user: {e}");
                     return 1;
                 }
             };
             let kdf_id = kdf::current_kdf_id();
             let Some(pw_hash) = kdf::hash_password(&password, &salt, &kdf_id) else {
-                eprintln!("口令派生失败（kdf={kdf_id}）");
+                eprintln!("password derivation failed (kdf={kdf_id})");
                 return 1;
             };
             let user = User { username: username.clone(), pw_hash, salt, kdf: kdf_id, is_admin, created: store::now_iso() };
             if let Err(e) = store.add_user(user) {
-                eprintln!("写 users.json 失败: {e}");
+                eprintln!("failed to write users.json: {e}");
                 return 1;
             }
             audit::append(root, "cli", audit::USER_ADD, None, &format!("{username} admin={is_admin}"));
-            println!("已建用户 {username}{}", if is_admin { "（站点管理员）" } else { "" });
-            println!("  密码用 argon2id 派生后存进 users.json（0600），明文不落盘。");
+            println!("created user {username}{}", if is_admin { " (site admin)" } else { "" });
+            println!("  The password is derived with argon2id and stored in users.json (0600); the plaintext never hits disk.");
             0
         }
         Some("list") => {
             let users = store.users();
             if users.is_empty() {
-                println!("还没有用户。`agit-hub user add <你> --admin` 建第一个。");
+                println!("no users yet. `agit-hub user add <you> --admin` creates the first one.");
             }
             for u in users {
                 println!("{:<20} {:<8} {}", u.username, if u.is_admin { "admin" } else { "user" }, u.created);
@@ -170,31 +180,33 @@ fn user_cmd(root: &Path, args: &[String]) -> i32 {
             0
         }
         _ => {
-            eprintln!("用法: agit-hub user add <name> [--admin] | agit-hub user list");
+            eprintln!("usage: agit-hub user add <name> [--admin] | agit-hub user list");
             2
         }
     }
 }
 
-/// 读新密码：tty 上关回显并要求输两遍；stdin 是管道时读一行（脚本化装机）。
+/// Read a new password: on a tty, turn off echo and ask for it twice; when stdin is a pipe, read
+/// one line (scripted provisioning).
 fn read_new_password() -> Result<String, String> {
-    let (pw, tty) = read_password("为该用户设置密码: ")?;
+    let (pw, tty) = read_password("set a password for this user: ")?;
     if pw.chars().count() < 8 {
-        return Err("密码太短（至少 8 个字符）。".into());
+        return Err("password too short (at least 8 characters).".into());
     }
     if tty {
-        let (again, _) = read_password("再输一次: ")?;
+        let (again, _) = read_password("again: ")?;
         if again != pw {
-            return Err("两次输入不一致。".into());
+            return Err("the two entries don't match.".into());
         }
     }
     Ok(pw)
 }
 
-/// 关回显读一行。返回 (密码, 是不是 tty)。
+/// Read one line with echo off. Returns (password, whether it was a tty).
 ///
-/// 不引 rpassword：一个 `stty -echo` 就够，而且 Hub 刻意保持零额外依赖的 CLI 面。
-/// stty 失败 = stdin 不是 tty（管道），那本来也不会回显。
+/// No rpassword dependency: a single `stty -echo` is enough, and the Hub deliberately keeps its CLI
+/// surface free of extra dependencies. A failing stty = stdin isn't a tty (a pipe), which wouldn't
+/// have echoed anyway.
 fn read_password(prompt: &str) -> Result<(String, bool), String> {
     eprint!("{prompt}");
     let _ = std::io::stderr().flush();
@@ -203,12 +215,12 @@ fn read_password(prompt: &str) -> Result<(String, bool), String> {
     let read = std::io::stdin().read_line(&mut line);
     if tty {
         stty(&["echo"]);
-        eprintln!(); // 回显关着，用户敲的回车没显示出来，这里补一个换行
+        eprintln!(); // Echo was off, so the user's Enter never showed: emit the newline ourselves
     }
     match read {
-        Ok(0) => Err("读不到密码（stdin 已结束）。".into()),
+        Ok(0) => Err("no password read (stdin ended).".into()),
         Ok(_) => Ok((line.trim_end_matches(['\n', '\r']).to_string(), tty)),
-        Err(e) => Err(format!("读密码失败: {e}")),
+        Err(e) => Err(format!("failed to read the password: {e}")),
     }
 }
 
@@ -223,17 +235,18 @@ fn stty(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// 没写 `--user` / `--owner` 时：只有一个用户就默认是他；否则要求写明白（别猜）。
+/// When `--user` / `--owner` is omitted: with exactly one user, default to them; otherwise demand it
+/// be spelled out (don't guess).
 fn resolve_user(store: &Store, explicit: Option<String>, flag_name: &str) -> Result<User, String> {
     if let Some(name) = explicit {
         let n = store::normalize_username(&name);
-        return store.user(&n).ok_or(format!("没有这个用户: {n}（`agit-hub user list` 看看）"));
+        return store.user(&n).ok_or(format!("no such user: {n} (try `agit-hub user list`)"));
     }
     let users = store.users();
     match users.len() {
-        0 => Err("还没有用户。先 `agit-hub user add <你> --admin`。".into()),
+        0 => Err("no users yet. Start with `agit-hub user add <you> --admin`.".into()),
         1 => Ok(users.into_iter().next().unwrap()),
-        _ => Err(format!("有多个用户，请用 {flag_name} <user> 指明。")),
+        _ => Err(format!("there are several users, name one with {flag_name} <user>.")),
     }
 }
 
@@ -241,7 +254,7 @@ fn resolve_user(store: &Store, explicit: Option<String>, flag_name: &str) -> Res
 
 fn add_cmd(root: &Path, args: &[String]) -> i32 {
     let Some(name) = positional(args, 1) else {
-        eprintln!("用法: agit-hub add <name> [--owner <user>] [--public]");
+        eprintln!("usage: agit-hub add <name> [--owner <user>] [--public]");
         return 2;
     };
     let store = Store::new(root);
@@ -252,22 +265,22 @@ fn add_cmd(root: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    // 默认 private —— 转录是敏感数据，公开必须是显式动作。
+    // Private by default — transcripts are sensitive data, so going public must be an explicit act.
     let visibility = if has_flag(args, "--public") { Visibility::Public } else { Visibility::Private };
     match create_agent(&store, name, &owner.username, visibility) {
         Ok(created) => {
             audit::append(root, "cli", audit::AGENT_CREATE, Some(name), &format!("owner={} visibility={}", owner.username, visibility.as_str()));
             if created {
-                println!("已托管 {name}  →  {}", repo_path(root, name).display());
+                println!("now hosting {name}  →  {}", repo_path(root, name).display());
             } else {
-                println!("已认领现有仓库 {name}  →  {}", repo_path(root, name).display());
+                println!("claimed existing repo {name}  →  {}", repo_path(root, name).display());
             }
             println!("  owner:      {}", owner.username);
-            println!("  可见性:     {}", visibility.as_str());
+            println!("  visibility: {}", visibility.as_str());
             if visibility == Visibility::Public {
-                println!("  ⚠ public = 任何能连上这个端口的人都能读它的全部转录。");
+                println!("  ⚠ public = anyone who can reach this port can read all of its transcripts.");
             }
-            println!("发布（需写 token，见 `agit-hub token add`）：");
+            println!("Publish (needs a write token, see `agit-hub token add`):");
             println!("  agit -a remote add origin http://localhost:8177/{name}.git");
             println!("  agit -a push -u origin main");
             0
@@ -279,21 +292,23 @@ fn add_cmd(root: &Path, args: &[String]) -> i32 {
     }
 }
 
-/// 建库 + 记元数据。返回 true = 新建；false = 认领了一个已存在但没登记的老仓库。
+/// Create the repo + record the metadata. Returns true = newly created; false = claimed an existing
+/// but unregistered old repo.
 ///
-/// "认领"这条路是给迁移用的：root 下可能已经有 `<name>.git`（老 Hub 建的，没有 owner）。
-/// 那种库在新模型里是**无主私有**，除了站点管理员谁也看不见 —— 认领是把它接回来的正路。
+/// The "claim" path is for migration: root may already hold a `<name>.git` (created by an old Hub,
+/// with no owner). Under the new model such a repo is **unowned and private**, invisible to everyone
+/// but the site admin — claiming it is the proper way to bring it back.
 fn create_agent(store: &Store, name: &str, owner: &str, visibility: Visibility) -> Result<bool, String> {
     if !valid_agent_name(name) {
-        return Err(format!("非法名字（只允许 [A-Za-z0-9._-]，禁止 .. 与前导点）: {name}"));
+        return Err(format!("invalid name ([A-Za-z0-9._-] only, no .. and no leading dot): {name}"));
     }
     if store.agent(name).is_some() {
-        return Err(format!("已存在: {name}"));
+        return Err(format!("already exists: {name}"));
     }
     let dir = store.root().join(format!("{name}.git"));
     let existed = dir.exists();
     if !existed {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create the directory: {e}"))?;
         let ok = Command::new("git")
             .args(["init", "-q", "--bare", "-b", "main"])
             .arg(&dir)
@@ -302,13 +317,13 @@ fn create_agent(store: &Store, name: &str, owner: &str, visibility: Visibility) 
             .unwrap_or(false);
         if !ok {
             let _ = std::fs::remove_dir_all(&dir);
-            return Err("git init --bare 失败".into());
+            return Err("git init --bare failed".into());
         }
         let _ = Command::new("git").arg("-C").arg(&dir).args(["config", "http.receivepack", "true"]).status();
     }
     store
         .update_agents(|a| a.push(AgentMeta::new(name, Some(owner), visibility)))
-        .map_err(|e| format!("写 agents.json 失败: {e}"))?;
+        .map_err(|e| format!("failed to write agents.json: {e}"))?;
     Ok(!existed)
 }
 
@@ -316,11 +331,11 @@ fn list_cmd(root: &Path) -> i32 {
     let store = Store::new(root);
     let names = list_agents(root);
     if names.is_empty() {
-        println!("还没有 agent。`agit-hub add <name>` 建一个。");
+        println!("no agents yet. `agit-hub add <name>` creates one.");
     }
     for n in names {
         let m = store.agent_or_unowned(&n);
-        let owner = m.owner.clone().unwrap_or_else(|| "—（无主）".into());
+        let owner = m.owner.clone().unwrap_or_else(|| "— (unowned)".into());
         println!("{:<24} {:<8} owner={}", n, m.visibility, owner);
     }
     0
@@ -332,7 +347,8 @@ fn list_agents(root: &Path) -> Vec<String> {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if let Some(n) = name.strip_suffix(".git") {
-                // 目录名是外面来的：不合法的一律不认（别让 `..git` 之类进到路由里）。
+                // Directory names come from outside: reject anything invalid (don't let the likes of
+                // `..git` reach the router).
                 if valid_agent_name(n) {
                     out.push(n.to_string());
                 }
@@ -354,7 +370,7 @@ fn token_cmd(root: &Path, args: &[String]) -> i32 {
     match args.get(1).map(|s| s.as_str()) {
         Some("add") => {
             let Some(name) = positional(args, 2) else {
-                eprintln!("用法: agit-hub token add <name> [--user <owner>] [--agent <name>] [--read|--write] [--ttl-days N]");
+                eprintln!("usage: agit-hub token add <name> [--user <owner>] [--agent <name>] [--read|--write] [--ttl-days N]");
                 return 2;
             };
             let owner = match resolve_user(&store, flag(args, "--user"), "--user") {
@@ -364,12 +380,13 @@ fn token_cmd(root: &Path, args: &[String]) -> i32 {
                     return 2;
                 }
             };
-            // 默认只读：发凭据时的失败方向只能是"权限更小"。老 CLI 默认是写，那是反的。
+            // Read-only by default: when issuing credentials, the only acceptable direction to fail
+            // in is "less power". The old CLI defaulted to write, which is backwards.
             let scope = if has_flag(args, "--write") { Scope::Write } else { Scope::Read };
             let agent = flag(args, "--agent");
             if let Some(a) = &agent {
                 if !valid_agent_name(a) || store.agent(a).is_none() {
-                    eprintln!("没有这个 agent: {a}");
+                    eprintln!("no such agent: {a}");
                     return 2;
                 }
             }
@@ -377,7 +394,7 @@ fn token_cmd(root: &Path, args: &[String]) -> i32 {
                 Some(v) => match v.parse::<i64>() {
                     Ok(n) if n > 0 => Some(n),
                     _ => {
-                        eprintln!("--ttl-days 要一个正整数");
+                        eprintln!("--ttl-days wants a positive integer");
                         return 2;
                     }
                 },
@@ -386,19 +403,19 @@ fn token_cmd(root: &Path, args: &[String]) -> i32 {
             match issue_token(&store, name, &owner.username, agent.as_deref(), scope, ttl_days) {
                 Ok(secret) => {
                     audit::append(root, "cli", audit::TOKEN_CREATE, agent.as_deref(), &format!("name={name} owner={} scope={}", owner.username, scope.as_str()));
-                    println!("已发 token 给 {}（{}）", owner.username, scope.as_str());
+                    println!("issued a token to {} ({})", owner.username, scope.as_str());
                     println!("  token: {secret}");
-                    println!("  这串只显示这一次（服务器只存它的 sha256 摘要）。");
+                    println!("  This string is shown once (the server only stores its sha256 digest).");
                     match &agent {
-                        Some(a) => println!("  只对 agent `{a}` 有效。"),
-                        None => println!("  对该用户能访问的所有 agent 有效 —— 用 --agent <name> 收窄。"),
+                        Some(a) => println!("  Valid for agent `{a}` only."),
+                        None => println!("  Valid for every agent this user can reach — narrow it with --agent <name>."),
                     }
                     match ttl_days {
-                        Some(d) => println!("  {d} 天后过期。"),
-                        None => println!("  ⚠ 永不过期 —— 用 --ttl-days N 给它一个期限。"),
+                        Some(d) => println!("  Expires in {d} days."),
+                        None => println!("  ⚠ Never expires — give it a deadline with --ttl-days N."),
                     }
-                    println!("  git 提示输入用户名/密码时，密码填这个 token（用户名随意）。");
-                    println!("  权限是 token 与属主权限的**交集**：属主没有的，token 也给不了。");
+                    println!("  When git asks for a username/password, put this token in the password field (username can be anything).");
+                    println!("  Permissions are the **intersection** of the token and its owner: a token can't grant what the owner lacks.");
                     0
                 }
                 Err(e) => {
@@ -410,34 +427,34 @@ fn token_cmd(root: &Path, args: &[String]) -> i32 {
         Some("list") => {
             let toks = store.tokens();
             if toks.is_empty() {
-                println!("还没有 token。`agit-hub token add <name> --write` 发一个。");
+                println!("no tokens yet. `agit-hub token add <name> --write` issues one.");
             }
             let legacy = toks.iter().filter(|t| t.owner.is_none()).count();
             for t in &toks {
                 let owner = t.owner.clone().unwrap_or_else(|| "—".into());
                 let agent = t.agent.clone().unwrap_or_else(|| "*".into());
-                let exp = t.expires.clone().unwrap_or_else(|| "永不".into());
-                let used = t.last_used.clone().unwrap_or_else(|| "从未".into());
+                let exp = t.expires.clone().unwrap_or_else(|| "never".into());
+                let used = t.last_used.clone().unwrap_or_else(|| "never".into());
                 let state = if t.owner.is_none() {
-                    " [失效：无属主]"
+                    " [dead: no owner]"
                 } else if t.expired() {
-                    " [已过期]"
+                    " [expired]"
                 } else {
                     ""
                 };
-                println!("{:<18} {:<16} owner={:<12} agent={:<12} {:<6} 过期={:<22} 最近用={}{}", t.id, t.name, owner, agent, t.scope, exp, used, state);
+                println!("{:<18} {:<16} owner={:<12} agent={:<12} {:<6} expires={:<22} last used={}{}", t.id, t.name, owner, agent, t.scope, exp, used, state);
             }
             if legacy > 0 {
                 println!();
-                println!("⚠ 有 {legacy} 个**老格式 token 没有属主**，已全部失效。");
-                println!("  它们是旧模型的遗产：一个 token = 整个 host 的通行证，没法映射到「谁能看谁的 agent」。");
-                println!("  用 `agit-hub token add <name> --user <owner> [--agent <a>]` 重发，再 `token rm <id>` 删掉旧的。");
+                println!("⚠ {legacy} **old-format tokens have no owner** and are all dead.");
+                println!("  They are leftovers from the old model: one token = a pass to the whole host, which can't be mapped onto \"who may see whose agent\".");
+                println!("  Reissue with `agit-hub token add <name> --user <owner> [--agent <a>]`, then `token rm <id>` to drop the old ones.");
             }
             0
         }
         Some("rm") => {
             let Some(id) = positional(args, 2) else {
-                eprintln!("用法: agit-hub token rm <id>（id 见 `agit-hub token list`）");
+                eprintln!("usage: agit-hub token rm <id>  (ids come from `agit-hub token list`)");
                 return 2;
             };
             match store.update_tokens(|toks| {
@@ -447,32 +464,34 @@ fn token_cmd(root: &Path, args: &[String]) -> i32 {
             }) {
                 Ok(true) => {
                     audit::append(root, "cli", audit::TOKEN_REVOKE, None, id);
-                    println!("已吊销 {id}");
+                    println!("revoked {id}");
                     0
                 }
                 Ok(false) => {
-                    eprintln!("没有这个 token: {id}");
+                    eprintln!("no such token: {id}");
                     1
                 }
                 Err(e) => {
-                    eprintln!("写 auth.json 失败: {e}");
+                    eprintln!("failed to write auth.json: {e}");
                     1
                 }
             }
         }
         _ => {
-            eprintln!("用法: agit-hub token add <name> [--user <owner>] [--agent <a>] [--read|--write] [--ttl-days N]");
-            eprintln!("      agit-hub token list | agit-hub token rm <id>");
+            eprintln!("usage: agit-hub token add <name> [--user <owner>] [--agent <a>] [--read|--write] [--ttl-days N]");
+            eprintln!("       agit-hub token list | agit-hub token rm <id>");
             2
         }
     }
 }
 
-/// 发 token：生成 32 字节 CSPRNG 明文，只存它的 sha256 摘要。返回明文（只此一次）。
+/// Issue a token: generate a 32-byte CSPRNG plaintext and store only its sha256 digest. Returns the
+/// plaintext (this once, and never again).
 fn issue_token(store: &Store, name: &str, owner: &str, agent: Option<&str>, scope: Scope, ttl_days: Option<i64>) -> Result<String, String> {
-    // CSPRNG 拿不到就**报错退出**，绝不退回可预测的时间值来发凭据。
-    let secret = kdf::gen_secret().map_err(|e| format!("拒绝发 token：{e}"))?;
-    let id = store::new_token_id().map_err(|e| format!("拒绝发 token：{e}"))?;
+    // If the CSPRNG is unavailable, **error out** — never fall back to predictable time values to
+    // mint credentials.
+    let secret = kdf::gen_secret().map_err(|e| format!("refusing to issue a token: {e}"))?;
+    let id = store::new_token_id().map_err(|e| format!("refusing to issue a token: {e}"))?;
     let expires = ttl_days.map(|d| (chrono::Utc::now() + chrono::Duration::days(d)).format("%Y-%m-%dT%H:%M:%SZ").to_string());
     let rec = TokenRec {
         id,
@@ -485,11 +504,11 @@ fn issue_token(store: &Store, name: &str, owner: &str, agent: Option<&str>, scop
         expires,
         last_used: None,
     };
-    store.update_tokens(|t| t.push(rec)).map_err(|e| format!("写 auth.json 失败: {e}"))?;
+    store.update_tokens(|t| t.push(rec)).map_err(|e| format!("failed to write auth.json: {e}"))?;
     Ok(secret)
 }
 
-// ─────────────────────── git 读取（bare 仓库）───────────────────────
+// ─────────────────────── git reads (bare repos) ───────────────────────
 
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git").arg("-C").arg(repo).args(args).output().ok()?;
@@ -510,18 +529,20 @@ fn recent_log(repo: &Path, n: usize) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// 最近一次提交的相对时间 + 主题，首页用它（便宜，单次 git log）。
+/// Relative time + subject of the last commit, used by the home page (cheap, a single git log).
 fn last_activity(repo: &Path) -> (String, String) {
     git(repo, &["log", "-1", "--format=%cr\x1f%s"])
         .and_then(|s| s.trim().split_once('\x1f').map(|(a, b)| (a.to_string(), b.to_string())))
         .unwrap_or_default()
 }
 
-/// store 里的 agent 身份。**权威来源是 store 自己**（agent.toml 提交在历史里），Hub 不铸造 aid。
-/// 返回 (aid, 来源)。来源取值：
-///   "agent.toml"   —— 读到了
-///   "none"         —— 库还空着，或者没有 agent.toml（新建但没人推过的库就是这样）
-///   "unidentified" —— 有 agent.toml，但里面没有 agt_ 身份（老 store 的占位 id）
+/// The agent identity inside the store. **The store itself is the authority** (agent.toml is
+/// committed into its history); the Hub never mints an aid.
+/// Returns (aid, source). Source values:
+///   "agent.toml"   — read it
+///   "none"         — the repo is still empty, or has no agent.toml (that's a freshly created repo
+///                    nobody has pushed to)
+///   "unidentified" — agent.toml exists but carries no agt_ identity (an old store's placeholder id)
 fn agent_aid(repo: &Path) -> (Option<String>, &'static str) {
     let Some(text) = git(repo, &["show", "HEAD:agent.toml"]) else {
         return (None, "none");
@@ -532,11 +553,12 @@ fn agent_aid(repo: &Path) -> (Option<String>, &'static str) {
     }
 }
 
-/// 一条 session 在 store 里的位置。
+/// Where one session lives in the store.
 ///
-/// 两种布局都要认（设计文档里新的带 environment，老库没有）：
-///   sessions/<env>/<runtime>/<id>.jsonl   —— 新
-///   sessions/<runtime>/<id>.jsonl         —— 老（env = None）
+/// Both layouts must be recognized (the new one in the design doc carries the environment; old
+/// repos don't):
+///   sessions/<env>/<runtime>/<id>.jsonl   — new
+///   sessions/<runtime>/<id>.jsonl         — old (env = None)
 struct SessionRef {
     env: Option<String>,
     runtime: String,
@@ -574,9 +596,9 @@ fn load_session(repo: &Path, path: &str, at: Option<&str>) -> Option<String> {
     git(repo, &["show", &format!("{}:{path}", at.unwrap_or("HEAD"))])
 }
 
-/// 每个 environment 的 session 数与最近活动。environment = session 来自哪个代码仓库。
+/// Session count and last activity per environment. environment = which code repo the session came from.
 fn environments(repo: &Path, refs: &[SessionRef]) -> Vec<serde_json::Value> {
-    // 保序（按第一次出现），顺带记下每组的目录，供 git log 限定范围。
+    // Keep the order (by first appearance) and note each group's directories, to scope the git log.
     let mut order: Vec<Option<String>> = vec![];
     let mut counts: HashMap<Option<String>, usize> = HashMap::new();
     let mut dirs: HashMap<Option<String>, Vec<String>> = HashMap::new();
@@ -585,7 +607,8 @@ fn environments(repo: &Path, refs: &[SessionRef]) -> Vec<serde_json::Value> {
             order.push(r.env.clone());
         }
         *counts.entry(r.env.clone()).or_insert(0) += 1;
-        // 新布局按 env 目录限定；老布局（env=None）没有 env 目录，只能按 runtime 目录限定。
+        // The new layout scopes by the env directory; the old one (env=None) has no env directory,
+        // so it can only be scoped by the runtime directory.
         let dir = match &r.env {
             Some(e) => format!("sessions/{e}"),
             None => format!("sessions/{}", r.runtime),
@@ -602,7 +625,8 @@ fn environments(repo: &Path, refs: &[SessionRef]) -> Vec<serde_json::Value> {
                 .get(&env)
                 .and_then(|ds| {
                     let mut args: Vec<String> = vec!["log".into(), "-1".into(), "--format=%cr".into(), "--".into()];
-                    // `:(literal)` 关掉 pathspec 的通配 —— 目录名来自仓库内容，可能带 `*`/`?`。
+                    // `:(literal)` turns off pathspec globbing — directory names come from repo
+                    // content and may contain `*`/`?`.
                     args.extend(ds.iter().map(|d| format!(":(literal){d}")));
                     let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                     git(repo, &argv)
@@ -632,7 +656,7 @@ fn branches(repo: &Path) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-/// 仓库占用的字节数。git count-objects 报的是 KiB。
+/// Bytes the repo occupies. git count-objects reports KiB.
 fn size_bytes(repo: &Path) -> u64 {
     let Some(out) = git(repo, &["count-objects", "-v"]) else {
         return 0;
@@ -648,7 +672,7 @@ fn size_bytes(repo: &Path) -> u64 {
     kib * 1024
 }
 
-/// store 里出现过的 runtime。字母序 —— claude-code 与 codex 是**对等**的，谁也不是默认。
+/// Runtimes seen in the store. Alphabetical — claude-code and codex are **peers**, neither is the default.
 fn runtimes(refs: &[SessionRef]) -> Vec<String> {
     let mut v: Vec<String> = refs.iter().map(|r| r.runtime.clone()).collect();
     v.sort();
@@ -656,7 +680,7 @@ fn runtimes(refs: &[SessionRef]) -> Vec<String> {
     v
 }
 
-// ─────────── session 解析（跨 runtime，走 agit 库） ───────────
+// ─────────── Session parsing (cross-runtime, through the agit lib) ───────────
 
 struct SessionDigest {
     id: String,
@@ -743,7 +767,8 @@ fn session_revisions(repo: &Path, path: &str) -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
-/// session 的事件脊线：有序 kinds → 'p'/'a'/'t'/'e' 串（SPA 渲染成波形）。跨 runtime 走 ConversationIR。
+/// A session's event spine: ordered kinds → a 'p'/'a'/'t'/'e' string (the SPA renders it as a
+/// waveform). Cross-runtime via ConversationIR.
 fn spine_string(runtime: &str, jsonl: &str) -> String {
     use agit::convo::EventKind;
     let Ok(ir) = agit::convo::read_conversation(runtime, jsonl) else {
@@ -774,27 +799,29 @@ fn clip(s: &str, n: usize) -> String {
     s.trim().chars().take(n).collect()
 }
 
-// ─────────────────────────── 配置 / 上下文 ───────────────────────────
+// ─────────────────────────── Config / context ───────────────────────────
 
 struct Cfg {
     host: IpAddr,
     port: u16,
-    /// 前面有 TLS 终结（反代）。影响：允许非环回 bind；cookie 打 Secure。
+    /// TLS is terminated in front (reverse proxy). Effects: non-loopback binds are allowed; cookies
+    /// get Secure.
     tls: bool,
-    /// 明知没有 TLS 也要对外听。
+    /// Listen publicly in full knowledge that there is no TLS.
     insecure: bool,
-    /// 可信反代的 IP —— 只有来自它们的连接，X-Forwarded-For 才算数。
+    /// IPs of trusted reverse proxies — X-Forwarded-For only counts on connections from them.
     trusted_proxies: Vec<IpAddr>,
 }
 
-/// 一个请求要用到的全部共享状态。
+/// All the shared state one request needs.
 struct Ctx {
     store: Store,
     cfg: Cfg,
     sessions: Sessions,
     limiter: Arc<ConnLimiter>,
-    /// 登录并发闸：argon2 是**故意**又慢又吃内存的（这正是它挡爆破的方式）。
-    /// 不限并发的话，几十个并发登录 = 几十份 19MiB + 满核 CPU，等于送人一个放大器。
+    /// Login concurrency gate: argon2 is **deliberately** slow and memory-hungry (that is exactly
+    /// how it stops brute force). Without a cap, a few dozen concurrent logins = a few dozen copies
+    /// of 19MiB + every core pegged, i.e. handing out an amplifier.
     login_gate: Arc<Semaphore>,
 }
 
@@ -804,18 +831,19 @@ impl Ctx {
     }
 }
 
-// ─────────────────────────── HTTP 服务 ───────────────────────────
+// ─────────────────────────── HTTP service ───────────────────────────
 
 fn serve_cmd(root: &Path, args: &[String]) -> i32 {
     let host: IpAddr = match flag(args, "--host") {
         Some(h) => match h.parse() {
             Ok(ip) => ip,
             Err(_) => {
-                eprintln!("--host 要一个 IP 地址（如 127.0.0.1 / 0.0.0.0 / ::1），拿到的是: {h}");
+                eprintln!("--host wants an IP address (e.g. 127.0.0.1 / 0.0.0.0 / ::1), got: {h}");
                 return 2;
             }
         },
-        // 默认只听环回：Hub 装着团队的全部转录，"装上就暴露在办公网"不能是默认。
+        // Loopback only by default: the Hub holds the team's entire transcript history, and
+        // "installing it exposes it to the office network" cannot be the default.
         None => IpAddr::from([127, 0, 0, 1]),
     };
     let port: u16 = flag(args, "--port").and_then(|p| p.parse().ok()).unwrap_or(8177);
@@ -836,41 +864,43 @@ fn serve_cmd(root: &Path, args: &[String]) -> i32 {
         return 2;
     }
     if has_flag(args, "--private") {
-        println!("提示：--private 已经不需要了 —— 可见性现在是**每个 agent 各自**的属性，且新建默认 private。");
-        println!("      要公开某个 agent：`agit-hub add <name> --public`，或在 UI 里改。");
+        println!("note: --private is no longer needed — visibility is now a **per-agent** property, and new agents are private by default.");
+        println!("      To publish one agent: `agit-hub add <name> --public`, or change it in the UI.");
     }
     serve(root, Cfg { host, port, tls, insecure, trusted_proxies })
 }
 
-/// bind 前的安全闸（纯函数，好测）。
+/// The safety gate before bind (pure function, easy to test).
 ///
-/// 非环回地址 = 网络上其他人能连。没有 TLS 时，密码与 token 会以**明文**过网线，
-/// 任何在路径上的人都能抄走。所以：要么 --tls（前面有终结），要么明确 --insecure。
+/// A non-loopback address = other people on the network can connect. Without TLS, passwords and
+/// tokens cross the wire in **plaintext** and anyone on the path can copy them. So: either --tls
+/// (terminated in front) or an explicit --insecure.
 fn bind_guard(host: IpAddr, tls: bool, insecure: bool) -> Result<(), String> {
     if host.is_loopback() || tls || insecure {
         return Ok(());
     }
     Err(format!(
-        "拒绝在 {host} 上明文监听。\n\
-         这个地址网络上的其他人能连到 —— 而没有 TLS 时，登录密码和 token 会明文过网线，\n\
-         路径上任何一跳都能抄走它们，然后就能读/推你团队的全部转录。\n\n\
-         选一个：\n\
-           - 只给本机用（默认）：去掉 --host\n\
-           - 前面挂 TLS 反代（nginx/caddy 终结 HTTPS）：加 --tls，并用 --trusted-proxy <代理IP>\n\
-           - 就是要明文（可信内网/临时演示）：加 --insecure，你已经知道代价了"
+        "refusing to listen on {host} in plaintext.\n\
+         Other people on this address's network can reach it — and without TLS, login passwords and\n\
+         tokens cross the wire in plaintext, so any hop on the path can copy them and then read/push\n\
+         your team's entire transcript history.\n\n\
+         Pick one:\n\
+           - This machine only (the default): drop --host\n\
+           - A TLS reverse proxy in front (nginx/caddy terminating HTTPS): add --tls, and use --trusted-proxy <proxy IP>\n\
+           - Plaintext on purpose (trusted LAN/quick demo): add --insecure, you know the price now"
     ))
 }
 
 fn serve(root: &Path, cfg: Cfg) -> i32 {
     if let Err(e) = store::ensure_root(root) {
-        eprintln!("建 root 失败 {}: {e}", root.display());
+        eprintln!("failed to create root {}: {e}", root.display());
         return 1;
     }
     let addr = std::net::SocketAddr::new(cfg.host, cfg.port);
     let listener = match TcpListener::bind(addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("绑定 {addr} 失败: {e}");
+            eprintln!("failed to bind {addr}: {e}");
             return 1;
         }
     };
@@ -881,28 +911,28 @@ fn serve(root: &Path, cfg: Cfg) -> i32 {
     let users = store.users();
     let legacy_tokens = store.tokens().iter().filter(|t| t.owner.is_none()).count();
 
-    println!("AgentGitHub 运行中");
-    println!("  监听:  {addr}{}", if cfg.tls { "（前面有 TLS 终结）" } else { "" });
-    println!("  前端:  {}://{}/", if cfg.tls { "https" } else { "http" }, display_host(&cfg));
-    println!("  root:  {}", root.display());
-    println!("  托管:  {} 个 agent（{} 个 public）", agents.len(), agents.iter().filter(|n| store.agent_or_unowned(n).visibility == "public").count());
-    println!("  用户:  {} 个（{} 个管理员）", users.len(), users.iter().filter(|u| u.is_admin).count());
+    println!("AgentGitHub running");
+    println!("  listen:  {addr}{}", if cfg.tls { " (TLS terminated in front)" } else { "" });
+    println!("  web:     {}://{}/", if cfg.tls { "https" } else { "http" }, display_host(&cfg));
+    println!("  root:    {}", root.display());
+    println!("  hosting: {} agents ({} public)", agents.len(), agents.iter().filter(|n| store.agent_or_unowned(n).visibility == "public").count());
+    println!("  users:   {} ({} admins)", users.len(), users.iter().filter(|u| u.is_admin).count());
     if !cfg.trusted_proxies.is_empty() {
-        println!("  代理:  信任 {:?} 的 X-Forwarded-For", cfg.trusted_proxies);
+        println!("  proxy:   trusting X-Forwarded-For from {:?}", cfg.trusted_proxies);
     }
     if cfg.insecure && !cfg.host.is_loopback() && !cfg.tls {
-        println!("  ⚠ --insecure：明文对外监听 —— 密码与 token 在网线上是裸的。");
+        println!("  ⚠ --insecure: listening publicly in plaintext — passwords and tokens are naked on the wire.");
     }
     if users.is_empty() {
-        println!("  ⚠ 一个用户都没有 —— 没人能登录。先 `agit-hub user add <你> --admin`。");
+        println!("  ⚠ not a single user — nobody can log in. Start with `agit-hub user add <you> --admin`.");
     }
     if unowned > 0 {
-        println!("  ⚠ {unowned} 个 agent 没有 owner（老仓库）：它们是私有的，只有站点管理员看得见。");
-        println!("    认领：`agit-hub add <name> --owner <user>`");
+        println!("  ⚠ {unowned} agents have no owner (old repos): they are private, visible only to the site admin.");
+        println!("    Claim them: `agit-hub add <name> --owner <user>`");
     }
     if legacy_tokens > 0 {
-        println!("  ⚠ {legacy_tokens} 个老 token 没有属主，**已失效**（旧的「一个 token = 全站」模型没法映射到新 ACL）。");
-        println!("    重发：`agit-hub token add <name> --user <owner> [--agent <a>]`；`agit-hub token list` 看详情。");
+        println!("  ⚠ {legacy_tokens} old tokens have no owner and are **dead** (the old \"one token = the whole site\" model can't be mapped onto the new ACL).");
+        println!("    Reissue: `agit-hub token add <name> --user <owner> [--agent <a>]`; `agit-hub token list` has the details.");
     }
 
     let ctx = Arc::new(Ctx {
@@ -913,14 +943,17 @@ fn serve(root: &Path, cfg: Cfg) -> i32 {
         login_gate: Arc::new(Semaphore::new(LOGIN_CONC)),
     });
 
-    // 并发上限：每连接一线程，但用信号量封顶 —— 否则 N 个慢连接 = N 个线程/内存，unbounded。
+    // Concurrency cap: a thread per connection, but capped by a semaphore — otherwise N slow
+    // connections = N threads/memory, unbounded.
     let sem = Arc::new(Semaphore::new(MAX_CONN));
     for stream in listener.incoming().flatten() {
         let peer = stream.peer_addr().map(|a| a.ip()).ok();
-        // 先按 IP 准入：满了直接丢连接（drop 关闭），不占全局槽、不 spawn。
+        // Admit by IP first: when full, drop the connection outright (drop closes it) without taking
+        // a global slot or spawning.
         //
-        // 可信代理例外：它后面站着所有真实用户，按它的 IP 数会让大家互相挤下线（这正是
-        // 需求 10 说的病）。那种连接的 per-IP 准入推迟到读完 XFF 之后（见 handle）。
+        // Trusted proxies are the exception: every real user stands behind one, so counting by its
+        // IP would push everyone off each other (exactly the disease requirement 10 describes).
+        // For those connections the per-IP admission is deferred until XFF has been read (see handle).
         let proxied = peer.map(|ip| ctx.cfg.trusted_proxies.contains(&ip)).unwrap_or(false);
         let ipguard = match (peer, proxied) {
             (Some(ip), false) => match ctx.limiter.try_acquire(ip) {
@@ -929,10 +962,11 @@ fn serve(root: &Path, cfg: Cfg) -> i32 {
             },
             _ => None,
         };
-        let permit = Permit::acquire(sem.clone()); // 到顶就在这里挡住 accept，多余连接排在内核 backlog。
+        let permit = Permit::acquire(sem.clone()); // At the cap this blocks accept here; the excess queues in the kernel backlog.
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            // 都持有到线程结束；**即使 handle panic 也会在 drop 时归还**（不泄漏槽位/IP 计数）。
+            // Both held until the thread ends; **even if handle panics they're returned on drop**
+            // (no leaked slots/IP counts).
             let _permit = permit;
             let _ipguard = ipguard;
             let _ = handle(stream, &ctx, peer, proxied);
@@ -949,7 +983,7 @@ fn display_host(cfg: &Cfg) -> String {
     }
 }
 
-/// 每 IP 的在途连接计数。
+/// In-flight connection count per IP.
 #[derive(Default)]
 struct ConnLimiter {
     map: Mutex<HashMap<IpAddr, usize>>,
@@ -970,7 +1004,7 @@ impl ConnLimiter {
     }
 }
 
-/// 一个占用的 per-IP 名额；drop 时减一（panic 安全）。
+/// One held per-IP slot; decremented on drop (panic-safe).
 struct IpGuard {
     limiter: Arc<ConnLimiter>,
     ip: IpAddr,
@@ -988,7 +1022,7 @@ impl Drop for IpGuard {
     }
 }
 
-/// 计数信号量（std 无内置）：封顶并发处理线程数。
+/// A counting semaphore (std has none): caps the number of concurrent handler threads.
 struct Semaphore {
     permits: Mutex<usize>,
     cv: Condvar,
@@ -1000,7 +1034,7 @@ impl Semaphore {
     }
 }
 
-/// 一个占用的槽位；drop 时归还（panic 安全 —— handle 崩了也不会漏掉一个 permit）。
+/// One held slot; returned on drop (panic-safe — a crashing handle still won't leak a permit).
 struct Permit(Arc<Semaphore>);
 
 impl Permit {
@@ -1045,25 +1079,33 @@ impl Req {
 }
 
 const MAX_BODY: usize = 512 * 1024 * 1024;
-/// JSON API 的 body 上限。API 只收小对象；给它 512MB 的额度毫无道理。
+/// Body cap for the JSON API. The API only takes small objects; a 512MB allowance makes no sense.
 const API_MAX_BODY: usize = 64 * 1024;
 const MAX_LINE: u64 = 16 * 1024;
 const MAX_HEADERS_BYTES: usize = 64 * 1024;
-/// 并发处理线程上限（挡住 unbounded thread-per-connection）。
+/// Cap on concurrent handler threads (stops unbounded thread-per-connection).
 const MAX_CONN: usize = 64;
-/// 单个 IP 的在途连接上限（挡住单一来源 slowloris 占满全池）。给全池的一半，留槽位给别人。
+/// Cap on in-flight connections from a single IP (stops one source's slowloris from filling the
+/// whole pool). Half the pool, so there are slots left for everyone else.
 const PER_IP_MAX: usize = 32;
-/// 同时最多几个 argon2 在跑。argon2 每次要 19MiB + 满核；不封顶 = 一个放大器。
+/// How many argon2 runs may be in flight at once. Each argon2 wants 19MiB + a full core; uncapped =
+/// an amplifier.
 const LOGIN_CONC: usize = 4;
-/// 从 accept 到读完请求头的整体墙钟上限（挡住 1 字节/<60s 的 slowloris 滴灌 —— 那能重置 per-read 超时）。
-/// 读头阶段的 socket 读超时也设成它 —— 于是阻塞在**请求行**那一次读上的连接也在此掐断（deadline 只在头循环顶检查，盖不住请求行读）。
+/// Overall wall-clock cap from accept to the end of the request headers (stops the 1-byte/<60s
+/// slowloris drip — that would keep resetting the per-read timeout).
+/// The socket read timeout during the header phase is set to it too — so a connection blocked on the
+/// **request line** read is cut off here as well (the deadline is only checked at the top of the
+/// header loop, which doesn't cover the request-line read).
 const HEADER_DEADLINE_SECS: u64 = 20;
-/// body（git push 的 pack）读超时更长：pack 持续流入，只在真卡住时触发。
+/// The body (a git push's pack) gets a longer read timeout: a pack streams in continuously, so this
+/// only fires when it truly stalls.
 const BODY_TIMEOUT_SECS: u64 = 60;
-/// 读完 API body 的整体墙钟上限。64KB 的 JSON 没有任何理由要慢慢来（挡 body 上的滴灌）。
+/// Overall wall-clock cap for reading an API body. 64KB of JSON has no reason to take its time
+/// (stops the drip on the body).
 const API_BODY_DEADLINE_SECS: u64 = 15;
 
-/// 只读请求行 + 头部，**不碰 body**。body 留在 reader 里，等鉴权通过、确实需要时再流式取。
+/// Read the request line + headers only, **never the body**. The body stays in the reader, to be
+/// streamed once authz passes and it's actually needed.
 fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Req> {
     let deadline = Instant::now() + Duration::from_secs(HEADER_DEADLINE_SECS);
     let mut line = String::new();
@@ -1077,7 +1119,7 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Req> {
     let mut headers_bytes = 0usize;
     loop {
         if Instant::now() > deadline {
-            return None; // 整体读头超时 → 掐掉（配合并发上限，slowloris 滴灌撑不住一个线程槽）
+            return None; // Overall header-read timeout → cut it (with the concurrency cap, a slowloris drip can't hold a thread slot)
         }
         let mut h = String::new();
         reader.by_ref().take(MAX_LINE).read_line(&mut h).ok()?;
@@ -1100,11 +1142,12 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> Option<Req> {
     Some(Req { method, target, headers, content_length })
 }
 
-/// 读 API 的小 body。既封顶**大小**，也封顶**总时长**。
+/// Read the API's small body. Caps both the **size** and the **total duration**.
 ///
-/// 为什么要自己数时间：socket 上的读超时是**每次读**的，1 字节/19 秒的滴灌能把它一直重置掉 ——
-/// 那正是 slowloris 的玩法，读头那里也是靠一个整体 deadline 才挡住的。git 的 body 是流式的
-/// pack（可能很大、持续时间长），只能靠 per-read 超时；API 的 body 就 64KB，没有任何理由慢。
+/// Why count the time ourselves: a socket read timeout is **per read**, and a 1-byte-every-19-seconds
+/// drip keeps resetting it — that is exactly the slowloris play, and the header read only stops it
+/// thanks to an overall deadline too. git's body is a streaming pack (possibly huge and long-lived),
+/// so it can only rely on the per-read timeout; an API body is 64KB and has no reason to be slow.
 fn read_api_body(reader: &mut BufReader<TcpStream>, len: usize) -> Option<Vec<u8>> {
     let deadline = Instant::now() + Duration::from_secs(API_BODY_DEADLINE_SECS);
     let mut out = Vec::with_capacity(len);
@@ -1115,7 +1158,7 @@ fn read_api_body(reader: &mut BufReader<TcpStream>, len: usize) -> Option<Vec<u8
             return None;
         }
         match taken.read(&mut chunk) {
-            Ok(0) => break, // 对面提前关了：按已收到的算，交给 JSON 解析去报错
+            Ok(0) => break, // The peer closed early: go with what arrived and let JSON parsing report the error
             Ok(n) => out.extend_from_slice(&chunk[..n]),
             Err(_) => return None,
         }
@@ -1124,7 +1167,8 @@ fn read_api_body(reader: &mut BufReader<TcpStream>, len: usize) -> Option<Vec<u8
 }
 
 fn handle(mut stream: TcpStream, ctx: &Ctx, peer: Option<IpAddr>, proxied: bool) -> std::io::Result<()> {
-    // 读头阶段：短读超时，任何一次阻塞读（含请求行）最多挂 HEADER_DEADLINE_SECS。
+    // Header phase: a short read timeout, so any blocking read (the request line included) hangs for
+    // at most HEADER_DEADLINE_SECS.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(HEADER_DEADLINE_SECS)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(BODY_TIMEOUT_SECS)));
 
@@ -1134,13 +1178,15 @@ fn handle(mut stream: TcpStream, ctx: &Ctx, peer: Option<IpAddr>, proxied: bool)
     };
     let path = req.target.split('?').next().unwrap_or("/").to_string();
 
-    // 路径穿越总闸：任何 `..` 段一律拒绝。
+    // The blanket path-traversal gate: reject any `..` segment.
     if path.split('/').any(|seg| seg == "..") {
         return write_response(&mut stream, &Resp::text(400, "bad request"));
     }
 
-    // 代理后的真实客户端 IP：只有 peer 是**声明过的**可信代理时才认 XFF（谁都能伪造它）。
-    // 这些连接在 accept 时故意没数 per-IP（否则代理后的所有人共用一个配额），在这里补上。
+    // The real client IP behind a proxy: XFF counts only when the peer is a **declared** trusted
+    // proxy (anyone can forge that header).
+    // These connections deliberately skipped the per-IP count at accept (otherwise everyone behind
+    // the proxy would share one quota); make it up here.
     let client = peer.map(|p| net::client_ip(p, req.header("x-forwarded-for"), &ctx.cfg.trusted_proxies));
     let _client_guard = match (proxied, client) {
         (true, Some(ip)) => match ctx.limiter.try_acquire(ip) {
@@ -1150,7 +1196,8 @@ fn handle(mut stream: TcpStream, ctx: &Ctx, peer: Option<IpAddr>, proxied: bool)
         _ => None,
     };
 
-    // 认证只看请求头 —— **不需要 body**。于是所有入口都能做到"先认身份，再决定要不要读 body"。
+    // Authentication only looks at the headers — **no body required**. That's what lets every entry
+    // point establish identity first and only then decide whether to read a body at all.
     let secrets = credentials(&req);
     let authn = auth::authenticate(&ctx.store, &ctx.sessions, req.sid().as_deref(), &secrets);
     if let Some(id) = &authn.token_id {
@@ -1160,28 +1207,31 @@ fn handle(mut stream: TcpStream, ctx: &Ctx, peer: Option<IpAddr>, proxied: bool)
     let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
 
     // ── git smart-http ──
-    // 先解析出**是哪个 agent**，再授权，最后才碰 body。
-    // 老代码在这里只看 `path.contains(".git/")`，鉴权是全站一把梭，还开着 GIT_HTTP_EXPORT_ALL=1
-    // —— 于是读闸一过，root 下任何库都能拉走。现在每个库各自判定。
+    // Work out **which agent** first, then authorize, and only then touch the body.
+    // The old code here just looked at `path.contains(".git/")`, authorized site-wide in one shot,
+    // and left GIT_HTTP_EXPORT_ALL=1 on — so once past the read gate, any repo under root could be
+    // pulled. Now every repo is decided on its own.
     if let Some(route) = net::parse_git_path(&path, req.query()) {
-        // 不存在的 agent 一律当「无主私有」来判定，**判定在前、存在性检查在后** ——
-        // 否则「不存在→404 / 私有→401」的差别本身就是一个枚举私有 agent 名字的接口。
+        // A nonexistent agent is always decided as "unowned private", **decision first, existence
+        // check second** — otherwise the difference between "doesn't exist → 404" and "private →
+        // 401" is itself an interface for enumerating private agent names.
         let meta = ctx.store.agent_or_unowned(&route.agent);
         match acl::decide(&caller, &meta.to_acl(), route.action) {
             Decision::Allow => {
-                // 判定通过了才配知道它到底存不存在。
+                // Only once the decision passes do you get to know whether it exists at all.
                 if !repo_path(ctx.root(), &route.agent).exists() {
                     return write_response(&mut stream, &Resp::text(404, "no such agent"));
                 }
             }
             Decision::Deny(d) => {
                 audit_deny(ctx, &actor, Some(&route.agent), route.action, d);
-                // git 客户端要靠 401 + WWW-Authenticate 才会去问用户要凭据。
+                // A git client only prompts the user for credentials on 401 + WWW-Authenticate.
                 return write_response(&mut stream, &git_deny_resp(&caller, d));
             }
         }
-        // 未授权的 push 直接在上面 401 了，绝不把它的 pack 读进内存
-        //（否则匿名 POST 一个 512MB body 就能把进程撑爆 —— body-before-auth 的内存耗尽 DoS）。
+        // An unauthorized push already got a 401 above; its pack never reaches memory
+        // (otherwise an anonymous POST with a 512MB body could blow up the process — the
+        // body-before-auth memory-exhaustion DoS).
         if req.content_length > MAX_BODY {
             return write_response(&mut stream, &Resp::text(413, "payload too large"));
         }
@@ -1195,8 +1245,9 @@ fn handle(mut stream: TcpStream, ctx: &Ctx, peer: Option<IpAddr>, proxied: bool)
         return git_http(&mut stream, &mut reader, ctx, &req, &route.agent, &actor);
     }
 
-    // ── 其余路由 ──
-    // body 上限收到 API_MAX_BODY：这里的 body 只可能是小 JSON。认证已经在上面做完了。
+    // ── Everything else ──
+    // The body cap tightens to API_MAX_BODY: a body here can only be small JSON. Authentication is
+    // already done above.
     let body = if req.method == "GET" || req.content_length == 0 {
         Vec::new()
     } else if req.content_length > API_MAX_BODY {
@@ -1212,14 +1263,15 @@ fn handle(mut stream: TcpStream, ctx: &Ctx, peer: Option<IpAddr>, proxied: bool)
     write_response(&mut stream, &resp)
 }
 
-/// git 的拒绝响应。匿名 → 401 带 Basic 挑战（git 会去问用户要凭据）；已认证但没权限 → 404/403。
+/// git's denial response. Anonymous → 401 with a Basic challenge (git will ask the user for
+/// credentials); authenticated but unauthorized → 404/403.
 fn git_deny_resp(caller: &Caller, d: Deny) -> Resp {
     if d == Deny::Anonymous {
-        return Resp::text(401, "需要凭据。git 密码处填 token（`agit-hub token add`），用户名随意。")
+        return Resp::text(401, "credentials required. Put a token (`agit-hub token add`) in git's password field; the username can be anything.")
             .with("WWW-Authenticate", "Basic realm=\"agit-hub\"");
     }
     let _ = caller;
-    Resp::text(403, &format!("拒绝：{}", d.reason()))
+    Resp::text(403, &format!("denied: {}", d.reason()))
 }
 
 fn credentials(req: &Req) -> Vec<String> {
@@ -1279,7 +1331,7 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-// ─────────────────────────── 响应 ───────────────────────────
+// ─────────────────────────── Responses ───────────────────────────
 
 struct Resp {
     status: u16,
@@ -1325,7 +1377,7 @@ fn write_response(stream: &mut TcpStream, r: &Resp) -> std::io::Result<()> {
 }
 
 fn route(ctx: &Ctx, req: &Req, path: &str, caller: &Caller, body: &[u8]) -> Resp {
-    // 前端资源。
+    // Frontend assets.
     if req.method == "GET" {
         match path {
             "/assets/app.js" => return Resp::new(200, "application/javascript; charset=utf-8", APP_JS.as_bytes().to_vec()),
@@ -1334,34 +1386,36 @@ fn route(ctx: &Ctx, req: &Req, path: &str, caller: &Caller, body: &[u8]) -> Resp
             _ => {}
         }
     }
-    // JSON API。
+    // JSON API.
     if let Some(rest) = path.strip_prefix("/api/") {
         return api(ctx, req, rest, caller, body);
     }
     if req.method != "GET" {
         return Resp::text(405, "method not allowed");
     }
-    // 其余一切 → SPA（前端自己按 URL 渲染 home/agent/session/diff）。
-    // SPA 本身不含数据 —— 数据都在 /api/* 后面，各自鉴权。
+    // Everything else → the SPA (the frontend renders home/agent/session/diff off the URL itself).
+    // The SPA carries no data — the data all sits behind /api/*, each authorized on its own.
     Resp::new(200, "text/html; charset=utf-8", INDEX_HTML.as_bytes().to_vec())
 }
 
-// ─────────────────────────── 授权闸 ───────────────────────────
+// ─────────────────────────── The authorization gate ───────────────────────────
 
-/// 记一条拒绝。匿名读被拒 = "还没登录"，那是噪音；已认证的人被拒、或写/管理动作被拒才是信号。
+/// Record a denial. A denied anonymous read = "not logged in yet", which is noise; a denied
+/// authenticated caller, or a denied write/manage action, is signal.
 fn audit_deny(ctx: &Ctx, actor: &str, agent: Option<&str>, action: Action, d: Deny) {
     if actor != "anonymous" || action != Action::Read {
         audit::append(ctx.root(), actor, audit::DENIED, agent, &format!("{action:?}: {}", d.reason()));
     }
 }
 
-/// 取 agent + 判定 + 出错响应。**每个 agent 入口都从这里进**。
+/// Fetch the agent + decide + produce the error response. **Every agent entry point comes through here.**
 ///
-/// 存在性本身也是机密：不存在的 agent 按「无主私有」判定，于是"不存在"与"看不见"
-/// 给出**同一个**响应 —— 否则 401/403/404 的差别就是一个枚举私有 agent 名字的接口。
-/// 判定通过之后才检查存在性（有权限的人才配知道它不存在）。
+/// Existence is itself a secret: a nonexistent agent is decided as "unowned private", so "doesn't
+/// exist" and "you can't see it" give **the same** response — otherwise the difference between
+/// 401/403/404 is an interface for enumerating private agent names.
+/// Existence is only checked after the decision passes (only the authorized get to know it's absent).
 fn gate(ctx: &Ctx, caller: &Caller, name: &str, action: Action) -> Result<AgentMeta, Resp> {
-    // 名字形状不对 → 404。这不是机密：它压根不可能是个合法 agent。
+    // A malformed name → 404. That's not a secret: it could never be a valid agent in the first place.
     if !valid_agent_name(name) {
         return Err(Resp::err(404, "not found"));
     }
@@ -1381,11 +1435,12 @@ fn gate(ctx: &Ctx, caller: &Caller, name: &str, action: Action) -> Result<AgentM
 }
 
 fn deny_resp(caller: &Caller, acl: &AgentAcl, d: Deny) -> Resp {
-    // 能读的人被拒写/拒管理 → 告诉他 403（他本来就知道这个 agent 存在）。
-    // 读都读不了 → 404，连「存在」都不承认。
+    // Someone who can read but is denied a write/manage → tell them 403 (they already know this
+    // agent exists).
+    // Someone who can't even read → 404, not even admitting it exists.
     let can_read = acl::decide(caller, acl, Action::Read).allowed();
     match (d, can_read) {
-        (Deny::Anonymous, false) => Resp::err(401, "需要登录"),
+        (Deny::Anonymous, false) => Resp::err(401, "login required"),
         (_, false) => Resp::err(404, "not found"),
         (_, true) => Resp::err(403, d.reason()),
     }
@@ -1435,8 +1490,8 @@ fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
         return api_session(&repo, tail, req.query());
     }
 
-    // agent/<name>/members[/<username>] —— tail 只能是空或 /<username>，
-    // 别把 /membersXYZ 也认成 /members。
+    // agent/<name>/members[/<username>] — tail may only be empty or /<username>;
+    // don't let /membersXYZ pass as /members.
     if let Some((name, tail)) = after.split_once("/members") {
         if tail.is_empty() || tail.starts_with('/') {
             return api_members(ctx, caller, name, tail, m, body);
@@ -1458,27 +1513,28 @@ fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
     }
 }
 
-// ── 认证 ──
+// ── Authentication ──
 
 fn api_login(ctx: &Ctx, req: &Req, body: &[u8]) -> Resp {
     let Some(v) = json_body(body) else {
-        return Resp::err(400, "要 JSON body");
+        return Resp::err(400, "want a JSON body");
     };
     let (Some(username), Some(password)) = (str_field(&v, "username"), str_field(&v, "password")) else {
-        return Resp::err(400, "要 username 与 password");
+        return Resp::err(400, "want username and password");
     };
-    // argon2 是故意慢的 —— 不封顶并发就等于给人一个 CPU/内存放大器。
+    // argon2 is slow on purpose — leaving its concurrency uncapped hands out a CPU/memory amplifier.
     let verified = {
         let _slot = Permit::acquire(ctx.login_gate.clone());
         auth::verify_login(&ctx.store, &username, &password)
     };
     let Some(user) = verified else {
         audit::append(ctx.root(), &store::normalize_username(&username), audit::LOGIN_FAILED, None, &req.host());
-        // 不说"用户不存在"还是"密码错" —— 那是给爆破的人递用户名字典。
-        return Resp::err(401, "用户名或密码不对");
+        // Don't say whether the user doesn't exist or the password is wrong — that hands the
+        // brute-forcer a username dictionary.
+        return Resp::err(401, "wrong username or password");
     };
     let Ok(sid) = ctx.sessions.create(&user.username) else {
-        return Resp::err(503, "会话建不出来，稍后再试");
+        return Resp::err(503, "couldn't create a session, try again shortly");
     };
     audit::append(ctx.root(), &user.username, audit::LOGIN, None, "");
     Resp::json(serde_json::json!({ "username": user.username, "is_admin": user.is_admin }))
@@ -1498,7 +1554,7 @@ fn api_logout(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
 fn api_me(caller: &Caller) -> Resp {
     match &caller.user {
         Some(u) => Resp::json(serde_json::json!({ "username": u, "is_admin": caller.is_admin })),
-        None => Resp::err(401, "未登录"),
+        None => Resp::err(401, "not logged in"),
     }
 }
 
@@ -1509,7 +1565,8 @@ fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
         .iter()
         .filter_map(|n| {
             let meta = ctx.store.agent_or_unowned(n);
-            // 看不见的不进列表 —— 列表本身就是"谁能看谁的 agent"的第一道答案。
+            // What you can't see doesn't make the list — the list is the first answer to "who may
+            // see whose agent".
             if !acl::decide(caller, &meta.to_acl(), Action::Read).allowed() {
                 return None;
             }
@@ -1536,8 +1593,8 @@ fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     Resp::json(serde_json::json!({ "agents": items, "host": req.host() }))
 }
 
-/// 调用方在这个 agent 上的**有效**角色，给 UI 决定显示哪些按钮。
-/// null = 没有显式授权（能看见只是因为它是 public）。
+/// The caller's **effective** role on this agent, for the UI to decide which buttons to show.
+/// null = no explicit grant (they can see it only because it's public).
 fn effective_role(caller: &Caller, meta: &AgentMeta) -> Option<&'static str> {
     let user = caller.user.as_deref()?;
     if meta.owner.as_deref() == Some(user) {
@@ -1551,27 +1608,27 @@ fn effective_role(caller: &Caller, meta: &AgentMeta) -> Option<&'static str> {
 
 fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body: &[u8]) -> Resp {
     let Some(user) = caller.user.clone() else {
-        return Resp::err(401, "需要登录");
+        return Resp::err(401, "login required");
     };
     let Some(v) = json_body(body) else {
-        return Resp::err(400, "要 JSON body");
+        return Resp::err(400, "want a JSON body");
     };
     let Some(name) = str_field(&v, "name") else {
-        return Resp::err(400, "要 name");
+        return Resp::err(400, "want name");
     };
     if !valid_agent_name(&name) {
-        return Resp::err(400, "非法名字（只允许 [A-Za-z0-9._-]，禁止 .. 与前导点）");
+        return Resp::err(400, "invalid name ([A-Za-z0-9._-] only, no .. and no leading dot)");
     }
-    // 没写 visibility 就是 private。**默认私有**，公开必须是显式的一句话。
+    // No visibility given means private. **Private by default**; going public takes an explicit word.
     let visibility = match v.get("visibility").and_then(|x| x.as_str()) {
         None => Visibility::Private,
         Some(s) => match Visibility::parse(s) {
             Some(x) => x,
-            None => return Resp::err(400, "visibility 只能是 private 或 public"),
+            None => return Resp::err(400, "visibility must be private or public"),
         },
     };
-    // 建库也过同一个判定：把它当成"在一个我自己是 owner 的 agent 上写" ——
-    // 于是绑在别的 agent 上的 token、只读 token 都建不出东西来。
+    // Creating a repo goes through the same decision: treat it as "writing to an agent I own" —
+    // so a token bound to another agent, or a read-only token, can't create anything.
     let hypothetical = AgentAcl { name: name.clone(), owner: Some(user.clone()), visibility, members: vec![] };
     if let Decision::Deny(d) = acl::decide(caller, &hypothetical, Action::Write) {
         audit_deny(ctx, &user, Some(&name), Action::Write, d);
@@ -1586,7 +1643,8 @@ fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body: &[u8]) -> Resp 
                 201,
                 serde_json::json!({
                     "name": name,
-                    // 空库里还没有 agent.toml —— aid 要等客户端把它推上来才有。老实报 null。
+                    // An empty repo has no agent.toml yet — the aid only exists once the client
+                    // pushes it. Report null honestly.
                     "aid": aid,
                     "aid_source": aid_source,
                     "clone_url": clone_url(ctx, req, &name),
@@ -1610,7 +1668,8 @@ fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta) -> Resp {
     let pageno: usize = param(query, "page").and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
     let refs = if has_head(&repo) { session_refs(&repo) } else { vec![] };
 
-    // 命中集合：无搜索 = 直接分页（只 git show 当页）；有搜索 = 扫内容（有上限）。
+    // The hit set: no search = page straight through (git show only the current page); with a
+    // search = scan the content (capped).
     let (window, total): (Vec<&SessionRef>, usize) = if search.is_empty() {
         let start = (pageno - 1) * PER_PAGE;
         (refs.iter().skip(start).take(PER_PAGE).collect(), refs.len())
@@ -1640,7 +1699,8 @@ fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta) -> Resp {
         .collect();
 
     let (aid, aid_source) = agent_aid(&repo);
-    // 学到 aid 就顺手缓存进 agents.json —— 权威值仍然只在 store 里，这只是省一次 git show。
+    // Once the aid is learned, cache it into agents.json — the authoritative value still lives only
+    // in the store; this just saves a git show.
     if let Some(a) = &aid {
         if meta.aid.as_deref() != Some(a.as_str()) {
             let _ = ctx.store.update_agents(|list| {
@@ -1686,13 +1746,13 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
         Err(r) => return r,
     };
     let Some(v) = json_body(body) else {
-        return Resp::err(400, "要 JSON body");
+        return Resp::err(400, "want a JSON body");
     };
     let actor = caller.user.clone().unwrap_or_default();
 
     if let Some(vis) = v.get("visibility").and_then(|x| x.as_str()) {
         let Some(vis) = Visibility::parse(vis) else {
-            return Resp::err(400, "visibility 只能是 private 或 public");
+            return Resp::err(400, "visibility must be private or public");
         };
         if vis.as_str() != meta.visibility {
             let r = ctx.store.update_agents(|list| {
@@ -1701,7 +1761,7 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
                 }
             });
             if r.is_err() {
-                return Resp::err(500, "写 agents.json 失败");
+                return Resp::err(500, "failed to write agents.json");
             }
             audit::append(ctx.root(), &actor, audit::AGENT_VISIBILITY, Some(&meta.name), &format!("{} → {}", meta.visibility, vis.as_str()));
         }
@@ -1710,13 +1770,13 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
     if let Some(newname) = str_field(&v, "name") {
         if newname != meta.name {
             if !valid_agent_name(&newname) {
-                return Resp::err(400, "非法名字（只允许 [A-Za-z0-9._-]，禁止 .. 与前导点）");
+                return Resp::err(400, "invalid name ([A-Za-z0-9._-] only, no .. and no leading dot)");
             }
             if repo_path(ctx.root(), &newname).exists() || ctx.store.agent(&newname).is_some() {
-                return Resp::err(409, "这个名字已经被占了");
+                return Resp::err(409, "that name is already taken");
             }
             if std::fs::rename(repo_path(ctx.root(), &meta.name), repo_path(ctx.root(), &newname)).is_err() {
-                return Resp::err(500, "改名失败（仓库目录动不了）");
+                return Resp::err(500, "rename failed (the repo directory won't move)");
             }
             let r = ctx.store.update_agents(|list| {
                 if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
@@ -1724,10 +1784,11 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
                 }
             });
             if r.is_err() {
-                return Resp::err(500, "写 agents.json 失败");
+                return Resp::err(500, "failed to write agents.json");
             }
-            // token 绑的是**名字**。改名不改身份（aid 在 store 里），所以绑定要跟着走 ——
-            // 否则改个名就把所有 CI token 悄悄弄哑了。
+            // Tokens are bound to the **name**. A rename doesn't change identity (the aid lives in
+            // the store), so the bindings have to follow — otherwise one rename silently mutes every
+            // CI token.
             let _ = ctx.store.update_tokens(|toks| {
                 for t in toks.iter_mut().filter(|t| t.agent.as_deref() == Some(meta.name.as_str())) {
                     t.agent = Some(newname.clone());
@@ -1748,11 +1809,12 @@ fn api_delete_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
         Err(r) => return r,
     };
     if std::fs::remove_dir_all(repo_path(ctx.root(), &meta.name)).is_err() {
-        return Resp::err(500, "删不掉仓库目录");
+        return Resp::err(500, "can't remove the repo directory");
     }
     let _ = ctx.store.update_agents(|list| list.retain(|m| m.name != meta.name));
-    // 绑在这个名字上的 token 必须一起死：否则将来有人建同名 agent，老 token 会**自动**获得
-    // 对那个新 agent 的权限（名字被回收了，token 却还认这个名字）。
+    // Tokens bound to this name must die with it: otherwise, when someone later creates an agent
+    // with the same name, the old tokens would **automatically** gain rights on that new agent (the
+    // name was recycled, but the token still keys off the name).
     let _ = ctx.store.update_tokens(|toks| toks.retain(|t| t.agent.as_deref() != Some(meta.name.as_str())));
     audit::append(ctx.root(), &caller.user.clone().unwrap_or_default(), audit::AGENT_DELETE, Some(&meta.name), "");
     Resp::no_content()
@@ -1762,7 +1824,8 @@ fn api_delete_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
 
 fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
     let actor = caller.user.clone().unwrap_or_default();
-    // GET 只要读权限（成员表在 agent 详情里本来就给读者看）；增删要 Manage。
+    // GET only needs read (the member list is already shown to readers in the agent detail);
+    // adding/removing needs Manage.
     let action = if method == "GET" { Action::Read } else { Action::Manage };
     let meta = match gate(ctx, caller, name, action) {
         Ok(x) => x,
@@ -1778,22 +1841,23 @@ fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str,
             .collect::<Vec<_>>())),
         ("POST", None) => {
             let Some(v) = json_body(body) else {
-                return Resp::err(400, "要 JSON body");
+                return Resp::err(400, "want a JSON body");
             };
             let (Some(username), Some(role)) = (str_field(&v, "username"), str_field(&v, "role")) else {
-                return Resp::err(400, "要 username 与 role");
+                return Resp::err(400, "want username and role");
             };
             let username = store::normalize_username(&username);
             let Some(role) = Role::parse(&role) else {
-                return Resp::err(400, "role 只能是 read / write / admin");
+                return Resp::err(400, "role must be read / write / admin");
             };
-            // 只能加真实存在的用户 —— 不然 agents.json 里会攒一堆拼错的名字，
-            // 而将来真有人叫这个名字时会**自动**继承这份权限。
+            // Only real, existing users can be added — otherwise agents.json collects a pile of
+            // misspelled names, and whoever really gets that name later **automatically** inherits
+            // the grant.
             if ctx.store.user(&username).is_none() {
-                return Resp::err(400, "没有这个用户");
+                return Resp::err(400, "no such user");
             }
             if meta.owner.as_deref() == Some(username.as_str()) {
-                return Resp::err(400, "owner 本来就有全部权限，不用再加成员");
+                return Resp::err(400, "the owner already has every right; no membership needed");
             }
             let r = ctx.store.update_agents(|list| {
                 if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
@@ -1804,7 +1868,7 @@ fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str,
                 }
             });
             if r.is_err() {
-                return Resp::err(500, "写 agents.json 失败");
+                return Resp::err(500, "failed to write agents.json");
             }
             audit::append(ctx.root(), &actor, audit::MEMBER_ADD, Some(&meta.name), &format!("{username}={}", role.as_str()));
             let fresh = ctx.store.agent_or_unowned(&meta.name);
@@ -1828,7 +1892,7 @@ fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str,
                 })
                 .unwrap_or(false);
             if !removed {
-                return Resp::err(404, "这个人不是成员");
+                return Resp::err(404, "that person isn't a member");
             }
             audit::append(ctx.root(), &actor, audit::MEMBER_REMOVE, Some(&meta.name), &username);
             Resp::no_content()
@@ -1841,9 +1905,9 @@ fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str,
 
 fn api_tokens(ctx: &Ctx, caller: &Caller) -> Resp {
     let Some(user) = caller.user.as_deref() else {
-        return Resp::err(401, "需要登录");
+        return Resp::err(401, "login required");
     };
-    // 只看自己的；站点管理员看全部。
+    // You only see your own; the site admin sees them all.
     let items: Vec<serde_json::Value> = ctx
         .store
         .tokens()
@@ -1859,7 +1923,7 @@ fn api_tokens(ctx: &Ctx, caller: &Caller) -> Resp {
                 "created": t.created,
                 "expires": t.expires,
                 "last_used": t.last_used,
-                // 老的无主 token 会在这里现形（它们已经不能用了）。
+                // Old ownerless tokens show up here for what they are (they no longer work).
                 "usable": t.usable(),
             })
         })
@@ -1869,25 +1933,26 @@ fn api_tokens(ctx: &Ctx, caller: &Caller) -> Resp {
 
 fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
     let Some(user) = caller.user.clone() else {
-        return Resp::err(401, "需要登录");
+        return Resp::err(401, "login required");
     };
-    // 发凭据必须是本人登录会话：拿 token 再发 token 是把一次泄露变成永久立足点
-    //（旧 token 到期了，它生的新 token 还活着）。
+    // Issuing credentials requires the person's own login session: minting a token from a token
+    // turns one leak into a permanent foothold (the old token expires, but the token it spawned
+    // lives on).
     if caller.token.is_some() {
-        return Resp::err(403, "发 token 要用登录会话，不能拿 token 发 token");
+        return Resp::err(403, "issuing a token takes a login session; you can't mint a token from a token");
     }
     let Some(v) = json_body(body) else {
-        return Resp::err(400, "要 JSON body");
+        return Resp::err(400, "want a JSON body");
     };
     let Some(name) = str_field(&v, "name") else {
-        return Resp::err(400, "要 name");
+        return Resp::err(400, "want name");
     };
     let Some(scope) = str_field(&v, "scope").and_then(|s| Scope::parse(&s)) else {
-        return Resp::err(400, "scope 只能是 read 或 write");
+        return Resp::err(400, "scope must be read or write");
     };
     let agent = str_field(&v, "agent");
     if let Some(a) = &agent {
-        // 只能给自己看得见的 agent 发 token。
+        // You can only issue tokens for agents you can see.
         if let Err(r) = gate(ctx, caller, a, Action::Read) {
             return r;
         }
@@ -1896,13 +1961,14 @@ fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
         None | Some(serde_json::Value::Null) => None,
         Some(x) => match x.as_i64() {
             Some(n) if n > 0 && n <= 3650 => Some(n),
-            _ => return Resp::err(400, "ttl_days 要 1..3650 的整数"),
+            _ => return Resp::err(400, "ttl_days wants an integer in 1..3650"),
         },
     };
     match issue_token(&ctx.store, &name, &user, agent.as_deref(), scope, ttl_days) {
         Ok(secret) => {
             audit::append(ctx.root(), &user, audit::TOKEN_CREATE, agent.as_deref(), &format!("name={name} scope={}", scope.as_str()));
-            // 明文只此一次 —— 服务器只留 sha256 摘要，之后谁也变不回来。
+            // The plaintext appears this once — the server keeps only the sha256 digest, which
+            // nobody can turn back.
             Resp::json_status(201, serde_json::json!({ "token": secret }))
         }
         Err(e) => Resp::err(500, &e),
@@ -1911,12 +1977,12 @@ fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
 
 fn api_revoke_token(ctx: &Ctx, caller: &Caller, id: &str) -> Resp {
     let Some(user) = caller.user.clone() else {
-        return Resp::err(401, "需要登录");
+        return Resp::err(401, "login required");
     };
     let Some(t) = ctx.store.tokens().into_iter().find(|t| t.id == id) else {
         return Resp::err(404, "not found");
     };
-    // 自己的 token，或者站点管理员。
+    // Your own token, or the site admin.
     if !caller.is_admin && t.owner.as_deref() != Some(user.as_str()) {
         return Resp::err(404, "not found");
     }
@@ -1930,7 +1996,7 @@ fn api_revoke_token(ctx: &Ctx, caller: &Caller, id: &str) -> Resp {
 fn api_audit(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     let limit: usize = param(req.query(), "limit").and_then(|s| s.parse().ok()).unwrap_or(100).clamp(1, 1000);
     match param(req.query(), "agent") {
-        // 某个 agent 的审计：要这个 agent 的 Manage（owner / 成员 admin / 站点管理员）。
+        // One agent's audit log: needs Manage on that agent (owner / member admin / site admin).
         Some(name) => {
             let meta = match gate(ctx, caller, &name, Action::Manage) {
                 Ok(x) => x,
@@ -1938,17 +2004,18 @@ fn api_audit(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
             };
             Resp::json(serde_json::json!(audit::query(ctx.root(), Some(&meta.name), limit)))
         }
-        // 全站审计：只有站点管理员，且必须是登录会话（token 做不了管理动作）。
+        // The site-wide audit log: site admins only, and only from a login session (tokens can't do
+        // manage actions).
         None => {
             if !caller.is_admin || caller.token.is_some() {
-                return Resp::err(403, "全站审计只对站点管理员开放（且要用登录会话）");
+                return Resp::err(403, "the site-wide audit log is open to site admins only (and only from a login session)");
             }
             Resp::json(serde_json::json!(audit::query(ctx.root(), None, limit)))
         }
     }
 }
 
-// ── sessions（读权限已在调用处判完）──
+// ── sessions (read access was already decided at the call site) ──
 
 fn session_summary(repo: &Path, r: &SessionRef, jsonl: &str) -> serde_json::Value {
     let d = digest(&r.runtime, &r.id, jsonl);
@@ -2030,7 +2097,7 @@ fn api_diff(repo: &Path, id: &str, query: &str) -> Resp {
     }))
 }
 
-/// a 里有、b 里没有的元素（保序去重，取首行）。
+/// Elements in a but not in b (order-preserving, deduped, first line only).
 fn diff_list(a: &[String], b: &[String]) -> Vec<String> {
     let bset: std::collections::HashSet<&String> = b.iter().collect();
     let mut seen = std::collections::HashSet::new();
@@ -2054,7 +2121,7 @@ fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
 
 // ─────────────────────── git smart-http (sync) ───────────────────────
 
-/// **调用前必须已经授权过 `name`**（见 handle）。这里只负责搬运。
+/// **`name` must already be authorized before calling this** (see handle). This only shuttles bytes.
 fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx, req: &Req, name: &str, actor: &str) -> std::io::Result<()> {
     let (path, query) = match req.target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -2062,7 +2129,8 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
     };
     let ctype = req.header("content-type").unwrap_or("").to_string();
 
-    // 已鉴权，进入 body 传输：放宽读超时（pack 可能不小、跨网慢，但持续流入）。
+    // Authorized, now moving the body: relax the read timeout (a pack can be large and slow across
+    // the network, but it keeps streaming in).
     let _ = stream.set_read_timeout(Some(Duration::from_secs(BODY_TIMEOUT_SECS)));
 
     ensure_exportable(&repo_path(ctx.root(), name));
@@ -2070,15 +2138,16 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
     let mut child = match Command::new("git")
         .arg("http-backend")
         .env("GIT_PROJECT_ROOT", ctx.root())
-        // GIT_HTTP_EXPORT_ALL **故意不设**：设了它，http-backend 就会服务 root 下任何 *.git，
-        // 于是"授权哪个 agent"这件事在它眼里根本不存在。现在只有被 ensure_exportable 标记过的
-        // 库（= 刚刚通过了 ACL 的那一个）它才认。真正的闸门是上面的 acl::decide，这只是第二道。
+        // GIT_HTTP_EXPORT_ALL is **deliberately unset**: with it, http-backend serves any *.git
+        // under root, so "which agent was authorized" simply doesn't exist as far as it's concerned.
+        // As it stands it only honours repos marked by ensure_exportable (= the one that just passed
+        // the ACL). The real gate is acl::decide above; this is only the second one.
         .env("REQUEST_METHOD", &req.method)
         .env("PATH_INFO", &path)
         .env("QUERY_STRING", &query)
         .env("CONTENT_TYPE", &ctype)
         .env("CONTENT_LENGTH", req.content_length.to_string())
-        // 谁推的会进 reflog；也让 http-backend 的错误里带上人。
+        // Who pushed goes into the reflog; it also puts a person on http-backend's errors.
         .env("REMOTE_USER", actor)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2086,18 +2155,20 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return write_response(stream, &Resp::text(500, "git http-backend 不可用")),
+        Err(_) => return write_response(stream, &Resp::text(500, "git http-backend unavailable")),
     };
 
-    // 把 body **流式**从 socket 灌进 http-backend stdin(不再整包 read_to_end 进 Vec)。
+    // **Stream** the body from the socket into http-backend's stdin (no more read_to_end of the
+    // whole thing into a Vec).
     let mut stdin = child.stdin.take().unwrap();
     let n = req.content_length.min(MAX_BODY) as u64;
     let _ = std::io::copy(&mut reader.by_ref().take(n), &mut stdin);
-    drop(stdin); // 关 stdin 发 EOF，让 http-backend 收尾
+    drop(stdin); // Closing stdin sends EOF so http-backend can wrap up
     let out = child.wait_with_output()?;
 
-    // CGI 输出 = 头部 + 空行 + 体。规范化头部：拆出 git 的 Status: 作真状态；丢掉它的
-    // Content-Length（我们自己算）；每行只补一个 CRLF（别对已是 CRLF 的头再 \n→\r\n 造出 \r\r\n）。
+    // CGI output = headers + blank line + body. Normalize the headers: pull out git's Status: as the
+    // real status; drop its Content-Length (we compute our own); append exactly one CRLF per line
+    // (don't turn \n→\r\n on a header that's already CRLF and produce \r\r\n).
     let raw = out.stdout;
     let sep = find_subslice(&raw, b"\r\n\r\n").map(|i| (i, 4)).or_else(|| find_subslice(&raw, b"\n\n").map(|i| (i, 2)));
     let (raw_headers, body) = match sep {
@@ -2118,7 +2189,7 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
                 continue;
             }
             if key.eq_ignore_ascii_case("content-length") {
-                continue; // 我们自己算，避免重复
+                continue; // We compute our own, so avoid a duplicate
             }
             fwd.push_str(key);
             fwd.push_str(": ");
@@ -2136,12 +2207,13 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
     stream.flush()
 }
 
-/// 给**这一个**库打上 http-backend 的导出标记。
+/// Put http-backend's export marker on **this one** repo.
 ///
-/// 没有 GIT_HTTP_EXPORT_ALL 的话，http-backend 只服务带 `git-daemon-export-ok` 的库。
-/// 这里在授权通过之后才打标记，顺带把老仓库（`agit-hub add` 之前建的）自动带上来。
-/// 注意：标记**不是**安全边界 —— 它只对 http-backend 说"这个库是拿来服务的"，
-/// 谁能访问由 acl::decide 决定，而那一步已经在上面跑完了。
+/// Without GIT_HTTP_EXPORT_ALL, http-backend only serves repos carrying `git-daemon-export-ok`.
+/// The marker is written only after authorization passes, which also brings old repos (created
+/// before `agit-hub add`) along automatically.
+/// Note: the marker is **not** a security boundary — it only tells http-backend "this repo is meant
+/// to be served". Who may access it is decided by acl::decide, and that step already ran above.
 fn ensure_exportable(repo: &Path) {
     let marker = repo.join("git-daemon-export-ok");
     if !marker.exists() {
@@ -2194,7 +2266,7 @@ mod tests {
             headers: vec![("Authorization".into(), auth.into())],
             content_length: 0,
         };
-        // git 把 token 填在密码位 —— 两段都当候选。
+        // git puts the token in the password field — treat both halves as candidates.
         assert_eq!(credentials(&req("Basic Z2l0OnNlY3JldDEyMw==")), vec!["secret123", "git"]);
         assert_eq!(credentials(&req("Bearer abc")), vec!["abc"]);
         assert_eq!(credentials(&req("bearer abc")), vec!["abc"]);
@@ -2214,7 +2286,7 @@ mod tests {
         assert_eq!(req.sid().as_deref(), Some("deadbeef"));
     }
 
-    // ── bind 闸（需求 4）──
+    // ── The bind gate (requirement 4) ──
 
     #[test]
     fn loopback_binds_without_ceremony() {
@@ -2225,8 +2297,8 @@ mod tests {
     #[test]
     fn public_bind_without_tls_is_refused() {
         let e = bind_guard("0.0.0.0".parse().unwrap(), false, false).unwrap_err();
-        // 拒绝要**说清为什么**，不是一句 "refused"。
-        assert!(e.contains("明文"), "{e}");
+        // A refusal must **say why**, not just "refused".
+        assert!(e.contains("plaintext"), "{e}");
         assert!(e.contains("--insecure"), "{e}");
         assert!(e.contains("--tls"), "{e}");
         assert!(bind_guard("192.168.1.10".parse().unwrap(), false, false).is_err());
@@ -2234,15 +2306,15 @@ mod tests {
 
     #[test]
     fn public_bind_needs_tls_or_explicit_insecure() {
-        assert!(bind_guard("0.0.0.0".parse().unwrap(), true, false).is_ok(), "--tls 放行");
-        assert!(bind_guard("0.0.0.0".parse().unwrap(), false, true).is_ok(), "--insecure 放行");
+        assert!(bind_guard("0.0.0.0".parse().unwrap(), true, false).is_ok(), "--tls lets it through");
+        assert!(bind_guard("0.0.0.0".parse().unwrap(), false, true).is_ok(), "--insecure lets it through");
     }
 
-    // ── session 布局：新老两种都要认 ──
+    // ── Session layouts: both the new and the old must be recognized ──
 
     #[test]
     fn runtimes_are_sorted_peers() {
-        // claude-code 与 codex 对等 —— 字母序，谁也不是"默认第一个"。
+        // claude-code and codex are peers — alphabetical, neither is "first by default".
         let refs = vec![
             SessionRef { env: None, runtime: "codex".into(), id: "a".into(), path: "sessions/codex/a.jsonl".into() },
             SessionRef { env: None, runtime: "claude-code".into(), id: "b".into(), path: "sessions/claude-code/b.jsonl".into() },
@@ -2259,7 +2331,7 @@ mod tests {
         assert_eq!(param("service=git-receive-pack", "service").as_deref(), Some("git-receive-pack"));
     }
 
-    // ── 拒绝时给什么状态码：这条策略就是"不泄露存在性" ──
+    // ── Which status a denial gets: the policy here is "don't leak existence" ──
 
     fn private_acl() -> AgentAcl {
         AgentAcl { name: "secret".into(), owner: Some("alice".into()), visibility: Visibility::Private, members: vec![] }
@@ -2273,15 +2345,15 @@ mod tests {
 
     #[test]
     fn denied_stranger_gets_404_not_403() {
-        // 403 等于承认"这个 agent 存在" —— 那就是一个枚举私有 agent 名字的接口。
-        // 读不了的人一律 404，跟"不存在"长得一模一样。
+        // A 403 admits "this agent exists" — that's an interface for enumerating private agent names.
+        // Anyone who can't read gets a 404, identical to "doesn't exist".
         let r = deny_resp(&Caller::user("eve"), &private_acl(), Deny::NoGrant);
         assert_eq!(r.status, 404);
     }
 
     #[test]
     fn reader_denied_a_write_gets_403() {
-        // 能读的人本来就知道它存在，没什么可藏的 —— 告诉他真实原因。
+        // Someone who can read already knows it exists; nothing left to hide — give them the real reason.
         let acl = AgentAcl {
             name: "secret".into(),
             owner: Some("alice".into()),
@@ -2301,11 +2373,11 @@ mod tests {
 
     #[test]
     fn git_anonymous_denial_challenges_so_git_asks_for_credentials() {
-        // 没有这个头，`git clone` 不会去问用户要密码，只会直接报错。
+        // Without this header, `git clone` won't ask the user for a password, it just errors out.
         let r = git_deny_resp(&Caller::anonymous(), Deny::Anonymous);
         assert_eq!(r.status, 401);
         assert!(r.extra.iter().any(|(k, v)| k == "WWW-Authenticate" && v.contains("Basic")));
-        // 已经认证过的就别再挑战了 —— 再问一遍密码也还是同一个答案。
+        // Don't challenge someone already authenticated — asking for the password again yields the same answer.
         let r = git_deny_resp(&Caller::user("eve"), Deny::NoGrant);
         assert_eq!(r.status, 403);
         assert!(r.extra.is_empty());
@@ -2314,9 +2386,9 @@ mod tests {
     #[test]
     fn json_helpers() {
         let v = json_body(br#"{"name":" x ","empty":"","n":3}"#).unwrap();
-        assert_eq!(str_field(&v, "name").as_deref(), Some("x"), "两头空白要 trim 掉");
-        assert_eq!(str_field(&v, "empty"), None, "空字符串当没给");
-        assert_eq!(str_field(&v, "n"), None, "非字符串当没给");
+        assert_eq!(str_field(&v, "name").as_deref(), Some("x"), "whitespace on both ends is trimmed");
+        assert_eq!(str_field(&v, "empty"), None, "an empty string counts as absent");
+        assert_eq!(str_field(&v, "n"), None, "a non-string counts as absent");
         assert_eq!(str_field(&v, "nope"), None);
         assert!(json_body(b"not json").is_none());
         assert!(json_body(b"").is_none());

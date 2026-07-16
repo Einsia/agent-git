@@ -1,23 +1,30 @@
-//! 浏览器会话（cookie）—— 给人用的认证。脚本/git 走 token，不碰这里。
+//! Browser sessions (cookies) — authentication for humans. Scripts and git use tokens and never
+//! touch this.
 //!
-//! 设计取舍：**不签名，用不可猜的随机 id + 服务端表**。签名 cookie（JWT 那套）省一张表，
-//! 代价是登出/踢人做不到（签名还在有效期内就一直有效）。会话表在内存里：进程重启 = 全体重登，
-//! 这是可接受的，换来的是"撤销立即生效"和"服务器上没有一份可离线爆破的东西"。
+//! The design trade: **no signing; an unguessable random id plus a server-side table**. Signed
+//! cookies (the JWT approach) save you the table, at the cost of not being able to log out or kick
+//! anyone (a signature stays valid until it expires). The session table lives in memory: a process
+//! restart means everyone logs in again, which is acceptable in exchange for "revocation takes
+//! effect immediately" and "there is nothing on the server to crack offline".
 //!
-//! 表里存的是 sid 的 **sha256**，不是 sid 本身 —— 内存被 dump（core dump / swap）也拿不到能用的 cookie。
+//! The table stores the **sha256** of the sid, not the sid itself — dumping memory (core dump /
+//! swap) still yields no usable cookie.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-/// cookie 名。带 `__Host-` 前缀本来更好（浏览器强制 Secure+Path=/+无 Domain），
-/// 但那要求必须是 HTTPS，而本地 http://localhost 开发是主路径 —— 会话直接失效。
+/// Cookie name. A `__Host-` prefix would be better (the browser then enforces Secure + Path=/ + no
+/// Domain), but it requires HTTPS, and local http://localhost development is the main path — the
+/// session would simply stop working.
 pub const COOKIE: &str = "agit_session";
 
-/// 会话有效期。够一个工作日，不够久到"忘了登出就一直开着"。
+/// Session lifetime. Enough for a working day, not so long that "forgot to log out" stays open
+/// forever.
 pub const TTL: Duration = Duration::from_secs(12 * 3600);
 
-/// 会话总数上限。挡住"无限登录 → 无限内存"。到顶时先清过期的，还满就拒绝。
+/// Cap on total sessions. Blocks "unlimited logins → unlimited memory". At the cap, sweep the
+/// expired ones first; if it is still full, refuse.
 const MAX_SESSIONS: usize = 4096;
 
 struct Sess {
@@ -35,15 +42,16 @@ impl Sessions {
         Sessions::default()
     }
 
-    /// 发一个新会话，返回**明文 sid**（只此一次，之后服务端只有它的摘要）。
+    /// Issue a new session, returning the **plaintext sid** (this once only; afterwards the server
+    /// holds nothing but its digest).
     pub fn create(&self, user: &str) -> std::io::Result<String> {
-        let sid = super::kdf::gen_secret()?; // 32 字节 CSPRNG = 256 bit，猜不动
+        let sid = super::kdf::gen_secret()?; // 32 CSPRNG bytes = 256 bits, not guessable
         let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if m.len() >= MAX_SESSIONS {
             let now = SystemTime::now();
             m.retain(|_, s| s.expires > now);
             if m.len() >= MAX_SESSIONS {
-                return Err(std::io::Error::other("会话数到上限，请稍后再试"));
+                return Err(std::io::Error::other("session limit reached, please try again later"));
             }
         }
         m.insert(
@@ -53,7 +61,7 @@ impl Sessions {
         Ok(sid)
     }
 
-    /// sid → 用户名。过期的当场清掉并返回 None。
+    /// sid → username. Expired ones are dropped on the spot and return None.
     pub fn lookup(&self, sid: &str) -> Option<String> {
         let key = crate::convo::sha256_hex(sid);
         let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -65,7 +73,7 @@ impl Sessions {
         Some(s.user.clone())
     }
 
-    /// 登出：撤销立即生效。
+    /// Log out: revocation takes effect immediately.
     pub fn revoke(&self, sid: &str) {
         let key = crate::convo::sha256_hex(sid);
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
@@ -77,11 +85,13 @@ impl Sessions {
     }
 }
 
-/// `Set-Cookie` 的值。
-///   HttpOnly —— JS 读不到，XSS 偷不走会话
-///   SameSite=Lax —— 挡跨站 POST（CSRF）；Lax 仍允许顶层导航带上 cookie，不影响点链接进来
-///   Secure —— 只在 TLS 下加；本地 http 开发加了会让浏览器直接丢掉这个 cookie
-///   Max-Age —— 和服务端 TTL 对齐
+/// The `Set-Cookie` value.
+///   HttpOnly — JS cannot read it, so XSS cannot steal the session
+///   SameSite=Lax — blocks cross-site POST (CSRF); Lax still lets top-level navigation carry the
+///                  cookie, so following a link in still works
+///   Secure — only added under TLS; on local http development it would make the browser drop the
+///            cookie outright
+///   Max-Age — kept in step with the server-side TTL
 pub fn set_cookie(sid: &str, secure: bool) -> String {
     format!(
         "{COOKIE}={sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
@@ -90,12 +100,12 @@ pub fn set_cookie(sid: &str, secure: bool) -> String {
     )
 }
 
-/// 登出用：同名空值 + Max-Age=0，让浏览器立刻扔掉。
+/// For logout: same name, empty value, Max-Age=0, so the browser throws it away at once.
 pub fn clear_cookie(secure: bool) -> String {
     format!("{COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}", if secure { "; Secure" } else { "" })
 }
 
-/// 从 `Cookie:` 头里抠出 sid。格式是 `a=1; b=2`。
+/// Dig the sid out of the `Cookie:` header. The format is `a=1; b=2`.
 pub fn parse_cookie(header: &str) -> Option<String> {
     header.split(';').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
@@ -113,7 +123,7 @@ mod tests {
         let sid = s.create("alice").unwrap();
         assert_eq!(s.lookup(&sid).as_deref(), Some("alice"));
         s.revoke(&sid);
-        assert_eq!(s.lookup(&sid), None, "登出后立刻失效");
+        assert_eq!(s.lookup(&sid), None, "dead the moment you log out");
     }
 
     #[test]
@@ -127,7 +137,8 @@ mod tests {
 
     #[test]
     fn plaintext_sid_is_not_stored() {
-        // 表里只该有摘要 —— 内存/core dump 里捞不到能直接用的 cookie。
+        // The table should hold digests only — no directly usable cookie to fish out of memory or a
+        // core dump.
         let s = Sessions::new();
         let sid = s.create("alice").unwrap();
         let m = s.inner.lock().unwrap();
@@ -152,7 +163,7 @@ mod tests {
             Sess { user: "alice".into(), expires: SystemTime::now() - Duration::from_secs(1) },
         );
         assert_eq!(s.lookup(sid), None);
-        assert_eq!(s.len(), 0, "过期的顺手清掉");
+        assert_eq!(s.len(), 0, "expired ones get swept along the way");
     }
 
     #[test]
@@ -162,7 +173,7 @@ mod tests {
         let b = s.create("bob").unwrap();
         s.revoke(&a);
         assert_eq!(s.lookup(&a), None);
-        assert_eq!(s.lookup(&b).as_deref(), Some("bob"), "撤一个不该影响别人");
+        assert_eq!(s.lookup(&b).as_deref(), Some("bob"), "revoking one must not affect the others");
     }
 
     #[test]
@@ -171,7 +182,7 @@ mod tests {
         assert!(c.contains("HttpOnly"));
         assert!(c.contains("SameSite=Lax"));
         assert!(c.contains("Max-Age=43200"));
-        assert!(!c.contains("Secure"), "无 TLS 时不能标 Secure，否则浏览器直接丢掉");
+        assert!(!c.contains("Secure"), "without TLS, Secure must not be set or the browser drops it");
         assert!(set_cookie("abc", true).contains("; Secure"));
         assert!(clear_cookie(false).contains("Max-Age=0"));
     }
@@ -183,7 +194,7 @@ mod tests {
         assert_eq!(parse_cookie(" agit_session = abc ").as_deref(), Some("abc"));
         assert_eq!(parse_cookie("other=abc"), None);
         assert_eq!(parse_cookie(""), None);
-        // 别把 agit_session_x 当成 agit_session
+        // Do not mistake agit_session_x for agit_session
         assert_eq!(parse_cookie("agit_session_other=abc"), None);
     }
 }

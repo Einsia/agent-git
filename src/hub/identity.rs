@@ -1,23 +1,26 @@
-//! 从 store 里读 agent 身份 —— `agent.toml`。
+//! Reading an agent's identity out of the store — `agent.toml`.
 //!
-//! aid（`agt_<uuid>`）是**客户端铸造、提交进 store 历史**的：它跟着仓库走，改名、换 Hub、
-//! 换机器都不变。Hub 不铸造 aid，只是把 `git show <ref>:agent.toml` 的结果读出来。
-//! 这意味着一个刚 `POST /api/agents` 建出来、还没人推过东西的空库**没有 aid** —— 那就老实报 null。
+//! The aid (`agt_<uuid>`) is **minted by the client and committed into the store's history**: it
+//! travels with the repo and survives renames, a different Hub, and a different machine. The Hub
+//! does not mint aids; it just reads out what `git show <ref>:agent.toml` gives back. Which means an
+//! empty repo freshly created by `POST /api/agents`, with nothing pushed yet, has **no aid** — so
+//! report null and be honest about it.
 //!
-//! 只认 `agt_` 前缀。老 scaffold 写的是 `id = "unnamed-agent"`（见 `crate::init::scaffold`），
-//! **每个 store 都是这个值** —— 把它当身份会让所有老库共享一个"身份"，比没有身份更糟。
+//! Only the `agt_` prefix counts. The old scaffold writes `id = "unnamed-agent"` (see
+//! `crate::init::scaffold`), and **every store carries that same value** — treating it as an
+//! identity would make all old repos share one "identity", which is worse than having none.
 
-/// agent.toml 里读出来的身份。
+/// The identity read out of agent.toml.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
-    /// 有正经 aid。
+    /// A proper aid.
     Aid(String),
-    /// 有 agent.toml，但没有 `agt_` 身份（老 store / 手写的占位值）。
+    /// Has an agent.toml, but no `agt_` identity (old store / hand-written placeholder).
     Unidentified,
 }
 
-/// 解析 agent.toml 取身份。容忍两种写法：
-///   `[agent]` 段里的 `id`（新格式），和顶层的 `id`（老 scaffold）。
+/// Parse agent.toml for the identity. Tolerates both spellings:
+///   `id` inside the `[agent]` section (new format), and a top-level `id` (old scaffold).
 pub fn parse_agent_toml(text: &str) -> Identity {
     let id = toml_string(text, Some("agent"), "id").or_else(|| toml_string(text, None, "id"));
     match id {
@@ -26,7 +29,8 @@ pub fn parse_agent_toml(text: &str) -> Identity {
     }
 }
 
-/// aid 形状闸：`agt_` + 非空、只含 [A-Za-z0-9-]。这串会进 JSON、进日志，得先当不可信输入验一遍。
+/// aid shape gate: `agt_` + non-empty, [A-Za-z0-9-] only. This string lands in JSON and in logs, so
+/// validate it as untrusted input first.
 pub fn is_aid(s: &str) -> bool {
     let Some(rest) = s.strip_prefix("agt_") else {
         return false;
@@ -36,10 +40,11 @@ pub fn is_aid(s: &str) -> bool {
         && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// 极简 TOML 取值：只够读 `key = "value"`。不引 toml 依赖 —— Hub 只需要认一个字符串键，
-/// 为它拉一整个解析器不划算。认不出来就返回 None（然后调用方报 null，不猜）。
+/// Minimal TOML lookup: only enough to read `key = "value"`. No toml dependency — the Hub only needs
+/// to recognize one string key, and pulling in a whole parser for that does not pay. Unrecognized →
+/// None (and the caller then reports null rather than guessing).
 ///
-/// `section` = None 表示取顶层（第一个 `[...]` 之前）的键。
+/// `section` = None means take the key from the top level (before the first `[...]`).
 fn toml_string(text: &str, section: Option<&str>, key: &str) -> Option<String> {
     let mut cur: Option<String> = None;
     for line in text.lines() {
@@ -61,7 +66,7 @@ fn toml_string(text: &str, section: Option<&str>, key: &str) -> Option<String> {
             continue;
         }
         let v = v.trim();
-        // 只认双引号/单引号包起来的字符串。
+        // Only strings wrapped in double or single quotes count.
         for q in ['"', '\''] {
             if let Some(inner) = v.strip_prefix(q).and_then(|s| s.strip_suffix(q)) {
                 return Some(inner.to_string());
@@ -72,7 +77,7 @@ fn toml_string(text: &str, section: Option<&str>, key: &str) -> Option<String> {
     None
 }
 
-/// 丢掉 `#` 之后的注释。引号里的 `#` 不算 —— `id = "agt_#1"` 不该被切断。
+/// Drop the comment after `#`. A `#` inside quotes does not count — `id = "agt_#1"` must not be cut.
 fn strip_comment(line: &str) -> &str {
     let b = line.as_bytes();
     let (mut in_s, mut in_d) = (false, false);
@@ -94,7 +99,7 @@ mod tests {
     #[test]
     fn reads_new_layout() {
         let t = r#"
-# Agent 身份
+# Agent identity
 [agent]
 id = "agt_9f1c2d3e-4b5a-6c7d-8e9f-0a1b2c3d4e5f"
 name = "reviewer"
@@ -108,7 +113,7 @@ created = "2026-07-16T10:00:00Z"
 
     #[test]
     fn reads_top_level_id_too() {
-        // 老 store 可能把 id 写在顶层 —— 两种布局都要认。
+        // Old stores may put id at the top level — both layouts must be recognized.
         assert_eq!(parse_agent_toml("id = \"agt_abc123\"\n"), Identity::Aid("agt_abc123".into()));
     }
 
@@ -120,8 +125,9 @@ created = "2026-07-16T10:00:00Z"
 
     #[test]
     fn legacy_placeholder_is_not_an_identity() {
-        // crate::init::scaffold 给**每个** store 都写这一行。当身份用 = 所有库同名。
-        assert_eq!(parse_agent_toml("# Agent 身份\nid = \"unnamed-agent\"\n"), Identity::Unidentified);
+        // crate::init::scaffold writes this line into **every** store. Using it as an identity =
+        // every repo sharing one name.
+        assert_eq!(parse_agent_toml("# Agent identity\nid = \"unnamed-agent\"\n"), Identity::Unidentified);
         assert_eq!(parse_agent_toml("[agent]\nid = \"unnamed-agent\"\n"), Identity::Unidentified);
     }
 
@@ -130,7 +136,7 @@ created = "2026-07-16T10:00:00Z"
         assert_eq!(parse_agent_toml(""), Identity::Unidentified);
         assert_eq!(parse_agent_toml("[agent]\nname = \"x\"\n"), Identity::Unidentified);
         assert_eq!(parse_agent_toml("id = agt_unquoted\n"), Identity::Unidentified);
-        assert_eq!(parse_agent_toml("这不是 toml"), Identity::Unidentified);
+        assert_eq!(parse_agent_toml("this is not toml"), Identity::Unidentified);
         assert_eq!(parse_agent_toml("[other]\nid = \"agt_x\"\n"), Identity::Unidentified);
     }
 
@@ -140,7 +146,7 @@ created = "2026-07-16T10:00:00Z"
         assert!(!is_aid("agt_"));
         assert!(!is_aid("unnamed-agent"));
         assert!(!is_aid("AGT_abc"));
-        // 这串要进 JSON / 日志：形状不对的一律不认
+        // This string goes into JSON / logs: anything with the wrong shape is refused
         assert!(!is_aid("agt_a/b"));
         assert!(!is_aid("agt_a b"));
         assert!(!is_aid("agt_\"x"));
@@ -149,16 +155,17 @@ created = "2026-07-16T10:00:00Z"
 
     #[test]
     fn trailing_comment_is_stripped() {
-        assert_eq!(parse_agent_toml("id = \"agt_abc\"  # 这是身份\n"), Identity::Aid("agt_abc".into()));
-        assert_eq!(parse_agent_toml("# id = \"agt_x\"\n"), Identity::Unidentified, "注释掉的键不算数");
+        assert_eq!(parse_agent_toml("id = \"agt_abc\"  # this is the identity\n"), Identity::Aid("agt_abc".into()));
+        assert_eq!(parse_agent_toml("# id = \"agt_x\"\n"), Identity::Unidentified, "a commented-out key does not count");
     }
 
     #[test]
     fn comment_stripper_respects_quotes() {
-        // 引号里的 `#` 不是注释起点。（这里的值过不了 is_aid 的形状闸，所以直接测切注释这一步。）
-        assert_eq!(strip_comment("id = \"a#b\"  # 注释").trim(), "id = \"a#b\"");
+        // A `#` inside quotes does not start a comment. (These values would not pass is_aid's shape
+        // gate, so test the comment-stripping step directly.)
+        assert_eq!(strip_comment("id = \"a#b\"  # comment").trim(), "id = \"a#b\"");
         assert_eq!(strip_comment("id = 'a#b'").trim(), "id = 'a#b'");
-        assert_eq!(strip_comment("# 整行注释"), "");
+        assert_eq!(strip_comment("# whole-line comment"), "");
         assert_eq!(strip_comment("no comment here"), "no comment here");
     }
 

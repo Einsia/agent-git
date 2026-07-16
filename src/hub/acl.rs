@@ -1,18 +1,21 @@
-//! Hub 授权 —— **唯一的判定点**。
+//! Hub authorization — **the only decision point**.
 //!
-//! 这里是纯函数：`decide(caller, agent, action) -> Decision`。不碰 IO、不碰 HTTP、不看 token 明文，
-//! 于是可以被穷举测试。Hub 的每个入口（JSON API、git smart-http、CLI）都必须过这一关，
-//! 尤其是 git smart-http —— 老代码在那里只看 `path.contains(".git/")` 就把请求丢给
-//! `git http-backend`（还开着 `GIT_HTTP_EXPORT_ALL=1`），于是"读闸"一过，root 下**任何**
-//! 仓库都能拉走。真正的授权点必须知道**是哪个 agent**，所以判定的输入里带着 `AgentAcl`。
+//! Pure functions here: `decide(caller, agent, action) -> Decision`. No IO, no HTTP, never looks at
+//! token plaintext, and so it can be tested exhaustively. Every entry point into the Hub (the JSON
+//! API, git smart-http, the CLI) must clear this gate — git smart-http most of all, since the old
+//! code there only checked `path.contains(".git/")` before throwing the request at
+//! `git http-backend` (with `GIT_HTTP_EXPORT_ALL=1` on, no less), so once past the "read gate",
+//! **any** repo under root could be pulled. A real authorization point has to know **which agent**,
+//! which is why `AgentAcl` is part of the decision's input.
 //!
-//! 判定顺序（重要）：token 的授权是**上界**，先封顶，再看用户自己的身份。一个只读 token
-//! 落在管理员手里，也只能读 —— 这是"交集"，不是"取最大"。
+//! Ordering (important): a token's grant is an **upper bound** — cap first, then look at the user's
+//! own identity. A read-only token in an admin's hands still only reads: this is an *intersection*,
+//! not a *maximum*.
 
-/// 调用方想对某个 agent 做的事。三档，映射到真实入口：
-///   Read   —— 看 session / 元数据；`git fetch` / `clone`（upload-pack）
-///   Write  —— `git push`（receive-pack）
-///   Manage —— 改可见性 / 改成员 / 改名 / 删库：破坏性动作
+/// What the caller wants to do to an agent. Three tiers, mapped to real entry points:
+///   Read   — view sessions / metadata; `git fetch` / `clone` (upload-pack)
+///   Write  — `git push` (receive-pack)
+///   Manage — change visibility / members / name, delete the repo: destructive actions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Read,
@@ -20,7 +23,7 @@ pub enum Action {
     Manage,
 }
 
-/// 成员在某个 agent 上的角色。有序：Admin > Write > Read。
+/// A member's role on an agent. Ordered: Admin > Write > Read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
     Read,
@@ -46,7 +49,8 @@ impl Role {
         }
     }
 
-    /// 这个角色能不能做这个动作。Manage 只给 admin —— write 能推代码，但不能把库删了或改可见性。
+    /// Whether this role may take this action. Manage is admin-only — write can push code, but not
+    /// delete the repo or change its visibility.
     fn allows(self, action: Action) -> bool {
         match action {
             Action::Read => true,
@@ -56,7 +60,8 @@ impl Role {
     }
 }
 
-/// agent 的可见性。**默认 Private** —— 转录里有 prompt、路径、有时还有密钥，失败方向只能是"看不见"。
+/// An agent's visibility. **Private by default** — transcripts carry prompts, paths, and sometimes
+/// secrets, so the only direction failure may take is "invisible".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
     Private,
@@ -80,7 +85,7 @@ impl Visibility {
     }
 }
 
-/// token 的授权范围。只有读/写两档 —— token 永远做不了 Manage（见 `decide`）。
+/// A token's grant scope. Read/write only — a token can never Manage (see `decide`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     Read,
@@ -104,18 +109,20 @@ impl Scope {
     }
 }
 
-/// 这次请求出示的 token 所带的**授权上界**：绑哪个 agent（None = 不绑）+ 读写封顶。
+/// The **grant upper bound** carried by the token presented on this request: which agent it is bound
+/// to (None = unbound) plus the read/write cap.
 #[derive(Debug, Clone)]
 pub struct TokenGrant {
-    /// Some(name) = 这个 token 只对这一个 agent 有效。
+    /// Some(name) = this token is only valid for that one agent.
     pub agent: Option<String>,
     pub scope: Scope,
 }
 
-/// 谁在发这个请求。
+/// Who is making this request.
 ///
-/// `user` 是**已经认证过**的身份（cookie 会话，或 token 的属主）；None = 匿名。
-/// `token` 有值表示这次是拿 token 来的 —— 于是要额外受 token 的上界约束。
+/// `user` is the **already authenticated** identity (a cookie session, or a token's owner); None =
+/// anonymous. A present `token` means the request arrived with a token — and is therefore
+/// additionally constrained by that token's upper bound.
 #[derive(Debug, Clone, Default)]
 pub struct Caller {
     pub user: Option<String>,
@@ -136,25 +143,25 @@ impl Caller {
         Caller { user: Some(name.to_string()), is_admin: true, token: None }
     }
 
-    /// 给这个 caller 挂上一个 token 上界（链式，测试里好写）。
+    /// Hang a token upper bound on this caller (chainable; convenient in tests).
     pub fn with_token(mut self, agent: Option<&str>, scope: Scope) -> Caller {
         self.token = Some(TokenGrant { agent: agent.map(|s| s.to_string()), scope });
         self
     }
 }
 
-/// 一个 agent 的访问控制事实。从 agents.json 来（见 `super::store`）。
+/// The access-control facts for one agent. Comes from agents.json (see `super::store`).
 #[derive(Debug, Clone)]
 pub struct AgentAcl {
     pub name: String,
-    /// None = 无主（老仓库迁移过来、还没认领）—— 只有站点管理员碰得到。
+    /// None = unowned (an old repo migrated in, not yet claimed) — only the site admin can touch it.
     pub owner: Option<String>,
     pub visibility: Visibility,
     pub members: Vec<(String, Role)>,
 }
 
 impl AgentAcl {
-    /// 无主私有 —— 未知仓库的**失败安全**取值。
+    /// Unowned and private — the **fail-safe** value for an unknown repo.
     pub fn unowned(name: &str) -> AgentAcl {
         AgentAcl { name: name.to_string(), owner: None, visibility: Visibility::Private, members: vec![] }
     }
@@ -164,30 +171,33 @@ impl AgentAcl {
     }
 }
 
-/// 拒绝的**原因** —— 不只是 false。审计日志要写它，HTTP 层要靠它区分 401/403/404。
+/// The **reason** for a denial — not just false. The audit log records it, and the HTTP layer uses
+/// it to tell 401/403/404 apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deny {
-    /// 匿名，而这个 agent 不是 public（或动作不是读）。→ 401，给一次认证机会。
+    /// Anonymous, and this agent is not public (or the action is not a read). → 401, one chance to
+    /// authenticate.
     Anonymous,
-    /// 认证过了，但在这个 agent 上没有足够的授权。
+    /// Authenticated, but without enough grant on this agent.
     NoGrant,
-    /// token 绑在别的 agent 上。
+    /// The token is bound to a different agent.
     TokenOtherAgent,
-    /// token 只有 read，却要写。
+    /// The token only has read, but a write was asked for.
     TokenScope,
-    /// 管理动作不接受 token —— 删库/改可见性这种事，必须是登录会话本人。
+    /// Management actions do not accept tokens — deleting a repo or changing visibility must be the
+    /// person themselves, on a login session.
     TokenCannotManage,
 }
 
 impl Deny {
-    /// 给人看的一句话（也进审计日志的 detail）。
+    /// A one-liner for humans (also goes into the audit log's detail).
     pub fn reason(self) -> &'static str {
         match self {
-            Deny::Anonymous => "需要认证",
-            Deny::NoGrant => "在这个 agent 上没有权限",
-            Deny::TokenOtherAgent => "这个 token 绑定在另一个 agent 上",
-            Deny::TokenScope => "这个 token 只有读权限",
-            Deny::TokenCannotManage => "管理动作不能用 token，请用登录会话",
+            Deny::Anonymous => "authentication required",
+            Deny::NoGrant => "no permission on this agent",
+            Deny::TokenOtherAgent => "this token is bound to another agent",
+            Deny::TokenScope => "this token only has read permission",
+            Deny::TokenCannotManage => "management actions cannot use a token; use a login session",
         }
     }
 }
@@ -204,17 +214,19 @@ impl Decision {
     }
 }
 
-/// **唯一的授权判定**。纯函数：同样的输入永远同样的输出，没有 IO。
+/// **The one authorization decision**. A pure function: same input, same output, always, no IO.
 ///
-/// 规则（按序）：
-///  1. token 封顶：绑定不符 / 越权 scope / 想做 Manage —— 先拒。token 是上界，不是权力来源。
-///  2. 站点管理员：放行（仍受 1 的封顶）。
-///  3. owner：放行。
-///  4. 显式成员：按角色放行。
-///  5. public：只放行 Read（匿名也算）。
-///  6. 其余一律拒绝 —— 默认拒绝，不是默认允许。
+/// The rules, in order:
+///  1. Token cap: wrong binding / scope exceeded / attempting Manage — deny first. A token is an
+///     upper bound, not a source of power.
+///  2. Site admin: allow (still under 1's cap).
+///  3. Owner: allow.
+///  4. Explicit member: allow per role.
+///  5. public: allow Read only (anonymous included).
+///  6. Everything else is denied — deny by default, not allow by default.
 pub fn decide(caller: &Caller, agent: &AgentAcl, action: Action) -> Decision {
-    // 1. token 上界。放在最前面：管理员拿只读 token 也只能读（交集，不是取最大）。
+    // 1. The token's upper bound. First, because an admin holding a read-only token still only
+    //    reads (intersection, not maximum).
     if let Some(t) = &caller.token {
         if let Some(bound) = &t.agent {
             if bound != &agent.name {
@@ -228,7 +240,7 @@ pub fn decide(caller: &Caller, agent: &AgentAcl, action: Action) -> Decision {
         }
     }
 
-    // 2..4 都要先有身份。匿名只能走到第 5 条。
+    // 2..4 all require an identity first. Anonymous can only reach rule 5.
     if let Some(user) = &caller.user {
         if caller.is_admin {
             return Decision::Allow;
@@ -243,12 +255,12 @@ pub fn decide(caller: &Caller, agent: &AgentAcl, action: Action) -> Decision {
         }
     }
 
-    // 5. public 只换来读权限 —— 公开一个 agent 不等于让人往里写。
+    // 5. public buys read only — making an agent public is not an invitation to write to it.
     if agent.visibility == Visibility::Public && action == Action::Read {
         return Decision::Allow;
     }
 
-    // 6. 默认拒绝。
+    // 6. Deny by default.
     match caller.user {
         None => Decision::Deny(Deny::Anonymous),
         Some(_) => Decision::Deny(Deny::NoGrant),
@@ -277,7 +289,7 @@ mod tests {
         }
     }
 
-    // ── 匿名 ──
+    // ── anonymous ──
 
     #[test]
     fn anonymous_reads_public_only() {
@@ -288,7 +300,8 @@ mod tests {
 
     #[test]
     fn anonymous_never_writes_even_public() {
-        // public = 可读，不是可写。老 Hub 的"读开放"闸门不该顺手把写也放了。
+        // public = readable, not writable. The old Hub's "reads are open" gate must not wave writes
+        // through along with them.
         let a = Caller::anonymous();
         assert_eq!(decide(&a, &public_agent(), Action::Write), Decision::Deny(Deny::Anonymous));
         assert_eq!(decide(&a, &public_agent(), Action::Manage), Decision::Deny(Deny::Anonymous));
@@ -314,13 +327,13 @@ mod tests {
 
     #[test]
     fn unowned_private_agent_is_invisible_to_everyone_else() {
-        // 迁移过来的老仓库没有 owner：除了站点管理员，谁都不该看见。
+        // A migrated-in old repo has no owner: nobody but the site admin should see it.
         let orphan = AgentAcl::unowned("orphan");
         assert_eq!(decide(&Caller::user("alice"), &orphan, Action::Read), Decision::Deny(Deny::NoGrant));
         assert_eq!(decide(&Caller::anonymous(), &orphan, Action::Read), Decision::Deny(Deny::Anonymous));
     }
 
-    // ── 成员角色 ──
+    // ── member roles ──
 
     #[test]
     fn member_roles_ladder() {
@@ -356,11 +369,11 @@ mod tests {
         assert_eq!(decide(&eve, &public_agent(), Action::Write), Decision::Deny(Deny::NoGrant));
     }
 
-    // ── token 上界：这是"token 不再是全站通行证"的地方 ──
+    // ── token upper bounds: this is where "a token is no longer a site-wide pass" lives ──
 
     #[test]
     fn token_bound_to_one_agent_cannot_touch_another() {
-        // 这条就是老模型的病灶：一个 token = 整个 host。
+        // This one is the old model's disease: one token = the whole host.
         let alice = Caller::user("alice").with_token(Some("other"), Scope::Write);
         assert_eq!(decide(&alice, &private_agent(), Action::Read), Decision::Deny(Deny::TokenOtherAgent));
         assert_eq!(decide(&alice, &private_agent(), Action::Write), Decision::Deny(Deny::TokenOtherAgent));
@@ -382,7 +395,7 @@ mod tests {
 
     #[test]
     fn read_token_never_writes_even_for_a_site_admin() {
-        // 交集，不是取最大：管理员身份不能把 token 的 scope 撑大。
+        // Intersection, not maximum: being an admin cannot stretch a token's scope.
         let root = Caller::admin("root").with_token(None, Scope::Read);
         assert!(decide(&root, &private_agent(), Action::Read).allowed());
         assert_eq!(decide(&root, &private_agent(), Action::Write), Decision::Deny(Deny::TokenScope));
@@ -390,7 +403,8 @@ mod tests {
 
     #[test]
     fn token_never_manages() {
-        // 删库/改可见性必须是本人登录会话 —— 泄一个 CI token 不该把库删了。
+        // Deleting a repo or changing visibility must be the person's own login session — leaking a
+        // CI token must not get the repo deleted.
         for caller in [
             Caller::user("alice").with_token(None, Scope::Write),
             Caller::admin("root").with_token(None, Scope::Write),
@@ -401,7 +415,8 @@ mod tests {
 
     #[test]
     fn token_does_not_grant_what_the_user_lacks() {
-        // 写 token 落在只读成员手里 —— 还是只读。token 是上界，不是权力来源。
+        // A write token in a read-only member's hands — still read-only. A token is an upper bound,
+        // not a source of power.
         let bob = Caller::user("bob").with_token(Some("secret"), Scope::Write);
         assert!(decide(&bob, &private_agent(), Action::Read).allowed());
         assert_eq!(decide(&bob, &private_agent(), Action::Write), Decision::Deny(Deny::NoGrant));
@@ -414,7 +429,7 @@ mod tests {
         assert_eq!(decide(&eve, &public_agent(), Action::Write), Decision::Deny(Deny::NoGrant));
     }
 
-    // ── 角色/可见性解析 ──
+    // ── role / visibility parsing ──
 
     #[test]
     fn role_and_visibility_parse_roundtrip() {
