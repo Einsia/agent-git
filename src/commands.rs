@@ -157,6 +157,16 @@ fn infer_runtime(text: &str) -> Option<&'static str> {
 }
 
 /// `agit convert <src> --to <rt> [--from <rt>] [--cwd P] [--write]`
+/// The install id for a materialized session: a human-readable proper name (`<branch>-<6hex>`) for a
+/// runtime that resumes by name (codex — `codex exec resume feature-a-3f9a2c`), or a fresh UUID for a
+/// runtime that requires one (claude-code rejects a non-UUID id).
+fn install_id(to_rt: &str, branch: Option<&str>, seed: &str) -> String {
+    match to_rt {
+        "codex" => crate::convo::proper_name(branch, seed),
+        _ => crate::convo::fresh_id("session"),
+    }
+}
+
 pub fn convert_cmd(
     src: &Path,
     from: Option<String>,
@@ -175,7 +185,7 @@ pub fn convert_cmd(
             .ok_or_else(|| anyhow::anyhow!("can't recognize the source runtime, pass --from claude-code|codex explicitly"))?,
     };
 
-    let new_id = convo::fresh_id("session");
+    let new_id = install_id(to, convo::peek_branch(&text).as_deref(), &text);
     let opts = ConvertOpts {
         cwd: cwd_override,
         new_id: new_id.clone(),
@@ -365,7 +375,7 @@ pub fn resume_cmd(src: &Path, as_rt: Option<String>, cwd_override: Option<String
     // Default target = the source runtime (a plain resume, no conversion); --as forces a different one.
     let to = as_rt.unwrap_or_else(|| from.to_string());
 
-    let new_id = convo::fresh_id("resume");
+    let new_id = install_id(&to, convo::peek_branch(&text).as_deref(), &text);
     let opts = ConvertOpts { cwd: cwd_override, new_id: new_id.clone() };
     let (out, ir) = convo::convert(src, from, &to, &opts)?;
     let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {

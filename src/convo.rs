@@ -153,6 +153,21 @@ mod tests {
     const CLAUDE_SRC: &str = "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"cwd\":\"/p\",\"gitBranch\":\"main\",\"message\":{\"role\":\"user\",\"content\":\"HELLO_PROMPT\"}}\n{\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"SECRETSIG\"},{\"type\":\"text\",\"text\":\"WORLD_REPLY\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"cargo test\"}}]}}\n";
 
     #[test]
+    fn proper_name_is_branch_slug_plus_stable_hash() {
+        let n = proper_name(Some("feature/Login-Rate"), "seed-content");
+        assert!(n.starts_with("feature-login-rate-"), "{n}");
+        assert_eq!(n.len(), "feature-login-rate-".len() + 6);
+        // stable for the same seed
+        assert_eq!(proper_name(Some("feature/Login-Rate"), "seed-content"), n);
+        // different seed → different suffix
+        assert_ne!(proper_name(Some("feature/Login-Rate"), "other"), n);
+        // no branch → "session-…"
+        assert!(proper_name(None, "x").starts_with("session-"));
+        // peek_branch reads claude gitBranch
+        assert_eq!(peek_branch(CLAUDE_SRC).as_deref(), Some("main"));
+    }
+
+    #[test]
     fn claude_to_codex_preserves_visible_drops_reasoning() {
         let opts = ConvertOpts { cwd: None, new_id: "NEWID".into() };
         let ir = read_conversation("claude-code", CLAUDE_SRC).unwrap();
@@ -233,6 +248,54 @@ pub fn sha256_hex(input: &str) -> String {
     let mut h = Sha256::new();
     h.update(input.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// A human-readable session name: `<branch-slug>-<6 hex>`, e.g. `feature-a-3f9a2c`. The hash is a
+/// stable digest of `seed` (the source session), so re-deriving the same session yields the same name.
+/// Used as the resume id for runtimes that accept a non-UUID id (codex resumes by this directly:
+/// `codex exec resume feature-a-3f9a2c`); claude requires a UUID, so it keeps `fresh_id()`.
+pub fn proper_name(branch: Option<&str>, seed: &str) -> String {
+    let slug = branch.map(slugify).filter(|s| !s.is_empty()).unwrap_or_else(|| "session".to_string());
+    let slug: String = slug.chars().take(28).collect();
+    let slug = slug.trim_end_matches('-');
+    format!("{slug}-{}", &sha256_hex(seed)[..6])
+}
+
+/// Slugify a branch name to `[a-z0-9-]` (non-alphanumerics collapse to a single '-', trimmed).
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Best-effort git branch recorded in a session dump: claude's `gitBranch` or codex's `payload.git.branch`.
+pub fn peek_branch(content: &str) -> Option<String> {
+    for line in content.lines().take(400) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            let b = v
+                .get("gitBranch")
+                .and_then(|x| x.as_str())
+                .or_else(|| v.get("payload").and_then(|p| p.get("git")).and_then(|g| g.get("branch")).and_then(|x| x.as_str()));
+            if let Some(b) = b {
+                if !b.is_empty() {
+                    return Some(b.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Generate a new, uuid-shaped session id (8-4-4-4-12). No uuid crate:
