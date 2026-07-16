@@ -1,20 +1,26 @@
-//! `agit -a sync <ref>` —— reconcile two diverged agent branches by DIALOGUE.
+//! `agit a merge <target>` (alias `sync`) —— reconcile my memory with another MEMORY, by DIALOGUE.
+//!
+//! The target is an agent name or a ref — **never a code branch**: one agent that worked feature-a then
+//! feature-b has ONE memory spanning both, so there is nothing there to reconcile. See the design's §7.
 //!
 //! No structured distillation, no CLAUDE.md. How it works (spike + first real run verified,
 //! see docs/plans/2026-07-16-...):
-//!   1. Three-dot diff to find the sessions the peer added since the common ancestor (the divergent tail).
-//!   2. Copy each side's "latest" session into a fresh-id session bound to that side's own worktree
+//!   1. Resolve the target to a memory, and read its AID to decide what merging it MEANS (`merge_mode`):
+//!      same agent → dialogue then a git merge (one memory again); different agent → dialogue only.
+//!   2. Find the divergent tail: the peer's sessions to reconcile against (`peer_sessions`).
+//!   3. Copy each side's "latest" session into a fresh-id session bound to that side's own worktree
 //!      (via the convert machinery, which rewrites id/cwd — the user's real sessions are never touched).
-//!   3. Two worktrees: each agent runs in ITS OWN branch's checked-out tree, carrying its OWN diff since the
+//!   4. Two worktrees: each agent runs in ITS OWN branch's checked-out tree, carrying its OWN diff since the
 //!      common ancestor (ground truth). Read-only (Read/Grep/Glob) — resolve by reading code, escalate real conflicts.
-//!   4. Output: the A-side session now contains the whole reconciliation → that IS the resumable merged state;
+//!   5. Output: the A-side session now contains the whole reconciliation → that IS the resumable merged state;
 //!      the transcript is also archived for provenance.
 //!
-//! MVP: both sides claude-code; one "latest" session per side. Two worktrees + diffs when both code branches
-//! are present in the repo; otherwise it falls back to a single tree (and says so).
+//! MVP: both sides on one runtime; one "latest" session per side. Two worktrees + diffs when both code
+//! branches are present in the repo; otherwise it falls back to a single tree (and says so).
 
+use crate::agent;
 use crate::convo::{self, ConvertOpts};
-use crate::scope::{self, Scope};
+use crate::scope::{self};
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -45,9 +51,160 @@ struct Side {
     brief: String,
 }
 
-pub fn run(reference: &str, runtime: &str, both: bool, quick: bool) -> Result<i32> {
+/// How the operand was disambiguated when it named both an agent and a ref (§7). Scripts pass one;
+/// a terminal gets the picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prefer {
+    Agent,
+    Ref,
+}
+
+/// A merge target is always another MEMORY — never a code branch (a code branch is a note ON a session,
+/// not a thing to reconcile with).
+enum Target {
+    /// A ref in my own store: a copy of some memory, reachable by git.
+    Ref(String),
+    /// Another agent, already on disk at `~/.agit/agents/<aid>/`. Deliberately NOT fetched into my
+    /// store: dragging a different agent's whole history in here buys nothing.
+    Peer(agent::Agent),
+}
+
+impl Target {
+    fn label(&self) -> String {
+        match self {
+            Target::Ref(r) => r.clone(),
+            Target::Peer(a) => a.name.clone(),
+        }
+    }
+}
+
+/// What a merge does to the two stores. Decided by the AID, never by whether a merge-base happens to
+/// exist — the design's whole point: `agent.toml` is committed IN the store, so identity is readable at
+/// any target.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Mode {
+    /// Same agent, another copy (a teammate's push) → dialogue, then git merge: one memory again.
+    Fuse,
+    /// A different agent → dialogue ONLY. Both agents stay intact; you merge the CODE yourself.
+    DialogueOnly,
+}
+
+/// Mode from the two aids. An UNKNOWN aid (a store predating identity) must never match another unknown
+/// one: fusing two unrelated memories is unrecoverable, while a needless dialogue-only costs a git merge
+/// you can still run by hand. So unknown ⇒ DialogueOnly, with no exception.
+///
+/// `Target::Ref` used to fall through to Fuse on the reasoning that a ref in my own store is my own
+/// history. It isn't: a teammate's copy arrives as a ref in my store too (`agit a fetch`), so a store
+/// with no identity would fuse a *different* agent's memory in — the one outcome you cannot undo.
+/// Fuse is reachable only by two aids that are present and equal.
+fn merge_mode(mine: Option<&str>, theirs: Option<&str>) -> Mode {
+    match (mine, theirs) {
+        (Some(a), Some(b)) if a == b => Mode::Fuse,
+        _ => Mode::DialogueOnly,
+    }
+}
+
+/// Resolve the operand: a known agent name → that agent's store; else a ref in my store; BOTH → ask;
+/// neither → an actionable error.
+fn resolve_target(store: &Path, name: &str, prefer: Option<Prefer>) -> Result<Target> {
+    let known = agent::list().unwrap_or_default();
+    let as_agent = known.iter().find(|a| a.name == name || a.aid == name).cloned();
+    let as_ref = scope::git_in_status(store, &["rev-parse", "--verify", "--quiet", name]).0 == 0;
+
+    let known_names = || -> String {
+        let names: Vec<&str> = known.iter().map(|a| a.name.as_str()).collect();
+        if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+    };
+
+    match (as_agent, as_ref, prefer) {
+        // An explicit disambiguator is AUTHORITATIVE, not advisory. It exists so agit never has to
+        // guess which memory you meant, so a miss is an error: honouring the other kind would answer
+        // a question the user did not ask, and quietly reconcile the wrong memory.
+        (Some(a), _, Some(Prefer::Agent)) => Ok(Target::Peer(a)),
+        (None, is_ref, Some(Prefer::Agent)) => bail!(
+            "--agent says `{name}` is an agent, but no agent by that name is tracked here.{}\n  \
+             known agents: {}",
+            if is_ref { format!("\n  There IS a ref `{name}` — did you mean `--ref {name}`?") } else { String::new() },
+            known_names()
+        ),
+        (_, true, Some(Prefer::Ref)) => Ok(Target::Ref(name.to_string())),
+        (is_agent, false, Some(Prefer::Ref)) => bail!(
+            "--ref says `{name}` is a ref, but the Agent Store has no such ref.{}",
+            if is_agent.is_some() { format!("\n  There IS an agent `{name}` — did you mean `--agent {name}`?") } else { String::new() }
+        ),
+
+        (Some(a), false, None) => Ok(Target::Peer(a)),
+        (None, true, None) => Ok(Target::Ref(name.to_string())),
+        (Some(a), true, None) => pick_ambiguous(store, name, a),
+        (None, false, None) => bail!(
+            "`{name}` is neither an agent nor a ref in this Agent Store.\n  \
+             known agents: {}\n  \
+             a teammate's copy of this agent arrives as a ref — fetch it first: agit a fetch <remote>",
+            known_names()
+        ),
+    }
+}
+
+/// Both matched: never guess which memory the user meant.
+fn pick_ambiguous(store: &Path, name: &str, a: agent::Agent) -> Result<Target> {
+    use std::io::{stdin, stdout, BufRead, IsTerminal, Write};
+    let sessions = crate::commands::store_sessions(&a.store).len();
+    if !stdin().is_terminal() {
+        bail!(
+            "`{name}` is ambiguous: it names both an agent ({}) and a ref in this store. \
+             Say which: --agent {name} or --ref {name}.",
+            short_aid(&a.aid)
+        );
+    }
+    println!("\"{name}\" is ambiguous:");
+    println!("  1) agent  {name:<16} {}   {sessions} sessions", short_aid(&a.aid));
+    println!("  2) ref    {}", scope::git_in_status(store, &["rev-parse", "--symbolic-full-name", name]).1);
+    print!("Pick [1/2]: ");
+    let _ = stdout().flush();
+    let mut line = String::new();
+    stdin().lock().read_line(&mut line).ok();
+    match line.trim() {
+        "1" | "agent" => Ok(Target::Peer(a)),
+        "2" | "ref" => Ok(Target::Ref(name.to_string())),
+        _ => bail!("nothing picked; rerun with --agent {name} or --ref {name}."),
+    }
+}
+
+fn short_aid(aid: &str) -> String {
+    if aid.is_empty() {
+        return "(no aid)".to_string();
+    }
+    let s: String = aid.chars().take(12).collect();
+    format!("{s}…")
+}
+
+/// The aid a store claims. `None` = no identity, which is NOT an identity that can match: the legacy
+/// scaffold wrote `id = "unnamed-agent"` into every store on earth, so a parser that accepted it would
+/// make every legacy store "the same agent" — and fuse two unrelated memories. `parse_agent_toml` is
+/// the one place that judgement lives; this reuses it rather than growing a second opinion.
+fn aid_of_store(store: &Path) -> Option<String> {
+    agent::read_identity(store).ok().map(|i| i.aid)
+}
+
+/// The aid at any ref: `agent.toml` is committed IN the store, so identity is readable at the target
+/// without checking anything out (§7) — which is what lets mode follow the AID, not git history.
+fn aid_at_ref(store: &Path, reference: &str) -> Option<String> {
+    use crate::hub::identity::{parse_agent_toml, Identity};
+    let (rc, out) = scope::git_in_status(store, &["show", &format!("{reference}:agent.toml")]);
+    match (rc == 0).then(|| parse_agent_toml(&out)) {
+        Some(Identity::Aid(a)) => Some(a),
+        _ => None,
+    }
+}
+
+pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, prefer: Option<Prefer>) -> Result<i32> {
     let env = scope::env_root()?;
-    let agent = scope::root_for(Scope::Agent)?;
+    // The RESOLVED agent's id-keyed store, not the legacy nested one. Reading `<env>/.agit/agent` made
+    // merge operate on a store that nothing writes to any more, and left `mine` permanently None — so
+    // the mode was decided by the unknown-identity fallback instead of by identity, which is the one
+    // thing this command is supposed to decide by.
+    let me = agent::resolve(None)?;
+    let agent = me.store.clone();
     let rt = normalize(runtime);
     if rt != "claude-code" && rt != "codex" {
         bail!("sync supports claude-code or codex on both sides (pick with --from <rt>).");
@@ -56,35 +213,40 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool) -> Result<i3
     if !which(cli) {
         bail!("sync needs `{cli}` on this machine (both sides of the dialogue are real resumed {cli} sessions).");
     }
-    if scope::git_in_status(&agent, &["rev-parse", "--verify", "--quiet", reference]).0 != 0 {
-        bail!("Agent Store has no ref `{reference}`. Run `agit -a fetch <remote>` first.");
+
+    // 1. Which memory is this, and what does merging it mean? Identity decides — not git history.
+    let target = resolve_target(&agent, reference, prefer)?;
+    let mine = aid_of_store(&agent);
+    let theirs = match &target {
+        Target::Ref(r) => aid_at_ref(&agent, r),
+        Target::Peer(a) => Some(a.aid.clone()).filter(|s| !s.is_empty()),
+    };
+    let mode = merge_mode(mine.as_deref(), theirs.as_deref());
+    announce(&target, theirs.as_deref(), mode);
+
+    // 2. The divergent tail: the peer's sessions to reconcile against.
+    let (b_all, grounded) = peer_sessions(&agent, &target, &rt)?;
+    if b_all.is_empty() {
+        // An empty tail means two very different things, and conflating them IS the bug this fixes.
+        // Grounded in a shared ancestor, empty is the truth: nothing diverged, we are up to date.
+        if grounded {
+            println!("{} added no {rt} sessions since the common ancestor — nothing to reconcile by dialogue.", target.label());
+            // Same agent still fuses: the peer may be ahead in commits that carry no session.
+            return if mode == Mode::Fuse { fuse(&agent, &target) } else { Ok(0) };
+        }
+        // Ungrounded and empty is NOT evidence of agreement — it is a failed read. Never exit 0 on it.
+        bail!(
+            "{} has no {rt} sessions to reconcile with, and shares no history with this store, so \
+             there is nothing to compare against. (`--from <runtime>` picks the other runtime.)",
+            target.label()
+        );
     }
 
-    // 1. Divergent tail: sessions the peer added since the common ancestor (three-dot diff).
-    let sdir = format!("sessions/{rt}");
-    let (_, diff) =
-        scope::git_in_status(&agent, &["diff", "--name-only", &format!("HEAD...{reference}"), "--", &sdir]);
-    let incoming: Vec<String> = diff.lines().filter(|l| l.ends_with(".jsonl")).map(String::from).collect();
-    if incoming.is_empty() {
-        println!("{reference} added no sessions since the common ancestor — nothing to sync.");
-        return Ok(0);
-    }
-
-    // 2. Gather ALL of each side's sessions (a branch's work may span several). A = local (not from the
-    //    peer); B = the peer's incoming sessions from <ref>.
-    let a_all = local_sessions(&agent, &rt, &incoming);
+    // 2b. Gather ALL of A's sessions (a branch's work may span several); A = local, i.e. not the peer's.
+    let incoming_names: Vec<String> = b_all.iter().map(|(n, _)| n.clone()).collect();
+    let a_all = local_sessions(&agent, &rt, &incoming_names);
     if a_all.is_empty() {
         bail!("no local session to represent A (does this branch have its own session yet?)");
-    }
-    let mut b_all: Vec<(String, String)> = Vec::new();
-    for rel in &incoming {
-        let (rc, content) = scope::git_in_status(&agent, &["show", &format!("{reference}:{rel}")]);
-        if rc == 0 && !content.trim().is_empty() {
-            b_all.push((rel.rsplit('/').next().unwrap_or(rel).to_string(), content));
-        }
-    }
-    if b_all.is_empty() {
-        bail!("could not read any peer session from `{reference}`.");
     }
 
     // 3. Branches, then pick the "voice" session per side (richest on that branch) + brief the rest.
@@ -141,7 +303,125 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool) -> Result<i3
     for wt in &worktrees {
         let _ = scope::git_in_status(&env, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
     }
-    result
+    let code = result?;
+
+    // 7. Same agent → the two copies become one memory again. A different agent NEVER gets here: its
+    //    history stays its own, and you merge the CODE yourself.
+    if mode == Mode::Fuse {
+        return Ok(code.max(fuse(&agent, &target)?));
+    }
+    Ok(code)
+}
+
+/// State the mode. The user must never have to infer whether their agents just got fused.
+fn announce(target: &Target, theirs: Option<&str>, mode: Mode) {
+    let label = target.label();
+    let aid = theirs.map(short_aid).unwrap_or_else(|| "no aid recorded".into());
+    match mode {
+        Mode::Fuse => println!("{label} is this agent ({aid}) — reconciling, then merging the histories."),
+        Mode::DialogueOnly => {
+            println!("{label} is a different agent ({aid}) — reconciling by dialogue; histories stay separate.")
+        }
+    }
+}
+
+/// Fuse the histories: one memory, restored by an ordinary git merge.
+fn fuse(store: &Path, target: &Target) -> Result<i32> {
+    let spec = match target {
+        Target::Ref(r) => r.clone(),
+        // Same aid on another path: it IS my memory, so fetching it is not "dragging in a stranger".
+        Target::Peer(a) => {
+            let rc = scope::git_in_inherit(store, &["fetch", &a.store.to_string_lossy(), "HEAD"]);
+            if rc != 0 {
+                bail!("could not fetch {} from {} (exit {rc}).", a.name, a.store.display());
+            }
+            "FETCH_HEAD".to_string()
+        }
+    };
+    println!("\nMerging the histories (same agent):");
+    let rc = scope::git_in_inherit(store, &["merge", &spec]);
+    if rc != 0 {
+        eprintln!(
+            "  ⚠ git merge left conflicts in the Agent Store. The reconciliation above is already \
+             recorded; resolve the files and `agit a commit`."
+        );
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+/// The peer's sessions of this runtime, as (basename, content) — the divergent tail — plus whether the
+/// answer is **grounded in a shared ancestor**. That flag is what lets the caller tell "nothing
+/// diverged" (trustworthy, exit 0) apart from "nothing was read" (never trustworthy).
+///
+/// The silent no-op this replaces: with NO merge base, `git diff HEAD...other` exits **128** and prints
+/// **nothing on stdout** (verified), and the old code read that empty stdout as "no divergent tail" →
+/// "nothing to sync", exit 0, does nothing. Exactly the cross-agent case. So: detect it via
+/// `git merge-base` (rc=1 = unrelated histories) and enumerate two-dot instead — and never ignore a
+/// non-zero rc from the diff itself.
+///
+/// `--diff-filter=ACMR` matters: a plain two-dot `--name-only` also lists paths the peer DELETED, which
+/// don't exist at that ref, so `git show <ref>:<path>` then fails on them.
+fn peer_sessions(store: &Path, target: &Target, rt: &str) -> Result<(Vec<(String, String)>, bool)> {
+    match target {
+        Target::Ref(r) => {
+            let related = scope::git_in_status(store, &["merge-base", "HEAD", r]).0 == 0;
+            let range = if related { format!("HEAD...{r}") } else { format!("HEAD..{r}") };
+            if !related {
+                eprintln!("No common ancestor with {r} — enumerating its sessions directly (two-dot).");
+            }
+            let (rc, out) = scope::git_in_status(
+                store,
+                &["diff", "--name-only", "--diff-filter=ACMR", &range, "--", crate::session::SESSIONS_SUBDIR],
+            );
+            if rc != 0 {
+                bail!("could not compute the divergent tail against `{r}` (git exit {rc}).");
+            }
+            let mut v = Vec::new();
+            for rel in out.lines().filter(|l| is_session_of(l, rt)) {
+                let (rc, content) = scope::git_in_status(store, &["show", &format!("{r}:{rel}")]);
+                if rc == 0 && !content.trim().is_empty() {
+                    v.push((basename(rel), content));
+                }
+            }
+            Ok((v, related))
+        }
+        // A different memory in a different repo: nothing to diff against, so its sessions ARE the tail.
+        // Never "grounded": an empty read here is a failure, not agreement.
+        Target::Peer(a) => {
+            let (rc, out) =
+                scope::git_in_status(&a.store, &["ls-tree", "-r", "--name-only", "HEAD", "--", crate::session::SESSIONS_SUBDIR]);
+            let mut v = Vec::new();
+            if rc == 0 {
+                for rel in out.lines().filter(|l| is_session_of(l, rt)) {
+                    let (rc, content) = scope::git_in_status(&a.store, &["show", &format!("HEAD:{rel}")]);
+                    if rc == 0 && !content.trim().is_empty() {
+                        v.push((basename(rel), content));
+                    }
+                }
+                return Ok((v, false));
+            }
+            // An agent that has never committed still has a memory on disk.
+            for s in crate::commands::store_sessions(&a.store).into_iter().filter(|s| s.runtime == rt) {
+                if let Ok(c) = std::fs::read_to_string(&s.path) {
+                    if !c.trim().is_empty() {
+                        v.push((basename(&s.path.to_string_lossy()), c));
+                    }
+                }
+            }
+            Ok((v, false))
+        }
+    }
+}
+
+/// A session of `rt` in either store layout (`sessions/<rt>/` or `sessions/<env>/<rt>/`), excluding a
+/// session's sidecars (`<id>/subagents/*.jsonl`), whose parent is the id, not the runtime.
+fn is_session_of(path: &str, rt: &str) -> bool {
+    path.ends_with(".jsonl") && path.split('/').rev().nth(1) == Some(rt)
+}
+
+fn basename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 /// If there are open conflicts and we're at a terminal, walk the user through deciding each and record
@@ -251,7 +531,7 @@ fn run_dialogue(rt: &str, a: &Side, b: &Side, quick: bool) -> Result<Vec<(char, 
         println!("B → {bmsg}\n");
         transcript.push(('B', bmsg.clone()));
         // In the default mode B's first reply is its handoff summary, so A receives it framed as one.
-        let ap = if first_b && !quick { relay_handoff(rt, "B", &bmsg) } else { relay(&bmsg) };
+        let ap = if first_b && !quick { relay_handoff("B", &bmsg) } else { relay(&bmsg) };
         first_b = false;
         let amsg = turn(rt, &a.cwd, &a.id, &ap)?;
         println!("A → {amsg}\n");
@@ -305,10 +585,27 @@ fn turn(rt: &str, cwd: &Path, session_id: &str, prompt: &str) -> Result<String> 
     turn_with(rt, cwd, session_id, prompt, true)
 }
 
-/// `tools = false` actually withholds the tools, rather than merely asking the model not to use them.
-/// The vendors' no-tools clamp is backed by a real constraint — compaction genuinely runs without tools,
-/// so their "tool calls will be REJECTED" is true. A handoff turn that only *says* it while `--allowedTools
-/// Read Grep Glob` is passed is a bluff: the model can burn its one turn on a Read and answer nothing.
+/// The tools withheld from a no-tools turn. `--disallowedTools` is the ONLY flag that actually withholds:
+/// verified against claude by asking a fresh `-p` session to read a file with a known word in it —
+///   no flag                → read it        (the default set applies; omitting a grant denies nothing)
+///   --allowedTools ""      → read it        (the flag is an additive GRANT, not a restriction)
+///   --tools ""             → withheld, but the model then emitted raw `<invoke name="Bash">` syntax AS
+///                            ITS TEXT ANSWER — which this code would relay to the peer as a summary
+///   --disallowedTools …    → clean refusal, and it says so in prose
+const WITHHELD_TOOLS: &[&str] = &[
+    "Read", "Grep", "Glob", "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task",
+];
+
+/// `tools = false` must WITHHOLD the tools, not merely ask the model not to use them: the vendors'
+/// no-tools clamp is backed by a real constraint (compaction genuinely runs without tools), so their
+/// "tool calls will be REJECTED" is true and the model's compliance is not being tested.
+///
+/// This previously withheld nothing — `tools = false` just skipped `--allowedTools`, which is an
+/// additive grant, so the turn kept claude's DEFAULT tools while the prompt told it tool calls would be
+/// rejected. That is the exact bluff the clamp exists to avoid, and it was asserted in this comment.
+///
+/// codex has no equivalent flag: `turn_codex` ignores `tools` and always runs `codex exec --sandbox
+/// read-only`, so on codex the clamp is still only textual. That is an honest gap, not a claim.
 fn turn_with(rt: &str, cwd: &Path, session_id: &str, prompt: &str, tools: bool) -> Result<String> {
     let reply = match rt {
         "codex" => turn_codex(cwd, session_id, prompt),
@@ -333,6 +630,8 @@ fn turn_claude(cwd: &Path, session_id: &str, prompt: &str, tools: bool) -> Resul
         .args(["--resume", session_id, "-p", prompt, "--output-format", "json"]);
     if tools {
         cmd.args(["--allowedTools", "Read", "Grep", "Glob"]);
+    } else {
+        cmd.args(["--disallowedTools"]).args(WITHHELD_TOOLS);
     }
     let out = cmd
         .output()
@@ -609,7 +908,10 @@ fn relay(other: &str) -> String {
 
 /// The peer's message IS a handoff summary: frame it as one (codex's receiver side) and open the
 /// reconciliation. Used for the single turn that follows the peer's handoff.
-fn relay_handoff(rt: &str, peer: &str, other: &str) -> String {
+///
+/// Takes no runtime: unlike `relay_first`, this turn is granted its tools (`turn`), so it carries no
+/// no-tools preamble to make runtime-specific.
+fn relay_handoff(peer: &str, other: &str) -> String {
     format!(
         "{}\n\n\"{other}\"\n\nNow reconcile it against your own work: raise anything that can't both be \
          true, or that would break at merge, as a 'CONFLICT:' line. {RULES}",
@@ -672,21 +974,25 @@ fn save_transcript(agent: &Path, rt: &str, a_id: &str, b_id: &str, transcript: &
     Ok(path)
 }
 
-/// All local (not from the peer) sessions of this runtime, as (filename, content).
+/// All local (not the peer's) sessions of this runtime, as (filename, content). `incoming` is the peer's
+/// session filenames — A is defined as everything that is not B.
+///
+/// Reads the store the same way `peer_sessions` does (via `store_sessions`), so both sides see every
+/// environment's sessions under either store layout. A side that only understood `sessions/<rt>/` would
+/// silently find nothing once the store is env-partitioned, and merge would bail claiming this agent has
+/// no session of its own.
 fn local_sessions(agent: &Path, rt: &str, incoming: &[String]) -> Vec<(String, String)> {
     let incoming_names: std::collections::HashSet<&str> =
         incoming.iter().map(|p| p.rsplit('/').next().unwrap_or(p)).collect();
-    let dir = agent.join("sessions").join(rt);
-    walkdir::WalkDir::new(&dir)
-        .max_depth(1)
+    crate::commands::store_sessions(agent)
         .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-        .filter(|e| !incoming_names.contains(e.file_name().to_string_lossy().as_ref()))
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            std::fs::read_to_string(e.path()).ok().map(|c| (name, c))
+        .filter(|s| s.runtime == rt)
+        .filter_map(|s| {
+            let name = basename(&s.path.to_string_lossy());
+            if incoming_names.contains(name.as_str()) {
+                return None;
+            }
+            std::fs::read_to_string(&s.path).ok().map(|c| (name, c))
         })
         .collect()
 }
@@ -793,6 +1099,192 @@ fn which(name: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> (i32, String) {
+        // Per-invocation identity: a global git config would clobber the developer's real one.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn peer(name: &str, aid: &str) -> Target {
+        Target::Peer(agent::Agent {
+            aid: aid.into(),
+            name: name.into(),
+            store: PathBuf::from("/x"),
+            remote: None,
+        })
+    }
+
+    /// The clamp must WITHHOLD, not ask. `--allowedTools` is an additive grant, so the old `tools=false`
+    /// (omit the flag) left claude's default tools in place while the prompt claimed they were rejected —
+    /// verified by having a fresh `-p` session read a file with a known word in it, with and without.
+    #[test]
+    fn a_no_tools_turn_names_the_tools_it_withholds() {
+        for t in ["Read", "Grep", "Glob", "Bash", "Edit", "Write"] {
+            assert!(WITHHELD_TOOLS.contains(&t), "a no-tools turn must withhold {t}");
+        }
+        assert!(
+            WITHHELD_TOOLS.contains(&"Task"),
+            "Task too: denied the file tools directly, the model tried to reach them via a subagent"
+        );
+    }
+
+    /// Mode follows the AID, never git history — that is what removes the guess.
+    #[test]
+    fn same_aid_fuses_and_a_different_aid_never_does() {
+        assert_eq!(merge_mode(Some("agt_01"), Some("agt_01")), Mode::Fuse);
+        // a different agent stays a different agent, whichever way it is named
+        assert_eq!(merge_mode(Some("agt_01"), Some("agt_02")), Mode::DialogueOnly);
+    }
+
+    /// The unrecoverable direction: a git merge of two unrelated memories cannot be undone, a skipped
+    /// one costs a command. So an UNKNOWN aid must never match another unknown one — including via a
+    /// ref, which is the case this test used to get wrong.
+    #[test]
+    fn an_unknown_aid_never_fuses_a_stranger() {
+        assert_eq!(merge_mode(None, None), Mode::DialogueOnly);
+        assert_eq!(merge_mode(Some("agt_01"), None), Mode::DialogueOnly);
+        assert_eq!(merge_mode(None, Some("agt_02")), Mode::DialogueOnly);
+        // The refuted case: this asserted Fuse, reasoning that "a ref in MY OWN store is my own
+        // history by construction". Its own example disproves it — `origin/main` is a remote-tracking
+        // ref, i.e. exactly what `agit a fetch <remote>` writes when a teammate's copy lands here, and
+        // that copy may be a different agent entirely. Identity decides, or nothing fuses.
+        assert_eq!(merge_mode(None, None), Mode::DialogueOnly);
+    }
+
+    /// The legacy scaffold wrote `id = "unnamed-agent"` into every store on earth. If that parsed as an
+    /// identity, every pre-identity store would "be" the same agent and merge would fuse strangers.
+    #[test]
+    fn the_placeholder_id_is_not_an_identity() {
+        let store = tempfile::tempdir().unwrap();
+        let d = store.path();
+        git(d, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(d.join("agent.toml"), "[agent]\nid = \"unnamed-agent\"\n").unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "legacy"]);
+
+        assert_eq!(aid_of_store(d), None, "the placeholder must read as NO identity");
+        assert_eq!(aid_at_ref(d, "HEAD"), None, "…at a ref too");
+        assert_eq!(
+            merge_mode(aid_of_store(d).as_deref(), aid_of_store(d).as_deref()),
+            Mode::DialogueOnly,
+            "two legacy stores must NOT fuse into one memory"
+        );
+
+        // a real aid, committed in the store, is readable at any ref without a checkout
+        std::fs::write(d.join("agent.toml"), "[agent]\nid = \"agt_01J\"\nname = \"frontend\"\n").unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "identity"]);
+        assert_eq!(aid_at_ref(d, "HEAD").as_deref(), Some("agt_01J"));
+        assert_eq!(aid_of_store(d).as_deref(), Some("agt_01J"));
+    }
+
+    /// Both store layouts, and never a session's sidecars (whose parent is the id, not the runtime).
+    #[test]
+    fn only_real_sessions_of_the_named_runtime_count_as_the_tail() {
+        assert!(is_session_of("sessions/claude-code/a.jsonl", "claude-code"));
+        assert!(is_session_of("sessions/web/claude-code/a.jsonl", "claude-code"));
+        assert!(!is_session_of("sessions/codex/a.jsonl", "claude-code"), "the other runtime is not the tail");
+        assert!(!is_session_of("sessions/claude-code/a/subagents/s.jsonl", "claude-code"), "a sidecar is not a session");
+        assert!(!is_session_of("merges/a-b.md", "claude-code"));
+        assert_eq!(basename("sessions/web/codex/x.jsonl"), "x.jsonl");
+    }
+
+    /// THE silent no-op. With no merge base `git diff HEAD...peer` exits 128 printing NOTHING on
+    /// stdout, and the old code read that empty stdout as "no divergent tail" → "nothing to sync",
+    /// exit 0, did nothing — exactly the cross-agent case. Asserted against real git so the trap stays
+    /// proven, then asserted fixed.
+    #[test]
+    fn unrelated_histories_still_yield_the_peers_sessions() {
+        let store = tempfile::tempdir().unwrap();
+        let d = store.path();
+        git(d, &["init", "-q", "-b", "main", "."]);
+        std::fs::create_dir_all(d.join("sessions/claude-code")).unwrap();
+        std::fs::write(d.join("sessions/claude-code/mine.jsonl"), "{\"a\":1}\n").unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "mine"]);
+
+        // an unrelated history: no merge base, the shape a different agent's copy arrives in
+        git(d, &["checkout", "-q", "--orphan", "peer"]);
+        git(d, &["rm", "-rq", "--cached", "."]);
+        std::fs::remove_file(d.join("sessions/claude-code/mine.jsonl")).unwrap();
+        std::fs::write(d.join("sessions/claude-code/theirs.jsonl"), "{\"b\":2}\n").unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "theirs"]);
+        git(d, &["checkout", "-q", "main"]);
+
+        // the trap, demonstrated in-repo
+        assert_eq!(git(d, &["merge-base", "main", "peer"]).0, 1, "no merge base");
+        let (rc, out) = scope::git_in_status(d, &["diff", "--name-only", "HEAD...peer", "--", "sessions"]);
+        assert_eq!(rc, 128, "git changed: three-dot with no merge base used to be fatal");
+        assert!(out.is_empty(), "…and it prints NOTHING on stdout, which is what read as 'no tail'");
+
+        // the fix: the peer's session is found anyway
+        let (tail, grounded) = peer_sessions(d, &Target::Ref("peer".into()), "claude-code").unwrap();
+        assert_eq!(tail.len(), 1, "expected exactly the peer's session, got {tail:?}");
+        assert_eq!(tail[0].0, "theirs.jsonl");
+        assert_eq!(tail[0].1.trim(), "{\"b\":2}");
+        // …and NOT my own file, which two-dot lists as a deletion and `git show peer:` cannot read
+        assert!(!tail.iter().any(|(n, _)| n == "mine.jsonl"), "a path the peer deleted is not its session");
+        // an answer with no shared ancestor is never "grounded": empty here would be a failed read,
+        // and the caller must refuse to report it as agreement.
+        assert!(!grounded);
+    }
+
+    /// The other half of the same bug: an empty tail is only trustworthy when it is grounded in a shared
+    /// ancestor. Up-to-date must stay a friendly no-op, or `merge` cries wolf every time you are current.
+    #[test]
+    fn an_empty_tail_is_only_trusted_when_a_common_ancestor_grounds_it() {
+        let store = tempfile::tempdir().unwrap();
+        let d = store.path();
+        git(d, &["init", "-q", "-b", "main", "."]);
+        std::fs::create_dir_all(d.join("sessions/claude-code")).unwrap();
+        std::fs::write(d.join("sessions/claude-code/base.jsonl"), "{\"base\":1}\n").unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["branch", "uptodate"]);
+
+        let (tail, grounded) = peer_sessions(d, &Target::Ref("uptodate".into()), "claude-code").unwrap();
+        assert!(tail.is_empty(), "nothing diverged");
+        assert!(grounded, "a shared ancestor makes the empty answer the truth, not a failed read");
+    }
+
+    /// The ordinary case must keep working: a real merge base ⇒ only what the peer ADDED since it.
+    #[test]
+    fn a_related_peer_contributes_only_its_divergent_tail() {
+        let store = tempfile::tempdir().unwrap();
+        let d = store.path();
+        git(d, &["init", "-q", "-b", "main", "."]);
+        std::fs::create_dir_all(d.join("sessions/claude-code")).unwrap();
+        std::fs::write(d.join("sessions/claude-code/base.jsonl"), "{\"base\":1}\n").unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "base"]);
+
+        git(d, &["checkout", "-qb", "peer"]);
+        std::fs::write(d.join("sessions/claude-code/theirs.jsonl"), "{\"b\":2}\n").unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "theirs"]);
+        git(d, &["checkout", "-q", "main"]);
+
+        let (tail, grounded) = peer_sessions(d, &Target::Ref("peer".into()), "claude-code").unwrap();
+        assert!(grounded, "a shared ancestor grounds the answer");
+        assert_eq!(tail.len(), 1, "only the divergent tail, not the shared base: {tail:?}");
+        assert_eq!(tail[0].0, "theirs.jsonl");
+        // the shared base is common context, not something to reconcile against
+        assert!(!tail.iter().any(|(n, _)| n == "base.jsonl"));
+    }
 }
 
 #[cfg(test)]
@@ -905,7 +1397,7 @@ mod tests {
 
     #[test]
     fn the_receiver_side_does_not_claim_the_peers_tool_state() {
-        let p = relay_handoff("claude-code", "B", "B's summary");
+        let p = relay_handoff("B", "B's summary");
         // codex's framing, minus the promise that is false here: each agent sees only its own worktree
         assert!(p.contains("build on the work that has already been done and avoid duplicating work"), "{p}");
         assert!(p.contains("do NOT have access to the state of the tools B used"), "{p}");

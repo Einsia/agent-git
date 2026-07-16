@@ -553,7 +553,11 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
             // The dialogue merge is one conversation, so it acts on exactly one runtime. Resolve it
             // against the sessions actually in the store — running two LLM dialogues is not a
             // meaningful "do both", so genuine ambiguity asks instead.
-            let agent = scope::root_for(Scope::Agent)?;
+            //
+            // The RESOLVED agent's store, matching sync::run: reading the legacy `<env>/.agit/agent`
+            // here made merge demand a store nothing writes to any more, so it died with "run `agit
+            // init` first" in a repo that already had an agent selected.
+            let agent = agit::agent::resolve(None)?.store;
             let rt = session::resolve_runtime(rt.as_deref(), &session::store_runtimes(&agent), "merge")?;
             sync::run(&r, &rt, both, quick, prefer)
         }
