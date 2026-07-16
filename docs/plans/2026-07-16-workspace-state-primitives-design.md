@@ -208,22 +208,24 @@ is the dialogue orchestrator; everything else is removal + renaming + wiring ove
 - No compatibility burden — clean primitive set.
 - `resume` is the universal loader (takeover / cross-runtime / cross-env are bindings).
 - Naming principle: git terms stay bound to git; agent-semantic ops get new names.
-- `sync` interaction model: watch, interrupt only at real conflicts.
+- `sync` interaction model: watch, interrupt only at real conflicts. **Inline resolution shipped** — you decide each
+  open conflict at the prompt and the decision is recorded into the merged session.
 - **Agent State = single-layer transcript.** No structured "understanding" (rejected: lossy + maintenance burden). §6.
 - **`sync` = two live agents in dialogue** (not a mediator model, not a structured diff). Spike-verified 2026-07-16. §6.
 - Dialogue agents run **with repo/tool access** so they self-resolve by reading code; orchestrator distinguishes
   converged-clean vs open-conflict.
+- **`reconcile` and the CLAUDE.md managed block are removed** (superseded by `sync`); the mirror is now `snap`.
+- **`sync` supports claude-code and codex** (`--from codex`); both revived read-only in their own worktrees.
+- The whole CLI + Hub is now **English**.
 
 ## Open decisions
 
-1. **`sync` MVP scope** — currently takes the single *latest* session per side and claude-code only. Multi-session
-   sides and codex-side revival are follow-ups.
-2. **Name for the smart-merge op** — `sync` (shipped) / `reconcile` / `converge` (§4). Low-stakes.
-3. **`sync` directionality** — currently writes the merged resumable session on the current side only; both-branches /
-   integration-branch are follow-ups.
-4. **Inline conflict resolution** — `sync` currently *surfaces* open conflicts; letting the user decide them inline
-   (the chosen interaction model) is not yet built.
-5. **`snap` cadence** — fully automatic (version every meaningful step) vs explicit checkpoints vs hybrid.
+1. **`sync` multi-session sides** — still takes the single *latest* session per side. Multiple sessions per side
+   (which one represents "the agent", or run several dialogues) is the main remaining `sync` follow-up.
+   *(Codex-side revival is now DONE — verified codex↔codex end-to-end 2026-07-16.)*
+2. **`snap` cadence** — fully automatic (version every meaningful step) vs explicit checkpoints vs hybrid.
+3. **Integration-branch directionality** — `--both` ships; a dedicated integration-branch mode is still a maybe.
+4. **`resume`/`graph` as first-class verbs** — `sync`/`snap` shipped; the rest of the primitive set is not wired yet.
 
 ## Resolved: which code each agent sees (**two worktrees + diff**)
 
