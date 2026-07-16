@@ -2,61 +2,75 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* shadcn neutral base + agit identity: iris primary, event-kind hues for the session spine. */
+/*
+  agit·hub — "instrument panel" identity.
+  Dark-first: a deep blue-slate ground with inset "readout" wells that hold the session
+  signal. Phosphor-cyan is the one interactive accent; the event-kind hues are the SIGNAL
+  palette (the multi-hue spine is the brand). Light mode is the same instrument in daylight.
+*/
 :root {
-  --radius: 0.6rem;
+  --radius: 0.5rem;
 
-  --background: oklch(0.985 0.002 260);
-  --foreground: oklch(0.19 0.01 265);
+  /* daylight instrument */
+  --background: oklch(0.98 0.004 240);
+  --foreground: oklch(0.2 0.02 255);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.19 0.01 265);
+  --card-foreground: oklch(0.2 0.02 255);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.19 0.01 265);
-  --primary: oklch(0.53 0.22 277);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.96 0.004 265);
-  --secondary-foreground: oklch(0.25 0.01 265);
-  --muted: oklch(0.96 0.004 265);
-  --muted-foreground: oklch(0.53 0.02 265);
-  --accent: oklch(0.95 0.01 277);
-  --accent-foreground: oklch(0.3 0.05 277);
-  --destructive: oklch(0.58 0.22 25);
-  --border: oklch(0.9 0.006 265);
-  --input: oklch(0.9 0.006 265);
-  --ring: oklch(0.53 0.22 277);
+  --popover-foreground: oklch(0.2 0.02 255);
+  --primary: oklch(0.52 0.11 205);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.955 0.005 245);
+  --secondary-foreground: oklch(0.26 0.02 255);
+  --muted: oklch(0.955 0.005 245);
+  --muted-foreground: oklch(0.47 0.02 250);
+  --accent: oklch(0.93 0.02 205);
+  --accent-foreground: oklch(0.3 0.05 205);
+  --destructive: oklch(0.55 0.2 25);
+  --border: oklch(0.89 0.006 245);
+  --input: oklch(0.89 0.006 245);
+  --ring: oklch(0.52 0.11 205);
 
-  --kind-prompt: oklch(0.55 0.21 277);
-  --kind-assist: oklch(0.6 0.13 235);
-  --kind-tool: oklch(0.68 0.13 68);
-  --kind-edit: oklch(0.6 0.15 155);
-  --kind-warn: oklch(0.6 0.2 25);
+  /* readout well + its graticule gridlines (alpha baked in) */
+  --readout: oklch(0.965 0.005 240);
+  --grid: oklch(0.35 0.03 245 / 0.09);
+
+  /* signal palette */
+  --kind-prompt: oklch(0.5 0.2 285);
+  --kind-assist: oklch(0.52 0.14 240);
+  --kind-tool: oklch(0.58 0.12 65);
+  --kind-edit: oklch(0.52 0.15 152);
+  --kind-warn: oklch(0.55 0.2 25);
 }
 
 .dark {
-  --background: oklch(0.17 0.008 265);
-  --foreground: oklch(0.92 0.008 265);
-  --card: oklch(0.21 0.01 265);
-  --card-foreground: oklch(0.92 0.008 265);
-  --popover: oklch(0.21 0.01 265);
-  --popover-foreground: oklch(0.92 0.008 265);
-  --primary: oklch(0.7 0.16 278);
-  --primary-foreground: oklch(0.17 0.02 278);
-  --secondary: oklch(0.26 0.012 265);
-  --secondary-foreground: oklch(0.92 0.008 265);
-  --muted: oklch(0.26 0.012 265);
-  --muted-foreground: oklch(0.65 0.02 265);
-  --accent: oklch(0.3 0.03 278);
-  --accent-foreground: oklch(0.92 0.01 278);
-  --destructive: oklch(0.66 0.2 25);
-  --border: oklch(0.29 0.012 265);
-  --input: oklch(0.31 0.012 265);
-  --ring: oklch(0.7 0.16 278);
+  --background: oklch(0.16 0.018 250);
+  --foreground: oklch(0.92 0.012 240);
+  --card: oklch(0.194 0.019 250);
+  --card-foreground: oklch(0.92 0.012 240);
+  --popover: oklch(0.194 0.019 250);
+  --popover-foreground: oklch(0.92 0.012 240);
+  --primary: oklch(0.82 0.13 195);
+  --primary-foreground: oklch(0.16 0.03 220);
+  --secondary: oklch(0.26 0.016 250);
+  --secondary-foreground: oklch(0.92 0.012 240);
+  --muted: oklch(0.25 0.016 250);
+  --muted-foreground: oklch(0.64 0.02 245);
+  --accent: oklch(0.3 0.04 200);
+  --accent-foreground: oklch(0.92 0.02 200);
+  --destructive: oklch(0.68 0.2 25);
+  --border: oklch(0.29 0.017 250);
+  --input: oklch(0.31 0.017 250);
+  --ring: oklch(0.82 0.13 195);
 
-  --kind-prompt: oklch(0.72 0.16 278);
-  --kind-assist: oklch(0.68 0.13 235);
-  --kind-tool: oklch(0.76 0.13 70);
-  --kind-edit: oklch(0.72 0.14 158);
-  --kind-warn: oklch(0.68 0.19 25);
+  --readout: oklch(0.12 0.02 250);
+  --grid: oklch(0.7 0.04 220 / 0.1);
+
+  --kind-prompt: oklch(0.72 0.18 285);
+  --kind-assist: oklch(0.72 0.13 235);
+  --kind-tool: oklch(0.8 0.13 75);
+  --kind-edit: oklch(0.78 0.15 152);
+  --kind-warn: oklch(0.7 0.2 25);
 }
 
 @theme inline {
@@ -83,6 +97,7 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-readout: var(--readout);
 
   --color-kind-prompt: var(--kind-prompt);
   --color-kind-assist: var(--kind-assist);
@@ -91,7 +106,7 @@
   --color-kind-warn: var(--kind-warn);
 
   --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
 }
 
 * {
@@ -104,6 +119,51 @@ body {
   color: var(--foreground);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
+}
+
+/* An inset instrument screen: dark well + faint graticule + a hint of top-edge phosphor. */
+.readout {
+  background-color: var(--readout);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size:
+    100% 11px,
+    24px 100%;
+  background-position: center bottom;
+  box-shadow:
+    inset 0 1px 0 0 color-mix(in oklch, var(--primary) 22%, transparent),
+    inset 0 0 44px -22px oklch(0 0 0 / 0.7);
+}
+
+/* A signal bar glows in its own kind color (color set via text-kind-*, fill via bg-current). */
+.glow {
+  box-shadow: 0 0 7px -1px currentColor;
+}
+
+/* Instrument label: tracked uppercase mono eyebrow. */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--muted-foreground);
+}
+
+/* Power-on sweep for the hero trace: bars rise once, left to right (staggered inline). */
+@keyframes sweep {
+  from {
+    transform: scaleY(0.05);
+    opacity: 0.25;
+  }
+  to {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+.sweep > span {
+  transform-origin: bottom;
+  animation: sweep 0.45s cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
 @media (prefers-reduced-motion: reduce) {

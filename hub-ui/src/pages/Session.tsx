@@ -5,7 +5,7 @@ import { GitCompare } from "lucide-react"
 import { api } from "@/lib/api"
 import { useAsync } from "@/lib/useAsync"
 import { Crumb } from "@/components/Crumb"
-import { Spine } from "@/components/Spine"
+import { SpineReadout } from "@/components/Spine"
 import { ProvChips } from "@/components/ProvChips"
 
 export function Session() {
@@ -17,41 +17,39 @@ export function Session() {
   return (
     <div>
       <Crumb name={name} session={id} />
-      {loading && <p className="py-6 text-muted-foreground">加载中…</p>}
-      {error && <p className="py-6 text-destructive">加载失败：{error}</p>}
+      {loading && <p className="py-6 text-muted-foreground">Loading…</p>}
+      {error && <p className="py-6 text-destructive">Couldn’t load session — {error}</p>}
 
       {data && (
         <>
-          <div className="flex flex-wrap items-start justify-between gap-4">
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight">
-                会话 <span className="font-mono text-xl">{data.id}</span>
-              </h1>
-              <div className="mt-2.5">
-                <ProvChips
-                  runtime={data.runtime}
-                  model={data.model}
-                  branch={data.branch}
-                  author={data.author}
-                  when={data.when}
-                />
-              </div>
+          <div className="mb-5">
+            <span className="eyebrow">session</span>
+            <h1 className="mt-1 break-all font-mono text-xl font-bold tracking-tight">{data.id}</h1>
+            <div className="mt-2.5">
+              <ProvChips
+                runtime={data.runtime}
+                model={data.model}
+                branch={data.branch}
+                author={data.author}
+                when={data.when}
+              />
             </div>
-            <Spine spine={data.spine} height="h-6" cap={320} />
           </div>
 
+          <SpineReadout spine={data.spine} />
+
           {data.pinned && (
-            <p className="mt-4 rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
-              正在看 pin 到 <code className="font-mono">{data.pinned}</code> 的历史版本。{" "}
+            <p className="mt-4 rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
+              Viewing revision <code className="font-mono">{data.pinned}</code>.{" "}
               <Link className="text-primary hover:underline" to={`/agent/${name}/session/${id}`}>
-                回到最新
+                Back to latest
               </Link>
             </p>
           )}
 
-          <div className="mt-6 grid grid-cols-1 gap-8 md:grid-cols-[1fr_280px]">
+          <div className="mt-7 grid grid-cols-1 gap-8 md:grid-cols-[1fr_260px]">
             <div>
-              <Section title={`要它做的（${data.prompts.length}）`}>
+              <Section title={`prompts · ${data.prompts.length}`}>
                 <ul className="divide-y">
                   {data.prompts.map((p, i) => (
                     <li key={i} className="py-2 text-[0.92rem]">
@@ -61,7 +59,7 @@ export function Session() {
                 </ul>
               </Section>
 
-              <Section title="它说过的（节选）">
+              <Section title="assistant · excerpt">
                 <div className="space-y-2">
                   {data.texts.slice(-6).map((t, i) => (
                     <p
@@ -75,7 +73,7 @@ export function Session() {
               </Section>
 
               {data.files.length > 0 && (
-                <Section title="改动文件">
+                <Section title="files changed">
                   <div className="flex flex-wrap gap-1.5">
                     {data.files.map((f) => (
                       <code
@@ -91,9 +89,7 @@ export function Session() {
             </div>
 
             <aside>
-              <h3 className="mb-2 font-mono text-[0.72rem] uppercase tracking-[0.08em] text-muted-foreground">
-                revision（{data.revisions.length}）
-              </h3>
+              <h3 className="eyebrow mb-2">revisions · {data.revisions.length}</h3>
               <ul className="space-y-1.5 text-[0.8rem]">
                 {data.revisions.map((r, i) => {
                   const prev = data.revisions[i + 1]
@@ -113,7 +109,7 @@ export function Session() {
                           to={`/agent/${name}/session/${id}/diff?from=${prev.sha.slice(0, 9)}&to=${shortSha}`}
                           className="inline-flex items-center gap-1 text-[0.72rem] text-primary hover:underline"
                         >
-                          <GitCompare className="size-3" /> 与上一版 diff
+                          <GitCompare className="size-3" /> diff vs previous
                         </Link>
                       )}
                     </li>
@@ -121,13 +117,11 @@ export function Session() {
                 })}
               </ul>
 
-              <h3 className="mb-2 mt-6 font-mono text-[0.72rem] uppercase tracking-[0.08em] text-muted-foreground">
-                拉取并 resume
-              </h3>
-              <pre className="overflow-auto rounded-lg bg-muted p-3 font-mono text-[0.72rem] leading-relaxed">
+              <h3 className="eyebrow mb-2 mt-6">pull &amp; resume</h3>
+              <pre className="overflow-auto rounded-md border bg-muted p-3 font-mono text-[0.72rem] leading-relaxed">
 {`agit clone \\
   http://${location.host}/${name}.git
-agit -a reconcile origin/main`}
+agit -a sync origin/main`}
               </pre>
               <p className="mt-3 font-mono text-[0.72rem] text-muted-foreground">{data.commit.slice(0, 12)}</p>
             </aside>
@@ -141,9 +135,7 @@ agit -a reconcile origin/main`}
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="mb-6">
-      <h3 className="mb-2 font-mono text-[0.72rem] uppercase tracking-[0.08em] text-muted-foreground">
-        {title}
-      </h3>
+      <h3 className="eyebrow mb-2">{title}</h3>
       {children}
     </section>
   )

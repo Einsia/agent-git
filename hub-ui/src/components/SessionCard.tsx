@@ -5,9 +5,11 @@ import { Card } from "@/components/ui/card"
 import { Spine } from "@/components/Spine"
 import { ProvChips } from "@/components/ProvChips"
 
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
+
 export function SessionCard({ name, s }: { name: string; s: SessionSummary }) {
   return (
-    <Card className="p-4 transition-colors hover:border-primary/40">
+    <Card className="p-4 transition-colors hover:border-primary/50">
       <div className="flex items-center justify-between gap-4">
         <Link
           to={`/agent/${name}/session/${s.id}`}
@@ -19,7 +21,7 @@ export function SessionCard({ name, s }: { name: string; s: SessionSummary }) {
       </div>
 
       <div className="mt-2.5 text-[1.05rem] font-semibold leading-snug">
-        {s.title || <span className="text-muted-foreground">（无 prompt）</span>}
+        {s.title || <span className="text-muted-foreground">Untitled session</span>}
       </div>
       {s.conclusion && (
         <p className="mt-1 line-clamp-2 text-[0.92rem] text-muted-foreground">{s.conclusion}</p>
@@ -44,7 +46,8 @@ export function SessionCard({ name, s }: { name: string; s: SessionSummary }) {
           when={s.when}
         />
         <span className="ml-auto font-mono text-[0.72rem] tabular-nums text-muted-foreground">
-          {s.n_prompts} prompt · {s.n_texts} 回复 · {s.tools} 工具
+          {plural(s.n_prompts, "prompt")} · {plural(s.n_texts, "reply", "replies")} ·{" "}
+          {plural(s.tools, "tool")}
         </span>
       </div>
     </Card>

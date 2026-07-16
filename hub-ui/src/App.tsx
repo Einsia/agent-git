@@ -15,7 +15,7 @@ export default function App() {
           <Route path="/agent/:name" element={<Agent />} />
           <Route path="/agent/:name/session/:id" element={<Session />} />
           <Route path="/agent/:name/session/:id/diff" element={<Diff />} />
-          <Route path="*" element={<p className="text-muted-foreground">没找到。</p>} />
+          <Route path="*" element={<p className="text-muted-foreground">Not found.</p>} />
         </Routes>
       </Layout>
     </BrowserRouter>
