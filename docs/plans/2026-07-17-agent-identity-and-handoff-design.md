@@ -43,7 +43,7 @@ model, which in turn is what makes #1's exposure/takeover and #2's agent-to-agen
 | *Divergence between copies of an agent* | **an agent branch** (ordinary git) |
 
 **Code branches and agent branches both exist and are independent.** You can sit on code branch
-`feature-a` with agent branch `main`. `git checkout` moves one; `agit -a checkout` moves the other.
+`feature-a` with agent branch `main`. `git checkout` moves one; `agit a checkout` moves the other.
 
 ### What was wrong before (and is wrong in the code today)
 
@@ -114,7 +114,7 @@ remote = "https://hub.acme.com/api.git"
 agent = "api"        # what a FRESH clone activates — not what you have active
 ```
 
-**Resolution order for `-a` / any agent-scoped command:**
+**Resolution order for `agit a …` / any agent-scoped command:**
 
 1. `--agent <name|aid>` — per-invocation
 2. `$AGIT_AGENT` — per-shell (this is how you run two agents at once)
@@ -133,21 +133,84 @@ agent = "api"        # what a FRESH clone activates — not what you have active
 
 ## 5. Commands
 
-```
-agit init [--agent <name>] [--import]   bind/mint an agent; --import adopts a legacy .agit/agent
-agit agent list                          known agents, which are running, which is default
-agit agent use <name>                    set MY default here (a default, NOT a lock)
-agit agent add <name|url>                declare an agent in .agit.toml (clone if needed)
-agit agent new <name>                    mint a new agent (works with no remote)
-agit agent publish [--remote <url>]      push it to AgitHub; records remote in .agit.toml
-agit agent rename <old> <new>            metadata only
-agit agent show <name>                   name, aid, store, remote, sessions, environments
-agit agent rebind <name> --remote <url>  override the integrity check, deliberately
+### `-a` is gone. One namespace: `agit agent …`, alias `agit a …`
 
-agit start [--agent X] [--as claude-code|codex]   launch a session carrying that agent's context
-agit -a <git…>                            git on the resolved agent's store
-agit -a merge <ref>                       reconcile with another copy / another agent (§7)
+`-a` was a flag *before* the verb, which produced the tool's worst footgun: `agit -a commit` (agent) vs
+`agit commit -a` (code, `-a` is git's stage-all). A subcommand cannot be transposed, so the footgun dies.
+
 ```
+agit a <git…>            git, on the resolved agent's store   (agit a log / commit / push / pull)
+agit a <mgmt-verb> …     agent management (closed set, below)
+agit agent …             the long form; `a` is an alias
+agit <git…>              git, on your code repo (unchanged)
+```
+
+**Resolution:** the word after `a` is checked against a **closed, documented set** of management verbs;
+anything else is handed to git. The set is deliberately chosen to **not collide with git's namespace**:
+
+| Verb | Why not the obvious name |
+|---|---|
+| `agit a list` | — |
+| `agit a use <name>` | sets MY default here — a default, **not a lock** (§5.2) |
+| `agit a new <name>` | mint an agent; works with no remote |
+| `agit a track <name\|url>` | **not `add`** — `git add` is far too common to shadow |
+| `agit a info <name>` | **not `show`** — `git show` is a real verb |
+| `agit a rename <old> <new>` | metadata only |
+| `agit a publish [--remote <url>]` | push to AgitHub; records the remote in `.agit.toml` |
+| `agit a rebind <name> --remote <url>` | deliberately override the integrity check |
+| `agit a merge <target>` | the dialogue merge (§7) — shadows `git merge` **on purpose** |
+| `agit a import` | adopt a legacy `.agit/agent` |
+
+Everything else — `agit a log`, `agit a add -A`, `agit a commit`, `agit a push`, `agit a diff`, `agit a
+branch`, `agit a checkout` — is plain git on the store.
+
+Top level stays code-repo-shaped: `agit init`, `agit start`, `agit watch`, `agit graph`, `agit
+workspace`, `agit resume`, `agit convert`, `agit scan`, `agit adapter`, and git passthrough.
+
+### 5.1 `agit start` — the smooth path
+
+1. resolve the agent (§4)
+2. pick **its latest session from any environment** (from the store index, *not* from git-log topology:
+   `git log --name-only` prints **nothing** on a merge commit, so a log-derived leaf-finder breaks
+   exactly after a `merge`/`pull`)
+3. resolve the **runtime** (§5.3) — never assume claude
+4. rebind cwd to this repo; keep the paths it recorded elsewhere (real memory of that codebase)
+5. materialize + install (id is **always a UUID** — §9)
+6. **write the launch record** `session-id → agent` (§6)
+7. ensure this repo's watcher is running (§6)
+8. exec the runtime
+
+`agit a use X` prints the equivalent manual command, so plain `claude`/`codex` always works too.
+
+### 5.2 Two agents at once, same project
+
+`use` sets a default; it is not a lock. Selection is per-invocation:
+
+```console
+# terminal 1                    # terminal 2, same repo, same time
+$ agit start --agent frontend   $ agit start --agent api
+```
+
+`--agent` **does not** flip the default. (An earlier draft made it sticky so capture would file
+correctly — unnecessary once the launch record owns attribution, and actively wrong here: it would make
+two concurrent agents fight over one pointer.)
+
+### 5.3 Runtime parity — claude-code and codex are peers
+
+Today claude-code is hard-coded as the default in `snap`, `sync`, and `convert` (`let mut rt =
+"claude-code".to_string()`), and codex reads as an afterthought. That is a bug of framing, and it leaks
+into behaviour (`agit -a snap` silently means *claude*).
+
+**Rule: there is no default runtime.** Resolve, in order:
+
+1. `--as <rt>` / `--from <rt>` — explicit
+2. **the session's own runtime** — a session knows what produced it; `start`/`resume` continue in it
+3. the agent's sessions: exactly one runtime present → that one
+4. both present → **ask** (or take the most recent, and say which); never silently pick
+5. neither → error naming both
+
+`snap` and `watch` capture **both** runtimes (watch already does; snap must stop defaulting).
+Every user-facing list, error, and doc names them in the same breath, alphabetically: `claude-code, codex`.
 
 ### `agit start` — the smooth path
 
@@ -224,7 +287,7 @@ root-commit key when `git rev-parse --is-shallow-repository`.
 
 ## 7. Merge — always "reconcile my memory with another memory"
 
-`agit -a merge <target>` takes **another memory**. Never a code branch. (`feature-a` as an operand was
+`agit a merge <target>` takes **another memory**. Never a code branch. (`feature-a` as an operand was
 my error: one agent that worked feature-a then feature-b has *one* memory spanning both — nothing to
 reconcile, and it correctly finds no divergent tail.)
 
@@ -234,7 +297,7 @@ plumbing, and `frontend/main` also required a hidden `remote add` + `fetch` that
 whole history into this store for no reason — the agent is already on disk at `~/.agit/agents/<aid>/`).
 
 ```
-agit -a merge <X>
+agit a merge <X>
   ├─ X is a known agent name?   → that agent's store
   ├─ X is a ref in my store?    → that ref
   ├─ BOTH                       → selector; ask (scripts: --agent X / --ref X)
@@ -259,10 +322,10 @@ enumerate the peer's sessions two-dot instead, and never attempt a git merge.
 
 agit states the mode it chose:
 ```console
-$ agit -a merge origin
+$ agit a merge origin
 origin is this agent (agt_01J…) — reconciling, then merging the histories.
 
-$ agit -a merge frontend
+$ agit a merge frontend
 frontend is a different agent (agt_02X…) — reconciling by dialogue; histories stay separate.
 ```
 
@@ -284,7 +347,7 @@ nothing. Detect it (`git merge-base` rc=1) and enumerate the peer's sessions two
 $ cd ~/code/api
 $ agit agent add frontend && agit agent use frontend
 $ agit start            # carries its latest session (from ~/code/web) into api
-$ agit -a log           # one memory, two environments
+$ agit a log           # one memory, two environments
 ```
 Continuity comes from **session lineage** (the resumed session literally contains the prior
 conversation), not from branches.
@@ -389,6 +452,88 @@ Adopt, concretely:
 
 ---
 
+## 11b. UX issues to fix along the way
+
+| Issue | Fix |
+|---|---|
+| `agit init` names the agent after the directory (`web`), so everyone renames immediately | **ask**: `Agent name [web]:` — one prompt, `--agent X` to skip, non-interactive falls back to the dir name |
+| `agent track X` then `agent use X` — two commands, one intent | `track` **activates** by default (`--no-use` opts out) |
+| `-a` transposition footgun (`agit commit -a` vs `agit -a commit`) | gone — `agit a commit` (§5) |
+| `snap` silently means *claude* | no default runtime (§5.3) |
+| `merge` printed nothing until the dialogue ended (~2 min of dead air) | stream turns live (§11c) |
+| conflicts resolved via bare `print!`/`read_line`, no context | a real picker (§11c) |
+| an unresolvable codex name silently starts a fresh session, exit 0 | verify by re-resolving; never trust exit 0 (§9) |
+| `agit watch` output is invisible when piped (block-buffered, lost on SIGTERM) | flush per line |
+
+## 11c. Presentation — light TUI, not a TUI framework
+
+Constraint: **no ratatui, no alt-screen, no full-screen takeover.** agit is a git-shaped CLI; it must
+stay pipeable and scriptable. Everything below is ANSI + box-drawing + numbered pickers, degrading to
+plain text when `!stdout().is_terminal()` or `NO_COLOR` is set.
+
+**Ambiguity picker** (`merge bob` matching both an agent and a ref):
+```
+"bob" is ambiguous:
+  1) agent  bob             agt_02X…   8 sessions · last 2h ago
+  2) ref    refs/heads/bob  this agent · 3 sessions ahead
+Pick [1/2]:
+```
+
+**`agit a list`** — a table, with what's running:
+```
+  AGENT      STATUS          SESSIONS  LAST
+  frontend   ● running       11        2h ago  (here)
+  api        ● running        8        5m ago
+  infra      ·                2        5d ago
+  default: frontend
+```
+
+**`agit start`** — a header, so you always know what you're carrying:
+```
+┌ frontend · ~/code/api · claude-code
+└ carrying its latest session (from ~/code/web, 2h ago)
+    "the login form posts user_id to /api/login"
+```
+
+**`merge`** — stream the dialogue live (it takes minutes; silence reads as a hang), then a conflict
+picker with context rather than a bare prompt:
+```
+  A → I post user_id to /api/login …
+  B → CONFLICT: I renamed that field to uid …
+
+┌ conflict 1/2 ─────────────────────────────────
+│ field name: user_id (frontend) vs uid (api)
+│   1) keep uid, frontend updates its caller
+│   2) keep user_id, api reverts the rename
+│   3) leave open, decide later
+└ your call [1/2/3]:
+```
+
+Rules: colour is emphasis only (never the sole carrier of meaning); every spinner/stream line is
+`\r`-safe and flushed; anything interactive has a non-interactive counterpart that exits non-zero and
+prints what needed deciding.
+
+## 11d. AgitHub — what to fix
+
+The PRD's 权限控制 ("who can see whose agent") is a **hub** requirement, and the hub as built cannot
+express it: a token is all-or-nothing for the whole host, and reads are open by default. Ordered by
+severity:
+
+| # | Problem | Fix |
+|---|---|---|
+| 1 | **git-http bypasses auth per-repo**: the route is `path.contains(".git/")` + `GIT_HTTP_EXPORT_ALL=1`, so http-backend will serve **any** `*.git` under root once you're past the (open) read gate | authorize **the named agent** against the token's grants *before* handing off to http-backend; drop `EXPORT_ALL` |
+| 2 | **No per-agent ACL** — the PRD's core ask | grants: token → {agent, read\|write}. `agit-hub token add bob --agent frontend --write` |
+| 3 | **Reads open by default** (`--private` is opt-in) | **private by default**; `--public` is the explicit, loud opt-out. Sessions are transcripts — fail safe |
+| 4 | **Binds 0.0.0.0 by default** | bind `127.0.0.1` unless `--host` is given explicitly |
+| 5 | **No TLS** — tokens and full transcripts in cleartext | terminate TLS (or require a proxy and *refuse* to bind non-loopback without `--insecure`) |
+| 6 | **Per-IP cap keys on the raw peer IP** → behind a proxy every user shares one IP and throttles together | trusted-proxy config + `X-Forwarded-For`; keep raw-IP behaviour when no proxy is declared |
+| 7 | **Tokens never expire, can't be revoked** | TTL + `token revoke`; store `created/expires/last_used` |
+| 8 | **No audit trail** — exposure control without accountability | append-only log: who read/pushed which agent, when |
+| 9 | **Secrets gated only client-side** (a local hook, bypassable with `--no-verify`) | scan server-side on receive-pack; reject the push |
+
+(1)+(2) are the load-bearing pair: without them "who can view whose agent" has no enforcement point,
+and the answer to the PRD requirement is currently *"anyone who can reach the port."*
+
 ## 12. Cutover (hard, per decision)
 
 Nested `<env>/.agit/agent` stops resolving; `scope::STORE_PTR` + `init --store` are deleted.
@@ -404,8 +549,7 @@ exactly the one that corrupts a flat, single-env store. Land the invariants firs
    `mv` under a running daemon silently zombies it)
 6. rewrite demo + all docs + tests
 
-Legacy detection belongs in **the resolver**, so every entry point (`-a`, snap, watch, start, resume,
-merge) gives the same actionable error — not just `init`.
+Legacy detection belongs in **the resolver**, so every entry point (`agit a …`, snap, watch, start, resume, merge) gives the same actionable error — not just `init`.
 
 Honest sizing: the resolver+import+test-isolation slice is ~2–3 days. The **union** of what this doc
 requires is **3–5 weeks**.
@@ -414,9 +558,9 @@ requires is **3–5 weeks**.
 
 ## 13. Acceptance criteria
 
-1. **PRD #3** — frontend agent continues in backend: `agent add frontend && agent use frontend && start`
+1. **PRD #3** — frontend agent continues in backend: `agit a track frontend && agit start`
    carries its latest session; a later snap lands in the **same** store; both repos show one history.
-2. **PRD #2** — two agents reconcile: `agit -a merge frontend/main` runs the dialogue, leaves **both**
+2. **PRD #2** — two agents reconcile: `agit a merge frontend` runs the dialogue, leaves **both**
    agents intact, emits a resumable merged session; **fails loudly** when no merge-base exists.
 3. **PRD #1** — takeover: bob clones the code repo, `agit init` clones the declared agents from AgitHub,
    `agit start` continues alice's agent; both push to one agent and reconcile after diverging.

@@ -157,14 +157,21 @@ fn infer_runtime(text: &str) -> Option<&'static str> {
 }
 
 /// `agit convert <src> --to <rt> [--from <rt>] [--cwd P] [--write]`
-/// The install id for a materialized session: a human-readable proper name (`<branch>-<6hex>`) for a
-/// runtime that resumes by name (codex — `codex exec resume feature-a-3f9a2c`), or a fresh UUID for a
-/// runtime that requires one (claude-code rejects a non-UUID id).
-fn install_id(to_rt: &str, branch: Option<&str>, seed: &str) -> String {
-    match to_rt {
-        "codex" => crate::convo::proper_name(branch, seed),
-        _ => crate::convo::fresh_id("session"),
-    }
+/// The install id for a materialized session: **always a UUID**, for every runtime.
+///
+/// This is a regression lock, not a style choice. `codex exec resume` advertises "UUID **or thread
+/// name**", so agit briefly installed codex sessions under a proper name (`feature-a-3f9a2c`). That is
+/// broken, and it fails OPEN — verified against codex 0.144.4 with a fact only the history could know:
+///   * UUID id, file on disk, absent from codex's index → resume RECALLED the fact (codex reads the file)
+///   * proper-name id, identical file      → resume answered from thin air, ZERO history, exit 0
+/// Root cause: a non-UUID is resolved as a thread name via ~/.codex/state_5.sqlite (`threads` has
+/// id/rollout_path/title — no name column), and a file agit drops on disk is never indexed there. So a
+/// named install silently starts a FRESH session. A UUID, by contrast, is matched against the rollout
+/// files themselves and works.
+///
+/// Proper names therefore survive only as a human-facing LABEL (see convo::proper_name), never as the id.
+fn install_id(_to_rt: &str, _branch: Option<&str>, _seed: &str) -> String {
+    crate::convo::fresh_id("session")
 }
 
 pub fn convert_cmd(
@@ -539,3 +546,27 @@ pub fn resume_cmd(
     Ok(0)
 }
 
+
+#[cfg(test)]
+mod install_id_tests {
+    use super::*;
+
+    /// Regression lock. codex advertises "UUID or thread name", but a name-id install silently starts a
+    /// FRESH session (verified against codex 0.144.4: name-resume answered with zero history, exit 0).
+    /// Only a UUID is matched against the rollout files on disk. Never hand a runtime a non-UUID id.
+    #[test]
+    fn install_id_is_always_a_uuid_even_for_codex() {
+        for rt in ["codex", "claude-code"] {
+            let id = install_id(rt, Some("feature-a"), "seed-content");
+            assert!(!id.starts_with("feature-a"), "{rt}: got a proper name, not a uuid: {id}");
+            let parts: Vec<&str> = id.split('-').collect();
+            assert_eq!(parts.len(), 5, "{rt}: not uuid-shaped: {id}");
+            assert_eq!(
+                (parts[0].len(), parts[1].len(), parts[2].len(), parts[3].len(), parts[4].len()),
+                (8, 4, 4, 4, 12),
+                "{rt}: not 8-4-4-4-12: {id}"
+            );
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{rt}: non-hex: {id}");
+        }
+    }
+}
