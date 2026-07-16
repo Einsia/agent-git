@@ -1,93 +1,128 @@
-# agit 架构(session 模型)
+# agit architecture (session model)
 
-> 当前架构。之前的"两库 + 手写 fact + 确定性证据合并"(architecture-v2)已废弃。
+> The current architecture. The earlier "two repos + hand-authored facts + deterministic evidence merge" design (architecture-v2) has been retired.
 
-## 一句话
+## In one sentence
 
-**版本化对象是 agent 的原始 session。** Claude Code 自己把整个会话 dump 到
-`~/.claude/projects/<slug>/`,agit 把这坨版本化、push/pull 同步;合并交给一个 agent
-读会话来做,只有真冲突才问人。**不设计 fact、不设计 schema、最小侵入。**
+**The versioned object is the agent's raw session.** Claude Code already dumps the whole
+conversation to `~/.claude/projects/<slug>/`; agit versions that dump and syncs it with
+push/pull. Merging is delegated to the agents themselves — they revive, read the sessions
+and the code, and reconcile; only genuine conflicts are put to you. **No facts, no schema,
+minimal footprint.**
 
-## 两个 git 库 + 一个配对
+## Two git repos + one pairing
 
-| | 是什么 | 位置 |
+| | What it is | Location |
 |---|---|---|
-| **Environment** | 你的代码仓库,原封不动 | 项目根的 `.git` |
-| **Agent Store** | 独立 git 仓库,装 session dump | `.agit/agent`(gitignored) |
-| **WorkspaceRevision** | Agent↔Environment 的配对 | `.agit/workspace`(git 之外,避免递归) |
+| **Environment** | Your code repository, untouched | The project root's `.git` |
+| **Agent Store** | A separate git repo holding the session dump | `.agit/agent` (gitignored) |
+| **WorkspaceRevision** | The Agent↔Environment pairing | `.agit/workspace` (outside git, to avoid recursion) |
 
 ```
-agit <git-args>     = 透明 git 作用在 Environment
-agit -a <git-args>  = 同构 git 作用在 Agent Store
+agit <git-args>     = transparent git acting on the Environment
+agit -a <git-args>  = isomorphic git acting on the Agent Store
 ```
-scope 开关只认紧跟 agit 的第一个 token(`agit -a commit` vs `agit commit -a`)。
+The scope switch only recognizes the first token immediately after `agit`
+(`agit -a commit` vs `agit commit -a`).
 
-## Agent Store 里装什么
+## What lives in the Agent Store
 
 ```
 .agit/agent/
-  agent.toml                      Agent 身份
+  agent.toml                      Agent identity
   sessions/<runtime>/
-    <id>.jsonl                    完整转录
-    <id>/subagents,tool-results   子 agent、大工具结果
+    <id>.jsonl                    Full transcript
+    <id>/subagents,tool-results   Sub-agents, large tool results
 ```
-`agit -a sync` 把 runtime 的 session dump 目录**整棵镜像**进来。没有 `state/`、没有 fact。
+`agit -a snap` mirrors the runtime's session-dump directory **wholesale** into the store.
+No `state/`, no facts. (This mirror command was formerly named `sync`; it is now `snap`.)
 
-## 数据流
+## Data flow
 
 ```
-Claude 会话 ──dump──> ~/.claude/projects/<slug>/
-                          │  agit -a sync(镜像)
+Claude session ──dump──> ~/.claude/projects/<slug>/
+                          │  agit -a snap (mirror)
                           ▼
-                   .agit/agent/sessions/<rt>/     ──push/pull(git)──> 团队 / Hub
-                          │  agit -a reconcile <ref>
+                   .agit/agent/sessions/<rt>/     ──push/pull (git)──> team / Hub
+                          │  agit -a sync <ref>
                           ▼
-              LLM 读两边会话 brief ──> CLAUDE.md(统一上下文) + 冲突清单
+        both agents revive read-only, converse over the divergent tail
+                          ▼
+              resumable merged session  +  a list of real conflicts
 ```
 
-## 三层,注意哪层确定、哪层不确定
+The merged session is a real session, versioned like any other. You continue from it by
+resuming it in your runtime — `agit -a sync` prints the resume command (e.g.
+`claude --resume <id>` / `codex exec resume <id>`). Nothing is distilled into a `CLAUDE.md`.
 
-| 层 | 确定性? | 谁做 |
+## Three layers — mind which is deterministic and which is not
+
+| Layer | Deterministic? | Who does it |
 |---|---|---|
-| **存储 / 同步**(sync、commit、push/pull) | ✅ 确定 | git |
-| **文件层合并**(不同 uuid 的会话并排落入) | ✅ 确定 | git(无文本冲突) |
-| **语义合并 / 判冲突**(reconcile) | ❌ **不确定** | LLM(`src/llm.rs`);无后端时退回确定性机械合并 |
+| **Storage / sync** (`snap`, `commit`, `push`/`pull`) | ✅ deterministic | git |
+| **File-level merge** (sessions with distinct uuids land side by side) | ✅ deterministic | git (no text conflicts) |
+| **Semantic merge / conflict detection** (`sync`) | ❌ **non-deterministic** | live agents in dialogue + `src/llm.rs` orchestration |
 
-**关键设计:raw session 是唯一真相(git 确定性版本化);CLAUDE.md 只是可重新生成的派生视图。**
-把不确定性隔离在最上层、且产物可丢弃重建,是控制风险的主手段(见 [`风险分析.md`](风险分析.md))。
+**Key design: the raw session is the single source of truth (git versions it
+deterministically); a merge produces another resumable session, not a summary file.**
+Isolating the non-determinism in the top layer — and making its output a resumable,
+re-runnable session rather than a hand-maintained artifact — is the main lever for
+controlling risk (see [risk analysis](风险分析.md)).
 
-reconcile 有 `--dry-run`(只预览)/ `--abort` / `--continue`(文本冲突时保留合并中状态,不硬 abort);
-无可用 LLM 时退回**确定性机械合并**(离线可用,不去重/不判冲突)。
+`agit -a sync <ref>` revives **both** agents (each side's latest session) read-only, each in
+its own branch's git worktree with its own diff since the merge-base. The two agents converse
+over the divergent tail, resolving what they can by reading the code, and surface only the
+real conflicts — letting you decide each one interactively. Both claude-code and codex are
+supported (`--from codex` to revive the codex side; `--both` to write the merged session on
+both branches). Because the dialogue is driven by live runtime sessions, `sync` needs the
+relevant runtime CLI available.
 
-## LLM 后端可插拔
+## Pluggable LLM backend
 
-`src/llm.rs`:默认 `claude -p`;`AGIT_LLM=codex` 走本机 `codex exec`(**已实现**,`-o` 取干净回复);
-`AGIT_LLM_CMD` 接任意 stdin→stdout 的 CLI。所有用模型的地方(目前只有 reconcile)都走这里。
+`src/llm.rs`: defaults to `claude -p`; `AGIT_LLM=codex` shells out to the local `codex exec`
+(**implemented**, `-o` for the clean reply); `AGIT_LLM_CMD` accepts any stdin→stdout CLI.
+The model-backed steps of `sync` — the orchestrator/facilitator prompts and the synthesis of
+the RESOLVED / OPEN conflict summary — go through this backend. (The dialogue turns
+themselves are real resumed agent sessions, driven separately.)
 
-## 密钥
+## Secrets
 
-dump 全会话 = 转录里可能有 agent 见过的密钥。commit/push hook 扫 session:
-jsonl 只用**高精度规则**(AWS key/连接串/私钥/`password=`…),**关掉泛化熵检测**——否则转录里
-海量 UUID/requestId 会疯狂误报。拦不住一般性敏感内容(见风险分析 §八)。
+Dumping the whole session means the transcript may contain secrets the agent has seen. The
+commit/push hooks scan the session: for jsonl they use **high-precision rules only**
+(AWS keys, connection strings, private keys, `password=`…) and **turn off generic entropy
+detection** — otherwise the sea of UUIDs / requestIds in a transcript would flood you with
+false positives. This does not catch general sensitive content (see risk analysis §8).
 
-## 模块
+## Modules
 
-| 模块 | 职责 |
+| Module | Responsibility |
 |---|---|
-| `scope` | 双库发现、scope 路由 |
-| `passthrough` | 透明 git 透传(spawn、继承 stdio、传播退出码、post-hook 配对) |
-| `session` | `sync`(镜像) + `reconcile`(agent 合并,含 dry-run/abort/continue + 离线回退) |
-| `adapter` | session 解析(`export`→`SessionIR`),Claude 与 Codex **均已实现** |
-| `convo` / `register` | ConversationIR 无损互转 + 落进目标 runtime 供 resume(`agit convert`) |
-| `llm` | 可插拔 LLM CLI 后端(claude / codex / 任意命令) |
-| `scan` | 密钥扫描(session 模式) |
-| `environment` / `workspace` | EnvironmentState 捕获 / WorkspaceRevision 配对(真实连边 + `restore`) |
-| `commands` | scan / workspace(含 restore) / clone / convert / adapter / write_claude_block |
-| `init` | 建 Agent Store + hook |
-| `src/bin/agit-hub.rs` + `hub-ui/` | Hub:托管 + git smart-http + token 鉴权 + JSON API + 内嵌 React SPA |
+| `scope` | Dual-repo discovery, scope routing |
+| `passthrough` | Transparent git passthrough (spawn, inherit stdio, propagate exit code, post-hook pairing) |
+| `gitx` | Small git plumbing helpers shared across modules |
+| `session` | `snap` — mirror the runtime's session dump into the Agent Store |
+| `sync` | Dialogue-based agent merge (revive both sides read-only in per-branch worktrees, relay the conversation, surface + resolve real conflicts, leave a resumable merged session); claude-code + codex |
+| `adapter` | Session parsing (`export` → `SessionIR`); Claude and Codex **both implemented** |
+| `convo` / `register` | Lossless `ConversationIR` round-trip + install into a target runtime for resume (`agit convert`) |
+| `llm` | Pluggable LLM CLI backend (claude / codex / any command); drives `sync`'s orchestration + synthesis |
+| `scan` | Secret scanning (session mode) |
+| `environment` / `workspace` | `EnvironmentState` capture / `WorkspaceRevision` pairing (real edges + `restore`) |
+| `commands` | scan / workspace (incl. restore) / clone / convert / adapter |
+| `init` | Create the Agent Store + hooks |
+| `src/bin/agit-hub.rs` + `hub-ui/` | Hub: hosting + git smart-http + token auth + JSON API + embedded React SPA |
 
-## 明确不做
+## Explicitly out of scope
 
-- 手写 fact / 证据 schema / 确定性证据合并(已删)。
-- Hub 上跑 agent / 做合并(合并只在消费者本地,避免贵 + prompt 注入)。
-- 精确 replay / KV-cache 复用 / 进程快照(那是 Shepherd 的地盘,见 competitive-analysis)。
+- Hand-authored facts / an evidence schema / deterministic evidence merge (deleted).
+- Running agents or merging on the Hub (merging happens only on the consumer's machine, to
+  avoid cost + prompt injection).
+- Exact replay / KV-cache reuse / process snapshots (that is Shepherd's territory, see
+  competitive-analysis).
+
+## Roadmap (design, not all shipped)
+
+The design direction is a small primitive set — `snap` / `resume` / `sync` /
+`push`-`pull`-`clone` / `graph` — operating on Workspace State (Agent State + Environment
+State + Relations). `snap` and `sync` are shipped; `resume` (a universal loader over
+`convert`/`register`) and `graph` (the Workspace-State DAG) are still being designed. See
+[`plans/2026-07-16-workspace-state-primitives-design.md`](plans/2026-07-16-workspace-state-primitives-design.md).

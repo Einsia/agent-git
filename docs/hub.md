@@ -1,86 +1,104 @@
 # AgentGitHub Hub
 
-托管团队的 Agent Store(每个就是个 git 仓库,装原始 session),提供同步 + 网页浏览。
-一个自包含二进制 `agit-hub`:后端零重量级依赖(std TCP + shell out 到 git),
-前端是编译期嵌入的 React SPA(hub-ui/,见 [hub-ui/README](../hub-ui/README.md))。
+Hosts your team's Agent Stores (each one is a git repo holding raw sessions) and provides
+sync plus web browsing. A single self-contained binary, `agit-hub`: the backend carries no
+heavyweight dependencies (std TCP + shelling out to git), and the frontend is a React SPA
+embedded at build time (hub-ui/, see [hub-ui/README](../hub-ui/README.md)).
 
-**Hub = Registry + Sync + 只读渲染,不运行 agent、不做语义合并。**
-真正的合并在**消费者本地** `agit -a reconcile`(那里才有 LLM)。
+**Hub = Registry + Sync + read-only rendering. It does not run agents and does not do semantic merges.**
+The real merge happens locally, on the consumer, with `agit -a sync` — that is where the code and the LLM live.
 
-## 起
+## Getting started
 
 ```sh
-./build.sh ui                  # 先编前端(改过前端才需要;dist 已随仓库提交)
+./build.sh ui                  # build the frontend first (only needed if you changed it; dist is committed)
 ./build.sh --release
 
-agit-hub add payments          # 托管一个 agent(建 bare 仓库)
-agit-hub token add ci --write  # 发一个写 token —— push 必须带它(见「鉴权」)
-agit-hub serve --port 8177     # 启动;默认数据目录 ~/.agit-hub。--private 时读也要 token
+agit-hub add payments          # host an agent (creates a bare repo)
+agit-hub token add ci --write  # issue a write token — push requires one (see "Auth")
+agit-hub serve --port 8177     # start it; data dir defaults to ~/.agit-hub. With --private, reads need a token too
 ```
 
-打开 `http://<机器>:8177/`。前端会用请求的 `Host` 头拼出可直接复制的 clone 地址。
+Open `http://<host>:8177/`. The frontend uses the request's `Host` header to build a
+copy-pasteable clone URL.
 
-## 鉴权(token)
+## Auth (token)
 
-push(`git-receive-pack`)**必须**带一个写 token,否则 401 —— 这挡掉了"谁都能推、
-谁都能覆盖/污染别人会话"的口子。没配任何写 token 时,谁也不能 push(安全默认)。
+Push (`git-receive-pack`) **must** carry a write token, or it is rejected with 401 — this
+closes the "anyone can push, anyone can overwrite or poison someone else's sessions" hole.
+When no write token is configured, nobody can push (a safe default).
 
 ```sh
-agit-hub token add alice --write   # 发写 token(可 push);token 只显示一次
-agit-hub token add bob --read      # 只读 token(--private 模式下用于读)
-agit-hub token list                # 只列名字与权限,不回显 secret
+agit-hub token add alice --write   # issue a write token (can push); the token is shown only once
+agit-hub token add bob --read      # a read-only token (used for reads in --private mode)
+agit-hub token list                # lists names and permissions only, never the secret
 ```
 
-token 存在 `<root>/auth.json`。git 提示输入用户名/密码时,密码填 token(用户名随意);
-或走 `Authorization: Bearer <token>`。默认读开放;`serve --private` 时读也要有效 token。
+Tokens live in `<root>/auth.json`. When git prompts for a username/password, put the token in
+the password field (any username works); or use `Authorization: Bearer <token>`. Reads are open
+by default; with `serve --private`, reads also require a valid token.
 
-## 发布(Alice)
+## Publishing (Alice)
 
 ```sh
 cd your-repo
-agit -a sync                                   # 先把本项目的 Claude session 镜像进来
-agit -a remote add origin http://alice:<token>@<机器>:8177/payments.git
-agit -a push -u origin main                    # pre-push 先扫密钥,再走 git smart-http(带 token)
+agit -a snap                                   # mirror this project's Claude session into the store (snap --from codex for Codex)
+agit -a remote add origin http://alice:<token>@<host>:8177/payments.git
+agit -a push -u origin main                    # pre-push scans for secrets first, then git smart-http (with the token)
 ```
 
-## 消费(同事)
+## Consuming (a teammate)
 
 ```sh
-agit clone http://<机器>:8177/payments.git     # 一条命令拉团队 Agent Store
+agit clone http://<host>:8177/payments.git     # one command to pull the team's Agent Store
 agit -a fetch origin
-agit -a reconcile origin/main                  # 本地:agent 读会话、合成 CLAUDE.md,真冲突才问你
+agit -a sync origin/main                        # local: revive both agents, they reconcile by reading code, and only real conflicts prompt you — leaving a resumable merged session
 ```
 
-## 端点
+`agit -a sync` works for both claude-code and codex sessions. The dialogue and synthesis it
+runs use a local LLM backend, selected with `AGIT_LLM=claude` (default) / `AGIT_LLM=codex` /
+`AGIT_LLM_CMD="<cmd>"`.
 
-网页路由(`/`、`/agent/<name>`、`/session/<id>`、`.../diff`)全部返回同一个 SPA 外壳,
-由前端按 URL 渲染;数据从下面的 JSON API 取。
+## Endpoints
 
-| 路径 | 内容 |
+The web routes (`/`, `/agent/<name>`, `/session/<id>`, `.../diff`) all return the same SPA shell,
+which the frontend renders by URL; the data comes from the JSON API below.
+
+| Path | Content |
 |---|---|
-| `GET /` 及任意网页路由 | React SPA 外壳(`/assets/app.js` + `app.css` 编译期嵌入) |
-| `GET /api/agents` | agent 花名册:名字、session 数、最近活动、`host` |
-| `GET /api/agent/<name>?page=&q=` | 分页的会话摘要(脊线、provenance、指令、结论、改动文件)+ 提交历史 |
-| `GET /api/agent/<name>/session/<id>?at=` | 单条 session 全貌 + revision 列表(`at=` pin 到历史提交) |
-| `GET /api/agent/<name>/session/<id>/diff?from=&to=` | 两版的**语义** diff(指令/文件/结论增减,不是 jsonl 行噪声) |
-| `/<name>.git/...` | git smart-http(push/pull/clone;push 需写 token) |
+| `GET /` and any web route | React SPA shell (`/assets/app.js` + `app.css`, embedded at build time) |
+| `GET /api/agents` | agent roster: name, session count, last activity, `host` |
+| `GET /api/agent/<name>?page=&q=` | paged session summaries (spine, provenance, instructions, conclusions, changed files) + commit history |
+| `GET /api/agent/<name>/session/<id>?at=` | full view of one session + revision list (`at=` pins to a historical commit) |
+| `GET /api/agent/<name>/session/<id>/diff?from=&to=` | the **semantic** diff between two revisions (added/removed instructions/files/conclusions, not raw jsonl line noise) |
+| `/<name>.git/...` | git smart-http (push/pull/clone; push requires a write token) |
 
-**session 脊线(signature):** 每条 session 渲染成一排 tick,按事件类型(prompt/回复/工具/编辑)
-定高低与颜色 —— 一眼读出会话的节奏(工具密集?来回讨论?最后一串编辑?),数据来自 ConversationIR。
+**Session spine (signature):** each session renders as a row of ticks, with height and color set
+by event type (prompt / reply / tool / edit) — so you can read the rhythm of a session at a glance
+(tool-heavy? lots of back-and-forth? a burst of edits at the end?). The data comes from ConversationIR.
 
-**provenance:** 每条 session 显示 runtime / 模型 / 分支 / 作者 / 时间(改它的最后一次提交),
-consumer 据此判断信任、时效、相关性,再决定要不要 reconcile 进自己的 CLAUDE.md。
+**Provenance:** each session shows its runtime / model / branch / author / time (the last commit
+that touched it). A consumer uses this to judge trust, freshness, and relevance before deciding
+whether to `sync` it against their own agent branch.
 
-## 为什么 Hub 不做合并
+## Why the Hub does not merge
 
-合并要读会话、要判断语义 —— 那是 LLM 的活,得在**有代码、有模型**的消费者本地做。
-Hub 没有你的代码、按设计不跑 agent,所以只做:托管、同步、只读渲染。
-这也避免了"Hub 上跑一个 LLM 处理所有人上传的会话"这种既贵又危险(prompt 注入)的设计。
+Merging means reading the sessions and reasoning about their meaning — that is an LLM's job, and it
+belongs where the code and the model are: locally, on the consumer. `agit -a sync` revives both
+agents (each read-only in its own branch's git worktree, with its own diff), lets them talk it out
+and resolve conflicts by reading the code, and surfaces only the real conflicts for you to decide.
+The Hub has neither your code nor, by design, a running agent, so it does only three things: hosting,
+sync, and read-only rendering. This also avoids the expensive and dangerous (prompt-injection)
+design of "run one LLM on the Hub to process everyone's uploaded sessions".
 
-## 边界
+## Limits
 
-- **只读渲染**:Hub 不合并、不判冲突、不重算任何东西。合并仍在消费者本地 reconcile。
-- **不存 secret**:靠发布侧 pre-push hook 拦;但只拦已知格式(见 [风险分析](风险分析.md) §八)。
-- **鉴权粒度**:token 是全局的(写 token 能 push 任意仓库);还没有 per-agent ACL / 订阅。
-- **搜索上限**:带 `?q=` 时最多扫最近若干条 session(超出会在响应里标记,不静默截断)。
-- Windows 下 `git http-backend` 行为不同,未验证。
+- **Read-only rendering**: the Hub does not merge, does not judge conflicts, does not recompute
+  anything. Merging still happens locally on the consumer via `agit -a sync`.
+- **No secrets stored**: enforced by the publisher-side pre-push hook; but it only catches known
+  formats (see [risk analysis](风险分析.md) §8).
+- **Auth granularity**: tokens are global (a write token can push to any repo); there is no
+  per-agent ACL or subscription yet.
+- **Search cap**: with `?q=`, it scans at most the most recent N sessions (anything beyond that is
+  flagged in the response, not silently truncated).
+- `git http-backend` behaves differently on Windows; untested.
