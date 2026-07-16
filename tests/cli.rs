@@ -193,9 +193,27 @@ fn agit_a_info_is_management_while_show_stays_git() {
 fn management_verbs_are_a_closed_set_and_never_reach_git() {
     let r = Repo::new();
     for verb in ["list", "use", "new", "track", "info", "rename", "publish", "rebind", "import"] {
-        let (_, _, err) = r.agit(&["a", verb]);
-        assert!(err.contains(&format!("agit agent {verb}")), "`agit a {verb}` should be a management verb: {err}");
+        let (_, out, err) = r.agit(&["a", verb]);
+        let said = format!("{out}{err}");
+        // The invariant is that the verb is agit's, not git's. This used to assert the stub's
+        // "not implemented yet" text, which made the STUB the spec: implementing `list` broke it
+        // even though routing — the thing being guarded — was never touched.
+        assert!(
+            !said.contains("is not a git command"),
+            "`agit a {verb}` fell through to git, which is exactly what the closed set prevents: {said}"
+        );
+        assert!(
+            !said.trim().is_empty(),
+            "`agit a {verb}` said nothing at all — it must either act or explain itself"
+        );
     }
+    // The negative control, without which the assertions above pass for a build that routes NOTHING:
+    // a verb outside the closed set MUST still reach git, because `agit a <git-verb>` is the feature.
+    let (_, _, err) = r.agit(&["a", "bogusverb"]);
+    assert!(
+        err.contains("is not a git command"),
+        "a verb outside the closed set must reach git, or `agit a log` would stop working: {err}"
+    );
 }
 
 /// `-a` keeps working while the docs, demo scripts and install-shadow.sh still say it — silently.
