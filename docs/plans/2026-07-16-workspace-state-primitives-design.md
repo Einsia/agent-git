@@ -220,12 +220,16 @@ is the dialogue orchestrator; everything else is removal + renaming + wiring ove
 
 ## Open decisions
 
-1. **`sync` multi-session sides** — still takes the single *latest* session per side. Multiple sessions per side
-   (which one represents "the agent", or run several dialogues) is the main remaining `sync` follow-up.
-   *(Codex-side revival is now DONE — verified codex↔codex end-to-end 2026-07-16.)*
-2. **`snap` cadence** — fully automatic (version every meaningful step) vs explicit checkpoints vs hybrid.
-3. **Integration-branch directionality** — `--both` ships; a dedicated integration-branch mode is still a maybe.
-4. **`resume`/`graph` as first-class verbs** — `sync`/`snap` shipped; the rest of the primitive set is not wired yet.
+1. **`snap` cadence** — fully automatic (version every meaningful step) vs explicit checkpoints vs hybrid. The main
+   remaining primitive question.
+2. **Integration-branch directionality** — `--both` ships; a dedicated integration-branch mode is still a maybe.
+
+*Resolved since:* **multi-session per side** (`df3318f`) — a branch's sessions collectively represent the agent;
+`sync` resumes the richest on-branch session as the voice and briefs it on the rest (the diff stays the code
+ground-truth). Verified end-to-end: a decision from a non-voice session shaped the merge. **`resume` and `graph`
+are now first-class verbs** (`08142c2`): `agit resume <session> [--as rt] [--exec]` is the universal loader (verified
+same-runtime and cross-runtime), and `agit graph` renders the Workspace-State timeline + relation edges. **Codex-side
+`sync`** verified codex↔codex.
 
 ## Resolved: which code each agent sees (**two worktrees + diff**)
 
