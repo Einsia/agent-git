@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 pub mod adapter;
+pub mod agent;
 pub mod commands;
 pub mod convo;
 pub mod environment;

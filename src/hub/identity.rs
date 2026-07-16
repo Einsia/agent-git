@@ -29,6 +29,57 @@ pub fn parse_agent_toml(text: &str) -> Identity {
     }
 }
 
+// ─────────────────────── the aid cache: name is a label, aid is the identity ───────────────────────
+
+/// What the Hub should do with its cached aid after reading the store again.
+///
+/// The Hub keys its URLs on **name** (they have to stay readable), but a name is a mutable label:
+/// renaming must not touch the identity, and the same name coming back backed by a *different* store
+/// is a different memory wearing an old label. Everything that distinction needs is decided here —
+/// pure, so the awkward cases get tests rather than a debate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AidVerdict {
+    /// Nothing to learn (no aid in the store yet), or the cache already agrees. Leave it alone.
+    Unchanged,
+    /// First sighting of this store's identity → cache it.
+    Learn(String),
+    /// The store's aid is not the one cached under this name: the repo was deleted and recreated, or
+    /// a different store was pushed over it. **Detectable, and not silently overwritten** — the name
+    /// now points at a different memory than every `.agit.toml` that recorded this aid believes.
+    Replaced { was: String, now: String },
+    /// Another agent already holds this aid. Two agents may never share one, so refuse to cache it:
+    /// whoever got there first keeps it.
+    Conflict { aid: String, held_by: String },
+}
+
+/// Compare what the store says against what the Hub cached.
+///
+/// - `cached` — the aid in agents.json for `name` (None = never learned).
+/// - `seen`   — the aid just read out of agent.toml (None = empty repo / no identity committed).
+/// - `holder` — the agent that already has `seen` cached, if any (the uniqueness lookup).
+///
+/// `seen = None` never clears the cache: an agent whose HEAD is temporarily unreadable has not lost
+/// its identity, and forgetting it would let a *different* store slide in unnoticed afterwards.
+pub fn reconcile(name: &str, cached: Option<&str>, seen: Option<&str>, holder: Option<&str>) -> AidVerdict {
+    let Some(seen) = seen else {
+        return AidVerdict::Unchanged;
+    };
+    if cached == Some(seen) {
+        return AidVerdict::Unchanged;
+    }
+    // Uniqueness first: an aid another agent already holds is not learnable, whether this is a first
+    // sighting or a replacement. (A holder that *is* this agent is the cache we are refreshing.)
+    if let Some(h) = holder {
+        if h != name {
+            return AidVerdict::Conflict { aid: seen.to_string(), held_by: h.to_string() };
+        }
+    }
+    match cached {
+        None => AidVerdict::Learn(seen.to_string()),
+        Some(was) => AidVerdict::Replaced { was: was.to_string(), now: seen.to_string() },
+    }
+}
+
 /// aid shape gate: `agt_` + non-empty, [A-Za-z0-9-] only. This string lands in JSON and in logs, so
 /// validate it as untrusted input first.
 pub fn is_aid(s: &str) -> bool {
@@ -45,7 +96,7 @@ pub fn is_aid(s: &str) -> bool {
 /// None (and the caller then reports null rather than guessing).
 ///
 /// `section` = None means take the key from the top level (before the first `[...]`).
-fn toml_string(text: &str, section: Option<&str>, key: &str) -> Option<String> {
+pub(crate) fn toml_string(text: &str, section: Option<&str>, key: &str) -> Option<String> {
     let mut cur: Option<String> = None;
     for line in text.lines() {
         let line = strip_comment(line).trim();
@@ -78,7 +129,7 @@ fn toml_string(text: &str, section: Option<&str>, key: &str) -> Option<String> {
 }
 
 /// Drop the comment after `#`. A `#` inside quotes does not count — `id = "agt_#1"` must not be cut.
-fn strip_comment(line: &str) -> &str {
+pub(crate) fn strip_comment(line: &str) -> &str {
     let b = line.as_bytes();
     let (mut in_s, mut in_d) = (false, false);
     for i in 0..b.len() {
@@ -172,5 +223,59 @@ created = "2026-07-16T10:00:00Z"
     #[test]
     fn single_quotes_work() {
         assert_eq!(parse_agent_toml("[agent]\nid = 'agt_abc'\n"), Identity::Aid("agt_abc".into()));
+    }
+
+    // ── the aid cache ──
+
+    #[test]
+    fn first_sighting_is_learned() {
+        assert_eq!(reconcile("pay", None, Some("agt_a"), None), AidVerdict::Learn("agt_a".into()));
+    }
+
+    #[test]
+    fn agreeing_cache_is_left_alone() {
+        assert_eq!(reconcile("pay", Some("agt_a"), Some("agt_a"), Some("pay")), AidVerdict::Unchanged);
+    }
+
+    #[test]
+    fn empty_repo_never_clears_a_learned_aid() {
+        // A store whose HEAD is unreadable has not lost its identity. Clearing it would also let a
+        // different store be pushed over the name and read as a plain first sighting afterwards.
+        assert_eq!(reconcile("pay", Some("agt_a"), None, None), AidVerdict::Unchanged);
+        assert_eq!(reconcile("pay", None, None, None), AidVerdict::Unchanged);
+    }
+
+    #[test]
+    fn a_recreated_repo_is_detected_not_swallowed() {
+        // The whole point of item 1: `agit-hub` deleted + recreated under the same name is a
+        // *different memory* wearing an old label, and every .agit.toml pointing at the old aid
+        // deserves to find out.
+        assert_eq!(
+            reconcile("pay", Some("agt_old"), Some("agt_new"), None),
+            AidVerdict::Replaced { was: "agt_old".into(), now: "agt_new".into() }
+        );
+    }
+
+    #[test]
+    fn two_agents_may_never_share_an_aid() {
+        // A store cloned and pushed to a second name must not make both names claim one identity —
+        // by-aid lookup would then have no answer to give.
+        assert_eq!(
+            reconcile("copy", None, Some("agt_a"), Some("pay")),
+            AidVerdict::Conflict { aid: "agt_a".into(), held_by: "pay".into() }
+        );
+        // ...and the conflict outranks a replacement, too: stealing an aid off another agent by
+        // force-pushing over your own store is the same theft.
+        assert_eq!(
+            reconcile("copy", Some("agt_b"), Some("agt_a"), Some("pay")),
+            AidVerdict::Conflict { aid: "agt_a".into(), held_by: "pay".into() }
+        );
+    }
+
+    #[test]
+    fn holding_your_own_aid_is_not_a_conflict_with_yourself() {
+        // The uniqueness lookup finds *this* agent when refreshing its own cache — that is the
+        // normal path, not a collision.
+        assert_eq!(reconcile("pay", Some("agt_a"), Some("agt_a"), Some("pay")), AidVerdict::Unchanged);
     }
 }

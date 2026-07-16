@@ -48,11 +48,92 @@ const AGENT_MGMT_VERBS: &[&str] = &[
 ];
 
 /// Recognizing the management verbs is what keeps them away from git — `agit a info` must not become
-/// `git info` — so the routing lands and is testable ahead of the agent-identity feature that fills them in.
-fn agent_mgmt(verb: &str) -> anyhow::Result<i32> {
-    eprintln!("agit agent {verb}: not implemented yet — agent identity & handoff is still in design.");
-    eprintln!("  `agit agent …` (alias `agit a …`) runs git on the Agent Store today: agit a log · agit a add -A · agit a commit · agit a push");
-    Ok(2)
+/// `git info`.
+fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
+    use agit::agent;
+
+    // A verb whose argument is mandatory must not read a missing one as "the empty selector": every
+    // resolution rung treats blank as absent, so `agit a use` would silently act on the default.
+    let need = |what: &str| -> anyhow::Result<String> {
+        match args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            Some(a) => Ok(a.to_string()),
+            None => anyhow::bail!("agit agent {verb}: missing <{what}>\n  usage: agit a {verb} <{what}>"),
+        }
+    };
+    let flag = |f: &str| args.iter().any(|a| a == f);
+
+    match verb {
+        "list" => {
+            let agents = agent::list()?;
+            if agents.is_empty() {
+                println!("no agents yet — agit a new <name> mints one.");
+                return Ok(0);
+            }
+            let active = scope::env_root().ok().and_then(|e| agent::read_active(&e).ok().flatten());
+            let w = agents.iter().map(|a| a.name.len()).max().unwrap_or(4);
+            for a in &agents {
+                let here = if Some(&a.aid) == active.as_ref() { "●" } else { " " };
+                println!("{here} {:<w$}  {}  {}", a.name, a.aid, a.remote.as_deref().unwrap_or("—"), w = w);
+            }
+            Ok(0)
+        }
+        "info" => {
+            let a = agent::info(&need("name|aid")?)?;
+            println!("name   {}", a.name);
+            println!("aid    {}", a.aid);
+            println!("store  {}", a.store.display());
+            println!("remote {}", a.remote.as_deref().unwrap_or("— (local only; agit a publish adds one)"));
+            Ok(0)
+        }
+        "use" => {
+            let a = agent::use_agent(&need("name|aid")?)?;
+            println!("● {} ({})  — this worktree's agent", a.name, a.aid);
+            Ok(0)
+        }
+        "new" => {
+            let a = agent::new_agent(&need("name")?)?;
+            println!("minted {} ({})", a.name, a.aid);
+            println!("  store {}", a.store.display());
+            // Minting works outside a repo on purpose (identity precedes any URL), so binding is
+            // best-effort: without it `agit a new` would leave `agit start` still saying "no agent
+            // selected", which is the dead end this verb exists to end.
+            bind_and_activate(&a)?;
+            Ok(0)
+        }
+        "track" => {
+            let a = agent::track(&need("name|url")?, !flag("--no-use"))?;
+            println!("tracking {} ({})", a.name, a.aid);
+            println!("  store  {}", a.store.display());
+            Ok(0)
+        }
+        "rename" => {
+            let old = need("old-name")?;
+            let new = match args.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                Some(n) => n.to_string(),
+                None => anyhow::bail!("agit agent rename: missing <new-name>\n  usage: agit a rename <old> <new>"),
+            };
+            let a = agent::rename(&old, &new)?;
+            println!("renamed {old} → {} ({} — unchanged)", a.name, a.aid);
+            Ok(0)
+        }
+        // Still design-only. Named individually so the message cannot outlive the gap.
+        v => {
+            eprintln!("agit agent {v}: not implemented yet.");
+            eprintln!("  available: list · new · use · track · info · rename");
+            Ok(2)
+        }
+    }
+}
+
+/// Bind a freshly-minted agent to this repo and make it the active one.
+///
+/// Outside a git repo this is a no-op rather than an error: `agit a new` is explicitly allowed there.
+fn bind_and_activate(a: &agit::agent::Agent) -> anyhow::Result<()> {
+    let Ok(env) = scope::env_root() else { return Ok(()) };
+    agit::agent::bind_here(a, &env, false)?;
+    agit::agent::write_active(&env, &a.aid)?;
+    println!("  bound  .agit.toml (commit it: your team gets this agent on clone)");
+    Ok(())
 }
 
 fn dispatch(argv: Vec<String>) -> i32 {
@@ -90,6 +171,13 @@ fn dispatch(argv: Vec<String>) -> i32 {
         "--version" => {
             println!("agit {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
+        }
+
+        // ── start: the headline path — launch a real session here, already carrying the agent's
+        //    context, with no ids and no file paths typed. ──
+        "start" => {
+            let (agent, as_rt) = parse_start(args);
+            commands::start_cmd(agent.as_deref(), as_rt.as_deref())
         }
 
         // ── Native verbs that agit adds value to ──
@@ -261,7 +349,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
         },
 
         // ── Agent-store management verbs, checked before passthrough so they never reach git ──
-        v if scope == Scope::Agent && AGENT_MGMT_VERBS.contains(&v) => agent_mgmt(v),
+        v if scope == Scope::Agent && AGENT_MGMT_VERBS.contains(&v) => agent_mgmt(v, args),
 
         // ── Everything else: transparently pass through to the corresponding repo's git ──
         _ => passthrough::run(scope, rest),
@@ -276,6 +364,28 @@ fn dispatch(argv: Vec<String>) -> i32 {
     }
 }
 
+
+/// start arguments: `--agent <name|aid>` (this invocation only — it does NOT flip the default, or two
+/// agents in one repo would fight over one pointer) and `--as <runtime>`.
+fn parse_start(args: &[String]) -> (Option<String>, Option<String>) {
+    let mut agent = None;
+    let mut as_rt = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agent" if i + 1 < args.len() => {
+                agent = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--as" if i + 1 < args.len() => {
+                as_rt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    (agent, as_rt)
+}
 
 /// convert arguments: positional src + --to (required) + --from/--cwd/--write.
 /// Returns None when src or --to is missing.
@@ -393,18 +503,33 @@ fn harness_cmd(sub: &str, rt: Option<&str>, force: bool) -> anyhow::Result<i32> 
     }
 }
 
-/// Parse and run the dialogue merge (`agit a merge <ref>`, alias `sync`): positional <ref> plus
-/// --from <rt> / --both / --quick.
+/// Parse and run the dialogue merge (`agit a merge <target>`, alias `sync`): positional <target> plus
+/// --from <rt> / --both / --quick, and --agent/--ref to disambiguate the target in scripts.
+///
+/// The target is another MEMORY — an agent name or a ref — never a code branch. When a word names both,
+/// `--agent X` / `--ref X` say which without a prompt; interactively agit asks.
 fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
     let mut rt: Option<String> = None;
     let mut reference = None;
     let mut both = false;
     let mut quick = false;
+    let mut prefer = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--from" if i + 1 < args.len() => {
                 rt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            // `--agent X` / `--ref X` both name the target AND disambiguate it.
+            "--agent" if i + 1 < args.len() => {
+                reference = Some(args[i + 1].clone());
+                prefer = Some(sync::Prefer::Agent);
+                i += 2;
+            }
+            "--ref" if i + 1 < args.len() => {
+                reference = Some(args[i + 1].clone());
+                prefer = Some(sync::Prefer::Ref);
                 i += 2;
             }
             "--both" => {
@@ -430,10 +555,10 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
             // meaningful "do both", so genuine ambiguity asks instead.
             let agent = scope::root_for(Scope::Agent)?;
             let rt = session::resolve_runtime(rt.as_deref(), &session::store_runtimes(&agent), "merge")?;
-            sync::run(&r, &rt, both, quick)
+            sync::run(&r, &rt, both, quick, prefer)
         }
         None => {
-            eprintln!("usage: agit a merge <ref> [--from <runtime>] [--both] [--quick]   (reconcile this branch's agent with <ref>'s by dialogue; --quick skips the context handoff)");
+            eprintln!("usage: agit a merge <target> [--from <runtime>] [--both] [--quick]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref — --agent X / --ref X disambiguate; --quick skips the context handoff)");
             Ok(2)
         }
     }
@@ -461,7 +586,8 @@ you name with --from, else the only one present, else they ask.
   agit init [--store P]    Create an Agent Store next to the code repository (--store detaches it to P, so several repos share one agent's history)
   agit a snap [--watch]    Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store; captures every runtime with sessions here unless --from names one (--watch = auto-snap; --no-harness = sessions only)
   agit a push / pull       Sync sessions with the team (the Agent Store is just a git repo)
-  agit a merge <ref>       Merge this branch's agent with <ref>'s by dialogue (alias: sync); only real conflicts prompt you
+  agit start               Launch a session HERE already carrying this agent's latest context, from whatever repo it was last in (--agent <name> picks the agent for this invocation only; --as <rt> switches runtime)
+  agit a merge <target>    Merge this agent's memory with <target>'s by dialogue (alias: sync); <target> is an agent name or a ref — never a code branch. Same agent → the histories merge too; a different agent → dialogue only, both stay intact (--agent X / --ref X disambiguate)
   agit clone <url>         Clone the team Agent Store in one command
   agit a scan [--staged]   Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
