@@ -216,25 +216,33 @@ is the dialogue orchestrator; everything else is removal + renaming + wiring ove
 
 ## Open decisions
 
-1. **Which code does each agent see during `sync`?** *(surfaced by the first real end-to-end run, 2026-07-16.)* With
-   read-only repo access, the agents ground-truth against the **checked-out tree** — which is *one* branch's. In the
-   test, B (the rename branch) read feature-a's tree, found no `uid`, and honestly reported "no surface," because its
-   own work lived on feature-b's uncheckout branch. Options: give each agent *its own* branch's tree (two worktrees),
-   feed each side its branch **diff** as context, or accept single-tree and lean on the transcripts for the other
-   side's work. This is now the biggest open item — it decides how grounded the dialogue can be.
-2. **`sync` MVP scope** — currently takes the single *latest* session per side and claude-code only. Multi-session
+1. **`sync` MVP scope** — currently takes the single *latest* session per side and claude-code only. Multi-session
    sides and codex-side revival are follow-ups.
-3. **Name for the smart-merge op** — `sync` (shipped) / `reconcile` / `converge` (§4). Low-stakes.
-4. **`sync` directionality** — currently writes the merged resumable session on the current side only; both-branches /
+2. **Name for the smart-merge op** — `sync` (shipped) / `reconcile` / `converge` (§4). Low-stakes.
+3. **`sync` directionality** — currently writes the merged resumable session on the current side only; both-branches /
    integration-branch are follow-ups.
+4. **Inline conflict resolution** — `sync` currently *surfaces* open conflicts; letting the user decide them inline
+   (the chosen interaction model) is not yet built.
 5. **`snap` cadence** — fully automatic (version every meaningful step) vs explicit checkpoints vs hybrid.
+
+## Resolved: which code each agent sees (**two worktrees + diff**)
+
+*(Was the biggest open item; resolved and verified 2026-07-16.)* Each agent runs in **its own branch's checked-out
+tree** (a detached `git worktree` per side) and is handed **its own diff since the merge-base** as ground truth. The
+first single-tree run had B (the rename branch) read A's tree, find no `uid`, and honestly report "no surface." With
+two worktrees the second run was decisively better: each side reasoned from its real code, B caught the silent
+clean-merge hazard, A rejected a wrong fix, B retracted an unsupported claim, and they escalated two clean items.
+Robustness note learned along the way: don't derive the code branch from a single `session.gitBranch` (a session spans
+branches, and project dirs accumulate) — A comes from the live checkout, B from a session branch that *differs* from A.
+Safety verified: `--allowedTools Read Grep Glob` truly blocks writes and bash (the agents can read code, nothing else).
 
 ## Status of the build (2026-07-16)
 
-MVP `agit -a sync <ref>` shipped (`d42123b`) and verified end-to-end with real `claude`: revives both sides as fresh
-read-only copies (via the convert/register machinery — `resume` really is built on convert), runs the dialogue in the
-repo, synthesizes 已达成 / 仍需裁决, archives the transcript to `sessions/sync/`, and leaves a resumable merged session.
-The mirror command was renamed `sync`→`snap`. `reconcile` still exists (not yet removed).
+MVP `agit -a sync <ref>` shipped and verified end-to-end with real `claude` (`d42123b`, then `06d716e`): revives both
+sides as fresh read-only copies (via convert/register — `resume` really is built on convert), runs the dialogue with
+**each agent in its own branch worktree + diff**, synthesizes RESOLVED / OPEN, archives the transcript to
+`sessions/sync/`, and leaves a resumable merged session. User-facing messages are English. The mirror command was
+renamed `sync`→`snap`. `reconcile` still exists (not yet removed).
 
 ## Appendix: history
 
