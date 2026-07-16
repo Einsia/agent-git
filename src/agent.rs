@@ -750,13 +750,67 @@ fn looks_like_url(t: &str) -> bool {
     t.contains("://") || t.contains('@') || t.starts_with('/') || t.starts_with('.') || t.starts_with('~')
 }
 
+/// Transports agit will hand to `git clone`. An allowlist, because the danger is a REMOTE THIS MACHINE
+/// DID NOT CHOOSE: `.agit.toml` is committed, so `agit a track frontend` clones a URL whoever wrote the
+/// repo picked. That is code execution on `git clone` if the URL names a transport helper.
+///
+/// Verified against git 2.43: `git clone 'ext::<cmd>'` RUNS `<cmd>` — the clone then reports "Could not
+/// read from remote repository", but the payload has already executed. `--` does NOT stop it (it is a
+/// scheme, not a flag), and it is gated only by the victim's own `protocol.ext.allow`.
+const SAFE_SCHEMES: &[&str] = &["https://", "http://", "ssh://", "git://", "file://"];
+
+/// A remote agit is willing to clone. Rejects rather than sanitizes: a URL we cannot classify is one we
+/// cannot vouch for, and `track` has an obvious safe answer — make the human paste it themselves.
+fn check_remote(url: &str) -> Result<()> {
+    let u = url.trim();
+    if u.is_empty() {
+        bail!("empty remote URL");
+    }
+    // `git clone -<anything>` reads as a flag. Not currently exploitable here (the destination does not
+    // exist yet, so clone dies before `--upload-pack` runs) — but that is an accident of argument order,
+    // not a control, and it would silently become one again if the order ever changed.
+    if u.starts_with('-') {
+        bail!("refusing a remote that starts with `-` — git would read `{u}` as a flag, not a URL");
+    }
+    // Remote-helper syntax `<transport>::<address>`, which is what makes ext:: run commands. Checked
+    // before the scheme allowlist: `https://` contains no `::`, so nothing legitimate is caught here.
+    if let Some(h) = u.split("::").next().filter(|h| *h != u && !h.contains('/')) {
+        bail!(
+            "refusing the `{h}::` transport — git remote helpers run commands, and `{h}::…` would \
+             execute this machine's shell on a URL that came from {BINDING_FILE}.\n\
+             \x20      Allowed: {}, git@host:path, or a local path.",
+            SAFE_SCHEMES.join(", ")
+        );
+    }
+    let scp_like = || match u.split_once('@') {
+        // scp syntax `user@host:path` — a colon after the host, and no scheme.
+        Some((user, rest)) => !user.is_empty() && rest.contains(':') && !rest.starts_with('/'),
+        None => false,
+    };
+    let local = u.starts_with('/') || u.starts_with("./") || u.starts_with("../") || u.starts_with('~');
+    if SAFE_SCHEMES.iter().any(|s| u.starts_with(s)) || scp_like() || local {
+        return Ok(());
+    }
+    bail!(
+        "refusing a remote agit cannot classify: `{u}`\n\
+         \x20      Allowed: {}, git@host:path, or a local path.",
+        SAFE_SCHEMES.join(", ")
+    )
+}
+
 /// Clone into a temp dir first: the destination is keyed by the aid, which only the clone can tell us.
 fn clone_in(home: &Path, url: &str) -> Result<Agent> {
+    check_remote(url)?;
     let tmp = home.join("tmp").join(format!("clone-{}", convo::fresh_id(url)));
     std::fs::create_dir_all(tmp.parent().unwrap_or(home))?;
     // Inherited stdio: capturing would swallow git's errors and block credential prompts.
+    // Defence in depth behind `check_remote`: `-c` denies the command-running transports outright (a
+    // victim with `protocol.ext.allow=always` in their own gitconfig is otherwise one step from RCE),
+    // and `--` stops any future `-`-prefixed URL from being read as a flag. Neither is sufficient alone
+    // — `--` does not stop `ext::`, and the config does not stop flag smuggling.
     let ok = Command::new("git")
-        .args(["clone", "--quiet", url])
+        .args(["-c", "protocol.ext.allow=never", "-c", "protocol.fd.allow=never"])
+        .args(["clone", "--quiet", "--", url])
         .arg(&tmp)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1164,6 +1218,44 @@ agent = "frontend"        # what a FRESH clone activates
     }
 
     #[test]
+    /// The remote comes from COMMITTED .agit.toml, so it is attacker-controlled input on a repo you
+    /// merely cloned. Verified against git 2.43: `git clone 'ext::<cmd>'` executed <cmd> — the clone
+    /// then failed, but the payload had already run, and `--` did not stop it (a scheme, not a flag).
+    #[test]
+    fn a_remote_that_could_run_a_command_is_refused() {
+        for evil in [
+            "ext::sh -c touch /tmp/pwned",
+            "ext::/tmp/evil.sh",
+            "fd::7",
+            "-u",
+            "--upload-pack=touch /tmp/pwned",
+            "--template=/tmp/evil",
+            "",
+            "  ",
+        ] {
+            assert!(check_remote(evil).is_err(), "must refuse `{evil}`");
+        }
+    }
+
+    /// The refusal must not eat the remotes people actually use — a security check that blocks the
+    /// normal case gets turned off.
+    #[test]
+    fn the_remotes_people_actually_use_still_clone() {
+        for ok in [
+            "https://hub.acme.com/frontend.git",
+            "http://10.0.0.2:8080/f.git",
+            "ssh://git@github.com/me/f.git",
+            "git://example.com/f.git",
+            "file:///srv/agents/f.git",
+            "git@github.com:me/f.git",
+            "/srv/agents/f.git",
+            "./local-store",
+            "~/stores/f.git",
+        ] {
+            assert!(check_remote(ok).is_ok(), "must allow `{ok}`: {:?}", check_remote(ok).err());
+        }
+    }
+
     fn url_shapes_are_not_mistaken_for_names() {
         for u in ["https://hub/f.git", "git@github.com:me/f.git", "/srv/agents/f.git", "./f", "~/f"] {
             assert!(looks_like_url(u), "{u}");

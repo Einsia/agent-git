@@ -463,6 +463,29 @@ Adopt, concretely:
 | `agit start` leaf-finder breaks after any merge/pull | `git log -1 --name-only` prints nothing on a merge commit |
 | tests write into the developer's real `~/.agit` | `tests/cli.rs` + `tests/adapter.rs` have no `$AGIT_HOME` isolation |
 | shared store has unlocked concurrent writers | restore/record/snap all write one index+HEAD |
+| the no-tools clamp withheld nothing | `--allowedTools` is an additive GRANT; omitting it kept claude's default tools while the prompt claimed rejection |
+| a committed `.agit.toml` remote is RCE on `agit a track` | verified, git 2.43: `git clone 'ext::<cmd>'` RAN `<cmd>` |
+
+### The `.agit.toml` remote is attacker-controlled input
+
+`.agit.toml` is **committed**, so `agit a track frontend` clones a URL chosen by whoever wrote the repo
+— not by the machine running it. Clone a hostile repo, run one ordinary command, and it is code
+execution. `track`'s bare-name path passed `entry.remote` straight to `git clone` with no check at all
+(`looks_like_url` guards only the CLI path, and returns **false** for `ext::…` anyway).
+
+Verified against git 2.43 — and the obvious fix does not work:
+
+| attempt | result |
+|---|---|
+| `git clone 'ext::<cmd>'` | **`<cmd>` executed.** The clone then fails ("Could not read from remote repository") — *after* the payload has run |
+| `git clone -- 'ext::<cmd>'` | **still executed.** `--` stops flag smuggling; `ext::` is a *scheme*, not a flag |
+| `git clone '--upload-pack=<cmd>'` | not executed — but only because the destination does not exist yet, so clone dies first. An accident of argument order, not a control |
+
+So the guard is an **allowlist of transports** (`check_remote`), refusing rather than sanitizing: a URL
+agit cannot classify is one it cannot vouch for, and `track` has a safe answer — make the human paste it.
+Behind it, `-c protocol.ext.allow=never` (a victim with `protocol.ext.allow=always` in their own
+gitconfig is otherwise one step from RCE) and `--` for any future `-`-prefixed URL. Neither belt is
+sufficient alone, which is the point: `--` does not stop `ext::`, and the config does not stop flags.
 
 ---
 
