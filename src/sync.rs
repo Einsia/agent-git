@@ -42,11 +42,12 @@ pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
     let rt = normalize(runtime);
-    if rt != "claude-code" {
-        bail!("sync currently supports claude-code on both sides only (codex side is not wired yet).");
+    if rt != "claude-code" && rt != "codex" {
+        bail!("sync supports claude-code or codex on both sides (pick with --from <rt>).");
     }
-    if !which("claude") {
-        bail!("sync needs `claude` on this machine (both sides of the dialogue are real resumed claude sessions).");
+    let cli = if rt == "codex" { "codex" } else { "claude" };
+    if !which(cli) {
+        bail!("sync needs `{cli}` on this machine (both sides of the dialogue are real resumed {cli} sessions).");
     }
     if scope::git_in_status(&agent, &["rev-parse", "--verify", "--quiet", reference]).0 != 0 {
         bail!("Agent Store has no ref `{reference}`. Run `agit -a fetch <remote>` first.");
@@ -99,7 +100,7 @@ pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
     // 5–6. Dialogue → synthesize → emit → inline resolution. Worktrees must stay alive through the
     // decision turn (which resumes A in its tree), so clean them up only after this whole block.
     let result = (|| -> Result<i32> {
-        let transcript = run_dialogue(&a, &b)?;
+        let transcript = run_dialogue(&rt, &a, &b)?;
         let (resolved, open) = synthesize(&transcript)?;
         let archive = save_transcript(&agent, &rt, &a.id, &b.id, &transcript)?;
         println!("── sync result ──");
@@ -108,13 +109,13 @@ pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
         }
         println!("\nTranscript archived → {}", archive.display());
         println!("Merged state (both contexts + the reconciliation) — resume it to continue:");
-        println!("  (cd {} && claude --resume {})", env.display(), a.id);
+        println!("  {}", resume_cmd(&rt, &env, &a.id));
         if both {
             if let Err(e) = emit_both(&rt, &b, &env) {
                 eprintln!("(--both) couldn't materialize B's merged state: {e}");
             }
         }
-        resolve_inline(&a, &open)
+        resolve_inline(&rt, &a, &open)
     })();
     for wt in &worktrees {
         let _ = scope::git_in_status(&env, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
@@ -124,12 +125,12 @@ pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
 
 /// If there are open conflicts and we're at a terminal, walk the user through deciding each and record
 /// the decisions into A's session (the merged state). Non-interactive: just surface them.
-fn resolve_inline(a: &Side, open: &str) -> Result<i32> {
+fn resolve_inline(rt: &str, a: &Side, open: &str) -> Result<i32> {
     use std::io::{stdin, stdout, BufRead, IsTerminal, Write};
     let items: Vec<String> = open
         .lines()
         .map(|l| l.trim().trim_start_matches(['-', '*']).trim().to_string())
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("none") && !l.eq_ignore_ascii_case("n/a"))
         .collect();
     if items.is_empty() {
         println!("\nNothing left for you to decide.");
@@ -162,6 +163,7 @@ fn resolve_inline(a: &Side, open: &str) -> Result<i32> {
     // Bake the human's decisions into A's session so `resume` continues with them settled.
     let joined = decisions.join("\n");
     let _ = turn(
+        rt,
         &a.cwd,
         &a.id,
         &format!(
@@ -211,9 +213,9 @@ fn ground_on_worktrees(
 }
 
 /// Run the dialogue, returning the full transcript. Split out so worktree cleanup can run unconditionally.
-fn run_dialogue(a: &Side, b: &Side) -> Result<Vec<(char, String)>> {
+fn run_dialogue(rt: &str, a: &Side, b: &Side) -> Result<Vec<(char, String)>> {
     let mut transcript: Vec<(char, String)> = Vec::new();
-    let mut msg = turn(&a.cwd, &a.id, &open_prompt(&a.diff))?;
+    let mut msg = turn(rt, &a.cwd, &a.id, &open_prompt(&a.diff))?;
     println!("\nA → {msg}\n");
     transcript.push(('A', msg.clone()));
 
@@ -221,10 +223,10 @@ fn run_dialogue(a: &Side, b: &Side) -> Result<Vec<(char, String)>> {
     for _ in 0..MAX_ROUNDS {
         let bp = if first_b { relay_first(&msg, &b.diff) } else { relay(&msg) };
         first_b = false;
-        let bmsg = turn(&b.cwd, &b.id, &bp)?;
+        let bmsg = turn(rt, &b.cwd, &b.id, &bp)?;
         println!("B → {bmsg}\n");
         transcript.push(('B', bmsg.clone()));
-        let amsg = turn(&a.cwd, &a.id, &relay(&bmsg))?;
+        let amsg = turn(rt, &a.cwd, &a.id, &relay(&bmsg))?;
         println!("A → {amsg}\n");
         transcript.push(('A', amsg.clone()));
         msg = amsg;
@@ -235,9 +237,20 @@ fn run_dialogue(a: &Side, b: &Side) -> Result<Vec<(char, String)>> {
     Ok(transcript)
 }
 
+/// The command to resume a merged session, per runtime.
+fn resume_cmd(rt: &str, cwd: &Path, id: &str) -> String {
+    match rt {
+        "codex" => format!("(cd {} && codex exec resume {id})", cwd.display()),
+        _ => format!("(cd {} && claude --resume {id})", cwd.display()),
+    }
+}
+
 /// `--both`: B's session already carries the reconciliation (it took every B turn). Re-bind that merged
 /// state to the repo under a fresh id so B's branch can also resume with the combined context.
 fn emit_both(rt: &str, b: &Side, env: &Path) -> Result<()> {
+    if rt == "codex" {
+        bail!("--both is claude-code only for now");
+    }
     let path = crate::adapter::claude_code::projects_dir()?
         .join(crate::adapter::claude_code::slug_for(&b.cwd))
         .join(format!("{}.jsonl", b.id));
@@ -258,8 +271,16 @@ fn install_copy(rt: &str, src: &str, new_id: &str, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run one turn of a resumed claude session (read-only tools); return its reply text.
-fn turn(cwd: &Path, session_id: &str, prompt: &str) -> Result<String> {
+/// Run one read-only turn of a resumed session (dispatch by runtime); return its reply text.
+fn turn(rt: &str, cwd: &Path, session_id: &str, prompt: &str) -> Result<String> {
+    match rt {
+        "codex" => turn_codex(cwd, session_id, prompt),
+        _ => turn_claude(cwd, session_id, prompt),
+    }
+}
+
+/// Claude: `claude --resume <id> -p <prompt>` with read-only tools.
+fn turn_claude(cwd: &Path, session_id: &str, prompt: &str) -> Result<String> {
     let out = Command::new("claude")
         .current_dir(cwd)
         .args(["--resume", session_id, "-p", prompt, "--output-format", "json", "--allowedTools", "Read", "Grep", "Glob"])
@@ -275,6 +296,34 @@ fn turn(cwd: &Path, session_id: &str, prompt: &str) -> Result<String> {
         }
     }
     Ok(text.trim().to_string())
+}
+
+/// Codex: `codex exec --sandbox read-only … -o <file> resume <id> -` (prompt via stdin, clean reply from -o).
+fn turn_codex(cwd: &Path, session_id: &str, prompt: &str) -> Result<String> {
+    use std::io::Write as _;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let out_file = std::env::temp_dir().join(format!("agit-sync-codex-{}-{nanos}.txt", std::process::id()));
+    let mut child = Command::new("codex")
+        .current_dir(cwd)
+        .args(["exec", "--sandbox", "read-only", "--skip-git-repo-check", "--color", "never", "-o"])
+        .arg(&out_file)
+        .args(["resume", session_id, "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("failed to start `codex` (is it on PATH?)")?;
+    child.stdin.take().context("no codex stdin")?.write_all(prompt.as_bytes())?;
+    let status = child.wait()?;
+    let reply = std::fs::read_to_string(&out_file).ok();
+    let _ = std::fs::remove_file(&out_file);
+    if !status.success() {
+        bail!("`codex exec resume` exited non-zero");
+    }
+    reply.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).context("codex produced no reply")
 }
 
 const RULES: &str = "Rules: at most 4 sentences per turn; put any real conflict (something that can't both be \
@@ -400,7 +449,12 @@ fn session_branches(jsonl: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in jsonl.lines().take(400) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            if let Some(b) = v.get("gitBranch").and_then(|x| x.as_str()) {
+            // claude records "gitBranch"; codex records it under payload.git.branch (session_meta).
+            let b = v
+                .get("gitBranch")
+                .and_then(|x| x.as_str())
+                .or_else(|| v.get("payload").and_then(|p| p.get("git")).and_then(|g| g.get("branch")).and_then(|x| x.as_str()));
+            if let Some(b) = b {
                 if !b.is_empty() && seen.insert(b.to_string()) {
                     out.push(b.to_string());
                 }
