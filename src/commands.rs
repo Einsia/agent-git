@@ -318,3 +318,74 @@ pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
     Ok(0)
 }
 
+// ─────────────────────── graph: the Workspace-State timeline + relations ───────────────────────
+
+/// `agit graph` -- render the WorkspaceRevision DAG: each joint state, plus the Agent↔Environment /
+/// Agent↔Agent edges recorded at that point.
+pub fn workspace_graph() -> Result<i32> {
+    let mut revs = workspace_revisions()?;
+    if revs.is_empty() {
+        println!("No WorkspaceRevisions yet. One is generated automatically after either repo moves a ref.");
+        return Ok(0);
+    }
+    revs.reverse(); // oldest first, so the timeline reads top-to-bottom
+    let short = |s: &str| s.chars().take(9).collect::<String>();
+    println!("Workspace timeline ({} revisions, oldest first):\n", revs.len());
+    for r in &revs {
+        let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
+        let trig = r.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
+        let ar = r.get("agent_rev").and_then(|v| v.as_str()).unwrap_or("");
+        let ec = r.get("env").and_then(|e| e.get("head_commit")).and_then(|v| v.as_str()).unwrap_or("");
+        println!("● {ts}  {trig}");
+        println!("│   agent {}  ·  env {}", if ar.is_empty() { "∅".into() } else { short(ar) }, short(ec));
+        if let Some(rels) = r.get("relations").and_then(|v| v.as_array()) {
+            for e in rels {
+                if let Some(e) = e.as_str() {
+                    println!("│   ⇄ {e}");
+                }
+            }
+        }
+        println!("│");
+    }
+    Ok(0)
+}
+
+// ─────────────────────── resume: load a session into a runtime and continue ───────────────────────
+
+/// `agit resume <src-session> [--as <rt>] [--cwd <path>] [--exec]` -- the universal loader: install a
+/// session so a runtime can resume it (converting across runtimes when `--as` differs from the source),
+/// then print or (with --exec) launch the resume command. A thin, first-class wrapper over convert/register.
+pub fn resume_cmd(src: &Path, as_rt: Option<String>, cwd_override: Option<String>, exec: bool) -> Result<i32> {
+    use crate::convo::{self, ConvertOpts};
+
+    let text = std::fs::read_to_string(src)
+        .map_err(|e| anyhow::anyhow!("failed to read source session {}: {e}", src.display()))?;
+    let from = infer_runtime(&text)
+        .ok_or_else(|| anyhow::anyhow!("could not detect the source runtime; the file doesn't look like a claude-code or codex session"))?;
+    // Default target = the source runtime (a plain resume, no conversion); --as forces a different one.
+    let to = as_rt.unwrap_or_else(|| from.to_string());
+
+    let new_id = convo::fresh_id("resume");
+    let opts = ConvertOpts { cwd: cwd_override, new_id: new_id.clone() };
+    let (out, ir) = convo::convert(src, from, &to, &opts)?;
+    let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {
+        Some(c) => PathBuf::from(c),
+        None => std::env::current_dir()?,
+    };
+
+    let hits = scan::scan_text_opts(&out, false).len();
+    if hits > 0 {
+        eprintln!("  ⚠ {hits} suspected secret(s) in the materialized session -- a fresh copy of what the source saw.");
+    }
+    let h = crate::register::install(&to, &new_id, &cwd, &out)?;
+    println!("Installed → {}", h.path.display());
+    println!("Resume: {}", h.resume_cmd);
+
+    if exec {
+        println!("\nLaunching…\n");
+        let status = std::process::Command::new("sh").arg("-c").arg(&h.resume_cmd).status()?;
+        return Ok(status.code().unwrap_or(0));
+    }
+    Ok(0)
+}
+

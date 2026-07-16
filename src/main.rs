@@ -113,6 +113,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
             }
         }
         "adapter" => commands::adapter_list(),
+        "graph" => commands::workspace_graph(),
 
         // ── Convert a session across runtimes (resume it in another CLI) ──
         "convert" => match parse_convert(args) {
@@ -121,6 +122,15 @@ fn dispatch(argv: Vec<String>) -> i32 {
             }
             None => {
                 eprintln!("usage: agit convert <src-session> --to claude-code|codex [--from RT] [--cwd PATH] [--write]");
+                Ok(2)
+            }
+        },
+
+        // ── resume: load a session into a runtime and continue (the universal loader) ──
+        "resume" => match parse_resume(args) {
+            Some((src, as_rt, cwd, exec)) => commands::resume_cmd(&src, as_rt, cwd, exec),
+            None => {
+                eprintln!("usage: agit resume <src-session> [--as claude-code|codex] [--cwd PATH] [--exec]");
                 Ok(2)
             }
         },
@@ -195,6 +205,39 @@ fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
     Some((src?, from, to?, cwd, write))
 }
 
+/// resume arguments: positional src + --as <rt> / --cwd <path> / --exec. Returns None when src is missing.
+type ResumeArgs = (PathBuf, Option<String>, Option<String>, bool);
+fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
+    let mut src = None;
+    let mut as_rt = None;
+    let mut cwd = None;
+    let mut exec = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--as" => {
+                as_rt = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--cwd" => {
+                cwd = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--exec" => {
+                exec = true;
+                i += 1;
+            }
+            other => {
+                if src.is_none() && !other.starts_with('-') {
+                    src = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+        }
+    }
+    Some((src?, as_rt, cwd, exec))
+}
+
 fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {
     let mut staged = false;
     let mut paths = Vec::new();
@@ -219,8 +262,10 @@ agit — version an agent's raw session so teams can collaborate on Agent Contex
   agit -a scan [--staged]  Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
   agit workspace restore [N]  Roll both repos back together to a pairing's joint state
+  agit graph               Show the Workspace-State timeline + relation edges
   agit adapter             List runtime adapters
   agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist)
+  agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime, --exec to launch)
 
   agit <git-args>          Run git transparently on the code repository (Environment)
   agit -a <git-args>       Run isomorphic git on the Agent Store
