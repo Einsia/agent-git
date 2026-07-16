@@ -469,6 +469,7 @@ pub fn resume_cmd(
     cwd_override: Option<String>,
     env_override: Option<String>,
     exec: bool,
+    relocate: bool,
 ) -> Result<i32> {
     use crate::convo::{self, ConvertOpts};
 
@@ -502,6 +503,15 @@ pub fn resume_cmd(
         None => std::env::current_dir()?,
     };
 
+    // --relocate: rewrite the ORIGINAL environment's path prefix everywhere in the transcript (bash
+    // commands, file_paths, narrated tools), not just the session's own cwd. Only correct when the
+    // SAME project moved to a new path — pointing an agent at a different repo must keep its paths,
+    // since those are its real memory of the other codebase.
+    let out = match (relocate, ir.cwd.as_deref()) {
+        (true, Some(old)) => convo::swap_path(&out, old, &cwd.to_string_lossy()),
+        _ => out,
+    };
+
     let hits = scan::scan_text_opts(&out, false).len();
     if hits > 0 {
         eprintln!("  ⚠ {hits} suspected secret(s) in the materialized session -- a fresh copy of what the source saw.");
@@ -511,9 +521,13 @@ pub fn resume_cmd(
     if let Some(envp) = &rebound {
         let origin = ir.cwd.as_deref().unwrap_or("(unknown)");
         println!("Environment: {}  (rebound from {origin})", envp.display());
-        eprintln!(
-            "  note: only the session's own cwd is rebound — absolute paths the agent wrote inside the\n         transcript still refer to the original checkout."
-        );
+        if relocate {
+            println!("  relocated: rewrote {origin} → {} throughout the transcript", envp.display());
+        } else {
+            eprintln!(
+                "  note: the session's own cwd is rebound; paths it recorded under {origin} are kept as-is\n         (they're its memory of that codebase). Pass --relocate if this is the SAME project moved."
+            );
+        }
     }
     println!("Resume: {}", h.resume_cmd);
 

@@ -153,6 +153,18 @@ mod tests {
     const CLAUDE_SRC: &str = "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"cwd\":\"/p\",\"gitBranch\":\"main\",\"message\":{\"role\":\"user\",\"content\":\"HELLO_PROMPT\"}}\n{\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"SECRETSIG\"},{\"type\":\"text\",\"text\":\"WORLD_REPLY\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"cargo test\"}}]}}\n";
 
     #[test]
+    fn swap_path_rewrites_only_at_boundaries() {
+        let t = r#"{"cwd":"/a/app","cmd":"cd /a/app && ls","f":"/a/app/src/x.ts","other":"/a/application/y","bak":"/a/app.bak"}"#;
+        let out = swap_path(t, "/a/app", "/b/proj");
+        assert!(out.contains(r#""cwd":"/b/proj""#));
+        assert!(out.contains("cd /b/proj && ls")); // embedded in a larger string — swap_quoted misses this
+        assert!(out.contains("/b/proj/src/x.ts"));
+        // must NOT clobber a longer, different path
+        assert!(out.contains("/a/application/y"), "{out}");
+        assert!(out.contains("/a/app.bak"), "{out}");
+    }
+
+    #[test]
     fn proper_name_is_branch_slug_plus_stable_hash() {
         let n = proper_name(Some("feature/Login-Rate"), "seed-content");
         assert!(n.starts_with("feature-login-rate-"), "{n}");
@@ -248,6 +260,34 @@ pub fn sha256_hex(input: &str) -> String {
     let mut h = Sha256::new();
     h.update(input.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// Rewrite every occurrence of the path `old` to `new`, but only at a path boundary — so relocating
+/// `/a/app` never clobbers `/a/application`, and `/p.bak` isn't hit when relocating `/p`. Unlike
+/// `swap_quoted` (which only rewrites standalone `"…"` values), this also catches paths embedded in
+/// larger strings: a Bash `cd /old/x && …`, a Read `file_path`, a narrated tool line.
+/// Only for relocating the SAME project to a new path — not for pointing an agent at a different repo,
+/// where the original paths are the agent's real memory of the other codebase.
+pub fn swap_path(text: &str, old: &str, new: &str) -> String {
+    if old.is_empty() || old == new {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(old) {
+        let after = &rest[i + old.len()..];
+        // a following name char (or '.') means this is a different, longer path — leave it alone
+        let boundary = after
+            .chars()
+            .next()
+            .map(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'))
+            .unwrap_or(true);
+        out.push_str(&rest[..i]);
+        out.push_str(if boundary { new } else { old });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A human-readable session name: `<branch-slug>-<6 hex>`, e.g. `feature-a-3f9a2c`. The hash is a

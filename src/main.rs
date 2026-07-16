@@ -40,7 +40,16 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
     let result = match cmd {
         // ── Top-level native commands (independent of scope) ──
-        "init" => init::run(),
+        // `--store <path>` detaches the Agent Store from this repo so several Environments can share
+        // one agent's history (a frontend agent carrying its context into the backend repo).
+        "init" => {
+            let store = args
+                .iter()
+                .position(|a| a == "--store")
+                .and_then(|i| args.get(i + 1))
+                .cloned();
+            init::run_with_store(store)
+        }
         "clone" => match args.first() {
             Some(url) => commands::clone_agent(url),
             None => {
@@ -219,9 +228,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── resume: load a session into a runtime and continue (the universal loader) ──
         "resume" => match parse_resume(args) {
-            Some((src, as_rt, cwd, env, exec)) => commands::resume_cmd(&src, as_rt, cwd, env, exec),
+            Some((src, as_rt, cwd, env, exec, relocate)) => {
+                commands::resume_cmd(&src, as_rt, cwd, env, exec, relocate)
+            }
             None => {
-                eprintln!("usage: agit resume <src-session> [--as claude-code|codex] [--env PATH] [--cwd PATH] [--exec]");
+                eprintln!("usage: agit resume <src-session> [--as claude-code|codex] [--env PATH] [--relocate] [--cwd PATH] [--exec]");
                 Ok(2)
             }
         },
@@ -281,13 +292,14 @@ fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
 
 /// resume arguments: positional src + --as <rt> / --cwd <path> / --env <path> / --exec.
 /// Returns None when src is missing.
-type ResumeArgs = (PathBuf, Option<String>, Option<String>, Option<String>, bool);
+type ResumeArgs = (PathBuf, Option<String>, Option<String>, Option<String>, bool, bool);
 fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
     let mut src = None;
     let mut as_rt = None;
     let mut cwd = None;
     let mut env = None;
     let mut exec = false;
+    let mut relocate = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -303,6 +315,10 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
                 env = args.get(i + 1).cloned();
                 i += 2;
             }
+            "--relocate" => {
+                relocate = true;
+                i += 1;
+            }
             "--exec" => {
                 exec = true;
                 i += 1;
@@ -315,7 +331,7 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
             }
         }
     }
-    Some((src?, as_rt, cwd, env, exec))
+    Some((src?, as_rt, cwd, env, exec, relocate))
 }
 
 /// Parse and run the dialogue merge (`agit -a merge <ref>`, alias `sync`): positional <ref> plus
@@ -373,7 +389,7 @@ fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {
 const USAGE: &str = "\
 agit — version an agent's raw session so teams can collaborate on Agent Context
 
-  agit init                Create an Agent Store next to the code repository
+  agit init [--store P]    Create an Agent Store next to the code repository (--store detaches it to P, so several repos share one agent's history)
   agit -a snap [--watch]   Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store (--watch = auto-snap; --no-harness = sessions only)
   agit -a push / pull      Sync sessions with the team (the Agent Store is just a git repo)
   agit -a merge <ref>      Merge this branch's agent with <ref>'s by dialogue (alias: sync); only real conflicts prompt you
@@ -386,7 +402,7 @@ agit — version an agent's raw session so teams can collaborate on Agent Contex
   agit harness [apply]     Show, or apply, the captured harness (MCP/skills/config); apply asks first (--force to skip)
   agit adapter             List runtime adapters
   agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist; --watch auto-converts both ways in the background)
-  agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime, --env <path> to run it against a different checkout, --exec to launch)
+  agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime; --env <path> to run this agent against a different repo; --relocate if it's the same project moved; --exec to launch)
 
   agit <git-args>          Run git transparently on the code repository (Environment)
   agit -a <git-args>       Run isomorphic git on the Agent Store

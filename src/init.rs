@@ -1,16 +1,48 @@
 //! `agit init` — sets up the Agent Store and pairing infrastructure alongside the current code repo.
 
-use crate::scope::{self, AGENT_DIR};
+use crate::scope;
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Expand a leading `~/` so `--store ~/agents/foo` works.
+fn shellexpand_home(s: &str) -> String {
+    match s.strip_prefix("~/") {
+        Some(rest) => std::env::var("HOME")
+            .map(|h| format!("{h}/{rest}"))
+            .unwrap_or_else(|_| s.to_string()),
+        None => s.to_string(),
+    }
+}
+
 pub fn run() -> Result<i32> {
+    run_with_store(None)
+}
+
+/// `agit init [--store <path>]`. With `--store`, the Agent Store is **detached** from this repo: the
+/// store lives at <path> and this Environment only keeps a pointer to it (`.agit/store`). Several
+/// repos can point at the SAME store, so one agent's context carries across Environments — e.g. a
+/// frontend agent continuing its work in the backend repo, with one continuous session history.
+pub fn run_with_store(store: Option<String>) -> Result<i32> {
     let env = scope::env_root().context("agit init must be run inside a git repository (your code repo)")?;
-    let agent = env.join(AGENT_DIR);
 
     // 1. Environment side: keep .agit/ out of the code history
     ensure_gitignore(&env)?;
+
+    let (agent, detached) = match store {
+        Some(s) => {
+            let p = PathBuf::from(shellexpand_home(&s));
+            std::fs::create_dir_all(&p)
+                .with_context(|| format!("failed to create the Agent Store at {}", p.display()))?;
+            let abs = std::fs::canonicalize(&p)?;
+            std::fs::create_dir_all(env.join(".agit"))?;
+            std::fs::write(env.join(scope::STORE_PTR), format!("{}\n", abs.display()))
+                .context("failed to write the .agit/store pointer")?;
+            (abs, true)
+        }
+        // an existing pointer keeps winning, so re-running plain `agit init` doesn't silently re-attach
+        None => (scope::agent_root()?, env.join(scope::STORE_PTR).exists()),
+    };
 
     // 2. Build the Agent Store (a standalone git repo) to hold session dumps
     let fresh = !agent.join(".git").exists();
@@ -34,7 +66,11 @@ pub fn run() -> Result<i32> {
 
     println!("agit is ready.");
     println!("  Environment : {}", env.display());
-    println!("  Agent Store : {}", agent.display());
+    println!(
+        "  Agent Store : {}{}",
+        agent.display(),
+        if detached { "   (detached — this repo points at it via .agit/store)" } else { "" }
+    );
     println!();
     println!("  agit -a snap            mirror this project's session dump in (add --watch to auto-snap continuously)");
     println!("  agit -a push / pull     sync sessions with your team");

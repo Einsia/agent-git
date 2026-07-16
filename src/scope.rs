@@ -38,9 +38,31 @@ pub fn env_root() -> Result<PathBuf> {
     ))
 }
 
+/// A pointer file (in the Environment) holding the path of a DETACHED Agent Store.
+pub const STORE_PTR: &str = ".agit/store";
+
 /// The working-tree root of the Agent Store (may not exist yet).
+///
+/// Resolution order — this is what lets Agent State be **detached** from any one Environment, so a
+/// single agent's store can be shared by several code repos (e.g. a frontend agent carrying its
+/// context on into the backend repo):
+///   1. `$AGIT_AGENT_DIR`     — explicit override, for one-off/scripted use
+///   2. `<env>/.agit/store`   — pointer file written by `agit init --store <path>`
+///   3. `<env>/.agit/agent`   — the default, nested store
 pub fn agent_root() -> Result<PathBuf> {
-    Ok(env_root()?.join(AGENT_DIR))
+    if let Ok(d) = std::env::var("AGIT_AGENT_DIR") {
+        if !d.trim().is_empty() {
+            return Ok(PathBuf::from(d.trim()));
+        }
+    }
+    let env = env_root()?;
+    if let Ok(s) = std::fs::read_to_string(env.join(STORE_PTR)) {
+        let p = s.trim();
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+    Ok(env.join(AGENT_DIR))
 }
 
 pub fn workspace_dir() -> Result<PathBuf> {
