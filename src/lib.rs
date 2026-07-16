@@ -18,6 +18,7 @@ pub mod commands;
 pub mod convo;
 pub mod environment;
 pub mod gitx;
+pub mod harness;
 pub mod init;
 pub mod llm;
 pub mod passthrough;

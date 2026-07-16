@@ -75,6 +75,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
             let mut rt = "claude-code".to_string();
             let mut watch = false;
             let mut interval = 5u64;
+            let mut harness = true;
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -90,6 +91,10 @@ fn dispatch(argv: Vec<String>) -> i32 {
                         interval = args[i + 1].parse().unwrap_or(5);
                         i += 2;
                     }
+                    "--no-harness" => {
+                        harness = false;
+                        i += 1;
+                    }
                     other => {
                         // a bare positional is shorthand for the runtime: `agit -a snap codex`
                         if !other.starts_with('-') {
@@ -102,7 +107,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
             if watch {
                 session::snap_watch(&rt, interval)
             } else {
-                session::sync(&rt)
+                session::sync(&rt, harness)
             }
         }
 
@@ -269,7 +274,7 @@ const USAGE: &str = "\
 agit — version an agent's raw session so teams can collaborate on Agent Context
 
   agit init                Create an Agent Store next to the code repository
-  agit -a snap [--watch]   Mirror this project's session dump into the Agent Store (--watch = auto-snap on every change)
+  agit -a snap [--watch]   Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store (--watch = auto-snap; --no-harness = sessions only)
   agit -a push / pull      Sync sessions with the team (the Agent Store is just a git repo)
   agit -a sync <ref>       Merge this branch's agent with <ref>'s agent by dialogue; only real conflicts prompt you
   agit clone <url>         Clone the team Agent Store in one command

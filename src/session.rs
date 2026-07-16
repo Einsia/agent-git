@@ -33,7 +33,8 @@ fn source_dir(runtime: &str, cwd: &Path) -> Result<PathBuf> {
 }
 
 /// `agit -a snap [--from <runtime>]` — mirror the runtime's session dump into the Agent Store, once.
-pub fn sync(runtime: &str) -> Result<i32> {
+/// `capture_harness` also captures the project's MCP/skills/config (redacting secrets); `--no-harness` skips it.
+pub fn sync(runtime: &str, capture_harness: bool) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
     let rt = normalize(runtime);
@@ -47,6 +48,26 @@ pub fn sync(runtime: &str) -> Result<i32> {
         eprintln!("  ⚠ Found {hits} likely secrets — the session transcript carries sensitive content the agent has seen.");
         eprintln!("     This will be blocked again before push; run `agit -a scan` first to check, or clear it from the transcript.");
     }
+
+    // Capture the harness (MCP servers / skills / config) alongside the sessions, redacting secrets.
+    if capture_harness {
+        match crate::harness::capture(&agent, &env, &rt) {
+            Ok(r) if r.files > 0 => {
+                println!(
+                    "  harness: {} files ({} secret field(s) redacted)",
+                    r.files,
+                    r.redactions.len()
+                );
+                for w in &r.warnings {
+                    eprintln!("  ⚠ {w}");
+                }
+            }
+            Ok(_) => {}
+            // Harness capture must never fail the snap — the session dump is already mirrored.
+            Err(e) => eprintln!("  ⚠ harness capture skipped: {e:#}"),
+        }
+    }
+
     println!("\n  Commit: agit -a add -A && agit -a commit -m 'snap {rt} sessions'");
     Ok(0)
 }
