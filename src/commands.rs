@@ -362,6 +362,67 @@ pub fn workspace_graph() -> Result<i32> {
 
 // ─────────────────────── resume: load a session into a runtime and continue ───────────────────────
 
+/// Convert a session file to runtime `to` and install it into that runtime's native store so it can be
+/// resumed. Returns the resume handle. Shared by `convert --write`, `resume`, and the auto-convert worker.
+pub fn materialize(src: &Path, from: &str, to: &str, cwd_override: Option<String>) -> Result<crate::register::ResumeHandle> {
+    use crate::convo::{self, ConvertOpts};
+    let text = std::fs::read_to_string(src)?;
+    let new_id = install_id(to, convo::peek_branch(&text).as_deref(), &text);
+    let opts = ConvertOpts { cwd: cwd_override, new_id: new_id.clone() };
+    let (out, ir) = convo::convert(src, from, to, &opts)?;
+    let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {
+        Some(c) => PathBuf::from(c),
+        None => std::env::current_dir()?,
+    };
+    crate::register::install(to, &new_id, &cwd, &out)
+}
+
+/// `agit convert --watch [--interval N]` — the auto-convert background worker. Watches the Agent Store's
+/// per-runtime session trees and, for each session not yet mirrored into the OTHER runtime, converts and
+/// installs it under its proper name — so any captured session is immediately resumable in either CLI
+/// (`codex exec resume <name>` / `claude --resume <id>`). Conversion is a pure deterministic transform
+/// (no model calls). Ctrl-C to stop.
+pub fn convert_watch(interval_secs: u64) -> Result<i32> {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    let agent = crate::scope::root_for(crate::scope::Scope::Agent)?;
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let pairs = [("claude-code", "codex"), ("codex", "claude-code")];
+    let mut seen: HashSet<String> = HashSet::new();
+    println!(
+        "Auto-converting sessions both ways (claude-code ↔ codex) every {}s. Ctrl-C to stop.",
+        interval.as_secs()
+    );
+    loop {
+        for (from, to) in pairs {
+            let dir = agent.join("sessions").join(from);
+            let files = walkdir::WalkDir::new(&dir)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false));
+            for e in files {
+                let content = match std::fs::read_to_string(e.path()) {
+                    Ok(c) if !c.trim().is_empty() => c,
+                    _ => continue,
+                };
+                // key on source content — a session already converted (unchanged) is skipped; once
+                // marked seen (even on error) it won't spin re-attempting the same input.
+                let key = format!("{from}->{to}:{}", &crate::convo::sha256_hex(&content)[..16]);
+                if !seen.insert(key) {
+                    continue;
+                }
+                match materialize(e.path(), from, to, None) {
+                    Ok(h) => println!("  ● {from}→{to}  {}", h.resume_cmd),
+                    Err(err) => eprintln!("  ⚠ {from}→{to} {}: {err:#}", e.file_name().to_string_lossy()),
+                }
+            }
+        }
+        std::thread::sleep(interval);
+    }
+}
+
 /// `agit resume <src-session> [--as <rt>] [--cwd <path>] [--exec]` -- the universal loader: install a
 /// session so a runtime can resume it (converting across runtimes when `--as` differs from the source),
 /// then print or (with --exec) launch the resume command. A thin, first-class wrapper over convert/register.

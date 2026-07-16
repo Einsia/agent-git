@@ -152,13 +152,22 @@ fn dispatch(argv: Vec<String>) -> i32 {
             }
         }
 
-        // ── Convert a session across runtimes (resume it in another CLI) ──
+        // ── Convert a session across runtimes (resume it in another CLI); --watch = auto-convert worker ──
+        "convert" if args.iter().any(|a| a == "--watch") => {
+            let interval = args
+                .iter()
+                .position(|a| a == "--interval")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5);
+            commands::convert_watch(interval)
+        }
         "convert" => match parse_convert(args) {
             Some((src, from, to, cwd, write)) => {
                 commands::convert_cmd(&src, from, &to, cwd, write)
             }
             None => {
-                eprintln!("usage: agit convert <src-session> --to claude-code|codex [--from RT] [--cwd PATH] [--write]");
+                eprintln!("usage: agit convert <src-session> --to claude-code|codex [--from RT] [--cwd PATH] [--write]  (or --watch [--interval N] to auto-convert both ways)");
                 Ok(2)
             }
         },
@@ -324,7 +333,7 @@ agit — version an agent's raw session so teams can collaborate on Agent Contex
   agit graph               Show the Workspace-State timeline + relation edges
   agit harness [apply]     Show, or apply, the captured harness (MCP/skills/config); apply asks first (--force to skip)
   agit adapter             List runtime adapters
-  agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist)
+  agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist; --watch auto-converts both ways in the background)
   agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime, --exec to launch)
 
   agit <git-args>          Run git transparently on the code repository (Environment)
