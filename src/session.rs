@@ -77,18 +77,51 @@ pub fn sync(runtime: &str, capture_harness: bool) -> Result<i32> {
 fn mirror_once(rt: &str, env: &Path, agent: &Path) -> Result<(Stats, String, usize, PathBuf)> {
     let dst = agent.join(SESSIONS_SUBDIR).join(rt);
     std::fs::create_dir_all(&dst)?;
-    // Runtimes differ in storage model: Claude splits directories by project slug (mirror the whole tree);
-    // Codex splits by date with all projects mixed (filter this project's rollouts by session_meta.cwd).
+    // Runtimes differ in storage model, but the ownership rule is the same for both: mirror ONLY this
+    // project's sessions, decided by the cwd recorded in the transcript. Claude splits by project slug
+    // (which collides — see claude_collect); Codex splits by date with all projects mixed.
     let (stats, source_desc) = match rt {
-        "claude-code" => {
-            let src = source_dir(rt, env)?;
-            (mirror(&src, &dst)?, src.display().to_string())
-        }
+        "claude-code" => claude_collect(env, &dst)?,
         "codex" => codex_collect(env, &dst)?,
         other => bail!("session dump for runtime `{other}` isn't wired up yet (see src/session.rs)"),
     };
     let hits = crate::scan::scan_tree(&dst)?;
     Ok((stats, source_desc, hits, dst))
+}
+
+/// Claude capture: mirror only the sessions this project owns out of `~/.claude/projects/<slug>/`.
+///
+/// `slug_for` collapses every non-alphanumeric char, so `/a/b.c`, `/a/b-c` and `/a/b/c` all share ONE
+/// slug directory. Tree-mirroring it copied a *different* project's transcripts into this Agent Store,
+/// and a push then shipped them to this project's teammates. Ownership comes from each transcript's
+/// launch cwd (`claude_code::project_sessions`), so a colliding neighbour is skipped.
+fn claude_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
+    let src = source_dir("claude-code", env)?;
+    let owned = claude_code::project_sessions(env);
+    let mut stats = Stats::default();
+    for (path, id) in &owned {
+        copy_if_changed(path, &dst.join(format!("{id}.jsonl")), &mut stats)?;
+        // a session's sidecars (subagents/, tool-results/) live under a dir named for its id
+        let side = src.join(id);
+        if side.is_dir() {
+            let s = mirror(&side, &dst.join(id))?;
+            stats.total += s.total;
+            stats.added += s.added;
+            stats.updated += s.updated;
+            stats.bytes += s.bytes;
+        }
+    }
+    // `memory/` hangs off the slug, not off any session, so under a collision it belongs to nobody in
+    // particular and cannot be attributed. Carry it only when we have the slug dir to ourselves.
+    let mem = src.join("memory");
+    if mem.is_dir() && claude_code::slug_dir_is_exclusive(env) {
+        let s = mirror(&mem, &dst.join("memory"))?;
+        stats.total += s.total;
+        stats.added += s.added;
+        stats.updated += s.updated;
+        stats.bytes += s.bytes;
+    }
+    Ok((stats, format!("{} ({} owned sessions)", src.display(), owned.len())))
 }
 
 /// `agit -a snap --watch [--interval N]` — **fully automatic snap**: watch the runtime's session dump and,
@@ -184,6 +217,7 @@ fn normalize(runtime: &str) -> String {
     }
 }
 
+#[derive(Default)]
 struct Stats {
     total: usize,
     added: usize,
@@ -194,30 +228,39 @@ struct Stats {
 /// Codex sync: scan ~/.codex/sessions and flatten only **this project's** rollouts
 /// (session_meta.cwd == env root) into dst/<id>.jsonl. Filtering by cwd is a privacy
 /// bottom line — never pull in another project's sessions.
-fn codex_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
-    let rollouts = crate::adapter::codex::project_rollouts(env);
-    let mut st = Stats { total: 0, added: 0, updated: 0, bytes: 0 };
-    for (src, id) in &rollouts {
-        let dp = dst.join(format!("{id}.jsonl"));
-        let smeta = std::fs::metadata(src)?;
-        match std::fs::metadata(&dp) {
-            Err(_) => {
-                std::fs::copy(src, &dp)?;
-                st.added += 1;
-            }
-            Ok(dmeta) => {
-                let newer = match (smeta.modified(), dmeta.modified()) {
-                    (Ok(s), Ok(d)) => s > d,
-                    _ => true,
-                };
-                if dmeta.len() != smeta.len() || newer {
-                    std::fs::copy(src, &dp)?;
-                    st.updated += 1;
-                }
+/// Copy one file if the destination is missing, a different size, or older. Shared by both runtimes'
+/// collectors. Missing mtimes are treated as "re-copy", which is the conservative direction.
+fn copy_if_changed(src: &Path, dp: &Path, st: &mut Stats) -> Result<()> {
+    if let Some(parent) = dp.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let smeta = std::fs::metadata(src)?;
+    match std::fs::metadata(dp) {
+        Err(_) => {
+            std::fs::copy(src, dp)?;
+            st.added += 1;
+        }
+        Ok(dmeta) => {
+            let newer = match (smeta.modified(), dmeta.modified()) {
+                (Ok(s), Ok(d)) => s > d,
+                _ => true,
+            };
+            if dmeta.len() != smeta.len() || newer {
+                std::fs::copy(src, dp)?;
+                st.updated += 1;
             }
         }
-        st.total += 1;
-        st.bytes += smeta.len();
+    }
+    st.total += 1;
+    st.bytes += smeta.len();
+    Ok(())
+}
+
+fn codex_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
+    let rollouts = crate::adapter::codex::project_rollouts(env);
+    let mut st = Stats::default();
+    for (src, id) in &rollouts {
+        copy_if_changed(src, &dst.join(format!("{id}.jsonl")), &mut st)?;
     }
     let root = crate::adapter::codex::sessions_root()
         .map(|r| r.display().to_string())
@@ -413,4 +456,69 @@ pub fn watch_status() -> Result<i32> {
         _ => println!("agit watch is not running for this project."),
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod claude_ownership_tests {
+    use super::*;
+
+    /// The leak this fix exists for: `/tmp/<x>/proj-a` and `/tmp/<x>/proj.a` collapse to ONE claude slug
+    /// dir, so snapping project A used to mirror B's transcript into A's store (and push it to A's team).
+    #[test]
+    fn snap_only_takes_sessions_this_project_owns() {
+        let home = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let a = base.path().join("proj-a"); // → slug -tmp-…-proj-a
+        let b = base.path().join("proj.a"); // → slug -tmp-…-proj-a  (SAME)
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        assert_eq!(
+            claude_code::slug_for(&a),
+            claude_code::slug_for(&b),
+            "test is meaningless unless the two paths really collide"
+        );
+
+        // one shared slug dir holding a transcript from each project, plus one with no cwd at all
+        let slug_dir = home.path().join(".claude/projects").join(claude_code::slug_for(&a));
+        std::fs::create_dir_all(&slug_dir).unwrap();
+        let rec = |cwd: &std::path::Path, msg: &str| {
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"s\",\"cwd\":\"{}\",\"message\":{{\"content\":\"{msg}\"}}}}\n",
+                cwd.display()
+            )
+        };
+        std::fs::write(slug_dir.join("mine.jsonl"), rec(&a, "mine")).unwrap();
+        std::fs::write(slug_dir.join("theirs.jsonl"), rec(&b, "SECRET_OF_B")).unwrap();
+        // drift: launch cwd is A, later records cd into a subdir → still A's
+        std::fs::write(
+            slug_dir.join("drift.jsonl"),
+            rec(&a, "start") + &rec(&a.join("sub"), "after cd"),
+        )
+        .unwrap();
+        std::fs::write(slug_dir.join("nocwd.jsonl"), "{\"type\":\"queue-operation\"}\n").unwrap();
+
+        temp_env(home.path(), || {
+            let owned: Vec<String> = claude_code::project_sessions(&a).into_iter().map(|(_, id)| id).collect();
+            assert!(owned.contains(&"mine.jsonl".replace(".jsonl", "")), "own session must be captured");
+            assert!(owned.contains(&"drift".to_string()), "cd-drift must not lose ownership");
+            assert!(!owned.contains(&"theirs".to_string()), "LEAK: captured the colliding project's session");
+            assert!(!owned.contains(&"nocwd".to_string()), "unattributable transcript must fail closed");
+            // memory/ is slug-level: unattributable while a foreign session shares the dir
+            assert!(!claude_code::slug_dir_is_exclusive(&a), "a foreign session shares this slug");
+        });
+    }
+
+    /// $HOME drives claude's projects dir; set it only for the closure. Serialized because it is process-global.
+    fn temp_env(home: &Path, f: impl FnOnce()) {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home);
+        f();
+        match old {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 }

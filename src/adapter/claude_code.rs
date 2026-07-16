@@ -29,6 +29,85 @@ pub fn projects_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".claude/projects"))
 }
 
+/// A transcript's owning project = the **launch cwd**: the first record that carries one. Claude derives
+/// the slug from exactly that, and it is the only cwd that identifies the project.
+///
+/// Deliberately NOT codex's rule (`id_if_owned`: every recorded cwd must match, else drop the file).
+/// Claude records `cwd` on *every* record, so one `cd` by the agent makes later records carry a
+/// subdirectory. Measured on 1013 real transcripts here: 9 drift across several cwds — including this
+/// repo's own session (`/home/user/agent-git` then `/home/user/agent-git/hub-ui`). An all-must-match
+/// rule would silently stop capturing them. Reads line by line and stops at the first cwd.
+fn launch_cwd(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(f).lines() {
+        let Ok(line) = line else { break };
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue; // leading records may be queue-operations / non-JSON
+        };
+        if let Some(c) = rec.get("cwd").and_then(|v| v.as_str()) {
+            if !c.is_empty() {
+                return Some(c.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The claude sessions that belong to `env`: (transcript path, session id). The id is the file stem, so
+/// callers can carry each session's sidecar dirs (`<id>/subagents`, `<id>/tool-results`) along with it.
+///
+/// The privacy bottom line, symmetric with `codex::project_rollouts`: `slug_for` collapses every
+/// non-alphanumeric char, so `/a/b.c` and `/a/b/c` share ONE `projects/<slug>/` directory — which can
+/// therefore hold a *different* project's transcripts. Mirroring the directory wholesale would copy them
+/// into this project's Agent Store and push them to this project's teammates. A transcript with no cwd
+/// at all is **not** owned (fail closed): better to miss a capture than to leak someone else's work.
+pub fn project_sessions(env: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(dir) = projects_dir().map(|d| d.join(slug_for(env))) else {
+        return vec![];
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return vec![];
+    };
+    let want = env.to_string_lossy();
+    let mut out = vec![];
+    for e in rd.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if !p.is_file() || p.extension().map(|x| x != "jsonl").unwrap_or(true) {
+            continue;
+        }
+        if launch_cwd(&p).as_deref() != Some(&*want) {
+            continue;
+        }
+        if let Some(id) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) {
+            out.push((p, id));
+        }
+    }
+    out
+}
+
+/// Does this project have the slug directory to itself? Used to decide whether slug-level content that
+/// belongs to no session (`memory/`) can be attributed to us at all.
+pub fn slug_dir_is_exclusive(env: &Path) -> bool {
+    let Ok(dir) = projects_dir().map(|d| d.join(slug_for(env))) else {
+        return false;
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let want = env.to_string_lossy();
+    for e in rd.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if p.is_file() && p.extension().map(|x| x == "jsonl").unwrap_or(false) {
+            match launch_cwd(&p) {
+                Some(c) if c == *want => {}
+                _ => return false, // a foreign (or unattributable) transcript shares this slug
+            }
+        }
+    }
+    true
+}
+
 /// Claude Code injects a batch of XML-style tags into the transcript (not real prompts). These are the known injected tag names.
 const INJECTED_TAGS: &[&str] = &[
     "system-reminder",
