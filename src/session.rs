@@ -246,12 +246,12 @@ fn claude_collect(env: &Path, dst: &Path) -> Result<(Stats, String)> {
 /// Runtime-agnostic; the pre-commit secret hook still applies (a snap carrying a secret is refused, with a warning).
 /// `snap --watch --from <rt>`: validate first. An unknown name here is the worst case — the loop runs
 /// forever polling a dump that cannot exist, reporting nothing, looking healthy.
-pub fn snap_watch_checked(runtime: &str, interval_secs: u64) -> Result<i32> {
+pub fn snap_watch_checked(runtime: &str, interval_secs: u64, capture_harness: bool) -> Result<i32> {
     let rt = resolve_runtime(Some(runtime), &[], "watch")?;
-    snap_watch(&rt, interval_secs)
+    snap_watch(&rt, interval_secs, capture_harness)
 }
 
-pub fn snap_watch(runtime: &str, interval_secs: u64) -> Result<i32> {
+pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
     let rt = normalize(runtime);
@@ -274,7 +274,14 @@ pub fn snap_watch(runtime: &str, interval_secs: u64) -> Result<i32> {
             last_sig = sig;
         } else if pending {
             match mirror_once(&rt, &env, &agent) {
-                Ok((stats, _, hits, _)) if stats.added + stats.updated > 0 => commit_snap(&agent, &rt, hits, &mut count),
+                Ok((stats, _, hits, _)) if stats.added + stats.updated > 0 => {
+                    // --no-harness must mean the same thing here as it does for `--watch` with no
+                    // --from: one documented flag cannot have two behaviours decided by another flag.
+                    if capture_harness {
+                        let _ = crate::harness::capture(&agent, &env, &rt);
+                    }
+                    commit_snap(&agent, &rt, hits, &mut count)
+                }
                 Ok(_) => {}
                 Err(e) => eprintln!("  snap failed: {e:#}"),
             }

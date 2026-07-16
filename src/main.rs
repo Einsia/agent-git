@@ -143,7 +143,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
             }
             match (watch, rt) {
                 // The watcher polls one runtime's dump; unnamed, `agit watch` is the both-runtimes loop.
-                (true, Some(rt)) => session::snap_watch_checked(&rt, interval),
+                (true, Some(rt)) => session::snap_watch_checked(&rt, interval, harness),
                 (true, None) => session::watch(interval, false, harness),
                 (false, rt) => session::snap(rt.as_deref(), harness),
             }
