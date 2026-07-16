@@ -42,46 +42,114 @@ fn is_secret_container(key: &str) -> bool {
     )
 }
 
-/// A scalar key whose own value is a secret (e.g. "token": "…", "apiKey": "…").
+/// A key whose value is a secret (e.g. "token", "apiKey", "deployKey", "authorization").
 fn is_secret_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
-    ["token", "secret", "password", "passwd", "apikey", "api_key", "api-key", "accesskey",
-     "access_key", "privatekey", "private_key", "authorization", "bearer", "credential"]
+    ["token", "secret", "password", "passwd", "pwd", "apikey", "api_key", "api-key", "accesskey",
+     "access_key", "privatekey", "private_key", "authorization", "bearer", "credential", "key",
+     "auth", "cookie", "signature", "webhook", "dsn", "connectionstring", "connection_string"]
         .iter()
         .any(|needle| k.contains(needle))
 }
 
-/// Recursively redact a parsed config value in place. Default-deny for secret containers (env/headers):
-/// every leaf value is replaced. Elsewhere, a secret-named key's string value is replaced, and any other
-/// string the secret scanner flags is replaced too (belt-and-suspenders for creds in urls/args).
-fn redact_value(v: &mut Value, file: &str, path: &str, in_secret_container: bool, out: &mut Vec<Redaction>) {
+/// A CLI flag whose *following* argument is a secret (`--token X`, `--api-key X`, `--password X`).
+fn is_secret_flag(s: &str) -> bool {
+    if !s.starts_with('-') {
+        return false;
+    }
+    let t = s.trim_start_matches('-').to_ascii_lowercase();
+    ["token", "secret", "password", "passwd", "pwd", "apikey", "api-key", "api_key", "key", "auth",
+     "credential", "bearer"]
+        .iter()
+        .any(|n| t.contains(n))
+}
+
+/// Does a URL carry a secret? userinfo (`scheme://user:pass@host`) or a long opaque path/query segment
+/// (webhook tokens like slack/discord live in the path and match no format rule).
+fn url_has_secret(s: &str) -> bool {
+    let Some((_, rest)) = s.split_once("://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if authority.contains('@') {
+        return true;
+    }
+    // any 20+ char run of URL-token chars beyond the authority (path/query) is treated as a secret
+    let after = &rest[authority.len()..];
+    let mut run = 0usize;
+    for c in after.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            run += 1;
+            if run >= 20 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+fn record_and_redact(v: &mut Value, file: &str, path: &str, hint: &str, out: &mut Vec<Redaction>) {
+    if let Value::String(_) = v {
+        out.push(Redaction { file: file.into(), path: path.into(), hint: hint.into() });
+        *v = Value::String(placeholder(hint));
+    }
+}
+
+/// Redact EVERY string leaf under a value (used once a key/container is known to be secret-bearing).
+/// Each leaf's hint is its own object key (so env-var leaves keep names like GITHUB_TOKEN for restore);
+/// array elements fall back to the enclosing key.
+fn redact_subtree(v: &mut Value, file: &str, path: &str, hint: &str, out: &mut Vec<Redaction>) {
+    match v {
+        Value::Object(m) => {
+            for (k, c) in m.iter_mut() {
+                redact_subtree(c, file, &format!("{path}.{k}"), k, out);
+            }
+        }
+        Value::Array(a) => {
+            for (i, c) in a.iter_mut().enumerate() {
+                redact_subtree(c, file, &format!("{path}[{i}]"), hint, out);
+            }
+        }
+        Value::String(_) => record_and_redact(v, file, path, hint, out),
+        _ => {}
+    }
+}
+
+/// Recursively redact a parsed config value in place. Default-deny: a secret container (env/headers)
+/// or a secret-named key has its ENTIRE subtree redacted; an argument following a secret flag is
+/// redacted; a URL carrying userinfo or a long opaque segment is redacted; and any remaining string
+/// the scanner flags (entropy ON for these small configs) is redacted too.
+fn redact_value(v: &mut Value, file: &str, path: &str, out: &mut Vec<Redaction>) {
     match v {
         Value::Object(map) => {
             for (k, child) in map.iter_mut() {
                 let child_path = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
-                let container = in_secret_container || is_secret_container(k);
-                if !container && is_secret_key(k) {
-                    if let Value::String(_) = child {
-                        out.push(Redaction { file: file.into(), path: child_path.clone(), hint: k.clone() });
-                        *child = Value::String(placeholder(k));
-                        continue;
-                    }
+                if is_secret_container(k) || is_secret_key(k) {
+                    redact_subtree(child, file, &child_path, k, out);
+                } else {
+                    redact_value(child, file, &child_path, out);
                 }
-                redact_value(child, file, &child_path, container, out);
             }
         }
         Value::Array(arr) => {
+            let mut flag_hint: Option<String> = None;
             for (i, child) in arr.iter_mut().enumerate() {
-                redact_value(child, file, &format!("{path}[{i}]"), in_secret_container, out);
+                let child_path = format!("{path}[{i}]");
+                if let Some(h) = flag_hint.take() {
+                    record_and_redact(child, file, &child_path, &h, out);
+                    continue;
+                }
+                if let Value::String(s) = child {
+                    if is_secret_flag(s) {
+                        flag_hint = Some(s.trim_start_matches('-').to_string());
+                    }
+                }
+                redact_value(child, file, &child_path, out);
             }
         }
         Value::String(s) => {
-            // In a secret container every value goes; elsewhere, only if the scanner flags it.
             let hint = path.rsplit(['.', '[']).next().unwrap_or(path).trim_end_matches(']');
-            if in_secret_container {
-                out.push(Redaction { file: file.into(), path: path.into(), hint: hint.into() });
-                *s = placeholder(hint);
-            } else if !crate::scan::scan_text_opts(s, false).is_empty() {
+            if url_has_secret(s) || !crate::scan::scan_text_opts(s, true).is_empty() {
                 out.push(Redaction { file: file.into(), path: path.into(), hint: hint.into() });
                 *s = placeholder(hint);
             }
@@ -94,7 +162,7 @@ fn redact_value(v: &mut Value, file: &str, path: &str, in_secret_container: bool
 pub fn redact_json_doc(text: &str, file: &str) -> Result<(String, Vec<Redaction>)> {
     let mut v: Value = serde_json::from_str(text).with_context(|| format!("{file} is not valid JSON"))?;
     let mut out = Vec::new();
-    redact_value(&mut v, file, "", false, &mut out);
+    redact_value(&mut v, file, "", &mut out);
     Ok((serde_json::to_string_pretty(&v)? + "\n", out))
 }
 
@@ -144,13 +212,16 @@ pub fn capture(agent: &Path, env: &Path, runtime: &str) -> Result<Report> {
     Ok(report)
 }
 
+/// Copy a prose file, but SKIP it (don't write it to the store) if it carries a suspected secret.
+/// Capture is the gate — we never rely on the commit hook, which scans the harness tree unevenly.
 fn copy_prose(src: &Path, dst: &Path, label: &str, report: &mut Report) -> Result<()> {
     if !src.is_file() {
         return Ok(());
     }
     let text = std::fs::read_to_string(src)?;
     if !crate::scan::scan_text_opts(&text, true).is_empty() {
-        report.warnings.push(format!("{label} contains suspected secrets (not auto-redacted — prose)"));
+        report.warnings.push(format!("{label} NOT captured — contains a suspected secret; remove it and re-snap"));
+        return Ok(());
     }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
@@ -160,6 +231,9 @@ fn copy_prose(src: &Path, dst: &Path, label: &str, report: &mut Report) -> Resul
     Ok(())
 }
 
+/// Copy a skills/commands tree. `.json` files are field-redacted like the top-level configs; any other
+/// file carrying a suspected secret is SKIPPED (not written), so a secret never enters the store —
+/// regardless of extension or of what the commit hook happens to scan.
 fn copy_tree_scanned(src: &Path, dst: &Path, label: &str, report: &mut Report) -> Result<()> {
     for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
         let rel = entry.path().strip_prefix(src).unwrap_or(entry.path());
@@ -168,8 +242,22 @@ fn copy_tree_scanned(src: &Path, dst: &Path, label: &str, report: &mut Report) -
             std::fs::create_dir_all(parent)?;
         }
         let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        let is_json = entry.path().extension().map(|e| e == "json").unwrap_or(false);
+        if is_json {
+            // structured: redact fields rather than skip, so a config with a token still travels usable.
+            match redact_json_doc(&text, &rel.to_string_lossy()) {
+                Ok((redacted, reds)) => {
+                    std::fs::write(&target, redacted)?;
+                    report.redactions.extend(reds);
+                    report.files += 1;
+                }
+                Err(_) => report.warnings.push(format!("{label}/{} NOT captured — unparseable JSON", rel.display())),
+            }
+            continue;
+        }
         if !crate::scan::scan_text_opts(&text, true).is_empty() {
-            report.warnings.push(format!("{label}/{} contains suspected secrets", rel.display()));
+            report.warnings.push(format!("{label}/{} NOT captured — contains a suspected secret", rel.display()));
+            continue;
         }
         std::fs::copy(entry.path(), &target)?;
         report.files += 1;
@@ -474,6 +562,35 @@ mod tests {
         let doc = r#"{ "mcpServers": { "fs": { "command": "mcp-fs", "args": ["--root", "/tmp"] } } }"#;
         let (_out, reds) = redact_json_doc(doc, "mcp.json").unwrap();
         assert!(reds.is_empty());
+    }
+
+    // Each of these is a concrete leak input from the adversarial review; all must redact.
+    #[test]
+    fn redacts_opaque_secrets_the_scanner_would_miss() {
+        let doc = r#"{
+          "mcpServers": {
+            "a": { "command": "srv", "args": ["--token", "AbCd1234OpaqueValue", "--root", "/tmp"] },
+            "b": { "url": "https://user:pass@internal.example.com" },
+            "c": { "url": "https://hooks.slack.com/services/T00/B00/XXXXXXXXXXXXXXXXXXXXXXXX" },
+            "d": { "deployKey": "opaquevalue" },
+            "e": { "credential": { "custom": "opaquevalue" } },
+            "f": { "token": ["opaque-positional-value"] }
+          }
+        }"#;
+        let (out, _reds) = redact_json_doc(doc, "mcp.json").unwrap();
+        for leaked in [
+            "AbCd1234OpaqueValue",         // arg after --token (flag adjacency)
+            "user:pass@internal",          // url userinfo
+            "XXXXXXXXXXXXXXXXXXXXXXXX",     // webhook token in url path
+            "\"opaquevalue\"",             // deployKey (custom secret-named) + credential.custom (container)
+            "opaque-positional-value",     // token:[...] (secret key holding array)
+        ] {
+            assert!(!out.contains(leaked), "leaked: {leaked}\n{out}");
+        }
+        // non-secrets survive
+        assert!(out.contains("\"srv\""));
+        assert!(out.contains("/tmp"));
+        assert!(out.contains("internal.example.com") || out.contains("${AGIT_SECRET:url}"));
     }
 
     #[test]
