@@ -38,7 +38,7 @@ struct Side {
     diff: String,
 }
 
-pub fn run(reference: &str, runtime: &str) -> Result<i32> {
+pub fn run(reference: &str, runtime: &str, both: bool) -> Result<i32> {
     let env = scope::env_root()?;
     let agent = scope::root_for(Scope::Agent)?;
     let rt = normalize(runtime);
@@ -96,30 +96,84 @@ pub fn run(reference: &str, runtime: &str) -> Result<i32> {
     install_copy(&rt, &b_src, &b.id, &b.cwd)?;
     eprintln!("Reviving both sessions (read-only): A={} … B={} …", &a.id[..8], &b.id[..8]);
 
-    // 5. Run the dialogue. Clean up worktrees even on error (inner call, then unconditional cleanup).
-    let outcome = run_dialogue(&a, &b);
+    // 5–6. Dialogue → synthesize → emit → inline resolution. Worktrees must stay alive through the
+    // decision turn (which resumes A in its tree), so clean them up only after this whole block.
+    let result = (|| -> Result<i32> {
+        let transcript = run_dialogue(&a, &b)?;
+        let (resolved, open) = synthesize(&transcript)?;
+        let archive = save_transcript(&agent, &rt, &a.id, &b.id, &transcript)?;
+        println!("── sync result ──");
+        if !resolved.is_empty() {
+            println!("Agreed:\n{resolved}");
+        }
+        println!("\nTranscript archived → {}", archive.display());
+        println!("Merged state (both contexts + the reconciliation) — resume it to continue:");
+        println!("  (cd {} && claude --resume {})", env.display(), a.id);
+        if both {
+            if let Err(e) = emit_both(&rt, &b, &env) {
+                eprintln!("(--both) couldn't materialize B's merged state: {e}");
+            }
+        }
+        resolve_inline(&a, &open)
+    })();
     for wt in &worktrees {
         let _ = scope::git_in_status(&env, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
     }
-    let transcript = outcome?;
+    result
+}
 
-    // 6. Synthesize + emit outputs.
-    let (resolved, open) = synthesize(&transcript)?;
-    let archive = save_transcript(&agent, &rt, &a.id, &b.id, &transcript)?;
-    println!("── sync result ──");
-    if !resolved.is_empty() {
-        println!("Agreed:\n{resolved}");
-    }
-    println!("\nTranscript archived → {}", archive.display());
-    println!("Merged state (both contexts + the reconciliation) — resume it to continue:");
-    println!("  (cd {} && claude --resume {})", env.display(), a.id);
-
-    if open.trim().is_empty() {
+/// If there are open conflicts and we're at a terminal, walk the user through deciding each and record
+/// the decisions into A's session (the merged state). Non-interactive: just surface them.
+fn resolve_inline(a: &Side, open: &str) -> Result<i32> {
+    use std::io::{stdin, stdout, BufRead, IsTerminal, Write};
+    let items: Vec<String> = open
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['-', '*']).trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if items.is_empty() {
         println!("\nNothing left for you to decide.");
-        Ok(0)
-    } else {
+        return Ok(0);
+    }
+    if !stdin().is_terminal() {
         println!("\nNeeds your decision:\n{open}");
-        Ok(1)
+        return Ok(1);
+    }
+    println!("\n{} open conflict(s). Decide each (blank = leave open):", items.len());
+    let mut decisions: Vec<String> = Vec::new();
+    let sin = stdin();
+    for (i, it) in items.iter().enumerate() {
+        println!("\n[{}/{}] {it}", i + 1, items.len());
+        print!("  your call> ");
+        let _ = stdout().flush();
+        let mut line = String::new();
+        if sin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let d = line.trim();
+        if !d.is_empty() {
+            decisions.push(format!("- {it}\n  → decided: {d}"));
+        }
+    }
+    if decisions.is_empty() {
+        println!("\nAll left open:\n{open}");
+        return Ok(1);
+    }
+    // Bake the human's decisions into A's session so `resume` continues with them settled.
+    let joined = decisions.join("\n");
+    let _ = turn(
+        &a.cwd,
+        &a.id,
+        &format!(
+            "The human resolved the open conflicts as follows. Record these as the agreed decisions going \
+             forward (do not edit files):\n{joined}\nReply 'noted'."
+        ),
+    );
+    println!("\nRecorded {} decision(s) into the merged state.", decisions.len());
+    if decisions.len() < items.len() {
+        Ok(1) // some left open
+    } else {
+        Ok(0)
     }
 }
 
@@ -179,6 +233,20 @@ fn run_dialogue(a: &Side, b: &Side) -> Result<Vec<(char, String)>> {
         }
     }
     Ok(transcript)
+}
+
+/// `--both`: B's session already carries the reconciliation (it took every B turn). Re-bind that merged
+/// state to the repo under a fresh id so B's branch can also resume with the combined context.
+fn emit_both(rt: &str, b: &Side, env: &Path) -> Result<()> {
+    let path = crate::adapter::claude_code::projects_dir()?
+        .join(crate::adapter::claude_code::slug_for(&b.cwd))
+        .join(format!("{}.jsonl", b.id));
+    let content = std::fs::read_to_string(&path)?;
+    let b_merged = convo::fresh_id("sync-b-merged");
+    install_copy(rt, &content, &b_merged, env)?;
+    println!("B's merged state — resume it on B's branch:");
+    println!("  (cd {} && claude --resume {b_merged})", env.display());
+    Ok(())
 }
 
 /// Copy a claude session into a fresh-id session bound to `cwd` (same-vendor replay rewrites id/cwd).

@@ -82,11 +82,32 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── sync：用对话合并两个分叉的 agent 分支（两侧真 resume、只读对账，真冲突才问你）──
         "sync" => {
-            let (rt, pos) = parse_runtime_arg(args, "--from");
-            match pos {
-                Some(r) => sync::run(&r.to_string_lossy(), &rt),
+            let mut rt = "claude-code".to_string();
+            let mut reference = None;
+            let mut both = false;
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--from" if i + 1 < args.len() => {
+                        rt = args[i + 1].clone();
+                        i += 2;
+                    }
+                    "--both" => {
+                        both = true;
+                        i += 1;
+                    }
+                    other => {
+                        if reference.is_none() && !other.starts_with('-') {
+                            reference = Some(other.to_string());
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            match reference {
+                Some(r) => sync::run(&r, &rt, both),
                 None => {
-                    eprintln!("usage: agit -a sync <ref>   (reconcile this branch's agent with <ref>'s agent by dialogue)");
+                    eprintln!("usage: agit -a sync <ref> [--both]   (reconcile this branch's agent with <ref>'s agent by dialogue)");
                     Ok(2)
                 }
             }
