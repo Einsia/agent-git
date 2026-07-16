@@ -78,7 +78,7 @@ cat <<EOF
   Agent Store ${G}main${N} = agent A's session · ${G}bob${N} = agent B's session
 
 ${DIM}Follow the host script act by act:${N}
-  ${G}\$EDITOR demo/showcase/host-script.md${N}
+  ${G}\$EDITOR demo/showcase/讲稿.md${N}
 ${DIM}Then, from feature-a, reconcile the two agents by dialogue:${N}
   ${G}cd $PROJ && agit -a sync bob${N}
 EOF
