@@ -216,12 +216,25 @@ is the dialogue orchestrator; everything else is removal + renaming + wiring ove
 
 ## Open decisions
 
-1. **Name for the smart-merge op** — `sync` / `reconcile` / `converge` / `integrate` (§4). Low-stakes.
-2. **`sync` directionality** — update only the current branch, both branches, or a fresh integration branch. (Started,
-   not decided.)
-3. **Orchestrator specifics** — turn-taking / termination protocol (the spike used `CONFLICT:`/`DONE` markers), max
-   turns, and how the reconciled result is captured back into a resumable state.
-4. **`snap` cadence** — fully automatic (version every meaningful step) vs explicit checkpoints vs hybrid.
+1. **Which code does each agent see during `sync`?** *(surfaced by the first real end-to-end run, 2026-07-16.)* With
+   read-only repo access, the agents ground-truth against the **checked-out tree** — which is *one* branch's. In the
+   test, B (the rename branch) read feature-a's tree, found no `uid`, and honestly reported "no surface," because its
+   own work lived on feature-b's uncheckout branch. Options: give each agent *its own* branch's tree (two worktrees),
+   feed each side its branch **diff** as context, or accept single-tree and lean on the transcripts for the other
+   side's work. This is now the biggest open item — it decides how grounded the dialogue can be.
+2. **`sync` MVP scope** — currently takes the single *latest* session per side and claude-code only. Multi-session
+   sides and codex-side revival are follow-ups.
+3. **Name for the smart-merge op** — `sync` (shipped) / `reconcile` / `converge` (§4). Low-stakes.
+4. **`sync` directionality** — currently writes the merged resumable session on the current side only; both-branches /
+   integration-branch are follow-ups.
+5. **`snap` cadence** — fully automatic (version every meaningful step) vs explicit checkpoints vs hybrid.
+
+## Status of the build (2026-07-16)
+
+MVP `agit -a sync <ref>` shipped (`d42123b`) and verified end-to-end with real `claude`: revives both sides as fresh
+read-only copies (via the convert/register machinery — `resume` really is built on convert), runs the dialogue in the
+repo, synthesizes 已达成 / 仍需裁决, archives the transcript to `sessions/sync/`, and leaves a resumable merged session.
+The mirror command was renamed `sync`→`snap`. `reconcile` still exists (not yet removed).
 
 ## Appendix: history
 
