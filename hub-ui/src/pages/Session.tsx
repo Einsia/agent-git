@@ -3,22 +3,26 @@ import { Link, useParams, useSearchParams } from "react-router-dom"
 import { GitCompare } from "lucide-react"
 
 import { api } from "@/lib/api"
-import { useAsync } from "@/lib/useAsync"
+import { useGuarded } from "@/lib/useGuarded"
 import { Crumb } from "@/components/Crumb"
 import { SpineReadout } from "@/components/Spine"
 import { ProvChips } from "@/components/ProvChips"
+import { Forbidden, LoadError } from "@/components/States"
 
 export function Session() {
   const { name = "", id = "" } = useParams()
   const [params] = useSearchParams()
   const at = params.get("at") ?? undefined
-  const { data, loading, error } = useAsync(() => api.session(name, id, at), [name, id, at])
+  const { data, loading, error, status, forbidden } = useGuarded(() => api.session(name, id, at), [name, id, at])
+
+  if (forbidden) return <Forbidden what={name} />
 
   return (
     <div>
       <Crumb name={name} session={id} />
       {loading && <p className="py-6 text-muted-foreground">Loading…</p>}
-      {error && <p className="py-6 text-destructive">Couldn’t load session — {error}</p>}
+      {/* 401 is already redirecting to the login form; don't flash an error behind it. */}
+      {error && status !== 401 && <LoadError message={error} />}
 
       {data && (
         <>

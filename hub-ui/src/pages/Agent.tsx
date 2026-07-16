@@ -1,13 +1,16 @@
 import { useEffect, useState, type FormEvent } from "react"
-import { useParams, useSearchParams } from "react-router-dom"
-import { Search } from "lucide-react"
+import { Link, useParams, useSearchParams } from "react-router-dom"
+import { Lock, Search, Settings2 } from "lucide-react"
 
 import { api } from "@/lib/api"
-import { useAsync } from "@/lib/useAsync"
+import { useGuarded } from "@/lib/useGuarded"
 import { Input } from "@/components/ui/input"
-import { Button } from "@/components/ui/button"
+import { Button, buttonVariants } from "@/components/ui/button"
+import { Badge } from "@/components/ui/badge"
 import { SessionCard } from "@/components/SessionCard"
 import { Crumb } from "@/components/Crumb"
+import { Forbidden, LoadError } from "@/components/States"
+import { cn } from "@/lib/utils"
 
 export function Agent() {
   const { name = "" } = useParams()
@@ -18,7 +21,7 @@ export function Agent() {
 
   useEffect(() => setQuery(q), [q])
 
-  const { data, loading, error } = useAsync(() => api.agent(name, page, q), [name, page, q])
+  const { data, loading, error, status, forbidden } = useGuarded(() => api.agent(name, page, q), [name, page, q])
 
   function submitSearch(e: FormEvent) {
     e.preventDefault()
@@ -34,25 +37,53 @@ export function Agent() {
   }
 
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.per_page)) : 1
-  const host = data?.git ? location.host : "HOST:PORT"
+  // The server builds the clone url (it knows the scheme — http vs https behind TLS).
+  const cloneUrl = data?.clone_url || `http://HOST:PORT/${name}.git`
+
+  if (forbidden) return <Forbidden what={name} />
 
   return (
     <div>
       <Crumb name={name} />
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
-        <h1 className="font-mono text-2xl font-bold tracking-tight">{name}</h1>
-        <form onSubmit={submitSearch} className="flex gap-2">
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search sessions…"
-              className="w-[240px] pl-8"
-            />
-          </div>
-          <Button type="submit">Search</Button>
-        </form>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <h1 className="font-mono text-2xl font-bold tracking-tight">{name}</h1>
+          {data?.visibility === "private" && (
+            <Badge variant="muted" className="gap-1">
+              <Lock className="size-3" />
+              private
+            </Badge>
+          )}
+          {data?.role && (
+            <Badge variant={data.role === "owner" ? "default" : "muted"} className="font-mono text-[0.6rem]">
+              {data.role}
+            </Badge>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <form onSubmit={submitSearch} className="flex gap-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search sessions…"
+                className="w-[240px] pl-8"
+              />
+            </div>
+            <Button type="submit">Search</Button>
+          </form>
+          {/* Settings is readable by anyone who can read the agent; it just shows less to
+              someone who can't administer it. */}
+          <Link
+            to={`/agent/${name}/settings`}
+            aria-label="Settings"
+            title="Settings"
+            className={cn(buttonVariants({ variant: "ghost", size: "icon" }))}
+          >
+            <Settings2 className="size-4" />
+          </Link>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-8 md:grid-cols-[1fr_260px]">
@@ -63,7 +94,8 @@ export function Agent() {
           </div>
 
           {loading && <p className="py-6 text-muted-foreground">Loading…</p>}
-          {error && <p className="py-6 text-destructive">Couldn’t load sessions — {error}</p>}
+          {/* 401 is already on its way to the login form; don't flash an error behind it. */}
+          {error && status !== 401 && <LoadError message={error} />}
 
           {data && data.sessions.length === 0 && (
             <p className="py-6 text-muted-foreground">
@@ -94,7 +126,7 @@ export function Agent() {
           <h3 className="eyebrow mb-2">pull &amp; merge</h3>
           <pre className="overflow-auto rounded-md border bg-muted p-3 font-mono text-[0.72rem] leading-relaxed">
 {`agit clone \\
-  http://${host}/${name}.git
+  ${cloneUrl}
 agit -a merge origin/main`}
           </pre>
           <h3 className="eyebrow mb-2 mt-6">commits</h3>

@@ -1,8 +1,9 @@
 import { useParams, useSearchParams } from "react-router-dom"
 
 import { api } from "@/lib/api"
-import { useAsync } from "@/lib/useAsync"
+import { useGuarded } from "@/lib/useGuarded"
 import { Crumb } from "@/components/Crumb"
+import { Forbidden, LoadError } from "@/components/States"
 
 export function Diff() {
   const { name = "", id = "" } = useParams()
@@ -10,7 +11,7 @@ export function Diff() {
   const from = params.get("from") ?? ""
   const to = params.get("to") ?? ""
   const missing = !from || !to
-  const { data, loading, error } = useAsync(
+  const { data, loading, error, status, forbidden } = useGuarded(
     // Don't fire a doomed request when a revision is missing — show a clear message instead.
     () => (missing ? Promise.resolve(null) : api.diff(name, id, from, to)),
     [name, id, from, to]
@@ -24,6 +25,8 @@ export function Diff() {
     !data.removed_files.length &&
     data.conclusion_before === data.conclusion_after
 
+  if (forbidden) return <Forbidden what={name} />
+
   return (
     <div>
       <Crumb name={name} session={id} />
@@ -36,7 +39,12 @@ export function Diff() {
         </p>
       )}
       {!missing && loading && <p className="py-6 text-muted-foreground">Loading…</p>}
-      {!missing && error && <p className="py-6 text-destructive">Couldn’t load diff — {error}</p>}
+      {/* 401 is already redirecting to the login form; don't flash an error behind it. */}
+      {!missing && error && status !== 401 && (
+        <div className="mt-4">
+          <LoadError message={error} />
+        </div>
+      )}
 
       {data && (
         <>
