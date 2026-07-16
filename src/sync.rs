@@ -16,6 +16,8 @@
 use crate::convo::{self, ConvertOpts};
 use crate::scope::{self, Scope};
 use anyhow::{bail, Context, Result};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -237,18 +239,21 @@ fn ground_on_worktrees(
 fn run_dialogue(rt: &str, a: &Side, b: &Side, quick: bool) -> Result<Vec<(char, String)>> {
     let rounds = if quick { QUICK_ROUNDS } else { MAX_ROUNDS };
     let mut transcript: Vec<(char, String)> = Vec::new();
-    let mut msg = turn(rt, &a.cwd, &a.id, &open_prompt(&a.diff, &a.brief, quick))?;
+    // default mode opens with a HANDOFF (a summarization turn) → no tools, so the clamp is real.
+    let mut msg = turn_with(rt, &a.cwd, &a.id, &open_prompt(rt, &a.diff, &a.brief, quick), quick)?;
     println!("\nA → {msg}\n");
     transcript.push(('A', msg.clone()));
 
     let mut first_b = true;
     for _ in 0..rounds {
-        let bp = if first_b { relay_first(&msg, &b.diff, &b.brief, quick) } else { relay(&msg) };
-        first_b = false;
-        let bmsg = turn(rt, &b.cwd, &b.id, &bp)?;
+        let bp = if first_b { relay_first(rt, &msg, &b.diff, &b.brief, quick) } else { relay(&msg) };
+        let bmsg = turn_with(rt, &b.cwd, &b.id, &bp, !(first_b && !quick))?;
         println!("B → {bmsg}\n");
         transcript.push(('B', bmsg.clone()));
-        let amsg = turn(rt, &a.cwd, &a.id, &relay(&bmsg))?;
+        // In the default mode B's first reply is its handoff summary, so A receives it framed as one.
+        let ap = if first_b && !quick { relay_handoff(rt, "B", &bmsg) } else { relay(&bmsg) };
+        first_b = false;
+        let amsg = turn(rt, &a.cwd, &a.id, &ap)?;
         println!("A → {amsg}\n");
         transcript.push(('A', amsg.clone()));
         msg = amsg;
@@ -294,18 +299,42 @@ fn install_copy(rt: &str, src: &str, new_id: &str, cwd: &Path) -> Result<()> {
 }
 
 /// Run one read-only turn of a resumed session (dispatch by runtime); return its reply text.
+/// Handoff turns answer with an <analysis> scratchpad the peer must never see, so every reply is stripped
+/// here — the one place the transcript, the relay, and `is_done` all read from.
 fn turn(rt: &str, cwd: &Path, session_id: &str, prompt: &str) -> Result<String> {
-    match rt {
+    turn_with(rt, cwd, session_id, prompt, true)
+}
+
+/// `tools = false` actually withholds the tools, rather than merely asking the model not to use them.
+/// The vendors' no-tools clamp is backed by a real constraint — compaction genuinely runs without tools,
+/// so their "tool calls will be REJECTED" is true. A handoff turn that only *says* it while `--allowedTools
+/// Read Grep Glob` is passed is a bluff: the model can burn its one turn on a Read and answer nothing.
+fn turn_with(rt: &str, cwd: &Path, session_id: &str, prompt: &str, tools: bool) -> Result<String> {
+    let reply = match rt {
         "codex" => turn_codex(cwd, session_id, prompt),
-        _ => turn_claude(cwd, session_id, prompt),
+        _ => turn_claude(cwd, session_id, prompt, tools),
+    }?;
+    Ok(strip_analysis_or_raw(&reply))
+}
+
+/// The tools each runtime actually grants a reconcile turn — the clamp must name these, not the other
+/// runtime's (codex has no Read/Grep/Glob; naming them there is noise the model can't act on).
+fn tool_names(rt: &str) -> &'static str {
+    match rt {
+        "codex" => "shell, apply_patch",
+        _ => "Read, Grep, Glob",
     }
 }
 
 /// Claude: `claude --resume <id> -p <prompt>` with read-only tools.
-fn turn_claude(cwd: &Path, session_id: &str, prompt: &str) -> Result<String> {
-    let out = Command::new("claude")
-        .current_dir(cwd)
-        .args(["--resume", session_id, "-p", prompt, "--output-format", "json", "--allowedTools", "Read", "Grep", "Glob"])
+fn turn_claude(cwd: &Path, session_id: &str, prompt: &str, tools: bool) -> Result<String> {
+    let mut cmd = Command::new("claude");
+    cmd.current_dir(cwd)
+        .args(["--resume", session_id, "-p", prompt, "--output-format", "json"]);
+    if tools {
+        cmd.args(["--allowedTools", "Read", "Grep", "Glob"]);
+    }
+    let out = cmd
         .output()
         .context("failed to start `claude` (is it on PATH?)")?;
     if !out.status.success() {
@@ -353,6 +382,187 @@ true, or that would break at merge) on its own line starting with 'CONFLICT:'; y
 your branch's tree (Read/Grep/Glob) — check the code instead of guessing; end your message with 'DONE' when \
 you have nothing left to raise or resolve.";
 
+// ── The handoff prompt ──
+//
+// A handoff IS a compaction, so the structure below is borrowed from the vendors' shipped compaction
+// prompts rather than hand-rolled:
+//   * claude-code 2.1.211's `Bkg` variant (the "up_to"/prefix summarizer, reached via Gvu(_, "up_to")):
+//     the analysis→summary shape, the 9-section schema, the security-verbatim clause, and the
+//     three-layer no-tools clamp (`Tto`'s preamble + the body + the `jvu` reminder). `Bkg`, not the main
+//     `Nkg`, because Bkg summarizes an earlier portion for a reader who will see newer messages the
+//     summarizer cannot — semantically a handoff. Nkg assumes the summarizer IS the resumer, and drifts
+//     when a different agent picks the work up (hence Bkg's tail: Work Completed / Context for
+//     Continuing Work, not Nkg's Current Work / Optional Next Step).
+//   * codex 0.144.4 (core/src/compact.rs): the split between a summarizer-side prompt and a separate
+//     receiver-side one, and the receiver's "build on the work … avoid duplicating work" framing.
+//
+// Two deliberate departures from the sources:
+//   1. Codex's receiver prompt promises "you also have access to the state of the tools that were used by
+//      that language model" — true for compaction, FALSE here: each agent reads only its own worktree, so
+//      that sentence is inverted below. Left as-is it invites an agent to read its own copy of a file and
+//      mistake it for the peer's.
+//   2. Codex's 425-byte prompt is purely additive (an `Include:` list, no drop list, no schema) because it
+//      carries tool state out of band. Nothing but text crosses this boundary, so the drop list and the
+//      fixed schema are ours to supply — unsaid substrate gets dropped at the model's discretion.
+
+/// Layer 1 of the no-tools clamp (claude's `Tto` preamble), naming the tools this RUNTIME grants —
+/// codex has no Read/Grep/Glob, so naming them there is noise the model cannot act on. Backed by a real
+/// constraint: `turn_with(.., tools=false)` actually withholds them on a handoff turn, so "will be
+/// REJECTED" is true rather than a bluff. A summarization turn that calls a tool burns the turn.
+fn no_tools_preamble(rt: &str) -> String {
+    format!(
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+
+- Do NOT use {}, or ANY other tool.
+- You already have all the context you need in the conversation above.
+- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
+- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+
+",
+        tool_names(rt)
+    )
+}
+
+/// Layer 3 of the clamp (claude's `jvu`, appended last).
+const NO_TOOLS_REMINDER: &str = "
+
+REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> \
+block. Tool calls will be rejected and you will fail the task.";
+
+/// The forced scratchpad pre-pass. Stripped from the reply before anything sees it (see `strip_analysis`);
+/// it exists to make the model walk the conversation chronologically, not to be read.
+const HANDOFF_ANALYSIS: &str = "Before your final summary, wrap your analysis in <analysis> tags to organize \
+your thoughts and ensure you've covered all necessary points. In your analysis process:
+
+1. Chronologically analyze each message and section of the conversation. For each, thoroughly identify:
+   - What you were explicitly asked for, and your intent
+   - Your approach, the key decisions you made, and the alternatives you considered and rejected
+   - Specific details like file names, full code snippets, function signatures, and file edits
+   - Errors you ran into and how you fixed them
+   - Any correction you were given, especially where you were told to do something differently
+   - Any security-relevant instruction or constraint you were given (e.g. sensitive files or data to avoid, \
+operations that must not be performed, credential or secret handling rules). These MUST be preserved \
+verbatim in the summary so they continue to apply after the handoff.
+2. Double-check for technical accuracy and completeness, addressing each required element thoroughly.";
+
+/// The handoff's fixed section schema, in order. Claude's `Bkg` sections 1–7 with its prefix-summarizer
+/// tail (8. Work Completed / 9. Context for Continuing Work), reworded for a branch-to-branch handoff.
+const HANDOFF_SECTIONS: [(&str, &str); 9] = [
+    ("Primary Request and Intent", "What you were asked to do on this branch, in detail — the goal, not just the diff."),
+    ("Key Technical Concepts", "The technologies, patterns, and invariants this work relies on."),
+    ("Files and Code Sections", "Files you examined, changed, or created. Include the code that matters and why each file matters."),
+    ("Errors and fixes", "Errors you hit and how you fixed them, in one line each."),
+    ("Problem Solving", "Problems solved, and any troubleshooting still in flight."),
+    (
+        "All user messages",
+        "Every instruction your human gave you on this branch that is not a tool result — these carry \
+         feedback and changing intent. Preserve security-relevant instructions and constraints VERBATIM so \
+         they still bind after the handoff. The reconciliation turns of this merge (this prompt, and \
+         anything relayed from the other agent) are not your human's instructions: do not list them.",
+    ),
+    ("Pending Tasks", "What you were explicitly asked for that is not done."),
+    ("Work Completed", "What is actually finished and settled by the end of your branch's work."),
+    (
+        "Context for Continuing Work",
+        "The decisions, rejected alternatives, and state the other agent needs in order to continue and to \
+         reconcile with you without redoing your reasoning.",
+    ),
+];
+
+/// What must NOT cross. Codex omits this half; it can afford to, we cannot (see the module comment).
+const HANDOFF_DROP: &str = "Leave OUT — it costs the other agent context and misleads:
+- Approaches you superseded, unless the other agent might plausibly retry one; then say it was rejected and why.
+- Errors you already fixed, beyond the one-line record in section 4.
+- Verbose tool output, file dumps, and command logs already reflected on disk — the diff below is ground truth for those.
+- Anything you cannot support from the conversation or your diff. Do not speculate to fill a section; write 'none'.";
+
+fn section_schema() -> String {
+    HANDOFF_SECTIONS
+        .iter()
+        .enumerate()
+        .map(|(i, (name, what))| format!("{}. {name}: {what}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Receiver side (codex's bridge prompt), with its tool-state promise inverted — see the module comment.
+fn receiver_frame(peer: &str) -> String {
+    format!(
+        "Agent {peer} produced a summary of its thinking process. Use this to build on the work that has \
+         already been done and avoid duplicating work. Note that you do NOT have access to the state of the \
+         tools {peer} used: {peer} worked in its own tree, and your Read/Grep/Glob see only YOUR branch's \
+         tree — so {peer}'s summary and the diffs you are given are your only evidence about {peer}'s side. \
+         Never assume a file you can read is {peer}'s version of it. Here is the summary produced by \
+         {peer}, use the information in this summary to assist with your own analysis:"
+    )
+}
+
+/// The summarizer-side handoff. `incoming` = the peer's handoff, when this side is answering one.
+fn handoff_prompt(rt: &str, role: &str, peer: &str, incoming: Option<&str>, diff: &str, brief: &str) -> String {
+    let preamble = no_tools_preamble(rt);
+    let received = match incoming {
+        Some(msg) => format!("{}\n\n\"{msg}\"\n\n", receiver_frame(peer)),
+        None => String::new(),
+    };
+    format!(
+        "{preamble}{received}You are agent {role}. You and agent {peer} each worked from a common \
+         starting point on separate branches of this repo, and are about to merge. Your task is to create a \
+         detailed handoff summary of YOUR work. It will be placed at the start of the reconciliation; \
+         {peer}'s context and the turns that reconcile the two branches follow after it (you do not see \
+         them here). Summarize thoroughly so that {peer}, reading only your summary, can understand what \
+         you did and why, and reconcile it against their own work. Your diff is ground truth for WHAT \
+         changed — the reasoning is the part {peer} cannot see.\n\n\
+         {HANDOFF_ANALYSIS}\n\n\
+         Your summary must contain these sections, in this order:\n\n{}\n\n\
+         {HANDOFF_DROP}\n\n\
+         Output an <analysis> block, then a <summary> block containing the numbered sections above.\
+         {}{}{NO_TOOLS_REMINDER}",
+        section_schema(),
+        diff_block(diff),
+        brief_block(brief)
+    )
+}
+
+/// Strip the scratchpad and unwrap the summary (claude's `Ukg`): drop `<analysis>…</analysis>`, rewrite
+/// `<summary>…</summary>` to its body, collapse blank runs. The analysis is a thinking aid — it is never
+/// relayed to the peer and never archived.
+fn strip_analysis(reply: &str) -> String {
+    static ANALYSIS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<analysis>.*?</analysis>").unwrap());
+    static SUMMARY: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<summary>(.*?)</summary>").unwrap());
+    static BLANKS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
+
+    // The summary is authoritative when present: take it and drop everything else. This is what makes an
+    // UNCLOSED <analysis> safe — the paired regex below cannot match one, so without this branch the whole
+    // scratchpad would flow on to the peer *and* into save_transcript(), i.e. into a store that gets pushed
+    // to the team. Truncation (an unclosed tag) is exactly when the model rambled longest.
+    if let Some(c) = SUMMARY.captures(reply) {
+        let body = c[1].trim();
+        if !body.is_empty() {
+            return BLANKS.replace_all(body, "\n\n").trim().to_string();
+        }
+    }
+    let out = ANALYSIS.replace_all(reply, "");
+    // No closing tag and no summary: hard-drop from the opening tag rather than pass the scratchpad through.
+    let out = match out.find("<analysis>") {
+        Some(i) => out[..i].to_string(),
+        None => out.into_owned(),
+    };
+    let out = SUMMARY.replace(&out, |c: &regex::Captures| c[1].trim().to_string());
+    BLANKS.replace_all(out.as_ref(), "\n\n").trim().to_string()
+}
+
+/// Strip the scratchpad, but never hand the dialogue an empty turn. A reply that is *only* an analysis
+/// block (the model spent its whole turn thinking) would otherwise strip to "", and the peer would then be
+/// told "here is the summary produced by A" followed by nothing — silent, total context loss.
+fn strip_analysis_or_raw(reply: &str) -> String {
+    let stripped = strip_analysis(reply);
+    if stripped.is_empty() && !reply.trim().is_empty() {
+        // Salvage: no summary survived, so relay the reply with the tags flattened rather than nothing.
+        return reply.replace("<analysis>", "").replace("</analysis>", "").trim().to_string();
+    }
+    stripped
+}
+
 fn diff_block(diff: &str) -> String {
     if diff.trim().is_empty() {
         String::new()
@@ -369,7 +579,7 @@ fn brief_block(brief: &str) -> String {
     }
 }
 
-fn open_prompt(diff_a: &str, brief_a: &str, quick: bool) -> String {
+fn open_prompt(rt: &str, diff_a: &str, brief_a: &str, quick: bool) -> String {
     if quick {
         return format!(
             "You are agent A. You and another agent, B, each changed this repo from a common starting point, on \
@@ -379,19 +589,10 @@ fn open_prompt(diff_a: &str, brief_a: &str, quick: bool) -> String {
             brief_block(brief_a)
         );
     }
-    format!(
-        "You are agent A, handing your work off to another agent, B. You each worked from a common starting \
-         point on separate branches and are about to merge. This first turn is a HANDOFF, not a conflict hunt: \
-         brief B on your whole working context — what you were doing and WHY, the decisions you made and \
-         rejected, what's settled, and what's still open — not just your diff. Your diff is ground truth for \
-         WHAT changed, but the reasoning is the part B can't see. (For this handoff, up to ~8 sentences is fine.) \
-         End by asking B to hand their context back the same way. {RULES}{}{}",
-        diff_block(diff_a),
-        brief_block(brief_a)
-    )
+    handoff_prompt(rt, "A", "B", None, diff_a, brief_a)
 }
 
-fn relay_first(other: &str, diff_b: &str, brief_b: &str, quick: bool) -> String {
+fn relay_first(rt: &str, other: &str, diff_b: &str, brief_b: &str, quick: bool) -> String {
     if quick {
         return format!(
             "The other agent said: \"{other}\"\n\nRespond under the same rules. {RULES}{}{}",
@@ -399,19 +600,21 @@ fn relay_first(other: &str, diff_b: &str, brief_b: &str, quick: bool) -> String 
             brief_block(brief_b)
         );
     }
-    format!(
-        "You are agent B. Agent A handed off their working context:\n\"{other}\"\n\n\
-         First hand YOUR context back the same way — what you were doing and why, decisions made and rejected, \
-         what's settled and what's open — using your diff as ground truth. (Up to ~8 sentences is fine.) \
-         Then begin reconciling: raise anything that can't both be true, or would break at merge, as a \
-         'CONFLICT:' line. {RULES}{}{}",
-        diff_block(diff_b),
-        brief_block(brief_b)
-    )
+    handoff_prompt(rt, "B", "A", Some(other), diff_b, brief_b)
 }
 
 fn relay(other: &str) -> String {
     format!("The other agent said: \"{other}\"\n\nRespond under the same rules. {RULES}")
+}
+
+/// The peer's message IS a handoff summary: frame it as one (codex's receiver side) and open the
+/// reconciliation. Used for the single turn that follows the peer's handoff.
+fn relay_handoff(rt: &str, peer: &str, other: &str) -> String {
+    format!(
+        "{}\n\n\"{other}\"\n\nNow reconcile it against your own work: raise anything that can't both be \
+         true, or that would break at merge, as a 'CONFLICT:' line. {RULES}",
+        receiver_frame(peer)
+    )
 }
 
 fn is_done(msg: &str) -> bool {
@@ -590,4 +793,132 @@ fn which(name: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_analysis_drops_the_scratchpad_and_unwraps_the_summary() {
+        let reply = "<analysis>\nchronological walk, a thinking aid only\n</analysis>\n\n\
+                     <summary>\n1. Primary Request and Intent:\n   ship the parser\n</summary>";
+        let out = strip_analysis(reply);
+        assert!(!out.contains("<analysis>"), "{out}");
+        assert!(!out.contains("thinking aid"), "the analysis body must never be persisted: {out}");
+        assert!(!out.contains("<summary>") && !out.contains("</summary>"), "{out}");
+        assert!(out.starts_with("1. Primary Request and Intent:"), "{out}");
+        assert!(out.ends_with("ship the parser"), "{out}");
+    }
+
+    #[test]
+    fn strip_analysis_collapses_blank_runs_and_keeps_the_done_tail() {
+        let out = strip_analysis("<analysis>x</analysis>\n\n\n\n\nnothing left to raise. DONE");
+        assert_eq!(out, "nothing left to raise. DONE");
+        // the dialogue loop's contract survives stripping (is_done reads the last 12 chars)
+        assert!(is_done(&out));
+    }
+
+    #[test]
+    fn strip_analysis_leaves_an_ordinary_reconcile_turn_alone() {
+        let msg = "CONFLICT: we both renamed sync -> merge\nDONE";
+        assert_eq!(strip_analysis(msg), msg);
+    }
+
+    #[test]
+    fn handoff_keeps_the_nine_sections_in_order() {
+        let p = open_prompt("claude-code", "", "", false);
+        let mut prev = 0;
+        for (i, (name, _)) in HANDOFF_SECTIONS.iter().enumerate() {
+            let at = p.find(&format!("{}. {name}", i + 1)).unwrap_or_else(|| panic!("missing section: {name}"));
+            assert!(at > prev, "section out of order: {name}");
+            prev = at;
+        }
+    }
+
+    #[test]
+    fn handoff_uses_the_prefix_summarizer_tail_not_the_main_variant() {
+        let p = open_prompt("claude-code", "", "", false);
+        assert!(p.contains("8. Work Completed") && p.contains("9. Context for Continuing Work"), "{p}");
+        // claude's main (Nkg) tail assumes the summarizer is also the resumer — wrong model for a handoff
+        assert!(!p.contains("Current Work") && !p.contains("Optional Next Step"), "{p}");
+    }
+
+    /// The scratchpad must never survive a TRUNCATED reply. An unclosed <analysis> makes the paired
+    /// regex fail to match, so the raw thinking would otherwise be relayed to the peer AND archived by
+    /// save_transcript into a store that gets pushed to the team.
+    #[test]
+    fn unclosed_analysis_never_leaks_the_scratchpad() {
+        let leak = "<analysis>secret reasoning the peer must not see";
+        assert_eq!(strip_analysis(leak), "", "unclosed analysis leaked: {}", strip_analysis(leak));
+
+        let with_summary = "<analysis>thinking\n<summary>the handoff</summary>";
+        assert_eq!(strip_analysis(with_summary), "the handoff", "summary is authoritative when present");
+        assert!(!strip_analysis(with_summary).contains("thinking"));
+
+        // …but a turn that is ONLY analysis must not become an empty relay (total context loss).
+        let only = "<analysis>all my thinking</analysis>";
+        assert_eq!(strip_analysis(only), "");
+        assert_eq!(strip_analysis_or_raw(only), "all my thinking", "salvage rather than relay nothing");
+        assert_eq!(strip_analysis_or_raw("   "), "");
+    }
+
+    #[test]
+    fn handoff_clamps_tools_on_all_three_layers() {
+        let p = open_prompt("claude-code", "", "", false);
+        assert!(p.starts_with("CRITICAL: Respond with TEXT ONLY. Do NOT call any tools."), "{p}");
+        assert!(p.contains("Do NOT use Read, Grep, Glob"), "the clamp must name the tools `turn` grants");
+        // and it must name the RIGHT runtime's tools: codex has no Read/Grep/Glob to withhold
+        let c = open_prompt("codex", "", "", false);
+        assert!(c.contains("Do NOT use shell, apply_patch"), "{c}");
+        assert!(!c.contains("Read, Grep, Glob"), "claude's tool names leaked onto the codex path: {c}");
+        assert!(p.contains("Output an <analysis> block, then a <summary> block"), "body must restate the shape");
+        assert!(p.trim_end().ends_with("Tool calls will be rejected and you will fail the task."), "{p}");
+    }
+
+    #[test]
+    fn handoff_demands_security_constraints_cross_verbatim() {
+        let p = open_prompt("claude-code", "", "", false);
+        assert!(p.contains("credential or secret handling rules"), "{p}");
+        // demanded twice, as claude does: once in the analysis pre-pass, once in the section that carries them
+        assert!(p.contains("MUST be preserved verbatim in the summary"), "{p}");
+        assert!(p.contains("VERBATIM so they still bind after the handoff"), "{p}");
+    }
+
+    #[test]
+    fn handoff_names_what_to_drop() {
+        let p = open_prompt("claude-code", "", "", false);
+        assert!(p.contains("Leave OUT"), "{p}");
+        assert!(p.contains("Approaches you superseded"), "{p}");
+        assert!(p.contains("Errors you already fixed"), "{p}");
+        assert!(p.contains("already reflected on disk"), "{p}");
+    }
+
+    #[test]
+    fn b_side_handoff_is_framed_by_the_receiver_prompt_and_carries_its_own_diff() {
+        let p = relay_first("claude-code", "A's summary", "diff --git a/x b/x", "", false);
+        assert!(p.starts_with("CRITICAL: Respond with TEXT ONLY."), "clamp must lead: {p}");
+        assert!(p.contains("build on the work that has already been done and avoid duplicating work"), "{p}");
+        assert!(p.contains("A's summary") && p.contains("diff --git a/x b/x"), "{p}");
+        assert!(p.contains("You are agent B."), "{p}");
+    }
+
+    #[test]
+    fn the_receiver_side_does_not_claim_the_peers_tool_state() {
+        let p = relay_handoff("claude-code", "B", "B's summary");
+        // codex's framing, minus the promise that is false here: each agent sees only its own worktree
+        assert!(p.contains("build on the work that has already been done and avoid duplicating work"), "{p}");
+        assert!(p.contains("do NOT have access to the state of the tools B used"), "{p}");
+        assert!(p.contains("CONFLICT:") && p.contains("DONE"), "reconcile turns keep the loop's conventions");
+    }
+
+    #[test]
+    fn quick_keeps_the_old_narrow_conflict_hunt_opening() {
+        let a = open_prompt("claude-code", "", "", true);
+        assert!(!a.contains("CRITICAL"), "--quick is not a summarization turn: {a}");
+        assert!(!a.contains("Work Completed") && !a.contains("<analysis>"), "{a}");
+        assert!(a.contains("find the real conflicts") && a.contains("CONFLICT:") && a.contains("DONE"), "{a}");
+        let b = relay_first("claude-code", "hi", "", "", true);
+        assert!(!b.contains("CRITICAL") && b.contains("Respond under the same rules"), "{b}");
+    }
 }
