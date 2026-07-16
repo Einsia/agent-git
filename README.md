@@ -44,7 +44,7 @@ agit init                     # create the Agent Store; re-run after cloning
 ## Usage
 
 ```bash
-agit -a snap                          # mirror this project's Claude session dump in (use --from codex for Codex)
+agit -a snap                          # mirror this project's session dump in (--watch to auto-snap continuously; --from codex for Codex)
 agit -a add -A && agit -a commit -m '...'
 agit -a push                          # publish to the team (secrets are scanned before push)
 

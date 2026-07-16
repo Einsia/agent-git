@@ -220,9 +220,12 @@ is the dialogue orchestrator; everything else is removal + renaming + wiring ove
 
 ## Open decisions
 
-1. **`snap` cadence** — fully automatic (version every meaningful step) vs explicit checkpoints vs hybrid. The main
-   remaining primitive question.
-2. **Integration-branch directionality** — `--both` ships; a dedicated integration-branch mode is still a maybe.
+1. **Integration-branch directionality** — `--both` ships; a dedicated integration-branch mode is still a maybe.
+
+*Resolved:* **`snap` cadence → fully automatic** (`462ab3e`). `agit -a snap --watch` watches the runtime's session
+dump and, whenever it changes and then settles (debounced), auto-mirrors + auto-commits into the Agent Store —
+runtime-agnostic, secret-hook still enforced. One-shot `agit -a snap` remains for manual capture. Verified live:
+create/modify a session → two debounced `auto-snap` commits.
 
 *Resolved since:* **multi-session per side** (`df3318f`) — a branch's sessions collectively represent the agent;
 `sync` resumes the richest on-branch session as the voice and briefs it on the rest (the diff stays the code
