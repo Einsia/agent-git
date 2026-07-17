@@ -16,7 +16,9 @@ impl Repo {
         r.sh("git config user.name d && git config user.email d@x && git config commit.gpgsign false");
         r.write("app.ts", "x\n");
         r.sh("git add -A && git commit -qm seed");
-        assert_eq!(r.agit(&["init"]).0, 0);
+        // `--agent` is required non-interactively: an agent is named for what it knows, so agit will
+        // not invent a label from the directory.
+        assert_eq!(r.agit(&["init", "--agent", "adapter-test"]).0, 0);
         r
     }
     fn path(&self) -> &Path {

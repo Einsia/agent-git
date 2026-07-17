@@ -54,7 +54,7 @@ that read sessions use the one you name with `--from`, else the only one present
 cp target/release/agit ~/.local/bin/
 
 cd your-repo
-agit init                     # asks what to call the agent, then binds it here
+agit init --agent frontend    # mint that agent and bind it here (bare `agit init` asks)
 ```
 
 ## Usage

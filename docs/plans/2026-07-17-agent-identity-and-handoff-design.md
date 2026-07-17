@@ -493,7 +493,7 @@ sufficient alone, which is the point: `--` does not stop `ext::`, and the config
 
 | Issue | Fix |
 |---|---|
-| `agit init` names the agent after the directory (`web`), so everyone renames immediately | **ask**: `Agent name [web]:` — one prompt, `--agent X` to skip, non-interactive falls back to the dir name |
+| `agit init` names the agent after the directory (`web`), so everyone renames immediately | **ask**: `Agent name — what will this agent know? [web]:` — one prompt, `--agent X` to skip. **Non-interactive REFUSES** (exit 2, mints nothing) — see below |
 | `agent track X` then `agent use X` — two commands, one intent | `track` **activates** by default (`--no-use` opts out) |
 | `-a` transposition footgun (`agit commit -a` vs `agit -a commit`) | gone — `agit a commit` (§5) |
 | `snap` silently means *claude* | no default runtime (§5.3) |
@@ -501,6 +501,27 @@ sufficient alone, which is the point: `--` does not stop `ext::`, and the config
 | conflicts resolved via bare `print!`/`read_line`, no context | a real picker (§11c) |
 | an unresolvable codex name silently starts a fresh session, exit 0 | verify by re-resolving; never trust exit 0 (§9) |
 | `agit watch` output is invisible when piped (block-buffered, lost on SIGTERM) | flush per line |
+
+### Why non-interactive `init` refuses instead of falling back to the directory name
+
+This row used to end "non-interactive falls back to the dir name". That clause was **wrong**, and the
+proof is a dead end a user cannot escape:
+
+```
+$ agit a new .tmp9ndKZa      →  minted .tmp9ndKZa (agt_85889e7b…)      # succeeds
+$ agit a track .tmp9ndKZa    →  agit: refusing a remote agit cannot classify: `.tmp9ndKZa`
+```
+
+`looks_like_url` reads **any** leading `.` as a path, and `check_remote` then refuses it as an
+unclassifiable remote — so a directory-derived name from a temp or dotted path mints an agent **no
+teammate can ever `track` by name**. The binding declares it; the fresh-clone path (§13.3) cannot use
+it. A silent fallback is what produces such a name, because nobody is present to see it.
+
+The principle both halves of this design agree on is **never derive a name silently**. A directory
+offered as a suggestion a human reads and can reject is a *decision*; a directory used because nobody
+was watching is a *guess*. So: **ask a human, refuse a script.** `validate_name` additionally refuses a
+leading `-`, `.` or `~` (a dot *inside* a name — `payments.api` — is fine), tested via the `track`
+round-trip rather than the character class, so the test survives someone "tidying" the charset later.
 
 ## 11c. Presentation — light TUI, not a TUI framework
 

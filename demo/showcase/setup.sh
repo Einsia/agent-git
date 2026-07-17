@@ -66,10 +66,13 @@ if command -v claude >/dev/null 2>&1; then
   B_JSONL="$(ls -t "$CDIR"/*.jsonl 2>/dev/null | grep -v "$(basename "$A_JSONL")" | head -1)"
   gc dev checkout -q feature-a
 
-  # File each session into ITS OWN agent's store — the layout `agit snap` writes.
+  # File each session into ITS OWN agent's store, at the path `agit snap` writes: sessions are
+  # partitioned by ENVIRONMENT, because one agent works in many repos and its memory of each must stay
+  # tellable apart.
+  ENV_SLUG="$(slug "$PROJ")"
   for pair in "ratelimit:$RL_STORE:$A_JSONL" "identity:$ID_STORE:$B_JSONL"; do
     name="${pair%%:*}"; rest="${pair#*:}"; store="${rest%%:*}"; jsonl="${rest#*:}"
-    S="$store/sessions/claude-code"
+    S="$store/sessions/$ENV_SLUG/claude-code"
     mkdir -p "$S"
     cp "$jsonl" "$S/$name-session.jsonl"
     # AGIT_AGENT selects per-shell — rung 2 of resolution, and how you drive two agents at once.
