@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 
 pub const SESSIONS_SUBDIR: &str = "sessions";
 
+/// The watcher's pidfile, inside the store's `.git` so it is never tracked or scanned.
+const WATCH_PID: &str = "agit-watch.pid";
+
 /// The runtimes agit speaks. Peers — there is no first among them, so they are listed alphabetically
 /// wherever a user reads them, and no code path may fall back to one of them as a default.
 pub const RUNTIMES: [&str; 2] = ["claude-code", "codex"];
@@ -687,6 +690,15 @@ fn watch_rundir() -> Result<PathBuf> {
     Ok(scope::root_for(Scope::Agent)?.join(".git"))
 }
 
+/// The live watcher for a given store, if any. Stores are keyed by aid, so the pidfile inside one is a
+/// per-AGENT fact — which is what lets `agit a list` say which memories are being watched right now.
+///
+/// A pidfile whose process is gone reads as not-watching rather than stale-and-believed: `agit watch`
+/// clears it when it notices, but a killed daemon never gets to.
+pub fn watcher_pid(store: &Path) -> Option<u32> {
+    read_pid(&store.join(".git").join(WATCH_PID)).filter(|p| pid_alive(*p))
+}
+
 fn read_pid(p: &Path) -> Option<u32> {
     std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse().ok())
 }
@@ -709,7 +721,7 @@ pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool)
     let env = scope::env_root()?;
     let rundir = watch_rundir()?;
     let logp = rundir.join("agit-watch.log");
-    let pidp = rundir.join("agit-watch.pid");
+    let pidp = rundir.join(WATCH_PID);
     if let Some(pid) = read_pid(&pidp) {
         if pid_alive(pid) {
             println!("agit watch already running (pid {pid}). Stop it with: agit watch --stop");
@@ -743,7 +755,7 @@ pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool)
 
 /// `agit watch --stop` — kill the background watcher recorded for this project.
 pub fn watch_stop() -> Result<i32> {
-    let pidp = watch_rundir()?.join("agit-watch.pid");
+    let pidp = watch_rundir()?.join(WATCH_PID);
     match read_pid(&pidp) {
         Some(pid) => {
             let killed = std::process::Command::new("kill")
@@ -769,7 +781,7 @@ pub fn watch_stop() -> Result<i32> {
 /// `agit watch --status` — report whether the background watcher is running.
 pub fn watch_status() -> Result<i32> {
     let rundir = watch_rundir()?;
-    match read_pid(&rundir.join("agit-watch.pid")) {
+    match read_pid(&rundir.join(WATCH_PID)) {
         Some(pid) if pid_alive(pid) => {
             println!("agit watch is running (pid {pid}).");
             println!("  log: {}", rundir.join("agit-watch.log").display());

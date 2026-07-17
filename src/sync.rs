@@ -146,28 +146,73 @@ fn resolve_target(store: &Path, name: &str, prefer: Option<Prefer>) -> Result<Ta
 }
 
 /// Both matched: never guess which memory the user meant.
+///
+/// The two rows carry what makes the choice informed rather than a coin toss (§11c) — which agent, how
+/// much memory it has and how recently it worked; which ref, whose memory is at it, and how far ahead.
+/// A bare "1) agent 2) ref" asks the user to guess at exactly the moment agit refused to.
 fn pick_ambiguous(store: &Path, name: &str, a: agent::Agent) -> Result<Target> {
-    use std::io::{stdin, stdout, BufRead, IsTerminal, Write};
-    let sessions = crate::commands::store_sessions(&a.store).len();
-    if !stdin().is_terminal() {
-        bail!(
-            "`{name}` is ambiguous: it names both an agent ({}) and a ref in this store. \
-             Say which: --agent {name} or --ref {name}.",
-            short_aid(&a.aid)
-        );
+    let sessions = crate::commands::store_sessions(&a.store);
+    let last = crate::commands::latest_session(&a.store)
+        .map(|s| format!(" · last {}", crate::ui::ago(s.recency())))
+        .unwrap_or_default();
+    let (_, full_ref) = scope::git_in_status(store, &["rev-parse", "--symbolic-full-name", name]);
+    // Whose memory is at that ref decides what merging it would MEAN (`merge_mode`), so it is the
+    // single most decision-relevant fact about the row.
+    let whose = match (aid_of_store(store), aid_at_ref(store, name)) {
+        (Some(mine), Some(theirs)) if mine == theirs => "this agent".to_string(),
+        (_, Some(theirs)) => format!("agent {}", short_aid(&theirs)),
+        (_, None) => "no aid recorded".to_string(),
+    };
+    let ahead = match ref_ahead_sessions(store, name) {
+        Some(n) => format!("{n} sessions ahead"),
+        None => "no shared history".to_string(),
+    };
+    let rows = vec![
+        vec![
+            "agent".to_string(),
+            name.to_string(),
+            short_aid(&a.aid),
+            format!("{} sessions{last}", sessions.len()),
+        ],
+        vec!["ref".to_string(), full_ref.trim().to_string(), whose, ahead],
+    ];
+    let options: Vec<String> = crate::ui::table(&[], &rows).lines().map(str::to_string).collect();
+    let picked = crate::ui::pick(
+        &format!("\"{name}\" is ambiguous:"),
+        &options,
+        &format!("Say which: --agent {name} or --ref {name}."),
+    )?;
+    if picked == 0 {
+        Ok(Target::Peer(a))
+    } else {
+        Ok(Target::Ref(name.to_string()))
     }
-    println!("\"{name}\" is ambiguous:");
-    println!("  1) agent  {name:<16} {}   {sessions} sessions", short_aid(&a.aid));
-    println!("  2) ref    {}", scope::git_in_status(store, &["rev-parse", "--symbolic-full-name", name]).1);
-    print!("Pick [1/2]: ");
-    let _ = stdout().flush();
-    let mut line = String::new();
-    stdin().lock().read_line(&mut line).ok();
-    match line.trim() {
-        "1" | "agent" => Ok(Target::Peer(a)),
-        "2" | "ref" => Ok(Target::Ref(name.to_string())),
-        _ => bail!("nothing picked; rerun with --agent {name} or --ref {name}."),
-    }
+}
+
+/// How many sessions a ref carries that this store does not — the "3 sessions ahead" on the picker's
+/// ref row. `None` = no shared history, where "ahead" has no meaning to report.
+///
+/// Counts SESSIONS, not commits: `rev-list --count` would answer with a number about git, and the user
+/// is choosing between two memories. Runtime-blind on purpose — the picker runs before `--from` has
+/// been applied, and a count that silently excluded the other runtime's sessions would be a lie.
+fn ref_ahead_sessions(store: &Path, reference: &str) -> Option<usize> {
+    (scope::git_in_status(store, &["merge-base", "HEAD", reference]).0 == 0).then_some(())?;
+    let (rc, out) = scope::git_in_status(
+        store,
+        &[
+            "diff",
+            "--name-only",
+            "--diff-filter=ACMR",
+            &format!("HEAD...{reference}"),
+            "--",
+            crate::session::SESSIONS_SUBDIR,
+        ],
+    );
+    (rc == 0).then(|| {
+        out.lines()
+            .filter(|l| crate::session::RUNTIMES.iter().any(|rt| is_session_of(l, rt)))
+            .count()
+    })
 }
 
 fn short_aid(aid: &str) -> String {
@@ -424,37 +469,68 @@ fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
+/// One open conflict: what it is, and the concrete ways out the dialogue named (if any).
+struct Conflict {
+    what: String,
+    options: Vec<String>,
+}
+
+/// Parse the synthesis's `[OPEN]` lines into conflicts. `synthesize` asks for
+/// `<conflict> || <option> | <option>`; a line without options is still a conflict, just one the user
+/// answers in their own words (the no-LLM fallback path produces exactly those from `CONFLICT:` markers).
+fn parse_conflicts(open: &str) -> Vec<Conflict> {
+    open.lines()
+        .map(|l| l.trim().trim_start_matches(['-', '*']).trim())
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("none") && !l.eq_ignore_ascii_case("n/a"))
+        .map(|l| match l.split_once("||") {
+            Some((what, opts)) => Conflict {
+                what: what.trim().to_string(),
+                options: opts.split('|').map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect(),
+            },
+            None => Conflict { what: l.to_string(), options: Vec::new() },
+        })
+        .collect()
+}
+
 /// If there are open conflicts and we're at a terminal, walk the user through deciding each and record
 /// the decisions into A's session (the merged state). Non-interactive: just surface them.
 fn resolve_inline(rt: &str, a: &Side, open: &str) -> Result<i32> {
-    use std::io::{stdin, stdout, BufRead, IsTerminal, Write};
-    let items: Vec<String> = open
-        .lines()
-        .map(|l| l.trim().trim_start_matches(['-', '*']).trim().to_string())
-        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("none") && !l.eq_ignore_ascii_case("n/a"))
-        .collect();
+    let items = parse_conflicts(open);
     if items.is_empty() {
         println!("\nNothing left for you to decide.");
         return Ok(0);
     }
-    if !stdin().is_terminal() {
-        println!("\nNeeds your decision:\n{open}");
+    // A merge in CI must never block on a prompt nobody can answer: print what needed deciding, with
+    // every option, and leave non-zero for the pipeline to act on.
+    if !crate::ui::interactive() {
+        println!("\nNeeds your decision — rerun at a terminal to answer, or decide these by hand:");
+        for (i, c) in items.iter().enumerate() {
+            println!("\n[{}/{}] {}", i + 1, items.len(), c.what);
+            for (n, o) in c.options.iter().enumerate() {
+                println!("    {}) {o}", n + 1);
+            }
+        }
         return Ok(1);
     }
-    println!("\n{} open conflict(s). Decide each (blank = leave open):", items.len());
     let mut decisions: Vec<String> = Vec::new();
-    let sin = stdin();
-    for (i, it) in items.iter().enumerate() {
-        println!("\n[{}/{}] {it}", i + 1, items.len());
-        print!("  your call> ");
-        let _ = stdout().flush();
-        let mut line = String::new();
-        if sin.lock().read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        let d = line.trim();
-        if !d.is_empty() {
-            decisions.push(format!("- {it}\n  → decided: {d}"));
+    for (i, c) in items.iter().enumerate() {
+        let mut options = c.options.clone();
+        options.push("leave open, decide later".to_string());
+        let last = options.len() - 1;
+        let choice = crate::ui::pick_boxed(
+            &format!("conflict {}/{}", i + 1, items.len()),
+            &c.what,
+            &options,
+            "your call",
+        )?;
+        match choice {
+            // Anything typed instead of a number IS the decision: the options are a shortcut, and the
+            // dialogue cannot have foreseen every way out.
+            crate::ui::Choice::Typed(d) => decisions.push(format!("- {}\n  → decided: {d}", c.what)),
+            crate::ui::Choice::Option(n) if n != last => {
+                decisions.push(format!("- {}\n  → decided: {}", c.what, options[n]))
+            }
+            _ => {}
         }
     }
     if decisions.is_empty() {
@@ -520,21 +596,18 @@ fn run_dialogue(rt: &str, a: &Side, b: &Side, quick: bool) -> Result<Vec<(char, 
     let rounds = if quick { QUICK_ROUNDS } else { MAX_ROUNDS };
     let mut transcript: Vec<(char, String)> = Vec::new();
     // default mode opens with a HANDOFF (a summarization turn) → no tools, so the clamp is real.
-    let mut msg = turn_with(rt, &a.cwd, &a.id, &open_prompt(rt, &a.diff, &a.brief, quick), quick)?;
-    println!("\nA → {msg}\n");
+    let mut msg = turn_aloud('A', rt, &a.cwd, &a.id, &open_prompt(rt, &a.diff, &a.brief, quick), quick)?;
     transcript.push(('A', msg.clone()));
 
     let mut first_b = true;
     for _ in 0..rounds {
         let bp = if first_b { relay_first(rt, &msg, &b.diff, &b.brief, quick) } else { relay(&msg) };
-        let bmsg = turn_with(rt, &b.cwd, &b.id, &bp, !(first_b && !quick))?;
-        println!("B → {bmsg}\n");
+        let bmsg = turn_aloud('B', rt, &b.cwd, &b.id, &bp, !(first_b && !quick))?;
         transcript.push(('B', bmsg.clone()));
         // In the default mode B's first reply is its handoff summary, so A receives it framed as one.
         let ap = if first_b && !quick { relay_handoff("B", &bmsg) } else { relay(&bmsg) };
         first_b = false;
-        let amsg = turn(rt, &a.cwd, &a.id, &ap)?;
-        println!("A → {amsg}\n");
+        let amsg = turn_aloud('A', rt, &a.cwd, &a.id, &ap, true)?;
         transcript.push(('A', amsg.clone()));
         msg = amsg;
         if is_done(&bmsg) && is_done(&msg) {
@@ -542,6 +615,28 @@ fn run_dialogue(rt: &str, a: &Side, b: &Side, quick: bool) -> Result<Vec<(char, 
         }
     }
     Ok(transcript)
+}
+
+/// One turn, with the wait made visible and the reply printed as it lands.
+///
+/// NOT token-by-token, and nothing here pretends otherwise: `turn_claude` and `turn_codex` shell out
+/// and collect the whole reply before returning (`.output()`, and codex's `-o <file>`), so there is no
+/// token stream to relay without rebuilding both around a streaming vendor flag. What this fixes is the
+/// part that read as a hang — a turn takes minutes and the silence was total. The spinner says WHO is
+/// thinking and for how long; it lives on stderr, so `agit a merge … > log` still captures a clean
+/// transcript, and it is cleared before the reply prints (and on drop, so an error lands on a clean
+/// line).
+fn turn_aloud(who: char, rt: &str, cwd: &Path, id: &str, prompt: &str, tools: bool) -> Result<String> {
+    let spinner = crate::ui::Spinner::start(&format!("{who} is thinking"));
+    let reply = turn_with(rt, cwd, id, prompt, tools);
+    let took = spinner.stop();
+    let msg = reply?;
+    println!(
+        "\n{} {msg}\n{}",
+        crate::ui::accent(&format!("{who} →")),
+        crate::ui::dim(&format!("  ({}s)", took.as_secs()))
+    );
+    Ok(msg)
 }
 
 /// The command to resume a merged session, per runtime.
@@ -937,11 +1032,19 @@ fn synthesize(transcript: &[(char, String)]) -> Result<(String, String)> {
             .collect();
         return Ok((String::from("(no LLM backend, not synthesized)"), open.join("\n")));
     }
+    // The `||` shape is what turns the conflict prompt from a blank box into a decision: the dialogue
+    // is the only thing that knows what the two ways out actually ARE (§11c's "keep uid, frontend
+    // updates its caller"). It stays optional — a line without it is still a conflict the user answers
+    // in their own words, which is also what the no-LLM path above produces.
     let prompt = format!(
         "Below is a reconciliation dialogue between two agents merging parallel branches. Summarize for a human \
          in two sections:\n\
          [RESOLVED] decisions they agreed on (one per line; write 'none' if empty).\n\
          [OPEN] conflicts still needing a human decision (one per line; write 'none' if empty).\n\
+         Write each [OPEN] line as: <the conflict, naming both sides> || <one way out> | <the other way out>\n\
+         Each way out must be a concrete action a human can pick, naming who changes what — e.g.\n\
+         field name: user_id (frontend) vs uid (api) || keep uid, frontend updates its caller | keep user_id, api reverts the rename\n\
+         Omit the `||` and the options only if the dialogue never named a way out.\n\
          Be terse; don't replay the dialogue.\n\n{convo_text}"
     );
     let reply = crate::llm::ask(&prompt)?;
@@ -1402,6 +1505,34 @@ mod tests {
         assert!(p.contains("build on the work that has already been done and avoid duplicating work"), "{p}");
         assert!(p.contains("do NOT have access to the state of the tools B used"), "{p}");
         assert!(p.contains("CONFLICT:") && p.contains("DONE"), "reconcile turns keep the loop's conventions");
+    }
+
+    /// The conflict picker is only as good as this parse: `||` splits the conflict from the ways out,
+    /// and a line without one is still a conflict — just one the user answers in their own words.
+    #[test]
+    fn a_conflict_carries_its_ways_out_when_the_dialogue_named_them() {
+        let open = "- field name: user_id (frontend) vs uid (api) || keep uid, frontend updates its caller | keep user_id, api reverts the rename\n\
+                    - who owns the retry budget";
+        let c = parse_conflicts(open);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].what, "field name: user_id (frontend) vs uid (api)");
+        assert_eq!(c[0].options, ["keep uid, frontend updates its caller", "keep user_id, api reverts the rename"]);
+        // no `||`: still a real conflict, with no options to shortcut it
+        assert_eq!(c[1].what, "who owns the retry budget");
+        assert!(c[1].options.is_empty());
+    }
+
+    /// "none" is the synthesis saying there is nothing to decide — reading it as a conflict named
+    /// "none" would invent work and, worse, exit non-zero on a clean merge.
+    #[test]
+    fn an_empty_open_section_is_not_a_conflict() {
+        for empty in ["", "none", "None", "- none\n", "n/a", "  \n  "] {
+            assert!(parse_conflicts(empty).is_empty(), "{empty:?} is not a conflict");
+        }
+        // the no-LLM fallback path's shape (built from CONFLICT: markers) parses as plain conflicts
+        let c = parse_conflicts("- we both renamed sync -> merge");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].what, "we both renamed sync -> merge");
     }
 
     #[test]

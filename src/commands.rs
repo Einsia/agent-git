@@ -6,6 +6,7 @@ use crate::adapter;
 use crate::agent;
 use crate::scan;
 use crate::scope::{self, Scope};
+use crate::ui;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -693,7 +694,7 @@ pub struct StoredSession {
 
 impl StoredSession {
     /// What to show a user as "when". mtime is the fallback, not the source: see `latest_session`.
-    fn recency(&self) -> std::time::SystemTime {
+    pub fn recency(&self) -> std::time::SystemTime {
         self.last_activity.map(std::time::SystemTime::from).unwrap_or(self.mtime)
     }
 }
@@ -773,16 +774,31 @@ pub fn latest_session(store: &Path) -> Option<StoredSession> {
     store_sessions(store).into_iter().max_by_key(|s| (s.last_activity, s.mtime))
 }
 
-/// Roughly how long ago, for the header. Precision past "2h ago" is noise here.
-fn ago(t: std::time::SystemTime) -> String {
-    let Ok(d) = std::time::SystemTime::now().duration_since(t) else { return "just now".into() };
-    let s = d.as_secs();
-    match s {
-        0..=59 => "just now".to_string(),
-        60..=3599 => format!("{}m ago", s / 60),
-        3600..=86399 => format!("{}h ago", s / 3600),
-        _ => format!("{}d ago", s / 86400),
-    }
+/// Where a stored session came from, and what it was about — the two things the `start` header carries
+/// beyond the agent's own name (§11c).
+///
+/// The origin is the cwd the session RECORDED, not `env_slug`: the slug is the store's partition name
+/// (`web`), while the header has room for the path the agent actually worked in (`~/code/web`), and a
+/// store written in the flat layout has no slug at all. The slug remains the fallback.
+///
+/// One parse yields both, and it is the same parse the rest of agit reads sessions with — a header that
+/// disagreed with `agit -a info` about what a session is would be worse than no header.
+fn origin_and_gist(s: &StoredSession) -> (Option<String>, Option<String>) {
+    let Ok(content) = std::fs::read_to_string(&s.path) else { return (s.env_slug.clone(), None) };
+    let ir = match s.runtime {
+        "codex" => crate::adapter::codex::parse_rollout(&content, "x"),
+        _ => crate::adapter::claude_code::parse_jsonl(&content, "x"),
+    };
+    let origin = ir
+        .cwd
+        .map(|c| ui::tilde(Path::new(&c)))
+        .or_else(|| s.env_slug.clone());
+    let gist = ir
+        .prompts
+        .into_iter()
+        .map(|p| ui::one_line(&p, 72))
+        .find(|p| !p.is_empty());
+    (origin, gist)
 }
 
 /// `agit start [--agent X] [--as claude-code|codex]` — launch a real session in THIS repo already
@@ -801,12 +817,20 @@ fn start_carrying(ag: &agent::Agent, env: &Path, s: StoredSession, as_rt: Option
     // default: the runtimes are peers (§5.3).
     let rt = crate::session::resolve_runtime(as_rt, &[s.runtime], "start")?;
 
-    println!("┌ {} · {} · {rt}", ag.name, env.display());
-    let from = match &s.env_slug {
-        Some(e) => format!(" (from {e}, {})", ago(s.recency())),
-        None => format!(" ({})", ago(s.recency())),
+    let here = ui::tilde(env);
+    println!("┌ {} · {} · {rt}", ui::bold(&ag.name), ui::accent(&here));
+    // The origin is the point of §5.1's cross-environment carry: a frontend agent continuing in the
+    // backend repo carries a session recorded somewhere else, and the header is where you find that out.
+    // Suppressed when it IS here — the line above already said where "here" is.
+    let (origin, gist) = origin_and_gist(&s);
+    let from = match origin.filter(|o| *o != here) {
+        Some(o) => format!(" (from {o}, {})", ui::ago(s.recency())),
+        None => format!(" ({})", ui::ago(s.recency())),
     };
-    println!("└ carrying its latest session{from}");
+    println!("└ carrying its latest session{}", ui::dim(&from));
+    if let Some(g) = gist {
+        println!("    {}", ui::dim(&format!("\"{g}\"")));
+    }
 
     // Rebind cwd to this repo but KEEP the paths it recorded elsewhere: those are its real memory of
     // that other codebase, not stale strings. That is `resume --env` without `--relocate` (which is only
@@ -827,7 +851,7 @@ fn start_fresh(ag: &agent::Agent, env: &Path, as_rt: Option<&str>) -> Result<i32
         anyhow::anyhow!("{e}\n  `{}` has no sessions yet, so there is no runtime to continue in — name one: agit start --as claude-code|codex", ag.name)
     })?;
     let cli = if rt == "codex" { "codex" } else { "claude" };
-    println!("┌ {} · {} · {rt}", ag.name, env.display());
+    println!("┌ {} · {} · {rt}", ui::bold(&ag.name), ui::accent(&ui::tilde(env)));
     println!("└ no sessions yet — starting FRESH, bound to this agent.");
     // The runtime mints the id, so there is nothing to write a launch record against yet: this session
     // will be attributed to the repo's default agent when captured. Said, never assumed.
@@ -932,7 +956,6 @@ mod start_tests {
         std::fs::write(p, s).unwrap();
     }
 
-    #[test]
     /// The bug this keys on: git does not preserve mtimes. `agit a track` CLONES the store, and a clone
     /// stamps every file at checkout time — verified identical to the nanosecond — so an mtime-ordered
     /// leaf-finder returns whichever session WalkDir happened to hand back last. Recency must therefore

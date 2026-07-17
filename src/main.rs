@@ -14,7 +14,7 @@
 
 // Core logic lives in the lib (crate `agit`), shared with agit-hub, so the two bins don't each write their own parsing and drift apart.
 use agit::scope::{self, Scope};
-use agit::{commands, harness, init, passthrough, session, sync};
+use agit::{commands, harness, init, passthrough, session, sync, ui};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -69,11 +69,36 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
                 println!("no agents yet — agit a new <name> mints one.");
                 return Ok(0);
             }
-            let active = scope::env_root().ok().and_then(|e| agent::read_active(&e).ok().flatten());
-            let w = agents.iter().map(|a| a.name.len()).max().unwrap_or(4);
-            for a in &agents {
-                let here = if Some(&a.aid) == active.as_ref() { "●" } else { " " };
-                println!("{here} {:<w$}  {}  {}", a.name, a.aid, a.remote.as_deref().unwrap_or("—"), w = w);
+            let env = scope::env_root().ok();
+            let active = env.as_deref().and_then(|e| agent::read_active(e).ok().flatten());
+            let default = env
+                .as_deref()
+                .and_then(|e| agent::Binding::load(e).ok().flatten())
+                .and_then(|b| b.default);
+
+            let rows: Vec<Vec<String>> = agents
+                .iter()
+                .map(|a| {
+                    let sessions = commands::store_sessions(&a.store);
+                    // "watching", not "running": a pidfile proves agit has a watcher on this store, and
+                    // nothing here can see whether a human has a live session open.
+                    let status = match session::watcher_pid(&a.store) {
+                        Some(_) => ui::accent("● watching"),
+                        None => ui::dim("·").to_string(),
+                    };
+                    let last = sessions
+                        .iter()
+                        .map(|s| s.recency())
+                        .max()
+                        .map(ui::ago)
+                        .unwrap_or_else(|| "—".into());
+                    let here = if Some(&a.aid) == active.as_ref() { "  (here)" } else { "" };
+                    vec![a.name.clone(), status, sessions.len().to_string(), format!("{last}{here}")]
+                })
+                .collect();
+            println!("{}", ui::table(&["AGENT", "STATUS", "SESSIONS", "LAST"], &rows));
+            if let Some(d) = default {
+                println!("{}", ui::dim(&format!("default: {d}")));
             }
             Ok(0)
         }
