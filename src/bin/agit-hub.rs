@@ -368,34 +368,39 @@ fn create_agent(store: &Store, name: &str, owner: &str, visibility: Visibility) 
     if !valid_agent_name(name) {
         return Err(format!("invalid name ([A-Za-z0-9._-] only, no .. and no leading dot): {name}"));
     }
-    // Covers soft-deleted agents too: their record is still here, and the name is still theirs until
-    // someone purges them. Handing it out would leave the restore nowhere to land.
-    if let Some(existing) = store.agent(name) {
-        return Err(match existing.lifecycle() {
-            Lifecycle::Deleted => format!("a deleted agent still holds this name: restore or purge it first: {name}"),
-            _ => format!("already exists: {name}"),
-        });
-    }
-    let dir = store.root().join(format!("{name}.git"));
-    let existed = dir.exists();
-    if !existed {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create the directory: {e}"))?;
-        let ok = Command::new("git")
-            .args(["init", "-q", "--bare", "-b", "main"])
-            .arg(&dir)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err("git init --bare failed".into());
-        }
-        let _ = Command::new("git").arg("-C").arg(&dir).args(["config", "http.receivepack", "true"]).status();
-    }
+    // The existence check and the record append run together under the agents.json lock. Split apart,
+    // two concurrent creates of one name both pass the check and both append — two records, one name.
+    // update_agents holds the lock across the whole closure, so checking inside it is the atomic guard.
     store
-        .update_agents(|a| a.push(AgentMeta::new(name, Some(owner), visibility)))
-        .map_err(|e| format!("failed to write agents.json: {e}"))?;
-    Ok(!existed)
+        .update_agents(|list| {
+            // Covers soft-deleted agents too: their record is still here, and the name is still theirs
+            // until someone purges them. Handing it out would leave the restore nowhere to land.
+            if let Some(existing) = list.iter().find(|a| a.name == name) {
+                return Err(match existing.lifecycle() {
+                    Lifecycle::Deleted => format!("a deleted agent still holds this name: restore or purge it first: {name}"),
+                    _ => format!("already exists: {name}"),
+                });
+            }
+            let dir = store.root().join(format!("{name}.git"));
+            let existed = dir.exists();
+            if !existed {
+                std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create the directory: {e}"))?;
+                let ok = Command::new("git")
+                    .args(["init", "-q", "--bare", "-b", "main"])
+                    .arg(&dir)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err("git init --bare failed".into());
+                }
+                let _ = Command::new("git").arg("-C").arg(&dir).args(["config", "http.receivepack", "true"]).status();
+            }
+            list.push(AgentMeta::new(name, Some(owner), visibility));
+            Ok(!existed)
+        })
+        .map_err(|e| format!("failed to write agents.json: {e}"))?
 }
 
 fn list_cmd(root: &Path) -> i32 {
@@ -2684,19 +2689,36 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
             if name_taken(ctx, &newname) {
                 return Resp::err(409, "that name is already taken");
             }
-            if std::fs::rename(repo_path(ctx.root(), &meta.name), repo_path(ctx.root(), &newname)).is_err() {
-                return Resp::err(500, "rename failed (the repo directory won't move)");
-            }
-            // A rename is a **metadata edit, not a new identity**: only the label moves. The aid is
-            // deliberately untouched here (it isn't the Hub's to mint or retire — it lives in the
-            // store's agent.toml), so everything keyed on identity survives.
-            let r = ctx.store.update_agents(|list| {
+            // Reserve the new name atomically — check and rename the record together under the lock, so
+            // two renames to one name can't both land. Done BEFORE moving the repo dir, so a lost race
+            // fails before touching the filesystem. (The `name_taken` above is only a fast fail.)
+            //
+            // A rename is a metadata edit, not a new identity: only the label moves. The aid is
+            // deliberately untouched (it lives in the store's agent.toml), so everything keyed on
+            // identity survives.
+            let reserved = ctx.store.update_agents(|list| {
+                if list.iter().any(|m| m.name == newname) {
+                    return false;
+                }
                 if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
                     m.name = newname.clone();
                 }
+                true
             });
-            if r.is_err() {
-                return Resp::err(500, "failed to write agents.json");
+            match reserved {
+                Ok(true) => {}
+                Ok(false) => return Resp::err(409, "that name is already taken"),
+                Err(_) => return Resp::err(500, "failed to write agents.json"),
+            }
+            // Move the repo dir to match the record. On failure, roll the name back so the record and
+            // the directory never disagree.
+            if std::fs::rename(repo_path(ctx.root(), &meta.name), repo_path(ctx.root(), &newname)).is_err() {
+                let _ = ctx.store.update_agents(|list| {
+                    if let Some(m) = list.iter_mut().find(|m| m.name == newname) {
+                        m.name = meta.name.clone();
+                    }
+                });
+                return Resp::err(500, "rename failed (the repo directory won't move)");
             }
             // Tokens are bound to the **name**. A rename doesn't change identity (the aid lives in
             // the store), so the bindings have to follow — otherwise one rename silently mutes every
@@ -2850,17 +2872,30 @@ fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]
     let (src_aid, _) = agent_aid(&repo_path(ctx.root(), &source.name));
     // Private by default, whatever the source was: forking a public agent is not a decision to
     // publish your copy of it.
+    // Authoritative name check, atomic with the insert. The `name_taken` above is only a fast fail; a
+    // fork that raced us to this name between there and here must not produce a second record.
     let r = ctx.store.update_agents(|list| {
+        if list.iter().any(|a| a.name == fork) {
+            return false;
+        }
         list.push(AgentMeta {
             forked_from: Some(source.name.clone()),
             forked_from_aid: src_aid.clone(),
             description: source.description.clone(),
             ..AgentMeta::new(&fork, Some(&user), Visibility::Private)
-        })
+        });
+        true
     });
-    if r.is_err() {
-        let _ = std::fs::remove_dir_all(&dst);
-        return Resp::err(500, "failed to write agents.json");
+    match r {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = std::fs::remove_dir_all(&dst);
+            return Resp::err(409, "that name is already taken");
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&dst);
+            return Resp::err(500, "failed to write agents.json");
+        }
     }
     audit::append(ctx.root(), &user, audit::AGENT_FORK, Some(&fork), &format!("forked from {}", source.name));
     let (aid, aid_source) = agent_aid(&dst);
