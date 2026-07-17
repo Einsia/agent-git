@@ -35,7 +35,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny, Role, Scope, Visibility};
+use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny, Lifecycle, Role, Scope, Visibility};
 use agit::hub::identity::Identity;
 use agit::hub::net::{self, valid_agent_name};
 use agit::hub::session::Sessions;
@@ -43,6 +43,68 @@ use agit::hub::store::{AgentMeta, Member, Store, TokenRec, User};
 use agit::hub::{audit, auth, identity, kdf, mr, session as websession, store};
 
 const PER_PAGE: usize = 20;
+
+/// One line about an agent, for the list. The README is where prose goes; this is a label.
+const DESCRIPTION_MAX: usize = 300;
+
+/// The largest page a caller may ask for. Asking for more is not an error worth failing on, but it
+/// is not an instruction either.
+const PAGE_MAX: usize = 100;
+
+/// What a list request asked for. `limit: None` = everything.
+///
+/// **Pagination is opt-in.** Without `limit` these endpoints return the whole list exactly as they
+/// always have, because the embedded SPA does not know what a cursor is: defaulting to a page would
+/// cap its list at 20 with no way for it to ask for the rest, and a silent cap in a UI is worse than
+/// an unbounded one in an API. Every response says `has_more` and `next_cursor` either way, so a
+/// client can always tell which it got — that is the part that must never be silent.
+struct Page {
+    limit: usize,
+    after: Option<String>,
+}
+
+fn page_params(query: &str) -> Result<Page, Resp> {
+    let limit = match param(query, "limit") {
+        None => usize::MAX,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n >= 1 => n.min(PAGE_MAX),
+            _ => return Err(Resp::err(400, &format!("limit must be a whole number from 1 to {PAGE_MAX}"))),
+        },
+    };
+    let after = match param(query, "cursor") {
+        None => None,
+        Some(c) => match cursor_decode(&c) {
+            Some(x) => Some(x),
+            None => return Err(Resp::err(400, "invalid cursor")),
+        },
+    };
+    Ok(Page { limit, after })
+}
+
+/// An opaque resume point. Hex, rather than the key itself: what a caller gets back here is not a
+/// contract, and a cursor that looks like data is an invitation to build on its shape.
+fn cursor_encode(key: &str) -> String {
+    key.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+fn cursor_decode(c: &str) -> Option<String> {
+    if c.is_empty() || !c.is_ascii() || c.len() % 2 != 0 || c.len() > 512 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..c.len()).step_by(2).map(|i| u8::from_str_radix(&c[i..i + 2], 16).ok()).collect();
+    String::from_utf8(bytes?).ok()
+}
+
+/// The lifecycle/ownership verbs, so the route table can name them instead of matching strings twice.
+#[derive(Clone, Copy)]
+enum Verb {
+    Fork,
+    Transfer,
+    Archive,
+    Unarchive,
+    Restore,
+    Star,
+}
 /// How many sessions a query may scan at most (stops an unbounded git show). Going over is flagged
 /// in the response rather than silently truncated.
 const SEARCH_SCAN_CAP: usize = 400;
@@ -303,8 +365,13 @@ fn create_agent(store: &Store, name: &str, owner: &str, visibility: Visibility) 
     if !valid_agent_name(name) {
         return Err(format!("invalid name ([A-Za-z0-9._-] only, no .. and no leading dot): {name}"));
     }
-    if store.agent(name).is_some() {
-        return Err(format!("already exists: {name}"));
+    // Covers soft-deleted agents too: their record is still here, and the name is still theirs until
+    // someone purges them. Handing it out would leave the restore nowhere to land.
+    if let Some(existing) = store.agent(name) {
+        return Err(match existing.lifecycle() {
+            Lifecycle::Deleted => format!("a deleted agent still holds this name: restore or purge it first: {name}"),
+            _ => format!("already exists: {name}"),
+        });
     }
     let dir = store.root().join(format!("{name}.git"));
     let existed = dir.exists();
@@ -909,6 +976,14 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// `git`, without the lossy UTF-8 conversion. Anything serving a blob's **bytes** has to use this:
+/// `from_utf8_lossy` silently rewrites every invalid sequence to U+FFFD, which corrupts the file it
+/// claims to be handing over.
+fn git_bytes(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let out = Command::new("git").arg("-C").arg(repo).args(args).output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
 fn has_head(repo: &Path) -> bool {
     git(repo, &["rev-parse", "HEAD"]).is_some()
 }
@@ -937,6 +1012,34 @@ fn last_activity(repo: &Path) -> (String, String) {
 ///   "none"         — the repo is still empty, or has no agent.toml (that's a freshly created repo
 ///                    nobody has pushed to)
 ///   "unidentified" — agent.toml exists but carries no agt_ identity (an old store's placeholder id)
+/// Bytes of README served with the agent detail. Prose, not a book — and it rides along on a route
+/// people hit constantly.
+const README_MAX: usize = 64 * 1024;
+
+/// The store's README, read out of the default ref. None = there isn't one, which is the common case
+/// and not an error.
+///
+/// Returned as **text for a JSON field**, never as a document: it is pushed content, so it is
+/// attacker-authored by definition, and the moment it is served as its own response it needs the same
+/// treatment as `api_raw`. The SPA renders it; the SPA must not render it as HTML.
+fn readme(repo: &Path) -> Option<String> {
+    if !has_head(repo) {
+        return None;
+    }
+    for candidate in ["README.md", "readme.md", "README"] {
+        let Some(out) = git_bytes(repo, &["show", &format!("HEAD:{candidate}")]) else {
+            continue;
+        };
+        // A binary blob called README.md is not a README; it is a way to put NULs in a JSON string.
+        if out.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out).into_owned();
+        return Some(clip(&text, README_MAX));
+    }
+    None
+}
+
 fn agent_aid(repo: &Path) -> (Option<String>, &'static str) {
     let Some(text) = git(repo, &["show", "HEAD:agent.toml"]) else {
         return (None, "none");
@@ -987,7 +1090,15 @@ fn session_refs(repo: &Path) -> Vec<SessionRef> {
 }
 
 fn load_session(repo: &Path, path: &str, at: Option<&str>) -> Option<String> {
-    git(repo, &["show", &format!("{}:{path}", at.unwrap_or("HEAD"))])
+    let at = at.unwrap_or("HEAD");
+    // The rev arrives off the query string and is concatenated into a `<rev>:<path>` **argv slot**,
+    // so a leading `-` makes git read the whole thing as an option — and `git show` has options that
+    // write files (`--output=`). Checked here rather than at each caller: this is the one place the
+    // value reaches git, so it is the one place that cannot be forgotten.
+    if !valid_rev(at) {
+        return None;
+    }
+    git(repo, &["show", &format!("{at}:{path}")])
 }
 
 /// Session count and last activity per environment. environment = which code repo the session came from.
@@ -1944,8 +2055,34 @@ fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
     // agent/<name>/mrs[/<id>[/comments|/close]]
     if let Some((name, tail)) = after.split_once("/mrs") {
         if tail.is_empty() || tail.starts_with('/') {
-            return api_mrs(ctx, caller, name, tail, m, body);
+            return api_mrs(ctx, caller, name, tail, m, req.query(), body);
         }
+    }
+
+    // agent/<name>/raw/<path> and agent/<name>/compare — both read the store's bytes, so both go
+    // through the Read gate first, like every other entry point.
+    for sep in ["/raw/", "/compare"] {
+        let Some((name, tail)) = after.split_once(sep) else {
+            continue;
+        };
+        if sep == "/compare" && !tail.is_empty() {
+            continue; // don't let /compareXYZ pass as /compare
+        }
+        if m != "GET" {
+            return Resp::text(405, "method not allowed");
+        }
+        let meta = match gate(ctx, caller, name, Action::Read) {
+            Ok(x) => x,
+            Err(r) => return r,
+        };
+        let repo = repo_path(ctx.root(), &meta.name);
+        if !has_head(&repo) {
+            return Resp::err(404, "not found");
+        }
+        return match sep {
+            "/raw/" => api_raw(&repo, tail, req.query()),
+            _ => api_compare(&repo, req.query()),
+        };
     }
 
     // agent/<name>/session/<id>[/diff]
@@ -1975,6 +2112,39 @@ fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
         }
     }
 
+    // agent/<name>/<verb> — the lifecycle verbs. Each is its own route rather than a PATCH field:
+    // they are events with their own audit rows and their own legal predecessors, not attributes.
+    for (verb, handler) in [
+        ("/fork", Verb::Fork),
+        ("/transfer", Verb::Transfer),
+        ("/archive", Verb::Archive),
+        ("/unarchive", Verb::Unarchive),
+        ("/restore", Verb::Restore),
+        ("/star", Verb::Star),
+    ] {
+        if let Some(name) = after.strip_suffix(verb) {
+            if m != "POST" {
+                return Resp::text(405, "method not allowed");
+            }
+            return match handler {
+                Verb::Fork => api_fork_agent(ctx, req, caller, name, body),
+                Verb::Transfer => api_transfer_agent(ctx, caller, name, body),
+                Verb::Archive => {
+                    set_lifecycle(ctx, caller, name, Lifecycle::Archived, &[Lifecycle::Active], audit::AGENT_ARCHIVE)
+                }
+                Verb::Unarchive => {
+                    set_lifecycle(ctx, caller, name, Lifecycle::Active, &[Lifecycle::Archived], audit::AGENT_UNARCHIVE)
+                }
+                // Restore lands on Active, not on "whatever it was": an agent coming back from the
+                // trash writable is the surprise; coming back and needing one more click is not.
+                Verb::Restore => {
+                    set_lifecycle(ctx, caller, name, Lifecycle::Active, &[Lifecycle::Deleted], audit::AGENT_RESTORE)
+                }
+                Verb::Star => api_star_agent(ctx, caller, name, body),
+            };
+        }
+    }
+
     // agent/<name>
     match m {
         "GET" => {
@@ -1985,7 +2155,7 @@ fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
             api_agent(ctx, req, caller, &meta)
         }
         "PATCH" => api_patch_agent(ctx, caller, after, body),
-        "DELETE" => api_delete_agent(ctx, caller, after),
+        "DELETE" => api_delete_agent(ctx, caller, after, req.query()),
         _ => Resp::text(405, "method not allowed"),
     }
 }
@@ -2038,15 +2208,29 @@ fn api_me(caller: &Caller) -> Resp {
 // ── agents ──
 
 fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
-    let items: Vec<serde_json::Value> = list_agents(ctx.root())
+    let page = match page_params(req.query()) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    // What you can't see doesn't make the list — the list is the first answer to "who may see whose
+    // agent", and it is also what makes archived agents show and deleted ones vanish, since both are
+    // decided in the same place.
+    //
+    // Filtered before paging, never after: a page that hides its rejects would hand out short pages
+    // and let a caller infer, from the gaps, exactly how many agents they cannot see.
+    let visible: Vec<String> = list_agents(ctx.root())
+        .into_iter()
+        .filter(|n| acl::decide(caller, &ctx.store.agent_or_unowned(n).to_acl(), Action::Read).allowed())
+        .filter(|n| page.after.as_deref().is_none_or(|a| n.as_str() > a))
+        .collect();
+    let has_more = visible.len() > page.limit;
+    let window: Vec<String> = visible.into_iter().take(page.limit).collect();
+    let next_cursor = has_more.then(|| window.last().map(|n| cursor_encode(n))).flatten();
+
+    let items: Vec<serde_json::Value> = window
         .iter()
         .filter_map(|n| {
             let meta = ctx.store.agent_or_unowned(n);
-            // What you can't see doesn't make the list — the list is the first answer to "who may
-            // see whose agent".
-            if !acl::decide(caller, &meta.to_acl(), Action::Read).allowed() {
-                return None;
-            }
             let repo = repo_path(ctx.root(), n);
             let (count, when, subject) = if has_head(&repo) {
                 let (w, s) = last_activity(&repo);
@@ -2063,11 +2247,21 @@ fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
                 "when": when,
                 "subject": subject,
                 "visibility": meta.visibility,
+                "lifecycle": meta.lifecycle().as_str(),
+                "description": meta.description,
+                "forked_from": meta.forked_from,
+                "stars": meta.stars.len(),
+                "starred": caller.user.as_ref().is_some_and(|u| meta.stars.contains(u)),
                 "role": effective_role(caller, &meta),
             }))
         })
         .collect();
-    Resp::json(serde_json::json!({ "agents": items, "host": req.host() }))
+    Resp::json(serde_json::json!({
+        "agents": items,
+        "host": req.host(),
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }))
 }
 
 /// The caller's **effective** role on this agent, for the UI to decide which buttons to show.
@@ -2106,7 +2300,8 @@ fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body: &[u8]) -> Resp 
     };
     // Creating a repo goes through the same decision: treat it as "writing to an agent I own" —
     // so a token bound to another agent, or a read-only token, can't create anything.
-    let hypothetical = AgentAcl { name: name.clone(), owner: Some(user.clone()), visibility, members: vec![] };
+    let hypothetical =
+        AgentAcl { name: name.clone(), owner: Some(user.clone()), visibility, lifecycle: Lifecycle::Active, members: vec![] };
     if let Decision::Deny(d) = acl::decide(caller, &hypothetical, Action::Write) {
         audit_deny(ctx, &user, Some(&name), Action::Write, d);
         return Resp::err(403, d.reason());
@@ -2191,6 +2386,12 @@ fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta) -> Resp {
         "aid_status": aid_status,
         "clone_url": clone_url(ctx, req, name),
         "visibility": meta.visibility,
+        "lifecycle": meta.lifecycle().as_str(),
+        "description": meta.description,
+        "forked_from": meta.forked_from,
+        "readme": readme(&repo),
+        "stars": meta.stars.len(),
+        "starred": caller.user.as_ref().is_some_and(|u| meta.stars.contains(u)),
         "owner": meta.owner,
         "members": members,
         "role": effective_role(caller, meta),
@@ -2344,12 +2545,30 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
         }
     }
 
+    // `{"description": ""}` clears it — an explicit empty string is a real instruction, and the only
+    // way to take a description back off.
+    if let Some(d) = v.get("description").and_then(|x| x.as_str()) {
+        let d = match mr::bounded(d, DESCRIPTION_MAX) {
+            Ok(x) => x,
+            Err(e) => return Resp::err(400, &format!("description {e}")),
+        };
+        let r = ctx.store.update_agents(|list| {
+            if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
+                m.description = d.clone();
+            }
+        });
+        if r.is_err() {
+            return Resp::err(500, "failed to write agents.json");
+        }
+        audit::append(ctx.root(), &actor, audit::AGENT_DESCRIBE, Some(&meta.name), d.as_deref().unwrap_or("(cleared)"));
+    }
+
     if let Some(newname) = str_field(&v, "name") {
         if newname != meta.name {
             if !valid_agent_name(&newname) {
                 return Resp::err(400, "invalid name ([A-Za-z0-9._-] only, no .. and no leading dot)");
             }
-            if repo_path(ctx.root(), &newname).exists() || ctx.store.agent(&newname).is_some() {
+            if name_taken(ctx, &newname) {
                 return Resp::err(409, "that name is already taken");
             }
             if std::fs::rename(repo_path(ctx.root(), &meta.name), repo_path(ctx.root(), &newname)).is_err() {
@@ -2387,11 +2606,60 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
     Resp::json(serde_json::json!({ "name": fresh.name, "visibility": fresh.visibility, "owner": fresh.owner }))
 }
 
-fn api_delete_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
+/// Is this name spoken for? **Includes soft-deleted agents**, whose whole point is that the name
+/// stays theirs: hand it to someone else and the restore has nowhere to land, while every token and
+/// `.agit.toml` still pointing at the name silently starts addressing a stranger's agent.
+fn name_taken(ctx: &Ctx, name: &str) -> bool {
+    ctx.store.agent(name).is_some() || repo_path(ctx.root(), name).exists()
+}
+
+/// Move an agent between lifecycle states. The state itself is enforced in `acl::decide` — this only
+/// writes it down.
+fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Lifecycle, from: &[Lifecycle], action: &'static str) -> Resp {
     let meta = match gate(ctx, caller, name, Action::Manage) {
         Ok(x) => x,
         Err(r) => return r,
     };
+    // Refusing the no-op transition is what makes each of these verbs mean something: "restore" on a
+    // live agent is a caller who thinks it was deleted, and answering 204 would agree with them.
+    if !from.contains(&meta.lifecycle()) {
+        return Resp::err(409, &format!("this agent is {}", meta.lifecycle().as_str()));
+    }
+    let r = ctx.store.update_agents(|list| {
+        if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
+            m.lifecycle = to.as_str().to_string();
+        }
+    });
+    if r.is_err() {
+        return Resp::err(500, "failed to write agents.json");
+    }
+    let actor = caller.user.clone().unwrap_or_default();
+    audit::append(ctx.root(), &actor, action, Some(&meta.name), &format!("{} → {}", meta.lifecycle().as_str(), to.as_str()));
+    Resp::json(serde_json::json!({ "name": meta.name, "lifecycle": to.as_str(), "aid": meta.aid }))
+}
+
+/// `DELETE /api/agent/<name>` — **soft**. The repo, the tokens, the MRs and the name all survive; the
+/// agent simply stops being findable (`acl::decide` denies everything but Manage on a deleted agent).
+///
+/// Destroying the bytes is `?purge=true`, and only from here — two steps, because the one-step version
+/// of this is how a memory nobody meant to lose gets lost.
+fn api_delete_agent(ctx: &Ctx, caller: &Caller, name: &str, query: &str) -> Resp {
+    if param(query, "purge").as_deref() == Some("true") {
+        return api_purge_agent(ctx, caller, name);
+    }
+    set_lifecycle(ctx, caller, name, Lifecycle::Deleted, &[Lifecycle::Active, Lifecycle::Archived], audit::AGENT_DELETE)
+}
+
+/// The irreversible one: the bytes go. Only reachable for an already soft-deleted agent, so nothing
+/// live can be destroyed by a single mistyped verb.
+fn api_purge_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
+    let meta = match gate(ctx, caller, name, Action::Manage) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if meta.lifecycle() != Lifecycle::Deleted {
+        return Resp::err(409, "purge only empties the trash: delete this agent first, then purge it");
+    }
     if std::fs::remove_dir_all(repo_path(ctx.root(), &meta.name)).is_err() {
         return Resp::err(500, "can't remove the repo directory");
     }
@@ -2402,8 +2670,187 @@ fn api_delete_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
     let _ = ctx.store.update_tokens(|toks| toks.retain(|t| t.agent.as_deref() != Some(meta.name.as_str())));
     // Same reasoning for MRs targeting it: a recycled name must not inherit the old agent's reviews.
     let _ = ctx.store.update_mrs(|mrs| mrs.retain(|m| m.target.agent != meta.name));
-    audit::append(ctx.root(), &caller.user.clone().unwrap_or_default(), audit::AGENT_DELETE, Some(&meta.name), "");
+    audit::append(ctx.root(), &caller.user.clone().unwrap_or_default(), audit::AGENT_PURGE, Some(&meta.name), "");
     Resp::no_content()
+}
+
+/// Fork: a new agent, **owned by the caller**, carrying the source's history.
+///
+/// Two things this deliberately does not do.
+///
+/// It does not copy the source's members. A fork is not a way to hand your collaborators an agent
+/// they were never granted — the fork's ACL starts from the forker alone, and everyone else has to be
+/// invited to it the normal way.
+///
+/// It does not copy the aid into the fork's metadata. The cloned store still *contains* the source's
+/// agent.toml, so the fork wears the source's identity until someone rebinds it locally
+/// (`agit a rebind`) and pushes — until then `sync_aid` reports it as a conflict and refuses to cache
+/// it, which is exactly right: two agents may never share one aid, and the Hub does not mint them.
+fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+    // You cannot fork what you cannot read — otherwise fork is an oracle for private agents, and a
+    // way to walk off with one.
+    let source = match gate(ctx, caller, name, Action::Read) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    // A fork is a write the caller performs, so a read-only token must not get to do it.
+    if caller.token.as_ref().is_some_and(|t| t.scope != Scope::Write) {
+        audit_deny(ctx, &user, Some(name), Action::Write, Deny::TokenScope);
+        return Resp::err(403, Deny::TokenScope.reason());
+    }
+    let fork = match json_body(body).as_ref().and_then(|v| str_field(v, "name")) {
+        Some(n) => n,
+        None => format!("{}-fork", source.name),
+    };
+    if !valid_agent_name(&fork) {
+        return Resp::err(400, "invalid name ([A-Za-z0-9._-] only, no .. and no leading dot)");
+    }
+    if name_taken(ctx, &fork) {
+        return Resp::err(409, "that name is already taken");
+    }
+    let dst = repo_path(ctx.root(), &fork);
+    let ok = Command::new("git")
+        .args(["clone", "-q", "--bare"])
+        .arg(repo_path(ctx.root(), &source.name))
+        .arg(&dst)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_dir_all(&dst);
+        return Resp::err(500, "git clone --bare failed");
+    }
+    let _ = Command::new("git").arg("-C").arg(&dst).args(["config", "http.receivepack", "true"]).status();
+    // A bare clone records its origin. The fork is its own agent on its own disk — leaving a remote
+    // pointing at the source would make its `--not --all` scan bound, and its pushes routable,
+    // through somebody else's repo.
+    let _ = Command::new("git").arg("-C").arg(&dst).args(["remote", "remove", "origin"]).status();
+    install_pre_receive(&dst, ctx.root(), &fork);
+
+    // Private by default, whatever the source was: forking a public agent is not a decision to
+    // publish your copy of it.
+    let r = ctx.store.update_agents(|list| {
+        list.push(AgentMeta {
+            forked_from: Some(source.name.clone()),
+            description: source.description.clone(),
+            ..AgentMeta::new(&fork, Some(&user), Visibility::Private)
+        })
+    });
+    if r.is_err() {
+        let _ = std::fs::remove_dir_all(&dst);
+        return Resp::err(500, "failed to write agents.json");
+    }
+    audit::append(ctx.root(), &user, audit::AGENT_FORK, Some(&fork), &format!("forked from {}", source.name));
+    let (aid, aid_source) = agent_aid(&dst);
+    Resp::json_status(
+        201,
+        serde_json::json!({
+            "name": fork,
+            "forked_from": source.name,
+            "owner": user,
+            "visibility": Visibility::Private.as_str(),
+            "clone_url": clone_url(ctx, req, &fork),
+            // The identity the *clone* carries, which is still the source's. Reported, never cached:
+            // `by-aid` keeps resolving to the source until this fork is rebound.
+            "aid": aid,
+            "aid_source": aid_source,
+            "aid_status": "conflict",
+            "note": "this fork carries the source's aid until you run `agit a rebind` locally and push",
+        }),
+    )
+}
+
+/// Star / unstar, per user. `{"starred": false}` unstars; the default is to star.
+///
+/// Gated at Read, not Write: starring is a bookmark the *caller* keeps, and needing write access to
+/// bookmark something would make the feature useless for exactly the agents worth bookmarking. It
+/// still writes hub state, so it takes an identity and refuses a read-only token, same as an MR
+/// comment (see `mutation_actor`).
+fn api_star_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+    let meta = match gate(ctx, caller, name, Action::Read) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let actor = match mutation_actor(ctx, caller, name) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let on = json_body(body).and_then(|v| v.get("starred").and_then(|x| x.as_bool())).unwrap_or(true);
+    let who = actor.clone();
+    let r = ctx.store.update_agents(|list| {
+        if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
+            m.stars.retain(|u| u != &who);
+            if on {
+                m.stars.push(who.clone());
+            }
+        }
+    });
+    if r.is_err() {
+        return Resp::err(500, "failed to write agents.json");
+    }
+    audit::append(ctx.root(), &actor, audit::AGENT_STAR, Some(&meta.name), if on { "starred" } else { "unstarred" });
+    let fresh = ctx.store.agent_or_unowned(&meta.name);
+    Resp::json(serde_json::json!({ "name": meta.name, "starred": on, "stars": fresh.stars.len() }))
+}
+
+/// Transfer ownership. The aid does not move — a transfer is a metadata edit, exactly like a rename:
+/// the memory is the same memory, it just answers to someone else now.
+///
+/// **The previous owner keeps nothing.** No membership row is left behind for them, so on a private
+/// agent they lose read access at the same moment, and their name-bound tokens stop working. That is
+/// the honest reading of "transfer", and the alternative — quietly leaving the old owner an admin
+/// grant — hands the new owner an agent that someone else still controls without saying so. The way
+/// back is for the new owner to add them, or for the site admin to step in; both are deliberate acts
+/// by someone who still has the rights, which is the property worth keeping.
+fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+    let meta = match gate(ctx, caller, name, Action::Manage) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let Some(to) = json_body(body).as_ref().and_then(|v| str_field(v, "to")) else {
+        return Resp::err(400, "want to (the username to transfer ownership to)");
+    };
+    let to = store::normalize_username(&to);
+    // Only a real, existing user — the same rule members follow, and for the same reason: an agent
+    // owned by a name nobody holds is an agent whoever registers that name later inherits.
+    if ctx.store.user(&to).is_none() {
+        return Resp::err(400, &format!("no such user: {to}"));
+    }
+    if meta.owner.as_deref() == Some(to.as_str()) {
+        return Resp::err(409, &format!("{to} already owns this agent"));
+    }
+    let (from, target) = (meta.owner.clone(), to.clone());
+    let r = ctx.store.update_agents(|list| {
+        if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
+            m.owner = Some(target.clone());
+            // The new owner's membership row, if any, is now noise at best and a demotion at worst
+            // (owner outranks every role) — drop it rather than leave two answers to "what may they
+            // do".
+            m.members.retain(|x| x.username != target);
+        }
+    });
+    if r.is_err() {
+        return Resp::err(500, "failed to write agents.json");
+    }
+    let actor = caller.user.clone().unwrap_or_default();
+    audit::append(
+        ctx.root(),
+        &actor,
+        audit::AGENT_TRANSFER,
+        Some(&meta.name),
+        &format!("{} → {to}", from.as_deref().unwrap_or("(unowned)")),
+    );
+    Resp::json(serde_json::json!({
+        "name": meta.name,
+        "owner": to,
+        "previous_owner": from,
+        // The point of a transfer being safe is that identity did not move. Say so, rather than
+        // leaving the caller to take it on faith.
+        "aid": meta.aid,
+    }))
 }
 
 // ── members ──
@@ -2587,7 +3034,7 @@ fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
 /// since anyone who may read the review may take part in it. That tier is about *who may join the
 /// discussion* — it is not a claim that a comment is not a write, so every POST here additionally
 /// clears `mutation_actor`. Nothing here merges anything: see the module docs on `agit::hub::mr`.
-fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
+fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, query: &str, body: &[u8]) -> Resp {
     // The action this route needs, decided **before** the agent is fetched, so the gate is the first
     // thing that happens on every path.
     let action = match (method, tail) {
@@ -2611,7 +3058,7 @@ fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, bod
     };
 
     match (method, tail) {
-        ("GET", "") => api_mr_list(ctx, caller, &meta),
+        ("GET", "") => api_mr_list(ctx, caller, &meta, query),
         ("POST", "") => api_mr_open(ctx, caller, &meta, &actor, body),
         _ => {
             // mrs/<id> | mrs/<id>/comments | mrs/<id>/close
@@ -2662,10 +3109,25 @@ fn mutation_actor(ctx: &Ctx, caller: &Caller, name: &str) -> Result<String, Resp
 
 /// The list view: no transcripts. They are the big field, and nobody reading an index wants every
 /// merge dialogue on the agent shipped along with it.
-fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta) -> Resp {
-    let items: Vec<serde_json::Value> = ctx
-        .store
-        .mrs_for(&meta.name)
+fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, query: &str) -> Resp {
+    let page = match page_params(query) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    // Ids climb and `mrs_for` sorts by them, so the id of the last row is a resume point that
+    // survives an MR being opened or deleted underneath the caller — which an offset would not.
+    let after: Option<usize> = match page.after.as_deref().map(|a| a.parse::<usize>()) {
+        None => None,
+        Some(Ok(n)) => Some(n),
+        Some(Err(_)) => return Resp::err(400, "invalid cursor"),
+    };
+    let all: Vec<mr::Mr> =
+        ctx.store.mrs_for(&meta.name).into_iter().filter(|m| after.is_none_or(|a| m.id > a)).collect();
+    let has_more = all.len() > page.limit;
+    let window: Vec<mr::Mr> = all.into_iter().take(page.limit).collect();
+    let next_cursor = has_more.then(|| window.last().map(|m| cursor_encode(&m.id.to_string()))).flatten();
+
+    let items: Vec<serde_json::Value> = window
         .iter()
         .map(|m| {
             serde_json::json!({
@@ -2682,7 +3144,12 @@ fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta) -> Resp {
             })
         })
         .collect();
-    Resp::json(serde_json::json!({ "agent": meta.name, "mrs": items }))
+    Resp::json(serde_json::json!({
+        "agent": meta.name,
+        "mrs": items,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }))
 }
 
 fn can_read_agent(ctx: &Ctx, caller: &Caller, agent: &str) -> bool {
@@ -2895,6 +3362,30 @@ fn api_mr_close(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, id: usize, actor: 
     }
 }
 
+/// A revision the caller is allowed to name: a sha, a branch, a tag.
+///
+/// Same shape as a ref name, and deliberately narrow. Every rev here ends up in a git **argv slot** —
+/// `<rev>:<path>`, or `git diff <a> <b>` — where a leading `-` stops being data and becomes an
+/// option. That is not hypothetical: `git show --output=<file>` writes to the filesystem, and these
+/// values arrive straight off the query string with no decoding in between.
+///
+/// The cost is that `HEAD~1` and `main^` are not sayable. Shas and branch names are, which is what
+/// the UI passes, and "spell it as a sha" is a much better trade than parsing git's rev grammar.
+fn valid_rev(r: &str) -> bool {
+    valid_ref_name(r)
+}
+
+/// A path inside the store, as it arrives in a URL. Rejects the shapes that make `git show
+/// <rev>:<path>` mean something other than "read this file", and the control bytes that would break
+/// out of a header value further down.
+fn valid_repo_path(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= 512
+        && !p.starts_with('-')
+        && !p.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+        && !p.bytes().any(|b| b < 0x20 || b == 0x7f)
+}
+
 /// A git ref name, conservatively. Not `git check-ref-format` — this only has to be a safe, boring
 /// label to store and echo back, and refusing an exotic-but-legal ref costs nothing here.
 fn valid_ref_name(r: &str) -> bool {
@@ -3078,6 +3569,137 @@ fn api_session(repo: &Path, id: &str, query: &str) -> Resp {
         "revisions": revisions,
         "pinned": at,
     }))
+}
+
+/// Bytes served by the raw route in one response. A store holds transcripts, not releases.
+const RAW_MAX: u64 = 8 * 1024 * 1024;
+/// Rows of `compare` output. A diff between two distant points is unbounded; the answer to "what
+/// changed across 40,000 files" is not a JSON array.
+const COMPARE_MAX: usize = 500;
+
+/// `GET /api/agent/<name>/raw/<path>?at=<rev>` — a file out of the store, as bytes.
+///
+/// **This is the one route whose response headers are the security control.** Everything it serves is
+/// pushed content, so it is attacker-authored by definition: a session file can hold `<script>` as
+/// easily as it holds JSON, and it is served from the Hub's own origin — the origin the session
+/// cookie belongs to. So the content-type is never guessed from the extension, and never negotiated:
+///
+///   - `application/octet-stream` — a guessed `text/html` here is stored XSS, full stop.
+///   - `attachment` — a browser following the link downloads it instead of rendering it.
+///   - `nosniff` — without it a browser will content-sniff its way back to `text/html` whatever the
+///     header said, which is exactly the bug the header was supposed to prevent.
+///   - `sandbox` + a null CSP — defence in depth: if something does render it, it renders inert.
+///
+/// The SPA reads this with fetch() and decides how to display it. That is the right place for the
+/// decision, because the SPA knows it is showing a transcript rather than a document.
+fn api_raw(repo: &Path, path: &str, query: &str) -> Resp {
+    if !valid_repo_path(path) {
+        return Resp::err(400, "invalid path");
+    }
+    let at = param(query, "at").unwrap_or_else(|| "HEAD".into());
+    if !valid_rev(&at) {
+        return Resp::err(400, "invalid revision");
+    }
+    let spec = format!("{at}:{path}");
+    // Size first, from the object header, so an enormous blob is refused before it is read into
+    // memory rather than after.
+    let size: u64 = match git(repo, &["cat-file", "-s", &spec]).and_then(|s| s.trim().parse().ok()) {
+        Some(n) => n,
+        None => return Resp::err(404, "not found"),
+    };
+    if size > RAW_MAX {
+        return Resp::err(413, &format!("this file is {size} bytes; the raw view stops at {RAW_MAX}. Clone the store for it."));
+    }
+    let Some(body) = git_bytes(repo, &["cat-file", "blob", &spec]) else {
+        return Resp::err(404, "not found");
+    };
+    Resp::new(200, "application/octet-stream", body)
+        .with("Content-Disposition", &format!("attachment; filename=\"{}\"", safe_filename(path)))
+        .with("X-Content-Type-Options", "nosniff")
+        .with("Content-Security-Policy", "default-src 'none'; sandbox")
+}
+
+/// The basename, reduced to bytes that cannot break out of a quoted header value.
+///
+/// `Resp::with` writes headers verbatim, and this string comes from a URL: a `"` would end the value
+/// early and a CR/LF would start a header of the attacker's choosing. Filtering rather than escaping,
+/// because the only thing a filename has to do here is name the file.
+fn safe_filename(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or("file");
+    let s: String = base.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).take(80).collect();
+    match s.trim_matches('.').is_empty() {
+        true => "file".into(),
+        false => s,
+    }
+}
+
+/// `GET /api/agent/<name>/compare?from=<rev>&to=<rev>` — what changed between two points of the
+/// store, across the whole tree rather than within one session (that is `session/<id>/diff`).
+fn api_compare(repo: &Path, query: &str) -> Resp {
+    let (Some(from), Some(to)) = (param(query, "from"), param(query, "to")) else {
+        return Resp::err(400, "need from and to");
+    };
+    if !valid_rev(&from) || !valid_rev(&to) {
+        return Resp::err(400, "invalid revision");
+    }
+    // Resolve both before diffing: an unknown rev is a 404, not an empty diff that reads like "these
+    // two points are identical".
+    let (Some(fsha), Some(tsha)) = (rev_sha(repo, &from), rev_sha(repo, &to)) else {
+        return Resp::err(404, "no such revision");
+    };
+
+    let raw = git(repo, &["diff", "--numstat", &fsha, &tsha, "--"]).unwrap_or_default();
+    let mut files: Vec<serde_json::Value> = vec![];
+    let mut truncated = false;
+    for line in raw.lines() {
+        if files.len() >= COMPARE_MAX {
+            truncated = true;
+            break;
+        }
+        let mut f = line.split('\t');
+        let (added, deleted, path) = (f.next().unwrap_or("-"), f.next().unwrap_or("-"), f.next().unwrap_or(""));
+        if path.is_empty() {
+            continue;
+        }
+        // numstat prints "-" for a binary file rather than a count. Report null, not 0: "no lines
+        // changed" and "lines are not the unit here" are different answers.
+        files.push(serde_json::json!({
+            "path": path,
+            "added": added.parse::<u64>().ok(),
+            "deleted": deleted.parse::<u64>().ok(),
+            "binary": added == "-",
+        }));
+    }
+
+    let commits: Vec<serde_json::Value> = git(repo, &["log", "--format=%H\x1f%s", &format!("{fsha}..{tsha}")])
+        .unwrap_or_default()
+        .lines()
+        .take(COMPARE_MAX)
+        .filter_map(|l| {
+            let (sha, subject) = l.split_once('\x1f')?;
+            Some(serde_json::json!({ "sha": sha, "subject": subject }))
+        })
+        .collect();
+
+    Resp::json(serde_json::json!({
+        "from": from,
+        "to": to,
+        // What the names resolved to, so a moving branch can be told from a fixed point later.
+        "resolved": { "from": fsha, "to": tsha },
+        "commits": commits,
+        "files": files,
+        "truncated": truncated,
+    }))
+}
+
+/// Resolve a rev to a commit sha. None = it does not name a commit here.
+fn rev_sha(repo: &Path, rev: &str) -> Option<String> {
+    if !valid_rev(rev) {
+        return None;
+    }
+    let out = git(repo, &["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])?;
+    let s = out.trim().to_string();
+    (s.len() == 40).then_some(s)
 }
 
 fn api_diff(repo: &Path, id: &str, query: &str) -> Resp {
@@ -3351,7 +3973,13 @@ mod tests {
     // ── Which status a denial gets: the policy here is "don't leak existence" ──
 
     fn private_acl() -> AgentAcl {
-        AgentAcl { name: "secret".into(), owner: Some("alice".into()), visibility: Visibility::Private, members: vec![] }
+        AgentAcl {
+            name: "secret".into(),
+            owner: Some("alice".into()),
+            visibility: Visibility::Private,
+            lifecycle: Lifecycle::Active,
+            members: vec![],
+        }
     }
 
     #[test]
@@ -3375,6 +4003,7 @@ mod tests {
             name: "secret".into(),
             owner: Some("alice".into()),
             visibility: Visibility::Private,
+            lifecycle: Lifecycle::Active,
             members: vec![("bob".into(), Role::Read)],
         };
         let r = deny_resp(&Caller::user("bob"), &acl, Deny::NoGrant);
@@ -3530,6 +4159,97 @@ mod tests {
 
         let errored = ScanReport { findings: vec![], unscanned: vec![], errored: Some("git failed".into()) };
         assert!(errored.incomplete(), "an IO failure is not a clean scan");
+    }
+
+    // ── pagination ──
+
+    #[test]
+    fn a_cursor_roundtrips_and_refuses_junk() {
+        for key in ["payments", "1", "a.b-c_d", "42"] {
+            assert_eq!(cursor_decode(&cursor_encode(key)).as_deref(), Some(key));
+        }
+        // Opaque means opaque: it must not read as the key it encodes.
+        assert_ne!(cursor_encode("payments"), "payments");
+        for bad in ["", "zz", "abc", "payments", "的的"] {
+            assert_eq!(cursor_decode(bad), None, "{bad:?} must not decode");
+        }
+        // A cursor is a resume point, not a place to post a novel.
+        assert_eq!(cursor_decode(&"61".repeat(300)), None);
+    }
+
+    /// `Resp` is deliberately not Debug (it carries response bodies), so unwrap it by hand.
+    fn page_of(query: &str) -> Option<Page> {
+        page_params(query).ok()
+    }
+
+    #[test]
+    fn no_limit_means_everything_not_a_default_page() {
+        // The embedded SPA does not know what a cursor is. A default page would cap its list with no
+        // way for it to ask for the rest — a silent cap in a UI, which is the thing being avoided.
+        let p = page_of("").expect("no params is a valid request");
+        assert_eq!(p.limit, usize::MAX);
+        assert!(p.after.is_none());
+    }
+
+    #[test]
+    fn a_limit_is_clamped_and_junk_is_refused_rather_than_ignored() {
+        assert_eq!(page_of("limit=5").map(|p| p.limit), Some(5));
+        // Over the ceiling is clamped, not an error: asking for too much is not an instruction.
+        assert_eq!(page_of("limit=99999").map(|p| p.limit), Some(PAGE_MAX));
+        // ...but nonsense is refused, never silently treated as "everything".
+        for bad in ["limit=0", "limit=-1", "limit=abc", "limit="] {
+            assert!(page_of(bad).is_none(), "{bad:?} must be refused");
+        }
+        assert!(page_of("cursor=nothex").is_none());
+        assert_eq!(page_of(&format!("cursor={}", cursor_encode("payments"))).and_then(|p| p.after).as_deref(), Some("payments"));
+    }
+
+    // ── the values that reach a git argv slot ──
+
+    #[test]
+    fn a_rev_that_could_become_a_git_option_is_refused() {
+        // `git show --output=<file>` WRITES A FILE. The rev is concatenated into `<rev>:<path>`, so a
+        // leading `-` turns the whole argument into an option — and this value arrives straight off
+        // the query string.
+        assert!(!valid_rev("--output=/tmp/pwned"));
+        assert!(!valid_rev("-o"));
+        assert!(!valid_rev("--upload-pack=evil"));
+        // ...while the things a caller legitimately says still work.
+        assert!(valid_rev("HEAD"));
+        assert!(valid_rev("main"));
+        assert!(valid_rev("refs/heads/topic"));
+        assert!(valid_rev("d43585c9e0f8a1b2c3d4e5f60718293a4b5c6d7e"));
+        // Range syntax is not a rev: `from..to` is built here, from two revs checked separately.
+        assert!(!valid_rev("a..b"));
+        assert!(!valid_rev(""));
+    }
+
+    #[test]
+    fn a_repo_path_cannot_climb_out_or_break_a_header() {
+        for bad in ["../../../etc/passwd", "sessions/../../../etc/passwd", "a/../b", "a//b", "./x", "x/./y", "/etc/passwd", "-x", ""] {
+            assert!(!valid_repo_path(bad), "{bad:?} must be refused");
+        }
+        // Control bytes never reach a header value, quoted or not.
+        assert!(!valid_repo_path("a\r\nX-Evil: 1"));
+        assert!(!valid_repo_path("a\nb"));
+        assert!(!valid_repo_path("a\0b"));
+        for ok in ["tracked.txt", "sessions/claude-code/s1.jsonl", "a-b_c.2.json"] {
+            assert!(valid_repo_path(ok), "{ok:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn a_filename_cannot_break_out_of_the_content_disposition_header() {
+        // Resp::with writes headers verbatim: a quote ends the value early, a CRLF starts a header of
+        // the attacker's choosing. Filtered, not escaped — a filename only has to name the file.
+        assert_eq!(safe_filename("sessions/x/s1.jsonl"), "s1.jsonl");
+        assert_eq!(safe_filename(r#"a".txt"#), "a.txt");
+        assert_eq!(safe_filename("a\r\nX-Evil: 1.txt"), "aX-Evil1.txt");
+        assert_eq!(safe_filename("a b;c.txt"), "abc.txt");
+        // Nothing usable left → a name, not an empty quoted value.
+        assert_eq!(safe_filename("的"), "file");
+        assert_eq!(safe_filename("..."), "file");
+        assert_eq!(safe_filename(""), "file");
     }
 
     #[test]

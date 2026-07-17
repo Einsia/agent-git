@@ -60,6 +60,38 @@ impl Role {
     }
 }
 
+/// Where an agent is in its life. **Orthogonal to visibility**: a public archived agent is still
+/// public, it has just stopped accepting pushes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    Active,
+    /// Read-only, still listed and still readable. The memory is finished, not gone.
+    Archived,
+    /// Soft-deleted: invisible and unusable, but the record survives so a restore is possible — and
+    /// so the **name stays taken**, since a name handed out again would silently redirect every
+    /// `.agit.toml` and token that still points at it.
+    Deleted,
+}
+
+impl Lifecycle {
+    pub fn parse(s: &str) -> Option<Lifecycle> {
+        match s {
+            "active" => Some(Lifecycle::Active),
+            "archived" => Some(Lifecycle::Archived),
+            "deleted" => Some(Lifecycle::Deleted),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lifecycle::Active => "active",
+            Lifecycle::Archived => "archived",
+            Lifecycle::Deleted => "deleted",
+        }
+    }
+}
+
 /// An agent's visibility. **Private by default** — transcripts carry prompts, paths, and sometimes
 /// secrets, so the only direction failure may take is "invisible".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,13 +189,20 @@ pub struct AgentAcl {
     /// None = unowned (an old repo migrated in, not yet claimed) — only the site admin can touch it.
     pub owner: Option<String>,
     pub visibility: Visibility,
+    pub lifecycle: Lifecycle,
     pub members: Vec<(String, Role)>,
 }
 
 impl AgentAcl {
     /// Unowned and private — the **fail-safe** value for an unknown repo.
     pub fn unowned(name: &str) -> AgentAcl {
-        AgentAcl { name: name.to_string(), owner: None, visibility: Visibility::Private, members: vec![] }
+        AgentAcl {
+            name: name.to_string(),
+            owner: None,
+            visibility: Visibility::Private,
+            lifecycle: Lifecycle::Active,
+            members: vec![],
+        }
     }
 
     fn member_role(&self, user: &str) -> Option<Role> {
@@ -187,6 +226,12 @@ pub enum Deny {
     /// Management actions do not accept tokens — deleting a repo or changing visibility must be the
     /// person themselves, on a login session.
     TokenCannotManage,
+    /// The agent is archived: read-only until someone unarchives it. → 403; they can still see it,
+    /// and the state is the answer to "why was my push refused".
+    Archived,
+    /// The agent is soft-deleted. → 404 for everyone: a deleted agent is not a thing you can find,
+    /// only a thing its owner can restore.
+    Deleted,
 }
 
 impl Deny {
@@ -198,6 +243,8 @@ impl Deny {
             Deny::TokenOtherAgent => "this token is bound to another agent",
             Deny::TokenScope => "this token only has read permission",
             Deny::TokenCannotManage => "management actions cannot use a token; use a login session",
+            Deny::Archived => "this agent is archived; unarchive it before writing to it",
+            Deny::Deleted => "this agent is deleted",
         }
     }
 }
@@ -217,14 +264,32 @@ impl Decision {
 /// **The one authorization decision**. A pure function: same input, same output, always, no IO.
 ///
 /// The rules, in order:
+///  0. Lifecycle cap: archived denies Write, deleted denies everything but Manage. An upper bound on
+///     the *agent's* side, exactly as the token is one on the caller's.
 ///  1. Token cap: wrong binding / scope exceeded / attempting Manage — deny first. A token is an
 ///     upper bound, not a source of power.
-///  2. Site admin: allow (still under 1's cap).
+///  2. Site admin: allow (still under 0's and 1's cap).
 ///  3. Owner: allow.
 ///  4. Explicit member: allow per role.
 ///  5. public: allow Read only (anonymous included).
 ///  6. Everything else is denied — deny by default, not allow by default.
 pub fn decide(caller: &Caller, agent: &AgentAcl, action: Action) -> Decision {
+    // 0. The agent's own upper bound. Same shape as the token cap below and for the same reason —
+    //    intersection, not maximum: being the owner does not make an archived agent writable, it
+    //    makes you the person who can unarchive it.
+    //
+    //    Manage survives both states deliberately: unarchiving and restoring *are* Manage, and a
+    //    state you cannot leave is not a state, it is a wall. Every other entry point — the JSON
+    //    API, git smart-http, the agent list — reads its answer from here, so "archived" and
+    //    "deleted" mean the same thing at all of them without any of them being told about it.
+    match agent.lifecycle {
+        Lifecycle::Active => {}
+        Lifecycle::Archived if action == Action::Write => return Decision::Deny(Deny::Archived),
+        Lifecycle::Archived => {}
+        Lifecycle::Deleted if action != Action::Manage => return Decision::Deny(Deny::Deleted),
+        Lifecycle::Deleted => {}
+    }
+
     // 1. The token's upper bound. First, because an admin holding a read-only token still only
     //    reads (intersection, not maximum).
     if let Some(t) = &caller.token {
@@ -276,6 +341,7 @@ mod tests {
             name: "shared".into(),
             owner: Some("alice".into()),
             visibility: Visibility::Public,
+            lifecycle: Lifecycle::Active,
             members: vec![],
         }
     }
@@ -285,8 +351,13 @@ mod tests {
             name: "secret".into(),
             owner: Some("alice".into()),
             visibility: Visibility::Private,
+            lifecycle: Lifecycle::Active,
             members: vec![("bob".into(), Role::Read), ("carol".into(), Role::Write), ("dave".into(), Role::Admin)],
         }
+    }
+
+    fn at(lifecycle: Lifecycle) -> AgentAcl {
+        AgentAcl { lifecycle, ..private_agent() }
     }
 
     // ── anonymous ──
@@ -429,7 +500,85 @@ mod tests {
         assert_eq!(decide(&eve, &public_agent(), Action::Write), Decision::Deny(Deny::NoGrant));
     }
 
+    // ── lifecycle: an upper bound on the agent's side ──
+
+    #[test]
+    fn archived_is_read_only_for_everyone_including_the_owner() {
+        // Intersection, not maximum — the same rule the token cap follows. Owning an archived agent
+        // does not make it writable; it makes you the person who can unarchive it.
+        let archived = at(Lifecycle::Archived);
+        for caller in [Caller::user("alice"), Caller::admin("root"), Caller::user("carol")] {
+            assert!(decide(&caller, &archived, Action::Read).allowed());
+            assert_eq!(decide(&caller, &archived, Action::Write), Decision::Deny(Deny::Archived));
+        }
+    }
+
+    #[test]
+    fn archiving_is_a_state_you_can_leave() {
+        // Manage must survive the cap, or unarchive is unreachable and the state is a wall.
+        assert!(decide(&Caller::user("alice"), &at(Lifecycle::Archived), Action::Manage).allowed());
+        assert!(decide(&Caller::user("dave"), &at(Lifecycle::Archived), Action::Manage).allowed());
+    }
+
+    #[test]
+    fn archiving_does_not_widen_anything() {
+        // The cap only ever subtracts: a stranger gets no more from an archived agent than a live
+        // one, and read-members do not become writers by way of a state change.
+        assert_eq!(decide(&Caller::user("eve"), &at(Lifecycle::Archived), Action::Read), Decision::Deny(Deny::NoGrant));
+        assert_eq!(decide(&Caller::user("bob"), &at(Lifecycle::Archived), Action::Manage), Decision::Deny(Deny::NoGrant));
+    }
+
+    #[test]
+    fn a_deleted_agent_is_invisible_to_everyone() {
+        // Not 403-with-a-name: Read is denied outright, which is what makes it drop out of the agent
+        // list and answer 404 — the same shape as "this agent does not exist".
+        let deleted = at(Lifecycle::Deleted);
+        for caller in [Caller::anonymous(), Caller::user("eve"), Caller::user("bob"), Caller::user("alice"), Caller::admin("root")] {
+            assert_eq!(decide(&caller, &deleted, Action::Read), Decision::Deny(Deny::Deleted), "{caller:?}");
+            assert_eq!(decide(&caller, &deleted, Action::Write), Decision::Deny(Deny::Deleted), "{caller:?}");
+        }
+    }
+
+    #[test]
+    fn a_deleted_agent_can_still_be_restored_by_whoever_could_manage_it() {
+        // Manage is the one door left open — restore is a Manage action, so closing it would make
+        // soft-delete indistinguishable from destruction.
+        assert!(decide(&Caller::user("alice"), &at(Lifecycle::Deleted), Action::Manage).allowed());
+        assert!(decide(&Caller::admin("root"), &at(Lifecycle::Deleted), Action::Manage).allowed());
+        // ...and only for them. Deletion is not an opening.
+        assert_eq!(decide(&Caller::user("eve"), &at(Lifecycle::Deleted), Action::Manage), Decision::Deny(Deny::NoGrant));
+        assert_eq!(decide(&Caller::anonymous(), &at(Lifecycle::Deleted), Action::Manage), Decision::Deny(Deny::Anonymous));
+    }
+
+    #[test]
+    fn a_token_cannot_restore_or_unarchive() {
+        // Both are Manage, and rule 1 still refuses tokens for Manage. A leaked CI token must not be
+        // able to bring a deleted agent back, any more than it could delete one.
+        let alice = Caller::user("alice").with_token(None, Scope::Write);
+        assert_eq!(decide(&alice, &at(Lifecycle::Deleted), Action::Manage), Decision::Deny(Deny::TokenCannotManage));
+        assert_eq!(decide(&alice, &at(Lifecycle::Archived), Action::Manage), Decision::Deny(Deny::TokenCannotManage));
+    }
+
+    #[test]
+    fn a_public_archived_agent_is_still_public() {
+        // Lifecycle and visibility are orthogonal: archiving is not a way to hide something, and it
+        // must not quietly become one.
+        let a = AgentAcl { lifecycle: Lifecycle::Archived, ..public_agent() };
+        assert!(decide(&Caller::anonymous(), &a, Action::Read).allowed());
+        assert_eq!(decide(&Caller::anonymous(), &a, Action::Write), Decision::Deny(Deny::Archived));
+    }
+
     // ── role / visibility parsing ──
+
+    #[test]
+    fn lifecycle_parses_roundtrip_and_rejects_junk() {
+        for l in [Lifecycle::Active, Lifecycle::Archived, Lifecycle::Deleted] {
+            assert_eq!(Lifecycle::parse(l.as_str()), Some(l));
+        }
+        assert_eq!(Lifecycle::parse("Active"), None);
+        assert_eq!(Lifecycle::parse("purged"), None);
+        assert_eq!(Lifecycle::parse(""), None);
+    }
 
     #[test]
     fn role_and_visibility_parse_roundtrip() {

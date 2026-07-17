@@ -470,6 +470,209 @@ n200="$(echo "$out" | grep -c 200)"
 is "the same address on a session is unaffected" "alice" "$(api "$U/api/me" | jq -r .username)"
 is "and a different token has its own budget"    200     "$(code -u "x:$WTOK" "$U/payments.git/info/refs?service=git-upload-pack")"
 
+echo "${B}Act 12 · fork${N}"
+# Act 11 spent RTOK's request budget; a fresh read token, or the 403s below arrive as 429s.
+RTOK2="$(api -X POST -d '{"name":"r2","scope":"read","agent":"payments"}' "$U/api/tokens" | jq -r .token)"
+[[ ${#RTOK2} -ge 32 ]] && ok "a fresh read token for the fork checks" || bad "no second read token parsed"
+# POSITIVE CONTROLS FIRST. Every check below is of the form "the bad thing did not happen", and each
+# one passes just as well against an agent that was never created — so prove the source is real, is
+# readable, has an identity, and has a member, before proving the fork carries none of it across.
+is "the source exists and alice can read it"        200        "$(acode "$U/api/agent/payments")"
+is "and carries the identity the fork must NOT take" "$AID"    "$(api "$U/api/agent/payments" | jq -r .aid)"
+api -X POST -d '{"username":"bob","role":"read"}' "$U/api/agent/payments/members" >/dev/null
+is "and has a member (the control for the laundering check)" "read" \
+  "$(api "$U/api/agent/payments/members" | jq -r '.[] | select(.username=="bob") | .role')"
+is "who really can read the source"                 200        "$(bcode "$U/api/agent/payments")"
+SRCN="$(api "$U/api/agent/payments" | jq -r '.sessions | length')"
+
+f="$(api -X POST -d '{"name":"payments-forked"}' "$U/api/agent/payments/fork")"
+is "the fork is created"                       "payments-forked" "$(echo "$f" | jq -r .name)"
+is "it records what it came from"              "payments"        "$(echo "$f" | jq -r .forked_from)"
+is "IT IS OWNED BY THE CALLER"                 "alice"           "$(echo "$f" | jq -r .owner)"
+is "and is private, whatever the source was"   "private"         "$(echo "$f" | jq -r .visibility)"
+is "the fork really carries the history"       "$SRCN"           "$(api "$U/api/agent/payments-forked" | jq -r '.sessions | length')"
+# The laundering check: a fork must not be a way to hand your collaborators an agent they were never
+# granted.
+is "THE FORK DID NOT INHERIT THE SOURCE'S MEMBERS" 0             "$(api "$U/api/agent/payments-forked/members" | jq 'length')"
+is "so bob, a member of the SOURCE, cannot see the fork"  404    "$(bcode "$U/api/agent/payments-forked")"
+# ...and it did not walk off with the identity either: two agents may never share one aid.
+is "THE FORK DID NOT STEAL THE SOURCE'S IDENTITY" "payments"     "$(api "$U/api/agent/by-aid/$AID" | jq -r .name)"
+is "and the clash is reported, not hidden"        "conflict"     "$(api "$U/api/agent/payments-forked" | jq -r .aid_status)"
+is "you cannot fork what you cannot read"         404 "$(bcode -X POST -d '{"name":"stolen"}' "$U/api/agent/privagent/fork")"
+is "and nothing was created by the attempt"       404 "$(acode "$U/api/agent/stolen")"
+is "a READ token cannot fork"                     403 "$(curl -s -o /dev/null -w '%{http_code}' -u "x:$RTOK2" -H 'content-type: application/json' -X POST -d '{"name":"tokfork"}' "$U/api/agent/payments/fork")"
+is "and that created nothing either"              404 "$(acode "$U/api/agent/tokfork")"
+is "an already-taken name is refused"             409 "$(acode -X POST -d '{"name":"payments"}' "$U/api/agent/payments/fork")"
+grep -q '"action":"agent.fork"' "$A" && ok "the fork is audited" || bad "no agent.fork row"
+
+echo "${B}Act 13 · transfer${N}"
+is "privagent's owner before the move"  "alice"  "$(api "$U/api/agent/privagent" | jq -r .owner)"
+is "and its identity before the move"   "$PAID"  "$(api "$U/api/agent/privagent" | jq -r .aid)"
+is "bob cannot transfer someone else's agent" 404 "$(bcode -X POST -d '{"to":"bob"}' "$U/api/agent/privagent/transfer")"
+is "transfer to a nonexistent user is refused" 400 "$(acode -X POST -d '{"to":"ghost"}' "$U/api/agent/privagent/transfer")"
+is "transfer to the current owner is refused"  409 "$(acode -X POST -d '{"to":"alice"}' "$U/api/agent/privagent/transfer")"
+t="$(api -X POST -d '{"to":"bob"}' "$U/api/agent/privagent/transfer")"
+is "ownership moves"                    "bob"    "$(echo "$t" | jq -r .owner)"
+is "and it names who had it"            "alice"  "$(echo "$t" | jq -r .previous_owner)"
+is "bob holds it as owner now"          "owner"  "$(bapi "$U/api/agent/privagent" | jq -r .role)"
+is "A TRANSFER MUST NOT CHANGE THE IDENTITY" "$PAID" "$(bapi "$U/api/agent/privagent" | jq -r .aid)"
+is "by-aid follows the new owner"       "privagent" "$(bapi "$U/api/agent/by-aid/$PAID" | jq -r .name)"
+is "and the previous owner keeps NOTHING"    404 "$(acode "$U/api/agent/privagent")"
+# A live proof that the MR redaction is per-reader rather than decided once at open time: alice
+# opened that MR and could read its private source a moment ago. She just gave the source away.
+is "so the MR's private source is NOW redacted for ALICE too" "null" \
+  "$(api "$U/api/agent/pubagent/mrs" | jq -r '.mrs[0].source.agent')"
+is "while bob, who now owns it, sees it"      "privagent" "$(bapi "$U/api/agent/pubagent/mrs" | jq -r '.mrs[0].source.agent')"
+grep -q '"action":"agent.transfer"' "$A" && ok "the transfer is audited" || bad "no agent.transfer row"
+
+echo "${B}Act 14 · archive, soft-delete, restore, purge${N}"
+# CONTROL: it exists, it is readable, and it accepts a push RIGHT NOW. Otherwise "the push was
+# refused" below proves nothing.
+cd "$R1"; git reset -q --hard "$newhead" >/dev/null 2>&1
+echo "pre-archive" > arch.txt; git -c user.name=a -c user.email=a@e.com add -A
+git -c user.name=a -c user.email=a@e.com commit -qm "pre-archive"
+git push -q "http://x:$WTOK@127.0.0.1:$PORT/payments.git" main 2>/dev/null \
+  && ok "CONTROL: payments accepts a push before archiving" || bad "the control push failed — Act 14 would be vacuous"
+cd "$ROOT"
+is "archive reports the new state"  "archived" "$(api -X POST -d '{}' "$U/api/agent/payments/archive" | jq -r .lifecycle)"
+is "an archived agent is STILL VISIBLE" 200 "$(acode "$U/api/agent/payments")"
+is "and still says so in the list" "archived" "$(api "$U/api/agents?limit=100" | jq -r '.agents[] | select(.name=="payments") | .lifecycle')"
+cd "$R1"; echo "post-archive" >> arch.txt; git -c user.name=a -c user.email=a@e.com commit -qam "post-archive"
+if git push "http://x:$WTOK@127.0.0.1:$PORT/payments.git" main >"$TMP/ar" 2>&1; then
+  bad "SECURITY: an ARCHIVED agent accepted a push"
+else
+  ok "an archived agent refuses a push"
+fi
+grep -qi "archived" "$TMP/ar" && ok "and the refusal says why" || bad "the archive refusal never said it was archived"
+cd "$ROOT"
+is "archiving twice is refused, not a silent no-op" 409 "$(acode -X POST -d '{}' "$U/api/agent/payments/archive")"
+is "restore is refused on an agent that is not deleted" 409 "$(acode -X POST -d '{}' "$U/api/agent/payments/restore")"
+is "unarchive brings it back" "active" "$(api -X POST -d '{}' "$U/api/agent/payments/unarchive" | jq -r .lifecycle)"
+cd "$R1"; git push -q "http://x:$WTOK@127.0.0.1:$PORT/payments.git" main 2>/dev/null \
+  && ok "and it accepts pushes again" || bad "the agent never recovered from archiving"
+cd "$ROOT"
+
+# soft delete. CONTROL first: it is there and readable before the delete.
+is "CONTROL: the fork is readable before deleting" 200 "$(acode "$U/api/agent/payments-forked")"
+is "delete reports the new state" "deleted" "$(api -X DELETE "$U/api/agent/payments-forked" | jq -r .lifecycle)"
+is "a soft-deleted agent is GONE from the listing" "" \
+  "$(api "$U/api/agents?limit=100" | jq -r '[.agents[] | select(.name=="payments-forked") | .name] | join("")')"
+is "and answers 404, not 403"                     404 "$(acode "$U/api/agent/payments-forked")"
+is "its repo directory still exists (restorable)" "yes" "$([[ -d "$H/payments-forked.git" ]] && echo yes || echo no)"
+is "THE NAME IS NOT REUSABLE while it holds it"   409 "$(acode -X POST -d '{"name":"payments-forked"}' "$U/api/agents")"
+is "nor by a fork claiming it"                    409 "$(acode -X POST -d '{"name":"payments-forked"}' "$U/api/agent/payments/fork")"
+is "nor by a rename onto it"                      409 "$(acode -X PATCH -d '{"name":"payments-forked"}' "$U/api/agent/feature-work")"
+is "restore brings it back"     "active" "$(api -X POST -d '{}' "$U/api/agent/payments-forked/restore" | jq -r .lifecycle)"
+is "and it is readable again"       200 "$(acode "$U/api/agent/payments-forked")"
+is "and back in the listing" "payments-forked" \
+  "$(api "$U/api/agents?limit=100" | jq -r '.agents[] | select(.name=="payments-forked") | .name')"
+# purge is two-step on purpose: nothing live can be destroyed by one mistyped verb.
+is "purge refuses a LIVE agent"                    409 "$(acode -X DELETE "$U/api/agent/payments-forked?purge=true")"
+is "its repo is still there after that refusal"   "yes" "$([[ -d "$H/payments-forked.git" ]] && echo yes || echo no)"
+api -X DELETE "$U/api/agent/payments-forked" >/dev/null
+is "purge empties the trash"                       204 "$(acode -X DELETE "$U/api/agent/payments-forked?purge=true")"
+is "the repo directory is GONE"                   "no" "$([[ -d "$H/payments-forked.git" ]] && echo yes || echo no)"
+is "and only now is the name free again" "payments-forked" \
+  "$(api -X POST -d '{"name":"payments-forked"}' "$U/api/agents" | jq -r .name)"
+for row in agent.archive agent.unarchive agent.delete agent.restore agent.purge; do
+  grep -q "\"action\":\"$row\"" "$A" && ok "$row is audited" || bad "no $row row"
+done
+
+echo "${B}Act 15 · description, README, raw bytes, compare${N}"
+api -X PATCH -d '{"description":"the checkout memory"}' "$U/api/agent/payments" >/dev/null
+is "a description lands"        "the checkout memory" "$(api "$U/api/agent/payments" | jq -r .description)"
+is "and shows up in the list"   "the checkout memory" "$(api "$U/api/agents?limit=100" | jq -r '.agents[] | select(.name=="payments") | .description')"
+is "an over-long description is refused, not truncated" 400 "$(acode -X PATCH -d "{\"description\":\"$(printf 'x%.0s' {1..400})\"}" "$U/api/agent/payments")"
+is "and the old one survived the refusal" "the checkout memory" "$(api "$U/api/agent/payments" | jq -r .description)"
+is "an empty string clears it"  "null" "$(api -X PATCH -d '{"description":""}' "$U/api/agent/payments" > /dev/null; api "$U/api/agent/payments" | jq -r .description)"
+
+is "no README yet reads as null" "null" "$(api "$U/api/agent/payments" | jq -r .readme)"
+cd "$R1"
+printf '# payments\n\nthe billing agent memory\n' > README.md
+# A pushed session is attacker-authored by definition. This one is a stored-XSS payload.
+mkdir -p sessions/claude-code
+printf '<script>alert(document.cookie)</script>\n' > sessions/claude-code/evil.jsonl
+echo one > cmp.txt
+git -c user.name=a -c user.email=a@e.com add -A
+git -c user.name=a -c user.email=a@e.com commit -qm "readme + a hostile session"
+CA="$(git rev-parse HEAD)"
+echo two > cmp.txt; echo added > cmp2.txt
+git -c user.name=a -c user.email=a@e.com add -A
+git -c user.name=a -c user.email=a@e.com commit -qm "second"
+CB="$(git rev-parse HEAD)"
+git push -q "http://x:$WTOK@127.0.0.1:$PORT/payments.git" main 2>"$TMP/rp" || bad "the README push failed: $(head -1 "$TMP/rp")"
+cd "$ROOT"
+api "$U/api/agent/payments" | jq -r .readme | grep -q "the billing agent memory" \
+  && ok "the README is read out of the store" || bad "the README never showed up"
+
+# The raw route serves attacker-authored bytes from the Hub's own origin. The headers ARE the control.
+RAWH="$(curl -s -D- -o /dev/null -b "$J" "$U/api/agent/payments/raw/sessions/claude-code/evil.jsonl")"
+echo "$RAWH" | grep -qi "^content-type: application/octet-stream" \
+  && ok "raw serves octet-stream, never a type guessed from the extension" || bad "raw served a guessed content-type"
+echo "$RAWH" | grep -qi "^content-disposition: attachment" \
+  && ok "and as an attachment, so a browser downloads rather than renders it" || bad "raw is not an attachment"
+echo "$RAWH" | grep -qi "^x-content-type-options: nosniff" \
+  && ok "and nosniff, so the browser cannot sniff its way back to text/html" || bad "no nosniff on raw"
+echo "$RAWH" | grep -qi "^content-security-policy: default-src 'none'" \
+  && ok "and a null CSP, so it renders inert even if something renders it" || bad "no CSP on raw"
+echo "$RAWH" | grep -qi "content-type: text/html" && bad "RAW SERVED text/html — that is stored XSS" || ok "nothing here is text/html"
+is "and the bytes come back intact" "<script>alert(document.cookie)</script>" \
+  "$(api "$U/api/agent/payments/raw/sessions/claude-code/evil.jsonl")"
+# `git show --output=<file>` WRITES A FILE, and the rev lands in a git argv slot.
+rm -f /tmp/agit-e2e-pwned
+is "a rev that would become a git option is refused" 400 "$(acode "$U/api/agent/payments/raw/cmp.txt?at=--output=/tmp/agit-e2e-pwned")"
+is "and the same on the session route"               404 "$(acode "$U/api/agent/payments/session/evil?at=--output=/tmp/agit-e2e-pwned")"
+[[ -e /tmp/agit-e2e-pwned ]] && bad "OPTION INJECTION: git wrote a file the request named" || ok "no file was written by either"
+is "a traversing path is refused" 400 "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' -b "$J" "$U/api/agent/payments/raw/../../../etc/passwd")"
+is "anonymous gets nothing from raw on a private agent" 401 "$(code "$U/api/agent/payments/raw/cmp.txt")"
+
+c="$(api "$U/api/agent/payments/compare?from=$CA&to=$CB")"
+is "compare resolves both ends"     "$CB" "$(echo "$c" | jq -r .resolved.to)"
+is "and lists the commits between"  "second" "$(echo "$c" | jq -r '.commits[0].subject')"
+is "and exactly the files that changed" "cmp.txt,cmp2.txt" "$(echo "$c" | jq -r '[.files[].path] | sort | join(",")')"
+is "with line counts"               1 "$(echo "$c" | jq -r '.files[] | select(.path=="cmp.txt") | .added')"
+is "an unknown rev is a 404"        404 "$(acode "$U/api/agent/payments/compare?from=$CA&to=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")"
+is "a rev that is really an option" 400 "$(acode "$U/api/agent/payments/compare?from=$CA&to=--output=/tmp/x")"
+
+echo "${B}Act 16 · stars and cursor pagination${N}"
+is "starring is per-user"      "true" "$(api -X POST -d '{}' "$U/api/agent/pubagent/star" | jq -r .starred)"
+is "and counts"                1      "$(api "$U/api/agent/pubagent" | jq -r .stars)"
+is "bob's own view is his own" "false" "$(bapi "$U/api/agent/pubagent" | jq -r .starred)"
+is "bob stars it too"          2      "$(bapi -X POST -d '{}' "$U/api/agent/pubagent/star" | jq -r .stars)"
+is "unstarring is idempotent-safe" 1  "$(api -X POST -d '{"starred":false}' "$U/api/agent/pubagent/star" | jq -r .stars)"
+is "an ANONYMOUS star is refused"  401 "$(code -X POST -H 'content-type: application/json' -d '{}' "$U/api/agent/pubagent/star")"
+is "a READ token cannot star"      403 "$(curl -s -o /dev/null -w '%{http_code}' -u "x:$RTOK2" -H 'content-type: application/json' -X POST -d '{}' "$U/api/agent/payments/star")"
+
+# Without `limit` the list is whole — the embedded SPA does not know what a cursor is, and a default
+# page would cap ITS list with no way to ask for the rest.
+ALL="$(api "$U/api/agents" | jq -r '.agents | length')"
+[[ "$ALL" -ge 4 ]] && ok "no limit returns the whole list ($ALL agents)" || bad "the unpaginated list is suspiciously short ($ALL)"
+is "and says it is whole"       "false" "$(api "$U/api/agents" | jq -r .has_more)"
+is "with no cursor to follow"   "null"  "$(api "$U/api/agents" | jq -r .next_cursor)"
+is "limit=2 pages"              2       "$(api "$U/api/agents?limit=2" | jq -r '.agents | length')"
+is "and announces there is more" "true" "$(api "$U/api/agents?limit=2" | jq -r .has_more)"
+# Walk the cursor to the end and prove the union is exactly the unpaginated list — no gaps, no repeats.
+cur=""; got=""; guard=0
+while :; do
+  q="limit=2"; [[ -n "$cur" ]] && q="$q&cursor=$cur"
+  r="$(api "$U/api/agents?$q")"
+  got="$got $(echo "$r" | jq -r '.agents[].name')"
+  [[ "$(echo "$r" | jq -r .has_more)" == "true" ]] || break
+  cur="$(echo "$r" | jq -r .next_cursor)"
+  guard=$((guard+1)); [[ $guard -gt 40 ]] && { bad "the cursor never terminated"; break; }
+done
+paged="$(echo $got | tr ' ' '\n' | sort | tr '\n' ',')"
+whole="$(api "$U/api/agents" | jq -r '.agents[].name' | sort | tr '\n' ',')"
+is "PAGING THE CURSOR YIELDS EXACTLY THE WHOLE LIST" "$whole" "$paged"
+uniq_n="$(echo $got | tr ' ' '\n' | sort -u | wc -l)"; all_n="$(echo $got | tr ' ' '\n' | wc -l)"
+is "and never repeats a row" "$uniq_n" "$all_n"
+is "junk limit is refused, not read as 'everything'" 400 "$(acode "$U/api/agents?limit=0")"
+is "a junk cursor too"                               400 "$(acode "$U/api/agents?cursor=nothex")"
+is "the MR list paginates on the same contract" 1 "$(api "$U/api/agent/payments/mrs?limit=1" | jq -r '.mrs | length')"
+is "and announces its cursor"              "true" "$(api "$U/api/agent/payments/mrs?limit=1" | jq -r .has_more)"
+MRC="$(api "$U/api/agent/payments/mrs?limit=1" | jq -r .next_cursor)"
+is "which resumes after the first row"        2 "$(api "$U/api/agent/payments/mrs?limit=1&cursor=$MRC" | jq -r '.mrs[0].id')"
+
 echo
 if [[ $FAIL -eq 0 ]]; then echo "${G}${B}hub e2e: $PASS checks passed.${N}"; else echo "${R}${B}hub e2e: $FAIL failed, $PASS passed.${N}"; fi
 exit $FAIL

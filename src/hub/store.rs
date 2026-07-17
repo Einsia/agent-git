@@ -9,7 +9,7 @@
 //! many threads, so an in-process Mutex is enough; several processes writing one root concurrently
 //! is out of scope (they would overwrite each other), and this does not pretend to survive it.
 
-use super::acl::{AgentAcl, Role, Scope, Visibility};
+use super::acl::{AgentAcl, Lifecycle, Role, Scope, Visibility};
 use super::mr::Mr;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -86,6 +86,21 @@ pub struct AgentMeta {
     /// "private" | "public". **New ones default to private.**
     #[serde(default = "default_visibility")]
     pub visibility: String,
+    /// "active" | "archived" | "deleted". Absent in files written before lifecycles existed, which
+    /// is exactly what `default_lifecycle` is for — an old agent is a live one.
+    #[serde(default = "default_lifecycle")]
+    pub lifecycle: String,
+    /// One line, for the agent list. An agent nobody can describe is one nobody adopts.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The agent this one was forked from, at fork time. A label for humans: it is **not** an
+    /// identity link, since the fork gets its own aid the moment it is rebound.
+    #[serde(default)]
+    pub forked_from: Option<String>,
+    /// Usernames who starred this agent. Per-user, and deliberately not a count: the count is
+    /// derivable, the list is not.
+    #[serde(default)]
+    pub stars: Vec<String>,
     #[serde(default)]
     pub members: Vec<Member>,
     #[serde(default)]
@@ -96,6 +111,10 @@ fn default_visibility() -> String {
     "private".into()
 }
 
+fn default_lifecycle() -> String {
+    "active".into()
+}
+
 impl AgentMeta {
     pub fn new(name: &str, owner: Option<&str>, visibility: Visibility) -> AgentMeta {
         AgentMeta {
@@ -103,6 +122,10 @@ impl AgentMeta {
             aid: None,
             owner: owner.map(|s| s.to_string()),
             visibility: visibility.as_str().to_string(),
+            lifecycle: Lifecycle::Active.as_str().to_string(),
+            description: None,
+            forked_from: None,
+            stars: vec![],
             members: vec![],
             created: now_iso(),
         }
@@ -111,11 +134,17 @@ impl AgentMeta {
     /// Metadata → the facts the authorization decision needs. **An unrecognized visibility is
     /// treated as private**, and an unrecognized role is dropped — hand-mangling agents.json errs in
     /// the direction of "locked down tighter".
+    ///
+    /// An unrecognized lifecycle reads as **archived**: tighter than active (nothing can be written
+    /// through a state nobody can parse) but still visible, so the operator can see the agent and
+    /// fix the file. Falling back to `deleted` would be tighter still and is the wrong trade — a
+    /// typo would silently erase an agent from every listing.
     pub fn to_acl(&self) -> AgentAcl {
         AgentAcl {
             name: self.name.clone(),
             owner: self.owner.clone(),
             visibility: Visibility::parse(&self.visibility).unwrap_or(Visibility::Private),
+            lifecycle: Lifecycle::parse(&self.lifecycle).unwrap_or(Lifecycle::Archived),
             members: self
                 .members
                 .iter()
@@ -126,6 +155,12 @@ impl AgentMeta {
 
     pub fn role_of(&self, user: &str) -> Option<Role> {
         self.members.iter().find(|m| m.username == user).and_then(|m| Role::parse(&m.role))
+    }
+
+    /// The parsed lifecycle, with the same fail-safe as `to_acl` — one source of truth for both, so
+    /// a route can never read a state the decision point disagrees with.
+    pub fn lifecycle(&self) -> Lifecycle {
+        Lifecycle::parse(&self.lifecycle).unwrap_or(Lifecycle::Archived)
     }
 }
 
@@ -249,13 +284,11 @@ impl Store {
     /// **Fail-safe**: a migrated-in old repo does not become world-pullable just because there is no
     /// record of it.
     pub fn agent_or_unowned(&self, name: &str) -> AgentMeta {
+        // Built through `new` rather than field-by-field: a field added later must not be able to
+        // acquire a laxer default here than a real agent gets.
         self.agent(name).unwrap_or_else(|| AgentMeta {
-            name: name.to_string(),
-            aid: None,
-            owner: None,
-            visibility: "private".into(),
-            members: vec![],
             created: String::new(),
+            ..AgentMeta::new(name, None, Visibility::Private)
         })
     }
 
@@ -495,16 +528,32 @@ mod tests {
     #[test]
     fn broken_visibility_falls_back_to_private() {
         let m = AgentMeta {
-            name: "x".into(),
-            aid: None,
-            owner: Some("alice".into()),
             visibility: "PUBLIC".into(), // hand-mangled
             members: vec![Member { username: "bob".into(), role: "superuser".into() }],
-            created: String::new(),
+            ..AgentMeta::new("x", Some("alice"), Visibility::Public)
         };
         let acl = m.to_acl();
         assert_eq!(acl.visibility, Visibility::Private);
         assert!(acl.members.is_empty(), "an unrecognized role must be dropped, not treated as a permission");
+    }
+
+    #[test]
+    fn a_broken_lifecycle_reads_as_archived_not_as_active() {
+        // Tighter than active — nothing is written through a state nobody can parse — but still
+        // visible, so the agent can be found and the file fixed. `deleted` would be tighter and
+        // wrong: a typo must not erase an agent from every listing.
+        let m = AgentMeta { lifecycle: "Active".into(), ..AgentMeta::new("x", Some("alice"), Visibility::Public) };
+        assert_eq!(m.lifecycle(), Lifecycle::Archived);
+        assert_eq!(m.to_acl().lifecycle, Lifecycle::Archived, "to_acl and lifecycle() must never disagree");
+    }
+
+    #[test]
+    fn an_agents_json_written_before_lifecycles_reads_as_active() {
+        // The upgrade path: an old file has no lifecycle field at all, and every agent in it is live.
+        let m: AgentMeta = serde_json::from_str(r#"{"name":"old","visibility":"public"}"#).unwrap();
+        assert_eq!(m.lifecycle(), Lifecycle::Active);
+        assert_eq!(m.description, None);
+        assert!(m.stars.is_empty());
     }
 
     #[test]

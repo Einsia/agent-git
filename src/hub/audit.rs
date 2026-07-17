@@ -39,6 +39,18 @@ pub const AGENT_CREATE: &str = "agent.create";
 pub const AGENT_DELETE: &str = "agent.delete";
 pub const AGENT_RENAME: &str = "agent.rename";
 pub const AGENT_VISIBILITY: &str = "agent.visibility";
+pub const AGENT_DESCRIBE: &str = "agent.describe";
+pub const AGENT_FORK: &str = "agent.fork";
+/// Ownership moving is the one edit that can lock the previous owner out of their own agent, so it
+/// gets its own row rather than hiding inside agent.rename's shape.
+pub const AGENT_TRANSFER: &str = "agent.transfer";
+pub const AGENT_ARCHIVE: &str = "agent.archive";
+pub const AGENT_UNARCHIVE: &str = "agent.unarchive";
+pub const AGENT_RESTORE: &str = "agent.restore";
+/// The irreversible one. `agent.delete` is now a soft delete; this is the row that means the bytes
+/// are gone.
+pub const AGENT_PURGE: &str = "agent.purge";
+pub const AGENT_STAR: &str = "agent.star";
 pub const MEMBER_ADD: &str = "member.add";
 pub const MEMBER_REMOVE: &str = "member.remove";
 pub const TOKEN_CREATE: &str = "token.create";
