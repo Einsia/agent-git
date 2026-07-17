@@ -1,84 +1,129 @@
-//! `agit init` — sets up the Agent Store and pairing infrastructure alongside the current code repo.
+//! `agit init` — make this code repo ready to work with an agent.
+//!
+//! Init no longer *places* a store, which was its whole job before identity. An agent is a memory that
+//! outlives any one repo, so it lives at `$AGIT_HOME/agents/<aid>/` and this repo only records
+//! **which** agents it works with, in the committed `.agit.toml`.
+//!
+//! What is left is genuinely init's, and nothing else does all of it in one place:
+//!   * keep `.agit/` (this environment's local state) out of the code history;
+//!   * make sure this repo resolves to an agent — minting one only when a human names it;
+//!   * install (or **repair**) the store's secret gate — `.git/hooks` is carried by no clone, and a
+//!     store cloned by an older agit has none;
+//!   * say which agent this repo is now pointed at, and what to type next.
 
+use crate::agent::{self, Binding};
 use crate::scope;
-use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-/// Expand a leading `~/` so `--store ~/agents/foo` works.
-fn shellexpand_home(s: &str) -> String {
-    match s.strip_prefix("~/") {
-        Some(rest) => std::env::var("HOME")
-            .map(|h| format!("{h}/{rest}"))
-            .unwrap_or_else(|_| s.to_string()),
-        None => s.to_string(),
-    }
-}
+use anyhow::{bail, Context, Result};
+use std::io::{IsTerminal, Write};
+use std::path::Path;
 
 pub fn run() -> Result<i32> {
-    run_with_store(None)
+    run_named(None)
 }
 
-/// `agit init [--store <path>]`. With `--store`, the Agent Store is **detached** from this repo: the
-/// store lives at <path> and this Environment only keeps a pointer to it (`.agit/store`). Several
-/// repos can point at the SAME store, so one agent's context carries across Environments — e.g. a
-/// frontend agent continuing its work in the backend repo, with one continuous session history.
-pub fn run_with_store(store: Option<String>) -> Result<i32> {
+/// `agit init [--agent <name>]`.
+pub fn run_named(name: Option<String>) -> Result<i32> {
     let env = scope::env_root().context("agit init must be run inside a git repository (your code repo)")?;
 
-    // 1. Environment side: keep .agit/ out of the code history
+    // The store no longer lives here, but `.agit/` still holds this environment's local state (the
+    // workspace log, the watcher's pidfile and log) — none of which belongs in the code history.
     ensure_gitignore(&env)?;
 
-    let (agent, detached) = match store {
-        Some(s) => {
-            let p = PathBuf::from(shellexpand_home(&s));
-            std::fs::create_dir_all(&p)
-                .with_context(|| format!("failed to create the Agent Store at {}", p.display()))?;
-            let abs = std::fs::canonicalize(&p)?;
-            std::fs::create_dir_all(env.join(".agit"))?;
-            std::fs::write(env.join(scope::STORE_PTR), format!("{}\n", abs.display()))
-                .context("failed to write the .agit/store pointer")?;
-            (abs, true)
+    let agent = match agent::resolve(None) {
+        Ok(a) => a,
+        // Two failures init must NOT paper over by minting a second agent: a store that predates
+        // identity (adopt it — the memory is real), and a repo whose committed binding declares agents
+        // this machine simply does not have yet (track them — that is the fresh-clone path). The
+        // resolver already words both, so init repeats rather than reinvents them.
+        Err(e) if agent::legacy_store(&env).is_some() || declares_agents(&env) => {
+            eprintln!("{e:#}");
+            return Ok(2);
         }
-        // an existing pointer keeps winning, so re-running plain `agit init` doesn't silently re-attach
-        None => (scope::agent_root()?, env.join(scope::STORE_PTR).exists()),
+        Err(_) => agent::new_agent(&pick_name(&env, name.as_deref())?)?,
     };
 
-    // 2. Build the Agent Store (a standalone git repo) to hold session dumps
-    let fresh = !agent.join(".git").exists();
-    if fresh {
-        std::fs::create_dir_all(&agent)?;
-        git(&agent, &["init", "-q", "-b", "main"])?;
-        let _ = git(&agent, &["config", "user.name", "agit"]);
-        let _ = git(&agent, &["config", "user.email", "agit@local"]);
-        scaffold(&agent)?;
-    }
+    // Idempotent, and re-run deliberately: a store cloned by an older agit, or one whose .git/hooks
+    // was blown away, gets the gate back by running init.
+    install_hooks(&agent.store)?;
 
-    // 3. Secret-scanning hook — dumping every session means the transcripts may carry secrets the agent has seen
-    let exe = std::env::current_exe().context("could not locate agit's own path")?;
-    install_hook(&agent, "pre-commit", &exe, "hook-scan --staged")?;
-    install_hook(&agent, "pre-push", &exe, "hook-scan")?;
-
-    if fresh {
-        git(&agent, &["add", "-A"])?;
-        git(&agent, &["commit", "-q", "-m", "agit: initialize Agent Store"])?;
-    }
+    agent::bind_here(&agent, &env, false)?;
+    agent::write_active(&env, &agent.aid)?;
 
     println!("agit is ready.");
     println!("  Environment : {}", env.display());
-    println!(
-        "  Agent Store : {}{}",
-        agent.display(),
-        if detached { "   (detached — this repo points at it via .agit/store)" } else { "" }
-    );
+    println!("  Agent       : {} ({})", agent.name, agent.aid);
+    println!("  Store       : {}", agent.store.display());
+    println!("  Binding     : {}   (commit it — your team gets this agent on clone)", agent::BINDING_FILE);
     println!();
-    println!("  agit -a snap            mirror this project's session dump in (add --watch to auto-snap continuously)");
-    println!("  agit -a push / pull     sync sessions with your team");
-    println!("  agit -a merge <ref>      merge this branch's agent with the other side's conversation (only asks on real conflicts)");
+    println!("  agit start              launch a session already carrying this agent's latest context");
+    println!("  agit snap               capture this project's sessions into the store");
+    println!("  agit a push / pull      sync the memory with your team");
+    println!("  agit a merge <agent>    reconcile this agent's memory with another agent's, by dialogue");
     Ok(0)
 }
 
-fn ensure_gitignore(env: &Path) -> Result<()> {
+/// Whether the committed binding names agents — i.e. this is a teammate's clone, and the answer to
+/// "no agent" is `agit a track <name>`, not minting a stranger.
+fn declares_agents(env: &Path) -> bool {
+    Binding::load(env).ok().flatten().map(|b| !b.agents.is_empty()).unwrap_or(false)
+}
+
+/// An agent is named for what it KNOWS (`frontend`, `payments-api`) — not for the directory it
+/// happened to be initialised in. It works across many repos, so the cwd is the worst available label,
+/// and naming from it is a guess dressed as an answer.
+///
+/// So the name is always a human's decision: `--agent <name>`, or one prompt. A script that gives
+/// neither gets an actionable error, never a name agit invented — the same rule as resolution, where
+/// agit will not guess which memory you meant.
+fn pick_name(env: &Path, given: Option<&str>) -> Result<String> {
+    if let Some(n) = given.map(str::trim).filter(|n| !n.is_empty()) {
+        return Ok(n.to_string());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "no agent here yet, and agit will not name one for you.\n\
+             \x20      An agent is a memory, named for what it knows — `frontend`, `payments-api` — and it outlives\n\
+             \x20      this repo, so `{}` would be the wrong label even when it is a legal one.\n\
+             \x20        agit init --agent <name>   mint one here\n\
+             \x20        agit a track <name|url>    use one you (or your team) already have",
+            env.file_name().and_then(|s| s.to_str()).unwrap_or("this directory")
+        );
+    }
+    // Interactive: the directory is offered as a *suggestion* a human can see and reject — which is
+    // the point. It is only a default when someone looked at it and pressed Enter.
+    let dir = env.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+    let suggest = crate::agent::is_usable_name(&dir).then_some(dir);
+    loop {
+        match &suggest {
+            Some(d) => print!("Agent name — what will this agent know? [{d}]: "),
+            None => print!("Agent name — what will this agent know?: "),
+        }
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            bail!("no agent name given (stdin closed) — agit init --agent <name>");
+        }
+        match (line.trim(), &suggest) {
+            ("", Some(d)) => return Ok(d.clone()),
+            ("", None) => println!("  a name is needed, and this directory does not suggest a usable one."),
+            (n, _) => match crate::agent::is_usable_name(n) {
+                true => return Ok(n.to_string()),
+                // Re-ask rather than abort: they are already at the prompt, and losing the whole
+                // command over a typo is the kind of thing that teaches people to script around it.
+                false => println!("  `{n}` is not a usable agent name (letters, digits, `-`, `_`, `.`; max 64)."),
+            },
+        }
+    }
+}
+
+/// Keep `.agit/` — this environment's local state (the workspace log, the watcher's pidfile and log)
+/// — out of the code history.
+///
+/// Called from `bind_here` as well as `init`, because init is no longer the only door: `a new`,
+/// `a track` and `a import` all tie an agent to a repo, and `workspace::record` starts writing
+/// `.agit/` the moment either repo commits. Whichever way you arrived, agit's local scratch must not
+/// show up as untracked noise in your project.
+pub(crate) fn ensure_gitignore(env: &Path) -> Result<()> {
     let gi = env.join(".gitignore");
     let existing = std::fs::read_to_string(&gi).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == ".agit/" || l.trim() == ".agit") {
@@ -94,14 +139,17 @@ fn ensure_gitignore(env: &Path) -> Result<()> {
     Ok(())
 }
 
-fn scaffold(agent: &Path) -> Result<()> {
-    std::fs::write(
-        agent.join("agent.toml"),
-        "# Agent identity\nid = \"unnamed-agent\"\n",
-    )?;
-    std::fs::create_dir_all(agent.join("sessions"))?;
-    std::fs::write(agent.join("sessions/.gitkeep"), "")?;
-    Ok(())
+/// The secret gate, installed into a store's `.git/hooks`.
+///
+/// Every store gets this **at creation** — `agit a new`, `a track`, `a import` — not only at `agit
+/// init`. Under the old model init was what built the store, so init was the only door; now identity
+/// mints stores, and a store that skipped this scans nothing, silently. That matters here more than
+/// anywhere: a store holds whole transcripts, so it holds whatever the agent saw — the `.env` it read,
+/// the connection string it printed — and pushing one publishes them to the team.
+pub(crate) fn install_hooks(store: &Path) -> Result<()> {
+    let exe = std::env::current_exe().context("could not locate agit's own path")?;
+    install_hook(store, "pre-commit", &exe, "hook-scan --staged")?;
+    install_hook(store, "pre-push", &exe, "hook-scan")
 }
 
 /// POSIX sh single-quote escaping: the only dangerous character is `'` itself; break out with `'\''` and rejoin.
@@ -128,16 +176,4 @@ fn install_hook(agent: &Path, name: &str, exe: &Path, args: &str) -> Result<()> 
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))?;
     }
     Ok(())
-}
-
-fn git(root: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(root).args(args).output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }

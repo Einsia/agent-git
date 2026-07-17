@@ -65,10 +65,11 @@ pub struct StoreIdentity {
     pub created: String,
 }
 
-/// Read a store's identity. Refuses the legacy placeholder: `crate::init::scaffold` writes
-/// `id = "unnamed-agent"` into **every** store on earth, so accepting it would give every store one
-/// shared "identity". The hub already rejects it (`hub::identity`); this stays consistent by reusing
-/// that parser rather than growing a second opinion.
+/// Read a store's identity. Refuses the legacy placeholder: every store agit scaffolded before
+/// identity existed carries `id = "unnamed-agent"`, which they ALL share — accepting it would hand
+/// every store on earth one "identity". Those stores are adopted by `import`, never read as identified.
+/// The hub already rejects it (`hub::identity`); this stays consistent by reusing that parser rather
+/// than growing a second opinion.
 pub fn read_identity(store: &Path) -> Result<StoreIdentity> {
     let p = store.join("agent.toml");
     let text = std::fs::read_to_string(&p)
@@ -112,20 +113,34 @@ fn now() -> String {
 }
 
 /// Names are labels, but they land in TOML, in paths printed to users, and in shell suggestions.
+///
+/// A leading `.` or `~` is refused because `looks_like_url` reads either as a path: an agent named
+/// `.foo` mints fine and is then **untrackable by name** — `agit a track .foo` treats it as a local
+/// path and refuses it as an unclassifiable remote. A name a teammate can never track is not a name.
+/// A leading `-` is refused for the same class of reason: git would read it as a flag.
 fn validate_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
-        && !name.starts_with('-')
+        && !name.starts_with(['-', '.', '~'])
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
     if !ok {
-        bail!("`{name}` is not a usable agent name (use letters, digits, `-`, `_`, `.`; max 64)");
+        bail!(
+            "`{name}` is not a usable agent name (letters, digits, `-`, `_`, `.`; max 64; \
+             not starting with `-`, `.` or `~`)"
+        );
     }
     if is_aid(name) {
         bail!("`{name}` looks like an aid; a name must be a label, or `agit a use {name}` becomes ambiguous");
     }
     Ok(())
+}
+
+/// The same rule as `validate_name`, asked rather than enforced — so a prompt can check an answer, and
+/// offer a suggestion, without a second opinion about what a name is.
+pub fn is_usable_name(name: &str) -> bool {
+    validate_name(name).is_ok()
 }
 
 /// TOML here is written by hand (no toml crate — see `hub::identity`), so a value that would need
@@ -475,6 +490,7 @@ pub fn check_resolved(binding: &Binding, agent: &Agent) -> Result<()> {
 /// Record an agent in the committed binding. `agit a track` and `agit a new` both go through here, so
 /// a teammate's fresh clone can find the same agents.
 pub fn bind_here(agent: &Agent, env_root: &Path, set_default: bool) -> Result<()> {
+    crate::init::ensure_gitignore(env_root)?;
     let mut b = Binding::load(env_root)?.unwrap_or_default();
     b.upsert(BoundAgent { id: agent.aid.clone(), name: agent.name.clone(), remote: agent.remote.clone() });
     if set_default || b.default.is_none() {
@@ -526,6 +542,15 @@ fn pick<'a>(
     .find_map(|(v, s)| v.map(str::trim).filter(|v| !v.is_empty()).map(|v| (v, s)))
 }
 
+/// A store from before identity: `<env>/.agit/agent`, the location the cutover stopped resolving.
+///
+/// Recognized, never resolved. Its `agent.toml` says `id = "unnamed-agent"` — a placeholder every
+/// store on earth shares, so it can never be an identity (`read_identity` refuses it).
+pub fn legacy_store(env_root: &Path) -> Option<PathBuf> {
+    let p = env_root.join(scope::AGENT_DIR);
+    p.join(".git").exists().then_some(p)
+}
+
 /// Resolve the agent for this invocation: `--agent` → `$AGIT_AGENT` → active pointer → `.agit.toml
 /// [defaults]` → an actionable error.
 pub fn resolve(explicit: Option<&str>) -> Result<Agent> {
@@ -541,7 +566,8 @@ pub fn resolve(explicit: Option<&str>) -> Result<Agent> {
         None => None,
     };
     let var = std::env::var("AGIT_AGENT").ok();
-    resolve_in(&home, explicit, var.as_deref(), active.as_deref(), binding.as_ref())
+    let legacy = env.as_deref().and_then(legacy_store);
+    resolve_in(&home, explicit, var.as_deref(), active.as_deref(), binding.as_ref(), legacy.as_deref())
 }
 
 fn resolve_in(
@@ -550,10 +576,11 @@ fn resolve_in(
     var: Option<&str>,
     active: Option<&str>,
     binding: Option<&Binding>,
+    legacy: Option<&Path>,
 ) -> Result<Agent> {
     let default = binding.and_then(|b| b.default.as_deref());
     let Some((sel, src)) = pick(explicit, var, active, default) else {
-        bail!(no_agent_error(home, binding));
+        bail!(no_agent_error(home, binding, legacy));
     };
     let agent = find_in(home, sel).with_context(|| format!("selected by {}", src.describe()))?;
     if let Some(b) = binding {
@@ -562,7 +589,24 @@ fn resolve_in(
     Ok(agent)
 }
 
-fn no_agent_error(home: &Path, binding: Option<&Binding>) -> String {
+/// Legacy detection lives HERE, in the resolver, and not in `init`: every agent-scoped entry point —
+/// `agit a log`, snap, watch, start, resume, merge — comes through here, so all of them say the same
+/// actionable thing. A user who typed `agit a log` must not have to guess that `import` is the answer.
+///
+/// It is reported only when nothing else selected an agent: a repo that has since been imported (or
+/// that tracks a second agent) has a working answer, and must not be nagged about the husk left behind.
+fn no_agent_error(home: &Path, binding: Option<&Binding>, legacy: Option<&Path>) -> String {
+    if let Some(l) = legacy {
+        return format!(
+            "this repo's agent store predates agent identity:\n\
+             \x20      {}\n\
+             \x20      It no longer resolves. A store is now keyed by its identity, at $AGIT_HOME/agents/<aid>/ —\n\
+             \x20      which is what lets one agent carry its memory into another repo instead of being welded to this one.\n\
+             \x20      Adopt it (mints an identity, moves the store, writes the binding — nothing is lost):\n\
+             \x20        agit a import\n",
+            l.display()
+        );
+    }
     let mut s = String::from("no agent selected — agit will not guess which memory you meant.\n");
     let known: Vec<String> = list_in(home)
         .unwrap_or_default()
@@ -686,6 +730,12 @@ fn new_agent_in(home: &Path, name: &str) -> Result<Agent> {
 /// A store is a git repo whose first commit carries the identity. The user/email are set **locally**:
 /// agit must never touch the developer's global git identity, and a store with no committer config
 /// cannot commit at all.
+///
+/// agit's own metadata commits (mint/rename/adopt) pass `--no-verify`. They stage nothing but the
+/// `agent.toml` agit itself just wrote — an aid, a validated name, a timestamp, with quotes,
+/// backslashes and control characters refused at the door — so there is nothing there to scan. The
+/// gate exists for what the AGENT saw: sessions, which arrive by snap and by the user's own commits,
+/// and which are never part of these.
 fn scaffold_store(store: &Path, id: &StoreIdentity) -> Result<()> {
     scope::git_in(store, &["init", "-q", "-b", "main"])?;
     scope::git_in(store, &["config", "user.name", "agit"])?;
@@ -694,8 +744,10 @@ fn scaffold_store(store: &Path, id: &StoreIdentity) -> Result<()> {
     std::fs::create_dir_all(store.join("sessions"))?;
     std::fs::write(store.join("sessions/.gitkeep"), "")?;
     scope::git_in(store, &["add", "-A"])?;
-    scope::git_in(store, &["commit", "-q", "-m", &format!("agit: mint agent {} ({})", id.name, id.aid)])?;
-    Ok(())
+    scope::git_in(store, &["commit", "-q", "--no-verify", "-m", &format!("agit: mint agent {} ({})", id.name, id.aid)])?;
+    // After the mint commit: the identity is agit's own and has nothing to scan, and a store must not
+    // be able to reach its first real session without the gate already in place.
+    crate::init::install_hooks(store)
 }
 
 /// `agit a track <name|url>` — adopt an agent this machine does not have yet. A bare name is looked
@@ -839,6 +891,9 @@ fn clone_in(home: &Path, url: &str) -> Result<Agent> {
             .with_context(|| format!("failed to move the clone into {}", dest.display()))?;
     }
     let id = read_identity(&dest)?;
+    // Hooks live in .git/hooks, which no clone carries: a tracked agent would otherwise push a secret
+    // its owner's machine would have caught.
+    crate::init::install_hooks(&dest)?;
     registry_put(home, &id.name, &id.aid)?;
     Ok(agent_at(dest, id))
 }
@@ -884,13 +939,187 @@ fn rename_in(home: &Path, old: &str, new: &str) -> Result<Agent> {
     scope::git_in(&agent.store, &["add", "agent.toml"])?;
     scope::git_in(
         &agent.store,
-        &["commit", "-q", "-m", &format!("agit: rename agent {old} -> {new}")],
+        &["commit", "-q", "--no-verify", "-m", &format!("agit: rename agent {old} -> {new}")],
     )?;
     let mut m = registry_load(home);
     m.remove(old);
     m.insert(new.to_string(), id.aid.clone());
     registry_save(home, &m)?;
     Ok(agent_at(agent.store, id))
+}
+
+// ---------------------------------------------------------------------------------------------
+// import — the one-shot adoption of a legacy nested store
+// ---------------------------------------------------------------------------------------------
+
+/// `kill -0 <pid>`: asks the kernel whether the process exists without delivering a signal.
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Every pidfile a live watcher could be recorded in. Two locations, deliberately: `session::watch_daemon`
+/// writes it inside the store's own `.git`, and the design moves it to `<env>/.agit/` (a shared store
+/// means two repos would otherwise collide on one pidfile). Import must refuse under either, so it stays
+/// correct across that move rather than silently losing its pre-flight the day the pidfile relocates.
+fn watcher_pidfiles(env: &Path, store: &Path) -> [PathBuf; 2] {
+    [store.join(".git/agit-watch.pid"), env.join(".agit/agit-watch.pid")]
+}
+
+fn live_watcher(env: &Path, store: &Path) -> Option<u32> {
+    watcher_pidfiles(env, store).into_iter().find_map(|p| {
+        let pid: u32 = std::fs::read_to_string(&p).ok()?.trim().parse().ok()?;
+        pid_alive(pid).then_some(pid)
+    })
+}
+
+/// EXDEV. `$AGIT_HOME` and the code repo routinely sit on different filesystems, where `rename` cannot
+/// work at all — a container's bind-mounted workspace against a home on the image, say.
+const EXDEV: i32 = 18;
+
+/// Move a directory, atomically when the kernel allows it. Only a genuine cross-device error falls back
+/// to copy: any other failure is reported as itself, rather than being retried as a slow copy that will
+/// fail again for the same reason and blame the wrong step.
+fn move_dir(from: &Path, to: &Path) -> Result<()> {
+    if let Some(p) = to.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.raw_os_error() == Some(EXDEV) => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to move {} → {}", from.display(), to.display()))
+        }
+    }
+    copy_dir(from, to).with_context(|| format!("failed to copy {} → {}", from.display(), to.display()))?;
+    std::fs::remove_dir_all(from)
+        .with_context(|| format!("copied to {}, but failed to remove {}", to.display(), from.display()))
+}
+
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        let ft = e.file_type()?;
+        if ft.is_dir() {
+            copy_dir(&src, &dst)?;
+        } else if ft.is_symlink() {
+            // Copying the target would silently turn a link into a second copy of the file.
+            std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// `agit a import [<name>]` — adopt this repo's legacy `<env>/.agit/agent` as a real, identified agent.
+///
+/// Mints an aid into the store's committed `agent.toml`, moves the store to `$AGIT_HOME/agents/<aid>/`,
+/// writes the binding, and activates it. The history is the agent's memory, so it is **moved**, never
+/// re-created: nothing is lost and no session is re-captured.
+pub fn import(name: Option<&str>) -> Result<Agent> {
+    let home = scope::agit_home()?;
+    let env = scope::env_root().context("agit a import must run inside your code repo")?;
+    import_in(&home, &env, name)
+}
+
+fn import_in(home: &Path, env: &Path, name: Option<&str>) -> Result<Agent> {
+    let Some(legacy) = legacy_store(env) else {
+        bail!(
+            "there is no legacy store to import: {} is not a git repository.\n\
+             \x20      agit a new <name>      mint a fresh agent here\n\
+             \x20      agit a track <url>     adopt one that already exists",
+            env.join(scope::AGENT_DIR).display()
+        );
+    };
+
+    // PRE-FLIGHT. Moving the store out from under a running watcher does not fail — it silently
+    // ZOMBIES it: the daemon holds the old inode open and keeps writing captures into a directory
+    // nothing will ever read again. The user would lose sessions with no error at all, so this refuses
+    // rather than warns, and names the command that fixes it.
+    if let Some(pid) = live_watcher(env, &legacy) {
+        bail!(
+            "a watcher is running (pid {pid}) — refusing to move the store out from under it.\n\
+             \x20      It would keep writing captures into the old directory, and you would lose them silently.\n\
+             \x20      Stop it, import, then start it again:\n\
+             \x20        agit watch --stop\n\
+             \x20        agit a import\n\
+             \x20        agit watch --daemon"
+        );
+    }
+
+    // An aid already in the store IS the identity — minting a second would fork one memory in two.
+    let existing = read_identity(&legacy).ok();
+    let name = match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => n.to_string(),
+        // §11b: naming the agent after the directory is what made everyone rename it immediately, so a
+        // name the store already carries wins over the folder it happens to sit in.
+        None => existing
+            .as_ref()
+            .map(|i| i.name.clone())
+            .filter(|n| !is_aid(n))
+            .or_else(|| env.file_name().and_then(|s| s.to_str()).map(str::to_string))
+            .context("could not name the agent from this repo's directory — pass one: agit a import <name>")?,
+    };
+    validate_name(&name)?;
+    if let Ok(a) = find_in(home, &name) {
+        bail!(
+            "an agent named `{name}` already exists ({}).\n\
+             \x20      Names are labels, so agit will not have two wearing one name: agit a import <other-name>",
+            a.aid
+        );
+    }
+
+    let aid = existing.as_ref().map(|i| i.aid.clone()).unwrap_or_else(mint_aid);
+    let dest = agents_dir_in(home).join(&aid);
+    if dest.exists() {
+        bail!(
+            "{} already exists — this store has been imported already.\n\
+             \x20      agit a use {name}   point this repo at it",
+            dest.display()
+        );
+    }
+
+    move_dir(&legacy, &dest)?;
+    // Before the identity commit, deliberately: the legacy store's hooks point at whatever path agit
+    // lived at when it was inited, and a hook naming a binary that has since moved fails the very
+    // commit import is here to make.
+    crate::init::install_hooks(&dest)?;
+    let id = StoreIdentity {
+        aid,
+        name,
+        created: existing.map(|i| i.created).filter(|c| !c.is_empty()).unwrap_or_else(now),
+    };
+    write_agent_toml(&dest, &id)?;
+    // The legacy scaffold set these locally, but a store that was hand-made or cloned may have neither,
+    // and a store that cannot commit cannot record the identity it just gained.
+    for (k, v) in [("user.name", "agit"), ("user.email", "agit@local")] {
+        if scope::git_in_status(&dest, &["config", "--get", k]).0 != 0 {
+            scope::git_in(&dest, &["config", k, v])?;
+        }
+    }
+    scope::git_in(&dest, &["add", "agent.toml"])?;
+    // A store that already carried this exact identity has nothing to commit, and `git commit` calls
+    // that an error.
+    if !scope::git_in(&dest, &["status", "--porcelain", "--", "agent.toml"])?.is_empty() {
+        scope::git_in(
+            &dest,
+            &["commit", "-q", "--no-verify", "-m", &format!("agit: adopt store as agent {} ({})", id.name, id.aid)],
+        )?;
+    }
+    registry_put(home, &id.name, &id.aid)?;
+
+    let agent = agent_at(dest, id);
+    bind_here(&agent, env, true)?;
+    write_active(env, &agent.aid)?;
+    Ok(agent)
 }
 
 #[cfg(test)]
@@ -938,7 +1167,7 @@ mod tests {
         let h = tmp();
         let store = h.path().join("agents/legacy");
         std::fs::create_dir_all(&store).unwrap();
-        // Byte-for-byte what crate::init::scaffold writes into every store on earth.
+        // Byte-for-byte what agit scaffolded into every store before identity existed.
         std::fs::write(store.join("agent.toml"), "# Agent identity\nid = \"unnamed-agent\"\n").unwrap();
         let e = read_identity(&store).unwrap_err().to_string();
         assert!(e.contains("no agent identity"), "got: {e}");
@@ -1024,7 +1253,7 @@ agent = "frontend"        # what a FRESH clone activates
         let binding = Binding { default: Some("default-agent".into()), ..Binding::default() };
         let b = Some(&binding);
 
-        let r = |e, v, a| resolve_in(h.path(), e, v, a, b).unwrap().aid;
+        let r = |e, v, a| resolve_in(h.path(), e, v, a, b, None).unwrap().aid;
         assert_eq!(r(Some("flag-agent"), Some("var-agent"), Some("active-agent")), flag.aid);
         assert_eq!(r(None, Some("var-agent"), Some("active-agent")), var.aid);
         assert_eq!(r(None, None, Some("active-agent")), active.aid);
@@ -1034,7 +1263,7 @@ agent = "frontend"        # what a FRESH clone activates
         assert_eq!(r(Some(&active.aid), None, None), active.aid);
 
         // Rung 5: an actionable error, never a silent fallback.
-        let e = resolve_in(h.path(), None, None, None, None).unwrap_err().to_string();
+        let e = resolve_in(h.path(), None, None, None, None, None).unwrap_err().to_string();
         assert!(e.contains("no agent selected"), "got: {e}");
         assert!(e.contains("agit a use <name>"), "got: {e}");
         assert!(e.contains("known agents: active-agent"), "got: {e}");
@@ -1047,7 +1276,7 @@ agent = "frontend"        # what a FRESH clone activates
         let binding = Binding { default: Some("default-agent".into()), ..Binding::default() };
         for blank in ["", "   ", "\n"] {
             assert_eq!(
-                resolve_in(h.path(), None, Some(blank), Some(blank), Some(&binding)).unwrap().aid,
+                resolve_in(h.path(), None, Some(blank), Some(blank), Some(&binding), None).unwrap().aid,
                 deflt.aid,
                 "a blank rung must fall through to [defaults], not select nothing"
             );
@@ -1066,7 +1295,7 @@ agent = "frontend"        # what a FRESH clone activates
         assert_eq!(read_active(&env).unwrap(), None);
         let binding = Binding { default: Some("frontend".into()), ..Binding::default() };
         assert_eq!(
-            resolve_in(h.path(), None, None, read_active(&env).unwrap().as_deref(), Some(&binding)).unwrap().aid,
+            resolve_in(h.path(), None, None, read_active(&env).unwrap().as_deref(), Some(&binding), None).unwrap().aid,
             agent.aid
         );
 
@@ -1149,6 +1378,19 @@ agent = "frontend"        # what a FRESH clone activates
         assert!(new_agent_in(h.path(), "quote\"name").is_err());
         assert!(new_agent_in(h.path(), "--agent").is_err());
         assert!(rename_in(h.path(), "frontend", "bad name").is_err());
+
+        // A name `track` could never resolve is not a name. `looks_like_url` reads a leading `.` or
+        // `~` as a path, so `agit a track .tmp9ndKZa` refuses it as an unclassifiable remote rather
+        // than finding the agent — i.e. minting one strands the teammate who needs it.
+        for path_like in [".tmp9ndKZa", ".hidden", "~home", "./rel"] {
+            assert!(
+                new_agent_in(h.path(), path_like).is_err(),
+                "`{path_like}` must be refused at mint: looks_like_url reads it as a path, so no \
+                 teammate could ever `agit a track {path_like}`"
+            );
+            assert!(rename_in(h.path(), "frontend", path_like).is_err(), "and rename must not sneak one in");
+        }
+        assert!(new_agent_in(h.path(), "payments.api").is_ok(), "a dot INSIDE a name is still fine");
     }
 
     #[test]
@@ -1190,7 +1432,7 @@ agent = "frontend"        # what a FRESH clone activates
             }],
             default: Some("frontend".into()),
         };
-        let e = resolve_in(h.path(), None, None, None, Some(&binding)).unwrap_err().to_string();
+        let e = resolve_in(h.path(), None, None, None, Some(&binding), None).unwrap_err().to_string();
         assert!(e.contains("this repo is bound to"), "got: {e}");
         assert!(e.contains(&a.aid), "the error must name the aid actually found: {e}");
 
@@ -1199,11 +1441,11 @@ agent = "frontend"        # what a FRESH clone activates
         // the selector let exactly this case through silently.
         for sel in [Some(a.aid.as_str()), Some("frontend")] {
             assert!(
-                resolve_in(h.path(), sel, None, None, Some(&binding)).is_err(),
+                resolve_in(h.path(), sel, None, None, Some(&binding), None).is_err(),
                 "a store that is not the bound agent must be refused however it was selected ({sel:?})"
             );
-            assert!(resolve_in(h.path(), None, sel, None, Some(&binding)).is_err());
-            assert!(resolve_in(h.path(), None, None, sel, Some(&binding)).is_err());
+            assert!(resolve_in(h.path(), None, sel, None, Some(&binding), None).is_err());
+            assert!(resolve_in(h.path(), None, None, sel, Some(&binding), None).is_err());
         }
 
         // An entry that agrees on the id is settled, whatever label it wears (a stale rename hint).
@@ -1211,13 +1453,12 @@ agent = "frontend"        # what a FRESH clone activates
             agents: vec![BoundAgent { id: a.aid.clone(), name: "old-label".into(), remote: None }],
             ..Binding::default()
         };
-        assert_eq!(resolve_in(h.path(), Some(&a.aid), None, None, Some(&ok)).unwrap().aid, a.aid);
+        assert_eq!(resolve_in(h.path(), Some(&a.aid), None, None, Some(&ok), None).unwrap().aid, a.aid);
         // An agent the binding says nothing about is not this check's business.
         let unrelated = new_agent_in(h.path(), "infra").unwrap();
-        assert_eq!(resolve_in(h.path(), Some("infra"), None, None, Some(&binding)).unwrap().aid, unrelated.aid);
+        assert_eq!(resolve_in(h.path(), Some("infra"), None, None, Some(&binding), None).unwrap().aid, unrelated.aid);
     }
 
-    #[test]
     /// The remote comes from COMMITTED .agit.toml, so it is attacker-controlled input on a repo you
     /// merely cloned. Verified against git 2.43: `git clone 'ext::<cmd>'` executed <cmd> — the clone
     /// then failed, but the payload had already run, and `--` did not stop it (a scheme, not a flag).
@@ -1256,6 +1497,163 @@ agent = "frontend"        # what a FRESH clone activates
         }
     }
 
+    /// A store exactly as agit scaffolded them before identity existed: nested in the code repo,
+    /// carrying the `unnamed-agent` placeholder that every such store on earth shares.
+    fn legacy_repo(dir: &Path) -> (PathBuf, PathBuf) {
+        let env = env_repo(dir);
+        let store = env.join(scope::AGENT_DIR);
+        std::fs::create_dir_all(&store).unwrap();
+        scope::git_in(&store, &["init", "-q", "-b", "main"]).unwrap();
+        scope::git_in(&store, &["config", "user.name", "agit"]).unwrap();
+        scope::git_in(&store, &["config", "user.email", "agit@local"]).unwrap();
+        std::fs::write(store.join("agent.toml"), "# Agent identity\nid = \"unnamed-agent\"\n").unwrap();
+        std::fs::create_dir_all(store.join("sessions/claude-code")).unwrap();
+        std::fs::write(store.join("sessions/claude-code/old.jsonl"), "{\"role\":\"user\"}\n").unwrap();
+        scope::git_in(&store, &["add", "-A"]).unwrap();
+        scope::git_in(&store, &["commit", "-q", "-m", "agit: initialize Agent Store"]).unwrap();
+        (env, store)
+    }
+
+    #[test]
+    fn import_adopts_the_legacy_store_without_losing_its_memory() {
+        let h = tmp();
+        let d = tmp();
+        let (env, legacy) = legacy_repo(d.path());
+        let before = scope::git_in(&legacy, &["rev-parse", "HEAD"]).unwrap();
+
+        let a = import_in(h.path(), &env, Some("frontend")).unwrap();
+        assert!(is_aid(&a.aid), "import mints a real identity, not another placeholder");
+        assert_eq!(a.name, "frontend");
+        assert_eq!(a.store, h.path().join("agents").join(&a.aid), "the store is keyed by aid now");
+        assert!(!legacy.exists(), "the store is MOVED — one memory must not become two");
+
+        // The memory itself survives: import adopts history, it does not re-create a store.
+        assert!(a.store.join("sessions/claude-code/old.jsonl").exists());
+        assert!(
+            scope::git_in(&a.store, &["log", "--format=%H"]).unwrap().contains(&before),
+            "the pre-identity history must still be there"
+        );
+        assert!(
+            scope::git_in(&a.store, &["show", "HEAD:agent.toml"]).unwrap().contains(&a.aid),
+            "and the identity is committed, so it travels with the store"
+        );
+
+        // Bound and active, so the repo resolves it from here on.
+        let b = Binding::load(&env).unwrap().unwrap();
+        assert_eq!(b.agents, vec![BoundAgent { id: a.aid.clone(), name: "frontend".into(), remote: None }]);
+        assert_eq!(b.default.as_deref(), Some("frontend"));
+        assert_eq!(read_active(&env).unwrap().as_deref(), Some(a.aid.as_str()));
+        assert_eq!(
+            resolve_in(h.path(), None, None, read_active(&env).unwrap().as_deref(), Some(&b), None).unwrap().aid,
+            a.aid
+        );
+    }
+
+    /// The pre-flight, and the reason it refuses instead of warning: moving a directory out from under a
+    /// running watcher does not fail. It silently ZOMBIES it — the daemon keeps the old inode open and
+    /// writes captures into a place nothing will ever read again. Losing sessions with no error at all is
+    /// the one outcome agit exists to prevent.
+    #[test]
+    fn import_refuses_to_move_the_store_under_a_live_watcher() {
+        // Both pidfile locations: `session::watch_daemon` writes it inside the store's .git today, and
+        // the design moves it to `<env>/.agit/`. The refusal must survive that move.
+        for loc in ["store", "env"] {
+            let h = tmp();
+            let d = tmp();
+            let (env, legacy) = legacy_repo(d.path());
+            let mut watcher = Command::new("sleep").arg("30").spawn().unwrap();
+            let pidf = match loc {
+                "store" => legacy.join(".git/agit-watch.pid"),
+                _ => env.join(".agit/agit-watch.pid"),
+            };
+            std::fs::create_dir_all(pidf.parent().unwrap()).unwrap();
+            std::fs::write(&pidf, format!("{}\n", watcher.id())).unwrap();
+
+            let e = import_in(h.path(), &env, Some("frontend")).unwrap_err().to_string();
+            assert!(e.contains("a watcher is running"), "[{loc}] got: {e}");
+            assert!(e.contains("agit watch --stop"), "[{loc}] the refusal must name the fix: {e}");
+            assert!(legacy.join(".git").exists(), "[{loc}] the store must not have moved");
+            assert!(list_in(h.path()).unwrap().is_empty(), "[{loc}] and no identity may be minted");
+            assert!(Binding::load(&env).unwrap().is_none(), "[{loc}] and nothing may be bound");
+
+            watcher.kill().unwrap();
+            watcher.wait().unwrap();
+            // Liveness is the test, not the file: a pidfile left by a dead watcher must not block anyone.
+            assert!(
+                import_in(h.path(), &env, Some("frontend")).is_ok(),
+                "[{loc}] a stale pidfile must not wedge import"
+            );
+        }
+    }
+
+    /// Acceptance §13.6: one actionable error, from whatever the user happened to type. It is the
+    /// RESOLVER that says it, so `agit a log`, snap, watch, start, resume and merge all say it alike.
+    #[test]
+    fn a_store_that_predates_identity_gets_one_actionable_error() {
+        let h = tmp();
+        let d = tmp();
+        let (env, legacy) = legacy_repo(d.path());
+        let e = resolve_in(h.path(), None, None, None, None, legacy_store(&env).as_deref())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("predates agent identity"), "got: {e}");
+        assert!(e.contains(&legacy.display().to_string()), "must name the store it found: {e}");
+        assert!(e.contains("agit a import"), "must name the one command that fixes it: {e}");
+
+        // But only while it IS the answer: once the repo has an agent, the husk left behind must not
+        // shout over it.
+        let a = new_agent_in(h.path(), "frontend").unwrap();
+        let b = Binding { default: Some("frontend".into()), ..Binding::default() };
+        assert_eq!(
+            resolve_in(h.path(), None, None, None, Some(&b), legacy_store(&env).as_deref()).unwrap().aid,
+            a.aid
+        );
+    }
+
+    /// A store holds whole transcripts, so it holds whatever the agent saw — and pushing one publishes
+    /// that to the team. Under the old model `agit init` built the store, so init could be the only
+    /// place the gate was installed; identity mints stores now, and every door must fit it.
+    #[test]
+    fn every_store_gets_the_secret_gate_however_it_was_created() {
+        let h = tmp();
+        let minted = new_agent_in(h.path(), "frontend").unwrap();
+        for hook in ["pre-commit", "pre-push"] {
+            assert!(
+                minted.store.join(".git/hooks").join(hook).exists(),
+                "agit a new must install {hook} — a store minted without it scans nothing, silently"
+            );
+        }
+
+        // .git/hooks is never carried by a clone, so tracking must re-install it.
+        let d = tmp();
+        let (env, _) = legacy_repo(d.path());
+        let imported = import_in(h.path(), &env, Some("adopted")).unwrap();
+        assert!(
+            imported.store.join(".git/hooks/pre-commit").exists(),
+            "an imported store must be gated too"
+        );
+    }
+
+    #[test]
+    fn import_refuses_what_it_cannot_adopt() {
+        let h = tmp();
+        let d = tmp();
+        let env = env_repo(d.path());
+        let e = import_in(h.path(), &env, None).unwrap_err().to_string();
+        assert!(e.contains("no legacy store"), "got: {e}");
+        assert!(e.contains("agit a new"), "must offer the real alternative: {e}");
+
+        let d2 = tmp();
+        let (env2, _) = legacy_repo(d2.path());
+        new_agent_in(h.path(), "taken").unwrap();
+        let e = import_in(h.path(), &env2, Some("taken")).unwrap_err().to_string();
+        assert!(e.contains("already exists"), "names are labels; two agents must not share one: {e}");
+
+        // No name given → the repo's directory is the only hint there is (`env_repo` builds `<tmp>/code`).
+        assert_eq!(import_in(h.path(), &env2, None).unwrap().name, "code");
+    }
+
+    #[test]
     fn url_shapes_are_not_mistaken_for_names() {
         for u in ["https://hub/f.git", "git@github.com:me/f.git", "/srv/agents/f.git", "./f", "~/f"] {
             assert!(looks_like_url(u), "{u}");

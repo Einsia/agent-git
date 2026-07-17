@@ -19,15 +19,29 @@ impl Repo {
         r.sh("git config commit.gpgsign false");
         r.write("app.ts", "export const x = 1;\n");
         r.sh("git add -A && git commit -qm seed");
-        assert_eq!(r.agit(&["init"]).0, 0, "init should succeed");
+        // `--agent` is required non-interactively: an agent is named for what it knows, so agit will
+        // not invent a label from the directory — which here would be the tempdir's `.tmpXXXXXX`.
+        assert_eq!(r.agit(&["init", "--agent", "testmemory"]).0, 0, "init should succeed");
         r
     }
 
     fn path(&self) -> &Path {
         self.dir.path()
     }
+    /// The resolved agent's store — **not** a path a test may hardcode. A store is keyed by the
+    /// agent's identity at `$AGIT_HOME/agents/<aid>/`, so the only way to find it is to ask agit
+    /// which agent this repo resolves to, exactly as a user would. `agit a <git…>` is plain git on
+    /// that store, so git itself answers.
     fn agent(&self) -> PathBuf {
-        self.path().join(".agit/agent")
+        let (code, out, err) = self.agit(&["a", "rev-parse", "--show-toplevel"]);
+        assert_eq!(code, 0, "could not resolve this repo's agent store: {err}");
+        PathBuf::from(out.trim())
+    }
+    /// Write into the resolved store, the way `snap` would.
+    fn write_agent(&self, rel: &str, content: &str) {
+        let p = self.agent().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
     }
 
     /// Every process this suite spawns goes through here. agit resolves ~/.claude, ~/.codex and its own
@@ -84,18 +98,101 @@ impl Repo {
 // ─────────────────────────── init / storage model ───────────────────────────
 
 #[test]
-fn init_creates_agent_store_for_sessions() {
+fn init_binds_an_identified_store_outside_the_code_repo() {
     let r = Repo::new();
-    assert!(r.agent().join(".git").exists(), "Agent Store should be a standalone git repo");
+    assert!(r.agent().join(".git").exists(), "the store should be a standalone git repo");
     assert!(r.agent().join("sessions").exists(), "should have the sessions/ skeleton");
     // no more fact machinery
     assert!(!r.agent().join("state/facts").exists(), "state/facts should have been removed");
     assert!(r.git_env(&["config", "--get", "merge.agit.driver"]).is_empty(), "the fact merge driver is no longer registered");
-    // .agit/ is ignored by the code repo
-    assert!(r.sh("git check-ignore .agit; echo $?").contains('0'));
+    // .agit/ holds this environment's local state (workspace log, watcher pid/log) and stays out of
+    // the code history. Asked about a path *inside* it: the `.agit/` pattern carries a trailing slash,
+    // so it only matches a directory that exists, and init no longer creates one — the store moved out.
+    assert!(r.sh("git check-ignore .agit/workspace/log.jsonl; echo $?").contains('0'));
     // secret hooks are installed
     assert!(r.agent().join(".git/hooks/pre-commit").exists());
     assert!(r.agent().join(".git/hooks/pre-push").exists());
+
+    // The cutover, and the whole point of it: the store is keyed by the agent's IDENTITY, under
+    // $AGIT_HOME — NOT nested in the code repo. A nested store is welded to one environment, which is
+    // exactly what stopped an agent carrying its memory into another repo.
+    let store = r.agent();
+    assert!(
+        store.starts_with(r.path().join("agit-home").join("agents")),
+        "the store must live at $AGIT_HOME/agents/<aid>/, got {}",
+        store.display()
+    );
+    assert!(
+        store.file_name().unwrap().to_str().unwrap().starts_with("agt_"),
+        "the store directory must BE the aid, so rename/publish never move it: {}",
+        store.display()
+    );
+    assert!(!r.path().join(".agit/agent").exists(), "the legacy nested store must not be created");
+    assert!(!r.path().join(".agit/store").exists(), "the .agit/store pointer file is gone");
+
+    // The binding is COMMITTED — this is what makes a teammate's clone work.
+    let binding = std::fs::read_to_string(r.path().join(".agit.toml")).expect(".agit.toml should be written");
+    assert!(binding.contains("id     = \"agt_"), "the binding must record the aid: {binding}");
+    assert!(
+        r.sh("git check-ignore .agit.toml; echo $?").contains('1'),
+        "the binding must NOT be gitignored — an uncommitted binding tells a teammate nothing"
+    );
+}
+
+/// An agent is a memory, "named for what it knows" — not for the directory it happened to be
+/// initialised in, which it outlives and which everyone's `~/code/api` shares. So a non-interactive
+/// `init` with no `--agent` must refuse rather than invent a label, exactly as resolution refuses to
+/// guess which memory you meant.
+#[test]
+fn init_will_not_name_an_agent_after_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = Repo { dir };
+    r.sh("git init -q -b main .");
+    r.sh("git config user.name dev && git config user.email d@x.com && git config commit.gpgsign false");
+    r.write("app.ts", "x\n");
+    r.sh("git add -A && git commit -qm seed");
+
+    let (code, out, err) = r.agit(&["init"]);
+    let said = format!("{out}{err}");
+    assert_ne!(code, 0, "init must not mint an agent nobody named: {said}");
+    assert!(said.contains("will not name one for you"), "{said}");
+    assert!(said.contains("agit init --agent <name>"), "must name the fix: {said}");
+    assert!(said.contains("agit a track"), "and the other real answer: {said}");
+    // Nothing may be left behind by the refusal.
+    let dirname = r.path().file_name().unwrap().to_str().unwrap().to_string();
+    let (_, listed, _) = r.agit(&["a", "list"]);
+    assert!(!listed.contains(&dirname), "no agent may be named after the directory: {listed}");
+    assert!(!r.path().join(".agit.toml").exists(), "and nothing may be bound");
+
+    // Named explicitly, it works — the name was a decision, not a guess.
+    assert_eq!(r.agit(&["init", "--agent", "payments-api"]).0, 0);
+    let (_, listed, _) = r.agit(&["a", "list"]);
+    assert!(listed.contains("payments-api"), "{listed}");
+}
+
+/// A repo from before identity gets ONE actionable error, from whatever the user typed — not a
+/// second, silently empty store beside the memory it already has.
+#[test]
+fn a_store_that_predates_identity_is_refused_with_one_actionable_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = Repo { dir };
+    r.sh("git init -q -b main .");
+    r.sh("git config user.name dev && git config user.email d@x.com && git config commit.gpgsign false");
+    r.write("app.ts", "x\n");
+    r.sh("git add -A && git commit -qm seed");
+    // exactly what agit scaffolded before identity: the nested store with the shared placeholder
+    r.write(".agit/agent/agent.toml", "# Agent identity\nid = \"unnamed-agent\"\n");
+    r.write(".agit/agent/sessions/claude-code/old.jsonl", "{\"type\":\"user\"}\n");
+    r.sh("cd .agit/agent && git init -q -b main . && git add -A && \
+          git -c user.name=a -c user.email=a@x -c commit.gpgsign=false commit -qm 'agit: initialize Agent Store'");
+
+    for args in [vec!["a", "log"], vec!["start"], vec!["init"]] {
+        let (code, out, err) = r.agit(&args);
+        let said = format!("{out}{err}");
+        assert_ne!(code, 0, "`agit {}` must not silently succeed on a legacy repo", args.join(" "));
+        assert!(said.contains("predates agent identity"), "`agit {}`: {said}", args.join(" "));
+        assert!(said.contains("agit a import"), "`agit {}` must name the fix: {said}", args.join(" "));
+    }
 }
 
 #[test]
@@ -124,13 +221,16 @@ fn default_scope_is_transparent_git_on_code_repo() {
     let r = Repo::new();
     let (code, out, _) = r.agit(&["status", "--short"]);
     assert_eq!(code, 0);
-    assert!(!out.contains(".agit"), "agit status should not expose .agit/:\n{out}");
+    assert!(!out.contains(".agit/"), "agit status should not expose .agit/ local state:\n{out}");
+    // `.agit.toml` is the exception, and deliberately so: it is the COMMITTED binding, so it must
+    // show up as untracked until you commit it. A binding nobody commits tells a teammate nothing.
+    assert!(out.contains(".agit.toml"), "the binding must be visible to commit:\n{out}");
 }
 
 #[test]
 fn agit_dash_a_targets_agent_store() {
     let r = Repo::new();
-    r.write(".agit/agent/notes.md", "hi\n");
+    r.write_agent("notes.md", "hi\n");
     assert_eq!(r.agit(&["-a", "add", "-A"]).0, 0);
     assert_eq!(r.agit(&["-a", "commit", "-m", "agent scope"]).0, 0);
     assert_eq!(r.git_agent(&["log", "-1", "--format=%s"]), "agent scope");
@@ -158,7 +258,10 @@ fn agit_a_subcommand_runs_git_on_the_agent_store() {
     for verb in ["a", "agent"] {
         let (code, out, err) = r.agit(&[verb, "log", "-1", "--format=%s"]);
         assert_eq!(code, 0, "`agit {verb} log` should reach the store: {err}");
-        assert_eq!(out.trim(), "agit: initialize Agent Store", "`agit {verb} log` should show the store's history, not the code repo's");
+        assert!(
+            out.contains("agit: mint agent"),
+            "`agit {verb} log` should show the store's history, not the code repo's: {out}"
+        );
     }
 }
 
@@ -166,7 +269,7 @@ fn agit_a_subcommand_runs_git_on_the_agent_store() {
 #[test]
 fn agit_a_add_is_git_add_not_a_management_verb() {
     let r = Repo::new();
-    r.write(".agit/agent/notes.md", "hi\n");
+    r.write_agent("notes.md", "hi\n");
     let (code, _, err) = r.agit(&["a", "add", "-A"]);
     assert_eq!(code, 0, "`agit a add -A` must be git-add on the store: {err}");
     assert_eq!(r.agit(&["a", "commit", "-m", "via subcommand"]).0, 0);
@@ -185,7 +288,7 @@ fn agit_a_info_is_management_while_show_stays_git() {
 
     let (code, out, _) = r.agit(&["a", "show", "--stat", "--format=%s"]);
     assert_eq!(code, 0, "`git show` must stay reachable through `agit a show`");
-    assert!(out.contains("agit: initialize Agent Store"), "`agit a show` should be git-show on the store: {out}");
+    assert!(out.contains("agit: mint agent"), "`agit a show` should be git-show on the store: {out}");
 }
 
 /// Every closed-set verb is recognized, so none of them silently becomes a git invocation.
@@ -222,7 +325,7 @@ fn dash_a_remains_a_silent_deprecated_alias() {
     let r = Repo::new();
     let (code, out, err) = r.agit(&["-a", "log", "-1", "--format=%s"]);
     assert_eq!(code, 0, "`agit -a log` must keep working: {err}");
-    assert_eq!(out.trim(), "agit: initialize Agent Store");
+    assert!(out.contains("agit: mint agent"), "{out}");
     assert!(!err.to_lowercase().contains("deprecat"), "the alias must print nothing yet: {err}");
 }
 
@@ -231,7 +334,7 @@ fn dash_a_remains_a_silent_deprecated_alias() {
 #[test]
 fn agent_commit_generates_workspace_revision() {
     let r = Repo::new();
-    r.write(".agit/agent/notes.md", "x\n");
+    r.write_agent("notes.md", "x\n");
     r.agit(&["-a", "add", "-A"]);
     r.agit(&["-a", "commit", "-m", "c"]);
     let head = r.path().join(".agit/workspace/HEAD.json");
@@ -255,7 +358,7 @@ fn env_commit_also_pairs() {
 fn environment_state_captures_dirty_worktree() {
     let r = Repo::new();
     r.write("scratch.txt", "未跟踪\n");
-    r.write(".agit/agent/notes.md", "x\n");
+    r.write_agent("notes.md", "x\n");
     r.agit(&["-a", "add", "-A"]);
     r.agit(&["-a", "commit", "-m", "pair while dirty"]);
     let json = std::fs::read_to_string(r.path().join(".agit/workspace/HEAD.json")).unwrap();
@@ -268,8 +371,8 @@ fn environment_state_captures_dirty_worktree() {
 fn secret_in_session_blocked_by_precommit() {
     let r = Repo::new();
     // simulate a post-sync session dump that carries a real secret
-    r.write(
-        ".agit/agent/sessions/claude-code/s.jsonl",
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
         "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n",
     );
     r.agit(&["-a", "add", "-A"]);
@@ -282,8 +385,8 @@ fn secret_in_session_blocked_by_precommit() {
 fn scan_covers_sessions_but_ignores_uuid_noise() {
     let r = Repo::new();
     // a high-entropy UUID/requestId should not false-positive; a real AWS key should be reported
-    r.write(
-        ".agit/agent/sessions/claude-code/s.jsonl",
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
         "{\"uuid\":\"7c48816b-6fa5-42f7-9fff-bbeea20ff632\",\"requestId\":\"req_a8Xk92mFqLp3\"}\n\
          {\"content\":\"AKIAIOSFODNN7EXAMPLE\"}\n",
     );
@@ -299,10 +402,10 @@ fn scan_covers_sessions_but_ignores_uuid_noise() {
 #[test]
 fn staged_secret_blocked_even_after_worktree_cleaned() {
     let r = Repo::new();
-    let p = ".agit/agent/sessions/claude-code/s.jsonl";
-    r.write(p, "{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}\n"); // the secret version
+    let p = "sessions/claude-code/s.jsonl";
+    r.write_agent(p, "{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}\n"); // the secret version
     r.agit(&["-a", "add", "-A"]); // stage the secret blob
-    r.write(p, "{\"content\":\"clean\"}\n"); // revert the working tree to clean, without re-staging
+    r.write_agent(p, "{\"content\":\"clean\"}\n"); // revert the working tree to clean, without re-staging
     let (code, _, err) = r.agit(&["-a", "commit", "-m", "sneaky"]);
     assert_ne!(code, 0, "a staged secret should be blocked even if the working tree is already clean: {err}");
     assert!(err.contains("suspected secrets") || err.contains("aws"), "{err}");
@@ -438,7 +541,7 @@ fn snap_with_no_sessions_anywhere_names_both_runtimes() {
 fn harness_apply_refuses_to_guess_between_both_runtimes() {
     let r = Repo::new();
     for rt in ["claude-code", "codex"] {
-        r.write(&format!(".agit/agent/harness/{rt}/project/mcp.json"), "{}\n");
+        r.write_agent(&format!("harness/{rt}/project/mcp.json"), "{}\n");
     }
     let (code, out, err) = r.agit(&["harness", "apply"]);
     assert_ne!(code, 0, "must not pick a runtime on its own: {out}");

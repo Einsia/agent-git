@@ -2,10 +2,14 @@
 //!
 //! The core of the PRD: the versioned objects are two git repos + a pairing.
 //!   Environment = the user's existing code repository (left untouched)
-//!   Agent Store = .agit/agent/ -- a standalone git repository holding AgentState
+//!   Agent Store = a standalone git repository holding AgentState, found by IDENTITY (`crate::agent`)
 //!
 //!   agit <git-args>        = agit -e <git-args>  → git operates on the Environment
 //!   agit agent <git-args>  (alias: agit a)       → git operates on the Agent Store (isomorphic operation)
+//!
+//! The store is **not** a location this module decides. An agent is a memory that outlives any one
+//! repo, so it lives at `$AGIT_HOME/agents/<aid>/` and is reached by resolving *which agent* — never
+//! by walking to a path relative to the code repo.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -19,7 +23,11 @@ pub enum Scope {
     Agent,
 }
 
-/// The Agent Store's location relative to the code repository root. Written into the code repository's .gitignore.
+/// Where a store lived **before** agent identity, relative to the code repo root.
+///
+/// This is no longer a place agit resolves a store — it is only the place agit *recognizes* one, so
+/// that a repo predating identity gets an actionable "run `agit a import`" from every agent-scoped
+/// command instead of a fresh empty store. See `crate::agent::legacy_store`.
 pub const AGENT_DIR: &str = ".agit/agent";
 /// Where the WorkspaceRevision log lives. Deliberately placed outside both git worktrees, to avoid moving the agent ref when writing a pairing.
 pub const WORKSPACE_DIR: &str = ".agit/workspace";
@@ -38,31 +46,19 @@ pub fn env_root() -> Result<PathBuf> {
     ))
 }
 
-/// A pointer file (in the Environment) holding the path of a DETACHED Agent Store.
-pub const STORE_PTR: &str = ".agit/store";
-
-/// The working-tree root of the Agent Store (may not exist yet).
+/// The working-tree root of the resolved agent's store: `$AGIT_HOME/agents/<aid>/`.
 ///
-/// Resolution order — this is what lets Agent State be **detached** from any one Environment, so a
-/// single agent's store can be shared by several code repos (e.g. a frontend agent carrying its
-/// context on into the backend repo):
-///   1. `$AGIT_AGENT_DIR`     — explicit override, for one-off/scripted use
-///   2. `<env>/.agit/store`   — pointer file written by `agit init --store <path>`
-///   3. `<env>/.agit/agent`   — the default, nested store
+/// There is exactly ONE answer, and identity is what gives it (`crate::agent::resolve`: `--agent` →
+/// `$AGIT_AGENT` → the active pointer → `.agit.toml [defaults]` → an actionable error).
+///
+/// The three rungs this replaced — `$AGIT_AGENT_DIR`, the `.agit/store` pointer file, and the nested
+/// `<env>/.agit/agent` — all answered "where", and none of them answered "whose". A store found by
+/// location is welded to one code repo, which is what made PRD #3 (an agent carrying its memory into
+/// another repo) impossible. The pointer file failed the rule that keeps a local file honest — *its
+/// absence must be fully recoverable from committed state* — because deleting it left nothing on earth
+/// able to say where the store had gone.
 pub fn agent_root() -> Result<PathBuf> {
-    if let Ok(d) = std::env::var("AGIT_AGENT_DIR") {
-        if !d.trim().is_empty() {
-            return Ok(PathBuf::from(d.trim()));
-        }
-    }
-    let env = env_root()?;
-    if let Ok(s) = std::fs::read_to_string(env.join(STORE_PTR)) {
-        let p = s.trim();
-        if !p.is_empty() {
-            return Ok(PathBuf::from(p));
-        }
-    }
-    Ok(env.join(AGENT_DIR))
+    Ok(crate::agent::resolve(None)?.store)
 }
 
 pub fn workspace_dir() -> Result<PathBuf> {
@@ -94,6 +90,9 @@ fn agit_home_from(agit_home: Option<&str>, home: Option<&str>) -> Result<PathBuf
 }
 
 /// The working-tree root of the repository for a given scope.
+///
+/// `Scope::Agent` still means "run git on the agent's store" — `agit a log`, `agit a commit` — it just
+/// reaches it by identity now.
 pub fn root_for(scope: Scope) -> Result<PathBuf> {
     match scope {
         Scope::Environment => env_root(),
@@ -101,37 +100,14 @@ pub fn root_for(scope: Scope) -> Result<PathBuf> {
             let a = agent_root()?;
             if !a.join(".git").exists() {
                 bail!(
-                    "The Agent Store does not exist yet ({}). Run `agit init` first.",
+                    "{} carries an agent's identity but is not a git repository.\n\
+                     \x20      The store is damaged; if it has a remote, re-clone it with `agit a track <url>`.",
                     a.display()
                 );
             }
             Ok(a)
         }
     }
-}
-
-/// Whether the cwd is in the code repository or the Agent Store, always returns the root of the **Environment (the code repository)**.
-///
-/// A fact's evidence `file:` pointer is resolved relative to the Environment, but the merge driver runs inside the Agent Store,
-/// and verify may be invoked from either place -- all of them need a stable way to obtain the code repository root.
-/// The Agent Store is always at `<env>/.agit/agent`, so we back up two levels accordingly.
-pub fn environment_root() -> Result<PathBuf> {
-    let top = env_root()?;
-    if top.ends_with(AGENT_DIR) {
-        Ok(top
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .unwrap_or(top))
-    } else {
-        Ok(top)
-    }
-}
-
-pub fn agent_exists() -> bool {
-    agent_root()
-        .map(|p| p.join(".git").exists())
-        .unwrap_or(false)
 }
 
 /// Run a single git command in the given repository's working tree, require success, and return stdout.

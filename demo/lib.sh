@@ -10,6 +10,11 @@ ROOT="$(cd "$DEMO_DIR/.." && pwd)"
 DEMO_HOME="${DEMO_HOME:-/tmp/agit-demo}"
 BIN_DIR="$DEMO_HOME/bin"
 
+# An agent's store lives at $AGIT_HOME/agents/<aid>/ — it is a memory, not a folder in the project.
+# So the demo MUST point $AGIT_HOME somewhere of its own: unset, it would mint demo agents into the
+# developer's real ~/.agit and leave them there.
+export AGIT_HOME="${AGIT_HOME:-$DEMO_HOME/agit-home}"
+
 B=$'\033[1m'; DIM=$'\033[2m'; G=$'\033[32m'; Y=$'\033[33m'; N=$'\033[0m'
 
 # Find (compiling if necessary) agit and symlink it under $DEMO_HOME/bin.

@@ -141,10 +141,19 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             println!("renamed {old} → {} ({} — unchanged)", a.name, a.aid);
             Ok(0)
         }
+        // The one-shot adoption of a store minted before identity existed. Optional name: a store that
+        // already knows what it is keeps its own label.
+        "import" => {
+            let a = agent::import(args.first().map(|s| s.trim()).filter(|s| !s.is_empty()))?;
+            println!("imported {} ({})", a.name, a.aid);
+            println!("  store  {}", a.store.display());
+            println!("  bound  {}   (commit it: your team gets this agent on clone)", agent::BINDING_FILE);
+            Ok(0)
+        }
         // Still design-only. Named individually so the message cannot outlive the gap.
         v => {
             eprintln!("agit agent {v}: not implemented yet.");
-            eprintln!("  available: list · new · use · track · info · rename");
+            eprintln!("  available: list · new · use · track · info · rename · import");
             Ok(2)
         }
     }
@@ -172,15 +181,13 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
     let result = match cmd {
         // ── Top-level native commands (independent of scope) ──
-        // `--store <path>` detaches the Agent Store from this repo so several Environments can share
-        // one agent's history (a frontend agent carrying its context into the backend repo).
         "init" => {
-            let store = args
+            let agent = args
                 .iter()
-                .position(|a| a == "--store")
+                .position(|a| a == "--agent")
                 .and_then(|i| args.get(i + 1))
                 .cloned();
-            init::run_with_store(store)
+            init::run_named(agent)
         }
         "clone" => match args.first() {
             Some(url) => commands::clone_agent(url),
