@@ -1,0 +1,26 @@
+title: agit
+description: Version control for AI coding-agent sessions.
+remote_theme: just-the-docs/just-the-docs
+url: https://einsia.github.io
+baseurl: /agent-git
+
+# just-the-docs
+search_enabled: true
+heading_anchors: true
+color_scheme: dark
+aux_links:
+  Repository: https://github.com/Einsia/agent-git
+aux_links_new_tab: true
+
+# Render the reference material and design history, but keep them out of the
+# generated site unless they carry front matter.
+exclude:
+  - plans/
+  - Gemfile
+  - Gemfile.lock
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
