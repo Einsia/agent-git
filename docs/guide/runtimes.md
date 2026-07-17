@@ -5,10 +5,8 @@ nav_order: 5
 
 # Runtimes
 
-agit supports two agent runtimes, Claude Code and Codex, and treats them as peers. There is no default
-runtime. A command that reads sessions uses the runtime named with `--from`, or the only runtime
-present, or, if both are present and no choice is given, it asks. Where runtimes are listed, they are
-listed alphabetically.
+agit supports Claude Code and Codex. A command that reads sessions uses the runtime you name with
+`--from`; if only one has sessions it uses that, and if both do it asks which.
 
 ```
 agit adapter        # list the runtimes agit recognizes

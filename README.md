@@ -12,7 +12,7 @@ disk, lets you push and pull it, and when two people's agents have diverged, it 
 themselves read each other's work, reconcile it, and surface only the genuine conflicts for you to
 decide. No summaries to write, no schema to maintain — just the session, under version control.
 
-Works with **Claude Code** and **Codex**, treated as equals.
+Works with **Claude Code** and **Codex**.
 
 ---
 

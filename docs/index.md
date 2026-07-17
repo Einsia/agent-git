@@ -11,7 +11,7 @@ intended, is not. agit stores that transcript in a git repository, synchronizes 
 push and pull operations, and reconciles divergent sessions by having the agents themselves compare
 their work.
 
-It supports Claude Code and Codex, and treats them as equivalent runtimes.
+It supports Claude Code and Codex.
 
 ## Model
 
