@@ -972,6 +972,53 @@ fn committed_locator(url: &str) -> Result<String> {
     Ok(loc)
 }
 
+/// The result of reconciling the committed binding with the store's own `origin`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingSync {
+    /// No `origin` on the store — nothing a clone could be pointed at.
+    NoOrigin,
+    /// `origin` is set but is not a transport agit will write into a committed file (an `ext::`
+    /// helper, a `-`-leading URL). The binding is left untouched; the offending URL is carried back
+    /// so the caller can say why. A local push still works — this only refuses to *record* it.
+    NotShareable(String),
+    /// The binding already records this locator; nothing was written.
+    Unchanged(String),
+    /// The binding was updated to this credential-stripped locator. `stripped` is true when a
+    /// credential was removed from the store's raw origin on the way in.
+    Recorded { locator: String, stripped: bool },
+}
+
+/// Reconcile the committed binding with the store's current `origin`: if `origin` is a shareable
+/// transport, record its credential-stripped locator next to the aid, so a teammate's fresh clone can
+/// find this agent. Idempotent — an unchanged origin writes nothing.
+///
+/// This is what makes `agit a push` the agent-context push rather than a bare git push: the locator is
+/// only useful to anyone else once it is committed next to the aid, and a push is exactly the moment a
+/// store first gains (or changes) the remote worth recording.
+pub fn sync_origin_to_binding(aid: &str, env_root: &Path) -> Result<BindingSync> {
+    sync_origin_to_binding_in(&scope::agit_home()?, aid, env_root)
+}
+
+fn sync_origin_to_binding_in(home: &Path, aid: &str, env_root: &Path) -> Result<BindingSync> {
+    // Re-read from the store's own origin, so this is the same answer every other reader gets.
+    let a = find_in(home, aid)?;
+    let Some(raw) = a.remote.clone() else { return Ok(BindingSync::NoOrigin) };
+    // The binding is COMMITTED and cloned by other machines: an `ext::`/`-` origin must never land in
+    // it (that is the RCE-on-clone vector). Refuse to record it — the local push is git's own business.
+    if check_remote(&raw).is_err() {
+        return Ok(BindingSync::NotShareable(raw));
+    }
+    let locator = committed_locator(&raw)?;
+    let current = Binding::load(env_root)?
+        .and_then(|b| b.agents.into_iter().find(|e| e.id == a.aid).and_then(|e| e.remote));
+    if current.as_deref() == Some(locator.as_str()) {
+        return Ok(BindingSync::Unchanged(locator));
+    }
+    let stripped = locator != raw;
+    bind_here(&Agent { remote: Some(locator.clone()), ..a }, env_root, false)?;
+    Ok(BindingSync::Recorded { locator, stripped })
+}
+
 /// `agit a publish [--remote <url>]` (§5) — give this agent a locator, and record it where a fresh clone
 /// will look. With no url, re-push to the remote already set — the ordinary "share my new sessions" case.
 ///
@@ -1011,26 +1058,31 @@ pub fn publish(url: Option<&str>, push: bool) -> Result<Agent> {
         None => {}
     }
 
-    // Re-read rather than trust: `remote` on an Agent comes from the store's own origin, so this is the
-    // same answer every other reader will get, and a set-url that silently did nothing cannot pass.
-    let agent = find_in(&scope::agit_home()?, &agent.aid)?;
-
-    // The binding is COMMITTED, so what goes in it must be a LOCATOR and never a credential. The store's
-    // own remote keeps the full URL — that lives in .git/config, is local, and is how every git user
-    // already works — but `https://x:ghp_…@github.com/me/f.git` recorded here would be a token pushed to
-    // the team, from the one file this command exists to tell people to commit.
-    let committed = agent.remote.as_deref().map(committed_locator).transpose()?;
-    let bound = Agent { remote: committed, ..agent.clone() };
-    if bound.remote != agent.remote {
-        eprintln!("  note: credentials stripped from the recorded remote — {BINDING_FILE} is committed.");
-        eprintln!("        The store keeps the full URL locally; your teammates' git supplies their own.");
+    // Record origin in the committed binding — the same one source of truth `agit a push` uses, so the
+    // two can never drift. The binding gets a LOCATOR, never a credential: the store keeps the full URL
+    // in .git/config (local, how every git user already works), but a token recorded here would be
+    // pushed to the team from the one file this command exists to tell people to commit.
+    match sync_origin_to_binding(&agent.aid, &env)? {
+        BindingSync::Recorded { stripped: true, .. } => {
+            eprintln!("  note: credentials stripped from the recorded remote — {BINDING_FILE} is committed.");
+            eprintln!("        The store keeps the full URL locally; your teammates' git supplies their own.");
+        }
+        BindingSync::NotShareable(u) => bail!(
+            "origin ({u}) is not a transport agit will write into {BINDING_FILE} — publish to an \
+             https/ssh/local remote so a teammate's clone can run it safely."
+        ),
+        _ => {}
     }
-    bind_here(&bound, &env, false)?;
+
+    // Re-read for the returned Agent, whose `remote` must be the LOCATOR the binding holds, never the
+    // raw URL: echoing a token lands in scrollback and in whatever CI log ran the command.
+    let agent = find_in(&scope::agit_home()?, &agent.aid)?;
+    let bound = Agent { remote: agent.remote.as_deref().map(committed_locator).transpose()?, ..agent };
 
     if push {
         // Inherited stdio: a push is where credential helpers prompt, and capturing would both swallow
         // git's errors and block the prompt.
-        let code = scope::git_in_inherit(&agent.store, &["push", "-u", "origin", "HEAD"]);
+        let code = scope::git_in_inherit(&bound.store, &["push", "-u", "origin", "HEAD"]);
         if code != 0 {
             bail!(
                 "the remote is recorded in {BINDING_FILE}, but the push failed (git exit {code}).\n\
@@ -1038,8 +1090,6 @@ pub fn publish(url: Option<&str>, push: bool) -> Result<Agent> {
             );
         }
     }
-    // The bound agent, so a caller printing `remote` prints the locator: the raw URL may carry a token,
-    // and echoing it lands in scrollback and in whatever CI log ran the command.
     Ok(bound)
 }
 
@@ -1668,6 +1718,54 @@ agent = "frontend"        # what a FRESH clone activates
             assert!(rename_in(h.path(), "frontend", path_like).is_err(), "and rename must not sneak one in");
         }
         assert!(new_agent_in(h.path(), "payments.api").is_ok(), "a dot INSIDE a name is still fine");
+    }
+
+    #[test]
+    fn a_push_records_origin_in_the_binding_credential_stripped() {
+        let h = tmp();
+        let d = tmp();
+        let env = env_repo(d.path());
+        let a = new_agent_in(h.path(), "frontend").unwrap();
+        bind_here(&a, &env, false).unwrap();
+
+        // No origin yet — a push has nothing to point a clone at.
+        assert_eq!(sync_origin_to_binding_in(h.path(), &a.aid, &env).unwrap(), BindingSync::NoOrigin);
+
+        // `git remote add` sets an origin that carries a credential, as a person typing a token URL would.
+        scope::git_in(
+            &a.store,
+            &["remote", "add", "origin", "https://alice:ghp_secrettoken00000000000000000000@hub.example.com/frontend.git"],
+        )
+        .unwrap();
+
+        // The first push records the locator with the credential stripped out.
+        match sync_origin_to_binding_in(h.path(), &a.aid, &env).unwrap() {
+            BindingSync::Recorded { locator, stripped } => {
+                assert!(stripped, "a credential in the origin must be stripped on the way into the binding");
+                assert_eq!(locator, "https://hub.example.com/frontend.git");
+                assert!(!locator.contains("ghp_"), "no token may reach the committed binding: {locator}");
+            }
+            other => panic!("expected Recorded, got {other:?}"),
+        }
+        let b = Binding::load(&env).unwrap().unwrap();
+        assert_eq!(b.agents[0].remote.as_deref(), Some("https://hub.example.com/frontend.git"));
+
+        // Idempotent: pushing again with an unchanged origin writes nothing.
+        assert!(matches!(
+            sync_origin_to_binding_in(h.path(), &a.aid, &env).unwrap(),
+            BindingSync::Unchanged(_)
+        ));
+
+        // An `ext::` origin (the RCE-on-clone transport) is refused for the committed file — the local
+        // push is git's business, but agit will not hand a teammate a shell command to clone.
+        scope::git_in(&a.store, &["remote", "set-url", "origin", "ext::sh -c evil"]).unwrap();
+        match sync_origin_to_binding_in(h.path(), &a.aid, &env).unwrap() {
+            BindingSync::NotShareable(url) => assert!(url.contains("ext::"), "got: {url}"),
+            other => panic!("expected NotShareable, got {other:?}"),
+        }
+        // ...and the last good locator still stands, untouched.
+        let b = Binding::load(&env).unwrap().unwrap();
+        assert_eq!(b.agents[0].remote.as_deref(), Some("https://hub.example.com/frontend.git"));
     }
 
     #[test]

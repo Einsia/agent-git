@@ -681,3 +681,80 @@ fn passthrough_propagates_git_exit_code() {
     assert_ne!(code, 0);
     assert_ne!(code, 2, "passthrough should propagate git's exit code");
 }
+
+// ─────────────────────── smart agent-scope verbs ───────────────────────
+
+#[test]
+fn a_pull_fast_forwards_but_refuses_to_textually_merge_diverged_sessions() {
+    let r = Repo::new();
+
+    // A bare "hub" to share the store through, and the store pointed at it (smart push records the
+    // binding and sets the upstream).
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    let hub = hub_path.to_str().unwrap();
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub]).0, 0, "remote add");
+    assert_eq!(r.agit(&["a", "push", "-u", "origin", "main"]).0, 0, "initial push");
+
+    // A teammate clones the hub and pushes a session; we hold no local commits of our own yet.
+    r.sh(&format!("git clone -q {hub} team"));
+    r.sh("cd team && git config user.name t && git config user.email t@x && git config commit.gpgsign false");
+    r.sh("cd team && git commit -q --allow-empty -m 'teammate session' && git push -q origin main");
+
+    // Fast-forward case: strictly behind → `agit a pull` succeeds and takes the new session.
+    let (code, _o, err) = r.agit(&["a", "pull"]);
+    assert_eq!(code, 0, "a pull that only needs a fast-forward must succeed: {err}");
+
+    // Divergence case: both sides now commit.
+    r.sh("cd team && git commit -q --allow-empty -m 'teammate again' && git push -q origin main");
+    r.git_agent(&["commit", "--allow-empty", "--no-verify", "-m", "our local session"]);
+
+    let (code, _o, err) = r.agit(&["a", "pull"]);
+    assert_ne!(code, 0, "a diverged pull must NOT textually splice transcripts");
+    assert!(err.contains("agit a merge"), "it must route to the dialogue merge: {err}");
+    assert!(err.to_lowercase().contains("diverg"), "and explain why: {err}");
+
+    // And no textual merge happened: HEAD is still a single-parent commit, not a merge.
+    let parents = r.git_agent(&["rev-list", "--parents", "-n", "1", "HEAD"]);
+    assert_eq!(parents.split_whitespace().count(), 2, "HEAD must not be a merge commit: {parents}");
+}
+
+#[test]
+fn a_fetch_reports_incoming_sessions_without_integrating() {
+    let r = Repo::new();
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    let hub = hub_path.to_str().unwrap();
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub]).0, 0, "remote add");
+    assert_eq!(r.agit(&["a", "push", "-u", "origin", "main"]).0, 0, "initial push");
+
+    // A teammate clones, adds a real codex session, and pushes it.
+    r.sh(&format!("git clone -q {hub} team"));
+    r.sh("cd team && git config user.name t && git config user.email t@x && git config commit.gpgsign false");
+    r.sh("mkdir -p team/sessions/codex && printf '{}\\n' > team/sessions/codex/sess1.jsonl");
+    r.sh("cd team && git add -A && git commit -q -m 'a codex session' && git push -q origin main");
+
+    let (code, out, err) = r.agit(&["a", "fetch"]);
+    assert_eq!(code, 0, "fetch should succeed: {err}");
+    assert!(out.contains("new session"), "fetch reports incoming sessions in session terms: {out}");
+    assert!(out.contains("codex"), "and attributes the runtime: {out}");
+
+    // Fetch must not integrate — no working-tree change, the session is not present locally.
+    assert!(
+        !r.agent().join("sessions/codex/sess1.jsonl").exists(),
+        "fetch only advances remote-tracking refs; it must not touch the working tree"
+    );
+}
+
+#[test]
+fn a_clone_and_a_init_redirect_to_the_smart_verbs() {
+    let r = Repo::new();
+
+    let (code, _o, err) = r.agit(&["a", "clone", "https://example.com/x.git"]);
+    assert_ne!(code, 0, "raw clone into a store is a footgun");
+    assert!(err.contains("agit a track"), "should redirect to track: {err}");
+
+    let (code, _o, err) = r.agit(&["a", "init"]);
+    assert_ne!(code, 0, "raw init of a store is a footgun");
+    assert!(err.contains("agit a new"), "should redirect to new: {err}");
+}

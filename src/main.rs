@@ -208,6 +208,16 @@ fn dispatch(argv: Vec<String>) -> i32 {
     let args = &rest[1..];
 
     let result = match cmd {
+        // ── init under the agent scope is a footgun: a store isn't git-init'd by hand — it needs an
+        //    identity. Redirect to the smart verb rather than make an identity-less repo. (Checked
+        //    before the scope-independent `init` below, which is the code-repo setup.) ──
+        "init" if scope == Scope::Agent => {
+            eprintln!("agit a init: an agent store isn't created by hand — it needs an identity.");
+            eprintln!("  agit a new <name>      mint a new agent (aid + agent.toml)");
+            eprintln!("  agit init              set up the agents this repo already declares");
+            Ok(2)
+        }
+
         // ── Top-level native commands (independent of scope) ──
         "init" => {
             let agent = args
@@ -300,6 +310,31 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    git untouched. `sync` remains as a back-compat alias. ──
         "merge" if scope == Scope::Agent => merge_cmd(args),
         "sync" => merge_cmd(args),
+
+        // ── push (agent scope): a real git push on the store, plus the one thing a bare push can't do
+        //    in the agent's context — record the store's origin in the committed binding, so a
+        //    teammate's clone can find this agent. `agit push` / `git push` on the code repo is
+        //    untouched passthrough. ──
+        "push" if scope == Scope::Agent => agent_push(args),
+
+        // ── pull (agent scope): fast-forward when it safely can, but NEVER let git textually merge
+        //    diverged jsonl transcripts (that corrupts exactly the sessions `agit a merge` reconciles
+        //    by dialogue). On divergence, refuse and route to merge. ──
+        "pull" if scope == Scope::Agent => agent_pull(args),
+
+        // ── fetch (agent scope): a bare fetch only moves remote-tracking refs — nothing to convert
+        //    yet — so the session-aware thing it can do is report which sessions arrived, and how to
+        //    integrate them. ──
+        "fetch" if scope == Scope::Agent => agent_fetch(args),
+
+        // ── clone (agent scope): a footgun. Raw `git clone` inside the store makes a nested repo that
+        //    resolves to nothing; a store is cloned by identity. Redirect to the smart verb. ──
+        "clone" if scope == Scope::Agent => {
+            eprintln!("agit a clone: an agent store is cloned by identity, not by raw git.");
+            eprintln!("  agit a track <name>    clone the agent your repo's binding declares");
+            eprintln!("  agit a track <url>     clone a specific store and adopt its identity");
+            Ok(2)
+        }
         "adapter" => commands::adapter_list(),
         "graph" => commands::workspace_graph(),
 
@@ -577,6 +612,132 @@ fn harness_cmd(sub: &str, rt: Option<&str>, force: bool, from_env: Option<&str>)
 ///
 /// The target is another MEMORY — an agent name or a ref — never a code branch. When a word names both,
 /// `--agent X` / `--ref X` say which without a prompt; interactively agit asks.
+/// `agit a push [git-push-args…]` — the agent-context push. It runs the real git push on the store
+/// with the caller's args untouched, then, on success, records the store's `origin` in the committed
+/// binding so a teammate's clone can find this agent. That binding write is the only thing separating
+/// this from bare passthrough; everything about the push itself is git's.
+fn agent_push(args: &[String]) -> anyhow::Result<i32> {
+    use agit::agent;
+    let a = agent::resolve(None)?;
+
+    // The push, verbatim. Inherited stdio: a push is where credential helpers prompt, and capturing
+    // would both swallow git's errors and block the prompt.
+    let mut push_args: Vec<&str> = vec!["push"];
+    push_args.extend(args.iter().map(String::as_str));
+    let code = scope::git_in_inherit(&a.store, &push_args);
+    if code != 0 {
+        return Ok(code);
+    }
+
+    // Reconcile the binding with origin only inside an environment — a bare store has nowhere to write
+    // one, and that is not an error.
+    if let Ok(env) = scope::env_root() {
+        match agent::sync_origin_to_binding(&a.aid, &env)? {
+            agent::BindingSync::Recorded { locator, stripped } => {
+                println!(
+                    "  bound  {} → {locator}   (commit {}: teammates clone the agent from here)",
+                    a.name,
+                    agent::BINDING_FILE
+                );
+                if stripped {
+                    eprintln!(
+                        "  note: credentials stripped from the recorded remote — {} is committed.",
+                        agent::BINDING_FILE
+                    );
+                    eprintln!("        The store keeps the full URL locally; your teammates' git supplies their own.");
+                }
+            }
+            agent::BindingSync::NotShareable(url) => eprintln!(
+                "  note: origin ({url}) is not a transport agit will record in {} — binding left unchanged.",
+                agent::BINDING_FILE
+            ),
+            agent::BindingSync::NoOrigin | agent::BindingSync::Unchanged(_) => {}
+        }
+    }
+    Ok(0)
+}
+
+/// `agit a pull [git-pull-args…]` — the agent-context pull. A bare `git pull` on the store would do a
+/// TEXTUAL merge of the jsonl transcripts on divergence, corrupting exactly the sessions `agit a merge`
+/// reconciles by dialogue. So this fast-forwards when it safely can (`--ff-only`), and on divergence
+/// refuses and routes to merge rather than splice transcripts line by line.
+fn agent_pull(args: &[String]) -> anyhow::Result<i32> {
+    use agit::agent;
+    let a = agent::resolve(None)?;
+
+    // `--ff-only`: git integrates by fast-forward or not at all — never a textual merge. The caller's
+    // args (an explicit remote/branch) ride along. Inherited stdio so credential helpers can prompt.
+    let mut pull_args: Vec<&str> = vec!["pull", "--ff-only"];
+    pull_args.extend(args.iter().map(String::as_str));
+    let code = scope::git_in_inherit(&a.store, &pull_args);
+    if code == 0 {
+        return Ok(0);
+    }
+
+    // The pull failed. If it failed because the two sides DIVERGED (each holds commits the other
+    // lacks), that is the case dialogue-merge exists for — say so, with the command to run. Any other
+    // failure (no upstream, network) is git's own and already printed above.
+    if diverged(&a.store) {
+        eprintln!();
+        eprintln!("your sessions and the remote's have diverged — a textual git merge would corrupt the");
+        eprintln!("transcripts. Reconcile them by dialogue instead:");
+        eprintln!("  agit a merge {}", a.name);
+    }
+    Ok(code)
+}
+
+/// `agit a fetch [git-fetch-args…]` — the agent-context fetch. A bare git fetch only advances
+/// remote-tracking refs, so nothing lands in the working tree to convert; what it *can* do that plain
+/// git won't is report the incoming work in session terms — how many sessions arrived, from which
+/// runtime — and how to integrate them.
+fn agent_fetch(args: &[String]) -> anyhow::Result<i32> {
+    use agit::agent;
+    let a = agent::resolve(None)?;
+
+    let mut fetch_args: Vec<&str> = vec!["fetch"];
+    fetch_args.extend(args.iter().map(String::as_str));
+    let code = scope::git_in_inherit(&a.store, &fetch_args);
+    if code != 0 {
+        return Ok(code);
+    }
+    report_incoming(&a.store);
+    Ok(0)
+}
+
+/// Best-effort summary of the sessions on the tracked upstream that HEAD does not yet have. Silent if
+/// there is no upstream to compare against (a fetch with an explicit refspec and no tracking branch).
+fn report_incoming(store: &std::path::Path) {
+    let (code, out) = scope::git_in_status(
+        store,
+        &["diff", "--name-only", "--diff-filter=A", "HEAD..@{u}", "--", "sessions"],
+    );
+    if code != 0 {
+        return;
+    }
+    let new: Vec<&str> = out.lines().filter(|l| l.ends_with(".jsonl")).collect();
+    if new.is_empty() {
+        println!("  up to date — no new sessions on the remote.");
+        return;
+    }
+    let codex = new.iter().filter(|f| f.contains("/codex/")).count();
+    let claude = new.iter().filter(|f| f.contains("/claude-code/")).count();
+    println!("  {} new session(s) on the remote (claude-code: {claude}, codex: {codex}).", new.len());
+    println!("  integrate with: agit a pull");
+}
+
+/// True when HEAD and its upstream each hold commits the other does not — the one case a fast-forward
+/// cannot cover and a textual merge must not. An absent or unresolvable upstream is not "diverged".
+fn diverged(store: &std::path::Path) -> bool {
+    let (code, out) = scope::git_in_status(store, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]);
+    if code != 0 {
+        return false;
+    }
+    let mut counts = out.split_whitespace().filter_map(|s| s.parse::<u64>().ok());
+    let behind = counts.next().unwrap_or(0);
+    let ahead = counts.next().unwrap_or(0);
+    behind > 0 && ahead > 0
+}
+
 fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
     let mut rt: Option<String> = None;
     let mut reference = None;
