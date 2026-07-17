@@ -22,8 +22,8 @@ That mints a new agent named `frontend`, binds it to this repo through a committ
 installs a secret-scanning hook on its store. Name it for what it knows (`frontend`, `payments-api`),
 not for you or the folder.
 
-To mint an agent without binding it to a repo, use `agit a init frontend` — you can bind it later with
-`agit a switch frontend`.
+`agit init` sets up the repo, so run it once. To add a second agent to a repo you've already set up,
+use `agit a init <name>`.
 
 ## Turn on the daemon
 
@@ -80,16 +80,16 @@ For a shared server with a web UI and per-agent permissions, see [The hub](../hu
 
 ## Pick it up elsewhere
 
-A teammate clones the code repo, then:
+A teammate clones the code repo, then runs `agit init`. It reads `.agit.toml` and clones every agent
+the binding declares, so one command sets them up:
 
 ```
-agit a clone frontend
+agit init
 agit start
 ```
 
-`agit a clone frontend` reads `.agit.toml` to learn which agent and where, and clones its store by
-identity. Or run `agit init` in the fresh clone — it clones every agent the binding declares. Either
-way it's the same agent, carrying the same identity (its aid), not a copy.
+To pull a single agent instead of all of them, use `agit a clone frontend`. Either way it's the same
+agent, carrying the same identity (its aid), not a copy.
 
 ## Reconcile
 

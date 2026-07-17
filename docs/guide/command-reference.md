@@ -12,7 +12,7 @@ Anything not listed here is passed through to git: `agit <git-args>` runs on the
 
 | Command | Does |
 |---|---|
-| `agit init [--agent <name>]` | Set up the agents this repo declares; `--agent` mints and binds a new one. |
+| `agit init [--agent <name>]` | Set up this repo: clone the agents `.agit.toml` declares, or mint the first with `--agent`. |
 | `agit start [--agent <name>] [--as <runtime>]` | Launch a session already carrying the agent's context. |
 | `agit snap [--from <runtime>]` | Snapshot this project's sessions into the store by hand. |
 | `agit watch [--daemon\|--stop\|--status] [--no-convert]` | Hands-off auto-snap and auto-convert; `--daemon` runs it in the background. |
@@ -31,7 +31,7 @@ them between runtimes so either CLI can resume them. `agit snap` is the manual a
 | Command | Does |
 |---|---|
 | `agit a list` | Agents you have locally, with session counts and which is active. |
-| `agit a init <name>` | Mint a new agent — a store with its own identity. |
+| `agit a init <name>` | Add another agent to this repo (a store with its own identity). |
 | `agit a switch <name>` | Select this worktree's active agent. |
 | `agit a clone <name\|url>` | Clone an agent's store by identity; a bare name resolves through `.agit.toml`. |
 | `agit a info <name>` | Name, aid, store path, and remote for one agent. |
