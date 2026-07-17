@@ -881,6 +881,21 @@ fn clone_in(home: &Path, url: &str) -> Result<Agent> {
         let _ = std::fs::remove_dir_all(&tmp);
         bail!("git clone {url} failed");
     }
+    // A store IS just a git repo, and a self-hosted bare hub (`git init --bare` with
+    // `init.defaultBranch` unset) has HEAD → `refs/heads/master` while agit's stores are on `main`. The
+    // clone then checks out NO working tree ("remote HEAD refers to nonexistent ref"), so agent.toml is
+    // absent from the tree even though the store is fully present under a remote branch. Recover by
+    // checking out whichever branch the remote actually has, rather than declaring the store invalid.
+    if scope::git_in_status(&tmp, &["rev-parse", "--verify", "--quiet", "HEAD"]).0 != 0 {
+        let (_, refs) = scope::git_in_status(&tmp, &["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"]);
+        let branch = refs.lines().find(|b| b.ends_with("/main"))
+            .or_else(|| refs.lines().find(|b| b.ends_with("/master")))
+            .or_else(|| refs.lines().find(|b| !b.ends_with("/HEAD")));
+        if let Some(rb) = branch {
+            let local = rb.rsplit('/').next().unwrap_or("main");
+            let _ = scope::git_in(&tmp, &["checkout", "-B", local, rb]);
+        }
+    }
     let id = match read_identity(&tmp) {
         Ok(id) => id,
         Err(e) => {
@@ -914,8 +929,20 @@ fn clone_in(home: &Path, url: &str) -> Result<Agent> {
 /// the whole team reads. For ssh/scp the user is part of the ADDRESS, not a credential — `git@github.com`
 /// stops resolving without it — so only a password is removed there.
 fn locator(url: &str) -> String {
-    // scp-like `git@host:path` has no scheme and no password to remove.
-    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // No scheme → scp-like `[user[:pw]@]host:path`. The user is the ssh address and stays, but a
+        // password (non-standard, but a hand-written `x:ghp_…@host:path` reaches here) is stripped, so
+        // even a colon-userinfo scp URL cannot carry a secret into the committed binding.
+        if let Some((userinfo, hostpath)) = url.split_once('@') {
+            let looks_scp = hostpath.contains(':') && !hostpath.starts_with('/')
+                && !url.starts_with('/') && !url.starts_with('.') && !url.starts_with('~');
+            if looks_scp {
+                let user = userinfo.split_once(':').map(|(u, _)| u).unwrap_or(userinfo);
+                return if user.is_empty() { hostpath.to_string() } else { format!("{user}@{hostpath}") };
+            }
+        }
+        return url.to_string();
+    };
     // Userinfo lives only in the authority (up to the first `/`); a `@` in the path is just a character.
     let (authority, path) = match rest.split_once('/') {
         Some((a, p)) => (a, Some(p)),
@@ -1028,6 +1055,24 @@ pub fn publish(url: Option<&str>, push: bool) -> Result<Agent> {
 
 pub fn rename(old: &str, new: &str) -> Result<Agent> {
     let home = scope::agit_home()?;
+    // Refuse if `new` is already a DIFFERENT agent in the committed binding — even one not cloned
+    // locally (rename_in only sees local stores). Without this, the rename's binding upsert would
+    // silently drop that other agent's entry (it collides on the name), and a teammate's `agit init`
+    // would then no longer clone it. Names are labels: two agents may never share one.
+    if let Ok(env) = scope::env_root() {
+        if let Some(b) = Binding::load(&env)? {
+            let mine = find_in(&home, old).map(|a| a.aid).ok();
+            if let Some(other) = b.find(new) {
+                if Some(&other.id) != mine.as_ref() {
+                    bail!(
+                        "`{new}` is already declared in {BINDING_FILE} for a different agent ({}).\n\
+                         \x20      Names are labels; rename to something else, or remove that entry first.",
+                        other.id
+                    );
+                }
+            }
+        }
+    }
     let agent = rename_in(&home, old, new)?;
     // The binding names agents by label, so a rename that skipped it would leave `[defaults] api`
     // pointing at nothing.
@@ -1272,11 +1317,30 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
             let aid = read_active(&env)?.context("no agent selected to re-mint — agit a use <name> first")?;
             find_in(&home, &aid)
         })?;
+        // Re-mint MOVES the store (it is keyed by aid). Moving it out from under a live watcher zombies
+        // the daemon onto the old inode — the same silent-capture-loss import refuses, so refuse here too.
+        if let Some(pid) = live_watcher(&env, &agent.store) {
+            bail!(
+                "a watcher is running (pid {pid}) — refusing to re-mint the store out from under it.\n\
+                 \x20      Stop it, re-mint, then start it again:\n\
+                 \x20        agit watch --stop\n\
+                 \x20        agit a rebind --new-id\n\
+                 \x20        agit watch --daemon"
+            );
+        }
         let fresh = mint_aid();
         let dest = agents_dir_in(&home).join(&fresh);
         if dest.exists() {
             bail!("{} already exists — refusing to overwrite a store", dest.display());
         }
+        // Re-minting changes the IDENTITY, and the store is shared across repos by design: any other
+        // repo or worktree still bound to the old aid will stop resolving until it re-tracks the fork.
+        // Said, never silent — the old aid genuinely no longer exists after this.
+        eprintln!(
+            "  note: re-minting gives this store a new identity ({} → a fresh aid). Any OTHER repo bound\n\
+             \x20      to the old aid must `agit a track` the fork to follow it.",
+            agent.aid
+        );
         let id = StoreIdentity { aid: fresh.clone(), name: agent.name.clone(), created: now() };
         move_dir(&agent.store, &dest)?;
         write_agent_toml(&dest, &id)?;
@@ -1301,22 +1365,28 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
     let agent = find_in(&home, sel)
         .with_context(|| format!("no agent `{sel}` on this machine to rebind — agit a track <url> first"))?;
     let mut b = Binding::load(&env)?.unwrap_or_default();
-    // Same committed-file rule as publish: the binding gets a locator with no secret, or the rebind is
-    // refused before anything moves.
-    let new_remote = remote.map(committed_locator).transpose()?;
-    if let Some(r) = remote {
-        check_remote(r)?;
-        // Keep the store's own origin in step, credentials and all — the binding gets the locator only.
-        match scope::git_in_status(&agent.store, &["remote", "get-url", "origin"]).0 {
-            0 => scope::git_in(&agent.store, &["remote", "set-url", "origin", r])?,
-            _ => scope::git_in(&agent.store, &["remote", "add", "origin", r])?,
-        };
-    }
-    b.upsert(BoundAgent { id: agent.aid.clone(), name: agent.name.clone(),
-        remote: new_remote.or_else(|| agent.remote.clone()) });
+    // Every remote written to the COMMITTED binding goes through committed_locator — the new one if
+    // `--remote` is given, else the store's EXISTING origin. The `--remote`-omitted fallback used to
+    // write `agent.remote` raw (the credentialed `git remote get-url origin`) straight into the file
+    // publish tells you to commit: a token into the team and into git history. Never again.
+    let committed = match remote {
+        Some(r) => {
+            check_remote(r)?;
+            let loc = committed_locator(r)?; // fails before any mutation if it would leak
+            match scope::git_in_status(&agent.store, &["remote", "get-url", "origin"]).0 {
+                0 => scope::git_in(&agent.store, &["remote", "set-url", "origin", r])?,
+                _ => scope::git_in(&agent.store, &["remote", "add", "origin", r])?,
+            };
+            Some(loc)
+        }
+        None => agent.remote.as_deref().map(committed_locator).transpose()?,
+    };
+    b.upsert(BoundAgent { id: agent.aid.clone(), name: agent.name.clone(), remote: committed.clone() });
     b.save(&env)?;
     write_active(&env, &agent.aid)?;
-    Ok(agent)
+    // Return the LOCATOR, not the store's raw origin: a caller printing `remote` must not echo a token
+    // to the terminal or a CI log (the same hygiene publish already keeps).
+    Ok(Agent { remote: committed, ..agent })
 }
 
 #[cfg(test)]
@@ -1931,6 +2001,10 @@ agent = "frontend"        # what a FRESH clone activates
         // stays; only a password would be stripped.
         assert_eq!(locator("git@github.com:me/f.git"), "git@github.com:me/f.git");
         assert_eq!(locator("ssh://git@github.com/me/f.git"), "ssh://git@github.com/me/f.git");
+        // scp-like with a (non-standard) password: strip the password, keep the user as the address.
+        assert_eq!(locator("x:ghp_SECRET123@github.com:me/f.git"), "x@github.com:me/f.git");
+        // a local path containing `@` is NOT scp userinfo — left alone.
+        assert_eq!(locator("/srv/a@b/f.git"), "/srv/a@b/f.git");
         // no credential to strip — unchanged.
         assert_eq!(locator("https://github.com/me/f.git"), "https://github.com/me/f.git");
         assert_eq!(locator("/srv/agents/f.git"), "/srv/agents/f.git");
@@ -1946,6 +2020,7 @@ agent = "frontend"        # what a FRESH clone activates
             "http://user:ghp_SECRET123@host/f.git",
             "https://u:p@ghp_SECRET123@host/f.git",
             "https://x:ghp_SECRET123@host/path/with@at.git",
+            "x:ghp_SECRET123@host:me/f.git",
         ] {
             assert!(!locator(u).contains("ghp_SECRET123"), "credential survived in {}", locator(u));
         }

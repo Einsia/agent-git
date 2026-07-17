@@ -287,9 +287,13 @@ fn commit_dash_a_is_git_flag_not_scope() {
 fn a_teammate_takes_over_with_git_clone_then_agit_init() {
     let root = tempfile::tempdir().unwrap();
     let hub = root.path().join("frontend.git"); // the "hub": a bare repo publish pushes to
-    // `main` to match the store's branch — a real hub sets HEAD to the pushed branch; a plain bare repo
-    // defaulting to `master` would leave a dangling symbolic HEAD that a clone cannot check out.
-    let st = Command::new("git").args(["init", "-q", "--bare", "--initial-branch=main"]).arg(&hub).status().unwrap();
+    // A PLAIN bare repo, HEAD defaulting to `master` while agit's store is on `main` — the exact
+    // dangling-HEAD case a self-hosted `git init --bare` hub creates. clone_in must recover by checking
+    // out the branch the remote actually has; an earlier version of this test used --initial-branch=main
+    // and so tested AROUND the bug the takeover has to survive.
+    let st = Command::new("git")
+        .args(["-c", "init.defaultBranch=master", "init", "-q", "--bare"])
+        .arg(&hub).status().unwrap();
     assert!(st.success());
 
     let run = |home: &Path, cwd: &Path, args: &[&str]| -> (i32, String, String) {
