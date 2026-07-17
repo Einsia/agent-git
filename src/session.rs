@@ -5,8 +5,9 @@
 //!   <uuid>/subagents/*.jsonl  subagent transcripts
 //!   <uuid>/tool-results/*.txt large tool results
 //!   memory/                   memory
-//! `agit a snap` mirrors this blob into sessions/<runtime>/ of the store belonging to the agent that
-//! PRODUCED each session (`route`) — the dump is per project, so one pass can feed several stores.
+//! `agit a snap` mirrors this blob into sessions/<env-slug>/<runtime>/ of the store belonging to the
+//! agent that PRODUCED each session (`route`) — the dump is per project, so one pass can feed several
+//! stores, and one store is fed by several projects.
 
 use crate::adapter::claude_code;
 use crate::commands::Attribution;
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 pub const SESSIONS_SUBDIR: &str = "sessions";
 
-/// The watcher's pidfile, inside the store's `.git` so it is never tracked or scanned.
+/// The watcher's pidfile, in `<env>/.agit/` (gitignored by `agit init`).
 const WATCH_PID: &str = "agit-watch.pid";
 
 /// The runtimes agit speaks. Peers — there is no first among them, so they are listed alphabetically
@@ -46,16 +47,45 @@ pub fn live_runtimes(env: &Path) -> Vec<&'static str> {
     RUNTIMES.into_iter().filter(|rt| has_live_sessions(rt, env)).collect()
 }
 
-/// The runtimes with sessions for this project already in the Agent Store, alphabetically.
+/// The runtimes with sessions already in the Agent Store, alphabetically.
+///
+/// **Both layouts, always.** A store partitioned by environment while this globbed only the flat
+/// `sessions/<rt>/` reported ZERO runtimes, so `agit a merge` died with "No claude-code, codex sessions
+/// found to merge" against a store visibly full of them. Flat stores exist on disk and are never
+/// migrated, so neither layout is the legacy one to be read second.
 pub fn store_runtimes(agent: &Path) -> Vec<&'static str> {
-    RUNTIMES
-        .into_iter()
-        .filter(|rt| {
-            std::fs::read_dir(agent.join(SESSIONS_SUBDIR).join(rt))
-                .map(|mut d| d.any(|e| e.map(|e| e.path().extension().is_some_and(|x| x == "jsonl")).unwrap_or(false)))
-                .unwrap_or(false)
+    let root = agent.join(SESSIONS_SUBDIR);
+    RUNTIMES.into_iter().filter(|rt| runtime_has_sessions(&root, rt)).collect()
+}
+
+fn runtime_has_sessions(sessions: &Path, rt: &str) -> bool {
+    if dir_holds_transcript(&sessions.join(rt)) {
+        return true;
+    }
+    std::fs::read_dir(sessions)
+        .map(|d| {
+            d.filter_map(|e| e.ok()).any(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false) && dir_holds_transcript(&e.path().join(rt)))
         })
-        .collect()
+        .unwrap_or(false)
+}
+
+fn dir_holds_transcript(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut d| d.any(|e| e.map(|e| e.path().extension().is_some_and(|x| x == "jsonl")).unwrap_or(false)))
+        .unwrap_or(false)
+}
+
+/// The store's partition for an environment: `sessions/<env-slug>/<rt>/` (§6). One store is shared by
+/// several code repos, which is the point of the model — so a flat `sessions/<rt>/` mixes every repo's
+/// transcripts into one folder, and leaves nothing to tell `agit start` which repo the memory it is
+/// carrying was recorded in.
+///
+/// `slug_for` maps every non-alphanumeric character to `-`, so `/my/app`, `/my-app`, `/my_app` and
+/// `/my.app` all collide on one slug. Survivable HERE and nowhere else: a collision groups two repos'
+/// sessions under one folder, and each session's recorded cwd — not this slug — stays the authority on
+/// where it ran. It is a partition key, never an identity.
+fn env_slug(env: &Path) -> String {
+    claude_code::slug_for(env)
 }
 
 /// Resolve the one runtime a single-runtime command acts on. There is NO default: an explicit flag
@@ -302,6 +332,8 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
         if let Some(n) = &r.note {
             eprintln!("  note   : {n}");
         }
+        // Held across mirror + harness capture: everything this pass writes into the store.
+        let _lock = lock_store(&r.store)?;
         let (stats, hits, dst) = mirror_owned(&rt, env, r)?;
         let who = match &r.agent {
             Some(a) => format!("   ({a} · {} session(s))", r.sessions.len()),
@@ -335,15 +367,102 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
     Ok(0)
 }
 
+// ─────────────────────── The store lock: one store, many concurrent writers ───────────────────────
+
+/// Advisory lockfile in the store's `.git`, so it is never tracked, scanned, or pushed. Named apart
+/// from git's own `index.lock`: this guards agit's whole read-modify-write (mirror → add → commit),
+/// which git's lock does not span.
+const STORE_LOCK: &str = "agit-store.lock";
+
+/// Long enough to outlast a snap of a large dump, short enough that a wedged holder is reported rather
+/// than waited on forever. A watcher that loses a tick tries again next tick; a user gets an error.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Held for as long as the writer needs the store; released on drop, including on `?` and on panic.
+#[derive(Debug)]
+pub struct StoreLock {
+    path: PathBuf,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Take the store's write lock, waiting up to `LOCK_WAIT`.
+///
+/// A store used to belong to one repo, so its writers were serialized by there only being one of them.
+/// It is now shared by several (§6), which makes `snap`, `restore` and the pairing record concurrent
+/// writers to ONE index and ONE HEAD **by design** — two repos snapping the same agent at once corrupt
+/// each other's index.
+///
+/// Advisory, and honest about it: nothing stops a writer that never asks. It serializes agit's own
+/// paths, which is what the shared store made unsafe.
+pub fn lock_store(store: &Path) -> Result<StoreLock> {
+    use std::io::{ErrorKind, Write};
+    let dir = store.join(".git");
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot prepare {} for locking", dir.display()))?;
+    let path = dir.join(STORE_LOCK);
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match std::fs::OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(mut f) => {
+                // Best-effort: the pid names the holder in an error. A lock we hold but cannot stamp is
+                // still a lock, so a failed write must not fail the take.
+                let _ = writeln!(f, "{}", std::process::id());
+                return Ok(StoreLock { path });
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("cannot create {}", path.display())),
+        }
+        // A holder killed mid-write (SIGKILL, a crash, a reboot) never released it. Break that lock as
+        // soon as we can PROVE the pid is gone, rather than making every later write sit out the full
+        // timeout. An unreadable pidfile proves nothing — it is equally a holder that has created the
+        // file microseconds before stamping it — so it waits out the deadline instead.
+        if let Some(pid) = read_pid(&path) {
+            if !pid_alive(pid) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let who = match read_pid(&path) {
+                Some(p) => format!("pid {p}"),
+                None => "an unknown process (the lock names no pid)".to_string(),
+            };
+            bail!(
+                "{} is locked by {who} and did not release it within {}s.\n\
+                 \x20      Another agit is writing this agent — one store is shared by every repo that tracks it.\n\
+                 \x20      If that process is gone, clear the lock: rm {}",
+                store.display(),
+                LOCK_WAIT.as_secs(),
+                path.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Mirror one agent's share of the dump into ITS store, and secret-scan what landed.
 ///
 /// Runtimes differ in storage model, but the ownership rule is the same for both: mirror ONLY this
 /// project's sessions, decided by the cwd recorded in the transcript (`live_sessions`).
 fn mirror_owned(rt: &str, env: &Path, r: &Routed) -> Result<(Stats, usize, PathBuf)> {
-    let dst = r.store.join(SESSIONS_SUBDIR).join(rt);
-    std::fs::create_dir_all(&dst)?;
+    let part = r.store.join(SESSIONS_SUBDIR).join(env_slug(env)).join(rt);
+    let flat = r.store.join(SESSIONS_SUBDIR).join(rt);
+    std::fs::create_dir_all(&part)?;
     let mut stats = Stats::default();
+    let mut used: Vec<PathBuf> = Vec::new();
     for o in &r.sessions {
+        // A session already captured under the pre-partition layout keeps its place. Re-mirroring it
+        // into the partition would leave the store holding the SAME session twice, one copy frozen at
+        // the moment the layout changed; moving it would rewrite paths in a git repo nobody asked to
+        // rewrite. Only sessions new to this store land partitioned.
+        let dst = if flat.join(format!("{}.jsonl", o.id)).exists() { &flat } else { &part };
+        if !used.contains(dst) {
+            used.push(dst.clone());
+        }
         let dp = dst.join(format!("{}.jsonl", o.id));
         let copied = copy_if_changed(&o.src, &dp, &mut stats)?;
         // The sidecar is a pure function of the transcript, so rewriting it unchanged would turn every
@@ -358,14 +477,28 @@ fn mirror_owned(rt: &str, env: &Path, r: &Routed) -> Result<(Stats, usize, PathB
     }
     // `memory/` hangs off the slug, not off any session, so under a collision it belongs to nobody in
     // particular and cannot be attributed. Carry it only when we have the slug dir to ourselves.
+    //
+    // ALWAYS partitioned, unlike a session: sessions are UUID-named and disjoint, so a flat store
+    // merely piles two repos' transcripts together, but `memory/` is one fixed name PER CHECKOUT (§6).
+    // Flat, two repos sharing a store overwrite each other's memory on every snap — the ping-pong §6
+    // names — and that is a live loss, not the cosmetic double-count the in-place rule exists to avoid.
+    // A legacy flat `memory/` is left where it lies: nothing reads it, so it goes inert rather than stale.
     if rt == "claude-code" && !r.sessions.is_empty() {
         let mem = source_dir("claude-code", env)?.join("memory");
         if mem.is_dir() && claude_code::slug_dir_is_exclusive(env) {
-            stats.absorb(mirror(&mem, &dst.join("memory"))?);
+            stats.absorb(mirror(&mem, &part.join("memory"))?);
+            if !used.contains(&part) {
+                used.push(part.clone());
+            }
         }
     }
-    let hits = crate::scan::scan_tree(&dst)?;
-    Ok((stats, hits, dst))
+    // Scan every directory this pass wrote into, not just the one it reports: a store mid-migration
+    // takes both, and a secret is no less pushed for having landed in the older half.
+    let mut hits = 0;
+    for d in &used {
+        hits += crate::scan::scan_tree(d)?;
+    }
+    Ok((stats, hits, used.first().cloned().unwrap_or(part)))
 }
 
 /// What the store records about a captured session (§6). It exists so the facts `start` needs survive a
@@ -446,6 +579,7 @@ pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> R
     let mut last_sig = String::new();
     let mut pending = false;
     let mut count: u64 = 0;
+    let mut announced = std::collections::HashSet::new();
     loop {
         let sig = watch.as_deref().map(dir_signature).unwrap_or_default();
         if sig != last_sig {
@@ -455,8 +589,9 @@ pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> R
         } else if pending {
             // --no-harness must mean the same thing here as it does for `--watch` with no --from: one
             // documented flag cannot have two behaviours decided by another flag.
-            if let Err(e) = capture_pass(&rt, &env, capture_harness, &mut count) {
-                eprintln!("  snap failed: {e:#}");
+            match capture_pass(&rt, &env, capture_harness, &mut count) {
+                Ok(touched) => announce_watching(&touched, &env, &mut announced),
+                Err(e) => eprintln!("  snap failed: {e:#}"),
             }
             pending = false;
         }
@@ -469,6 +604,18 @@ pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> R
 fn capture_pass(rt: &str, env: &Path, capture_harness: bool, count: &mut u64) -> Result<Vec<PathBuf>> {
     let (routed, _) = route(rt, env)?;
     for r in &routed {
+        // mirror → add → commit is one read-modify-write of the store's index and HEAD. Two repos
+        // watching one shared agent run this loop at the same time by design, so it is taken as a
+        // unit: git's own index.lock does not span it, and a lost tick is not worth a corrupt store.
+        let lock = match lock_store(&r.store) {
+            Ok(l) => l,
+            // Never fatal: the next tick tries again, and a watcher that exits on contention is a
+            // watcher that silently stops capturing.
+            Err(e) => {
+                eprintln!("  snap {rt} skipped this tick: {e:#}");
+                continue;
+            }
+        };
         match mirror_owned(rt, env, r) {
             Ok((stats, hits, _)) if stats.added + stats.updated > 0 => {
                 if capture_harness {
@@ -479,6 +626,7 @@ fn capture_pass(rt: &str, env: &Path, capture_harness: bool, count: &mut u64) ->
             Ok(_) => {}
             Err(e) => eprintln!("  snap {rt} failed: {e:#}"),
         }
+        drop(lock);
     }
     Ok(routed.into_iter().map(|r| r.store).collect())
 }
@@ -648,6 +796,8 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
     // The stores to auto-convert: what this repo resolves to now, plus every store a capture routes
     // into. One agent's sessions must not stop converting because another agent also worked here.
     let mut stores: Vec<PathBuf> = convert_target().into_iter().collect();
+    let mut announced = std::collections::HashSet::new();
+    announce_watching(&stores, &env, &mut announced);
     println!(
         "Watching {} every {}s: auto-snap{}. Ctrl-C to stop.",
         runtime_list(),
@@ -666,6 +816,7 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
                 pending.insert(rt, false);
                 match capture_pass(rt, &env, capture_harness, &mut count) {
                     Ok(touched) => {
+                        announce_watching(&touched, &env, &mut announced);
                         for s in touched {
                             if !stores.contains(&s) {
                                 stores.push(s);
@@ -685,32 +836,105 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
     }
 }
 
-fn watch_rundir() -> Result<PathBuf> {
-    // keep the pid/log inside the agent repo's .git so they're never tracked or scanned
-    Ok(scope::root_for(Scope::Agent)?.join(".git"))
+/// The watcher's pid and log live with the ENVIRONMENT, because that is what a watcher watches: one
+/// repo's session dump, routed afterwards to whichever agents worked there (§6).
+///
+/// They used to live in the store's `.git`, which made them one file per STORE. A shared store is now
+/// the normal case, so two repos watching one agent fought over one pidfile: the second `agit watch`
+/// either refused as "already running" or overwrote the first's pid and orphaned a live daemon.
+/// `agit init` gitignores `.agit/`, so nothing here is ever tracked or scanned.
+fn watch_rundir(env: &Path) -> Result<PathBuf> {
+    let dir = env.join(".agit");
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    Ok(dir)
 }
 
-/// The live watcher for a given store, if any. Stores are keyed by aid, so the pidfile inside one is a
-/// per-AGENT fact — which is what lets `agit a list` say which memories are being watched right now.
+/// One watcher, as it announces itself: `{aid, env, pid, started}`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Watcher {
+    /// Identity, not the label — a rename must not orphan the record.
+    pub aid: String,
+    pub env: String,
+    pub pid: u32,
+    pub started: String,
+}
+
+/// `$AGIT_HOME/watchers.jsonl` — machine-local, spans repos, append-only and scanned, exactly like
+/// `launches.jsonl` and for the same reason.
 ///
-/// A pidfile whose process is gone reads as not-watching rather than stale-and-believed: `agit watch`
-/// clears it when it notices, but a killed daemon never gets to.
-pub fn watcher_pid(store: &Path) -> Option<u32> {
-    read_pid(&store.join(".git").join(WATCH_PID)).filter(|p| pid_alive(*p))
+/// The pidfile answers "is this environment being watched?". `agit a list` asks a different question —
+/// "is anyone watching THIS AGENT, from anywhere?" — which no single environment can answer now that
+/// one store is shared by many. A watcher therefore announces each agent it captures for, here.
+fn watchers_file(home: &Path) -> PathBuf {
+    home.join("watchers.jsonl")
+}
+
+fn record_watcher_at(home: &Path, w: &Watcher) -> Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(home)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(watchers_file(home))?;
+    writeln!(f, "{}", serde_json::to_string(w)?)?;
+    Ok(())
+}
+
+fn watching_pid_at(home: &Path, aid: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(watchers_file(home)).ok()?;
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Watcher>(l.trim()).ok())
+        .filter(|w| w.aid == aid)
+        .map(|w| w.pid)
+        .find(|p| pid_alive(*p))
+}
+
+/// The live watcher capturing for this agent, from any environment — what `agit a list` prints as
+/// `● watching`.
+///
+/// A record whose process is gone reads as not-watching, never as stale-and-believed: nothing prunes
+/// this log, and a killed daemon never gets to retract its own record.
+pub fn watching_pid(aid: &str) -> Option<u32> {
+    watching_pid_at(&scope::agit_home().ok()?, aid)
+}
+
+/// Announce this process as the watcher of every agent it captures for. The set is not known at
+/// startup — capture discovers agents as they work here — so it is announced as it grows, and each aid
+/// only once per process.
+fn announce_watching(stores: &[PathBuf], env: &Path, announced: &mut std::collections::HashSet<String>) {
+    for s in stores {
+        let Ok(id) = crate::agent::read_identity(s) else { continue };
+        if !announced.insert(id.aid.clone()) {
+            continue;
+        }
+        let w = Watcher {
+            aid: id.aid,
+            env: env.display().to_string(),
+            pid: std::process::id(),
+            started: now_iso(),
+        };
+        if let Err(e) = scope::agit_home().and_then(|h| record_watcher_at(&h, &w)) {
+            eprintln!("  ⚠ watcher not announced ({e:#}) — `agit a list` will not show this agent as watched.");
+        }
+    }
 }
 
 fn read_pid(p: &Path) -> Option<u32> {
     std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse().ok())
 }
 
+/// `kill -0 <pid>`: asks the kernel whether the process exists, without delivering a signal.
+///
+/// 0 is refused before it reaches the kernel, where it does NOT mean "no process": `kill -0 0` signals
+/// the caller's own process group and always succeeds. A truncated or zeroed pidfile would otherwise
+/// read as a live holder forever — wedging the store lock, and making `agit watch` refuse to start
+/// against a watcher that does not exist.
 fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    pid != 0
+        && std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
 }
 
 /// `agit watch --daemon` — spawn the watcher detached (own process group, stdio to a log inside the
@@ -719,7 +943,7 @@ pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool)
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let env = scope::env_root()?;
-    let rundir = watch_rundir()?;
+    let rundir = watch_rundir(&env)?;
     let logp = rundir.join("agit-watch.log");
     let pidp = rundir.join(WATCH_PID);
     if let Some(pid) = read_pid(&pidp) {
@@ -755,7 +979,7 @@ pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool)
 
 /// `agit watch --stop` — kill the background watcher recorded for this project.
 pub fn watch_stop() -> Result<i32> {
-    let pidp = watch_rundir()?.join(WATCH_PID);
+    let pidp = watch_rundir(&scope::env_root()?)?.join(WATCH_PID);
     match read_pid(&pidp) {
         Some(pid) => {
             let killed = std::process::Command::new("kill")
@@ -780,7 +1004,7 @@ pub fn watch_stop() -> Result<i32> {
 
 /// `agit watch --status` — report whether the background watcher is running.
 pub fn watch_status() -> Result<i32> {
-    let rundir = watch_rundir()?;
+    let rundir = watch_rundir(&scope::env_root()?)?;
     match read_pid(&rundir.join(WATCH_PID)) {
         Some(pid) if pid_alive(pid) => {
             println!("agit watch is running (pid {pid}).");
@@ -866,8 +1090,10 @@ mod routing_tests {
                 mirror_owned("claude-code", &env, r).unwrap();
             }
 
-            let fe_sessions = fe.store.join("sessions/claude-code");
-            let api_sessions = api.store.join("sessions/claude-code");
+            // Partitioned by environment, not flat: the store is shared by every repo the agent works
+            // in, so the path itself has to say which one each session came from.
+            let fe_sessions = fe.store.join(SESSIONS_SUBDIR).join(env_slug(&env)).join("claude-code");
+            let api_sessions = api.store.join(SESSIONS_SUBDIR).join(env_slug(&env)).join("claude-code");
             assert!(fe_sessions.join("s-fe.jsonl").exists(), "frontend's session must land in frontend's store");
             assert!(api_sessions.join("s-api.jsonl").exists(), "api's session must land in api's store");
             assert!(!fe_sessions.join("s-api.jsonl").exists(), "MISFILED: api's transcript is in frontend's store");
@@ -936,6 +1162,276 @@ mod routing_tests {
             assert_eq!(routed[0].store, fe.store, "the store is keyed by aid, so a rename never moves it");
             assert_eq!(routed[0].agent.as_deref(), Some("frontend"), "the report must use the current label");
         });
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn transcript(cwd: &Path) -> String {
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"{}\",\"timestamp\":\"2026-07-16T09:00:00.000Z\",\"message\":{{\"content\":\"hi\"}}}}\n",
+            cwd.display()
+        )
+    }
+
+    /// A store written before partitioning existed must keep working, forever and unmigrated. Several
+    /// exist on disk right now, and `store_runtimes` globbing only ONE layout is what made `agit a
+    /// merge` die with "No claude-code, codex sessions found to merge" against a store full of them.
+    #[test]
+    fn a_flat_store_still_reports_its_runtimes() {
+        let d = tempfile::tempdir().unwrap();
+        let s = d.path().join(SESSIONS_SUBDIR);
+        std::fs::create_dir_all(s.join("claude-code")).unwrap();
+        std::fs::write(s.join("claude-code/old.jsonl"), "{}\n").unwrap();
+
+        assert_eq!(store_runtimes(d.path()), vec!["claude-code"], "the pre-partition layout must never stop resolving");
+    }
+
+    /// The bug this pairs with: give a store the partitioned layout and a flat-only glob reports ZERO
+    /// runtimes — a store visibly full of sessions reads as empty, and every consumer downstream of it
+    /// fails claiming there is nothing there.
+    #[test]
+    fn a_partitioned_store_reports_its_runtimes() {
+        let d = tempfile::tempdir().unwrap();
+        let s = d.path().join(SESSIONS_SUBDIR);
+        std::fs::create_dir_all(s.join("-code-web/claude-code")).unwrap();
+        std::fs::write(s.join("-code-web/claude-code/a.jsonl"), "{}\n").unwrap();
+        std::fs::create_dir_all(s.join("-code-api/codex")).unwrap();
+        std::fs::write(s.join("-code-api/codex/b.jsonl"), "{}\n").unwrap();
+
+        assert_eq!(store_runtimes(d.path()), vec!["claude-code", "codex"], "an env-partitioned store must report both");
+    }
+
+    /// Both layouts at once — the state every existing store enters the moment it is snapped again.
+    /// Neither half may hide the other.
+    #[test]
+    fn a_half_migrated_store_reports_both_layouts() {
+        let d = tempfile::tempdir().unwrap();
+        let s = d.path().join(SESSIONS_SUBDIR);
+        std::fs::create_dir_all(s.join("claude-code")).unwrap();
+        std::fs::write(s.join("claude-code/legacy.jsonl"), "{}\n").unwrap();
+        std::fs::create_dir_all(s.join("-code-api/codex")).unwrap();
+        std::fs::write(s.join("-code-api/codex/new.jsonl"), "{}\n").unwrap();
+
+        assert_eq!(store_runtimes(d.path()), vec!["claude-code", "codex"]);
+    }
+
+    /// A directory is not a session. `merges/` (dialogue transcripts) and a store with nothing in it
+    /// must not be read as a runtime having sessions.
+    #[test]
+    fn an_empty_store_and_a_merges_dir_report_no_runtimes() {
+        let d = tempfile::tempdir().unwrap();
+        let s = d.path().join(SESSIONS_SUBDIR);
+        std::fs::create_dir_all(s.join("merges")).unwrap();
+        std::fs::write(s.join("merges/a-b.md"), "# transcript\n").unwrap();
+        std::fs::create_dir_all(s.join("claude-code")).unwrap();
+
+        assert!(store_runtimes(d.path()).is_empty(), "an empty runtime dir holds no sessions");
+    }
+
+    /// The writer half of §12 step 2, and PRD #3's visible payoff: a captured session's PATH records
+    /// which environment it was recorded in, so `agit start` in another repo can say where the memory
+    /// it is carrying came from.
+    #[test]
+    fn snap_writes_the_env_partitioned_path() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::new_agent("frontend").unwrap();
+            let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
+            std::fs::create_dir_all(&slug).unwrap();
+            std::fs::write(slug.join("s1.jsonl"), transcript(&env)).unwrap();
+            crate::commands::record_launch("s1", &fe.aid, "frontend", &env, "claude-code").unwrap();
+
+            let (routed, _) = route("claude-code", &env).unwrap();
+            mirror_owned("claude-code", &env, &routed[0]).unwrap();
+
+            let want = fe.store.join(SESSIONS_SUBDIR).join(env_slug(&env)).join("claude-code/s1.jsonl");
+            assert!(want.exists(), "snap must partition by environment: {}", want.display());
+            assert!(
+                !fe.store.join(SESSIONS_SUBDIR).join("claude-code/s1.jsonl").exists(),
+                "a new session must not land in the flat layout"
+            );
+
+            // …and the reader reports the partition, which is the half `agit start`'s header prints.
+            let s = crate::commands::latest_session(&fe.store).unwrap();
+            assert_eq!(s.env_slug.as_deref(), Some(env_slug(&env).as_str()));
+        });
+    }
+
+    /// A store already holding a session flat keeps it there. Re-mirroring it into the partition would
+    /// leave the store holding the SAME session twice — one copy frozen at the moment the layout
+    /// changed — and `agit a list` counting it twice. Moving it would rewrite paths in a git repo
+    /// nobody asked to rewrite.
+    #[test]
+    fn an_already_captured_session_is_not_duplicated_into_the_partition() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::new_agent("frontend").unwrap();
+            let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
+            std::fs::create_dir_all(&slug).unwrap();
+            std::fs::write(slug.join("s1.jsonl"), transcript(&env)).unwrap();
+            crate::commands::record_launch("s1", &fe.aid, "frontend", &env, "claude-code").unwrap();
+
+            // the store as a pre-partition agit left it
+            let flat = fe.store.join(SESSIONS_SUBDIR).join("claude-code");
+            std::fs::create_dir_all(&flat).unwrap();
+            std::fs::write(flat.join("s1.jsonl"), transcript(&env)).unwrap();
+
+            let (routed, _) = route("claude-code", &env).unwrap();
+            mirror_owned("claude-code", &env, &routed[0]).unwrap();
+
+            assert!(flat.join("s1.jsonl").exists(), "the session must stay where the store already had it");
+            assert!(
+                !fe.store.join(SESSIONS_SUBDIR).join(env_slug(&env)).join("claude-code/s1.jsonl").exists(),
+                "DUPLICATED: the same session now exists under both layouts"
+            );
+            assert_eq!(crate::commands::store_sessions(&fe.store).len(), 1, "one session, counted once");
+        });
+    }
+
+    /// The loss partitioning actually prevents. Sessions are UUID-named and disjoint, so a flat store
+    /// merely piles two repos' transcripts together — but `memory/` is ONE fixed name per checkout, so
+    /// flat, the second repo to snap overwrote the first's memory, every time (§6's ping-pong).
+    #[test]
+    fn two_repos_sharing_one_store_keep_their_own_memory() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::new_agent("frontend").unwrap();
+            // one agent, two code repos — the shared store the whole design is for
+            for (i, env) in [a.path(), b.path()].into_iter().enumerate() {
+                let slug = home.path().join(".claude/projects").join(claude_code::slug_for(env));
+                std::fs::create_dir_all(slug.join("memory")).unwrap();
+                std::fs::write(slug.join(format!("s{i}.jsonl")), transcript(env)).unwrap();
+                std::fs::write(slug.join("memory/MEMORY.md"), format!("memory of repo {i}\n")).unwrap();
+                crate::commands::record_launch(&format!("s{i}"), &fe.aid, "frontend", env, "claude-code").unwrap();
+
+                let (routed, _) = route("claude-code", env).unwrap();
+                mirror_owned("claude-code", env, &routed[0]).unwrap();
+            }
+
+            let mem = |env: &Path| {
+                fe.store.join(SESSIONS_SUBDIR).join(env_slug(env)).join("claude-code/memory/MEMORY.md")
+            };
+            assert_eq!(std::fs::read_to_string(mem(a.path())).unwrap(), "memory of repo 0\n");
+            assert_eq!(
+                std::fs::read_to_string(mem(b.path())).unwrap(),
+                "memory of repo 1\n",
+                "the second repo's snap overwrote the first's memory"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod store_lock_tests {
+    use super::*;
+
+    /// The lock is mutual exclusion, and it releases on drop.
+    #[test]
+    fn a_second_taker_waits_and_a_released_lock_is_free() {
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path();
+        let held = lock_store(store).unwrap();
+        assert!(store.join(".git").join(STORE_LOCK).exists());
+        drop(held);
+        assert!(!store.join(".git").join(STORE_LOCK).exists(), "the lock must release on drop");
+        lock_store(store).unwrap();
+    }
+
+    /// A holder killed mid-write (SIGKILL, a crash, a reboot) never releases. That must not wedge the
+    /// store forever — but the lock may only be broken once the pid is PROVABLY gone.
+    #[test]
+    fn a_lock_held_by_a_dead_pid_is_broken_rather_than_waited_out() {
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path();
+        std::fs::create_dir_all(store.join(".git")).unwrap();
+        // A zeroed pidfile — what a truncated write leaves behind, and the one value `kill -0` gets
+        // wrong: it signals the caller's own process group and succeeds. Believed, it wedges the store
+        // forever, since no pid ever proves itself gone.
+        std::fs::write(store.join(".git").join(STORE_LOCK), "0\n").unwrap();
+        assert!(!pid_alive(0), "pid 0 must never read as alive: `kill -0 0` signals our own process group");
+
+        let t = std::time::Instant::now();
+        let _l = lock_store(store).expect("a dead holder's lock must be broken");
+        assert!(t.elapsed() < LOCK_WAIT, "waited out the full timeout instead of breaking a dead lock");
+    }
+
+    /// The error has to name the holder and say how to clear it — a lock that fails with "resource
+    /// busy" is a lock the user cannot act on.
+    #[test]
+    fn contention_names_the_holder_and_how_to_clear_it() {
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path();
+        let _held = lock_store(store).unwrap();
+        // The live holder is THIS process, so the second take can never succeed: it waits out the
+        // deadline and reports, rather than stealing its own lock and calling that success.
+        let e = lock_store(store).unwrap_err().to_string();
+        assert!(e.contains(&format!("pid {}", std::process::id())), "the error must name the holder: {e}");
+        assert!(e.contains("rm "), "the error must say how to clear a stale lock: {e}");
+        assert!(e.contains(&store.display().to_string()), "the error must name the store: {e}");
+    }
+}
+
+#[cfg(test)]
+mod watcher_registry_tests {
+    use super::*;
+
+    fn w(aid: &str, pid: u32) -> Watcher {
+        Watcher { aid: aid.into(), env: "/code/web".into(), pid, started: "2026-07-17T00:00:00Z".into() }
+    }
+
+    /// The question `agit a list` asks is per-AGENT, and one agent is now watched from any of several
+    /// repos. The pidfile is per-environment and cannot answer it; this log can.
+    #[test]
+    fn a_live_record_reads_as_watching_and_a_dead_one_never_does() {
+        let home = tempfile::tempdir().unwrap();
+        record_watcher_at(home.path(), &w("agt_01", std::process::id())).unwrap();
+        // A watcher that was SIGKILLed leaves its record behind and nothing prunes the log, so
+        // liveness — not the record's existence — is the answer.
+        record_watcher_at(home.path(), &w("agt_02", 0)).unwrap();
+
+        assert_eq!(watching_pid_at(home.path(), "agt_01"), Some(std::process::id()));
+        assert_eq!(watching_pid_at(home.path(), "agt_02"), None, "a stale record must never read as watching");
+        assert_eq!(watching_pid_at(home.path(), "agt_never"), None);
+    }
+
+    /// Two repos watching ONE shared store is the case the pidfile could not represent: it is one file
+    /// per store, so the second watcher overwrote the first's pid and orphaned a live daemon. Both
+    /// watchers must be visible, and the agent must read as watched while EITHER lives.
+    #[test]
+    fn two_environments_can_watch_one_agent() {
+        let home = tempfile::tempdir().unwrap();
+        record_watcher_at(home.path(), &Watcher { env: "/code/web".into(), ..w("agt_01", 0) }).unwrap();
+        record_watcher_at(
+            home.path(),
+            &Watcher { env: "/code/api".into(), ..w("agt_01", std::process::id()) },
+        )
+        .unwrap();
+
+        assert_eq!(
+            watching_pid_at(home.path(), "agt_01"),
+            Some(std::process::id()),
+            "a dead watcher in one repo must not hide a live one in another"
+        );
+        assert_eq!(
+            std::fs::read_to_string(watchers_file(home.path())).unwrap().lines().count(),
+            2,
+            "append-only: both watchers are recorded, neither overwrites the other"
+        );
     }
 }
 

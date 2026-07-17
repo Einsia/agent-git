@@ -110,31 +110,6 @@ fn finish_scan(total: usize, staged: bool, scanned: usize) -> Result<i32> {
     Ok(0)
 }
 
-/// `agit clone <url>` -- pull the team's Agent Store into .agit/agent and install the drivers/hooks.
-/// A single command for consuming someone else's context: clone + init (idempotent).
-pub fn clone_agent(url: &str) -> Result<i32> {
-    let env = scope::env_root()?;
-    let agent = env.join(scope::AGENT_DIR);
-    if agent.join(".git").exists() {
-        anyhow::bail!(
-            "{} already exists. To swap in the remote context, remove it first, or just agit -a pull.",
-            agent.display()
-        );
-    }
-    std::fs::create_dir_all(agent.parent().unwrap())?;
-    // Inherit stdio: keep git's progress visible, credential prompts answerable, and real stderr reaching the terminal on failure.
-    // A capturing .output() would swallow all of that -- clone is the one place that reaches the remote, where flying blind is least acceptable.
-    let code = scope::git_in_inherit(&env, &["clone", url, &agent.to_string_lossy()]);
-    if code != 0 {
-        anyhow::bail!("git clone {url} failed (exit code {code}). The git error above is the reason.");
-    }
-    println!("Pulled Agent Store ← {url}");
-    // install driver / hook (init is idempotent; it fills in config on an existing clone)
-    crate::init::run()?;
-    println!("\nSee what you got: agit -a log   (or agit -a merge origin/main to merge conversations)");
-    Ok(0)
-}
-
 // ─────────────────────── convert: convert sessions across runtimes ───────────────────────
 
 /// Infer the runtime from the source file's content (session_meta=codex; sessionId/parentUuid=claude).
@@ -322,6 +297,9 @@ pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
     if !agent_rev.is_empty() {
         if let Ok(agent) = scope::agent_root() {
             println!("Agent Store:");
+            // Moving HEAD under a concurrent snap is what the store lock exists for: one store is
+            // shared by every repo that tracks the agent, and a watcher in another repo is a writer.
+            let _lock = crate::session::lock_store(&agent)?;
             let ac = scope::git_in_inherit(&agent, &["checkout", agent_rev]);
             if ac != 0 {
                 anyhow::bail!("Agent Store checkout failed (exit code {ac}). Environment was already rolled back, Agent Store untouched.");
@@ -436,21 +414,18 @@ pub fn convert_pass(agent: &Path, env: &Path, seen: &mut std::collections::HashS
     // pushes it to that team. A legacy store has no identity to record, and needs none: it is the only
     // store its sessions can go to.
     let owner = agent::read_identity(agent).ok();
+    // `store_sessions`, not a glob of `sessions/<rt>/`: it reads BOTH store layouts, so an
+    // env-partitioned store does not silently stop auto-converting, and it already excludes a
+    // session's sidecars (`<id>/subagents/*.jsonl`), which the old `max_depth(1)` was there for.
+    let sessions = store_sessions(agent);
     for (from, to) in [("claude-code", "codex"), ("codex", "claude-code")] {
-        let dir = agent.join("sessions").join(from);
-        let files = walkdir::WalkDir::new(&dir)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false));
-        for e in files {
+        for e in sessions.iter().filter(|s| s.runtime == from) {
             // never re-convert a session agit itself produced — that's the feedback-loop guard.
-            let stem = e.path().file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let stem = e.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             if generated.contains(&stem) {
                 continue;
             }
-            let content = match std::fs::read_to_string(e.path()) {
+            let content = match std::fs::read_to_string(&e.path) {
                 Ok(c) if !c.trim().is_empty() => c,
                 _ => continue,
             };
@@ -460,7 +435,7 @@ pub fn convert_pass(agent: &Path, env: &Path, seen: &mut std::collections::HashS
             if !seen.insert(key) {
                 continue;
             }
-            match materialize_id(e.path(), from, to, None) {
+            match materialize_id(&e.path, from, to, None) {
                 Ok((new_id, h)) => {
                     if let Some(o) = &owner {
                         if let Err(err) = record_launch(&new_id, &o.aid, &o.name, env, to) {
@@ -469,7 +444,7 @@ pub fn convert_pass(agent: &Path, env: &Path, seen: &mut std::collections::HashS
                     }
                     println!("  ● {from}→{to}  {}", h.resume_cmd);
                 }
-                Err(err) => eprintln!("  ⚠ {from}→{to} {}: {err:#}", e.file_name().to_string_lossy()),
+                Err(err) => eprintln!("  ⚠ {from}→{to} {}: {err:#}", e.path.display()),
             }
         }
     }
@@ -984,11 +959,22 @@ mod start_tests {
         let clone = dst.path().join("c");
         git(d, &["clone", "-q", ".", &clone.to_string_lossy()]);
 
-        // The premise, asserted rather than remembered: after a clone there is no recency left in the fs.
+        // The premise, asserted rather than remembered: after a clone there is no recency left in the
+        // fs. Checkout stamps both files as it writes them, so they land together — but "together" is
+        // scheduling, not an atomic act, and git promises no more than that. Demanding the two stamps
+        // match to the NANOSECOND made this fail whenever a loaded machine straddled a clock tick. What
+        // must hold is that the gap carries no information: 6 YEARS apart by content, indistinguishable
+        // on disk.
         let m = |n: &str| {
             std::fs::metadata(clone.join("sessions/web/claude-code").join(n)).unwrap().modified().unwrap()
         };
-        assert_eq!(m("old.jsonl"), m("new.jsonl"), "a clone must flatten mtimes, or this test proves nothing");
+        let (a, b) = (m("old.jsonl"), m("new.jsonl"));
+        let gap = a.duration_since(b).or_else(|_| b.duration_since(a)).unwrap_or_default();
+        assert!(
+            gap < std::time::Duration::from_secs(60),
+            "a clone must erase the content-age gap (these are 6 years apart by content), got {gap:?} — \
+             otherwise this test proves nothing"
+        );
 
         let latest = latest_session(&clone).expect("a cloned store still has sessions");
         assert!(
@@ -998,6 +984,10 @@ mod start_tests {
         );
     }
 
+    /// Both store layouts resolve, from one walk. A flat store is never migrated (§12 step 2), so
+    /// `sessions/<rt>/` is not a legacy path to be read second — it is one of two live layouts, and a
+    /// reader that understood only the partitioned one would report an existing store as EMPTY.
+    #[test]
     fn latest_session_spans_environments_and_ignores_sidecars() {
         let store = tempfile::tempdir().unwrap();
         let s = store.path().join("sessions");
