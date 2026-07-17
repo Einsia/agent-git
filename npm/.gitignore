@@ -1,0 +1,3 @@
+# Runtime download target — the postinstall drops the platform binaries here.
+# Never committed and never published (not in package.json "files").
+/bin/

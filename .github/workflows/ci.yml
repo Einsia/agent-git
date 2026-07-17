@@ -1,0 +1,102 @@
+name: CI
+
+# Continuous integration for the `agit` workspace (two binaries: `agit`, `agit-hub`).
+#
+# Every command below was run locally against this tree before this file was committed and each
+# exited 0 (clippy exits 0 because it is deliberately NOT run with `-D warnings` yet — see the job).
+#
+# Toolchain: the repo pins `stable` (+ rustfmt, clippy) in rust-toolchain.toml, which the runner's
+# preinstalled rustup honors automatically. We still `rustup component add` explicitly so the
+# fmt/clippy components are guaranteed present regardless of the runner image.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# Newer pushes to the same ref supersede in-flight runs, so we don't burn minutes on stale commits.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# CI only reads the repo; no job here needs write access to anything.
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (workspace, all targets)
+        run: cargo build --workspace --all-targets
+      - name: Test (workspace)
+        # ~326 tests across the lib, both bins, and the integration suites in tests/.
+        run: cargo test --workspace
+
+  fmt:
+    name: rustfmt (report-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      # TODO: tighten to a blocking `cargo fmt --all --check` once the formatting/clippy-clean task
+      # lands. The current tree is NOT rustfmt-clean and this workflow is not permitted to reformat
+      # it, and no rustfmt.toml can make the existing hand-formatting pass (verified: hunks remain
+      # even at max_width=200 — they are import-grouping and brace-style, not line width). So for now
+      # we surface the diff as a warning without failing the job. When the cleanup merges, drop the
+      # `|| { ... }` wrapper below so a dirty tree fails CI again.
+      - name: rustfmt --check (non-blocking)
+        run: |
+          if ! cargo fmt --all --check; then
+            echo "::warning title=rustfmt::Tree is not rustfmt-clean (known). NOT failing CI yet — see the TODO in .github/workflows/ci.yml. Flip this step to blocking once the formatting cleanup lands."
+          fi
+
+  clippy:
+    name: clippy (report-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      # TODO: tighten to `-D warnings` once the clippy-clean task lands. The tree currently carries
+      # ~27 cosmetic clippy warnings that THIS workflow is not permitted to fix (another agent owns
+      # that). We run clippy WITHOUT `-D warnings` so it reports the warnings but does not fail the
+      # job. When the cleanup merges, append `-- -D warnings` to the command below.
+      - name: clippy (non-blocking; NOT -D warnings yet)
+        run: cargo clippy --workspace --all-targets
+
+  hub-e2e:
+    name: hub e2e (demo/hub-e2e.sh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      # The script asserts ~267 checks against a REAL agit-hub server started on 127.0.0.1:8194.
+      # It needs git, curl, python3 and jq — all preinstalled on ubuntu-latest. jq is installed
+      # defensively only if the image ever drops it; the others are guaranteed present.
+      - name: Verify e2e prerequisites
+        run: |
+          for t in git curl python3; do
+            command -v "$t" >/dev/null || { echo "missing required tool: $t" >&2; exit 1; }
+          done
+          command -v jq >/dev/null || { sudo apt-get update && sudo apt-get install -y jq; }
+      - name: Build agit-hub (release)
+        run: cargo build --release --bin agit-hub
+      - name: Run hub end-to-end acceptance
+        run: ./demo/hub-e2e.sh

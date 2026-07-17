@@ -1,0 +1,45 @@
+{
+  "name": "@agentgit/agit",
+  "version": "0.1.0",
+  "description": "Git for agent context: version raw agent session dumps, sync with your team, LLM-merge on pull. Installs the prebuilt agit (and agit-hub) binaries.",
+  "keywords": [
+    "agit",
+    "agent",
+    "git",
+    "llm",
+    "claude",
+    "claude-code",
+    "session",
+    "cli"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/agentgit/agit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentgit/agit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/agentgit/agit/issues"
+  },
+  "bin": {
+    "agit": "npm/shim.js",
+    "agit-hub": "npm/shim-hub.js"
+  },
+  "files": [
+    "npm/shim.js",
+    "npm/shim-hub.js",
+    "npm/install.js",
+    "npm/lib/",
+    "npm/README.md",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node npm/install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,142 @@
+name: Release
+
+# Cross-compiled release builds for both binaries (`agit` and `agit-hub`), triggered by pushing a
+# tag that matches `v*` (e.g. `v0.1.0`).
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+#  ARTIFACT NAMING CONTRACT  (the npm package depends on this — DO NOT change without updating
+#  .github/RELEASE_ARTIFACTS.md and telling whoever owns npm distribution)
+#
+#  For tag `vX.Y.Z`, VERSION = `X.Y.Z` (the leading `v` is stripped). One archive per target:
+#
+#     agit-<VERSION>-x86_64-unknown-linux-gnu.tar.gz
+#     agit-<VERSION>-aarch64-unknown-linux-gnu.tar.gz
+#     agit-<VERSION>-x86_64-apple-darwin.tar.gz
+#     agit-<VERSION>-aarch64-apple-darwin.tar.gz
+#     agit-<VERSION>-x86_64-pc-windows-msvc.zip
+#     SHA256SUMS
+#
+#  Each archive contains BOTH binaries at its ROOT (no wrapping directory):
+#     unix:    agit        agit-hub
+#     windows: agit.exe    agit-hub.exe
+#
+#  SHA256SUMS lists every archive by bare filename, `sha256sum`/`shasum -a 256` format.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege by default; only the publish job below opts up to contents: write.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # aarch64 linux is the one target that needs a cross linker; all crate deps are pure Rust, so a
+      # GNU cross linker is sufficient (no C sysroot / `cross` container required).
+      - name: Install aarch64 cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build both binaries (release)
+        run: cargo build --release --target ${{ matrix.target }} --bin agit --bin agit-hub
+
+      # Package into the exact archive named in the contract at the top of this file. Runs under bash
+      # on every OS (Git Bash on the Windows runner). Binaries land at the archive root.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARGET="${{ matrix.target }}"
+          BINDIR="target/$TARGET/release"
+          STAGE="agit-$VERSION-$TARGET"
+          mkdir -p "$STAGE"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp "$BINDIR/agit.exe" "$BINDIR/agit-hub.exe" "$STAGE/"
+            ARCHIVE="$STAGE.zip"
+            ( cd "$STAGE" && 7z a -tzip "../$ARCHIVE" agit.exe agit-hub.exe >/dev/null )
+          else
+            cp "$BINDIR/agit" "$BINDIR/agit-hub" "$STAGE/"
+            ARCHIVE="$STAGE.tar.gz"
+            tar -C "$STAGE" -czf "$ARCHIVE" agit agit-hub
+          fi
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          echo "Built $ARCHIVE:"; ls -l "$ARCHIVE"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # required to create the GitHub Release and upload assets
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum agit-* > SHA256SUMS
+          echo "── SHA256SUMS ──"
+          cat SHA256SUMS
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/agit-*
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
