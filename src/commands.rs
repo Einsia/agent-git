@@ -146,6 +146,28 @@ fn install_id(_to_rt: &str, _branch: Option<&str>, _seed: &str) -> String {
     crate::convo::fresh_id("session")
 }
 
+/// The shared front half of convert / materialize / resume: mint the install id, convert `src` into
+/// runtime `to`, and resolve the destination cwd. Returns `(new_id, output, ir, cwd)`. It does NOT
+/// install — the callers differ on what comes next (dry-run preview, launch, or marking the id as
+/// agit-generated), so installing stays theirs.
+fn convert_for_install(
+    text: &str,
+    src: &Path,
+    from: &str,
+    to: &str,
+    cwd_override: Option<String>,
+) -> Result<(String, String, crate::convo::ConversationIR, PathBuf)> {
+    use crate::convo::{self, ConvertOpts};
+    let new_id = install_id(to, convo::peek_branch(text).as_deref(), text);
+    let opts = ConvertOpts { cwd: cwd_override, new_id: new_id.clone() };
+    let (out, ir) = convo::convert(src, from, to, &opts)?;
+    let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {
+        Some(c) => PathBuf::from(c),
+        None => std::env::current_dir()?,
+    };
+    Ok((new_id, out, ir, cwd))
+}
+
 pub fn convert_cmd(
     src: &Path,
     from: Option<String>,
@@ -153,7 +175,7 @@ pub fn convert_cmd(
     cwd_override: Option<String>,
     write: bool,
 ) -> Result<i32> {
-    use crate::convo::{self, ConvertOpts};
+    use crate::convo;
 
     let text = std::fs::read_to_string(src)
         .map_err(|e| anyhow::anyhow!("failed to read source session {}: {e}", src.display()))?;
@@ -164,20 +186,8 @@ pub fn convert_cmd(
             .ok_or_else(|| anyhow::anyhow!("can't recognize the source runtime, pass --from claude-code|codex explicitly"))?,
     };
 
-    let new_id = install_id(to, convo::peek_branch(&text).as_deref(), &text);
-    let opts = ConvertOpts {
-        cwd: cwd_override,
-        new_id: new_id.clone(),
-    };
-    let (out, ir) = convo::convert(src, &from, to, &opts)?;
+    let (new_id, out, ir, cwd) = convert_for_install(&text, src, &from, to, cwd_override)?;
     let cross = convo::is_cross_vendor(&from, to);
-
-    // Target cwd (which project it installs under / where resume lands). current_dir() is evaluated lazily: called only when the source has no cwd either,
-    // and its failure shouldn't needlessly abort the conversion when the cwd is already known.
-    let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {
-        Some(c) => PathBuf::from(c),
-        None => std::env::current_dir()?,
-    };
 
     // The output = a new copy of sensitive content; scan it at high precision before writing to disk (jsonl: entropy detection off)
     let hits = scan::scan_text_opts(&out, true).len();
@@ -353,15 +363,8 @@ pub fn materialize_id(
     to: &str,
     cwd_override: Option<String>,
 ) -> Result<(String, crate::register::ResumeHandle)> {
-    use crate::convo::{self, ConvertOpts};
     let text = std::fs::read_to_string(src)?;
-    let new_id = install_id(to, convo::peek_branch(&text).as_deref(), &text);
-    let opts = ConvertOpts { cwd: cwd_override, new_id: new_id.clone() };
-    let (out, ir) = convo::convert(src, from, to, &opts)?;
-    let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {
-        Some(c) => PathBuf::from(c),
-        None => std::env::current_dir()?,
-    };
+    let (new_id, out, _ir, cwd) = convert_for_install(&text, src, from, to, cwd_override)?;
     let h = crate::register::install(to, &new_id, &cwd, &out)?;
     // Record that agit produced this id, so the watcher never re-converts its own output (which would
     // otherwise feed back: A→B, then snap B, then B→A, forever).
@@ -490,7 +493,7 @@ pub fn resume_cmd(
     exec: bool,
     relocate: bool,
 ) -> Result<i32> {
-    use crate::convo::{self, ConvertOpts};
+    use crate::convo;
 
     let text = std::fs::read_to_string(src)
         .map_err(|e| anyhow::anyhow!("failed to read source session {}: {e}", src.display()))?;
@@ -514,13 +517,7 @@ pub fn resume_cmd(
         None => (cwd_override, None),
     };
 
-    let new_id = install_id(&to, convo::peek_branch(&text).as_deref(), &text);
-    let opts = ConvertOpts { cwd: cwd_override, new_id: new_id.clone() };
-    let (out, ir) = convo::convert(src, from, &to, &opts)?;
-    let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {
-        Some(c) => PathBuf::from(c),
-        None => std::env::current_dir()?,
-    };
+    let (new_id, out, ir, cwd) = convert_for_install(&text, src, from, &to, cwd_override)?;
 
     // --relocate: rewrite the ORIGINAL environment's path prefix everywhere in the transcript (bash
     // commands, file_paths, narrated tools), not just the session's own cwd. Only correct when the
