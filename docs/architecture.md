@@ -162,8 +162,8 @@ false positives. This does not catch general sensitive content (see risk analysi
 - Hand-authored facts / an evidence schema / deterministic evidence merge (deleted).
 - Running agents or merging on the Hub (merging happens only on the consumer's machine, to
   avoid cost + prompt injection).
-- Exact replay / KV-cache reuse / process snapshots (that is Shepherd's territory, see
-  competitive-analysis).
+- Exact replay / KV-cache reuse / process snapshots (that is a different approach, taken by
+  systems like Shepherd; agit versions and reconciles the transcript, not the process).
 
 ## Roadmap (design, not all shipped)
 
