@@ -373,6 +373,48 @@ git push --no-verify "http://x:$WTOK@127.0.0.1:$PORT/payments.git" main >"$TMP/n
   && bad "SECURITY: --no-verify walked the NUL-hidden key past the server" || ok "--no-verify does not reach it"
 cd "$ROOT"
 
+echo "${B}Act 9d · metadata is a channel too — commit message, author, tag${N}"
+# A blob is not the only place a secret rides in. These three all read back off the server, and none
+# has a path in \`rev-list --objects\`, so a blob-only scan was blind to them. Verified: an AKIA key in a
+# commit message pushed clean before this. Each pushes to its OWN ref off the clean baseline, so the
+# only new-to-server secret is the metadata under test — not a poisoned ancestor.
+cd "$R1"
+git reset -q --hard "$clean"
+echo benign > f.txt
+git -c user.name=a -c user.email=a@e.com commit -qam 'totally normal fix AKIAIOSFODNN7EXAMPLE trailing'
+if git push "http://x:$WTOK@127.0.0.1:$PORT/payments.git" "HEAD:refs/heads/msgattack" >"$TMP/m1" 2>&1; then
+  bad "SECURITY: a live AWS key in a COMMIT MESSAGE was accepted"
+else
+  ok "a secret in a commit message is REFUSED"
+fi
+git reset -q --hard "$clean"
+echo benign2 > f.txt
+git -c user.name='AKIAIOSFODNN7EXAMPLE' -c user.email=a@e.com commit -qam 'normal message'
+if git push "http://x:$WTOK@127.0.0.1:$PORT/payments.git" "HEAD:refs/heads/identattack" >"$TMP/m2" 2>&1; then
+  bad "SECURITY: a live AWS key in the AUTHOR NAME was accepted"
+else
+  ok "a secret in the author name is REFUSED"
+fi
+git reset -q --hard "$clean"
+git -c user.name=a -c user.email=a@e.com tag -a leaky-tag -m 'release notes AKIAIOSFODNN7EXAMPLE' 2>/dev/null
+if git push "http://x:$WTOK@127.0.0.1:$PORT/payments.git" leaky-tag >"$TMP/m3" 2>&1; then
+  bad "SECURITY: a live AWS key in a TAG MESSAGE was accepted"
+else
+  ok "a secret in an annotated tag message is REFUSED"
+fi
+git tag -d leaky-tag >/dev/null 2>&1
+# The control: a benign commit with a normal prose message and author MUST still push, or the gate has
+# just become a blanket deny.
+git reset -q --hard "$clean"
+echo fine > f.txt
+git -c user.name=a -c user.email=a@e.com commit -qam 'fix: handle the empty-input case in the parser'
+if git push "http://x:$WTOK@127.0.0.1:$PORT/payments.git" "HEAD:refs/heads/cleanmeta" >"$TMP/m4" 2>&1; then
+  ok "a benign commit (normal message + author) still pushes — not a blanket deny"
+else
+  bad "the metadata scan over-blocks: a perfectly normal commit was refused ($(tail -1 "$TMP/m4"))"
+fi
+cd "$ROOT"
+
 echo "${B}Act 9c · the scan FAILS CLOSED on its own bounds${N}"
 cd "$R1"
 git reset -q --hard "$clean"

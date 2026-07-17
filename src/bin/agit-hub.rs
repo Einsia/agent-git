@@ -773,16 +773,31 @@ fn scan_push(repo: &Path, news: &[String]) -> ScanReport {
         }
         want.push((sha.to_string(), path.to_string()));
     }
-    if want.is_empty() {
-        return out;
-    }
+    // Scan the blob CONTENT (may be empty — a tag or a metadata-only push brings no new blobs; that must
+    // NOT skip the metadata scan below, which was the bug that let a tag message through).
+    scan_blob_content(repo, &want, &allow, &mut out);
+    // Blobs are not the only channel a secret rides in on. A commit MESSAGE, an AUTHOR or COMMITTER
+    // name/email, and an annotated TAG message all travel with the push and are readable back off the
+    // server — and none of them has a path in `rev-list --objects`, so the loop above never saw them.
+    // A gate that advertises "a pushed secret is a burnt secret" but scans only file content is blind to
+    // three channels; verified live, an AKIA key in a commit message pushed clean.
+    scan_meta(repo, news, &allow, &skip, &mut out);
+    out
+}
 
+/// Scan the CONTENT of the blobs a push brings. Extracted so `scan_push` can run it and the metadata
+/// scan unconditionally: a push with no new blobs (a tag, or a ref that only moves metadata) must not
+/// short-circuit before the message/author/tag channels are checked.
+fn scan_blob_content(repo: &Path, want: &[(String, String)], allow: &agit::scan::Allowlist, out: &mut ScanReport) {
+    if want.is_empty() {
+        return;
+    }
     // One `cat-file --batch-check` for every candidate: types and sizes in a single process, so the
     // size bound can be applied *before* any content is read.
     let shas: String = want.iter().map(|(s, _)| format!("{s}\n")).collect();
     let Some(check) = git_stdin(repo, &["cat-file", "--batch-check"], shas.as_bytes()) else {
-        out.errored = Some("`git cat-file --batch-check` could not size the pushed objects".into());
-        return out;
+        out.errored.get_or_insert_with(|| "`git cat-file --batch-check` could not size the pushed objects".into());
+        return;
     };
     let mut budget = SCAN_MAX_TOTAL_BYTES;
     let mut todo: Vec<(String, String)> = vec![];
@@ -814,14 +829,14 @@ fn scan_push(repo: &Path, news: &[String]) -> ScanReport {
         todo.push((sha.clone(), path.clone()));
     }
     if todo.is_empty() {
-        return out;
+        return;
     }
 
     // ...and one `cat-file --batch` for the survivors' contents.
     let shas: String = todo.iter().map(|(s, _)| format!("{s}\n")).collect();
     let Some(blobs) = git_stdin(repo, &["cat-file", "--batch"], shas.as_bytes()) else {
-        out.errored = Some("`git cat-file --batch` could not read the pushed blobs".into());
-        return out;
+        out.errored.get_or_insert_with(|| "`git cat-file --batch` could not read the pushed blobs".into());
+        return;
     };
     // Keyed by sha, never by position: a missing object yields no body, and a positional zip would
     // then pair every later blob's content with the *previous* blob's path — and the path is the whole
@@ -841,13 +856,75 @@ fn scan_push(repo: &Path, news: &[String]) -> ScanReport {
             false => String::from_utf8_lossy(content).into_owned(),
             true => printable_runs(content),
         };
-        for f in agit::scan::scan_text_allow(&text, !binary, &allow) {
+        for f in agit::scan::scan_text_allow(&text, !binary, allow) {
             // For a binary blob `line` counts printable runs, not file lines — the rule and the path
             // are what the operator acts on either way.
             out.findings.push((f.rule.to_string(), path.clone(), f.line, clip(&f.excerpt, 120)));
         }
     }
-    out
+}
+
+/// Scan the metadata the push brings — commit messages, author/committer identity, tag messages — for
+/// the same secrets as blob content. Reuses the blob path's batch machinery and bounds.
+///
+/// Entropy is OFF here on purpose: a raw commit object carries `tree`/`parent` 40-hex lines, which the
+/// entropy heuristic would flag as high-entropy strings. The named rules (AKIA, `ghp_…`, and the rest)
+/// do not need entropy and do not match a hex sha, so metadata is scanned by rule only.
+fn scan_meta(repo: &Path, news: &[String], allow: &agit::scan::Allowlist, skip: &[String], out: &mut ScanReport) {
+    // Commits the push introduces, exactly the same range as the blob scan.
+    let mut list_args: Vec<&str> = vec!["rev-list"];
+    for n in news {
+        list_args.push(n);
+    }
+    list_args.push("--not");
+    list_args.push("--all");
+    let mut shas: Vec<String> = match git(repo, &list_args) {
+        Some(listing) => listing.lines().map(str::to_string).collect(),
+        None => {
+            out.errored.get_or_insert_with(|| "`git rev-list` could not list the pushed commits".into());
+            return;
+        }
+    };
+    // Annotated tags carry their own message/tagger and are not reachable as commits. A ref tip that is
+    // itself a tag object gets scanned too.
+    for n in news {
+        if let Some(check) = git(repo, &["cat-file", "-t", n]) {
+            if check.trim() == "tag" {
+                shas.push(n.clone());
+            }
+        }
+    }
+    if shas.is_empty() {
+        return;
+    }
+    if shas.len() > SCAN_MAX_BLOBS {
+        out.unscanned.push((
+            format!("commit {}", &shas[SCAN_MAX_BLOBS][..shas[SCAN_MAX_BLOBS].len().min(12)]),
+            format!("this push carries more than {SCAN_MAX_BLOBS} commits — this one and every commit after it went unscanned"),
+        ));
+        shas.truncate(SCAN_MAX_BLOBS);
+    }
+
+    let batch: String = shas.iter().map(|s| format!("{s}\n")).collect();
+    let Some(raw) = git_stdin(repo, &["cat-file", "--batch"], batch.as_bytes()) else {
+        out.errored.get_or_insert_with(|| "`git cat-file --batch` could not read the pushed commits".into());
+        return;
+    };
+    let bodies = parse_batch(&raw);
+    for sha in &shas {
+        let label = format!("commit {}", &sha[..sha.len().min(12)]);
+        if skip.iter().any(|s| s == &label) {
+            continue;
+        }
+        let Some(content) = bodies.get(sha) else {
+            out.unscanned.push((label, "git returned no content for this commit".into()));
+            continue;
+        };
+        let text = String::from_utf8_lossy(content);
+        for f in agit::scan::scan_text_allow(&text, false, allow) {
+            out.findings.push((f.rule.to_string(), label.clone(), f.line, clip(&f.excerpt, 120)));
+        }
+    }
 }
 
 /// The `strings(1)` of a blob: its printable runs, one per line, so the text rules can see them.
