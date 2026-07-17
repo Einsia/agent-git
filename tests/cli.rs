@@ -240,9 +240,12 @@ fn init_is_idempotent() {
 #[test]
 fn spawned_agit_resolves_the_isolated_home_not_the_developers() {
     let r = Repo::new();
-    let (_, _, err) = r.agit(&["-a", "snap", "--from", "claude-code"]);
+    let (_, out, err) = r.agit(&["-a", "snap", "--from", "claude-code"]);
     let isolated = format!("{}/.claude/projects", r.path().display());
-    assert!(err.contains(&isolated), "snap should look under the isolated HOME ({isolated}), got:\n{err}");
+    // snap names the directory it looked under (the source line), whether or not it exists — that path
+    // is the proof of which HOME agit resolved.
+    let seen = format!("{out}{err}");
+    assert!(seen.contains(&isolated), "snap should look under the isolated HOME ({isolated}), got:\n{seen}");
 }
 
 // ─────────────────────── scope routing (key ambiguity) ───────────────────────

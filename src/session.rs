@@ -269,7 +269,14 @@ fn live_sessions(rt: &str, env: &Path) -> Result<(Vec<(PathBuf, String)>, String
             let owned = claude_code::project_sessions(env);
             let desc = match source_dir("claude-code", env) {
                 Ok(src) => format!("{} ({} owned sessions)", src.display(), owned.len()),
-                Err(_) => format!("(no Claude Code session directory for this project yet — {} owned sessions)", owned.len()),
+                // Still name the directory agit looked under, even absent — it's the "which HOME did I
+                // use?" signal, and clearer than a bare "none".
+                Err(_) => {
+                    let looked = claude_code::projects_dir()
+                        .map(|p| p.join(claude_code::slug_for(env)).display().to_string())
+                        .unwrap_or_else(|_| "~/.claude/projects".to_string());
+                    format!("{looked} (no Claude Code session directory for this project yet — {} owned sessions)", owned.len())
+                }
             };
             Ok((owned, desc))
         }
