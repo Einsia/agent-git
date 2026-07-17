@@ -20,7 +20,10 @@ pub struct GitRoute {
 pub fn valid_agent_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && !name.starts_with('.')
+        // Leading `-` banned too, so a hosted name is always trackable locally: the client refuses a
+        // leading `-` (it would be read as a flag), and a hub name a client can never `track` is a trap.
+        // Kept in step with `agent::validate_name` — a name is legal iff BOTH accept it.
+        && !name.starts_with(['.', '-', '~'])
         && !name.contains("..")
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }

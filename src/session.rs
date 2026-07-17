@@ -285,6 +285,16 @@ fn live_sessions(rt: &str, env: &Path) -> Result<(Vec<(PathBuf, String)>, String
 /// BOTH (the shape `watch` already uses), skipping quietly whichever has no sessions for this project.
 /// An explicit `--from` is a different contract — the user named a runtime, so its absence is an error.
 pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
+    // A pre-identity repo gets the SAME actionable error here as from every other agent-scoped command.
+    // Without this, snap bailed on "no sessions found" before ever resolving the store, so the one
+    // command a new user is most likely to type never surfaced the `agit a import` path.
+    if let Ok(env) = scope::env_root() {
+        if crate::agent::legacy_store(&env).is_some() {
+            if let Err(e) = crate::agent::resolve(None) {
+                return Err(e);
+            }
+        }
+    }
     // Validate an explicit runtime BEFORE any filesystem walk: `--from bogus` used to reach the
     // per-runtime path and die with a confusing "isn't wired up yet", and under `--watch` it became a
     // silent permanent no-op — the watcher polls a runtime that can never exist. Fail-open on a typo is

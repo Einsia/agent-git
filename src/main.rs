@@ -653,7 +653,7 @@ agit — version an agent's raw session so teams can collaborate on Agent Contex
 Runtimes are peers and there is no default: claude-code, codex. Commands that read sessions use the one
 you name with --from, else the only one present, else they ask.
 
-  agit init [--store P]    Create an Agent Store next to the code repository (--store detaches it to P, so several repos share one agent's history)
+  agit init [--agent N]    Prepare this repo: clone or select its agent, install the secret hooks (--agent names one)
   agit a snap [--watch]    Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store; captures every runtime with sessions here unless --from names one (--watch = auto-snap; --no-harness = sessions only)
   agit a push / pull       Sync sessions with the team (the Agent Store is just a git repo)
   agit start               Launch a session HERE already carrying this agent's latest context, from whatever repo it was last in (--agent <name> picks the agent for this invocation only; --as <rt> switches runtime)

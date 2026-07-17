@@ -122,13 +122,17 @@ fn validate_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
         && !name.starts_with(['-', '.', '~'])
+        // `..` is banned so a locally-minted name is always hostable: the hub reads names into URL paths
+        // and refuses `..`, and a name you can mint but can never publish is a trap. `payments.api` (one
+        // dot) stays fine. Keep this in step with `hub::net::valid_agent_name`.
+        && !name.contains("..")
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
     if !ok {
         bail!(
             "`{name}` is not a usable agent name (letters, digits, `-`, `_`, `.`; max 64; \
-             not starting with `-`, `.` or `~`)"
+             no `..`; not starting with `-`, `.` or `~`)"
         );
     }
     if is_aid(name) {
@@ -1877,6 +1881,27 @@ agent = "frontend"        # what a FRESH clone activates
     }
 
     /// The binding is COMMITTED, so `publish` must write a LOCATOR, never a credential — a token here is
+    /// A name you can mint locally must be one the hub can host, and vice versa — otherwise you hit a
+    /// mint-then-fail-at-publish trap. The two validators live in different modules (client vs server),
+    /// so this asserts they agree on a battery of names rather than trusting they were kept in step.
+    #[test]
+    fn local_and_hub_name_rules_agree() {
+        for good in ["frontend", "payments-api", "payments.api", "a_b", "x1", &"z".repeat(64)] {
+            assert!(validate_name(good).is_ok(), "local rejects a good name: {good}");
+            assert!(crate::hub::net::valid_agent_name(good), "hub rejects a good name: {good}");
+        }
+        for bad in ["a..b", "-x", ".x", "~x", "", "a/b", "a b", "x..", &"z".repeat(65), "agt_00000000-0000-4000-8000-000000000000"] {
+            let local_ok = validate_name(bad).is_ok();
+            let hub_ok = crate::hub::net::valid_agent_name(bad);
+            assert!(!local_ok, "local accepts a bad name: {bad}");
+            // the aid-shaped name is a local-only concern (ambiguity with `agit a use`), not a hub path
+            // rule, so exempt exactly that one from the hub side of the agreement.
+            if !is_aid(bad) {
+                assert!(!hub_ok, "hub accepts a name local rejects: {bad}");
+            }
+        }
+    }
+
     /// The backstop behind `locator`: a secret in a place `locator` does not strip (a query string, the
     /// path) must still not reach the committed binding. `committed_locator` scans the result and refuses.
     #[test]
