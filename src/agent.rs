@@ -164,13 +164,6 @@ fn agents_dir_in(home: &Path) -> PathBuf {
     home.join("agents")
 }
 
-/// `$AGIT_HOME/agents/<aid>/`.
-pub fn store_path(aid: &str) -> Result<PathBuf> {
-    if !is_aid(aid) {
-        bail!("`{aid}` is not an aid (expected `agt_…`)");
-    }
-    Ok(agents_dir_in(&scope::agit_home()?).join(aid))
-}
 
 fn store_remote(store: &Path) -> Option<String> {
     match scope::git_in_status(store, &["remote", "get-url", "origin"]) {
@@ -196,9 +189,6 @@ fn registry_path_in(home: &Path) -> PathBuf {
     home.join(REGISTRY_FILE)
 }
 
-pub fn registry_path() -> Result<PathBuf> {
-    Ok(registry_path_in(&scope::agit_home()?))
-}
 
 /// Load name→aid. Missing or corrupt reads as empty: this is a cache, and a cache that errors is
 /// worse than one that misses — every lookup falls back to scanning the stores, which are the truth.

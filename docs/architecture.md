@@ -146,7 +146,6 @@ false positives. This does not catch general sensitive content (see risk analysi
 | `scope` | Dual-repo discovery, scope routing, `$AGIT_HOME` |
 | `agent` | Identity (aid), the registry cache, the `.agit.toml` binding, resolution, and the agent verbs (`new`/`track`/`use`/`info`/`rename`/`import`) |
 | `passthrough` | Transparent git passthrough (spawn, inherit stdio, propagate exit code, post-hook pairing) |
-| `gitx` | Small git plumbing helpers shared across modules |
 | `session` | `snap` — mirror the runtime's session dump into the store of the agent that owns it; `watch`; runtime resolution (no default) |
 | `sync` | Dialogue-based agent merge (revive both sides read-only in per-branch worktrees, relay the conversation, surface + resolve real conflicts, leave a resumable merged session); claude-code + codex |
 | `adapter` | Session parsing (`export` → `SessionIR`); Claude and Codex **both implemented** |

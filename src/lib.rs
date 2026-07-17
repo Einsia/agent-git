@@ -7,9 +7,9 @@
 //! library, both bins call `adapter::claude_code::parse_jsonl`, so a rule changed in
 //! one place takes effect in both.
 //!
-//! `#![allow(dead_code)]`: some modules (such as fields on gitx / environment) go
-//! unused in one of the bins, but pub items don't produce dead_code warnings; this is
-//! kept here to cover the few private helper items.
+//! `#![allow(dead_code)]`: some helper items go unused in one of the two bins (`agit`
+//! vs `agit-hub`), and pub items don't produce dead_code warnings, so this covers the
+//! few private helpers that are only used from one bin.
 
 
 // Pedantic markdown-in-doc-comment lint; the comment style here is deliberate.
@@ -21,7 +21,6 @@ pub mod agent;
 pub mod commands;
 pub mod convo;
 pub mod environment;
-pub mod gitx;
 pub mod harness;
 pub mod hub;
 pub mod init;
