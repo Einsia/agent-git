@@ -1,0 +1,25 @@
+# Caddy terminates HTTPS in front of agit-hub and reverse-proxies to it.
+#
+#   client ──HTTPS──▶ caddy :443 ──HTTP──▶ hub :8177
+#
+# {$HUB_DOMAIN} is supplied by the compose environment. With a real public domain
+# pointed at this host, Caddy obtains and renews a Let's Encrypt certificate
+# automatically — nothing else to configure.
+#
+# For a LOCAL trial, set HUB_DOMAIN=localhost: Caddy serves "localhost" with its
+# own internally-trusted certificate out of the box. For any other private name
+# or a bare IP that Let's Encrypt cannot validate, uncomment `tls internal`.
+
+{$HUB_DOMAIN} {
+	encode gzip
+
+	# reverse_proxy sets X-Forwarded-For (the connecting client's IP) and
+	# X-Forwarded-Proto. The hub honours X-Forwarded-For only from its
+	# --trusted-proxy address (Caddy's fixed address, set in docker-compose.yml),
+	# so the per-IP rate limit keys on the real client rather than on Caddy.
+	reverse_proxy hub:8177
+
+	# Local / non-public name: use Caddy's own CA instead of reaching out to
+	# Let's Encrypt for a name it cannot validate.
+	# tls internal
+}

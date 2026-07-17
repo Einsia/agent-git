@@ -1,0 +1,66 @@
+[Unit]
+Description=agit-hub — AgentGitHub (git-hosted AI session transcripts)
+Documentation=file:/opt/agit-hub/docs/deploying-the-hub.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agithub
+Group=agithub
+
+# agit-hub keeps everything (users.json, agents.json, auth.json, audit.log and
+# the bare repos) under one data root. StateDirectory creates and owns
+# /var/lib/agit-hub (0700) and, under ProtectSystem=strict, marks it writable.
+StateDirectory=agit-hub
+StateDirectoryMode=0700
+
+# Bind loopback only: this unit expects a TLS-terminating reverse proxy
+# (nginx/Caddy) on the SAME host forwarding to 127.0.0.1:8177. A loopback bind
+# needs neither --tls nor --insecure. --trusted-proxy 127.0.0.1 lets the hub read
+# the X-Forwarded-For the local proxy sets, so the per-IP rate limit keys on the
+# real client. (If the proxy runs on a DIFFERENT host, bind --host to the
+# interface it reaches, add --tls, and set --trusted-proxy to the proxy's IP.)
+#
+# --root is passed explicitly and must match StateDirectory. Run any manual admin
+# command with the SAME --root, e.g.:
+#   sudo -u agithub agit-hub user add you --admin --root /var/lib/agit-hub
+ExecStart=/usr/local/bin/agit-hub serve \
+    --host 127.0.0.1 --port 8177 \
+    --root /var/lib/agit-hub \
+    --trusted-proxy 127.0.0.1
+
+Restart=on-failure
+RestartSec=2
+
+# ── Sandboxing / hardening ──────────────────────────────────────────────────
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+# The hub and git are ordinary ELF binaries with no W^X pages; if a future git
+# ever needs writable+executable memory, relax this one line.
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

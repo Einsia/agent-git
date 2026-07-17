@@ -1,0 +1,77 @@
+# TLS-terminated production topology for agit-hub.
+#
+#   client ──HTTPS──▶ caddy (:443) ──HTTP──▶ hub (:8177)
+#
+# Caddy terminates HTTPS and reverse-proxies to the hub over the internal Docker
+# network. The hub binds 0.0.0.0 inside the container with --tls ("TLS terminated
+# in front") and trusts Caddy's fixed address, so the per-IP rate limit keys on
+# the real client IP that Caddy forwards, not on Caddy itself.
+#
+# Bring it up (from the repo root):
+#   HUB_DOMAIN=hub.example.com docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Create the first admin (interactive — the password prompt needs a TTY, hence -T
+# is NOT passed):
+#   docker compose -f deploy/docker-compose.yml exec hub agit-hub user add you --admin
+#
+# The hub's data root is the /data volume; every `exec hub agit-hub …` command
+# resolves --root from $HOME=/data automatically (see the Dockerfile), so no
+# --root flag is needed for admin commands here.
+
+services:
+  hub:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: agit-hub:latest
+    restart: unless-stopped
+    # Only Caddy's address is pinned (below), so the hub can trust it precisely.
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8177"
+      - --tls
+      - --trusted-proxy
+      - 172.28.0.2
+    volumes:
+      - hub-data:/data
+    networks:
+      edge:
+    # No published ports: the hub is reachable only through Caddy.
+    expose:
+      - "8177"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - hub
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # The name Caddy serves and obtains a certificate for. Override per deploy;
+      # defaults to localhost for a local trial.
+      HUB_DOMAIN: ${HUB_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data      # Caddy's ACME account + issued certificates — persist!
+      - caddy-config:/config
+    networks:
+      edge:
+        # Fixed address so the hub's --trusted-proxy can name it exactly.
+        ipv4_address: 172.28.0.2
+
+networks:
+  edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  hub-data:      # the hub's data root (users.json, agents.json, auth.json, audit.log, bare repos)
+  caddy-data:    # Caddy's certificates + ACME account
+  caddy-config:

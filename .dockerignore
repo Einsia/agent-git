@@ -1,0 +1,24 @@
+# Build artifacts — the image compiles from source inside the build stage.
+target/
+**/target/
+
+# Version control.
+.git/
+.gitignore
+.gitattributes
+
+# The frontend is already built into hub-ui/dist (committed) and embedded into
+# the binary at compile time, so node_modules is large and unnecessary here.
+# NOTE: hub-ui/dist is deliberately NOT ignored — the build needs it.
+**/node_modules/
+
+# Things that are not part of the build context.
+deploy/
+docs/
+.github/
+demo/
+
+# Editor / OS cruft.
+.DS_Store
+*.swp
+*~
