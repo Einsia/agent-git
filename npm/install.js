@@ -78,15 +78,12 @@ async function main() {
   fs.mkdirSync(BIN_DIR, { recursive: true });
 
   const primaryDest = path.join(BIN_DIR, info.primaryBinary);
-  const hubDest = path.join(BIN_DIR, info.hubBinary);
 
   // Local-binary override: skip the network entirely.
   if (process.env.AGIT_BINARY) {
     installLocal(process.env.AGIT_BINARY, primaryDest, info.isWindows);
-    if (process.env.AGIT_HUB_BINARY) {
-      installLocal(process.env.AGIT_HUB_BINARY, hubDest, info.isWindows);
-    }
     log.info(`Using AGIT_BINARY (${process.env.AGIT_BINARY}); skipped download.`);
+    shadowHint();
     return;
   }
 
@@ -150,12 +147,18 @@ async function main() {
   }
 
   finalizeBinary(primaryDest, info.isWindows, { required: true });
-  const gotHub = finalizeBinary(hubDest, info.isWindows, { required: false });
-  if (!gotHub) {
-    log.warn(`${info.hubBinary} was not in the archive; the agit-hub command will be unavailable.`);
-  }
 
   log.info(`agit v${version} installed -> ${primaryDest}`);
+  shadowHint();
+}
+
+// The one setup step worth surfacing, but never done silently: enabling the git shadow reroutes
+// `git` through agit in the user's shell, so it's opt-in — we print the command, we don't run it.
+function shadowHint() {
+  log.info('');
+  log.info('To version agent context on every git command, enable the git shadow:');
+  log.info('  agit shadow install');
+  log.info('(reroutes `git` through agit in your shell; undo any time with `agit shadow uninstall`)');
 }
 
 main().catch((e) => {

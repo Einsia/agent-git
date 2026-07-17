@@ -68,7 +68,10 @@ function detect(nodePlatform, nodeArch) {
     ext: isWindows ? 'zip' : 'tar.gz',
     primaryBinary,
     hubBinary,
-    binaries: [primaryBinary, hubBinary],
+    // Only the client binary is extracted. The release archive also carries agit-hub, but the hub is a
+    // server teams host (Docker / build from source, see deploying-the-hub.md) — it is deliberately NOT
+    // installed onto every machine that npm-installs the client.
+    binaries: [primaryBinary],
   };
 }
 

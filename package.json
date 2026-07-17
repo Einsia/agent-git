@@ -1,7 +1,7 @@
 {
   "name": "@agentgit/agit",
   "version": "0.1.0",
-  "description": "Git for agent context: version raw agent session dumps, sync with your team, LLM-merge on pull. Installs the prebuilt agit (and agit-hub) binaries.",
+  "description": "Git for agent context: version raw agent session dumps, sync with your team, LLM-merge on pull. Installs the prebuilt agit client binary. The agit-hub server is distributed separately (Docker / build from source).",
   "keywords": [
     "agit",
     "agent",
@@ -22,12 +22,10 @@
     "url": "https://github.com/Einsia/agent-git/issues"
   },
   "bin": {
-    "agit": "npm/shim.js",
-    "agit-hub": "npm/shim-hub.js"
+    "agit": "npm/shim.js"
   },
   "files": [
     "npm/shim.js",
-    "npm/shim-hub.js",
     "npm/install.js",
     "npm/lib/",
     "npm/README.md",
