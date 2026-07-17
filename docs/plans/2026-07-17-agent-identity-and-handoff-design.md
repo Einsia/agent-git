@@ -493,7 +493,7 @@ sufficient alone, which is the point: `--` does not stop `ext::`, and the config
 
 | Issue | Fix |
 |---|---|
-| `agit init` names the agent after the directory (`web`), so everyone renames immediately | **ask**: `Agent name — what will this agent know? [web]:` — one prompt, `--agent X` to skip. **Non-interactive REFUSES** (exit 2, mints nothing) — see below |
+| `agit init` names the agent after the directory (`web`), so everyone renames immediately | **ask a human, refuse a script**: `--agent X`, else one prompt — `Agent name — what will this agent know? [web]:` — else an actionable error. The name is **never** derived silently; see below for why the dir-name fallback is banned |
 | `agent track X` then `agent use X` — two commands, one intent | `track` **activates** by default (`--no-use` opts out) |
 | `-a` transposition footgun (`agit commit -a` vs `agit -a commit`) | gone — `agit a commit` (§5) |
 | `snap` silently means *claude* | no default runtime (§5.3) |
@@ -502,26 +502,43 @@ sufficient alone, which is the point: `--` does not stop `ext::`, and the config
 | an unresolvable codex name silently starts a fresh session, exit 0 | verify by re-resolving; never trust exit 0 (§9) |
 | `agit watch` output is invisible when piped (block-buffered, lost on SIGTERM) | flush per line |
 
-### Why non-interactive `init` refuses instead of falling back to the directory name
+### The directory-name fallback is banned, not merely discouraged
 
-This row used to end "non-interactive falls back to the dir name". That clause was **wrong**, and the
-proof is a dead end a user cannot escape:
+An earlier draft of the row above ended *"non-interactive falls back to the dir name"*. That fallback is
+**deleted**, and the reason is mechanical rather than aesthetic: **it mints agents that can never be adopted.**
 
+`validate_name` permitted a leading `.`, and `looks_like_url` reads any leading `.` as a **path**. So any repo
+in a temp or dotted directory (`/tmp/.tmp9ndKZa`, `~/.config/foo`) minted an agent whose name `track` can never
+resolve. Verified against the real binary:
+
+```console
+$ agit a new .tmp9ndKZa
+minted .tmp9ndKZa (agt_85889e7b-…)          # succeeds
+
+$ agit a track .tmp9ndKZa                    # from any other repo
+error: refusing a remote agit cannot classify: `.tmp9ndKZa`
+       Allowed: https://, http://, ssh://, git://, file://, git@host:path, or a local path.
 ```
-$ agit a new .tmp9ndKZa      →  minted .tmp9ndKZa (agt_85889e7b…)      # succeeds
-$ agit a track .tmp9ndKZa    →  agit: refusing a remote agit cannot classify: `.tmp9ndKZa`
-```
 
-`looks_like_url` reads **any** leading `.` as a path, and `check_remote` then refuses it as an
-unclassifiable remote — so a directory-derived name from a temp or dotted path mints an agent **no
-teammate can ever `track` by name**. The binding declares it; the fresh-clone path (§13.3) cannot use
-it. A silent fallback is what produces such a name, because nobody is present to see it.
+The binding names it, `track` reads it as a path and refuses it as an unclassifiable remote, and **PRD #3 (§8)
+and the fresh-clone path (§13.3) are dead for that agent**. `check_remote` — §11's fix for the `ext::` RCE —
+and `validate_name` disagreed about what a name *is*, and the fallback is what walked users into the gap. The
+test suite hit it first: every tempdir repo minted `.tmpXXXXXX`.
 
-The principle both halves of this design agree on is **never derive a name silently**. A directory
-offered as a suggestion a human reads and can reject is a *decision*; a directory used because nobody
-was watching is a *guess*. So: **ask a human, refuse a script.** `validate_name` additionally refuses a
-leading `-`, `.` or `~` (a dot *inside* a name — `payments.api` — is fine), tested via the `track`
-round-trip rather than the character class, so the test survives someone "tidying" the charset later.
+Two rules follow, and both are enforced:
+
+1. **A name is always a human's decision** — `--agent`, or a prompt someone answered. A script that supplies
+   neither gets an actionable error, never a name agit invented. This is §4's rule ("never a silent fallback")
+   applied to naming: agit does not guess which memory you meant, and it does not guess what to call one either.
+2. **`validate_name` refuses a leading `-`, `.` or `~`** — a name `track` cannot resolve is not a name. (A dot
+   *inside* a name, `payments.api`, is fine.) Test it via the **`track` round-trip**, not the character class,
+   so the test states the reason and survives someone tidying the charset later.
+
+**The prompt is kept, and it does the teaching.** `Agent name — what will this agent know? [web]:` puts the
+model in front of the user at the one moment they have to apply it — an agent is named for what it knows, and
+it outlives this repo. The directory is offered as a *suggestion a human can see and reject*: a default only
+once someone looked at it and pressed Enter. That is a decision. A directory used because nobody was watching
+is a guess, and guessing is what this section exists to stop.
 
 ## 11c. Presentation — light TUI, not a TUI framework
 
