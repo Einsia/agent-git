@@ -5,12 +5,18 @@
 //! PROJECT-scope harness into the Agent Store, with default-deny secret redaction. Not yet done here:
 //! restore (`resume` apply-with-ask), user-scope capture, codex parity, and the sync union-merge.
 //!
-//! Layout written: <agent-store>/harness/<runtime>/project/{mcp.json,settings.json,CLAUDE.md,skills/,commands/}
-//! plus harness/<runtime>/manifest.json recording what was captured and which secret fields were redacted.
+//! Layout written: <agent-store>/harness/<env-slug>/<runtime>/project/{mcp.json,settings.json,CLAUDE.md,skills/,commands/}
+//! plus harness/<env-slug>/<runtime>/manifest.json recording what was captured, the checkout it was
+//! captured in, and which secret fields were redacted.
+//!
+//! The <env-slug> level partitions by CHECKOUT (design §6): one store is shared by several code repos,
+//! so without it the second repo to capture silently overwrites the first repo's MCP config and
+//! settings. Stores written before that level exist on disk, so reads also resolve the flat
+//! harness/<runtime>/project — those keep working, and are never rewritten.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One redacted secret: where it was, and the hint a human/agent needs to re-supply it on restore.
 #[derive(Debug, Clone)]
@@ -166,6 +172,87 @@ pub fn redact_json_doc(text: &str, file: &str) -> Result<(String, Vec<Redaction>
     Ok((serde_json::to_string_pretty(&v)? + "\n", out))
 }
 
+// ── partitioning: one store, many checkouts ──
+
+/// The harness partition key. Transcripts key on the *environment*; the harness is project-scoped, so
+/// it keys on the **checkout** — one env can be many worktrees, and folding them together is what makes
+/// a config ping-pong between checkouts (design §6). A path-derived slug is the checkout, exactly.
+///
+/// `slug_for` maps every non-alphanumeric character to `-`, so `/my/app`, `/my-app`, `/my_app` and
+/// `/my.app` share one partition. Same key as `session::env_slug`, deliberately, so the two partitions
+/// agree; the manifest's `env` field, never the slug, is the authority on which checkout captured what.
+fn env_slug(env: &Path) -> String {
+    crate::adapter::claude_code::slug_for(env)
+}
+
+/// One captured harness for one runtime, and the checkout it came from.
+///
+/// `slug`/`env` are None for a store written before the per-checkout layout: which checkout captured a
+/// flat `harness/<rt>/project` is recorded nowhere, so it is never claimed to be this one.
+#[derive(Debug, Clone)]
+pub struct Partition {
+    dir: PathBuf,
+    slug: Option<String>,
+    env: Option<String>,
+    captured_at: Option<String>,
+}
+
+impl Partition {
+    fn project(&self) -> PathBuf {
+        self.dir.join("project")
+    }
+
+    /// How a human is told where a harness came from: the captured path, else the slug it is filed
+    /// under, else an admission that a pre-partition store does not record it.
+    pub fn label(&self) -> String {
+        match (&self.env, &self.slug) {
+            (Some(e), _) => e.clone(),
+            (None, Some(s)) => format!("(checkout {s})"),
+            (None, None) => "(a checkout from before agit partitioned the harness — agit cannot tell which)".to_string(),
+        }
+    }
+}
+
+/// Read the partition at `dir`, if it actually holds a captured harness.
+fn load_partition(dir: PathBuf, slug: Option<String>) -> Option<Partition> {
+    if !dir.join("project").is_dir() {
+        return None;
+    }
+    let m = std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    let field = |k: &str| m.as_ref().and_then(|v| v.get(k)).and_then(|v| v.as_str()).map(str::to_string);
+    Some(Partition { env: field("env"), captured_at: field("captured_at"), dir, slug })
+}
+
+/// This checkout's own partition for `rt`.
+fn own_partition(agent: &Path, env: &Path, rt: &str) -> Option<Partition> {
+    let slug = env_slug(env);
+    load_partition(agent.join("harness").join(&slug).join(rt), Some(slug))
+}
+
+/// Every partition for `rt` that is NOT this checkout's, newest capture first — including a
+/// pre-partition flat `harness/<rt>/project`.
+fn other_partitions(agent: &Path, env: &Path, rt: &str) -> Vec<Partition> {
+    let mine = env_slug(env);
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(agent.join("harness")).into_iter().flatten().filter_map(|e| e.ok()) {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == mine || !e.path().is_dir() {
+            continue;
+        }
+        // A runtime name at this level is the pre-partition layout. It cannot be mistaken for a slug:
+        // a slug comes from an ABSOLUTE path, so it always starts with '-'.
+        out.extend(if crate::session::RUNTIMES.contains(&name.as_str()) {
+            if name == rt { load_partition(e.path(), None) } else { None }
+        } else {
+            load_partition(e.path().join(rt), Some(name))
+        });
+    }
+    out.sort_by(|a, b| b.captured_at.cmp(&a.captured_at).then(a.slug.cmp(&b.slug)));
+    out
+}
+
 /// Capture the project-scope harness for `runtime` into the Agent Store. Returns a Report; missing
 /// files are simply skipped (a project may have no .mcp.json). Errors on a genuinely broken config
 /// (unparseable JSON) rather than copying it with secrets unredacted.
@@ -178,7 +265,8 @@ pub fn capture(agent: &Path, env: &Path, runtime: &str) -> Result<Report> {
     if rt != "claude-code" {
         return Ok(report);
     }
-    let dst = agent.join("harness").join(rt).join("project");
+    let slug = env_slug(env);
+    let dst = agent.join("harness").join(&slug).join(rt).join("project");
 
     // (source relative to env, destination name) for the two redacted JSON configs.
     for (src_rel, dst_name) in [(".mcp.json", "mcp.json"), (".claude/settings.json", "settings.json")] {
@@ -207,7 +295,7 @@ pub fn capture(agent: &Path, env: &Path, runtime: &str) -> Result<Report> {
     }
 
     if report.files > 0 {
-        write_manifest(agent, rt, &report)?;
+        write_manifest(agent, &slug, rt, env, &report)?;
     }
     Ok(report)
 }
@@ -265,19 +353,23 @@ fn copy_tree_scanned(src: &Path, dst: &Path, label: &str, report: &mut Report) -
     Ok(())
 }
 
-fn write_manifest(agent: &Path, rt: &str, report: &Report) -> Result<()> {
+fn write_manifest(agent: &Path, slug: &str, rt: &str, env: &Path, report: &Report) -> Result<()> {
     let redactions: Vec<Value> = report
         .redactions
         .iter()
         .map(|r| json!({ "file": r.file, "path": r.path, "hint": r.hint }))
         .collect();
+    // `env` and `captured_at` are what a user is shown when a harness is adopted from another
+    // checkout: the slug is lossy and orders nothing, so neither question is answerable without them.
     let manifest = json!({
         "runtime": rt,
         "scope": "project",
+        "env": env.to_string_lossy(),
+        "captured_at": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         "files": report.files,
         "redactions": redactions,
     });
-    let dir = agent.join("harness").join(rt);
+    let dir = agent.join("harness").join(slug).join(rt);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)? + "\n")?;
     Ok(())
@@ -287,43 +379,151 @@ fn write_manifest(agent: &Path, rt: &str, report: &Report) -> Result<()> {
 
 const PH_PREFIX: &str = "${AGIT_SECRET:";
 
-/// The runtimes with a harness captured in the store, alphabetically.
-pub fn captured_runtimes(agent: &Path) -> Vec<&'static str> {
+/// The runtimes this agent has a harness for, alphabetically — captured in THIS checkout or in any
+/// other. The union is deliberate: a runtime the agent only ever captured in another repo still
+/// resolves here, and without that `apply` could never adopt one, which is the point of a shared store.
+pub fn captured_runtimes(agent: &Path, env: &Path) -> Vec<&'static str> {
     crate::session::RUNTIMES
         .into_iter()
-        .filter(|rt| agent.join("harness").join(rt).join("project").is_dir())
+        .filter(|rt| own_partition(agent, env, rt).is_some() || !other_partitions(agent, env, rt).is_empty())
         .collect()
 }
 
-/// `agit harness show` — list what's captured in the local Agent Store.
-pub fn show(agent: &Path, runtime: &str) -> Result<i32> {
+/// `agit harness show` — what's captured in the local Agent Store. Once the store is shared, "the
+/// harness" has no single answer, so this reports this checkout's and every other checkout's: an agent
+/// carries all of them, and one it captured next door is exactly what a user is looking for here.
+pub fn show(agent: &Path, env: &Path, runtime: &str) -> Result<i32> {
     let rt = norm(runtime);
-    let src = agent.join("harness").join(&rt).join("project");
-    if !src.is_dir() {
-        println!("No captured harness for {rt}. Run `agit -a snap` to capture it.");
-        return Ok(0);
+    let own = own_partition(agent, env, &rt);
+    let others = other_partitions(agent, env, &rt);
+    match &own {
+        Some(p) => {
+            println!("Captured harness ({rt}, project scope) — this checkout, {}:", env.display());
+            let (servers, skills, commands, secrets) = summarize(p);
+            println!("  MCP servers : {servers}");
+            println!("  skills      : {skills}");
+            println!("  commands    : {commands}");
+            println!("  secrets     : {secrets} redacted field(s) to provide on apply");
+            println!("\n  Apply into this project: agit harness apply");
+        }
+        None if others.is_empty() => {
+            println!("No captured harness for {rt}. Run `agit -a snap` to capture it.");
+            return Ok(0);
+        }
+        // "nothing here" and "the agent has one" are both true, and printed as two flat statements they
+        // read as contradicting each other — a dead end announced directly above the thing it denies.
+        // One sentence, so the user reconciles nothing.
+        None => println!(
+            "Nothing captured in this checkout yet ({}) — but this agent carries a {rt} harness from elsewhere:",
+            env.display()
+        ),
     }
-    let (servers, skills, commands, secrets) = summarize(agent, &rt, &src);
-    println!("Captured harness ({rt}, project scope):");
-    println!("  MCP servers : {servers}");
-    println!("  skills      : {skills}");
-    println!("  commands    : {commands}");
-    println!("  secrets     : {secrets} redacted field(s) to provide on apply");
-    println!("\n  Apply into this project: agit harness apply");
+    if !others.is_empty() {
+        if own.is_some() {
+            println!("\nThis agent also has a {rt} harness from other checkouts:");
+        }
+        for p in &others {
+            let (servers, skills, commands, secrets) = summarize(p);
+            println!("  {} — {servers} MCP server(s), {skills} skill(s), {commands} command(s), {secrets} secret(s){}", p.label(), when(p));
+        }
+        println!(
+            "\n  {}",
+            match (own.is_some(), others.len()) {
+                (true, _) => "Adopt one instead of this checkout's: agit harness apply --from-env <checkout>".to_string(),
+                // several is a question apply will ask rather than guess, so name the flag that answers it
+                (false, 1) => "Adopt it here: agit harness apply    (the next snap gives this checkout its own)".to_string(),
+                (false, n) => format!("Adopt one of the {n} here: agit harness apply --from-env <checkout>"),
+            }
+        );
+    }
     Ok(0)
 }
 
-/// `agit harness apply` — union-merge the captured harness into the current project, asking first
+/// Pick the partition `apply` acts on. One candidate is an answer; several is a question, and agit asks
+/// it rather than guessing — recency is not intent, and adopting the wrong repo's config unasked is the
+/// ping-pong the design exists to prevent. `interactive` is passed in, not read from stdin here, so the
+/// choice is testable and so a non-TTY caller can never be left at a prompt.
+fn select(
+    own: Option<Partition>,
+    others: Vec<Partition>,
+    env: &Path,
+    from_env: Option<&str>,
+    rt: &str,
+    interactive: bool,
+) -> Result<Option<(Partition, bool)>> {
+    use std::io::{stdin, stdout, BufRead, Write};
+    if let Some(sel) = from_env {
+        let want = env_slug(Path::new(sel));
+        let all = own.into_iter().map(|p| (p, true)).chain(others.into_iter().map(|p| (p, false)));
+        for (p, is_own) in all {
+            if p.env.as_deref() == Some(sel) || p.slug.as_deref() == Some(sel) || p.slug.as_deref() == Some(want.as_str()) {
+                return Ok(Some((p, is_own)));
+            }
+        }
+        bail!("no {rt} harness captured in `{sel}`. `agit harness show` lists the checkouts that have one.");
+    }
+    // This checkout's own capture wins: it is the only candidate that is not another repo's config.
+    if let Some(p) = own {
+        return Ok(Some((p, true)));
+    }
+    match others.len() {
+        0 => Ok(None),
+        1 => Ok(Some((others.into_iter().next().unwrap(), false))),
+        _ => {
+            let labels: Vec<String> = others.iter().map(|p| p.label()).collect();
+            if !interactive {
+                bail!(
+                    "Nothing captured in this checkout ({}), and this agent captured a {rt} harness in {} others:\n  {}\n\
+                     Which of them this checkout should adopt is not agit's to guess — say which with --from-env <checkout>.",
+                    env.display(),
+                    others.len(),
+                    labels.join("\n  ")
+                );
+            }
+            println!("Nothing captured in this checkout ({}). This agent captured a {rt} harness in:", env.display());
+            for (i, p) in others.iter().enumerate() {
+                println!("  {}) {}{}", i + 1, p.label(), when(p));
+            }
+            print!("Adopt which? [1-{}]: ", others.len());
+            let _ = stdout().flush();
+            let mut line = String::new();
+            stdin().lock().read_line(&mut line).ok();
+            let pick = line.trim();
+            labels
+                .iter()
+                .position(|l| l == pick)
+                .or_else(|| pick.parse::<usize>().ok().filter(|n| (1..=others.len()).contains(n)).map(|n| n - 1))
+                .map(|i| Some((others.into_iter().nth(i).unwrap(), false)))
+                .ok_or_else(|| anyhow::anyhow!("no checkout picked; rerun with --from-env <checkout>"))
+        }
+    }
+}
+
+fn when(p: &Partition) -> String {
+    p.captured_at.as_deref().map(|t| format!(", captured {t}")).unwrap_or_default()
+}
+
+/// `agit harness apply` — union-merge a captured harness into the current project, asking first
 /// (decision 3) and resolving each redacted secret from its env var, else prompting at a TTY.
-pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool) -> Result<i32> {
+///
+/// WHICH harness, now that a store is shared: this checkout's own capture if it has one — restoring
+/// what was captured here is the only case that touches no other repo's config. Otherwise the harness
+/// another checkout captured, which is the point of carrying an agent between repos, and is ALWAYS
+/// announced: a config arriving from another repo unexplained is indistinguishable from a bug.
+pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool, from_env: Option<&str>) -> Result<i32> {
     use std::io::{stdin, stdout, IsTerminal, Write};
     let rt = norm(runtime);
-    let src = agent.join("harness").join(&rt).join("project");
-    if !src.is_dir() {
+    let own = own_partition(agent, env, &rt);
+    let others = other_partitions(agent, env, &rt);
+    let Some((chosen, is_own)) = select(own, others, env, from_env, &rt, stdin().is_terminal())? else {
         println!("No captured harness for {rt} to apply.");
         return Ok(0);
+    };
+    let src = chosen.project();
+    let (servers, skills, commands, secrets) = summarize(&chosen);
+    if !is_own {
+        println!("Adopting the harness this agent captured in {}{} — this checkout ({}) has none of its own.", chosen.label(), when(&chosen), env.display());
     }
-    let (servers, skills, commands, secrets) = summarize(agent, &rt, &src);
     println!("Captured harness ({rt}): {servers} MCP servers, {skills} skills, {commands} commands, {secrets} secret(s) to provide.");
 
     // Ask (decision 3): applying rewrites local .mcp.json / .claude — never silent.
@@ -383,7 +583,8 @@ fn norm(runtime: &str) -> String {
     }
 }
 
-fn summarize(agent: &Path, rt: &str, src: &Path) -> (usize, usize, usize, usize) {
+fn summarize(p: &Partition) -> (usize, usize, usize, usize) {
+    let src = p.project();
     let servers = std::fs::read_to_string(src.join("mcp.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -391,7 +592,7 @@ fn summarize(agent: &Path, rt: &str, src: &Path) -> (usize, usize, usize, usize)
         .unwrap_or(0);
     let skills = count_dirs(&src.join("skills"));
     let commands = count_files(&src.join("commands"));
-    let secrets = std::fs::read_to_string(agent.join("harness").join(rt).join("manifest.json"))
+    let secrets = std::fs::read_to_string(p.dir.join("manifest.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .and_then(|v| v.get("redactions").and_then(|r| r.as_array()).map(|a| a.len()))
@@ -643,5 +844,154 @@ mod tests {
         // the unresolved one keeps its placeholder
         assert!(v["env"]["MISS"].as_str().unwrap().starts_with(PH_PREFIX));
         std::env::remove_var("AGIT_TEST_TOKEN_XZ");
+    }
+
+    // ── partitioning: one store, many checkouts ──
+
+    fn with_mcp(dir: &Path, server: &str) {
+        std::fs::write(dir.join(".mcp.json"), format!(r#"{{"mcpServers":{{"{server}":{{"command":"{server}-srv"}}}}}}"#)).unwrap();
+    }
+
+    fn captured_mcp(store: &Path, env: &Path) -> String {
+        let p = own_partition(store, env, "claude-code").expect("checkout has no partition");
+        std::fs::read_to_string(p.project().join("mcp.json")).unwrap()
+    }
+
+    /// THE bug: one store shared by two checkouts. Under the flat `harness/<rt>/project` layout the
+    /// second capture silently overwrote the first checkout's MCP config, and told nobody.
+    #[test]
+    fn two_checkouts_capture_without_overwriting_each_other() {
+        let store = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let api = tempfile::tempdir().unwrap();
+        with_mcp(web.path(), "web");
+        with_mcp(api.path(), "api");
+
+        capture(store.path(), web.path(), "claude-code").unwrap();
+        capture(store.path(), api.path(), "claude-code").unwrap();
+
+        assert!(captured_mcp(store.path(), web.path()).contains("web-srv"));
+        assert!(!captured_mcp(store.path(), web.path()).contains("api-srv"), "api's capture clobbered web's");
+        assert!(captured_mcp(store.path(), api.path()).contains("api-srv"));
+        assert!(!captured_mcp(store.path(), api.path()).contains("web-srv"), "web's capture clobbered api's");
+
+        // each partition records the checkout it came from — the slug is lossy and names no one
+        let m = std::fs::read_to_string(
+            store.path().join("harness").join(env_slug(web.path())).join("claude-code/manifest.json"),
+        )
+        .unwrap();
+        let m: Value = serde_json::from_str(&m).unwrap();
+        assert_eq!(m["env"], json!(web.path().to_string_lossy()));
+        assert!(m["captured_at"].is_string());
+    }
+
+    /// A store written before the per-checkout layout keeps resolving forever: its files are never
+    /// moved, so a reader that only knew the new layout would report an existing harness as missing.
+    #[test]
+    fn flat_layout_store_still_resolves() {
+        let store = tempfile::tempdir().unwrap();
+        let env = tempfile::tempdir().unwrap();
+        let flat = store.path().join("harness/claude-code");
+        std::fs::create_dir_all(flat.join("project")).unwrap();
+        std::fs::write(flat.join("project/mcp.json"), r#"{"mcpServers":{"old":{"command":"old-srv"}}}"#).unwrap();
+        std::fs::write(
+            flat.join("manifest.json"),
+            r#"{"runtime":"claude-code","scope":"project","files":1,"redactions":[{"file":"mcp.json","path":"x","hint":"TOK"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(captured_runtimes(store.path(), env.path()), vec!["claude-code"]);
+        let found = other_partitions(store.path(), env.path(), "claude-code");
+        assert_eq!(found.len(), 1);
+        assert_eq!(summarize(&found[0]), (1, 0, 0, 1));
+        // a flat store records no checkout, so it is never claimed to be this one
+        assert!(own_partition(store.path(), env.path(), "claude-code").is_none());
+        assert!(found[0].label().contains("before agit partitioned"));
+    }
+
+    /// Adopting what the agent captured next door is the point of a shared store — and it is named,
+    /// because a config arriving from another repo unexplained looks exactly like a bug.
+    #[test]
+    fn apply_adopts_the_other_checkouts_harness_and_names_it() {
+        let store = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let api = tempfile::tempdir().unwrap();
+        with_mcp(web.path(), "web");
+        capture(store.path(), web.path(), "claude-code").unwrap();
+
+        let (chosen, is_own) = select(
+            own_partition(store.path(), api.path(), "claude-code"),
+            other_partitions(store.path(), api.path(), "claude-code"),
+            api.path(),
+            None,
+            "claude-code",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!is_own);
+        assert_eq!(chosen.label(), web.path().to_string_lossy());
+
+        assert_eq!(apply(store.path(), api.path(), "claude-code", true, None).unwrap(), 0);
+        assert!(std::fs::read_to_string(api.path().join(".mcp.json")).unwrap().contains("web-srv"));
+    }
+
+    #[test]
+    fn apply_prefers_this_checkouts_own_partition() {
+        let store = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let api = tempfile::tempdir().unwrap();
+        with_mcp(web.path(), "web");
+        with_mcp(api.path(), "api");
+        capture(store.path(), web.path(), "claude-code").unwrap();
+        capture(store.path(), api.path(), "claude-code").unwrap();
+
+        let (chosen, is_own) = select(
+            own_partition(store.path(), api.path(), "claude-code"),
+            other_partitions(store.path(), api.path(), "claude-code"),
+            api.path(),
+            None,
+            "claude-code",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(is_own);
+        assert_eq!(chosen.label(), api.path().to_string_lossy());
+    }
+
+    /// Several candidates is a real question with no right answer, so agit asks it. Non-interactive it
+    /// refuses and says what needed deciding, rather than hang or pick one.
+    #[test]
+    fn apply_will_not_guess_between_several_other_checkouts() {
+        let store = tempfile::tempdir().unwrap();
+        let web = tempfile::tempdir().unwrap();
+        let api = tempfile::tempdir().unwrap();
+        let docs = tempfile::tempdir().unwrap();
+        with_mcp(web.path(), "web");
+        with_mcp(api.path(), "api");
+        capture(store.path(), web.path(), "claude-code").unwrap();
+        capture(store.path(), api.path(), "claude-code").unwrap();
+
+        let pick = |from: Option<&str>| {
+            select(
+                own_partition(store.path(), docs.path(), "claude-code"),
+                other_partitions(store.path(), docs.path(), "claude-code"),
+                docs.path(),
+                from,
+                "claude-code",
+                false,
+            )
+        };
+        let err = pick(None).unwrap_err().to_string();
+        assert!(err.contains("--from-env"), "{err}");
+        assert!(err.contains(&*web.path().to_string_lossy()), "{err}");
+        assert!(err.contains(&*api.path().to_string_lossy()), "{err}");
+
+        // …and --from-env answers it without a prompt
+        let (chosen, is_own) = pick(Some(&web.path().to_string_lossy())).unwrap().unwrap();
+        assert!(!is_own);
+        assert_eq!(chosen.label(), web.path().to_string_lossy());
+        assert!(pick(Some("/no/such/checkout")).unwrap_err().to_string().contains("no claude-code harness captured"));
     }
 }
