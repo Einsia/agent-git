@@ -290,9 +290,7 @@ pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
     // command a new user is most likely to type never surfaced the `agit a import` path.
     if let Ok(env) = scope::env_root() {
         if crate::agent::legacy_store(&env).is_some() {
-            if let Err(e) = crate::agent::resolve(None) {
-                return Err(e);
-            }
+            crate::agent::resolve(None)?;
         }
     }
     // Validate an explicit runtime BEFORE any filesystem walk: `--from bogus` used to reach the

@@ -11,6 +11,9 @@
 //! unused in one of the bins, but pub items don't produce dead_code warnings; this is
 //! kept here to cover the few private helper items.
 
+
+// Pedantic markdown-in-doc-comment lint; the comment style here is deliberate.
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 #![allow(dead_code)]
 
 pub mod adapter;

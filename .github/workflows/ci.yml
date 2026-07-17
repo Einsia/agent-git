@@ -3,7 +3,8 @@ name: CI
 # Continuous integration for the `agit` workspace (two binaries: `agit`, `agit-hub`).
 #
 # Every command below was run locally against this tree before this file was committed and each
-# exited 0 (clippy exits 0 because it is deliberately NOT run with `-D warnings` yet — see the job).
+# exited 0. clippy is a BLOCKING gate (`-D warnings`); rustfmt is report-only because the codebase
+# has an established hand-formatting no rustfmt config reproduces (see the fmt job).
 #
 # Toolchain: the repo pins `stable` (+ rustfmt, clippy) in rust-toolchain.toml, which the runner's
 # preinstalled rustup honors automatically. We still `rustup component add` explicitly so the
@@ -63,7 +64,7 @@ jobs:
           fi
 
   clippy:
-    name: clippy (report-only)
+    name: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -71,12 +72,11 @@ jobs:
       - name: Install Rust components
         run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
-      # TODO: tighten to `-D warnings` once the clippy-clean task lands. The tree currently carries
-      # ~27 cosmetic clippy warnings that THIS workflow is not permitted to fix (another agent owns
-      # that). We run clippy WITHOUT `-D warnings` so it reports the warnings but does not fail the
-      # job. When the cleanup merges, append `-- -D warnings` to the command below.
-      - name: clippy (non-blocking; NOT -D warnings yet)
-        run: cargo clippy --workspace --all-targets
+      # BLOCKING: the tree is clippy-clean (`-D warnings` exits 0). Two pedantic doc-comment lints
+      # (doc_overindented_list_items, doc_lazy_continuation) are allowed at each crate root — the
+      # comment style there is deliberate, and they are formatting, not correctness.
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   hub-e2e:
     name: hub e2e (demo/hub-e2e.sh)

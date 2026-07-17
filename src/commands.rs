@@ -57,11 +57,11 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
         // and the working tree is then reverted to a clean version (git add -p / editing the transcript to strip the secret after staging), the secret still lands in the repo.
         // `-z` separates with NUL and does no octal quoting, so filenames with special characters aren't missed either.
         let (_, out) = scope::git_in_status(
-            &root,
+            root,
             &["diff", "--cached", "--name-only", "-z", "--diff-filter=ACM"],
         );
         for name in out.split('\0').filter(|s| !s.is_empty()) {
-            let (code, content) = scope::git_in_status(&root, &["show", &format!(":{name}")]);
+            let (code, content) = scope::git_in_status(root, &["show", &format!(":{name}")]);
             if code != 0 {
                 continue; // can't extract this blob (very rare), skip rather than abort
             }
@@ -77,7 +77,7 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
     } else {
         // Scan EVERY file in the Agent Store: an extension gate skipped .env/.pem/.key/.sh/.yaml and
         // extensionless files, which hold secrets just as well. Binaries are detected by content in scan_file.
-        WalkDir::new(&root)
+        WalkDir::new(root)
             .into_iter()
             .filter_entry(|e| e.file_name() != ".git")
             .filter_map(|e| e.ok())
@@ -90,7 +90,7 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
         if !t.exists() {
             continue;
         }
-        let rel = t.strip_prefix(&root).unwrap_or(t).display().to_string();
+        let rel = t.strip_prefix(root).unwrap_or(t).display().to_string();
         report(&rel, scan::scan_file_allow(t, &allow)?);
     }
 
@@ -618,9 +618,7 @@ fn record_launch_at(home: &Path, l: &Launch) -> Result<()> {
 fn lookup_launch_at(home: &Path, session: &str) -> Option<Launch> {
     let text = std::fs::read_to_string(launches_file(home)).ok()?;
     text.lines()
-        .filter_map(|l| serde_json::from_str::<Launch>(l.trim()).ok())
-        .filter(|l| l.session == session)
-        .next_back()
+        .filter_map(|l| serde_json::from_str::<Launch>(l.trim()).ok()).rfind(|l| l.session == session)
 }
 
 /// Write the launch record. Called by `start` BEFORE the runtime is exec'd: a session captured before

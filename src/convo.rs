@@ -54,6 +54,7 @@ pub enum EventKind {
 
 /// convert options.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct ConvertOpts {
     /// Override the target conversation's cwd (decides which project resume lands in). Defaults to the source cwd.
     pub cwd: Option<String>,
@@ -61,11 +62,6 @@ pub struct ConvertOpts {
     pub new_id: String,
 }
 
-impl Default for ConvertOpts {
-    fn default() -> Self {
-        ConvertOpts { cwd: None, new_id: String::new() }
-    }
-}
 
 /// Normalize the runtime name (aligned with adapter::get's keys).
 pub fn normalize_runtime(rt: &str) -> &'static str {
@@ -143,98 +139,6 @@ pub fn truncate(s: &str, n: usize) -> String {
     } else {
         let t: String = s.chars().take(n).collect();
         format!("{t}…[truncated]")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const CLAUDE_SRC: &str = "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"cwd\":\"/p\",\"gitBranch\":\"main\",\"message\":{\"role\":\"user\",\"content\":\"HELLO_PROMPT\"}}\n{\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"SECRETSIG\"},{\"type\":\"text\",\"text\":\"WORLD_REPLY\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"cargo test\"}}]}}\n";
-
-    #[test]
-    fn swap_path_rewrites_only_at_boundaries() {
-        let t = r#"{"cwd":"/a/app","cmd":"cd /a/app && ls","f":"/a/app/src/x.ts","other":"/a/application/y","bak":"/a/app.bak"}"#;
-        let out = swap_path(t, "/a/app", "/b/proj");
-        assert!(out.contains(r#""cwd":"/b/proj""#));
-        assert!(out.contains("cd /b/proj && ls")); // embedded in a larger string — swap_quoted misses this
-        assert!(out.contains("/b/proj/src/x.ts"));
-        // must NOT clobber a longer, different path
-        assert!(out.contains("/a/application/y"), "{out}");
-        assert!(out.contains("/a/app.bak"), "{out}");
-    }
-
-    #[test]
-    fn proper_name_is_branch_slug_plus_stable_hash() {
-        let n = proper_name(Some("feature/Login-Rate"), "seed-content");
-        assert!(n.starts_with("feature-login-rate-"), "{n}");
-        assert_eq!(n.len(), "feature-login-rate-".len() + 6);
-        // stable for the same seed
-        assert_eq!(proper_name(Some("feature/Login-Rate"), "seed-content"), n);
-        // different seed → different suffix
-        assert_ne!(proper_name(Some("feature/Login-Rate"), "other"), n);
-        // no branch → "session-…"
-        assert!(proper_name(None, "x").starts_with("session-"));
-        // peek_branch reads claude gitBranch
-        assert_eq!(peek_branch(CLAUDE_SRC).as_deref(), Some("main"));
-    }
-
-    #[test]
-    fn claude_to_codex_preserves_visible_drops_reasoning() {
-        let opts = ConvertOpts { cwd: None, new_id: "NEWID".into() };
-        let ir = read_conversation("claude-code", CLAUDE_SRC).unwrap();
-        let out = write_conversation("codex", &ir, &opts).unwrap();
-        // visible content survives the cross-vendor hop
-        assert!(out.contains("HELLO_PROMPT"));
-        assert!(out.contains("WORLD_REPLY"));
-        assert!(out.contains("cargo test"), "tool narrated: {out}");
-        // fresh id in session_meta; encrypted reasoning dropped
-        assert!(out.contains("NEWID"));
-        assert!(!out.contains("SECRETSIG"), "encrypted reasoning must not carry over");
-        // re-read the codex output → the prompt is recoverable
-        let ir2 = read_conversation("codex", &out).unwrap();
-        let prompts: Vec<String> = ir2
-            .events
-            .iter()
-            .flat_map(|e| &e.kinds)
-            .filter_map(|k| if let EventKind::UserPrompt(s) = k { Some(s.clone()) } else { None })
-            .collect();
-        assert!(prompts.iter().any(|p| p == "HELLO_PROMPT"), "{prompts:?}");
-    }
-
-    #[test]
-    fn convert_refuses_source_with_no_turns() {
-        let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("rollout.jsonl");
-        // only a session_meta, no turns
-        std::fs::write(&f, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"S1\",\"cwd\":\"/p\"}}\n").unwrap();
-        let opts = ConvertOpts { cwd: None, new_id: "N".into() };
-        let err = convert(&f, "codex", "claude-code", &opts).unwrap_err();
-        assert!(err.to_string().contains("rebuild"), "{err}");
-    }
-
-    #[test]
-    fn swap_quoted_anchors_and_guards() {
-        // exact quoted value is replaced
-        assert_eq!(swap_quoted("{\"cwd\":\"/a/app\"}", "/a/app", "/a/x"), "{\"cwd\":\"/a/x\"}");
-        // a path that merely has old as a PREFIX must NOT be corrupted (the confirmed bug)
-        assert_eq!(
-            swap_quoted("{\"p\":\"/a/application/f\"}", "/a/app", "/a/x"),
-            "{\"p\":\"/a/application/f\"}"
-        );
-        // empty old → no-op (no replace("",…) between-every-char explosion)
-        assert_eq!(swap_quoted("{\"a\":\"b\"}", "", "/x"), "{\"a\":\"b\"}");
-        // old == new → no-op
-        assert_eq!(swap_quoted("x", "a", "a"), "x");
-    }
-
-    #[test]
-    fn fresh_id_is_uuid_shaped_and_unique() {
-        let a = fresh_id("x");
-        let b = fresh_id("y");
-        assert_ne!(a, b);
-        let parts: Vec<&str> = a.split('-').collect();
-        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
     }
 }
 
@@ -362,4 +266,96 @@ pub fn fresh_id(salt: &str) -> String {
         &hex[17..20],
         &hex[20..32]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLAUDE_SRC: &str = "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"cwd\":\"/p\",\"gitBranch\":\"main\",\"message\":{\"role\":\"user\",\"content\":\"HELLO_PROMPT\"}}\n{\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"SECRETSIG\"},{\"type\":\"text\",\"text\":\"WORLD_REPLY\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"cargo test\"}}]}}\n";
+
+    #[test]
+    fn swap_path_rewrites_only_at_boundaries() {
+        let t = r#"{"cwd":"/a/app","cmd":"cd /a/app && ls","f":"/a/app/src/x.ts","other":"/a/application/y","bak":"/a/app.bak"}"#;
+        let out = swap_path(t, "/a/app", "/b/proj");
+        assert!(out.contains(r#""cwd":"/b/proj""#));
+        assert!(out.contains("cd /b/proj && ls")); // embedded in a larger string — swap_quoted misses this
+        assert!(out.contains("/b/proj/src/x.ts"));
+        // must NOT clobber a longer, different path
+        assert!(out.contains("/a/application/y"), "{out}");
+        assert!(out.contains("/a/app.bak"), "{out}");
+    }
+
+    #[test]
+    fn proper_name_is_branch_slug_plus_stable_hash() {
+        let n = proper_name(Some("feature/Login-Rate"), "seed-content");
+        assert!(n.starts_with("feature-login-rate-"), "{n}");
+        assert_eq!(n.len(), "feature-login-rate-".len() + 6);
+        // stable for the same seed
+        assert_eq!(proper_name(Some("feature/Login-Rate"), "seed-content"), n);
+        // different seed → different suffix
+        assert_ne!(proper_name(Some("feature/Login-Rate"), "other"), n);
+        // no branch → "session-…"
+        assert!(proper_name(None, "x").starts_with("session-"));
+        // peek_branch reads claude gitBranch
+        assert_eq!(peek_branch(CLAUDE_SRC).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn claude_to_codex_preserves_visible_drops_reasoning() {
+        let opts = ConvertOpts { cwd: None, new_id: "NEWID".into() };
+        let ir = read_conversation("claude-code", CLAUDE_SRC).unwrap();
+        let out = write_conversation("codex", &ir, &opts).unwrap();
+        // visible content survives the cross-vendor hop
+        assert!(out.contains("HELLO_PROMPT"));
+        assert!(out.contains("WORLD_REPLY"));
+        assert!(out.contains("cargo test"), "tool narrated: {out}");
+        // fresh id in session_meta; encrypted reasoning dropped
+        assert!(out.contains("NEWID"));
+        assert!(!out.contains("SECRETSIG"), "encrypted reasoning must not carry over");
+        // re-read the codex output → the prompt is recoverable
+        let ir2 = read_conversation("codex", &out).unwrap();
+        let prompts: Vec<String> = ir2
+            .events
+            .iter()
+            .flat_map(|e| &e.kinds)
+            .filter_map(|k| if let EventKind::UserPrompt(s) = k { Some(s.clone()) } else { None })
+            .collect();
+        assert!(prompts.iter().any(|p| p == "HELLO_PROMPT"), "{prompts:?}");
+    }
+
+    #[test]
+    fn convert_refuses_source_with_no_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("rollout.jsonl");
+        // only a session_meta, no turns
+        std::fs::write(&f, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"S1\",\"cwd\":\"/p\"}}\n").unwrap();
+        let opts = ConvertOpts { cwd: None, new_id: "N".into() };
+        let err = convert(&f, "codex", "claude-code", &opts).unwrap_err();
+        assert!(err.to_string().contains("rebuild"), "{err}");
+    }
+
+    #[test]
+    fn swap_quoted_anchors_and_guards() {
+        // exact quoted value is replaced
+        assert_eq!(swap_quoted("{\"cwd\":\"/a/app\"}", "/a/app", "/a/x"), "{\"cwd\":\"/a/x\"}");
+        // a path that merely has old as a PREFIX must NOT be corrupted (the confirmed bug)
+        assert_eq!(
+            swap_quoted("{\"p\":\"/a/application/f\"}", "/a/app", "/a/x"),
+            "{\"p\":\"/a/application/f\"}"
+        );
+        // empty old → no-op (no replace("",…) between-every-char explosion)
+        assert_eq!(swap_quoted("{\"a\":\"b\"}", "", "/x"), "{\"a\":\"b\"}");
+        // old == new → no-op
+        assert_eq!(swap_quoted("x", "a", "a"), "x");
+    }
+
+    #[test]
+    fn fresh_id_is_uuid_shaped_and_unique() {
+        let a = fresh_id("x");
+        let b = fresh_id("y");
+        assert_ne!(a, b);
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+    }
 }

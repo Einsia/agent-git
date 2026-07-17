@@ -249,8 +249,8 @@ pub fn parse_rollout(text: &str, fallback_id: &str) -> SessionIR {
                     _ => {}
                 }
             }
-            "response_item" => {
-                if p.and_then(|p| p.get("type")).and_then(|v| v.as_str()) == Some("function_call") {
+            "response_item"
+                if p.and_then(|p| p.get("type")).and_then(|v| v.as_str()) == Some("function_call") => {
                     ir.tool_uses += 1;
                     let name = p.and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("");
                     if matches!(name, "shell" | "local_shell" | "shell_command" | "exec_command") {
@@ -261,7 +261,6 @@ pub fn parse_rollout(text: &str, fallback_id: &str) -> SessionIR {
                         }
                     }
                 }
-            }
             _ => {}
         }
     }
@@ -434,8 +433,8 @@ pub fn read_conversation(text: &str) -> ConversationIR {
                         _ => {}
                     }
                 }
-                "response_item" => {
-                    if p.and_then(|p| p.get("type")).and_then(|v| v.as_str()) == Some("function_call") {
+                "response_item"
+                    if p.and_then(|p| p.get("type")).and_then(|v| v.as_str()) == Some("function_call") => {
                         let name = p.and_then(|p| p.get("name")).and_then(|v| v.as_str()).unwrap_or("");
                         if matches!(name, "shell" | "local_shell" | "shell_command" | "exec_command") {
                             let args = p.and_then(|p| p.get("arguments")).and_then(|v| v.as_str()).unwrap_or("");
@@ -448,7 +447,6 @@ pub fn read_conversation(text: &str) -> ConversationIR {
                             }
                         }
                     }
-                }
                 _ => {}
             }
         }

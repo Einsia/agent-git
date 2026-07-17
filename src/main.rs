@@ -12,6 +12,9 @@
 //! `agent`/`a` is a subcommand rather than a flag precisely so those two cannot be transposed. `-a` survives
 //! as a silent deprecated alias while the docs, demo scripts and install-shadow.sh still say it.
 
+
+// Pedantic markdown-in-doc-comment lint; the comment style here is deliberate.
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 // Core logic lives in the lib (crate `agit`), shared with agit-hub, so the two bins don't each write their own parsing and drift apart.
 use agit::scope::{self, Scope};
 use agit::{commands, harness, init, passthrough, session, sync, ui};

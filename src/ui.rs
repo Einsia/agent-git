@@ -447,7 +447,7 @@ mod tests {
     fn styling_inside_a_cell_does_not_skew_the_column() {
         let rows = vec![vec![format!("{ACCENT}running{RESET}"), "11".into()], vec!["idle".into(), "2".into()]];
         let t = table_with(true, &["STATUS", "N"], &rows);
-        let seen: Vec<String> = t.lines().map(|l| strip_ansi(l)).collect();
+        let seen: Vec<String> = t.lines().map(strip_ansi).collect();
         assert_eq!(seen, vec!["STATUS   N", "running  11", "idle     2"], "raw: {t:?}");
     }
 

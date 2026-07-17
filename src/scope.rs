@@ -140,6 +140,22 @@ pub fn git_in_status(root: &Path, args: &[&str]) -> (i32, String) {
     }
 }
 
+/// Inherited-stdio variant: git's progress, interactive credential prompts, and real stderr all go straight to the terminal.
+/// Remote operations (clone/fetch) must use this -- capturing stdout would swallow git's error messages and also block credential input.
+pub fn git_in_inherit(root: &Path, args: &[&str]) -> i32 {
+    use std::process::Stdio;
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map(|s| s.code().unwrap_or(-1))
+        .unwrap_or(-1)
+}
+
 #[cfg(test)]
 mod agit_home_tests {
     use super::agit_home_from;
@@ -171,20 +187,4 @@ mod agit_home_tests {
             "no $AGIT_HOME and no $HOME must fail loudly, not yield a relative path"
         );
     }
-}
-
-/// Inherited-stdio variant: git's progress, interactive credential prompts, and real stderr all go straight to the terminal.
-/// Remote operations (clone/fetch) must use this -- capturing stdout would swallow git's error messages and also block credential input.
-pub fn git_in_inherit(root: &Path, args: &[&str]) -> i32 {
-    use std::process::Stdio;
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map(|s| s.code().unwrap_or(-1))
-        .unwrap_or(-1)
 }

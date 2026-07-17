@@ -27,6 +27,9 @@
 //!   - Passwords use argon2id (salted), not sha256. Tokens are stored as sha256 digests only.
 //!   - The real IP behind a proxy honours X-Forwarded-For only after an explicit `--trusted-proxy`.
 
+
+// Pedantic markdown-in-doc-comment lint; the comment style here is deliberate.
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
@@ -88,7 +91,7 @@ fn cursor_encode(key: &str) -> String {
 }
 
 fn cursor_decode(c: &str) -> Option<String> {
-    if c.is_empty() || !c.is_ascii() || c.len() % 2 != 0 || c.len() > 512 {
+    if c.is_empty() || !c.is_ascii() || !c.len().is_multiple_of(2) || c.len() > 512 {
         return None;
     }
     let bytes: Option<Vec<u8>> = (0..c.len()).step_by(2).map(|i| u8::from_str_radix(&c[i..i + 2], 16).ok()).collect();
@@ -2306,7 +2309,7 @@ fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
 
     let items: Vec<serde_json::Value> = window
         .iter()
-        .filter_map(|n| {
+        .map(|n| {
             let meta = ctx.store.agent_or_unowned(n);
             let repo = repo_path(ctx.root(), n);
             let (count, when, subject) = if has_head(&repo) {
@@ -2316,7 +2319,7 @@ fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
                 (0, String::new(), String::new())
             };
             let (aid, aid_source) = agent_aid(&repo);
-            Some(serde_json::json!({
+            serde_json::json!({
                 "name": n,
                 "aid": aid,
                 "aid_source": aid_source,
@@ -2330,7 +2333,7 @@ fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
                 "stars": meta.stars.len(),
                 "starred": caller.user.as_ref().is_some_and(|u| meta.stars.contains(u)),
                 "role": effective_role(caller, &meta),
-            }))
+            })
         })
         .collect();
     Resp::json(serde_json::json!({
@@ -3940,7 +3943,7 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
             if key.eq_ignore_ascii_case("status") {
-                status = v.trim().split_whitespace().next().and_then(|c| c.parse().ok()).unwrap_or(200);
+                status = v.split_whitespace().next().and_then(|c| c.parse().ok()).unwrap_or(200);
                 continue;
             }
             if key.eq_ignore_ascii_case("content-length") {

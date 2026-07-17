@@ -1177,7 +1177,7 @@ fn session_branches(jsonl: &str) -> Vec<String> {
 
 fn branch_tip(env: &Path, b: &str) -> Option<String> {
     let (rc, sha) = scope::git_in_status(env, &["rev-parse", "--verify", "--quiet", b]);
-    (rc == 0 && !sha.is_empty()).then(|| sha)
+    (rc == 0 && !sha.is_empty()).then_some(sha)
 }
 
 fn git_diff(env: &Path, from: &str, to: &str) -> String {
