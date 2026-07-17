@@ -755,6 +755,156 @@ pub fn latest_session(store: &Path) -> Option<StoredSession> {
     store_sessions(store).into_iter().max_by_key(|s| (s.last_activity, s.mtime))
 }
 
+// ─────────────────────── ahead/behind — one implementation, shared by status/pull/fetch ───────────────────────
+
+/// How the store's HEAD stands against its tracked upstream: `(ahead, behind)` — the commits HEAD has
+/// that the upstream lacks, and the commits the upstream has that HEAD lacks. `None` when there is no
+/// resolvable upstream to compare against (a store with no tracking branch, e.g. never pushed).
+///
+/// The ONE ahead/behind primitive: `agit a status` reads it for its summary, `diverged` derives the
+/// pull/merge decision from it, and both go through `scope::git_in_status` so a missing upstream is a
+/// clean `None`, never a hard error.
+pub fn ahead_behind(store: &Path) -> Option<(u64, u64)> {
+    let (code, out) =
+        scope::git_in_status(store, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]);
+    if code != 0 {
+        return None;
+    }
+    // `--left-right --count @{u}...HEAD` prints "<behind>\t<ahead>": the left side is the upstream.
+    let mut counts = out.split_whitespace().filter_map(|s| s.parse::<u64>().ok());
+    let behind = counts.next()?;
+    let ahead = counts.next()?;
+    Some((ahead, behind))
+}
+
+/// True when HEAD and its upstream each hold commits the other does not — the one case a fast-forward
+/// cannot cover and a textual merge must not. An absent or unresolvable upstream is not "diverged".
+///
+/// Promoted out of `main.rs` so `agit a pull`, `agit a fetch` and `agit a status` share the single
+/// `ahead_behind` above rather than each reimplementing the rev-list.
+pub fn diverged(store: &Path) -> bool {
+    matches!(ahead_behind(store), Some((ahead, behind)) if ahead > 0 && behind > 0)
+}
+
+/// Best-effort summary of the sessions on the tracked upstream that HEAD does not yet have. Silent if
+/// there is no upstream to compare against (a fetch with an explicit refspec and no tracking branch).
+///
+/// Promoted out of `main.rs` alongside `diverged` so `agit a fetch` and any other session-aware reader
+/// narrate incoming work the same way.
+pub fn report_incoming(store: &Path) {
+    let (code, out) = scope::git_in_status(
+        store,
+        &["diff", "--name-only", "--diff-filter=A", "HEAD..@{u}", "--", "sessions"],
+    );
+    if code != 0 {
+        return;
+    }
+    let new: Vec<&str> = out.lines().filter(|l| l.ends_with(".jsonl")).collect();
+    if new.is_empty() {
+        println!("  up to date — no new sessions on the remote.");
+        return;
+    }
+    // Break the count down per runtime by asking the registry which runtimes exist, not by naming any
+    // — a new adapter shows up here for free.
+    let breakdown: Vec<String> = crate::adapter::names()
+        .iter()
+        .filter_map(|rt| {
+            let n = new.iter().filter(|f| f.contains(&format!("/{rt}/"))).count();
+            (n > 0).then(|| format!("{rt}: {n}"))
+        })
+        .collect();
+    let suffix = if breakdown.is_empty() { String::new() } else { format!(" ({})", breakdown.join(", ")) };
+    println!("  {} new session(s) on the remote{suffix}.", new.len());
+    println!("  integrate with: agit a pull");
+}
+
+// ─────────────────────── status: this repo's agents at a glance ───────────────────────
+
+/// A one-line summary of the active store's position against its upstream, for `agit a status`.
+fn upstream_line(store: &Path) -> String {
+    match ahead_behind(store) {
+        None => "no upstream yet — agit a push to publish".to_string(),
+        Some((0, 0)) => "up to date with the remote".to_string(),
+        Some((ahead, 0)) => format!("{ahead} unpushed — agit a push to publish"),
+        Some((0, behind)) => format!("{behind} behind — agit a pull to integrate"),
+        Some((ahead, behind)) => {
+            format!("{ahead} ahead, {behind} behind — diverged; agit a merge to reconcile")
+        }
+    }
+}
+
+/// `agit a status` — a per-repo overview: which agents this repo works with (from the committed
+/// binding), which one is active here, each one's session count and last activity, whether a watcher is
+/// live for it, and where the active store stands against its remote.
+///
+/// Read-only and resilient: a bound agent this machine has not cloned is shown as such rather than
+/// erroring, and the integrity check that `resolve` runs is allowed to fail softly (the overview still
+/// lists the rest).
+pub fn agent_status() -> Result<i32> {
+    let env = scope::env_root()?;
+    let binding = agent::Binding::load(&env)?;
+    let local = agent::list().unwrap_or_default();
+    // The active agent as commands actually resolve it (pointer → $AGIT_AGENT → default). `ok()` so a
+    // recreated-remote integrity error never blanks the whole overview.
+    let resolved = agent::resolve(None).ok();
+    let active_aid = resolved.as_ref().map(|a| a.aid.clone());
+
+    println!("{}", ui::dim(&format!("repo {}", ui::tilde(&env))));
+
+    // The agents this repo works with = the committed binding; fall back to the resolved active agent
+    // when there is no binding yet (a repo that only ran `agit a init` before this landed).
+    let bound: Vec<(String, String)> = match &binding {
+        Some(b) if !b.agents.is_empty() => {
+            b.agents.iter().map(|e| (e.name.clone(), e.id.clone())).collect()
+        }
+        _ => match &resolved {
+            Some(a) => vec![(a.name.clone(), a.aid.clone())],
+            None => {
+                println!("no agents bound to this repo — agit a init <name> mints one.");
+                return Ok(0);
+            }
+        },
+    };
+
+    let rows: Vec<Vec<String>> = bound
+        .iter()
+        .map(|(name, aid)| {
+            let store = local.iter().find(|a| &a.aid == aid).map(|a| a.store.clone());
+            let (status, sessions, last) = match &store {
+                Some(store) => {
+                    let sessions = store_sessions(store);
+                    let status = match crate::session::watching_pid(aid) {
+                        Some(_) => ui::accent("● watching"),
+                        None => ui::dim("·").to_string(),
+                    };
+                    let last = sessions
+                        .iter()
+                        .map(|s| s.recency())
+                        .max()
+                        .map(ui::ago)
+                        .unwrap_or_else(|| "—".into());
+                    (status, sessions.len().to_string(), last)
+                }
+                None => (ui::dim("not cloned").to_string(), "—".into(), "—".into()),
+            };
+            let here = if Some(aid) == active_aid.as_ref() { "  (active)" } else { "" };
+            vec![name.clone(), status, sessions, format!("{last}{here}")]
+        })
+        .collect();
+    println!("{}", ui::table(&["AGENT", "STATUS", "SESSIONS", "LAST"], &rows));
+
+    if let Some(d) = binding.as_ref().and_then(|b| b.default.clone()) {
+        println!("{}", ui::dim(&format!("default: {d}")));
+    }
+
+    // Where the active store stands against its remote — the unpushed/ahead-behind the overview exists
+    // to surface. Only for a cloned active agent (a store to ask git about).
+    if let Some(a) = resolved.as_ref().filter(|a| a.store.join(".git").exists()) {
+        println!("\n{} {}", ui::bold(&a.name), ui::dim(&upstream_line(&a.store)));
+    }
+    Ok(0)
+}
+
 /// Where a stored session came from, and what it was about — the two things the `start` header carries
 /// beyond the agent's own name (§11c).
 ///

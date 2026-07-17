@@ -356,15 +356,19 @@ fn clone_is_gits_clone_and_works_outside_a_repo() {
 // ─────────────────── `agit a` — the subcommand that replaces `-a` ───────────────────
 
 /// The whole point of the subcommand: `agit a <git-verb>` reaches the store exactly as `agit -a` did.
+///
+/// `log` is now session-aware by default, so this routes through the `--raw` escape hatch — which is
+/// the thing being guarded here: that `agit a <git-verb>` still reaches the STORE's git (its history),
+/// not the code repo's. `--raw` drops the flag and hands the rest to real git passthrough.
 #[test]
 fn agit_a_subcommand_runs_git_on_the_agent_store() {
     let r = Repo::new();
     for verb in ["a", "agent"] {
-        let (code, out, err) = r.agit(&[verb, "log", "-1", "--format=%s"]);
-        assert_eq!(code, 0, "`agit {verb} log` should reach the store: {err}");
+        let (code, out, err) = r.agit(&[verb, "log", "--raw", "-1", "--format=%s"]);
+        assert_eq!(code, 0, "`agit {verb} log --raw` should reach the store: {err}");
         assert!(
             out.contains("agit: mint agent"),
-            "`agit {verb} log` should show the store's history, not the code repo's: {out}"
+            "`agit {verb} log --raw` should show the store's history, not the code repo's: {out}"
         );
     }
 }
@@ -427,8 +431,10 @@ fn management_verbs_are_a_closed_set_and_never_reach_git() {
 #[test]
 fn dash_a_remains_a_silent_deprecated_alias() {
     let r = Repo::new();
-    let (code, out, err) = r.agit(&["-a", "log", "-1", "--format=%s"]);
-    assert_eq!(code, 0, "`agit -a log` must keep working: {err}");
+    // `log --raw` is the passthrough escape hatch (log is session-aware by default); the alias must
+    // route it to the STORE's git just like `agit a`.
+    let (code, out, err) = r.agit(&["-a", "log", "--raw", "-1", "--format=%s"]);
+    assert_eq!(code, 0, "`agit -a log --raw` must keep working: {err}");
     assert!(out.contains("agit: mint agent"), "{out}");
     assert!(!err.to_lowercase().contains("deprecat"), "the alias must print nothing yet: {err}");
 }
@@ -860,4 +866,191 @@ fn a_rebind_new_id_with_a_bad_name_errors_and_leaves_the_active_agent_alone() {
     assert_eq!(after, before, "the active agent's store must not have moved");
     assert_eq!(after.file_name().unwrap().to_str().unwrap(), aid_before, "its aid must be unchanged");
     assert!(before.exists(), "the original store must still exist");
+}
+
+// ─────────────────────── `agit a status` — the per-repo overview ───────────────────────
+
+/// `agit a status` names this repo's agents, marks the active one, and reports where the active store
+/// stands against its remote — no upstream yet, then unpushed after a local commit.
+#[test]
+fn a_status_lists_this_repos_agents_and_the_active_stores_upstream_position() {
+    let r = Repo::new();
+
+    let (code, out, err) = r.agit(&["a", "status"]);
+    assert_eq!(code, 0, "status must succeed: {err}");
+    assert!(out.contains("AGENT") && out.contains("SESSIONS"), "renders the overview table: {out}");
+    assert!(out.contains("testmemory"), "names this repo's agent: {out}");
+    assert!(out.contains("(active)"), "marks which agent is active here: {out}");
+    assert!(out.contains("no upstream"), "a store never pushed has no upstream to report: {out}");
+
+    // Give the store a real upstream, push, then make a local commit it hasn't pushed.
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    let hub = hub_path.to_str().unwrap();
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub]).0, 0, "remote add");
+    assert_eq!(r.agit(&["a", "push", "-u", "origin", "main"]).0, 0, "initial push");
+    r.git_agent(&["commit", "--allow-empty", "--no-verify", "-m", "local work"]);
+
+    let (code, out, err) = r.agit(&["a", "status"]);
+    assert_eq!(code, 0, "status must succeed with an upstream: {err}");
+    assert!(out.contains("unpushed"), "status surfaces the unpushed commit (ahead of origin): {out}");
+}
+
+// ─────────────────────── session-aware `agit a log` / `agit a diff` ───────────────────────
+
+/// A minimal Claude transcript carrying a real user prompt, an `Edit` tool call, and a timestamp (so
+/// recency ordering is deterministic).
+fn session_with(prompt: &str, edit_file: &str, ts: &str) -> String {
+    format!(
+        "{{\"type\":\"user\",\"sessionId\":\"s\",\"uuid\":\"u1\",\"timestamp\":\"{ts}\",\"cwd\":\"/code/web\",\"message\":{{\"role\":\"user\",\"content\":\"{prompt}\"}}}}\n\
+         {{\"type\":\"assistant\",\"sessionId\":\"s\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"timestamp\":\"{ts}\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Edit\",\"input\":{{\"file_path\":\"{edit_file}\"}}}}]}}}}\n"
+    )
+}
+
+/// `agit a log` renders the SESSION timeline (prompt gist + tool activity, most recent first), not the
+/// store's git history — and `--raw` is the escape hatch back to `git log`.
+#[test]
+fn a_log_renders_the_session_timeline_and_raw_falls_back_to_git() {
+    let r = Repo::new();
+    r.write_agent(
+        "sessions/claude-code/older.jsonl",
+        &session_with("build the login form", "/code/web/login.rs", "2026-07-10T09:00:00Z"),
+    );
+    r.write_agent(
+        "sessions/claude-code/newer.jsonl",
+        &session_with("add a rate limiter", "/code/web/limit.rs", "2026-07-16T09:00:00Z"),
+    );
+
+    let (code, out, err) = r.agit(&["a", "log"]);
+    assert_eq!(code, 0, "the session-aware log must succeed: {err}");
+    assert!(out.contains("build the login form"), "shows a session's opening prompt: {out}");
+    assert!(out.contains("add a rate limiter"), "shows the other session's prompt: {out}");
+    assert!(out.contains("tool call"), "summarizes tool activity: {out}");
+    assert!(out.contains("edited"), "names the edited file(s): {out}");
+    assert!(!out.contains("agit: mint agent"), "the session view is NOT the store's git log: {out}");
+    // Most recent first: the newer session's prompt appears before the older one's.
+    let newer = out.find("add a rate limiter").unwrap();
+    let older = out.find("build the login form").unwrap();
+    assert!(newer < older, "sessions must be listed most-recent first: {out}");
+
+    // The escape hatch: `--raw` drops the flag and hands the rest to real git.
+    let (code, raw, err) = r.agit(&["a", "log", "--raw", "-1", "--format=%s"]);
+    assert_eq!(code, 0, "`a log --raw` must fall back to git: {err}");
+    assert!(raw.contains("agit: mint agent"), "`a log --raw` shows the store's git history: {raw}");
+    assert!(!raw.contains("rate limiter"), "the raw git log is not the session view: {raw}");
+}
+
+/// `agit a diff` shows the session-level change between two refs — the prompts and edits ADDED, not a
+/// line-by-line diff of the jsonl — and `--raw` falls back to `git diff`.
+#[test]
+fn a_diff_shows_session_level_changes_and_raw_falls_back_to_git() {
+    let r = Repo::new();
+    // A new session captured in one commit, so HEAD~1..HEAD is exactly "this session was added".
+    r.write_agent(
+        "sessions/claude-code/health.jsonl",
+        &session_with("add the health endpoint", "/code/web/health.rs", "2026-07-16T10:00:00Z"),
+    );
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "captured a session"]);
+
+    let (code, out, err) = r.agit(&["a", "diff", "HEAD~1", "HEAD"]);
+    assert_eq!(code, 0, "the session-aware diff must succeed: {err}");
+    assert!(out.contains("new session"), "labels the added session: {out}");
+    assert!(out.contains("add the health endpoint"), "shows the prompt added: {out}");
+    assert!(out.contains("health.rs"), "shows the edit added: {out}");
+    assert!(!out.contains("sessionId"), "the session view is NOT the raw jsonl diff: {out}");
+
+    // No refs → a bare diff still runs (defaults to HEAD~1..HEAD here) and finds the same change.
+    let (code, bare, err) = r.agit(&["a", "diff"]);
+    assert_eq!(code, 0, "a bare `a diff` must resolve a default range: {err}");
+    assert!(bare.contains("add the health endpoint"), "the default range covers the new session: {bare}");
+
+    // `--raw` is git's byte-level diff, which DOES carry the jsonl.
+    let (code, raw, err) = r.agit(&["a", "diff", "--raw", "HEAD~1", "HEAD"]);
+    assert_eq!(code, 0, "`a diff --raw` must fall back to git: {err}");
+    assert!(raw.contains("sessionId"), "`a diff --raw` is the byte-level git diff: {raw}");
+}
+
+// ─────────────────────── `agit a rebind` — binding-repair e2e coverage ───────────────────────
+
+/// A stale but well-formed aid, standing in for the identity a committed binding still records after a
+/// remote was recreated under the same name with a different store.
+const STALE_AID: &str = "agt_00000000-0000-7000-8000-000000000000";
+
+/// Overwrite `.agit.toml` so this repo's binding claims the name `frontend` maps to a DIFFERENT aid than
+/// the store actually carries — exactly the "recreated remote, same name, new identity" case the aid
+/// integrity check exists to catch. `remote` is written verbatim (credential and all).
+fn corrupt_binding_to(r: &Repo, remote: &str) {
+    r.write(
+        ".agit.toml",
+        &format!(
+            "version = 1\n\n[[agent]]\nid = \"{STALE_AID}\"\nname = \"frontend\"\nremote = \"{remote}\"\n\n[defaults]\nagent = \"frontend\"\n"
+        ),
+    );
+}
+
+/// The DEFAULT rebind path (no `--remote`): a recreated remote changing the aid trips the integrity
+/// error that names `agit a rebind`; rebind then repairs the binding to a single entry carrying the
+/// store's real aid, recording the store's EXISTING origin credential-stripped.
+#[test]
+fn a_rebind_repairs_the_binding_and_strips_the_stores_credentialed_origin() {
+    let r = Repo::new();
+    // One agent, named `frontend`, so "exactly one entry" is literal. Its store's real aid:
+    assert_eq!(r.agit(&["a", "rename", "testmemory", "frontend"]).0, 0, "rename to frontend");
+    let real_aid = r.agent().file_name().unwrap().to_str().unwrap().to_string();
+
+    // The store has a credentialed origin (what a push would have set).
+    let origin = "https://alice:tok_secret123@ex.com/frontend.git";
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", origin]).0, 0, "remote add");
+
+    // The binding now records a DIFFERENT aid for `frontend` → the integrity check must refuse and name
+    // rebind.
+    corrupt_binding_to(&r, origin);
+    let (code, _o, err) = r.agit(&["a", "switch", "frontend"]);
+    assert_ne!(code, 0, "a recreated-remote aid mismatch must refuse, not silently rebind");
+    assert!(err.contains("rebind"), "the integrity error must name `agit a rebind`: {err}");
+
+    // Repair: the default path rewrites the binding to the store's real identity and records its origin.
+    let (code, _o, err) = r.agit(&["a", "rebind", "frontend"]);
+    assert_eq!(code, 0, "rebind must repair the binding: {err}");
+
+    let toml = std::fs::read_to_string(r.path().join(".agit.toml")).unwrap();
+    assert_eq!(toml.matches("[[agent]]").count(), 1, "exactly one entry, no duplicate name/aid: {toml}");
+    assert!(toml.contains(&real_aid), "the binding now carries the store's real aid: {toml}");
+    assert!(!toml.contains(STALE_AID), "the stale aid must be gone: {toml}");
+    assert!(toml.contains("https://ex.com/frontend.git"), "records the credential-stripped locator: {toml}");
+    assert!(!toml.contains("tok_secret123"), "a token must never land in the committed binding: {toml}");
+
+    // …and the mismatch is gone: the same command that refused now succeeds.
+    assert_eq!(r.agit(&["a", "switch", "frontend"]).0, 0, "the binding resolves cleanly after rebind");
+}
+
+/// The `--remote` rebind path: point the binding at a NEW recreated remote, adopting the store's real
+/// identity and recording the new URL credential-stripped, still as a single entry.
+#[test]
+fn a_rebind_remote_repoints_the_binding_credential_stripped() {
+    let r = Repo::new();
+    assert_eq!(r.agit(&["a", "rename", "testmemory", "frontend"]).0, 0, "rename to frontend");
+    let real_aid = r.agent().file_name().unwrap().to_str().unwrap().to_string();
+
+    // The committed binding records a stale aid + old remote for `frontend`.
+    corrupt_binding_to(&r, "https://ex.com/old-frontend.git");
+    let (code, _o, err) = r.agit(&["a", "switch", "frontend"]);
+    assert_ne!(code, 0, "the stale aid must refuse");
+    assert!(err.contains("rebind"), "and name rebind: {err}");
+
+    // Repair, repointing at a NEW credentialed remote.
+    let new_remote = "https://bob:tok_other456@newhub.com/frontend.git";
+    let (code, _o, err) = r.agit(&["a", "rebind", "frontend", "--remote", new_remote]);
+    assert_eq!(code, 0, "rebind --remote must succeed: {err}");
+
+    let toml = std::fs::read_to_string(r.path().join(".agit.toml")).unwrap();
+    assert_eq!(toml.matches("[[agent]]").count(), 1, "one entry only, no dup: {toml}");
+    assert!(toml.contains(&real_aid), "adopts the store's real aid: {toml}");
+    assert!(!toml.contains(STALE_AID), "the stale aid is dropped: {toml}");
+    assert!(toml.contains("https://newhub.com/frontend.git"), "repointed at the new remote, stripped: {toml}");
+    assert!(!toml.contains("tok_other456"), "no credential in the committed binding: {toml}");
+    // The store's own origin was updated to the new remote too.
+    assert_eq!(r.git_agent(&["remote", "get-url", "origin"]), new_remote, "the store's origin is repointed");
+    assert_eq!(r.agit(&["a", "switch", "frontend"]).0, 0, "resolves cleanly after the remote rebind");
 }

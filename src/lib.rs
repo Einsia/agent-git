@@ -33,4 +33,5 @@ pub mod session;
 pub mod shadow;
 pub mod sync;
 pub mod ui;
+pub mod view;
 pub mod workspace;

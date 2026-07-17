@@ -17,7 +17,7 @@
 #![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 // Core logic lives in the lib (crate `agit`), shared with agit-hub, so the two bins don't each write their own parsing and drift apart.
 use agit::scope::{self, Scope};
-use agit::{commands, harness, init, passthrough, session, sync, ui};
+use agit::{commands, harness, init, passthrough, session, sync, ui, view};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -45,10 +45,11 @@ fn split_scope(argv: &[String]) -> (Scope, &[String]) {
 ///
 /// Where a git verb means the same thing on the store it keeps the git name — the agent version is
 /// just the smarter one: `clone` (by identity), `init` (mint an identity), `switch` (active agent),
-/// `push`/`pull`/`fetch`/`merge`. The verbs here are the ones with no git primitive: `list`, `info`,
-/// `rename`, `rebind` (a repair — "accept a changed identity"). `info` not `show` so `git show` on the
-/// store still works.
-const AGENT_MGMT_VERBS: &[&str] = &["list", "switch", "info", "rename", "rebind"];
+/// `push`/`pull`/`fetch`/`merge`. The verbs here are the ones with no git primitive: `list`, `status`,
+/// `info`, `rename`, `rebind` (a repair — "accept a changed identity"). `info` not `show` so `git show`
+/// on the store still works. (`log`/`diff` stay git verbs — intercepted only to render the session view,
+/// with `--raw` as the passthrough escape hatch.)
+const AGENT_MGMT_VERBS: &[&str] = &["list", "status", "switch", "info", "rename", "rebind"];
 
 /// Recognizing the management verbs is what keeps them away from git — `agit a info` must not become
 /// `git info`.
@@ -105,6 +106,9 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             }
             Ok(0)
         }
+        // `status` is the per-repo overview: which agents this repo works with, which is active, their
+        // session counts + last activity + live-watcher, and the active store's unpushed/ahead-behind.
+        "status" => commands::agent_status(),
         "info" => {
             let a = agent::info(&need("name|aid")?)?;
             println!("name   {}", a.name);
@@ -144,7 +148,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
         // adding a name to the closed set without an arm fails loudly here rather than falling to git.
         v => {
             eprintln!("agit agent {v}: no handler — this is a bug (a closed-set verb with no arm).");
-            eprintln!("  available: list · switch · info · rename · rebind");
+            eprintln!("  available: list · status · switch · info · rename · rebind");
             Ok(2)
         }
     }
@@ -292,6 +296,25 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    adopts its identity. (Raw `git clone` here would make a nested repo that resolves to
         //    nothing, which is exactly what this replaces.) ──
         "clone" if scope == Scope::Agent => agent_clone(args),
+
+        // ── log / diff (agent scope): a raw `git log`/`git diff` on the store is a wall of jsonl bytes,
+        //    so by default these render the SESSION view — `a log` a timeline of the store's sessions,
+        //    `a diff` the prompts + edits ADDED between two refs. `--raw` (or `--git`) drops the flag and
+        //    falls back to real git passthrough, so the byte-level view (and every scripted `--format`)
+        //    still works. Only the Agent scope is intercepted — `agit log` / `git log` on the code repo is
+        //    untouched passthrough. ──
+        "log" | "diff" if scope == Scope::Agent => {
+            if args.iter().any(|a| a == "--raw" || a == "--git") {
+                // Strip the escape-hatch flag; hand the rest to git verbatim (rest[0] is the verb).
+                let git_args: Vec<String> =
+                    rest.iter().filter(|a| *a != "--raw" && *a != "--git").cloned().collect();
+                passthrough::run(scope, &git_args)
+            } else if cmd == "log" {
+                view::agent_log(args)
+            } else {
+                view::agent_diff(args)
+            }
+        }
         "adapter" => commands::adapter_list(),
         "graph" => commands::workspace_graph(),
 
@@ -666,7 +689,7 @@ fn agent_pull(args: &[String]) -> anyhow::Result<i32> {
     // The pull failed. If it failed because the two sides DIVERGED (each holds commits the other
     // lacks), that is the case dialogue-merge exists for — say so, with the command to run. Any other
     // failure (no upstream, network) is git's own and already printed above.
-    if diverged(&a.store) {
+    if commands::diverged(&a.store) {
         eprintln!();
         eprintln!("your sessions and the remote's have diverged — a textual git merge would corrupt the");
         eprintln!("transcripts. Reconcile them by dialogue instead:");
@@ -689,50 +712,8 @@ fn agent_fetch(args: &[String]) -> anyhow::Result<i32> {
     if code != 0 {
         return Ok(code);
     }
-    report_incoming(&a.store);
+    commands::report_incoming(&a.store);
     Ok(0)
-}
-
-/// Best-effort summary of the sessions on the tracked upstream that HEAD does not yet have. Silent if
-/// there is no upstream to compare against (a fetch with an explicit refspec and no tracking branch).
-fn report_incoming(store: &std::path::Path) {
-    let (code, out) = scope::git_in_status(
-        store,
-        &["diff", "--name-only", "--diff-filter=A", "HEAD..@{u}", "--", "sessions"],
-    );
-    if code != 0 {
-        return;
-    }
-    let new: Vec<&str> = out.lines().filter(|l| l.ends_with(".jsonl")).collect();
-    if new.is_empty() {
-        println!("  up to date — no new sessions on the remote.");
-        return;
-    }
-    // Break the count down per runtime by asking the registry which runtimes exist, not by naming any
-    // — a new adapter shows up here for free.
-    let breakdown: Vec<String> = agit::adapter::names()
-        .iter()
-        .filter_map(|rt| {
-            let n = new.iter().filter(|f| f.contains(&format!("/{rt}/"))).count();
-            (n > 0).then(|| format!("{rt}: {n}"))
-        })
-        .collect();
-    let suffix = if breakdown.is_empty() { String::new() } else { format!(" ({})", breakdown.join(", ")) };
-    println!("  {} new session(s) on the remote{suffix}.", new.len());
-    println!("  integrate with: agit a pull");
-}
-
-/// True when HEAD and its upstream each hold commits the other does not — the one case a fast-forward
-/// cannot cover and a textual merge must not. An absent or unresolvable upstream is not "diverged".
-fn diverged(store: &std::path::Path) -> bool {
-    let (code, out) = scope::git_in_status(store, &["rev-list", "--left-right", "--count", "@{u}...HEAD"]);
-    if code != 0 {
-        return false;
-    }
-    let mut counts = out.split_whitespace().filter_map(|s| s.parse::<u64>().ok());
-    let behind = counts.next().unwrap_or(0);
-    let ahead = counts.next().unwrap_or(0);
-    behind > 0 && ahead > 0
 }
 
 fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
@@ -840,7 +821,10 @@ the only one present, else they ask.
   agit <git-args>          Run git transparently on the code repository (Environment)
   agit agent <git-args>    Run isomorphic git on the Agent Store — `agit a` is the alias (agit a log · agit a add -A · agit a commit · agit a push)
 
-  agit agent <verb>        Agent management, a closed set: init, clone, switch, list, info, rename, rebind, merge (push/pull/fetch too).
+  agit a status            Overview of this repo: its agents, which is active, each one's sessions + last activity + live-watcher, and the active store's unpushed/ahead-behind
+  agit a log / diff        The SESSION view of the store (a timeline of sessions; the prompts + edits added between two refs) — pass --raw for the byte-level git log/diff
+
+  agit agent <verb>        Agent management, a closed set: init, clone, switch, list, status, info, rename, rebind, merge (push/pull/fetch too).
                            Anything else after `a` is git, so `agit a add -A` is git-add and `agit a show` is git-show.
 
   `a` is a subcommand, so it cannot be transposed: agit a commit (agent store) vs agit commit -a (code repo, -a is git's stage-all).
