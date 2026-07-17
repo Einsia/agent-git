@@ -110,7 +110,7 @@ agit -a push -u origin main                    # pre-push scans for secrets firs
 ```sh
 agit clone http://<host>:8177/payments.git     # one command to pull the team's Agent Store
 agit -a fetch origin
-agit -a merge origin/main                  # local: the agent reads the sessions, synthesizes CLAUDE.md, only real conflicts prompt you
+agit a merge origin/main                   # local: the agents revive, read the sessions, reconcile by dialogue, and leave a resumable merged session; only real conflicts prompt you
 ```
 
 ## Endpoints
@@ -149,7 +149,7 @@ lots of back-and-forth? a burst of edits at the end?). The data comes from Conve
 
 **Provenance:** each session shows its runtime / model / branch / author / time (the last commit that
 touched it), and a consumer uses that to judge trust, freshness, and relevance before deciding whether to
-reconcile it into their own CLAUDE.md.
+merge it into their own memory.
 
 ## Why the Hub does not merge
 
@@ -163,7 +163,7 @@ process everyone's uploaded sessions".
 ## Limits
 
 - **Read-only rendering**: the Hub does not merge, does not judge conflicts, does not recompute anything.
-  Merging still happens locally on the consumer, in reconcile.
+  Merging still happens locally on the consumer, via `agit a merge`.
 - **No secrets stored**: enforced by the publisher-side pre-push hook; but it only catches known formats
   (see [risk analysis](风险分析.md) §8).
 - **No TLS**: the Hub does not terminate HTTPS itself; either listen on loopback only, or put a reverse

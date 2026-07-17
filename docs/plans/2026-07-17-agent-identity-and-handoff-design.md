@@ -1,7 +1,7 @@
 # Agent identity, environment migration, and handoff — the design of record
 
-Status: design. Supersedes the `.agit/store` pointer (a hack, to be removed) and revises the branch
-model in `2026-07-16-workspace-state-primitives-design.md`. Nothing here is implemented yet.
+Status: implemented and shipped. Supersedes the `.agit/store` pointer (removed) and the branch model in
+`2026-07-16-workspace-state-primitives-design.md`. This document is kept as the record of the design.
 
 ---
 

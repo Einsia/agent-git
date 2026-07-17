@@ -1,7 +1,8 @@
 # AgentGit primitives — the Workspace State model
 
-**Status:** proposal / design. Not implemented. Several decisions still open (see [Open decisions](#open-decisions)).
-Supersedes the `reconcile`-centric model. Relates to
+**Status:** superseded. This early proposal is kept for history; the shipped model is described in
+[`2026-07-17-agent-identity-and-handoff-design.md`](2026-07-17-agent-identity-and-handoff-design.md)
+and [`../architecture.md`](../architecture.md). It supersedes the `reconcile`-centric model. Relates to
 [`2026-07-15-claude-codex-conversion-design.md`](2026-07-15-claude-codex-conversion-design.md) (the resume/convert
 machinery this design leans on).
 

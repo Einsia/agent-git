@@ -1,6 +1,6 @@
 # Versioning the harness (MCP + skills + config) as Workspace State
 
-Status: design of record. Net-new; not yet implemented.
+Status: implemented and shipped. Kept as the record of the design.
 
 ## Problem
 
