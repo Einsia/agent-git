@@ -791,6 +791,68 @@ fn a_merge_splice_combines_both_sides_without_a_model() {
     }
 }
 
+/// `--dry-run` is a pure preview: it reports what the merge WOULD do (target, mode, each side's sessions,
+/// whether the histories would fuse) and returns 0 WITHOUT spending the model, installing a session,
+/// writing a transcript/ledger, or fusing the histories. Proven end to end — no `claude`/`codex` is
+/// installed (a real dialogue merge would demand one), the store gains no `sessions/sync` dir, no session
+/// is installed, and main's tip is untouched (no fuse commit).
+#[test]
+fn a_merge_dry_run_previews_without_spending_the_model_or_touching_the_store() {
+    let r = Repo::new();
+
+    // A base commit both sides fork from, so the merge is grounded in a shared ancestor.
+    r.git_agent(&["commit", "--allow-empty", "--no-verify", "-m", "base"]);
+
+    // A peer branch carrying a diverged Claude session that HEAD does not have.
+    r.git_agent(&["checkout", "-q", "-b", "peer"]);
+    r.write_agent("sessions/claude-code/team.jsonl", &claude_session("TEAM", "team found the deadlock"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "team session"]);
+
+    // Back on main, our own diverged Claude session. main keeps this exact tip through a dry run.
+    r.git_agent(&["checkout", "-q", "main"]);
+    r.write_agent("sessions/claude-code/local.jsonl", &claude_session("LOCAL", "local fixed the parser"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "local session"]);
+    let main_before = r.git_agent(&["rev-parse", "main"]);
+
+    let (code, out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--dry-run"]);
+    assert_eq!(code, 0, "dry-run must exit 0 with no model and no claude/codex installed: {err}{out}");
+    assert!(out.contains("dry run"), "it banners the preview: {out}");
+    assert!(out.to_lowercase().contains("no model"), "it promises no model spend: {out}");
+    assert!(out.contains("peer"), "it names the target: {out}");
+    assert!(out.contains("session(s)"), "it reports each side's session inventory: {out}");
+
+    // Nothing was installed: a real merge would install revived sessions under ~/.claude/projects.
+    assert!(installed_claude_sessions(&r).is_empty(), "a dry run must install no session: it spends nothing");
+    // No transcript and no decision ledger were written — both would land in <store>/sessions/sync/.
+    assert!(!r.agent().join("sessions/sync").exists(), "a dry run must write no transcript or ledger");
+    // And the histories were NOT fused, even though this is the same agent (Fuse mode).
+    assert_eq!(r.git_agent(&["rev-parse", "main"]), main_before, "main's tip must be untouched: no fuse commit");
+    // The peer branch is likewise untouched, and no stray worktree was left behind.
+    assert!(r.git_agent(&["worktree", "list"]).lines().count() <= 1, "a dry run must leave no worktree behind");
+}
+
+/// `--preview` is the spelled-out alias for `--dry-run`: same pure preview, same exit 0, same no-op.
+#[test]
+fn a_merge_preview_is_an_alias_for_dry_run() {
+    let r = Repo::new();
+    r.git_agent(&["commit", "--allow-empty", "--no-verify", "-m", "base"]);
+    r.git_agent(&["checkout", "-q", "-b", "peer"]);
+    r.write_agent("sessions/claude-code/team.jsonl", &claude_session("TEAM", "peer work"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "team session"]);
+    r.git_agent(&["checkout", "-q", "main"]);
+    r.write_agent("sessions/claude-code/local.jsonl", &claude_session("LOCAL", "local work"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "local session"]);
+
+    let (code, out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--preview"]);
+    assert_eq!(code, 0, "--preview must behave exactly like --dry-run: {err}{out}");
+    assert!(out.contains("dry run"), "the alias reaches the same preview: {out}");
+    assert!(!r.agent().join("sessions/sync").exists(), "the alias installs and writes nothing either");
+}
+
 #[test]
 fn a_fetch_reports_incoming_sessions_without_integrating() {
     let r = Repo::new();

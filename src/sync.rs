@@ -242,7 +242,7 @@ fn aid_at_ref(store: &Path, reference: &str) -> Option<String> {
     }
 }
 
-pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool, prefer: Option<Prefer>) -> Result<i32> {
+pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool, dry_run: bool, prefer: Option<Prefer>) -> Result<i32> {
     let env = scope::env_root()?;
     // The RESOLVED agent's id-keyed store, not the legacy nested one. Reading `<env>/.agit/agent` made
     // merge operate on a store that nothing writes to any more, and left `mine` permanently None — so
@@ -256,8 +256,8 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
     }
     let cli = if rt == "codex" { "codex" } else { "claude" };
     // The dialogue merge resumes real sessions, so it needs the runtime CLI. `--splice` does not run a
-    // model at all, so it does not.
-    if !splice && !which(cli) {
+    // model at all, so it does not — and neither does `--dry-run`, which stops before the first turn.
+    if !splice && !dry_run && !which(cli) {
         bail!("sync needs `{cli}` on this machine (both sides of the dialogue are real resumed {cli} sessions).");
     }
 
@@ -278,6 +278,13 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
         // Grounded in a shared ancestor, empty is the truth: nothing diverged, we are up to date.
         if grounded {
             println!("{} added no {rt} sessions since the common ancestor — nothing to reconcile by dialogue.", target.label());
+            // A dry run reports what WOULD happen and mutates nothing — not even the git fuse.
+            if dry_run {
+                if mode == Mode::Fuse {
+                    println!("(dry run) would fuse the git histories (same agent) — nothing else to do.");
+                }
+                return Ok(0);
+            }
             // Same agent still fuses: the peer may be ahead in commits that carry no session.
             return if mode == Mode::Fuse { fuse(&agent, &target) } else { Ok(0) };
         }
@@ -301,6 +308,17 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
     let branch_b = branch_a.as_deref().and_then(|a| b_all.iter().find_map(|(_, c)| peer_branch(c, a)));
     let (a_voice, a_brief) = pick_side(&rt, &a_all, branch_a.as_deref());
     let (b_voice, b_brief) = pick_side(&rt, &b_all, branch_b.as_deref());
+
+    // `--dry-run` (alias `--preview`): everything above this point is pure inspection — git reads only,
+    // no model, no writes. So this is the last safe branch: report what the merge WOULD do (target, mode,
+    // each side's sessions + picked voice, whether the histories would fuse) and return. It installs
+    // nothing, revives no session, runs no dialogue, saves no transcript, and leaves no worktree behind.
+    if dry_run {
+        let a_side = SidePreview { branch: branch_a.as_deref(), sessions: &a_all, voice: &a_voice };
+        let b_side = SidePreview { branch: branch_b.as_deref(), sessions: &b_all, voice: &b_voice };
+        println!("{}", dry_run_report(&target.label(), mode, &a_side, &b_side));
+        return Ok(0);
+    }
 
     // `--splice`: the no-model merge. Combine both sides' voice sessions into one new session (A's full
     // transcript plus B's tail after the point they forked from, ids normalized) and install it.
@@ -364,7 +382,7 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
                 eprintln!("(--both) couldn't materialize B's merged state: {e}");
             }
         }
-        resolve_inline(&rt, &a, &open)
+        resolve_inline(&rt, &a, &open, &agent, &b.id)
     })();
     for wt in &worktrees {
         let _ = scope::git_in_status(&env, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
@@ -389,6 +407,42 @@ fn announce(target: &Target, theirs: Option<&str>, mode: Mode) {
             println!("{label} is a different agent ({aid}) — reconciling by dialogue; histories stay separate.")
         }
     }
+}
+
+/// The `--dry-run` preview: what a merge WOULD do, built from the same inspection phases the real run
+/// uses (resolve → peer/local sessions → pick the voice per side), with NOTHING run, installed, fused, or
+/// left behind. Pure, so the text is testable without a model or a store.
+/// One side as the preview sees it: its code branch (if recorded), its sessions, and the picked voice.
+struct SidePreview<'a> {
+    branch: Option<&'a str>,
+    sessions: &'a [(String, String)],
+    voice: &'a str,
+}
+
+impl SidePreview<'_> {
+    /// The filename of the voice session (matched back from its content), for the audit line.
+    fn voice_name(&self) -> String {
+        self.sessions
+            .iter()
+            .find(|(_, c)| c.as_str() == self.voice)
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| "?".into())
+    }
+}
+
+fn dry_run_report(target: &str, mode: Mode, a: &SidePreview, b: &SidePreview) -> String {
+    let mut s = String::from("── dry run (no model spent; nothing installed, fused, or left behind) ──\n");
+    s.push_str(&format!("Target: {target}\n"));
+    s.push_str(match mode {
+        Mode::Fuse => "Mode: same agent — would reconcile by dialogue, THEN fuse the git histories.\n",
+        Mode::DialogueOnly => {
+            "Mode: different agent — would reconcile by dialogue only; the git histories stay separate.\n"
+        }
+    });
+    s.push_str(&format!("A @ {}: {} session(s), voice = {}\n", a.branch.unwrap_or("?"), a.sessions.len(), a.voice_name()));
+    s.push_str(&format!("B @ {}: {} session(s), voice = {}\n", b.branch.unwrap_or("?"), b.sessions.len(), b.voice_name()));
+    s.push_str("Rerun without --dry-run to run the reconciliation.");
+    s
 }
 
 /// Fuse the histories: one memory, restored by an ordinary git merge.
@@ -513,9 +567,37 @@ fn parse_conflicts(open: &str) -> Vec<Conflict> {
         .collect()
 }
 
-/// If there are open conflicts and we're at a terminal, walk the user through deciding each and record
-/// the decisions into A's session (the merged state). Non-interactive: just surface them.
-fn resolve_inline(rt: &str, a: &Side, open: &str) -> Result<i32> {
+/// One recorded conflict decision: a listed way out the user accepted, a call they typed in their own
+/// words, or a deliberate defer (a rejection of every option, for now).
+enum Decision {
+    Accepted(String),
+    Custom(String),
+    Deferred,
+}
+
+impl Decision {
+    /// The audit-trail verdict line for the ledger.
+    fn verdict(&self) -> String {
+        match self {
+            Decision::Accepted(o) => format!("accepted → {o}"),
+            Decision::Custom(d) => format!("custom → {d}"),
+            Decision::Deferred => "rejected (left open)".to_string(),
+        }
+    }
+    /// The instruction line baked into A's resumed session, or `None` for a deferral (nothing to settle).
+    fn settled(&self, what: &str) -> Option<String> {
+        match self {
+            Decision::Accepted(o) => Some(format!("- {what}\n  → decided: {o}")),
+            Decision::Custom(d) => Some(format!("- {what}\n  → decided: {d}")),
+            Decision::Deferred => None,
+        }
+    }
+}
+
+/// If there are open conflicts and we're at a terminal, walk the user through deciding each, PERSIST the
+/// accept/reject/choose outcomes as an auditable ledger beside the transcript, and record the settled ones
+/// into A's session (the merged state). Non-interactive: just surface them (list + exit 1).
+fn resolve_inline(rt: &str, a: &Side, open: &str, agent: &Path, b_id: &str) -> Result<i32> {
     let items = parse_conflicts(open);
     if items.is_empty() {
         println!("\nNothing left for you to decide.");
@@ -533,7 +615,7 @@ fn resolve_inline(rt: &str, a: &Side, open: &str) -> Result<i32> {
         }
         return Ok(1);
     }
-    let mut decisions: Vec<String> = Vec::new();
+    let mut ledger: Vec<(&Conflict, Decision)> = Vec::new();
     for (i, c) in items.iter().enumerate() {
         let mut options = c.options.clone();
         options.push("leave open, decide later".to_string());
@@ -544,22 +626,28 @@ fn resolve_inline(rt: &str, a: &Side, open: &str) -> Result<i32> {
             &options,
             "your call",
         )?;
-        match choice {
+        let decision = match choice {
             // Anything typed instead of a number IS the decision: the options are a shortcut, and the
             // dialogue cannot have foreseen every way out.
-            crate::ui::Choice::Typed(d) => decisions.push(format!("- {}\n  → decided: {d}", c.what)),
-            crate::ui::Choice::Option(n) if n != last => {
-                decisions.push(format!("- {}\n  → decided: {}", c.what, options[n]))
-            }
-            _ => {}
-        }
+            crate::ui::Choice::Typed(d) => Decision::Custom(d),
+            crate::ui::Choice::Option(n) if n != last => Decision::Accepted(options[n].clone()),
+            // The "leave open" option, an empty answer, or none picked: a conscious deferral, recorded.
+            _ => Decision::Deferred,
+        };
+        ledger.push((c, decision));
     }
-    if decisions.is_empty() {
+    // Persist the whole ledger — rejections and deferrals are decisions too, so every conflict is on the
+    // record, not only the resolved ones. Deterministic record-keeping: no model, always written.
+    let ledger_path = save_decisions(agent, rt, &a.id, b_id, &ledger)?;
+    println!("\nDecision ledger recorded → {}", ledger_path.display());
+
+    let settled: Vec<String> = ledger.iter().filter_map(|(c, d)| d.settled(&c.what)).collect();
+    if settled.is_empty() {
         println!("\nAll left open:\n{open}");
         return Ok(1);
     }
-    // Bake the human's decisions into A's session so `resume` continues with them settled.
-    let joined = decisions.join("\n");
+    // Bake the human's settled decisions into A's session so `resume` continues with them decided.
+    let joined = settled.join("\n");
     let _ = turn(
         rt,
         &a.cwd,
@@ -569,12 +657,35 @@ fn resolve_inline(rt: &str, a: &Side, open: &str) -> Result<i32> {
              forward (do not edit files):\n{joined}\nReply 'noted'."
         ),
     );
-    println!("\nRecorded {} decision(s) into the merged state.", decisions.len());
-    if decisions.len() < items.len() {
+    println!("\nRecorded {} decision(s) into the merged state.", settled.len());
+    if settled.len() < items.len() {
         Ok(1) // some left open
     } else {
         Ok(0)
     }
+}
+
+/// Persist the accept/reject/choose decisions as an auditable ledger in `<agent>/sessions/sync/`, beside
+/// the transcript `save_transcript` writes (same `<a8>-<b8>` stem, a `.decisions.md` suffix). Deterministic
+/// record-keeping — no model. Records EVERY conflict, its options, and the verdict, including the ones left
+/// open, so the ledger is a complete audit trail of what was decided and what was consciously deferred.
+fn save_decisions(agent: &Path, rt: &str, a_id: &str, b_id: &str, ledger: &[(&Conflict, Decision)]) -> Result<PathBuf> {
+    let dir = agent.join("sessions").join("sync");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}-{}.decisions.md", &a_id[..8], &b_id[..8]));
+    let mut md = format!("# conflict decisions ({rt})\n\nA={a_id}\nB={b_id}\n\n");
+    for (i, (c, decision)) in ledger.iter().enumerate() {
+        md.push_str(&format!("## {}. {}\n", i + 1, c.what));
+        if !c.options.is_empty() {
+            md.push_str("options:\n");
+            for o in &c.options {
+                md.push_str(&format!("  - {o}\n"));
+            }
+        }
+        md.push_str(&format!("decision: {}\n\n", decision.verdict()));
+    }
+    std::fs::write(&path, md)?;
+    Ok(path)
 }
 
 /// Try to bind each side to its own branch's worktree + compute its diff. Fills a/b/worktrees on success.
@@ -1605,6 +1716,72 @@ mod tests {
         assert!(a.contains("find the real conflicts") && a.contains("CONFLICT:") && a.contains("DONE"), "{a}");
         let b = relay_first("claude-code", "hi", "", "", true);
         assert!(!b.contains("CRITICAL") && b.contains("Respond under the same rules"), "{b}");
+    }
+
+    /// The `--dry-run` preview must name the target, the mode (fuse vs dialogue-only), each side's session
+    /// count and its picked voice, and the branches — everything a user needs to decide whether to run the
+    /// real merge — while promising no model spend. Pure text, no store or model needed.
+    #[test]
+    fn dry_run_report_names_the_sides_the_voices_and_the_mode() {
+        let a_all = vec![
+            ("a1.jsonl".to_string(), "one\ntwo\nthree".to_string()),
+            ("a2.jsonl".to_string(), "x".to_string()),
+        ];
+        let b_all = vec![("b1.jsonl".to_string(), "solo".to_string())];
+        let a_voice = a_all[0].1.clone(); // the richest local session
+        let b_voice = b_all[0].1.clone();
+
+        let a_side = SidePreview { branch: Some("feature-a"), sessions: &a_all, voice: &a_voice };
+        let b_side = SidePreview { branch: Some("feature-b"), sessions: &b_all, voice: &b_voice };
+        let out = dry_run_report("peer", Mode::Fuse, &a_side, &b_side);
+        assert!(out.contains("dry run"), "banners the preview: {out}");
+        assert!(out.to_lowercase().contains("no model"), "promises no model spend: {out}");
+        assert!(out.contains("Target: peer"), "names the target: {out}");
+        assert!(out.contains("fuse the git histories"), "Fuse surfaces the history merge: {out}");
+        assert!(out.contains("feature-a") && out.contains("feature-b"), "both branches: {out}");
+        assert!(out.contains("A @ feature-a: 2 session(s), voice = a1.jsonl"), "A count + voice: {out}");
+        assert!(out.contains("B @ feature-b: 1 session(s), voice = b1.jsonl"), "B count + voice: {out}");
+
+        // A different agent reconciles by dialogue only — the histories are NOT fused. Unrecorded branches.
+        let a_none = SidePreview { branch: None, sessions: &a_all, voice: &a_voice };
+        let b_none = SidePreview { branch: None, sessions: &b_all, voice: &b_voice };
+        let d = dry_run_report("frontend", Mode::DialogueOnly, &a_none, &b_none);
+        assert!(d.contains("stay separate") && !d.contains("fuse the git histories"), "dialogue-only: {d}");
+        assert!(d.contains("A @ ?:") && d.contains("B @ ?:"), "an unrecorded branch shows as ?: {d}");
+    }
+
+    /// The audit ledger records EVERY conflict and its verdict — accepted option, custom call, and a
+    /// deferral alike — beside the transcript, so decisions no longer live only inside the resumed session.
+    #[test]
+    fn the_conflict_ledger_records_every_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path();
+        let c1 = Conflict {
+            what: "field name: user_id (frontend) vs uid (api)".into(),
+            options: vec!["keep uid".into(), "keep user_id".into()],
+        };
+        let c2 = Conflict { what: "who owns the retry budget".into(), options: vec![] };
+        let c3 = Conflict { what: "log format".into(), options: vec!["json".into()] };
+        let ledger: Vec<(&Conflict, Decision)> = vec![
+            (&c1, Decision::Accepted("keep uid".into())),
+            (&c2, Decision::Custom("split it 50/50".into())),
+            (&c3, Decision::Deferred),
+        ];
+
+        let path = save_decisions(store, "claude-code", "sync-a-123456789", "sync-b-987654321", &ledger).unwrap();
+        // Written beside the transcript (same dir, distinguishable suffix), not inside a resumed session.
+        assert!(path.starts_with(store.join("sessions").join("sync")), "ledger lives beside the transcript: {}", path.display());
+        assert!(path.to_string_lossy().ends_with(".decisions.md"), "distinguishable from the .md transcript: {}", path.display());
+
+        let md = std::fs::read_to_string(&path).unwrap();
+        assert!(md.contains("accepted → keep uid"), "a chosen way out is recorded: {md}");
+        assert!(md.contains("custom → split it 50/50"), "a typed decision is recorded verbatim: {md}");
+        assert!(md.contains("rejected (left open)"), "a deferral is a decision too, and recorded: {md}");
+        // every conflict is on the record, with the options that were presented
+        assert!(md.contains("field name: user_id (frontend) vs uid (api)"), "conflict 1: {md}");
+        assert!(md.contains("who owns the retry budget"), "conflict 2 (no options): {md}");
+        assert!(md.contains("log format"), "conflict 3: {md}");
+        assert!(md.contains("keep user_id"), "the options presented are part of the audit trail: {md}");
     }
 
     #[test]

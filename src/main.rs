@@ -722,6 +722,7 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
     let mut both = false;
     let mut quick = false;
     let mut splice = false;
+    let mut dry_run = false;
     let mut prefer = None;
     let mut i = 0;
     while i < args.len() {
@@ -754,6 +755,11 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
                 splice = true;
                 i += 1;
             }
+            // Preview only: show what the merge WOULD do — no model, no install, no worktrees, no fuse.
+            "--dry-run" | "--preview" => {
+                dry_run = true;
+                i += 1;
+            }
             other => {
                 if reference.is_none() && !other.starts_with('-') {
                     reference = Some(other.to_string());
@@ -773,10 +779,10 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
             // init` first" in a repo that already had an agent selected.
             let agent = agit::agent::resolve(None)?.store;
             let rt = session::resolve_runtime(rt.as_deref(), &session::store_runtimes(&agent), "merge")?;
-            sync::run(&r, &rt, both, quick, splice, prefer)
+            sync::run(&r, &rt, both, quick, splice, dry_run, prefer)
         }
         None => {
-            eprintln!("usage: agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref — --agent X / --ref X disambiguate; --quick shortens the dialogue; --splice skips the model and just combines both sessions' context)");
+            eprintln!("usage: agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice] [--dry-run]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref — --agent X / --ref X disambiguate; --quick shortens the dialogue; --splice skips the model and just combines both sessions' context; --dry-run/--preview shows what the merge would do without running the model)");
             Ok(2)
         }
     }
