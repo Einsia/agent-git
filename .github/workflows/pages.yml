@@ -1,0 +1,58 @@
+name: Deploy docs to Pages
+
+# Builds the just-the-docs site under `docs/` and deploys it to GitHub Pages.
+#
+# One-time repository setup (Settings → Pages): set "Build and deployment → Source" to
+# "GitHub Actions". No branch selection is needed — this workflow is the source.
+#
+# The site uses `remote_theme: just-the-docs/just-the-docs`, which the `actions/jekyll-build-pages`
+# action supports because it bundles the `github-pages` gem (and with it `jekyll-remote-theme`). The
+# site's `url`/`baseurl` are pinned in `docs/_config.yml` to `einsia.github.io` / `/agent-git`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# Pages deploys need these three; nothing here writes to repo contents.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One live deployment at a time. Don't cancel an in-flight deploy — let it finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    name: deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
