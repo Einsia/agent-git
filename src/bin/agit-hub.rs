@@ -40,7 +40,7 @@ use agit::hub::identity::Identity;
 use agit::hub::net::{self, valid_agent_name};
 use agit::hub::session::Sessions;
 use agit::hub::store::{AgentMeta, Member, Store, TokenRec, User};
-use agit::hub::{audit, auth, identity, kdf, session as websession, store};
+use agit::hub::{audit, auth, identity, kdf, mr, session as websession, store};
 
 const PER_PAGE: usize = 20;
 /// How many sessions a query may scan at most (stops an unbounded git show). Going over is flagged
@@ -69,6 +69,7 @@ fn run() -> i32 {
         "list" => list_cmd(&root),
         "token" => token_cmd(&root, &args),
         "user" => user_cmd(&root, &args),
+        "pre-receive" => pre_receive_cmd(&root, &args),
         "-h" | "--help" => {
             print_help();
             0
@@ -508,6 +509,399 @@ fn issue_token(store: &Store, name: &str, owner: &str, agent: Option<&str>, scop
     Ok(secret)
 }
 
+// ─────────────────── server-side secret scan (pre-receive) ───────────────────
+//
+// The client-side hook is `agit`'s, and `git push --no-verify` skips it — by design, that flag
+// exists precisely to skip local hooks. So a client hook is a **reminder**, not a gate: the only
+// place a push can actually be refused is the server, and this is it. A pre-receive hook runs before
+// any ref is updated, so a rejected push leaves nothing behind to clean up.
+//
+// The scanner is the library's (`agit::scan`), so a rule fixed for `agit` is fixed here too.
+
+// Every bound below now **refuses** the push it cannot cover rather than waving it through, so each
+// one is an outage if it trips on ordinary work. They are set to bound cost, not to be reached.
+
+/// Blobs scanned per push. A push is a pack of arbitrary size; without a ceiling a single push can
+/// keep a core busy for as long as the pusher likes.
+const SCAN_MAX_BLOBS: usize = 2_000;
+/// Bytes scanned per blob. Generous: a session transcript is routinely megabytes, and the scan is one
+/// linear pass, so the old 1MiB ceiling bought little and refused a lot.
+const SCAN_MAX_BLOB_BYTES: u64 = 16 * 1024 * 1024;
+/// Bytes scanned per push, across all blobs. `cat-file --batch` is buffered whole, so this is a
+/// memory ceiling before it is a time one — which is why it does not simply follow the per-blob bound
+/// upwards.
+const SCAN_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// The operator's escape hatch from fail-closed: paths accepted as unscannable, one per line, read
+/// from the **bare repo** on the server. Same placement as the allowlist and for the same reason — a
+/// file the pusher controls is not a gate, it is a form to fill in.
+const SCAN_SKIP_FILE: &str = ".agit-scan-skip";
+/// Bytes of a blob sniffed for NUL before calling it binary. Matches `agit::scan`'s own sniff.
+const BINARY_SNIFF_BYTES: usize = 8192;
+/// Shortest printable run worth scanning inside a binary blob. A credential has to survive being
+/// copied through a config file or an env var, so it is printable and it is long.
+const MIN_PRINTABLE_RUN: usize = 6;
+
+/// `agit-hub pre-receive --root <root> --agent <name>` — run by git as the repo's pre-receive hook,
+/// with the pushed ref updates on stdin.
+///
+/// Exit non-zero = the push is refused, and everything on stderr reaches the pusher's terminal.
+fn pre_receive_cmd(root: &Path, args: &[String]) -> i32 {
+    let Some(agent) = flag(args, "--agent") else {
+        eprintln!("pre-receive: --agent is required");
+        return 2;
+    };
+    // git runs the hook with cwd = the bare repo.
+    let repo = std::env::current_dir().unwrap_or_else(|_| repo_path(root, &agent));
+    let mut news = vec![];
+    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+        let mut f = line.split_whitespace();
+        let (_old, new) = (f.next().unwrap_or_default(), f.next().unwrap_or_default());
+        // All-zero = a deletion: nothing new arrived to scan.
+        if new.is_empty() || new.bytes().all(|b| b == b'0') {
+            continue;
+        }
+        news.push(new.to_string());
+    }
+    if news.is_empty() {
+        return 0;
+    }
+
+    let report = scan_push(&repo, &news);
+    // REMOTE_USER is set for http-backend and inherited all the way down to this hook.
+    let actor = std::env::var("REMOTE_USER").unwrap_or_else(|_| "unknown".into());
+    if report.findings.is_empty() && !report.incomplete() {
+        return 0;
+    }
+
+    let mut detail: Vec<String> = report.findings.iter().take(20).map(|f| format!("{} in {}:{}", f.0, f.1, f.2)).collect();
+    detail.extend(report.unscanned.iter().take(20).map(|(path, why)| format!("unscanned {path}: {why}")));
+    if let Some(e) = &report.errored {
+        detail.push(format!("scan failed: {e}"));
+    }
+    audit::append(
+        root,
+        &actor,
+        audit::GIT_PUSH_REJECTED,
+        Some(&agent),
+        &format!(
+            "secret scan: {} finding(s), {} unscanned blob(s){}; {}",
+            report.findings.len(),
+            report.unscanned.len(),
+            if report.errored.is_some() { ", the scan itself failed" } else { "" },
+            detail.join(", "),
+        ),
+    );
+
+    eprintln!();
+    if !report.findings.is_empty() {
+        eprintln!("agit-hub: push REFUSED — {} possible secret(s) in the pushed objects.", report.findings.len());
+        eprintln!();
+        for (rule, path, line, excerpt) in report.findings.iter().take(20) {
+            eprintln!("  {rule}  {path}:{line}");
+            eprintln!("      {excerpt}");
+        }
+        if report.findings.len() > 20 {
+            eprintln!("  ... and {} more", report.findings.len() - 20);
+        }
+        eprintln!();
+    }
+    if report.incomplete() {
+        // The reason this refuses instead of warning: a gate that clears what it could not read is
+        // worse than no gate, because it is trusted. One NUL byte used to buy exactly that.
+        eprintln!("agit-hub: push REFUSED — this push could not be scanned in full.");
+        eprintln!();
+        if let Some(e) = &report.errored {
+            eprintln!("  the scan itself failed: {e}");
+            eprintln!("      nothing is known about ANY object in this push.");
+        }
+        for (path, why) in report.unscanned.iter().take(20) {
+            eprintln!("  NOT SCANNED  {path}");
+            eprintln!("      {why}");
+        }
+        if report.unscanned.len() > 20 {
+            eprintln!("  ... and {} more", report.unscanned.len() - 20);
+        }
+        eprintln!();
+        eprintln!("A push that could not be read cannot be cleared — that is what this gate is for.");
+        eprintln!("If a path above is genuinely fine, add it to {} in the bare repo on the", SCAN_SKIP_FILE);
+        eprintln!("server (one path per line) and it will be skipped rather than refused.");
+        eprintln!();
+    }
+    if !report.findings.is_empty() {
+        eprintln!("If a finding is wrong: add the line's literal to {} in the bare repo on the server,", agit::scan::ALLOW_FILE);
+        eprintln!("or mark the line with the `{}` pragma before committing.", agit::scan::ALLOW_PRAGMA);
+        eprintln!("Rewrite the history that carries the secret — and rotate it; a pushed secret is a burnt secret.");
+        eprintln!();
+    }
+    eprintln!("Nothing was written — no ref moved. This gate is on the server, so --no-verify does not reach it.");
+    eprintln!();
+    1
+}
+
+struct ScanReport {
+    /// (rule, path, line, excerpt)
+    findings: Vec<(String, String, usize, String)>,
+    /// Blobs no rule ever ran over: (path, the bound or failure that stopped it). The path is the
+    /// actionable half — an operator who cannot tell which limit hit which file cannot act on either.
+    unscanned: Vec<(String, String)>,
+    /// The scan broke before it could reach any blob. Unlike `unscanned` there is no file to name:
+    /// nothing at all is known about the push. A `bool` would do, but the message is the point.
+    errored: Option<String>,
+}
+
+impl ScanReport {
+    /// Anything the scan did not cover. `pre_receive_cmd` refuses on this: "found nothing" and
+    /// "looked at nothing" are different claims, and only one of them clears a push.
+    fn incomplete(&self) -> bool {
+        !self.unscanned.is_empty() || self.errored.is_some()
+    }
+}
+
+/// Scan the objects these refs bring that the repo does not already have.
+///
+/// `--not --all` is what keeps this proportional to the **push** rather than to the repo: during
+/// pre-receive no ref has moved yet, so `--all` is the history already on the server, and the
+/// difference is exactly what is arriving. Re-scanning history already accepted would make every
+/// push cost the size of the repo.
+fn scan_push(repo: &Path, news: &[String]) -> ScanReport {
+    // The allowlist is the **server's**, read from the bare repo directory — deliberately not from
+    // the pushed tree. An allowlist the pusher controls is not a gate, it is a form to fill in.
+    let allow = agit::scan::Allowlist::load(repo);
+    let skip = load_scan_skip(repo);
+    let mut out = ScanReport { findings: vec![], unscanned: vec![], errored: None };
+
+    let mut list_args: Vec<&str> = vec!["rev-list", "--objects"];
+    for n in news {
+        list_args.push(n);
+    }
+    list_args.push("--not");
+    list_args.push("--all");
+    let Some(listing) = git(repo, &list_args) else {
+        out.errored = Some("`git rev-list` could not list the objects this push brings".into());
+        return out;
+    };
+
+    // "<sha> [path]" — the path is git's best guess at a name for the object, which is what makes a
+    // finding reportable to a human.
+    let mut want: Vec<(String, String)> = vec![];
+    for line in listing.lines() {
+        let (sha, path) = match line.split_once(' ') {
+            Some((s, p)) => (s, p),
+            None => (line, ""),
+        };
+        if sha.len() < 7 || path.is_empty() {
+            continue; // commits/tags have no path here; only blobs (and trees) do
+        }
+        if skip.iter().any(|s| s == path) {
+            continue;
+        }
+        if want.len() >= SCAN_MAX_BLOBS {
+            // One entry, not one per blob: the tail of an oversized push is unbounded, and naming the
+            // first object past the bound is what an operator needs to act on it anyway.
+            out.unscanned.push((
+                path.to_string(),
+                format!("this push carries more than {SCAN_MAX_BLOBS} blobs — this one and every blob after it went unscanned"),
+            ));
+            break;
+        }
+        want.push((sha.to_string(), path.to_string()));
+    }
+    if want.is_empty() {
+        return out;
+    }
+
+    // One `cat-file --batch-check` for every candidate: types and sizes in a single process, so the
+    // size bound can be applied *before* any content is read.
+    let shas: String = want.iter().map(|(s, _)| format!("{s}\n")).collect();
+    let Some(check) = git_stdin(repo, &["cat-file", "--batch-check"], shas.as_bytes()) else {
+        out.errored = Some("`git cat-file --batch-check` could not size the pushed objects".into());
+        return out;
+    };
+    let mut budget = SCAN_MAX_TOTAL_BYTES;
+    let mut todo: Vec<(String, String)> = vec![];
+    // --batch-check answers every input line with exactly one output line, so this zip stays aligned
+    // even for an object git has lost (`<sha> missing`).
+    for (line, (sha, path)) in String::from_utf8_lossy(&check).lines().zip(want.iter()) {
+        let mut f = line.split_whitespace();
+        let (_s, kind, size) = (f.next(), f.next().unwrap_or(""), f.next().unwrap_or("0"));
+        if kind == "missing" {
+            out.unscanned.push((path.clone(), "git no longer has this object".into()));
+            continue;
+        }
+        if kind != "blob" {
+            continue; // a tree has no content of its own to scan
+        }
+        let size: u64 = size.parse().unwrap_or(0);
+        if size > SCAN_MAX_BLOB_BYTES {
+            out.unscanned.push((path.clone(), format!("{size} bytes — past the {SCAN_MAX_BLOB_BYTES}-byte per-blob scan bound")));
+            continue;
+        }
+        if size > budget {
+            out.unscanned.push((
+                path.clone(),
+                format!("{size} bytes — past what is left of this push's {SCAN_MAX_TOTAL_BYTES}-byte total scan budget"),
+            ));
+            continue;
+        }
+        budget -= size;
+        todo.push((sha.clone(), path.clone()));
+    }
+    if todo.is_empty() {
+        return out;
+    }
+
+    // ...and one `cat-file --batch` for the survivors' contents.
+    let shas: String = todo.iter().map(|(s, _)| format!("{s}\n")).collect();
+    let Some(blobs) = git_stdin(repo, &["cat-file", "--batch"], shas.as_bytes()) else {
+        out.errored = Some("`git cat-file --batch` could not read the pushed blobs".into());
+        return out;
+    };
+    // Keyed by sha, never by position: a missing object yields no body, and a positional zip would
+    // then pair every later blob's content with the *previous* blob's path — and the path is the whole
+    // actionable part of "rewrite the history that carries this secret".
+    let bodies = parse_batch(&blobs);
+    for (sha, path) in todo.iter() {
+        let Some(content) = bodies.get(sha) else {
+            out.unscanned.push((path.clone(), "git returned no content for this object".into()));
+            continue;
+        };
+        // A NUL byte used to skip the blob whole and silently: `printf '\000' > f; cat key >> f` was a
+        // complete bypass of this gate. Binary holds a key just as well as text does, so scan its
+        // printable runs instead — and with the entropy heuristic off, which over the strings of a
+        // compressed or compiled file is a false-positive generator, not a rule.
+        let binary = content.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0);
+        let text = match binary {
+            false => String::from_utf8_lossy(content).into_owned(),
+            true => printable_runs(content),
+        };
+        for f in agit::scan::scan_text_allow(&text, !binary, &allow) {
+            // For a binary blob `line` counts printable runs, not file lines — the rule and the path
+            // are what the operator acts on either way.
+            out.findings.push((f.rule.to_string(), path.clone(), f.line, clip(&f.excerpt, 120)));
+        }
+    }
+    out
+}
+
+/// The `strings(1)` of a blob: its printable runs, one per line, so the text rules can see them.
+///
+/// A credential has to survive being copied through a config file, an env var or a header, so it is
+/// printable ASCII by construction — the bytes around it cannot hide it.
+fn printable_runs(content: &[u8]) -> String {
+    let mut out = String::new();
+    let mut run: Vec<u8> = vec![];
+    // Tab included: an indent does not end a run a human would read as one line.
+    let printable = |b: u8| (0x20..0x7f).contains(&b) || b == b'\t';
+    for &b in content.iter().chain(std::iter::once(&0)) {
+        match printable(b) {
+            true => run.push(b),
+            false => {
+                if run.len() >= MIN_PRINTABLE_RUN {
+                    out.push_str(&String::from_utf8_lossy(&run));
+                    out.push('\n');
+                }
+                run.clear();
+            }
+        }
+    }
+    out
+}
+
+/// Paths the operator has accepted as unscannable. Absent file = empty list, which is the safe
+/// direction: fail-closed stays closed until someone says otherwise.
+fn load_scan_skip(repo: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(repo.join(SCAN_SKIP_FILE)) else {
+        return vec![];
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `git cat-file --batch` output: `<sha> <type> <size>\n<size bytes>\n`, repeated. Split on the
+/// declared size rather than on newlines — blob content contains newlines, and a "missing" line has
+/// no size at all.
+///
+/// Keyed by the sha in the header rather than returned in order: an object git has lost contributes no
+/// body, so position is not identity here.
+fn parse_batch(raw: &[u8]) -> HashMap<String, Vec<u8>> {
+    let mut out = HashMap::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let Some(nl) = raw[i..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let header = String::from_utf8_lossy(&raw[i..i + nl]).to_string();
+        i += nl + 1;
+        let mut f = header.split_whitespace();
+        let Some(sha) = f.next() else {
+            continue;
+        };
+        let Some(size) = f.nth(1).and_then(|s| s.parse::<usize>().ok()) else {
+            continue; // "<sha> missing" — no content follows
+        };
+        let end = (i + size).min(raw.len());
+        out.insert(sha.to_string(), raw[i..end].to_vec());
+        i = end + 1; // the trailing newline git adds after the content
+    }
+    out
+}
+
+fn git_stdin(repo: &Path, args: &[&str], input: &[u8]) -> Option<Vec<u8>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(input).ok()?;
+    let out = child.wait_with_output().ok()?;
+    Some(out.stdout)
+}
+
+/// Install the pre-receive hook into a bare repo, pointing at this very binary.
+///
+/// The absolute path of the running executable is baked in: the hook runs from git's environment,
+/// where PATH is whatever the service inherited, and a hook that cannot find its binary is a gate
+/// that silently isn't there.
+fn install_pre_receive(repo: &Path, root: &Path, agent: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let hook = repo.join("hooks").join("pre-receive");
+    let script = format!(
+        "#!/bin/sh\n\
+         # Installed by agit-hub. The server-side secret gate: `git push --no-verify` skips the\n\
+         # client's hook, not this one. Regenerated on demand — edit agit-hub, not this file.\n\
+         exec {} pre-receive --root {} --agent {}\n",
+        shell_quote(&exe.to_string_lossy()),
+        shell_quote(&root.to_string_lossy()),
+        shell_quote(agent),
+    );
+    // Rewrite whenever it differs: the binary may have moved since the repo was created, and a hook
+    // pointing at a path that no longer exists fails the push rather than passing it (git treats a
+    // hook that cannot execute as a failure) — but silently wrong is still worth correcting.
+    if std::fs::read_to_string(&hook).ok().as_deref() == Some(script.as_str()) {
+        return;
+    }
+    let _ = std::fs::create_dir_all(repo.join("hooks"));
+    if std::fs::write(&hook, &script).is_ok() {
+        let _ = std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// Single-quote for /bin/sh. Paths come from the filesystem and the agent name is validated, but a
+/// hook script is code — quoting it is not where to save a line.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 // ─────────────────────── git reads (bare repos) ───────────────────────
 
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
@@ -823,6 +1217,9 @@ struct Ctx {
     /// how it stops brute force). Without a cap, a few dozen concurrent logins = a few dozen copies
     /// of 19MiB + every core pegged, i.e. handing out an amplifier.
     login_gate: Arc<Semaphore>,
+    /// Per-token request budget (see TokenBuckets) — charges a runaway robot to its own credential
+    /// rather than to whatever address it shares.
+    token_rl: Arc<TokenBuckets>,
 }
 
 impl Ctx {
@@ -941,6 +1338,7 @@ fn serve(root: &Path, cfg: Cfg) -> i32 {
         sessions: Sessions::new(),
         limiter: Arc::new(ConnLimiter::default()),
         login_gate: Arc::new(Semaphore::new(LOGIN_CONC)),
+        token_rl: Arc::new(TokenBuckets::new()),
     });
 
     // Concurrency cap: a thread per connection, but capped by a semaphore — otherwise N slow
@@ -1001,6 +1399,59 @@ impl ConnLimiter {
         }
         *n += 1;
         Some(IpGuard { limiter: self.clone(), ip })
+    }
+}
+
+/// Per-token request budget — **a different question from the per-IP cap**, which counts *concurrent
+/// connections* from one address and exists to stop a slowloris filling the thread pool. This counts
+/// *requests over time* from one credential, and exists because a token is a robot: a wedged CI loop
+/// or a leaked token hammers the Hub from an address that may be shared (a NAT, a proxy) with people
+/// who have done nothing wrong. Keying the budget on the credential charges the right party.
+///
+/// A token bucket, so a normal `git clone` — a burst of requests, then nothing — is unaffected,
+/// while a sustained hammer settles to the refill rate.
+struct TokenBuckets {
+    inner: Mutex<HashMap<String, Bucket>>,
+}
+
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
+/// Sustained rate, requests/second/token. A clone or a push is a handful of requests; anything
+/// steadily above this is a loop, not a person.
+const TOKEN_RATE_PER_SEC: f64 = 4.0;
+/// Burst allowance. Deliberately generous: a fetch of a big store fans out into many requests at
+/// once, and throttling a legitimate clone would be worse than the problem being solved.
+const TOKEN_BURST: f64 = 240.0;
+
+impl TokenBuckets {
+    fn new() -> TokenBuckets {
+        TokenBuckets { inner: Mutex::new(HashMap::new()) }
+    }
+
+    fn allow(&self, id: &str) -> bool {
+        self.allow_at(id, Instant::now())
+    }
+
+    /// The clock is a parameter so the refill can be tested without sleeping.
+    ///
+    /// The map only ever grows a key per **authenticated** token id, so it is bounded by the number
+    /// of issued tokens — an unauthenticated flood cannot make it allocate.
+    fn allow_at(&self, id: &str, now: Instant) -> bool {
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let b = m.entry(id.to_string()).or_insert(Bucket { tokens: TOKEN_BURST, last: now });
+        // saturating_duration_since, not `-`: Instant subtraction panics if now precedes last, and
+        // two threads can read the clock out of order.
+        let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
+        b.last = now;
+        b.tokens = (b.tokens + elapsed * TOKEN_RATE_PER_SEC).min(TOKEN_BURST);
+        if b.tokens < 1.0 {
+            return false;
+        }
+        b.tokens -= 1.0;
+        true
     }
 }
 
@@ -1202,6 +1653,15 @@ fn handle(mut stream: TcpStream, ctx: &Ctx, peer: Option<IpAddr>, proxied: bool)
     let authn = auth::authenticate(&ctx.store, &ctx.sessions, req.sid().as_deref(), &secrets);
     if let Some(id) = &authn.token_id {
         auth::touch_token(&ctx.store, id);
+        // The token's own budget, charged before any work is done for it. Only reached by a token
+        // that already authenticated, so an anonymous flood cannot grow the bucket map.
+        if !ctx.token_rl.allow(id) {
+            return write_response(
+                &mut stream,
+                &Resp::text(429, "this token is over its request budget; slow down (the limit is per token, not per address)")
+                    .with("Retry-After", "1"),
+            );
+        }
     }
     let caller = authn.caller;
     let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
@@ -1459,6 +1919,7 @@ fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
         ("GET", "tokens") => return api_tokens(ctx, caller),
         ("POST", "tokens") => return api_create_token(ctx, caller, body),
         ("GET", "audit") => return api_audit(ctx, req, caller),
+        ("GET", "search") => return api_search(ctx, req, caller),
         _ => {}
     }
     if let Some(id) = rest.strip_prefix("tokens/") {
@@ -1470,6 +1931,22 @@ fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
     let Some(after) = rest.strip_prefix("agent/") else {
         return Resp::err(404, "not found");
     };
+
+    // agent/by-aid/<aid> — identity → current name. Before the name routes, since `by-aid` is not an
+    // agent name (a real one could never contain `/`).
+    if let Some(aid) = after.strip_prefix("by-aid/") {
+        return match m {
+            "GET" => api_agent_by_aid(ctx, req, caller, aid),
+            _ => Resp::text(405, "method not allowed"),
+        };
+    }
+
+    // agent/<name>/mrs[/<id>[/comments|/close]]
+    if let Some((name, tail)) = after.split_once("/mrs") {
+        if tail.is_empty() || tail.starts_with('/') {
+            return api_mrs(ctx, caller, name, tail, m, body);
+        }
+    }
 
     // agent/<name>/session/<id>[/diff]
     if let Some((name, tail)) = after.split_once("/session/") {
@@ -1698,18 +2175,7 @@ fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta) -> Resp {
         .map(|(sha, subject)| serde_json::json!({ "sha": sha, "subject": subject }))
         .collect();
 
-    let (aid, aid_source) = agent_aid(&repo);
-    // Once the aid is learned, cache it into agents.json — the authoritative value still lives only
-    // in the store; this just saves a git show.
-    if let Some(a) = &aid {
-        if meta.aid.as_deref() != Some(a.as_str()) {
-            let _ = ctx.store.update_agents(|list| {
-                if let Some(m) = list.iter_mut().find(|m| &m.name == name) {
-                    m.aid = Some(a.clone());
-                }
-            });
-        }
-    }
+    let (aid, aid_source, aid_status) = sync_aid(ctx, meta, &caller.user.clone().unwrap_or_else(|| "anonymous".into()));
 
     let members: Vec<serde_json::Value> = meta
         .members
@@ -1722,6 +2188,7 @@ fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta) -> Resp {
         "git": format!("/{name}.git"),
         "aid": aid,
         "aid_source": aid_source,
+        "aid_status": aid_status,
         "clone_url": clone_url(ctx, req, name),
         "visibility": meta.visibility,
         "owner": meta.owner,
@@ -1734,9 +2201,119 @@ fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta) -> Resp {
         "total": total,
         "page": pageno,
         "per_page": PER_PAGE,
+        // With a search, `total` counts the hits among the sessions actually scanned — so say how
+        // many that was, and whether the cap cut it short. The count alone cannot tell you.
+        "scanned": if search.is_empty() { refs.len() } else { refs.len().min(SEARCH_SCAN_CAP) },
+        "scan_cap": SEARCH_SCAN_CAP,
         "scan_capped": !search.is_empty() && refs.len() > SEARCH_SCAN_CAP,
         "sessions": sessions,
         "history": history,
+    }))
+}
+
+/// Read the store's identity, reconcile it with what agents.json has cached, and act on the verdict.
+/// Returns `(aid, source, status)` for the response.
+///
+/// **The store is the authority** — the Hub never mints an aid, it only remembers what it read (the
+/// cache exists so `by-aid` and the agent list don't have to `git show` every repo). The reconciling
+/// itself is `identity::reconcile`, a pure function with the awkward cases pinned down in tests; all
+/// this does is the IO around it.
+///
+/// `status`: "ok" | "learned" | "replaced" | "conflict".
+fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<String>, &'static str, &'static str) {
+    let repo = repo_path(ctx.root(), &meta.name);
+    let (seen, source) = agent_aid(&repo);
+
+    // Nothing to decide and nothing to write: the store said nothing this time, or it said what the
+    // cache already holds. Taking the lock on every read of every agent would make a GET a file write.
+    if seen.is_none() || seen == meta.aid {
+        return match (seen, meta.aid.clone()) {
+            (Some(a), _) => (Some(a), source, "ok"),
+            // The store didn't say this time (empty repo / unreadable HEAD) — report what the Hub
+            // remembers, and label it as the cache rather than passing it off as a fresh read.
+            (None, Some(a)) => (Some(a), "cache", "ok"),
+            (None, None) => (None, source, "ok"),
+        };
+    }
+
+    // Past here the verdict can write, so reading the cache, looking up the holder and writing must be
+    // ONE critical section. Looking the holder up outside the lock was a TOCTOU: two concurrent syncs
+    // of two stores carrying the same aid could both see no holder, both Learn, and both write —
+    // breaking the invariant `Store::agent_by_aid` leans on, that the first match is the only match.
+    let name = meta.name.clone();
+    let mut verdict = identity::AidVerdict::Unchanged;
+    // The cache write stays best-effort, as before: the store is the authority, so a verdict whose
+    // write failed is still the truth about what was read, and the next sync reconciles again.
+    let _ = ctx.store.update_agents(|list| {
+        let cached = list.iter().find(|m| m.name == name).and_then(|m| m.aid.clone());
+        let holder = seen
+            .as_deref()
+            .and_then(|a| list.iter().find(|m| m.aid.as_deref() == Some(a)))
+            .map(|m| m.name.clone());
+        verdict = identity::reconcile(&name, cached.as_deref(), seen.as_deref(), holder.as_deref());
+        if let identity::AidVerdict::Learn(a) | identity::AidVerdict::Replaced { now: a, .. } = &verdict {
+            if let Some(m) = list.iter_mut().find(|m| m.name == name) {
+                m.aid = Some(a.clone());
+            }
+        }
+    });
+
+    match verdict {
+        // Re-read under the lock, the cache already agreed — the race this section exists to close.
+        identity::AidVerdict::Unchanged => match seen {
+            Some(a) => (Some(a), source, "ok"),
+            None => (None, source, "ok"),
+        },
+        identity::AidVerdict::Learn(a) => {
+            audit::append(ctx.root(), actor, audit::AGENT_AID_LEARNED, Some(&meta.name), &a);
+            (Some(a), source, "learned")
+        }
+        identity::AidVerdict::Replaced { was, now } => {
+            // The store is the authority, so the cache follows it — but the response only says
+            // "replaced" this once, and the audit log is what makes it still findable tomorrow.
+            audit::append(ctx.root(), actor, audit::AGENT_AID_REPLACED, Some(&meta.name), &format!("{was} → {now}"));
+            (Some(now), source, "replaced")
+        }
+        identity::AidVerdict::Conflict { aid, held_by } => {
+            audit::append(
+                ctx.root(),
+                actor,
+                audit::AGENT_AID_CONFLICT,
+                Some(&meta.name),
+                &format!("{aid} is already held by {held_by}"),
+            );
+            // Deliberately does **not** name the other agent in the response: the caller may have no
+            // permission to know it exists, and "which name holds this aid" is exactly what the
+            // by-aid endpoint gates.
+            (Some(aid), source, "conflict")
+        }
+    }
+}
+
+/// `GET /api/agent/by-aid/<aid>` — the identity → current name lookup.
+///
+/// This is what makes a rename safe: a `.agit.toml` records the **aid**, and asks here for whatever
+/// name that memory currently answers to. Routes through the normal gate on the resolved agent, so
+/// an aid is not an oracle for the existence of agents you cannot read.
+fn api_agent_by_aid(ctx: &Ctx, req: &Req, caller: &Caller, aid: &str) -> Resp {
+    if !identity::is_aid(aid) {
+        return Resp::err(400, "not an aid (want agt_<id>)");
+    }
+    // Unresolvable and unreadable must look the same, for the same reason gate() hides existence:
+    // otherwise this endpoint enumerates the private agents by aid instead of by name.
+    let Some(meta) = ctx.store.agent_by_aid(aid) else {
+        return Resp::err(404, "not found");
+    };
+    let meta = match gate(ctx, caller, &meta.name, Action::Read) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    Resp::json(serde_json::json!({
+        "aid": aid,
+        "name": meta.name,
+        "clone_url": clone_url(ctx, req, &meta.name),
+        "visibility": meta.visibility,
+        "owner": meta.owner,
     }))
 }
 
@@ -1778,6 +2355,9 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
             if std::fs::rename(repo_path(ctx.root(), &meta.name), repo_path(ctx.root(), &newname)).is_err() {
                 return Resp::err(500, "rename failed (the repo directory won't move)");
             }
+            // A rename is a **metadata edit, not a new identity**: only the label moves. The aid is
+            // deliberately untouched here (it isn't the Hub's to mint or retire — it lives in the
+            // store's agent.toml), so everything keyed on identity survives.
             let r = ctx.store.update_agents(|list| {
                 if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
                     m.name = newname.clone();
@@ -1794,8 +2374,12 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
                     t.agent = Some(newname.clone());
                 }
             });
+            // MR endpoints carry both aid and name; the names are labels and have to follow too.
+            let _ = ctx.store.rename_in_mrs(&meta.name, &newname);
             audit::append(ctx.root(), &actor, audit::AGENT_RENAME, Some(&newname), &format!("{} → {newname}", meta.name));
-            return Resp::json(serde_json::json!({ "name": newname, "renamed_from": meta.name }));
+            // Echo the aid back: the whole point of the rename being safe is that identity did not
+            // move, and a caller should be able to see that rather than take it on faith.
+            return Resp::json(serde_json::json!({ "name": newname, "renamed_from": meta.name, "aid": meta.aid }));
         }
     }
 
@@ -1816,6 +2400,8 @@ fn api_delete_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
     // with the same name, the old tokens would **automatically** gain rights on that new agent (the
     // name was recycled, but the token still keys off the name).
     let _ = ctx.store.update_tokens(|toks| toks.retain(|t| t.agent.as_deref() != Some(meta.name.as_str())));
+    // Same reasoning for MRs targeting it: a recycled name must not inherit the old agent's reviews.
+    let _ = ctx.store.update_mrs(|mrs| mrs.retain(|m| m.target.agent != meta.name));
     audit::append(ctx.root(), &caller.user.clone().unwrap_or_default(), audit::AGENT_DELETE, Some(&meta.name), "");
     Resp::no_content()
 }
@@ -1899,6 +2485,427 @@ fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str,
         }
         _ => Resp::text(405, "method not allowed"),
     }
+}
+
+// ── cross-agent search ──
+
+/// Sessions scanned across the whole query, all agents together. Each one costs a `git show` plus a
+/// parse, so this — not the agent count — is the thing worth bounding.
+const XSEARCH_SCAN_CAP: usize = 400;
+/// Hits returned. Past this the scan stops early: nobody reads hit 200, and the work is real.
+const XSEARCH_MAX_HITS: usize = 50;
+
+/// `GET /api/search?q=` — one query across **every agent the caller may read**, over the fields
+/// people actually remember: what they asked, what came back, which files were touched.
+///
+/// The permission is per agent and decided by `acl::decide`, exactly like everywhere else: an agent
+/// you cannot read contributes nothing, and cannot even be inferred from a hit count.
+fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
+    let q = param(req.query(), "q").map(|q| q.replace('+', " ")).unwrap_or_default();
+    let q = q.trim().to_lowercase();
+    if q.len() < 2 {
+        return Resp::err(400, "want q, at least 2 characters");
+    }
+    let mut hits: Vec<serde_json::Value> = vec![];
+    let mut scanned = 0usize;
+    let mut capped = false;
+
+    'agents: for name in list_agents(ctx.root()) {
+        let meta = ctx.store.agent_or_unowned(&name);
+        if !acl::decide(caller, &meta.to_acl(), Action::Read).allowed() {
+            continue;
+        }
+        let repo = repo_path(ctx.root(), &name);
+        if !has_head(&repo) {
+            continue;
+        }
+        for r in session_refs(&repo) {
+            if scanned >= XSEARCH_SCAN_CAP || hits.len() >= XSEARCH_MAX_HITS {
+                capped = true;
+                break 'agents;
+            }
+            scanned += 1;
+            let Some(jsonl) = load_session(&repo, &r.path, None) else {
+                continue;
+            };
+            let d = digest(&r.runtime, &r.id, &jsonl);
+            let conclusion = d.texts.last().cloned().unwrap_or_default();
+            // Where it matched is worth reporting: "in a prompt" and "in a filename" are different
+            // memories, and the UI can say which.
+            let mut fields = vec![];
+            if d.prompts.iter().any(|p| p.to_lowercase().contains(&q)) {
+                fields.push("prompt");
+            }
+            if conclusion.to_lowercase().contains(&q) {
+                fields.push("conclusion");
+            }
+            if d.files.iter().any(|f| f.to_lowercase().contains(&q)) {
+                fields.push("file");
+            }
+            if fields.is_empty() {
+                continue;
+            }
+            hits.push(serde_json::json!({
+                "agent": name,
+                "aid": meta.aid,
+                "id": d.id,
+                "env": r.env,
+                "runtime": r.runtime,
+                "matched": fields,
+                "title": d.prompts.first().map(|s| first_line(s)).unwrap_or_default(),
+                "conclusion": clip(&conclusion, 200),
+                "files": d.files.iter().filter(|f| f.to_lowercase().contains(&q)).take(5).cloned().collect::<Vec<_>>(),
+            }));
+        }
+    }
+
+    Resp::json(serde_json::json!({
+        "q": q,
+        "hits": hits,
+        // `total` is the number of hits **found**, and `scan_capped` says whether that is the whole
+        // story. Reporting a capped count as if it were the total is the lie this flag exists to
+        // stop.
+        "total": hits.len(),
+        "scanned": scanned,
+        "scan_capped": capped,
+        "scan_cap": XSEARCH_SCAN_CAP,
+    }))
+}
+
+// ── merge requests ──
+
+/// `/api/agent/<name>/mrs...` — the MR routes, keyed on the **target** agent (that is the memory
+/// being changed, so that is the ACL that governs).
+///
+///   POST   mrs               open one                     [Write on the target]
+///   GET    mrs               list                         [Read]
+///   GET    mrs/<id>          detail + transcript          [Read]
+///   POST   mrs/<id>/comments comment                      [Read on the target + `mutation_actor`]
+///   POST   mrs/<id>/close    close / record it as merged  [Write]
+///
+/// Opening needs Write because an MR is a proposal against that memory; commenting only needs Read,
+/// since anyone who may read the review may take part in it. That tier is about *who may join the
+/// discussion* — it is not a claim that a comment is not a write, so every POST here additionally
+/// clears `mutation_actor`. Nothing here merges anything: see the module docs on `agit::hub::mr`.
+fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
+    // The action this route needs, decided **before** the agent is fetched, so the gate is the first
+    // thing that happens on every path.
+    let action = match (method, tail) {
+        ("GET", _) => Action::Read,
+        ("POST", "") => Action::Write,
+        ("POST", t) if t.ends_with("/comments") => Action::Read,
+        ("POST", t) if t.ends_with("/close") => Action::Write,
+        _ => return Resp::text(405, "method not allowed"),
+    };
+    let meta = match gate(ctx, caller, name, action) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    // Every POST below mutates hub state, whichever tier `gate` authorized it at.
+    let actor = match method {
+        "POST" => match mutation_actor(ctx, caller, name) {
+            Ok(a) => a,
+            Err(r) => return r,
+        },
+        _ => caller.user.clone().unwrap_or_default(),
+    };
+
+    match (method, tail) {
+        ("GET", "") => api_mr_list(ctx, caller, &meta),
+        ("POST", "") => api_mr_open(ctx, caller, &meta, &actor, body),
+        _ => {
+            // mrs/<id> | mrs/<id>/comments | mrs/<id>/close
+            let rest = match tail.strip_prefix('/') {
+                Some(r) => r,
+                None => return Resp::err(404, "not found"),
+            };
+            let (id, sub) = match rest.split_once('/') {
+                Some((i, s)) => (i, s),
+                None => (rest, ""),
+            };
+            let Ok(id) = id.parse::<usize>() else {
+                return Resp::err(404, "not found");
+            };
+            match (method, sub) {
+                ("GET", "") => api_mr_detail(ctx, caller, &meta, id),
+                ("POST", "comments") => api_mr_comment(ctx, &meta, id, &actor, body),
+                ("POST", "close") => api_mr_close(ctx, caller, &meta, id, &actor, body),
+                _ => Resp::text(405, "method not allowed"),
+            }
+        }
+    }
+}
+
+/// The identity every MR mutation must have, and the token cap that `gate` could not apply.
+///
+/// Commenting is deliberately gated at `Action::Read` — anyone who may read a review may take part in
+/// it, read-members included — but a comment is still a **write of hub state**, and that carries two
+/// requirements the agent tier does not:
+///
+///   - It must be attributable. Anonymous clears the Read tier on a public agent (acl.rs rule 5), and
+///     would otherwise author a comment as the empty string: a mutation attributed to nobody.
+///   - A read-only token must never write, whoever holds it. `acl::decide` caps tokens on
+///     `Action::Write`, so a route gated at Read never reaches that rule — see acl.rs's
+///     `read_token_never_writes_even_for_the_owner`. The cap is an intersection, not a maximum, so it
+///     has to be applied where the write actually happens.
+fn mutation_actor(ctx: &Ctx, caller: &Caller, name: &str) -> Result<String, Resp> {
+    let Some(actor) = caller.user.clone() else {
+        audit_deny(ctx, "anonymous", Some(name), Action::Write, Deny::Anonymous);
+        return Err(Resp::err(401, "login required"));
+    };
+    if caller.token.as_ref().is_some_and(|t| t.scope != Scope::Write) {
+        audit_deny(ctx, &actor, Some(name), Action::Write, Deny::TokenScope);
+        return Err(Resp::err(403, Deny::TokenScope.reason()));
+    }
+    Ok(actor)
+}
+
+/// The list view: no transcripts. They are the big field, and nobody reading an index wants every
+/// merge dialogue on the agent shipped along with it.
+fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta) -> Resp {
+    let items: Vec<serde_json::Value> = ctx
+        .store
+        .mrs_for(&meta.name)
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "title": m.title,
+                "author": m.author,
+                "state": m.state,
+                "created": m.created,
+                "updated": m.updated,
+                "source": mr_endpoint_json(ctx, caller, &m.source),
+                "target": mr_endpoint_json(ctx, caller, &m.target),
+                "comments": m.comments.len(),
+                "has_transcript": m.dialogue_transcript.is_some() && can_read_agent(ctx, caller, &m.source.agent),
+            })
+        })
+        .collect();
+    Resp::json(serde_json::json!({ "agent": meta.name, "mrs": items }))
+}
+
+fn can_read_agent(ctx: &Ctx, caller: &Caller, agent: &str) -> bool {
+    acl::decide(caller, &ctx.store.agent_or_unowned(agent).to_acl(), Action::Read).allowed()
+}
+
+/// Serialize one endpoint **for this reader**, not for the person who opened the MR.
+///
+/// An MR's source is a different agent with its own ACL, and the opener's permission is not the
+/// audience's: alice may open an MR from a private agent into a public one, and from then on everyone
+/// who can read the *target* reads the object. Deciding again per reader is what keeps `gate`'s rule —
+/// existence is itself a secret — true of the MR views too; checking only the opener leaves the name,
+/// aid and ref of a private agent readable by anonymous.
+fn mr_endpoint_json(ctx: &Ctx, caller: &Caller, e: &mr::Endpoint) -> serde_json::Value {
+    if !can_read_agent(ctx, caller, &e.agent) {
+        return serde_json::json!({ "aid": null, "agent": null, "ref": null, "redacted": true });
+    }
+    serde_json::json!({ "aid": e.aid, "agent": e.agent, "ref": e.git_ref })
+}
+
+fn mr_json(ctx: &Ctx, caller: &Caller, m: &mr::Mr) -> serde_json::Value {
+    // The transcript is the dialogue `agit a merge` held *between the two sides*, so it quotes the
+    // source by construction — a reader who may not know the source exists may not read it either.
+    // Withheld whole rather than filtered: there is no reliable way to strip one agent's voice out of
+    // free text, and a partial redaction that looks complete is worse than an honest absence.
+    let show_source = can_read_agent(ctx, caller, &m.source.agent);
+    serde_json::json!({
+        "id": m.id,
+        "title": m.title,
+        "author": m.author,
+        "state": m.state,
+        "created": m.created,
+        "updated": m.updated,
+        "source": mr_endpoint_json(ctx, caller, &m.source),
+        "target": mr_endpoint_json(ctx, caller, &m.target),
+        "dialogue_transcript": if show_source { m.dialogue_transcript.clone() } else { None },
+        "transcript_redacted": !show_source && m.dialogue_transcript.is_some(),
+        "comments": m.comments.iter().map(|c| serde_json::json!({
+            "id": c.id,
+            "author": c.author,
+            "body": c.body,
+            "created": c.created,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, actor: &str, body: &[u8]) -> Resp {
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(title) = str_field(&v, "title") else {
+        return Resp::err(400, "want title");
+    };
+    let title = match mr::bounded(&title, mr::TITLE_MAX) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Resp::err(400, "want title"),
+        Err(e) => return Resp::err(400, &format!("title {e}")),
+    };
+    let Some(source_name) = str_field(&v, "source") else {
+        return Resp::err(400, "want source (the agent the change is coming from)");
+    };
+    // The source is a real agent on this Hub, and **the caller must be able to read it**: an MR
+    // carries the source's identity and ref into an object other people will read, so proposing from
+    // an agent you cannot see would leak that it exists.
+    let source = match gate(ctx, caller, &source_name, Action::Read) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if source.name == meta.name {
+        return Resp::err(400, "an agent cannot open a merge request against itself");
+    }
+    let source_ref = str_field(&v, "source_ref").unwrap_or_else(|| "main".into());
+    let target_ref = str_field(&v, "target_ref").unwrap_or_else(|| "main".into());
+    for r in [&source_ref, &target_ref] {
+        if !valid_ref_name(r) {
+            return Resp::err(400, "invalid ref name");
+        }
+    }
+    // The transcript `agit a merge` produced. Optional: an MR may be opened before the dialogue is
+    // run, and it can be filled in later by comment. Bounded, and never truncated silently.
+    let transcript = match v.get("dialogue_transcript").and_then(|x| x.as_str()) {
+        None => None,
+        Some(t) => match mr::bounded(t, mr::TRANSCRIPT_MAX) {
+            Ok(x) => x,
+            Err(e) => return Resp::err(413, &format!("dialogue_transcript {e}")),
+        },
+    };
+
+    let open_now = ctx.store.mrs_for(&meta.name).iter().filter(|m| m.is_open()).count();
+    if open_now >= mr::OPEN_MAX {
+        return Resp::err(429, &format!("this agent already has {} open merge requests", mr::OPEN_MAX));
+    }
+
+    // Snapshot both identities now. Names get renamed; the aid is what still says, a year later,
+    // which two memories this review was actually between.
+    let src_aid = sync_aid(ctx, &source, actor).0;
+    let tgt_aid = sync_aid(ctx, meta, actor).0;
+    let now = store::now_iso();
+    let rec = ctx.store.update_mrs(|mrs| {
+        let id = mr::next_id(mrs, &meta.name);
+        let rec = mr::Mr {
+            id,
+            source: mr::Endpoint { aid: src_aid.clone(), agent: source.name.clone(), git_ref: source_ref.clone() },
+            target: mr::Endpoint { aid: tgt_aid.clone(), agent: meta.name.clone(), git_ref: target_ref.clone() },
+            title: title.clone(),
+            author: actor.to_string(),
+            state: mr::State::Open.as_str().to_string(),
+            created: now.clone(),
+            updated: now.clone(),
+            dialogue_transcript: transcript.clone(),
+            comments: vec![],
+        };
+        mrs.push(rec.clone());
+        rec
+    });
+    let Ok(rec) = rec else {
+        return Resp::err(500, "failed to write mrs.json");
+    };
+    audit::append(
+        ctx.root(),
+        actor,
+        audit::MR_OPEN,
+        Some(&meta.name),
+        &format!("#{} {} ← {}:{}", rec.id, title, source.name, source_ref),
+    );
+    Resp::json_status(201, mr_json(ctx, caller, &rec))
+}
+
+fn api_mr_detail(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, id: usize) -> Resp {
+    match ctx.store.mrs_for(&meta.name).into_iter().find(|m| m.id == id) {
+        Some(m) => Resp::json(mr_json(ctx, caller, &m)),
+        None => Resp::err(404, "not found"),
+    }
+}
+
+fn api_mr_comment(ctx: &Ctx, meta: &AgentMeta, id: usize, actor: &str, body: &[u8]) -> Resp {
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(text) = str_field(&v, "body") else {
+        return Resp::err(400, "want body");
+    };
+    let text = match mr::bounded(&text, mr::COMMENT_MAX) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Resp::err(400, "want body"),
+        Err(e) => return Resp::err(400, &format!("body {e}")),
+    };
+    let target = meta.name.clone();
+    let out = ctx.store.update_mrs(|mrs| {
+        let Some(m) = mrs.iter_mut().find(|m| m.target.agent == target && m.id == id) else {
+            return Err(Resp::err(404, "not found"));
+        };
+        // A settled MR is a record. Reopening the discussion on it would quietly edit history that
+        // someone already acted on.
+        if !m.is_open() {
+            return Err(Resp::err(409, &format!("this merge request is {}", m.state)));
+        }
+        if m.comments_full() {
+            return Err(Resp::err(429, &format!("this merge request already has {} comments", mr::COMMENTS_MAX)));
+        }
+        let c = mr::Comment { id: m.next_comment_id(), author: actor.to_string(), body: text.clone(), created: store::now_iso() };
+        m.comments.push(c.clone());
+        m.updated = store::now_iso();
+        Ok(c)
+    });
+    match out {
+        Ok(Ok(c)) => {
+            audit::append(ctx.root(), actor, audit::MR_COMMENT, Some(&meta.name), &format!("#{id} comment {}", c.id));
+            Resp::json_status(201, serde_json::json!({ "id": c.id, "author": c.author, "body": c.body, "created": c.created }))
+        }
+        Ok(Err(r)) => r,
+        Err(_) => Resp::err(500, "failed to write mrs.json"),
+    }
+}
+
+/// Close an MR, or record that it was merged.
+///
+/// `{"state": "merged"}` does **not** merge anything — it records that someone ran `agit a merge`
+/// locally and pushed the result. The Hub has no model and no working tree; claiming otherwise here
+/// would be the lie that turns this object into a fake engine.
+fn api_mr_close(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, id: usize, actor: &str, body: &[u8]) -> Resp {
+    let state = match json_body(body).as_ref().and_then(|v| str_field(v, "state")) {
+        None => mr::State::Closed,
+        Some(s) => match mr::State::parse(&s) {
+            Some(x) if !x.is_open() => x,
+            // "open" here would be a reopen, which is a different verb on a different route.
+            _ => return Resp::err(400, "state must be closed or merged"),
+        },
+    };
+    let target = meta.name.clone();
+    let out = ctx.store.update_mrs(|mrs| {
+        let Some(m) = mrs.iter_mut().find(|m| m.target.agent == target && m.id == id) else {
+            return Err(Resp::err(404, "not found"));
+        };
+        if !m.is_open() {
+            return Err(Resp::err(409, &format!("this merge request is already {}", m.state)));
+        }
+        m.state = state.as_str().to_string();
+        m.updated = store::now_iso();
+        Ok(m.clone())
+    });
+    match out {
+        Ok(Ok(m)) => {
+            let action = if state == mr::State::Merged { audit::MR_MERGED } else { audit::MR_CLOSE };
+            audit::append(ctx.root(), actor, action, Some(&meta.name), &format!("#{id} {}", state.as_str()));
+            Resp::json(mr_json(ctx, caller, &m))
+        }
+        Ok(Err(r)) => r,
+        Err(_) => Resp::err(500, "failed to write mrs.json"),
+    }
+}
+
+/// A git ref name, conservatively. Not `git check-ref-format` — this only has to be a safe, boring
+/// label to store and echo back, and refusing an exotic-but-legal ref costs nothing here.
+fn valid_ref_name(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= 200
+        && !r.starts_with('-')
+        && !r.starts_with('/')
+        && !r.contains("..")
+        && !r.contains("//")
+        && !r.ends_with('/')
+        && r.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
 }
 
 // ── tokens ──
@@ -2133,7 +3140,7 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
     // the network, but it keeps streaming in).
     let _ = stream.set_read_timeout(Some(Duration::from_secs(BODY_TIMEOUT_SECS)));
 
-    ensure_exportable(&repo_path(ctx.root(), name));
+    prepare_repo(&repo_path(ctx.root(), name), ctx.root(), name);
 
     let mut child = match Command::new("git")
         .arg("http-backend")
@@ -2205,6 +3212,16 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
     stream.write_all(head.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+/// Make a repo ready to be served: the export marker, and the server-side secret gate.
+///
+/// Both are done here, right before http-backend runs, rather than only at create time — that is
+/// what brings repos made by an older agit-hub (or `git init --bare` by hand) under the same rules
+/// instead of leaving them as quiet exceptions.
+fn prepare_repo(repo: &Path, root: &Path, agent: &str) {
+    ensure_exportable(repo);
+    install_pre_receive(repo, root, agent);
 }
 
 /// Put http-backend's export marker on **this one** repo.
@@ -2381,6 +3398,164 @@ mod tests {
         let r = git_deny_resp(&Caller::user("eve"), Deny::NoGrant);
         assert_eq!(r.status, 403);
         assert!(r.extra.is_empty());
+    }
+
+    // ── the per-token budget ──
+
+    #[test]
+    fn a_token_spends_its_burst_and_is_then_refused() {
+        let rl = TokenBuckets::new();
+        let t0 = Instant::now();
+        for i in 0..TOKEN_BURST as usize {
+            assert!(rl.allow_at("tok_a", t0), "request {i} is still inside the burst");
+        }
+        assert!(!rl.allow_at("tok_a", t0), "the burst is spent — the next one must be refused");
+    }
+
+    #[test]
+    fn the_budget_refills_over_time() {
+        let rl = TokenBuckets::new();
+        let t0 = Instant::now();
+        for _ in 0..TOKEN_BURST as usize {
+            rl.allow_at("tok_a", t0);
+        }
+        assert!(!rl.allow_at("tok_a", t0));
+        // One second later there is a second's worth of refill and no more.
+        let t1 = t0 + Duration::from_secs(1);
+        for i in 0..TOKEN_RATE_PER_SEC as usize {
+            assert!(rl.allow_at("tok_a", t1), "refilled request {i}");
+        }
+        assert!(!rl.allow_at("tok_a", t1), "the refill is the rate, not a fresh burst");
+    }
+
+    #[test]
+    fn the_refill_never_exceeds_the_burst() {
+        // An idle token comes back with a full bucket, not an unbounded one — otherwise a token
+        // left alone for a day would bank a day's worth of requests.
+        let rl = TokenBuckets::new();
+        let t0 = Instant::now();
+        rl.allow_at("tok_a", t0);
+        let later = t0 + Duration::from_secs(86_400);
+        for _ in 0..TOKEN_BURST as usize {
+            assert!(rl.allow_at("tok_a", later));
+        }
+        assert!(!rl.allow_at("tok_a", later), "a day idle must not bank a day of requests");
+    }
+
+    #[test]
+    fn one_tokens_budget_is_not_anothers() {
+        // The whole point of charging the credential: a wedged CI token must not lock out the token
+        // next to it (which the per-IP cap would, when both sit behind one NAT).
+        let rl = TokenBuckets::new();
+        let t0 = Instant::now();
+        for _ in 0..TOKEN_BURST as usize {
+            rl.allow_at("tok_a", t0);
+        }
+        assert!(!rl.allow_at("tok_a", t0));
+        assert!(rl.allow_at("tok_b", t0), "a different token has its own budget");
+    }
+
+    #[test]
+    fn a_clock_that_goes_backwards_does_not_panic() {
+        // Instant subtraction panics on a negative delta, and two threads can read the clock out of
+        // order. Refusing to crash here matters more than the arithmetic being exact.
+        let rl = TokenBuckets::new();
+        let t1 = Instant::now() + Duration::from_secs(10);
+        assert!(rl.allow_at("tok_a", t1));
+        assert!(rl.allow_at("tok_a", t1 - Duration::from_secs(5)));
+    }
+
+    // ── the pre-receive secret gate ──
+
+    #[test]
+    fn batch_output_splits_on_the_declared_size_not_on_newlines() {
+        // Blob content contains newlines; splitting on them would cut a blob into pieces and scan
+        // the header line as if it were content. git's shape is exactly: `<sha> <type> <size>\n`,
+        // then <size> bytes, then a separator newline of its own.
+        let raw = b"aaa blob 11\nline1\nline2\nbbb blob 3\nxyz\n";
+        let out = parse_batch(raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out["aaa"], b"line1\nline2");
+        assert_eq!(out["bbb"], b"xyz", "the separator newline must not be eaten out of the next header");
+    }
+
+    #[test]
+    fn a_missing_object_does_not_shift_every_later_blob_onto_the_wrong_path() {
+        // The bug this keys on: "<sha> missing" yields no body, so the old positional zip paired
+        // "hi" with the MISSING object's path and every blob after it with its predecessor's. The
+        // rejection then named the wrong file — and the path is the whole actionable half of it.
+        let raw = b"deadbeef missing\naaa blob 2\nhi\nbbb blob 3\nkey\n";
+        let out = parse_batch(raw);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out["aaa"], b"hi");
+        assert_eq!(out["bbb"], b"key");
+        assert!(!out.contains_key("deadbeef"), "a missing object must contribute no body at all");
+        assert!(parse_batch(b"").is_empty());
+    }
+
+    #[test]
+    fn printable_runs_find_a_key_a_nul_byte_used_to_hide() {
+        // One NUL used to skip the blob whole and silently: this is the bypass that made the gate a
+        // liar. The strings pass has to still see the key.
+        let mut blob = vec![0u8, 1, 2];
+        blob.extend_from_slice(b"aws_access_key_id = AKIAIOSFODNN7EXAMPLE");
+        blob.extend_from_slice(&[0u8, 0xff]);
+        let runs = printable_runs(&blob);
+        assert!(runs.contains("AKIAIOSFODNN7EXAMPLE"), "{runs:?}");
+        // entropy off, as scan_push runs it for binary: the named rule must not depend on it.
+        let hits = agit::scan::scan_text_allow(&runs, false, &agit::scan::Allowlist::empty());
+        let rules: Vec<&str> = hits.iter().map(|f| f.rule).collect();
+        assert!(rules.contains(&"aws-access-key-id"), "{rules:?}");
+    }
+
+    #[test]
+    fn printable_runs_drop_the_noise_between_them() {
+        // Runs shorter than the minimum are the incidental bytes of any binary — keeping them would
+        // hand the rules a haystack made of chaff.
+        assert_eq!(printable_runs(&[0, b'a', b'b', 0, 0xff]), "");
+        assert_eq!(printable_runs(b"hello world"), "hello world\n");
+        assert_eq!(printable_runs(&[b'l', b'o', b'n', b'g', b'e', b'r', 0, b'x']), "longer\n");
+        // A run ending at the very end of the blob is still a run.
+        assert_eq!(printable_runs(&[0, b'l', b'o', b'n', b'g', b'e', b'r']), "longer\n");
+    }
+
+    #[test]
+    fn an_unscanned_blob_makes_the_report_incomplete() {
+        // `incomplete()` is what `pre_receive_cmd` refuses on. "Found nothing" and "looked at
+        // nothing" must never be the same value.
+        let mut r = ScanReport { findings: vec![], unscanned: vec![], errored: None };
+        assert!(!r.incomplete(), "a clean, complete scan clears the push");
+        r.unscanned.push(("big.bin".into(), "past the per-blob bound".into()));
+        assert!(r.incomplete());
+
+        let errored = ScanReport { findings: vec![], unscanned: vec![], errored: Some("git failed".into()) };
+        assert!(errored.incomplete(), "an IO failure is not a clean scan");
+    }
+
+    #[test]
+    fn hook_paths_are_shell_quoted() {
+        // The hook is a shell script; a path with a space or a quote in it must not become code.
+        assert_eq!(shell_quote("/tmp/x"), "'/tmp/x'");
+        assert_eq!(shell_quote("/tmp/a b"), "'/tmp/a b'");
+        assert_eq!(shell_quote("/tmp/it's"), r"'/tmp/it'\''s'");
+        assert_eq!(shell_quote("a';rm -rf /;'"), r"'a'\'';rm -rf /;'\'''");
+    }
+
+    // ── MR refs ──
+
+    #[test]
+    fn ref_names_reject_traversal_and_option_injection() {
+        assert!(valid_ref_name("main"));
+        assert!(valid_ref_name("feat/hub"));
+        assert!(valid_ref_name("v1.2.3"));
+        assert!(!valid_ref_name(""));
+        assert!(!valid_ref_name("--upload-pack=evil"), "a leading dash could be read as an option");
+        assert!(!valid_ref_name("../etc"));
+        assert!(!valid_ref_name("/abs"));
+        assert!(!valid_ref_name("a//b"));
+        assert!(!valid_ref_name("trailing/"));
+        assert!(!valid_ref_name("has space"));
+        assert!(!valid_ref_name(&"x".repeat(201)));
     }
 
     #[test]

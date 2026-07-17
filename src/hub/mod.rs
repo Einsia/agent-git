@@ -21,6 +21,7 @@ pub mod audit;
 pub mod auth;
 pub mod identity;
 pub mod kdf;
+pub mod mr;
 pub mod net;
 pub mod session;
 pub mod store;

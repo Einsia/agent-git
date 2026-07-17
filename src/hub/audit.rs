@@ -45,6 +45,22 @@ pub const TOKEN_CREATE: &str = "token.create";
 pub const TOKEN_REVOKE: &str = "token.revoke";
 pub const GIT_FETCH: &str = "git.fetch";
 pub const GIT_PUSH: &str = "git.push";
+/// A push the server-side secret scan turned away. The client hook is `--no-verify`-able, so this
+/// row is the only durable trace that someone tried.
+pub const GIT_PUSH_REJECTED: &str = "git.push.rejected";
+/// Identity events. The Hub never mints an aid — it only ever reports what it read out of the store,
+/// and these say what it made of it.
+pub const AGENT_AID_LEARNED: &str = "agent.aid.learned";
+/// The store behind a name now carries a **different** aid: the repo was recreated, or another store
+/// was pushed over it. Every `.agit.toml` pinned to the old aid is now pointed at a stranger — that
+/// is worth a permanent row, since the response only says so once.
+pub const AGENT_AID_REPLACED: &str = "agent.aid.replaced";
+/// Two agents claiming one identity. Refused, and recorded.
+pub const AGENT_AID_CONFLICT: &str = "agent.aid.conflict";
+pub const MR_OPEN: &str = "mr.open";
+pub const MR_COMMENT: &str = "mr.comment";
+pub const MR_CLOSE: &str = "mr.close";
+pub const MR_MERGED: &str = "mr.merged";
 pub const DENIED: &str = "denied";
 
 pub fn log_path(root: &Path) -> PathBuf {

@@ -10,6 +10,7 @@
 //! is out of scope (they would overwrite each other), and this does not pretend to survive it.
 
 use super::acl::{AgentAcl, Role, Scope, Visibility};
+use super::mr::Mr;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -199,6 +200,10 @@ impl Store {
         self.root.join("auth.json")
     }
 
+    fn mrs_path(&self) -> PathBuf {
+        self.root.join("mrs.json")
+    }
+
     // ── users ──
 
     pub fn users(&self) -> Vec<User> {
@@ -231,6 +236,15 @@ impl Store {
         self.agents().into_iter().find(|a| a.name == name)
     }
 
+    /// Resolve an identity to the agent currently wearing it. **The aid is the identity, the name is
+    /// only a label** — this is what lets a `.agit.toml` pinned to an aid survive a rename.
+    ///
+    /// Only ever one answer: `super::identity::reconcile` refuses to cache an aid a second agent
+    /// already holds, so the first match is the only match.
+    pub fn agent_by_aid(&self, aid: &str) -> Option<AgentMeta> {
+        self.agents().into_iter().find(|a| a.aid.as_deref() == Some(aid))
+    }
+
     /// `<name>.git` exists on disk but agents.json has no record of it → unowned and private.
     /// **Fail-safe**: a migrated-in old repo does not become world-pullable just because there is no
     /// record of it.
@@ -256,6 +270,46 @@ impl Store {
         let r = f(&mut agents);
         write_list(&self.root, &self.agents_path(), "agents", &agents)?;
         Ok(r)
+    }
+
+    // ── merge requests ──
+
+    pub fn mrs(&self) -> Vec<Mr> {
+        read_list(&self.mrs_path(), "mrs")
+    }
+
+    /// Every MR whose **target** is this agent, oldest first (the id order MRs were opened in).
+    pub fn mrs_for(&self, target: &str) -> Vec<Mr> {
+        let mut v: Vec<Mr> = self.mrs().into_iter().filter(|m| m.target.agent == target).collect();
+        v.sort_by_key(|m| m.id);
+        v
+    }
+
+    pub fn update_mrs<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<Mr>) -> R,
+    {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mrs = self.mrs();
+        let r = f(&mut mrs);
+        write_list(&self.root, &self.mrs_path(), "mrs", &mrs)?;
+        Ok(r)
+    }
+
+    /// Carry an agent's MRs across a rename. The **aid does not move** — it never changes — but the
+    /// name on each endpoint is a label, and a stale label is a dead link and a lie about who the MR
+    /// is between.
+    pub fn rename_in_mrs(&self, from: &str, to: &str) -> io::Result<()> {
+        self.update_mrs(|mrs| {
+            for m in mrs.iter_mut() {
+                if m.target.agent == from {
+                    m.target.agent = to.to_string();
+                }
+                if m.source.agent == from {
+                    m.source.agent = to.to_string();
+                }
+            }
+        })
     }
 
     // ── tokens ──
@@ -539,6 +593,92 @@ mod tests {
         s.update_tokens(|t| t.clear()).unwrap();
         assert!(s.tokens().is_empty());
         assert!(!s.auth_path().with_extension("tmp").exists(), "the temp file must be renamed away, not left behind");
+    }
+
+    // ── aid: the identity, as opposed to the name ──
+
+    #[test]
+    fn an_agent_resolves_by_aid() {
+        let (_d, s) = tmp_store();
+        s.update_agents(|a| {
+            let mut m = AgentMeta::new("payments", Some("alice"), Visibility::Private);
+            m.aid = Some("agt_pay".into());
+            a.push(m);
+            a.push(AgentMeta::new("other", Some("bob"), Visibility::Private));
+        })
+        .unwrap();
+        assert_eq!(s.agent_by_aid("agt_pay").unwrap().name, "payments");
+        assert!(s.agent_by_aid("agt_nope").is_none());
+        assert!(s.agent_by_aid("").is_none(), "an agent with no aid cached must not match the empty string");
+    }
+
+    #[test]
+    fn a_rename_preserves_the_aid() {
+        // The footgun this exists to close: a rename must not mint a new identity, or every
+        // .agit.toml pinned to the old aid is orphaned by a cosmetic edit.
+        let (_d, s) = tmp_store();
+        s.update_agents(|a| {
+            let mut m = AgentMeta::new("payments", Some("alice"), Visibility::Private);
+            m.aid = Some("agt_pay".into());
+            a.push(m);
+        })
+        .unwrap();
+        s.update_agents(|a| a[0].name = "billing".into()).unwrap();
+        assert_eq!(s.agent("billing").unwrap().aid.as_deref(), Some("agt_pay"));
+        assert_eq!(s.agent_by_aid("agt_pay").unwrap().name, "billing", "by-aid follows the rename");
+        assert!(s.agent("payments").is_none());
+    }
+
+    // ── merge requests ──
+
+    fn mk_mr(id: usize, source: &str, target: &str) -> Mr {
+        use super::super::mr::Endpoint;
+        Mr {
+            id,
+            source: Endpoint { aid: Some("agt_src".into()), agent: source.into(), git_ref: "main".into() },
+            target: Endpoint { aid: Some("agt_dst".into()), agent: target.into(), git_ref: "main".into() },
+            title: "reconcile the payments memory".into(),
+            author: "alice".into(),
+            state: "open".into(),
+            created: now_iso(),
+            updated: String::new(),
+            dialogue_transcript: Some("a: ...\nb: ...".into()),
+            comments: vec![],
+        }
+    }
+
+    #[test]
+    fn mrs_roundtrip_and_filter_by_target() {
+        let (_d, s) = tmp_store();
+        s.update_mrs(|m| {
+            m.push(mk_mr(1, "fork", "payments"));
+            m.push(mk_mr(2, "fork", "payments"));
+            m.push(mk_mr(1, "x", "other"));
+        })
+        .unwrap();
+        let pay = s.mrs_for("payments");
+        assert_eq!(pay.len(), 2);
+        assert_eq!(pay.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 2], "oldest first");
+        assert_eq!(pay[0].dialogue_transcript.as_deref(), Some("a: ...\nb: ..."));
+        assert_eq!(s.mrs_for("other").len(), 1);
+        assert!(s.mrs_for("nobody").is_empty());
+    }
+
+    #[test]
+    fn a_rename_carries_the_mrs_with_it() {
+        // Otherwise one rename leaves every MR pointing at a name that no longer exists.
+        let (_d, s) = tmp_store();
+        s.update_mrs(|m| {
+            m.push(mk_mr(1, "fork", "payments"));
+            m.push(mk_mr(1, "payments", "other")); // payments as the *source* moves too
+        })
+        .unwrap();
+        s.rename_in_mrs("payments", "billing").unwrap();
+        assert_eq!(s.mrs_for("billing").len(), 1);
+        assert!(s.mrs_for("payments").is_empty());
+        assert_eq!(s.mrs_for("other")[0].source.agent, "billing");
+        // The identity is untouched by a label change.
+        assert_eq!(s.mrs_for("billing")[0].target.aid.as_deref(), Some("agt_dst"));
     }
 
     #[test]
