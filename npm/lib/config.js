@@ -24,10 +24,8 @@
 //    • URL:         https://github.com/<owner>/<repo>/releases/download/
 //                     v<version>/agit-<version>-<target>.tar.gz  (and /SHA256SUMS)
 //
-//  The ONE thing the contract leaves open is the GitHub `<owner>/<repo>`: the
-//  repo's git remote points at a private host, not GitHub, so the release repo
-//  slug is not yet pinned. `REPO_SLUG` below is a placeholder that MUST be set
-//  to the real slug before publishing. It (and the whole base URL) can also be
+//  The GitHub `owner/repo` that hosts the Releases is `Einsia/agent-git`
+//  (the git remote that pushes there). It (and the whole base URL) can be
 //  overridden at install time via env vars — see each constant.
 // ===========================================================================
 
@@ -35,7 +33,7 @@ const pkg = require('../../package.json');
 
 // GitHub `owner/repo` that hosts the Releases.
 //   Override:  AGIT_REPO=myorg/myrepo
-const REPO_SLUG = process.env.AGIT_REPO || 'agentgit/agit';
+const REPO_SLUG = process.env.AGIT_REPO || 'Einsia/agent-git';
 
 // Prefix on the git tag / release path (tag = `${TAG_PREFIX}${version}`).
 const TAG_PREFIX = 'v';

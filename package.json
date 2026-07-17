@@ -13,13 +13,13 @@
     "cli"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/agentgit/agit#readme",
+  "homepage": "https://github.com/Einsia/agent-git#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/agentgit/agit.git"
+    "url": "git+https://github.com/Einsia/agent-git.git"
   },
   "bugs": {
-    "url": "https://github.com/agentgit/agit/issues"
+    "url": "https://github.com/Einsia/agent-git/issues"
   },
   "bin": {
     "agit": "npm/shim.js",
