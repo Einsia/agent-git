@@ -149,7 +149,7 @@ jobs:
     # Trusted publishing (OIDC): npm exchanges this short-lived GitHub id-token for publish rights, so
     # there is NO long-lived NPM_TOKEN and no 2FA prompt. It also stamps provenance automatically.
     #
-    # One-time setup on npmjs.com (required before this can succeed): open the @agentgit/agit package →
+    # One-time setup on npmjs.com (required before this can succeed): open the @einsia/agentgit package →
     # Settings → "Trusted Publisher" → GitHub Actions, and point it at repo Einsia/agent-git with
     # workflow file `release.yml`. Until that link exists, `npm publish` here will fail (the GitHub
     # Release with the binaries still ships — that's a separate, earlier job).

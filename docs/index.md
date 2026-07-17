@@ -5,68 +5,58 @@ nav_order: 1
 
 # agit
 
-agit is a version-control tool for the sessions produced by AI coding agents. An agent's code changes
-are already shared through Git; its session, the transcript of what it read, ran, concluded, and
-intended, is not. agit stores that transcript in a git repository, synchronizes it with the standard
-push and pull operations, and reconciles divergent sessions by having the agents themselves compare
-their work.
+agit is version control for the sessions an AI coding agent produces (Claude Code and Codex). Your
+code is already shared through Git; the session — what the agent read, ran, concluded, and intended —
+is not. agit stores that session in a git repository, syncs it with push and pull, and reconciles
+divergent sessions by having the agents compare their own work against the code.
 
-It supports Claude Code and Codex.
+## The two scopes
 
-## Model
+agit wraps git twice. `agit <git-args>` runs git against your code repository, transparently — what
+you already type keeps working. `agit a <git-args>` runs git against the resolved agent's store, a
+normal git repository of session transcripts kept under `~/.agit`. The agent scope maps to git
+directly:
 
-The unit agit manages is an **agent**: a git repository containing the raw session transcripts an
-agent has produced, identified by a stable identifier rather than by a name or a location. An agent is
-distinct from the code repository it works in, which agit calls an **environment**. The relationship
-is many-to-many: one agent can work across several environments, and one environment can host several
-agents.
-
-For a developer familiar with Git, the mapping is direct:
-
-| Git | agit |
-|-----|------|
-| A repository of source files | An agent: a repository of session transcripts |
-| `git clone <url>` | `agit a clone <name>` (resolved from the environment's binding) |
+| Git (your code) | agit (the agent's store) |
+|---|---|
+| `git clone <url>` | `agit a clone <name>` — resolves the URL from `.agit.toml` |
 | `git push` / `git pull` | `agit a push` / `agit a pull` |
-| `git merge`, textual | `agit a merge <agent>`, a semantic reconciliation performed by the agents |
-| `git log`, `git diff`, ... | `agit a log`, `agit a diff`, ... (git, run against the agent's store) |
+| `git merge` (textual) | `agit a merge <agent>` — a semantic merge the agents perform (see [Merging](guide/merging.html)) |
+| `git log`, `git diff`, ... | `agit a log`, `agit a diff`, ... — plain git against the store |
 
-`agit <args>` runs git against the environment (the code repository) unchanged. `agit a <args>` runs
-git against the resolved agent's store. Commands that are not git, such as creating an agent or
-capturing a session, are described in this guide.
+One committed file, `.agit.toml`, declares which agents a repo uses and where to clone them, so a
+teammate's fresh clone can pull the same agents. One agent can work across many repos, and one repo
+can host many.
 
-## Installation
-
-```
-npm install -g @agentgit/agit
-```
-
-This installs the `agit` client. The `agit-hub` server is distributed separately — teams host it with
-Docker or build it from source (see [Deploying the hub](deploying-the-hub.html)). To build the client
-from source instead:
+## Install
 
 ```
-git clone https://github.com/Einsia/agent-git && cd agent-git
-./build.sh --release
-cp target/release/agit ~/.local/bin/
+npm install -g @einsia/agentgit
 ```
 
-`build.sh` is used in place of `cargo build` because the project targets Rust edition 2024 and a v4
-`Cargo.lock`, which require cargo 1.78 or later; the script locates a suitable cargo.
-
-To route `git` through `agit` so every git command also versions your agent context:
+This installs the `agit` client. Optionally route `git` through `agit`, so ordinary git commands also
+version your agent's sessions:
 
 ```
-agit shadow install     # bash, zsh, fish, or PowerShell; agit shadow uninstall to undo
+agit shadow install     # bash, zsh, fish, or PowerShell; undo with agit shadow uninstall
 ```
+
+The `agit-hub` server is distributed separately — teams host it with Docker or build it from source
+(see [Deploying the hub](deploying-the-hub.html)).
+
+## The daemon
+
+Run `agit watch --daemon` once and leave it: it snapshots new sessions into the agent's store as you
+work, and converts them between Claude Code and Codex so a session recorded in one is resumable in the
+other.
 
 ## Guide
 
 1. [Quickstart](guide/quickstart.html) — create, capture, share, and merge an agent.
-2. [How it works](guide/concepts.html) — the four ideas behind the tool.
+2. [How it works](guide/concepts.html) — the ideas behind the tool.
 3. [Merging](guide/merging.html) — reconciling divergent sessions.
-4. [Runtimes](guide/runtimes.html) — Claude Code and Codex; session conversion.
-5. [Migration](guide/migration.html) — rebinding identity and importing legacy stores.
+4. [Runtimes](guide/runtimes.html) — Claude Code and Codex, and session conversion.
+5. [Migration](guide/migration.html) — rebinding an agent's identity for recreated remotes and forks.
 6. [Configuration](guide/configuration.html) — environment variables and files.
 7. [Command reference](guide/command-reference.html) — every command.
 
@@ -74,4 +64,3 @@ agit shadow install     # bash, zsh, fish, or PowerShell; agit shadow uninstall 
 
 - [The hub](hub.html) — what `agit-hub` is, and how its permissions and API work.
 - [Deploying the hub](deploying-the-hub.html) — running one for your team.
-- [Architecture](architecture.html) — the session model, for contributors.

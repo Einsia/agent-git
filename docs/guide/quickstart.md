@@ -5,62 +5,93 @@ nav_order: 2
 
 # Quickstart
 
+agit versions the sessions your coding agent produces — what it read, ran, and concluded — in a git
+repo alongside your code. This runs the whole loop: create an agent, turn on the daemon, work, share,
+and reconcile. `agit a <git-command>` is git on the agent's store; everything you know about git
+applies.
+
 ## Create an agent
 
-Inside your code repository:
+Inside your code repo:
 
 ```
 agit init --agent frontend
 ```
 
-This creates the agent `frontend`, binds it to this repo (in a committed `.agit.toml`), and installs a
-secret-scanning hook on its store.
+That mints a new agent named `frontend`, binds it to this repo through a committed `.agit.toml`, and
+installs a secret-scanning hook on its store. Name it for what it knows (`frontend`, `payments-api`),
+not for you or the folder.
 
-## Capture what it did
+To mint an agent without binding it to a repo, use `agit a init frontend` — you can bind it later with
+`agit a switch frontend`.
 
-Start a session that carries the agent's context, work as usual, then snapshot the transcript into the
-agent's store and commit it:
-
-```
-agit start
-agit snap
-agit a commit -am "auth flow"
-```
-
-`agit a <git-command>` runs git against the agent's store. `agit snap` copies the runtime's session
-files in. To capture continuously in the background instead of running `snap` by hand:
+## Turn on the daemon
 
 ```
 agit watch --daemon
 ```
 
+Set this once. It runs in the background and does two things as you work: it snapshots new sessions
+into the agent's store, and it converts each one between Claude Code and Codex so a session recorded in
+either CLI stays resumable in the other. After this you never run a capture command again.
+
+| Command | Effect |
+| --- | --- |
+| `agit watch --daemon` | start it in the background |
+| `agit watch --status` | whether it's running and what it has captured |
+| `agit watch --stop` | stop it |
+| `agit watch` | run it in the foreground |
+
+Pass `--no-convert` to snapshot only and skip the runtime conversion.
+
+Without the daemon you capture by hand: `agit snap` copies the runtime's current session files into the
+store, then `agit a commit -am "auth flow"` commits them. The daemon just does both for you.
+
+## Work
+
+```
+agit start
+```
+
+This launches a session already carrying the agent's context from this repo. Work normally — the daemon
+captures as you go.
+
+- `--agent <name>` runs a specific agent; `agit a switch <name>` sets the worktree default so you can
+  omit it. Selection is per command, so `agit start --agent frontend` and `agit start --agent api` can
+  run side by side in two terminals.
+- `--as <runtime>` chooses Claude Code or Codex. Commands that read sessions use the runtime you name,
+  else the only one installed, else they ask. See [Runtimes](runtimes.html).
+
 ## Share it
 
-Point the store at a remote and push. `agit a` commands are git on the store, so this is the git you
-already know:
+Sharing is plain git on the store:
 
 ```
 agit a remote add origin https://hub.example.com/frontend.git
-agit a push -u origin main
+agit a push -u origin HEAD
 git add .agit.toml && git commit -m "declare the frontend agent"
 ```
 
-`agit a push` records the remote in `.agit.toml` (credentials stripped) as it pushes, so a teammate's
-clone can find the agent — commit that file so they get it. Later pushes just send new sessions.
+`agit a push` records the remote into `.agit.toml` as it pushes, with credentials stripped. Commit that
+file so teammates get the agent and know where to clone it. Later pushes send only new sessions.
+`agit a pull` fast-forwards; if the histories have diverged it routes you to `agit a merge`.
 
-## Pick it up on another machine
+For a shared server with a web UI and per-agent permissions, see [The hub](../hub.html).
 
-A teammate clones the code repo and runs:
+## Pick it up elsewhere
+
+A teammate clones the code repo, then:
 
 ```
-agit a clone frontend      # reads .agit.toml, clones the agent's store
-agit start                 # continue where it left off
+agit a clone frontend
+agit start
 ```
 
-`agit init` in a fresh clone does the same automatically for every agent the binding declares. The
-agent keeps its identity, so it's the same agent, not a copy.
+`agit a clone frontend` reads `.agit.toml` to learn which agent and where, and clones its store by
+identity. Or run `agit init` in the fresh clone — it clones every agent the binding declares. Either
+way it's the same agent, carrying the same identity (its aid), not a copy.
 
-## Reconcile divergent work
+## Reconcile
 
 When two people's sessions have diverged:
 
@@ -68,17 +99,8 @@ When two people's sessions have diverged:
 agit a merge frontend
 ```
 
-The two sessions are revived, compare their work against the code, and reconcile what they can; only
-genuine conflicts stop to ask you. The result is a resumable session (`claude --resume <id>` /
-`codex exec resume <id>`). See [Merging](merging.html) for the details.
-
-## Two agents at once
-
-Selection is per command, so you can run two in the same repo:
-
-```
-agit start --agent frontend    # terminal 1
-agit start --agent api         # terminal 2
-```
-
-`agit a switch <name>` sets a default for the worktree; `--agent` overrides it per command.
+Both sides' latest sessions are revived read-only, compare their work against the code, and reconcile
+what they can. The output is a resumable merged session (`claude --resume <id>` /
+`codex exec resume <id>`) plus the list of genuine conflicts left for you. It uses a model, so it's a
+real semantic merge rather than a line-by-line one, and it isn't deterministic. See
+[Merging](merging.html).

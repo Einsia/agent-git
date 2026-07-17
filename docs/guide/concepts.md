@@ -5,27 +5,33 @@ nav_order: 3
 
 # How it works
 
-Four ideas cover everything else in this guide.
+Four ideas cover the rest of this guide. Read them in order.
 
-**An agent is a git repo of session transcripts.** It lives under `$AGIT_HOME/agents/<aid>/` (default
-`~/.agit`), separate from your code. `agit a <git-command>` runs git against it, on your agent's
-sessions instead of your code: `agit a log`, `agit a diff`, `agit a push`, `agit a pull` all work.
-Managing agents adds a few commands of its own, covered through this guide.
+**An agent is a git repo of session transcripts.** It lives at `~/.agit/agents/<aid>/` (under
+`$AGIT_HOME`), separate from your code. It's named for what it knows — `frontend`, `payments-api` — not
+for a person or a folder. `agit a <git-args>` runs git against that store, which is a normal git repo:
+`agit a log`, `agit a diff`, `agit a push`, `agit a pull` all mean what you expect. A few verbs are
+agent-aware and do more than plain git; those are covered where they come up in this guide.
 
-**An agent has a stable identity, the aid** (`agt_<uuid>`), committed in its `agent.toml`. The name and
-the remote URL are labels that can change; the aid does not. This is why a remote recreated under the
-same name can't silently swap one agent for another, and why tracking an agent gives you the same
-agent, not a copy.
+**An agent has a stable identity: the aid** (`agt_<uuid>`), minted once and committed in the store's
+`agent.toml`. The name and the remote URL are mutable labels — a name can be changed or collide, a URL
+is just a locator. The aid is the identity. Because `.agit.toml` records the aid, a remote recreated
+under the same name can't silently bind you to a different agent.
 
-**An environment is your code repo**, left untouched. The only thing agit adds to it is `.agit.toml`, a
-committed file that records which agents the repo uses and where to get them. A teammate's clone reads
-it. `.agit/` (local state) is git-ignored automatically.
+**Your code repo is untouched.** The one thing agit adds is `.agit.toml`, a committed file that declares
+which agents the repo uses and where to clone them. That's the binding, and a teammate's clone reads it
+to pull the same agents. Local per-worktree state under `.agit/` is git-ignored.
 
-**An agent and a code repo are many-to-many.** One agent can work across several repos (its store is
-keyed by aid, not tied to a location), and one repo can host several agents.
+**Agents and repos are many-to-many.** One agent can work across several repos — its store is keyed by
+aid, not tied to a location — and one repo can host several agents.
 
 ## Selecting an agent
 
-Commands that act on an agent use, in order: `--agent <name>`, then `$AGIT_AGENT`, then the worktree's
-active agent (set by `agit a switch`), then the binding's default. If none resolves, the command errors
-rather than guessing.
+A command that acts on an agent resolves which one, in order:
+
+1. `--agent <name>` on the command
+2. `$AGIT_AGENT` in the environment
+3. the worktree's active agent, set by `agit a switch <name>`
+4. the binding's default in `.agit.toml`
+
+If none of these resolves, the command errors instead of guessing.

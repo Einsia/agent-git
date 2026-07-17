@@ -5,30 +5,36 @@ nav_order: 6
 
 # Migration
 
-## Rebind
+An agent is keyed by its aid, and agit refuses to connect a binding to a store whose aid doesn't match
+what `.agit.toml` records (see [How it works](concepts.html)). That integrity check is what stops a
+recreated remote from silently swapping in a different agent under the same name. When you actually mean
+to change the mapping, `agit a rebind` overrides it. There are two forms.
 
-`agit a rebind` overrides the binding's integrity check, and re-mints an agent's identity. It has two
-forms.
+## Point a binding at a recreated remote
 
-`--remote <url>` corrects the binding when the store an agent resolves to holds a different aid than
-the binding records, which happens when a remote is recreated with a fresh identity, or when DNS
-changes what a name resolves to. Resolution refuses this case by default; rebind is the explicit
-acceptance of it:
+Use `--remote` when the store a name resolves to holds a different aid than the binding records — a
+remote recreated with a fresh identity, or DNS pointing the name somewhere new. Resolution refuses that
+by default; rebind is the explicit acceptance of it:
 
 ```
 agit a rebind frontend --remote https://hub.example.com/frontend.git
 ```
 
-The binding entry is rewritten to the identity the store actually holds, and the store's origin is set
-to the given URL. As with `agit a push`, any credential in the URL is kept out of the committed binding.
+The binding entry is rewritten to the aid the store actually holds, and the store's origin is set to the
+URL. As with `agit a push`, any credential in the URL is kept out of the committed `.agit.toml`.
 
-`--new-id` gives a store a fresh identity:
+## Give a fork its own identity
+
+A clone of a fork carries the source's aid, so it reads as the same agent — a second claimant on one
+identity. `--new-id` mints a fresh aid, making the fork an independent agent:
 
 ```
 agit a rebind --new-id
 ```
 
-This is used after forking an agent. A clone of a fork carries the source's aid; `--new-id` mints a new
-aid for it, so it becomes an independent agent rather than a second claimant on the source's identity.
-Re-minting moves the store (it is keyed by aid), so it is refused while a watcher is running against
-it, and it reports that other repositories bound to the old aid must `agit a clone` the fork again.
+Re-minting moves the store, because the store is keyed by aid. Two consequences follow:
+
+- It's refused while a watcher is running against the agent. Stop the watcher first with
+  `agit watch --stop`.
+- Other repositories bound to the old aid don't follow the fork. Each must `agit a clone` the fork again
+  to pick it up.

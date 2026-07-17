@@ -1,5 +1,5 @@
 {
-  "name": "@agentgit/agit",
+  "name": "@einsia/agentgit",
   "version": "0.1.0",
   "description": "Git for agent context: version raw agent session dumps, sync with your team, LLM-merge on pull. Installs the prebuilt agit client binary. The agit-hub server is distributed separately (Docker / build from source).",
   "keywords": [

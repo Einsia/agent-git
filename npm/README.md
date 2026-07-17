@@ -1,11 +1,11 @@
-# @agentgit/agit (npm distribution)
+# @einsia/agentgit (npm distribution)
 
 This package installs the prebuilt **`agit`** CLI (and its companion
 **`agit-hub`** server) so you can get them via npm instead of building from
 source or running `cargo install`.
 
 ```sh
-npm install -g @agentgit/agit
+npm install -g @einsia/agentgit
 agit --help
 ```
 
@@ -67,5 +67,5 @@ Point `AGIT_BINARY` (and optionally `AGIT_HUB_BINARY`) at binaries you already
 have, and the installer copies them into place instead of hitting the network:
 
 ```sh
-AGIT_BINARY=/path/to/agit npm install -g @agentgit/agit
+AGIT_BINARY=/path/to/agit npm install -g @einsia/agentgit
 ```
