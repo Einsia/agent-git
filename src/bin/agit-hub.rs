@@ -1747,6 +1747,10 @@ const HEADER_DEADLINE_SECS: u64 = 20;
 /// The body (a git push's pack) gets a longer read timeout: a pack streams in continuously, so this
 /// only fires when it truly stalls.
 const BODY_TIMEOUT_SECS: u64 = 60;
+/// Cap on how much of git http-backend's CGI output we buffer looking for the header/body separator.
+/// The headers are a few hundred bytes; past this we stop searching and stream the rest as body, so a
+/// fetch response is never held whole in memory.
+const MAX_CGI_HEADERS: usize = 64 * 1024;
 /// Overall wall-clock cap for reading an API body. 64KB of JSON has no reason to take its time
 /// (stops the drip on the body).
 const API_BODY_DEADLINE_SECS: u64 = 15;
@@ -3957,17 +3961,38 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
     let n = req.content_length.min(MAX_BODY) as u64;
     let _ = std::io::copy(&mut reader.by_ref().take(n), &mut stdin);
     drop(stdin); // Closing stdin sends EOF so http-backend can wrap up
-    let out = child.wait_with_output()?;
 
-    // CGI output = headers + blank line + body. Normalize the headers: pull out git's Status: as the
-    // real status; drop its Content-Length (we compute our own); append exactly one CRLF per line
-    // (don't turn \n→\r\n on a header that's already CRLF and produce \r\r\n).
-    let raw = out.stdout;
-    let sep = find_subslice(&raw, b"\r\n\r\n").map(|i| (i, 4)).or_else(|| find_subslice(&raw, b"\n\n").map(|i| (i, 2)));
-    let (raw_headers, body) = match sep {
-        Some((i, n)) => (&raw[..i], &raw[i + n..]),
-        None => (&b""[..], &raw[..]),
+    // Stream the response instead of buffering it. A fetch/clone pack can be gigabytes; the old
+    // `wait_with_output` read the whole thing into a Vec, an OOM the client controls. Read only the
+    // small CGI header block into memory, then copy the body straight to the socket. The response is
+    // Connection: close, so no Content-Length is needed — git reads to EOF.
+    let mut cout = child.stdout.take().unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    // CGI output = headers + blank line + body. Read until we have the separator (or give up and treat
+    // it all as body).
+    let sep = loop {
+        if let Some(hit) = find_subslice(&buf, b"\r\n\r\n")
+            .map(|i| (i, 4))
+            .or_else(|| find_subslice(&buf, b"\n\n").map(|i| (i, 2)))
+        {
+            break Some(hit);
+        }
+        if buf.len() >= MAX_CGI_HEADERS {
+            break None;
+        }
+        let k = cout.read(&mut chunk)?;
+        if k == 0 {
+            break None;
+        }
+        buf.extend_from_slice(&chunk[..k]);
     };
+    let (raw_headers, body_prefix): (&[u8], &[u8]) = match sep {
+        Some((i, n)) => (&buf[..i], &buf[i + n..]),
+        None => (&[][..], &buf[..]),
+    };
+    // Normalize the headers: pull out git's Status: as the real status; drop its Content-Length (we
+    // send none); append exactly one CRLF per line (don't turn \n→\r\n on a CRLF header and get \r\r\n).
     let mut status = 200u16;
     let mut fwd = String::new();
     for line in String::from_utf8_lossy(raw_headers).split('\n') {
@@ -3982,7 +4007,7 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
                 continue;
             }
             if key.eq_ignore_ascii_case("content-length") {
-                continue; // We compute our own, so avoid a duplicate
+                continue; // close-delimited; we do not forward or compute a Content-Length
             }
             fwd.push_str(key);
             fwd.push_str(": ");
@@ -3990,13 +4015,11 @@ fn git_http(stream: &mut TcpStream, reader: &mut BufReader<TcpStream>, ctx: &Ctx
             fwd.push_str("\r\n");
         }
     }
-    let head = format!(
-        "HTTP/1.1 {status} {}\r\n{fwd}Content-Length: {}\r\nConnection: close\r\n\r\n",
-        reason(status),
-        body.len()
-    );
+    let head = format!("HTTP/1.1 {status} {}\r\n{fwd}Connection: close\r\n\r\n", reason(status));
     stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
+    stream.write_all(body_prefix)?;
+    std::io::copy(&mut cout, stream)?;
+    let _ = child.wait();
     stream.flush()
 }
 
