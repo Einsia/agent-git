@@ -1124,12 +1124,22 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
             let target = std::fs::read_link(&src)?;
             #[cfg(unix)]
             std::os::unix::fs::symlink(&target, &dst)?;
-            // Windows symlinks need a privilege and a file/dir distinction; a copy of the target is the
-            // pragmatic fallback there (session stores rarely contain links).
-            #[cfg(not(unix))]
+            #[cfg(windows)]
             {
-                let _ = &target;
-                std::fs::copy(&src, &dst)?;
+                // Windows has symlinks too, but creating one needs privilege (admin, or Developer Mode)
+                // and it distinguishes file from directory links. Make the right kind; only if Windows
+                // denies it do we fall back to copying a file target, so the store copy still succeeds.
+                use std::os::windows::fs::{symlink_dir, symlink_file};
+                let made = if src.is_dir() {
+                    symlink_dir(&target, &dst)
+                } else {
+                    symlink_file(&target, &dst)
+                };
+                if made.is_err() && src.is_file() {
+                    std::fs::copy(&src, &dst)?;
+                } else {
+                    made?;
+                }
             }
         } else {
             std::fs::copy(&src, &dst)?;
