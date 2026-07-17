@@ -32,21 +32,10 @@ Anything not listed here is passed through to git: `agit <git-args>` runs agains
 | `agit a track <name\|url>` | Clone an agent's store (from the binding, or a URL). |
 | `agit a info <name\|aid>` | Name, aid, store path, and remote for one agent. |
 | `agit a rename <old> <new>` | Rename an agent. |
-| `agit a publish [<url>] [--no-push]` | One step: set the remote, record it, and push. Same binding effect as `push` below. |
+| `agit a push [<git args>]` | Push the agent's sessions, and record its remote so teammates can clone it. |
+| `agit a pull [<git args>]` | Pull teammates' sessions; when they've diverged from yours, sends you to `agit a merge` to reconcile. |
+| `agit a fetch [<git args>]` | Fetch, and report which sessions arrived. |
+| `agit a publish [<url>] [--no-push]` | Set the remote, record it, and push, in one step. |
 | `agit a rebind [<name>] [--remote <url>] [--new-id]` | Fix a binding's identity, or give a fork its own aid. See [Migration](migration.html). |
 | `agit a import [<name>]` | Adopt a legacy in-repo store. See [Migration](migration.html). |
 | `agit a merge <target> [--from <runtime>] [--both] [--quick]` | Reconcile with another memory. `--quick` skips the context handoff. See [Merging](merging.html). |
-
-## Git on the store, augmented
-
-A handful of git verbs do the session-aware thing under `agit a`, because plain git would be wrong or
-incomplete for transcripts. Everything else (`log`, `diff`, `status`, `commit`, `branch`, …) is plain
-git on the store.
-
-| Command | Does |
-|---|---|
-| `agit a push [<git args>]` | Git push, and record the store's `origin` in the binding (credential-stripped) so teammates can clone the agent. |
-| `agit a pull [<git args>]` | Fast-forward only. On divergence it refuses rather than textually merge transcripts, and routes you to `agit a merge`. |
-| `agit a fetch [<git args>]` | Git fetch, then report which sessions arrived (and from which runtime) and how to integrate them. |
-| `agit a clone …` | Refused — a store is cloned by identity. Redirects to `agit a track`. |
-| `agit a init` | Refused — a store needs an identity. Redirects to `agit a new`. |

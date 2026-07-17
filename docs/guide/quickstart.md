@@ -45,11 +45,10 @@ agit a push -u origin main
 git add .agit.toml && git commit -m "declare the frontend agent"
 ```
 
-`agit a push` is git push plus the one thing it can't do on its own: it records the remote in the
-committed `.agit.toml` (credentials stripped) so a teammate's clone can find the agent. Commit
-`.agit.toml` so they get it; later pushes just send new sessions.
+`agit a push` records the remote in `.agit.toml` (credentials stripped) as it pushes, so a teammate's
+clone can find the agent — commit that file so they get it. Later pushes just send new sessions.
 
-`agit a publish <url>` does the same in one step (set the remote, record it, push) if you'd rather.
+`agit a publish <url>` sets the remote, records it, and pushes in one step.
 
 ## Pick it up on another machine
 

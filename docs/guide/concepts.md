@@ -8,13 +8,9 @@ nav_order: 3
 Four ideas cover everything else in this guide.
 
 **An agent is a git repo of session transcripts.** It lives under `$AGIT_HOME/agents/<aid>/` (default
-`~/.agit`), separate from your code. `agit a <git-command>` runs git against it — `agit a log`,
-`agit a diff`, `agit a commit` behave exactly as you'd expect. The `a` is a target selector (the store
-instead of your code), not a namespace: most verbs pass straight through to git, and a small closed set
-are agit's own (`list`, `use`, `track`, `publish`, `merge`) or git verbs it augments where plain git
-would be wrong for transcripts (`push` records the remote for your team, `pull` refuses to textually
-merge diverged sessions, `fetch` reports what arrived). `agit a info` exists instead of letting
-`agit a show` fall through to `git show`, so the two never collide.
+`~/.agit`), separate from your code. `agit a <git-command>` runs git against it, on your agent's
+sessions instead of your code: `agit a log`, `agit a diff`, `agit a push`, `agit a pull` all work.
+Managing agents adds a few commands of its own, covered through this guide.
 
 **An agent has a stable identity, the aid** (`agt_<uuid>`), committed in its `agent.toml`. The name and
 the remote URL are labels that can change; the aid does not. This is why a remote recreated under the
