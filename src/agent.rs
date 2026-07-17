@@ -934,7 +934,8 @@ fn locator(url: &str) -> String {
     }
 }
 
-/// `agit a publish <url>` — give this agent a locator, and record it where a fresh clone will look.
+/// `agit a publish [--remote <url>]` (§5) — give this agent a locator, and record it where a fresh clone
+/// will look. With no url, re-push to the remote already set — the ordinary "share my new sessions" case.
 ///
 /// This is the keystone of collaboration, and its absence was silent. `track` reads a teammate's remote
 /// out of the COMMITTED binding, but nothing ever wrote one there: an agent minted locally has no URL
@@ -945,19 +946,30 @@ fn locator(url: &str) -> String {
 ///
 /// Publishing is therefore a binding edit first and a push second: the URL is only useful to anyone
 /// else once it is committed next to the aid.
-pub fn publish(url: &str, push: bool) -> Result<Agent> {
-    // The same allowlist `track` clones through. A remote lands in a COMMITTED file that other people's
-    // machines will clone from, so refusing `ext::…` here is the same gate, one step earlier.
-    check_remote(url)?;
+pub fn publish(url: Option<&str>, push: bool) -> Result<Agent> {
     let agent = resolve(None)?;
     let env = scope::env_root()?;
 
-    // `set-url` after the first publish: re-publishing to a new host must move the locator, not fail.
-    // The aid does not change — a remote is a locator, and this agent stays the same memory.
-    match scope::git_in_status(&agent.store, &["remote", "get-url", "origin"]).0 {
-        0 => scope::git_in(&agent.store, &["remote", "set-url", "origin", url])?,
-        _ => scope::git_in(&agent.store, &["remote", "add", "origin", url])?,
-    };
+    match url {
+        Some(url) => {
+            // The same allowlist `track` clones through. A remote lands in a COMMITTED file that other
+            // people's machines clone from, so refusing `ext::…` here is the same gate, a step earlier.
+            check_remote(url)?;
+            // `set-url` after the first publish: re-publishing to a new host must move the locator, not
+            // fail. The aid does not change — a remote is a locator, this agent stays the same memory.
+            match scope::git_in_status(&agent.store, &["remote", "get-url", "origin"]).0 {
+                0 => scope::git_in(&agent.store, &["remote", "set-url", "origin", url])?,
+                _ => scope::git_in(&agent.store, &["remote", "add", "origin", url])?,
+            };
+        }
+        // Bare `agit a publish`: push to the remote already recorded. Refuse rather than guess if there
+        // is none — the first publish must name where.
+        None if scope::git_in_status(&agent.store, &["remote", "get-url", "origin"]).0 != 0 => bail!(
+            "{} has no remote yet — name one the first time:\n  agit a publish --remote <url>",
+            agent.name
+        ),
+        None => {}
+    }
 
     // Re-read rather than trust: `remote` on an Agent comes from the store's own origin, so this is the
     // same answer every other reader will get, and a set-url that silently did nothing cannot pass.

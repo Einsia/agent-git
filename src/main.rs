@@ -144,7 +144,10 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
         // Records the locator in the COMMITTED binding, which is the half a teammate's clone needs:
         // without it `agit a track <name>` has nowhere to clone from.
         "publish" => {
-            let a = agent::publish(&need("url")?, !flag("--no-push"))?;
+            // `--remote <url>` (§5), or a bare positional url, or nothing (re-push to the recorded one).
+            let url = args.iter().position(|a| a == "--remote").and_then(|i| args.get(i + 1)).cloned()
+                .or_else(|| args.first().filter(|a| !a.starts_with('-')).cloned());
+            let a = agent::publish(url.as_deref(), !flag("--no-push"))?;
             println!("published {} ({})", a.name, a.aid);
             // The locator, not the store's raw remote: a token echoed here lands in scrollback and in
             // whatever CI log ran the command.
