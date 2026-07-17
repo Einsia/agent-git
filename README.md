@@ -69,10 +69,13 @@ agit start                            # launch a session HERE already carrying t
 agit snap                             # capture this project's sessions + harness into the store
 agit watch --daemon                   # hands-off: auto-snap + auto-convert, in the background
 agit a add -A && agit a commit -m '...'
-agit a push                           # publish to the team (secrets are scanned before push)
+agit a publish https://hub/frontend.git   # first time: record the remote in .agit.toml + push.
+                                      #   The URL is stripped of any credential before it is committed.
+agit a push                           # thereafter: push new sessions (secrets are scanned first)
 
 # teammate, on a fresh clone of the code repo:
-agit a track frontend                 # .agit.toml already says which agents and where; this gets the memory
+agit a track frontend                 # .agit.toml (committed by publish) says which agents and WHERE;
+                                      #   this clones the memory, and its aid matches — same agent, not a copy
 
 agit a merge frontend                 # reconcile two memories by dialogue; only real conflicts prompt you
 #   same agent (another copy)  → the histories merge too
@@ -194,7 +197,8 @@ push-pull-clone / graph**. `snap`, `merge`, `resume`, `start`, `watch` and the g
 today. The identity model — an agent as a memory, keyed by an aid, shared across environments — is
 specified in [the design of record](docs/plans/2026-07-17-agent-identity-and-handoff-design.md), which
 supersedes the branch model in [the earlier note](docs/plans/2026-07-16-workspace-state-primitives-design.md).
-Still design-stage there: `a publish` / `a rebind`, and the per-environment session partition.
+The full identity model ships today, including `a publish` / `a rebind` and the per-environment session
+partition; the hub adds fork, transfer, archive, soft-delete, compare, raw view and cursor pagination.
 
 ## Development
 

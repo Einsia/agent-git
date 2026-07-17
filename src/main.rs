@@ -171,9 +171,10 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             println!("  bound  {}   (commit it: your team gets this agent on clone)", agent::BINDING_FILE);
             Ok(0)
         }
-        // Still design-only. Named individually so the message cannot outlive the gap.
+        // Unreachable: every verb in AGENT_MGMT_VERBS has an arm above. Kept as a defensive default so
+        // adding a name to the closed set without an arm fails loudly here rather than falling to git.
         v => {
-            eprintln!("agit agent {v}: not implemented yet.");
+            eprintln!("agit agent {v}: no handler — this is a bug (a closed-set verb with no arm).");
             eprintln!("  available: list · new · use · track · info · rename · publish · rebind · import");
             Ok(2)
         }

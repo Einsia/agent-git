@@ -176,5 +176,6 @@ The identity model above is specified in
 [`plans/2026-07-17-agent-identity-and-handoff-design.md`](plans/2026-07-17-agent-identity-and-handoff-design.md),
 **the design of record**, which supersedes the branch model in
 [`plans/2026-07-16-workspace-state-primitives-design.md`](plans/2026-07-16-workspace-state-primitives-design.md).
-Still design-stage there: `agit a publish` / `a rebind`, and the per-environment session partition
-(`sessions/<env>/<rt>/`) — `snap` writes the flat `sessions/<rt>/` today.
+The full identity model ships today: `agit a publish` / `a rebind`, and the per-environment session
+partition (`sessions/<env-slug>/<rt>/`) that `snap` now writes — flat `sessions/<rt>/` stores from before
+the partition still resolve.
