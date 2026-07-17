@@ -943,12 +943,20 @@ pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool)
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log2);
-    // A new process group so the daemon survives the launching shell's SIGHUP. Unix-only; on Windows
-    // a detached child already survives the parent, so nothing extra is needed to compile or run.
+    // Detach the daemon from the launching shell so it outlives it. On Unix, its own process group
+    // means the shell's SIGHUP does not reach it. On Windows, DETACHED_PROCESS drops the console and
+    // CREATE_NEW_PROCESS_GROUP stops Ctrl-C/close from propagating — the same intent.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     let child = cmd.spawn().context("failed to spawn the background watcher")?;
     let pid = child.id();
