@@ -1,3 +1,8 @@
+---
+title: Deploying the hub
+nav_order: 10
+---
+
 # Deploying agit-hub
 
 `agit-hub` is AgentGitHub: one self-contained HTTP service that hosts your team's

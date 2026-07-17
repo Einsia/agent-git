@@ -1,3 +1,8 @@
+---
+title: Architecture
+nav_order: 11
+---
+
 # agit architecture (session model)
 
 > The current architecture. The earlier "two repos + hand-authored facts + deterministic evidence merge" design (architecture-v2) has been retired.
@@ -134,10 +139,12 @@ themselves are real resumed agent sessions, driven separately.)
 Dumping the whole session means the transcript may contain secrets the agent has seen. The
 commit/push hooks are installed **when the store is created** — whichever door it came through
 (`a new`, `a track`, `a import`, `init`), because a store that skipped them scans nothing, silently.
-They scan the session: for jsonl they use **high-precision rules only**
-(AWS keys, connection strings, private keys, `password=`…) and **turn off generic entropy
-detection** — otherwise the sea of UUIDs / requestIds in a transcript would flood you with
-false positives. This does not catch general sensitive content (see risk analysis §8).
+They scan the session with the high-precision format rules (AWS keys, connection strings, private
+keys, `password=`…) **and** generic entropy detection. Entropy stays on for jsonl — the thing that
+makes it viable is scanning **only JSON string values**, never keys or structure, and applying a
+field-name and shape whitelist so the sea of UUIDs and requestIds in a transcript doesn't flood you
+with false positives. That combination catches opaque credentials that match no known format. It still
+does not catch general sensitive content (see risk analysis §8).
 
 ## Modules
 
