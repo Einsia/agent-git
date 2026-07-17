@@ -142,46 +142,42 @@ jobs:
           generate_release_notes: true
 
   npm-publish:
-    name: publish to npm
+    name: publish to npm (trusted publishing)
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Trusted publishing (OIDC): npm exchanges this short-lived GitHub id-token for publish rights, so
+    # there is NO long-lived NPM_TOKEN and no 2FA prompt. It also stamps provenance automatically.
+    #
+    # One-time setup on npmjs.com (required before this can succeed): open the @agentgit/agit package →
+    # Settings → "Trusted Publisher" → GitHub Actions, and point it at repo Einsia/agent-git with
+    # workflow file `release.yml`. Until that link exists, `npm publish` here will fail (the GitHub
+    # Release with the binaries still ships — that's a separate, earlier job).
+    permissions:
+      id-token: write # mint the OIDC token npm exchanges for publish rights
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing needs npm >= 11.5.1; the Node bundle ships an older npm, so update it first.
+      - name: Update npm to a trusted-publishing-capable version
+        run: npm install -g npm@latest
 
-      # The npm package ships only the shims + install.js; the postinstall pulls the matching binary
-      # from the GitHub Release this run just published (hence `needs: release`). Without an NPM_TOKEN
-      # secret, skip publishing rather than fail the release — the GitHub Release is already live.
-      - name: Decide whether to publish
-        id: guard
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "NPM_TOKEN not set — skipping npm publish. Set the secret to enable it." >&2
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      # The published version comes from package.json; a tag that disagrees would ship the wrong
-      # binary URL. Fail loudly instead.
+      # The published version comes from package.json; a tag that disagrees would ship the wrong binary
+      # URL (the postinstall downloads from the GitHub Release for this tag). Fail loudly.
       - name: Check package.json version matches the tag
-        if: steps.guard.outputs.publish == 'true'
         run: |
           PKG_VER="$(node -p "require('./package.json').version")"
           TAG_VER="${GITHUB_REF_NAME#v}"
           if [ "$PKG_VER" != "$TAG_VER" ]; then
-            echo "package.json version ($PKG_VER) != tag ($TAG_VER) — bump package.json before tagging." >&2
+            echo "package.json version ($PKG_VER) != tag ($TAG_VER) -- bump package.json before tagging." >&2
             exit 1
           fi
 
-      - name: npm publish
-        if: steps.guard.outputs.publish == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # No NODE_AUTH_TOKEN: npm detects the trusted-publishing environment via OIDC and authenticates
+      # itself, then attaches a provenance statement.
+      - name: npm publish (OIDC)
         run: npm publish
