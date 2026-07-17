@@ -436,11 +436,14 @@ impl Binding {
     }
 
     /// Match on the **id**: a rename must edit the entry, not add a second one.
+    /// Both the aid and the name are unique within a binding — the aid is the identity, the name is the
+    /// routing key — so an entry colliding on EITHER is the same slot and must be replaced, not
+    /// appended. Matching on the aid alone missed a rebind (name fixed, aid changes) and left two
+    /// entries wearing one name; matching on the name alone would miss a rename. Any stale entry that
+    /// collides on either axis is dropped, so a rebind cannot leave the old identity behind.
     pub fn upsert(&mut self, e: BoundAgent) {
-        match self.agents.iter_mut().find(|a| a.id == e.id) {
-            Some(cur) => *cur = e,
-            None => self.agents.push(e),
-        }
+        self.agents.retain(|a| a.id != e.id && a.name != e.name);
+        self.agents.push(e);
     }
 }
 
@@ -907,20 +910,27 @@ fn clone_in(home: &Path, url: &str) -> Result<Agent> {
 /// the whole team reads. For ssh/scp the user is part of the ADDRESS, not a credential — `git@github.com`
 /// stops resolving without it — so only a password is removed there.
 fn locator(url: &str) -> String {
-    let (scheme, rest) = match url.split_once("://") {
-        Some((s, r)) => (Some(s), r),
-        // scp-like `git@host:path` has no scheme and no password to remove.
-        None => return url.to_string(),
+    // scp-like `git@host:path` has no scheme and no password to remove.
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    // Userinfo lives only in the authority (up to the first `/`); a `@` in the path is just a character.
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (rest, None),
     };
-    // Only userinfo before the FIRST `/` is auth; a `@` later in the path is just a character.
-    let host_and_path = rest.split_once('/').map(|(h, _)| h).unwrap_or(rest);
-    let Some((userinfo, _)) = host_and_path.rsplit_once('@') else { return url.to_string() };
-    let keep_user = matches!(scheme, Some("ssh") | Some("git"));
+    // The userinfo/host boundary is the LAST `@` in the authority — a password may itself contain `@`
+    // (`user:p@ss@host`), so splitting on the first `@` would leave part of the password behind. That
+    // was a real credential leak into a committed file.
+    let Some((userinfo, host)) = authority.rsplit_once('@') else { return url.to_string() };
+    // ssh/scp keep the user (it is the address: `git@github.com` stops resolving without it); http(s)
+    // drop the whole userinfo, since a bare username is still an account name in a shared file.
     let user = userinfo.split_once(':').map(|(u, _)| u).unwrap_or(userinfo);
-    let stripped = rest.splitn(2, '@').nth(1).unwrap_or(rest);
-    match (keep_user, user.is_empty()) {
-        (true, false) => format!("{}://{user}@{stripped}", scheme.unwrap_or("")),
-        _ => format!("{}://{stripped}", scheme.unwrap_or("")),
+    let authority = match (matches!(scheme, "ssh" | "git"), user.is_empty()) {
+        (true, false) => format!("{user}@{host}"),
+        _ => host.to_string(),
+    };
+    match path {
+        Some(p) => format!("{scheme}://{authority}/{p}"),
+        None => format!("{scheme}://{authority}"),
     }
 }
 
@@ -1202,6 +1212,74 @@ fn import_in(home: &Path, env: &Path, name: Option<&str>) -> Result<Agent> {
     Ok(agent)
 }
 
+/// `agit a rebind <name> --remote <url>` — deliberately override the integrity check (§4).
+///
+/// The binding records `name → (aid, remote)` as an integrity check: a recreated `frontend.git`, or DNS
+/// moving under you, would otherwise silently bind this repo to a *different* agent wearing the same
+/// name, and `check_binding` refuses. Rebind is the "yes, I meant that" — it rewrites the binding entry
+/// to whatever identity the named store actually holds, and points it at the new remote.
+///
+/// `--new-id` is the other referenced use: a store cloned from a FORK carries its source's aid (the fork
+/// wears the source's identity until re-minted). `--new-id` gives this store a fresh aid, so a fork
+/// becomes a genuinely independent memory rather than a second claimant on one identity.
+pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<Agent> {
+    let home = scope::agit_home()?;
+    let env = scope::env_root()?;
+
+    if new_id {
+        // Re-mint: change the store's committed identity, which moves it (the store is keyed by aid on
+        // disk), then repoint the registry, binding and active pointer. Same shape as `import`, minus
+        // the move-from-legacy.
+        let agent = resolve(sel).or_else(|_| {
+            // resolve() runs the integrity check, which a fork trips by construction; fall back to the
+            // active pointer's raw aid so `--new-id` still works on exactly the store that needs it.
+            let aid = read_active(&env)?.context("no agent selected to re-mint — agit a use <name> first")?;
+            find_in(&home, &aid)
+        })?;
+        let fresh = mint_aid();
+        let dest = agents_dir_in(&home).join(&fresh);
+        if dest.exists() {
+            bail!("{} already exists — refusing to overwrite a store", dest.display());
+        }
+        let id = StoreIdentity { aid: fresh.clone(), name: agent.name.clone(), created: now() };
+        move_dir(&agent.store, &dest)?;
+        write_agent_toml(&dest, &id)?;
+        scope::git_in(&dest, &["add", "agent.toml"])?;
+        scope::git_in(&dest, &["commit", "-q", "--no-verify", "-m",
+            &format!("agit: re-mint identity {} → {} ({})", agent.aid, id.name, fresh)])?;
+        // The registry is keyed by NAME, which is unchanged, so this overwrites the old aid mapping;
+        // the old aid-keyed directory no longer exists (it was moved), and the cache self-heals via
+        // `repair` regardless.
+        registry_put(&home, &id.name, &fresh)?;
+        let rebound = agent_at(dest, id);
+        bind_here(&rebound, &env, false)?;
+        write_active(&env, &rebound.aid)?;
+        return Ok(rebound);
+    }
+
+    let sel = sel.map(str::trim).filter(|s| !s.is_empty())
+        .context("agit a rebind: name a bound agent, or pass --new-id\n  usage: agit a rebind <name> --remote <url>")?;
+    // The store this name actually resolves to, whatever aid it holds — that identity is what the
+    // binding must be corrected to. find_in bypasses the integrity check on purpose: overriding it is
+    // the whole point of this verb.
+    let agent = find_in(&home, sel)
+        .with_context(|| format!("no agent `{sel}` on this machine to rebind — agit a track <url> first"))?;
+    let mut b = Binding::load(&env)?.unwrap_or_default();
+    let new_remote = remote.map(locator);
+    if let Some(r) = remote {
+        // Keep the store's own origin in step, credentials and all — the binding gets the locator only.
+        match scope::git_in_status(&agent.store, &["remote", "get-url", "origin"]).0 {
+            0 => scope::git_in(&agent.store, &["remote", "set-url", "origin", r])?,
+            _ => scope::git_in(&agent.store, &["remote", "add", "origin", r])?,
+        };
+    }
+    b.upsert(BoundAgent { id: agent.aid.clone(), name: agent.name.clone(),
+        remote: new_remote.or_else(|| agent.remote.clone()) });
+    b.save(&env)?;
+    write_active(&env, &agent.aid)?;
+    Ok(agent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1254,6 +1332,26 @@ mod tests {
         // And it must not surface as an agent anywhere else.
         assert!(list_in(h.path()).unwrap().is_empty());
         assert!(find_in(h.path(), "legacy").is_err());
+    }
+
+    /// A rebind changes the aid for a fixed name; a rename changes the name for a fixed aid. Both must
+    /// leave ONE entry, not two. `upsert` keying on the aid alone appended on rebind and left the repo
+    /// bound to two agents wearing one name — the integrity check would then pick whichever came first.
+    #[test]
+    fn upsert_replaces_on_either_the_aid_or_the_name() {
+        let mut b = Binding::default();
+        b.upsert(BoundAgent { id: "agt_old".into(), name: "frontend".into(), remote: None });
+        // rebind: same name, new aid → replaces, does not append.
+        b.upsert(BoundAgent { id: "agt_new".into(), name: "frontend".into(), remote: None });
+        assert_eq!(b.agents.len(), 1, "a rebind left a duplicate name: {:?}", b.agents);
+        assert_eq!(b.agents[0].id, "agt_new");
+        // rename: same aid, new name → replaces the same slot.
+        b.upsert(BoundAgent { id: "agt_new".into(), name: "web".into(), remote: None });
+        assert_eq!(b.agents.len(), 1, "a rename left a duplicate aid: {:?}", b.agents);
+        assert_eq!(b.agents[0].name, "web");
+        // a genuinely different agent is a new entry.
+        b.upsert(BoundAgent { id: "agt_other".into(), name: "api".into(), remote: None });
+        assert_eq!(b.agents.len(), 2);
     }
 
     #[test]
@@ -1763,11 +1861,16 @@ agent = "frontend"        # what a FRESH clone activates
         assert_eq!(locator("/srv/agents/f.git"), "/srv/agents/f.git");
         // a `@` in the PATH is not userinfo and must not be mistaken for it.
         assert_eq!(locator("https://github.com/me/f@v2.git"), "https://github.com/me/f@v2.git");
+        // a password CONTAINING `@` — the userinfo boundary is the LAST `@` in the authority, not the
+        // first. Splitting on the first `@` leaked the password tail into the committed binding.
+        assert_eq!(locator("https://user:p@ss@github.com/me/f.git"), "https://github.com/me/f.git");
         // the property that actually matters: no output of `locator` contains a known secret token.
         for u in [
             "https://x:ghp_SECRET123@github.com/me/f.git",
             "https://ghp_SECRET123@github.com/me/f.git",
             "http://user:ghp_SECRET123@host/f.git",
+            "https://u:p@ghp_SECRET123@host/f.git",
+            "https://x:ghp_SECRET123@host/path/with@at.git",
         ] {
             assert!(!locator(u).contains("ghp_SECRET123"), "credential survived in {}", locator(u));
         }

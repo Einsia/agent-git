@@ -2805,7 +2805,7 @@ fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]
                 false => "ok",
             },
             "note": match aid.is_some() {
-                true => Some("this fork carries the source's aid until you run `agit a rebind` locally and push"),
+                true => Some("this fork carries the source's aid; give it its own identity with `agit a rebind --new-id` locally, then push"),
                 false => None,
             },
         }),

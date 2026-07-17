@@ -152,6 +152,16 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             println!("  bound  {}   (COMMIT IT — this is how your team's clone finds this memory)", agent::BINDING_FILE);
             Ok(0)
         }
+        // Override the integrity check (`--remote <url>`), or give a forked store its own identity
+        // (`--new-id`). Both are referenced by errors that used to point at a stub.
+        "rebind" => {
+            let remote = args.iter().position(|a| a == "--remote").and_then(|i| args.get(i + 1)).cloned();
+            let name = args.first().filter(|a| !a.starts_with("--")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let a = agent::rebind(name.as_deref(), remote.as_deref(), flag("--new-id"))?;
+            println!("rebound {} ({})", a.name, a.aid);
+            println!("  remote {}", a.remote.as_deref().unwrap_or("—"));
+            Ok(0)
+        }
         // The one-shot adoption of a store minted before identity existed. Optional name: a store that
         // already knows what it is keeps its own label.
         "import" => {
@@ -164,7 +174,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
         // Still design-only. Named individually so the message cannot outlive the gap.
         v => {
             eprintln!("agit agent {v}: not implemented yet.");
-            eprintln!("  available: list · new · use · track · info · rename · import · publish");
+            eprintln!("  available: list · new · use · track · info · rename · publish · rebind · import");
             Ok(2)
         }
     }
