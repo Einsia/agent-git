@@ -56,18 +56,45 @@ pub trait Adapter {
     fn locate_default(&self, cwd: &Path) -> Result<PathBuf>;
 }
 
-/// Get an adapter by name. New runtimes register here.
+/// One registered runtime. This is the single place a runtime is named: its canonical name, a
+/// one-line description, the aliases `get` also accepts, and how to construct its adapter. Adding a
+/// runtime is one entry here plus the adapter impl — nothing else in the tree names a runtime.
+struct Registered {
+    name: &'static str,
+    desc: &'static str,
+    aliases: &'static [&'static str],
+    make: fn() -> Box<dyn Adapter>,
+}
+
+const REGISTRY: &[Registered] = &[
+    Registered {
+        name: "claude-code",
+        desc: "Claude Code — parses ~/.claude/projects/<slug>/<session>.jsonl (implemented)",
+        aliases: &["claude", "cc"],
+        make: || Box::new(claude_code::ClaudeCode),
+    },
+    Registered {
+        name: "codex",
+        desc: "Codex — parses ~/.codex/sessions/*/rollout-*.jsonl (filters projects by cwd) (implemented)",
+        aliases: &[],
+        make: || Box::new(codex::Codex),
+    },
+];
+
+/// The canonical runtime names, in registry order. The one source every other module iterates instead
+/// of naming a runtime; `session::runtimes()` re-exports it for convenience.
+pub fn names() -> Vec<&'static str> {
+    REGISTRY.iter().map(|r| r.name).collect()
+}
+
+/// Get an adapter by canonical name or alias.
 pub fn get(runtime: &str) -> Result<Box<dyn Adapter>> {
-    match runtime {
-        "claude-code" | "claude" | "cc" => Ok(Box::new(claude_code::ClaudeCode)),
-        "codex" => Ok(Box::new(codex::Codex)),
-        other => bail!("unknown runtime `{other}`. Registered: claude-code, codex"),
+    match REGISTRY.iter().find(|r| r.name == runtime || r.aliases.contains(&runtime)) {
+        Some(r) => Ok((r.make)()),
+        None => bail!("unknown runtime `{runtime}`. Registered: {}", names().join(", ")),
     }
 }
 
 pub fn list() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("claude-code", "Claude Code — parses ~/.claude/projects/<slug>/<session>.jsonl (implemented)"),
-        ("codex", "Codex — parses ~/.codex/sessions/*/rollout-*.jsonl (filters projects by cwd) (implemented)"),
-    ]
+    REGISTRY.iter().map(|r| (r.name, r.desc)).collect()
 }

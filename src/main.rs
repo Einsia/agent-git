@@ -719,9 +719,17 @@ fn report_incoming(store: &std::path::Path) {
         println!("  up to date — no new sessions on the remote.");
         return;
     }
-    let codex = new.iter().filter(|f| f.contains("/codex/")).count();
-    let claude = new.iter().filter(|f| f.contains("/claude-code/")).count();
-    println!("  {} new session(s) on the remote (claude-code: {claude}, codex: {codex}).", new.len());
+    // Break the count down per runtime by asking the registry which runtimes exist, not by naming any
+    // — a new adapter shows up here for free.
+    let breakdown: Vec<String> = agit::adapter::names()
+        .iter()
+        .filter_map(|rt| {
+            let n = new.iter().filter(|f| f.contains(&format!("/{rt}/"))).count();
+            (n > 0).then(|| format!("{rt}: {n}"))
+        })
+        .collect();
+    let suffix = if breakdown.is_empty() { String::new() } else { format!(" ({})", breakdown.join(", ")) };
+    println!("  {} new session(s) on the remote{suffix}.", new.len());
     println!("  integrate with: agit a pull");
 }
 

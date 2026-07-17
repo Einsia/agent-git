@@ -209,8 +209,9 @@ fn ref_ahead_sessions(store: &Path, reference: &str) -> Option<usize> {
         ],
     );
     (rc == 0).then(|| {
+        let runtimes = crate::session::runtimes();
         out.lines()
-            .filter(|l| crate::session::RUNTIMES.iter().any(|rt| is_session_of(l, rt)))
+            .filter(|l| runtimes.iter().any(|rt| is_session_of(l, rt)))
             .count()
     })
 }

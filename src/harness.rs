@@ -243,7 +243,7 @@ fn other_partitions(agent: &Path, env: &Path, rt: &str) -> Vec<Partition> {
         }
         // A runtime name at this level is the pre-partition layout. It cannot be mistaken for a slug:
         // a slug comes from an ABSOLUTE path, so it always starts with '-'.
-        out.extend(if crate::session::RUNTIMES.contains(&name.as_str()) {
+        out.extend(if crate::session::runtimes().contains(&name.as_str()) {
             if name == rt { load_partition(e.path(), None) } else { None }
         } else {
             load_partition(e.path().join(rt), Some(name))
@@ -383,7 +383,7 @@ const PH_PREFIX: &str = "${AGIT_SECRET:";
 /// other. The union is deliberate: a runtime the agent only ever captured in another repo still
 /// resolves here, and without that `apply` could never adopt one, which is the point of a shared store.
 pub fn captured_runtimes(agent: &Path, env: &Path) -> Vec<&'static str> {
-    crate::session::RUNTIMES
+    crate::session::runtimes()
         .into_iter()
         .filter(|rt| own_partition(agent, env, rt).is_some() || !other_partitions(agent, env, rt).is_empty())
         .collect()

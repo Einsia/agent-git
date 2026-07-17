@@ -418,7 +418,18 @@ pub fn convert_pass(agent: &Path, env: &Path, seen: &mut std::collections::HashS
     // env-partitioned store does not silently stop auto-converting, and it already excludes a
     // session's sidecars (`<id>/subagents/*.jsonl`), which the old `max_depth(1)` was there for.
     let sessions = store_sessions(agent);
-    for (from, to) in [("claude-code", "codex"), ("codex", "claude-code")] {
+    // Every ordered pair of distinct runtimes, from the registry — so a third runtime is converted to
+    // and from the others with no change here.
+    let runtimes = crate::session::runtimes();
+    let mut pairs = Vec::new();
+    for &from in &runtimes {
+        for &to in &runtimes {
+            if from != to {
+                pairs.push((from, to));
+            }
+        }
+    }
+    for (from, to) in pairs {
         for e in sessions.iter().filter(|s| s.runtime == from) {
             // never re-convert a session agit itself produced — that's the feedback-loop guard.
             let stem = e.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -714,7 +725,7 @@ pub fn store_sessions(store: &Path) -> Vec<StoredSession> {
             continue;
         }
         let Some(parent) = p.parent() else { continue };
-        let Some(rt) = crate::session::RUNTIMES
+        let Some(rt) = crate::session::runtimes()
             .into_iter()
             .find(|rt| parent.file_name().map(|n| n == *rt).unwrap_or(false))
         else {

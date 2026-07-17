@@ -20,13 +20,16 @@ pub const SESSIONS_SUBDIR: &str = "sessions";
 /// The watcher's pidfile, in `<env>/.agit/` (gitignored by `agit init`).
 const WATCH_PID: &str = "agit-watch.pid";
 
-/// The runtimes agit speaks. Peers — there is no first among them, so they are listed alphabetically
-/// wherever a user reads them, and no code path may fall back to one of them as a default.
-pub const RUNTIMES: [&str; 2] = ["claude-code", "codex"];
+/// The runtimes agit speaks, from the adapter registry — the single place they are named. Peers:
+/// there is no first among them, so they read alphabetically wherever a user sees them, and no code
+/// path may fall back to one of them as a default.
+pub fn runtimes() -> Vec<&'static str> {
+    crate::adapter::names()
+}
 
 /// The runtimes named the way the user should always see them: alphabetically, in one breath.
 pub fn runtime_list() -> String {
-    RUNTIMES.join(", ")
+    runtimes().join(", ")
 }
 
 /// Whether a runtime holds any session **this project owns**.
@@ -44,7 +47,7 @@ pub fn has_live_sessions(rt: &str, env: &Path) -> bool {
 
 /// The runtimes with sessions for this project, alphabetically.
 pub fn live_runtimes(env: &Path) -> Vec<&'static str> {
-    RUNTIMES.into_iter().filter(|rt| has_live_sessions(rt, env)).collect()
+    runtimes().into_iter().filter(|rt| has_live_sessions(rt, env)).collect()
 }
 
 /// The runtimes with sessions already in the Agent Store, alphabetically.
@@ -55,7 +58,7 @@ pub fn live_runtimes(env: &Path) -> Vec<&'static str> {
 /// migrated, so neither layout is the legacy one to be read second.
 pub fn store_runtimes(agent: &Path) -> Vec<&'static str> {
     let root = agent.join(SESSIONS_SUBDIR);
-    RUNTIMES.into_iter().filter(|rt| runtime_has_sessions(&root, rt)).collect()
+    runtimes().into_iter().filter(|rt| runtime_has_sessions(&root, rt)).collect()
 }
 
 fn runtime_has_sessions(sessions: &Path, rt: &str) -> bool {
@@ -98,7 +101,7 @@ pub fn resolve_runtime(explicit: Option<&str>, present: &[&'static str], what: &
     use std::io::{stdin, stdout, BufRead, IsTerminal, Write};
     if let Some(r) = explicit {
         let rt = normalize(r);
-        if !RUNTIMES.contains(&rt.as_str()) {
+        if !runtimes().contains(&rt.as_str()) {
             bail!("unknown runtime `{r}`. Registered: {}", runtime_list());
         }
         return Ok(rt);
@@ -796,7 +799,7 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
     use std::time::Duration;
     let env = scope::env_root()?;
     let interval = Duration::from_secs(interval_secs.max(1));
-    let runtimes = RUNTIMES;
+    let runtimes = runtimes();
     let mut last: HashMap<&str, String> = HashMap::new();
     let mut pending: HashMap<&str, bool> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -813,7 +816,7 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
         if do_convert { " + auto-convert both ways" } else { "" }
     );
     loop {
-        for rt in runtimes {
+        for &rt in &runtimes {
             let sig = source_path(rt, &env).map(|p| dir_signature(&p)).unwrap_or_default();
             // first sight of a runtime counts as "changed" so pre-existing sessions get captured on start
             let changed = last.get(rt).map(|l| l != &sig).unwrap_or(true);
