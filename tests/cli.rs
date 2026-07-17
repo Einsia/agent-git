@@ -760,6 +760,17 @@ fn a_clone_and_a_init_redirect_to_the_smart_verbs() {
 }
 
 #[test]
+fn snap_from_a_never_run_runtime_exits_zero_for_both_peers() {
+    let r = Repo::new();
+    // HOME is the repo dir, so neither runtime has a session dump. Both peers must behave the same:
+    // nothing to mirror, exit 0 — not one erroring (claude-code) and the other succeeding (codex).
+    for rt in ["claude-code", "codex"] {
+        let (code, out, err) = r.agit(&["snap", "--from", rt]);
+        assert_eq!(code, 0, "snap --from {rt} with no sessions must exit 0: out={out} err={err}");
+    }
+}
+
+#[test]
 fn a_rebind_new_id_with_a_bad_name_errors_and_leaves_the_active_agent_alone() {
     let r = Repo::new();
     // The store the repo's (active) agent resolves to. Its directory name IS the aid.

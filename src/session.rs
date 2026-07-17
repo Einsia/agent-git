@@ -261,11 +261,16 @@ fn live_sessions(rt: &str, env: &Path) -> Result<(Vec<(PathBuf, String)>, String
         // tree-mirroring it copied a *different* project's transcripts into this store, which a push
         // then shipped to this project's teammates.
         "claude-code" => {
-            // source_dir first: "this project has never run in Claude Code" is a better error than an
-            // empty list, and it names the HOME agit actually looked under.
-            let src = source_dir("claude-code", env)?;
+            // Parity with codex: an absent session directory yields an empty list, not an error, so
+            // `snap --from claude-code` and `agit watch` behave the same whether or not this project
+            // has run in Claude Code. snap_one still prints the source and "nothing to mirror", so the
+            // "never run here" case is still legible — it just isn't a non-zero exit one peer has and
+            // the other doesn't.
             let owned = claude_code::project_sessions(env);
-            let desc = format!("{} ({} owned sessions)", src.display(), owned.len());
+            let desc = match source_dir("claude-code", env) {
+                Ok(src) => format!("{} ({} owned sessions)", src.display(), owned.len()),
+                Err(_) => format!("(no Claude Code session directory for this project yet — {} owned sessions)", owned.len()),
+            };
             Ok((owned, desc))
         }
         // Codex splits by date with every project mixed together, and a fork/resume rollout embeds the

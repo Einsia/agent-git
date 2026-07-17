@@ -919,6 +919,10 @@ fn scan_meta(repo: &Path, news: &[String], allow: &agit::scan::Allowlist, skip: 
         return;
     };
     let bodies = parse_batch(&raw);
+    // The same byte bounds the blob path applies: a commit message can be arbitrarily large, so cap
+    // each object and the metadata scan as a whole rather than regex-scanning unbounded text. Oversize
+    // objects are reported as unscanned (fail-closed), never waved through.
+    let mut budget = SCAN_MAX_TOTAL_BYTES;
     for sha in &shas {
         let label = format!("commit {}", &sha[..sha.len().min(12)]);
         if skip.iter().any(|s| s == &label) {
@@ -928,6 +932,16 @@ fn scan_meta(repo: &Path, news: &[String], allow: &agit::scan::Allowlist, skip: 
             out.unscanned.push((label, "git returned no content for this commit".into()));
             continue;
         };
+        let size = content.len() as u64;
+        if size > SCAN_MAX_BLOB_BYTES {
+            out.unscanned.push((label, format!("{size} bytes — past the {SCAN_MAX_BLOB_BYTES}-byte per-object scan bound")));
+            continue;
+        }
+        if size > budget {
+            out.unscanned.push((label, format!("{size} bytes — past what is left of this push's {SCAN_MAX_TOTAL_BYTES}-byte total scan budget")));
+            continue;
+        }
+        budget -= size;
         let text = String::from_utf8_lossy(content);
         for f in agit::scan::scan_text_allow(&text, false, allow) {
             out.findings.push((f.rule.to_string(), label.clone(), f.line, clip(&f.excerpt, 120)));

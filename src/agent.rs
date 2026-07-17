@@ -1165,13 +1165,17 @@ fn rename_in(home: &Path, old: &str, new: &str) -> Result<Agent> {
 
 /// `kill -0 <pid>`: asks the kernel whether the process exists without delivering a signal.
 fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // pid 0 is not a real process: `kill -0 0` signals the caller's own process group and succeeds, so
+    // a zeroed or corrupt pidfile would read as "a watcher is live" and wedge import/rebind forever.
+    // Guard it, exactly as session.rs does.
+    pid != 0
+        && Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
 }
 
 /// Every pidfile a live watcher could be recorded in. Two locations, deliberately: `session::watch_daemon`
@@ -1727,6 +1731,13 @@ agent = "frontend"        # what a FRESH clone activates
             assert!(rename_in(h.path(), "frontend", path_like).is_err(), "and rename must not sneak one in");
         }
         assert!(new_agent_in(h.path(), "payments.api").is_ok(), "a dot INSIDE a name is still fine");
+    }
+
+    #[test]
+    fn a_zeroed_pidfile_is_not_a_live_watcher() {
+        // `kill -0 0` succeeds (it signals our own process group), so without the guard a zeroed
+        // pidfile would read as a live watcher and wedge import/rebind forever.
+        assert!(!pid_alive(0), "pid 0 must never read as alive");
     }
 
     #[test]
