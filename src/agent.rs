@@ -1346,17 +1346,26 @@ fn import_in(home: &Path, env: &Path, name: Option<&str>) -> Result<Agent> {
 pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<Agent> {
     let home = scope::agit_home()?;
     let env = scope::env_root()?;
+    let sel = sel.map(str::trim).filter(|s| !s.is_empty());
 
     if new_id {
         // Re-mint: change the store's committed identity, which moves it (the store is keyed by aid on
         // disk), then repoint the registry, binding and active pointer. Same shape as `import`, minus
         // the move-from-legacy.
-        let agent = resolve(sel).or_else(|_| {
-            // resolve() runs the integrity check, which a fork trips by construction; fall back to the
-            // active pointer's raw aid so `--new-id` still works on exactly the store that needs it.
-            let aid = read_active(&env)?.context("no agent selected to re-mint — agit a use <name> first")?;
-            find_in(&home, &aid)
-        })?;
+        //
+        // Resolve the EXACT store named. `find_in` (not `resolve`) bypasses the integrity check that a
+        // fork trips by construction — but it still honors the name. A bad name must error, never fall
+        // through to the active agent: re-mint MOVES the store and rewrites its identity, and doing
+        // that to the wrong store on a typo is not something to guess at. Only with no name given do we
+        // fall back to the active pointer.
+        let agent = match sel {
+            Some(s) => find_in(&home, s)
+                .with_context(|| format!("no agent `{s}` on this machine to re-mint — agit a track <url> first"))?,
+            None => {
+                let aid = read_active(&env)?.context("no agent selected to re-mint — agit a use <name> first")?;
+                find_in(&home, &aid)?
+            }
+        };
         // Re-mint MOVES the store (it is keyed by aid). Moving it out from under a live watcher zombies
         // the daemon onto the old inode — the same silent-capture-loss import refuses, so refuse here too.
         if let Some(pid) = live_watcher(&env, &agent.store) {

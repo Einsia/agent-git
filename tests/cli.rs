@@ -758,3 +758,23 @@ fn a_clone_and_a_init_redirect_to_the_smart_verbs() {
     assert_ne!(code, 0, "raw init of a store is a footgun");
     assert!(err.contains("agit a new"), "should redirect to new: {err}");
 }
+
+#[test]
+fn a_rebind_new_id_with_a_bad_name_errors_and_leaves_the_active_agent_alone() {
+    let r = Repo::new();
+    // The store the repo's (active) agent resolves to. Its directory name IS the aid.
+    let before = r.agent();
+    let aid_before = before.file_name().unwrap().to_str().unwrap().to_string();
+
+    // Re-mint MOVES the store and rewrites its identity. A typo'd name must error, never re-mint the
+    // active agent by falling through.
+    let (code, _out, err) = r.agit(&["a", "rebind", "no-such-agent", "--new-id"]);
+    assert_ne!(code, 0, "a bad name must error, not re-mint whatever is active");
+    assert!(err.contains("no-such-agent"), "the error must name the bad selector: {err}");
+
+    // The active agent is untouched: same store, same aid, still on disk.
+    let after = r.agent();
+    assert_eq!(after, before, "the active agent's store must not have moved");
+    assert_eq!(after.file_name().unwrap().to_str().unwrap(), aid_before, "its aid must be unchanged");
+    assert!(before.exists(), "the original store must still exist");
+}
