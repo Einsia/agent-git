@@ -43,6 +43,37 @@ impl Repo {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, content).unwrap();
     }
+    /// Find a captured session by runtime + filename, under EITHER store layout — `sessions/<rt>/` or
+    /// `sessions/<env-slug>/<rt>/`.
+    ///
+    /// The per-environment partition exists because one agent works in many repos and its memory of
+    /// each must stay tellable apart; it is landing separately from this cutover. What these tests
+    /// assert is that the session reached the right AGENT, which is the same claim under either
+    /// layout — so they should not fail, or pass, on the strength of where inside the store it sits.
+    fn captured(&self, rt: &str, file: &str) -> bool {
+        fn walk(dir: &Path, want: &Path) -> bool {
+            std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+                let p = e.path();
+                p.ends_with(want) || (p.is_dir() && walk(&p, want))
+            })
+        }
+        walk(&self.agent().join("sessions"), &PathBuf::from(rt).join(file))
+    }
+    /// Every session byte in the store, wherever it sits.
+    fn all_session_text(&self) -> String {
+        fn walk(dir: &Path, out: &mut String) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                match p.is_dir() {
+                    true => walk(&p, out),
+                    false => out.push_str(&std::fs::read_to_string(&p).unwrap_or_default()),
+                }
+            }
+        }
+        let mut s = String::new();
+        walk(&self.agent().join("sessions"), &mut s);
+        s
+    }
 
     /// Every process this suite spawns goes through here. agit resolves ~/.claude, ~/.codex and its own
     /// home from the environment, so an un-isolated test reads — and can write — the developer's real
@@ -247,6 +278,35 @@ fn commit_dash_a_is_git_flag_not_scope() {
     assert_eq!(code, 0, "commit -a should act on the code repo: {err}");
     assert_eq!(r.git_env(&["log", "-1", "--format=%s"]), "code via -a");
     assert_eq!(r.git_agent(&["rev-list", "--count", "HEAD"]), agent_before, "should not touch the Agent Store");
+}
+
+/// `agit clone <url>` is git's clone, on the code repo. It used to mean "clone the team's Agent Store
+/// into `<env>/.agit/agent`" — shadowing git's own verb, and after the cutover building a store at a
+/// path nothing resolves. The transparent wrapper must also be no PICKIER than git: clone is run from
+/// outside a repo by definition, so requiring one would reject the command whose job is to make one.
+#[test]
+fn clone_is_gits_clone_and_works_outside_a_repo() {
+    let src = Repo::new();
+    src.write("f.txt", "hello\n");
+    src.sh("git add -A && git commit -qm seed2");
+
+    let out = tempfile::tempdir().unwrap();
+    let mut c = Command::new(BIN);
+    c.current_dir(out.path())
+        .env("HOME", out.path())
+        .env("AGIT_HOME", out.path().join("agit-home"))
+        .args(["clone", &src.path().to_string_lossy(), "cloned"]);
+    let o = c.output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "agit clone should clone the CODE repo: {}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        std::fs::read_to_string(out.path().join("cloned/f.txt")).unwrap(),
+        "hello\n",
+        "it must be git's clone of the code repo"
+    );
+    assert!(
+        !out.path().join("cloned/.agit/agent").exists(),
+        "it must not build an Agent Store at a path the resolver cannot reach"
+    );
 }
 
 // ─────────────────── `agit a` — the subcommand that replaces `-a` ───────────────────
@@ -455,15 +515,13 @@ fn codex_sync_only_pulls_matching_project() {
     assert_eq!(code, 0, "codex sync should succeed: {err}");
     assert!(out.contains("matched 1 rollouts"), "should match only this project's 1 rollout (the fork must be skipped):\n{out}");
 
-    let cdir = r.agent().join("sessions/codex");
-    assert!(cdir.join("mineid.jsonl").exists(), "this project's session should be written to disk");
-    assert!(!cdir.join("otherid.jsonl").exists(), "another project's session should never be synced");
-    assert!(!cdir.join("forkid.jsonl").exists(), "a fork that contains a foreign-project session should not be synced at all");
-    // double insurance: another project's content should not appear anywhere in the codex directory
-    let mut all = String::new();
-    for e in std::fs::read_dir(&cdir).unwrap() {
-        all.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
-    }
+    assert!(r.captured("codex", "mineid.jsonl"), "this project's session should be written to disk");
+    assert!(!r.captured("codex", "otherid.jsonl"), "another project's session should never be synced");
+    assert!(!r.captured("codex", "forkid.jsonl"), "a fork that contains a foreign-project session should not be synced at all");
+    // Double insurance, and the privacy bottom line: another project's content must not appear
+    // ANYWHERE in the store — read the whole tree, not one directory, so the claim cannot be narrowed
+    // by where the layout happens to put a file.
+    let all = r.all_session_text();
     assert!(all.contains("MINE work"));
     assert!(!all.contains("OTHER secret"), "another project's content leaked");
     assert!(!all.contains("PARENT leaked secret"), "the parent-project session inside the fork leaked");
@@ -498,7 +556,7 @@ fn snap_captures_codex_without_being_told_when_it_is_the_only_runtime() {
     let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
     assert_eq!(code, 0, "a bare snap must find codex on its own: {err}{out}");
     assert!(out.contains("codex"), "should report capturing codex: {out}");
-    assert!(r.agent().join("sessions/codex/onlycodex.jsonl").exists(), "codex session should be mirrored into the store");
+    assert!(r.captured("codex", "onlycodex.jsonl"), "codex session should be mirrored into the store");
     assert!(!err.contains("Claude Code"), "must not fail over a runtime this project never used: {err}");
 }
 
@@ -521,8 +579,8 @@ fn snap_with_no_from_captures_both_runtimes() {
 
     let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
     assert_eq!(code, 0, "snap should capture both: {err}");
-    assert!(r.agent().join("sessions/codex/cx.jsonl").exists(), "codex must be captured: {out}");
-    assert!(r.agent().join("sessions/claude-code/cc.jsonl").exists(), "claude-code must be captured: {out}");
+    assert!(r.captured("codex", "cx.jsonl"), "codex must be captured: {out}");
+    assert!(r.captured("claude-code", "cc.jsonl"), "claude-code must be captured: {out}");
 }
 
 /// No sessions in either runtime: the error names them as peers, alphabetically, and never singles

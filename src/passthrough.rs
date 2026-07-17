@@ -14,7 +14,17 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub fn run(scope: Scope, args: &[String]) -> Result<i32> {
-    let root = scope::root_for(scope)?;
+    // A transparent wrapper must not be pickier than git. `agit clone <url>` and `agit init` are run
+    // from OUTSIDE a repo by definition, so demanding one here would reject the very commands whose job
+    // is to make one — and would answer with agit's paraphrase where git has a better error of its own.
+    // The Agent scope keeps demanding a store: "which memory?" has no cwd fallback.
+    let root = match scope {
+        Scope::Environment => match scope::env_root() {
+            Ok(r) => r,
+            Err(_) => std::env::current_dir()?,
+        },
+        Scope::Agent => scope::root_for(scope)?,
+    };
     let subcommand = args.first().cloned().unwrap_or_default();
 
     // HEAD before any ref moved, used to tell whether it actually changed.

@@ -80,9 +80,9 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
                 .iter()
                 .map(|a| {
                     let sessions = commands::store_sessions(&a.store);
-                    // "watching", not "running": a pidfile proves agit has a watcher on this store, and
+                    // "watching", not "running": a live watcher announced itself for this agent, and
                     // nothing here can see whether a human has a live session open.
-                    let status = match session::watcher_pid(&a.store) {
+                    let status = match session::watching_pid(&a.aid) {
                         Some(_) => ui::accent("● watching"),
                         None => ui::dim("·").to_string(),
                     };
@@ -189,13 +189,10 @@ fn dispatch(argv: Vec<String>) -> i32 {
                 .cloned();
             init::run_named(agent)
         }
-        "clone" => match args.first() {
-            Some(url) => commands::clone_agent(url),
-            None => {
-                eprintln!("usage: agit clone <hub-url>/<name>.git   (clone the team Agent Store locally and set up the driver)");
-                Ok(2)
-            }
-        },
+        // No `"clone"` arm: `agit clone <url>` is git's clone, on the code repo, like every other
+        // unclaimed verb. It used to mean "clone the team's Agent Store into <env>/.agit/agent" — which
+        // shadowed git's own verb (the thing `track` not `add` and `info` not `show` exist to avoid) and,
+        // after the cutover, built a store at a path nothing resolves. `agit a track <url>` is the memory.
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(0)
@@ -326,6 +323,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
         // ── harness: show / apply the captured MCP + skills + config (part of Agent State) ──
         "harness" => {
             let mut rt: Option<String> = None;
+            let mut from_env: Option<String> = None;
             let mut force = false;
             let mut sub = "show".to_string();
             let mut i = 0;
@@ -333,6 +331,13 @@ fn dispatch(argv: Vec<String>) -> i32 {
                 match args[i].as_str() {
                     "--from" if i + 1 < args.len() => {
                         rt = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    // Which CHECKOUT's harness, when this agent captured one in several. The
+                    // non-interactive answer to that question, so a script is never left with a
+                    // prompt it cannot see.
+                    "--from-env" if i + 1 < args.len() => {
+                        from_env = Some(args[i + 1].clone());
                         i += 2;
                     }
                     "--force" => {
@@ -346,7 +351,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
                     _ => i += 1,
                 }
             }
-            harness_cmd(&sub, rt.as_deref(), force)
+            harness_cmd(&sub, rt.as_deref(), force, from_env.as_deref())
         }
 
         // ── Convert a session across runtimes (resume it in another CLI); --watch = auto-convert worker ──
@@ -508,16 +513,20 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
 /// The two halves answer ambiguity differently, and deliberately: `show` is read-only, so listing every
 /// captured runtime IS the answer; `apply` rewrites the project's own .mcp.json / .claude, so it acts on
 /// exactly one runtime and asks rather than guess.
-fn harness_cmd(sub: &str, rt: Option<&str>, force: bool) -> anyhow::Result<i32> {
+///
+/// Both also answer *which checkout's* harness: one agent works in several repos, so `show` reports this
+/// checkout's and every other checkout's, while `apply` acts on one and announces it when it comes from
+/// another — a config arriving from a repo you did not name is indistinguishable from a bug.
+fn harness_cmd(sub: &str, rt: Option<&str>, force: bool, from_env: Option<&str>) -> anyhow::Result<i32> {
     let agent = scope::root_for(Scope::Agent)?;
     let env = scope::env_root()?;
-    let captured = harness::captured_runtimes(&agent);
+    let captured = harness::captured_runtimes(&agent, &env);
     if sub == "apply" {
         let rt = session::resolve_runtime(rt, &captured, "apply")?;
-        return harness::apply(&agent, &env, &rt, force);
+        return harness::apply(&agent, &env, &rt, force, from_env);
     }
     match rt {
-        Some(r) => harness::show(&agent, &session::resolve_runtime(Some(r), &captured, "show")?),
+        Some(r) => harness::show(&agent, &env, &session::resolve_runtime(Some(r), &captured, "show")?),
         None if captured.is_empty() => {
             println!(
                 "No harness captured for {} yet. Run `agit a snap` to capture it.",
@@ -528,7 +537,7 @@ fn harness_cmd(sub: &str, rt: Option<&str>, force: bool) -> anyhow::Result<i32> 
         None => {
             let mut code = 0;
             for rt in captured {
-                code = harness::show(&agent, rt)?;
+                code = harness::show(&agent, &env, rt)?;
             }
             Ok(code)
         }
@@ -624,7 +633,7 @@ you name with --from, else the only one present, else they ask.
   agit a push / pull       Sync sessions with the team (the Agent Store is just a git repo)
   agit start               Launch a session HERE already carrying this agent's latest context, from whatever repo it was last in (--agent <name> picks the agent for this invocation only; --as <rt> switches runtime)
   agit a merge <target>    Merge this agent's memory with <target>'s by dialogue (alias: sync); <target> is an agent name or a ref — never a code branch. Same agent → the histories merge too; a different agent → dialogue only, both stay intact (--agent X / --ref X disambiguate)
-  agit clone <url>         Clone the team Agent Store in one command
+  agit a track <url>       Track an agent published on a hub (its memory, by identity)
   agit a scan [--staged]   Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
   agit workspace restore [N]  Roll both repos back together to a pairing's joint state
