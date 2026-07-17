@@ -338,6 +338,9 @@ fn dispatch(argv: Vec<String>) -> i32 {
         "adapter" => commands::adapter_list(),
         "graph" => commands::workspace_graph(),
 
+        // ── shadow: route `git` through `agit` in your interactive shell (cross-platform). ──
+        "shadow" => agit::shadow::run(args),
+
         // ── watch: fully hands-off — watch both runtimes' dumps, auto-snap + auto-convert both ways.
         //    --daemon runs it forever in the background; --stop / --status manage it. ──
         "watch" => {
@@ -822,8 +825,8 @@ fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {
 const USAGE: &str = "\
 agit — version an agent's raw session so teams can collaborate on Agent Context
 
-Runtimes are peers and there is no default: claude-code, codex. Commands that read sessions use the one
-you name with --from, else the only one present, else they ask.
+Works with claude-code and codex. Commands that read sessions use the one you name with --from, else
+the only one present, else they ask.
 
   agit init [--agent N]    Prepare this repo: clone or select its agent, install the secret hooks (--agent names one)
   agit a snap [--watch]    Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store; captures every runtime with sessions here unless --from names one (--watch = auto-snap; --no-harness = sessions only)
@@ -838,6 +841,7 @@ you name with --from, else the only one present, else they ask.
   agit graph               Show the Workspace-State timeline + relation edges
   agit harness [apply]     Show, or apply, the captured harness (MCP/skills/config); apply asks first (--force to skip)
   agit adapter             List runtime adapters
+  agit shadow [install]    Route `git` through `agit` in your shell so every git command versions agent context (uninstall / status to manage)
   agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist; --watch auto-converts both ways in the background)
   agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime; --env <path> to run this agent against a different repo; --relocate if it's the same project moved; --exec to launch)
 

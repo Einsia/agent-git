@@ -30,6 +30,7 @@ pub mod register;
 pub mod scan;
 pub mod scope;
 pub mod session;
+pub mod shadow;
 pub mod sync;
 pub mod ui;
 pub mod workspace;
