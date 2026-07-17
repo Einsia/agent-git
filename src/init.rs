@@ -31,14 +31,26 @@ pub fn run_named(name: Option<String>) -> Result<i32> {
 
     let agent = match agent::resolve(None) {
         Ok(a) => a,
-        // Two failures init must NOT paper over by minting a second agent: a store that predates
-        // identity (adopt it — the memory is real), and a repo whose committed binding declares agents
-        // this machine simply does not have yet (track them — that is the fresh-clone path). The
-        // resolver already words both, so init repeats rather than reinvents them.
-        Err(e) if agent::legacy_store(&env).is_some() || declares_agents(&env) => {
+        // A store that predates identity is adopted, not re-minted — the memory is real, and minting a
+        // second agent beside it would fork it. init does not paper over that; it repeats the resolver's
+        // actionable error, which names `agit a import`.
+        Err(e) if agent::legacy_store(&env).is_some() => {
             eprintln!("{e:#}");
             return Ok(2);
         }
+        // The fresh-clone takeover (§13.1): the committed binding names agents this machine lacks, so
+        // init clones the ones that carry a remote and resolves again. This is the whole of PRD #1 —
+        // `git clone` then `agit init` and the team's memory is here — so init doing it, rather than
+        // making the user `track` each name by hand, is the point.
+        Err(_) if declares_agents(&env) => match track_declared(&env)? {
+            Some(a) => a,
+            // Declared, but nothing could be cloned (no remote recorded, or every clone failed). The
+            // resolver's own words name what to do; do not mint a namesake on top of a declared agent.
+            None => {
+                eprintln!("{:#}", agent::resolve(None).unwrap_err());
+                return Ok(2);
+            }
+        },
         Err(_) => agent::new_agent(&pick_name(&env, name.as_deref())?)?,
     };
 
@@ -63,9 +75,52 @@ pub fn run_named(name: Option<String>) -> Result<i32> {
 }
 
 /// Whether the committed binding names agents — i.e. this is a teammate's clone, and the answer to
-/// "no agent" is `agit a track <name>`, not minting a stranger.
+/// "no agent" is to clone what it declares, not to mint a stranger.
 fn declares_agents(env: &Path) -> bool {
     Binding::load(env).ok().flatten().map(|b| !b.agents.is_empty()).unwrap_or(false)
+}
+
+/// Clone every declared agent this machine does not already have and that carries a remote, then return
+/// the one the binding defaults to (so init can activate it). This is the fresh-clone takeover.
+///
+/// A declared agent with NO remote cannot be cloned — the owner minted it but never published — so it is
+/// reported and skipped rather than failing the whole takeover: the agents that CAN be pulled still are.
+fn track_declared(env: &Path) -> Result<Option<agent::Agent>> {
+    let Some(binding) = Binding::load(env)? else { return Ok(None) };
+    let mut got: Vec<agent::Agent> = Vec::new();
+    for entry in &binding.agents {
+        // Already here (a re-run, or an agent shared by two repos): track is idempotent, but skipping
+        // avoids a needless network round-trip on every init.
+        if agent::info(&entry.id).is_ok() {
+            if let Ok(a) = agent::info(&entry.id) {
+                got.push(a);
+            }
+            continue;
+        }
+        if entry.remote.is_none() {
+            eprintln!("  · {} is declared but has no remote to clone — skipping (its owner has not published it)", entry.name);
+            continue;
+        }
+        match agent::track(&entry.name, false) {
+            Ok(a) => {
+                println!("  ✓ cloned {} ({})", a.name, a.aid);
+                got.push(a);
+            }
+            // One agent that fails to clone must not sink the others: a private repo the teammate lacks
+            // a token for is a real, recoverable situation, not a reason to abort the takeover.
+            Err(e) => eprintln!("  · could not clone {}: {e:#}", entry.name),
+        }
+    }
+    if got.is_empty() {
+        return Ok(None);
+    }
+    // Prefer the binding's default; else the first one that came down.
+    let default = binding.default.as_deref();
+    Ok(got
+        .iter()
+        .find(|a| Some(a.name.as_str()) == default)
+        .or_else(|| got.first())
+        .cloned())
 }
 
 /// An agent is named for what it KNOWS (`frontend`, `payments-api`) — not for the directory it

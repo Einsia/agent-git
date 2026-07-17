@@ -280,6 +280,67 @@ fn commit_dash_a_is_git_flag_not_scope() {
     assert_eq!(r.git_agent(&["rev-list", "--count", "HEAD"]), agent_before, "should not touch the Agent Store");
 }
 
+/// Acceptance §13.1, PRD #1 takeover: bob does `git clone <code repo>` then `agit init`, and the memory
+/// alice published is here — cloned by init, not by a manual `track`, with alice's exact aid. Two
+/// isolated HOMEs share a bare repo standing in for the hub; `publish`/`track` clone over a local path.
+#[test]
+fn a_teammate_takes_over_with_git_clone_then_agit_init() {
+    let root = tempfile::tempdir().unwrap();
+    let hub = root.path().join("frontend.git"); // the "hub": a bare repo publish pushes to
+    // `main` to match the store's branch — a real hub sets HEAD to the pushed branch; a plain bare repo
+    // defaulting to `master` would leave a dangling symbolic HEAD that a clone cannot check out.
+    let st = Command::new("git").args(["init", "-q", "--bare", "--initial-branch=main"]).arg(&hub).status().unwrap();
+    assert!(st.success());
+
+    let run = |home: &Path, cwd: &Path, args: &[&str]| -> (i32, String, String) {
+        let o = Command::new(BIN)
+            .current_dir(cwd)
+            .env("HOME", home)
+            .env("AGIT_HOME", home.join(".agit"))
+            .args(args)
+            .output()
+            .unwrap();
+        (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into(), String::from_utf8_lossy(&o.stderr).into())
+    };
+    let git = |cwd: &Path, args: &[&str]| {
+        Command::new("git").current_dir(cwd)
+            .args(["-c", "user.name=t", "-c", "user.email=t@e.com", "-c", "commit.gpgsign=false"])
+            .args(args).output().unwrap();
+    };
+
+    // ── alice: mint, publish (pushes to the bare repo and writes the remote into .agit.toml), commit ──
+    let alice = root.path().join("alice");
+    let web = alice.join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    git(&web, &["init", "-q", "-b", "main", "."]);
+    std::fs::write(web.join("f"), "x").unwrap();
+    git(&web, &["add", "-A"]);
+    git(&web, &["commit", "-qm", "seed"]);
+    assert_eq!(run(&alice, &web, &["init", "--agent", "frontend"]).0, 0);
+    let (c, _, e) = run(&alice, &web, &["a", "publish", hub.to_str().unwrap()]);
+    assert_eq!(c, 0, "publish failed: {e}");
+    git(&web, &["add", ".agit.toml"]);
+    git(&web, &["commit", "-qm", "declare frontend"]);
+    let alice_aid = std::fs::read_to_string(web.join(".agit.toml")).unwrap()
+        .lines().find(|l| l.trim_start().starts_with("id")).unwrap().to_string();
+
+    // ── bob: a clean machine. git clone the CODE repo, then a single `agit init`. ──
+    let bob = root.path().join("bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    let code = bob.join("code");
+    Command::new("git").args(["clone", "-q"]).arg(&web).arg(&code).output().unwrap();
+
+    let (ic, iout, ierr) = run(&bob, &code, &["init"]);
+    assert_eq!(ic, 0, "bob's init should clone the declared agent, not error: {ierr}");
+    assert!(iout.contains("cloned frontend"), "init should say it cloned the agent: {iout}{ierr}");
+
+    // same agent, not a namesake: bob's frontend carries alice's aid.
+    let (_, binfo, _) = run(&bob, &code, &["a", "info", "frontend"]);
+    let bob_aid = binfo.lines().find(|l| l.starts_with("aid")).unwrap();
+    let alice_aid_val = alice_aid.split('"').nth(1).unwrap();
+    assert!(bob_aid.contains(alice_aid_val), "bob got a namesake, not alice's agent: {bob_aid} vs {alice_aid_val}");
+}
+
 /// `agit clone <url>` is git's clone, on the code repo. It used to mean "clone the team's Agent Store
 /// into `<env>/.agit/agent`" — shadowing git's own verb, and after the cutover building a store at a
 /// path nothing resolves. The transparent wrapper must also be no PICKIER than git: clone is run from
