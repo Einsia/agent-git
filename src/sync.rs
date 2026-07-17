@@ -243,7 +243,7 @@ fn aid_at_ref(store: &Path, reference: &str) -> Option<String> {
     }
 }
 
-pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, prefer: Option<Prefer>) -> Result<i32> {
+pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool, prefer: Option<Prefer>) -> Result<i32> {
     let env = scope::env_root()?;
     // The RESOLVED agent's id-keyed store, not the legacy nested one. Reading `<env>/.agit/agent` made
     // merge operate on a store that nothing writes to any more, and left `mine` permanently None — so
@@ -256,7 +256,9 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, prefer: Opti
         bail!("sync supports claude-code or codex on both sides (pick with --from <rt>).");
     }
     let cli = if rt == "codex" { "codex" } else { "claude" };
-    if !which(cli) {
+    // The dialogue merge resumes real sessions, so it needs the runtime CLI. `--splice` does not run a
+    // model at all, so it does not.
+    if !splice && !which(cli) {
         bail!("sync needs `{cli}` on this machine (both sides of the dialogue are real resumed {cli} sessions).");
     }
 
@@ -300,6 +302,25 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, prefer: Opti
     let branch_b = branch_a.as_deref().and_then(|a| b_all.iter().find_map(|(_, c)| peer_branch(c, a)));
     let (a_voice, a_brief) = pick_side(&rt, &a_all, branch_a.as_deref());
     let (b_voice, b_brief) = pick_side(&rt, &b_all, branch_b.as_deref());
+
+    // `--splice`: the no-model merge. Combine both sides' voice sessions into one new session (A's full
+    // transcript plus B's tail after the point they forked from, ids normalized) and install it.
+    // Resuming it hands a fresh agent both contexts in one window. No dialogue, no reconciliation, no
+    // runtime CLI, deterministic.
+    if splice {
+        let new_id = convo::fresh_id("session");
+        let combined = splice_sessions(&rt, &a_voice, &b_voice, &new_id, &env)?;
+        crate::register::install(&rt, &new_id, &env, &combined)?;
+        println!("── splice (no model) ──");
+        println!(
+            "Combined {} local + {} incoming session(s) into one. Resume it and the agent reads both sides:",
+            a_all.len(),
+            b_all.len()
+        );
+        println!("  {}", resume_cmd(&rt, &env, &new_id));
+        // Same agent: fuse the git histories too, so the two copies become one memory again.
+        return if mode == Mode::Fuse { Ok(fuse(&agent, &target)?) } else { Ok(0) };
+    }
 
     // 4. Two worktrees + diffs (when both code branches are present in the repo and differ).
     let (mut a, mut b) = (
@@ -663,6 +684,32 @@ fn emit_both(rt: &str, b: &Side, env: &Path) -> Result<()> {
     println!("B's merged state — resume it on B's branch:");
     println!("  (cd {} && claude --resume {b_merged})", env.display());
     Ok(())
+}
+
+/// `--splice`: combine two same-runtime sessions into one. A's transcript in full, then B's events
+/// after the shared prefix (the point the two forked from), with B's session id and cwd normalized
+/// onto A's so the id/cwd rewrite in `write_conversation` catches every line. Deterministic, no model.
+fn splice_sessions(rt: &str, a_text: &str, b_text: &str, new_id: &str, cwd: &Path) -> Result<String> {
+    let mut ir = convo::read_conversation(rt, a_text)?;
+    let ir_b = convo::read_conversation(rt, b_text)?;
+    // The shared prefix is the common ancestor both sessions forked from — keep it once, from A.
+    let shared = ir
+        .events
+        .iter()
+        .zip(ir_b.events.iter())
+        .take_while(|(x, y)| x.raw == y.raw)
+        .count();
+    let (a_id, a_cwd) = (ir.session_id.clone(), ir.cwd.clone());
+    for e in &ir_b.events[shared..] {
+        let mut e = e.clone();
+        e.raw = convo::swap_quoted(&e.raw, &ir_b.session_id, &a_id);
+        if let (Some(b_cwd), Some(a_cwd)) = (&ir_b.cwd, &a_cwd) {
+            e.raw = convo::swap_quoted(&e.raw, b_cwd, a_cwd);
+        }
+        ir.events.push(e);
+    }
+    let opts = ConvertOpts { cwd: Some(cwd.to_string_lossy().into_owned()), new_id: new_id.to_string() };
+    convo::write_conversation(rt, &ir, &opts)
 }
 
 /// Copy a claude session into a fresh-id session bound to `cwd` (same-vendor replay rewrites id/cwd).
@@ -1544,5 +1591,30 @@ mod tests {
         assert!(a.contains("find the real conflicts") && a.contains("CONFLICT:") && a.contains("DONE"), "{a}");
         let b = relay_first("claude-code", "hi", "", "", true);
         assert!(!b.contains("CRITICAL") && b.contains("Respond under the same rules"), "{b}");
+    }
+
+    #[test]
+    fn splice_combines_both_sides_under_one_new_id() {
+        // Two independent sessions (different sessionIds, so no shared raw prefix):
+        // splice concatenates A's transcript with B's, normalizes both ids onto the
+        // fresh new_id, and yields one resumable session carrying both sides' work.
+        let a = concat!(
+            r#"{"type":"user","sessionId":"AAA","uuid":"u1","cwd":"/proj","message":{"role":"user","content":"shared"}}"#, "\n",
+            r#"{"type":"assistant","sessionId":"AAA","uuid":"u2","parentUuid":"u1","cwd":"/proj","message":{"role":"assistant","content":[{"type":"text","text":"A did X"}]}}"#, "\n",
+        );
+        let b = concat!(
+            r#"{"type":"user","sessionId":"BBB","uuid":"u1","cwd":"/proj","message":{"role":"user","content":"shared"}}"#, "\n",
+            r#"{"type":"assistant","sessionId":"BBB","uuid":"u3","parentUuid":"u1","cwd":"/proj","message":{"role":"assistant","content":[{"type":"text","text":"B did Y"}]}}"#, "\n",
+        );
+        let out = splice_sessions("claude-code", a, b, "NEWID", std::path::Path::new("/proj")).unwrap();
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 4, "both sides' events land in the combined session: {out}");
+        assert!(out.contains("A did X") && out.contains("B did Y"), "both sides' work is present: {out}");
+        assert!(out.contains("NEWID"), "combined session carries the fresh id: {out}");
+        assert!(!out.contains("AAA") && !out.contains("BBB"), "both source ids are normalized away: {out}");
+        // each line stays valid JSON — the result is a resumable transcript, not a text blob
+        for l in &lines {
+            serde_json::from_str::<serde_json::Value>(l).unwrap_or_else(|_| panic!("line is valid json: {l}"));
+        }
     }
 }

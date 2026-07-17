@@ -60,6 +60,7 @@ is the aid, not the label — see [How it works](concepts.html).
 | `--from <runtime>` | Pick which runtime revives the sessions when both have sessions present. |
 | `--both` | Write the merged session onto both branches instead of one. |
 | `--quick` | Skip the context handoff — reconcile from the diffs alone, without the summary exchange. Faster, less thorough. |
+| `--splice` | The no-model merge. Combine both sides into one session for a fresh agent to read, instead of reconciling them. See below. |
 
 ## It's model-backed
 
@@ -71,3 +72,23 @@ Deferring to a model is the trade for a real semantic merge with no schema, and 
 is non-deterministic — run it twice and the merged session may differ. That's fine, because the merge
 is not the record. The raw sessions on both sides stay committed in the store, git-versioned, and
 remain the source of truth; a merge you don't like is one you can drop and redo.
+
+## The stupid mode: `--splice`
+
+`--splice` skips the model entirely. Instead of reconciling the two sides, it combines them: it takes
+A's full transcript, appends B's tail from the point the two forked, normalizes the session id and cwd
+onto one, and installs the result as a single new session.
+
+```
+agit a merge peer --splice
+```
+
+Nothing is reconciled and no conflicts are computed. You resume the combined session and the agent
+reads both sides' context in one window, then decides for itself what to do with it — the reconciliation
+happens live, in that session, rather than up front. Because it runs no model and revives nothing, it
+needs neither `AGIT_LLM` nor the runtime CLI, and it is deterministic: the same two sessions always
+splice to the same bytes.
+
+Use it when you'd rather hand the whole picture to a fresh agent than have two revived ones negotiate,
+or when no model is configured. Same-aid targets still fuse the git histories afterward, as with a
+normal merge.

@@ -698,6 +698,69 @@ fn a_pull_fast_forwards_but_refuses_to_textually_merge_diverged_sessions() {
     assert_eq!(parents.split_whitespace().count(), 2, "HEAD must not be a merge commit: {parents}");
 }
 
+/// A minimal but valid Claude session: two lines carrying `sid` and a distinctive note.
+fn claude_session(sid: &str, note: &str) -> String {
+    format!(
+        "{{\"type\":\"user\",\"sessionId\":\"{sid}\",\"uuid\":\"u1\",\"cwd\":\"/proj\",\"message\":{{\"role\":\"user\",\"content\":\"go\"}}}}\n\
+         {{\"type\":\"assistant\",\"sessionId\":\"{sid}\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"cwd\":\"/proj\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{note}\"}}]}}}}\n"
+    )
+}
+
+/// Concatenate every installed Claude session (`~/.claude/projects/<slug>/<id>.jsonl`, HOME being the
+/// repo dir in these tests) — that is where a spliced session lands, ready to resume.
+fn installed_claude_sessions(r: &Repo) -> String {
+    fn walk(dir: &Path, out: &mut String) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().map(|x| x == "jsonl").unwrap_or(false) {
+                out.push_str(&std::fs::read_to_string(&p).unwrap_or_default());
+            }
+        }
+    }
+    let mut s = String::new();
+    walk(&r.path().join(".claude/projects"), &mut s);
+    s
+}
+
+/// `--splice` is the no-model, no-runtime-CLI merge: it combines both sides' sessions into one new
+/// resumable session instead of running a dialogue. This runs the whole path end to end — with neither
+/// a model nor `claude`/`codex` installed — and asserts the combined session carries both sides' work.
+#[test]
+fn a_merge_splice_combines_both_sides_without_a_model() {
+    let r = Repo::new();
+
+    // A base commit both sides fork from, so the merge is grounded in a shared ancestor.
+    r.git_agent(&["commit", "--allow-empty", "--no-verify", "-m", "base"]);
+
+    // A peer branch carrying a diverged Claude session that HEAD does not have.
+    r.git_agent(&["checkout", "-q", "-b", "peer"]);
+    r.write_agent("sessions/claude-code/team.jsonl", &claude_session("TEAM", "team found the deadlock"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "team session"]);
+
+    // Back on main, our own diverged Claude session.
+    r.git_agent(&["checkout", "-q", "main"]);
+    r.write_agent("sessions/claude-code/local.jsonl", &claude_session("LOCAL", "local fixed the parser"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "local session"]);
+
+    let (code, out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--splice"]);
+    assert_eq!(code, 0, "splice must succeed with no model and no claude/codex installed: {err}{out}");
+    assert!(out.contains("splice (no model)"), "it announces the no-model path: {out}");
+    assert!(out.contains("resume"), "it prints how to resume the combined session: {out}");
+
+    // The combined session is a real installed transcript carrying BOTH sides' work.
+    let combined = installed_claude_sessions(&r);
+    assert!(combined.contains("local fixed the parser"), "carries the local side: {combined}");
+    assert!(combined.contains("team found the deadlock"), "carries the peer side: {combined}");
+    // And it is valid JSONL, not a glued-together text blob.
+    for line in combined.lines().filter(|l| !l.trim().is_empty()) {
+        serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|_| panic!("resumable line is valid json: {line}"));
+    }
+}
+
 #[test]
 fn a_fetch_reports_incoming_sessions_without_integrating() {
     let r = Repo::new();

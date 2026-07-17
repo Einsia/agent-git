@@ -40,4 +40,4 @@ them between runtimes so either CLI can resume them. `agit snap` is the manual a
 | `agit a pull` | Fast-forward pull; divergence routes to `agit a merge`. |
 | `agit a fetch` | Fetch, and report which sessions arrived. |
 | `agit a rebind [--remote <url>] [--new-id]` | Repair a binding's identity, or give a fork its own aid. See [Migration](migration.html). |
-| `agit a merge <target> [--from <runtime>] [--both] [--quick]` | Reconcile two memories by dialogue into a resumable merged session. See [Merging](merging.html). |
+| `agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice]` | Reconcile two memories by dialogue into a resumable merged session. `--splice` skips the model and just combines both sides into one session. See [Merging](merging.html). |

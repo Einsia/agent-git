@@ -101,7 +101,7 @@ Anything agit does not recognize as its own verb is passed straight through to g
 | `agit a list` / `agit a info <name>` | List your agents, or inspect one. |
 | `agit a rename <old> <new>` | Rename an agent; the aid is unchanged. |
 | `agit a rebind [--remote <url>] [--new-id]` | Repair identity, or give a fork its own aid. |
-| `agit a merge <target> [--from <rt>] [--both] [--quick]` | Reconcile two memories by dialogue (see [Merge](#merge)). |
+| `agit a merge <target> [--from <rt>] [--both] [--quick] [--splice]` | Reconcile two memories by dialogue, or `--splice` to just combine both (see [Merge](#merge)). |
 
 ## Runtimes
 
@@ -123,11 +123,14 @@ Two people ran the same agent and both pushed. `agit a pull` fast-forwards when 
 agit a merge frontend                 # reconcile against the frontend agent
 agit a merge frontend --from claude-code   # name the runtime when both are installed
 agit a merge frontend --both --quick  # revive both sides; shorter dialogue
+agit a merge frontend --splice        # no model: just combine both sides into one session
 ```
 
 `agit a merge <agent>` does not diff text. It revives both sides' latest sessions read-only, has them compare their work against the actual code, and produces a **resumable merged session**, which you pick up with `claude --resume <id>` or `codex exec resume <id>`, plus the list of genuine conflicts. Not a summary written to a file.
 
 Merge runs through a model, so its result is not deterministic. The raw sessions on both sides stay committed and versioned in the store, so a merge you do not like is one you can drop and redo.
+
+**`--splice` is the stupid mode.** It skips the model: it combines A's transcript with B's divergent tail into one new session, normalizing the ids so it resumes cleanly. Nothing is reconciled — you resume it and a fresh agent reads both sides' context in one window and takes it from there. It needs no model and no runtime CLI, and it is deterministic.
 
 ## Sharing
 

@@ -738,6 +738,7 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
     let mut reference = None;
     let mut both = false;
     let mut quick = false;
+    let mut splice = false;
     let mut prefer = None;
     let mut i = 0;
     while i < args.len() {
@@ -765,6 +766,11 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
                 quick = true;
                 i += 1;
             }
+            // The no-model merge: combine both sessions' context into one, skip the dialogue entirely.
+            "--splice" => {
+                splice = true;
+                i += 1;
+            }
             other => {
                 if reference.is_none() && !other.starts_with('-') {
                     reference = Some(other.to_string());
@@ -784,10 +790,10 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
             // init` first" in a repo that already had an agent selected.
             let agent = agit::agent::resolve(None)?.store;
             let rt = session::resolve_runtime(rt.as_deref(), &session::store_runtimes(&agent), "merge")?;
-            sync::run(&r, &rt, both, quick, prefer)
+            sync::run(&r, &rt, both, quick, splice, prefer)
         }
         None => {
-            eprintln!("usage: agit a merge <target> [--from <runtime>] [--both] [--quick]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref — --agent X / --ref X disambiguate; --quick skips the context handoff)");
+            eprintln!("usage: agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref — --agent X / --ref X disambiguate; --quick shortens the dialogue; --splice skips the model and just combines both sessions' context)");
             Ok(2)
         }
     }
@@ -832,7 +838,7 @@ the only one present, else they ask.
   agit <git-args>          Run git transparently on the code repository (Environment)
   agit agent <git-args>    Run isomorphic git on the Agent Store — `agit a` is the alias (agit a log · agit a add -A · agit a commit · agit a push)
 
-  agit agent <verb>        Agent management, a closed set: list, use, new, track, info, rename, publish, rebind, import, merge.
+  agit agent <verb>        Agent management, a closed set: init, clone, switch, list, info, rename, rebind, merge (push/pull/fetch too).
                            Anything else after `a` is git, so `agit a add -A` is git-add and `agit a show` is git-show.
 
   `a` is a subcommand, so it cannot be transposed: agit a commit (agent store) vs agit commit -a (code repo, -a is git's stage-all).
