@@ -1121,7 +1121,16 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
             copy_dir(&src, &dst)?;
         } else if ft.is_symlink() {
             // Copying the target would silently turn a link into a second copy of the file.
-            std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+            let target = std::fs::read_link(&src)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &dst)?;
+            // Windows symlinks need a privilege and a file/dir distinction; a copy of the target is the
+            // pragmatic fallback there (session stores rarely contain links).
+            #[cfg(not(unix))]
+            {
+                let _ = &target;
+                std::fs::copy(&src, &dst)?;
+            }
         } else {
             std::fs::copy(&src, &dst)?;
         }

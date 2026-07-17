@@ -917,7 +917,6 @@ fn pid_alive(pid: u32) -> bool {
 /// `agit watch --daemon` — spawn the watcher detached (own process group, stdio to a log inside the
 /// agent repo's .git) so it keeps running after the launching shell exits.
 pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Result<i32> {
-    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let env = scope::env_root()?;
     let rundir = watch_rundir(&env)?;
@@ -943,8 +942,14 @@ pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool)
     cmd.current_dir(&env) // child resolves the same repos from the project root
         .stdin(Stdio::null())
         .stdout(log)
-        .stderr(log2)
-        .process_group(0); // new process group → survives the launching shell's SIGHUP
+        .stderr(log2);
+    // A new process group so the daemon survives the launching shell's SIGHUP. Unix-only; on Windows
+    // a detached child already survives the parent, so nothing extra is needed to compile or run.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let child = cmd.spawn().context("failed to spawn the background watcher")?;
     let pid = child.id();
     std::fs::write(&pidp, pid.to_string())?;

@@ -78,6 +78,24 @@ jobs:
       - name: clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  windows-check:
+    name: cross-check (windows)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The release builds for x86_64-pc-windows-msvc, but the other CI jobs run on Linux, so a
+    # Unix-only API (os::unix, process_group, file mode bits) can slip through and only fail the
+    # release. `cargo check` for the Windows target type-checks the platform cfgs without needing the
+    # MSVC linker — cheap, on a Linux runner, and it catches that class of breakage before a tag.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust + Windows target
+        run: rustup target add x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-check
+      - name: cargo check (windows target, no link)
+        run: cargo check --workspace --bins --target x86_64-pc-windows-msvc
+
   hub-e2e:
     name: hub e2e (demo/hub-e2e.sh)
     runs-on: ubuntu-latest

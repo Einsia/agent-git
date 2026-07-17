@@ -1036,7 +1036,6 @@ fn git_stdin(repo: &Path, args: &[&str], input: &[u8]) -> Option<Vec<u8>> {
 /// where PATH is whatever the service inherited, and a hook that cannot find its binary is a gate
 /// that silently isn't there.
 fn install_pre_receive(repo: &Path, root: &Path, agent: &str) {
-    use std::os::unix::fs::PermissionsExt;
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -1058,7 +1057,12 @@ fn install_pre_receive(repo: &Path, root: &Path, agent: &str) {
     }
     let _ = std::fs::create_dir_all(repo.join("hooks"));
     if std::fs::write(&hook, &script).is_ok() {
-        let _ = std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700));
+        // Make the hook executable on Unix; Windows git runs hooks without a mode bit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700));
+        }
     }
 }
 

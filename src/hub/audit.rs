@@ -95,13 +95,20 @@ pub fn append(root: &Path, actor: &str, action: &str, agent: Option<&str>, detai
 }
 
 fn try_append(root: &Path, e: &Entry) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     super::store::ensure_root(root)?;
     // Assemble the whole line, then write it once: O_APPEND + a single write = concurrent appends
     // that do not interleave.
     let mut line = serde_json::to_string(e).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push('\n');
-    let mut f = std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(log_path(root))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true).create(true);
+    // 0600 owner-only on Unix; Windows has no mode bits (file security is by ACL), so this is a no-op there.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(log_path(root))?;
     f.write_all(line.as_bytes())
 }
 
@@ -169,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn log_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();

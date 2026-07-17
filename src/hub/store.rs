@@ -425,13 +425,21 @@ fn write_list<T: Serialize>(root: &Path, path: &Path, key: &str, items: &[T]) ->
 /// root is a credential directory: 0700, owner-only. When the directory already exists the mode has
 /// no effect (mode only applies at creation), so tighten it explicitly afterwards.
 pub fn ensure_root(root: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(root)
-        .or_else(|e| if root.is_dir() { Ok(()) } else { Err(e) })?;
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    // 0700 owner-only on Unix; on Windows directory security is by ACL, so the mode is a no-op there.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(root).or_else(|e| if root.is_dir() { Ok(()) } else { Err(e) })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// 0600 temp file → rename. A reader sees either the complete old version or the complete new one,
@@ -439,15 +447,17 @@ pub fn ensure_root(root: &Path) -> io::Result<()> {
 /// and an already-open fd is unaffected by the chmod anyway).
 fn write_secret_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        // 0600 from the start on Unix; Windows has no mode bits (file security is by ACL).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?; // fsync after the rename would be too late: a crash could leave an empty file in place of the old version
     }
@@ -513,6 +523,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn secret_files_are_0600_and_root_is_0700() {
         use std::os::unix::fs::PermissionsExt;
         let (d, s) = tmp_store();
