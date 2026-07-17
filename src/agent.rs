@@ -1253,6 +1253,110 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
     Ok(Agent { remote: committed, ..agent })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Provenance: the machine's ed25519 signing identity
+// ---------------------------------------------------------------------------------------------
+//
+// Attribution today is a plaintext launch record: it SAYS who produced a session but proves nothing.
+// A signing key ties a session to the machine that captured it. The keypair is per-machine, minted
+// once on first use and reused forever, so provenance is fully offline: no server, no enrollment.
+//
+// Cross-team pubkey→person trust is the hub's job (out of scope here). What lives here is client-side:
+// mint the key, sign a session's digest, and self-verify a recorded signature against its own pubkey.
+
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+
+/// `$AGIT_HOME/identity/` — where the machine keypair lives, spanning every repo like `launches.jsonl`.
+fn identity_dir(home: &Path) -> PathBuf {
+    home.join("identity")
+}
+
+/// The private signing key, stored 0600. Hex of the 32 raw ed25519 secret bytes.
+fn signing_key_path(home: &Path) -> PathBuf {
+    identity_dir(home).join("ed25519")
+}
+
+/// Load this machine's signing key, minting it once on first use. The public path resolves `$AGIT_HOME`.
+pub fn machine_signing_key() -> Result<SigningKey> {
+    load_or_create_signing_key(&scope::agit_home()?)
+}
+
+/// Load-or-create, taking `home` explicitly so a test can point it at a temp dir.
+///
+/// A key already on disk is reused verbatim: rotating it would strand every signature it ever made.
+pub fn load_or_create_signing_key(home: &Path) -> Result<SigningKey> {
+    let path = signing_key_path(home);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let raw = hex::decode(text.trim())
+            .with_context(|| format!("{} is not valid hex — the machine identity is corrupt", path.display()))?;
+        let bytes: [u8; 32] = raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("{} is not a 32-byte ed25519 key", path.display()))?;
+        return Ok(SigningKey::from_bytes(&bytes));
+    }
+    // First use on this machine: mint the keypair and persist it before returning, so the very first
+    // signature is reproducible on the next run.
+    std::fs::create_dir_all(identity_dir(home))
+        .with_context(|| format!("cannot create {}", identity_dir(home).display()))?;
+    let mut csprng = rand::rngs::OsRng;
+    let key = SigningKey::generate(&mut csprng);
+    write_secret_0600(&path, &hex::encode(key.to_bytes()))?;
+    // A world-readable public half is a convenience, never a secret: teammates need it to verify.
+    let _ = std::fs::write(
+        identity_dir(home).join("ed25519.pub"),
+        format!("{}\n", hex::encode(key.verifying_key().to_bytes())),
+    );
+    Ok(key)
+}
+
+/// The machine's public verifying key as hex, minting the keypair if this machine has none yet.
+pub fn machine_pubkey_hex() -> Result<String> {
+    Ok(hex::encode(machine_signing_key()?.verifying_key().to_bytes()))
+}
+
+/// Write a private file created with 0600 from the start (no world-readable window). On non-unix the
+/// permission bits do not apply, so it is a plain write there.
+fn write_secret_0600(path: &Path, contents: &str) -> Result<()> {
+    let body = format!("{contents}\n");
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        f.write_all(body.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, body).with_context(|| format!("cannot create {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Sign `message` with a signing key, returning the 64-byte signature as hex.
+pub fn sign_hex(key: &SigningKey, message: &[u8]) -> String {
+    hex::encode(key.sign(message).to_bytes())
+}
+
+/// Verify `sig_hex` over `message` against `pubkey_hex`. Every malformed input is a plain `false`, never
+/// an error or a panic: a signature that cannot be parsed is exactly as unverified as one that does not
+/// match, and provenance verification must never block on bad data.
+pub fn verify_hex(pubkey_hex: &str, message: &[u8], sig_hex: &str) -> bool {
+    let Ok(pk_raw) = hex::decode(pubkey_hex.trim()) else { return false };
+    let Ok(pk_bytes) = <[u8; 32]>::try_from(pk_raw.as_slice()) else { return false };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk_bytes) else { return false };
+    let Ok(sig_raw) = hex::decode(sig_hex.trim()) else { return false };
+    let Ok(sig_bytes) = <[u8; 64]>::try_from(sig_raw.as_slice()) else { return false };
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    vk.verify(message, &sig).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1268,6 +1372,35 @@ mod tests {
         std::fs::create_dir_all(&r).unwrap();
         scope::git_in(&r, &["init", "-q", "-b", "main"]).unwrap();
         r
+    }
+
+    /// The machine key is minted once and its private half is not world-readable: a signing key any
+    /// process on the box can read is not an identity.
+    #[test]
+    fn machine_key_is_minted_once_and_private() {
+        let h = tmp();
+        let k1 = load_or_create_signing_key(h.path()).unwrap();
+        let priv_path = h.path().join("identity").join("ed25519");
+        let pub_path = h.path().join("identity").join("ed25519.pub");
+        assert!(priv_path.exists(), "the private key must be written on first use");
+        assert!(pub_path.exists(), "the public half must be written too, for verifiers");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&priv_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the private key must be 0600, got {mode:o}");
+        }
+
+        // Reload returns the same key — signatures made now must still verify later.
+        let k2 = load_or_create_signing_key(h.path()).unwrap();
+        assert_eq!(k1.to_bytes(), k2.to_bytes(), "the key must be stable across loads");
+
+        // A signature round-trips through the hex helpers.
+        let sig = sign_hex(&k1, b"hello");
+        let pk = hex::encode(k1.verifying_key().to_bytes());
+        assert!(verify_hex(&pk, b"hello", &sig), "a valid signature must verify");
+        assert!(!verify_hex(&pk, b"tampered", &sig), "a different message must not verify");
     }
 
     #[test]

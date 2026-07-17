@@ -449,7 +449,7 @@ fn mirror_owned(rt: &str, env: &Path, r: &Routed) -> Result<(Stats, usize, PathB
         // The sidecar is a pure function of the transcript, so rewriting it unchanged would turn every
         // watch tick into a commit. Building it re-reads the transcript, so do it only when one moved.
         if copied || !crate::commands::sidecar_path(&dp).exists() {
-            write_sidecar(&dp, o, env, rt)?;
+            write_sidecar(&dp, o, env, rt, &r.store)?;
         }
         // a session's sidecars (subagents/, tool-results/) live under a dir named for its id
         if let Some(side) = o.src.parent().map(|d| d.join(&o.id)).filter(|d| d.is_dir()) {
@@ -484,7 +484,11 @@ fn mirror_owned(rt: &str, env: &Path, r: &Routed) -> Result<(Stats, usize, PathB
 
 /// What the store records about a captured session (§6). It exists so the facts `start` needs survive a
 /// clone: git carries content, but not mtimes, and not the launch record, which is machine-local.
-fn write_sidecar(dp: &Path, o: &Owned, env: &Path, rt: &str) -> Result<()> {
+///
+/// This is also where provenance is written (§ provenance): the sidecar is COMMITTED beside the session,
+/// so the signature travels with the transcript to a teammate, unlike the machine-local launch record.
+/// The signature binds `(sha256(transcript) ‖ aid ‖ committer email ‖ started)` to this machine's key.
+fn write_sidecar(dp: &Path, o: &Owned, env: &Path, rt: &str, store: &Path) -> Result<()> {
     let mut v = serde_json::json!({
         "env": env.display().to_string(),
         "runtime": rt,
@@ -499,6 +503,12 @@ fn write_sidecar(dp: &Path, o: &Owned, env: &Path, rt: &str) -> Result<()> {
             Attribution::RepoDefault { .. } => "repo-default",
         }
         .into();
+        // Sign the captured transcript. Best-effort by design: no attributable aid, no readable
+        // transcript, or no usable machine key each leave the sidecar unsigned — capture must never fail
+        // because signing could not run, and verification degrades to "unverified" rather than blocking.
+        if let Some(p) = sign_captured(dp, a, store) {
+            v["provenance"] = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
+        }
     }
     let body = format!("{}\n", serde_json::to_string_pretty(&v)?);
     let p = crate::commands::sidecar_path(dp);
@@ -506,6 +516,23 @@ fn write_sidecar(dp: &Path, o: &Owned, env: &Path, rt: &str) -> Result<()> {
         std::fs::write(&p, body)?;
     }
     Ok(())
+}
+
+/// Sign a just-captured transcript, or `None` when anything needed is missing (unreadable transcript, no
+/// machine key). Deterministic: an unchanged transcript signs to the same record, so it never churns the
+/// sidecar into a fresh commit on every watch tick.
+fn sign_captured(dp: &Path, a: &Attribution, store: &Path) -> Option<crate::commands::Provenance> {
+    let content = std::fs::read_to_string(dp).ok()?;
+    let key = crate::agent::machine_signing_key().ok()?;
+    let email = crate::commands::committer_email(store);
+    // A launch record fixes when the session began; a fallback-attributed session has none, so its own
+    // last activity stands in. Either way the value is recorded and read back at verify, so it is
+    // internally consistent regardless of which was used.
+    let started = match a {
+        Attribution::Launched(l) => l.started.clone(),
+        Attribution::RepoDefault { .. } => last_activity(dp).unwrap_or_default(),
+    };
+    Some(crate::commands::sign_provenance(&key, &content, a.aid(), &email, &started))
 }
 
 /// When a transcript last did anything: the last record carrying a timestamp. Both runtimes write a
@@ -1070,8 +1097,8 @@ mod routing_tests {
             std::fs::write(slug.join("s-fe.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
             std::fs::write(slug.join("s-api.jsonl"), transcript(&env, "2026-07-16T10:00:00.000Z")).unwrap();
 
-            crate::commands::record_launch("s-fe", &fe.aid, "frontend", &env, "claude-code").unwrap();
-            crate::commands::record_launch("s-api", &api.aid, "api", &env, "claude-code").unwrap();
+            crate::commands::record_launch("s-fe", &fe.aid, "frontend", &env, "claude-code", None).unwrap();
+            crate::commands::record_launch("s-api", &api.aid, "api", &env, "claude-code", None).unwrap();
 
             let (routed, _) = route("claude-code", &env).unwrap();
             assert_eq!(routed.len(), 2, "one pass must write into BOTH agents' stores, not collapse to one");
@@ -1144,7 +1171,7 @@ mod routing_tests {
             std::fs::create_dir_all(&slug).unwrap();
             std::fs::write(slug.join("s1.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
             // launched as `web`, since renamed to `frontend`
-            crate::commands::record_launch("s1", &fe.aid, "web", &env, "claude-code").unwrap();
+            crate::commands::record_launch("s1", &fe.aid, "web", &env, "claude-code", None).unwrap();
 
             let (routed, _) = route("claude-code", &env).unwrap();
             assert_eq!(routed.len(), 1);
@@ -1235,7 +1262,7 @@ mod layout_tests {
             let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
             std::fs::create_dir_all(&slug).unwrap();
             std::fs::write(slug.join("s1.jsonl"), transcript(&env)).unwrap();
-            crate::commands::record_launch("s1", &fe.aid, "frontend", &env, "claude-code").unwrap();
+            crate::commands::record_launch("s1", &fe.aid, "frontend", &env, "claude-code", None).unwrap();
 
             let (routed, _) = route("claude-code", &env).unwrap();
             mirror_owned("claude-code", &env, &routed[0]).unwrap();
@@ -1269,7 +1296,7 @@ mod layout_tests {
             let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
             std::fs::create_dir_all(&slug).unwrap();
             std::fs::write(slug.join("s1.jsonl"), transcript(&env)).unwrap();
-            crate::commands::record_launch("s1", &fe.aid, "frontend", &env, "claude-code").unwrap();
+            crate::commands::record_launch("s1", &fe.aid, "frontend", &env, "claude-code", None).unwrap();
 
             // the store as a pre-partition agit left it
             let flat = fe.store.join(SESSIONS_SUBDIR).join("claude-code");
@@ -1306,7 +1333,7 @@ mod layout_tests {
                 std::fs::create_dir_all(slug.join("memory")).unwrap();
                 std::fs::write(slug.join(format!("s{i}.jsonl")), transcript(env)).unwrap();
                 std::fs::write(slug.join("memory/MEMORY.md"), format!("memory of repo {i}\n")).unwrap();
-                crate::commands::record_launch(&format!("s{i}"), &fe.aid, "frontend", env, "claude-code").unwrap();
+                crate::commands::record_launch(&format!("s{i}"), &fe.aid, "frontend", env, "claude-code", None).unwrap();
 
                 let (routed, _) = route("claude-code", env).unwrap();
                 mirror_owned("claude-code", env, &routed[0]).unwrap();

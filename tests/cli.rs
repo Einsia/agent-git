@@ -1116,3 +1116,110 @@ fn a_rebind_remote_repoints_the_binding_credential_stripped() {
     assert_eq!(r.git_agent(&["remote", "get-url", "origin"]), new_remote, "the store's origin is repointed");
     assert_eq!(r.agit(&["a", "switch", "frontend"]).0, 0, "resolves cleanly after the remote rebind");
 }
+// ─────────────────────────── provenance: sessions tied to their producer ───────────────────────────
+
+/// Seed a claude transcript this project owns, into `<home>/.claude/projects/<slug>/`.
+fn seed_claude_session(r: &Repo, home: &Path, id: &str, msg: &str) {
+    let top = r.sh("git rev-parse --show-toplevel").trim().to_string();
+    let slug: String = top.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    let sdir = home.join(".claude/projects").join(&slug);
+    std::fs::create_dir_all(&sdir).unwrap();
+    std::fs::write(
+        sdir.join(format!("{id}.jsonl")),
+        format!("{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{top}\",\"message\":{{\"content\":\"{msg}\"}}}}\n"),
+    )
+    .unwrap();
+}
+
+/// The captured transcript on disk in the store, under either layout.
+fn captured_transcript(r: &Repo, rt: &str, file: &str) -> PathBuf {
+    fn walk(dir: &Path, want: &Path) -> Option<PathBuf> {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.ends_with(want) {
+                return Some(p);
+            }
+            if p.is_dir() {
+                if let Some(found) = walk(&p, want) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    walk(&r.agent().join("sessions"), &PathBuf::from(rt).join(file))
+        .unwrap_or_else(|| panic!("{rt}/{file} was not captured into the store"))
+}
+
+/// End to end: snap signs the captured session into its committed sidecar, and `provenance verify`
+/// confirms the signature. This is the whole client-side loop — sign on capture, self-verify later.
+#[test]
+fn a_snapped_session_is_signed_and_verifies() {
+    let r = Repo::new();
+    let home = r.path().join("cchome");
+    seed_claude_session(&r, &home, "sess1", "provenance work");
+
+    let (code, _out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
+    assert_eq!(code, 0, "snap must succeed: {err}");
+
+    let transcript = captured_transcript(&r, "claude-code", "sess1.jsonl");
+    // The sidecar beside it must carry a provenance block with a pubkey and signature.
+    let sidecar = transcript.with_extension("agit.json");
+    let side = std::fs::read_to_string(&sidecar).expect("sidecar must exist");
+    assert!(side.contains("\"provenance\""), "the sidecar must carry provenance: {side}");
+    assert!(side.contains("\"sig\""), "provenance must carry a signature: {side}");
+    assert!(side.contains("\"pubkey\""), "provenance must carry a pubkey: {side}");
+
+    let (code, out, err) = r.agit(&["provenance", "verify", transcript.to_str().unwrap()]);
+    assert_eq!(code, 0, "a signed, intact session must verify (exit 0): {err}{out}");
+    assert!(out.contains("verified"), "must report verified: {out}");
+    assert!(!out.contains("UNVERIFIED"), "an intact session is not a failure: {out}");
+}
+
+/// Tamper the committed transcript after it was signed: verification must fail loudly (non-zero) and
+/// name the reason as a content change, not silently pass.
+#[test]
+fn a_tampered_session_fails_verification_end_to_end() {
+    let r = Repo::new();
+    let home = r.path().join("cchome");
+    seed_claude_session(&r, &home, "sess2", "honest work");
+    assert_eq!(r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]).0, 0);
+
+    let transcript = captured_transcript(&r, "claude-code", "sess2.jsonl");
+    // Edit the stored transcript — the signature was over its original bytes.
+    let mut content = std::fs::read_to_string(&transcript).unwrap();
+    content.push_str("{\"type\":\"user\",\"message\":{\"content\":\"forged line\"}}\n");
+    std::fs::write(&transcript, content).unwrap();
+
+    let (code, out, _err) = r.agit(&["provenance", "verify", transcript.to_str().unwrap()]);
+    assert_eq!(code, 1, "a tampered session must fail verification: {out}");
+    assert!(out.contains("UNVERIFIED"), "must report the failure: {out}");
+    assert!(out.contains("tampered") || out.contains("changed"), "must name the reason: {out}");
+}
+
+/// A session with no signature (no sidecar provenance) degrades to "unverified" and exit 0 — it must
+/// never panic or block, mirroring the attribution fallback contract.
+#[test]
+fn an_unsigned_session_is_unverified_never_blocked() {
+    let r = Repo::new();
+    // A bare transcript on disk, with no sidecar at all.
+    let loose = r.path().join("loose.jsonl");
+    std::fs::write(&loose, "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
+
+    let (code, out, err) = r.agit(&["provenance", "verify", loose.to_str().unwrap()]);
+    assert_eq!(code, 0, "an unsigned session must not block (exit 0): {err}{out}");
+    assert!(out.contains("unverified"), "must report unverified: {out}");
+    assert!(out.contains("no signature"), "must say why: {out}");
+}
+
+/// `agit provenance key` mints (once) and prints this machine's public key.
+#[test]
+fn provenance_key_prints_a_stable_public_key() {
+    let r = Repo::new();
+    let (code, out, err) = r.agit(&["provenance", "key"]);
+    assert_eq!(code, 0, "key must succeed: {err}");
+    assert!(out.contains("pubkey"), "must print the public key: {out}");
+    // Minted once: a second call prints the same key.
+    let (_, out2, _) = r.agit(&["provenance", "key"]);
+    assert_eq!(out, out2, "the machine key must be stable across calls");
+}

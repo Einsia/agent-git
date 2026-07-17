@@ -7,7 +7,7 @@ use crate::agent;
 use crate::scan;
 use crate::scope::{self, Scope};
 use crate::ui;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -452,7 +452,9 @@ pub fn convert_pass(agent: &Path, env: &Path, seen: &mut std::collections::HashS
             match materialize_id(&e.path, from, to, None) {
                 Ok((new_id, h)) => {
                     if let Some(o) = &owner {
-                        if let Err(err) = record_launch(&new_id, &o.aid, &o.name, env, to) {
+                        // Unsigned here: the converted copy's captured content differs from this source,
+                        // so its authoritative signature is written at capture, into the sidecar.
+                        if let Err(err) = record_launch(&new_id, &o.aid, &o.name, env, to, None) {
                             eprintln!("  ⚠ {from}→{to} launch record not written ({err:#}) — capture will attribute this copy by repo default.");
                         }
                     }
@@ -573,13 +575,19 @@ pub struct Launch {
     pub env: String,
     pub runtime: String,
     pub started: String,
+    /// The machine's signature over this launch's context (§ provenance). Optional and skipped when
+    /// absent, so records written before signing existed still parse, and a launch with no key/content
+    /// to sign is simply unsigned — never a failed launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
 }
 
 /// How a session was attributed to an agent. Capture must be able to SAY which — a guess reported as a
 /// fact is the failure mode this whole record exists to remove.
 pub enum Attribution {
-    /// `agit start` wrote a record: authoritative.
-    Launched(Launch),
+    /// `agit start` wrote a record: authoritative. Boxed — a `Launch` now carries an optional signature,
+    /// which would otherwise make this variant dwarf `RepoDefault`.
+    Launched(Box<Launch>),
     /// No record (a plain `claude`/`codex` session) → the repo's default agent, reported as a fallback.
     RepoDefault { aid: String, name: String },
 }
@@ -631,7 +639,27 @@ fn lookup_launch_at(home: &Path, session: &str) -> Option<Launch> {
 
 /// Write the launch record. Called by `start` BEFORE the runtime is exec'd: a session captured before
 /// its record exists is a session attributed by guesswork.
-pub fn record_launch(session: &str, aid: &str, name: &str, env: &Path, runtime: &str) -> Result<()> {
+///
+/// `sign_over` is `Some((content, email))` when the launch carries content worth binding to the machine
+/// key — the session being resumed. The record is then stamped with a signature over
+/// `(sha256(content) ‖ aid ‖ email ‖ started)`. Signing is best-effort: if this machine has no usable
+/// key the record is written unsigned rather than not at all, because a launch record — even unsigned —
+/// beats none for attribution. The authoritative, content-bound provenance is written at capture, into
+/// the session's committed sidecar.
+pub fn record_launch(
+    session: &str,
+    aid: &str,
+    name: &str,
+    env: &Path,
+    runtime: &str,
+    sign_over: Option<(&str, &str)>,
+) -> Result<()> {
+    let started = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let provenance = sign_over.and_then(|(content, email)| {
+        agent::machine_signing_key()
+            .ok()
+            .map(|key| sign_provenance(&key, content, aid, email, &started))
+    });
     record_launch_at(
         &scope::agit_home()?,
         &Launch {
@@ -640,7 +668,8 @@ pub fn record_launch(session: &str, aid: &str, name: &str, env: &Path, runtime: 
             name: name.to_string(),
             env: env.display().to_string(),
             runtime: runtime.to_string(),
-            started: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            started,
+            provenance,
         },
     )
 }
@@ -653,10 +682,227 @@ pub fn lookup_launch(session: &str) -> Option<Launch> {
 /// — never the active pointer, which cannot tell two agents in one dump folder apart.
 pub fn attribute_session(session: &str) -> Result<Attribution> {
     if let Some(l) = lookup_launch(session) {
-        return Ok(Attribution::Launched(l));
+        return Ok(Attribution::Launched(Box::new(l)));
     }
     let a = agent::resolve(None)?;
     Ok(Attribution::RepoDefault { aid: a.aid, name: a.name })
+}
+
+// ─────────────────────── Provenance: a session, cryptographically tied to its producer ───────────────────────
+
+/// A signed statement that a specific machine captured a specific session for a specific agent.
+///
+/// It travels two ways: inside a session's committed sidecar (so it survives a clone and reaches a
+/// teammate) and inside the machine-local launch record. The signed message is the tuple
+/// `(content_digest ‖ aid ‖ email ‖ started)` — the session content is already content-addressed, so a
+/// single edit to the transcript changes `content_digest` and breaks the signature. `content_digest` is
+/// recorded too, but verification RECOMPUTES it from the transcript on disk: the stored copy is only for
+/// a legible "the content changed" message, never the thing trusted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Provenance {
+    pub aid: String,
+    /// The git committer email in force when the session was signed. Read, never set: agit must not
+    /// touch the developer's git identity, so whatever the store already commits under is what is bound.
+    pub email: String,
+    pub started: String,
+    /// sha256 of the transcript at signing time. Recomputed at verify — a mismatch is a tampered session.
+    pub content_digest: String,
+    /// The machine's ed25519 public key, hex. Self-verify checks the signature against THIS key; who the
+    /// key belongs to (pubkey→person) is the hub's trust problem, out of scope here.
+    pub pubkey: String,
+    pub sig: String,
+}
+
+/// The exact bytes signed. A version tag domain-separates it from any other agit signature, and newlines
+/// join the fields: a session content digest is hex and an aid/email/timestamp none contain a newline, so
+/// no two distinct tuples can serialize to the same bytes.
+fn provenance_message(content_digest: &str, aid: &str, email: &str, started: &str) -> Vec<u8> {
+    format!("agit-provenance-v1\n{content_digest}\n{aid}\n{email}\n{started}").into_bytes()
+}
+
+/// Sign a session's provenance with the machine key. Pure: the same content and tuple always yield the
+/// same record (ed25519 is deterministic), so re-signing an unchanged session rewrites nothing.
+pub fn sign_provenance(
+    key: &ed25519_dalek::SigningKey,
+    content: &str,
+    aid: &str,
+    email: &str,
+    started: &str,
+) -> Provenance {
+    let content_digest = crate::convo::sha256_hex(content);
+    let msg = provenance_message(&content_digest, aid, email, started);
+    Provenance {
+        aid: aid.to_string(),
+        email: email.to_string(),
+        started: started.to_string(),
+        pubkey: hex::encode(key.verifying_key().to_bytes()),
+        sig: agent::sign_hex(key, &msg),
+        content_digest,
+    }
+}
+
+/// The outcome of self-verifying a session's provenance. Only `Verified` is a cryptographic pass;
+/// everything else is a reported reason, never a panic and never a block — an unsigned or unreadable
+/// session degrades to `Unsigned`, mirroring the "attribution fallback is never silent" contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvenanceStatus {
+    Verified { aid: String, email: String, pubkey: String },
+    /// No signature to check (a session captured before signing, or with no key available at capture).
+    Unsigned,
+    /// The transcript's current digest differs from the one signed: the content changed after signing.
+    ContentTampered { recorded: String, actual: String },
+    /// The signature does not verify against its own recorded public key.
+    BadSignature,
+}
+
+impl ProvenanceStatus {
+    /// The one-line verdict, verified or not. Never the word "trusted": self-verify proves the content is
+    /// intact and the signature matches the recorded key, not who that key belongs to.
+    pub fn summary(&self) -> String {
+        match self {
+            ProvenanceStatus::Verified { aid, pubkey, .. } => {
+                format!("verified · signed for {aid} by key {}", short_key(pubkey))
+            }
+            ProvenanceStatus::Unsigned => "unverified · no signature recorded".to_string(),
+            ProvenanceStatus::ContentTampered { .. } => {
+                "UNVERIFIED · content changed since it was signed (tampered)".to_string()
+            }
+            ProvenanceStatus::BadSignature => {
+                "UNVERIFIED · signature does not match its recorded public key".to_string()
+            }
+        }
+    }
+    pub fn is_verified(&self) -> bool {
+        matches!(self, ProvenanceStatus::Verified { .. })
+    }
+}
+
+fn short_key(pubkey: &str) -> String {
+    if pubkey.len() > 16 {
+        format!("{}…", &pubkey[..16])
+    } else {
+        pubkey.to_string()
+    }
+}
+
+/// Self-verify a session's provenance: recompute the transcript digest, rebuild the signed message, and
+/// check the signature against the pubkey the record itself carries. Degrades gracefully — a `None`
+/// record is `Unsigned`, not an error.
+pub fn verify_provenance(content: &str, p: Option<&Provenance>) -> ProvenanceStatus {
+    let Some(p) = p else { return ProvenanceStatus::Unsigned };
+    let actual = crate::convo::sha256_hex(content);
+    if actual != p.content_digest {
+        return ProvenanceStatus::ContentTampered { recorded: p.content_digest.clone(), actual };
+    }
+    let msg = provenance_message(&p.content_digest, &p.aid, &p.email, &p.started);
+    if agent::verify_hex(&p.pubkey, &msg, &p.sig) {
+        ProvenanceStatus::Verified {
+            aid: p.aid.clone(),
+            email: p.email.clone(),
+            pubkey: p.pubkey.clone(),
+        }
+    } else {
+        ProvenanceStatus::BadSignature
+    }
+}
+
+/// The committer email the store commits under, read never written (agit must not touch git identity).
+/// Falls back to the store default when git has nothing configured, so signing always has a stable field.
+pub fn committer_email(store: &Path) -> String {
+    scope::git_in(store, &["config", "user.email"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "agit@local".to_string())
+}
+
+/// Read the `provenance` block from a session's sidecar, if it has one. Absent sidecar, unparsable JSON,
+/// or a sidecar with no provenance all yield `None` — the caller reports "unsigned", never fails.
+pub fn sidecar_provenance(transcript: &Path) -> Option<Provenance> {
+    let text = std::fs::read_to_string(sidecar_path(transcript)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    serde_json::from_value(v.get("provenance")?.clone()).ok()
+}
+
+/// `agit provenance [verify <session> | key]` — self-verify a captured session's signature, or show this
+/// machine's public key. Verification never blocks: an unsigned or tampered session reports and returns 0
+/// for `key`/no-arg, and a non-zero code only when an explicit `verify` finds a session NOT verified.
+pub fn provenance_cmd(args: &[String]) -> Result<i32> {
+    match args.first().map(|s| s.as_str()) {
+        Some("verify") => provenance_verify(args.get(1).map(|s| s.as_str())),
+        Some("key") | Some("show") | None => provenance_key(),
+        Some(other) => {
+            eprintln!("agit provenance: unknown subcommand `{other}`");
+            eprintln!("  usage: agit provenance verify <session>   ·   agit provenance key");
+            Ok(2)
+        }
+    }
+}
+
+/// Print this machine's signing identity (minting it if absent). The public key is safe to show and share.
+fn provenance_key() -> Result<i32> {
+    let pk = agent::machine_pubkey_hex()?;
+    println!("machine signing key (ed25519)");
+    println!("  pubkey {pk}");
+    println!("  stored {}", scope::agit_home()?.join("identity").join("ed25519").display());
+    println!("  (private key is 0600; sessions you capture are signed with it)");
+    Ok(0)
+}
+
+/// Resolve `<session>` to a transcript on disk — a direct path, a sidecar path, or a session id in the
+/// resolved agent's store — then self-verify its provenance.
+fn provenance_verify(session: Option<&str>) -> Result<i32> {
+    let Some(sel) = session.map(str::trim).filter(|s| !s.is_empty()) else {
+        anyhow::bail!("agit provenance verify: name a session\n  usage: agit provenance verify <session-path|id>");
+    };
+    let transcript = resolve_session_transcript(sel)?;
+    let content = std::fs::read_to_string(&transcript)
+        .with_context(|| format!("cannot read session {}", transcript.display()))?;
+    let status = verify_provenance(&content, sidecar_provenance(&transcript).as_ref());
+
+    println!("session {}", transcript.display());
+    println!("  {}", status.summary());
+    if let ProvenanceStatus::Verified { email, .. } = &status {
+        println!("  committer {email}");
+    }
+    if let ProvenanceStatus::ContentTampered { recorded, actual } = &status {
+        println!("  signed digest  {recorded}");
+        println!("  current digest {actual}");
+    }
+    // Never block: an unsigned session is a soft "unverified" (exit 0, like the attribution fallback); a
+    // signature that is present but does NOT check out is a hard failure worth a non-zero code.
+    Ok(match status {
+        ProvenanceStatus::Verified { .. } | ProvenanceStatus::Unsigned => 0,
+        ProvenanceStatus::ContentTampered { .. } | ProvenanceStatus::BadSignature => 1,
+    })
+}
+
+/// A session selector is a filesystem path (to the transcript or its sidecar) when one exists, else a
+/// bare session id looked up in the resolved agent's store.
+fn resolve_session_transcript(sel: &str) -> Result<PathBuf> {
+    let p = Path::new(sel);
+    if p.is_file() {
+        // A sidecar was passed: point back at its transcript (`<id>.agit.json` → `<id>.jsonl`).
+        if p.extension().map(|e| e == "json").unwrap_or(false)
+            && p.file_stem().map(|s| Path::new(s).extension().map(|e| e == "agit").unwrap_or(false)).unwrap_or(false)
+        {
+            let jsonl = p.with_file_name(format!(
+                "{}.jsonl",
+                p.file_stem().and_then(|s| Path::new(s).file_stem()).unwrap_or_default().to_string_lossy()
+            ));
+            if jsonl.is_file() {
+                return Ok(jsonl);
+            }
+        }
+        return Ok(p.to_path_buf());
+    }
+    // Not a path: treat it as a session id in the resolved agent's store.
+    let store = agent::resolve(None)?.store;
+    store_sessions(&store)
+        .into_iter()
+        .find(|s| s.path.file_stem().map(|n| n == sel).unwrap_or(false))
+        .map(|s| s.path)
+        .with_context(|| format!("no session `{sel}` here — pass a transcript path, or a session id in this agent's store"))
 }
 
 // ─────────────────────── start: the agent's latest session, here ───────────────────────
@@ -968,9 +1214,16 @@ fn start_carrying(ag: &agent::Agent, env: &Path, s: StoredSession, as_rt: Option
     // correct when the SAME project moved).
     let (id, h) = materialize_id(&s.path, s.runtime, &rt, Some(env.display().to_string()))?;
 
+    // Bind the launch to this machine's key by signing over the context it carries — the session being
+    // resumed. Best-effort: reading it just to sign must never fail a start, so a read error simply
+    // records the launch unsigned (capture will sign the session's own content into its sidecar).
+    let sign_over = std::fs::read_to_string(&s.path).ok();
+    let email = committer_email(&ag.store);
+    let sign_over = sign_over.as_deref().map(|c| (c, email.as_str()));
+
     // The record must exist before the runtime does. Its absence is not fatal — a session that captures
     // to the default agent beats no session — but it is never silent.
-    if let Err(e) = record_launch(&id, &ag.aid, &ag.name, env, &rt) {
+    if let Err(e) = record_launch(&id, &ag.aid, &ag.name, env, &rt, sign_over) {
         eprintln!("  ⚠ launch record not written ({e:#}) — capture will attribute this session by repo default.");
     }
     exec(&h.resume_cmd)
@@ -1022,6 +1275,7 @@ mod launch_record_tests {
             env: "/code/web".into(),
             runtime: "claude-code".into(),
             started: "2026-07-16T00:00:00Z".into(),
+            provenance: None,
         }
     }
 
@@ -1054,7 +1308,7 @@ mod launch_record_tests {
     /// A record is authoritative and says nothing; a fallback must always disclose itself.
     #[test]
     fn attribution_by_default_agent_is_never_silent() {
-        let launched = Attribution::Launched(launch("s", "agt_01", "frontend"));
+        let launched = Attribution::Launched(Box::new(launch("s", "agt_01", "frontend")));
         assert_eq!(launched.aid(), "agt_01");
         assert!(launched.note().is_none(), "an authoritative record has nothing to disclose");
 
@@ -1062,6 +1316,99 @@ mod launch_record_tests {
         let note = fallback.note().expect("a guess MUST be reported");
         assert!(note.contains("no launch record"), "{note}");
         assert!(note.contains("api"), "the note must name the agent it filed under: {note}");
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    fn key(home: &Path) -> ed25519_dalek::SigningKey {
+        agent::load_or_create_signing_key(home).unwrap()
+    }
+
+    /// The happy path: sign a session's content, then self-verify it. The signature must check out and
+    /// report the aid and committer it was signed for.
+    #[test]
+    fn sign_then_verify_round_trips() {
+        let home = tempfile::tempdir().unwrap();
+        let k = key(home.path());
+        let content = "the session transcript, verbatim\n";
+        let p = sign_provenance(&k, content, "agt_01", "dev@x.com", "2026-07-16T00:00:00Z");
+
+        let status = verify_provenance(content, Some(&p));
+        assert!(status.is_verified(), "a freshly signed session must verify: {status:?}");
+        match status {
+            ProvenanceStatus::Verified { aid, email, pubkey } => {
+                assert_eq!(aid, "agt_01");
+                assert_eq!(email, "dev@x.com");
+                assert_eq!(pubkey, hex::encode(k.verifying_key().to_bytes()), "the signer's own key");
+            }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    /// The tamper case: change one byte of the transcript after signing, and verification must fail —
+    /// the recorded content digest no longer matches what is on disk.
+    #[test]
+    fn a_tampered_session_fails_verification() {
+        let home = tempfile::tempdir().unwrap();
+        let k = key(home.path());
+        let p = sign_provenance(&k, "original content\n", "agt_01", "dev@x.com", "t0");
+
+        let status = verify_provenance("original content, edited\n", Some(&p));
+        assert!(!status.is_verified(), "an edited transcript must not verify");
+        assert!(
+            matches!(status, ProvenanceStatus::ContentTampered { .. }),
+            "the reason must be the content digest, not the signature: {status:?}"
+        );
+    }
+
+    /// A signature that does not belong to its recorded key (here, a record whose pubkey was swapped for
+    /// a second machine's) is rejected as a bad signature — not a tamper, not a pass.
+    #[test]
+    fn a_signature_that_does_not_match_its_key_is_rejected() {
+        let home1 = tempfile::tempdir().unwrap();
+        let home2 = tempfile::tempdir().unwrap();
+        let content = "content\n";
+        let mut p = sign_provenance(&key(home1.path()), content, "agt_01", "dev@x.com", "t0");
+        // Claim a different machine's public key while keeping machine 1's signature.
+        p.pubkey = hex::encode(key(home2.path()).verifying_key().to_bytes());
+
+        assert_eq!(
+            verify_provenance(content, Some(&p)),
+            ProvenanceStatus::BadSignature,
+            "a signature must not verify against a foreign key"
+        );
+    }
+
+    /// The graceful-degradation contract: a session with NO provenance recorded is "unsigned", reported
+    /// plainly — never a panic and never a hard failure.
+    #[test]
+    fn a_session_with_no_signature_is_unsigned_not_a_panic() {
+        let status = verify_provenance("anything at all", None);
+        assert_eq!(status, ProvenanceStatus::Unsigned);
+        assert!(!status.is_verified());
+        assert!(status.summary().contains("no signature"), "{}", status.summary());
+    }
+
+    /// Malformed pubkey/signature hex must degrade to `false`, never panic: verification runs on data a
+    /// teammate's clone supplied, which cannot be trusted to be well-formed.
+    #[test]
+    fn malformed_signature_material_never_panics() {
+        assert!(!agent::verify_hex("not-hex", b"msg", "also-not-hex"));
+        assert!(!agent::verify_hex("", b"msg", ""));
+        assert!(!agent::verify_hex("aa", b"msg", "bb"), "too-short but valid hex");
+    }
+
+    /// The machine key is minted once and then stable: a second load returns the identical key, so a
+    /// signature made today still verifies tomorrow.
+    #[test]
+    fn the_machine_key_is_stable_across_loads() {
+        let home = tempfile::tempdir().unwrap();
+        let first = key(home.path());
+        let again = key(home.path());
+        assert_eq!(first.to_bytes(), again.to_bytes(), "the key must not rotate on reload");
     }
 }
 

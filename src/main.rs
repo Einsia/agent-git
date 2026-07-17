@@ -318,6 +318,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         "adapter" => commands::adapter_list(),
         "graph" => commands::workspace_graph(),
 
+        // ── provenance: self-verify that a captured session is cryptographically tied to its producer,
+        //    or show this machine's signing key. Verification degrades gracefully — an unsigned session
+        //    reports "unverified", never blocks. ──
+        "provenance" => commands::provenance_cmd(args),
+
         // ── shadow: route `git` through `agit` in your interactive shell (cross-platform). ──
         "shadow" => agit::shadow::run(args),
 
@@ -823,6 +828,7 @@ the only one present, else they ask.
   agit shadow [install]    Route `git` through `agit` in your shell so every git command versions agent context (uninstall / status to manage)
   agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist; --watch auto-converts both ways in the background)
   agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime; --env <path> to run this agent against a different repo; --relocate if it's the same project moved; --exec to launch)
+  agit provenance verify <session>  Check a captured session's signature against its recorded key (unsigned → unverified, never blocks); `agit provenance key` shows this machine's public key
 
   agit <git-args>          Run git transparently on the code repository (Environment)
   agit agent <git-args>    Run isomorphic git on the Agent Store — `agit a` is the alias (agit a log · agit a add -A · agit a commit · agit a push)
