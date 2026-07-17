@@ -150,12 +150,40 @@ impl Adapter for ClaudeCode {
         "claude-code"
     }
 
+    fn project_sessions(&self, env: &Path) -> Vec<(PathBuf, String)> {
+        project_sessions(env)
+    }
+
+    fn source_desc(&self, env: &Path) -> String {
+        let owned = project_sessions(env);
+        // Name the directory even when it is absent — the "which HOME did I look under" signal.
+        match projects_dir() {
+            Ok(dir) => {
+                let p = dir.join(slug_for(env));
+                if p.exists() {
+                    format!("{} ({} owned sessions)", p.display(), owned.len())
+                } else {
+                    format!("{} (no Claude Code session directory for this project yet — {} owned sessions)", p.display(), owned.len())
+                }
+            }
+            Err(_) => format!("~/.claude/projects (unavailable — {} owned sessions)", owned.len()),
+        }
+    }
+
+    fn watch_dir(&self, env: &Path) -> Option<PathBuf> {
+        projects_dir().ok().map(|d| d.join(slug_for(env)))
+    }
+
+    fn parse(&self, text: &str, fallback_id: &str) -> SessionIR {
+        parse_jsonl(text, fallback_id)
+    }
+
     fn locate_default(&self, cwd: &Path) -> Result<PathBuf> {
         let dir = projects_dir()?.join(slug_for(cwd));
         if !dir.exists() {
             bail!(
                 "cannot find this project's Claude Code session directory: {}\n\
-                 (the slug is derived from cwd. Change directory, or specify it explicitly with `agit -a import <session.jsonl>`.)",
+                 (the slug is derived from cwd — change directory, or pass the session file explicitly).",
                 dir.display()
             );
         }

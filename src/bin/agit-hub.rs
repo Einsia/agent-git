@@ -1297,10 +1297,11 @@ struct SessionDigest {
 }
 
 fn digest(runtime: &str, id: &str, jsonl: &str) -> SessionDigest {
-    let ir = match agit::convo::normalize_runtime(runtime) {
-        "codex" => agit::adapter::codex::parse_rollout(jsonl, id),
-        _ => agit::adapter::claude_code::parse_jsonl(jsonl, id),
-    };
+    // Parse through the adapter registry; an unknown runtime falls back to the claude-code parser,
+    // as before.
+    let ir = agit::adapter::get(runtime)
+        .map(|a| a.parse(jsonl, id))
+        .unwrap_or_else(|_| agit::adapter::claude_code::parse_jsonl(jsonl, id));
     let mut files = Vec::new();
     for w in &ir.writes {
         let f = w.rsplit('/').next().unwrap_or(w).to_string();

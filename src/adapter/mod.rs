@@ -54,6 +54,22 @@ pub trait Adapter {
 
     /// Locate the current project's default (latest) session. Adapters with no session concept may return an error.
     fn locate_default(&self, cwd: &Path) -> Result<PathBuf>;
+
+    /// This runtime's sessions owned by the project at `env`: `(transcript path, session id)`. The
+    /// single answer to "which of this project's sessions are this runtime's", used by capture and by
+    /// "has this project run here yet".
+    fn project_sessions(&self, env: &Path) -> Vec<(PathBuf, String)>;
+
+    /// A human description of where those sessions come from, for snap's output. Named per runtime
+    /// because the on-disk layouts differ (claude splits by project slug, codex by date).
+    fn source_desc(&self, env: &Path) -> String;
+
+    /// The directory the watcher polls for this runtime's new sessions (`None` if not applicable). No
+    /// existence check — the watcher waits for it to appear.
+    fn watch_dir(&self, env: &Path) -> Option<PathBuf>;
+
+    /// Parse this runtime's raw transcript text into the IR (the hub renders session digests from it).
+    fn parse(&self, text: &str, fallback_id: &str) -> SessionIR;
 }
 
 /// One registered runtime. This is the single place a runtime is named: its canonical name, a

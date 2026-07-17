@@ -123,6 +123,24 @@ impl Adapter for Codex {
         "codex"
     }
 
+    fn project_sessions(&self, env: &Path) -> Vec<(PathBuf, String)> {
+        project_rollouts(env)
+    }
+
+    fn source_desc(&self, env: &Path) -> String {
+        let owned = project_rollouts(env);
+        let root = sessions_root().map(|r| r.display().to_string()).unwrap_or_default();
+        format!("{root} (cwd={} matched {} rollouts)", env.display(), owned.len())
+    }
+
+    fn watch_dir(&self, _env: &Path) -> Option<PathBuf> {
+        sessions_root().ok()
+    }
+
+    fn parse(&self, text: &str, fallback_id: &str) -> SessionIR {
+        parse_rollout(text, fallback_id)
+    }
+
     fn locate_default(&self, cwd: &Path) -> Result<PathBuf> {
         let root = sessions_root()?;
         if !root.exists() {

@@ -38,11 +38,7 @@ pub fn runtime_list() -> String {
 /// directory merely existing is not enough, since claude's slug dir can be occupied entirely by a
 /// colliding project.
 pub fn has_live_sessions(rt: &str, env: &Path) -> bool {
-    match rt {
-        "claude-code" => !claude_code::project_sessions(env).is_empty(),
-        "codex" => !crate::adapter::codex::project_rollouts(env).is_empty(),
-        _ => false,
-    }
+    crate::adapter::get(rt).map(|a| !a.project_sessions(env).is_empty()).unwrap_or(false)
 }
 
 /// The runtimes with sessions for this project, alphabetically.
@@ -253,45 +249,15 @@ fn route(rt: &str, env: &Path) -> Result<(Vec<Routed>, String)> {
 }
 
 /// This runtime's sessions that belong to this project: (transcript, session id), plus how to describe
-/// where they came from.
+/// where they came from. Both come from the adapter — ownership rules and directory layout are the
+/// runtime's own business (claude splits by project slug; codex by date, with the cwd filter).
+///
+/// An absent runtime directory yields an EMPTY list, not an error, so `snap --from <rt>` and
+/// `agit watch` behave the same for every runtime whether or not the project has run there; the source
+/// description still names where it looked.
 fn live_sessions(rt: &str, env: &Path) -> Result<(Vec<(PathBuf, String)>, String)> {
-    match rt {
-        // Claude splits by project slug — which collides, so `project_sessions` decides ownership by
-        // each transcript's launch cwd: `/a/b.c`, `/a/b-c` and `/a/b/c` share ONE slug directory, and
-        // tree-mirroring it copied a *different* project's transcripts into this store, which a push
-        // then shipped to this project's teammates.
-        "claude-code" => {
-            // Parity with codex: an absent session directory yields an empty list, not an error, so
-            // `snap --from claude-code` and `agit watch` behave the same whether or not this project
-            // has run in Claude Code. snap_one still prints the source and "nothing to mirror", so the
-            // "never run here" case is still legible — it just isn't a non-zero exit one peer has and
-            // the other doesn't.
-            let owned = claude_code::project_sessions(env);
-            let desc = match source_dir("claude-code", env) {
-                Ok(src) => format!("{} ({} owned sessions)", src.display(), owned.len()),
-                // Still name the directory agit looked under, even absent — it's the "which HOME did I
-                // use?" signal, and clearer than a bare "none".
-                Err(_) => {
-                    let looked = claude_code::projects_dir()
-                        .map(|p| p.join(claude_code::slug_for(env)).display().to_string())
-                        .unwrap_or_else(|_| "~/.claude/projects".to_string());
-                    format!("{looked} (no Claude Code session directory for this project yet — {} owned sessions)", owned.len())
-                }
-            };
-            Ok((owned, desc))
-        }
-        // Codex splits by date with every project mixed together, and a fork/resume rollout embeds the
-        // parent session of another project — `project_rollouts` skips the whole file when it sees one.
-        "codex" => {
-            let owned = crate::adapter::codex::project_rollouts(env);
-            let root = crate::adapter::codex::sessions_root()
-                .map(|r| r.display().to_string())
-                .unwrap_or_default();
-            let desc = format!("{root} (cwd={} matched {} rollouts)", env.display(), owned.len());
-            Ok((owned, desc))
-        }
-        other => bail!("session dump for runtime `{other}` isn't wired up yet (see src/session.rs)"),
-    }
+    let adapter = crate::adapter::get(rt)?;
+    Ok((adapter.project_sessions(env), adapter.source_desc(env)))
 }
 
 /// `agit a snap [--from <runtime>]` — mirror session dumps into the Agent Store, once.
@@ -669,11 +635,7 @@ fn commit_snap(agent: &Path, rt: &str, hits: usize, count: &mut u64) {
 
 /// Where a runtime's session dump for this project lives (no existence check — the watcher waits for it).
 fn source_path(rt: &str, env: &Path) -> Option<PathBuf> {
-    match rt {
-        "claude-code" => claude_code::projects_dir().ok().map(|d| d.join(claude_code::slug_for(env))),
-        "codex" => crate::adapter::codex::sessions_root().ok(),
-        _ => None,
-    }
+    crate::adapter::get(rt).ok().and_then(|a| a.watch_dir(env))
 }
 
 /// A cheap change signature of a directory tree: sorted (path, size, mtime) of every file.
