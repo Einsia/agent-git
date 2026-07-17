@@ -44,7 +44,7 @@ pub fn run_named(name: Option<String>) -> Result<i32> {
                 return Ok(2);
             }
         },
-        Err(_) => agent::new_agent(&pick_name(&env, name.as_deref())?)?,
+        Err(_) => agent::init_agent(&pick_name(&env, name.as_deref())?)?,
     };
 
     // Idempotent, and re-run deliberately: a store cloned by an older agit, or one whose .git/hooks
@@ -94,7 +94,7 @@ fn track_declared(env: &Path) -> Result<Option<agent::Agent>> {
             eprintln!("  · {} is declared but has no remote to clone — skipping (its owner has not published it)", entry.name);
             continue;
         }
-        match agent::track(&entry.name, false) {
+        match agent::clone_agent(&entry.name, false) {
             Ok(a) => {
                 println!("  ✓ cloned {} ({})", a.name, a.aid);
                 got.push(a);

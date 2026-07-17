@@ -663,6 +663,30 @@ fn passthrough_propagates_git_exit_code() {
 
 // ─────────────────────── smart agent-scope verbs ───────────────────────
 
+/// `sync` is the back-compat alias for the dialogue merge, and it must be scope-gated exactly like
+/// `merge`: only the Agent scope runs it. In the Environment scope `agit sync` is not agit's verb —
+/// it passes through to git and must NEVER trigger the dialogue merge (the ungated-alias bug).
+#[test]
+fn sync_alias_is_scope_gated_like_merge() {
+    let r = Repo::new();
+
+    // Agent scope: `a sync` reaches the same command as `a merge`. With no target both print the same
+    // usage and exit 2 — proof `sync` routes to merge_cmd, symmetric with `merge`.
+    let (mc, mo, me) = r.agit(&["a", "merge"]);
+    let (sc, so, se) = r.agit(&["a", "sync"]);
+    assert_eq!(mc, 2, "`a merge` with no target exits 2: {me}");
+    assert!(me.contains("agit a merge <target>"), "`a merge` prints the merge usage: {me}");
+    assert_eq!((sc, &so, &se), (mc, &mo, &me), "`a sync` must behave exactly like `a merge`");
+
+    // Environment scope: `agit sync` passes through to git — it must not run the dialogue merge (no
+    // merge usage on either stream), which is precisely what the ungated alias used to do.
+    let (_ec, eo, ee) = r.agit(&["sync"]);
+    assert!(
+        !eo.contains("agit a merge <target>") && !ee.contains("agit a merge <target>"),
+        "`agit sync` in the environment must pass through to git, not run the dialogue merge: {eo}{ee}"
+    );
+}
+
 #[test]
 fn a_pull_fast_forwards_but_refuses_to_textually_merge_diverged_sessions() {
     let r = Repo::new();

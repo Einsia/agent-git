@@ -116,7 +116,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
         // `switch` is the git-native name for "select this worktree's active agent" — the smart
         // version of `git switch` on the store.
         "switch" => {
-            let a = agent::use_agent(&need("name|aid")?)?;
+            let a = agent::switch_agent(&need("name|aid")?)?;
             println!("● {} ({})  — this worktree's agent", a.name, a.aid);
             Ok(0)
         }
@@ -265,9 +265,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         // ── merge: reconcile two diverged agent branches by dialogue (the git-term verb; both sides
         //    truly resume, read-only, only real conflicts prompt you). Only the Agent scope is the
         //    semantic dialogue merge — `agit merge` / `git merge` on the code repo passes through to
-        //    git untouched. `sync` remains as a back-compat alias. ──
+        //    git untouched. `sync` remains as a back-compat alias, scope-gated to Agent exactly like
+        //    `merge` so `agit sync` in the Environment falls through to git rather than running the
+        //    dialogue merge. ──
         "merge" if scope == Scope::Agent => merge_cmd(args),
-        "sync" => merge_cmd(args),
+        "sync" if scope == Scope::Agent => merge_cmd(args),
 
         // ── push (agent scope): a real git push on the store, plus the one thing a bare push can't do
         //    in the agent's context — record the store's origin in the committed binding, so a
@@ -578,7 +580,7 @@ fn agent_init(args: &[String]) -> anyhow::Result<i32> {
     let Some(name) = args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
         anyhow::bail!("agit a init: name the agent — agit a init <name>");
     };
-    let a = agent::new_agent(name)?;
+    let a = agent::init_agent(name)?;
     println!("minted {} ({})", a.name, a.aid);
     println!("  store {}", a.store.display());
     // Without the binding, `agit start` would still say "no agent selected" — the dead end this ends.
@@ -593,7 +595,7 @@ fn agent_clone(args: &[String]) -> anyhow::Result<i32> {
     let Some(target) = args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
         anyhow::bail!("agit a clone: name an agent or a store URL — agit a clone <name|url>");
     };
-    let a = agent::track(target, !args.iter().any(|x| x == "--no-switch"))?;
+    let a = agent::clone_agent(target, !args.iter().any(|x| x == "--no-switch"))?;
     println!("cloned {} ({})", a.name, a.aid);
     println!("  store {}", a.store.display());
     Ok(0)
@@ -820,10 +822,10 @@ the only one present, else they ask.
 
   agit init [--agent N]    Prepare this repo: clone or select its agent, install the secret hooks (--agent names one)
   agit a snap [--watch]    Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store; captures every runtime with sessions here unless --from names one (--watch = auto-snap; --no-harness = sessions only)
-  agit a push / pull       Sync sessions with the team (the Agent Store is just a git repo)
+  agit a push / pull       Push your sessions to, and pull the team's back from, the shared store (the Agent Store is just a git repo)
   agit start               Launch a session HERE already carrying this agent's latest context, from whatever repo it was last in (--agent <name> picks the agent for this invocation only; --as <rt> switches runtime)
   agit a merge <target>    Merge this agent's memory with <target>'s by dialogue (alias: sync); <target> is an agent name or a ref — never a code branch. Same agent → the histories merge too; a different agent → dialogue only, both stay intact (--agent X / --ref X disambiguate)
-  agit a clone <url>       Track an agent published on a hub (its memory, by identity)
+  agit a clone <url>       Clone an agent published on a hub (its memory, by identity)
   agit a scan [--staged]   Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
   agit workspace restore [N]  Roll both repos back together to a pairing's joint state

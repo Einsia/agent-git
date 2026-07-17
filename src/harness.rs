@@ -576,11 +576,10 @@ pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool, from_env: Opt
     Ok(if unresolved.is_empty() { 0 } else { 1 })
 }
 
+/// Canonical runtime name, delegating to the one shared alias map (`adapter::normalize`). Unknown
+/// names pass through unchanged, preserving the prior behavior.
 fn norm(runtime: &str) -> String {
-    match runtime {
-        "claude" | "cc" | "claude-code" => "claude-code".into(),
-        other => other.to_string(),
-    }
+    crate::adapter::normalize(runtime).map(str::to_string).unwrap_or_else(|| runtime.to_string())
 }
 
 fn summarize(p: &Partition) -> (usize, usize, usize, usize) {
@@ -618,7 +617,7 @@ pub fn merge_mcp(captured: &str, local_path: &Path, conflicts: &mut Vec<String>)
     };
     let local_servers = local
         .as_object_mut()
-        .unwrap()
+        .context("local .mcp.json is not a JSON object")?
         .entry("mcpServers")
         .or_insert_with(|| json!({}))
         .as_object_mut()
@@ -818,6 +817,23 @@ mod tests {
         assert!(!out.contains("\"npx\"")); // captured github NOT overwritten
         assert_eq!(conflicts.len(), 1);
         assert!(conflicts[0].contains("github"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A valid-JSON-but-non-object local `.mcp.json` (e.g. `[]` or a bare string) must return an error,
+    /// not panic (was `local.as_object_mut().unwrap()`).
+    #[test]
+    fn merge_mcp_with_non_object_local_errors_without_panicking() {
+        let dir = std::env::temp_dir().join(format!("agit-merge-nonobj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let captured = r#"{"mcpServers":{"fs":{"command":"mcp-fs"}}}"#;
+        for bad in [r#"[]"#, r#""just a string""#, "42"] {
+            let local = dir.join(".mcp.json");
+            std::fs::write(&local, bad).unwrap();
+            let mut conflicts = Vec::new();
+            let res = merge_mcp(captured, &local, &mut conflicts);
+            assert!(res.is_err(), "non-object local `{bad}` must be an Err, got {res:?}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

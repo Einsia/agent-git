@@ -658,11 +658,10 @@ fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// Canonical runtime name, delegating to the one shared alias map (`adapter::normalize`). Unknown
+/// names pass through unchanged, preserving the prior behavior.
 fn normalize(runtime: &str) -> String {
-    match runtime {
-        "claude" | "cc" | "claude-code" => "claude-code".into(),
-        other => other.to_string(),
-    }
+    crate::adapter::normalize(runtime).map(str::to_string).unwrap_or_else(|| runtime.to_string())
 }
 
 #[derive(Default)]
@@ -1062,8 +1061,8 @@ mod routing_tests {
         let env = envd.path().to_path_buf();
 
         testenv::with(home.path(), agit_home.path(), || {
-            let fe = crate::agent::new_agent("frontend").unwrap();
-            let api = crate::agent::new_agent("api").unwrap();
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            let api = crate::agent::init_agent("api").unwrap();
 
             // ONE dump folder: claude keys on the project's cwd slug, never on the agent.
             let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
@@ -1115,7 +1114,7 @@ mod routing_tests {
         let env = envd.path().to_path_buf();
 
         testenv::with(home.path(), agit_home.path(), || {
-            let fe = crate::agent::new_agent("frontend").unwrap();
+            let fe = crate::agent::init_agent("frontend").unwrap();
             let d = fe.store.join("sessions/claude-code");
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("s1.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
@@ -1140,7 +1139,7 @@ mod routing_tests {
         let env = envd.path().to_path_buf();
 
         testenv::with(home.path(), agit_home.path(), || {
-            let fe = crate::agent::new_agent("frontend").unwrap();
+            let fe = crate::agent::init_agent("frontend").unwrap();
             let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
             std::fs::create_dir_all(&slug).unwrap();
             std::fs::write(slug.join("s1.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
@@ -1232,7 +1231,7 @@ mod layout_tests {
         let env = envd.path().to_path_buf();
 
         testenv::with(home.path(), agit_home.path(), || {
-            let fe = crate::agent::new_agent("frontend").unwrap();
+            let fe = crate::agent::init_agent("frontend").unwrap();
             let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
             std::fs::create_dir_all(&slug).unwrap();
             std::fs::write(slug.join("s1.jsonl"), transcript(&env)).unwrap();
@@ -1266,7 +1265,7 @@ mod layout_tests {
         let env = envd.path().to_path_buf();
 
         testenv::with(home.path(), agit_home.path(), || {
-            let fe = crate::agent::new_agent("frontend").unwrap();
+            let fe = crate::agent::init_agent("frontend").unwrap();
             let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
             std::fs::create_dir_all(&slug).unwrap();
             std::fs::write(slug.join("s1.jsonl"), transcript(&env)).unwrap();
@@ -1300,7 +1299,7 @@ mod layout_tests {
         let b = tempfile::tempdir().unwrap();
 
         testenv::with(home.path(), agit_home.path(), || {
-            let fe = crate::agent::new_agent("frontend").unwrap();
+            let fe = crate::agent::init_agent("frontend").unwrap();
             // one agent, two code repos — the shared store the whole design is for
             for (i, env) in [a.path(), b.path()].into_iter().enumerate() {
                 let slug = home.path().join(".claude/projects").join(claude_code::slug_for(env));

@@ -655,7 +655,7 @@ fn find_in(home: &Path, sel: &str) -> Result<Agent> {
 
 /// `agit a switch <name|aid>` — sets MY default in THIS worktree. A default, not a lock: two agents can
 /// run in one repo at once, each selected per-invocation with `--agent`.
-pub fn use_agent(sel: &str) -> Result<Agent> {
+pub fn switch_agent(sel: &str) -> Result<Agent> {
     let home = scope::agit_home()?;
     let env = scope::env_root()?;
     let agent = find_in(&home, sel)?;
@@ -667,7 +667,7 @@ pub fn use_agent(sel: &str) -> Result<Agent> {
 }
 
 /// `agit a init <name>` — mint an agent. Works with no remote: identity exists before any URL does.
-pub fn new_agent(name: &str) -> Result<Agent> {
+pub fn init_agent(name: &str) -> Result<Agent> {
     new_agent_in(&scope::agit_home()?, name)
 }
 
@@ -720,7 +720,7 @@ fn scaffold_store(store: &Path, id: &StoreIdentity) -> Result<()> {
 ///
 /// Tracking **activates** by default (`--no-use` opts out): `track` then `use` was two commands for
 /// one intent.
-pub fn track(target: &str, activate: bool) -> Result<Agent> {
+pub fn clone_agent(target: &str, activate: bool) -> Result<Agent> {
     let home = scope::agit_home()?;
     let env = scope::env_root().ok();
     let binding = match env.as_deref() {

@@ -43,13 +43,13 @@ struct Rule {
 static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     let r = |name, spec, pat: &str| Rule {
         name,
-        re: Regex::new(pat).expect("内置规则的正则必须可编译"),
+        re: Regex::new(pat).expect("built-in rule regex must compile"),
         spec,
         validate: None,
     };
     let v = |name, spec, pat: &str, f: fn(&str) -> bool| Rule {
         name,
-        re: Regex::new(pat).expect("内置规则的正则必须可编译"),
+        re: Regex::new(pat).expect("built-in rule regex must compile"),
         spec,
         validate: Some(f),
     };

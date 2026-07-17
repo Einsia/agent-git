@@ -114,3 +114,11 @@ pub fn get(runtime: &str) -> Result<Box<dyn Adapter>> {
 pub fn list() -> Vec<(&'static str, &'static str)> {
     REGISTRY.iter().map(|r| (r.name, r.desc)).collect()
 }
+
+/// Canonicalize a runtime name or alias to its registered canonical name (`"cc"` → `"claude-code"`),
+/// or `None` if it names no registered runtime. The single place the alias map lives — modules that
+/// used to keep a private copy of the `"claude"|"cc"|"claude-code" => "claude-code"` match now route
+/// through this.
+pub fn normalize(name: &str) -> Option<&'static str> {
+    REGISTRY.iter().find(|r| r.name == name || r.aliases.contains(&name)).map(|r| r.name)
+}

@@ -35,11 +35,10 @@ const QUICK_ROUNDS: usize = 4;
 /// Cap on the diff (chars) fed to each agent.
 const DIFF_CAP: usize = 6000;
 
+/// Canonical runtime name, delegating to the one shared alias map (`adapter::normalize`). Unknown
+/// names pass through unchanged, preserving the prior behavior.
 fn normalize(runtime: &str) -> String {
-    match runtime {
-        "claude" | "cc" | "claude-code" => "claude-code".into(),
-        other => other.to_string(),
-    }
+    crate::adapter::normalize(runtime).map(str::to_string).unwrap_or_else(|| runtime.to_string())
 }
 
 /// One side of the dialogue: its resumed session id, the tree it runs in, its diff since the ancestor,
@@ -1161,8 +1160,12 @@ fn pick_side(rt: &str, sessions: &[(String, String)], branch: Option<&str>) -> (
         }
         None => sessions.iter().collect(),
     };
-    // Voice = the richest (most lines) — a proxy for the most complete context.
-    let voice = on_branch.iter().max_by_key(|(_, c)| c.lines().count()).unwrap();
+    // Voice = the richest (most lines) — a proxy for the most complete context. Callers guard
+    // against empty side lists, but stay defensive: no sessions → no voice, no brief (never panic).
+    let voice = match on_branch.iter().max_by_key(|(_, c)| c.lines().count()) {
+        Some(v) => v,
+        None => return (String::new(), String::new()),
+    };
     let others: Vec<&&(String, String)> = on_branch.iter().filter(|s| s.0 != voice.0).collect();
 
     let mut brief = String::new();
@@ -1290,6 +1293,17 @@ mod identity_tests {
             WITHHELD_TOOLS.contains(&"Task"),
             "Task too: denied the file tools directly, the model tried to reach them via a subagent"
         );
+    }
+
+    /// An empty side list must never panic (was `max_by_key(...).unwrap()`). Callers guard against it,
+    /// but the guard is defense in depth: no sessions → empty voice, empty brief.
+    #[test]
+    fn pick_side_on_empty_sessions_does_not_panic() {
+        let (voice, brief) = pick_side("claude-code", &[], None);
+        assert!(voice.is_empty() && brief.is_empty());
+        // A branch filter that matches nothing falls back to the (still empty) full list.
+        let (voice, brief) = pick_side("claude-code", &[], Some("main"));
+        assert!(voice.is_empty() && brief.is_empty());
     }
 
     /// Mode follows the AID, never git history — that is what removes the guess.
