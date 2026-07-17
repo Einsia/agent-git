@@ -40,61 +40,163 @@ pub fn hook_scan(staged: bool) -> Result<i32> {
 
 fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<i32> {
     let allow = scan::Allowlist::load(root);
-    let mut total = 0;
-    let mut report = |name: &str, findings: Vec<scan::Finding>| {
-        for f in findings {
-            if total == 0 {
-                eprintln!("Found suspected secrets:");
-            }
-            eprintln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
-            total += 1;
-        }
-    };
-
-    if staged && paths.is_empty() {
-        // Key point: pre-commit must scan **what is about to be committed**, i.e. the blob in the index, not the working tree.
-        // The old code took the filename from `git diff --cached` but read_to_string'd the working tree -- if the blob is staged
-        // and the working tree is then reverted to a clean version (git add -p / editing the transcript to strip the secret after staging), the secret still lands in the repo.
-        // `-z` separates with NUL and does no octal quoting, so filenames with special characters aren't missed either.
-        let (_, out) = scope::git_in_status(
-            root,
-            &["diff", "--cached", "--name-only", "-z", "--diff-filter=ACM"],
-        );
-        for name in out.split('\0').filter(|s| !s.is_empty()) {
-            let (code, content) = scope::git_in_status(root, &["show", &format!(":{name}")]);
-            if code != 0 {
-                continue; // can't extract this blob (very rare), skip rather than abort
-            }
-            // Entropy is on for everything now: jsonl is parsed and only STRING VALUES are scanned,
-            // with shape allowlists, so UUIDs/paths/requestIds no longer drown the signal (see scan.rs).
-            report(name, scan::scan_text_allow(&content, true, &allow));
-        }
-        return finish_scan(total, staged, 0);
-    }
-
-    let targets: Vec<PathBuf> = if !paths.is_empty() {
-        paths.iter().map(|p| root.join(p)).collect()
+    let (findings, scanned) = if staged && paths.is_empty() {
+        (staged_findings(root, &allow), 0usize)
     } else {
-        // Scan EVERY file in the Agent Store: an extension gate skipped .env/.pem/.key/.sh/.yaml and
-        // extensionless files, which hold secrets just as well. Binaries are detected by content in scan_file.
-        WalkDir::new(root)
-            .into_iter()
-            .filter_entry(|e| e.file_name() != ".git")
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .map(|e| e.path().to_path_buf())
-            .collect()
+        let targets = scan_targets(root, paths);
+        let n = targets.len();
+        (tree_findings(root, &allow, &targets)?, n)
     };
 
-    for t in &targets {
+    if !findings.is_empty() {
+        eprintln!("Found suspected secrets:");
+        for (name, f) in &findings {
+            eprintln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
+        }
+    }
+    finish_scan(findings.len(), staged, scanned)
+}
+
+/// The files a whole-tree scan covers: every file in the store except `.git`, or an explicit path
+/// list. An extension gate skipped .env/.pem/.key/.sh/.yaml and extensionless files, which hold
+/// secrets just as well — binaries are detected by content in scan_file, not by name.
+fn scan_targets(root: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
+    if !paths.is_empty() {
+        return paths.iter().map(|p| root.join(p)).collect();
+    }
+    WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| e.file_name() != ".git")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect()
+}
+
+/// Findings in the git INDEX — what a commit is about to write, not what sits in the working tree.
+/// The filename comes from `git diff --cached`, but the CONTENT is read from the staged blob (`git
+/// show :name`): if a secret is staged and the working tree is then reverted to a clean version
+/// (git add -p / editing the transcript after staging), the secret still lands in the repo, and only
+/// the blob shows it. `-z` separates with NUL and does no octal quoting, so odd filenames survive.
+/// Entropy is on for everything: jsonl is parsed and only STRING VALUES are scanned, with shape
+/// allowlists, so UUIDs/paths/requestIds no longer drown the signal (see scan.rs).
+fn staged_findings(root: &Path, allow: &scan::Allowlist) -> Vec<(String, scan::Finding)> {
+    let (_, out) = scope::git_in_status(
+        root,
+        &["diff", "--cached", "--name-only", "-z", "--diff-filter=ACM"],
+    );
+    let mut v = Vec::new();
+    for name in out.split('\0').filter(|s| !s.is_empty()) {
+        let (code, content) = scope::git_in_status(root, &["show", &format!(":{name}")]);
+        if code != 0 {
+            continue; // can't extract this blob (very rare), skip rather than abort
+        }
+        for f in scan::scan_text_allow(&content, true, allow) {
+            v.push((name.to_string(), f));
+        }
+    }
+    v
+}
+
+/// Findings across a set of working-tree files — what a push is about to publish.
+fn tree_findings(
+    root: &Path,
+    allow: &scan::Allowlist,
+    targets: &[PathBuf],
+) -> Result<Vec<(String, scan::Finding)>> {
+    let mut v = Vec::new();
+    for t in targets {
         if !t.exists() {
             continue;
         }
         let rel = t.strip_prefix(root).unwrap_or(t).display().to_string();
-        report(&rel, scan::scan_file_allow(t, &allow)?);
+        for f in scan::scan_file_allow(t, allow)? {
+            v.push((rel.clone(), f));
+        }
+    }
+    Ok(v)
+}
+
+// ─────────────────────── The non-bypassable wrapper secret gate ───────────────────────
+
+/// The visible, auditable override for agit's own secret gate. Set to `1` (or `true`/`yes`) to let a
+/// commit/push/snap through THROUGH agit despite suspected secrets.
+///
+/// This exists on purpose. A gate with no legible exit gets bypassed at a coarser grain — someone
+/// drops `--no-verify`, which slips past git's hook leaving no trace in the store, or stops using agit
+/// altogether. This override is the opposite: agit DISCLOSES it every time it honors it (which agent,
+/// which findings, that the consequences are owned), so the escape is on the record instead of hidden.
+pub const ALLOW_ENV: &str = "AGIT_ALLOW_SECRETS";
+
+/// Is the visible override switched on? Only the truthy spellings count, so a stray `AGIT_ALLOW_SECRETS=0`
+/// does not silently disarm the gate.
+pub fn allow_override_enabled() -> bool {
+    std::env::var(ALLOW_ENV)
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+/// What the gate decided.
+pub enum Gate {
+    /// Nothing suspected — proceed.
+    Clean,
+    /// Findings, but the visible override is set — proceed, and it was disclosed on stderr.
+    Overridden,
+    /// Findings and no override — refuse. Carries the count for the caller's own message.
+    Blocked(usize),
+}
+
+impl Gate {
+    /// May the caller proceed to delegate to git? True for Clean and (disclosed) Overridden.
+    pub fn allowed(&self) -> bool {
+        !matches!(self, Gate::Blocked(_))
+    }
+}
+
+/// The gate agit's OWN commit/push/snap wrappers run BEFORE delegating to git — so scanning holds even
+/// when git's pre-commit/pre-push hook is skipped with `--no-verify`, which agit's own entry points must
+/// not let anyone do silently. `staged` scans the git index (what a commit will write); otherwise the
+/// working tree (what a push will publish). `verb` names the action for the disclosure line ("commit",
+/// "push", "snap").
+///
+/// It REUSES scan.rs wholesale (Allowlist + scan_text_allow/scan_file_allow via the collectors above),
+/// so the in-file `agit:allow-secret` pragma and the `.agit-allow-secrets` allowlist still suppress
+/// known-safe hits exactly as before. The only new exit is the disclosed `AGIT_ALLOW_SECRETS` override.
+pub fn secret_gate(store: &Path, staged: bool, verb: &str) -> Result<Gate> {
+    let allow = scan::Allowlist::load(store);
+    let findings = if staged {
+        staged_findings(store, &allow)
+    } else {
+        tree_findings(store, &allow, &scan_targets(store, &[]))?
+    };
+    if findings.is_empty() {
+        return Ok(Gate::Clean);
     }
 
-    finish_scan(total, staged, targets.len())
+    eprintln!("agit: secret gate — suspected secrets in what you are about to {verb}:");
+    for (name, f) in &findings {
+        eprintln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
+    }
+
+    if allow_override_enabled() {
+        eprintln!(
+            "  {ALLOW_ENV} is set — gate BYPASSED for this {verb}. This override is explicit and auditable \
+             (unlike git --no-verify, which leaves no trace). You own the consequences: pushing publishes these to the team."
+        );
+        Ok(Gate::Overridden)
+    } else {
+        eprintln!(
+            "{} suspected. Fix them, mark a false positive with a `{}` pragma or a `{}` entry, or — to override \
+             this gate wholesale — re-run with {ALLOW_ENV}=1 (disclosed and auditable, not a silent bypass).",
+            findings.len(),
+            scan::ALLOW_PRAGMA,
+            scan::ALLOW_FILE,
+        );
+        Ok(Gate::Blocked(findings.len()))
+    }
 }
 
 /// scan_root wrap-up: unifies the "found/not found" report and exit code.

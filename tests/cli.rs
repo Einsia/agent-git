@@ -524,6 +524,141 @@ fn staged_secret_blocked_even_after_worktree_cleaned() {
 }
 
 
+/// The non-bypassable gate: `agit a commit` scans the staged index ITSELF, before delegating to git.
+/// A secret must be blocked even with git's pre-commit hook removed — the whole point is that agit's
+/// own commit path cannot be slipped past with `--no-verify` (or a wiped hook), unlike bare `git commit`.
+#[test]
+fn secret_blocked_through_agit_commit_even_with_git_hook_removed() {
+    let r = Repo::new();
+    // Rip out git's own hooks so ONLY the in-wrapper gate can be doing the blocking.
+    std::fs::remove_file(r.agent().join(".git/hooks/pre-commit")).ok();
+    std::fs::remove_file(r.agent().join(".git/hooks/pre-push")).ok();
+
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n",
+    );
+    r.agit(&["-a", "add", "-A"]);
+    let (code, _, err) = r.agit(&["-a", "commit", "-m", "leak via agit"]);
+    assert_ne!(code, 0, "the wrapper gate must block a staged secret with no git hook present: {err}");
+    assert!(err.contains("secret gate") || err.contains("aws"), "{err}");
+    // Nothing was committed: the store's HEAD still points at the mint commit, not the leak.
+    let head_subject = r.git_agent(&["log", "-1", "--format=%s"]);
+    assert!(head_subject.starts_with("agit: mint agent"), "the secret commit must not exist: {head_subject}");
+}
+
+/// Regression (bypass hole): `agit a commit -a` stages tracked modifications AT COMMIT TIME, after a
+/// pre-commit index scan, and --no-verify skips git's hook. So the wrapper must pre-stage what -a will
+/// add and scan THAT. Before the fix, `agit a commit -a` committed a secret with exit 0, strictly less
+/// safe than bare git.
+#[test]
+fn secret_blocked_through_agit_commit_dash_a() {
+    let r = Repo::new();
+    std::fs::remove_file(r.agent().join(".git/hooks/pre-commit")).ok();
+    // A clean, TRACKED session first (so a later `-a` stages its modification).
+    r.write_agent("sessions/claude-code/s.jsonl", "{\"type\":\"user\",\"message\":{\"content\":\"clean\"}}\n");
+    r.agit(&["-a", "add", "-A"]);
+    assert_eq!(r.agit(&["-a", "commit", "-m", "base"]).0, 0, "a clean base commit succeeds");
+    // Now modify it to carry a secret and try to sneak it in with -a.
+    r.write_agent("sessions/claude-code/s.jsonl", "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n");
+    let (code, _out, err) = r.agit(&["-a", "commit", "-a", "-m", "sneak via -a"]);
+    assert_ne!(code, 0, "agit a commit -a must gate what it stages at commit time: {err}");
+    assert!(
+        !r.git_agent(&["show", "HEAD:sessions/claude-code/s.jsonl"]).contains("AKIA"),
+        "the secret staged by -a must not reach a commit"
+    );
+}
+
+/// Regression (bypass hole): `agit a commit <pathspec>` stages the named path at commit time; the
+/// wrapper must stage and scan the pathspec, not just the pre-existing index.
+#[test]
+fn secret_blocked_through_agit_commit_pathspec() {
+    let r = Repo::new();
+    std::fs::remove_file(r.agent().join(".git/hooks/pre-commit")).ok();
+    r.write_agent("sessions/claude-code/s.jsonl", "{\"type\":\"user\",\"message\":{\"content\":\"clean\"}}\n");
+    r.agit(&["-a", "add", "-A"]);
+    assert_eq!(r.agit(&["-a", "commit", "-m", "base"]).0, 0, "a clean base commit succeeds");
+    // Modify to carry a secret, then commit it by pathspec (git stages the path at commit time).
+    r.write_agent("sessions/claude-code/s.jsonl", "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n");
+    let (code, _out, err) = r.agit(&["-a", "commit", "-m", "sneak", "sessions/claude-code/s.jsonl"]);
+    assert_ne!(code, 0, "agit a commit <pathspec> must gate the path it stages: {err}");
+    assert!(
+        !r.git_agent(&["show", "HEAD:sessions/claude-code/s.jsonl"]).contains("AKIA"),
+        "the secret staged by the pathspec must not reach a commit"
+    );
+}
+
+/// The LEGIBLE escape valve: the gate is refusable, but the exit is visible and auditable — not a
+/// silent bypass. `AGIT_ALLOW_SECRETS=1` lets the same commit through AND discloses that it did.
+#[test]
+fn visible_override_lets_a_secret_commit_through_and_discloses_it() {
+    let r = Repo::new();
+    std::fs::remove_file(r.agent().join(".git/hooks/pre-commit")).ok();
+
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n",
+    );
+    r.agit(&["-a", "add", "-A"]);
+    let (code, _out, err) = r.agit_env(&[("AGIT_ALLOW_SECRETS", "1")], &["-a", "commit", "-m", "explicit override"]);
+    assert_eq!(code, 0, "the disclosed override must let the commit through: {err}");
+    // It committed…
+    assert_eq!(r.git_agent(&["log", "-1", "--format=%s"]), "explicit override");
+    // …and it said so — the escape is on the record, not hidden.
+    assert!(err.contains("AGIT_ALLOW_SECRETS"), "the override must be disclosed on stderr: {err}");
+    assert!(err.to_lowercase().contains("bypass"), "the disclosure must name what it did: {err}");
+}
+
+/// The push gate: `agit a push` scans the store tree before touching the remote, so a committed secret
+/// cannot be published even though the commit that carried it slipped in with `--no-verify`. Bare `git
+/// push` fires only the pre-push hook, which `--no-verify` skips — agit's push must not.
+#[test]
+fn secret_blocked_through_agit_push_before_touching_the_remote() {
+    let r = Repo::new();
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    let hub = hub_path.to_str().unwrap();
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub]).0, 0, "remote add");
+
+    // Commit a secret into the store WITHOUT the gate — raw git, bypassing the hook — then try to push it.
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n",
+    );
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "snuck a secret in"]);
+
+    let (code, _out, err) = r.agit(&["a", "push", "-u", "origin", "main"]);
+    assert_ne!(code, 0, "the push gate must refuse to publish a committed secret: {err}");
+    assert!(err.contains("secret gate") || err.contains("aws"), "{err}");
+    // The remote never received the branch: the gate ran BEFORE git push.
+    assert!(
+        r.git_at(&hub_path, &["rev-parse", "--verify", "refs/heads/main"]).is_empty(),
+        "nothing may have reached the remote: {err}"
+    );
+
+    // The disclosed override publishes it — legibly.
+    let (code, _o, err) = r.agit_env(&[("AGIT_ALLOW_SECRETS", "yes")], &["a", "push", "-u", "origin", "main"]);
+    assert_eq!(code, 0, "the disclosed override must let the push through: {err}");
+    assert!(err.contains("AGIT_ALLOW_SECRETS"), "the override must be disclosed: {err}");
+}
+
+/// The pragma / allowlist escape stays intact through the wrapper gate — a false positive marked with
+/// `agit:allow-secret` on the line still commits, exactly as it did through the git hook.
+#[test]
+fn inline_pragma_still_lets_a_flagged_line_commit_through_the_wrapper_gate() {
+    let r = Repo::new();
+    std::fs::remove_file(r.agent().join(".git/hooks/pre-commit")).ok();
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"doc example AKIAIOSFODNN7EXAMPLE agit:allow-secret\"}}\n",
+    );
+    r.agit(&["-a", "add", "-A"]);
+    let (code, _o, err) = r.agit(&["-a", "commit", "-m", "flagged false positive"]);
+    assert_eq!(code, 0, "a line carrying the allow pragma must not be gated: {err}");
+    assert_eq!(r.git_agent(&["log", "-1", "--format=%s"]), "flagged false positive");
+}
+
 /// Regression: codex sync filters by session_meta.cwd -- it syncs only this project's rollouts,
 /// and never pulls in another project's sessions (the privacy bottom line).
 #[test]

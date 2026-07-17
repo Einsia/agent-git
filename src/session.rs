@@ -625,11 +625,11 @@ fn capture_pass(rt: &str, env: &Path, capture_harness: bool, count: &mut u64) ->
             }
         };
         match mirror_owned(rt, env, r) {
-            Ok((stats, hits, _)) if stats.added + stats.updated > 0 => {
+            Ok((stats, _hits, _)) if stats.added + stats.updated > 0 => {
                 if capture_harness {
                     let _ = crate::harness::capture(&r.store, env, rt);
                 }
-                commit_snap(&r.store, rt, hits, count);
+                commit_snap(&r.store, rt, count);
             }
             Ok(_) => {}
             Err(e) => eprintln!("  snap {rt} failed: {e:#}"),
@@ -639,23 +639,49 @@ fn capture_pass(rt: &str, env: &Path, capture_harness: bool, count: &mut u64) ->
     Ok(routed.into_iter().map(|r| r.store).collect())
 }
 
-/// Stage + commit the mirrored dump. Nothing staged → no-op. Commit blocked by the pre-commit secret hook → warn.
-fn commit_snap(agent: &Path, rt: &str, hits: usize, count: &mut u64) {
+/// Stage + commit the mirrored dump. Nothing staged → no-op.
+///
+/// The gate runs HERE, on the staged index, before the commit — not on git's pre-commit hook, which
+/// `--no-verify` skips. Auto-snap owns this commit, so a secret in a transcript the agent just saw is
+/// caught even on the fully hands-off `watch` path. Blocked → mirrored to disk but never committed;
+/// the visible `AGIT_ALLOW_SECRETS` override lets it through and is disclosed by the gate.
+fn commit_snap(agent: &Path, rt: &str, count: &mut u64) {
     let _ = scope::git_in_status(agent, &["add", "-A"]);
     // `diff --cached --quiet` exits 1 when something is staged, 0 when nothing is.
     if scope::git_in_status(agent, &["diff", "--cached", "--quiet"]).0 == 0 {
         return;
     }
+
+    match crate::commands::secret_gate(agent, true, "snap") {
+        Ok(g) if g.allowed() => {}
+        Ok(_) => {
+            eprintln!(
+                "  ⚠ auto-snap not committed (suspected secrets) — mirrored to disk, held out of history. \
+                 `agit -a scan` to see; set {}=1 to override.",
+                crate::commands::ALLOW_ENV
+            );
+            let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
+            return;
+        }
+        Err(e) => {
+            eprintln!("  ⚠ auto-snap not committed — secret gate failed to run ({e:#}). `agit -a scan` to see.");
+            let _ = scope::git_in_status(agent, &["reset", "-q"]);
+            return;
+        }
+    }
+
     let ts = now_iso();
-    let (rc, _) = scope::git_in_status(agent, &["commit", "-m", &format!("auto-snap {rt} {ts}")]);
+    // The wrapper already gated the index, so skip git's now-redundant pre-commit hook. The hook stays
+    // installed as the defense for a raw `git commit` that never went through agit.
+    let (rc, _) = scope::git_in_status(
+        agent,
+        &["commit", "--no-verify", "-m", &format!("auto-snap {rt} {ts}")],
+    );
     if rc == 0 {
         *count += 1;
         println!("  ● snapped {ts}  (#{count})");
     } else {
-        eprintln!(
-            "  ⚠ auto-snap not committed{} — mirrored to disk but the pre-commit hook refused it. `agit -a scan` to see.",
-            if hits > 0 { " (likely secrets)" } else { "" }
-        );
+        eprintln!("  ⚠ auto-snap not committed — `git commit` refused it. `agit -a scan` to see.");
         let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
     }
 }

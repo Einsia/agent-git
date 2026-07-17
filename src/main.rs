@@ -281,6 +281,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    untouched passthrough. ──
         "push" if scope == Scope::Agent => agent_push(args),
 
+        // ── commit (agent scope): a real git commit on the store, but the secret gate runs on the
+        //    staged index BEFORE git — because a bare passthrough fires only git's pre-commit hook,
+        //    which `--no-verify` skips, and agit's own commit must not offer that silent exit. ──
+        "commit" if scope == Scope::Agent => agent_commit(args),
+
         // ── pull (agent scope): fast-forward when it safely can, but NEVER let git textually merge
         //    diverged jsonl transcripts (that corrupts exactly the sessions `agit a merge` reconciles
         //    by dialogue). On divergence, refuse and route to merge. ──
@@ -633,13 +638,84 @@ fn agent_clone(args: &[String]) -> anyhow::Result<i32> {
 /// with the caller's args untouched, then, on success, records the store's `origin` in the committed
 /// binding so a teammate's clone can find this agent. That binding write is the only thing separating
 /// this from bare passthrough; everything about the push itself is git's.
+/// `agit a commit [git-commit-args…]` — commit into the Agent Store, but scan the staged INDEX first.
+/// A bare passthrough fires only git's pre-commit hook, which `--no-verify` skips; agit owns this entry
+/// point, so it gates here and refuses on findings before any commit exists. On pass it delegates
+/// through passthrough (so the WorkspaceRevision post-hook still fires) with git's now-redundant hook
+/// skipped. The visible AGIT_ALLOW_SECRETS override is disclosed by the gate, never silent.
+fn agent_commit(args: &[String]) -> anyhow::Result<i32> {
+    use agit::agent;
+    let a = agent::resolve(None)?;
+    // `git commit -a` and `git commit <pathspec>` stage content AT COMMIT TIME, after a pre-commit index
+    // scan runs, and the `--no-verify` below skips git's own hook. So stage that content into the index
+    // NOW, before the gate, so the scan sees exactly what the commit will contain. The commit re-stages
+    // the same bytes (a no-op), so -a/pathspec semantics are preserved. Without this, `agit a commit -a`
+    // could commit a secret the index scan never looked at (it was strictly less safe than bare git).
+    stage_commit_inputs(&a.store, args);
+    if !commands::secret_gate(&a.store, true, "commit")?.allowed() {
+        return Ok(1);
+    }
+    // The wrapper already gated the index; `--no-verify` skips git's redundant pre-commit hook (kept
+    // installed for a raw `git commit` that never went through agit). Keeping --no-verify also preserves
+    // the visible AGIT_ALLOW_SECRETS override, which the raw hook deliberately does not honor.
+    let mut rest: Vec<String> = vec!["commit".into(), "--no-verify".into()];
+    rest.extend(args.iter().cloned());
+    passthrough::run(Scope::Agent, &rest)
+}
+
+/// Stage into the store's index exactly what a `git commit` with these args would add, so the in-process
+/// secret gate scans it before the commit exists. `-a`/`--all` stages tracked modifications; any argument
+/// that names an existing path (a pathspec, incl. everything after `--`) is staged too. Option VALUES are
+/// skipped (so `-m <msg>` never stages a file), and the existence check makes a misread value harmless.
+fn stage_commit_inputs(store: &std::path::Path, args: &[String]) {
+    use agit::scope::git_in_status;
+    // git-commit flags that consume the following token as their value.
+    const TAKES_VALUE: &[&str] = &[
+        "-m", "--message", "-F", "--file", "-C", "--reuse-message", "-c", "--reedit-message",
+        "--author", "--date", "--fixup", "--squash", "-t", "--template", "--cleanup",
+        "--pathspec-from-file", "--trailer",
+    ];
+    if args.iter().any(|x| x == "-a" || x == "--all") {
+        let _ = git_in_status(store, &["add", "-u"]);
+    }
+    let mut i = 0;
+    let mut after_dashdash = false;
+    while i < args.len() {
+        let x = &args[i];
+        if !after_dashdash && x == "--" {
+            after_dashdash = true;
+            i += 1;
+            continue;
+        }
+        if !after_dashdash && x.starts_with('-') {
+            i += if TAKES_VALUE.contains(&x.as_str()) && i + 1 < args.len() { 2 } else { 1 };
+            continue;
+        }
+        // A pathspec. Stage it only if it resolves to a real path in the store, so a misclassified
+        // option value (which won't exist as a file) is silently ignored rather than erroring the commit.
+        if store.join(x).exists() {
+            let _ = git_in_status(store, &["add", "--", x]);
+        }
+        i += 1;
+    }
+}
+
 fn agent_push(args: &[String]) -> anyhow::Result<i32> {
     use agit::agent;
     let a = agent::resolve(None)?;
 
+    // The gate runs BEFORE git — a bare `git push` fires only the pre-push hook, which `--no-verify`
+    // skips, and agit's own push must not offer that silent exit. Pushing publishes the store to the
+    // team, so this is the last line before a secret in a transcript leaves the machine. Blocked →
+    // refuse without touching the remote; the visible AGIT_ALLOW_SECRETS override is disclosed by the gate.
+    if !agit::commands::secret_gate(&a.store, false, "push")?.allowed() {
+        return Ok(1);
+    }
+
     // The push, verbatim. Inherited stdio: a push is where credential helpers prompt, and capturing
-    // would both swallow git's errors and block the prompt.
-    let mut push_args: Vec<&str> = vec!["push"];
+    // would both swallow git's errors and block the prompt. `--no-verify` skips git's now-redundant
+    // pre-push hook (we just gated the tree); the hook stays installed for a raw `git push`.
+    let mut push_args: Vec<&str> = vec!["push", "--no-verify"];
     push_args.extend(args.iter().map(String::as_str));
     let code = scope::git_in_inherit(&a.store, &push_args);
     if code != 0 {
