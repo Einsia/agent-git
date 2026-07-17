@@ -10,7 +10,7 @@
 //!   agit commit -a   → Environment scope, -a is an argument to git commit
 //!
 //! `agent`/`a` is a subcommand rather than a flag precisely so those two cannot be transposed. `-a` survives
-//! as a silent deprecated alias while the docs, demo scripts and install-shadow.sh still say it.
+//! as a silent deprecated alias while the docs and demo scripts still say it.
 
 
 // Pedantic markdown-in-doc-comment lint; the comment style here is deliberate.

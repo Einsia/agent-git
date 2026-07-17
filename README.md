@@ -46,12 +46,20 @@ Three commands cover most of it:
 npm install -g @agentgit/agit
 ```
 
-This puts `agit` (and the `agit-hub` server) on your PATH. Or build from source:
+This puts the `agit` client on your PATH. (The `agit-hub` server is separate — teams host it with
+Docker or build it from source; see [deploying the hub](docs/deploying-the-hub.md).) Or build the
+client from source:
 
 ```bash
 git clone https://github.com/Einsia/agent-git && cd agent-git
 ./build.sh --release
 cp target/release/agit ~/.local/bin/
+```
+
+Optionally, route `git` through `agit` so every git command also versions your agent context:
+
+```bash
+agit shadow install     # bash, zsh, fish, or PowerShell; `agit shadow uninstall` to undo
 ```
 
 ## Quickstart

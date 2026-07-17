@@ -5,9 +5,8 @@
 //! flags, `init`, `clone`, `version`, `help` — fall straight through to real git. `command git …`
 //! always bypasses the shadow.
 //!
-//! This is the cross-platform successor to the old bash-only `install-shadow.sh`: it knows bash, zsh,
-//! fish, and PowerShell, writes an idempotent, reversible block to the right profile, and can report
-//! or remove itself.
+//! Cross-platform: it knows bash, zsh, fish, and PowerShell, writes an idempotent, reversible block to
+//! the right profile, and can report or remove itself.
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;

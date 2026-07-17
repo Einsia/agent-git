@@ -447,7 +447,7 @@ fn management_verbs_are_a_closed_set_and_never_reach_git() {
     );
 }
 
-/// `-a` keeps working while the docs, demo scripts and install-shadow.sh still say it — silently.
+/// `-a` keeps working while the docs and demo scripts still say it — silently.
 #[test]
 fn dash_a_remains_a_silent_deprecated_alias() {
     let r = Repo::new();

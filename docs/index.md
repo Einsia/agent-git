@@ -41,7 +41,9 @@ capturing a session, are described in this guide.
 npm install -g @agentgit/agit
 ```
 
-This installs the `agit` client and the `agit-hub` server. To build from source instead:
+This installs the `agit` client. The `agit-hub` server is distributed separately — teams host it with
+Docker or build it from source (see [Deploying the hub](deploying-the-hub.html)). To build the client
+from source instead:
 
 ```
 git clone https://github.com/Einsia/agent-git && cd agent-git
@@ -51,6 +53,12 @@ cp target/release/agit ~/.local/bin/
 
 `build.sh` is used in place of `cargo build` because the project targets Rust edition 2024 and a v4
 `Cargo.lock`, which require cargo 1.78 or later; the script locates a suitable cargo.
+
+To route `git` through `agit` so every git command also versions your agent context:
+
+```
+agit shadow install     # bash, zsh, fish, or PowerShell; agit shadow uninstall to undo
+```
 
 ## Guide
 
