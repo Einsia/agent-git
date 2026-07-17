@@ -188,7 +188,7 @@ fn init_will_not_name_an_agent_after_the_directory() {
     assert_ne!(code, 0, "init must not mint an agent nobody named: {said}");
     assert!(said.contains("will not name one for you"), "{said}");
     assert!(said.contains("agit init --agent <name>"), "must name the fix: {said}");
-    assert!(said.contains("agit a track"), "and the other real answer: {said}");
+    assert!(said.contains("agit a clone"), "and the other real answer: {said}");
     // Nothing may be left behind by the refusal.
     let dirname = r.path().file_name().unwrap().to_str().unwrap().to_string();
     let (_, listed, _) = r.agit(&["a", "list"]);
@@ -199,31 +199,6 @@ fn init_will_not_name_an_agent_after_the_directory() {
     assert_eq!(r.agit(&["init", "--agent", "payments-api"]).0, 0);
     let (_, listed, _) = r.agit(&["a", "list"]);
     assert!(listed.contains("payments-api"), "{listed}");
-}
-
-/// A repo from before identity gets ONE actionable error, from whatever the user typed — not a
-/// second, silently empty store beside the memory it already has.
-#[test]
-fn a_store_that_predates_identity_is_refused_with_one_actionable_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let r = Repo { dir };
-    r.sh("git init -q -b main .");
-    r.sh("git config user.name dev && git config user.email d@x.com && git config commit.gpgsign false");
-    r.write("app.ts", "x\n");
-    r.sh("git add -A && git commit -qm seed");
-    // exactly what agit scaffolded before identity: the nested store with the shared placeholder
-    r.write(".agit/agent/agent.toml", "# Agent identity\nid = \"unnamed-agent\"\n");
-    r.write(".agit/agent/sessions/claude-code/old.jsonl", "{\"type\":\"user\"}\n");
-    r.sh("cd .agit/agent && git init -q -b main . && git add -A && \
-          git -c user.name=a -c user.email=a@x -c commit.gpgsign=false commit -qm 'agit: initialize Agent Store'");
-
-    for args in [vec!["a", "log"], vec!["start"], vec!["init"]] {
-        let (code, out, err) = r.agit(&args);
-        let said = format!("{out}{err}");
-        assert_ne!(code, 0, "`agit {}` must not silently succeed on a legacy repo", args.join(" "));
-        assert!(said.contains("predates agent identity"), "`agit {}`: {said}", args.join(" "));
-        assert!(said.contains("agit a import"), "`agit {}` must name the fix: {said}", args.join(" "));
-    }
 }
 
 #[test]
@@ -315,7 +290,7 @@ fn a_teammate_takes_over_with_git_clone_then_agit_init() {
             .args(args).output().unwrap();
     };
 
-    // ── alice: mint, publish (pushes to the bare repo and writes the remote into .agit.toml), commit ──
+    // ── alice: mint, point the store at the hub and push (records the remote into .agit.toml), commit ──
     let alice = root.path().join("alice");
     let web = alice.join("web");
     std::fs::create_dir_all(&web).unwrap();
@@ -324,8 +299,9 @@ fn a_teammate_takes_over_with_git_clone_then_agit_init() {
     git(&web, &["add", "-A"]);
     git(&web, &["commit", "-qm", "seed"]);
     assert_eq!(run(&alice, &web, &["init", "--agent", "frontend"]).0, 0);
-    let (c, _, e) = run(&alice, &web, &["a", "publish", hub.to_str().unwrap()]);
-    assert_eq!(c, 0, "publish failed: {e}");
+    assert_eq!(run(&alice, &web, &["a", "remote", "add", "origin", hub.to_str().unwrap()]).0, 0, "remote add");
+    let (c, _, e) = run(&alice, &web, &["a", "push", "-u", "origin", "HEAD"]);
+    assert_eq!(c, 0, "push failed: {e}");
     git(&web, &["add", ".agit.toml"]);
     git(&web, &["commit", "-qm", "declare frontend"]);
     let alice_aid = std::fs::read_to_string(web.join(".agit.toml")).unwrap()
@@ -423,7 +399,7 @@ fn agit_a_info_is_management_while_show_stays_git() {
 #[test]
 fn management_verbs_are_a_closed_set_and_never_reach_git() {
     let r = Repo::new();
-    for verb in ["list", "use", "new", "track", "info", "rename", "publish", "rebind", "import"] {
+    for verb in ["list", "switch", "info", "rename", "rebind"] {
         let (_, out, err) = r.agit(&["a", verb]);
         let said = format!("{out}{err}");
         // The invariant is that the verb is agit's, not git's. This used to assert the stub's
@@ -750,16 +726,22 @@ fn a_fetch_reports_incoming_sessions_without_integrating() {
 }
 
 #[test]
-fn a_clone_and_a_init_redirect_to_the_smart_verbs() {
+fn a_init_mints_an_agent_and_a_switch_selects_it() {
     let r = Repo::new();
 
-    let (code, _o, err) = r.agit(&["a", "clone", "https://example.com/x.git"]);
-    assert_ne!(code, 0, "raw clone into a store is a footgun");
-    assert!(err.contains("agit a track"), "should redirect to track: {err}");
+    // `agit a init <name>` is the git-native mint (was `new`): a store with its own identity.
+    let (code, out, err) = r.agit(&["a", "init", "backend"]);
+    assert_eq!(code, 0, "agit a init should mint: {err}");
+    assert!(out.contains("minted backend"), "should report the mint: {out}");
 
-    let (code, _o, err) = r.agit(&["a", "init"]);
-    assert_ne!(code, 0, "raw init of a store is a footgun");
-    assert!(err.contains("agit a new"), "should redirect to new: {err}");
+    // With two agents, `agit a switch` (was `use`) picks which one this worktree resolves to.
+    let (code, _o, err) = r.agit(&["a", "switch", "backend"]);
+    assert_eq!(code, 0, "agit a switch should select the agent: {err}");
+    let (_, info, _) = r.agit(&["a", "info", "backend"]);
+    assert!(info.contains("backend"), "switched agent should resolve: {info}");
+
+    // A bare name (no `<name>`) is an error, not a silent no-op.
+    assert_ne!(r.agit(&["a", "init"]).0, 0, "init needs a name");
 }
 
 #[test]

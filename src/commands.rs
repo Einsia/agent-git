@@ -747,7 +747,7 @@ pub fn store_sessions(store: &Path) -> Vec<StoredSession> {
 
 /// The most recent session, ordered by what the store RECORDS — never by the filesystem.
 ///
-/// git does not preserve mtimes: after the `git clone` that `agit a track` performs, every session
+/// git does not preserve mtimes: after the `git clone` that `agit a clone` performs, every session
 /// carries the checkout time, identical to the nanosecond, so an mtime order collapses into whatever
 /// order the directory walk happened to produce. A session the store records a time for therefore
 /// always beats one it does not, and mtime only breaks a tie.
@@ -937,7 +937,7 @@ mod start_tests {
         std::fs::write(p, s).unwrap();
     }
 
-    /// The bug this keys on: git does not preserve mtimes. `agit a track` CLONES the store, and a clone
+    /// The bug this keys on: git does not preserve mtimes. `agit a clone` CLONES the store, and a clone
     /// stamps every file at checkout time — verified identical to the nanosecond — so an mtime-ordered
     /// leaf-finder returns whichever session WalkDir happened to hand back last. Recency must therefore
     /// come from recorded CONTENT. This is acceptance criterion 3: bob clones and picks up alice's LATEST.
@@ -1061,7 +1061,7 @@ mod start_tests {
         f.set_modified(t).unwrap();
     }
 
-    /// Acceptance criterion 3: bob clones the agent and picks up alice's LATEST session. `agit a track`
+    /// Acceptance criterion 3: bob clones the agent and picks up alice's LATEST session. `agit a clone`
     /// is a `git clone`, and git does not preserve mtimes — every file gets the checkout time — so an
     /// mtime-ordered leaf-finder returns whatever the directory walk happened to hand back last.
     /// Asserted against real git, so the trap stays proven rather than remembered.
@@ -1082,7 +1082,7 @@ mod start_tests {
         git(&store, &["commit", "-qm", "alice's sessions"]);
         assert_eq!(latest_session(&store).unwrap().path.file_stem().unwrap(), "new");
 
-        // bob: `agit a track` → git clone.
+        // bob: `agit a clone` → git clone.
         let clone = d.path().join("clone");
         let out = Command::new("git").args(["clone", "-q"]).arg(&store).arg(&clone).output().unwrap();
         assert!(out.status.success(), "clone failed: {}", String::from_utf8_lossy(&out.stderr));

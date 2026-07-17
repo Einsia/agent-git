@@ -43,12 +43,12 @@ fn split_scope(argv: &[String]) -> (Scope, &[String]) {
 /// Agent-store management verbs — a CLOSED set (design doc §5). Everything outside it is handed to git
 /// on the store, so `agit a log`, `agit a commit`, `agit a push` and `agit a diff` all keep working.
 ///
-/// The names deliberately avoid shadowing git's namespace: `track` not `add` (`git add` is far too
-/// common to lose), `info` not `show` (`git show` is a real verb). `merge` is a management verb too, but
-/// is dispatched separately above because it alone is implemented — and it shadows `git merge` on purpose.
-const AGENT_MGMT_VERBS: &[&str] = &[
-    "list", "use", "new", "track", "info", "rename", "publish", "rebind", "import",
-];
+/// Where a git verb means the same thing on the store it keeps the git name — the agent version is
+/// just the smarter one: `clone` (by identity), `init` (mint an identity), `switch` (active agent),
+/// `push`/`pull`/`fetch`/`merge`. The verbs here are the ones with no git primitive: `list`, `info`,
+/// `rename`, `rebind` (a repair — "accept a changed identity"). `info` not `show` so `git show` on the
+/// store still works.
+const AGENT_MGMT_VERBS: &[&str] = &["list", "switch", "info", "rename", "rebind"];
 
 /// Recognizing the management verbs is what keeps them away from git — `agit a info` must not become
 /// `git info`.
@@ -56,7 +56,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
     use agit::agent;
 
     // A verb whose argument is mandatory must not read a missing one as "the empty selector": every
-    // resolution rung treats blank as absent, so `agit a use` would silently act on the default.
+    // resolution rung treats blank as absent, so `agit a switch` would silently act on the default.
     let need = |what: &str| -> anyhow::Result<String> {
         match args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
             Some(a) => Ok(a.to_string()),
@@ -69,7 +69,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
         "list" => {
             let agents = agent::list()?;
             if agents.is_empty() {
-                println!("no agents yet — agit a new <name> mints one.");
+                println!("no agents yet — agit a init <name> mints one.");
                 return Ok(0);
             }
             let env = scope::env_root().ok();
@@ -110,28 +110,14 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             println!("name   {}", a.name);
             println!("aid    {}", a.aid);
             println!("store  {}", a.store.display());
-            println!("remote {}", a.remote.as_deref().unwrap_or("— (local only; agit a publish adds one)"));
+            println!("remote {}", a.remote.as_deref().unwrap_or("— (local only; agit a push records one)"));
             Ok(0)
         }
-        "use" => {
+        // `switch` is the git-native name for "select this worktree's active agent" — the smart
+        // version of `git switch` on the store.
+        "switch" => {
             let a = agent::use_agent(&need("name|aid")?)?;
             println!("● {} ({})  — this worktree's agent", a.name, a.aid);
-            Ok(0)
-        }
-        "new" => {
-            let a = agent::new_agent(&need("name")?)?;
-            println!("minted {} ({})", a.name, a.aid);
-            println!("  store {}", a.store.display());
-            // Minting works outside a repo on purpose (identity precedes any URL), so binding is
-            // best-effort: without it `agit a new` would leave `agit start` still saying "no agent
-            // selected", which is the dead end this verb exists to end.
-            bind_and_activate(&a)?;
-            Ok(0)
-        }
-        "track" => {
-            let a = agent::track(&need("name|url")?, !flag("--no-use"))?;
-            println!("tracking {} ({})", a.name, a.aid);
-            println!("  store  {}", a.store.display());
             Ok(0)
         }
         "rename" => {
@@ -144,22 +130,8 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             println!("renamed {old} → {} ({} — unchanged)", a.name, a.aid);
             Ok(0)
         }
-        // Records the locator in the COMMITTED binding, which is the half a teammate's clone needs:
-        // without it `agit a track <name>` has nowhere to clone from.
-        "publish" => {
-            // `--remote <url>` (§5), or a bare positional url, or nothing (re-push to the recorded one).
-            let url = args.iter().position(|a| a == "--remote").and_then(|i| args.get(i + 1)).cloned()
-                .or_else(|| args.first().filter(|a| !a.starts_with('-')).cloned());
-            let a = agent::publish(url.as_deref(), !flag("--no-push"))?;
-            println!("published {} ({})", a.name, a.aid);
-            // The locator, not the store's raw remote: a token echoed here lands in scrollback and in
-            // whatever CI log ran the command.
-            println!("  remote {}", a.remote.as_deref().unwrap_or("—"));
-            println!("  bound  {}   (COMMIT IT — this is how your team's clone finds this memory)", agent::BINDING_FILE);
-            Ok(0)
-        }
         // Override the integrity check (`--remote <url>`), or give a forked store its own identity
-        // (`--new-id`). Both are referenced by errors that used to point at a stub.
+        // (`--new-id`). A repair verb — no git primitive means "accept a changed identity".
         "rebind" => {
             let remote = args.iter().position(|a| a == "--remote").and_then(|i| args.get(i + 1)).cloned();
             let name = args.first().filter(|a| !a.starts_with("--")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -168,20 +140,11 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             println!("  remote {}", a.remote.as_deref().unwrap_or("—"));
             Ok(0)
         }
-        // The one-shot adoption of a store minted before identity existed. Optional name: a store that
-        // already knows what it is keeps its own label.
-        "import" => {
-            let a = agent::import(args.first().map(|s| s.trim()).filter(|s| !s.is_empty()))?;
-            println!("imported {} ({})", a.name, a.aid);
-            println!("  store  {}", a.store.display());
-            println!("  bound  {}   (commit it: your team gets this agent on clone)", agent::BINDING_FILE);
-            Ok(0)
-        }
         // Unreachable: every verb in AGENT_MGMT_VERBS has an arm above. Kept as a defensive default so
         // adding a name to the closed set without an arm fails loudly here rather than falling to git.
         v => {
             eprintln!("agit agent {v}: no handler — this is a bug (a closed-set verb with no arm).");
-            eprintln!("  available: list · new · use · track · info · rename · publish · rebind · import");
+            eprintln!("  available: list · switch · info · rename · rebind");
             Ok(2)
         }
     }
@@ -189,7 +152,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
 
 /// Bind a freshly-minted agent to this repo and make it the active one.
 ///
-/// Outside a git repo this is a no-op rather than an error: `agit a new` is explicitly allowed there.
+/// Outside a git repo this is a no-op rather than an error: `agit a init` is explicitly allowed there.
 fn bind_and_activate(a: &agit::agent::Agent) -> anyhow::Result<()> {
     let Ok(env) = scope::env_root() else { return Ok(()) };
     agit::agent::bind_here(a, &env, false)?;
@@ -208,15 +171,10 @@ fn dispatch(argv: Vec<String>) -> i32 {
     let args = &rest[1..];
 
     let result = match cmd {
-        // ── init under the agent scope is a footgun: a store isn't git-init'd by hand — it needs an
-        //    identity. Redirect to the smart verb rather than make an identity-less repo. (Checked
-        //    before the scope-independent `init` below, which is the code-repo setup.) ──
-        "init" if scope == Scope::Agent => {
-            eprintln!("agit a init: an agent store isn't created by hand — it needs an identity.");
-            eprintln!("  agit a new <name>      mint a new agent (aid + agent.toml)");
-            eprintln!("  agit init              set up the agents this repo already declares");
-            Ok(2)
-        }
+        // ── init (agent scope): mint a new agent — the git-native name for creating a repo, here a
+        //    store with its own identity. (Checked before the scope-independent `init` below, which is
+        //    the code-repo setup.) ──
+        "init" if scope == Scope::Agent => agent_init(args),
 
         // ── Top-level native commands (independent of scope) ──
         "init" => {
@@ -230,7 +188,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
         // No `"clone"` arm: `agit clone <url>` is git's clone, on the code repo, like every other
         // unclaimed verb. It used to mean "clone the team's Agent Store into <env>/.agit/agent" — which
         // shadowed git's own verb (the thing `track` not `add` and `info` not `show` exist to avoid) and,
-        // after the cutover, built a store at a path nothing resolves. `agit a track <url>` is the memory.
+        // after the cutover, built a store at a path nothing resolves. `agit a clone <url>` is the memory.
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(0)
@@ -327,14 +285,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    integrate them. ──
         "fetch" if scope == Scope::Agent => agent_fetch(args),
 
-        // ── clone (agent scope): a footgun. Raw `git clone` inside the store makes a nested repo that
-        //    resolves to nothing; a store is cloned by identity. Redirect to the smart verb. ──
-        "clone" if scope == Scope::Agent => {
-            eprintln!("agit a clone: an agent store is cloned by identity, not by raw git.");
-            eprintln!("  agit a track <name>    clone the agent your repo's binding declares");
-            eprintln!("  agit a track <url>     clone a specific store and adopt its identity");
-            Ok(2)
-        }
+        // ── clone (agent scope): clone an agent's store by identity — the git-native name for what
+        //    used to be `track`. A bare name resolves through the binding; a URL clones that store and
+        //    adopts its identity. (Raw `git clone` here would make a nested repo that resolves to
+        //    nothing, which is exactly what this replaces.) ──
+        "clone" if scope == Scope::Agent => agent_clone(args),
         "adapter" => commands::adapter_list(),
         "graph" => commands::workspace_graph(),
 
@@ -615,6 +570,35 @@ fn harness_cmd(sub: &str, rt: Option<&str>, force: bool, from_env: Option<&str>)
 ///
 /// The target is another MEMORY — an agent name or a ref — never a code branch. When a word names both,
 /// `--agent X` / `--ref X` say which without a prompt; interactively agit asks.
+/// `agit a init <name>` — mint a new agent (a store with its own identity). The git-native name for
+/// creating a repo, here one that carries an aid. Minting works outside a repo on purpose (identity
+/// precedes any URL), so binding is best-effort.
+fn agent_init(args: &[String]) -> anyhow::Result<i32> {
+    use agit::agent;
+    let Some(name) = args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        anyhow::bail!("agit a init: name the agent — agit a init <name>");
+    };
+    let a = agent::new_agent(name)?;
+    println!("minted {} ({})", a.name, a.aid);
+    println!("  store {}", a.store.display());
+    // Without the binding, `agit start` would still say "no agent selected" — the dead end this ends.
+    bind_and_activate(&a)?;
+    Ok(0)
+}
+
+/// `agit a clone <name|url>` — clone an agent's store by identity (the git-native name for `track`). A
+/// bare name resolves through the committed binding; a URL clones that store and adopts its identity.
+fn agent_clone(args: &[String]) -> anyhow::Result<i32> {
+    use agit::agent;
+    let Some(target) = args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        anyhow::bail!("agit a clone: name an agent or a store URL — agit a clone <name|url>");
+    };
+    let a = agent::track(target, !args.iter().any(|x| x == "--no-switch"))?;
+    println!("cloned {} ({})", a.name, a.aid);
+    println!("  store {}", a.store.display());
+    Ok(0)
+}
+
 /// `agit a push [git-push-args…]` — the agent-context push. It runs the real git push on the store
 /// with the caller's args untouched, then, on success, records the store's `origin` in the committed
 /// binding so a teammate's clone can find this agent. That binding write is the only thing separating
@@ -833,7 +817,7 @@ the only one present, else they ask.
   agit a push / pull       Sync sessions with the team (the Agent Store is just a git repo)
   agit start               Launch a session HERE already carrying this agent's latest context, from whatever repo it was last in (--agent <name> picks the agent for this invocation only; --as <rt> switches runtime)
   agit a merge <target>    Merge this agent's memory with <target>'s by dialogue (alias: sync); <target> is an agent name or a ref — never a code branch. Same agent → the histories merge too; a different agent → dialogue only, both stay intact (--agent X / --ref X disambiguate)
-  agit a track <url>       Track an agent published on a hub (its memory, by identity)
+  agit a clone <url>       Track an agent published on a hub (its memory, by identity)
   agit a scan [--staged]   Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
   agit workspace restore [N]  Roll both repos back together to a pairing's joint state

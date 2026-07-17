@@ -23,12 +23,6 @@ pub enum Scope {
     Agent,
 }
 
-/// Where a store lived **before** agent identity, relative to the code repo root.
-///
-/// This is no longer a place agit resolves a store — it is only the place agit *recognizes* one, so
-/// that a repo predating identity gets an actionable "run `agit a import`" from every agent-scoped
-/// command instead of a fresh empty store. See `crate::agent::legacy_store`.
-pub const AGENT_DIR: &str = ".agit/agent";
 /// Where the WorkspaceRevision log lives. Deliberately placed outside both git worktrees, to avoid moving the agent ref when writing a pairing.
 pub const WORKSPACE_DIR: &str = ".agit/workspace";
 
@@ -101,7 +95,7 @@ pub fn root_for(scope: Scope) -> Result<PathBuf> {
             if !a.join(".git").exists() {
                 bail!(
                     "{} carries an agent's identity but is not a git repository.\n\
-                     \x20      The store is damaged; if it has a remote, re-clone it with `agit a track <url>`.",
+                     \x20      The store is damaged; if it has a remote, re-clone it with `agit a clone <url>`.",
                     a.display()
                 );
             }

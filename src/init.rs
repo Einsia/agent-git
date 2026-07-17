@@ -31,13 +31,6 @@ pub fn run_named(name: Option<String>) -> Result<i32> {
 
     let agent = match agent::resolve(None) {
         Ok(a) => a,
-        // A store that predates identity is adopted, not re-minted — the memory is real, and minting a
-        // second agent beside it would fork it. init does not paper over that; it repeats the resolver's
-        // actionable error, which names `agit a import`.
-        Err(e) if agent::legacy_store(&env).is_some() => {
-            eprintln!("{e:#}");
-            return Ok(2);
-        }
         // The fresh-clone takeover (§13.1): the committed binding names agents this machine lacks, so
         // init clones the ones that carry a remote and resolves again. This is the whole of PRD #1 —
         // `git clone` then `agit init` and the team's memory is here — so init doing it, rather than
@@ -140,7 +133,7 @@ fn pick_name(env: &Path, given: Option<&str>) -> Result<String> {
              \x20      An agent is a memory, named for what it knows — `frontend`, `payments-api` — and it outlives\n\
              \x20      this repo, so `{}` would be the wrong label even when it is a legal one.\n\
              \x20        agit init --agent <name>   mint one here\n\
-             \x20        agit a track <name|url>    use one you (or your team) already have",
+             \x20        agit a clone <name|url>    use one you (or your team) already have",
             env.file_name().and_then(|s| s.to_str()).unwrap_or("this directory")
         );
     }
@@ -196,7 +189,7 @@ pub(crate) fn ensure_gitignore(env: &Path) -> Result<()> {
 
 /// The secret gate, installed into a store's `.git/hooks`.
 ///
-/// Every store gets this **at creation** — `agit a new`, `a track`, `a import` — not only at `agit
+/// Every store gets this **at creation** — `agit a init`, `a track`, `a import` — not only at `agit
 /// init`. Under the old model init was what built the store, so init was the only door; now identity
 /// mints stores, and a store that skipped this scans nothing, silently. That matters here more than
 /// anywhere: a store holds whole transcripts, so it holds whatever the agent saw — the `.env` it read,
