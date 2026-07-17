@@ -2669,13 +2669,8 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
             return Resp::err(400, "visibility must be private or public");
         };
         if vis.as_str() != meta.visibility {
-            let r = ctx.store.update_agents(|list| {
-                if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
-                    m.visibility = vis.as_str().to_string();
-                }
-            });
-            if r.is_err() {
-                return Resp::err(500, "failed to write agents.json");
+            if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.visibility = vis.as_str().to_string()) {
+                return resp;
             }
             audit::append(ctx.root(), &actor, audit::AGENT_VISIBILITY, Some(&meta.name), &format!("{} → {}", meta.visibility, vis.as_str()));
         }
@@ -2688,13 +2683,8 @@ fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp 
             Ok(x) => x,
             Err(e) => return Resp::err(400, &format!("description {e}")),
         };
-        let r = ctx.store.update_agents(|list| {
-            if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
-                m.description = d.clone();
-            }
-        });
-        if r.is_err() {
-            return Resp::err(500, "failed to write agents.json");
+        if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.description = d.clone()) {
+            return resp;
         }
         audit::append(ctx.root(), &actor, audit::AGENT_DESCRIBE, Some(&meta.name), d.as_deref().unwrap_or("(cleared)"));
     }
@@ -2766,6 +2756,18 @@ fn name_taken(ctx: &Ctx, name: &str) -> bool {
     ctx.store.agent(name).is_some() || repo_path(ctx.root(), name).exists()
 }
 
+/// Mutate the agents.json record for `name` under the lock, mapping a write failure to a 500. The
+/// find-by-name / err-to-500 boilerplate that every field-editing handler otherwise repeats.
+fn edit_agent(ctx: &Ctx, name: &str, f: impl FnOnce(&mut AgentMeta)) -> Result<(), Resp> {
+    ctx.store
+        .update_agents(|list| {
+            if let Some(m) = list.iter_mut().find(|m| m.name == name) {
+                f(m);
+            }
+        })
+        .map_err(|_| Resp::err(500, "failed to write agents.json"))
+}
+
 /// Move an agent between lifecycle states. The state itself is enforced in `acl::decide` — this only
 /// writes it down.
 fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Lifecycle, from: &[Lifecycle], action: &'static str) -> Resp {
@@ -2778,13 +2780,8 @@ fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Lifecycle, from: &[
     if !from.contains(&meta.lifecycle()) {
         return Resp::err(409, &format!("this agent is {}", meta.lifecycle().as_str()));
     }
-    let r = ctx.store.update_agents(|list| {
-        if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
-            m.lifecycle = to.as_str().to_string();
-        }
-    });
-    if r.is_err() {
-        return Resp::err(500, "failed to write agents.json");
+    if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.lifecycle = to.as_str().to_string()) {
+        return resp;
     }
     let actor = caller.user.clone().unwrap_or_default();
     audit::append(ctx.root(), &actor, action, Some(&meta.name), &format!("{} → {}", meta.lifecycle().as_str(), to.as_str()));
@@ -2962,16 +2959,13 @@ fn api_star_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
     };
     let on = json_body(body).and_then(|v| v.get("starred").and_then(|x| x.as_bool())).unwrap_or(true);
     let who = actor.clone();
-    let r = ctx.store.update_agents(|list| {
-        if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
-            m.stars.retain(|u| u != &who);
-            if on {
-                m.stars.push(who.clone());
-            }
+    if let Err(resp) = edit_agent(ctx, &meta.name, |m| {
+        m.stars.retain(|u| u != &who);
+        if on {
+            m.stars.push(who.clone());
         }
-    });
-    if r.is_err() {
-        return Resp::err(500, "failed to write agents.json");
+    }) {
+        return resp;
     }
     audit::append(ctx.root(), &actor, audit::AGENT_STAR, Some(&meta.name), if on { "starred" } else { "unstarred" });
     let fresh = ctx.store.agent_or_unowned(&meta.name);
@@ -3005,17 +2999,13 @@ fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Re
         return Resp::err(409, &format!("{to} already owns this agent"));
     }
     let (from, target) = (meta.owner.clone(), to.clone());
-    let r = ctx.store.update_agents(|list| {
-        if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
-            m.owner = Some(target.clone());
-            // The new owner's membership row, if any, is now noise at best and a demotion at worst
-            // (owner outranks every role) — drop it rather than leave two answers to "what may they
-            // do".
-            m.members.retain(|x| x.username != target);
-        }
-    });
-    if r.is_err() {
-        return Resp::err(500, "failed to write agents.json");
+    if let Err(resp) = edit_agent(ctx, &meta.name, |m| {
+        m.owner = Some(target.clone());
+        // The new owner's membership row, if any, is now noise at best and a demotion at worst (owner
+        // outranks every role) — drop it rather than leave two answers to "what may they do".
+        m.members.retain(|x| x.username != target);
+    }) {
+        return resp;
     }
     let actor = caller.user.clone().unwrap_or_default();
     audit::append(
@@ -3074,16 +3064,13 @@ fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str,
             if meta.owner.as_deref() == Some(username.as_str()) {
                 return Resp::err(400, "the owner already has every right; no membership needed");
             }
-            let r = ctx.store.update_agents(|list| {
-                if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
-                    match m.members.iter_mut().find(|x| x.username == username) {
-                        Some(x) => x.role = role.as_str().to_string(),
-                        None => m.members.push(Member { username: username.clone(), role: role.as_str().to_string() }),
-                    }
+            if let Err(resp) = edit_agent(ctx, &meta.name, |m| {
+                match m.members.iter_mut().find(|x| x.username == username) {
+                    Some(x) => x.role = role.as_str().to_string(),
+                    None => m.members.push(Member { username: username.clone(), role: role.as_str().to_string() }),
                 }
-            });
-            if r.is_err() {
-                return Resp::err(500, "failed to write agents.json");
+            }) {
+                return resp;
             }
             audit::append(ctx.root(), &actor, audit::MEMBER_ADD, Some(&meta.name), &format!("{username}={}", role.as_str()));
             let fresh = ctx.store.agent_or_unowned(&meta.name);
