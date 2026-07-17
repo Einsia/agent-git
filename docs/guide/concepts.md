@@ -9,9 +9,10 @@ Four ideas cover the rest of this guide. Read them in order.
 
 **An agent is a git repo of session transcripts.** It lives at `~/.agit/agents/<aid>/` (under
 `$AGIT_HOME`), separate from your code. It's named for what it knows — `frontend`, `payments-api` — not
-for a person or a folder. `agit a <git-args>` runs git against that store, which is a normal git repo:
-`agit a log`, `agit a diff`, `agit a push`, `agit a pull` all mean what you expect. A few verbs are
-agent-aware and do more than plain git; those are covered where they come up in this guide.
+for a person or a folder. `agit` on its own is plain git on your code repo — `agit commit`, `agit push`
+and the rest pass straight through. Put `a` after it and the same git runs against the agent's store
+instead: `agit a log`, `agit a diff`, `agit a push`, `agit a pull` all mean what you expect. A few
+`agit a` verbs are agent-aware and do a bit more than plain git; those come up where they're relevant.
 
 **An agent has a stable identity: the aid** (`agt_<uuid>`), minted once and committed in the store's
 `agent.toml`. The name and the remote URL are mutable labels — a name can be changed or collide, a URL

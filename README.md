@@ -24,25 +24,27 @@ Your code is already under version control. The session that produced it isn't. 
 
 ## How it works
 
+agit is the git you already use, with a layer added on top. Every git command still runs through it:
+`agit status`, `agit commit`, `agit push`, `agit log` act on your code repo exactly as plain git would.
+What agit adds is a second thing to version alongside the code — the agent.
+
 An **agent** is a git repo of session transcripts, stored at `~/.agit/agents/<aid>/` (under `$AGIT_HOME`) and separate from your code. You name it for what it knows, such as `frontend` or `payments-api`, and it carries a stable identity: the **aid** (`agt_<uuid>`), minted once and committed in its `agent.toml`. The name and the remote are mutable labels; the aid is the identity.
 
 Your code repo is untouched except for one committed file, `.agit.toml`, which declares the agents the repo uses and where to clone them. A teammate's clone reads it. One agent can work across many repos, and one repo can host many.
 
-agit wraps git in two scopes:
+You reach an agent's store by putting `a` after `agit` — the same git command then runs against the store instead of your code:
 
-| Command | Runs git against |
+| You type | Runs git against |
 |---|---|
-| `agit <git-args>` | your **code** repo, unchanged |
-| `agit a <git-args>` | the resolved **agent's** store, a normal git repo |
+| `agit <git command>` | your **code** repo — ordinary git, nothing changed |
+| `agit a <git command>` | the **agent's** store — a normal git repo of its sessions |
 
-`agit log` shows your code's history; `agit a log` shows the agent's. Where a git verb means the same thing on the store, `agit a` keeps the name and does a little more:
+So `agit log` is your code's history and `agit a log` is the agent's. Most `agit a` commands are plain git on the store. A few do a little more, because they're git verbs that carry a specific meaning for an agent:
 
-| Git | agit | What it adds |
-| --- | --- | --- |
-| `git clone <url>` | `agit a clone <name\|url>` | a bare name resolves through `.agit.toml` |
-| `git push` | `agit a push` | records the store's remote into `.agit.toml`, credentials stripped |
-| `git pull` | `agit a pull` | fast-forward only; divergence routes to `agit a merge` |
-| `git merge` | `agit a merge <agent>` | reconciles two sessions by dialogue, not by text |
+- `agit a clone <name>` clones an agent by identity — the name resolves through `.agit.toml`.
+- `agit a push` records the store's remote into `.agit.toml` as it pushes, credentials stripped.
+- `agit a pull` fast-forwards, and sends a diverged history to `agit a merge`.
+- `agit a merge <agent>` reconciles two sessions by dialogue, not line-by-line text.
 
 ## Install
 

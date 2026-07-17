@@ -12,17 +12,20 @@ divergent sessions by having the agents compare their own work against the code.
 
 ## The two scopes
 
-agit wraps git twice. `agit <git-args>` runs git against your code repository, transparently — what
-you already type keeps working. `agit a <git-args>` runs git against the resolved agent's store, a
-normal git repository of session transcripts kept under `~/.agit`. The agent scope maps to git
-directly:
+agit adds a layer on top of git rather than replacing it. `agit <git command>` runs git against your
+code repository, transparently — everything you already type keeps working, `agit commit` and
+`agit push` included. Put `a` after `agit` and the same command runs against the agent's store instead,
+a normal git repository of session transcripts kept under `~/.agit`:
 
-| Git (your code) | agit (the agent's store) |
+| You type | Runs git against |
 |---|---|
-| `git clone <url>` | `agit a clone <name>` — resolves the URL from `.agit.toml` |
-| `git push` / `git pull` | `agit a push` / `agit a pull` |
-| `git merge` (textual) | `agit a merge <agent>` — a semantic merge the agents perform (see [Merging](guide/merging.html)) |
-| `git log`, `git diff`, ... | `agit a log`, `agit a diff`, ... — plain git against the store |
+| `agit <git command>` | your code repo — ordinary git |
+| `agit a <git command>` | the agent's store — plain git, plus a few agent-aware verbs |
+
+Most `agit a` commands are plain git on the store. The ones that do more are git verbs that mean
+something specific for an agent: `agit a clone <name>` clones by identity (resolving the URL from
+`.agit.toml`), `agit a push` records the store's remote into `.agit.toml`, and `agit a merge <agent>`
+reconciles two sessions by dialogue rather than textually (see [Merging](guide/merging.html)).
 
 One committed file, `.agit.toml`, declares which agents a repo uses and where to clone them, so a
 teammate's fresh clone can pull the same agents. One agent can work across many repos, and one repo
