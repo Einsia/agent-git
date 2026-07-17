@@ -97,6 +97,21 @@ pub struct AgentMeta {
     /// identity link, since the fork gets its own aid the moment it is rebound.
     #[serde(default)]
     pub forked_from: Option<String>,
+    /// The **aid** of the agent this one was forked from. Stored beside the name and not derived
+    /// from it, because the name is a mutable label — the source can be renamed, and lineage keyed on
+    /// a stale name would turn a routine fork back into a reported collision.
+    ///
+    /// Lineage only, never permission: `identity::reconcile` uses it to tell an inherited aid from a
+    /// stolen one, and it can never cause an aid to be cached.
+    #[serde(default)]
+    pub forked_from_aid: Option<String>,
+    /// The conflicting aid already reported for this agent, if any.
+    ///
+    /// A conflict is a **state**, not an event: it is re-derived on every read, and auditing each
+    /// re-derivation grows audit.log without bound and buries the one row that matters under copies
+    /// of itself. This is what makes the audit row fire on the transition into the state instead.
+    #[serde(default)]
+    pub aid_conflict: Option<String>,
     /// Usernames who starred this agent. Per-user, and deliberately not a count: the count is
     /// derivable, the list is not.
     #[serde(default)]
@@ -125,6 +140,8 @@ impl AgentMeta {
             lifecycle: Lifecycle::Active.as_str().to_string(),
             description: None,
             forked_from: None,
+            forked_from_aid: None,
+            aid_conflict: None,
             stars: vec![],
             members: vec![],
             created: now_iso(),

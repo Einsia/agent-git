@@ -2436,6 +2436,15 @@ fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<String>, &'stat
             (None, None) => (None, source, "ok"),
         };
     }
+    // A fork reads its source's aid on **every** read, forever, since the clone carries the source's
+    // agent.toml and `reconcile` rightly refuses to cache an aid someone else holds — so `meta.aid`
+    // stays None and the check above can never short-circuit it. Left to fall through, that made a
+    // routine read of a routine fork take the lock and write an `agent.aid.conflict` row every time.
+    // Mirrors reconcile's lineage rule, which stays the authority; this only avoids taking a lock to
+    // be told what cannot have changed (`forked_from_aid` is fixed at fork time).
+    if seen.is_some() && seen == meta.forked_from_aid {
+        return (seen, source, "inherited");
+    }
 
     // Past here the verdict can write, so reading the cache, looking up the holder and writing must be
     // ONE critical section. Looking the holder up outside the lock was a TOCTOU: two concurrent syncs
@@ -2443,6 +2452,9 @@ fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<String>, &'stat
     // breaking the invariant `Store::agent_by_aid` leans on, that the first match is the only match.
     let name = meta.name.clone();
     let mut verdict = identity::AidVerdict::Unchanged;
+    // Whether this read is the one that *entered* the conflict, as opposed to the millionth to
+    // observe it. Only the transition is an event; see `AgentMeta::aid_conflict`.
+    let mut newly_conflicted = false;
     // The cache write stays best-effort, as before: the store is the authority, so a verdict whose
     // write failed is still the truth about what was read, and the next sync reconciles again.
     let _ = ctx.store.update_agents(|list| {
@@ -2451,11 +2463,23 @@ fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<String>, &'stat
             .as_deref()
             .and_then(|a| list.iter().find(|m| m.aid.as_deref() == Some(a)))
             .map(|m| m.name.clone());
-        verdict = identity::reconcile(&name, cached.as_deref(), seen.as_deref(), holder.as_deref());
-        if let identity::AidVerdict::Learn(a) | identity::AidVerdict::Replaced { now: a, .. } = &verdict {
-            if let Some(m) = list.iter_mut().find(|m| m.name == name) {
+        let lineage = list.iter().find(|m| m.name == name).and_then(|m| m.forked_from_aid.clone());
+        verdict = identity::reconcile(&name, cached.as_deref(), seen.as_deref(), holder.as_deref(), lineage.as_deref());
+        let Some(m) = list.iter_mut().find(|m| m.name == name) else {
+            return;
+        };
+        match &verdict {
+            identity::AidVerdict::Learn(a) | identity::AidVerdict::Replaced { now: a, .. } => {
                 m.aid = Some(a.clone());
+                // Whatever collision was reported is over: this agent now holds an aid of its own,
+                // so the next one deserves a fresh alert.
+                m.aid_conflict = None;
             }
+            identity::AidVerdict::Conflict { aid, .. } => {
+                newly_conflicted = m.aid_conflict.as_deref() != Some(aid.as_str());
+                m.aid_conflict = Some(aid.clone());
+            }
+            identity::AidVerdict::Inherited { .. } | identity::AidVerdict::Unchanged => {}
         }
     });
 
@@ -2476,18 +2500,27 @@ fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<String>, &'stat
             (Some(now), source, "replaced")
         }
         identity::AidVerdict::Conflict { aid, held_by } => {
-            audit::append(
-                ctx.root(),
-                actor,
-                audit::AGENT_AID_CONFLICT,
-                Some(&meta.name),
-                &format!("{aid} is already held by {held_by}"),
-            );
+            // **Only on the transition.** A conflict is a state, re-derived on every read; auditing
+            // each observation grew audit.log without bound and buried the one row an operator
+            // alerts on under thousands of copies of itself — so polling a conflicted agent became a
+            // way to drown out the alert that names you.
+            if newly_conflicted {
+                audit::append(
+                    ctx.root(),
+                    actor,
+                    audit::AGENT_AID_CONFLICT,
+                    Some(&meta.name),
+                    &format!("{aid} is already held by {held_by}"),
+                );
+            }
             // Deliberately does **not** name the other agent in the response: the caller may have no
             // permission to know it exists, and "which name holds this aid" is exactly what the
             // by-aid endpoint gates.
             (Some(aid), source, "conflict")
         }
+        // Expected, so it is not an event: a fork carries its source's agent.toml until it is
+        // rebound. No audit row, and no cache — the source keeps the aid.
+        identity::AidVerdict::Inherited { aid, .. } => (Some(aid), source, "inherited"),
     }
 }
 
@@ -2730,11 +2763,17 @@ fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]
     let _ = Command::new("git").arg("-C").arg(&dst).args(["remote", "remove", "origin"]).status();
     install_pre_receive(&dst, ctx.root(), &fork);
 
+    // The identity the clone carries. Recorded as lineage so `identity::reconcile` can tell this
+    // fork's inherited aid from a stolen one — see `AgentMeta::forked_from_aid`. Read from the source
+    // repo rather than from `source.aid`, which is only the Hub's cache and may not have been
+    // populated yet.
+    let (src_aid, _) = agent_aid(&repo_path(ctx.root(), &source.name));
     // Private by default, whatever the source was: forking a public agent is not a decision to
     // publish your copy of it.
     let r = ctx.store.update_agents(|list| {
         list.push(AgentMeta {
             forked_from: Some(source.name.clone()),
+            forked_from_aid: src_aid.clone(),
             description: source.description.clone(),
             ..AgentMeta::new(&fork, Some(&user), Visibility::Private)
         })
@@ -2755,10 +2794,20 @@ fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]
             "clone_url": clone_url(ctx, req, &fork),
             // The identity the *clone* carries, which is still the source's. Reported, never cached:
             // `by-aid` keeps resolving to the source until this fork is rebound.
+            //
+            // "inherited", not "conflict": a fork wearing its source's aid is the expected state, and
+            // giving it the same word as a real collision is what teaches an operator to ignore the
+            // word. An empty source has no aid to inherit, so there is nothing to report.
             "aid": aid,
             "aid_source": aid_source,
-            "aid_status": "conflict",
-            "note": "this fork carries the source's aid until you run `agit a rebind` locally and push",
+            "aid_status": match aid.is_some() {
+                true => "inherited",
+                false => "ok",
+            },
+            "note": match aid.is_some() {
+                true => Some("this fork carries the source's aid until you run `agit a rebind` locally and push"),
+                false => None,
+            },
         }),
     )
 }

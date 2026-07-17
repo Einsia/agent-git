@@ -168,6 +168,13 @@ api -X POST -d '{"name":"payments-copy"}' "$U/api/agents" >/dev/null
 CTOK="$(api -X POST -d '{"name":"copy","scope":"write","agent":"payments-copy"}' "$U/api/tokens" | jq -r .token)"
 cd "$R1"; git push -q "http://x:$CTOK@127.0.0.1:$PORT/payments-copy.git" main 2>/dev/null; cd "$ROOT"
 is "a second store claiming a taken aid is flagged" "conflict" "$(api "$U/api/agent/payments-copy" | jq -r .aid_status)"
+# A conflict is a STATE, re-derived on every read — not an event per read. Auditing each observation
+# grew audit.log without bound and buried the one row an operator alerts on under copies of itself,
+# so polling a conflicted agent was a way to drown out the alert that names you.
+CFN="$(grep -c 'agent.aid.conflict' "$A")"
+for _ in 1 2 3 4 5; do api "$U/api/agent/payments-copy" > /dev/null; done
+is "and 5 more reads of it add NO further rows" "$CFN" "$(grep -c 'agent.aid.conflict' "$A")"
+is "while still reporting the state on every read" "conflict" "$(api "$U/api/agent/payments-copy" | jq -r .aid_status)"
 is "and the aid still resolves to the holder"       "payments" "$(api "$U/api/agent/by-aid/$AID" | jq -r .name)"
 grep -q "agent.aid.conflict" "$A" && ok "the aid conflict is audited" || bad "no agent.aid.conflict row"
 
@@ -497,13 +504,48 @@ is "THE FORK DID NOT INHERIT THE SOURCE'S MEMBERS" 0             "$(api "$U/api/
 is "so bob, a member of the SOURCE, cannot see the fork"  404    "$(bcode "$U/api/agent/payments-forked")"
 # ...and it did not walk off with the identity either: two agents may never share one aid.
 is "THE FORK DID NOT STEAL THE SOURCE'S IDENTITY" "payments"     "$(api "$U/api/agent/by-aid/$AID" | jq -r .name)"
-is "and the clash is reported, not hidden"        "conflict"     "$(api "$U/api/agent/payments-forked" | jq -r .aid_status)"
+is "and reports the inherited aid as INHERITED"    "inherited"    "$(api "$U/api/agent/payments-forked" | jq -r .aid_status)"
+is "the fork response says so at creation too"     "inherited"    "$(echo "$f" | jq -r .aid_status)"
+# A fork wearing its source's aid is the EXPECTED state. It used to be labelled "conflict" — the same
+# word a real identity collision gets — and audited on EVERY read, so a UI polling a fork grew
+# audit.log without bound and taught its operator to ignore the one row that means hijacking.
+FKN="$(grep -c 'agent.aid.conflict' "$A")"
+for _ in 1 2 3 4 5; do api "$U/api/agent/payments-forked" > /dev/null; done
+is "READING A FORK 5 TIMES AUDITS NO CONFLICT AT ALL" "$FKN" "$(grep -c 'agent.aid.conflict' "$A")"
+# ...and the fix must not have simply disabled detection. A REAL collision is still caught, still
+# audited, and still told apart from a fork — which is the half that stops this being a mute switch.
+is "CONTROL: a real collision is still flagged"    "conflict"     "$(api "$U/api/agent/payments-copy" | jq -r .aid_status)"
+[[ "$FKN" -ge 1 ]] && ok "and its audit row is really there ($FKN)" || bad "conflict detection is dead — no rows at all"
+# Lineage is keyed on the AID, not the source's name: renaming the source must not resurrect the
+# label. The name is a label, the aid is the identity — the same rule this whole Act is about.
+api -X PATCH -d '{"name":"payments-renamed"}' "$U/api/agent/payments" >/dev/null
+is "a fork stays inherited across a rename OF ITS SOURCE" "inherited" "$(api "$U/api/agent/payments-forked" | jq -r .aid_status)"
+api -X PATCH -d '{"name":"payments"}' "$U/api/agent/payments-renamed" >/dev/null
+is "and the source is back"                        "payments"     "$(api "$U/api/agent/payments" | jq -r .agent)"
 is "you cannot fork what you cannot read"         404 "$(bcode -X POST -d '{"name":"stolen"}' "$U/api/agent/privagent/fork")"
 is "and nothing was created by the attempt"       404 "$(acode "$U/api/agent/stolen")"
 is "a READ token cannot fork"                     403 "$(curl -s -o /dev/null -w '%{http_code}' -u "x:$RTOK2" -H 'content-type: application/json' -X POST -d '{"name":"tokfork"}' "$U/api/agent/payments/fork")"
 is "and that created nothing either"              404 "$(acode "$U/api/agent/tokfork")"
 is "an already-taken name is refused"             409 "$(acode -X POST -d '{"name":"payments"}' "$U/api/agent/payments/fork")"
 grep -q '"action":"agent.fork"' "$A" && ok "the fork is audited" || bad "no agent.fork row"
+
+# The way OUT of inherited, and the proof it needs no special-casing: rebind locally, push an aid
+# nobody holds. It is then a first sighting like any other.
+FTOK="$(api -X POST -d '{"name":"ftok","scope":"write","agent":"payments-forked"}' "$U/api/tokens" | jq -r .token)"
+[[ ${#FTOK} -ge 32 ]] && ok "a write token for the fork" || bad "no fork token parsed"
+FR="$TMP/forkrepo"; git clone -q "http://x:$FTOK@127.0.0.1:$PORT/payments-forked.git" "$FR" 2>/dev/null
+cd "$FR"
+NEWAID="agt_e2e-rebound-0003"
+printf '[agent]\nid = "%s"\nname = "payments-forked"\n' "$NEWAID" > agent.toml
+git -c user.name=a -c user.email=a@e.com add -A
+git -c user.name=a -c user.email=a@e.com commit -qm "rebind to a fresh identity"
+git push -q "http://x:$FTOK@127.0.0.1:$PORT/payments-forked.git" main 2>"$TMP/fp" || bad "the rebind push failed: $(head -1 "$TMP/fp")"
+cd "$ROOT"
+is "A REBOUND FORK LEARNS ITS OWN IDENTITY"  "learned"  "$(api "$U/api/agent/payments-forked" | jq -r .aid_status)"
+is "and it is the aid we minted"             "$NEWAID"  "$(api "$U/api/agent/payments-forked" | jq -r .aid)"
+is "by-aid now resolves it"      "payments-forked"  "$(api "$U/api/agent/by-aid/$NEWAID" | jq -r .name)"
+is "and the SOURCE keeps its own identity"   "payments" "$(api "$U/api/agent/by-aid/$AID" | jq -r .name)"
+is "the next read is a plain cache hit"      "ok"       "$(api "$U/api/agent/payments-forked" | jq -r .aid_status)"
 
 echo "${B}Act 13 · transfer${N}"
 is "privagent's owner before the move"  "alice"  "$(api "$U/api/agent/privagent" | jq -r .owner)"

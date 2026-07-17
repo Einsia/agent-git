@@ -50,6 +50,13 @@ pub enum AidVerdict {
     /// Another agent already holds this aid. Two agents may never share one, so refuse to cache it:
     /// whoever got there first keeps it.
     Conflict { aid: String, held_by: String },
+    /// The aid is the one this agent was **forked from**, and the source still holds it.
+    ///
+    /// Same outcome as `Conflict` — refuse to cache, the source keeps it — but a different *fact*: a
+    /// clone carries its source's agent.toml until someone rebinds it, so this is the expected state
+    /// of a fresh fork rather than two unrelated stores claiming one identity. Only one of the two is
+    /// worth an alert, and calling both `Conflict` is what buries the real one.
+    Inherited { aid: String, from: String },
 }
 
 /// Compare what the store says against what the Hub cached.
@@ -57,10 +64,21 @@ pub enum AidVerdict {
 /// - `cached` — the aid in agents.json for `name` (None = never learned).
 /// - `seen`   — the aid just read out of agent.toml (None = empty repo / no identity committed).
 /// - `holder` — the agent that already has `seen` cached, if any (the uniqueness lookup).
+/// - `forked_from_aid` — the **aid** of the agent this one was cloned from, if any. Keyed on the aid
+///   and not on the source's name, for the reason the whole module exists: the name is a mutable
+///   label, so lineage matched by name would turn a routine fork back into a reported collision the
+///   day someone renamed its source. **Lineage, not permission**: it only ever splits one
+///   already-refused outcome into two, and can never turn a refusal into a cache.
 ///
 /// `seen = None` never clears the cache: an agent whose HEAD is temporarily unreadable has not lost
 /// its identity, and forgetting it would let a *different* store slide in unnoticed afterwards.
-pub fn reconcile(name: &str, cached: Option<&str>, seen: Option<&str>, holder: Option<&str>) -> AidVerdict {
+pub fn reconcile(
+    name: &str,
+    cached: Option<&str>,
+    seen: Option<&str>,
+    holder: Option<&str>,
+    forked_from_aid: Option<&str>,
+) -> AidVerdict {
     let Some(seen) = seen else {
         return AidVerdict::Unchanged;
     };
@@ -71,7 +89,13 @@ pub fn reconcile(name: &str, cached: Option<&str>, seen: Option<&str>, holder: O
     // sighting or a replacement. (A holder that *is* this agent is the cache we are refreshing.)
     if let Some(h) = holder {
         if h != name {
-            return AidVerdict::Conflict { aid: seen.to_string(), held_by: h.to_string() };
+            // Seeing the very aid we were forked from is the expected state of a clone, not a
+            // collision. Neither branch caches — whoever holds it keeps it either way — so this only
+            // decides which fact gets reported and alerted on.
+            return match forked_from_aid == Some(seen) {
+                true => AidVerdict::Inherited { aid: seen.to_string(), from: h.to_string() },
+                false => AidVerdict::Conflict { aid: seen.to_string(), held_by: h.to_string() },
+            };
         }
     }
     match cached {
@@ -229,20 +253,20 @@ created = "2026-07-16T10:00:00Z"
 
     #[test]
     fn first_sighting_is_learned() {
-        assert_eq!(reconcile("pay", None, Some("agt_a"), None), AidVerdict::Learn("agt_a".into()));
+        assert_eq!(reconcile("pay", None, Some("agt_a"), None, None), AidVerdict::Learn("agt_a".into()));
     }
 
     #[test]
     fn agreeing_cache_is_left_alone() {
-        assert_eq!(reconcile("pay", Some("agt_a"), Some("agt_a"), Some("pay")), AidVerdict::Unchanged);
+        assert_eq!(reconcile("pay", Some("agt_a"), Some("agt_a"), Some("pay"), None), AidVerdict::Unchanged);
     }
 
     #[test]
     fn empty_repo_never_clears_a_learned_aid() {
         // A store whose HEAD is unreadable has not lost its identity. Clearing it would also let a
         // different store be pushed over the name and read as a plain first sighting afterwards.
-        assert_eq!(reconcile("pay", Some("agt_a"), None, None), AidVerdict::Unchanged);
-        assert_eq!(reconcile("pay", None, None, None), AidVerdict::Unchanged);
+        assert_eq!(reconcile("pay", Some("agt_a"), None, None, None), AidVerdict::Unchanged);
+        assert_eq!(reconcile("pay", None, None, None, None), AidVerdict::Unchanged);
     }
 
     #[test]
@@ -251,7 +275,7 @@ created = "2026-07-16T10:00:00Z"
         // *different memory* wearing an old label, and every .agit.toml pointing at the old aid
         // deserves to find out.
         assert_eq!(
-            reconcile("pay", Some("agt_old"), Some("agt_new"), None),
+            reconcile("pay", Some("agt_old"), Some("agt_new"), None, None),
             AidVerdict::Replaced { was: "agt_old".into(), now: "agt_new".into() }
         );
     }
@@ -261,13 +285,13 @@ created = "2026-07-16T10:00:00Z"
         // A store cloned and pushed to a second name must not make both names claim one identity —
         // by-aid lookup would then have no answer to give.
         assert_eq!(
-            reconcile("copy", None, Some("agt_a"), Some("pay")),
+            reconcile("copy", None, Some("agt_a"), Some("pay"), None),
             AidVerdict::Conflict { aid: "agt_a".into(), held_by: "pay".into() }
         );
         // ...and the conflict outranks a replacement, too: stealing an aid off another agent by
         // force-pushing over your own store is the same theft.
         assert_eq!(
-            reconcile("copy", Some("agt_b"), Some("agt_a"), Some("pay")),
+            reconcile("copy", Some("agt_b"), Some("agt_a"), Some("pay"), None),
             AidVerdict::Conflict { aid: "agt_a".into(), held_by: "pay".into() }
         );
     }
@@ -276,6 +300,83 @@ created = "2026-07-16T10:00:00Z"
     fn holding_your_own_aid_is_not_a_conflict_with_yourself() {
         // The uniqueness lookup finds *this* agent when refreshing its own cache — that is the
         // normal path, not a collision.
-        assert_eq!(reconcile("pay", Some("agt_a"), Some("agt_a"), Some("pay")), AidVerdict::Unchanged);
+        assert_eq!(reconcile("pay", Some("agt_a"), Some("agt_a"), Some("pay"), None), AidVerdict::Unchanged);
+    }
+
+    // ── lineage: a fork is not a collision ──
+
+    #[test]
+    fn a_fork_carrying_its_sources_aid_is_inherited_not_a_conflict() {
+        // A clone carries the source's agent.toml until someone rebinds it, so the source still
+        // holding that aid is the EXPECTED state — the same outcome as a conflict (nobody caches it)
+        // but not the same fact, and only one of the two is worth waking someone for.
+        assert_eq!(
+            reconcile("fork", None, Some("agt_a"), Some("pay"), Some("agt_a")),
+            AidVerdict::Inherited { aid: "agt_a".into(), from: "pay".into() }
+        );
+    }
+
+    #[test]
+    fn lineage_survives_the_source_being_renamed() {
+        // Why lineage is keyed on the aid and not on the source's name: renaming `pay` to `billing`
+        // must not turn a routine fork back into a reported collision. The name is a label; the aid
+        // is the identity — the module's whole point, applied to itself.
+        assert_eq!(
+            reconcile("fork", None, Some("agt_a"), Some("billing"), Some("agt_a")),
+            AidVerdict::Inherited { aid: "agt_a".into(), from: "billing".into() },
+            "the holder is the same memory under a new label"
+        );
+    }
+
+    #[test]
+    fn lineage_does_not_excuse_a_collision_with_a_stranger() {
+        // THE test that keeps the fix honest. A fork of `pay` whose store is force-pushed with an
+        // UNRELATED agent's aid is a real theft, and having lineage must not launder it into
+        // "inherited" — that would turn the fork feature into a way to silence the alarm.
+        assert_eq!(
+            reconcile("fork", None, Some("agt_zz"), Some("other"), Some("agt_a")),
+            AidVerdict::Conflict { aid: "agt_zz".into(), held_by: "other".into() }
+        );
+    }
+
+    #[test]
+    fn lineage_is_matched_on_the_aid_not_on_being_a_fork() {
+        // Being a fork of *something* is not the fact that matters; seeing *the aid you were forked
+        // from* is. Anything looser labels a stranger's aid "inherited" the moment an agent has any
+        // lineage at all.
+        assert_eq!(
+            reconcile("fork", None, Some("agt_a"), Some("pay"), None),
+            AidVerdict::Conflict { aid: "agt_a".into(), held_by: "pay".into() },
+            "no lineage recorded → a held aid is still a collision"
+        );
+    }
+
+    #[test]
+    fn a_rebound_fork_learns_its_own_aid_with_no_special_casing() {
+        // The way out: rebind locally, push a fresh aid nobody holds. Lineage is irrelevant then —
+        // it is a first sighting like any other, so the fork stops reporting inherited forever.
+        assert_eq!(
+            reconcile("fork", None, Some("agt_new"), None, Some("agt_a")),
+            AidVerdict::Learn("agt_new".into())
+        );
+    }
+
+    #[test]
+    fn lineage_never_widens_what_reconcile_would_have_cached() {
+        // Lineage only ever splits one already-refused outcome in two. Every verdict that does NOT
+        // involve someone else holding the aid must be identical with and without it — otherwise
+        // `forked_from` has become a permission rather than a label.
+        for (cached, seen, holder) in [
+            (None, Some("agt_a"), None),
+            (Some("agt_a"), Some("agt_a"), Some("pay")),
+            (Some("agt_old"), Some("agt_new"), None),
+            (Some("agt_a"), None, None),
+        ] {
+            assert_eq!(
+                reconcile("pay", cached, seen, holder, None),
+                reconcile("pay", cached, seen, holder, Some("anything")),
+                "lineage changed a verdict it has no business changing: {cached:?} {seen:?} {holder:?}"
+            );
+        }
     }
 }
