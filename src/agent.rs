@@ -900,6 +900,86 @@ fn clone_in(home: &Path, url: &str) -> Result<Agent> {
 
 /// `agit a rename <old> <new>` — metadata only. The store is keyed by the aid, so nothing moves and
 /// a running watcher keeps working.
+/// A URL with any credential stripped, for writing into the COMMITTED binding.
+///
+/// `https://x:ghp_…@github.com/me/f.git` → `https://github.com/me/f.git`. For http(s) the whole userinfo
+/// goes: git needs none of it to clone, and a bare username is still someone's account name in a file
+/// the whole team reads. For ssh/scp the user is part of the ADDRESS, not a credential — `git@github.com`
+/// stops resolving without it — so only a password is removed there.
+fn locator(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (Some(s), r),
+        // scp-like `git@host:path` has no scheme and no password to remove.
+        None => return url.to_string(),
+    };
+    // Only userinfo before the FIRST `/` is auth; a `@` later in the path is just a character.
+    let host_and_path = rest.split_once('/').map(|(h, _)| h).unwrap_or(rest);
+    let Some((userinfo, _)) = host_and_path.rsplit_once('@') else { return url.to_string() };
+    let keep_user = matches!(scheme, Some("ssh") | Some("git"));
+    let user = userinfo.split_once(':').map(|(u, _)| u).unwrap_or(userinfo);
+    let stripped = rest.splitn(2, '@').nth(1).unwrap_or(rest);
+    match (keep_user, user.is_empty()) {
+        (true, false) => format!("{}://{user}@{stripped}", scheme.unwrap_or("")),
+        _ => format!("{}://{stripped}", scheme.unwrap_or("")),
+    }
+}
+
+/// `agit a publish <url>` — give this agent a locator, and record it where a fresh clone will look.
+///
+/// This is the keystone of collaboration, and its absence was silent. `track` reads a teammate's remote
+/// out of the COMMITTED binding, but nothing ever wrote one there: an agent minted locally has no URL
+/// (identity precedes the locator, by design — §3), and `bind_here` only runs at `new`, before any
+/// remote exists. So a teammate who cloned the code repo was told "`.agit.toml` declares no remote for
+/// it", and then invited by `init` to `agit a new frontend` — minting a SECOND agent under one name,
+/// with a different aid. Two memories, split, which the whole identity model exists to prevent.
+///
+/// Publishing is therefore a binding edit first and a push second: the URL is only useful to anyone
+/// else once it is committed next to the aid.
+pub fn publish(url: &str, push: bool) -> Result<Agent> {
+    // The same allowlist `track` clones through. A remote lands in a COMMITTED file that other people's
+    // machines will clone from, so refusing `ext::…` here is the same gate, one step earlier.
+    check_remote(url)?;
+    let agent = resolve(None)?;
+    let env = scope::env_root()?;
+
+    // `set-url` after the first publish: re-publishing to a new host must move the locator, not fail.
+    // The aid does not change — a remote is a locator, and this agent stays the same memory.
+    match scope::git_in_status(&agent.store, &["remote", "get-url", "origin"]).0 {
+        0 => scope::git_in(&agent.store, &["remote", "set-url", "origin", url])?,
+        _ => scope::git_in(&agent.store, &["remote", "add", "origin", url])?,
+    };
+
+    // Re-read rather than trust: `remote` on an Agent comes from the store's own origin, so this is the
+    // same answer every other reader will get, and a set-url that silently did nothing cannot pass.
+    let agent = find_in(&scope::agit_home()?, &agent.aid)?;
+
+    // The binding is COMMITTED, so what goes in it must be a LOCATOR and never a credential. The store's
+    // own remote keeps the full URL — that lives in .git/config, is local, and is how every git user
+    // already works — but `https://x:ghp_…@github.com/me/f.git` recorded here would be a token pushed to
+    // the team, from the one file this command exists to tell people to commit.
+    let bound = Agent { remote: agent.remote.as_deref().map(locator), ..agent.clone() };
+    if bound.remote != agent.remote {
+        eprintln!("  note: credentials stripped from the recorded remote — {BINDING_FILE} is committed.");
+        eprintln!("        The store keeps the full URL locally; your teammates' git supplies their own.");
+    }
+    bind_here(&bound, &env, false)?;
+
+    if push {
+        // Inherited stdio: a push is where credential helpers prompt, and capturing would both swallow
+        // git's errors and block the prompt.
+        let code = scope::git_in_inherit(&agent.store, &["push", "-u", "origin", "HEAD"]);
+        if code != 0 {
+            bail!(
+                "the remote is recorded in {BINDING_FILE}, but the push failed (git exit {code}).\n\
+                 \x20      Fix the remote and retry: agit a push"
+            );
+        }
+    }
+    // The bound agent, so a caller printing `remote` prints the locator: the raw URL may carry a token,
+    // and echoing it lands in scrollback and in whatever CI log ran the command.
+    Ok(bound)
+}
+
 pub fn rename(old: &str, new: &str) -> Result<Agent> {
     let home = scope::agit_home()?;
     let agent = rename_in(&home, old, new)?;
@@ -1660,6 +1740,36 @@ agent = "frontend"        # what a FRESH clone activates
         }
         for n in ["frontend", "payments-api", "agt_abc"] {
             assert!(!looks_like_url(n), "{n}");
+        }
+    }
+
+    /// The binding is COMMITTED, so `publish` must write a LOCATOR, never a credential — a token here is
+    /// pushed to the whole team from the one file agit tells you to commit.
+    #[test]
+    fn a_published_remote_carries_no_credential() {
+        // http(s): the entire userinfo goes — git needs none of it, and a bare username is still an
+        // account name in a shared file.
+        assert_eq!(
+            locator("https://x:ghp_SECRET123@github.com/me/f.git"),
+            "https://github.com/me/f.git"
+        );
+        assert_eq!(locator("http://user@10.0.0.2:8080/f.git"), "http://10.0.0.2:8080/f.git");
+        // ssh/scp: the user is part of the ADDRESS (`git@github.com` stops resolving without it), so it
+        // stays; only a password would be stripped.
+        assert_eq!(locator("git@github.com:me/f.git"), "git@github.com:me/f.git");
+        assert_eq!(locator("ssh://git@github.com/me/f.git"), "ssh://git@github.com/me/f.git");
+        // no credential to strip — unchanged.
+        assert_eq!(locator("https://github.com/me/f.git"), "https://github.com/me/f.git");
+        assert_eq!(locator("/srv/agents/f.git"), "/srv/agents/f.git");
+        // a `@` in the PATH is not userinfo and must not be mistaken for it.
+        assert_eq!(locator("https://github.com/me/f@v2.git"), "https://github.com/me/f@v2.git");
+        // the property that actually matters: no output of `locator` contains a known secret token.
+        for u in [
+            "https://x:ghp_SECRET123@github.com/me/f.git",
+            "https://ghp_SECRET123@github.com/me/f.git",
+            "http://user:ghp_SECRET123@host/f.git",
+        ] {
+            assert!(!locator(u).contains("ghp_SECRET123"), "credential survived in {}", locator(u));
         }
     }
 }

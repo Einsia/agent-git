@@ -141,6 +141,17 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             println!("renamed {old} → {} ({} — unchanged)", a.name, a.aid);
             Ok(0)
         }
+        // Records the locator in the COMMITTED binding, which is the half a teammate's clone needs:
+        // without it `agit a track <name>` has nowhere to clone from.
+        "publish" => {
+            let a = agent::publish(&need("url")?, !flag("--no-push"))?;
+            println!("published {} ({})", a.name, a.aid);
+            // The locator, not the store's raw remote: a token echoed here lands in scrollback and in
+            // whatever CI log ran the command.
+            println!("  remote {}", a.remote.as_deref().unwrap_or("—"));
+            println!("  bound  {}   (COMMIT IT — this is how your team's clone finds this memory)", agent::BINDING_FILE);
+            Ok(0)
+        }
         // The one-shot adoption of a store minted before identity existed. Optional name: a store that
         // already knows what it is keeps its own label.
         "import" => {
@@ -153,7 +164,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
         // Still design-only. Named individually so the message cannot outlive the gap.
         v => {
             eprintln!("agit agent {v}: not implemented yet.");
-            eprintln!("  available: list · new · use · track · info · rename · import");
+            eprintln!("  available: list · new · use · track · info · rename · import · publish");
             Ok(2)
         }
     }
