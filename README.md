@@ -77,13 +77,14 @@ Work as usual, then capture and share what your agent learned:
 agit start                      # launch a session already carrying this agent's latest context
 agit snap                       # capture this project's sessions into the agent's store
 agit a commit -m "auth flow"    # it's a git repo — commit the memory
-agit a publish https://hub.example.com/frontend.git   # push it, and record the remote for your team
+agit a remote add origin https://hub.example.com/frontend.git
+agit a push -u origin HEAD      # push it, and record the remote for your team in .agit.toml
 ```
 
 A teammate, on a fresh clone of the code repo, gets the same memory in one command:
 
 ```bash
-agit a track frontend           # .agit.toml already says which agent and where; this clones it
+agit a clone frontend           # .agit.toml already says which agent and where; this clones it
 agit start                      # continue where the agent left off
 ```
 
@@ -96,9 +97,10 @@ agit a merge frontend
 #   claude --resume <id>   or   codex exec resume <id>
 ```
 
-`agit a <verb>` is a small, fixed set of management commands (`list`, `use`, `new`, `track`, `info`,
-`rename`, `publish`, `rebind`, `import`, `merge`). Anything else after `a` is passed straight to git,
-so `agit a log` and `agit a diff` do what you'd expect. agit never replaces `git`.
+Where a git verb means the same thing on the store, `agit a` uses the git name and adds the
+agent-aware behavior: `agit a clone` (by identity), `agit a init` (mint one), `agit a switch` (pick
+the active agent), `agit a push`/`pull`/`fetch`/`merge`. The rest are plain git on the store, so
+`agit a log` and `agit a diff` do what you'd expect. agit never replaces `git`.
 
 ## A few things worth knowing
 
@@ -117,8 +119,8 @@ agit start --agent api          # terminal 2
 agit attributes each captured session by the launch record it wrote at `agit start`, so the two never
 get mixed up even though both runtimes dump to the same folder.
 
-**Runtimes are peers.** Claude Code and Codex are equal citizens. Commands that read sessions use the
-one you name with `--from`, otherwise the only one present, otherwise they ask.
+**Runtimes.** Works with Claude Code and Codex. Commands that read sessions use the one you name with
+`--from`, otherwise the only one present, otherwise they ask.
 
 **Hands-off capture.** `agit watch --daemon` auto-snaps and auto-converts in the background so you
 never have to remember to run `snap`.

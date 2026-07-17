@@ -26,7 +26,7 @@ For a developer familiar with Git, the mapping is direct:
 | Git | agit |
 |-----|------|
 | A repository of source files | An agent: a repository of session transcripts |
-| `git clone <url>` | `agit a track <name>` (resolved from the environment's binding) |
+| `git clone <url>` | `agit a clone <name>` (resolved from the environment's binding) |
 | `git push` / `git pull` | `agit a push` / `agit a pull` |
 | `git merge`, textual | `agit a merge <agent>`, a semantic reconciliation performed by the agents |
 | `git log`, `git diff`, ... | `agit a log`, `agit a diff`, ... (git, run against the agent's store) |

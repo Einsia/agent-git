@@ -24,14 +24,13 @@ agit a push -u origin main                             # push, and record the re
 agit a push                                            # later: push new sessions (scanned first)
 
 # a teammate, after cloning the code repo
-agit a track frontend                                 # .agit.toml says which agent and where; clones it
+agit a clone frontend                                 # .agit.toml says which agent and where; clones it
 agit a merge frontend                                 # reconcile locally, by dialogue
 ```
 
-`agit a push` records the store's origin in the committed `.agit.toml` (the one-step
-`agit a publish <url>` does the same). Either way, any credential in the URL is stripped before it's
-written to that file, so a token never reaches the repo; the full URL stays in the store's local git
-config.
+`agit a push` records the store's origin in the committed `.agit.toml` as it pushes. Any credential in
+the URL is stripped before it's written to that file, so a token never reaches the repo; the full URL
+stays in the store's local git config.
 
 ## Permissions
 

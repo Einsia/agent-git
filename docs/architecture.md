@@ -48,8 +48,8 @@ what made "continue this agent in the backend repo" impossible.
 | **Registry** | `$AGIT_HOME/registry.json`: name→aid, a **rebuildable cache** | local |
 
 Not the URL (you mint an agent before any remote exists; a hub migration rewrites every URL). Not the
-name (names collide; renaming is labelling). **Keyed by the aid** ⇒ rename and publish are pure
-metadata edits, no directory ever moves, and a running watcher is never orphaned.
+name (names collide; renaming is labelling). **Keyed by the aid** ⇒ renaming and re-homing the remote
+are pure metadata edits, no directory ever moves, and a running watcher is never orphaned.
 
 **Resolution**, for every agent-scoped command: `--agent` → `$AGIT_AGENT` → the active pointer
 (per-worktree, local) → `.agit.toml [defaults]` → an actionable error. **Never a silent fallback.**
@@ -138,7 +138,7 @@ themselves are real resumed agent sessions, driven separately.)
 
 Dumping the whole session means the transcript may contain secrets the agent has seen. The
 commit/push hooks are installed **when the store is created** — whichever door it came through
-(`a new`, `a track`, `a import`, `init`), because a store that skipped them scans nothing, silently.
+(`a init`, `a clone`, `init`), because a store that skipped them scans nothing, silently.
 They scan the session with the high-precision format rules (AWS keys, connection strings, private
 keys, `password=`…) **and** generic entropy detection. Entropy stays on for jsonl — the thing that
 makes it viable is scanning **only JSON string values**, never keys or structure, and applying a
@@ -182,6 +182,6 @@ The identity model above is specified in
 [`plans/2026-07-17-agent-identity-and-handoff-design.md`](plans/2026-07-17-agent-identity-and-handoff-design.md),
 **the design of record**, which supersedes the branch model in
 [`plans/2026-07-16-workspace-state-primitives-design.md`](plans/2026-07-16-workspace-state-primitives-design.md).
-The full identity model ships today: `agit a publish` / `a rebind`, and the per-environment session
+The full identity model ships today: `agit a push` (records the remote) / `a rebind`, and the per-environment session
 partition (`sessions/<env-slug>/<rt>/`) that `snap` now writes — flat `sessions/<rt>/` stores from before
 the partition still resolve.

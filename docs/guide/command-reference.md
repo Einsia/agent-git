@@ -27,15 +27,13 @@ Anything not listed here is passed through to git: `agit <git-args>` runs agains
 | Command | Does |
 |---|---|
 | `agit a list` | Agents you have locally, with session counts and which is active. |
-| `agit a new <name>` | Mint a new agent. |
-| `agit a use <name>` | Set this worktree's default agent. |
-| `agit a track <name\|url>` | Clone an agent's store (from the binding, or a URL). |
+| `agit a init <name>` | Mint a new agent. |
+| `agit a switch <name>` | Set this worktree's default agent. |
+| `agit a clone <name\|url>` | Clone an agent's store (from the binding, or a URL). |
 | `agit a info <name\|aid>` | Name, aid, store path, and remote for one agent. |
 | `agit a rename <old> <new>` | Rename an agent. |
 | `agit a push [<git args>]` | Push the agent's sessions, and record its remote so teammates can clone it. |
 | `agit a pull [<git args>]` | Pull teammates' sessions; when they've diverged from yours, sends you to `agit a merge` to reconcile. |
 | `agit a fetch [<git args>]` | Fetch, and report which sessions arrived. |
-| `agit a publish [<url>] [--no-push]` | Set the remote, record it, and push, in one step. |
 | `agit a rebind [<name>] [--remote <url>] [--new-id]` | Fix a binding's identity, or give a fork its own aid. See [Migration](migration.html). |
-| `agit a import [<name>]` | Adopt a legacy in-repo store. See [Migration](migration.html). |
 | `agit a merge <target> [--from <runtime>] [--both] [--quick]` | Reconcile with another memory. `--quick` skips the context handoff. See [Merging](merging.html). |

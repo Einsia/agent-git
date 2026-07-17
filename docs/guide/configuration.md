@@ -25,5 +25,5 @@ lists open conflicts instead of resolving them; everything else works without a 
 | `.agit/` | git-ignored | Local per-worktree state, including the active-agent pointer. Not shared. |
 | `agent.toml` | the agent's store | Holds the aid. The client mints it; nothing else rewrites it. |
 
-Credentials in a publish or rebind URL are stripped before they're written to `.agit.toml`; the full
+Credentials in a pushed remote or a rebind URL are stripped before they're written to `.agit.toml`; the full
 URL with any token stays in the store's local git config only.

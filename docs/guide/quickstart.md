@@ -48,14 +48,12 @@ git add .agit.toml && git commit -m "declare the frontend agent"
 `agit a push` records the remote in `.agit.toml` (credentials stripped) as it pushes, so a teammate's
 clone can find the agent — commit that file so they get it. Later pushes just send new sessions.
 
-`agit a publish <url>` sets the remote, records it, and pushes in one step.
-
 ## Pick it up on another machine
 
 A teammate clones the code repo and runs:
 
 ```
-agit a track frontend      # reads .agit.toml, clones the agent's store
+agit a clone frontend      # reads .agit.toml, clones the agent's store
 agit start                 # continue where it left off
 ```
 
@@ -83,4 +81,4 @@ agit start --agent frontend    # terminal 1
 agit start --agent api         # terminal 2
 ```
 
-`agit a use <name>` sets a default for the worktree; `--agent` overrides it per command.
+`agit a switch <name>` sets a default for the worktree; `--agent` overrides it per command.

@@ -27,5 +27,5 @@ keyed by aid, not tied to a location), and one repo can host several agents.
 ## Selecting an agent
 
 Commands that act on an agent use, in order: `--agent <name>`, then `$AGIT_AGENT`, then the worktree's
-active agent (set by `agit a use`), then the binding's default. If none resolves, the command errors
+active agent (set by `agit a switch`), then the binding's default. If none resolves, the command errors
 rather than guessing.
