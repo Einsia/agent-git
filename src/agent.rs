@@ -934,6 +934,23 @@ fn locator(url: &str) -> String {
     }
 }
 
+/// The locator to COMMIT for a remote — `locator`, then a scanner backstop. `locator` strips userinfo,
+/// which is where git carries credentials; but a token can hide elsewhere (a `?token=` query, the path),
+/// and this file gets committed and pushed to the team. Rather than enumerate every place a secret could
+/// sit, refuse to write any locator agit's own scanner still flags. Defense in depth behind `locator`,
+/// not a replacement for it.
+fn committed_locator(url: &str) -> Result<String> {
+    let loc = locator(url);
+    if !crate::scan::scan_text(&loc).is_empty() {
+        bail!(
+            "that remote still looks like it carries a secret after stripping credentials, and {BINDING_FILE}\n\
+             \x20      is committed. Use a URL whose secret is NOT in the address (a credential helper, or\n\
+             \x20      ssh), so nothing sensitive is written to a file your team clones."
+        );
+    }
+    Ok(loc)
+}
+
 /// `agit a publish [--remote <url>]` (§5) — give this agent a locator, and record it where a fresh clone
 /// will look. With no url, re-push to the remote already set — the ordinary "share my new sessions" case.
 ///
@@ -955,6 +972,8 @@ pub fn publish(url: Option<&str>, push: bool) -> Result<Agent> {
             // The same allowlist `track` clones through. A remote lands in a COMMITTED file that other
             // people's machines clone from, so refusing `ext::…` here is the same gate, a step earlier.
             check_remote(url)?;
+            // Fail BEFORE touching the store if the URL would leak a secret into the committed binding.
+            committed_locator(url)?;
             // `set-url` after the first publish: re-publishing to a new host must move the locator, not
             // fail. The aid does not change — a remote is a locator, this agent stays the same memory.
             match scope::git_in_status(&agent.store, &["remote", "get-url", "origin"]).0 {
@@ -979,7 +998,8 @@ pub fn publish(url: Option<&str>, push: bool) -> Result<Agent> {
     // own remote keeps the full URL — that lives in .git/config, is local, and is how every git user
     // already works — but `https://x:ghp_…@github.com/me/f.git` recorded here would be a token pushed to
     // the team, from the one file this command exists to tell people to commit.
-    let bound = Agent { remote: agent.remote.as_deref().map(locator), ..agent.clone() };
+    let committed = agent.remote.as_deref().map(committed_locator).transpose()?;
+    let bound = Agent { remote: committed, ..agent.clone() };
     if bound.remote != agent.remote {
         eprintln!("  note: credentials stripped from the recorded remote — {BINDING_FILE} is committed.");
         eprintln!("        The store keeps the full URL locally; your teammates' git supplies their own.");
@@ -1277,8 +1297,11 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
     let agent = find_in(&home, sel)
         .with_context(|| format!("no agent `{sel}` on this machine to rebind — agit a track <url> first"))?;
     let mut b = Binding::load(&env)?.unwrap_or_default();
-    let new_remote = remote.map(locator);
+    // Same committed-file rule as publish: the binding gets a locator with no secret, or the rebind is
+    // refused before anything moves.
+    let new_remote = remote.map(committed_locator).transpose()?;
     if let Some(r) = remote {
+        check_remote(r)?;
         // Keep the store's own origin in step, credentials and all — the binding gets the locator only.
         match scope::git_in_status(&agent.store, &["remote", "get-url", "origin"]).0 {
             0 => scope::git_in(&agent.store, &["remote", "set-url", "origin", r])?,
@@ -1854,6 +1877,21 @@ agent = "frontend"        # what a FRESH clone activates
     }
 
     /// The binding is COMMITTED, so `publish` must write a LOCATOR, never a credential — a token here is
+    /// The backstop behind `locator`: a secret in a place `locator` does not strip (a query string, the
+    /// path) must still not reach the committed binding. `committed_locator` scans the result and refuses.
+    #[test]
+    fn committed_locator_refuses_a_secret_locator_cannot_strip() {
+        // an AKIA key in the query string — locator only touches userinfo, so it survives the strip, and
+        // the scanner must catch it before it is committed.
+        assert!(committed_locator("https://github.com/me/f.git?aws=AKIAIOSFODNN7EXAMPLE").is_err());
+        // a clean locator passes through unchanged.
+        assert_eq!(
+            committed_locator("https://x:ghp_tok@github.com/me/f.git").unwrap(),
+            "https://github.com/me/f.git"
+        );
+        assert_eq!(committed_locator("git@github.com:me/f.git").unwrap(), "git@github.com:me/f.git");
+    }
+
     /// pushed to the whole team from the one file agit tells you to commit.
     #[test]
     fn a_published_remote_carries_no_credential() {
