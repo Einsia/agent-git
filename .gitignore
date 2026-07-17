@@ -1,2 +1,4 @@
 /target
 .claude/worktrees/
+.playwright-mcp/
+*.tsbuildinfo
