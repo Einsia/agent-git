@@ -227,6 +227,7 @@ impl TokenRec {
 
 // ─────────────────────────── Store ───────────────────────────
 
+#[derive(Clone)]
 pub struct Store {
     root: PathBuf,
 }
