@@ -648,22 +648,46 @@ fn reorg_fs(root: &Path, map: &HashMap<String, String>) {
         let _ = std::fs::create_dir_all(&dst_dir);
         let _ = std::fs::rename(&src, &dst);
     }
-    // Blobs are keyed by agent name and only ever exist for agents with a row, so iterate the map (a
-    // top-level `blobs/<seg>/` dir must never be mistaken for a flat `blobs/<name>/`).
+    // Blobs share the same collision hazard as repos but WITHOUT a `.git` suffix to tell a flat
+    // `blobs/<name>/` apart from a `blobs/<seg>/` namespace container. Iterating and renaming in place
+    // could re-capture a just-created `<seg>/` container as a later move source (when an agent's bare
+    // name equals another agent's owner segment), silently stranding private blobs. So stage every flat
+    // blob dir OUT of the top level first, then place each into `<seg>/<name>`: once phase 1 has cleared
+    // the top level of flat name dirs, creating `<seg>/` containers can never re-capture one. Names in
+    // the v1→v2 map are globally unique (name was the PK at v1), so there are no key collisions.
     let blobs = root.join("blobs");
-    for (name, seg) in map {
+    let staging = blobs.join(".migrating-v2");
+    // Phase 1: flat `blobs/<name>` -> `blobs/.migrating-v2/<name>`.
+    for name in map.keys() {
         let src = blobs.join(name);
         if !src.is_dir() {
+            continue;
+        }
+        let staged = staging.join(name);
+        if staged.exists() {
+            continue; // a prior (crashed) run already staged it
+        }
+        let _ = std::fs::create_dir_all(&staging);
+        let _ = std::fs::rename(&src, &staged);
+    }
+    // Phase 2: `blobs/.migrating-v2/<name>` -> `blobs/<seg>/<name>` (no flat name dirs remain up top).
+    for (name, seg) in map {
+        let staged = staging.join(name);
+        if !staged.is_dir() {
             continue;
         }
         let dst_dir = blobs.join(seg);
         let dst = dst_dir.join(name);
         if dst.exists() {
+            // Already re-homed by a prior run; drop the redundant staged copy (content-addressed, so
+            // the reachable dst is authoritative).
+            let _ = std::fs::remove_dir_all(&staged);
             continue;
         }
         let _ = std::fs::create_dir_all(&dst_dir);
-        let _ = std::fs::rename(&src, &dst);
+        let _ = std::fs::rename(&staged, &dst);
     }
+    let _ = std::fs::remove_dir(&staging); // empty on success
 }
 
 // ─────────────────────────── Store (enum facade) ───────────────────────────
@@ -1666,6 +1690,40 @@ mod tests {
         let missing = s.agent_or_unowned("ghost", "frontend").await;
         assert!(missing.owner.is_none());
         assert_eq!(missing.visibility, "private");
+    }
+
+    /// Regression: the v1->v2 blob reorg must not strand a private agent's blobs when one agent's bare
+    /// name equals another agent's owner segment. Agent `bob` (flat blobs/bob) and agent `proj` owned by
+    /// user `bob` (proj's blobs move under blobs/bob/) share the top-level blobs/ space; an in-place
+    /// rename could re-capture the just-created blobs/bob/ container as bob's source and strand proj.
+    #[test]
+    fn reorg_fs_does_not_strand_blobs_on_a_name_equals_owner_collision() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let blobs = root.join("blobs");
+        std::fs::create_dir_all(blobs.join("bob")).unwrap();
+        std::fs::write(blobs.join("bob").join("sha_bob"), b"bob-blob").unwrap();
+        std::fs::create_dir_all(blobs.join("proj")).unwrap();
+        std::fs::write(blobs.join("proj").join("sha_proj"), b"proj-blob").unwrap();
+        // agent `bob` owned by `alice` (seg alice); agent `proj` owned by `bob` (seg bob).
+        let mut map = std::collections::HashMap::new();
+        map.insert("bob".to_string(), "alice".to_string());
+        map.insert("proj".to_string(), "bob".to_string());
+
+        super::reorg_fs(root, &map);
+
+        // Both agents' blobs reachable at their scoped paths, whatever the map iteration order.
+        assert_eq!(
+            std::fs::read(blobs.join("alice").join("bob").join("sha_bob")).unwrap(),
+            b"bob-blob",
+            "bob's blob must land at blobs/alice/bob/"
+        );
+        assert_eq!(
+            std::fs::read(blobs.join("bob").join("proj").join("sha_proj")).unwrap(),
+            b"proj-blob",
+            "proj's blob must land at blobs/bob/proj/ (not stranded under bob's move)"
+        );
+        assert!(!blobs.join(".migrating-v2").exists(), "the staging dir is cleaned up");
     }
 
     #[tokio::test]
