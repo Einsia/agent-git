@@ -1,0 +1,26 @@
+# Garage config for the bundled S3-compatible blob backend (see docker-compose.yml).
+#
+# Single-node, single-replica: this is one node holding the hub's blobs, not a
+# distributed cluster, so replication_factor is 1. The hub reaches the S3 API at
+# http://garage:3900 over the internal compose network.
+#
+# One-time init after `up` (Garage does not auto-create layout/bucket/key) — see the
+# header of docker-compose.yml for the exact `garage layout/bucket/key` commands.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+# Cluster RPC secret. Single-node, internal-only network — but Garage requires it.
+# Regenerate for your own deploy with: openssl rand -hex 32
+rpc_secret = "be0e0cf204301f5f2690bf61abe74db8fc8ca79ff0ab919a7c6845816df70c02"
+
+[s3_api]
+# Path-style S3 on :3900. The hub always uses path-style (Garage requires it), and
+# names this region "garage" (AGIT_HUB_S3_REGION), matching s3_region here.
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage"

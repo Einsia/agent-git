@@ -11,6 +11,7 @@ use axum::routing::{any, get};
 use axum::Router;
 
 use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny};
+use agit::hub::blob::BLOB_MAX;
 use agit::hub::net::{self, valid_agent_name};
 use agit::hub::store::AgentMeta;
 use agit::hub::{audit, auth};
@@ -167,6 +168,13 @@ fn caller_of(parts: &axum::http::request::Parts) -> Caller {
     parts.extensions.get::<Caller>().cloned().unwrap_or_else(Caller::anonymous)
 }
 
+/// Whether `rest` (the path after `/api/`) is the blob-upload endpoint `agent/<name>/blob` — a single
+/// agent segment then exactly `/blob`, no trailing digest. Mirrors the handler's PUT arm so the body
+/// cap and the route agree. A GET download carries the digest tail (and no body), so it never matches.
+fn is_blob_put_path(rest: &str) -> bool {
+    rest.strip_prefix("agent/").and_then(|r| r.strip_suffix("/blob")).map(|n| !n.is_empty() && !n.contains('/')).unwrap_or(false)
+}
+
 /// `/api/*` dispatcher. Rebuilds the [`Req`] view, enforces the API body cap, then runs the async
 /// `api()` string-dispatcher directly on the runtime (its store reads/writes are awaited).
 async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
@@ -177,12 +185,16 @@ async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
     let rest = parts.uri.path().strip_prefix("/api/").unwrap_or("").to_string();
     let clen = reqo.content_length;
 
+    // A blob PUT (agent/<name>/blob, no trailing digest) may carry up to BLOB_MAX; every other /api/
+    // body keeps the 64 KiB cap. Without this widening every upload over 64 KiB would silently 413.
+    let cap = if method == "PUT" && is_blob_put_path(&rest) { BLOB_MAX as usize } else { API_MAX_BODY };
+
     let body_bytes: Vec<u8> = if method == "GET" || clen == 0 {
         Vec::new()
-    } else if clen > API_MAX_BODY {
+    } else if clen > cap {
         return Resp::text(413, "payload too large").into_response();
     } else {
-        match axum::body::to_bytes(body, API_MAX_BODY).await {
+        match axum::body::to_bytes(body, cap).await {
             Ok(b) => b.to_vec(),
             Err(_) => return Resp::text(408, "request timeout").into_response(),
         }

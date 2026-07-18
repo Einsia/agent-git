@@ -18,6 +18,7 @@
 
 pub mod acl;
 pub mod audit;
+pub mod blob;
 pub mod auth;
 pub mod identity;
 pub mod kdf;

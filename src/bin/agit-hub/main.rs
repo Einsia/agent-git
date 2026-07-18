@@ -510,6 +510,7 @@ mod h4_tests {
     use std::sync::Arc;
 
     use agit::hub::acl::{Action, Caller, Visibility};
+    use agit::hub::blob::Blobs;
     use agit::hub::session::Sessions;
     use agit::hub::store::{now_iso, Org, OrgMember, Store, User};
     use agit::hub::{auth, kdf};
@@ -524,6 +525,8 @@ mod h4_tests {
     async fn test_ctx(registration: bool) -> (tempfile::TempDir, Ctx) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_sqlite(dir.path()).await.unwrap();
+        // FsBlobs under the tempdir — the zero-config test backend (no S3 env, so Blobs::open picks fs).
+        let blobs = Blobs::open(dir.path()).await.unwrap();
         let cfg = Cfg {
             host: "127.0.0.1".parse::<IpAddr>().unwrap(),
             port: 0,
@@ -534,6 +537,7 @@ mod h4_tests {
         };
         let ctx = Ctx(Arc::new(CtxInner {
             store,
+            blobs,
             cfg,
             sessions: Sessions::new(),
             limiter: Arc::new(ConnLimiter::default()),
@@ -664,5 +668,218 @@ mod h4_tests {
         assert_eq!(api_orgs_create(&ctx, &Caller::user("alice"), br#"{"name":"acme"}"#).await.status, 201);
         let r = api_org_members(&ctx, &Caller::user("alice"), "acme", "/alice", "DELETE", b"").await;
         assert_eq!(r.status, 409, "removing the only admin would orphan the org");
+    }
+}
+
+// ── H3: content-addressed blob upload/download, gated through the single acl::decide ──
+#[cfg(test)]
+mod h3_tests {
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    use agit::hub::acl::{Caller, Visibility};
+    use agit::hub::blob::{sha256_hex, Blobs, BLOB_MAX};
+    use agit::hub::session::Sessions;
+    use agit::hub::store::Member;
+
+    use crate::api::api;
+    use crate::cli::create_agent;
+    use crate::http::{Req, Resp};
+    use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC};
+    use crate::server::{Cfg, Ctx, CtxInner};
+
+    async fn test_ctx() -> (tempfile::TempDir, Ctx) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = agit::hub::store::Store::open_sqlite(dir.path()).await.unwrap();
+        let blobs = Blobs::open(dir.path()).await.unwrap();
+        let cfg = Cfg {
+            host: "127.0.0.1".parse::<IpAddr>().unwrap(),
+            port: 0,
+            tls: false,
+            insecure: false,
+            trusted_proxies: vec![],
+            registration: false,
+        };
+        let ctx = Ctx(Arc::new(CtxInner {
+            store,
+            blobs,
+            cfg,
+            sessions: Sessions::new(),
+            limiter: Arc::new(ConnLimiter::default()),
+            login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
+            token_rl: Arc::new(TokenBuckets::new()),
+        }));
+        (dir, ctx)
+    }
+
+    /// A minimal Req view. `target` carries the optional `?sha256=` query the handler reads.
+    fn req(method: &str, target: &str, clen: usize) -> Req {
+        Req { method: method.to_string(), target: target.to_string(), headers: vec![], content_length: clen }
+    }
+
+    /// Give `user` a read-only membership on an existing agent.
+    async fn add_read_member(ctx: &Ctx, agent: &str, user: &str) {
+        ctx.store
+            .update_agents(|list| {
+                if let Some(a) = list.iter_mut().find(|a| a.name == agent) {
+                    a.members.push(Member { username: user.into(), role: "read".into() });
+                }
+            })
+            .await
+            .unwrap();
+    }
+
+    fn header<'a>(r: &'a Resp, k: &str) -> Option<&'a str> {
+        r.extra.iter().find(|(hk, _)| hk.eq_ignore_ascii_case(k)).map(|(_, v)| v.as_str())
+    }
+
+    #[tokio::test]
+    async fn write_member_puts_and_authorized_reader_gets_it_back() {
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+        let body = b"a large-ish artifact that does not belong in git";
+
+        // Owner (admin role → Write) uploads; the server echoes the sha256 it computed.
+        let put = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        assert_eq!(put.status, 201);
+        let v: serde_json::Value = serde_json::from_slice(&put.body).unwrap();
+        let digest = v["sha256"].as_str().unwrap().to_string();
+        assert_eq!(digest, sha256_hex(body), "server-computed address");
+        assert_eq!(v["size"].as_u64().unwrap(), body.len() as u64);
+
+        // An authorized reader (the owner) fetches it: bytes identical + the hardened download headers.
+        let path = format!("/api/agent/art/blob/{digest}");
+        let rest = format!("agent/art/blob/{digest}");
+        let get = api(&ctx, &req("GET", &path, 0), &rest, &Caller::user("alice"), b"").await;
+        assert_eq!(get.status, 200);
+        assert_eq!(get.body, body);
+        assert_eq!(header(&get, "X-Content-Type-Options"), Some("nosniff"));
+        assert_eq!(header(&get, "Content-Security-Policy"), Some("default-src 'none'; sandbox"));
+        assert_eq!(header(&get, "Content-Disposition"), Some(format!("attachment; filename=\"{digest}\"").as_str()));
+        assert_eq!(get.ctype, "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn re_upload_is_idempotent_same_digest() {
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+        let body = b"identical bytes";
+        let a = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        let b = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        assert_eq!(a.status, 201);
+        assert_eq!(b.status, 201);
+        let da: serde_json::Value = serde_json::from_slice(&a.body).unwrap();
+        let db: serde_json::Value = serde_json::from_slice(&b.body).unwrap();
+        assert_eq!(da["sha256"], db["sha256"]);
+    }
+
+    #[tokio::test]
+    async fn anonymous_put_on_private_agent_is_401() {
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+        let body = b"x";
+        let r = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::anonymous(), body).await;
+        assert_eq!(r.status, 401, "no credentials on a private agent → one chance to authenticate");
+    }
+
+    #[tokio::test]
+    async fn read_only_member_put_is_403() {
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+        add_read_member(&ctx, "art", "reader").await;
+        let body = b"x";
+        let r = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("reader"), body).await;
+        assert_eq!(r.status, 403, "a reader can see the agent but may not write to it");
+    }
+
+    #[tokio::test]
+    async fn wrong_claimed_digest_is_409_correct_is_accepted() {
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+        let body = b"claim me";
+        let real = sha256_hex(body);
+
+        // A wrong (but well-formed) claimed digest is rejected rather than trusted.
+        let wrong = "0".repeat(64);
+        let bad = api(
+            &ctx,
+            &req("PUT", &format!("/api/agent/art/blob?sha256={wrong}"), body.len()),
+            "agent/art/blob",
+            &Caller::user("alice"),
+            body,
+        )
+        .await;
+        assert_eq!(bad.status, 409);
+
+        // The correct claim is accepted.
+        let ok = api(
+            &ctx,
+            &req("PUT", &format!("/api/agent/art/blob?sha256={real}"), body.len()),
+            "agent/art/blob",
+            &Caller::user("alice"),
+            body,
+        )
+        .await;
+        assert_eq!(ok.status, 201);
+    }
+
+    #[tokio::test]
+    async fn get_on_private_agent_by_a_stranger_is_404_non_disclosure() {
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+        let body = b"secret artifact";
+        let put = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
+
+        // eve has no access — she must not be able to tell "no such blob" from "no access to this agent".
+        let rest = format!("agent/art/blob/{digest}");
+        let path = format!("/api/{rest}");
+        let r = api(&ctx, &req("GET", &path, 0), &rest, &Caller::user("eve"), b"").await;
+        assert_eq!(r.status, 404, "the blob exists, but a stranger sees the same 404 as a missing agent");
+    }
+
+    #[tokio::test]
+    async fn get_missing_and_malformed_digests_are_404() {
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+
+        // A well-formed digest that names no blob → 404 (for an authorized reader).
+        let absent = "a".repeat(64);
+        let rest = format!("agent/art/blob/{absent}");
+        let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
+        assert_eq!(r.status, 404);
+
+        // Malformed digests (wrong length / non-hex) → 404, before the backend is ever touched.
+        for d in ["zz", "not-a-digest", "ZZZ"] {
+            let rest = format!("agent/art/blob/{d}");
+            let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
+            assert_eq!(r.status, 404, "malformed digest {d} → 404");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversize_upload_is_413() {
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+        // content_length over the ceiling is refused size-first, before any storage work.
+        let clen = (BLOB_MAX + 1) as usize;
+        let r = api(&ctx, &req("PUT", "/api/agent/art/blob", clen), "agent/art/blob", &Caller::user("alice"), b"small").await;
+        assert_eq!(r.status, 413);
+    }
+
+    #[tokio::test]
+    async fn corrupted_blob_surfaces_500_not_bad_bytes() {
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+        let body = b"honest bytes";
+        let put = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
+
+        // Corrupt the stored object under its key, then GET: the read-time re-hash must refuse it.
+        let file = ctx.root().join("blobs").join("art").join(&digest);
+        std::fs::write(&file, b"tampered!").unwrap();
+        let rest = format!("agent/art/blob/{digest}");
+        let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
+        assert_eq!(r.status, 500, "bytes that no longer hash to their address are not served");
     }
 }

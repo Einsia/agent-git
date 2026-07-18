@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 
+use agit::hub::blob::Blobs;
 use agit::hub::net;
 use agit::hub::session::Sessions;
 use agit::hub::store::{self, Store};
@@ -35,6 +36,9 @@ pub(crate) struct Cfg {
 /// every axum handler as `State<Ctx>`.
 pub(crate) struct CtxInner {
     pub(crate) store: Store,
+    /// Content-addressed blob storage (fs by default, S3/Garage when configured). Held by value like
+    /// `store`, since `CtxInner` is already behind one `Arc`; every handler reads `ctx.blobs`.
+    pub(crate) blobs: Blobs,
     pub(crate) cfg: Cfg,
     pub(crate) sessions: Sessions,
     pub(crate) limiter: Arc<ConnLimiter>,
@@ -159,6 +163,7 @@ async fn startup_banner(ctx: &Ctx, addr: SocketAddr) {
     println!("  listen:  {addr}{}", if cfg.tls { " (TLS terminated in front)" } else { "" });
     println!("  web:     {}://{}/", if cfg.tls { "https" } else { "http" }, display_host(cfg));
     println!("  root:    {}", root.display());
+    println!("  blobs:   {}", ctx.blobs.describe());
     println!("  hosting: {} agents ({public} public)", agents.len());
     println!("  users:   {} ({} admins)", users.len(), users.iter().filter(|u| u.is_admin).count());
     println!("  signup:  {}", if cfg.registration { "open (self-service)" } else { "invite-only" });
@@ -216,8 +221,16 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
                 return 1;
             }
         };
+        let blobs = match Blobs::open(root).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("failed to open blob storage: {e}");
+                return 1;
+            }
+        };
         let ctx = Ctx(Arc::new(CtxInner {
             store,
+            blobs,
             cfg,
             sessions: Sessions::new(),
             limiter: Arc::new(ConnLimiter::default()),

@@ -63,6 +63,13 @@ pub const TOKEN_CREATE: &str = "token.create";
 pub const TOKEN_REVOKE: &str = "token.revoke";
 pub const GIT_FETCH: &str = "git.fetch";
 pub const GIT_PUSH: &str = "git.push";
+/// A content-addressed blob was uploaded to an agent (PUT /api/agent/<name>/blob). The detail is the
+/// sha256 the server computed and stored.
+pub const BLOB_PUT: &str = "blob.put";
+/// A stored blob's bytes did not hash to the digest they are keyed under (fs corruption, or an S3
+/// object swapped underneath). The read is refused (500) rather than serving bytes that don't match
+/// their address, and this row is the durable trace.
+pub const BLOB_CORRUPT: &str = "blob.corrupt";
 /// A push the server-side secret scan turned away. The client hook is `--no-verify`-able, so this
 /// row is the only durable trace that someone tried.
 pub const GIT_PUSH_REJECTED: &str = "git.push.rejected";

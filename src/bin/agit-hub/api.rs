@@ -4,6 +4,7 @@ use std::io;
 use std::process::Command;
 
 use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny, Lifecycle, Role, Scope, Visibility};
+use agit::hub::blob::{self, BLOB_MAX};
 use agit::hub::net::valid_agent_name;
 use agit::hub::store::{AgentMeta, Member, Org, OrgMember, User};
 use agit::hub::{audit, auth, identity, kdf, mr, session as websession, store};
@@ -189,6 +190,29 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
         })
         .await
         .unwrap();
+    }
+
+    // agent/<name>/blob            (PUT) — content-addressed upload, Write-gated.
+    // agent/<name>/blob/<digest>   (GET) — content-addressed download, Read-gated.
+    // Same "read/write the store's bytes → through gate()" band as /raw/ + /compare above; placed after
+    // /session/ so a session literally named "blob" can never be shadowed. The tail is either empty
+    // (PUT) or `/`+digest (GET); a `/blobXYZ` falls through, unmatched.
+    if let Some((name, tail)) = after.split_once("/blob") {
+        if tail.is_empty() {
+            return match m {
+                "PUT" => api_blob_put(ctx, req, caller, name, body).await,
+                "GET" => Resp::text(405, "method not allowed"), // GET needs a /<digest>
+                _ => Resp::text(405, "method not allowed"),
+            };
+        }
+        if let Some(digest) = tail.strip_prefix('/') {
+            if !digest.contains('/') {
+                return match m {
+                    "GET" => api_blob_get(ctx, caller, name, digest).await,
+                    _ => Resp::text(405, "method not allowed"),
+                };
+            }
+        }
     }
 
     // agent/<name>/members[/<username>] — tail may only be empty or /<username>;
@@ -2110,6 +2134,89 @@ pub(crate) async fn api_audit(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
                 return Resp::err(403, "the site-wide audit log is open to site admins only (and only from a login session)");
             }
             Resp::json(serde_json::json!(audit::query(ctx.root(), None, limit)))
+        }
+    }
+}
+
+/// `PUT /api/agent/<name>/blob` — content-addressed upload. Write-gated, then the server computes and
+/// stores the sha256 (the client is never trusted). An optional client-claimed digest (`?sha256=` or
+/// the `X-Agit-Blob-Sha256` header) is checked against the computed one and a mismatch is a 409.
+/// Content-addressed ⇒ re-uploading identical bytes is idempotent.
+///
+/// A blob is opaque attacker-authored bytes, so it is deliberately NOT run through the secret scanner:
+/// the scanner exists to keep secrets out of the git transcript history (the source of truth); a blob
+/// never enters git, is never merged, and is served back only under the same ACL non-disclosure gate,
+/// with the same hardened download headers as a raw file. It is inert storage, not reviewable content.
+async fn api_blob_put(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+    // Size-first, like api_raw and the git push cap: refuse an oversize upload before doing any work.
+    if req.content_length as u64 > BLOB_MAX || body.len() as u64 > BLOB_MAX {
+        return Resp::err(413, &format!("blob too large; the ceiling is {BLOB_MAX} bytes"));
+    }
+    let meta = match gate(ctx, caller, name, Action::Write).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    // Optional client-claimed digest — query param first, then header.
+    let claimed = param(req.query(), "sha256").or_else(|| req.header("x-agit-blob-sha256").map(|s| s.to_string()));
+
+    let digest = match ctx.blobs.put(&meta.name, body).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("blob put failed for {}: {e}", meta.name);
+            return Resp::err(500, "failed to store blob");
+        }
+    };
+    if let Some(c) = claimed {
+        let c = c.trim().to_ascii_lowercase();
+        if !c.is_empty() && c != digest {
+            // Reject rather than trust the client: the bytes they sent do not hash to what they said.
+            return Resp::json_status(409, serde_json::json!({
+                "error": "digest mismatch: the bytes do not hash to the claimed sha256",
+                "claimed": c,
+                "sha256": digest,
+            }));
+        }
+    }
+    let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
+    audit_append(ctx.root(), &actor, audit::BLOB_PUT, Some(&meta.name), &digest).await;
+    Resp::json_status(201, serde_json::json!({ "sha256": digest, "size": body.len() }))
+}
+
+/// `GET /api/agent/<name>/blob/<digest>` — content-addressed download. Read-gated, with the SAME
+/// existence-non-disclosure as a private agent: the gate runs BEFORE the backend is touched, so
+/// "no such blob" and "no access to this agent" are indistinguishable (401/403/404 all from the gate).
+async fn api_blob_get(ctx: &Ctx, caller: &Caller, name: &str, digest: &str) -> Resp {
+    // A malformed digest could never name a real blob — 404, the same class as gate()'s malformed-name
+    // 404, so it leaks nothing. Checked before the gate: it is not agent-specific information.
+    if !blob::valid_digest(digest) {
+        return Resp::err(404, "not found");
+    }
+    let meta = match gate(ctx, caller, name, Action::Read).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match ctx.blobs.get(&meta.name, digest).await {
+        Ok(None) => Resp::err(404, "not found"),
+        Ok(Some(bytes)) => {
+            // Content-addressing invariant, verified at read time: the bytes are already buffered whole
+            // (to send them), so re-hashing is O(n) with no extra IO. A mismatch means fs corruption or
+            // an S3 object swapped underneath — refuse it (500 + audit) rather than serve bytes that do
+            // not match their address.
+            if blob::sha256_hex(&bytes) != digest {
+                let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
+                audit_append(ctx.root(), &actor, audit::BLOB_CORRUPT, Some(&meta.name), digest).await;
+                return Resp::err(500, "stored blob failed its integrity check");
+            }
+            // The identical hardened headers as api_raw: a blob is attacker-authored opaque bytes served
+            // from the hub's own cookie origin — exactly the stored-XSS surface these headers exist for.
+            Resp::new(200, "application/octet-stream", bytes)
+                .with("Content-Disposition", &format!("attachment; filename=\"{digest}\""))
+                .with("X-Content-Type-Options", "nosniff")
+                .with("Content-Security-Policy", "default-src 'none'; sandbox")
+        }
+        Err(e) => {
+            eprintln!("blob get failed for {}/{digest}: {e}", meta.name);
+            Resp::err(500, "failed to read blob")
         }
     }
 }

@@ -35,6 +35,11 @@ serde_json = "1"
 tempfile = "3"
 sha2 = "0.10"
 hex = "0.4"
+# S3-compatible object storage for the hub's content-addressed blob store (Garage in production). A
+# single self-contained async client — far lighter than aws-sdk-s3 (no aws-config/smithy stack) — that
+# cleanly does path-style S3 against Garage. `tokio-rustls-tls` (default features off) keeps the build
+# hermetic (no system OpenSSL). Always compiled, only instantiated when AGIT_HUB_S3_ENDPOINT is set.
+rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
 anyhow = "1"
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -24,6 +24,27 @@
 # /data instead, which is fine for a single-node self-host. Either way the bare git
 # repos and audit.log still live on the /data volume; only users/agents/tokens/MRs
 # move into the database.
+#
+# Blob backend (content-addressed object storage): chosen by AGIT_HUB_S3_ENDPOINT,
+# and ORTHOGONAL to the Postgres/SQLite choice above. Leave the hub's S3 env UNSET
+# (the default here) and blobs are stored on the /data volume under <root>/blobs —
+# the zero-config path, no extra service needed. Set the S3 env (see the commented
+# block in the hub service) to store blobs in the bundled Garage service instead.
+#
+# Garage does NOT auto-create its layout/bucket/key, so a Garage-backed deploy needs
+# a ONE-TIME init (like creating the first admin). After `up`, run once:
+#   # 1. Assign a storage layout to the single node (grab its id from `status`):
+#   docker compose -f deploy/docker-compose.yml exec garage /garage status
+#   docker compose -f deploy/docker-compose.yml exec garage /garage layout assign -z dc1 -c 1G <node-id>
+#   docker compose -f deploy/docker-compose.yml exec garage /garage layout apply --version 1
+#   # 2. Create the bucket the hub will use:
+#   docker compose -f deploy/docker-compose.yml exec garage /garage bucket create agit-blobs
+#   # 3. Mint an access key (prints an Access Key ID + Secret — capture both):
+#   docker compose -f deploy/docker-compose.yml exec garage /garage key create agit-hub-key
+#   # 4. Grant that key read+write on the bucket:
+#   docker compose -f deploy/docker-compose.yml exec garage /garage bucket allow --read --write agit-blobs --key agit-hub-key
+# Then bring the hub up with the key material and the S3 env uncommented:
+#   GARAGE_ACCESS_KEY=<id> GARAGE_SECRET_KEY=<secret> docker compose -f deploy/docker-compose.yml up -d
 
 services:
   hub:
@@ -34,10 +55,18 @@ services:
     restart: unless-stopped
     depends_on:
       - postgres
+      - garage
     # Postgres is the production backend. Drop this line to fall back to SQLite on
     # the /data volume. The password is shared with the postgres service below.
     environment:
       AGIT_HUB_DB: postgres://agithub:${PGPASSWORD:-agithub}@postgres:5432/agithub
+      # Uncomment to store blobs in Garage instead of on the /data volume (the keys
+      # come from `garage key create` — see the one-time init in the header):
+      # AGIT_HUB_S3_ENDPOINT: http://garage:3900
+      # AGIT_HUB_S3_BUCKET: agit-blobs
+      # AGIT_HUB_S3_REGION: garage
+      # AGIT_HUB_S3_ACCESS_KEY: ${GARAGE_ACCESS_KEY}
+      # AGIT_HUB_S3_SECRET_KEY: ${GARAGE_SECRET_KEY}
     # Only Caddy's address is pinned (below), so the hub can trust it precisely.
     command:
       - serve
@@ -74,6 +103,24 @@ services:
     expose:
       - "5432"
 
+  # S3-compatible object storage for the hub's content-addressed blob store. Only
+  # actually used when the hub's AGIT_HUB_S3_* env is set (above); otherwise it sits
+  # idle and blobs stay on the /data volume. Internal to the compose network, like
+  # Postgres — never published. Requires the one-time init documented in the header.
+  garage:
+    image: dxflrs/garage:v1.0.1
+    restart: unless-stopped
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    networks:
+      edge:
+    # The S3 API port; internal to the compose network (the hub reaches it at
+    # http://garage:3900). Not published to the host.
+    expose:
+      - "3900"
+
   caddy:
     image: caddy:2
     restart: unless-stopped
@@ -105,5 +152,7 @@ networks:
 volumes:
   hub-data:      # the hub's data root (audit.log, bare repos, and hub.db when on the SQLite backend)
   pg-data:       # Postgres data directory (the metadata store when on the Postgres backend)
+  garage-meta:   # Garage's metadata (layout, bucket/key registry) when blobs are on the S3 backend
+  garage-data:   # Garage's object data blocks when blobs are on the S3 backend
   caddy-data:    # Caddy's certificates + ACME account
   caddy-config:
