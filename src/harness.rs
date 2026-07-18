@@ -14,6 +14,7 @@
 //! settings. Stores written before that level exist on disk, so reads also resolve the flat
 //! harness/<runtime>/project — those keep working, and are never rewritten.
 
+use crate::{errln, outln};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -398,35 +399,35 @@ pub fn show(agent: &Path, env: &Path, runtime: &str) -> Result<i32> {
     let others = other_partitions(agent, env, &rt);
     match &own {
         Some(p) => {
-            println!("Captured harness ({rt}, project scope) — this checkout, {}:", env.display());
+            outln!("Captured harness ({rt}, project scope) — this checkout, {}:", env.display());
             let (servers, skills, commands, secrets) = summarize(p);
-            println!("  MCP servers : {servers}");
-            println!("  skills      : {skills}");
-            println!("  commands    : {commands}");
-            println!("  secrets     : {secrets} redacted field(s) to provide on apply");
-            println!("\n  Apply into this project: agit harness apply");
+            outln!("  MCP servers : {servers}");
+            outln!("  skills      : {skills}");
+            outln!("  commands    : {commands}");
+            outln!("  secrets     : {secrets} redacted field(s) to provide on apply");
+            outln!("\n  Apply into this project: agit harness apply");
         }
         None if others.is_empty() => {
-            println!("No captured harness for {rt}. Run `agit -a snap` to capture it.");
+            outln!("No captured harness for {rt}. Run `agit -a snap` to capture it.");
             return Ok(0);
         }
         // "nothing here" and "the agent has one" are both true, and printed as two flat statements they
         // read as contradicting each other — a dead end announced directly above the thing it denies.
         // One sentence, so the user reconciles nothing.
-        None => println!(
+        None => outln!(
             "Nothing captured in this checkout yet ({}) — but this agent carries a {rt} harness from elsewhere:",
             env.display()
         ),
     }
     if !others.is_empty() {
         if own.is_some() {
-            println!("\nThis agent also has a {rt} harness from other checkouts:");
+            outln!("\nThis agent also has a {rt} harness from other checkouts:");
         }
         for p in &others {
             let (servers, skills, commands, secrets) = summarize(p);
-            println!("  {} — {servers} MCP server(s), {skills} skill(s), {commands} command(s), {secrets} secret(s){}", p.label(), when(p));
+            outln!("  {} — {servers} MCP server(s), {skills} skill(s), {commands} command(s), {secrets} secret(s){}", p.label(), when(p));
         }
-        println!(
+        outln!(
             "\n  {}",
             match (own.is_some(), others.len()) {
                 (true, _) => "Adopt one instead of this checkout's: agit harness apply --from-env <checkout>".to_string(),
@@ -480,9 +481,9 @@ fn select(
                     labels.join("\n  ")
                 );
             }
-            println!("Nothing captured in this checkout ({}). This agent captured a {rt} harness in:", env.display());
+            outln!("Nothing captured in this checkout ({}). This agent captured a {rt} harness in:", env.display());
             for (i, p) in others.iter().enumerate() {
-                println!("  {}) {}{}", i + 1, p.label(), when(p));
+                outln!("  {}) {}{}", i + 1, p.label(), when(p));
             }
             print!("Adopt which? [1-{}]: ", others.len());
             let _ = stdout().flush();
@@ -516,20 +517,20 @@ pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool, from_env: Opt
     let own = own_partition(agent, env, &rt);
     let others = other_partitions(agent, env, &rt);
     let Some((chosen, is_own)) = select(own, others, env, from_env, &rt, stdin().is_terminal())? else {
-        println!("No captured harness for {rt} to apply.");
+        outln!("No captured harness for {rt} to apply.");
         return Ok(0);
     };
     let src = chosen.project();
     let (servers, skills, commands, secrets) = summarize(&chosen);
     if !is_own {
-        println!("Adopting the harness this agent captured in {}{} — this checkout ({}) has none of its own.", chosen.label(), when(&chosen), env.display());
+        outln!("Adopting the harness this agent captured in {}{} — this checkout ({}) has none of its own.", chosen.label(), when(&chosen), env.display());
     }
-    println!("Captured harness ({rt}): {servers} MCP servers, {skills} skills, {commands} commands, {secrets} secret(s) to provide.");
+    outln!("Captured harness ({rt}): {servers} MCP servers, {skills} skills, {commands} commands, {secrets} secret(s) to provide.");
 
     // Ask (decision 3): applying rewrites local .mcp.json / .claude — never silent.
     if !force {
         if !stdin().is_terminal() {
-            println!("Not applying: rerun at a terminal, or pass --force to apply non-interactively.");
+            outln!("Not applying: rerun at a terminal, or pass --force to apply non-interactively.");
             return Ok(0);
         }
         print!("Apply to this project? [y/N] ");
@@ -537,7 +538,7 @@ pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool, from_env: Opt
         let mut line = String::new();
         std::io::BufRead::read_line(&mut stdin().lock(), &mut line).ok();
         if !matches!(line.trim(), "y" | "Y" | "yes") {
-            println!("Skipped.");
+            outln!("Skipped.");
             return Ok(0);
         }
     }
@@ -566,12 +567,12 @@ pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool, from_env: Opt
         skipped.push("settings.json (may contain hooks that run commands — review and apply manually)".into());
     }
 
-    println!("\nApplied: {}", if applied.is_empty() { "(nothing)".into() } else { applied.join(", ") });
+    outln!("\nApplied: {}", if applied.is_empty() { "(nothing)".into() } else { applied.join(", ") });
     for s in &skipped {
-        println!("  skipped: {s}");
+        outln!("  skipped: {s}");
     }
     for u in &unresolved {
-        eprintln!("  ⚠ secret not provided: {u} — left as a placeholder in .mcp.json (set ${u} or edit it in)");
+        errln!("  ⚠ secret not provided: {u} — left as a placeholder in .mcp.json (set ${u} or edit it in)");
     }
     Ok(if unresolved.is_empty() { 0 } else { 1 })
 }

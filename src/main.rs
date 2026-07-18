@@ -224,40 +224,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
         // ── snap: mirror the runtime's session dump into the Agent Store (formerly named sync).
         //    --watch runs it continuously (fully automatic snap). ──
         "snap" => {
-            // No default runtime: `--from` (or a bare positional) names one, otherwise snap captures
-            // every runtime that has sessions here. See session::snap.
-            let mut rt: Option<String> = None;
-            let mut watch = false;
-            let mut interval = 5u64;
-            let mut harness = true;
-            let mut i = 0;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--from" if i + 1 < args.len() => {
-                        rt = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--watch" => {
-                        watch = true;
-                        i += 1;
-                    }
-                    "--interval" if i + 1 < args.len() => {
-                        interval = args[i + 1].parse().unwrap_or(5);
-                        i += 2;
-                    }
-                    "--no-harness" => {
-                        harness = false;
-                        i += 1;
-                    }
-                    other => {
-                        // a bare positional is shorthand for the runtime: `agit a snap codex`
-                        if !other.starts_with('-') {
-                            rt = Some(other.to_string());
-                        }
-                        i += 1;
-                    }
-                }
-            }
+            let (rt, watch, interval, harness) = parse_snap(args);
             match (watch, rt) {
                 // The watcher polls one runtime's dump; unnamed, `agit watch` is the both-runtimes loop.
                 (true, Some(rt)) => session::snap_watch_checked(&rt, interval, harness),
@@ -334,40 +301,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
         // ── watch: fully hands-off — watch both runtimes' dumps, auto-snap + auto-convert both ways.
         //    --daemon runs it forever in the background; --stop / --status manage it. ──
         "watch" => {
-            let mut interval = 5u64;
-            let mut convert = true;
-            let mut harness = true;
-            let mut action = 0u8; // 0=run 1=daemon 2=stop 3=status
-            let mut i = 0;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--interval" if i + 1 < args.len() => {
-                        interval = args[i + 1].parse().unwrap_or(5);
-                        i += 2;
-                    }
-                    "--no-convert" => {
-                        convert = false;
-                        i += 1;
-                    }
-                    "--no-harness" => {
-                        harness = false;
-                        i += 1;
-                    }
-                    "--daemon" | "--background" => {
-                        action = 1;
-                        i += 1;
-                    }
-                    "--stop" => {
-                        action = 2;
-                        i += 1;
-                    }
-                    "--status" => {
-                        action = 3;
-                        i += 1;
-                    }
-                    _ => i += 1,
-                }
-            }
+            let (interval, convert, harness, action) = parse_watch(args);
             match action {
                 1 => session::watch_daemon(interval, convert, harness),
                 2 => session::watch_stop(),
@@ -378,35 +312,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── harness: show / apply the captured MCP + skills + config (part of Agent State) ──
         "harness" => {
-            let mut rt: Option<String> = None;
-            let mut from_env: Option<String> = None;
-            let mut force = false;
-            let mut sub = "show".to_string();
-            let mut i = 0;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--from" if i + 1 < args.len() => {
-                        rt = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    // Which CHECKOUT's harness, when this agent captured one in several. The
-                    // non-interactive answer to that question, so a script is never left with a
-                    // prompt it cannot see.
-                    "--from-env" if i + 1 < args.len() => {
-                        from_env = Some(args[i + 1].clone());
-                        i += 2;
-                    }
-                    "--force" => {
-                        force = true;
-                        i += 1;
-                    }
-                    other if !other.starts_with('-') => {
-                        sub = other.to_string();
-                        i += 1;
-                    }
-                    _ => i += 1,
-                }
-            }
+            let (sub, rt, force, from_env) = parse_harness(args);
             harness_cmd(&sub, rt.as_deref(), force, from_env.as_deref())
         }
 
@@ -478,6 +384,126 @@ fn parse_start(args: &[String]) -> (Option<String>, Option<String>) {
         }
     }
     (agent, as_rt)
+}
+
+/// snap arguments: `--from <rt>` (or a bare positional) names the runtime, else snap captures every
+/// runtime with sessions here; `--watch` runs it continuously, `--interval <n>`, `--no-harness`.
+/// Returns (runtime, watch, interval, capture-harness).
+type SnapArgs = (Option<String>, bool, u64, bool);
+fn parse_snap(args: &[String]) -> SnapArgs {
+    // No default runtime: `--from` (or a bare positional) names one, otherwise snap captures every
+    // runtime that has sessions here. See session::snap.
+    let mut rt: Option<String> = None;
+    let mut watch = false;
+    let mut interval = 5u64;
+    let mut harness = true;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" if i + 1 < args.len() => {
+                rt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--watch" => {
+                watch = true;
+                i += 1;
+            }
+            "--interval" if i + 1 < args.len() => {
+                interval = args[i + 1].parse().unwrap_or(5);
+                i += 2;
+            }
+            "--no-harness" => {
+                harness = false;
+                i += 1;
+            }
+            other => {
+                // a bare positional is shorthand for the runtime: `agit a snap codex`
+                if !other.starts_with('-') {
+                    rt = Some(other.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    (rt, watch, interval, harness)
+}
+
+/// watch arguments: `--interval <n>`, `--no-convert`, `--no-harness`, and the action selector
+/// `--daemon`/`--background` (1), `--stop` (2), `--status` (3); default run (0).
+/// Returns (interval, do-convert, capture-harness, action).
+type WatchArgs = (u64, bool, bool, u8);
+fn parse_watch(args: &[String]) -> WatchArgs {
+    let mut interval = 5u64;
+    let mut convert = true;
+    let mut harness = true;
+    let mut action = 0u8; // 0=run 1=daemon 2=stop 3=status
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval" if i + 1 < args.len() => {
+                interval = args[i + 1].parse().unwrap_or(5);
+                i += 2;
+            }
+            "--no-convert" => {
+                convert = false;
+                i += 1;
+            }
+            "--no-harness" => {
+                harness = false;
+                i += 1;
+            }
+            "--daemon" | "--background" => {
+                action = 1;
+                i += 1;
+            }
+            "--stop" => {
+                action = 2;
+                i += 1;
+            }
+            "--status" => {
+                action = 3;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    (interval, convert, harness, action)
+}
+
+/// harness arguments: an optional subcommand positional (`show`/`apply`, default `show`), `--from <rt>`,
+/// `--from-env <path>`, `--force`. Returns (subcommand, runtime, force, from-env).
+type HarnessArgs = (String, Option<String>, bool, Option<String>);
+fn parse_harness(args: &[String]) -> HarnessArgs {
+    let mut rt: Option<String> = None;
+    let mut from_env: Option<String> = None;
+    let mut force = false;
+    let mut sub = "show".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--from" if i + 1 < args.len() => {
+                rt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            // Which CHECKOUT's harness, when this agent captured one in several. The
+            // non-interactive answer to that question, so a script is never left with a
+            // prompt it cannot see.
+            "--from-env" if i + 1 < args.len() => {
+                from_env = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            other if !other.starts_with('-') => {
+                sub = other.to_string();
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    (sub, rt, force, from_env)
 }
 
 /// convert arguments: positional src + --to (required) + --from/--cwd/--write.

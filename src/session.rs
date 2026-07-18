@@ -12,6 +12,7 @@
 use crate::adapter::claude_code;
 use crate::commands::Attribution;
 use crate::scope::{self, Scope};
+use crate::{errln, outln};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -110,9 +111,9 @@ pub fn resolve_runtime(explicit: Option<&str>, present: &[&'static str], what: &
             if !stdin().is_terminal() {
                 bail!("{names} all have sessions — say which with --from <runtime>.");
             }
-            println!("Sessions exist for {names}. Which runtime should agit {what}?");
+            outln!("Sessions exist for {names}. Which runtime should agit {what}?");
             for (i, rt) in many.iter().enumerate() {
-                println!("  {}) {rt}", i + 1);
+                outln!("  {}) {rt}", i + 1);
             }
             print!("Choice [1-{}]: ", many.len());
             let _ = stdout().flush();
@@ -201,7 +202,7 @@ fn store_for(by: Option<&Attribution>, id: &str) -> Result<Option<(PathBuf, Opti
     match crate::agent::info(by.aid()) {
         Ok(ag) => Ok(Some((ag.store, Some(ag.name)))),
         Err(e) => {
-            eprintln!(
+            errln!(
                 "  ⚠ {id} was launched by {} ({}), which this machine no longer has — not captured: {e:#}",
                 by.name(),
                 by.aid()
@@ -302,16 +303,16 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
     let rt = normalize(rt);
     let (routed, source_desc) = route(&rt, env)?;
 
-    println!("Mirrored the session dump for {}:", rt);
-    println!("  source : {source_desc}");
+    outln!("Mirrored the session dump for {}:", rt);
+    outln!("  source : {source_desc}");
     if routed.is_empty() {
-        println!("  (no sessions this project owns — nothing to mirror)");
+        outln!("  (no sessions this project owns — nothing to mirror)");
         return Ok(0);
     }
 
     for r in &routed {
         if let Some(n) = &r.note {
-            eprintln!("  note   : {n}");
+            errln!("  note   : {n}");
         }
         // Held across mirror + harness capture: everything this pass writes into the store.
         let _lock = lock_store(&r.store)?;
@@ -320,11 +321,11 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
             Some(a) => format!("   ({a} · {} session(s))", r.sessions.len()),
             None => String::new(),
         };
-        println!("  target : {}{who}", dst.display());
-        println!("  files  : {} files ({} updated / {} added), {} bytes", stats.total, stats.updated, stats.added, stats.bytes);
+        outln!("  target : {}{who}", dst.display());
+        outln!("  files  : {} files ({} updated / {} added), {} bytes", stats.total, stats.updated, stats.added, stats.bytes);
         if hits > 0 {
-            eprintln!("  ⚠ Found {hits} likely secrets — the session transcript carries sensitive content the agent has seen.");
-            eprintln!("     This will be blocked again before push; run `agit -a scan` first to check, or clear it from the transcript.");
+            errln!("  ⚠ Found {hits} likely secrets — the session transcript carries sensitive content the agent has seen.");
+            errln!("     This will be blocked again before push; run `agit -a scan` first to check, or clear it from the transcript.");
         }
 
         // Capture the harness (MCP servers / skills / config) alongside the sessions, redacting
@@ -333,17 +334,17 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
         if capture_harness {
             match crate::harness::capture(&r.store, env, &rt) {
                 Ok(h) if h.files > 0 => {
-                    println!("  harness: {} files ({} secret field(s) redacted)", h.files, h.redactions.len());
+                    outln!("  harness: {} files ({} secret field(s) redacted)", h.files, h.redactions.len());
                     for w in &h.warnings {
-                        eprintln!("  ⚠ {w}");
+                        errln!("  ⚠ {w}");
                     }
                 }
                 Ok(_) => {}
                 // Harness capture must never fail the snap — the session dump is already mirrored.
-                Err(e) => eprintln!("  ⚠ harness capture skipped: {e:#}"),
+                Err(e) => errln!("  ⚠ harness capture skipped: {e:#}"),
             }
         }
-        println!("\n  Commit: {}", r.commit_hint(&rt));
+        outln!("\n  Commit: {}", r.commit_hint(&rt));
     }
     Ok(0)
 }
@@ -579,9 +580,9 @@ pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> R
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
     let watch = source_path(&rt, &env);
 
-    println!("Auto-snapping {rt} on every change (settling window {interval_secs}s). Ctrl-C to stop.");
+    outln!("Auto-snapping {rt} on every change (settling window {interval_secs}s). Ctrl-C to stop.");
     if watch.as_deref().map(|p| !p.exists()).unwrap_or(true) {
-        println!("  (waiting for {rt} sessions to appear…)");
+        outln!("  (waiting for {rt} sessions to appear…)");
     }
 
     let mut last_sig = String::new();
@@ -599,7 +600,7 @@ pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> R
             // documented flag cannot have two behaviours decided by another flag.
             match capture_pass(&rt, &env, capture_harness, &mut count) {
                 Ok(touched) => announce_watching(&touched, &env, &mut announced),
-                Err(e) => eprintln!("  snap failed: {e:#}"),
+                Err(e) => errln!("  snap failed: {e:#}"),
             }
             pending = false;
         }
@@ -620,7 +621,7 @@ fn capture_pass(rt: &str, env: &Path, capture_harness: bool, count: &mut u64) ->
             // Never fatal: the next tick tries again, and a watcher that exits on contention is a
             // watcher that silently stops capturing.
             Err(e) => {
-                eprintln!("  snap {rt} skipped this tick: {e:#}");
+                errln!("  snap {rt} skipped this tick: {e:#}");
                 continue;
             }
         };
@@ -632,7 +633,7 @@ fn capture_pass(rt: &str, env: &Path, capture_harness: bool, count: &mut u64) ->
                 commit_snap(&r.store, rt, count);
             }
             Ok(_) => {}
-            Err(e) => eprintln!("  snap {rt} failed: {e:#}"),
+            Err(e) => errln!("  snap {rt} failed: {e:#}"),
         }
         drop(lock);
     }
@@ -655,7 +656,7 @@ fn commit_snap(agent: &Path, rt: &str, count: &mut u64) {
     match crate::commands::secret_gate(agent, true, "snap") {
         Ok(g) if g.allowed() => {}
         Ok(_) => {
-            eprintln!(
+            errln!(
                 "  ⚠ auto-snap not committed (suspected secrets) — mirrored to disk, held out of history. \
                  `agit -a scan` to see; set {}=1 to override.",
                 crate::commands::ALLOW_ENV
@@ -664,7 +665,7 @@ fn commit_snap(agent: &Path, rt: &str, count: &mut u64) {
             return;
         }
         Err(e) => {
-            eprintln!("  ⚠ auto-snap not committed — secret gate failed to run ({e:#}). `agit -a scan` to see.");
+            errln!("  ⚠ auto-snap not committed — secret gate failed to run ({e:#}). `agit -a scan` to see.");
             let _ = scope::git_in_status(agent, &["reset", "-q"]);
             return;
         }
@@ -679,9 +680,9 @@ fn commit_snap(agent: &Path, rt: &str, count: &mut u64) {
     );
     if rc == 0 {
         *count += 1;
-        println!("  ● snapped {ts}  (#{count})");
+        outln!("  ● snapped {ts}  (#{count})");
     } else {
-        eprintln!("  ⚠ auto-snap not committed — `git commit` refused it. `agit -a scan` to see.");
+        errln!("  ⚠ auto-snap not committed — `git commit` refused it. `agit -a scan` to see.");
         let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
     }
 }
@@ -827,7 +828,7 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
     let mut stores: Vec<PathBuf> = convert_target().into_iter().collect();
     let mut announced = std::collections::HashSet::new();
     announce_watching(&stores, &env, &mut announced);
-    println!(
+    outln!(
         "Watching {} every {}s: auto-snap{}. Ctrl-C to stop.",
         runtime_list(),
         interval.as_secs(),
@@ -852,7 +853,7 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
                             }
                         }
                     }
-                    Err(e) => eprintln!("  snap {rt} failed: {e:#}"),
+                    Err(e) => errln!("  snap {rt} failed: {e:#}"),
                 }
             }
         }
@@ -940,7 +941,7 @@ fn announce_watching(stores: &[PathBuf], env: &Path, announced: &mut std::collec
             started: now_iso(),
         };
         if let Err(e) = scope::agit_home().and_then(|h| record_watcher_at(&h, &w)) {
-            eprintln!("  ⚠ watcher not announced ({e:#}) — `agit a list` will not show this agent as watched.");
+            errln!("  ⚠ watcher not announced ({e:#}) — `agit a list` will not show this agent as watched.");
         }
     }
 }
@@ -976,7 +977,7 @@ pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool)
     let pidp = rundir.join(WATCH_PID);
     if let Some(pid) = read_pid(&pidp) {
         if pid_alive(pid) {
-            println!("agit watch already running (pid {pid}). Stop it with: agit watch --stop");
+            outln!("agit watch already running (pid {pid}). Stop it with: agit watch --stop");
             return Ok(0);
         }
     }
@@ -1013,9 +1014,9 @@ pub fn watch_daemon(interval_secs: u64, do_convert: bool, capture_harness: bool)
     let child = cmd.spawn().context("failed to spawn the background watcher")?;
     let pid = child.id();
     std::fs::write(&pidp, pid.to_string())?;
-    println!("agit watch started in the background (pid {pid}).");
-    println!("  log:    {}", logp.display());
-    println!("  status: agit watch --status   ·   stop: agit watch --stop");
+    outln!("agit watch started in the background (pid {pid}).");
+    outln!("  log:    {}", logp.display());
+    outln!("  status: agit watch --status   ·   stop: agit watch --stop");
     Ok(0)
 }
 
@@ -1031,14 +1032,14 @@ pub fn watch_stop() -> Result<i32> {
                 .unwrap_or(false);
             let _ = std::fs::remove_file(&pidp);
             if killed {
-                println!("Stopped agit watch (pid {pid}).");
+                outln!("Stopped agit watch (pid {pid}).");
             } else {
-                println!("No live process for pid {pid}; cleared the stale pidfile.");
+                outln!("No live process for pid {pid}; cleared the stale pidfile.");
             }
             Ok(0)
         }
         None => {
-            println!("No background watcher is recorded for this project.");
+            outln!("No background watcher is recorded for this project.");
             Ok(0)
         }
     }
@@ -1049,10 +1050,10 @@ pub fn watch_status() -> Result<i32> {
     let rundir = watch_rundir(&scope::env_root()?)?;
     match read_pid(&rundir.join(WATCH_PID)) {
         Some(pid) if pid_alive(pid) => {
-            println!("agit watch is running (pid {pid}).");
-            println!("  log: {}", rundir.join("agit-watch.log").display());
+            outln!("agit watch is running (pid {pid}).");
+            outln!("  log: {}", rundir.join("agit-watch.log").display());
         }
-        _ => println!("agit watch is not running for this project."),
+        _ => outln!("agit watch is not running for this project."),
     }
     Ok(0)
 }

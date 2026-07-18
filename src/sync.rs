@@ -21,6 +21,7 @@
 use crate::agent;
 use crate::convo::{self, ConvertOpts};
 use crate::scope::{self};
+use crate::{errln, outln};
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -277,11 +278,11 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
         // An empty tail means two very different things, and conflating them IS the bug this fixes.
         // Grounded in a shared ancestor, empty is the truth: nothing diverged, we are up to date.
         if grounded {
-            println!("{} added no {rt} sessions since the common ancestor — nothing to reconcile by dialogue.", target.label());
+            outln!("{} added no {rt} sessions since the common ancestor — nothing to reconcile by dialogue.", target.label());
             // A dry run reports what WOULD happen and mutates nothing — not even the git fuse.
             if dry_run {
                 if mode == Mode::Fuse {
-                    println!("(dry run) would fuse the git histories (same agent) — nothing else to do.");
+                    outln!("(dry run) would fuse the git histories (same agent) — nothing else to do.");
                 }
                 return Ok(0);
             }
@@ -316,7 +317,7 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
     if dry_run {
         let a_side = SidePreview { branch: branch_a.as_deref(), sessions: &a_all, voice: &a_voice };
         let b_side = SidePreview { branch: branch_b.as_deref(), sessions: &b_all, voice: &b_voice };
-        println!("{}", dry_run_report(&target.label(), mode, &a_side, &b_side));
+        outln!("{}", dry_run_report(&target.label(), mode, &a_side, &b_side));
         return Ok(0);
     }
 
@@ -328,13 +329,13 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
         let new_id = convo::fresh_id("session");
         let combined = splice_sessions(&rt, &a_voice, &b_voice, &new_id, &env)?;
         crate::register::install(&rt, &new_id, &env, &combined)?;
-        println!("── splice (no model) ──");
-        println!(
+        outln!("── splice (no model) ──");
+        outln!(
             "Combined {} local + {} incoming session(s) into one. Resume it and the agent reads both sides:",
             a_all.len(),
             b_all.len()
         );
-        println!("  {}", resume_cmd(&rt, &env, &new_id));
+        outln!("  {}", resume_cmd(&rt, &env, &new_id));
         // Same agent: fuse the git histories too, so the two copies become one memory again.
         return if mode == Mode::Fuse { Ok(fuse(&agent, &target)?) } else { Ok(0) };
     }
@@ -347,19 +348,19 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
     let mut worktrees: Vec<PathBuf> = Vec::new();
     let grounded = ground_on_worktrees(&env, &branch_a, &branch_b, &mut a, &mut b, &mut worktrees)?;
     if grounded {
-        eprintln!(
+        errln!(
             "Two worktrees: A@{} · B@{} (each carries its own diff since the common ancestor).",
             branch_a.as_deref().unwrap_or("?"),
             branch_b.as_deref().unwrap_or("?")
         );
     } else {
-        eprintln!("! Both code branches aren't in this repo (or share a name) — falling back to a single tree: the agents only see the current checkout, not each other's code.");
+        errln!("! Both code branches aren't in this repo (or share a name) — falling back to a single tree: the agents only see the current checkout, not each other's code.");
     }
 
     // 5. Revive the voice session per side, bound to its own tree (never touching the user's real sessions).
     install_copy(&rt, &a_voice, &a.id, &a.cwd)?;
     install_copy(&rt, &b_voice, &b.id, &b.cwd)?;
-    eprintln!(
+    errln!(
         "Reviving both sessions (read-only): A={} ({} local) … B={} ({} incoming) …",
         &a.id[..8], a_all.len(), &b.id[..8], b_all.len()
     );
@@ -370,16 +371,16 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
         let transcript = run_dialogue(&rt, &a, &b, quick)?;
         let (resolved, open) = synthesize(&transcript)?;
         let archive = save_transcript(&agent, &rt, &a.id, &b.id, &transcript)?;
-        println!("── sync result ──");
+        outln!("── sync result ──");
         if !resolved.is_empty() {
-            println!("Agreed:\n{resolved}");
+            outln!("Agreed:\n{resolved}");
         }
-        println!("\nTranscript archived → {}", archive.display());
-        println!("Merged state (both contexts + the reconciliation) — resume it to continue:");
-        println!("  {}", resume_cmd(&rt, &env, &a.id));
+        outln!("\nTranscript archived → {}", archive.display());
+        outln!("Merged state (both contexts + the reconciliation) — resume it to continue:");
+        outln!("  {}", resume_cmd(&rt, &env, &a.id));
         if both {
             if let Err(e) = emit_both(&rt, &b, &env) {
-                eprintln!("(--both) couldn't materialize B's merged state: {e}");
+                errln!("(--both) couldn't materialize B's merged state: {e}");
             }
         }
         resolve_inline(&rt, &a, &open, &agent, &b.id)
@@ -402,9 +403,9 @@ fn announce(target: &Target, theirs: Option<&str>, mode: Mode) {
     let label = target.label();
     let aid = theirs.map(short_aid).unwrap_or_else(|| "no aid recorded".into());
     match mode {
-        Mode::Fuse => println!("{label} is this agent ({aid}) — reconciling, then merging the histories."),
+        Mode::Fuse => outln!("{label} is this agent ({aid}) — reconciling, then merging the histories."),
         Mode::DialogueOnly => {
-            println!("{label} is a different agent ({aid}) — reconciling by dialogue; histories stay separate.")
+            outln!("{label} is a different agent ({aid}) — reconciling by dialogue; histories stay separate.")
         }
     }
 }
@@ -458,10 +459,10 @@ fn fuse(store: &Path, target: &Target) -> Result<i32> {
             "FETCH_HEAD".to_string()
         }
     };
-    println!("\nMerging the histories (same agent):");
+    outln!("\nMerging the histories (same agent):");
     let rc = scope::git_in_inherit(store, &["merge", &spec]);
     if rc != 0 {
-        eprintln!(
+        errln!(
             "  ⚠ git merge left conflicts in the Agent Store. The reconciliation above is already \
              recorded; resolve the files and `agit a commit`."
         );
@@ -488,7 +489,7 @@ fn peer_sessions(store: &Path, target: &Target, rt: &str) -> Result<(Vec<(String
             let related = scope::git_in_status(store, &["merge-base", "HEAD", r]).0 == 0;
             let range = if related { format!("HEAD...{r}") } else { format!("HEAD..{r}") };
             if !related {
-                eprintln!("No common ancestor with {r} — enumerating its sessions directly (two-dot).");
+                errln!("No common ancestor with {r} — enumerating its sessions directly (two-dot).");
             }
             let (rc, out) = scope::git_in_status(
                 store,
@@ -600,17 +601,17 @@ impl Decision {
 fn resolve_inline(rt: &str, a: &Side, open: &str, agent: &Path, b_id: &str) -> Result<i32> {
     let items = parse_conflicts(open);
     if items.is_empty() {
-        println!("\nNothing left for you to decide.");
+        outln!("\nNothing left for you to decide.");
         return Ok(0);
     }
     // A merge in CI must never block on a prompt nobody can answer: print what needed deciding, with
     // every option, and leave non-zero for the pipeline to act on.
     if !crate::ui::interactive() {
-        println!("\nNeeds your decision — rerun at a terminal to answer, or decide these by hand:");
+        outln!("\nNeeds your decision — rerun at a terminal to answer, or decide these by hand:");
         for (i, c) in items.iter().enumerate() {
-            println!("\n[{}/{}] {}", i + 1, items.len(), c.what);
+            outln!("\n[{}/{}] {}", i + 1, items.len(), c.what);
             for (n, o) in c.options.iter().enumerate() {
-                println!("    {}) {o}", n + 1);
+                outln!("    {}) {o}", n + 1);
             }
         }
         return Ok(1);
@@ -639,11 +640,11 @@ fn resolve_inline(rt: &str, a: &Side, open: &str, agent: &Path, b_id: &str) -> R
     // Persist the whole ledger — rejections and deferrals are decisions too, so every conflict is on the
     // record, not only the resolved ones. Deterministic record-keeping: no model, always written.
     let ledger_path = save_decisions(agent, rt, &a.id, b_id, &ledger)?;
-    println!("\nDecision ledger recorded → {}", ledger_path.display());
+    outln!("\nDecision ledger recorded → {}", ledger_path.display());
 
     let settled: Vec<String> = ledger.iter().filter_map(|(c, d)| d.settled(&c.what)).collect();
     if settled.is_empty() {
-        println!("\nAll left open:\n{open}");
+        outln!("\nAll left open:\n{open}");
         return Ok(1);
     }
     // Bake the human's settled decisions into A's session so `resume` continues with them decided.
@@ -657,7 +658,7 @@ fn resolve_inline(rt: &str, a: &Side, open: &str, agent: &Path, b_id: &str) -> R
              forward (do not edit files):\n{joined}\nReply 'noted'."
         ),
     );
-    println!("\nRecorded {} decision(s) into the merged state.", settled.len());
+    outln!("\nRecorded {} decision(s) into the merged state.", settled.len());
     if settled.len() < items.len() {
         Ok(1) // some left open
     } else {
@@ -763,7 +764,7 @@ fn turn_aloud(who: char, rt: &str, cwd: &Path, id: &str, prompt: &str, tools: bo
     let reply = turn_with(rt, cwd, id, prompt, tools);
     let took = spinner.stop();
     let msg = reply?;
-    println!(
+    outln!(
         "\n{} {msg}\n{}",
         crate::ui::accent(&format!("{who} →")),
         crate::ui::dim(&format!("  ({}s)", took.as_secs()))
@@ -791,8 +792,8 @@ fn emit_both(rt: &str, b: &Side, env: &Path) -> Result<()> {
     let content = std::fs::read_to_string(&path)?;
     let b_merged = convo::fresh_id("sync-b-merged");
     install_copy(rt, &content, &b_merged, env)?;
-    println!("B's merged state — resume it on B's branch:");
-    println!("  (cd {} && claude --resume {b_merged})", env.display());
+    outln!("B's merged state — resume it on B's branch:");
+    outln!("  (cd {} && claude --resume {b_merged})", env.display());
     Ok(())
 }
 

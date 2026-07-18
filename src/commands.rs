@@ -7,6 +7,7 @@ use crate::agent;
 use crate::scan;
 use crate::scope::{self, Scope};
 use crate::ui;
+use crate::{errln, out, outln};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -14,9 +15,9 @@ use walkdir::WalkDir;
 // ─────────────────────── Adapter: runtime ↔ AgentState ───────────────────────
 
 pub fn adapter_list() -> Result<i32> {
-    println!("Registered runtime adapters:");
+    outln!("Registered runtime adapters:");
     for (name, desc) in adapter::list() {
-        println!("  {name:<14} {desc}");
+        outln!("  {name:<14} {desc}");
     }
     Ok(0)
 }
@@ -49,9 +50,9 @@ fn scan_root(root: &std::path::Path, staged: bool, paths: &[PathBuf]) -> Result<
     };
 
     if !findings.is_empty() {
-        eprintln!("Found suspected secrets:");
+        errln!("Found suspected secrets:");
         for (name, f) in &findings {
-            eprintln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
+            errln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
         }
     }
     finish_scan(findings.len(), staged, scanned)
@@ -176,19 +177,19 @@ pub fn secret_gate(store: &Path, staged: bool, verb: &str) -> Result<Gate> {
         return Ok(Gate::Clean);
     }
 
-    eprintln!("agit: secret gate — suspected secrets in what you are about to {verb}:");
+    errln!("agit: secret gate — suspected secrets in what you are about to {verb}:");
     for (name, f) in &findings {
-        eprintln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
+        errln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
     }
 
     if allow_override_enabled() {
-        eprintln!(
+        errln!(
             "  {ALLOW_ENV} is set — gate BYPASSED for this {verb}. This override is explicit and auditable \
              (unlike git --no-verify, which leaves no trace). You own the consequences: pushing publishes these to the team."
         );
         Ok(Gate::Overridden)
     } else {
-        eprintln!(
+        errln!(
             "{} suspected. Fix them, mark a false positive with a `{}` pragma or a `{}` entry, or — to override \
              this gate wholesale — re-run with {ALLOW_ENV}=1 (disclosed and auditable, not a silent bypass).",
             findings.len(),
@@ -202,12 +203,12 @@ pub fn secret_gate(store: &Path, staged: bool, verb: &str) -> Result<Gate> {
 /// scan_root wrap-up: unifies the "found/not found" report and exit code.
 fn finish_scan(total: usize, staged: bool, scanned: usize) -> Result<i32> {
     if total > 0 {
-        eprintln!("\n{total} of them. Once the AgentState is pushed, a teammate who pulls carries them along.");
-        eprintln!("Fix it. Or use --no-verify to bypass this hook and explicitly own the consequences.");
+        errln!("\n{total} of them. Once the AgentState is pushed, a teammate who pulls carries them along.");
+        errln!("Fix it. Or use --no-verify to bypass this hook and explicitly own the consequences.");
         return Ok(1);
     }
     if !staged {
-        println!("Scanned {scanned} files, no secrets found.");
+        outln!("Scanned {scanned} files, no secrets found.");
     }
     Ok(0)
 }
@@ -294,25 +295,25 @@ pub fn convert_cmd(
     // The output = a new copy of sensitive content; scan it at high precision before writing to disk (jsonl: entropy detection off)
     let hits = scan::scan_text_opts(&out, true).len();
 
-    println!("convert {from} → {to}{}", if cross { " (cross-vendor: content-level, drops encrypted reasoning and narrated tools)" } else { " (same vendor: byte-level replay)" });
-    println!("  source   : {}", src.display());
-    println!("  new id   : {new_id}");
-    println!("  turns/ln : {} events → {} lines", ir.events.len(), out.lines().count());
-    println!("  dest cwd : {}", cwd.display());
+    outln!("convert {from} → {to}{}", if cross { " (cross-vendor: content-level, drops encrypted reasoning and narrated tools)" } else { " (same vendor: byte-level replay)" });
+    outln!("  source   : {}", src.display());
+    outln!("  new id   : {new_id}");
+    outln!("  turns/ln : {} events → {} lines", ir.events.len(), out.lines().count());
+    outln!("  dest cwd : {}", cwd.display());
     if hits > 0 {
-        eprintln!("  ⚠ scanned {hits} suspected secrets in the output -- a new copy of content the source session saw, so be careful not to leak it.");
+        errln!("  ⚠ scanned {hits} suspected secrets in the output -- a new copy of content the source session saw, so be careful not to leak it.");
     }
 
     if !write {
         let preview: String = out.lines().take(3).collect::<Vec<_>>().join("\n");
-        println!("\n  preview (first 3 lines):\n{preview}");
-        println!("\n  -- dry-run, nothing written. Add --write to install and print the resume command.");
+        outln!("\n  preview (first 3 lines):\n{preview}");
+        outln!("\n  -- dry-run, nothing written. Add --write to install and print the resume command.");
         return Ok(0);
     }
 
     let h = crate::register::install(to, &new_id, &cwd, &out)?;
-    println!("\n  written: {}", h.path.display());
-    println!("  resume : {}", h.resume_cmd);
+    outln!("\n  written: {}", h.path.display());
+    outln!("  resume : {}", h.resume_cmd);
     Ok(0)
 }
 
@@ -320,20 +321,20 @@ pub fn convert_cmd(
 pub fn workspace_show() -> Result<i32> {
     let head = scope::workspace_dir()?.join("HEAD.json");
     if !head.exists() {
-        println!("No WorkspaceRevision yet. One is generated automatically after either repo commits.");
+        outln!("No WorkspaceRevision yet. One is generated automatically after either repo commits.");
         return Ok(0);
     }
-    println!("{}", std::fs::read_to_string(head)?);
+    outln!("{}", std::fs::read_to_string(head)?);
     Ok(0)
 }
 
 pub fn workspace_log() -> Result<i32> {
     let log = scope::workspace_dir()?.join("log.jsonl");
     if !log.exists() {
-        println!("No WorkspaceRevision yet.");
+        outln!("No WorkspaceRevision yet.");
         return Ok(0);
     }
-    print!("{}", std::fs::read_to_string(log)?);
+    out!("{}", std::fs::read_to_string(log)?);
     Ok(0)
 }
 
@@ -362,15 +363,15 @@ pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
     let short = |s: &str| s.chars().take(9).collect::<String>();
     let Some(sel) = selector else {
         // No selector given: list the joint states to choose from (newest first).
-        println!("Restorable joint states (newest first):\n");
+        outln!("Restorable joint states (newest first):\n");
         for (i, r) in revs.iter().enumerate() {
             let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
             let trig = r.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
             let ar = r.get("agent_rev").and_then(|v| v.as_str()).unwrap_or("");
             let ec = r.get("env").and_then(|e| e.get("head_commit")).and_then(|v| v.as_str()).unwrap_or("");
-            println!("  {:>2}. {ts}  {trig:14}  agent {} · env {}", i + 1, short(ar), short(ec));
+            outln!("  {:>2}. {ts}  {trig:14}  agent {} · env {}", i + 1, short(ar), short(ec));
         }
-        println!("\nUse `agit workspace restore <number>` or `restore <agent-rev prefix>` to roll back.");
+        outln!("\nUse `agit workspace restore <number>` or `restore <agent-rev prefix>` to roll back.");
         return Ok(0);
     };
 
@@ -397,18 +398,18 @@ pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
     }
 
     let env = scope::env_root()?;
-    println!("Restoring joint state → env {} · agent {}", short(env_commit), short(agent_rev));
-    println!("(Both repos will checkout to that commit, entering detached HEAD; git will refuse to overwrite uncommitted changes.)\n");
+    outln!("Restoring joint state → env {} · agent {}", short(env_commit), short(agent_rev));
+    outln!("(Both repos will checkout to that commit, entering detached HEAD; git will refuse to overwrite uncommitted changes.)\n");
 
     // Environment first, then Agent Store. Stop on the first failure so the user sees git's real error.
-    println!("Environment:");
+    outln!("Environment:");
     let ec = scope::git_in_inherit(&env, &["checkout", env_commit]);
     if ec != 0 {
         anyhow::bail!("Environment checkout failed (exit code {ec}). Commit or stash your unsaved changes first.");
     }
     if !agent_rev.is_empty() {
         if let Ok(agent) = scope::agent_root() {
-            println!("Agent Store:");
+            outln!("Agent Store:");
             // Moving HEAD under a concurrent snap is what the store lock exists for: one store is
             // shared by every repo that tracks the agent, and a watcher in another repo is a writer.
             let _lock = crate::session::lock_store(&agent)?;
@@ -418,7 +419,7 @@ pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
             }
         }
     }
-    println!("\nBack at that joint state. To build on it, create a branch with `agit checkout -b <branch>` / `agit -a checkout -b <branch>`.");
+    outln!("\nBack at that joint state. To build on it, create a branch with `agit checkout -b <branch>` / `agit -a checkout -b <branch>`.");
     Ok(0)
 }
 
@@ -429,27 +430,27 @@ pub fn workspace_restore(selector: Option<&str>) -> Result<i32> {
 pub fn workspace_graph() -> Result<i32> {
     let mut revs = workspace_revisions()?;
     if revs.is_empty() {
-        println!("No WorkspaceRevisions yet. One is generated automatically after either repo moves a ref.");
+        outln!("No WorkspaceRevisions yet. One is generated automatically after either repo moves a ref.");
         return Ok(0);
     }
     revs.reverse(); // oldest first, so the timeline reads top-to-bottom
     let short = |s: &str| s.chars().take(9).collect::<String>();
-    println!("Workspace timeline ({} revisions, oldest first):\n", revs.len());
+    outln!("Workspace timeline ({} revisions, oldest first):\n", revs.len());
     for r in &revs {
         let ts = r.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
         let trig = r.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
         let ar = r.get("agent_rev").and_then(|v| v.as_str()).unwrap_or("");
         let ec = r.get("env").and_then(|e| e.get("head_commit")).and_then(|v| v.as_str()).unwrap_or("");
-        println!("● {ts}  {trig}");
-        println!("│   agent {}  ·  env {}", if ar.is_empty() { "∅".into() } else { short(ar) }, short(ec));
+        outln!("● {ts}  {trig}");
+        outln!("│   agent {}  ·  env {}", if ar.is_empty() { "∅".into() } else { short(ar) }, short(ec));
         if let Some(rels) = r.get("relations").and_then(|v| v.as_array()) {
             for e in rels {
                 if let Some(e) = e.as_str() {
-                    println!("│   ⇄ {e}");
+                    outln!("│   ⇄ {e}");
                 }
             }
         }
-        println!("│");
+        outln!("│");
     }
     Ok(0)
 }
@@ -557,12 +558,12 @@ pub fn convert_pass(agent: &Path, env: &Path, seen: &mut std::collections::HashS
                         // Unsigned here: the converted copy's captured content differs from this source,
                         // so its authoritative signature is written at capture, into the sidecar.
                         if let Err(err) = record_launch(&new_id, &o.aid, &o.name, env, to, None) {
-                            eprintln!("  ⚠ {from}→{to} launch record not written ({err:#}) — capture will attribute this copy by repo default.");
+                            errln!("  ⚠ {from}→{to} launch record not written ({err:#}) — capture will attribute this copy by repo default.");
                         }
                     }
-                    println!("  ● {from}→{to}  {}", h.resume_cmd);
+                    outln!("  ● {from}→{to}  {}", h.resume_cmd);
                 }
-                Err(err) => eprintln!("  ⚠ {from}→{to} {}: {err:#}", e.path.display()),
+                Err(err) => errln!("  ⚠ {from}→{to} {}: {err:#}", e.path.display()),
             }
         }
     }
@@ -576,7 +577,7 @@ pub fn convert_watch(interval_secs: u64) -> Result<i32> {
     let env = scope::env_root()?;
     let interval = Duration::from_secs(interval_secs.max(1));
     let mut seen = std::collections::HashSet::new();
-    println!(
+    outln!(
         "Auto-converting sessions both ways (claude-code ↔ codex) every {}s. Ctrl-C to stop.",
         interval.as_secs()
     );
@@ -634,25 +635,25 @@ pub fn resume_cmd(
 
     let hits = scan::scan_text_opts(&out, true).len();
     if hits > 0 {
-        eprintln!("  ⚠ {hits} suspected secret(s) in the materialized session -- a fresh copy of what the source saw.");
+        errln!("  ⚠ {hits} suspected secret(s) in the materialized session -- a fresh copy of what the source saw.");
     }
     let h = crate::register::install(&to, &new_id, &cwd, &out)?;
-    println!("Installed → {}", h.path.display());
+    outln!("Installed → {}", h.path.display());
     if let Some(envp) = &rebound {
         let origin = ir.cwd.as_deref().unwrap_or("(unknown)");
-        println!("Environment: {}  (rebound from {origin})", envp.display());
+        outln!("Environment: {}  (rebound from {origin})", envp.display());
         if relocate {
-            println!("  relocated: rewrote {origin} → {} throughout the transcript", envp.display());
+            outln!("  relocated: rewrote {origin} → {} throughout the transcript", envp.display());
         } else {
-            eprintln!(
+            errln!(
                 "  note: the session's own cwd is rebound; paths it recorded under {origin} are kept as-is\n         (they're its memory of that codebase). Pass --relocate if this is the SAME project moved."
             );
         }
     }
-    println!("Resume: {}", h.resume_cmd);
+    outln!("Resume: {}", h.resume_cmd);
 
     if exec {
-        println!("\nLaunching…\n");
+        outln!("\nLaunching…\n");
         let status = std::process::Command::new("sh").arg("-c").arg(&h.resume_cmd).status()?;
         return Ok(status.code().unwrap_or(0));
     }
@@ -934,8 +935,8 @@ pub fn provenance_cmd(args: &[String]) -> Result<i32> {
         Some("verify") => provenance_verify(args.get(1).map(|s| s.as_str())),
         Some("key") | Some("show") | None => provenance_key(),
         Some(other) => {
-            eprintln!("agit provenance: unknown subcommand `{other}`");
-            eprintln!("  usage: agit provenance verify <session>   ·   agit provenance key");
+            errln!("agit provenance: unknown subcommand `{other}`");
+            errln!("  usage: agit provenance verify <session>   ·   agit provenance key");
             Ok(2)
         }
     }
@@ -944,10 +945,10 @@ pub fn provenance_cmd(args: &[String]) -> Result<i32> {
 /// Print this machine's signing identity (minting it if absent). The public key is safe to show and share.
 fn provenance_key() -> Result<i32> {
     let pk = agent::machine_pubkey_hex()?;
-    println!("machine signing key (ed25519)");
-    println!("  pubkey {pk}");
-    println!("  stored {}", scope::agit_home()?.join("identity").join("ed25519").display());
-    println!("  (private key is 0600; sessions you capture are signed with it)");
+    outln!("machine signing key (ed25519)");
+    outln!("  pubkey {pk}");
+    outln!("  stored {}", scope::agit_home()?.join("identity").join("ed25519").display());
+    outln!("  (private key is 0600; sessions you capture are signed with it)");
     Ok(0)
 }
 
@@ -962,14 +963,14 @@ fn provenance_verify(session: Option<&str>) -> Result<i32> {
         .with_context(|| format!("cannot read session {}", transcript.display()))?;
     let status = verify_provenance(&content, sidecar_provenance(&transcript).as_ref());
 
-    println!("session {}", transcript.display());
-    println!("  {}", status.summary());
+    outln!("session {}", transcript.display());
+    outln!("  {}", status.summary());
     if let ProvenanceStatus::Verified { email, .. } = &status {
-        println!("  committer {email}");
+        outln!("  committer {email}");
     }
     if let ProvenanceStatus::ContentTampered { recorded, actual } = &status {
-        println!("  signed digest  {recorded}");
-        println!("  current digest {actual}");
+        outln!("  signed digest  {recorded}");
+        outln!("  current digest {actual}");
     }
     // Never block: an unsigned session is a soft "unverified" (exit 0, like the attribution fallback); a
     // signature that is present but does NOT check out is a hard failure worth a non-zero code.
@@ -1149,7 +1150,7 @@ pub fn report_incoming(store: &Path) {
     }
     let new: Vec<&str> = out.lines().filter(|l| l.ends_with(".jsonl")).collect();
     if new.is_empty() {
-        println!("  up to date — no new sessions on the remote.");
+        outln!("  up to date — no new sessions on the remote.");
         return;
     }
     // Break the count down per runtime by asking the registry which runtimes exist, not by naming any
@@ -1162,8 +1163,8 @@ pub fn report_incoming(store: &Path) {
         })
         .collect();
     let suffix = if breakdown.is_empty() { String::new() } else { format!(" ({})", breakdown.join(", ")) };
-    println!("  {} new session(s) on the remote{suffix}.", new.len());
-    println!("  integrate with: agit a pull");
+    outln!("  {} new session(s) on the remote{suffix}.", new.len());
+    outln!("  integrate with: agit a pull");
 }
 
 // ─────────────────────── status: this repo's agents at a glance ───────────────────────
@@ -1197,7 +1198,7 @@ pub fn agent_status() -> Result<i32> {
     let resolved = agent::resolve(None).ok();
     let active_aid = resolved.as_ref().map(|a| a.aid.clone());
 
-    println!("{}", ui::dim(&format!("repo {}", ui::tilde(&env))));
+    outln!("{}", ui::dim(&format!("repo {}", ui::tilde(&env))));
 
     // The agents this repo works with = the committed binding; fall back to the resolved active agent
     // when there is no binding yet (a repo that only ran `agit a init` before this landed).
@@ -1208,7 +1209,7 @@ pub fn agent_status() -> Result<i32> {
         _ => match &resolved {
             Some(a) => vec![(a.name.clone(), a.aid.clone())],
             None => {
-                println!("no agents bound to this repo — agit a init <name> mints one.");
+                outln!("no agents bound to this repo — agit a init <name> mints one.");
                 return Ok(0);
             }
         },
@@ -1239,16 +1240,16 @@ pub fn agent_status() -> Result<i32> {
             vec![name.clone(), status, sessions, format!("{last}{here}")]
         })
         .collect();
-    println!("{}", ui::table(&["AGENT", "STATUS", "SESSIONS", "LAST"], &rows));
+    outln!("{}", ui::table(&["AGENT", "STATUS", "SESSIONS", "LAST"], &rows));
 
     if let Some(d) = binding.as_ref().and_then(|b| b.default.clone()) {
-        println!("{}", ui::dim(&format!("default: {d}")));
+        outln!("{}", ui::dim(&format!("default: {d}")));
     }
 
     // Where the active store stands against its remote — the unpushed/ahead-behind the overview exists
     // to surface. Only for a cloned active agent (a store to ask git about).
     if let Some(a) = resolved.as_ref().filter(|a| a.store.join(".git").exists()) {
-        println!("\n{} {}", ui::bold(&a.name), ui::dim(&upstream_line(&a.store)));
+        outln!("\n{} {}", ui::bold(&a.name), ui::dim(&upstream_line(&a.store)));
     }
     Ok(0)
 }
@@ -1297,7 +1298,7 @@ fn start_carrying(ag: &agent::Agent, env: &Path, s: StoredSession, as_rt: Option
     let rt = crate::session::resolve_runtime(as_rt, &[s.runtime], "start")?;
 
     let here = ui::tilde(env);
-    println!("┌ {} · {} · {rt}", ui::bold(&ag.name), ui::accent(&here));
+    outln!("┌ {} · {} · {rt}", ui::bold(&ag.name), ui::accent(&here));
     // The origin is the point of §5.1's cross-environment carry: a frontend agent continuing in the
     // backend repo carries a session recorded somewhere else, and the header is where you find that out.
     // Suppressed when it IS here — the line above already said where "here" is.
@@ -1306,9 +1307,9 @@ fn start_carrying(ag: &agent::Agent, env: &Path, s: StoredSession, as_rt: Option
         Some(o) => format!(" (from {o}, {})", ui::ago(s.recency())),
         None => format!(" ({})", ui::ago(s.recency())),
     };
-    println!("└ carrying its latest session{}", ui::dim(&from));
+    outln!("└ carrying its latest session{}", ui::dim(&from));
     if let Some(g) = gist {
-        println!("    {}", ui::dim(&format!("\"{g}\"")));
+        outln!("    {}", ui::dim(&format!("\"{g}\"")));
     }
 
     // Rebind cwd to this repo but KEEP the paths it recorded elsewhere: those are its real memory of
@@ -1326,7 +1327,7 @@ fn start_carrying(ag: &agent::Agent, env: &Path, s: StoredSession, as_rt: Option
     // The record must exist before the runtime does. Its absence is not fatal — a session that captures
     // to the default agent beats no session — but it is never silent.
     if let Err(e) = record_launch(&id, &ag.aid, &ag.name, env, &rt, sign_over) {
-        eprintln!("  ⚠ launch record not written ({e:#}) — capture will attribute this session by repo default.");
+        errln!("  ⚠ launch record not written ({e:#}) — capture will attribute this session by repo default.");
     }
     exec(&h.resume_cmd)
 }
@@ -1337,11 +1338,11 @@ fn start_fresh(ag: &agent::Agent, env: &Path, as_rt: Option<&str>) -> Result<i32
         anyhow::anyhow!("{e}\n  `{}` has no sessions yet, so there is no runtime to continue in — name one: agit start --as claude-code|codex", ag.name)
     })?;
     let cli = if rt == "codex" { "codex" } else { "claude" };
-    println!("┌ {} · {} · {rt}", ui::bold(&ag.name), ui::accent(&ui::tilde(env)));
-    println!("└ no sessions yet — starting FRESH, bound to this agent.");
+    outln!("┌ {} · {} · {rt}", ui::bold(&ag.name), ui::accent(&ui::tilde(env)));
+    outln!("└ no sessions yet — starting FRESH, bound to this agent.");
     // The runtime mints the id, so there is nothing to write a launch record against yet: this session
     // will be attributed to the repo's default agent when captured. Said, never assumed.
-    eprintln!(
+    errln!(
         "  note: a fresh session gets its id from {cli}, so it has no launch record — capture files it \
          under this repo's default agent. Once it is snapped, `agit start --agent {}` carries it exactly.",
         ag.name

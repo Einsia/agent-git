@@ -13,6 +13,7 @@
 
 use crate::agent::{self, Binding};
 use crate::scope;
+use crate::{errln, outln};
 use anyhow::{bail, Context, Result};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -40,7 +41,7 @@ pub fn run_named(name: Option<String>) -> Result<i32> {
             // Declared, but nothing could be cloned (no remote recorded, or every clone failed). The
             // resolver's own words name what to do; do not mint a namesake on top of a declared agent.
             None => {
-                eprintln!("{:#}", agent::resolve(None).unwrap_err());
+                errln!("{:#}", agent::resolve(None).unwrap_err());
                 return Ok(2);
             }
         },
@@ -54,16 +55,16 @@ pub fn run_named(name: Option<String>) -> Result<i32> {
     agent::bind_here(&agent, &env, false)?;
     agent::write_active(&env, &agent.aid)?;
 
-    println!("agit is ready.");
-    println!("  Environment : {}", env.display());
-    println!("  Agent       : {} ({})", agent.name, agent.aid);
-    println!("  Store       : {}", agent.store.display());
-    println!("  Binding     : {}   (commit it — your team gets this agent on clone)", agent::BINDING_FILE);
-    println!();
-    println!("  agit start              launch a session already carrying this agent's latest context");
-    println!("  agit snap               capture this project's sessions into the store");
-    println!("  agit a push / pull      sync the memory with your team");
-    println!("  agit a merge <agent>    reconcile this agent's memory with another agent's, by dialogue");
+    outln!("agit is ready.");
+    outln!("  Environment : {}", env.display());
+    outln!("  Agent       : {} ({})", agent.name, agent.aid);
+    outln!("  Store       : {}", agent.store.display());
+    outln!("  Binding     : {}   (commit it — your team gets this agent on clone)", agent::BINDING_FILE);
+    outln!();
+    outln!("  agit start              launch a session already carrying this agent's latest context");
+    outln!("  agit snap               capture this project's sessions into the store");
+    outln!("  agit a push / pull      sync the memory with your team");
+    outln!("  agit a merge <agent>    reconcile this agent's memory with another agent's, by dialogue");
     Ok(0)
 }
 
@@ -91,17 +92,17 @@ fn track_declared(env: &Path) -> Result<Option<agent::Agent>> {
             continue;
         }
         if entry.remote.is_none() {
-            eprintln!("  · {} is declared but has no remote to clone — skipping (its owner has not published it)", entry.name);
+            errln!("  · {} is declared but has no remote to clone — skipping (its owner has not published it)", entry.name);
             continue;
         }
         match agent::clone_agent(&entry.name, false) {
             Ok(a) => {
-                println!("  ✓ cloned {} ({})", a.name, a.aid);
+                outln!("  ✓ cloned {} ({})", a.name, a.aid);
                 got.push(a);
             }
             // One agent that fails to clone must not sink the others: a private repo the teammate lacks
             // a token for is a real, recoverable situation, not a reason to abort the takeover.
-            Err(e) => eprintln!("  · could not clone {}: {e:#}", entry.name),
+            Err(e) => errln!("  · could not clone {}: {e:#}", entry.name),
         }
     }
     if got.is_empty() {
@@ -153,12 +154,12 @@ fn pick_name(env: &Path, given: Option<&str>) -> Result<String> {
         }
         match (line.trim(), &suggest) {
             ("", Some(d)) => return Ok(d.clone()),
-            ("", None) => println!("  a name is needed, and this directory does not suggest a usable one."),
+            ("", None) => outln!("  a name is needed, and this directory does not suggest a usable one."),
             (n, _) => match crate::agent::is_usable_name(n) {
                 true => return Ok(n.to_string()),
                 // Re-ask rather than abort: they are already at the prompt, and losing the whole
                 // command over a typo is the kind of thing that teaches people to script around it.
-                false => println!("  `{n}` is not a usable agent name (letters, digits, `-`, `_`, `.`; max 64)."),
+                false => outln!("  `{n}` is not a usable agent name (letters, digits, `-`, `_`, `.`; max 64)."),
             },
         }
     }
@@ -183,7 +184,7 @@ pub(crate) fn ensure_gitignore(env: &Path) -> Result<()> {
     }
     s.push_str(".agit/\n");
     std::fs::write(&gi, s)?;
-    println!("  appended to the code repo .gitignore: .agit/");
+    outln!("  appended to the code repo .gitignore: .agit/");
     Ok(())
 }
 

@@ -25,6 +25,7 @@ pub mod harness;
 pub mod hub;
 pub mod init;
 pub mod llm;
+pub mod output;
 pub mod passthrough;
 pub mod register;
 pub mod scan;
