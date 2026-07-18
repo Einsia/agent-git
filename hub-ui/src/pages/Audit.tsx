@@ -58,9 +58,10 @@ export function Audit() {
           aria-label="Filter by agent"
         >
           <option value="">site-wide</option>
+          {/* The audit log is keyed on the scoped id "<owner_ns>/<name>". */}
           {agents.data?.agents.map((a) => (
-            <option key={a.name} value={a.name}>
-              {a.name}
+            <option key={a.full_name} value={a.full_name}>
+              {a.full_name}
             </option>
           ))}
         </Select>

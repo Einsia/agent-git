@@ -40,6 +40,13 @@ export interface Org {
 
 export interface AgentSummary {
   name: string
+  /// The full owner string — a bare username, or "org:<name>" for an org-owned agent. null only
+  /// for the fail-safe unowned row. Routing uses `full_name`, not this: for an org the URL segment
+  /// is the owner_ns ("acme"), not the full owner ("org:acme").
+  owner: string | null
+  /// The scoped identity "<owner_ns>/<name>" — unique across owners (a name is unique only within
+  /// one). This is what every agent URL and API path is built from.
+  full_name: string
   /// null until the client pushes an agent.toml — an empty repo has no identity yet.
   aid: string | null
   aid_source: string
@@ -86,6 +93,8 @@ export interface Branch {
 
 export interface AgentPage {
   agent: string
+  /// The scoped identity "<owner_ns>/<name>" — what the agent's URLs and API paths are built from.
+  full_name: string
   git: string
   aid: string | null
   aid_source: string
@@ -142,6 +151,10 @@ export interface SessionDiff {
 
 export interface CreatedAgent {
   name: string
+  /// The owner the server assigned (the caller, or "org:<name>" under an org).
+  owner: string
+  /// The scoped identity "<owner_ns>/<name>" — route straight to it after create.
+  full_name: string
   aid: string | null
   aid_source: string
   clone_url: string
@@ -220,29 +233,42 @@ export const api = {
   me: () => get<Me>("/api/me"),
 
   // ── agents ──
+  // Identity is (owner, name): every agent path is /api/agent/<owner>/<name>, where <owner> is the
+  // owner_ns segment (the first half of `full_name`), NOT the full "org:<name>" owner string.
   agents: () => get<{ agents: AgentSummary[]; host: string }>("/api/agents"),
-  agent: (name: string, page = 1, q = "") =>
-    get<AgentPage>(`/api/agent/${encodeURIComponent(name)}?page=${page}&q=${encodeURIComponent(q)}`),
+  agent: (owner: string, name: string, page = 1, q = "") =>
+    get<AgentPage>(
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}?page=${page}&q=${encodeURIComponent(q)}`
+    ),
+  // The 201 carries {name, owner, full_name, ...} — callers route off `full_name`.
   createAgent: (name: string, visibility: Visibility) =>
     request<CreatedAgent>("/api/agents", { method: "POST", body: JSON.stringify({ name, visibility }) }),
   // Rename answers {name, renamed_from}; a visibility change answers {name, visibility, owner}.
   // Neither is worth a type: callers reload or navigate.
-  patchAgent: (name: string, patch: { name?: string; visibility?: Visibility }) =>
-    request<unknown>(`/api/agent/${encodeURIComponent(name)}`, { method: "PATCH", body: JSON.stringify(patch) }),
-  deleteAgent: (name: string) => request<void>(`/api/agent/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  patchAgent: (owner: string, name: string, patch: { name?: string; visibility?: Visibility }) =>
+    request<unknown>(`/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteAgent: (owner: string, name: string) =>
+    request<void>(`/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`, { method: "DELETE" }),
 
   // ── members ──
-  members: (name: string) => get<Member[]>(`/api/agent/${encodeURIComponent(name)}/members`),
+  members: (owner: string, name: string) =>
+    get<Member[]>(`/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/members`),
   // POST doubles as "change role": an existing member's role is overwritten in place.
-  addMember: (name: string, username: string, role: Role) =>
-    request<Member[]>(`/api/agent/${encodeURIComponent(name)}/members`, {
+  addMember: (owner: string, name: string, username: string, role: Role) =>
+    request<Member[]>(`/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/members`, {
       method: "POST",
       body: JSON.stringify({ username, role }),
     }),
-  removeMember: (name: string, username: string) =>
-    request<void>(`/api/agent/${encodeURIComponent(name)}/members/${encodeURIComponent(username)}`, {
-      method: "DELETE",
-    }),
+  removeMember: (owner: string, name: string, username: string) =>
+    request<void>(
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/members/${encodeURIComponent(username)}`,
+      {
+        method: "DELETE",
+      }
+    ),
 
   // ── orgs ──
   // The orgs the caller belongs to (a site admin sees all). 401 if signed out.
@@ -271,25 +297,27 @@ export const api = {
 
   // ── tokens ──
   tokens: () => get<TokenInfo[]>("/api/tokens"),
-  // The plaintext comes back once, and only here. The server stores a sha256 digest.
+  // The plaintext comes back once, and only here. The server stores a sha256 digest. `agent`, when
+  // set, is the scoped id "<owner_ns>/<name>" (a token binds to a scoped agent, not a bare name).
   createToken: (body: { name: string; agent?: string; scope: Scope; ttl_days?: number }) =>
     request<{ token: string }>("/api/tokens", { method: "POST", body: JSON.stringify(body) }),
   revokeToken: (id: string) => request<void>(`/api/tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   // ── audit ──
-  // No agent = the site-wide log (site admins only, 403 otherwise).
+  // No agent = the site-wide log (site admins only, 403 otherwise). A set `agent` is the scoped id
+  // "<owner_ns>/<name>"; that agent's log needs Manage on it.
   audit: (agent: string, limit: number) =>
     get<AuditEntry[]>(
       `/api/audit?limit=${limit}${agent ? `&agent=${encodeURIComponent(agent)}` : ""}`
     ),
 
   // ── sessions ──
-  session: (name: string, id: string, at?: string) =>
+  session: (owner: string, name: string, id: string, at?: string) =>
     get<SessionDetail>(
-      `/api/agent/${encodeURIComponent(name)}/session/${encodeURIComponent(id)}${at ? `?at=${at}` : ""}`
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/session/${encodeURIComponent(id)}${at ? `?at=${at}` : ""}`
     ),
-  diff: (name: string, id: string, from: string, to: string) =>
+  diff: (owner: string, name: string, id: string, from: string, to: string) =>
     get<SessionDiff>(
-      `/api/agent/${encodeURIComponent(name)}/session/${encodeURIComponent(id)}/diff?from=${from}&to=${to}`
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/session/${encodeURIComponent(id)}/diff?from=${from}&to=${to}`
     ),
 }

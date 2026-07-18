@@ -10,16 +10,19 @@ import { ProvChips } from "@/components/ProvChips"
 import { Forbidden, LoadError } from "@/components/States"
 
 export function Session() {
-  const { name = "", id = "" } = useParams()
+  const { owner = "", name = "", id = "" } = useParams()
   const [params] = useSearchParams()
   const at = params.get("at") ?? undefined
-  const { data, loading, error, status, forbidden } = useGuarded(() => api.session(name, id, at), [name, id, at])
+  const { data, loading, error, status, forbidden } = useGuarded(
+    () => api.session(owner, name, id, at),
+    [owner, name, id, at]
+  )
 
-  if (forbidden) return <Forbidden what={name} />
+  if (forbidden) return <Forbidden what={`${owner}/${name}`} />
 
   return (
     <div>
-      <Crumb name={name} session={id} />
+      <Crumb owner={owner} name={name} session={id} />
       {loading && <p className="py-6 text-muted-foreground">Loading…</p>}
       {/* 401 is already redirecting to the login form; don't flash an error behind it. */}
       {error && status !== 401 && <LoadError message={error} />}
@@ -45,7 +48,7 @@ export function Session() {
           {data.pinned && (
             <p className="mt-4 rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
               Viewing revision <code className="font-mono">{data.pinned}</code>.{" "}
-              <Link className="text-primary hover:underline" to={`/agent/${name}/session/${id}`}>
+              <Link className="text-primary hover:underline" to={`/agent/${owner}/${name}/session/${id}`}>
                 Back to latest
               </Link>
             </p>
@@ -101,7 +104,7 @@ export function Session() {
                   return (
                     <li key={r.sha} className="border-b pb-1.5">
                       <Link
-                        to={`/agent/${name}/session/${id}?at=${shortSha}`}
+                        to={`/agent/${owner}/${name}/session/${id}?at=${shortSha}`}
                         className="font-mono text-primary hover:underline"
                       >
                         {shortSha}
@@ -110,7 +113,7 @@ export function Session() {
                       <div className="text-muted-foreground">{r.subject}</div>
                       {prev && (
                         <Link
-                          to={`/agent/${name}/session/${id}/diff?from=${prev.sha.slice(0, 9)}&to=${shortSha}`}
+                          to={`/agent/${owner}/${name}/session/${id}/diff?from=${prev.sha.slice(0, 9)}&to=${shortSha}`}
                           className="inline-flex items-center gap-1 text-[0.72rem] text-primary hover:underline"
                         >
                           <GitCompare className="size-3" /> diff vs previous
@@ -124,7 +127,7 @@ export function Session() {
               <h3 className="eyebrow mb-2 mt-6">pull &amp; resume</h3>
               <pre className="overflow-auto rounded-md border bg-muted p-3 font-mono text-[0.72rem] leading-relaxed">
 {`agit clone \\
-  http://${location.host}/${name}.git
+  http://${location.host}/${owner}/${name}.git
 agit -a merge origin/main`}
               </pre>
               <p className="mt-3 font-mono text-[0.72rem] text-muted-foreground">{data.commit.slice(0, 12)}</p>

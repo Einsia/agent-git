@@ -86,7 +86,7 @@ export function Home() {
               </div>
             )}
             {data.agents.map((a) => (
-              <Row key={a.name} a={a} />
+              <Row key={a.full_name} a={a} />
             ))}
           </div>
         )}
@@ -122,7 +122,7 @@ export function Home() {
 function Row({ a }: { a: AgentSummary }) {
   return (
     <Link
-      to={`/agent/${a.name}`}
+      to={`/agent/${a.full_name}`}
       className="grid grid-cols-[1fr_2fr_auto] items-center gap-4 border-t px-4 py-3.5 first:border-t-0 transition-colors hover:bg-accent/40"
     >
       <span className="flex min-w-0 items-center gap-1.5 font-mono font-semibold">
@@ -131,7 +131,8 @@ function Row({ a }: { a: AgentSummary }) {
         {a.visibility === "private" && (
           <Lock className="size-3 shrink-0 text-muted-foreground" aria-label="private" />
         )}
-        <span className="truncate">{a.name}</span>
+        {/* The display identity is the scoped owner/name — a name is unique only within an owner. */}
+        <span className="truncate">{a.full_name}</span>
         <ArrowUpRight className="size-3.5 shrink-0 text-muted-foreground" />
       </span>
       <span className="min-w-0 truncate text-sm text-muted-foreground">

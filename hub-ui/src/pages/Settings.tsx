@@ -26,8 +26,8 @@ function formatBytes(n: number): string {
 }
 
 export function Settings() {
-  const { name = "" } = useParams()
-  const { data, loading, error, status, forbidden, reload } = useGuarded(() => api.agent(name), [name])
+  const { owner = "", name = "" } = useParams()
+  const { data, loading, error, status, forbidden, reload } = useGuarded(() => api.agent(owner, name), [owner, name])
 
   if (forbidden) return <Forbidden />
   if (loading) return <p className="py-10 text-muted-foreground">Loading…</p>
@@ -41,11 +41,14 @@ export function Settings() {
   return (
     <div className="flex flex-col gap-8">
       <header>
-        <Link to={`/agent/${name}`} className="eyebrow hover:text-foreground">
-          ← {name}
+        <Link to={`/agent/${owner}/${name}`} className="eyebrow hover:text-foreground">
+          ← {owner}/{name}
         </Link>
         <div className="mt-2 flex flex-wrap items-center gap-2.5">
-          <h1 className="font-mono text-2xl font-bold tracking-tight">{name}</h1>
+          <h1 className="font-mono text-2xl font-bold tracking-tight">
+            <span className="text-muted-foreground">{owner}/</span>
+            {name}
+          </h1>
           <VisibilityBadge v={data.visibility} />
           {data.role && (
             <Badge variant={data.role === "owner" ? "default" : "muted"} className="font-mono text-[0.6rem]">
@@ -59,13 +62,13 @@ export function Settings() {
       </header>
 
       <Identity data={data} />
-      <Bind data={data} name={name} />
+      <Bind data={data} owner={owner} name={name} />
       <Environments data={data} />
       <Branches data={data} />
-      <Members data={data} name={name} canAdmin={canAdmin} reload={reload} />
-      {canAdmin && <Rename name={name} />}
-      {canAdmin && <VisibilityControl name={name} current={data.visibility} reload={reload} />}
-      {canAdmin && <Danger name={name} />}
+      <Members data={data} owner={owner} name={name} canAdmin={canAdmin} reload={reload} />
+      {canAdmin && <Rename owner={owner} name={name} />}
+      {canAdmin && <VisibilityControl owner={owner} name={name} current={data.visibility} reload={reload} />}
+      {canAdmin && <Danger owner={owner} name={name} />}
     </div>
   )
 }
@@ -145,11 +148,11 @@ function Identity({ data }: { data: AgentPage }) {
   )
 }
 
-function Bind({ data, name }: { data: AgentPage; name: string }) {
+function Bind({ data, owner, name }: { data: AgentPage; owner: string; name: string }) {
   const snippet = `[agent]
 id = "${data.aid || "agt_…"}"
 name = "${name}"
-remote = "${data.clone_url || "http://HOST:PORT/" + name + ".git"}"`
+remote = "${data.clone_url || "http://HOST:PORT/" + owner + "/" + name + ".git"}"`
 
   return (
     <Section
@@ -227,11 +230,13 @@ const ROLES: Role[] = ["read", "write", "admin"]
 
 function Members({
   data,
+  owner,
   name,
   canAdmin,
   reload,
 }: {
   data: AgentPage
+  owner: string
   name: string
   canAdmin: boolean
   reload: () => void
@@ -246,7 +251,7 @@ function Members({
     setBusy(true)
     setError("")
     try {
-      await api.addMember(name, username.trim(), role)
+      await api.addMember(owner, name, username.trim(), role)
       setUsername("")
       setRole("read")
       reload()
@@ -261,7 +266,7 @@ function Members({
   async function changeRole(m: Member, next: Role) {
     setError("")
     try {
-      await api.addMember(name, m.username, next)
+      await api.addMember(owner, name, m.username, next)
       reload()
     } catch (err) {
       setError(String((err as Error)?.message ?? err))
@@ -271,7 +276,7 @@ function Members({
   async function remove(m: Member) {
     setError("")
     try {
-      await api.removeMember(name, m.username)
+      await api.removeMember(owner, name, m.username)
       reload()
     } catch (err) {
       setError(String((err as Error)?.message ?? err))
@@ -365,7 +370,7 @@ function Members({
   )
 }
 
-function Rename({ name }: { name: string }) {
+function Rename({ owner, name }: { owner: string; name: string }) {
   const nav = useNavigate()
   const [next, setNext] = useState(name)
   const [busy, setBusy] = useState(false)
@@ -380,8 +385,9 @@ function Rename({ name }: { name: string }) {
     setBusy(true)
     setError("")
     try {
-      await api.patchAgent(name, { name: next })
-      nav(`/agent/${next}/settings`, { replace: true })
+      // A rename stays within the same owner namespace — only the name half moves.
+      await api.patchAgent(owner, name, { name: next })
+      nav(`/agent/${owner}/${next}/settings`, { replace: true })
     } catch (err) {
       setError(String((err as Error)?.message ?? err))
     } finally {
@@ -409,10 +415,12 @@ function Rename({ name }: { name: string }) {
 
 // Named to stay clear of the Visibility type.
 function VisibilityControl({
+  owner,
   name,
   current,
   reload,
 }: {
+  owner: string
   name: string
   current: Visibility
   reload: () => void
@@ -425,7 +433,7 @@ function VisibilityControl({
     setBusy(true)
     setError("")
     try {
-      await api.patchAgent(name, { visibility: v })
+      await api.patchAgent(owner, name, { visibility: v })
       reload()
     } catch (err) {
       setError(String((err as Error)?.message ?? err))
@@ -470,7 +478,7 @@ function VisibilityControl({
   )
 }
 
-function Danger({ name }: { name: string }) {
+function Danger({ owner, name }: { owner: string; name: string }) {
   const nav = useNavigate()
   const [typed, setTyped] = useState("")
   const [busy, setBusy] = useState(false)
@@ -480,7 +488,7 @@ function Danger({ name }: { name: string }) {
     setBusy(true)
     setError("")
     try {
-      await api.deleteAgent(name)
+      await api.deleteAgent(owner, name)
       nav("/", { replace: true })
     } catch (err) {
       setError(String((err as Error)?.message ?? err))

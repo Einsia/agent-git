@@ -35,7 +35,9 @@ export function NewAgent() {
     setError("")
     try {
       const created = await api.createAgent(name, visibility)
-      nav(`/agent/${created.name}/settings`)
+      // The new agent is owned by the current user; route off the server's `full_name`
+      // (owner_ns/name), which already carries the owner it assigned.
+      nav(`/agent/${created.full_name}/settings`)
     } catch (err) {
       setError(String((err as Error)?.message ?? err))
       setBusy(false)

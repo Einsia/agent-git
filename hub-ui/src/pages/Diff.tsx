@@ -6,15 +6,15 @@ import { Crumb } from "@/components/Crumb"
 import { Forbidden, LoadError } from "@/components/States"
 
 export function Diff() {
-  const { name = "", id = "" } = useParams()
+  const { owner = "", name = "", id = "" } = useParams()
   const [params] = useSearchParams()
   const from = params.get("from") ?? ""
   const to = params.get("to") ?? ""
   const missing = !from || !to
   const { data, loading, error, status, forbidden } = useGuarded(
     // Don't fire a doomed request when a revision is missing — show a clear message instead.
-    () => (missing ? Promise.resolve(null) : api.diff(name, id, from, to)),
-    [name, id, from, to]
+    () => (missing ? Promise.resolve(null) : api.diff(owner, name, id, from, to)),
+    [owner, name, id, from, to]
   )
 
   const empty =
@@ -25,11 +25,11 @@ export function Diff() {
     !data.removed_files.length &&
     data.conclusion_before === data.conclusion_after
 
-  if (forbidden) return <Forbidden what={name} />
+  if (forbidden) return <Forbidden what={`${owner}/${name}`} />
 
   return (
     <div>
-      <Crumb name={name} session={id} />
+      <Crumb owner={owner} name={name} session={id} />
       <span className="eyebrow">revision diff</span>
       <h1 className="mt-1 break-all font-mono text-xl font-bold tracking-tight">{id}</h1>
 

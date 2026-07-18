@@ -110,9 +110,10 @@ export function Tokens() {
               <span className="eyebrow">scope</span>
               <Select value={agent} onChange={(e) => setAgent(e.target.value)} className="w-[180px]">
                 <option value="">all agents</option>
+                {/* A token binds to the scoped id "<owner_ns>/<name>", so that's the option value. */}
                 {agents.data?.agents.map((a) => (
-                  <option key={a.name} value={a.name}>
-                    {a.name}
+                  <option key={a.full_name} value={a.full_name}>
+                    {a.full_name}
                   </option>
                 ))}
               </Select>

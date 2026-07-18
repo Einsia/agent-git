@@ -7,12 +7,12 @@ import { ProvChips } from "@/components/ProvChips"
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
 
-export function SessionCard({ name, s }: { name: string; s: SessionSummary }) {
+export function SessionCard({ owner, name, s }: { owner: string; name: string; s: SessionSummary }) {
   return (
     <Card className="p-4 transition-colors hover:border-primary/50">
       <div className="flex items-center justify-between gap-4">
         <Link
-          to={`/agent/${name}/session/${s.id}`}
+          to={`/agent/${owner}/${name}/session/${s.id}`}
           className="break-all font-mono text-[0.82rem] text-primary hover:underline"
         >
           {s.id}

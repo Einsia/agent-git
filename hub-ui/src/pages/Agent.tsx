@@ -13,7 +13,7 @@ import { Forbidden, LoadError } from "@/components/States"
 import { cn } from "@/lib/utils"
 
 export function Agent() {
-  const { name = "" } = useParams()
+  const { owner = "", name = "" } = useParams()
   const [params, setParams] = useSearchParams()
   const page = Math.max(1, Number(params.get("page") ?? 1))
   const q = params.get("q") ?? ""
@@ -21,7 +21,10 @@ export function Agent() {
 
   useEffect(() => setQuery(q), [q])
 
-  const { data, loading, error, status, forbidden } = useGuarded(() => api.agent(name, page, q), [name, page, q])
+  const { data, loading, error, status, forbidden } = useGuarded(
+    () => api.agent(owner, name, page, q),
+    [owner, name, page, q]
+  )
 
   function submitSearch(e: FormEvent) {
     e.preventDefault()
@@ -38,16 +41,20 @@ export function Agent() {
 
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.per_page)) : 1
   // The server builds the clone url (it knows the scheme — http vs https behind TLS).
-  const cloneUrl = data?.clone_url || `http://HOST:PORT/${name}.git`
+  const cloneUrl = data?.clone_url || `http://HOST:PORT/${owner}/${name}.git`
 
-  if (forbidden) return <Forbidden what={name} />
+  if (forbidden) return <Forbidden what={`${owner}/${name}`} />
 
   return (
     <div>
-      <Crumb name={name} />
+      <Crumb owner={owner} name={name} />
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2.5">
-          <h1 className="font-mono text-2xl font-bold tracking-tight">{name}</h1>
+          {/* The display identity is the scoped owner/name; the owner half stays quiet. */}
+          <h1 className="font-mono text-2xl font-bold tracking-tight">
+            <span className="text-muted-foreground">{owner}/</span>
+            {name}
+          </h1>
           {data?.visibility === "private" && (
             <Badge variant="muted" className="gap-1">
               <Lock className="size-3" />
@@ -76,7 +83,7 @@ export function Agent() {
           {/* Settings is readable by anyone who can read the agent; it just shows less to
               someone who can't administer it. */}
           <Link
-            to={`/agent/${name}/settings`}
+            to={`/agent/${owner}/${name}/settings`}
             aria-label="Settings"
             title="Settings"
             className={cn(buttonVariants({ variant: "ghost", size: "icon" }))}
@@ -104,7 +111,7 @@ export function Agent() {
           )}
 
           <div className="flex flex-col gap-3">
-            {data?.sessions.map((s) => <SessionCard key={s.id} name={name} s={s} />)}
+            {data?.sessions.map((s) => <SessionCard key={s.id} owner={owner} name={name} s={s} />)}
           </div>
 
           {data && totalPages > 1 && (

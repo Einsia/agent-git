@@ -27,10 +27,10 @@ export default function App() {
             <Route path="/orgs" element={<Orgs />} />
             <Route path="/tokens" element={<Tokens />} />
             <Route path="/audit" element={<Audit />} />
-            <Route path="/agent/:name" element={<Agent />} />
-            <Route path="/agent/:name/settings" element={<Settings />} />
-            <Route path="/agent/:name/session/:id" element={<Session />} />
-            <Route path="/agent/:name/session/:id/diff" element={<Diff />} />
+            <Route path="/agent/:owner/:name" element={<Agent />} />
+            <Route path="/agent/:owner/:name/settings" element={<Settings />} />
+            <Route path="/agent/:owner/:name/session/:id" element={<Session />} />
+            <Route path="/agent/:owner/:name/session/:id/diff" element={<Diff />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </Layout>
