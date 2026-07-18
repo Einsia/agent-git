@@ -503,8 +503,12 @@ pub(crate) async fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body
     // create it. Absent → the caller owns it, exactly as before.
     let org = match str_field(&v, "org") {
         Some(orgname) => match ctx.store.org(&orgname).await {
-            Some(o) => Some(o),
-            None => return Resp::err(400, "no such org"),
+            // Existence non-disclosure (mirrors api_org_get / api_org_members): a missing org and one
+            // the caller can't see (not a member, not a site admin) both return the SAME 404, so create
+            // can't be used to probe which orgs exist. A member who merely lacks org-admin still gets a
+            // distinct 403 below — they already know the org exists, so that leaks nothing.
+            Some(o) if caller.is_admin || o.is_member(&user) => Some(o),
+            _ => return Resp::err(404, "not found"),
         },
         None => None,
     };
@@ -900,6 +904,24 @@ pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body
                     .await;
                 return Resp::err(500, "rename failed (the repo directory won't move)");
             }
+            // Blobs are keyed by the agent NAME (blobs/<name>/<sha>), so they must follow the rename or
+            // they are stranded under the old name and unreachable. Mirror the repo-dir move exactly:
+            // on failure, undo the repo move and roll the name back, so the record, the repo dir and the
+            // blobs never disagree — never a silent half-rename. (The blob backend offloads its own IO.)
+            if let Err(e) = ctx.blobs.rename_agent(&meta.name, &newname).await {
+                eprintln!("blob rename failed for {} → {newname}: {e}", meta.name);
+                let (undo_from, undo_to) = (repo_path(ctx.root(), &newname), repo_path(ctx.root(), &meta.name));
+                let _ = tokio::task::spawn_blocking(move || std::fs::rename(undo_from, undo_to)).await;
+                let _ = ctx
+                    .store
+                    .update_agents(|list| {
+                        if let Some(m) = list.iter_mut().find(|m| m.name == newname) {
+                            m.name = meta.name.clone();
+                        }
+                    })
+                    .await;
+                return Resp::err(500, "rename failed (couldn't move the agent's blobs)");
+            }
             // Tokens are bound to the **name**. A rename doesn't change identity (the aid lives in
             // the store), so the bindings have to follow — otherwise one rename silently mutes every
             // CI token.
@@ -990,6 +1012,15 @@ pub(crate) async fn api_purge_agent(ctx: &Ctx, caller: &Caller, name: &str) -> R
     let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir).is_ok()).await.unwrap_or(false);
     if !removed {
         return Resp::err(500, "can't remove the repo directory");
+    }
+    // Blobs are keyed by the agent NAME (blobs/<name>/<sha>). Destroy them with the repo, and BEFORE
+    // the agents.json record is dropped: leaving them behind is the recycled-name leak — a NEW agent
+    // later created under this same name would pass the name gate and read the previous owner's PRIVATE
+    // blobs. Surfacing a failure as a 500 while the record still stands means the name can't be recycled
+    // yet, so the leak never opens — the same recycled-name reasoning the tokens/MRs cleanup documents.
+    if let Err(e) = ctx.blobs.delete_agent(&meta.name).await {
+        eprintln!("blob purge failed for {}: {e}", meta.name);
+        return Resp::err(500, "can't remove the agent's blobs");
     }
     let _ = ctx.store.update_agents(|list| list.retain(|m| m.name != meta.name)).await;
     // Tokens bound to this name must die with it: otherwise, when someone later creates an agent
@@ -1192,12 +1223,13 @@ pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, b
     // flows to the org's members via folding. The caller must belong to the target org, so an agent
     // can't be dumped onto an org you have no part in.
     if let Some(orgname) = bodyv.as_ref().and_then(|v| str_field(v, "org")) {
-        let Some(org) = ctx.store.org(&orgname).await else {
-            return Resp::err(400, "no such org");
+        // Existence non-disclosure (mirrors api_org_get): membership IS the permission to transfer here,
+        // so a missing org and one the caller isn't a member of collapse to the SAME 404 — transfer
+        // can't be used to probe which orgs exist. The successful (member/site-admin) path is unchanged.
+        let org = match ctx.store.org(&orgname).await {
+            Some(o) if caller.is_admin || o.is_member(&actor) => o,
+            _ => return Resp::err(404, "not found"),
         };
-        if !(caller.is_admin || org.is_member(&actor)) {
-            return Resp::err(403, "you must be a member of the target org to transfer an agent to it");
-        }
         let new_owner = format!("org:{}", org.name);
         if meta.owner.as_deref() == Some(new_owner.as_str()) {
             return Resp::err(409, &format!("this agent is already owned by org:{}", org.name));
@@ -2185,7 +2217,7 @@ async fn api_blob_put(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &
 /// `GET /api/agent/<name>/blob/<digest>` — content-addressed download. Read-gated, with the SAME
 /// existence-non-disclosure as a private agent: the gate runs BEFORE the backend is touched, so
 /// "no such blob" and "no access to this agent" are indistinguishable (401/403/404 all from the gate).
-async fn api_blob_get(ctx: &Ctx, caller: &Caller, name: &str, digest: &str) -> Resp {
+pub(crate) async fn api_blob_get(ctx: &Ctx, caller: &Caller, name: &str, digest: &str) -> Resp {
     // A malformed digest could never name a real blob — 404, the same class as gate()'s malformed-name
     // 404, so it leaks nothing. Checked before the gate: it is not agent-specific information.
     if !blob::valid_digest(digest) {
@@ -2198,11 +2230,18 @@ async fn api_blob_get(ctx: &Ctx, caller: &Caller, name: &str, digest: &str) -> R
     match ctx.blobs.get(&meta.name, digest).await {
         Ok(None) => Resp::err(404, "not found"),
         Ok(Some(bytes)) => {
-            // Content-addressing invariant, verified at read time: the bytes are already buffered whole
-            // (to send them), so re-hashing is O(n) with no extra IO. A mismatch means fs corruption or
-            // an S3 object swapped underneath — refuse it (500 + audit) rather than serve bytes that do
-            // not match their address.
-            if blob::sha256_hex(&bytes) != digest {
+            // Content-addressing invariant, verified at read time: a mismatch means fs corruption or an
+            // S3 object swapped underneath — refuse it (500 + audit) rather than serve bytes that do not
+            // match their address. Re-hashing up to BLOB_MAX (100 MiB) of SHA-256 per download is real
+            // CPU work, so it runs on the blocking pool (matching FsBlobs::put); the bytes are moved in
+            // and handed back with the digest, so there is no extra IO and no clone.
+            let (bytes, computed) = tokio::task::spawn_blocking(move || {
+                let h = blob::sha256_hex(&bytes);
+                (bytes, h)
+            })
+            .await
+            .unwrap();
+            if computed != digest {
                 let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
                 audit_append(ctx.root(), &actor, audit::BLOB_CORRUPT, Some(&meta.name), digest).await;
                 return Resp::err(500, "stored blob failed its integrity check");

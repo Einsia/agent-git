@@ -65,6 +65,14 @@ pub trait BlobStore: Send + Sync {
     /// Remove `(agent, digest)`. Absent is not an error (idempotent). Not routed in v1 — kept for
     /// future GC/lifecycle work.
     async fn delete(&self, agent: &str, digest: &str) -> io::Result<()>;
+    /// Move **every** blob owned by `old` to be owned by `new` (a bulk per-agent rename). Absent
+    /// source = success (the agent simply had no blobs). Blobs are keyed by the agent NAME, so an
+    /// agent rename must carry them along or they are stranded under the old name and unreachable.
+    async fn rename_agent(&self, old: &str, new: &str) -> io::Result<()>;
+    /// Remove **every** blob owned by `agent` (a bulk per-agent purge). Absent = success (idempotent).
+    /// A purge must destroy these, or a NEW agent later recycling the name would read the previous
+    /// owner's PRIVATE blobs — the same recycled-name leak the tokens/MRs cleanup already closes.
+    async fn delete_agent(&self, agent: &str) -> io::Result<()>;
 }
 
 /// Backend dispatch, mirroring `Store::Sqlite`/`Store::Pg`.
@@ -126,6 +134,18 @@ impl Blobs {
         match self {
             Blobs::Fs(b) => b.delete(agent, digest).await,
             Blobs::S3(b) => b.delete(agent, digest).await,
+        }
+    }
+    pub async fn rename_agent(&self, old: &str, new: &str) -> io::Result<()> {
+        match self {
+            Blobs::Fs(b) => b.rename_agent(old, new).await,
+            Blobs::S3(b) => b.rename_agent(old, new).await,
+        }
+    }
+    pub async fn delete_agent(&self, agent: &str) -> io::Result<()> {
+        match self {
+            Blobs::Fs(b) => b.delete_agent(agent).await,
+            Blobs::S3(b) => b.delete_agent(agent).await,
         }
     }
 }
@@ -233,6 +253,40 @@ impl BlobStore for FsBlobs {
         .await
         .map_err(|e| io::Error::other(e.to_string()))?
     }
+
+    async fn rename_agent(&self, old: &str, new: &str) -> io::Result<()> {
+        // Both names are already `valid_agent_name` at the call sites; re-validate at the storage
+        // boundary (defence in depth) so a key can never build a path with a separator or `..`.
+        if !valid_agent_key(old) || !valid_agent_key(new) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid agent key"));
+        }
+        let from = self.dir.join(old);
+        let to = self.dir.join(new);
+        // Directory rename is blocking fs work — same blocking-pool discipline as every other op here.
+        tokio::task::spawn_blocking(move || match std::fs::rename(&from, &to) {
+            Ok(()) => Ok(()),
+            // The agent had no blob dir: nothing to move is success, not failure.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?
+    }
+
+    async fn delete_agent(&self, agent: &str) -> io::Result<()> {
+        if !valid_agent_key(agent) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid agent key"));
+        }
+        let dir = self.dir.join(agent);
+        tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            // No blob dir = nothing to purge = success (idempotent).
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        })
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?
+    }
 }
 
 // ─────────────────────────── S3 / Garage backend ───────────────────────────
@@ -294,7 +348,10 @@ impl BlobStore for S3Blobs {
         if !valid_agent_key(agent) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid agent key"));
         }
-        let digest = sha256_hex(bytes);
+        // Hashing up to BLOB_MAX (100 MiB) of SHA-256 is real CPU work — keep it off the async worker,
+        // exactly as FsBlobs::put deliberately does. (The upload itself is already async IO via rust-s3.)
+        let data = bytes.to_vec();
+        let digest = tokio::task::spawn_blocking(move || sha256_hex(&data)).await.map_err(|e| io::Error::other(e.to_string()))?;
         let resp = self.bucket.put_object(Self::key(agent, &digest), bytes).await.map_err(s3_err)?;
         let code = resp.status_code();
         if !(200..300).contains(&code) {
@@ -343,6 +400,50 @@ impl BlobStore for S3Blobs {
             Err(e) if s3_is_404(&e) => Ok(()),
             Err(e) => Err(s3_err(e)),
         }
+    }
+
+    async fn rename_agent(&self, old: &str, new: &str) -> io::Result<()> {
+        if !valid_agent_key(old) || !valid_agent_key(new) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid agent key"));
+        }
+        // Page through every object under `blobs/<old>/`, copy each to `blobs/<new>/<sha>`, then delete
+        // the old key. S3 has no atomic prefix rename, so this is a copy-then-delete per object. Correct
+        // by construction and tolerant: an absent prefix lists as empty and is a no-op success.
+        let old_prefix = format!("blobs/{old}/");
+        let results = self.bucket.list(old_prefix.clone(), None).await.map_err(s3_err)?;
+        for page in results {
+            for obj in page.contents {
+                // The key tail after `blobs/<old>/` is the sha; re-anchor it under the new agent. Skip a
+                // pseudo-"directory" marker (a key that is exactly the prefix) — it has no sha tail.
+                let Some(sha) = obj.key.strip_prefix(&old_prefix).filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let new_key = format!("blobs/{new}/{sha}");
+                // Copy first; only delete the source once the copy is confirmed 2xx, so a failed copy
+                // can never lose the blob.
+                let code = self.bucket.copy_object_internal(&obj.key, &new_key).await.map_err(s3_err)?;
+                if !(200..300).contains(&code) {
+                    return Err(io::Error::other(format!("s3 copy returned {code}")));
+                }
+                self.bucket.delete_object(&obj.key).await.map_err(s3_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_agent(&self, agent: &str) -> io::Result<()> {
+        if !valid_agent_key(agent) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid agent key"));
+        }
+        // List then delete, page by page. An absent prefix lists empty → nothing to delete → success.
+        let prefix = format!("blobs/{agent}/");
+        let results = self.bucket.list(prefix, None).await.map_err(s3_err)?;
+        for page in results {
+            for obj in page.contents {
+                self.bucket.delete_object(&obj.key).await.map_err(s3_err)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -421,6 +522,49 @@ mod tests {
         assert!(b.get("agentx", "../../etc/passwd").await.unwrap().is_none());
         assert!(b.get("../evil", HELLO_DIGEST).await.unwrap().is_none());
         assert!(b.put("../evil", b"x").await.is_err(), "an unsafe agent key is rejected outright");
+    }
+
+    #[tokio::test]
+    async fn rename_agent_moves_blobs_to_the_new_name() {
+        // The rename fix: a blob put under the old name is reachable under the new name and gone from
+        // the old, so an agent rename doesn't strand its blobs.
+        let d = tempfile::tempdir().unwrap();
+        let b = fs(d.path());
+        let digest = b.put("old", b"payload").await.unwrap();
+        b.rename_agent("old", "new").await.unwrap();
+        assert_eq!(b.get("new", &digest).await.unwrap().as_deref(), Some(&b"payload"[..]), "reachable under new name");
+        assert!(b.get("old", &digest).await.unwrap().is_none(), "gone from the old name");
+    }
+
+    #[tokio::test]
+    async fn rename_agent_with_no_blobs_is_ok() {
+        // An agent that never uploaded a blob has no dir to move — a no-op, not an error.
+        let d = tempfile::tempdir().unwrap();
+        let b = fs(d.path());
+        b.rename_agent("neveruploaded", "renamed").await.expect("absent source is success");
+    }
+
+    #[tokio::test]
+    async fn delete_agent_closes_the_recycled_name_leak() {
+        // The purge fix, at the storage layer: after delete_agent, the bytes are gone, so a new agent
+        // recycling the SAME name (same key namespace) cannot read the previous owner's blob.
+        let d = tempfile::tempdir().unwrap();
+        let b = fs(d.path());
+        let digest = b.put("recycled", b"private bytes").await.unwrap();
+        assert!(b.get("recycled", &digest).await.unwrap().is_some());
+        b.delete_agent("recycled").await.unwrap();
+        assert!(b.get("recycled", &digest).await.unwrap().is_none(), "the recycled name reads nothing — leak closed");
+        // Idempotent: purging an agent with no blobs is fine.
+        b.delete_agent("recycled").await.expect("absent is success");
+    }
+
+    #[tokio::test]
+    async fn bulk_ops_reject_unsafe_agent_keys() {
+        let d = tempfile::tempdir().unwrap();
+        let b = fs(d.path());
+        assert!(b.rename_agent("../evil", "ok").await.is_err());
+        assert!(b.rename_agent("ok", "../evil").await.is_err());
+        assert!(b.delete_agent("../evil").await.is_err());
     }
 
     #[tokio::test]

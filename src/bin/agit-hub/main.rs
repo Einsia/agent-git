@@ -680,7 +680,7 @@ mod h3_tests {
     use agit::hub::acl::{Caller, Visibility};
     use agit::hub::blob::{sha256_hex, Blobs, BLOB_MAX};
     use agit::hub::session::Sessions;
-    use agit::hub::store::Member;
+    use agit::hub::store::{now_iso, Member, Org, OrgMember};
 
     use crate::api::api;
     use crate::cli::create_agent;
@@ -881,5 +881,115 @@ mod h3_tests {
         let rest = format!("agent/art/blob/{digest}");
         let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
         assert_eq!(r.status, 500, "bytes that no longer hash to their address are not served");
+    }
+
+    #[tokio::test]
+    async fn rename_carries_blobs_to_the_new_name() {
+        // FIX 1: blobs are keyed by the agent NAME, so a rename must move them. Upload under "art",
+        // rename art → gallery, and the blob must be reachable under the NEW name and gone from the old.
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
+        let body = b"a renamed artifact";
+        let put = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        assert_eq!(put.status, 201);
+        let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
+
+        // Rename through the real PATCH route (owner → Manage).
+        let renamed = api(&ctx, &req("PATCH", "/api/agent/art", 0), "agent/art", &Caller::user("alice"), br#"{"name":"gallery"}"#).await;
+        assert_eq!(renamed.status, 200, "rename succeeds");
+
+        // Reachable under the NEW name, end to end (200 + identical bytes).
+        let rest = format!("agent/gallery/blob/{digest}");
+        let get = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
+        assert_eq!(get.status, 200, "the blob followed the rename");
+        assert_eq!(get.body, body);
+
+        // Unambiguously at the storage layer: present under the new key, absent under the old (not
+        // merely hidden by the gate now that "art" no longer exists).
+        assert!(ctx.blobs.get("gallery", &digest).await.unwrap().is_some(), "moved to the new name");
+        assert!(ctx.blobs.get("art", &digest).await.unwrap().is_none(), "not stranded under the old name");
+    }
+
+    #[tokio::test]
+    async fn purge_closes_the_recycled_name_blob_leak() {
+        // FIX 1, the security case: after an agent is purged, a NEW agent created under the SAME name
+        // must NOT be able to read the previous owner's private blob. Without the purge-time blob
+        // delete, blobs/<name>/ survives, the name gate passes for the new agent, and blobs.get returns
+        // the old bytes — the exact recycled-name leak already closed for tokens and MRs.
+        let (_d, ctx) = test_ctx().await;
+        create_agent(&ctx.store, "temp", "alice", Visibility::Private).await.unwrap();
+        let body = b"the previous owner's private bytes";
+        let put = api(&ctx, &req("PUT", "/api/agent/temp/blob", body.len()), "agent/temp/blob", &Caller::user("alice"), body).await;
+        assert_eq!(put.status, 201);
+        let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
+
+        // Soft delete, then purge (the two-step destroy), both through the real DELETE route.
+        let soft = api(&ctx, &req("DELETE", "/api/agent/temp", 0), "agent/temp", &Caller::user("alice"), b"").await;
+        assert_eq!(soft.status, 200, "soft delete");
+        let purge = api(&ctx, &req("DELETE", "/api/agent/temp?purge=true", 0), "agent/temp", &Caller::user("alice"), b"").await;
+        assert_eq!(purge.status, 204, "purge empties the trash");
+
+        // A brand-new owner recycles the name.
+        create_agent(&ctx.store, "temp", "mallory", Visibility::Private).await.unwrap();
+        // Mallory (the new owner) asks for the old digest under the recycled name: it must be 404, NOT
+        // the previous owner's bytes. This is the leak, and it is closed.
+        let rest = format!("agent/temp/blob/{digest}");
+        let get = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("mallory"), b"").await;
+        assert_eq!(get.status, 404, "the recycled name cannot read the purged owner's private blob");
+        assert!(ctx.blobs.get("temp", &digest).await.unwrap().is_none(), "the bytes are gone from storage");
+    }
+
+    async fn make_org(ctx: &Ctx, name: &str, admin: &str, member: &str) {
+        ctx.store
+            .update_orgs(|l| {
+                l.push(Org {
+                    name: name.into(),
+                    members: vec![
+                        OrgMember { username: admin.into(), role: "admin".into() },
+                        OrgMember { username: member.into(), role: "member".into() },
+                    ],
+                    created: now_iso(),
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_under_org_hides_org_existence() {
+        // FIX 3: a missing org and one the caller can't see must return the SAME response, so create
+        // can't be used to probe which orgs exist. eve is a member of nothing.
+        let (_d, ctx) = test_ctx().await;
+        make_org(&ctx, "acme", "alice", "bob").await;
+
+        let missing =
+            api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("eve"), br#"{"name":"x","org":"ghost"}"#).await;
+        let forbidden =
+            api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("eve"), br#"{"name":"y","org":"acme"}"#).await;
+        assert_eq!(missing.status, 404, "no such org → 404");
+        assert_eq!(forbidden.status, missing.status, "an existing org a stranger can't see is indistinguishable from a missing one");
+
+        // A member who merely lacks org-admin still gets a distinct 403 — they already know it exists.
+        let member = api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("bob"), br#"{"name":"z","org":"acme"}"#).await;
+        assert_eq!(member.status, 403, "a member who isn't an org admin is told so, not hidden");
+        // The successful path is unchanged: the org admin creates the org-owned agent.
+        let admin = api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("alice"), br#"{"name":"w","org":"acme"}"#).await;
+        assert_eq!(admin.status, 201, "the org admin still creates org-owned agents");
+    }
+
+    #[tokio::test]
+    async fn transfer_to_org_hides_org_existence() {
+        // FIX 3: same non-disclosure on the transfer path. alice owns "mine" but is not a member of the
+        // "secret" org, so transferring to a missing org and to "secret" both return 404.
+        let (_d, ctx) = test_ctx().await;
+        make_org(&ctx, "secret", "bob", "carol").await;
+        create_agent(&ctx.store, "mine", "alice", Visibility::Private).await.unwrap();
+
+        let missing =
+            api(&ctx, &req("POST", "/api/agent/mine/transfer", 0), "agent/mine/transfer", &Caller::user("alice"), br#"{"org":"ghost"}"#).await;
+        let forbidden =
+            api(&ctx, &req("POST", "/api/agent/mine/transfer", 0), "agent/mine/transfer", &Caller::user("alice"), br#"{"org":"secret"}"#).await;
+        assert_eq!(missing.status, 404, "no such org → 404");
+        assert_eq!(forbidden.status, missing.status, "a non-member can't tell 'secret exists' from 'no such org'");
     }
 }
