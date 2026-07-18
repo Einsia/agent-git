@@ -51,6 +51,11 @@ impl ConnLimiter {
 /// while a sustained hammer settles to the refill rate.
 pub(crate) struct TokenBuckets {
     pub(crate) inner: Mutex<HashMap<String, Bucket>>,
+    /// Sustained refill (tokens/sec) and burst ceiling for THIS bucket set. Parameterized so the one
+    /// piece of machinery serves both the generous per-token budget and the tight per-IP registration
+    /// limit without a second copy of the refill maths.
+    rate: f64,
+    burst: f64,
 }
 
 pub(crate) struct Bucket {
@@ -65,9 +70,23 @@ pub(crate) const TOKEN_RATE_PER_SEC: f64 = 4.0;
 /// once, and throttling a legitimate clone would be worse than the problem being solved.
 pub(crate) const TOKEN_BURST: f64 = 240.0;
 
+/// Registration burst, per client IP. Signing up is a once-per-person action, so the budget is far
+/// tighter than a token's: a small burst, then throttled to the refill rate.
+pub(crate) const REGISTER_BURST: f64 = 8.0;
+/// Registration refill, registrations/second/IP. On an `--open-registration` hub this is what stops
+/// one address from sweeping the endpoint for account-spam or username enumeration; a genuine signup
+/// (one attempt, maybe a retry) never feels it. 5 per minute, sustained.
+pub(crate) const REGISTER_RATE_PER_SEC: f64 = 5.0 / 60.0;
+
 impl TokenBuckets {
     pub(crate) fn new() -> TokenBuckets {
-        TokenBuckets { inner: Mutex::new(HashMap::new()) }
+        Self::with_rate(TOKEN_RATE_PER_SEC, TOKEN_BURST)
+    }
+
+    /// A bucket set with an explicit rate/burst — used for the registration limiter, whose budget is
+    /// far tighter than the per-token one.
+    pub(crate) fn with_rate(rate: f64, burst: f64) -> TokenBuckets {
+        TokenBuckets { inner: Mutex::new(HashMap::new()), rate, burst }
     }
 
     pub(crate) fn allow(&self, id: &str) -> bool {
@@ -76,16 +95,18 @@ impl TokenBuckets {
 
     /// The clock is a parameter so the refill can be tested without sleeping.
     ///
-    /// The map only ever grows a key per **authenticated** token id, so it is bounded by the number
-    /// of issued tokens — an unauthenticated flood cannot make it allocate.
+    /// The map grows one key per distinct id seen. For the per-token budget that id is an issued
+    /// token, so the map is bounded by the tokens in existence. For the registration limiter the id is
+    /// a client IP, bounded by the distinct real peers that reach the port — the same exposure the
+    /// per-IP connection limiter already carries, since it too keys on address.
     pub(crate) fn allow_at(&self, id: &str, now: Instant) -> bool {
         let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let b = m.entry(id.to_string()).or_insert(Bucket { tokens: TOKEN_BURST, last: now });
+        let b = m.entry(id.to_string()).or_insert(Bucket { tokens: self.burst, last: now });
         // saturating_duration_since, not `-`: Instant subtraction panics if now precedes last, and
         // two threads can read the clock out of order.
         let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
         b.last = now;
-        b.tokens = (b.tokens + elapsed * TOKEN_RATE_PER_SEC).min(TOKEN_BURST);
+        b.tokens = (b.tokens + elapsed * self.rate).min(self.burst);
         if b.tokens < 1.0 {
             return false;
         }

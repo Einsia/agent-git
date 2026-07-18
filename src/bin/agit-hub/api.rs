@@ -1,6 +1,7 @@
 //! JSON API handlers + shared helpers (sync bodies returning Resp). Verbatim from the monolith.
 #![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 use std::io;
+use std::net::IpAddr;
 use std::process::Command;
 
 use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny, Lifecycle, Role, Scope, Visibility};
@@ -77,11 +78,11 @@ pub(crate) enum Verb {
 /// in the response rather than silently truncated.
 pub(crate) const SEARCH_SCAN_CAP: usize = 400;
 
-pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
+pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, client_ip: Option<IpAddr>, body: &[u8]) -> Resp {
     let m = req.method.as_str();
     match (m, rest) {
         ("POST", "login") => return api_login(ctx, req, body).await,
-        ("POST", "register") => return api_register(ctx, body).await,
+        ("POST", "register") => return api_register(ctx, client_ip, body).await,
         ("POST", "logout") => return api_logout(ctx, req, caller).await,
         ("GET", "me") => return api_me(caller),
         ("GET", "agents") => return api_agents(ctx, req, caller).await,
@@ -330,7 +331,7 @@ pub(crate) fn api_me(caller: &Caller) -> Resp {
 ///
 /// **Security invariant**: `is_admin` is hardcoded `false`, and no admin field is ever read from the
 /// body — registration can never grant admin. Admin stays CLI-only (`agit-hub user add --admin`).
-pub(crate) async fn api_register(ctx: &Ctx, body: &[u8]) -> Resp {
+pub(crate) async fn api_register(ctx: &Ctx, client_ip: Option<IpAddr>, body: &[u8]) -> Resp {
     // Config gate FIRST — before any crypto — so a disabled hub spends nothing on a signup attempt.
     if !ctx.cfg.registration {
         return Resp::err(403, "self-service registration is disabled on this hub");
@@ -347,6 +348,16 @@ pub(crate) async fn api_register(ctx: &Ctx, body: &[u8]) -> Resp {
     }
     if store::is_reserved_account(&username) {
         return Resp::err(400, "that name is reserved");
+    }
+    // Per-IP registration rate limit (see `CtxInner::register_rl`). Charged once the request is a
+    // well-formed signup — after the cheap format checks, before the account store is touched or the
+    // argon2 hash runs — so a sweep is throttled at both the "is this name taken?" enumeration oracle
+    // and the argon2 amplifier, while a malformed request (already a cheap 400) is not penalized. A
+    // missing client IP (no ConnectInfo) fails open, exactly as the connection limiter does.
+    if let Some(ip) = client_ip {
+        if !ctx.register_rl.allow(&ip.to_string()) {
+            return Resp::err(429, "too many registration attempts from your address; slow down").with("Retry-After", "60");
+        }
     }
     // Unified account namespace: a username and an org name may never share a bare string.
     if ctx.store.org(&username).await.is_some() {
@@ -1625,19 +1636,34 @@ pub(crate) async fn api_org_members(ctx: &Ctx, caller: &Caller, name: &str, tail
                 return Resp::err(400, "no such user");
             }
             let orgname = org.name.clone();
-            if let Err(_e) = ctx
+            // Guard against orphaning the org: refuse demoting its last admin to a non-admin role.
+            // Mirrors the DELETE path's last-admin guard, checked inside the same lock so it can't race
+            // a concurrent demotion (POST could otherwise sneak past DELETE's guard by demoting instead
+            // of removing).
+            let outcome = ctx
                 .store
                 .update_orgs(|list| {
-                    if let Some(o) = list.iter_mut().find(|o| o.name == orgname) {
-                        match o.members.iter_mut().find(|m| m.username == username) {
-                            Some(m) => m.role = role.clone(),
-                            None => o.members.push(OrgMember { username: username.clone(), role: role.clone() }),
+                    let Some(o) = list.iter_mut().find(|o| o.name == orgname) else {
+                        return SetRoleOutcome::Ok;
+                    };
+                    if role != "admin" {
+                        let admins = o.members.iter().filter(|m| m.role == "admin").count();
+                        let target_is_admin = o.members.iter().any(|m| m.username == username && m.role == "admin");
+                        if admins == 1 && target_is_admin {
+                            return SetRoleOutcome::LastAdmin;
                         }
                     }
+                    match o.members.iter_mut().find(|m| m.username == username) {
+                        Some(m) => m.role = role.clone(),
+                        None => o.members.push(OrgMember { username: username.clone(), role: role.clone() }),
+                    }
+                    SetRoleOutcome::Ok
                 })
-                .await
-            {
-                return Resp::err(500, "couldn't update the org");
+                .await;
+            match outcome {
+                Ok(SetRoleOutcome::Ok) => {}
+                Ok(SetRoleOutcome::LastAdmin) => return Resp::err(409, "an org must keep at least one admin"),
+                Err(_e) => return Resp::err(500, "couldn't update the org"),
             }
             audit_append(ctx.root(), &user, audit::ORG_MEMBER_ADD, None, &format!("org={} {username}={role}", org.name)).await;
             let fresh = ctx.store.org(&org.name).await.unwrap_or(org);
@@ -1689,6 +1715,13 @@ enum RmOutcome {
     Removed,
     LastAdmin,
     NotMember,
+}
+
+/// The result of an org role change, so the last-admin guard (demoting the sole admin) can be told
+/// apart from an ordinary add-or-update after the atomic `update_orgs`.
+enum SetRoleOutcome {
+    Ok,
+    LastAdmin,
 }
 
 // ── cross-agent search ──

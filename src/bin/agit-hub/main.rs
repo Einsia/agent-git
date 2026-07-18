@@ -518,7 +518,7 @@ mod h4_tests {
     use crate::api::{api_org_members, api_orgs_create, api_register};
     use crate::cli::create_agent;
     use crate::http::Resp;
-    use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC};
+    use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC, REGISTER_BURST, REGISTER_RATE_PER_SEC};
     use crate::router::gate;
     use crate::server::{Cfg, Ctx, CtxInner};
 
@@ -543,6 +543,8 @@ mod h4_tests {
             limiter: Arc::new(ConnLimiter::default()),
             login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
             token_rl: Arc::new(TokenBuckets::new()),
+            // Mirror production's tight registration bucket, so the per-IP throttle is exercised for real.
+            register_rl: Arc::new(TokenBuckets::with_rate(REGISTER_RATE_PER_SEC, REGISTER_BURST)),
         }));
         (dir, ctx)
     }
@@ -572,7 +574,7 @@ mod h4_tests {
     #[tokio::test]
     async fn register_creates_a_non_admin_user_with_a_session() {
         let (_d, ctx) = test_ctx(true).await;
-        let r = api_register(&ctx, br#"{"username":"alice","password":"correct horse"}"#).await;
+        let r = api_register(&ctx, None, br#"{"username":"alice","password":"correct horse"}"#).await;
         assert_eq!(r.status, 200);
         assert!(has_set_cookie(&r), "a successful signup logs the user in");
         let u = ctx.store.user("alice").await.expect("the account persists");
@@ -584,7 +586,7 @@ mod h4_tests {
     async fn register_ignores_an_is_admin_field_in_the_body() {
         // The security invariant: an is_admin in the request body must be ignored outright.
         let (_d, ctx) = test_ctx(true).await;
-        let r = api_register(&ctx, br#"{"username":"eve","password":"password-123","is_admin":true}"#).await;
+        let r = api_register(&ctx, None, br#"{"username":"eve","password":"password-123","is_admin":true}"#).await;
         assert_eq!(r.status, 200);
         assert!(!ctx.store.user("eve").await.unwrap().is_admin);
     }
@@ -592,23 +594,47 @@ mod h4_tests {
     #[tokio::test]
     async fn register_duplicate_username_is_409_not_500() {
         let (_d, ctx) = test_ctx(true).await;
-        assert_eq!(api_register(&ctx, br#"{"username":"alice","password":"password-123"}"#).await.status, 200);
-        assert_eq!(api_register(&ctx, br#"{"username":"alice","password":"password-456"}"#).await.status, 409);
+        assert_eq!(api_register(&ctx, None, br#"{"username":"alice","password":"password-123"}"#).await.status, 200);
+        assert_eq!(api_register(&ctx, None, br#"{"username":"alice","password":"password-456"}"#).await.status, 409);
     }
 
     #[tokio::test]
     async fn register_rejects_short_password_and_bad_username() {
         let (_d, ctx) = test_ctx(true).await;
-        assert_eq!(api_register(&ctx, br#"{"username":"bob","password":"short"}"#).await.status, 400);
-        assert_eq!(api_register(&ctx, br#"{"username":"Bad Name","password":"password-123"}"#).await.status, 400);
+        assert_eq!(api_register(&ctx, None, br#"{"username":"bob","password":"short"}"#).await.status, 400);
+        assert_eq!(api_register(&ctx, None, br#"{"username":"Bad Name","password":"password-123"}"#).await.status, 400);
     }
 
     #[tokio::test]
     async fn register_is_403_when_disabled() {
         let (_d, ctx) = test_ctx(false).await;
-        let r = api_register(&ctx, br#"{"username":"alice","password":"password-123"}"#).await;
+        let r = api_register(&ctx, None, br#"{"username":"alice","password":"password-123"}"#).await;
         assert_eq!(r.status, 403);
         assert!(ctx.store.user("alice").await.is_none(), "nothing is created when signup is off");
+    }
+
+    #[tokio::test]
+    async fn register_is_rate_limited_per_ip() {
+        let (_d, ctx) = test_ctx(true).await;
+        let flooder: IpAddr = "203.0.113.7".parse().unwrap();
+        let bystander: IpAddr = "203.0.113.8".parse().unwrap();
+        // Distinct usernames, so any rejection is the rate limit talking and never a duplicate 409.
+        // More attempts than REGISTER_BURST, so the bucket is certain to drain within the loop.
+        let mut statuses = Vec::new();
+        for i in 0..(REGISTER_BURST as usize + 4) {
+            let body = format!(r#"{{"username":"flood{i}","password":"password-123"}}"#);
+            statuses.push(api_register(&ctx, Some(flooder), body.as_bytes()).await.status);
+        }
+        assert_eq!(statuses[0], 200, "the first signup from an IP is always allowed");
+        assert!(statuses.contains(&429), "a sustained sweep from one IP is eventually throttled (429)");
+        assert_eq!(*statuses.last().unwrap(), 429, "once the bucket drains, the throttle sticks");
+        // A different IP keeps its own bucket, untouched by the flooder.
+        let r = api_register(&ctx, Some(bystander), br#"{"username":"newcomer","password":"password-123"}"#).await;
+        assert_eq!(r.status, 200, "a different address is not charged for another IP's flood");
+        // No resolvable client IP → fail open (never blocked on a missing ConnectInfo), matching the
+        // connection limiter's behaviour for the same case.
+        let r = api_register(&ctx, None, br#"{"username":"anonip","password":"password-123"}"#).await;
+        assert_eq!(r.status, 200, "a missing client IP fails open");
     }
 
     // ── organizations ──
@@ -702,6 +728,28 @@ mod h4_tests {
         let r = api_org_members(&ctx, &Caller::user("alice"), "acme", "/alice", "DELETE", b"").await;
         assert_eq!(r.status, 409, "removing the only admin would orphan the org");
     }
+
+    #[tokio::test]
+    async fn org_cannot_demote_its_last_admin() {
+        // The DELETE path already refuses to remove the sole admin; the POST/update path must refuse to
+        // demote them too, or the same orphaning happens by another name.
+        let (_d, ctx) = test_ctx(false).await;
+        add_user(&ctx.store, "alice").await;
+        add_user(&ctx.store, "bob").await;
+        assert_eq!(api_orgs_create(&ctx, &Caller::user("alice"), br#"{"name":"acme"}"#).await.status, 201);
+        // alice is the sole admin — demoting her to member would leave the org with no admin → 409.
+        let r = api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"alice","role":"member"}"#).await;
+        assert_eq!(r.status, 409, "demoting the only admin would orphan the org");
+        assert!(ctx.store.org("acme").await.unwrap().is_admin("alice"), "the refused demotion left alice an admin");
+        // Promote bob so there are two admins.
+        assert_eq!(api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"admin"}"#).await.status, 200);
+        // Now demoting alice is fine — bob still holds the org.
+        let r = api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"alice","role":"member"}"#).await;
+        assert_eq!(r.status, 200, "demoting a non-last admin succeeds");
+        let org = ctx.store.org("acme").await.unwrap();
+        assert!(!org.is_admin("alice"), "alice is now a plain member");
+        assert!(org.is_admin("bob"), "bob remains the org admin");
+    }
 }
 
 // ── H3: content-addressed blob upload/download, gated through the single acl::decide ──
@@ -741,6 +789,7 @@ mod h3_tests {
             limiter: Arc::new(ConnLimiter::default()),
             login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
             token_rl: Arc::new(TokenBuckets::new()),
+            register_rl: Arc::new(TokenBuckets::new()),
         }));
         (dir, ctx)
     }
@@ -773,7 +822,7 @@ mod h3_tests {
         let body = b"a large-ish artifact that does not belong in git";
 
         // Owner (admin role → Write) uploads; the server echoes the sha256 it computed.
-        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), None, body).await;
         assert_eq!(put.status, 201);
         let v: serde_json::Value = serde_json::from_slice(&put.body).unwrap();
         let digest = v["sha256"].as_str().unwrap().to_string();
@@ -783,7 +832,7 @@ mod h3_tests {
         // An authorized reader (the owner) fetches it: bytes identical + the hardened download headers.
         let path = format!("/api/agent/alice/art/blob/{digest}");
         let rest = format!("agent/alice/art/blob/{digest}");
-        let get = api(&ctx, &req("GET", &path, 0), &rest, &Caller::user("alice"), b"").await;
+        let get = api(&ctx, &req("GET", &path, 0), &rest, &Caller::user("alice"), None, b"").await;
         assert_eq!(get.status, 200);
         assert_eq!(get.body, body);
         assert_eq!(header(&get, "X-Content-Type-Options"), Some("nosniff"));
@@ -797,8 +846,8 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"identical bytes";
-        let a = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
-        let b = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
+        let a = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), None, body).await;
+        let b = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), None, body).await;
         assert_eq!(a.status, 201);
         assert_eq!(b.status, 201);
         let da: serde_json::Value = serde_json::from_slice(&a.body).unwrap();
@@ -811,7 +860,7 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"x";
-        let r = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::anonymous(), body).await;
+        let r = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::anonymous(), None, body).await;
         assert_eq!(r.status, 401, "no credentials on a private agent → one chance to authenticate");
     }
 
@@ -821,7 +870,7 @@ mod h3_tests {
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         add_read_member(&ctx, "art", "reader").await;
         let body = b"x";
-        let r = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("reader"), body).await;
+        let r = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("reader"), None, body).await;
         assert_eq!(r.status, 403, "a reader can see the agent but may not write to it");
     }
 
@@ -839,6 +888,7 @@ mod h3_tests {
             &req("PUT", &format!("/api/agent/alice/art/blob?sha256={wrong}"), body.len()),
             "agent/alice/art/blob",
             &Caller::user("alice"),
+            None,
             body,
         )
         .await;
@@ -850,6 +900,7 @@ mod h3_tests {
             &req("PUT", &format!("/api/agent/alice/art/blob?sha256={real}"), body.len()),
             "agent/alice/art/blob",
             &Caller::user("alice"),
+            None,
             body,
         )
         .await;
@@ -861,13 +912,13 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"secret artifact";
-        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), None, body).await;
         let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
 
         // eve has no access — she must not be able to tell "no such blob" from "no access to this agent".
         let rest = format!("agent/alice/art/blob/{digest}");
         let path = format!("/api/{rest}");
-        let r = api(&ctx, &req("GET", &path, 0), &rest, &Caller::user("eve"), b"").await;
+        let r = api(&ctx, &req("GET", &path, 0), &rest, &Caller::user("eve"), None, b"").await;
         assert_eq!(r.status, 404, "the blob exists, but a stranger sees the same 404 as a missing agent");
     }
 
@@ -879,13 +930,13 @@ mod h3_tests {
         // A well-formed digest that names no blob → 404 (for an authorized reader).
         let absent = "a".repeat(64);
         let rest = format!("agent/alice/art/blob/{absent}");
-        let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
+        let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), None, b"").await;
         assert_eq!(r.status, 404);
 
         // Malformed digests (wrong length / non-hex) → 404, before the backend is ever touched.
         for d in ["zz", "not-a-digest", "ZZZ"] {
             let rest = format!("agent/alice/art/blob/{d}");
-            let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
+            let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), None, b"").await;
             assert_eq!(r.status, 404, "malformed digest {d} → 404");
         }
     }
@@ -896,7 +947,7 @@ mod h3_tests {
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         // content_length over the ceiling is refused size-first, before any storage work.
         let clen = (BLOB_MAX + 1) as usize;
-        let r = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", clen), "agent/alice/art/blob", &Caller::user("alice"), b"small").await;
+        let r = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", clen), "agent/alice/art/blob", &Caller::user("alice"), None, b"small").await;
         assert_eq!(r.status, 413);
     }
 
@@ -905,14 +956,14 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"honest bytes";
-        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), None, body).await;
         let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
 
         // Corrupt the stored object under its key, then GET: the read-time re-hash must refuse it.
         let file = ctx.root().join("blobs").join("alice").join("art").join(&digest);
         std::fs::write(&file, b"tampered!").unwrap();
         let rest = format!("agent/alice/art/blob/{digest}");
-        let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
+        let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), None, b"").await;
         assert_eq!(r.status, 500, "bytes that no longer hash to their address are not served");
     }
 
@@ -923,17 +974,17 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"a renamed artifact";
-        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), None, body).await;
         assert_eq!(put.status, 201);
         let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
 
         // Rename through the real PATCH route (owner → Manage).
-        let renamed = api(&ctx, &req("PATCH", "/api/agent/alice/art", 0), "agent/alice/art", &Caller::user("alice"), br#"{"name":"gallery"}"#).await;
+        let renamed = api(&ctx, &req("PATCH", "/api/agent/alice/art", 0), "agent/alice/art", &Caller::user("alice"), None, br#"{"name":"gallery"}"#).await;
         assert_eq!(renamed.status, 200, "rename succeeds");
 
         // Reachable under the NEW name, end to end (200 + identical bytes).
         let rest = format!("agent/alice/gallery/blob/{digest}");
-        let get = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
+        let get = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), None, b"").await;
         assert_eq!(get.status, 200, "the blob followed the rename");
         assert_eq!(get.body, body);
 
@@ -952,14 +1003,14 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "temp", "alice", Visibility::Private).await.unwrap();
         let body = b"the previous owner's private bytes";
-        let put = api(&ctx, &req("PUT", "/api/agent/alice/temp/blob", body.len()), "agent/alice/temp/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/temp/blob", body.len()), "agent/alice/temp/blob", &Caller::user("alice"), None, body).await;
         assert_eq!(put.status, 201);
         let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
 
         // Soft delete, then purge (the two-step destroy), both through the real DELETE route.
-        let soft = api(&ctx, &req("DELETE", "/api/agent/alice/temp", 0), "agent/alice/temp", &Caller::user("alice"), b"").await;
+        let soft = api(&ctx, &req("DELETE", "/api/agent/alice/temp", 0), "agent/alice/temp", &Caller::user("alice"), None, b"").await;
         assert_eq!(soft.status, 200, "soft delete");
-        let purge = api(&ctx, &req("DELETE", "/api/agent/alice/temp?purge=true", 0), "agent/alice/temp", &Caller::user("alice"), b"").await;
+        let purge = api(&ctx, &req("DELETE", "/api/agent/alice/temp?purge=true", 0), "agent/alice/temp", &Caller::user("alice"), None, b"").await;
         assert_eq!(purge.status, 204, "purge empties the trash");
 
         // A brand-new owner recycles the NAME under their own namespace (mallory/temp).
@@ -968,7 +1019,7 @@ mod h3_tests {
         // owner's bytes. This is the leak, and it is closed — and per-(owner,name) keys make it doubly
         // so, since alice/temp and mallory/temp are different namespaces to begin with.
         let rest = format!("agent/mallory/temp/blob/{digest}");
-        let get = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("mallory"), b"").await;
+        let get = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("mallory"), None, b"").await;
         assert_eq!(get.status, 404, "the recycled name cannot read the purged owner's private blob");
         assert!(ctx.blobs.get("alice", "temp", &digest).await.unwrap().is_none(), "the bytes are gone from storage");
     }
@@ -997,17 +1048,17 @@ mod h3_tests {
         make_org(&ctx, "acme", "alice", "bob").await;
 
         let missing =
-            api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("eve"), br#"{"name":"x","org":"ghost"}"#).await;
+            api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("eve"), None, br#"{"name":"x","org":"ghost"}"#).await;
         let forbidden =
-            api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("eve"), br#"{"name":"y","org":"acme"}"#).await;
+            api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("eve"), None, br#"{"name":"y","org":"acme"}"#).await;
         assert_eq!(missing.status, 404, "no such org → 404");
         assert_eq!(forbidden.status, missing.status, "an existing org a stranger can't see is indistinguishable from a missing one");
 
         // A member who merely lacks org-admin still gets a distinct 403 — they already know it exists.
-        let member = api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("bob"), br#"{"name":"z","org":"acme"}"#).await;
+        let member = api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("bob"), None, br#"{"name":"z","org":"acme"}"#).await;
         assert_eq!(member.status, 403, "a member who isn't an org admin is told so, not hidden");
         // The successful path is unchanged: the org admin creates the org-owned agent.
-        let admin = api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("alice"), br#"{"name":"w","org":"acme"}"#).await;
+        let admin = api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("alice"), None, br#"{"name":"w","org":"acme"}"#).await;
         assert_eq!(admin.status, 201, "the org admin still creates org-owned agents");
     }
 
@@ -1020,9 +1071,9 @@ mod h3_tests {
         create_agent(&ctx.store, "mine", "alice", Visibility::Private).await.unwrap();
 
         let missing =
-            api(&ctx, &req("POST", "/api/agent/alice/mine/transfer", 0), "agent/alice/mine/transfer", &Caller::user("alice"), br#"{"org":"ghost"}"#).await;
+            api(&ctx, &req("POST", "/api/agent/alice/mine/transfer", 0), "agent/alice/mine/transfer", &Caller::user("alice"), None, br#"{"org":"ghost"}"#).await;
         let forbidden =
-            api(&ctx, &req("POST", "/api/agent/alice/mine/transfer", 0), "agent/alice/mine/transfer", &Caller::user("alice"), br#"{"org":"secret"}"#).await;
+            api(&ctx, &req("POST", "/api/agent/alice/mine/transfer", 0), "agent/alice/mine/transfer", &Caller::user("alice"), None, br#"{"org":"secret"}"#).await;
         assert_eq!(missing.status, 404, "no such org → 404");
         assert_eq!(forbidden.status, missing.status, "a non-member can't tell 'secret exists' from 'no such org'");
     }

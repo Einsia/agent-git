@@ -23,6 +23,12 @@ use crate::limits::{API_MAX_BODY, MAX_BODY, MAX_CONN};
 use crate::server::Ctx;
 use crate::smarthttp::git_http;
 
+/// The real client IP the connection admission keyed on, stashed in request extensions by
+/// `gate_conn_and_auth` so path-specific rate limits (registration) charge the same address without
+/// re-deriving it. A newtype so it can't collide with any other `IpAddr` in extensions.
+#[derive(Clone, Copy)]
+pub(crate) struct ClientIp(pub(crate) IpAddr);
+
 // ── Frontend embedded at compile time (hub-ui/dist) ──
 pub(crate) const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/index.html"));
 pub(crate) const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/app.js"));
@@ -163,8 +169,12 @@ async fn gate_conn_and_auth(State(ctx): State<Ctx>, req: Request, next: Next) ->
     }
 
     // (e) Hand the Caller to the handlers via extensions, then run the inner service with the IpGuard
-    // still held across the await (RAII drop after).
+    // still held across the await (RAII drop after). The resolved client IP rides along too, so the
+    // registration rate limit charges the same address the connection limiter did.
     parts.extensions.insert(authn.caller);
+    if let Some(ip) = client {
+        parts.extensions.insert(ClientIp(ip));
+    }
     let req = Request::from_parts(parts, body);
     next.run(req).await
 }
@@ -190,6 +200,7 @@ fn is_blob_put_path(rest: &str) -> bool {
 async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let caller = caller_of(&parts);
+    let client_ip = parts.extensions.get::<ClientIp>().map(|c| c.0);
     let method = parts.method.as_str().to_string();
     let reqo = req_from_parts(&method, &parts.uri, &parts.headers);
     let rest = parts.uri.path().strip_prefix("/api/").unwrap_or("").to_string();
@@ -210,7 +221,7 @@ async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
         }
     };
 
-    let resp = api(&ctx, &reqo, &rest, &caller, &body_bytes).await;
+    let resp = api(&ctx, &reqo, &rest, &caller, client_ip, &body_bytes).await;
     resp.into_response()
 }
 

@@ -12,7 +12,7 @@ use agit::hub::session::Sessions;
 use agit::hub::store::{self, Store};
 
 use crate::cli::list_agents;
-use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC};
+use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC, REGISTER_BURST, REGISTER_RATE_PER_SEC};
 use crate::{flag, has_flag};
 
 pub(crate) struct Cfg {
@@ -48,6 +48,12 @@ pub(crate) struct CtxInner {
     pub(crate) login_gate: Arc<tokio::sync::Semaphore>,
     /// Per-token request budget (see TokenBuckets).
     pub(crate) token_rl: Arc<TokenBuckets>,
+    /// Per-IP registration budget. The shared connection limiter caps *concurrent* connections and the
+    /// per-token budget only bites *authenticated* callers, so self-service signup — unauthenticated and
+    /// cheap to retry — is otherwise an unbounded account-spam / username-enumeration surface on an
+    /// `--open-registration` hub. A tight token bucket keyed on the client IP throttles a sweep to a
+    /// trickle without troubling a real person who signs up once.
+    pub(crate) register_rl: Arc<TokenBuckets>,
 }
 
 #[derive(Clone)]
@@ -238,6 +244,7 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
             limiter: Arc::new(ConnLimiter::default()),
             login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
             token_rl: Arc::new(TokenBuckets::new()),
+            register_rl: Arc::new(TokenBuckets::with_rate(REGISTER_RATE_PER_SEC, REGISTER_BURST)),
         }));
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
