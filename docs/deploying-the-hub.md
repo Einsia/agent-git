@@ -1,6 +1,6 @@
 ---
 title: Deploying the hub
-nav_order: 10
+nav_order: 11
 ---
 
 # Deploying agit-hub
@@ -9,13 +9,17 @@ nav_order: 10
 Agent Stores (bare git repos of AI-session transcripts), readable by people
 through an embedded React SPA and pullable by agents over git smart-http. It
 carries auth (cookie sessions for people, scoped tokens for git/scripts), a
-per-agent ACL, an audit log, and a server-side secret scan on every push.
+per-agent ACL, an audit log, and a server-side secret scan on every push. Its
+metadata lives in a database (SQLite by default, Postgres for production), and
+large objects go in a content-addressed blob store (local filesystem by default,
+S3/Garage when configured).
 
 This guide covers the two supported ways to run it — a container behind a reverse
 proxy, and a systemd service behind a reverse proxy — plus the operational parts:
-TLS (why it is mandatory), the trusted-proxy story, backups, and upgrades.
+TLS (why it is mandatory), the trusted-proxy story, the database and blob backends,
+registration, backups, and upgrades.
 
-Everything below uses the **real** CLI. The full surface is:
+Everything below uses the **real** CLI. The full subcommand surface is:
 
 ```
 agit-hub serve [--host 127.0.0.1] [--port 8177] [--root ~/.agit-hub]
@@ -30,7 +34,12 @@ agit-hub token list                                  list tokens (metadata only)
 agit-hub token rm <id>                               revoke a token
 ```
 
-`agit-hub --help` prints exactly this.
+`agit-hub --help` prints exactly this. Two further switches are set at serve time
+and do not appear in that summary: `--open-registration` (covered under
+[Registration](#enabling-self-service-registration)), and the database and blob
+backends, which are selected by environment variables (`AGIT_HUB_DB`,
+`AGIT_HUB_S3_ENDPOINT`; see [The database and blob backends](#the-database-and-blob-backends)).
+Organizations are managed through the API and web UI, not the CLI.
 
 ---
 
@@ -60,11 +69,12 @@ them:
    `--insecure` is the "plaintext on purpose, I know the price" escape hatch for a
    trusted LAN or a throwaway demo.
 
-3. **Secrets on disk are locked down.** The data root is created `0700`;
-   `users.json`, `agents.json` and `auth.json` are written `0600` (atomically,
-   via a temp file + rename). Passwords are stored as argon2id hashes — the
-   plaintext never touches disk. Tokens are stored as sha256 digests only; the
-   token string is shown once, at issue.
+3. **Secrets on disk are locked down.** The data root is created `0700`. On the
+   default SQLite backend the metadata database (`hub.db` and its write-ahead-log
+   sidecars) is written `0600`; with Postgres the same metadata lives in the
+   database instead. Passwords are stored as argon2id hashes, and the plaintext
+   never touches disk. Tokens are stored as sha256 digests only; the token string
+   is shown once, at issue.
 
 4. **The real client IP comes from `--trusted-proxy`.** Behind a proxy the hub
    sees the proxy's IP as the peer. It only reads `X-Forwarded-For` from peers you
@@ -85,7 +95,7 @@ history. That is why the hub refuses a public plaintext bind unless you force it
 
 Files: [`Dockerfile`](../Dockerfile), [`.dockerignore`](../.dockerignore),
 [`deploy/docker-compose.yml`](../deploy/docker-compose.yml),
-[`deploy/Caddyfile`](../deploy/Caddyfile).
+[`deploy/Caddyfile`](../deploy/Caddyfile), [`deploy/garage.toml`](../deploy/garage.toml).
 
 ```
 client ──HTTPS──▶ caddy (:443) ──HTTP──▶ hub (:8177)
@@ -95,6 +105,12 @@ Caddy terminates HTTPS and reverse-proxies to the hub over the internal Docker
 network, forwarding `X-Forwarded-For`. Inside the container the hub binds
 `0.0.0.0:8177` with `--tls` (TLS terminated in front) and trusts Caddy's fixed
 address. Nothing but Caddy can reach the hub — it publishes no host ports.
+
+The compose file bundles four services: **caddy** (TLS in front), **hub**,
+**postgres** (the production metadata backend), and **garage** (S3-compatible blob
+storage). Only Caddy publishes host ports; postgres and garage stay internal to the
+compose network. Postgres is wired up by default; garage sits idle until you point
+the hub at it. Both backends are covered next.
 
 ### The image
 
@@ -126,6 +142,62 @@ Encrypt certificate automatically. For a local trial, drop `HUB_DOMAIN` (it
 defaults to `localhost`, which Caddy serves with its own trusted-locally cert);
 for any other private name or bare IP, uncomment `tls internal` in the
 `Caddyfile`.
+
+### The database and blob backends
+
+Two independent choices sit behind two environment variables. Both have zero-config
+defaults, so a hub with neither set runs on SQLite and local-disk blobs.
+
+**Metadata (`AGIT_HUB_DB`).** The compose file points the hub at the bundled
+Postgres by default:
+
+```yaml
+AGIT_HUB_DB: postgres://agithub:${PGPASSWORD:-agithub}@postgres:5432/agithub
+```
+
+Set a strong `PGPASSWORD` for a real deploy (it is shared with the postgres
+service). To fall back to the zero-config SQLite `hub.db` on the `/data` volume
+instead, drop that one line. Either way the hub creates and migrates its own tables
+at boot, so there is no init SQL, and the bare git repos and `audit.log` still live
+on `/data`.
+
+**Blobs (`AGIT_HUB_S3_ENDPOINT`).** Left unset (the default), blobs are stored on
+the `/data` volume under `<root>/blobs` and the garage service sits idle. To store
+them in Garage instead, uncomment the `AGIT_HUB_S3_*` block in the hub service:
+
+```yaml
+AGIT_HUB_S3_ENDPOINT: http://garage:3900
+AGIT_HUB_S3_BUCKET: agit-blobs
+AGIT_HUB_S3_REGION: garage
+AGIT_HUB_S3_ACCESS_KEY: ${GARAGE_ACCESS_KEY}
+AGIT_HUB_S3_SECRET_KEY: ${GARAGE_SECRET_KEY}
+```
+
+Garage does not auto-create its layout, bucket, or key, so a Garage-backed deploy
+needs a one-time init after the first `up` (much like creating the first admin):
+
+```sh
+# 1. assign a storage layout to the single node (its id comes from `status`)
+docker compose -f deploy/docker-compose.yml exec garage /garage status
+docker compose -f deploy/docker-compose.yml exec garage /garage layout assign -z dc1 -c 1G <node-id>
+docker compose -f deploy/docker-compose.yml exec garage /garage layout apply --version 1
+# 2. create the bucket the hub will use
+docker compose -f deploy/docker-compose.yml exec garage /garage bucket create agit-blobs
+# 3. mint an access key (prints an Access Key ID + Secret, capture both)
+docker compose -f deploy/docker-compose.yml exec garage /garage key create agit-hub-key
+# 4. grant that key read+write on the bucket
+docker compose -f deploy/docker-compose.yml exec garage /garage bucket allow --read --write agit-blobs --key agit-hub-key
+```
+
+Then bring the hub up with the key material in the environment:
+
+```sh
+GARAGE_ACCESS_KEY=<id> GARAGE_SECRET_KEY=<secret> \
+  docker compose -f deploy/docker-compose.yml up -d
+```
+
+A misconfigured S3 endpoint (set, but with a missing bucket or key) is an error at
+boot, not a silent fall back to local disk.
 
 ### First admin, first agent, first token
 
@@ -246,6 +318,29 @@ proxy's address.
 
 ---
 
+## Enabling self-service registration
+
+Accounts are created by a site admin (`agit-hub user add`) by default: the hub is
+invite-only. To let people create their own accounts, turn on registration at serve
+time, either with the flag or the environment variable:
+
+```sh
+# flag, on the serve command
+agit-hub serve ... --open-registration
+
+# or the environment variable (1 / true / open / yes)
+AGIT_HUB_REGISTRATION=1 agit-hub serve ...
+```
+
+Under compose, add `--open-registration` to the hub's `command:` list, or set
+`AGIT_HUB_REGISTRATION` in its `environment:`; under systemd, add the flag to the
+unit's `ExecStart`. This opens `POST /api/register`, which creates a **normal,
+non-admin** account and logs it in. Registration can never grant admin: that stays
+CLI-only (`agit-hub user add --admin`). The startup banner reports the current mode
+(`signup: open` or `invite-only`).
+
+---
+
 ## Trusted proxy / X-Forwarded-For, precisely
 
 The hub uses the request's source IP for its per-IP rate limit, and would forge
@@ -266,19 +361,25 @@ Option B — and nothing else.
 
 ## Backups
 
-All state is in one directory (the data root: `/data/.agit-hub` inside the
-container's `hub-data` volume, or `/var/lib/agit-hub` under systemd). Back up the
-whole thing:
+What to back up depends on the backends you chose, but the data root always holds
+the transcript history and the audit trail (the data root is `/data/.agit-hub`
+inside the container's `hub-data` volume, or `/var/lib/agit-hub` under systemd):
 
-- `users.json`, `agents.json`, `auth.json` — users, per-agent ACL/metadata,
-  token digests. `0600`; they contain password hashes and token digests, so treat
-  the backup as a secret.
-- `audit.log` — the append-only audit trail.
-- `<name>.git/` — one bare repo per agent, the actual transcript history.
+- **The bare repos:** `<name>.git/` under the data root, one per agent, the actual
+  transcript history.
+- **`audit.log`:** the append-only audit trail, also under the data root.
+- **The metadata database:** on the default SQLite backend this is `hub.db` (with
+  its `-wal`/`-shm` sidecars, `0600`) under the data root; on the Postgres backend
+  it is the postgres data instead (the `pg-data` volume under compose). It holds
+  password hashes and token digests, so treat this backup as a secret.
+- **Blobs:** on the filesystem backend, `<root>/blobs` under the data root; on the
+  S3/Garage backend, Garage's own storage (the `garage-meta` and `garage-data`
+  volumes under compose).
 
-The hub writes those JSON files atomically (temp file + rename), so a filesystem
-snapshot or a plain copy is internally consistent. For the containerised deploy,
-back the named volume up by running a throwaway container against it:
+For a consistent copy, stop the hub before snapshotting, or use each backend's own
+tool (`pg_dump` for Postgres, `.backup` for SQLite). For the containerised deploy,
+back the data-root volume up by running a throwaway container against it (do the
+same for `pg-data` and the garage volumes if you use those backends):
 
 ```sh
 docker run --rm -v deploy_hub-data:/data -v "$PWD":/backup debian:bookworm-slim \
@@ -295,9 +396,9 @@ sensitive even though they are not reversible plaintext.
 
 ## Upgrades
 
-The binary is self-contained (the frontend is compiled in), and the on-disk
-formats are read leniently — a hand-written or older `agents.json` reads as
-active/private rather than failing. Upgrading is replace-and-restart:
+The binary is self-contained (the frontend is compiled in), and the hub runs its
+own database migrations at boot (idempotent, gated by a schema-version row), so
+upgrading is replace-and-restart with no manual migration:
 
 **Docker:** rebuild and roll the hub; the volume carries the data across.
 
@@ -313,10 +414,10 @@ sudo install -m 0755 target/release/agit-hub /usr/local/bin/agit-hub
 sudo systemctl restart agit-hub.service
 ```
 
-There is no migration step. On start the hub reports anything needing attention:
-users with no accounts, old unowned repos to claim (`agit-hub add <name> --owner
-<user>`), and legacy tokens with no owner (dead under the current ACL — reissue
-with `agit-hub token add … --user <owner>` and drop the old ones with `agit-hub
-token rm <id>`).
+You never run a migration by hand. On start the hub reports anything needing
+attention: users with no accounts, old unowned repos to claim (`agit-hub add <name>
+--owner <user>`), and legacy tokens with no owner (dead under the current ACL, so
+reissue with `agit-hub token add … --user <owner>` and drop the old ones with
+`agit-hub token rm <id>`).
 
 Back up the data root before any upgrade.

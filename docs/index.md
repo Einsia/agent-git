@@ -61,9 +61,10 @@ other.
 4. [Runtimes](guide/runtimes.html) — Claude Code and Codex, and session conversion.
 5. [Migration](guide/migration.html) — rebinding an agent's identity for recreated remotes and forks.
 6. [Configuration](guide/configuration.html) — environment variables and files.
-7. [Command reference](guide/command-reference.html) — every command.
+7. [Security](guide/security.html): the secret gate and session provenance.
+8. [Command reference](guide/command-reference.html) — every command.
 
 ## Hosting
 
-- [The hub](hub.html) — what `agit-hub` is, and how its permissions and API work.
+- [The hub](hub.html) — what `agit-hub` is, and how its database, permissions, and API work.
 - [Deploying the hub](deploying-the-hub.html) — running one for your team.

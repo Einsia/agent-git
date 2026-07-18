@@ -90,6 +90,7 @@ Anything agit does not recognize as its own verb is passed straight through to g
 | `agit adapter` | List the runtimes agit recognizes. |
 | `agit harness [apply]` | Show, or apply, an agent's captured MCP servers, skills, and config. |
 | `agit shadow install\|uninstall\|status` | Route `git` through `agit` in your shell. |
+| `agit provenance key\|verify <session>` | Show this machine's signing key, or self-verify a captured session's signature (see [Security](#security)). |
 
 **Managing agents** (`agit a`)
 
@@ -99,9 +100,11 @@ Anything agit does not recognize as its own verb is passed straight through to g
 | `agit a clone <name\|url>` | Clone an agent's store by identity; a bare name resolves through `.agit.toml`. |
 | `agit a switch <name>` | Choose which agent this worktree uses. |
 | `agit a list` / `agit a info <name>` | List your agents, or inspect one. |
+| `agit a status` | This repo's agents: which is active, session counts, last activity, live-watcher state, and the active store's position against its remote. |
+| `agit a log` / `agit a diff` | The session view of the store (a timeline of sessions; the prompts and edits added between two refs). `--raw` falls back to plain git. |
 | `agit a rename <old> <new>` | Rename an agent; the aid is unchanged. |
 | `agit a rebind [--remote <url>] [--new-id]` | Repair identity, or give a fork its own aid. |
-| `agit a merge <target> [--from <rt>] [--both] [--quick] [--splice]` | Reconcile two memories by dialogue, or `--splice` to just combine both (see [Merge](#merge)). |
+| `agit a merge <target> [--from <rt>] [--both] [--quick] [--splice] [--dry-run]` | Reconcile two memories by dialogue, `--splice` to just combine both, or `--dry-run` to preview (see [Merge](#merge)). |
 
 ## Runtimes
 
@@ -124,11 +127,14 @@ agit a merge frontend                 # reconcile against the frontend agent
 agit a merge frontend --from claude-code   # name the runtime when both are installed
 agit a merge frontend --both --quick  # revive both sides; shorter dialogue
 agit a merge frontend --splice        # no model: just combine both sides into one session
+agit a merge frontend --dry-run       # preview: what the merge would do, without running it
 ```
 
 `agit a merge <agent>` does not diff text. It revives both sides' latest sessions read-only, has them compare their work against the actual code, and produces a **resumable merged session**, which you pick up with `claude --resume <id>` or `codex exec resume <id>`, plus the list of genuine conflicts. Not a summary written to a file.
 
 Merge runs through a model, so its result is not deterministic. The raw sessions on both sides stay committed and versioned in the store, so a merge you do not like is one you can drop and redo.
+
+**`--dry-run` (alias `--preview`) previews a merge without running it.** It prints the plan (the target, the mode, each side's sessions, the voice session picked per side, and whether the git histories would fuse) and stops before the first turn, so it spends no model and installs nothing. When you do run a merge, your accept, custom, and defer decisions on the conflicts are recorded to a ledger under `<agent>/sessions/sync/`, beside the merge transcript.
 
 **`--splice` is the stupid mode.** It skips the model: it combines A's transcript with B's divergent tail into one new session, normalizing the ids so it resumes cleanly. Nothing is reconciled — you resume it and a fresh agent reads both sides' context in one window and takes it from there. It needs no model and no runtime CLI, and it is deterministic.
 
@@ -155,14 +161,20 @@ To pull a single agent instead of all of them, use `agit a clone frontend`. Its 
 
 `agit-hub` is a separate, self-contained server your team hosts, via Docker or built from source (see the [`deploying-the-hub`](docs/deploying-the-hub.md) guide). It stores agents as bare git repos with sync, and serves a web UI (a React app compiled into the binary) that renders each session as a browsable event timeline with provenance and revision diffs.
 
+- **A real database:** metadata (users, agents, tokens, merge requests) lives in Postgres for production, or a zero-config SQLite `hub.db` for self-host, selected by `AGIT_HUB_DB`.
 - **Per-agent permissions:** an owner, a visibility (private by default), and members with read / write / admin.
+- **Organizations:** an org owns agents and has members with roles; every member gets access to the org's agents.
 - **Two ways in:** people sign in with a password (argon2id + cookie session); scripts and git use scoped, expiring, revocable tokens.
+- **Self-service registration:** off by default (invite-only); enable it with `--open-registration` or `AGIT_HUB_REGISTRATION` to let people create their own non-admin accounts.
+- **Blob storage:** content-addressed large-object storage, on the local filesystem by default or in S3/Garage via `AGIT_HUB_S3_ENDPOINT`, gated by the same per-agent ACL.
 - **One decision:** every request, git smart-http included, goes through a single authorization check.
 - **Secrets scanned server-side on every push,** so a leaked credential cannot land in a shared repo.
 
 ## Security
 
-Sessions can carry secrets: a `.env` the agent read, a token it printed. Every store is scanned before each commit and push, and the hub scans again on the way in, so those do not get committed or shared by accident.
+Sessions can carry secrets: a `.env` the agent read, a token it printed. `agit a commit`, `agit a push`, and every snapshot scan the content in-process before delegating to git, so the scan holds even when git's own hook is skipped with `--no-verify`. The one way through is `AGIT_ALLOW_SECRETS=1`, a visible override that agit discloses every time it honors it (unlike `git --no-verify`, which leaves no trace). Known-safe hits can be exempted with a `.agit-allow-secrets` allowlist or an `agit:allow-secret` pragma. The hub scans again on the way in, so a secret cannot land in a shared repo by accident.
+
+Provenance ties a captured session to the machine that produced it: each machine has an ed25519 key (`agit provenance key`) that signs sessions as they are captured, and `agit provenance verify <session>` self-verifies one. See [Security](docs/guide/security.md).
 
 `.agit.toml` is attacker-controlled input, since a teammate wrote it. Before agit clones a remote it declares, that remote is checked against a transport allowlist, because `git clone 'ext::<cmd>'` executes `<cmd>`.
 

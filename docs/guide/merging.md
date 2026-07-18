@@ -40,6 +40,16 @@ claude --resume <id>
 codex exec resume <id>
 ```
 
+## The conflict ledger
+
+When merge surfaces conflicts, you decide each one: accept a way out the dialogue named, type your own
+call, or leave it open for now. Those decisions are written to an auditable ledger beside the merge
+transcript, at `<agent>/sessions/sync/<a>-<b>.decisions.md`, so what was settled (and what was
+consciously deferred) lives in the store rather than only inside the resumed session. Every conflict is
+on the record: an accepted option, a custom decision, and a deliberate defer alike. The settled
+decisions are also folded into the merged session, so when you resume it the agent continues with them
+already decided.
+
 ## Same agent vs. different agent
 
 The target's aid decides how far the merge goes:
@@ -61,6 +71,7 @@ is the aid, not the label — see [How it works](concepts.html).
 | `--both` | Write the merged session onto both branches instead of one. |
 | `--quick` | Skip the context handoff — reconcile from the diffs alone, without the summary exchange. Faster, less thorough. |
 | `--splice` | The no-model merge. Combine both sides into one session for a fresh agent to read, instead of reconciling them. See below. |
+| `--dry-run` (alias `--preview`) | Show what the merge would do without running it. See below. |
 
 ## It's model-backed
 
@@ -72,6 +83,21 @@ Deferring to a model is the trade for a real semantic merge with no schema, and 
 is non-deterministic — run it twice and the merged session may differ. That's fine, because the merge
 is not the record. The raw sessions on both sides stay committed in the store, git-versioned, and
 remain the source of truth; a merge you don't like is one you can drop and redo.
+
+## Preview a merge: `--dry-run`
+
+`--dry-run` (alias `--preview`) shows what a merge would do without doing it:
+
+```
+agit a merge frontend --dry-run
+```
+
+It runs only the inspection phases the real merge starts with (resolve the target, read each side's
+sessions, pick the voice session per side) and prints the plan: the target, the mode (same agent, which
+would reconcile then fuse the git histories, or a different agent, which would reconcile by dialogue
+only), how many sessions each side has, and the voice session picked for each. It stops there. No model
+runs, no session is revived, no transcript or ledger is written, and no worktree is left behind, so it
+needs neither `AGIT_LLM` nor the runtime CLI. Rerun without `--dry-run` to carry it out.
 
 ## The stupid mode: `--splice`
 

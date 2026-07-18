@@ -1,13 +1,14 @@
 ---
 title: The hub
-nav_order: 9
+nav_order: 10
 ---
 
 # The agit hub
 
 `agit-hub` is a separate, self-contained server a team hosts to share agents. It holds each agent as a
-bare git repo of session transcripts and adds what a shared store needs: access control, sync over git
-smart-http, server-side secret scanning on every push, an audit log, and a web UI for browsing
+bare git repo of session transcripts and adds what a shared store needs: a database for its metadata,
+access control (with organizations), self-service registration, sync over git smart-http, server-side
+secret scanning on every push, content-addressed blob storage, an audit log, and a web UI for browsing
 sessions. Run it with Docker or build it from source — [Deploying the hub](deploying-the-hub.html)
 covers both.
 
@@ -42,6 +43,21 @@ agit a merge frontend                                  # reconcile locally, by d
 `agit init` in a fresh clone does the same clone step for every agent the binding declares. Merging is
 a local, model-driven reconciliation, not a server operation; see [Merging](guide/merging.html).
 
+## The database
+
+The hub keeps its metadata (users, agents, tokens, and merge requests) in a relational database, chosen
+by `AGIT_HUB_DB`:
+
+- **Postgres**, for production, when `AGIT_HUB_DB` is a `postgres://` URL.
+- **SQLite**, the zero-config default for a self-host, a `hub.db` file under the data root when
+  `AGIT_HUB_DB` is unset.
+
+Either way the bare git repos (the transcript history) and the audit log still live on disk under the
+data root; only the metadata moves into the database. The hub creates and migrates its own tables at
+boot, so there is no separate setup step, and a bad or unreachable `AGIT_HUB_DB` surfaces as a clear
+error at startup rather than on the first request. `hub.db` and its write-ahead-log sidecars are
+`0600`, since they hold credential digests and access-control facts.
+
 ## Permissions
 
 Each agent has an **owner**, a **visibility** (private by default), and a **member table** granting
@@ -69,6 +85,28 @@ A token is an **upper bound** on permission, never a source of it: effective per
 scope intersected with the owner's own permission. A read-only token in an admin's hands still only
 reads. Admin actions never accept a token at all — they require the person's own login session.
 
+## Organizations
+
+An owner can be a person or an **organization**. An org has a name and a member table of its own, with
+two roles: an org **member** gets write (read and push) on every agent the org owns, and an org
+**admin** gets admin (manage) on them and can add or remove members. Site admins can do everything.
+
+Ownership by an org is expressed as the owner `org:<name>`, and org membership is folded into an
+agent's effective permission at decision time: the single `acl::decide` check stays agent-only and
+never learns that orgs exist, so an org just contributes members to the agents it owns. The routes live
+under `/api/orgs`: `GET`/`POST /api/orgs` list and create orgs (the creator becomes the first org
+admin), `GET /api/orgs/<name>` shows one, and `/api/orgs/<name>/members[/<username>]` manages the
+roster. Org detail and membership follow the same existence-non-disclosure as agents: you only see orgs
+you belong to, so org names cannot be enumerated.
+
+## Registration
+
+New accounts are created by a site admin (`agit-hub user add`) by default: the hub is invite-only.
+Turning on self-service registration with `--open-registration` or `AGIT_HUB_REGISTRATION` opens
+`POST /api/register`, which lets anyone who can reach the hub create an account and be logged in with a
+session cookie. A registered account is always a **normal, non-admin** user; registration can never
+grant admin, which stays CLI-only. With registration off, `POST /api/register` is refused outright.
+
 ## Secret scanning on push
 
 Sessions can carry secrets: a `.env` the agent read, a token it printed. The hub scans every push
@@ -77,6 +115,25 @@ when someone bypasses the local hook with `--no-verify`. The scan covers blob co
 author and committer identity, and tag messages — a secret in any of those channels is refused. It
 fails closed: a push it cannot fully scan (an oversized blob, an unreadable object) is rejected rather
 than waved through.
+
+## Blob storage
+
+Alongside the git transcript history, the hub offers content-addressed storage for large objects an
+agent references. It sits behind a `BlobStore` with two backends, chosen by `AGIT_HUB_S3_ENDPOINT`
+(independently of the `AGIT_HUB_DB` choice above):
+
+- the local **filesystem** under the data root, the zero-config default, and
+- **S3/Garage** when `AGIT_HUB_S3_ENDPOINT` is set (with `AGIT_HUB_S3_BUCKET` and the access/secret
+  keys). A misconfigured S3 endpoint is an error at boot, never a silent fall back to local disk.
+
+Uploads go to `PUT /api/agent/<name>/blob` and downloads to `GET /api/agent/<name>/blob/<digest>`, both
+gated by the same per-agent ACL as everything else: write to upload, read to download. The server, not
+the client, computes the `sha256` on upload, and that digest is the address; re-uploading identical
+bytes is idempotent. Storage is namespaced per agent, so a blob uploaded under a private agent is
+reachable only by someone who may read that agent, the same non-disclosure gate covers it. A blob is
+opaque attacker-authored bytes, so it is deliberately not run through the secret scanner (which guards
+the git transcript, the source of truth) and is served back with the same hardened, non-executable
+download headers as a raw file.
 
 ## Audit log
 
@@ -107,5 +164,6 @@ cross-revision compare views serve their content with a content type the browser
   TLS-terminating reverse proxy. See [Deploying the hub](deploying-the-hub.html).
 - **Sessions live in memory.** Restarting logs everyone out — the upside is that revocation is
   immediate; tokens are unaffected.
-- **Single process per data root.** State files are guarded by an in-process lock and atomic renames,
-  so two servers pointed at the same root would clobber each other; that is unsupported.
+- **Single node per data root.** The bare git repos and the audit log live on the data root's local
+  disk, and on the default SQLite backend the metadata does too. Run one hub process per data root;
+  concurrent writers within it are serialized (a database transaction, plus a per-backend write lock).
