@@ -4,6 +4,8 @@ import { Layout } from "@/components/Layout"
 import { SessionProvider } from "@/lib/session"
 import { Home } from "@/pages/Home"
 import { Login } from "@/pages/Login"
+import { Register } from "@/pages/Register"
+import { Orgs } from "@/pages/Orgs"
 import { NewAgent } from "@/pages/NewAgent"
 import { Agent } from "@/pages/Agent"
 import { Settings } from "@/pages/Settings"
@@ -20,7 +22,9 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Home />} />
             <Route path="/login" element={<Login />} />
+            <Route path="/register" element={<Register />} />
             <Route path="/new" element={<NewAgent />} />
+            <Route path="/orgs" element={<Orgs />} />
             <Route path="/tokens" element={<Tokens />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/agent/:name" element={<Agent />} />

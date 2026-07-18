@@ -24,6 +24,7 @@ function useTheme() {
 function Nav({ isAdmin }: { isAdmin: boolean }) {
   return (
     <nav className="flex items-center gap-1">
+      <Tab to="/orgs">orgs</Tab>
       <Tab to="/tokens">tokens</Tab>
       {isAdmin && <Tab to="/audit">audit</Tab>}
     </nav>

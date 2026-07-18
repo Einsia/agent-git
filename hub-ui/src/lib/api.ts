@@ -22,6 +22,22 @@ export interface Member {
   role: Role
 }
 
+/// The **org** role, a separate axis from the agent-level `Role` above. "member" grants write on
+/// every agent the org owns; "admin" also manages the org's roster. (See OrgMember::agent_role in
+/// src/hub/store.rs.)
+export type OrgRole = "member" | "admin"
+
+export interface OrgMember {
+  username: string
+  role: OrgRole
+}
+
+export interface Org {
+  name: string
+  created: string
+  members: OrgMember[]
+}
+
 export interface AgentSummary {
   name: string
   /// null until the client pushes an agent.toml — an empty repo has no identity yet.
@@ -196,6 +212,10 @@ export const api = {
   // ── auth ──
   login: (username: string, password: string) =>
     request<Me>("/api/login", { method: "POST", body: JSON.stringify({ username, password }) }),
+  // Self-service signup. On 200 the server sets the session cookie and answers the Me shape
+  // ({username, is_admin:false}); 403 = registration disabled, 409 = taken, 400 = invalid.
+  register: (username: string, password: string) =>
+    request<Me>("/api/register", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<void>("/api/logout", { method: "POST" }),
   me: () => get<Me>("/api/me"),
 
@@ -221,6 +241,31 @@ export const api = {
     }),
   removeMember: (name: string, username: string) =>
     request<void>(`/api/agent/${encodeURIComponent(name)}/members/${encodeURIComponent(username)}`, {
+      method: "DELETE",
+    }),
+
+  // ── orgs ──
+  // The orgs the caller belongs to (a site admin sees all). 401 if signed out.
+  orgs: () => get<Org[]>("/api/orgs"),
+  // The creator becomes the org's first admin. The 201 body omits `created`, so this reports
+  // only what the server sends back; callers reload the list for the full record.
+  createOrg: (name: string) =>
+    request<{ name: string; members: OrgMember[] }>("/api/orgs", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+  org: (name: string) => get<Org>(`/api/orgs/${encodeURIComponent(name)}`),
+  orgMembers: (name: string) => get<OrgMember[]>(`/api/orgs/${encodeURIComponent(name)}/members`),
+  // POST doubles as "change role": an existing member's role is overwritten in place. Returns the
+  // fresh roster. Org-admin gated (403), 400 if the role or username is bad / user doesn't exist.
+  addOrgMember: (name: string, username: string, role: OrgRole) =>
+    request<OrgMember[]>(`/api/orgs/${encodeURIComponent(name)}/members`, {
+      method: "POST",
+      body: JSON.stringify({ username, role }),
+    }),
+  // 204 on success; 409 if it would leave the org with no admin.
+  removeOrgMember: (name: string, username: string) =>
+    request<void>(`/api/orgs/${encodeURIComponent(name)}/members/${encodeURIComponent(username)}`, {
       method: "DELETE",
     }),
 

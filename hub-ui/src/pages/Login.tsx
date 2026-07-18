@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react"
-import { useNavigate, useSearchParams } from "react-router-dom"
+import { Link, useNavigate, useSearchParams } from "react-router-dom"
 
 import { ApiError, api } from "@/lib/api"
 import { useSession } from "@/lib/session"
@@ -83,6 +83,14 @@ export function Login() {
       </form>
 
       <p className="mt-4 text-[0.8rem] text-muted-foreground">
+        New here?{" "}
+        <Link to="/register" className="text-primary hover:underline">
+          Create an account
+        </Link>
+        .
+      </p>
+
+      <p className="mt-2 text-[0.8rem] text-muted-foreground">
         Scripts and git use a token, not a password: sign in and make one at{" "}
         <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">/tokens</code>.
       </p>
