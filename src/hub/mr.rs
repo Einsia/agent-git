@@ -38,6 +38,12 @@ pub struct Endpoint {
     /// an agent.toml yet (an empty store) — honest null beats a made-up id.
     #[serde(default)]
     pub aid: Option<String>,
+    /// The owner **namespace segment** (`owner_ns`: user `alice` → `alice`, org `org:acme` → `acme`)
+    /// the agent lives under. Part of the endpoint's identity now that a name is unique only within an
+    /// owner — `daru/frontend` and `kaisen/frontend` are different memories. `#[serde(default)]` so a
+    /// pre-scoping record deserializes (empty), then the v2 migration backfills it.
+    #[serde(default)]
+    pub owner: String,
     /// The agent's name **at open time**. Renames keep this current (see `Store::update_mrs`), so it
     /// stays a usable link rather than a fossil.
     pub agent: String,
@@ -135,10 +141,10 @@ impl Mr {
     }
 }
 
-/// The next free id for one target agent. Max + 1, never `len() + 1`: ids must not be reused after a
-/// deletion, or a stale link starts pointing at somebody else's review.
-pub fn next_id(mrs: &[Mr], target: &str) -> usize {
-    mrs.iter().filter(|m| m.target.agent == target).map(|m| m.id).max().unwrap_or(0) + 1
+/// The next free id for one target agent `(seg, name)`. Max + 1, never `len() + 1`: ids must not be
+/// reused after a deletion, or a stale link starts pointing at somebody else's review.
+pub fn next_id(mrs: &[Mr], seg: &str, name: &str) -> usize {
+    mrs.iter().filter(|m| m.target.owner == seg && m.target.agent == name).map(|m| m.id).max().unwrap_or(0) + 1
 }
 
 /// Trim and bound one piece of user text. `None` = empty after trimming (absent), `Err` = too long.
@@ -161,8 +167,8 @@ mod tests {
     fn mk(id: usize, target: &str, state: &str) -> Mr {
         Mr {
             id,
-            source: Endpoint { aid: Some("agt_src".into()), agent: "src".into(), git_ref: "main".into() },
-            target: Endpoint { aid: Some("agt_dst".into()), agent: target.into(), git_ref: "main".into() },
+            source: Endpoint { aid: Some("agt_src".into()), owner: "alice".into(), agent: "src".into(), git_ref: "main".into() },
+            target: Endpoint { aid: Some("agt_dst".into()), owner: "alice".into(), agent: target.into(), git_ref: "main".into() },
             title: "t".into(),
             author: "alice".into(),
             state: state.into(),
@@ -196,17 +202,29 @@ mod tests {
     fn ids_are_per_target_agent() {
         // Two agents each get their own 1, 2, 3 — the id only has to be unique where it is routed.
         let mrs = vec![mk(1, "pay", "open"), mk(2, "pay", "closed"), mk(1, "other", "open")];
-        assert_eq!(next_id(&mrs, "pay"), 3);
-        assert_eq!(next_id(&mrs, "other"), 2);
-        assert_eq!(next_id(&mrs, "fresh"), 1);
-        assert_eq!(next_id(&[], "pay"), 1);
+        assert_eq!(next_id(&mrs, "alice", "pay"), 3);
+        assert_eq!(next_id(&mrs, "alice", "other"), 2);
+        assert_eq!(next_id(&mrs, "alice", "fresh"), 1);
+        assert_eq!(next_id(&[], "alice", "pay"), 1);
+    }
+
+    #[test]
+    fn ids_are_scoped_to_the_owner_too() {
+        // Same name under two owners is two different memories, so their MR ids are independent.
+        let mut daru = mk(5, "frontend", "open");
+        daru.target.owner = "daru".into();
+        let mut kaisen = mk(2, "frontend", "open");
+        kaisen.target.owner = "kaisen".into();
+        let mrs = vec![daru, kaisen];
+        assert_eq!(next_id(&mrs, "daru", "frontend"), 6);
+        assert_eq!(next_id(&mrs, "kaisen", "frontend"), 3);
     }
 
     #[test]
     fn ids_are_never_reused_after_a_deletion() {
         // max+1, not len+1: recycling #2 would silently redirect every link to the old #2.
         let mrs = vec![mk(1, "pay", "open"), mk(3, "pay", "closed")];
-        assert_eq!(next_id(&mrs, "pay"), 4);
+        assert_eq!(next_id(&mrs, "alice", "pay"), 4);
     }
 
     #[test]

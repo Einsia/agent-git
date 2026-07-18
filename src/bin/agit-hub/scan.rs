@@ -52,8 +52,14 @@ pub(crate) fn pre_receive_cmd(root: &Path, args: &[String]) -> i32 {
         eprintln!("pre-receive: --agent is required");
         return 2;
     };
+    let Some(owner) = flag(args, "--owner") else {
+        eprintln!("pre-receive: --owner is required");
+        return 2;
+    };
+    // The scoped id `<owner>/<name>` is what the audit log keys on now.
+    let scoped = format!("{owner}/{agent}");
     // git runs the hook with cwd = the bare repo.
-    let repo = std::env::current_dir().unwrap_or_else(|_| repo_path(root, &agent));
+    let repo = std::env::current_dir().unwrap_or_else(|_| repo_path(root, &owner, &agent));
     let mut news = vec![];
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
         let mut f = line.split_whitespace();
@@ -84,7 +90,7 @@ pub(crate) fn pre_receive_cmd(root: &Path, args: &[String]) -> i32 {
         root,
         &actor,
         audit::GIT_PUSH_REJECTED,
-        Some(&agent),
+        Some(&scoped),
         &format!(
             "secret scan: {} finding(s), {} unscanned blob(s){}; {}",
             report.findings.len(),
@@ -462,7 +468,7 @@ pub(crate) fn git_stdin(repo: &Path, args: &[&str], input: &[u8]) -> Option<Vec<
 /// The absolute path of the running executable is baked in: the hook runs from git's environment,
 /// where PATH is whatever the service inherited, and a hook that cannot find its binary is a gate
 /// that silently isn't there.
-pub(crate) fn install_pre_receive(repo: &Path, root: &Path, agent: &str) {
+pub(crate) fn install_pre_receive(repo: &Path, root: &Path, owner_ns: &str, name: &str) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -471,10 +477,11 @@ pub(crate) fn install_pre_receive(repo: &Path, root: &Path, agent: &str) {
         "#!/bin/sh\n\
          # Installed by agit-hub. The server-side secret gate: `git push --no-verify` skips the\n\
          # client's hook, not this one. Regenerated on demand — edit agit-hub, not this file.\n\
-         exec {} pre-receive --root {} --agent {}\n",
+         exec {} pre-receive --root {} --owner {} --agent {}\n",
         shell_quote(&exe.to_string_lossy()),
         shell_quote(&root.to_string_lossy()),
-        shell_quote(agent),
+        shell_quote(owner_ns),
+        shell_quote(name),
     );
     // Rewrite whenever it differs: the binary may have moved since the repo was created, and a hook
     // pointing at a path that no longer exists fails the push rather than passing it (git treats a

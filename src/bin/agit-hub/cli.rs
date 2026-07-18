@@ -56,8 +56,18 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
                 eprintln!("invalid username (2-32 lowercase [a-z0-9._-], no leading dot): {name}");
                 return 2;
             }
+            if store::is_reserved_account(&username) {
+                eprintln!("that name is reserved and cannot be registered: {username}");
+                return 2;
+            }
             if store.user(&username).await.is_some() {
                 eprintln!("user already exists: {username}");
+                return 1;
+            }
+            // Unified account namespace (GitHub-style): a username and an org name may never share a
+            // bare string, so the `owner_ns` segment maps to exactly one account.
+            if store.org(&username).await.is_some() {
+                eprintln!("that name is already taken by an organization: {username}");
                 return 1;
             }
             let is_admin = has_flag(args, "--admin");
@@ -197,13 +207,14 @@ async fn add_cmd_async(root: &Path, args: &[String]) -> i32 {
     };
     // Private by default — transcripts are sensitive data, so going public must be an explicit act.
     let visibility = if has_flag(args, "--public") { Visibility::Public } else { Visibility::Private };
+    let seg = owner.username.clone(); // a user-owned agent's namespace segment is the bare username
     match create_agent(&store, name, &owner.username, visibility).await {
         Ok(created) => {
             audit::append(root, "cli", audit::AGENT_CREATE, Some(name), &format!("owner={} visibility={}", owner.username, visibility.as_str()));
             if created {
-                println!("now hosting {name}  →  {}", repo_path(root, name).display());
+                println!("now hosting {seg}/{name}  →  {}", repo_path(root, &seg, name).display());
             } else {
-                println!("claimed existing repo {name}  →  {}", repo_path(root, name).display());
+                println!("claimed existing repo {seg}/{name}  →  {}", repo_path(root, &seg, name).display());
             }
             println!("  owner:      {}", owner.username);
             println!("  visibility: {}", visibility.as_str());
@@ -211,7 +222,7 @@ async fn add_cmd_async(root: &Path, args: &[String]) -> i32 {
                 println!("  ⚠ public = anyone who can reach this port can read all of its transcripts.");
             }
             println!("Publish (needs a write token, see `agit-hub token add`):");
-            println!("  agit -a remote add origin http://localhost:8177/{name}.git");
+            println!("  agit -a remote add origin http://localhost:8177/{seg}/{name}.git");
             println!("  agit -a push -u origin main");
             0
         }
@@ -232,20 +243,22 @@ pub(crate) async fn create_agent(store: &Store, name: &str, owner: &str, visibil
     if !valid_agent_name(name) {
         return Err(format!("invalid name ([A-Za-z0-9._-] only, no .. and no leading dot): {name}"));
     }
-    // The existence check and the record append run together under the agents.json lock. Split apart,
-    // two concurrent creates of one name both pass the check and both append — two records, one name.
-    // update_agents holds the lock across the whole closure, so checking inside it is the atomic guard.
+    let seg = store::owner_ns(owner).to_string();
+    // The existence check and the record append run together under the agents lock. Split apart, two
+    // concurrent creates of one (owner, name) both pass the check and both append — two records, one
+    // identity. update_agents holds the lock across the whole closure, so checking inside it is the
+    // atomic guard. Scoped: `daru/frontend` and `kaisen/frontend` are distinct and both allowed.
     store
         .update_agents(|list| {
             // Covers soft-deleted agents too: their record is still here, and the name is still theirs
             // until someone purges them. Handing it out would leave the restore nowhere to land.
-            if let Some(existing) = list.iter().find(|a| a.name == name) {
+            if let Some(existing) = list.iter().find(|a| a.matches(&seg, name)) {
                 return Err(match existing.lifecycle() {
-                    Lifecycle::Deleted => format!("a deleted agent still holds this name: restore or purge it first: {name}"),
-                    _ => format!("already exists: {name}"),
+                    Lifecycle::Deleted => format!("a deleted agent still holds this name: restore or purge it first: {seg}/{name}"),
+                    _ => format!("already exists: {seg}/{name}"),
                 });
             }
-            let dir = store.root().join(format!("{name}.git"));
+            let dir = store.root().join(&seg).join(format!("{name}.git"));
             let existed = dir.exists();
             if !existed {
                 std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create the directory: {e}"))?;
@@ -281,24 +294,38 @@ async fn list_cmd_async(root: &Path) -> i32 {
     if names.is_empty() {
         println!("no agents yet. `agit-hub add <name>` creates one.");
     }
-    for n in names {
-        let m = store.agent_or_unowned(&n).await;
+    for (seg, n) in names {
+        let m = store.agent_or_unowned(&seg, &n).await;
         let owner = m.owner.clone().unwrap_or_else(|| "— (unowned)".into());
-        println!("{:<24} {:<8} owner={}", n, m.visibility, owner);
+        println!("{:<28} {:<8} owner={}", format!("{seg}/{n}"), m.visibility, owner);
     }
     0
 }
 
-pub(crate) fn list_agents(root: &Path) -> Vec<String> {
+/// Walk the two-level `root/<owner_ns>/<name>.git` layout, returning every `(owner_ns, name)` whose
+/// BOTH segments validate. Directory names come from outside, so an invalid owner segment
+/// (`valid_username`) or name (`valid_agent_name`) is skipped — never let the likes of `..git` or a
+/// malformed owner reach the router.
+pub(crate) fn list_agents(root: &Path) -> Vec<(String, String)> {
     let mut out = vec![];
     if let Ok(rd) = std::fs::read_dir(root) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(n) = name.strip_suffix(".git") {
-                // Directory names come from outside: reject anything invalid (don't let the likes of
-                // `..git` reach the router).
-                if valid_agent_name(n) {
-                    out.push(n.to_string());
+        for owner_ent in rd.flatten() {
+            if !owner_ent.path().is_dir() {
+                continue;
+            }
+            let owner = owner_ent.file_name().to_string_lossy().into_owned();
+            if !store::valid_username(&owner) {
+                continue; // not a namespace dir (e.g. `blobs`, or a leftover flat repo)
+            }
+            let Ok(inner) = std::fs::read_dir(owner_ent.path()) else {
+                continue;
+            };
+            for e in inner.flatten() {
+                let fname = e.file_name().to_string_lossy().into_owned();
+                if let Some(n) = fname.strip_suffix(".git") {
+                    if valid_agent_name(n) {
+                        out.push((owner.clone(), n.to_string()));
+                    }
                 }
             }
         }
@@ -307,8 +334,8 @@ pub(crate) fn list_agents(root: &Path) -> Vec<String> {
     out
 }
 
-pub(crate) fn repo_path(root: &Path, name: &str) -> PathBuf {
-    root.join(format!("{name}.git"))
+pub(crate) fn repo_path(root: &Path, owner_ns: &str, name: &str) -> PathBuf {
+    root.join(owner_ns).join(format!("{name}.git"))
 }
 
 // ─────────────────────────── CLI: token ───────────────────────────
@@ -338,13 +365,21 @@ async fn token_cmd_async(root: &Path, args: &[String]) -> i32 {
             // Read-only by default: when issuing credentials, the only acceptable direction to fail
             // in is "less power". The old CLI defaulted to write, which is backwards.
             let scope = if has_flag(args, "--write") { Scope::Write } else { Scope::Read };
-            let agent = flag(args, "--agent");
-            if let Some(a) = &agent {
-                if !valid_agent_name(a) || store.agent(a).await.is_none() {
-                    eprintln!("no such agent: {a}");
-                    return 2;
+            // A token binds to the SCOPED id `<owner>/<name>` (names are unique only within an owner).
+            let agent = match flag(args, "--agent") {
+                None => None,
+                Some(spec) => {
+                    let Some((seg, aname)) = spec.split_once('/') else {
+                        eprintln!("--agent wants <owner>/<name> (e.g. alice/frontend, or acme/shared for an org)");
+                        return 2;
+                    };
+                    if !store::valid_username(seg) || !valid_agent_name(aname) || store.agent_scoped(seg, aname).await.is_none() {
+                        eprintln!("no such agent: {spec}");
+                        return 2;
+                    }
+                    Some(format!("{seg}/{aname}"))
                 }
-            }
+            };
             let ttl_days: Option<i64> = match flag(args, "--ttl-days") {
                 Some(v) => match v.parse::<i64>() {
                     Ok(n) if n > 0 => Some(n),

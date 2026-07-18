@@ -59,12 +59,12 @@ pub(crate) fn print_help() {
          agit-hub user list                                   list users\n\
          agit-hub add <name> [--owner <user>] [--public]      new Agent Store (private by default)\n\
          agit-hub list                                        list hosted agents\n\
-         agit-hub token add <name> [--user <owner>] [--agent <name>]\n\
+         agit-hub token add <name> [--user <owner>] [--agent <owner>/<name>]\n\
                             [--read|--write] [--ttl-days N]   issue an access token\n\
          agit-hub token list                                  list tokens (metadata only)\n\
          agit-hub token rm <id>                               revoke a token\n\n\
          First step: agit-hub user add <you> --admin\n\
-         Hosted repos are bare git. Publish with: agit -a push http://HOST:PORT/<name>.git (with a write token)\n\n\
+         Hosted repos are bare git. Publish with: agit -a push http://HOST:PORT/<owner>/<name>.git (with a write token)\n\n\
          Listens on 127.0.0.1 only by default. Serving the network needs --host 0.0.0.0, and without TLS also --insecure."
     );
 }
@@ -614,6 +614,39 @@ mod h4_tests {
     // ── organizations ──
 
     #[tokio::test]
+    async fn gate_hides_owner_and_agent_existence_uniformly() {
+        // The (owner, name) non-disclosure invariant: for a fixed caller, a private agent, a missing
+        // agent under a real owner, and an entirely unknown owner all collapse to the SAME outcome —
+        // no 404-for-missing-owner vs 403-for-invisible-agent oracle.
+        let (_d, ctx) = test_ctx(false).await;
+        add_user(&ctx.store, "daru").await;
+        add_user(&ctx.store, "kaisen").await;
+        create_agent(&ctx.store, "frontend", "daru", Visibility::Private).await.unwrap();
+        create_agent(&ctx.store, "frontend", "kaisen", Visibility::Public).await.unwrap();
+
+        let eve = Caller::user("eve");
+        // private daru/frontend, known-owner-missing-agent daru/nope, unknown-owner ghost/frontend.
+        let priv_agent = gate(&ctx, &eve, "daru", "frontend", Action::Read).await.unwrap_err().status;
+        let missing_agent = gate(&ctx, &eve, "daru", "nope", Action::Read).await.unwrap_err().status;
+        let missing_owner = gate(&ctx, &eve, "ghost", "frontend", Action::Read).await.unwrap_err().status;
+        assert_eq!((priv_agent, missing_agent, missing_owner), (404, 404, 404), "no existence oracle for a logged-in stranger");
+
+        // Anonymous gets a uniform 401 for all three (login required, nonexistent and invisible alike).
+        let anon = Caller::anonymous();
+        assert_eq!(gate(&ctx, &anon, "daru", "frontend", Action::Read).await.unwrap_err().status, 401);
+        assert_eq!(gate(&ctx, &anon, "ghost", "frontend", Action::Read).await.unwrap_err().status, 401);
+
+        // Coexistence: the two same-named agents resolve independently — daru owns the private one,
+        // and kaisen's is public so even a stranger reads it.
+        assert!(gate(&ctx, &Caller::user("daru"), "daru", "frontend", Action::Read).await.is_ok());
+        assert!(gate(&ctx, &eve, "kaisen", "frontend", Action::Read).await.is_ok(), "kaisen/frontend is public");
+        // A token bound to daru/frontend cannot reach kaisen/frontend (cross-owner escalation closed).
+        let bound = Caller::user("daru").with_token(Some("daru/frontend"), agit::hub::acl::Scope::Read);
+        assert!(gate(&ctx, &bound, "daru", "frontend", Action::Read).await.is_ok());
+        assert_eq!(gate(&ctx, &bound, "kaisen", "frontend", Action::Read).await.unwrap_err().status, 404, "bound token can't cross to another owner's same-named agent");
+    }
+
+    #[tokio::test]
     async fn org_member_reaches_an_org_owned_agent_and_a_stranger_does_not() {
         let (_d, ctx) = test_ctx(false).await;
         ctx.store
@@ -632,12 +665,12 @@ mod h4_tests {
         // A private agent owned by the org.
         create_agent(&ctx.store, "shared", "org:acme", Visibility::Private).await.unwrap();
         // A member reads it through the gate (org membership folded in before decide runs).
-        assert!(gate(&ctx, &Caller::user("bob"), "shared", Action::Read).await.is_ok());
+        assert!(gate(&ctx, &Caller::user("bob"), "acme", "shared", Action::Read).await.is_ok());
         // A stranger gets 404 — existence stays hidden, exactly as for a plain private agent.
-        assert_eq!(gate(&ctx, &Caller::user("eve"), "shared", Action::Read).await.unwrap_err().status, 404);
+        assert_eq!(gate(&ctx, &Caller::user("eve"), "acme", "shared", Action::Read).await.unwrap_err().status, 404);
         // The org admin can manage it; a plain member (folded to Write) cannot.
-        assert!(gate(&ctx, &Caller::user("alice"), "shared", Action::Manage).await.is_ok());
-        assert_eq!(gate(&ctx, &Caller::user("bob"), "shared", Action::Manage).await.unwrap_err().status, 403);
+        assert!(gate(&ctx, &Caller::user("alice"), "acme", "shared", Action::Manage).await.is_ok());
+        assert_eq!(gate(&ctx, &Caller::user("bob"), "acme", "shared", Action::Manage).await.unwrap_err().status, 403);
     }
 
     #[tokio::test]
@@ -740,7 +773,7 @@ mod h3_tests {
         let body = b"a large-ish artifact that does not belong in git";
 
         // Owner (admin role → Write) uploads; the server echoes the sha256 it computed.
-        let put = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
         assert_eq!(put.status, 201);
         let v: serde_json::Value = serde_json::from_slice(&put.body).unwrap();
         let digest = v["sha256"].as_str().unwrap().to_string();
@@ -748,8 +781,8 @@ mod h3_tests {
         assert_eq!(v["size"].as_u64().unwrap(), body.len() as u64);
 
         // An authorized reader (the owner) fetches it: bytes identical + the hardened download headers.
-        let path = format!("/api/agent/art/blob/{digest}");
-        let rest = format!("agent/art/blob/{digest}");
+        let path = format!("/api/agent/alice/art/blob/{digest}");
+        let rest = format!("agent/alice/art/blob/{digest}");
         let get = api(&ctx, &req("GET", &path, 0), &rest, &Caller::user("alice"), b"").await;
         assert_eq!(get.status, 200);
         assert_eq!(get.body, body);
@@ -764,8 +797,8 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"identical bytes";
-        let a = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
-        let b = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        let a = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
+        let b = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
         assert_eq!(a.status, 201);
         assert_eq!(b.status, 201);
         let da: serde_json::Value = serde_json::from_slice(&a.body).unwrap();
@@ -778,7 +811,7 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"x";
-        let r = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::anonymous(), body).await;
+        let r = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::anonymous(), body).await;
         assert_eq!(r.status, 401, "no credentials on a private agent → one chance to authenticate");
     }
 
@@ -788,7 +821,7 @@ mod h3_tests {
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         add_read_member(&ctx, "art", "reader").await;
         let body = b"x";
-        let r = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("reader"), body).await;
+        let r = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("reader"), body).await;
         assert_eq!(r.status, 403, "a reader can see the agent but may not write to it");
     }
 
@@ -803,8 +836,8 @@ mod h3_tests {
         let wrong = "0".repeat(64);
         let bad = api(
             &ctx,
-            &req("PUT", &format!("/api/agent/art/blob?sha256={wrong}"), body.len()),
-            "agent/art/blob",
+            &req("PUT", &format!("/api/agent/alice/art/blob?sha256={wrong}"), body.len()),
+            "agent/alice/art/blob",
             &Caller::user("alice"),
             body,
         )
@@ -814,8 +847,8 @@ mod h3_tests {
         // The correct claim is accepted.
         let ok = api(
             &ctx,
-            &req("PUT", &format!("/api/agent/art/blob?sha256={real}"), body.len()),
-            "agent/art/blob",
+            &req("PUT", &format!("/api/agent/alice/art/blob?sha256={real}"), body.len()),
+            "agent/alice/art/blob",
             &Caller::user("alice"),
             body,
         )
@@ -828,11 +861,11 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"secret artifact";
-        let put = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
         let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
 
         // eve has no access — she must not be able to tell "no such blob" from "no access to this agent".
-        let rest = format!("agent/art/blob/{digest}");
+        let rest = format!("agent/alice/art/blob/{digest}");
         let path = format!("/api/{rest}");
         let r = api(&ctx, &req("GET", &path, 0), &rest, &Caller::user("eve"), b"").await;
         assert_eq!(r.status, 404, "the blob exists, but a stranger sees the same 404 as a missing agent");
@@ -845,13 +878,13 @@ mod h3_tests {
 
         // A well-formed digest that names no blob → 404 (for an authorized reader).
         let absent = "a".repeat(64);
-        let rest = format!("agent/art/blob/{absent}");
+        let rest = format!("agent/alice/art/blob/{absent}");
         let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
         assert_eq!(r.status, 404);
 
         // Malformed digests (wrong length / non-hex) → 404, before the backend is ever touched.
         for d in ["zz", "not-a-digest", "ZZZ"] {
-            let rest = format!("agent/art/blob/{d}");
+            let rest = format!("agent/alice/art/blob/{d}");
             let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
             assert_eq!(r.status, 404, "malformed digest {d} → 404");
         }
@@ -863,7 +896,7 @@ mod h3_tests {
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         // content_length over the ceiling is refused size-first, before any storage work.
         let clen = (BLOB_MAX + 1) as usize;
-        let r = api(&ctx, &req("PUT", "/api/agent/art/blob", clen), "agent/art/blob", &Caller::user("alice"), b"small").await;
+        let r = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", clen), "agent/alice/art/blob", &Caller::user("alice"), b"small").await;
         assert_eq!(r.status, 413);
     }
 
@@ -872,13 +905,13 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"honest bytes";
-        let put = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
         let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
 
         // Corrupt the stored object under its key, then GET: the read-time re-hash must refuse it.
-        let file = ctx.root().join("blobs").join("art").join(&digest);
+        let file = ctx.root().join("blobs").join("alice").join("art").join(&digest);
         std::fs::write(&file, b"tampered!").unwrap();
-        let rest = format!("agent/art/blob/{digest}");
+        let rest = format!("agent/alice/art/blob/{digest}");
         let r = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
         assert_eq!(r.status, 500, "bytes that no longer hash to their address are not served");
     }
@@ -890,24 +923,24 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "art", "alice", Visibility::Private).await.unwrap();
         let body = b"a renamed artifact";
-        let put = api(&ctx, &req("PUT", "/api/agent/art/blob", body.len()), "agent/art/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/art/blob", body.len()), "agent/alice/art/blob", &Caller::user("alice"), body).await;
         assert_eq!(put.status, 201);
         let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
 
         // Rename through the real PATCH route (owner → Manage).
-        let renamed = api(&ctx, &req("PATCH", "/api/agent/art", 0), "agent/art", &Caller::user("alice"), br#"{"name":"gallery"}"#).await;
+        let renamed = api(&ctx, &req("PATCH", "/api/agent/alice/art", 0), "agent/alice/art", &Caller::user("alice"), br#"{"name":"gallery"}"#).await;
         assert_eq!(renamed.status, 200, "rename succeeds");
 
         // Reachable under the NEW name, end to end (200 + identical bytes).
-        let rest = format!("agent/gallery/blob/{digest}");
+        let rest = format!("agent/alice/gallery/blob/{digest}");
         let get = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("alice"), b"").await;
         assert_eq!(get.status, 200, "the blob followed the rename");
         assert_eq!(get.body, body);
 
         // Unambiguously at the storage layer: present under the new key, absent under the old (not
         // merely hidden by the gate now that "art" no longer exists).
-        assert!(ctx.blobs.get("gallery", &digest).await.unwrap().is_some(), "moved to the new name");
-        assert!(ctx.blobs.get("art", &digest).await.unwrap().is_none(), "not stranded under the old name");
+        assert!(ctx.blobs.get("alice", "gallery", &digest).await.unwrap().is_some(), "moved to the new name");
+        assert!(ctx.blobs.get("alice", "art", &digest).await.unwrap().is_none(), "not stranded under the old name");
     }
 
     #[tokio::test]
@@ -919,24 +952,25 @@ mod h3_tests {
         let (_d, ctx) = test_ctx().await;
         create_agent(&ctx.store, "temp", "alice", Visibility::Private).await.unwrap();
         let body = b"the previous owner's private bytes";
-        let put = api(&ctx, &req("PUT", "/api/agent/temp/blob", body.len()), "agent/temp/blob", &Caller::user("alice"), body).await;
+        let put = api(&ctx, &req("PUT", "/api/agent/alice/temp/blob", body.len()), "agent/alice/temp/blob", &Caller::user("alice"), body).await;
         assert_eq!(put.status, 201);
         let digest = serde_json::from_slice::<serde_json::Value>(&put.body).unwrap()["sha256"].as_str().unwrap().to_string();
 
         // Soft delete, then purge (the two-step destroy), both through the real DELETE route.
-        let soft = api(&ctx, &req("DELETE", "/api/agent/temp", 0), "agent/temp", &Caller::user("alice"), b"").await;
+        let soft = api(&ctx, &req("DELETE", "/api/agent/alice/temp", 0), "agent/alice/temp", &Caller::user("alice"), b"").await;
         assert_eq!(soft.status, 200, "soft delete");
-        let purge = api(&ctx, &req("DELETE", "/api/agent/temp?purge=true", 0), "agent/temp", &Caller::user("alice"), b"").await;
+        let purge = api(&ctx, &req("DELETE", "/api/agent/alice/temp?purge=true", 0), "agent/alice/temp", &Caller::user("alice"), b"").await;
         assert_eq!(purge.status, 204, "purge empties the trash");
 
-        // A brand-new owner recycles the name.
+        // A brand-new owner recycles the NAME under their own namespace (mallory/temp).
         create_agent(&ctx.store, "temp", "mallory", Visibility::Private).await.unwrap();
-        // Mallory (the new owner) asks for the old digest under the recycled name: it must be 404, NOT
-        // the previous owner's bytes. This is the leak, and it is closed.
-        let rest = format!("agent/temp/blob/{digest}");
+        // Mallory reads the old digest under her own recycled agent: it must be 404, NOT the previous
+        // owner's bytes. This is the leak, and it is closed — and per-(owner,name) keys make it doubly
+        // so, since alice/temp and mallory/temp are different namespaces to begin with.
+        let rest = format!("agent/mallory/temp/blob/{digest}");
         let get = api(&ctx, &req("GET", &format!("/api/{rest}"), 0), &rest, &Caller::user("mallory"), b"").await;
         assert_eq!(get.status, 404, "the recycled name cannot read the purged owner's private blob");
-        assert!(ctx.blobs.get("temp", &digest).await.unwrap().is_none(), "the bytes are gone from storage");
+        assert!(ctx.blobs.get("alice", "temp", &digest).await.unwrap().is_none(), "the bytes are gone from storage");
     }
 
     async fn make_org(ctx: &Ctx, name: &str, admin: &str, member: &str) {
@@ -986,9 +1020,9 @@ mod h3_tests {
         create_agent(&ctx.store, "mine", "alice", Visibility::Private).await.unwrap();
 
         let missing =
-            api(&ctx, &req("POST", "/api/agent/mine/transfer", 0), "agent/mine/transfer", &Caller::user("alice"), br#"{"org":"ghost"}"#).await;
+            api(&ctx, &req("POST", "/api/agent/alice/mine/transfer", 0), "agent/alice/mine/transfer", &Caller::user("alice"), br#"{"org":"ghost"}"#).await;
         let forbidden =
-            api(&ctx, &req("POST", "/api/agent/mine/transfer", 0), "agent/mine/transfer", &Caller::user("alice"), br#"{"org":"secret"}"#).await;
+            api(&ctx, &req("POST", "/api/agent/alice/mine/transfer", 0), "agent/alice/mine/transfer", &Caller::user("alice"), br#"{"org":"secret"}"#).await;
         assert_eq!(missing.status, 404, "no such org → 404");
         assert_eq!(forbidden.status, missing.status, "a non-member can't tell 'secret exists' from 'no such org'");
     }

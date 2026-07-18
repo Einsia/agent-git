@@ -27,6 +27,7 @@ use super::acl::{AgentAcl, Lifecycle, Role, Scope, Visibility};
 use super::mr::Mr;
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -63,11 +64,38 @@ pub struct User {
 /// Username rules: lowercase [a-z0-9._-], 2..=32, no leading dot. Login names are case-insensitive →
 /// normalize before storing, or "Alice" and "alice" become two accounts that can impersonate each
 /// other.
+///
+/// This is a **syntactic** check only, applied to both usernames and — since the two share one URL
+/// namespace segment — the owner half of a `/owner/name.git` path. Reserved names (see
+/// [`is_reserved_account`]) still pass here so the migrated `_unclaimed` namespace stays routable;
+/// creation paths refuse them separately.
 pub fn valid_username(name: &str) -> bool {
     let n = name.len();
     (2..=32).contains(&n)
         && !name.starts_with('.')
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The account that adopts legacy null-owner repos at migration time. Reserved: nobody may register
+/// it (see [`is_reserved_account`]), so no user or org can be handed the repos it holds — they stay
+/// private/admin-only until re-owned via `agit-hub add --owner`. It is still a valid URL segment, so
+/// `/_unclaimed/<name>.git` routes to those repos for the site admin.
+pub const UNCLAIMED: &str = "_unclaimed";
+
+/// Whether a name is reserved and may not be registered as a user or an org. Applied at every account
+/// creation site (`user add`, `api_register`, `api_orgs_create`) — NOT inside `valid_username`, so a
+/// reserved name stays a legal URL/namespace segment while being unclaimable.
+pub fn is_reserved_account(name: &str) -> bool {
+    name == UNCLAIMED
+}
+
+/// The **namespace segment** for an owner: the single canonical string used in every URL, repo
+/// directory, and blob key. A user-owned agent stores the bare username (`alice` → `alice`); an
+/// org-owned agent stores `org:<name>` (`org:acme` → `acme`). Because `valid_username` forbids `:`,
+/// the `org:` prefix is unforgeable, and because a username and an org name may never share a bare
+/// string (the unified-account rule, enforced at creation), this segment maps to exactly one account.
+pub fn owner_ns(owner: &str) -> &str {
+    owner.strip_prefix("org:").unwrap_or(owner)
 }
 
 pub fn normalize_username(name: &str) -> String {
@@ -235,6 +263,30 @@ impl AgentMeta {
     /// org access arrives ONLY through folded members (see `to_acl_with_org`).
     pub fn org_owner(&self) -> Option<&str> {
         self.owner.as_deref().and_then(|o| o.strip_prefix("org:"))
+    }
+
+    /// This agent's namespace segment (see [`owner_ns`]), if it has an owner. None only for the
+    /// fail-safe synthesized `agent_or_unowned` value, which has no owner at all.
+    pub fn owner_ns(&self) -> Option<&str> {
+        self.owner.as_deref().map(owner_ns)
+    }
+
+    /// The namespace segment for building this agent's repo dir / blob key. Falls back to
+    /// [`UNCLAIMED`] when the owner is None — but a real DB row always has an owner (the column is NOT
+    /// NULL), so that fallback is only ever the synthesized fail-safe, which never reaches storage.
+    pub fn seg(&self) -> &str {
+        self.owner_ns().unwrap_or(UNCLAIMED)
+    }
+
+    /// The canonical scoped id `"<owner_ns>/<name>"` — what a token binds to and what `acl::decide`
+    /// compares against.
+    pub fn scoped(&self) -> String {
+        format!("{}/{}", self.seg(), self.name)
+    }
+
+    /// Whether this row is the one addressed by URL segment `seg` and `name`.
+    pub fn matches(&self, seg: &str, name: &str) -> bool {
+        self.owner_ns() == Some(seg) && self.name == name
     }
 
     /// `to_acl`, plus the owning org's members folded into the ACL members list. Pure and sync — the
@@ -472,20 +524,25 @@ const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS users (\
        username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, salt TEXT NOT NULL, \
        kdf TEXT NOT NULL, is_admin BIGINT NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '')",
+    // Identity is (owner, name): a composite PRIMARY KEY, and owner is NOT NULL (it is the namespace).
+    // No surrogate id — `update_agents` rewrites the whole table every write, so a surrogate would be
+    // re-minted each time and buys nothing; the composite PK fits the snapshot model on both backends.
     "CREATE TABLE IF NOT EXISTS agents (\
-       name TEXT PRIMARY KEY, aid TEXT, owner TEXT, \
+       owner TEXT NOT NULL, name TEXT NOT NULL, aid TEXT, \
        visibility TEXT NOT NULL DEFAULT 'private', lifecycle TEXT NOT NULL DEFAULT 'active', \
        description TEXT, forked_from TEXT, forked_from_aid TEXT, aid_conflict TEXT, \
        stars TEXT NOT NULL DEFAULT '[]', members TEXT NOT NULL DEFAULT '[]', \
-       created TEXT NOT NULL DEFAULT '')",
+       created TEXT NOT NULL DEFAULT '', PRIMARY KEY (owner, name))",
     "CREATE INDEX IF NOT EXISTS agents_aid ON agents(aid)",
     "CREATE TABLE IF NOT EXISTS tokens (\
        id TEXT PRIMARY KEY, name TEXT NOT NULL, owner TEXT, agent TEXT, \
        scope TEXT NOT NULL, hash TEXT NOT NULL, created TEXT NOT NULL DEFAULT '', \
        expires TEXT, last_used TEXT)",
+    // An MR is keyed on its TARGET agent, which is now (owner_ns, name) — so the target namespace is a
+    // column and part of the PK. `id` is still unique per target agent.
     "CREATE TABLE IF NOT EXISTS mrs (\
-       target_agent TEXT NOT NULL, id BIGINT NOT NULL, data TEXT NOT NULL, \
-       PRIMARY KEY (target_agent, id))",
+       target_owner TEXT NOT NULL, target_agent TEXT NOT NULL, id BIGINT NOT NULL, data TEXT NOT NULL, \
+       PRIMARY KEY (target_owner, target_agent, id))",
     "CREATE TABLE IF NOT EXISTS orgs (\
        name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', created TEXT NOT NULL DEFAULT '')",
 ];
@@ -494,7 +551,11 @@ const DDL: &[&str] = &[
 /// **not** read-MAX-then-INSERT: two Hubs booting against one fresh Postgres at the same moment would
 /// both read 0 and both insert, leaving two rows. The upsert makes the second boot a no-op. Both
 /// SQLite (≥3.24) and Postgres support this form.
-const STAMP_VERSION: &str = "INSERT INTO schema_version (id, version) VALUES (1, 1) ON CONFLICT DO NOTHING";
+const STAMP_VERSION: &str = "INSERT INTO schema_version (id, version) VALUES (1, 2) ON CONFLICT DO NOTHING";
+
+/// The current schema version. Bumped to 2 for the (owner, name) scoping: a store stamped below this
+/// runs `migrate_v2` at boot before serving.
+const SCHEMA_VERSION: i64 = 2;
 
 /// The one global advisory-lock key Postgres `update_*` transactions take (ASCII "AGIT_HUB" as an
 /// i64). One key for all three tables reproduces the old single in-process Mutex: every read-modify-
@@ -509,6 +570,100 @@ fn err<E: std::error::Error + Send + Sync + 'static>(e: E) -> io::Error {
 fn is_pg_url(s: &str) -> bool {
     let s = s.trim();
     s.starts_with("postgres://") || s.starts_with("postgresql://")
+}
+
+// ─────────────────────────── v1 → v2 migration (owner-scoping) ───────────────────────────
+//
+// Both backends share this shape; only the row types differ. The DDL above already `CREATE TABLE IF
+// NOT EXISTS`es the NEW-shape tables, which is a no-op on a v1 store (the old tables already exist),
+// so this rebuilds the old-shape `agents`/`mrs` into the composite-PK shape and re-homes null-owner
+// rows to `_unclaimed`. Guarded by `schema_version < 2`, and structured to survive a crash: the table
+// rebuild and the FS reorg are both idempotent, and the version is bumped ONLY after the filesystem
+// has been reorganized, so an interrupted run re-runs cleanly instead of stranding repos.
+
+/// The portable statements that rebuild `agents` into the composite-PK, owner-NOT-NULL shape. Runs on
+/// an old-shape table (copies `owner` through `COALESCE(owner,'_unclaimed')`) and is idempotent on an
+/// already-migrated one (owner is then already non-null, so the COALESCE is a no-op).
+fn agents_rebuild_ddl() -> [String; 5] {
+    [
+        "DROP TABLE IF EXISTS agents_v2".to_string(),
+        "CREATE TABLE agents_v2 (\
+           owner TEXT NOT NULL, name TEXT NOT NULL, aid TEXT, \
+           visibility TEXT NOT NULL DEFAULT 'private', lifecycle TEXT NOT NULL DEFAULT 'active', \
+           description TEXT, forked_from TEXT, forked_from_aid TEXT, aid_conflict TEXT, \
+           stars TEXT NOT NULL DEFAULT '[]', members TEXT NOT NULL DEFAULT '[]', \
+           created TEXT NOT NULL DEFAULT '', PRIMARY KEY (owner, name))"
+            .to_string(),
+        format!(
+            "INSERT INTO agents_v2 (owner, name, aid, visibility, lifecycle, description, forked_from, forked_from_aid, aid_conflict, stars, members, created) \
+             SELECT COALESCE(owner, '{UNCLAIMED}'), name, aid, visibility, lifecycle, description, forked_from, forked_from_aid, aid_conflict, stars, members, created FROM agents"
+        ),
+        "DROP TABLE agents".to_string(),
+        "ALTER TABLE agents_v2 RENAME TO agents".to_string(),
+    ]
+}
+
+/// The map name → namespace segment used to backfill MR endpoints and re-home repos/blobs on disk.
+/// Built from the still-v1 `agents` rows (name was unique then), defaulting a null owner to
+/// `_unclaimed`.
+fn seg_map(pairs: &[(String, Option<String>)]) -> HashMap<String, String> {
+    pairs.iter().map(|(name, owner)| (name.clone(), owner.as_deref().map(owner_ns).unwrap_or(UNCLAIMED).to_string())).collect()
+}
+
+/// Patch one old MR's endpoints with the owner they belong under, resolved from the seg map (a target
+/// or source whose agent has no row falls back to `_unclaimed`, matching the repo re-homing).
+fn backfill_mr_owner(m: &mut Mr, map: &HashMap<String, String>) {
+    let seg = |name: &str| map.get(name).cloned().unwrap_or_else(|| UNCLAIMED.to_string());
+    m.target.owner = seg(&m.target.agent);
+    m.source.owner = seg(&m.source.agent);
+}
+
+/// Move `root/<name>.git` → `root/<seg>/<name>.git` and `root/blobs/<name>` → `root/blobs/<seg>/<name>`
+/// for every agent, using the resolved namespace segment (null owner → `_unclaimed`). Idempotent:
+/// each move is skipped when the destination already exists, and after a full run no flat `<name>.git`
+/// remains at the root. Orphan repos on disk with no agent row are re-homed to `_unclaimed`.
+fn reorg_fs(root: &Path, map: &HashMap<String, String>) {
+    // Repos: scan the flat `<name>.git` dirs still at the root (snapshot first so freshly-created
+    // `<seg>/` dirs are never re-scanned). An entry with no agent row lands under `_unclaimed`.
+    let mut repos: Vec<String> = vec![];
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            if !e.path().is_dir() {
+                continue;
+            }
+            let fname = e.file_name().to_string_lossy().into_owned();
+            if let Some(name) = fname.strip_suffix(".git") {
+                repos.push(name.to_string());
+            }
+        }
+    }
+    for name in repos {
+        let seg = map.get(&name).map(String::as_str).unwrap_or(UNCLAIMED);
+        let src = root.join(format!("{name}.git"));
+        let dst_dir = root.join(seg);
+        let dst = dst_dir.join(format!("{name}.git"));
+        if dst.exists() {
+            continue; // already re-homed
+        }
+        let _ = std::fs::create_dir_all(&dst_dir);
+        let _ = std::fs::rename(&src, &dst);
+    }
+    // Blobs are keyed by agent name and only ever exist for agents with a row, so iterate the map (a
+    // top-level `blobs/<seg>/` dir must never be mistaken for a flat `blobs/<name>/`).
+    let blobs = root.join("blobs");
+    for (name, seg) in map {
+        let src = blobs.join(name);
+        if !src.is_dir() {
+            continue;
+        }
+        let dst_dir = blobs.join(seg);
+        let dst = dst_dir.join(name);
+        if dst.exists() {
+            continue;
+        }
+        let _ = std::fs::create_dir_all(&dst_dir);
+        let _ = std::fs::rename(&src, &dst);
+    }
 }
 
 // ─────────────────────────── Store (enum facade) ───────────────────────────
@@ -613,8 +768,11 @@ impl Store {
         }
     }
 
-    pub async fn agent(&self, name: &str) -> Option<AgentMeta> {
-        self.agents().await.into_iter().find(|a| a.name == name)
+    /// Resolve one agent by its namespace segment + name. `seg` is the URL owner segment (see
+    /// [`owner_ns`]): user `alice` → `alice`, org `org:acme` → `acme`. At most one row matches, because
+    /// a username and an org name may never share a bare string (the unified-account rule).
+    pub async fn agent_scoped(&self, seg: &str, name: &str) -> Option<AgentMeta> {
+        self.agents().await.into_iter().find(|a| a.matches(seg, name))
     }
 
     /// Resolve an identity to the agent currently wearing it. **The aid is the identity, the name is
@@ -632,10 +790,12 @@ impl Store {
     /// `<name>.git` exists on disk but there is no record of it → unowned and private.
     /// **Fail-safe**: a migrated-in old repo does not become world-pullable just because there is no
     /// record of it.
-    pub async fn agent_or_unowned(&self, name: &str) -> AgentMeta {
+    pub async fn agent_or_unowned(&self, seg: &str, name: &str) -> AgentMeta {
         // Built through `new` rather than field-by-field: a field added later must not be able to
-        // acquire a laxer default here than a real agent gets.
-        self.agent(name).await.unwrap_or_else(|| AgentMeta {
+        // acquire a laxer default here than a real agent gets. The fail-safe carries owner:None (so it
+        // is byte-for-byte the SAME whether the owner account is missing, the agent is missing, or the
+        // agent exists-but-invisible) — that identity is what keeps `gate` from leaking existence.
+        self.agent_scoped(seg, name).await.unwrap_or_else(|| AgentMeta {
             created: String::new(),
             ..AgentMeta::new(name, None, Visibility::Private)
         })
@@ -663,9 +823,11 @@ impl Store {
         }
     }
 
-    /// Every MR whose **target** is this agent, oldest first (the id order MRs were opened in).
-    pub async fn mrs_for(&self, target: &str) -> Vec<Mr> {
-        let mut v: Vec<Mr> = self.mrs().await.into_iter().filter(|m| m.target.agent == target).collect();
+    /// Every MR whose **target** is this agent `(seg, name)`, oldest first (the id order MRs were
+    /// opened in).
+    pub async fn mrs_for(&self, seg: &str, name: &str) -> Vec<Mr> {
+        let mut v: Vec<Mr> =
+            self.mrs().await.into_iter().filter(|m| m.target.owner == seg && m.target.agent == name).collect();
         v.sort_by_key(|m| m.id);
         v
     }
@@ -683,13 +845,15 @@ impl Store {
     /// Carry an agent's MRs across a rename. The **aid does not move** — it never changes — but the
     /// name on each endpoint is a label, and a stale label is a dead link and a lie about who the MR
     /// is between.
-    pub async fn rename_in_mrs(&self, from: &str, to: &str) -> io::Result<()> {
+    /// Carry an agent's MRs across a rename within one namespace `seg`. Only the label moves — the aid
+    /// never changes — so endpoints in the same namespace whose name was `from` become `to`.
+    pub async fn rename_in_mrs(&self, seg: &str, from: &str, to: &str) -> io::Result<()> {
         self.update_mrs(|mrs| {
             for m in mrs.iter_mut() {
-                if m.target.agent == from {
+                if m.target.owner == seg && m.target.agent == from {
                     m.target.agent = to.to_string();
                 }
-                if m.source.agent == from {
+                if m.source.owner == seg && m.source.agent == from {
                     m.source.agent = to.to_string();
                 }
             }
@@ -784,6 +948,7 @@ impl SqliteStore {
             sqlx::query(stmt).execute(&self.pool).await.map_err(err)?;
         }
         sqlx::query(STAMP_VERSION).execute(&self.pool).await.map_err(err)?;
+        self.migrate_v2().await?;
         // create_if_missing may not honor the mode; tighten hub.db AND its WAL sidecars to 0600, the
         // same guarantee write_secret_atomic gave the old JSON files. The DDL/stamp above already
         // wrote, so in WAL mode the -wal/-shm sidecars now exist and get locked down too.
@@ -799,6 +964,60 @@ impl SqliteStore {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// v1 → v2 owner-scoping migration for SQLite. See the module-level migration notes. No-op once
+    /// `schema_version >= 2`.
+    async fn migrate_v2(&self) -> io::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let ver = sqlx::query("SELECT version FROM schema_version WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(err)?
+            .map(|r| r.int("version"))
+            .unwrap_or(0);
+        if ver >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        // Read the v1 rows (name unique then) to build the seg map and patch MR endpoints BEFORE the
+        // rebuild drops the old tables.
+        let agent_rows = sqlx::query("SELECT name, owner FROM agents").fetch_all(&self.pool).await.map_err(err)?;
+        let pairs: Vec<(String, Option<String>)> = agent_rows.iter().map(|r| (r.text("name"), r.opt("owner"))).collect();
+        let map = seg_map(&pairs);
+        let mr_rows = sqlx::query("SELECT data FROM mrs").fetch_all(&self.pool).await.map_err(err)?;
+        let mut mrs: Vec<Mr> = mr_rows.iter().filter_map(row_mr).collect();
+        for m in mrs.iter_mut() {
+            backfill_mr_owner(m, &map);
+        }
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        for stmt in agents_rebuild_ddl() {
+            sqlx::query(&stmt).execute(&mut *tx).await.map_err(err)?;
+        }
+        sqlx::query("CREATE INDEX IF NOT EXISTS agents_aid ON agents(aid)").execute(&mut *tx).await.map_err(err)?;
+        sqlx::query("DROP TABLE IF EXISTS mrs").execute(&mut *tx).await.map_err(err)?;
+        sqlx::query(
+            "CREATE TABLE mrs (target_owner TEXT NOT NULL, target_agent TEXT NOT NULL, id BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (target_owner, target_agent, id))",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+        for m in &mrs {
+            let data = serde_json::to_string(m).map_err(err)?;
+            sqlx::query("INSERT INTO mrs (target_owner, target_agent, id, data) VALUES (?, ?, ?, ?)")
+                .bind(&m.target.owner)
+                .bind(&m.target.agent)
+                .bind(m.id as i64)
+                .bind(data)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        // Re-home repos + blobs on disk, THEN record v2 — so an interrupted run re-migrates instead of
+        // leaving repos stranded at the old flat paths.
+        reorg_fs(&self.root, &map);
+        sqlx::query("UPDATE schema_version SET version = ? WHERE id = 1").bind(SCHEMA_VERSION).execute(&self.pool).await.map_err(err)?;
         Ok(())
     }
 
@@ -903,7 +1122,8 @@ impl SqliteStore {
         sqlx::query("DELETE FROM mrs").execute(&mut *tx).await.map_err(err)?;
         for m in &list {
             let data = serde_json::to_string(m).map_err(err)?;
-            sqlx::query("INSERT INTO mrs (target_agent, id, data) VALUES (?, ?, ?)")
+            sqlx::query("INSERT INTO mrs (target_owner, target_agent, id, data) VALUES (?, ?, ?, ?)")
+                .bind(&m.target.owner)
                 .bind(&m.target.agent)
                 .bind(m.id as i64)
                 .bind(data)
@@ -1015,6 +1235,58 @@ impl PgStore {
         }
         // Idempotent single-row stamp — no read-MAX-then-INSERT race under concurrent boot.
         sqlx::query(STAMP_VERSION).execute(&self.pool).await.map_err(err)?;
+        self.migrate_v2().await?;
+        Ok(())
+    }
+
+    /// v1 → v2 owner-scoping migration for Postgres. The rebuild runs under the one global advisory
+    /// lock so two hubs booting against one Postgres serialize; the rebuild itself is idempotent, so a
+    /// redundant concurrent run is harmless. No-op once `schema_version >= 2`.
+    async fn migrate_v2(&self) -> io::Result<()> {
+        let ver = sqlx::query("SELECT version FROM schema_version WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(err)?
+            .map(|r| r.int("version"))
+            .unwrap_or(0);
+        if ver >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        let agent_rows = sqlx::query("SELECT name, owner FROM agents").fetch_all(&self.pool).await.map_err(err)?;
+        let pairs: Vec<(String, Option<String>)> = agent_rows.iter().map(|r| (r.text("name"), r.opt("owner"))).collect();
+        let map = seg_map(&pairs);
+        let mr_rows = sqlx::query("SELECT data FROM mrs").fetch_all(&self.pool).await.map_err(err)?;
+        let mut mrs: Vec<Mr> = mr_rows.iter().filter_map(row_mr).collect();
+        for m in mrs.iter_mut() {
+            backfill_mr_owner(m, &map);
+        }
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        for stmt in agents_rebuild_ddl() {
+            sqlx::query(&stmt).execute(&mut *tx).await.map_err(err)?;
+        }
+        sqlx::query("CREATE INDEX IF NOT EXISTS agents_aid ON agents(aid)").execute(&mut *tx).await.map_err(err)?;
+        sqlx::query("DROP TABLE IF EXISTS mrs").execute(&mut *tx).await.map_err(err)?;
+        sqlx::query(
+            "CREATE TABLE mrs (target_owner TEXT NOT NULL, target_agent TEXT NOT NULL, id BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (target_owner, target_agent, id))",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+        for m in &mrs {
+            let data = serde_json::to_string(m).map_err(err)?;
+            sqlx::query("INSERT INTO mrs (target_owner, target_agent, id, data) VALUES ($1, $2, $3, $4)")
+                .bind(&m.target.owner)
+                .bind(&m.target.agent)
+                .bind(m.id as i64)
+                .bind(data)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        reorg_fs(&self.root, &map);
+        sqlx::query("UPDATE schema_version SET version = $1 WHERE id = 1").bind(SCHEMA_VERSION).execute(&self.pool).await.map_err(err)?;
         Ok(())
     }
 
@@ -1123,7 +1395,8 @@ impl PgStore {
         sqlx::query("DELETE FROM mrs").execute(&mut *tx).await.map_err(err)?;
         for m in &list {
             let data = serde_json::to_string(m).map_err(err)?;
-            sqlx::query("INSERT INTO mrs (target_agent, id, data) VALUES ($1, $2, $3)")
+            sqlx::query("INSERT INTO mrs (target_owner, target_agent, id, data) VALUES ($1, $2, $3, $4)")
+                .bind(&m.target.owner)
                 .bind(&m.target.agent)
                 .bind(m.id as i64)
                 .bind(data)
@@ -1299,7 +1572,7 @@ mod tests {
     async fn unknown_agent_is_private_and_unowned() {
         // Repo on disk, no record — it must not turn into "anyone can pull it".
         let (_d, s) = tmp_store().await;
-        let m = s.agent_or_unowned("legacy").await;
+        let m = s.agent_or_unowned("alice", "legacy").await;
         assert_eq!(m.visibility, "private");
         assert!(m.owner.is_none());
         let acl = m.to_acl();
@@ -1349,11 +1622,113 @@ mod tests {
         })
         .await
         .unwrap();
-        let m = s.agent("shared").await.unwrap();
+        let m = s.agent_scoped("alice", "shared").await.unwrap();
         assert_eq!(m.owner.as_deref(), Some("alice"));
         assert_eq!(m.visibility, "public");
         assert_eq!(m.role_of("bob"), Some(Role::Write));
         assert_eq!(m.role_of("eve"), None);
+    }
+
+    #[test]
+    fn owner_ns_and_reserved_helpers() {
+        assert_eq!(owner_ns("alice"), "alice");
+        assert_eq!(owner_ns("org:acme"), "acme");
+        assert_eq!(owner_ns("_unclaimed"), "_unclaimed");
+        assert!(is_reserved_account("_unclaimed"));
+        assert!(!is_reserved_account("alice"));
+        // Reserved names stay syntactically valid so `/_unclaimed/<name>.git` still routes.
+        assert!(valid_username("_unclaimed"));
+    }
+
+    #[tokio::test]
+    async fn two_owners_hold_the_same_name_independently() {
+        // The heart of (owner, name) scoping: daru/frontend and kaisen/frontend coexist.
+        let (_d, s) = tmp_store().await;
+        s.update_agents(|a| {
+            a.push(AgentMeta::new("frontend", Some("daru"), Visibility::Private));
+            let mut k = AgentMeta::new("frontend", Some("kaisen"), Visibility::Public);
+            k.aid = Some("agt_k".into());
+            a.push(k);
+            // An org-owned agent: its namespace segment is the org's bare name.
+            a.push(AgentMeta::new("shared", Some("org:acme"), Visibility::Private));
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.agents().await.len(), 3, "same name under two owners coexists (composite PK)");
+        assert_eq!(s.agent_scoped("daru", "frontend").await.unwrap().visibility, "private");
+        assert_eq!(s.agent_scoped("kaisen", "frontend").await.unwrap().visibility, "public");
+        assert_eq!(s.agent_scoped("daru", "frontend").await.unwrap().scoped(), "daru/frontend");
+        assert_eq!(s.agent_scoped("kaisen", "frontend").await.unwrap().scoped(), "kaisen/frontend");
+        // org:acme is addressed as /acme, never by the raw stored string.
+        assert!(s.agent_scoped("acme", "shared").await.is_some());
+        assert!(s.agent_scoped("org:acme", "shared").await.is_none());
+        // The fail-safe for an absent (owner, name) is owner:None / private.
+        let missing = s.agent_or_unowned("ghost", "frontend").await;
+        assert!(missing.owner.is_none());
+        assert_eq!(missing.visibility, "private");
+    }
+
+    #[tokio::test]
+    async fn v1_migration_rehomes_null_owner_and_moves_files_idempotently() {
+        use sqlx::sqlite::SqliteConnectOptions;
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        ensure_root(root).unwrap();
+        // Hand-build a v1 store: old agents schema (name PRIMARY KEY, nullable owner), version 1, a
+        // null-owner "legacy" row, an alice-owned "frontend", and a v1 MR (endpoints have no owner).
+        {
+            let pool = sqlx::SqlitePool::connect_with(SqliteConnectOptions::new().filename(root.join("hub.db")).create_if_missing(true))
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE schema_version (id INTEGER PRIMARY KEY, version BIGINT NOT NULL)").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO schema_version (id, version) VALUES (1, 1)").execute(&pool).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE agents (name TEXT PRIMARY KEY, aid TEXT, owner TEXT, visibility TEXT NOT NULL DEFAULT 'private', \
+                 lifecycle TEXT NOT NULL DEFAULT 'active', description TEXT, forked_from TEXT, forked_from_aid TEXT, aid_conflict TEXT, \
+                 stars TEXT NOT NULL DEFAULT '[]', members TEXT NOT NULL DEFAULT '[]', created TEXT NOT NULL DEFAULT '')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO agents (name, owner, visibility) VALUES ('legacy', NULL, 'private')").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO agents (name, owner, visibility) VALUES ('frontend', 'alice', 'public')").execute(&pool).await.unwrap();
+            sqlx::query("CREATE TABLE mrs (target_agent TEXT NOT NULL, id BIGINT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (target_agent, id))")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let mr = r#"{"id":1,"source":{"aid":null,"agent":"frontend","git_ref":"main"},"target":{"aid":null,"agent":"frontend","git_ref":"main"},"title":"t","author":"alice","state":"open","created":"2026-01-01T00:00:00Z"}"#;
+            sqlx::query("INSERT INTO mrs (target_agent, id, data) VALUES ('frontend', 1, ?)").bind(mr).execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+        // Flat (v1) repo + blob layout on disk.
+        std::fs::create_dir_all(root.join("legacy.git")).unwrap();
+        std::fs::create_dir_all(root.join("frontend.git")).unwrap();
+        std::fs::create_dir_all(root.join("blobs").join("frontend")).unwrap();
+        std::fs::write(root.join("blobs").join("frontend").join("deadbeef"), b"x").unwrap();
+
+        // Boot runs migrate_v2.
+        let s = Store::open_sqlite(root).await.unwrap();
+
+        // Rows: null owner → `_unclaimed`, others preserved and now addressed by segment.
+        assert_eq!(s.agent_scoped("_unclaimed", "legacy").await.unwrap().owner.as_deref(), Some("_unclaimed"));
+        assert!(s.agent_scoped("alice", "frontend").await.is_some());
+        // Files re-homed under the namespace segment; the flat paths are gone.
+        assert!(root.join("_unclaimed").join("legacy.git").is_dir(), "legacy repo re-homed to _unclaimed");
+        assert!(root.join("alice").join("frontend.git").is_dir(), "owned repo re-homed under its owner");
+        assert!(!root.join("legacy.git").exists() && !root.join("frontend.git").exists(), "flat repos gone");
+        assert!(root.join("blobs").join("alice").join("frontend").join("deadbeef").exists(), "blob re-homed under owner");
+        assert!(!root.join("blobs").join("frontend").join("deadbeef").exists(), "flat blob gone");
+        // MR endpoints backfilled with the owner segment.
+        let mrs = s.mrs_for("alice", "frontend").await;
+        assert_eq!(mrs.len(), 1);
+        assert_eq!(mrs[0].target.owner, "alice");
+        assert_eq!(mrs[0].source.owner, "alice");
+
+        // Idempotent: re-opening runs migrate() again but the version guard makes migrate_v2 a no-op.
+        let s2 = Store::open_sqlite(root).await.unwrap();
+        assert!(s2.agent_scoped("_unclaimed", "legacy").await.is_some());
+        assert!(s2.agent_scoped("alice", "frontend").await.is_some());
+        assert_eq!(s2.mrs_for("alice", "frontend").await.len(), 1);
     }
 
     #[test]
@@ -1471,9 +1846,9 @@ mod tests {
         .await
         .unwrap();
         s.update_agents(|a| a[0].name = "billing".into()).await.unwrap();
-        assert_eq!(s.agent("billing").await.unwrap().aid.as_deref(), Some("agt_pay"));
+        assert_eq!(s.agent_scoped("alice", "billing").await.unwrap().aid.as_deref(), Some("agt_pay"));
         assert_eq!(s.agent_by_aid("agt_pay").await.unwrap().name, "billing", "by-aid follows the rename");
-        assert!(s.agent("payments").await.is_none());
+        assert!(s.agent_scoped("alice", "payments").await.is_none());
     }
 
     // ── merge requests ──
@@ -1482,8 +1857,8 @@ mod tests {
         use super::super::mr::Endpoint;
         Mr {
             id,
-            source: Endpoint { aid: Some("agt_src".into()), agent: source.into(), git_ref: "main".into() },
-            target: Endpoint { aid: Some("agt_dst".into()), agent: target.into(), git_ref: "main".into() },
+            source: Endpoint { aid: Some("agt_src".into()), owner: "alice".into(), agent: source.into(), git_ref: "main".into() },
+            target: Endpoint { aid: Some("agt_dst".into()), owner: "alice".into(), agent: target.into(), git_ref: "main".into() },
             title: "reconcile the payments memory".into(),
             author: "alice".into(),
             state: "open".into(),
@@ -1504,12 +1879,12 @@ mod tests {
         })
         .await
         .unwrap();
-        let pay = s.mrs_for("payments").await;
+        let pay = s.mrs_for("alice", "payments").await;
         assert_eq!(pay.len(), 2);
         assert_eq!(pay.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 2], "oldest first");
         assert_eq!(pay[0].dialogue_transcript.as_deref(), Some("a: ...\nb: ..."));
-        assert_eq!(s.mrs_for("other").await.len(), 1);
-        assert!(s.mrs_for("nobody").await.is_empty());
+        assert_eq!(s.mrs_for("alice", "other").await.len(), 1);
+        assert!(s.mrs_for("alice", "nobody").await.is_empty());
     }
 
     #[tokio::test]
@@ -1522,12 +1897,12 @@ mod tests {
         })
         .await
         .unwrap();
-        s.rename_in_mrs("payments", "billing").await.unwrap();
-        assert_eq!(s.mrs_for("billing").await.len(), 1);
-        assert!(s.mrs_for("payments").await.is_empty());
-        assert_eq!(s.mrs_for("other").await[0].source.agent, "billing");
+        s.rename_in_mrs("alice", "payments", "billing").await.unwrap();
+        assert_eq!(s.mrs_for("alice", "billing").await.len(), 1);
+        assert!(s.mrs_for("alice", "payments").await.is_empty());
+        assert_eq!(s.mrs_for("alice", "other").await[0].source.agent, "billing");
         // The identity is untouched by a label change.
-        assert_eq!(s.mrs_for("billing").await[0].target.aid.as_deref(), Some("agt_dst"));
+        assert_eq!(s.mrs_for("alice", "billing").await[0].target.aid.as_deref(), Some("agt_dst"));
     }
 
     // ── per-row / per-column serde tolerance (the SQL analog of the JSON store's leniency) ──
@@ -1547,7 +1922,7 @@ mod tests {
         // members and a private (fail-safe) ACL — not vanish, and not panic.
         let (_d, s) = tmp_store().await;
         raw_exec(&s, "INSERT INTO agents (name, owner, members) VALUES ('good', 'alice', 'not json')").await;
-        let m = s.agent("good").await.expect("the row must survive a broken JSON column");
+        let m = s.agent_scoped("alice", "good").await.expect("the row must survive a broken JSON column");
         assert!(m.members.is_empty(), "a broken members column reads as no members");
         assert_eq!(m.to_acl().visibility, Visibility::Private);
     }
@@ -1558,8 +1933,8 @@ mod tests {
         // store's per-record tolerance.
         let (_d, s) = tmp_store().await;
         s.update_mrs(|m| m.push(mk_mr(1, "fork", "payments"))).await.unwrap();
-        raw_exec(&s, "INSERT INTO mrs (target_agent, id, data) VALUES ('payments', 999, 'not json')").await;
-        let pay = s.mrs_for("payments").await;
+        raw_exec(&s, "INSERT INTO mrs (target_owner, target_agent, id, data) VALUES ('alice', 'payments', 999, 'not json')").await;
+        let pay = s.mrs_for("alice", "payments").await;
         assert_eq!(pay.len(), 1, "the good MR survives; the broken row is skipped");
         assert_eq!(pay[0].id, 1);
     }

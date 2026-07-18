@@ -147,9 +147,10 @@ async fn startup_banner(ctx: &Ctx, addr: SocketAddr) {
     // One pass over the agents: async store reads can't sit inside an iterator's `.filter` closure.
     let mut unowned = 0usize;
     let mut public = 0usize;
-    for n in &agents {
-        let m = store.agent_or_unowned(n).await;
-        if m.owner.is_none() {
+    for (seg, n) in &agents {
+        let m = store.agent_or_unowned(seg, n).await;
+        // Legacy null-owner repos were re-homed to the reserved `_unclaimed` account at migration.
+        if m.owner_ns() == Some(agit::hub::store::UNCLAIMED) {
             unowned += 1;
         }
         if m.visibility == "public" {
@@ -178,8 +179,8 @@ async fn startup_banner(ctx: &Ctx, addr: SocketAddr) {
         println!("  ⚠ not a single user — nobody can log in. Start with `agit-hub user add <you> --admin`.");
     }
     if unowned > 0 {
-        println!("  ⚠ {unowned} agents have no owner (old repos): they are private, visible only to the site admin.");
-        println!("    Claim them: `agit-hub add <name> --owner <user>`");
+        println!("  ⚠ {unowned} agents are unclaimed (old repos, re-homed to `_unclaimed`): private, visible only to the site admin.");
+        println!("    Claim them: `agit-hub add <name> --owner <user>` (they answer at /_unclaimed/<name>.git meanwhile).");
     }
     if legacy_tokens > 0 {
         println!("  ⚠ {legacy_tokens} old tokens have no owner and are **dead** (the old \"one token = the whole site\" model can't be mapped onto the new ACL).");

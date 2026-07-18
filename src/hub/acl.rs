@@ -145,7 +145,7 @@ impl Scope {
 /// to (None = unbound) plus the read/write cap.
 #[derive(Debug, Clone)]
 pub struct TokenGrant {
-    /// Some(name) = this token is only valid for that one agent.
+    /// Some(`<owner_ns>/<name>`) = this token is only valid for that one agent, scoped to its owner.
     pub agent: Option<String>,
     pub scope: Scope,
 }
@@ -207,6 +207,14 @@ impl AgentAcl {
 
     fn member_role(&self, user: &str) -> Option<Role> {
         self.members.iter().find(|(n, _)| n == user).map(|(_, r)| *r)
+    }
+
+    /// The canonical scoped id `"<owner_ns>/<name>"` a token binds to. None for an unowned agent (the
+    /// fail-safe value), which a bound token can therefore never match — closing the cross-owner
+    /// escalation where a token bound to bare `frontend` matched both `daru/frontend` and
+    /// `kaisen/frontend`.
+    pub fn scoped_id(&self) -> Option<String> {
+        self.owner.as_deref().map(|o| format!("{}/{}", super::store::owner_ns(o), self.name))
     }
 }
 
@@ -294,7 +302,9 @@ pub fn decide(caller: &Caller, agent: &AgentAcl, action: Action) -> Decision {
     //    reads (intersection, not maximum).
     if let Some(t) = &caller.token {
         if let Some(bound) = &t.agent {
-            if bound != &agent.name {
+            // Compare against the SCOPED id `<owner_ns>/<name>`, not the bare name: a token bound to
+            // `daru/frontend` must not authorize `kaisen/frontend`.
+            if Some(bound.as_str()) != agent.scoped_id().as_deref() {
                 return Decision::Deny(Deny::TokenOtherAgent);
             }
         }
@@ -445,14 +455,33 @@ mod tests {
     #[test]
     fn token_bound_to_one_agent_cannot_touch_another() {
         // This one is the old model's disease: one token = the whole host.
-        let alice = Caller::user("alice").with_token(Some("other"), Scope::Write);
+        let alice = Caller::user("alice").with_token(Some("alice/other"), Scope::Write);
         assert_eq!(decide(&alice, &private_agent(), Action::Read), Decision::Deny(Deny::TokenOtherAgent));
         assert_eq!(decide(&alice, &private_agent(), Action::Write), Decision::Deny(Deny::TokenOtherAgent));
     }
 
     #[test]
+    fn token_binding_is_scoped_to_the_owner_not_just_the_name() {
+        // The escalation this closes: a token bound to `daru/frontend` must NOT authorize a different
+        // owner's agent that happens to share the name.
+        let daru_frontend = AgentAcl {
+            name: "frontend".into(),
+            owner: Some("daru".into()),
+            visibility: Visibility::Private,
+            lifecycle: Lifecycle::Active,
+            members: vec![("carol".into(), Role::Write)],
+        };
+        let kaisen_frontend = AgentAcl { owner: Some("kaisen".into()), ..daru_frontend.clone() };
+        let carol = Caller::user("carol").with_token(Some("daru/frontend"), Scope::Write);
+        // Bound owner matches → works on daru's.
+        assert!(decide(&carol, &daru_frontend, Action::Write).allowed());
+        // Same bare name, different owner → the binding does not reach it.
+        assert_eq!(decide(&carol, &kaisen_frontend, Action::Write), Decision::Deny(Deny::TokenOtherAgent));
+    }
+
+    #[test]
     fn token_bound_to_this_agent_works_within_scope() {
-        let alice = Caller::user("alice").with_token(Some("secret"), Scope::Write);
+        let alice = Caller::user("alice").with_token(Some("alice/secret"), Scope::Write);
         assert!(decide(&alice, &private_agent(), Action::Read).allowed());
         assert!(decide(&alice, &private_agent(), Action::Write).allowed());
     }
@@ -488,7 +517,7 @@ mod tests {
     fn token_does_not_grant_what_the_user_lacks() {
         // A write token in a read-only member's hands — still read-only. A token is an upper bound,
         // not a source of power.
-        let bob = Caller::user("bob").with_token(Some("secret"), Scope::Write);
+        let bob = Caller::user("bob").with_token(Some("alice/secret"), Scope::Write);
         assert!(decide(&bob, &private_agent(), Action::Read).allowed());
         assert_eq!(decide(&bob, &private_agent(), Action::Write), Decision::Deny(Deny::NoGrant));
     }

@@ -17,10 +17,13 @@ use crate::scan::install_pre_receive;
 use crate::limits::{MAX_BODY, MAX_CGI_HEADERS};
 use crate::server::Ctx;
 
-/// **`name` must already be authorized before calling this** (see git_or_spa). This only shuttles
-/// bytes: the request body is streamed into `git http-backend`'s stdin (capped at MAX_BODY) and its
-/// stdout is streamed straight back out (close-delimited, never buffered whole).
-pub(crate) async fn git_http(ctx: &Ctx, req: &Req, body: Body, name: &str, actor: &str) -> Response {
+/// **`(owner, name)` must already be authorized before calling this** (see git_or_spa). This only
+/// shuttles bytes: the request body is streamed into `git http-backend`'s stdin (capped at MAX_BODY)
+/// and its stdout is streamed straight back out (close-delimited, never buffered whole).
+///
+/// `PATH_INFO` is the incoming `/<owner>/<name>.git/...` path unchanged, and `GIT_PROJECT_ROOT` stays
+/// `root`, so http-backend resolves `root/<owner>/<name>.git` for free.
+pub(crate) async fn git_http(ctx: &Ctx, req: &Req, body: Body, owner: &str, name: &str, actor: &str) -> Response {
     let (path, query) = match req.target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (req.target.clone(), String::new()),
@@ -29,13 +32,14 @@ pub(crate) async fn git_http(ctx: &Ctx, req: &Req, body: Body, name: &str, actor
     let method = req.method.clone();
     let clen = req.content_length;
     let root = ctx.root().to_path_buf();
+    let owner_s = owner.to_string();
     let name_s = name.to_string();
 
     // Export marker + secret gate (fs writes) on the blocking pool.
     {
         let root2 = root.clone();
-        let n = name_s.clone();
-        tokio::task::spawn_blocking(move || prepare_repo(&repo_path(&root2, &n), &root2, &n)).await.unwrap();
+        let (o, n) = (owner_s.clone(), name_s.clone());
+        tokio::task::spawn_blocking(move || prepare_repo(&repo_path(&root2, &o, &n), &root2, &o, &n)).await.unwrap();
     }
 
     let mut child = match tokio::process::Command::new("git")
@@ -140,9 +144,9 @@ pub(crate) async fn git_http(ctx: &Ctx, req: &Req, body: Body, name: &str, actor
 /// Both are done here, right before http-backend runs, rather than only at create time — that is
 /// what brings repos made by an older agit-hub (or `git init --bare` by hand) under the same rules
 /// instead of leaving them as quiet exceptions.
-pub(crate) fn prepare_repo(repo: &Path, root: &Path, agent: &str) {
+pub(crate) fn prepare_repo(repo: &Path, root: &Path, owner_ns: &str, name: &str) {
     ensure_exportable(repo);
-    install_pre_receive(repo, root, agent);
+    install_pre_receive(repo, root, owner_ns, name);
 }
 
 /// Put http-backend's export marker on **this one** repo.

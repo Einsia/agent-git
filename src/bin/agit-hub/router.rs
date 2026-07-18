@@ -13,7 +13,7 @@ use axum::Router;
 use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny};
 use agit::hub::blob::BLOB_MAX;
 use agit::hub::net::{self, valid_agent_name};
-use agit::hub::store::AgentMeta;
+use agit::hub::store::{valid_username, AgentMeta};
 use agit::hub::{audit, auth};
 
 use crate::api::{agent_acl, api};
@@ -53,22 +53,28 @@ pub(crate) async fn audit_append(root: &std::path::Path, actor: &str, action: &s
 /// exist" and "you can't see it" give **the same** response — otherwise the difference between
 /// 401/403/404 is an interface for enumerating private agent names.
 /// Existence is only checked after the decision passes (only the authorized get to know it's absent).
-pub(crate) async fn gate(ctx: &Ctx, caller: &Caller, name: &str, action: Action) -> Result<AgentMeta, Resp> {
-    // A malformed name → 404. That's not a secret: it could never be a valid agent in the first place.
-    if !valid_agent_name(name) {
+pub(crate) async fn gate(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, action: Action) -> Result<AgentMeta, Resp> {
+    // A malformed owner OR name → 404. That's not a secret: neither could ever address a real agent,
+    // exactly like today's malformed-name 404 — no "no such owner" vs "no such agent" oracle.
+    if !valid_username(owner) || !valid_agent_name(name) {
         return Err(Resp::err(404, "not found"));
     }
-    let meta = ctx.store.agent_or_unowned(name).await;
+    // The fail-safe unowned/private meta is returned when the (owner, name) row is absent — identical
+    // whether the OWNER account is missing, the AGENT is missing, or it exists-but-invisible, so all
+    // three collapse to the same outcome for a fixed caller.
+    let meta = ctx.store.agent_or_unowned(owner, name).await;
     // Fold the owning org's members in before deciding — decide itself never learns "org" exists.
     let acl = agent_acl(ctx, &meta).await;
     match acl::decide(caller, &acl, action) {
-        Decision::Allow => match repo_path(ctx.root(), name).exists() {
+        // Repo existence is checked ONLY after Allow (post-decision), so an empty namespace still 404s
+        // for an authorized caller without ever being an existence oracle for the unauthorized.
+        Decision::Allow => match repo_path(ctx.root(), owner, name).exists() {
             true => Ok(meta),
             false => Err(Resp::err(404, "not found")),
         },
         Decision::Deny(d) => {
             let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
-            audit_deny(ctx, &actor, Some(name), action, d).await;
+            audit_deny(ctx, &actor, Some(&format!("{owner}/{name}")), action, d).await;
             Err(deny_resp(caller, &acl, d))
         }
     }
@@ -168,11 +174,15 @@ fn caller_of(parts: &axum::http::request::Parts) -> Caller {
     parts.extensions.get::<Caller>().cloned().unwrap_or_else(Caller::anonymous)
 }
 
-/// Whether `rest` (the path after `/api/`) is the blob-upload endpoint `agent/<name>/blob` — a single
-/// agent segment then exactly `/blob`, no trailing digest. Mirrors the handler's PUT arm so the body
-/// cap and the route agree. A GET download carries the digest tail (and no body), so it never matches.
+/// Whether `rest` (the path after `/api/`) is the blob-upload endpoint `agent/<owner>/<name>/blob` —
+/// an owner then a name segment, then exactly `/blob`, no trailing digest. Mirrors the handler's PUT
+/// arm so the body cap and the route agree. A GET download carries the digest tail (and no body), so
+/// it never matches.
 fn is_blob_put_path(rest: &str) -> bool {
-    rest.strip_prefix("agent/").and_then(|r| r.strip_suffix("/blob")).map(|n| !n.is_empty() && !n.contains('/')).unwrap_or(false)
+    let Some(mid) = rest.strip_prefix("agent/").and_then(|r| r.strip_suffix("/blob")) else {
+        return false;
+    };
+    matches!(mid.split_once('/'), Some((o, n)) if !o.is_empty() && !n.is_empty() && !n.contains('/'))
 }
 
 /// `/api/*` dispatcher. Rebuilds the [`Req`] view, enforces the API body cap, then runs the async
@@ -218,13 +228,16 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
     // ── git smart-http ── decide which agent first, authorize, and only then touch the body.
     if let Some(route) = net::parse_git_path(&path, &query) {
         let action = route.action;
+        let (owner, name) = (route.owner.as_str(), route.name.as_str());
+        let scoped = format!("{owner}/{name}");
         // A nonexistent agent is decided as "unowned private" — decision first, existence second — so
-        // "doesn't exist → 404" and "private → 401" cannot be told apart by an enumerator.
-        let meta = ctx.store.agent_or_unowned(&route.agent).await;
+        // "doesn't exist → 404" and "private → 401" cannot be told apart by an enumerator, and neither
+        // can a missing owner from a missing agent (the fail-safe is identical for all three).
+        let meta = ctx.store.agent_or_unowned(owner, name).await;
         // Fold the owning org's members so org members can clone/push org-owned agents over smart-http.
         let acl = agent_acl(&ctx, &meta).await;
         let decision = acl::decide(&caller, &acl, action);
-        let exists = repo_path(ctx.root(), &route.agent).exists();
+        let exists = repo_path(ctx.root(), owner, name).exists();
         match decision {
             Decision::Allow => {
                 if !exists {
@@ -232,7 +245,7 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
                 }
             }
             Decision::Deny(d) => {
-                audit_deny(&ctx, &actor, Some(&route.agent), action, d).await;
+                audit_deny(&ctx, &actor, Some(&scoped), action, d).await;
                 // A git client only prompts for credentials on 401 + WWW-Authenticate.
                 return git_deny_resp(&caller, d).into_response();
             }
@@ -246,11 +259,11 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
             ctx.root(),
             &actor,
             if action == Action::Write { audit::GIT_PUSH } else { audit::GIT_FETCH },
-            Some(&route.agent),
+            Some(&scoped),
             &path,
         )
         .await;
-        return git_http(&ctx, &reqo, body, &route.agent, &actor).await;
+        return git_http(&ctx, &reqo, body, owner, name, &actor).await;
     }
 
     // ── Everything else → the SPA (client-side routing renders home/agent/session/diff off the URL). ──

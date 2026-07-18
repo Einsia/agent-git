@@ -7,12 +7,15 @@
 //! peer IP.
 
 use super::acl::Action;
+use super::store::valid_username;
 use std::net::IpAddr;
 
-/// Which agent a git smart-http request hits, and what permission it needs.
+/// Which agent a git smart-http request hits, and what permission it needs. Identity is `(owner,
+/// name)`: `owner` is the namespace segment (`owner_ns`), `name` the agent name within it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitRoute {
-    pub agent: String,
+    pub owner: String,
+    pub name: String,
     pub action: Action,
 }
 
@@ -28,24 +31,28 @@ pub fn valid_agent_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// smart-http path → route. Anything outside `/<name>.git/...` is None (not a git request).
+/// smart-http path → route. Anything outside `/<owner>/<name>.git/...` is None (not a git request):
+/// an owner segment, then `<name>.git`, then a non-empty tail.
 ///
 /// This is the **input to the authorization point**: the old code only asked "does the path contain
 /// `.git/`?" and then handed the request to http-backend with `GIT_HTTP_EXPORT_ALL=1` — so once past
 /// the "read gate", any repo under root could be pulled. Authorizing at all requires knowing
-/// **which repo** first.
+/// **which repo** first, and identity is now `(owner, name)`.
 pub fn parse_git_path(path: &str, query: &str) -> Option<GitRoute> {
     let rest = path.strip_prefix('/')?;
-    let (first, tail) = rest.split_once('/')?; // `/x.git` alone is not a git endpoint; a further segment is required
-    let name = first.strip_suffix(".git")?;
-    if !valid_agent_name(name) || tail.is_empty() {
+    let (owner, after) = rest.split_once('/')?; // the owner namespace segment
+    let (name_git, tail) = after.split_once('/')?; // `<name>.git` then a further segment is required
+    let name = name_git.strip_suffix(".git")?;
+    // Owner is an account namespace segment (validated like a username); name is an agent name. A
+    // malformed either → None, exactly like today's malformed-name 404, which is not a secret.
+    if tail.is_empty() || !valid_username(owner) || !valid_agent_name(name) {
         return None;
     }
     let action = match needs_write(path, query) {
         true => Action::Write,
         false => Action::Read,
     };
-    Some(GitRoute { agent: name.to_string(), action })
+    Some(GitRoute { owner: owner.to_string(), name: name.to_string(), action })
 }
 
 /// Whether this request **writes** the repo.
@@ -157,21 +164,33 @@ mod tests {
 
     #[test]
     fn fetch_paths_need_read() {
-        let r = parse_git_path("/alice.git/info/refs", "service=git-upload-pack").unwrap();
-        assert_eq!(r, GitRoute { agent: "alice".into(), action: Action::Read });
-        assert_eq!(parse_git_path("/alice.git/git-upload-pack", "").unwrap().action, Action::Read);
+        let r = parse_git_path("/alice/frontend.git/info/refs", "service=git-upload-pack").unwrap();
+        assert_eq!(r, GitRoute { owner: "alice".into(), name: "frontend".into(), action: Action::Read });
+        assert_eq!(parse_git_path("/alice/frontend.git/git-upload-pack", "").unwrap().action, Action::Read);
         // dumb-protocol paths are reads too
-        assert_eq!(parse_git_path("/alice.git/HEAD", "").unwrap().action, Action::Read);
-        assert_eq!(parse_git_path("/alice.git/objects/info/packs", "").unwrap().action, Action::Read);
+        assert_eq!(parse_git_path("/alice/frontend.git/HEAD", "").unwrap().action, Action::Read);
+        assert_eq!(parse_git_path("/alice/frontend.git/objects/info/packs", "").unwrap().action, Action::Read);
+    }
+
+    #[test]
+    fn owner_and_name_are_both_parsed() {
+        // The same name under two owners is two different repos.
+        let a = parse_git_path("/daru/frontend.git/info/refs", "service=git-upload-pack").unwrap();
+        let b = parse_git_path("/kaisen/frontend.git/info/refs", "service=git-upload-pack").unwrap();
+        assert_eq!((a.owner.as_str(), a.name.as_str()), ("daru", "frontend"));
+        assert_eq!((b.owner.as_str(), b.name.as_str()), ("kaisen", "frontend"));
+        assert_ne!(a, b);
+        // The `org:` prefix is not a URL segment — the org's bare name is (owner_ns), so `/acme/...`.
+        assert_eq!(parse_git_path("/acme/shared.git/info/refs", "").unwrap().owner, "acme");
     }
 
     #[test]
     fn push_paths_need_write() {
-        assert_eq!(parse_git_path("/alice.git/git-receive-pack", "").unwrap().action, Action::Write);
+        assert_eq!(parse_git_path("/alice/frontend.git/git-receive-pack", "").unwrap().action, Action::Write);
         // info/refs?service=git-receive-pack is push's first step — it must demand write too, or a
         // read-only user could use it to probe the private branch layout.
         assert_eq!(
-            parse_git_path("/alice.git/info/refs", "service=git-receive-pack").unwrap().action,
+            parse_git_path("/alice/frontend.git/info/refs", "service=git-receive-pack").unwrap().action,
             Action::Write
         );
     }
@@ -179,16 +198,16 @@ mod tests {
     #[test]
     fn percent_encoded_receive_pack_still_needs_write() {
         // http-backend decodes the query itself. Not decoding here would wave a push through as a read.
-        let r = parse_git_path("/alice.git/info/refs", "service=git%2Dreceive%2Dpack").unwrap();
+        let r = parse_git_path("/alice/frontend.git/info/refs", "service=git%2Dreceive%2Dpack").unwrap();
         assert_eq!(r.action, Action::Write);
-        let r = parse_git_path("/alice.git/info/refs", "service=git%2dreceive%2dpack").unwrap();
+        let r = parse_git_path("/alice/frontend.git/info/refs", "service=git%2dreceive%2dpack").unwrap();
         assert_eq!(r.action, Action::Write);
     }
 
     #[test]
     fn write_classification_errs_toward_write() {
         // Stuffing in extra parameters does not talk it down to the "read" tier.
-        let r = parse_git_path("/alice.git/info/refs", "a=1&service=git-receive-pack&b=2").unwrap();
+        let r = parse_git_path("/alice/frontend.git/info/refs", "a=1&service=git-receive-pack&b=2").unwrap();
         assert_eq!(r.action, Action::Write);
     }
 
@@ -197,27 +216,41 @@ mod tests {
         assert_eq!(parse_git_path("/api/agents", ""), None);
         assert_eq!(parse_git_path("/", ""), None);
         assert_eq!(parse_git_path("/alice", ""), None);
-        assert_eq!(parse_git_path("/alice.git", ""), None); // no further segment
-        assert_eq!(parse_git_path("/alice.git/", ""), None);
+        // A client-side SPA route like `/alice/frontend` (no `.git`) is not a git request → SPA.
+        assert_eq!(parse_git_path("/alice/frontend", ""), None);
+        assert_eq!(parse_git_path("/alice/frontend.git", ""), None); // no further segment
+        assert_eq!(parse_git_path("/alice/frontend.git/", ""), None);
+        // A bare top-level `<name>.git` (no owner segment) no longer routes — every repo is namespaced.
+        assert_eq!(parse_git_path("/frontend.git/info/refs", ""), None);
     }
 
     #[test]
     fn traversal_in_git_path_is_refused() {
         // The old code's `path.contains(".git/")` would send every one of these straight into
         // http-backend.
-        assert_eq!(parse_git_path("/../etc.git/info/refs", ""), None);
-        assert_eq!(parse_git_path("/..%2f.git/info/refs", ""), None);
-        assert_eq!(parse_git_path("/a/b.git/info/refs", ""), None, "only <name>.git at the root counts");
-        assert_eq!(parse_git_path("/.hidden.git/info/refs", ""), None);
-        assert_eq!(parse_git_path("/a..b.git/info/refs", ""), None);
+        assert_eq!(parse_git_path("/x/../etc.git/info/refs", ""), None, "`..` in the name segment is refused");
+        assert_eq!(parse_git_path("/../etc/x.git/info/refs", ""), None, "`..` in the owner segment is refused");
+        assert_eq!(parse_git_path("/alice/..%2f.git/info/refs", ""), None);
+        assert_eq!(parse_git_path("/alice/.hidden.git/info/refs", ""), None);
+        assert_eq!(parse_git_path("/alice/a..b.git/info/refs", ""), None);
+        // A too-short owner segment fails the username rule (2..=32), so it never routes.
+        assert_eq!(parse_git_path("/a/b.git/info/refs", ""), None, "a one-char owner is not a valid namespace");
+    }
+
+    #[test]
+    fn a_valid_two_char_owner_and_name_route() {
+        // The shortest legal shapes: owner `aa` (username min length 2), name `bb`.
+        let r = parse_git_path("/aa/bb.git/info/refs", "").unwrap();
+        assert_eq!((r.owner.as_str(), r.name.as_str()), ("aa", "bb"));
     }
 
     #[test]
     fn nested_repo_path_cannot_escape_to_another_repo() {
-        // `/alice.git/../bob.git/info/refs` — the name comes from the first segment, and `..` is
-        // stopped by valid_agent_name; the HTTP layer also has a blanket `..` gate. This confirms
-        // parsing itself does not read it as anything but alice.
-        assert_eq!(parse_git_path("/alice.git/../bob.git/info/refs", "").unwrap().agent, "alice");
+        // `/alice/frontend.git/../bob.git/info/refs` — the name comes from the first `.git` segment, and
+        // `..` lands in the tail (which is not read as a name); the HTTP layer also has a blanket `..`
+        // gate. This confirms parsing itself does not read it as anything but alice/frontend.
+        let r = parse_git_path("/alice/frontend.git/../bob.git/info/refs", "").unwrap();
+        assert_eq!((r.owner.as_str(), r.name.as_str()), ("alice", "frontend"));
     }
 
     #[test]

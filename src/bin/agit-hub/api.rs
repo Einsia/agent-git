@@ -117,8 +117,8 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
         return Resp::err(404, "not found");
     };
 
-    // agent/by-aid/<aid> — identity → current name. Before the name routes, since `by-aid` is not an
-    // agent name (a real one could never contain `/`).
+    // agent/by-aid/<aid> — identity → current name. Before the owner peel + name routes, since
+    // `by-aid` is owner-less (a real owner segment is always followed by a name).
     if let Some(aid) = after.strip_prefix("by-aid/") {
         return match m {
             "GET" => api_agent_by_aid(ctx, req, caller, aid).await,
@@ -126,15 +126,21 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
         };
     }
 
-    // agent/<name>/mrs[/<id>[/comments|/close]]
+    // Peel the owner namespace segment: everything past here is `<owner>/<name>...`. Identity is
+    // (owner, name), so (owner, name) is threaded into `gate` at every sub-route below.
+    let Some((owner, after)) = after.split_once('/') else {
+        return Resp::err(404, "not found");
+    };
+
+    // agent/<owner>/<name>/mrs[/<id>[/comments|/close]]
     if let Some((name, tail)) = after.split_once("/mrs") {
         if tail.is_empty() || tail.starts_with('/') {
-            return api_mrs(ctx, caller, name, tail, m, req.query(), body).await;
+            return api_mrs(ctx, caller, owner, name, tail, m, req.query(), body).await;
         }
     }
 
-    // agent/<name>/raw/<path> and agent/<name>/compare — both read the store's bytes, so both go
-    // through the Read gate first, like every other entry point.
+    // agent/<owner>/<name>/raw/<path> and agent/<owner>/<name>/compare — both read the store's bytes,
+    // so both go through the Read gate first, like every other entry point.
     for sep in ["/raw/", "/compare"] {
         let Some((name, tail)) = after.split_once(sep) else {
             continue;
@@ -145,15 +151,15 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
         if m != "GET" {
             return Resp::text(405, "method not allowed");
         }
-        let meta = match gate(ctx, caller, name, Action::Read).await {
+        let meta = match gate(ctx, caller, owner, name, Action::Read).await {
             Ok(x) => x,
             Err(r) => return r,
         };
         // has_head + the content endpoint each shell out to git; run them on the blocking pool.
-        let (root, name, tail, query, is_raw) =
-            (ctx.root().to_path_buf(), meta.name.clone(), tail.to_string(), req.query().to_string(), sep == "/raw/");
+        let (root, seg, name, tail, query, is_raw) =
+            (ctx.root().to_path_buf(), meta.seg().to_string(), meta.name.clone(), tail.to_string(), req.query().to_string(), sep == "/raw/");
         return tokio::task::spawn_blocking(move || {
-            let repo = repo_path(&root, &name);
+            let repo = repo_path(&root, &seg, &name);
             if !has_head(&repo) {
                 return Resp::err(404, "not found");
             }
@@ -167,19 +173,19 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
         .unwrap();
     }
 
-    // agent/<name>/session/<id>[/diff]
+    // agent/<owner>/<name>/session/<id>[/diff]
     if let Some((name, tail)) = after.split_once("/session/") {
         if m != "GET" {
             return Resp::text(405, "method not allowed");
         }
-        let meta = match gate(ctx, caller, name, Action::Read).await {
+        let meta = match gate(ctx, caller, owner, name, Action::Read).await {
             Ok(x) => x,
             Err(r) => return r,
         };
-        let (root, name, tail, query) =
-            (ctx.root().to_path_buf(), meta.name.clone(), tail.to_string(), req.query().to_string());
+        let (root, seg, name, tail, query) =
+            (ctx.root().to_path_buf(), meta.seg().to_string(), meta.name.clone(), tail.to_string(), req.query().to_string());
         return tokio::task::spawn_blocking(move || {
-            let repo = repo_path(&root, &name);
+            let repo = repo_path(&root, &seg, &name);
             if !has_head(&repo) {
                 return Resp::err(404, "not found");
             }
@@ -192,15 +198,15 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
         .unwrap();
     }
 
-    // agent/<name>/blob            (PUT) — content-addressed upload, Write-gated.
-    // agent/<name>/blob/<digest>   (GET) — content-addressed download, Read-gated.
+    // agent/<owner>/<name>/blob            (PUT) — content-addressed upload, Write-gated.
+    // agent/<owner>/<name>/blob/<digest>   (GET) — content-addressed download, Read-gated.
     // Same "read/write the store's bytes → through gate()" band as /raw/ + /compare above; placed after
     // /session/ so a session literally named "blob" can never be shadowed. The tail is either empty
     // (PUT) or `/`+digest (GET); a `/blobXYZ` falls through, unmatched.
     if let Some((name, tail)) = after.split_once("/blob") {
         if tail.is_empty() {
             return match m {
-                "PUT" => api_blob_put(ctx, req, caller, name, body).await,
+                "PUT" => api_blob_put(ctx, req, caller, owner, name, body).await,
                 "GET" => Resp::text(405, "method not allowed"), // GET needs a /<digest>
                 _ => Resp::text(405, "method not allowed"),
             };
@@ -208,23 +214,23 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
         if let Some(digest) = tail.strip_prefix('/') {
             if !digest.contains('/') {
                 return match m {
-                    "GET" => api_blob_get(ctx, caller, name, digest).await,
+                    "GET" => api_blob_get(ctx, caller, owner, name, digest).await,
                     _ => Resp::text(405, "method not allowed"),
                 };
             }
         }
     }
 
-    // agent/<name>/members[/<username>] — tail may only be empty or /<username>;
+    // agent/<owner>/<name>/members[/<username>] — tail may only be empty or /<username>;
     // don't let /membersXYZ pass as /members.
     if let Some((name, tail)) = after.split_once("/members") {
         if tail.is_empty() || tail.starts_with('/') {
-            return api_members(ctx, caller, name, tail, m, body).await;
+            return api_members(ctx, caller, owner, name, tail, m, body).await;
         }
     }
 
-    // agent/<name>/<verb> — the lifecycle verbs. Each is its own route rather than a PATCH field:
-    // they are events with their own audit rows and their own legal predecessors, not attributes.
+    // agent/<owner>/<name>/<verb> — the lifecycle verbs. Each is its own route rather than a PATCH
+    // field: they are events with their own audit rows and their own legal predecessors, not attributes.
     for (verb, handler) in [
         ("/fork", Verb::Fork),
         ("/transfer", Verb::Transfer),
@@ -238,35 +244,35 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
                 return Resp::text(405, "method not allowed");
             }
             return match handler {
-                Verb::Fork => api_fork_agent(ctx, req, caller, name, body).await,
-                Verb::Transfer => api_transfer_agent(ctx, caller, name, body).await,
+                Verb::Fork => api_fork_agent(ctx, req, caller, owner, name, body).await,
+                Verb::Transfer => api_transfer_agent(ctx, caller, owner, name, body).await,
                 Verb::Archive => {
-                    set_lifecycle(ctx, caller, name, Lifecycle::Archived, &[Lifecycle::Active], audit::AGENT_ARCHIVE).await
+                    set_lifecycle(ctx, caller, owner, name, Lifecycle::Archived, &[Lifecycle::Active], audit::AGENT_ARCHIVE).await
                 }
                 Verb::Unarchive => {
-                    set_lifecycle(ctx, caller, name, Lifecycle::Active, &[Lifecycle::Archived], audit::AGENT_UNARCHIVE).await
+                    set_lifecycle(ctx, caller, owner, name, Lifecycle::Active, &[Lifecycle::Archived], audit::AGENT_UNARCHIVE).await
                 }
                 // Restore lands on Active, not on "whatever it was": an agent coming back from the
                 // trash writable is the surprise; coming back and needing one more click is not.
                 Verb::Restore => {
-                    set_lifecycle(ctx, caller, name, Lifecycle::Active, &[Lifecycle::Deleted], audit::AGENT_RESTORE).await
+                    set_lifecycle(ctx, caller, owner, name, Lifecycle::Active, &[Lifecycle::Deleted], audit::AGENT_RESTORE).await
                 }
-                Verb::Star => api_star_agent(ctx, caller, name, body).await,
+                Verb::Star => api_star_agent(ctx, caller, owner, name, body).await,
             };
         }
     }
 
-    // agent/<name>
+    // agent/<owner>/<name>
     match m {
         "GET" => {
-            let meta = match gate(ctx, caller, after, Action::Read).await {
+            let meta = match gate(ctx, caller, owner, after, Action::Read).await {
                 Ok(x) => x,
                 Err(r) => return r,
             };
             api_agent(ctx, req, caller, &meta).await
         }
-        "PATCH" => api_patch_agent(ctx, caller, after, body).await,
-        "DELETE" => api_delete_agent(ctx, caller, after, req.query()).await,
+        "PATCH" => api_patch_agent(ctx, caller, owner, after, body).await,
+        "DELETE" => api_delete_agent(ctx, caller, owner, after, req.query()).await,
         _ => Resp::text(405, "method not allowed"),
     }
 }
@@ -339,6 +345,13 @@ pub(crate) async fn api_register(ctx: &Ctx, body: &[u8]) -> Resp {
     if !store::valid_username(&username) {
         return Resp::err(400, "invalid username (2-32 lowercase [a-z0-9._-], no leading dot)");
     }
+    if store::is_reserved_account(&username) {
+        return Resp::err(400, "that name is reserved");
+    }
+    // Unified account namespace: a username and an org name may never share a bare string.
+    if ctx.store.org(&username).await.is_some() {
+        return Resp::err(409, "that username is taken");
+    }
     // Same minimum as the CLI's read_new_password, via the one shared constant.
     if password.chars().count() < store::MIN_PASSWORD_LEN {
         return Resp::err(400, "password too short (at least 8 characters)");
@@ -401,30 +414,33 @@ pub(crate) async fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     // iterator chain: the ACL read is an async store call.)
     // The ACL filter needs each agent's metadata (an async store read), so collect (name, meta) as we
     // go; the meta is reused when the row is built.
-    let mut visible: Vec<(String, AgentMeta)> = Vec::new();
-    for n in list_agents(ctx.root()) {
-        let meta = ctx.store.agent_or_unowned(&n).await;
+    // The list is keyed on `full_name` = `<owner_ns>/<name>`, which IS unique (a name is unique only
+    // within an owner), so paging and the cursor stay stable when two owners share a name.
+    let mut visible: Vec<(String, String, AgentMeta)> = Vec::new();
+    for (seg, n) in list_agents(ctx.root()) {
+        let meta = ctx.store.agent_or_unowned(&seg, &n).await;
         if !acl::decide(caller, &agent_acl(ctx, &meta).await, Action::Read).allowed() {
             continue;
         }
-        if page.after.as_deref().is_none_or(|a| n.as_str() > a) {
-            visible.push((n, meta));
+        let full = format!("{seg}/{n}");
+        if page.after.as_deref().is_none_or(|a| full.as_str() > a) {
+            visible.push((full, seg, meta));
         }
     }
     let has_more = visible.len() > page.limit;
-    let window: Vec<(String, AgentMeta)> = visible.into_iter().take(page.limit).collect();
-    let next_cursor = has_more.then(|| window.last().map(|(n, _)| cursor_encode(n))).flatten();
+    let window: Vec<(String, String, AgentMeta)> = visible.into_iter().take(page.limit).collect();
+    let next_cursor = has_more.then(|| window.last().map(|(full, _, _)| cursor_encode(full))).flatten();
 
     // The per-agent git reads (has_head / last_activity / session_refs / agent_aid) each shell out, so
     // one request over N agents is ~3N subprocesses. Run the whole fan-out on the blocking pool and
     // hand back the collected fields; the store reads above already ran async.
     let root = ctx.root().to_path_buf();
-    let names: Vec<String> = window.iter().map(|(n, _)| n.clone()).collect();
+    let paths: Vec<(String, String)> = window.iter().map(|(_, seg, m)| (seg.clone(), m.name.clone())).collect();
     let git_info: Vec<(usize, String, String, Option<String>, &'static str)> = tokio::task::spawn_blocking(move || {
-        names
+        paths
             .into_iter()
-            .map(|n| {
-                let repo = repo_path(&root, &n);
+            .map(|(seg, n)| {
+                let repo = repo_path(&root, &seg, &n);
                 let (count, when, subject) = if has_head(&repo) {
                     let (w, s) = last_activity(&repo);
                     (session_refs(&repo).len(), w, s)
@@ -440,9 +456,11 @@ pub(crate) async fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     .unwrap();
 
     let mut items: Vec<serde_json::Value> = Vec::with_capacity(window.len());
-    for ((n, meta), (count, when, subject, aid, aid_source)) in window.iter().zip(git_info) {
+    for ((full, _seg, meta), (count, when, subject, aid, aid_source)) in window.iter().zip(git_info) {
         items.push(serde_json::json!({
-            "name": n,
+            "name": meta.name,
+            "owner": meta.owner,
+            "full_name": full,
             "aid": aid,
             "aid_source": aid_source,
             "sessions": count,
@@ -533,22 +551,24 @@ pub(crate) async fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body
         audit_deny(ctx, &user, Some(&name), Action::Write, d).await;
         return Resp::err(403, d.reason());
     }
+    let seg = store::owner_ns(&owner).to_string();
     match create_agent(&ctx.store, &name, &owner, visibility).await {
         Ok(_) => {
-            audit_append(ctx.root(), &user, audit::AGENT_CREATE, Some(&name), &format!("visibility={} owner={owner}", visibility.as_str())).await;
-            let repo = repo_path(ctx.root(), &name);
+            audit_append(ctx.root(), &user, audit::AGENT_CREATE, Some(&format!("{seg}/{name}")), &format!("visibility={} owner={owner}", visibility.as_str())).await;
+            let repo = repo_path(ctx.root(), &seg, &name);
             let (aid, aid_source) = tokio::task::spawn_blocking(move || agent_aid(&repo)).await.unwrap();
             Resp::json_status(
                 201,
                 serde_json::json!({
                     "name": name,
+                    "owner": owner,
+                    "full_name": format!("{seg}/{name}"),
                     // An empty repo has no agent.toml yet — the aid only exists once the client
                     // pushes it. Report null honestly.
                     "aid": aid,
                     "aid_source": aid_source,
-                    "clone_url": clone_url(ctx, req, &name),
+                    "clone_url": clone_url(ctx, req, &seg, &name),
                     "visibility": visibility.as_str(),
-                    "owner": owner,
                 }),
             )
         }
@@ -556,8 +576,8 @@ pub(crate) async fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body
     }
 }
 
-pub(crate) fn clone_url(ctx: &Ctx, req: &Req, name: &str) -> String {
-    format!("{}://{}/{name}.git", if ctx.cfg.tls { "https" } else { "http" }, req.host())
+pub(crate) fn clone_url(ctx: &Ctx, req: &Req, owner_ns: &str, name: &str) -> String {
+    format!("{}://{}/{owner_ns}/{name}.git", if ctx.cfg.tls { "https" } else { "http" }, req.host())
 }
 
 /// Everything the agent-detail response reads out of the repo (git + fs). Collected inside one
@@ -589,10 +609,11 @@ pub(crate) async fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &Agen
     // recent_log, readme, environments, branches, size_bytes, runtimes) shell out — one bounded
     // spawn_blocking does the lot and returns the rendered pieces.
     let root = ctx.root().to_path_buf();
+    let seg_for_git = meta.seg().to_string();
     let name_for_git = meta.name.clone();
     let search2 = search.clone();
     let v: AgentView = tokio::task::spawn_blocking(move || {
-        let repo = repo_path(&root, &name_for_git);
+        let repo = repo_path(&root, &seg_for_git, &name_for_git);
         let refs = if has_head(&repo) { session_refs(&repo) } else { vec![] };
         // The hit set: no search = page straight through (git show only the current page); with a
         // search = scan the content (capped).
@@ -647,11 +668,12 @@ pub(crate) async fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &Agen
 
     Resp::json(serde_json::json!({
         "agent": name,
-        "git": format!("/{name}.git"),
+        "full_name": meta.scoped(),
+        "git": format!("/{}/{name}.git", meta.seg()),
         "aid": aid,
         "aid_source": aid_source,
         "aid_status": aid_status,
-        "clone_url": clone_url(ctx, req, name),
+        "clone_url": clone_url(ctx, req, meta.seg(), name),
         "visibility": meta.visibility,
         "lifecycle": meta.lifecycle().as_str(),
         "description": meta.description,
@@ -687,7 +709,13 @@ pub(crate) async fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &Agen
 ///
 /// `status`: "ok" | "learned" | "replaced" | "conflict".
 pub(crate) async fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<String>, &'static str, &'static str) {
-    let repo = repo_path(ctx.root(), &meta.name);
+    let seg = meta.seg().to_string();
+    let name = meta.name.clone();
+    // The agent's scoped identity `<owner_ns>/<name>` — reconcile compares identities as strings, so
+    // passing the scoped id (self AND holder) keeps two same-named agents under different owners from
+    // being mistaken for one another, without reconcile needing to know about owners.
+    let self_id = meta.scoped();
+    let repo = repo_path(ctx.root(), &seg, &name);
     // agent_aid shells out to `git show HEAD:agent.toml`; keep it off the async worker.
     let (seen, source) = tokio::task::spawn_blocking(move || agent_aid(&repo)).await.unwrap();
 
@@ -716,7 +744,6 @@ pub(crate) async fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Optio
     // ONE critical section. Looking the holder up outside the lock was a TOCTOU: two concurrent syncs
     // of two stores carrying the same aid could both see no holder, both Learn, and both write —
     // breaking the invariant `Store::agent_by_aid` leans on, that the first match is the only match.
-    let name = meta.name.clone();
     let mut verdict = identity::AidVerdict::Unchanged;
     // Whether this read is the one that *entered* the conflict, as opposed to the millionth to
     // observe it. Only the transition is an event; see `AgentMeta::aid_conflict`.
@@ -726,14 +753,16 @@ pub(crate) async fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Optio
     let _ = ctx
         .store
         .update_agents(|list| {
-            let cached = list.iter().find(|m| m.name == name).and_then(|m| m.aid.clone());
+            let cached = list.iter().find(|m| m.matches(&seg, &name)).and_then(|m| m.aid.clone());
+            // The holder is looked up by aid (globally unique) and identified by its scoped id, so a
+            // same-named agent under a different owner is not mistaken for "this agent already holds it".
             let holder = seen
                 .as_deref()
                 .and_then(|a| list.iter().find(|m| m.aid.as_deref() == Some(a)))
-                .map(|m| m.name.clone());
-            let lineage = list.iter().find(|m| m.name == name).and_then(|m| m.forked_from_aid.clone());
-            verdict = identity::reconcile(&name, cached.as_deref(), seen.as_deref(), holder.as_deref(), lineage.as_deref());
-            let Some(m) = list.iter_mut().find(|m| m.name == name) else {
+                .map(|m| m.scoped());
+            let lineage = list.iter().find(|m| m.matches(&seg, &name)).and_then(|m| m.forked_from_aid.clone());
+            verdict = identity::reconcile(&self_id, cached.as_deref(), seen.as_deref(), holder.as_deref(), lineage.as_deref());
+            let Some(m) = list.iter_mut().find(|m| m.matches(&seg, &name)) else {
                 return;
             };
             match &verdict {
@@ -759,13 +788,13 @@ pub(crate) async fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Optio
             None => (None, source, "ok"),
         },
         identity::AidVerdict::Learn(a) => {
-            audit_append(ctx.root(), actor, audit::AGENT_AID_LEARNED, Some(&meta.name), &a).await;
+            audit_append(ctx.root(), actor, audit::AGENT_AID_LEARNED, Some(&self_id), &a).await;
             (Some(a), source, "learned")
         }
         identity::AidVerdict::Replaced { was, now } => {
             // The store is the authority, so the cache follows it — but the response only says
             // "replaced" this once, and the audit log is what makes it still findable tomorrow.
-            audit_append(ctx.root(), actor, audit::AGENT_AID_REPLACED, Some(&meta.name), &format!("{was} → {now}")).await;
+            audit_append(ctx.root(), actor, audit::AGENT_AID_REPLACED, Some(&self_id), &format!("{was} → {now}")).await;
             (Some(now), source, "replaced")
         }
         identity::AidVerdict::Conflict { aid, held_by } => {
@@ -778,7 +807,7 @@ pub(crate) async fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Optio
                     ctx.root(),
                     actor,
                     audit::AGENT_AID_CONFLICT,
-                    Some(&meta.name),
+                    Some(&self_id),
                     &format!("{aid} is already held by {held_by}"),
                 )
                 .await;
@@ -808,24 +837,27 @@ pub(crate) async fn api_agent_by_aid(ctx: &Ctx, req: &Req, caller: &Caller, aid:
     let Some(meta) = ctx.store.agent_by_aid(aid).await else {
         return Resp::err(404, "not found");
     };
-    let meta = match gate(ctx, caller, &meta.name, Action::Read).await {
+    let seg = meta.seg().to_string();
+    let meta = match gate(ctx, caller, &seg, &meta.name, Action::Read).await {
         Ok(x) => x,
         Err(r) => return r,
     };
     Resp::json(serde_json::json!({
         "aid": aid,
         "name": meta.name,
-        "clone_url": clone_url(ctx, req, &meta.name),
-        "visibility": meta.visibility,
         "owner": meta.owner,
+        "full_name": meta.scoped(),
+        "clone_url": clone_url(ctx, req, meta.seg(), &meta.name),
+        "visibility": meta.visibility,
     }))
 }
 
-pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Manage).await {
+pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, body: &[u8]) -> Resp {
+    let meta = match gate(ctx, caller, owner, name, Action::Manage).await {
         Ok(x) => x,
         Err(r) => return r,
     };
+    let seg = meta.seg().to_string(); // the namespace a rename stays within
     let Some(v) = json_body(body) else {
         return Resp::err(400, "want a JSON body");
     };
@@ -836,10 +868,10 @@ pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body
             return Resp::err(400, "visibility must be private or public");
         };
         if vis.as_str() != meta.visibility {
-            if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.visibility = vis.as_str().to_string()).await {
+            if let Err(resp) = edit_agent(ctx, &seg, &meta.name, |m| m.visibility = vis.as_str().to_string()).await {
                 return resp;
             }
-            audit_append(ctx.root(), &actor, audit::AGENT_VISIBILITY, Some(&meta.name), &format!("{} → {}", meta.visibility, vis.as_str())).await;
+            audit_append(ctx.root(), &actor, audit::AGENT_VISIBILITY, Some(&meta.scoped()), &format!("{} → {}", meta.visibility, vis.as_str())).await;
         }
     }
 
@@ -850,10 +882,10 @@ pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body
             Ok(x) => x,
             Err(e) => return Resp::err(400, &format!("description {e}")),
         };
-        if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.description = d.clone()).await {
+        if let Err(resp) = edit_agent(ctx, &seg, &meta.name, |m| m.description = d.clone()).await {
             return resp;
         }
-        audit_append(ctx.root(), &actor, audit::AGENT_DESCRIBE, Some(&meta.name), d.as_deref().unwrap_or("(cleared)")).await;
+        audit_append(ctx.root(), &actor, audit::AGENT_DESCRIBE, Some(&meta.scoped()), d.as_deref().unwrap_or("(cleared)")).await;
     }
 
     if let Some(newname) = str_field(&v, "name") {
@@ -861,7 +893,8 @@ pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body
             if !valid_agent_name(&newname) {
                 return Resp::err(400, "invalid name ([A-Za-z0-9._-] only, no .. and no leading dot)");
             }
-            if name_taken(ctx, &newname).await {
+            // A rename stays within the same owner namespace — only the name half moves.
+            if name_taken(ctx, &seg, &newname).await {
                 return Resp::err(409, "that name is already taken");
             }
             // Reserve the new name atomically — check and rename the record together under the lock, so
@@ -874,10 +907,10 @@ pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body
             let reserved = ctx
                 .store
                 .update_agents(|list| {
-                    if list.iter().any(|m| m.name == newname) {
+                    if list.iter().any(|m| m.matches(&seg, &newname)) {
                         return false;
                     }
-                    if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
+                    if let Some(m) = list.iter_mut().find(|m| m.matches(&seg, &meta.name)) {
                         m.name = newname.clone();
                     }
                     true
@@ -890,75 +923,75 @@ pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body
             }
             // Move the repo dir to match the record (a blocking fs op, off the async worker). On
             // failure, roll the name back so the record and the directory never disagree.
-            let from = repo_path(ctx.root(), &meta.name);
-            let to = repo_path(ctx.root(), &newname);
+            let from = repo_path(ctx.root(), &seg, &meta.name);
+            let to = repo_path(ctx.root(), &seg, &newname);
             let moved = tokio::task::spawn_blocking(move || std::fs::rename(from, to).is_ok()).await.unwrap_or(false);
             if !moved {
                 let _ = ctx
                     .store
                     .update_agents(|list| {
-                        if let Some(m) = list.iter_mut().find(|m| m.name == newname) {
+                        if let Some(m) = list.iter_mut().find(|m| m.matches(&seg, &newname)) {
                             m.name = meta.name.clone();
                         }
                     })
                     .await;
                 return Resp::err(500, "rename failed (the repo directory won't move)");
             }
-            // Blobs are keyed by the agent NAME (blobs/<name>/<sha>), so they must follow the rename or
-            // they are stranded under the old name and unreachable. Mirror the repo-dir move exactly:
-            // on failure, undo the repo move and roll the name back, so the record, the repo dir and the
-            // blobs never disagree — never a silent half-rename. (The blob backend offloads its own IO.)
-            if let Err(e) = ctx.blobs.rename_agent(&meta.name, &newname).await {
-                eprintln!("blob rename failed for {} → {newname}: {e}", meta.name);
-                let (undo_from, undo_to) = (repo_path(ctx.root(), &newname), repo_path(ctx.root(), &meta.name));
+            // Blobs are keyed by (owner_ns, name), so they must follow the rename or they are stranded
+            // under the old name and unreachable. Mirror the repo-dir move exactly: on failure, undo the
+            // repo move and roll the name back, so record, repo dir and blobs never disagree.
+            if let Err(e) = ctx.blobs.rename_agent((&seg, &meta.name), (&seg, &newname)).await {
+                eprintln!("blob rename failed for {seg}/{} → {seg}/{newname}: {e}", meta.name);
+                let (undo_from, undo_to) = (repo_path(ctx.root(), &seg, &newname), repo_path(ctx.root(), &seg, &meta.name));
                 let _ = tokio::task::spawn_blocking(move || std::fs::rename(undo_from, undo_to)).await;
                 let _ = ctx
                     .store
                     .update_agents(|list| {
-                        if let Some(m) = list.iter_mut().find(|m| m.name == newname) {
+                        if let Some(m) = list.iter_mut().find(|m| m.matches(&seg, &newname)) {
                             m.name = meta.name.clone();
                         }
                     })
                     .await;
                 return Resp::err(500, "rename failed (couldn't move the agent's blobs)");
             }
-            // Tokens are bound to the **name**. A rename doesn't change identity (the aid lives in
-            // the store), so the bindings have to follow — otherwise one rename silently mutes every
-            // CI token.
+            // Tokens are bound to the **scoped id** `<owner_ns>/<name>`. A rename doesn't change identity
+            // (the aid lives in the store), so the bindings have to follow — otherwise one rename
+            // silently mutes every CI token.
+            let (old_scoped, new_scoped) = (format!("{seg}/{}", meta.name), format!("{seg}/{newname}"));
             let _ = ctx
                 .store
                 .update_tokens(|toks| {
-                    for t in toks.iter_mut().filter(|t| t.agent.as_deref() == Some(meta.name.as_str())) {
-                        t.agent = Some(newname.clone());
+                    for t in toks.iter_mut().filter(|t| t.agent.as_deref() == Some(old_scoped.as_str())) {
+                        t.agent = Some(new_scoped.clone());
                     }
                 })
                 .await;
-            // MR endpoints carry both aid and name; the names are labels and have to follow too.
-            let _ = ctx.store.rename_in_mrs(&meta.name, &newname).await;
-            audit_append(ctx.root(), &actor, audit::AGENT_RENAME, Some(&newname), &format!("{} → {newname}", meta.name)).await;
+            // MR endpoints carry owner + name; the name is a label within the namespace and has to follow.
+            let _ = ctx.store.rename_in_mrs(&seg, &meta.name, &newname).await;
+            audit_append(ctx.root(), &actor, audit::AGENT_RENAME, Some(&new_scoped), &format!("{} → {newname}", meta.name)).await;
             // Echo the aid back: the whole point of the rename being safe is that identity did not
             // move, and a caller should be able to see that rather than take it on faith.
             return Resp::json(serde_json::json!({ "name": newname, "renamed_from": meta.name, "aid": meta.aid }));
         }
     }
 
-    let fresh = ctx.store.agent_or_unowned(&meta.name).await;
-    Resp::json(serde_json::json!({ "name": fresh.name, "visibility": fresh.visibility, "owner": fresh.owner }))
+    let fresh = ctx.store.agent_or_unowned(&seg, &meta.name).await;
+    Resp::json(serde_json::json!({ "name": fresh.name, "visibility": fresh.visibility, "owner": fresh.owner, "full_name": fresh.scoped() }))
 }
 
 /// Is this name spoken for? **Includes soft-deleted agents**, whose whole point is that the name
 /// stays theirs: hand it to someone else and the restore has nowhere to land, while every token and
 /// `.agit.toml` still pointing at the name silently starts addressing a stranger's agent.
-pub(crate) async fn name_taken(ctx: &Ctx, name: &str) -> bool {
-    ctx.store.agent(name).await.is_some() || repo_path(ctx.root(), name).exists()
+pub(crate) async fn name_taken(ctx: &Ctx, seg: &str, name: &str) -> bool {
+    ctx.store.agent_scoped(seg, name).await.is_some() || repo_path(ctx.root(), seg, name).exists()
 }
 
-/// Mutate the agents.json record for `name` under the lock, mapping a write failure to a 500. The
-/// find-by-name / err-to-500 boilerplate that every field-editing handler otherwise repeats.
-pub(crate) async fn edit_agent(ctx: &Ctx, name: &str, f: impl FnOnce(&mut AgentMeta)) -> Result<(), Resp> {
+/// Mutate the record for the agent `(seg, name)` under the lock, mapping a write failure to a 500. The
+/// find / err-to-500 boilerplate that every field-editing handler otherwise repeats.
+pub(crate) async fn edit_agent(ctx: &Ctx, seg: &str, name: &str, f: impl FnOnce(&mut AgentMeta)) -> Result<(), Resp> {
     ctx.store
         .update_agents(|list| {
-            if let Some(m) = list.iter_mut().find(|m| m.name == name) {
+            if let Some(m) = list.iter_mut().find(|m| m.matches(seg, name)) {
                 f(m);
             }
         })
@@ -968,8 +1001,8 @@ pub(crate) async fn edit_agent(ctx: &Ctx, name: &str, f: impl FnOnce(&mut AgentM
 
 /// Move an agent between lifecycle states. The state itself is enforced in `acl::decide` — this only
 /// writes it down.
-pub(crate) async fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Lifecycle, from: &[Lifecycle], action: &'static str) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Manage).await {
+pub(crate) async fn set_lifecycle(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, to: Lifecycle, from: &[Lifecycle], action: &'static str) -> Resp {
+    let meta = match gate(ctx, caller, owner, name, Action::Manage).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -978,12 +1011,12 @@ pub(crate) async fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Li
     if !from.contains(&meta.lifecycle()) {
         return Resp::err(409, &format!("this agent is {}", meta.lifecycle().as_str()));
     }
-    if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.lifecycle = to.as_str().to_string()).await {
+    if let Err(resp) = edit_agent(ctx, meta.seg(), &meta.name, |m| m.lifecycle = to.as_str().to_string()).await {
         return resp;
     }
     let actor = caller.user.clone().unwrap_or_default();
-    audit_append(ctx.root(), &actor, action, Some(&meta.name), &format!("{} → {}", meta.lifecycle().as_str(), to.as_str())).await;
-    Resp::json(serde_json::json!({ "name": meta.name, "lifecycle": to.as_str(), "aid": meta.aid }))
+    audit_append(ctx.root(), &actor, action, Some(&meta.scoped()), &format!("{} → {}", meta.lifecycle().as_str(), to.as_str())).await;
+    Resp::json(serde_json::json!({ "name": meta.name, "full_name": meta.scoped(), "lifecycle": to.as_str(), "aid": meta.aid }))
 }
 
 /// `DELETE /api/agent/<name>` — **soft**. The repo, the tokens, the MRs and the name all survive; the
@@ -991,45 +1024,46 @@ pub(crate) async fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Li
 ///
 /// Destroying the bytes is `?purge=true`, and only from here — two steps, because the one-step version
 /// of this is how a memory nobody meant to lose gets lost.
-pub(crate) async fn api_delete_agent(ctx: &Ctx, caller: &Caller, name: &str, query: &str) -> Resp {
+pub(crate) async fn api_delete_agent(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, query: &str) -> Resp {
     if param(query, "purge").as_deref() == Some("true") {
-        return api_purge_agent(ctx, caller, name).await;
+        return api_purge_agent(ctx, caller, owner, name).await;
     }
-    set_lifecycle(ctx, caller, name, Lifecycle::Deleted, &[Lifecycle::Active, Lifecycle::Archived], audit::AGENT_DELETE).await
+    set_lifecycle(ctx, caller, owner, name, Lifecycle::Deleted, &[Lifecycle::Active, Lifecycle::Archived], audit::AGENT_DELETE).await
 }
 
 /// The irreversible one: the bytes go. Only reachable for an already soft-deleted agent, so nothing
 /// live can be destroyed by a single mistyped verb.
-pub(crate) async fn api_purge_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Manage).await {
+pub(crate) async fn api_purge_agent(ctx: &Ctx, caller: &Caller, owner: &str, name: &str) -> Resp {
+    let meta = match gate(ctx, caller, owner, name, Action::Manage).await {
         Ok(x) => x,
         Err(r) => return r,
     };
     if meta.lifecycle() != Lifecycle::Deleted {
         return Resp::err(409, "purge only empties the trash: delete this agent first, then purge it");
     }
-    let dir = repo_path(ctx.root(), &meta.name);
+    let seg = meta.seg().to_string();
+    let scoped = meta.scoped();
+    let dir = repo_path(ctx.root(), &seg, &meta.name);
     let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir).is_ok()).await.unwrap_or(false);
     if !removed {
         return Resp::err(500, "can't remove the repo directory");
     }
-    // Blobs are keyed by the agent NAME (blobs/<name>/<sha>). Destroy them with the repo, and BEFORE
-    // the agents.json record is dropped: leaving them behind is the recycled-name leak — a NEW agent
-    // later created under this same name would pass the name gate and read the previous owner's PRIVATE
-    // blobs. Surfacing a failure as a 500 while the record still stands means the name can't be recycled
-    // yet, so the leak never opens — the same recycled-name reasoning the tokens/MRs cleanup documents.
-    if let Err(e) = ctx.blobs.delete_agent(&meta.name).await {
-        eprintln!("blob purge failed for {}: {e}", meta.name);
+    // Blobs are keyed by (owner_ns, name). Destroy them with the repo, and BEFORE the record is dropped:
+    // leaving them behind is the recycled-name leak — a NEW agent later created under this same
+    // (owner, name) would pass the gate and read the previous owner's PRIVATE blobs. Surfacing a failure
+    // as a 500 while the record still stands means the name can't be recycled yet, so the leak never
+    // opens — the same recycled-name reasoning the tokens/MRs cleanup documents.
+    if let Err(e) = ctx.blobs.delete_agent(&seg, &meta.name).await {
+        eprintln!("blob purge failed for {scoped}: {e}");
         return Resp::err(500, "can't remove the agent's blobs");
     }
-    let _ = ctx.store.update_agents(|list| list.retain(|m| m.name != meta.name)).await;
-    // Tokens bound to this name must die with it: otherwise, when someone later creates an agent
-    // with the same name, the old tokens would **automatically** gain rights on that new agent (the
-    // name was recycled, but the token still keys off the name).
-    let _ = ctx.store.update_tokens(|toks| toks.retain(|t| t.agent.as_deref() != Some(meta.name.as_str()))).await;
+    let _ = ctx.store.update_agents(|list| list.retain(|m| !m.matches(&seg, &meta.name))).await;
+    // Tokens bound to this SCOPED id must die with it: otherwise a recycled (owner, name) would let old
+    // tokens automatically gain rights on the new agent.
+    let _ = ctx.store.update_tokens(|toks| toks.retain(|t| t.agent.as_deref() != Some(scoped.as_str()))).await;
     // Same reasoning for MRs targeting it: a recycled name must not inherit the old agent's reviews.
-    let _ = ctx.store.update_mrs(|mrs| mrs.retain(|m| m.target.agent != meta.name)).await;
-    audit_append(ctx.root(), &caller.user.clone().unwrap_or_default(), audit::AGENT_PURGE, Some(&meta.name), "").await;
+    let _ = ctx.store.update_mrs(|mrs| mrs.retain(|m| !(m.target.owner == seg && m.target.agent == meta.name))).await;
+    audit_append(ctx.root(), &caller.user.clone().unwrap_or_default(), audit::AGENT_PURGE, Some(&scoped), "").await;
     Resp::no_content()
 }
 
@@ -1045,10 +1079,10 @@ pub(crate) async fn api_purge_agent(ctx: &Ctx, caller: &Caller, name: &str) -> R
 /// agent.toml, so the fork wears the source's identity until someone rebinds it locally
 /// (`agit a rebind`) and pushes — until then `sync_aid` reports it as a conflict and refuses to cache
 /// it, which is exactly right: two agents may never share one aid, and the Hub does not mint them.
-pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, owner: &str, name: &str, body: &[u8]) -> Resp {
     // You cannot fork what you cannot read — otherwise fork is an oracle for private agents, and a
     // way to walk off with one.
-    let source = match gate(ctx, caller, name, Action::Read).await {
+    let source = match gate(ctx, caller, owner, name, Action::Read).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -1057,9 +1091,11 @@ pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: 
     };
     // A fork is a write the caller performs, so a read-only token must not get to do it.
     if caller.token.as_ref().is_some_and(|t| t.scope != Scope::Write) {
-        audit_deny(ctx, &user, Some(name), Action::Write, Deny::TokenScope).await;
+        audit_deny(ctx, &user, Some(&source.scoped()), Action::Write, Deny::TokenScope).await;
         return Resp::err(403, Deny::TokenScope.reason());
     }
+    // The fork is owned by (and namespaced under) the caller — its segment is the caller's username.
+    let fork_seg = user.clone();
     let fork = match json_body(body).as_ref().and_then(|v| str_field(v, "name")) {
         Some(n) => n,
         None => format!("{}-fork", source.name),
@@ -1067,18 +1103,18 @@ pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: 
     if !valid_agent_name(&fork) {
         return Resp::err(400, "invalid name ([A-Za-z0-9._-] only, no .. and no leading dot)");
     }
-    if name_taken(ctx, &fork).await {
+    if name_taken(ctx, &fork_seg, &fork).await {
         return Resp::err(409, "that name is already taken");
     }
-    let dst = repo_path(ctx.root(), &fork);
+    let dst = repo_path(ctx.root(), &fork_seg, &fork);
     // `git clone --bare` + the two `git config`/`remote` calls + install_pre_receive + reading the
     // source's aid all shell out or touch the fs. Run the whole lot on the blocking pool: it returns
     // None if the clone failed (already cleaned up), else the source's aid (the fork's lineage).
     let clone_out: Option<Option<String>> = {
-        let src = repo_path(ctx.root(), &source.name);
+        let src = repo_path(ctx.root(), source.seg(), &source.name);
         let dst = dst.clone();
         let root = ctx.root().to_path_buf();
-        let fork = fork.clone();
+        let (fork_seg, fork) = (fork_seg.clone(), fork.clone());
         tokio::task::spawn_blocking(move || {
             let ok = Command::new("git")
                 .args(["clone", "-q", "--bare"])
@@ -1096,7 +1132,7 @@ pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: 
             // remote pointing at the source would make its `--not --all` scan bound, and its pushes
             // routable, through somebody else's repo.
             let _ = Command::new("git").arg("-C").arg(&dst).args(["remote", "remove", "origin"]).status();
-            install_pre_receive(&dst, &root, &fork);
+            install_pre_receive(&dst, &root, &fork_seg, &fork);
             // The identity the clone carries. Recorded as lineage so `identity::reconcile` can tell
             // this fork's inherited aid from a stolen one — see `AgentMeta::forked_from_aid`. Read from
             // the source repo rather than from `source.aid`, which is only the Hub's cache.
@@ -1116,7 +1152,7 @@ pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: 
     let r = ctx
         .store
         .update_agents(|list| {
-            if list.iter().any(|a| a.name == fork) {
+            if list.iter().any(|a| a.matches(&fork_seg, &fork)) {
                 return false;
             }
             list.push(AgentMeta {
@@ -1141,7 +1177,7 @@ pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: 
             return Resp::err(500, "failed to persist the agent");
         }
     }
-    audit_append(ctx.root(), &user, audit::AGENT_FORK, Some(&fork), &format!("forked from {}", source.name)).await;
+    audit_append(ctx.root(), &user, audit::AGENT_FORK, Some(&format!("{fork_seg}/{fork}")), &format!("forked from {}", source.scoped())).await;
     let (aid, aid_source) = tokio::task::spawn_blocking(move || agent_aid(&dst)).await.unwrap();
     Resp::json_status(
         201,
@@ -1149,8 +1185,9 @@ pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: 
             "name": fork,
             "forked_from": source.name,
             "owner": user,
+            "full_name": format!("{fork_seg}/{fork}"),
             "visibility": Visibility::Private.as_str(),
-            "clone_url": clone_url(ctx, req, &fork),
+            "clone_url": clone_url(ctx, req, &fork_seg, &fork),
             // The identity the *clone* carries, which is still the source's. Reported, never cached:
             // `by-aid` keeps resolving to the source until this fork is rebound.
             //
@@ -1177,18 +1214,18 @@ pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: 
 /// bookmark something would make the feature useless for exactly the agents worth bookmarking. It
 /// still writes hub state, so it takes an identity and refuses a read-only token, same as an MR
 /// comment (see `mutation_actor`).
-pub(crate) async fn api_star_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Read).await {
+pub(crate) async fn api_star_agent(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, body: &[u8]) -> Resp {
+    let meta = match gate(ctx, caller, owner, name, Action::Read).await {
         Ok(x) => x,
         Err(r) => return r,
     };
-    let actor = match mutation_actor(ctx, caller, name).await {
+    let actor = match mutation_actor(ctx, caller, &meta.scoped()).await {
         Ok(a) => a,
         Err(r) => return r,
     };
     let on = json_body(body).and_then(|v| v.get("starred").and_then(|x| x.as_bool())).unwrap_or(true);
     let who = actor.clone();
-    if let Err(resp) = edit_agent(ctx, &meta.name, |m| {
+    if let Err(resp) = edit_agent(ctx, meta.seg(), &meta.name, |m| {
         m.stars.retain(|u| u != &who);
         if on {
             m.stars.push(who.clone());
@@ -1198,9 +1235,9 @@ pub(crate) async fn api_star_agent(ctx: &Ctx, caller: &Caller, name: &str, body:
     {
         return resp;
     }
-    audit_append(ctx.root(), &actor, audit::AGENT_STAR, Some(&meta.name), if on { "starred" } else { "unstarred" }).await;
-    let fresh = ctx.store.agent_or_unowned(&meta.name).await;
-    Resp::json(serde_json::json!({ "name": meta.name, "starred": on, "stars": fresh.stars.len() }))
+    audit_append(ctx.root(), &actor, audit::AGENT_STAR, Some(&meta.scoped()), if on { "starred" } else { "unstarred" }).await;
+    let fresh = ctx.store.agent_or_unowned(meta.seg(), &meta.name).await;
+    Resp::json(serde_json::json!({ "name": meta.name, "full_name": meta.scoped(), "starred": on, "stars": fresh.stars.len() }))
 }
 
 /// Transfer ownership. The aid does not move — a transfer is a metadata edit, exactly like a rename:
@@ -1212,11 +1249,62 @@ pub(crate) async fn api_star_agent(ctx: &Ctx, caller: &Caller, name: &str, body:
 /// grant — hands the new owner an agent that someone else still controls without saying so. The way
 /// back is for the new owner to add them, or for the site admin to step in; both are deliberate acts
 /// by someone who still has the rights, which is the property worth keeping.
-pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Manage).await {
+/// Move an agent's on-disk storage (repo dir + blobs) from `old_seg` to `new_seg`, keeping the same
+/// `name`. Storage-first with the same rollback discipline as the rename in `api_patch_agent`: on a
+/// blob-move failure the repo dir is moved back, so the two never disagree. A no-op when the segment
+/// is unchanged.
+async fn move_agent_storage(ctx: &Ctx, old_seg: &str, new_seg: &str, name: &str) -> Result<(), Resp> {
+    if old_seg == new_seg {
+        return Ok(());
+    }
+    let from = repo_path(ctx.root(), old_seg, name);
+    let to = repo_path(ctx.root(), new_seg, name);
+    let to2 = to.clone();
+    let moved = tokio::task::spawn_blocking(move || {
+        if let Some(p) = to2.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        std::fs::rename(&from, &to2).is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    if !moved {
+        return Err(Resp::err(500, "transfer failed (the repo directory won't move)"));
+    }
+    if let Err(e) = ctx.blobs.rename_agent((old_seg, name), (new_seg, name)).await {
+        eprintln!("blob transfer failed for {old_seg}/{name} → {new_seg}/{name}: {e}");
+        let (uf, ut) = (repo_path(ctx.root(), new_seg, name), repo_path(ctx.root(), old_seg, name));
+        let _ = tokio::task::spawn_blocking(move || std::fs::rename(uf, ut)).await;
+        return Err(Resp::err(500, "transfer failed (couldn't move the agent's blobs)"));
+    }
+    Ok(())
+}
+
+/// Carry an agent's MR endpoints across an ownership change (the name is unchanged; only the namespace
+/// segment moves). Mirrors `rename_in_mrs`, but for the owner half.
+async fn retarget_mrs_owner(ctx: &Ctx, old_seg: &str, new_seg: &str, name: &str) {
+    let (old_seg, new_seg, name) = (old_seg.to_string(), new_seg.to_string(), name.to_string());
+    let _ = ctx
+        .store
+        .update_mrs(|mrs| {
+            for m in mrs.iter_mut() {
+                if m.target.agent == name && m.target.owner == old_seg {
+                    m.target.owner = new_seg.clone();
+                }
+                if m.source.agent == name && m.source.owner == old_seg {
+                    m.source.owner = new_seg.clone();
+                }
+            }
+        })
+        .await;
+}
+
+pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, body: &[u8]) -> Resp {
+    let meta = match gate(ctx, caller, owner, name, Action::Manage).await {
         Ok(x) => x,
         Err(r) => return r,
     };
+    let old_seg = meta.seg().to_string();
     let actor = caller.user.clone().unwrap_or_default();
     let bodyv = json_body(body);
     // Transfer to an org (mutually exclusive with `to`): the owner becomes "org:<name>" and access
@@ -1231,30 +1319,42 @@ pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, b
             _ => return Resp::err(404, "not found"),
         };
         let new_owner = format!("org:{}", org.name);
+        let new_seg = org.name.clone(); // owner_ns of "org:acme" is "acme"
         if meta.owner.as_deref() == Some(new_owner.as_str()) {
             return Resp::err(409, &format!("this agent is already owned by org:{}", org.name));
         }
+        if name_taken(ctx, &new_seg, name).await {
+            return Resp::err(409, &format!("org:{} already has an agent named {name}", org.name));
+        }
         let from = meta.owner.clone();
-        if let Err(resp) = edit_agent(ctx, &meta.name, |m| {
+        // An owner change now moves the storage namespace: repo dir + blobs first, then the metadata.
+        if let Err(r) = move_agent_storage(ctx, &old_seg, &new_seg, name).await {
+            return r;
+        }
+        if let Err(resp) = edit_agent(ctx, &old_seg, name, |m| {
             m.owner = Some(new_owner.clone());
             // Drop any stale membership row that shares the org's bare name — the org grant supersedes.
             m.members.retain(|x| x.username != org.name);
         })
         .await
         {
+            // Roll the storage back so record and disk never disagree.
+            let _ = move_agent_storage(ctx, &new_seg, &old_seg, name).await;
             return resp;
         }
+        retarget_mrs_owner(ctx, &old_seg, &new_seg, name).await;
         audit_append(
             ctx.root(),
             &actor,
             audit::AGENT_TRANSFER,
-            Some(&meta.name),
-            &format!("{} → {new_owner}", from.as_deref().unwrap_or("(unowned)")),
+            Some(&format!("{new_seg}/{name}")),
+            &format!("{}/{name} → {new_owner}", old_seg),
         )
         .await;
         return Resp::json(serde_json::json!({
-            "name": meta.name,
+            "name": name,
             "owner": new_owner,
+            "full_name": format!("{new_seg}/{name}"),
             "previous_owner": from,
             "aid": meta.aid,
         }));
@@ -1271,8 +1371,15 @@ pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, b
     if meta.owner.as_deref() == Some(to.as_str()) {
         return Resp::err(409, &format!("{to} already owns this agent"));
     }
+    // The new owner's namespace segment is their bare username.
+    if name_taken(ctx, &to, name).await {
+        return Resp::err(409, &format!("{to} already has an agent named {name}"));
+    }
     let (from, target) = (meta.owner.clone(), to.clone());
-    if let Err(resp) = edit_agent(ctx, &meta.name, |m| {
+    if let Err(r) = move_agent_storage(ctx, &old_seg, &to, name).await {
+        return r;
+    }
+    if let Err(resp) = edit_agent(ctx, &old_seg, name, |m| {
         m.owner = Some(target.clone());
         // The new owner's membership row, if any, is now noise at best and a demotion at worst (owner
         // outranks every role) — drop it rather than leave two answers to "what may they do".
@@ -1280,19 +1387,22 @@ pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, b
     })
     .await
     {
+        let _ = move_agent_storage(ctx, &to, &old_seg, name).await;
         return resp;
     }
+    retarget_mrs_owner(ctx, &old_seg, &to, name).await;
     audit_append(
         ctx.root(),
         &actor,
         audit::AGENT_TRANSFER,
-        Some(&meta.name),
-        &format!("{} → {to}", from.as_deref().unwrap_or("(unowned)")),
+        Some(&format!("{to}/{name}")),
+        &format!("{old_seg}/{name} → {to}"),
     )
     .await;
     Resp::json(serde_json::json!({
-        "name": meta.name,
+        "name": name,
         "owner": to,
+        "full_name": format!("{to}/{name}"),
         "previous_owner": from,
         // The point of a transfer being safe is that identity did not move. Say so, rather than
         // leaving the caller to take it on faith.
@@ -1302,15 +1412,16 @@ pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, b
 
 // ── members ──
 
-pub(crate) async fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
+pub(crate) async fn api_members(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
     let actor = caller.user.clone().unwrap_or_default();
     // GET only needs read (the member list is already shown to readers in the agent detail);
     // adding/removing needs Manage.
     let action = if method == "GET" { Action::Read } else { Action::Manage };
-    let meta = match gate(ctx, caller, name, action).await {
+    let meta = match gate(ctx, caller, owner, name, action).await {
         Ok(x) => x,
         Err(r) => return r,
     };
+    let seg = meta.seg().to_string();
 
     let target = tail.strip_prefix('/').map(|s| s.to_string());
     match (method, target) {
@@ -1339,7 +1450,7 @@ pub(crate) async fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &s
             if meta.owner.as_deref() == Some(username.as_str()) {
                 return Resp::err(400, "the owner already has every right; no membership needed");
             }
-            if let Err(resp) = edit_agent(ctx, &meta.name, |m| {
+            if let Err(resp) = edit_agent(ctx, &seg, &meta.name, |m| {
                 match m.members.iter_mut().find(|x| x.username == username) {
                     Some(x) => x.role = role.as_str().to_string(),
                     None => m.members.push(Member { username: username.clone(), role: role.as_str().to_string() }),
@@ -1349,8 +1460,8 @@ pub(crate) async fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &s
             {
                 return resp;
             }
-            audit_append(ctx.root(), &actor, audit::MEMBER_ADD, Some(&meta.name), &format!("{username}={}", role.as_str())).await;
-            let fresh = ctx.store.agent_or_unowned(&meta.name).await;
+            audit_append(ctx.root(), &actor, audit::MEMBER_ADD, Some(&meta.scoped()), &format!("{username}={}", role.as_str())).await;
+            let fresh = ctx.store.agent_or_unowned(&seg, &meta.name).await;
             Resp::json(serde_json::json!(fresh
                 .members
                 .iter()
@@ -1361,7 +1472,7 @@ pub(crate) async fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &s
             let username = store::normalize_username(&username);
             let removed = ctx
                 .store
-                .update_agents(|list| match list.iter_mut().find(|m| m.name == meta.name) {
+                .update_agents(|list| match list.iter_mut().find(|m| m.matches(&seg, &meta.name)) {
                     Some(m) => {
                         let before = m.members.len();
                         m.members.retain(|x| x.username != username);
@@ -1374,7 +1485,7 @@ pub(crate) async fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &s
             if !removed {
                 return Resp::err(404, "that person isn't a member");
             }
-            audit_append(ctx.root(), &actor, audit::MEMBER_REMOVE, Some(&meta.name), &username).await;
+            audit_append(ctx.root(), &actor, audit::MEMBER_REMOVE, Some(&meta.scoped()), &username).await;
             Resp::no_content()
         }
         _ => Resp::text(405, "method not allowed"),
@@ -1424,6 +1535,14 @@ pub(crate) async fn api_orgs_create(ctx: &Ctx, caller: &Caller, body: &[u8]) -> 
     let name = store::normalize_username(&name);
     if !store::valid_username(&name) {
         return Resp::err(400, "invalid org name (2-32 lowercase [a-z0-9._-], no leading dot)");
+    }
+    if store::is_reserved_account(&name) {
+        return Resp::err(400, "that name is reserved");
+    }
+    // Unified account namespace (GitHub-style): an org and a user may never share a bare name, so the
+    // `owner_ns` segment resolves to exactly one account.
+    if ctx.store.user(&name).await.is_some() {
+        return Resp::err(409, "that name is already taken by a user");
     }
     // Atomic create: the existence check and the push run together under the orgs lock, so two racing
     // creates of one name can't both land.
@@ -1594,11 +1713,11 @@ pub(crate) async fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     // Decide readability async (each per-agent ACL is a store read), then hand the whole
     // subprocess-heavy scan (has_head + session_refs + load_session + digest, capped) to the blocking
     // pool in one shot.
-    let mut readable: Vec<(String, Option<String>)> = Vec::new();
-    for name in list_agents(ctx.root()) {
-        let meta = ctx.store.agent_or_unowned(&name).await;
+    let mut readable: Vec<(String, String, Option<String>)> = Vec::new();
+    for (seg, name) in list_agents(ctx.root()) {
+        let meta = ctx.store.agent_or_unowned(&seg, &name).await;
         if acl::decide(caller, &agent_acl(ctx, &meta).await, Action::Read).allowed() {
-            readable.push((name, meta.aid.clone()));
+            readable.push((seg, name, meta.aid.clone()));
         }
     }
     let root = ctx.root().to_path_buf();
@@ -1607,8 +1726,8 @@ pub(crate) async fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
         let mut hits: Vec<serde_json::Value> = vec![];
         let mut scanned = 0usize;
         let mut capped = false;
-        'agents: for (name, aid) in &readable {
-            let repo = repo_path(&root, name);
+        'agents: for (seg, name, aid) in &readable {
+            let repo = repo_path(&root, seg, name);
             if !has_head(&repo) {
                 continue;
             }
@@ -1640,6 +1759,8 @@ pub(crate) async fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
                 }
                 hits.push(serde_json::json!({
                     "agent": name,
+                    "owner": seg,
+                    "full_name": format!("{seg}/{name}"),
                     "aid": aid,
                     "id": d.id,
                     "env": r.env,
@@ -1684,7 +1805,8 @@ pub(crate) async fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
 /// since anyone who may read the review may take part in it. That tier is about *who may join the
 /// discussion* — it is not a claim that a comment is not a write, so every POST here additionally
 /// clears `mutation_actor`. Nothing here merges anything: see the module docs on `agit::hub::mr`.
-pub(crate) async fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, query: &str, body: &[u8]) -> Resp {
+#[allow(clippy::too_many_arguments)] // owner+name is the identity now; both must thread through
+pub(crate) async fn api_mrs(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, tail: &str, method: &str, query: &str, body: &[u8]) -> Resp {
     // The action this route needs, decided **before** the agent is fetched, so the gate is the first
     // thing that happens on every path.
     let action = match (method, tail) {
@@ -1694,13 +1816,13 @@ pub(crate) async fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, 
         ("POST", t) if t.ends_with("/close") => Action::Write,
         _ => return Resp::text(405, "method not allowed"),
     };
-    let meta = match gate(ctx, caller, name, action).await {
+    let meta = match gate(ctx, caller, owner, name, action).await {
         Ok(x) => x,
         Err(r) => return r,
     };
     // Every POST below mutates hub state, whichever tier `gate` authorized it at.
     let actor = match method {
-        "POST" => match mutation_actor(ctx, caller, name).await {
+        "POST" => match mutation_actor(ctx, caller, &meta.scoped()).await {
             Ok(a) => a,
             Err(r) => return r,
         },
@@ -1745,13 +1867,13 @@ pub(crate) async fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, 
 ///     `Action::Write`, so a route gated at Read never reaches that rule — see acl.rs's
 ///     `read_token_never_writes_even_for_the_owner`. The cap is an intersection, not a maximum, so it
 ///     has to be applied where the write actually happens.
-pub(crate) async fn mutation_actor(ctx: &Ctx, caller: &Caller, name: &str) -> Result<String, Resp> {
+pub(crate) async fn mutation_actor(ctx: &Ctx, caller: &Caller, scoped: &str) -> Result<String, Resp> {
     let Some(actor) = caller.user.clone() else {
-        audit_deny(ctx, "anonymous", Some(name), Action::Write, Deny::Anonymous).await;
+        audit_deny(ctx, "anonymous", Some(scoped), Action::Write, Deny::Anonymous).await;
         return Err(Resp::err(401, "login required"));
     };
     if caller.token.as_ref().is_some_and(|t| t.scope != Scope::Write) {
-        audit_deny(ctx, &actor, Some(name), Action::Write, Deny::TokenScope).await;
+        audit_deny(ctx, &actor, Some(scoped), Action::Write, Deny::TokenScope).await;
         return Err(Resp::err(403, Deny::TokenScope.reason()));
     }
     Ok(actor)
@@ -1772,7 +1894,7 @@ pub(crate) async fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, qu
         Some(Err(_)) => return Resp::err(400, "invalid cursor"),
     };
     let all: Vec<mr::Mr> =
-        ctx.store.mrs_for(&meta.name).await.into_iter().filter(|m| after.is_none_or(|a| m.id > a)).collect();
+        ctx.store.mrs_for(meta.seg(), &meta.name).await.into_iter().filter(|m| after.is_none_or(|a| m.id > a)).collect();
     let has_more = all.len() > page.limit;
     let window: Vec<mr::Mr> = all.into_iter().take(page.limit).collect();
     let next_cursor = has_more.then(|| window.last().map(|m| cursor_encode(&m.id.to_string()))).flatten();
@@ -1782,7 +1904,7 @@ pub(crate) async fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, qu
     for m in &window {
         let source = mr_endpoint_json(ctx, caller, &m.source).await;
         let target = mr_endpoint_json(ctx, caller, &m.target).await;
-        let has_transcript = m.dialogue_transcript.is_some() && can_read_agent(ctx, caller, &m.source.agent).await;
+        let has_transcript = m.dialogue_transcript.is_some() && can_read_agent(ctx, caller, &m.source.owner, &m.source.agent).await;
         items.push(serde_json::json!({
             "id": m.id,
             "title": m.title,
@@ -1804,8 +1926,8 @@ pub(crate) async fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, qu
     }))
 }
 
-pub(crate) async fn can_read_agent(ctx: &Ctx, caller: &Caller, agent: &str) -> bool {
-    let meta = ctx.store.agent_or_unowned(agent).await;
+pub(crate) async fn can_read_agent(ctx: &Ctx, caller: &Caller, seg: &str, name: &str) -> bool {
+    let meta = ctx.store.agent_or_unowned(seg, name).await;
     acl::decide(caller, &agent_acl(ctx, &meta).await, Action::Read).allowed()
 }
 
@@ -1817,10 +1939,10 @@ pub(crate) async fn can_read_agent(ctx: &Ctx, caller: &Caller, agent: &str) -> b
 /// existence is itself a secret — true of the MR views too; checking only the opener leaves the name,
 /// aid and ref of a private agent readable by anonymous.
 pub(crate) async fn mr_endpoint_json(ctx: &Ctx, caller: &Caller, e: &mr::Endpoint) -> serde_json::Value {
-    if !can_read_agent(ctx, caller, &e.agent).await {
-        return serde_json::json!({ "aid": null, "agent": null, "ref": null, "redacted": true });
+    if !can_read_agent(ctx, caller, &e.owner, &e.agent).await {
+        return serde_json::json!({ "aid": null, "owner": null, "agent": null, "full_name": null, "ref": null, "redacted": true });
     }
-    serde_json::json!({ "aid": e.aid, "agent": e.agent, "ref": e.git_ref })
+    serde_json::json!({ "aid": e.aid, "owner": e.owner, "agent": e.agent, "full_name": format!("{}/{}", e.owner, e.agent), "ref": e.git_ref })
 }
 
 pub(crate) async fn mr_json(ctx: &Ctx, caller: &Caller, m: &mr::Mr) -> serde_json::Value {
@@ -1828,7 +1950,7 @@ pub(crate) async fn mr_json(ctx: &Ctx, caller: &Caller, m: &mr::Mr) -> serde_jso
     // source by construction — a reader who may not know the source exists may not read it either.
     // Withheld whole rather than filtered: there is no reliable way to strip one agent's voice out of
     // free text, and a partial redaction that looks complete is worse than an honest absence.
-    let show_source = can_read_agent(ctx, caller, &m.source.agent).await;
+    let show_source = can_read_agent(ctx, caller, &m.source.owner, &m.source.agent).await;
     let source = mr_endpoint_json(ctx, caller, &m.source).await;
     let target = mr_endpoint_json(ctx, caller, &m.target).await;
     serde_json::json!({
@@ -1863,17 +1985,21 @@ pub(crate) async fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, ac
         Ok(None) => return Resp::err(400, "want title"),
         Err(e) => return Resp::err(400, &format!("title {e}")),
     };
-    let Some(source_name) = str_field(&v, "source") else {
-        return Resp::err(400, "want source (the agent the change is coming from)");
+    let Some(source_spec) = str_field(&v, "source") else {
+        return Resp::err(400, "want source (the agent the change is coming from, as owner/name)");
+    };
+    // Identity is (owner, name), so the source is addressed as `owner/name`.
+    let Some((source_owner, source_name)) = source_spec.split_once('/') else {
+        return Resp::err(400, "source must be owner/name (e.g. daru/frontend)");
     };
     // The source is a real agent on this Hub, and **the caller must be able to read it**: an MR
     // carries the source's identity and ref into an object other people will read, so proposing from
     // an agent you cannot see would leak that it exists.
-    let source = match gate(ctx, caller, &source_name, Action::Read).await {
+    let source = match gate(ctx, caller, source_owner, source_name, Action::Read).await {
         Ok(x) => x,
         Err(r) => return r,
     };
-    if source.name == meta.name {
+    if source.scoped() == meta.scoped() {
         return Resp::err(400, "an agent cannot open a merge request against itself");
     }
     let source_ref = str_field(&v, "source_ref").unwrap_or_else(|| "main".into());
@@ -1893,7 +2019,7 @@ pub(crate) async fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, ac
         },
     };
 
-    let open_now = ctx.store.mrs_for(&meta.name).await.iter().filter(|m| m.is_open()).count();
+    let open_now = ctx.store.mrs_for(meta.seg(), &meta.name).await.iter().filter(|m| m.is_open()).count();
     if open_now >= mr::OPEN_MAX {
         return Resp::err(429, &format!("this agent already has {} open merge requests", mr::OPEN_MAX));
     }
@@ -1902,13 +2028,14 @@ pub(crate) async fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, ac
     // which two memories this review was actually between.
     let src_aid = sync_aid(ctx, &source, actor).await.0;
     let tgt_aid = sync_aid(ctx, meta, actor).await.0;
+    let (src_seg, tgt_seg) = (source.seg().to_string(), meta.seg().to_string());
     let now = store::now_iso();
     let rec = ctx.store.update_mrs(|mrs| {
-        let id = mr::next_id(mrs, &meta.name);
+        let id = mr::next_id(mrs, &tgt_seg, &meta.name);
         let rec = mr::Mr {
             id,
-            source: mr::Endpoint { aid: src_aid.clone(), agent: source.name.clone(), git_ref: source_ref.clone() },
-            target: mr::Endpoint { aid: tgt_aid.clone(), agent: meta.name.clone(), git_ref: target_ref.clone() },
+            source: mr::Endpoint { aid: src_aid.clone(), owner: src_seg.clone(), agent: source.name.clone(), git_ref: source_ref.clone() },
+            target: mr::Endpoint { aid: tgt_aid.clone(), owner: tgt_seg.clone(), agent: meta.name.clone(), git_ref: target_ref.clone() },
             title: title.clone(),
             author: actor.to_string(),
             state: mr::State::Open.as_str().to_string(),
@@ -1927,15 +2054,15 @@ pub(crate) async fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, ac
         ctx.root(),
         actor,
         audit::MR_OPEN,
-        Some(&meta.name),
-        &format!("#{} {} ← {}:{}", rec.id, title, source.name, source_ref),
+        Some(&meta.scoped()),
+        &format!("#{} {} ← {}:{}", rec.id, title, source.scoped(), source_ref),
     )
     .await;
     Resp::json_status(201, mr_json(ctx, caller, &rec).await)
 }
 
 pub(crate) async fn api_mr_detail(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, id: usize) -> Resp {
-    match ctx.store.mrs_for(&meta.name).await.into_iter().find(|m| m.id == id) {
+    match ctx.store.mrs_for(meta.seg(), &meta.name).await.into_iter().find(|m| m.id == id) {
         Some(m) => Resp::json(mr_json(ctx, caller, &m).await),
         None => Resp::err(404, "not found"),
     }
@@ -1953,9 +2080,9 @@ pub(crate) async fn api_mr_comment(ctx: &Ctx, meta: &AgentMeta, id: usize, actor
         Ok(None) => return Resp::err(400, "want body"),
         Err(e) => return Resp::err(400, &format!("body {e}")),
     };
-    let target = meta.name.clone();
+    let (tseg, target) = (meta.seg().to_string(), meta.name.clone());
     let out = ctx.store.update_mrs(|mrs| {
-        let Some(m) = mrs.iter_mut().find(|m| m.target.agent == target && m.id == id) else {
+        let Some(m) = mrs.iter_mut().find(|m| m.target.owner == tseg && m.target.agent == target && m.id == id) else {
             return Err(Resp::err(404, "not found"));
         };
         // A settled MR is a record. Reopening the discussion on it would quietly edit history that
@@ -1973,7 +2100,7 @@ pub(crate) async fn api_mr_comment(ctx: &Ctx, meta: &AgentMeta, id: usize, actor
     }).await;
     match out {
         Ok(Ok(c)) => {
-            audit_append(ctx.root(), actor, audit::MR_COMMENT, Some(&meta.name), &format!("#{id} comment {}", c.id)).await;
+            audit_append(ctx.root(), actor, audit::MR_COMMENT, Some(&meta.scoped()), &format!("#{id} comment {}", c.id)).await;
             Resp::json_status(201, serde_json::json!({ "id": c.id, "author": c.author, "body": c.body, "created": c.created }))
         }
         Ok(Err(r)) => r,
@@ -1995,9 +2122,9 @@ pub(crate) async fn api_mr_close(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, i
             _ => return Resp::err(400, "state must be closed or merged"),
         },
     };
-    let target = meta.name.clone();
+    let (tseg, target) = (meta.seg().to_string(), meta.name.clone());
     let out = ctx.store.update_mrs(|mrs| {
-        let Some(m) = mrs.iter_mut().find(|m| m.target.agent == target && m.id == id) else {
+        let Some(m) = mrs.iter_mut().find(|m| m.target.owner == tseg && m.target.agent == target && m.id == id) else {
             return Err(Resp::err(404, "not found"));
         };
         if !m.is_open() {
@@ -2010,7 +2137,7 @@ pub(crate) async fn api_mr_close(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, i
     match out {
         Ok(Ok(m)) => {
             let action = if state == mr::State::Merged { audit::MR_MERGED } else { audit::MR_CLOSE };
-            audit_append(ctx.root(), actor, action, Some(&meta.name), &format!("#{id} {}", state.as_str())).await;
+            audit_append(ctx.root(), actor, action, Some(&meta.scoped()), &format!("#{id} {}", state.as_str())).await;
             Resp::json(mr_json(ctx, caller, &m).await)
         }
         Ok(Err(r)) => r,
@@ -2105,13 +2232,21 @@ pub(crate) async fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) ->
     let Some(scope) = str_field(&v, "scope").and_then(|s| Scope::parse(&s)) else {
         return Resp::err(400, "scope must be read or write");
     };
-    let agent = str_field(&v, "agent");
-    if let Some(a) = &agent {
-        // You can only issue tokens for agents you can see.
-        if let Err(r) = gate(ctx, caller, a, Action::Read).await {
-            return r;
+    // A token binds to the SCOPED id `<owner>/<name>` (names are unique only within an owner).
+    let agent = match str_field(&v, "agent") {
+        None => None,
+        Some(spec) => {
+            let Some((a_owner, a_name)) = spec.split_once('/') else {
+                return Resp::err(400, "agent must be owner/name (e.g. alice/frontend)");
+            };
+            // You can only issue tokens for agents you can see.
+            let meta = match gate(ctx, caller, a_owner, a_name, Action::Read).await {
+                Ok(m) => m,
+                Err(r) => return r,
+            };
+            Some(meta.scoped())
         }
-    }
+    };
     let ttl_days = match v.get("ttl_days") {
         None | Some(serde_json::Value::Null) => None,
         Some(x) => match x.as_i64() {
@@ -2151,13 +2286,17 @@ pub(crate) async fn api_revoke_token(ctx: &Ctx, caller: &Caller, id: &str) -> Re
 pub(crate) async fn api_audit(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     let limit: usize = param(req.query(), "limit").and_then(|s| s.parse().ok()).unwrap_or(100).clamp(1, 1000);
     match param(req.query(), "agent") {
-        // One agent's audit log: needs Manage on that agent (owner / member admin / site admin).
-        Some(name) => {
-            let meta = match gate(ctx, caller, &name, Action::Manage).await {
+        // One agent's audit log: needs Manage on that agent (owner / member admin / site admin). The
+        // `?agent=` value is the scoped `owner/name`, and the audit log is keyed on that scoped id.
+        Some(spec) => {
+            let Some((owner, name)) = spec.split_once('/') else {
+                return Resp::err(400, "agent must be owner/name (e.g. alice/frontend)");
+            };
+            let meta = match gate(ctx, caller, owner, name, Action::Manage).await {
                 Ok(x) => x,
                 Err(r) => return r,
             };
-            Resp::json(serde_json::json!(audit::query(ctx.root(), Some(&meta.name), limit)))
+            Resp::json(serde_json::json!(audit::query(ctx.root(), Some(&meta.scoped()), limit)))
         }
         // The site-wide audit log: site admins only, and only from a login session (tokens can't do
         // manage actions).
@@ -2179,22 +2318,22 @@ pub(crate) async fn api_audit(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
 /// the scanner exists to keep secrets out of the git transcript history (the source of truth); a blob
 /// never enters git, is never merged, and is served back only under the same ACL non-disclosure gate,
 /// with the same hardened download headers as a raw file. It is inert storage, not reviewable content.
-async fn api_blob_put(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+async fn api_blob_put(ctx: &Ctx, req: &Req, caller: &Caller, owner: &str, name: &str, body: &[u8]) -> Resp {
     // Size-first, like api_raw and the git push cap: refuse an oversize upload before doing any work.
     if req.content_length as u64 > BLOB_MAX || body.len() as u64 > BLOB_MAX {
         return Resp::err(413, &format!("blob too large; the ceiling is {BLOB_MAX} bytes"));
     }
-    let meta = match gate(ctx, caller, name, Action::Write).await {
+    let meta = match gate(ctx, caller, owner, name, Action::Write).await {
         Ok(x) => x,
         Err(r) => return r,
     };
     // Optional client-claimed digest — query param first, then header.
     let claimed = param(req.query(), "sha256").or_else(|| req.header("x-agit-blob-sha256").map(|s| s.to_string()));
 
-    let digest = match ctx.blobs.put(&meta.name, body).await {
+    let digest = match ctx.blobs.put(meta.seg(), &meta.name, body).await {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("blob put failed for {}: {e}", meta.name);
+            eprintln!("blob put failed for {}: {e}", meta.scoped());
             return Resp::err(500, "failed to store blob");
         }
     };
@@ -2210,24 +2349,24 @@ async fn api_blob_put(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &
         }
     }
     let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
-    audit_append(ctx.root(), &actor, audit::BLOB_PUT, Some(&meta.name), &digest).await;
+    audit_append(ctx.root(), &actor, audit::BLOB_PUT, Some(&meta.scoped()), &digest).await;
     Resp::json_status(201, serde_json::json!({ "sha256": digest, "size": body.len() }))
 }
 
 /// `GET /api/agent/<name>/blob/<digest>` — content-addressed download. Read-gated, with the SAME
 /// existence-non-disclosure as a private agent: the gate runs BEFORE the backend is touched, so
 /// "no such blob" and "no access to this agent" are indistinguishable (401/403/404 all from the gate).
-pub(crate) async fn api_blob_get(ctx: &Ctx, caller: &Caller, name: &str, digest: &str) -> Resp {
+pub(crate) async fn api_blob_get(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, digest: &str) -> Resp {
     // A malformed digest could never name a real blob — 404, the same class as gate()'s malformed-name
     // 404, so it leaks nothing. Checked before the gate: it is not agent-specific information.
     if !blob::valid_digest(digest) {
         return Resp::err(404, "not found");
     }
-    let meta = match gate(ctx, caller, name, Action::Read).await {
+    let meta = match gate(ctx, caller, owner, name, Action::Read).await {
         Ok(x) => x,
         Err(r) => return r,
     };
-    match ctx.blobs.get(&meta.name, digest).await {
+    match ctx.blobs.get(meta.seg(), &meta.name, digest).await {
         Ok(None) => Resp::err(404, "not found"),
         Ok(Some(bytes)) => {
             // Content-addressing invariant, verified at read time: a mismatch means fs corruption or an
@@ -2243,7 +2382,7 @@ pub(crate) async fn api_blob_get(ctx: &Ctx, caller: &Caller, name: &str, digest:
             .unwrap();
             if computed != digest {
                 let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
-                audit_append(ctx.root(), &actor, audit::BLOB_CORRUPT, Some(&meta.name), digest).await;
+                audit_append(ctx.root(), &actor, audit::BLOB_CORRUPT, Some(&meta.scoped()), digest).await;
                 return Resp::err(500, "stored blob failed its integrity check");
             }
             // The identical hardened headers as api_raw: a blob is attacker-authored opaque bytes served
@@ -2254,7 +2393,7 @@ pub(crate) async fn api_blob_get(ctx: &Ctx, caller: &Caller, name: &str, digest:
                 .with("Content-Security-Policy", "default-src 'none'; sandbox")
         }
         Err(e) => {
-            eprintln!("blob get failed for {}/{digest}: {e}", meta.name);
+            eprintln!("blob get failed for {}/{digest}: {e}", meta.scoped());
             Resp::err(500, "failed to read blob")
         }
     }
