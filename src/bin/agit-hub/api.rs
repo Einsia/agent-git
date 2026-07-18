@@ -1,11 +1,12 @@
 //! JSON API handlers + shared helpers (sync bodies returning Resp). Verbatim from the monolith.
 #![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
+use std::io;
 use std::process::Command;
 
 use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny, Lifecycle, Role, Scope, Visibility};
 use agit::hub::net::valid_agent_name;
-use agit::hub::store::{AgentMeta, Member};
-use agit::hub::{audit, auth, identity, mr, session as websession, store};
+use agit::hub::store::{AgentMeta, Member, Org, OrgMember, User};
+use agit::hub::{audit, auth, identity, kdf, mr, session as websession, store};
 
 use crate::cli::{create_agent, issue_token, list_agents, repo_path};
 use crate::gitplumb::*;
@@ -79,6 +80,7 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
     let m = req.method.as_str();
     match (m, rest) {
         ("POST", "login") => return api_login(ctx, req, body).await,
+        ("POST", "register") => return api_register(ctx, body).await,
         ("POST", "logout") => return api_logout(ctx, req, caller).await,
         ("GET", "me") => return api_me(caller),
         ("GET", "agents") => return api_agents(ctx, req, caller).await,
@@ -87,7 +89,22 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body:
         ("POST", "tokens") => return api_create_token(ctx, caller, body).await,
         ("GET", "audit") => return api_audit(ctx, req, caller).await,
         ("GET", "search") => return api_search(ctx, req, caller).await,
+        ("GET", "orgs") => return api_orgs_list(ctx, caller).await,
+        ("POST", "orgs") => return api_orgs_create(ctx, caller, body).await,
         _ => {}
+    }
+    // orgs/<name> and orgs/<name>/members[/<username>] — before the agent/ block, since an org name
+    // is not an agent name.
+    if let Some(after) = rest.strip_prefix("orgs/") {
+        if let Some((name, tail)) = after.split_once("/members") {
+            if tail.is_empty() || tail.starts_with('/') {
+                return api_org_members(ctx, caller, name, tail, m, body).await;
+            }
+        }
+        return match m {
+            "GET" => api_org_get(ctx, caller, after).await,
+            _ => Resp::text(405, "method not allowed"),
+        };
     }
     if let Some(id) = rest.strip_prefix("tokens/") {
         return match m {
@@ -277,6 +294,73 @@ pub(crate) fn api_me(caller: &Caller) -> Resp {
     }
 }
 
+/// `POST /api/register` — self-service signup. Creates a **normal, non-admin** user and logs them in
+/// with a session cookie, mirroring the CLI's `user add` crypto (cli.rs) + `api_login`'s session
+/// issuance. Off unless the operator enabled it (`ctx.cfg.registration`).
+///
+/// **Security invariant**: `is_admin` is hardcoded `false`, and no admin field is ever read from the
+/// body — registration can never grant admin. Admin stays CLI-only (`agit-hub user add --admin`).
+pub(crate) async fn api_register(ctx: &Ctx, body: &[u8]) -> Resp {
+    // Config gate FIRST — before any crypto — so a disabled hub spends nothing on a signup attempt.
+    if !ctx.cfg.registration {
+        return Resp::err(403, "self-service registration is disabled on this hub");
+    }
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let (Some(raw), Some(password)) = (str_field(&v, "username"), str_field(&v, "password")) else {
+        return Resp::err(400, "want username and password");
+    };
+    let username = store::normalize_username(&raw);
+    if !store::valid_username(&username) {
+        return Resp::err(400, "invalid username (2-32 lowercase [a-z0-9._-], no leading dot)");
+    }
+    // Same minimum as the CLI's read_new_password, via the one shared constant.
+    if password.chars().count() < store::MIN_PASSWORD_LEN {
+        return Resp::err(400, "password too short (at least 8 characters)");
+    }
+    let Ok(salt) = kdf::gen_salt() else {
+        return Resp::err(500, "no system entropy available, try again shortly");
+    };
+    let kdf_id = kdf::current_kdf_id();
+    // Run the argon2 hash under the login gate + blocking pool, reusing the login handler's CPU/memory
+    // amplifier defense (argon2 is deliberately slow; uncapped concurrency is a DoS lever).
+    let (pw, salt2, kdf2) = (password.clone(), salt.clone(), kdf_id.clone());
+    let hashed = {
+        let _slot = ctx.login_gate.acquire().await.expect("login gate semaphore is never closed");
+        tokio::task::spawn_blocking(move || kdf::hash_password(&pw, &salt2, &kdf2)).await.unwrap()
+    };
+    let Some(pw_hash) = hashed else {
+        return Resp::err(500, "password derivation failed");
+    };
+    // is_admin: false is the security invariant — never read any admin field from the body.
+    let user = User { username: username.clone(), pw_hash, salt, kdf: kdf_id, is_admin: false, created: store::now_iso() };
+    match ctx.store.add_user(user).await {
+        Ok(()) => {}
+        // The username PRIMARY KEY makes this race-safe: a duplicate is always a clean AlreadyExists,
+        // never a 500.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Resp::err(409, "that username is taken"),
+        Err(_) => return Resp::err(500, "couldn't create the account"),
+    }
+    let Ok(sid) = ctx.sessions.create(&username) else {
+        return Resp::err(503, "couldn't create a session, try again shortly");
+    };
+    audit_append(ctx.root(), &username, audit::USER_REGISTER, None, "").await;
+    Resp::json(serde_json::json!({ "username": username, "is_admin": false }))
+        .with("Set-Cookie", &websession::set_cookie(&sid, ctx.cfg.tls))
+}
+
+/// Resolve an agent's effective ACL, folding in the owning org's members when it is org-owned. **This
+/// is the one place org membership is expanded**, before `acl::decide` runs — so decide stays pure and
+/// never learns "org" exists. Fail-closed: a missing/unreadable org folds nobody in.
+pub(crate) async fn agent_acl(ctx: &Ctx, meta: &AgentMeta) -> AgentAcl {
+    let org = match meta.org_owner() {
+        Some(n) => ctx.store.org(n).await,
+        None => None,
+    };
+    meta.to_acl_with_org(org.as_ref())
+}
+
 // ── agents ──
 
 pub(crate) async fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
@@ -296,7 +380,7 @@ pub(crate) async fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     let mut visible: Vec<(String, AgentMeta)> = Vec::new();
     for n in list_agents(ctx.root()) {
         let meta = ctx.store.agent_or_unowned(&n).await;
-        if !acl::decide(caller, &meta.to_acl(), Action::Read).allowed() {
+        if !acl::decide(caller, &agent_acl(ctx, &meta).await, Action::Read).allowed() {
             continue;
         }
         if page.after.as_deref().is_none_or(|a| n.as_str() > a) {
@@ -391,17 +475,39 @@ pub(crate) async fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body
             None => return Resp::err(400, "visibility must be private or public"),
         },
     };
+    // Optional org owner: when present, the agent is owned by "org:<name>" and only an org admin may
+    // create it. Absent → the caller owns it, exactly as before.
+    let org = match str_field(&v, "org") {
+        Some(orgname) => match ctx.store.org(&orgname).await {
+            Some(o) => Some(o),
+            None => return Resp::err(400, "no such org"),
+        },
+        None => None,
+    };
+    if let Some(o) = &org {
+        if !o.is_admin(&user) {
+            return Resp::err(403, "must be an org admin to create agents under it");
+        }
+    }
+    let owner = match &org {
+        Some(o) => format!("org:{}", o.name),
+        None => user.clone(),
+    };
     // Creating a repo goes through the same decision: treat it as "writing to an agent I own" —
-    // so a token bound to another agent, or a read-only token, can't create anything.
-    let hypothetical =
-        AgentAcl { name: name.clone(), owner: Some(user.clone()), visibility, lifecycle: Lifecycle::Active, members: vec![] };
+    // so a token bound to another agent, or a read-only token, can't create anything. Under an org the
+    // hypothetical folds the org members, so the caller passes via their folded Admin role (keeping the
+    // single-gate pattern); decide never sees the "org:" owner directly.
+    let hypothetical = match &org {
+        Some(o) => AgentMeta::new(&name, Some(&owner), visibility).to_acl_with_org(Some(o)),
+        None => AgentAcl { name: name.clone(), owner: Some(user.clone()), visibility, lifecycle: Lifecycle::Active, members: vec![] },
+    };
     if let Decision::Deny(d) = acl::decide(caller, &hypothetical, Action::Write) {
         audit_deny(ctx, &user, Some(&name), Action::Write, d).await;
         return Resp::err(403, d.reason());
     }
-    match create_agent(&ctx.store, &name, &user, visibility).await {
+    match create_agent(&ctx.store, &name, &owner, visibility).await {
         Ok(_) => {
-            audit_append(ctx.root(), &user, audit::AGENT_CREATE, Some(&name), &format!("visibility={}", visibility.as_str())).await;
+            audit_append(ctx.root(), &user, audit::AGENT_CREATE, Some(&name), &format!("visibility={} owner={owner}", visibility.as_str())).await;
             let repo = repo_path(ctx.root(), &name);
             let (aid, aid_source) = tokio::task::spawn_blocking(move || agent_aid(&repo)).await.unwrap();
             Resp::json_status(
@@ -414,6 +520,7 @@ pub(crate) async fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body
                     "aid_source": aid_source,
                     "clone_url": clone_url(ctx, req, &name),
                     "visibility": visibility.as_str(),
+                    "owner": owner,
                 }),
             )
         }
@@ -1055,8 +1162,49 @@ pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, b
         Ok(x) => x,
         Err(r) => return r,
     };
-    let Some(to) = json_body(body).as_ref().and_then(|v| str_field(v, "to")) else {
-        return Resp::err(400, "want to (the username to transfer ownership to)");
+    let actor = caller.user.clone().unwrap_or_default();
+    let bodyv = json_body(body);
+    // Transfer to an org (mutually exclusive with `to`): the owner becomes "org:<name>" and access
+    // flows to the org's members via folding. The caller must belong to the target org, so an agent
+    // can't be dumped onto an org you have no part in.
+    if let Some(orgname) = bodyv.as_ref().and_then(|v| str_field(v, "org")) {
+        let Some(org) = ctx.store.org(&orgname).await else {
+            return Resp::err(400, "no such org");
+        };
+        if !(caller.is_admin || org.is_member(&actor)) {
+            return Resp::err(403, "you must be a member of the target org to transfer an agent to it");
+        }
+        let new_owner = format!("org:{}", org.name);
+        if meta.owner.as_deref() == Some(new_owner.as_str()) {
+            return Resp::err(409, &format!("this agent is already owned by org:{}", org.name));
+        }
+        let from = meta.owner.clone();
+        if let Err(resp) = edit_agent(ctx, &meta.name, |m| {
+            m.owner = Some(new_owner.clone());
+            // Drop any stale membership row that shares the org's bare name — the org grant supersedes.
+            m.members.retain(|x| x.username != org.name);
+        })
+        .await
+        {
+            return resp;
+        }
+        audit_append(
+            ctx.root(),
+            &actor,
+            audit::AGENT_TRANSFER,
+            Some(&meta.name),
+            &format!("{} → {new_owner}", from.as_deref().unwrap_or("(unowned)")),
+        )
+        .await;
+        return Resp::json(serde_json::json!({
+            "name": meta.name,
+            "owner": new_owner,
+            "previous_owner": from,
+            "aid": meta.aid,
+        }));
+    }
+    let Some(to) = bodyv.as_ref().and_then(|v| str_field(v, "to")) else {
+        return Resp::err(400, "want to (the username to transfer ownership to) or org (an org name)");
     };
     let to = store::normalize_username(&to);
     // Only a real, existing user — the same rule members follow, and for the same reason: an agent
@@ -1078,7 +1226,6 @@ pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, b
     {
         return resp;
     }
-    let actor = caller.user.clone().unwrap_or_default();
     audit_append(
         ctx.root(),
         &actor,
@@ -1178,6 +1325,197 @@ pub(crate) async fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &s
     }
 }
 
+// ── organizations ──
+
+/// Serialize an org's member list for the API.
+fn org_members_json(org: &Org) -> serde_json::Value {
+    serde_json::json!(org
+        .members
+        .iter()
+        .map(|m| serde_json::json!({ "username": m.username, "role": m.role }))
+        .collect::<Vec<_>>())
+}
+
+/// `GET /api/orgs` — the orgs the caller belongs to (site admin sees all). You only see orgs you are a
+/// member of, which prevents enumerating org membership.
+pub(crate) async fn api_orgs_list(ctx: &Ctx, caller: &Caller) -> Resp {
+    let Some(user) = caller.user.as_deref() else {
+        return Resp::err(401, "login required");
+    };
+    let items: Vec<serde_json::Value> = ctx
+        .store
+        .orgs()
+        .await
+        .into_iter()
+        .filter(|o| caller.is_admin || o.is_member(user))
+        .map(|o| serde_json::json!({ "name": o.name, "created": o.created, "members": org_members_json(&o) }))
+        .collect();
+    Resp::json(serde_json::json!(items))
+}
+
+/// `POST /api/orgs` — create an org. The creator becomes its first (and only) admin. Org names use the
+/// same rules as usernames, keeping them clean and echo-safe.
+pub(crate) async fn api_orgs_create(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(name) = str_field(&v, "name") else {
+        return Resp::err(400, "want name");
+    };
+    let name = store::normalize_username(&name);
+    if !store::valid_username(&name) {
+        return Resp::err(400, "invalid org name (2-32 lowercase [a-z0-9._-], no leading dot)");
+    }
+    // Atomic create: the existence check and the push run together under the orgs lock, so two racing
+    // creates of one name can't both land.
+    let created = ctx
+        .store
+        .update_orgs(|list| {
+            if list.iter().any(|o| o.name == name) {
+                return false;
+            }
+            list.push(Org {
+                name: name.clone(),
+                members: vec![OrgMember { username: user.clone(), role: "admin".into() }],
+                created: store::now_iso(),
+            });
+            true
+        })
+        .await;
+    match created {
+        Ok(true) => {
+            audit_append(ctx.root(), &user, audit::ORG_CREATE, None, &format!("org={name}")).await;
+            Resp::json_status(
+                201,
+                serde_json::json!({ "name": name, "members": [{ "username": user, "role": "admin" }] }),
+            )
+        }
+        Ok(false) => Resp::err(409, "that org name is taken"),
+        Err(_) => Resp::err(500, "couldn't create the org"),
+    }
+}
+
+/// `GET /api/orgs/<name>` — org detail. Existence non-disclosure, the same shape as the agent gate: a
+/// missing org and one the caller may not see both answer 404, so org names cannot be enumerated.
+pub(crate) async fn api_org_get(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
+    let org = ctx.store.org(name).await;
+    let visible = |o: &Org| caller.is_admin || caller.user.as_deref().is_some_and(|u| o.is_member(u));
+    match org {
+        Some(o) if visible(&o) => {
+            Resp::json(serde_json::json!({ "name": o.name, "created": o.created, "members": org_members_json(&o) }))
+        }
+        _ => Resp::err(404, "not found"),
+    }
+}
+
+/// `/api/orgs/<name>/members[/<username>]` — the org membership routes. Authorization here is an ORG
+/// gate (`is_admin` on the org), NOT `acl::decide` — decide stays agent-only. Managing members needs
+/// org-admin (or site admin); listing needs only membership.
+pub(crate) async fn api_org_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    // 404 for a missing org OR one the caller can't see — existence non-disclosure, as above.
+    let Some(org) = ctx.store.org(name).await else {
+        return Resp::err(404, "not found");
+    };
+    if !(caller.is_admin || org.is_member(&user)) {
+        return Resp::err(404, "not found");
+    }
+    let can_manage = caller.is_admin || org.is_admin(&user);
+    let target = tail.strip_prefix('/').map(|s| s.to_string());
+    match (method, target) {
+        // Any member (or site admin) may see the roster.
+        ("GET", None) => Resp::json(org_members_json(&org)),
+        ("POST", None) => {
+            if !can_manage {
+                return Resp::err(403, "must be an org admin to manage members");
+            }
+            let Some(v) = json_body(body) else {
+                return Resp::err(400, "want a JSON body");
+            };
+            let (Some(username), Some(role)) = (str_field(&v, "username"), str_field(&v, "role")) else {
+                return Resp::err(400, "want username and role");
+            };
+            let username = store::normalize_username(&username);
+            if role != "member" && role != "admin" {
+                return Resp::err(400, "role must be member or admin");
+            }
+            // Only real, existing users — the same rule agent members follow, so an org can't collect
+            // misspelled names that whoever registers them later inherits.
+            if ctx.store.user(&username).await.is_none() {
+                return Resp::err(400, "no such user");
+            }
+            let orgname = org.name.clone();
+            if let Err(_e) = ctx
+                .store
+                .update_orgs(|list| {
+                    if let Some(o) = list.iter_mut().find(|o| o.name == orgname) {
+                        match o.members.iter_mut().find(|m| m.username == username) {
+                            Some(m) => m.role = role.clone(),
+                            None => o.members.push(OrgMember { username: username.clone(), role: role.clone() }),
+                        }
+                    }
+                })
+                .await
+            {
+                return Resp::err(500, "couldn't update the org");
+            }
+            audit_append(ctx.root(), &user, audit::ORG_MEMBER_ADD, None, &format!("org={} {username}={role}", org.name)).await;
+            let fresh = ctx.store.org(&org.name).await.unwrap_or(org);
+            Resp::json(org_members_json(&fresh))
+        }
+        ("DELETE", Some(target_user)) => {
+            if !can_manage {
+                return Resp::err(403, "must be an org admin to manage members");
+            }
+            let target_user = store::normalize_username(&target_user);
+            let orgname = org.name.clone();
+            // Guard against orphaning the org: refuse removing its last admin. Checked inside the lock,
+            // so it can't race another concurrent demotion.
+            let outcome = ctx
+                .store
+                .update_orgs(|list| {
+                    let Some(o) = list.iter_mut().find(|o| o.name == orgname) else {
+                        return RmOutcome::NotMember;
+                    };
+                    if !o.members.iter().any(|m| m.username == target_user) {
+                        return RmOutcome::NotMember;
+                    }
+                    let admins = o.members.iter().filter(|m| m.role == "admin").count();
+                    let target_is_admin = o.members.iter().any(|m| m.username == target_user && m.role == "admin");
+                    if admins == 1 && target_is_admin {
+                        return RmOutcome::LastAdmin;
+                    }
+                    o.members.retain(|m| m.username != target_user);
+                    RmOutcome::Removed
+                })
+                .await
+                .unwrap_or(RmOutcome::NotMember);
+            match outcome {
+                RmOutcome::Removed => {
+                    audit_append(ctx.root(), &user, audit::ORG_MEMBER_REMOVE, None, &format!("org={} {target_user}", org.name)).await;
+                    Resp::no_content()
+                }
+                RmOutcome::LastAdmin => Resp::err(409, "an org must keep at least one admin"),
+                RmOutcome::NotMember => Resp::err(404, "that person isn't a member"),
+            }
+        }
+        _ => Resp::text(405, "method not allowed"),
+    }
+}
+
+/// The result of an org member removal, so the last-admin guard and the not-a-member case can be told
+/// apart after the atomic `update_orgs`.
+enum RmOutcome {
+    Removed,
+    LastAdmin,
+    NotMember,
+}
+
 // ── cross-agent search ──
 
 /// Sessions scanned across the whole query, all agents together. Each one costs a `git show` plus a
@@ -1203,7 +1541,7 @@ pub(crate) async fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     let mut readable: Vec<(String, Option<String>)> = Vec::new();
     for name in list_agents(ctx.root()) {
         let meta = ctx.store.agent_or_unowned(&name).await;
-        if acl::decide(caller, &meta.to_acl(), Action::Read).allowed() {
+        if acl::decide(caller, &agent_acl(ctx, &meta).await, Action::Read).allowed() {
             readable.push((name, meta.aid.clone()));
         }
     }
@@ -1411,7 +1749,8 @@ pub(crate) async fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, qu
 }
 
 pub(crate) async fn can_read_agent(ctx: &Ctx, caller: &Caller, agent: &str) -> bool {
-    acl::decide(caller, &ctx.store.agent_or_unowned(agent).await.to_acl(), Action::Read).allowed()
+    let meta = ctx.store.agent_or_unowned(agent).await;
+    acl::decide(caller, &agent_acl(ctx, &meta).await, Action::Read).allowed()
 }
 
 /// Serialize one endpoint **for this reader**, not for the person who opened the MR.

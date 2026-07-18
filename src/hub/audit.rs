@@ -35,6 +35,9 @@ pub const LOGIN: &str = "login";
 pub const LOGIN_FAILED: &str = "login.failed";
 pub const LOGOUT: &str = "logout";
 pub const USER_ADD: &str = "user.add";
+/// Self-service signup (POST /api/register). Distinct from `user.add` (the admin CLI path), so the
+/// audit log shows which door a new account came through.
+pub const USER_REGISTER: &str = "user.register";
 pub const AGENT_CREATE: &str = "agent.create";
 pub const AGENT_DELETE: &str = "agent.delete";
 pub const AGENT_RENAME: &str = "agent.rename";
@@ -53,6 +56,9 @@ pub const AGENT_PURGE: &str = "agent.purge";
 pub const AGENT_STAR: &str = "agent.star";
 pub const MEMBER_ADD: &str = "member.add";
 pub const MEMBER_REMOVE: &str = "member.remove";
+pub const ORG_CREATE: &str = "org.create";
+pub const ORG_MEMBER_ADD: &str = "org.member.add";
+pub const ORG_MEMBER_REMOVE: &str = "org.member.remove";
 pub const TOKEN_CREATE: &str = "token.create";
 pub const TOKEN_REVOKE: &str = "token.revoke";
 pub const GIT_FETCH: &str = "git.fetch";

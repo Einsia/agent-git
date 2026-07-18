@@ -15,7 +15,7 @@ use agit::hub::net::{self, valid_agent_name};
 use agit::hub::store::AgentMeta;
 use agit::hub::{audit, auth};
 
-use crate::api::api;
+use crate::api::{agent_acl, api};
 use crate::cli::repo_path;
 use crate::http::{credentials, git_deny_resp, req_from_parts, Resp};
 use crate::limits::{API_MAX_BODY, MAX_BODY, MAX_CONN};
@@ -58,7 +58,8 @@ pub(crate) async fn gate(ctx: &Ctx, caller: &Caller, name: &str, action: Action)
         return Err(Resp::err(404, "not found"));
     }
     let meta = ctx.store.agent_or_unowned(name).await;
-    let acl = meta.to_acl();
+    // Fold the owning org's members in before deciding — decide itself never learns "org" exists.
+    let acl = agent_acl(ctx, &meta).await;
     match acl::decide(caller, &acl, action) {
         Decision::Allow => match repo_path(ctx.root(), name).exists() {
             true => Ok(meta),
@@ -208,7 +209,9 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
         // A nonexistent agent is decided as "unowned private" — decision first, existence second — so
         // "doesn't exist → 404" and "private → 401" cannot be told apart by an enumerator.
         let meta = ctx.store.agent_or_unowned(&route.agent).await;
-        let decision = acl::decide(&caller, &meta.to_acl(), action);
+        // Fold the owning org's members so org members can clone/push org-owned agents over smart-http.
+        let acl = agent_acl(&ctx, &meta).await;
+        let decision = acl::decide(&caller, &acl, action);
         let exists = repo_path(ctx.root(), &route.agent).exists();
         match decision {
             Decision::Allow => {

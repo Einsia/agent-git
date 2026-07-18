@@ -500,3 +500,169 @@ mod tests {
         assert!(json_body(b"").is_none());
     }
 }
+
+/// H4: self-service registration + organizations. These exercise the real handlers against a live
+/// SQLite store, so they need a `Ctx` and a tokio runtime (hence the separate module with its own
+/// imports).
+#[cfg(test)]
+mod h4_tests {
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    use agit::hub::acl::{Action, Caller, Visibility};
+    use agit::hub::session::Sessions;
+    use agit::hub::store::{now_iso, Org, OrgMember, Store, User};
+    use agit::hub::{auth, kdf};
+
+    use crate::api::{api_org_members, api_orgs_create, api_register};
+    use crate::cli::create_agent;
+    use crate::http::Resp;
+    use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC};
+    use crate::router::gate;
+    use crate::server::{Cfg, Ctx, CtxInner};
+
+    async fn test_ctx(registration: bool) -> (tempfile::TempDir, Ctx) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_sqlite(dir.path()).await.unwrap();
+        let cfg = Cfg {
+            host: "127.0.0.1".parse::<IpAddr>().unwrap(),
+            port: 0,
+            tls: false,
+            insecure: false,
+            trusted_proxies: vec![],
+            registration,
+        };
+        let ctx = Ctx(Arc::new(CtxInner {
+            store,
+            cfg,
+            sessions: Sessions::new(),
+            limiter: Arc::new(ConnLimiter::default()),
+            login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
+            token_rl: Arc::new(TokenBuckets::new()),
+        }));
+        (dir, ctx)
+    }
+
+    async fn add_user(store: &Store, name: &str) {
+        let salt = kdf::gen_salt().unwrap();
+        let kdf_id = kdf::current_kdf_id();
+        store
+            .add_user(User {
+                username: name.into(),
+                pw_hash: kdf::hash_password("password-123", &salt, &kdf_id).unwrap(),
+                salt,
+                kdf: kdf_id,
+                is_admin: false,
+                created: now_iso(),
+            })
+            .await
+            .unwrap();
+    }
+
+    fn has_set_cookie(r: &Resp) -> bool {
+        r.extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+    }
+
+    // ── registration ──
+
+    #[tokio::test]
+    async fn register_creates_a_non_admin_user_with_a_session() {
+        let (_d, ctx) = test_ctx(true).await;
+        let r = api_register(&ctx, br#"{"username":"alice","password":"correct horse"}"#).await;
+        assert_eq!(r.status, 200);
+        assert!(has_set_cookie(&r), "a successful signup logs the user in");
+        let u = ctx.store.user("alice").await.expect("the account persists");
+        assert!(!u.is_admin, "self-service signup must never grant admin");
+        assert!(auth::verify_login(&ctx.store, "alice", "correct horse").await.is_some(), "the password is argon2-verifiable");
+    }
+
+    #[tokio::test]
+    async fn register_ignores_an_is_admin_field_in_the_body() {
+        // The security invariant: an is_admin in the request body must be ignored outright.
+        let (_d, ctx) = test_ctx(true).await;
+        let r = api_register(&ctx, br#"{"username":"eve","password":"password-123","is_admin":true}"#).await;
+        assert_eq!(r.status, 200);
+        assert!(!ctx.store.user("eve").await.unwrap().is_admin);
+    }
+
+    #[tokio::test]
+    async fn register_duplicate_username_is_409_not_500() {
+        let (_d, ctx) = test_ctx(true).await;
+        assert_eq!(api_register(&ctx, br#"{"username":"alice","password":"password-123"}"#).await.status, 200);
+        assert_eq!(api_register(&ctx, br#"{"username":"alice","password":"password-456"}"#).await.status, 409);
+    }
+
+    #[tokio::test]
+    async fn register_rejects_short_password_and_bad_username() {
+        let (_d, ctx) = test_ctx(true).await;
+        assert_eq!(api_register(&ctx, br#"{"username":"bob","password":"short"}"#).await.status, 400);
+        assert_eq!(api_register(&ctx, br#"{"username":"Bad Name","password":"password-123"}"#).await.status, 400);
+    }
+
+    #[tokio::test]
+    async fn register_is_403_when_disabled() {
+        let (_d, ctx) = test_ctx(false).await;
+        let r = api_register(&ctx, br#"{"username":"alice","password":"password-123"}"#).await;
+        assert_eq!(r.status, 403);
+        assert!(ctx.store.user("alice").await.is_none(), "nothing is created when signup is off");
+    }
+
+    // ── organizations ──
+
+    #[tokio::test]
+    async fn org_member_reaches_an_org_owned_agent_and_a_stranger_does_not() {
+        let (_d, ctx) = test_ctx(false).await;
+        ctx.store
+            .update_orgs(|l| {
+                l.push(Org {
+                    name: "acme".into(),
+                    members: vec![
+                        OrgMember { username: "alice".into(), role: "admin".into() },
+                        OrgMember { username: "bob".into(), role: "member".into() },
+                    ],
+                    created: now_iso(),
+                })
+            })
+            .await
+            .unwrap();
+        // A private agent owned by the org.
+        create_agent(&ctx.store, "shared", "org:acme", Visibility::Private).await.unwrap();
+        // A member reads it through the gate (org membership folded in before decide runs).
+        assert!(gate(&ctx, &Caller::user("bob"), "shared", Action::Read).await.is_ok());
+        // A stranger gets 404 — existence stays hidden, exactly as for a plain private agent.
+        assert_eq!(gate(&ctx, &Caller::user("eve"), "shared", Action::Read).await.unwrap_err().status, 404);
+        // The org admin can manage it; a plain member (folded to Write) cannot.
+        assert!(gate(&ctx, &Caller::user("alice"), "shared", Action::Manage).await.is_ok());
+        assert_eq!(gate(&ctx, &Caller::user("bob"), "shared", Action::Manage).await.unwrap_err().status, 403);
+    }
+
+    #[tokio::test]
+    async fn org_create_makes_the_creator_an_admin() {
+        let (_d, ctx) = test_ctx(false).await;
+        let r = api_orgs_create(&ctx, &Caller::user("alice"), br#"{"name":"acme"}"#).await;
+        assert_eq!(r.status, 201);
+        assert!(ctx.store.org("acme").await.unwrap().is_admin("alice"));
+    }
+
+    #[tokio::test]
+    async fn org_member_management_is_admin_only_and_needs_a_real_user() {
+        let (_d, ctx) = test_ctx(false).await;
+        add_user(&ctx.store, "alice").await;
+        add_user(&ctx.store, "bob").await;
+        assert_eq!(api_orgs_create(&ctx, &Caller::user("alice"), br#"{"name":"acme"}"#).await.status, 201);
+        // The org admin adds bob.
+        assert_eq!(api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"member"}"#).await.status, 200);
+        // A non-admin member cannot add anyone.
+        assert_eq!(api_org_members(&ctx, &Caller::user("bob"), "acme", "", "POST", br#"{"username":"alice","role":"admin"}"#).await.status, 403);
+        // Adding a user who does not exist is refused.
+        assert_eq!(api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"ghost","role":"member"}"#).await.status, 400);
+    }
+
+    #[tokio::test]
+    async fn org_cannot_remove_its_last_admin() {
+        let (_d, ctx) = test_ctx(false).await;
+        assert_eq!(api_orgs_create(&ctx, &Caller::user("alice"), br#"{"name":"acme"}"#).await.status, 201);
+        let r = api_org_members(&ctx, &Caller::user("alice"), "acme", "/alice", "DELETE", b"").await;
+        assert_eq!(r.status, 409, "removing the only admin would orphan the org");
+    }
+}

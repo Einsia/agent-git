@@ -74,6 +74,10 @@ pub fn normalize_username(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+/// Minimum password length. Hoisted here so the CLI (`read_new_password`) and self-service
+/// registration (`api_register`) consume ONE constant and can never drift on password strength.
+pub const MIN_PASSWORD_LEN: usize = 8;
+
 // ─────────────────────────── agent metadata ───────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +85,49 @@ pub struct Member {
     pub username: String,
     /// "read" | "write" | "admin"
     pub role: String,
+}
+
+// ─────────────────────────── organizations ───────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgMember {
+    pub username: String,
+    /// "member" | "admin" — the **org** role, not the agent-level `acl::Role`.
+    pub role: String,
+}
+
+impl OrgMember {
+    /// The org role folded down to the agent-level [`Role`] it grants on every agent the org owns.
+    /// "member" → Write (push/read), "admin" → Admin (manage). Junk drops (fail-safe), mirroring
+    /// `to_acl`'s `Role::parse` filter — an unrecognized role grants nothing.
+    pub fn agent_role(&self) -> Option<Role> {
+        match self.role.as_str() {
+            "member" => Some(Role::Write),
+            "admin" => Some(Role::Admin),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Org {
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<OrgMember>,
+    #[serde(default)]
+    pub created: String,
+}
+
+impl Org {
+    /// Whether `user` can manage the org (add/remove members, and manage every agent it owns).
+    pub fn is_admin(&self, user: &str) -> bool {
+        self.members.iter().any(|m| m.username == user && m.role == "admin")
+    }
+
+    /// Whether `user` belongs to the org in any role.
+    pub fn is_member(&self, user: &str) -> bool {
+        self.members.iter().any(|m| m.username == user)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +227,41 @@ impl AgentMeta {
                 .filter_map(|m| Role::parse(&m.role).map(|r| (m.username.clone(), r)))
                 .collect(),
         }
+    }
+
+    /// If this agent is owned by an org, the org's name. The owner field is namespaced as
+    /// `"org:<name>"`; `store::valid_username` forbids ':' , so this can never collide with a real
+    /// username — meaning `acl::decide`'s owner check can never match a user against an org owner, and
+    /// org access arrives ONLY through folded members (see `to_acl_with_org`).
+    pub fn org_owner(&self) -> Option<&str> {
+        self.owner.as_deref().and_then(|o| o.strip_prefix("org:"))
+    }
+
+    /// `to_acl`, plus the owning org's members folded into the ACL members list. Pure and sync — the
+    /// already-resolved `org` is passed in, so `acl::decide` never learns "org" exists (org membership
+    /// is expanded BEFORE it runs). The no-org path (`org = None`) is byte-for-byte `to_acl`.
+    ///
+    /// Folding only ever ADDS or RAISES a grant: a folded role is merged by max against any explicit
+    /// per-agent member, so it can never lower an explicit member's role. Only usernames literally in
+    /// `org.members` are inserted, so no non-member gains access.
+    pub fn to_acl_with_org(&self, org: Option<&Org>) -> AgentAcl {
+        let mut acl = self.to_acl();
+        if let Some(org) = org {
+            for om in &org.members {
+                if let Some(role) = om.agent_role() {
+                    match acl.members.iter_mut().find(|(n, _)| n == &om.username) {
+                        // Dedupe by keeping the HIGHER role (Role is Ord: Admin > Write > Read).
+                        Some(e) => {
+                            if role > e.1 {
+                                e.1 = role;
+                            }
+                        }
+                        None => acl.members.push((om.username.clone(), role)),
+                    }
+                }
+            }
+        }
+        acl
     }
 
     pub fn role_of(&self, user: &str) -> Option<Role> {
@@ -371,6 +453,10 @@ fn row_mr(r: &impl Cols) -> Option<Mr> {
     serde_json::from_str(&r.text("data")).ok()
 }
 
+fn row_org(r: &impl Cols) -> Org {
+    Org { name: r.text("name"), members: parse_json_vec(&r.text("members")), created: r.text("created") }
+}
+
 // ─────────────────────────── schema ───────────────────────────
 
 /// One portable migration set for both backends. Only portable constructs are used (no SERIAL /
@@ -400,6 +486,8 @@ const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS mrs (\
        target_agent TEXT NOT NULL, id BIGINT NOT NULL, data TEXT NOT NULL, \
        PRIMARY KEY (target_agent, id))",
+    "CREATE TABLE IF NOT EXISTS orgs (\
+       name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', created TEXT NOT NULL DEFAULT '')",
 ];
 
 /// Stamp the schema version idempotently. A single fixed row (id=1) plus `ON CONFLICT DO NOTHING`,
@@ -607,6 +695,32 @@ impl Store {
         match self {
             Store::Sqlite(s) => s.update_tokens(f).await,
             Store::Pg(s) => s.update_tokens(f).await,
+        }
+    }
+
+    // ── organizations ──
+
+    pub async fn orgs(&self) -> Vec<Org> {
+        match self {
+            Store::Sqlite(s) => s.orgs().await,
+            Store::Pg(s) => s.orgs().await,
+        }
+    }
+
+    /// Look one org up by name. Normalizes like `user()` — org names live in the same lowercase
+    /// namespace as usernames.
+    pub async fn org(&self, name: &str) -> Option<Org> {
+        let n = normalize_username(name);
+        self.orgs().await.into_iter().find(|o| o.name == n)
+    }
+
+    pub async fn update_orgs<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<Org>) -> R,
+    {
+        match self {
+            Store::Sqlite(s) => s.update_orgs(f).await,
+            Store::Pg(s) => s.update_orgs(f).await,
         }
     }
 }
@@ -821,6 +935,38 @@ impl SqliteStore {
         tx.commit().await.map_err(err)?;
         Ok(r)
     }
+
+    async fn orgs(&self) -> Vec<Org> {
+        match sqlx::query("SELECT * FROM orgs").fetch_all(&self.pool).await {
+            Ok(rows) => rows.iter().map(row_org).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    async fn update_orgs<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<Org>) -> R,
+    {
+        // Same serialization as the other three writers: the async write mutex, then a tracked
+        // transaction so a dropped handler future auto-rolls back instead of wedging the pool.
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        let rows = sqlx::query("SELECT * FROM orgs").fetch_all(&mut *tx).await.map_err(err)?;
+        let mut list: Vec<Org> = rows.iter().map(row_org).collect();
+        let r = f(&mut list);
+        sqlx::query("DELETE FROM orgs").execute(&mut *tx).await.map_err(err)?;
+        for o in &list {
+            sqlx::query("INSERT INTO orgs (name, members, created) VALUES (?, ?, ?)")
+                .bind(&o.name)
+                .bind(serde_json::to_string(&o.members).unwrap_or_else(|_| "[]".into()))
+                .bind(&o.created)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        Ok(r)
+    }
 }
 
 // ─────────────────────────── Postgres backend ───────────────────────────
@@ -1005,6 +1151,38 @@ impl PgStore {
             .execute(&mut *tx)
             .await
             .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        Ok(r)
+    }
+
+    async fn orgs(&self) -> Vec<Org> {
+        match sqlx::query("SELECT * FROM orgs").fetch_all(&self.pool).await {
+            Ok(rows) => rows.iter().map(row_org).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    async fn update_orgs<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<Org>) -> R,
+    {
+        // The same single advisory-lock critical section every other read-modify-write runs in, so an
+        // org edit a create/transfer depends on cannot interleave with an agents/tokens/mrs rewrite.
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        let rows = sqlx::query("SELECT * FROM orgs").fetch_all(&mut *tx).await.map_err(err)?;
+        let mut list: Vec<Org> = rows.iter().map(row_org).collect();
+        let r = f(&mut list);
+        sqlx::query("DELETE FROM orgs").execute(&mut *tx).await.map_err(err)?;
+        for o in &list {
+            sqlx::query("INSERT INTO orgs (name, members, created) VALUES ($1, $2, $3)")
+                .bind(&o.name)
+                .bind(serde_json::to_string(&o.members).unwrap_or_else(|_| "[]".into()))
+                .bind(&o.created)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
         }
         tx.commit().await.map_err(err)?;
         Ok(r)
@@ -1393,5 +1571,115 @@ mod tests {
             h.await.unwrap();
         }
         assert_eq!(s.agents().await.len(), 8, "every concurrent writer's row must survive; the tx replaces the old LOCK");
+    }
+
+    // ── organizations ──
+
+    fn org_member(username: &str, role: &str) -> OrgMember {
+        OrgMember { username: username.into(), role: role.into() }
+    }
+
+    #[tokio::test]
+    async fn orgs_roundtrip_through_db() {
+        let (_d, s) = tmp_store().await;
+        s.update_orgs(|orgs| {
+            orgs.push(Org {
+                name: "acme".into(),
+                members: vec![org_member("bob", "admin"), org_member("carol", "member")],
+                created: now_iso(),
+            });
+        })
+        .await
+        .unwrap();
+        let o = s.org("acme").await.unwrap();
+        assert_eq!(o.members.len(), 2);
+        assert!(o.is_admin("bob"));
+        assert!(o.is_member("carol"));
+        assert!(!o.is_admin("carol"));
+        // Lookup is case-insensitive, like user().
+        assert!(s.org("ACME").await.is_some());
+        assert_eq!(s.orgs().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn broken_org_members_column_still_yields_org() {
+        // A members JSON that will not parse loses only itself (empty members), never the whole row —
+        // the same per-record tolerance agents get.
+        let (_d, s) = tmp_store().await;
+        raw_exec(&s, "INSERT INTO orgs (name, members) VALUES ('acme', 'not json')").await;
+        let o = s.org("acme").await.expect("the row must survive a broken JSON column");
+        assert!(o.members.is_empty(), "a broken members column reads as no members");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_update_orgs_do_not_lose_writes() {
+        // Same guarantee as concurrent_update_agents: the write_lock / advisory_lock serializes the
+        // whole DELETE+re-INSERT snapshot, so eight racing pushes all survive.
+        let (_d, s) = tmp_store().await;
+        let mut handles = vec![];
+        for i in 0..8 {
+            let s = s.clone();
+            handles.push(tokio::spawn(async move {
+                s.update_orgs(move |list| {
+                    list.push(Org { name: format!("org{i}"), members: vec![], created: now_iso() });
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(s.orgs().await.len(), 8, "every concurrent org writer's row must survive");
+    }
+
+    #[test]
+    fn to_acl_with_org_folds_and_dedupes_max() {
+        // Agent owned by org:acme, with an explicit per-agent member carol=read. Folding org admin bob
+        // and org member carol must yield (bob, Admin) and RAISE carol to Write (the higher role wins),
+        // and must never lower a pre-existing explicit admin.
+        let org = Org {
+            name: "acme".into(),
+            members: vec![org_member("bob", "admin"), org_member("carol", "member"), org_member("mallory", "bogus")],
+            created: now_iso(),
+        };
+        let m = AgentMeta {
+            members: vec![Member { username: "carol".into(), role: "read".into() }, Member { username: "dave".into(), role: "admin".into() }],
+            ..AgentMeta::new("shared", Some("org:acme"), Visibility::Private)
+        };
+        let acl = m.to_acl_with_org(Some(&org));
+        let role_of = |u: &str| acl.members.iter().find(|(n, _)| n == u).map(|(_, r)| *r);
+        assert_eq!(role_of("bob"), Some(Role::Admin), "org admin folds to Admin");
+        assert_eq!(role_of("carol"), Some(Role::Write), "org member folds to Write, raising the explicit read");
+        assert_eq!(role_of("dave"), Some(Role::Admin), "a pre-existing explicit admin is not lowered");
+        assert_eq!(role_of("mallory"), None, "a junk org role folds to nothing (fail-safe)");
+    }
+
+    #[test]
+    fn to_acl_unchanged_without_org() {
+        // The no-org path must be byte-for-byte to_acl(), so every existing decide test still holds.
+        let m = AgentMeta {
+            members: vec![Member { username: "bob".into(), role: "write".into() }],
+            ..AgentMeta::new("x", Some("alice"), Visibility::Public)
+        };
+        let a = m.to_acl();
+        let b = m.to_acl_with_org(None);
+        assert_eq!(a.owner, b.owner);
+        assert_eq!(a.visibility, b.visibility);
+        assert_eq!(a.members, b.members);
+    }
+
+    #[test]
+    fn org_owner_parse() {
+        let org_owned = AgentMeta { owner: Some("org:acme".into()), ..AgentMeta::new("x", None, Visibility::Private) };
+        assert_eq!(org_owned.org_owner(), Some("acme"));
+        let user_owned = AgentMeta::new("x", Some("alice"), Visibility::Private);
+        assert_eq!(user_owned.org_owner(), None);
+        let unowned = AgentMeta::new("x", None, Visibility::Private);
+        assert_eq!(unowned.org_owner(), None);
+        // The unforgeability argument: ':' is not a valid username char, so "org:x" can never equal a
+        // real username — org access can never arrive through decide's owner branch.
+        assert!(!valid_username("org:acme"));
+        assert!(!valid_username(":"));
     }
 }

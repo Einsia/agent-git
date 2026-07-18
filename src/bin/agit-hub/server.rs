@@ -24,6 +24,11 @@ pub(crate) struct Cfg {
     pub(crate) insecure: bool,
     /// IPs of trusted reverse proxies — X-Forwarded-For only counts on connections from them.
     pub(crate) trusted_proxies: Vec<IpAddr>,
+    /// Self-service registration (POST /api/register). **Disabled by default** (invite-only): the Hub
+    /// is conservative at every other axis (loopback-only bind, private-by-default agents, admin-only
+    /// user creation), and opening account creation to anyone who can reach the port must be a
+    /// deliberate opt-in. Enabled via `AGIT_HUB_REGISTRATION` or `--open-registration`.
+    pub(crate) registration: bool,
 }
 
 /// All the shared state one request needs. Wrapped in a single Arc so [`Ctx`] is cheap to clone into
@@ -83,6 +88,12 @@ pub(crate) fn serve_cmd(root: &Path, args: &[String]) -> i32 {
         },
         None => vec![],
     };
+    // Self-service signup is OFF unless explicitly turned on (env or flag), mirroring the env-driven
+    // AGIT_HUB_DB wiring. Default invite-only: safest default, opt in explicitly.
+    let registration = std::env::var("AGIT_HUB_REGISTRATION")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "open" | "yes"))
+        .unwrap_or(false)
+        || has_flag(args, "--open-registration");
     if let Err(e) = bind_guard(host, tls, insecure) {
         eprintln!("{e}");
         return 2;
@@ -91,7 +102,7 @@ pub(crate) fn serve_cmd(root: &Path, args: &[String]) -> i32 {
         println!("note: --private is no longer needed — visibility is now a **per-agent** property, and new agents are private by default.");
         println!("      To publish one agent: `agit-hub add <name> --public`, or change it in the UI.");
     }
-    serve(root, Cfg { host, port, tls, insecure, trusted_proxies })
+    serve(root, Cfg { host, port, tls, insecure, trusted_proxies, registration })
 }
 
 /// The safety gate before bind (pure function, easy to test).
@@ -150,6 +161,7 @@ async fn startup_banner(ctx: &Ctx, addr: SocketAddr) {
     println!("  root:    {}", root.display());
     println!("  hosting: {} agents ({public} public)", agents.len());
     println!("  users:   {} ({} admins)", users.len(), users.iter().filter(|u| u.is_admin).count());
+    println!("  signup:  {}", if cfg.registration { "open (self-service)" } else { "invite-only" });
     if !cfg.trusted_proxies.is_empty() {
         println!("  proxy:   trusting X-Forwarded-For from {:?}", cfg.trusted_proxies);
     }

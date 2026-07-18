@@ -113,7 +113,7 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
 /// one line (scripted provisioning).
 pub(crate) fn read_new_password() -> Result<String, String> {
     let (pw, tty) = read_password("set a password for this user: ")?;
-    if pw.chars().count() < 8 {
+    if pw.chars().count() < store::MIN_PASSWORD_LEN {
         return Err("password too short (at least 8 characters).".into());
     }
     if tty {
