@@ -30,10 +30,20 @@ pub(crate) const FAVICON: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBo
 
 /// Record a denial. A denied anonymous read = "not logged in yet", which is noise; a denied
 /// authenticated caller, or a denied write/manage action, is signal.
-pub(crate) fn audit_deny(ctx: &Ctx, actor: &str, agent: Option<&str>, action: Action, d: Deny) {
+pub(crate) async fn audit_deny(ctx: &Ctx, actor: &str, agent: Option<&str>, action: Action, d: Deny) {
     if actor != "anonymous" || action != Action::Read {
-        audit::append(ctx.root(), actor, audit::DENIED, agent, &format!("{action:?}: {}", d.reason()));
+        audit_append(ctx.root(), actor, audit::DENIED, agent, &format!("{action:?}: {}", d.reason())).await;
     }
+}
+
+/// Offload the audit append (a blocking fs open+write) to the blocking pool, and await it so the
+/// record is durable before the handler's response returns (a later `GET /api/audit` in the same flow
+/// must observe it). Now that `api()` runs inline on the async workers, this keeps the fs write off
+/// them.
+pub(crate) async fn audit_append(root: &std::path::Path, actor: &str, action: &str, agent: Option<&str>, detail: &str) {
+    let (root, actor, action, agent, detail) =
+        (root.to_path_buf(), actor.to_string(), action.to_string(), agent.map(|s| s.to_string()), detail.to_string());
+    let _ = tokio::task::spawn_blocking(move || audit::append(&root, &actor, &action, agent.as_deref(), &detail)).await;
 }
 
 /// Fetch the agent + decide + produce the error response. **Every agent entry point comes through here.**
@@ -42,12 +52,12 @@ pub(crate) fn audit_deny(ctx: &Ctx, actor: &str, agent: Option<&str>, action: Ac
 /// exist" and "you can't see it" give **the same** response — otherwise the difference between
 /// 401/403/404 is an interface for enumerating private agent names.
 /// Existence is only checked after the decision passes (only the authorized get to know it's absent).
-pub(crate) fn gate(ctx: &Ctx, caller: &Caller, name: &str, action: Action) -> Result<AgentMeta, Resp> {
+pub(crate) async fn gate(ctx: &Ctx, caller: &Caller, name: &str, action: Action) -> Result<AgentMeta, Resp> {
     // A malformed name → 404. That's not a secret: it could never be a valid agent in the first place.
     if !valid_agent_name(name) {
         return Err(Resp::err(404, "not found"));
     }
-    let meta = ctx.store.agent_or_unowned(name);
+    let meta = ctx.store.agent_or_unowned(name).await;
     let acl = meta.to_acl();
     match acl::decide(caller, &acl, action) {
         Decision::Allow => match repo_path(ctx.root(), name).exists() {
@@ -56,7 +66,7 @@ pub(crate) fn gate(ctx: &Ctx, caller: &Caller, name: &str, action: Action) -> Re
         },
         Decision::Deny(d) => {
             let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
-            audit_deny(ctx, &actor, Some(name), action, d);
+            audit_deny(ctx, &actor, Some(name), action, d).await;
             Err(deny_resp(caller, &acl, d))
         }
     }
@@ -126,21 +136,14 @@ async fn gate_conn_and_auth(State(ctx): State<Ctx>, req: Request, next: Next) ->
         None => None,
     };
 
-    // (c) Authentication looks only at headers — no body required. Store reads run on the blocking pool.
+    // (c) Authentication looks only at headers — no body required. The async store is awaited directly.
     let secrets = credentials(&reqo);
     let sid = reqo.sid();
-    let authn = {
-        let ctxa = ctx.clone();
-        tokio::task::spawn_blocking(move || auth::authenticate(&ctxa.store, &ctxa.sessions, sid.as_deref(), &secrets))
-            .await
-            .unwrap()
-    };
+    let authn = auth::authenticate(&ctx.store, &ctx.sessions, sid.as_deref(), &secrets).await;
 
     // (d) Token bookkeeping + per-token budget (keyed on token id, not IP).
     if let Some(id) = authn.token_id.clone() {
-        let ctxt = ctx.clone();
-        let idc = id.clone();
-        tokio::task::spawn_blocking(move || auth::touch_token(&ctxt.store, &idc)).await.unwrap();
+        auth::touch_token(&ctx.store, &id).await;
         if !ctx.token_rl.allow(&id) {
             return Resp::text(
                 429,
@@ -163,8 +166,8 @@ fn caller_of(parts: &axum::http::request::Parts) -> Caller {
     parts.extensions.get::<Caller>().cloned().unwrap_or_else(Caller::anonymous)
 }
 
-/// `/api/*` dispatcher. Rebuilds the [`Req`] view, enforces the API body cap, then runs the verbatim
-/// `api()` string-dispatcher on the blocking pool (it does synchronous store + fs work).
+/// `/api/*` dispatcher. Rebuilds the [`Req`] view, enforces the API body cap, then runs the async
+/// `api()` string-dispatcher directly on the runtime (its store reads/writes are awaited).
 async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let caller = caller_of(&parts);
@@ -184,10 +187,7 @@ async fn api_entry(State(ctx): State<Ctx>, req: Request) -> Response {
         }
     };
 
-    let ctx2 = ctx.clone();
-    let resp = tokio::task::spawn_blocking(move || api(&ctx2, &reqo, &rest, &caller, &body_bytes))
-        .await
-        .unwrap();
+    let resp = api(&ctx, &reqo, &rest, &caller, &body_bytes).await;
     resp.into_response()
 }
 
@@ -207,19 +207,9 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
         let action = route.action;
         // A nonexistent agent is decided as "unowned private" — decision first, existence second — so
         // "doesn't exist → 404" and "private → 401" cannot be told apart by an enumerator.
-        let (decision, exists) = {
-            let ctxb = ctx.clone();
-            let ag = route.agent.clone();
-            let caller_b = caller.clone();
-            tokio::task::spawn_blocking(move || {
-                let meta = ctxb.store.agent_or_unowned(&ag);
-                let d = acl::decide(&caller_b, &meta.to_acl(), action);
-                let exists = repo_path(ctxb.root(), &ag).exists();
-                (d, exists)
-            })
-            .await
-            .unwrap()
-        };
+        let meta = ctx.store.agent_or_unowned(&route.agent).await;
+        let decision = acl::decide(&caller, &meta.to_acl(), action);
+        let exists = repo_path(ctx.root(), &route.agent).exists();
         match decision {
             Decision::Allow => {
                 if !exists {
@@ -227,10 +217,7 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
                 }
             }
             Decision::Deny(d) => {
-                let ctxd = ctx.clone();
-                let ag = route.agent.clone();
-                let ac = actor.clone();
-                tokio::task::spawn_blocking(move || audit_deny(&ctxd, &ac, Some(&ag), action, d)).await.unwrap();
+                audit_deny(&ctx, &actor, Some(&route.agent), action, d).await;
                 // A git client only prompts for credentials on 401 + WWW-Authenticate.
                 return git_deny_resp(&caller, d).into_response();
             }
@@ -240,23 +227,14 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
         if reqo.content_length > MAX_BODY {
             return Resp::text(413, "payload too large").into_response();
         }
-        {
-            let ctxa = ctx.clone();
-            let ag = route.agent.clone();
-            let ac = actor.clone();
-            let p = path.clone();
-            tokio::task::spawn_blocking(move || {
-                audit::append(
-                    ctxa.root(),
-                    &ac,
-                    if action == Action::Write { audit::GIT_PUSH } else { audit::GIT_FETCH },
-                    Some(&ag),
-                    &p,
-                );
-            })
-            .await
-            .unwrap();
-        }
+        audit_append(
+            ctx.root(),
+            &actor,
+            if action == Action::Write { audit::GIT_PUSH } else { audit::GIT_FETCH },
+            Some(&route.agent),
+            &path,
+        )
+        .await;
         return git_http(&ctx, &reqo, body, &route.agent, &actor).await;
     }
 

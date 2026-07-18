@@ -17,6 +17,13 @@
 # The hub's data root is the /data volume; every `exec hub agit-hub …` command
 # resolves --root from $HOME=/data automatically (see the Dockerfile), so no
 # --root flag is needed for admin commands here.
+#
+# Persistence backend: relational, chosen by AGIT_HUB_DB. This topology points the
+# hub at the bundled Postgres (below) — the production backend. Omit AGIT_HUB_DB
+# (or unset it) and the hub falls back to a zero-config SQLite file (hub.db) under
+# /data instead, which is fine for a single-node self-host. Either way the bare git
+# repos and audit.log still live on the /data volume; only users/agents/tokens/MRs
+# move into the database.
 
 services:
   hub:
@@ -25,6 +32,12 @@ services:
       dockerfile: Dockerfile
     image: agit-hub:latest
     restart: unless-stopped
+    depends_on:
+      - postgres
+    # Postgres is the production backend. Drop this line to fall back to SQLite on
+    # the /data volume. The password is shared with the postgres service below.
+    environment:
+      AGIT_HUB_DB: postgres://agithub:${PGPASSWORD:-agithub}@postgres:5432/agithub
     # Only Caddy's address is pinned (below), so the hub can trust it precisely.
     command:
       - serve
@@ -42,6 +55,24 @@ services:
     # No published ports: the hub is reachable only through Caddy.
     expose:
       - "8177"
+
+  # Production metadata store. The hub creates its own tables at boot (idempotent
+  # migrations gated by a schema_version row), so no init SQL is needed here.
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agithub
+      POSTGRES_PASSWORD: ${PGPASSWORD:-agithub}
+      POSTGRES_DB: agithub
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks:
+      edge:
+    # Loopback-only publish for local inspection; drop it to keep Postgres purely
+    # internal to the compose network.
+    expose:
+      - "5432"
 
   caddy:
     image: caddy:2
@@ -72,6 +103,7 @@ networks:
         - subnet: 172.28.0.0/24
 
 volumes:
-  hub-data:      # the hub's data root (users.json, agents.json, auth.json, audit.log, bare repos)
+  hub-data:      # the hub's data root (audit.log, bare repos, and hub.db when on the SQLite backend)
+  pg-data:       # Postgres data directory (the metadata store when on the Postgres backend)
   caddy-data:    # Caddy's certificates + ACME account
   caddy-config:

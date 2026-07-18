@@ -2,7 +2,7 @@
 //! minus the socket-timeout constants (now hyper/tower concerns).
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Largest git request body (a push pack) streamed to http-backend.
@@ -112,36 +112,7 @@ impl Drop for IpGuard {
     }
 }
 
-/// A counting semaphore (std has none): caps the number of concurrent handler threads.
-pub(crate) struct Semaphore {
-    pub(crate) permits: Mutex<usize>,
-    pub(crate) cv: Condvar,
-}
-
-impl Semaphore {
-    pub(crate) fn new(n: usize) -> Self {
-        Semaphore { permits: Mutex::new(n), cv: Condvar::new() }
-    }
-}
-
-/// One held slot; returned on drop (panic-safe — a crashing handle still won't leak a permit).
-pub(crate) struct Permit(Arc<Semaphore>);
-
-impl Permit {
-    pub(crate) fn acquire(sem: Arc<Semaphore>) -> Permit {
-        let mut p = sem.permits.lock().unwrap_or_else(|e| e.into_inner());
-        while *p == 0 {
-            p = sem.cv.wait(p).unwrap_or_else(|e| e.into_inner());
-        }
-        *p -= 1;
-        drop(p);
-        Permit(sem)
-    }
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        *self.0.permits.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-        self.0.cv.notify_one();
-    }
-}
+// The login concurrency cap is now a `tokio::sync::Semaphore` (see CtxInner::login_gate): the login
+// handler runs on the async runtime and `.await`s a permit, so a std Condvar wait here would block a
+// worker thread while the permit it needs is released by another async task — a self-deadlock. The
+// async semaphore yields instead of blocking.

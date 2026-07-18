@@ -11,7 +11,7 @@ use agit::hub::session::Sessions;
 use agit::hub::store::{self, Store};
 
 use crate::cli::list_agents;
-use crate::limits::{ConnLimiter, Semaphore, TokenBuckets, LOGIN_CONC};
+use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC};
 use crate::{flag, has_flag};
 
 pub(crate) struct Cfg {
@@ -34,8 +34,9 @@ pub(crate) struct CtxInner {
     pub(crate) sessions: Sessions,
     pub(crate) limiter: Arc<ConnLimiter>,
     /// Login concurrency gate: argon2 is **deliberately** slow and memory-hungry. Without a cap, a few
-    /// dozen concurrent logins = a few dozen copies of 19MiB + every core pegged.
-    pub(crate) login_gate: Arc<Semaphore>,
+    /// dozen concurrent logins = a few dozen copies of 19MiB + every core pegged. An async semaphore,
+    /// so the login handler yields (rather than blocking a worker thread) while it waits for a slot.
+    pub(crate) login_gate: Arc<tokio::sync::Semaphore>,
     /// Per-token request budget (see TokenBuckets).
     pub(crate) token_rl: Arc<TokenBuckets>,
 }
@@ -123,20 +124,31 @@ pub(crate) fn display_host(cfg: &Cfg) -> String {
 }
 
 /// Print the startup banner (verbatim text from the monolith), computed off the live store.
-fn startup_banner(ctx: &Ctx, addr: SocketAddr) {
+async fn startup_banner(ctx: &Ctx, addr: SocketAddr) {
     let cfg = &ctx.cfg;
     let root = ctx.root();
     let store = &ctx.store;
     let agents = list_agents(root);
-    let unowned = agents.iter().filter(|n| store.agent_or_unowned(n).owner.is_none()).count();
-    let users = store.users();
-    let legacy_tokens = store.tokens().iter().filter(|t| t.owner.is_none()).count();
+    // One pass over the agents: async store reads can't sit inside an iterator's `.filter` closure.
+    let mut unowned = 0usize;
+    let mut public = 0usize;
+    for n in &agents {
+        let m = store.agent_or_unowned(n).await;
+        if m.owner.is_none() {
+            unowned += 1;
+        }
+        if m.visibility == "public" {
+            public += 1;
+        }
+    }
+    let users = store.users().await;
+    let legacy_tokens = store.tokens().await.iter().filter(|t| t.owner.is_none()).count();
 
     println!("AgentGitHub running");
     println!("  listen:  {addr}{}", if cfg.tls { " (TLS terminated in front)" } else { "" });
     println!("  web:     {}://{}/", if cfg.tls { "https" } else { "http" }, display_host(cfg));
     println!("  root:    {}", root.display());
-    println!("  hosting: {} agents ({} public)", agents.len(), agents.iter().filter(|n| store.agent_or_unowned(n).visibility == "public").count());
+    println!("  hosting: {} agents ({public} public)", agents.len());
     println!("  users:   {} ({} admins)", users.len(), users.iter().filter(|u| u.is_admin).count());
     if !cfg.trusted_proxies.is_empty() {
         println!("  proxy:   trusting X-Forwarded-For from {:?}", cfg.trusted_proxies);
@@ -172,14 +184,6 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
     }
 
     let addr = SocketAddr::new(cfg.host, cfg.port);
-    let ctx = Ctx(Arc::new(CtxInner {
-        store: Store::new(root),
-        cfg,
-        sessions: Sessions::new(),
-        limiter: Arc::new(ConnLimiter::default()),
-        login_gate: Arc::new(Semaphore::new(LOGIN_CONC)),
-        token_rl: Arc::new(TokenBuckets::new()),
-    }));
 
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(r) => r,
@@ -190,6 +194,24 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
     };
 
     rt.block_on(async move {
+        // Build the pool + run migrations here, on the runtime that will serve requests. A bad
+        // AGIT_HUB_DB (or an unreachable Postgres) surfaces as a clear error at boot rather than on
+        // the first request.
+        let store = match Store::open(root).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to open the metadata database: {e}");
+                return 1;
+            }
+        };
+        let ctx = Ctx(Arc::new(CtxInner {
+            store,
+            cfg,
+            sessions: Sessions::new(),
+            limiter: Arc::new(ConnLimiter::default()),
+            login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
+            token_rl: Arc::new(TokenBuckets::new()),
+        }));
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -197,7 +219,7 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
                 return 1;
             }
         };
-        startup_banner(&ctx, addr);
+        startup_banner(&ctx, addr).await;
         let app = crate::router::build(ctx);
         match axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(shutdown_signal())

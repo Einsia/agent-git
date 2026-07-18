@@ -21,6 +21,9 @@ path = "src/bin/agit-hub/main.rs"
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "signal", "sync", "time"] }
+# Persistence: Postgres (production) + SQLite (self-host, tests) behind the Store. RUNTIME queries
+# only — the `macros` feature is deliberately omitted so the build is hermetic (no live DB at compile).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
 tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tokio-util = { version = "0.7", features = ["io"] }

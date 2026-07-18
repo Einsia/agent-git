@@ -11,10 +11,40 @@ use agit::hub::{audit, kdf, store};
 
 use crate::{flag, has_flag, positional};
 
+/// Bridge a sync CLI subcommand to the async store: spin up a short-lived tokio runtime and drive the
+/// future to completion. Only `serve` needs the full server runtime; the admin subcommands are
+/// one-shot, so a fresh runtime per invocation is fine. `Store::open` honors `AGIT_HUB_DB`, so an
+/// admin command run against a Postgres-backed hub (e.g. `docker exec … user add`) hits the same DB
+/// the server does.
+pub(crate) fn run_async<F: std::future::Future<Output = i32>>(fut: F) -> i32 {
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(fut),
+        Err(e) => {
+            eprintln!("failed to start the async runtime: {e}");
+            1
+        }
+    }
+}
+
+/// Open the configured backend, mapping any error to a printed message + exit code 1.
+async fn open_store(root: &Path) -> Result<Store, i32> {
+    Store::open(root).await.map_err(|e| {
+        eprintln!("failed to open the metadata database: {e}");
+        1
+    })
+}
+
 // ─────────────────────────── CLI: user ───────────────────────────
 
 pub(crate) fn user_cmd(root: &Path, args: &[String]) -> i32 {
-    let store = Store::new(root);
+    run_async(user_cmd_async(root, args))
+}
+
+async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
+    let store = match open_store(root).await {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     match args.get(1).map(|s| s.as_str()) {
         Some("add") => {
             let Some(name) = positional(args, 2) else {
@@ -26,7 +56,7 @@ pub(crate) fn user_cmd(root: &Path, args: &[String]) -> i32 {
                 eprintln!("invalid username (2-32 lowercase [a-z0-9._-], no leading dot): {name}");
                 return 2;
             }
-            if store.user(&username).is_some() {
+            if store.user(&username).await.is_some() {
                 eprintln!("user already exists: {username}");
                 return 1;
             }
@@ -53,7 +83,7 @@ pub(crate) fn user_cmd(root: &Path, args: &[String]) -> i32 {
                 return 1;
             };
             let user = User { username: username.clone(), pw_hash, salt, kdf: kdf_id, is_admin, created: store::now_iso() };
-            if let Err(e) = store.add_user(user) {
+            if let Err(e) = store.add_user(user).await {
                 eprintln!("failed to write users.json: {e}");
                 return 1;
             }
@@ -63,7 +93,7 @@ pub(crate) fn user_cmd(root: &Path, args: &[String]) -> i32 {
             0
         }
         Some("list") => {
-            let users = store.users();
+            let users = store.users().await;
             if users.is_empty() {
                 println!("no users yet. `agit-hub user add <you> --admin` creates the first one.");
             }
@@ -130,12 +160,12 @@ pub(crate) fn stty(args: &[&str]) -> bool {
 
 /// When `--user` / `--owner` is omitted: with exactly one user, default to them; otherwise demand it
 /// be spelled out (don't guess).
-pub(crate) fn resolve_user(store: &Store, explicit: Option<String>, flag_name: &str) -> Result<User, String> {
+pub(crate) async fn resolve_user(store: &Store, explicit: Option<String>, flag_name: &str) -> Result<User, String> {
     if let Some(name) = explicit {
         let n = store::normalize_username(&name);
-        return store.user(&n).ok_or(format!("no such user: {n} (try `agit-hub user list`)"));
+        return store.user(&n).await.ok_or(format!("no such user: {n} (try `agit-hub user list`)"));
     }
-    let users = store.users();
+    let users = store.users().await;
     match users.len() {
         0 => Err("no users yet. Start with `agit-hub user add <you> --admin`.".into()),
         1 => Ok(users.into_iter().next().unwrap()),
@@ -146,12 +176,19 @@ pub(crate) fn resolve_user(store: &Store, explicit: Option<String>, flag_name: &
 // ─────────────────────────── CLI: agent ───────────────────────────
 
 pub(crate) fn add_cmd(root: &Path, args: &[String]) -> i32 {
+    run_async(add_cmd_async(root, args))
+}
+
+async fn add_cmd_async(root: &Path, args: &[String]) -> i32 {
     let Some(name) = positional(args, 1) else {
         eprintln!("usage: agit-hub add <name> [--owner <user>] [--public]");
         return 2;
     };
-    let store = Store::new(root);
-    let owner = match resolve_user(&store, flag(args, "--owner"), "--owner") {
+    let store = match open_store(root).await {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let owner = match resolve_user(&store, flag(args, "--owner"), "--owner").await {
         Ok(u) => u,
         Err(e) => {
             eprintln!("{e}");
@@ -160,7 +197,7 @@ pub(crate) fn add_cmd(root: &Path, args: &[String]) -> i32 {
     };
     // Private by default — transcripts are sensitive data, so going public must be an explicit act.
     let visibility = if has_flag(args, "--public") { Visibility::Public } else { Visibility::Private };
-    match create_agent(&store, name, &owner.username, visibility) {
+    match create_agent(&store, name, &owner.username, visibility).await {
         Ok(created) => {
             audit::append(root, "cli", audit::AGENT_CREATE, Some(name), &format!("owner={} visibility={}", owner.username, visibility.as_str()));
             if created {
@@ -191,7 +228,7 @@ pub(crate) fn add_cmd(root: &Path, args: &[String]) -> i32 {
 /// The "claim" path is for migration: root may already hold a `<name>.git` (created by an old Hub,
 /// with no owner). Under the new model such a repo is **unowned and private**, invisible to everyone
 /// but the site admin — claiming it is the proper way to bring it back.
-pub(crate) fn create_agent(store: &Store, name: &str, owner: &str, visibility: Visibility) -> Result<bool, String> {
+pub(crate) async fn create_agent(store: &Store, name: &str, owner: &str, visibility: Visibility) -> Result<bool, String> {
     if !valid_agent_name(name) {
         return Err(format!("invalid name ([A-Za-z0-9._-] only, no .. and no leading dot): {name}"));
     }
@@ -227,17 +264,25 @@ pub(crate) fn create_agent(store: &Store, name: &str, owner: &str, visibility: V
             list.push(AgentMeta::new(name, Some(owner), visibility));
             Ok(!existed)
         })
+        .await
         .map_err(|e| format!("failed to write agents.json: {e}"))?
 }
 
 pub(crate) fn list_cmd(root: &Path) -> i32 {
-    let store = Store::new(root);
+    run_async(list_cmd_async(root))
+}
+
+async fn list_cmd_async(root: &Path) -> i32 {
+    let store = match open_store(root).await {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let names = list_agents(root);
     if names.is_empty() {
         println!("no agents yet. `agit-hub add <name>` creates one.");
     }
     for n in names {
-        let m = store.agent_or_unowned(&n);
+        let m = store.agent_or_unowned(&n).await;
         let owner = m.owner.clone().unwrap_or_else(|| "— (unowned)".into());
         println!("{:<24} {:<8} owner={}", n, m.visibility, owner);
     }
@@ -269,14 +314,21 @@ pub(crate) fn repo_path(root: &Path, name: &str) -> PathBuf {
 // ─────────────────────────── CLI: token ───────────────────────────
 
 pub(crate) fn token_cmd(root: &Path, args: &[String]) -> i32 {
-    let store = Store::new(root);
+    run_async(token_cmd_async(root, args))
+}
+
+async fn token_cmd_async(root: &Path, args: &[String]) -> i32 {
+    let store = match open_store(root).await {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     match args.get(1).map(|s| s.as_str()) {
         Some("add") => {
             let Some(name) = positional(args, 2) else {
                 eprintln!("usage: agit-hub token add <name> [--user <owner>] [--agent <name>] [--read|--write] [--ttl-days N]");
                 return 2;
             };
-            let owner = match resolve_user(&store, flag(args, "--user"), "--user") {
+            let owner = match resolve_user(&store, flag(args, "--user"), "--user").await {
                 Ok(u) => u,
                 Err(e) => {
                     eprintln!("{e}");
@@ -288,7 +340,7 @@ pub(crate) fn token_cmd(root: &Path, args: &[String]) -> i32 {
             let scope = if has_flag(args, "--write") { Scope::Write } else { Scope::Read };
             let agent = flag(args, "--agent");
             if let Some(a) = &agent {
-                if !valid_agent_name(a) || store.agent(a).is_none() {
+                if !valid_agent_name(a) || store.agent(a).await.is_none() {
                     eprintln!("no such agent: {a}");
                     return 2;
                 }
@@ -303,7 +355,7 @@ pub(crate) fn token_cmd(root: &Path, args: &[String]) -> i32 {
                 },
                 None => None,
             };
-            match issue_token(&store, name, &owner.username, agent.as_deref(), scope, ttl_days) {
+            match issue_token(&store, name, &owner.username, agent.as_deref(), scope, ttl_days).await {
                 Ok(secret) => {
                     audit::append(root, "cli", audit::TOKEN_CREATE, agent.as_deref(), &format!("name={name} owner={} scope={}", owner.username, scope.as_str()));
                     println!("issued a token to {} ({})", owner.username, scope.as_str());
@@ -328,7 +380,7 @@ pub(crate) fn token_cmd(root: &Path, args: &[String]) -> i32 {
             }
         }
         Some("list") => {
-            let toks = store.tokens();
+            let toks = store.tokens().await;
             if toks.is_empty() {
                 println!("no tokens yet. `agit-hub token add <name> --write` issues one.");
             }
@@ -360,11 +412,14 @@ pub(crate) fn token_cmd(root: &Path, args: &[String]) -> i32 {
                 eprintln!("usage: agit-hub token rm <id>  (ids come from `agit-hub token list`)");
                 return 2;
             };
-            match store.update_tokens(|toks| {
-                let before = toks.len();
-                toks.retain(|t| &t.id != id);
-                before != toks.len()
-            }) {
+            match store
+                .update_tokens(|toks| {
+                    let before = toks.len();
+                    toks.retain(|t| &t.id != id);
+                    before != toks.len()
+                })
+                .await
+            {
                 Ok(true) => {
                     audit::append(root, "cli", audit::TOKEN_REVOKE, None, id);
                     println!("revoked {id}");
@@ -390,7 +445,7 @@ pub(crate) fn token_cmd(root: &Path, args: &[String]) -> i32 {
 
 /// Issue a token: generate a 32-byte CSPRNG plaintext and store only its sha256 digest. Returns the
 /// plaintext (this once, and never again).
-pub(crate) fn issue_token(store: &Store, name: &str, owner: &str, agent: Option<&str>, scope: Scope, ttl_days: Option<i64>) -> Result<String, String> {
+pub(crate) async fn issue_token(store: &Store, name: &str, owner: &str, agent: Option<&str>, scope: Scope, ttl_days: Option<i64>) -> Result<String, String> {
     // If the CSPRNG is unavailable, **error out** — never fall back to predictable time values to
     // mint credentials.
     let secret = kdf::gen_secret().map_err(|e| format!("refusing to issue a token: {e}"))?;
@@ -407,6 +462,6 @@ pub(crate) fn issue_token(store: &Store, name: &str, owner: &str, agent: Option<
         expires,
         last_used: None,
     };
-    store.update_tokens(|t| t.push(rec)).map_err(|e| format!("failed to write auth.json: {e}"))?;
+    store.update_tokens(|t| t.push(rec)).await.map_err(|e| format!("failed to write auth.json: {e}"))?;
     Ok(secret)
 }

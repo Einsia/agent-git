@@ -48,8 +48,10 @@ ENV HOME=/data
 USER agithub
 WORKDIR /data
 
-# All hub state — users.json, agents.json, auth.json, audit.log and the bare
-# repos — lives under $HOME/.agit-hub. Persist it.
+# All hub state — audit.log, the bare repos, and (on the default SQLite backend)
+# the hub.db database — lives under $HOME/.agit-hub. Persist it. With the Postgres
+# backend (AGIT_HUB_DB set) the metadata lives in Postgres instead; the repos and
+# audit.log still land here.
 VOLUME ["/data"]
 
 # agit-hub serve defaults to --port 8177.

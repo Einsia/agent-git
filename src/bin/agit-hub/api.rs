@@ -11,8 +11,7 @@ use crate::cli::{create_agent, issue_token, list_agents, repo_path};
 use crate::gitplumb::*;
 use crate::content::{api_compare, api_diff, api_raw, api_session, session_summary};
 use crate::http::{Req, Resp};
-use crate::limits::Permit;
-use crate::router::{audit_deny, gate};
+use crate::router::{audit_append, audit_deny, gate};
 use crate::scan::install_pre_receive;
 use crate::server::Ctx;
 
@@ -76,23 +75,23 @@ pub(crate) enum Verb {
 /// in the response rather than silently truncated.
 pub(crate) const SEARCH_SCAN_CAP: usize = 400;
 
-pub(crate) fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
+pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]) -> Resp {
     let m = req.method.as_str();
     match (m, rest) {
-        ("POST", "login") => return api_login(ctx, req, body),
-        ("POST", "logout") => return api_logout(ctx, req, caller),
+        ("POST", "login") => return api_login(ctx, req, body).await,
+        ("POST", "logout") => return api_logout(ctx, req, caller).await,
         ("GET", "me") => return api_me(caller),
-        ("GET", "agents") => return api_agents(ctx, req, caller),
-        ("POST", "agents") => return api_create_agent(ctx, req, caller, body),
-        ("GET", "tokens") => return api_tokens(ctx, caller),
-        ("POST", "tokens") => return api_create_token(ctx, caller, body),
-        ("GET", "audit") => return api_audit(ctx, req, caller),
-        ("GET", "search") => return api_search(ctx, req, caller),
+        ("GET", "agents") => return api_agents(ctx, req, caller).await,
+        ("POST", "agents") => return api_create_agent(ctx, req, caller, body).await,
+        ("GET", "tokens") => return api_tokens(ctx, caller).await,
+        ("POST", "tokens") => return api_create_token(ctx, caller, body).await,
+        ("GET", "audit") => return api_audit(ctx, req, caller).await,
+        ("GET", "search") => return api_search(ctx, req, caller).await,
         _ => {}
     }
     if let Some(id) = rest.strip_prefix("tokens/") {
         return match m {
-            "DELETE" => api_revoke_token(ctx, caller, id),
+            "DELETE" => api_revoke_token(ctx, caller, id).await,
             _ => Resp::text(405, "method not allowed"),
         };
     }
@@ -104,7 +103,7 @@ pub(crate) fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]
     // agent name (a real one could never contain `/`).
     if let Some(aid) = after.strip_prefix("by-aid/") {
         return match m {
-            "GET" => api_agent_by_aid(ctx, req, caller, aid),
+            "GET" => api_agent_by_aid(ctx, req, caller, aid).await,
             _ => Resp::text(405, "method not allowed"),
         };
     }
@@ -112,7 +111,7 @@ pub(crate) fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]
     // agent/<name>/mrs[/<id>[/comments|/close]]
     if let Some((name, tail)) = after.split_once("/mrs") {
         if tail.is_empty() || tail.starts_with('/') {
-            return api_mrs(ctx, caller, name, tail, m, req.query(), body);
+            return api_mrs(ctx, caller, name, tail, m, req.query(), body).await;
         }
     }
 
@@ -128,18 +127,26 @@ pub(crate) fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]
         if m != "GET" {
             return Resp::text(405, "method not allowed");
         }
-        let meta = match gate(ctx, caller, name, Action::Read) {
+        let meta = match gate(ctx, caller, name, Action::Read).await {
             Ok(x) => x,
             Err(r) => return r,
         };
-        let repo = repo_path(ctx.root(), &meta.name);
-        if !has_head(&repo) {
-            return Resp::err(404, "not found");
-        }
-        return match sep {
-            "/raw/" => api_raw(&repo, tail, req.query()),
-            _ => api_compare(&repo, req.query()),
-        };
+        // has_head + the content endpoint each shell out to git; run them on the blocking pool.
+        let (root, name, tail, query, is_raw) =
+            (ctx.root().to_path_buf(), meta.name.clone(), tail.to_string(), req.query().to_string(), sep == "/raw/");
+        return tokio::task::spawn_blocking(move || {
+            let repo = repo_path(&root, &name);
+            if !has_head(&repo) {
+                return Resp::err(404, "not found");
+            }
+            if is_raw {
+                api_raw(&repo, &tail, &query)
+            } else {
+                api_compare(&repo, &query)
+            }
+        })
+        .await
+        .unwrap();
     }
 
     // agent/<name>/session/<id>[/diff]
@@ -147,25 +154,31 @@ pub(crate) fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]
         if m != "GET" {
             return Resp::text(405, "method not allowed");
         }
-        let meta = match gate(ctx, caller, name, Action::Read) {
+        let meta = match gate(ctx, caller, name, Action::Read).await {
             Ok(x) => x,
             Err(r) => return r,
         };
-        let repo = repo_path(ctx.root(), &meta.name);
-        if !has_head(&repo) {
-            return Resp::err(404, "not found");
-        }
-        if let Some(id) = tail.strip_suffix("/diff") {
-            return api_diff(&repo, id, req.query());
-        }
-        return api_session(&repo, tail, req.query());
+        let (root, name, tail, query) =
+            (ctx.root().to_path_buf(), meta.name.clone(), tail.to_string(), req.query().to_string());
+        return tokio::task::spawn_blocking(move || {
+            let repo = repo_path(&root, &name);
+            if !has_head(&repo) {
+                return Resp::err(404, "not found");
+            }
+            match tail.strip_suffix("/diff") {
+                Some(id) => api_diff(&repo, id, &query),
+                None => api_session(&repo, &tail, &query),
+            }
+        })
+        .await
+        .unwrap();
     }
 
     // agent/<name>/members[/<username>] — tail may only be empty or /<username>;
     // don't let /membersXYZ pass as /members.
     if let Some((name, tail)) = after.split_once("/members") {
         if tail.is_empty() || tail.starts_with('/') {
-            return api_members(ctx, caller, name, tail, m, body);
+            return api_members(ctx, caller, name, tail, m, body).await;
         }
     }
 
@@ -184,20 +197,20 @@ pub(crate) fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]
                 return Resp::text(405, "method not allowed");
             }
             return match handler {
-                Verb::Fork => api_fork_agent(ctx, req, caller, name, body),
-                Verb::Transfer => api_transfer_agent(ctx, caller, name, body),
+                Verb::Fork => api_fork_agent(ctx, req, caller, name, body).await,
+                Verb::Transfer => api_transfer_agent(ctx, caller, name, body).await,
                 Verb::Archive => {
-                    set_lifecycle(ctx, caller, name, Lifecycle::Archived, &[Lifecycle::Active], audit::AGENT_ARCHIVE)
+                    set_lifecycle(ctx, caller, name, Lifecycle::Archived, &[Lifecycle::Active], audit::AGENT_ARCHIVE).await
                 }
                 Verb::Unarchive => {
-                    set_lifecycle(ctx, caller, name, Lifecycle::Active, &[Lifecycle::Archived], audit::AGENT_UNARCHIVE)
+                    set_lifecycle(ctx, caller, name, Lifecycle::Active, &[Lifecycle::Archived], audit::AGENT_UNARCHIVE).await
                 }
                 // Restore lands on Active, not on "whatever it was": an agent coming back from the
                 // trash writable is the surprise; coming back and needing one more click is not.
                 Verb::Restore => {
-                    set_lifecycle(ctx, caller, name, Lifecycle::Active, &[Lifecycle::Deleted], audit::AGENT_RESTORE)
+                    set_lifecycle(ctx, caller, name, Lifecycle::Active, &[Lifecycle::Deleted], audit::AGENT_RESTORE).await
                 }
-                Verb::Star => api_star_agent(ctx, caller, name, body),
+                Verb::Star => api_star_agent(ctx, caller, name, body).await,
             };
         }
     }
@@ -205,21 +218,21 @@ pub(crate) fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, body: &[u8]
     // agent/<name>
     match m {
         "GET" => {
-            let meta = match gate(ctx, caller, after, Action::Read) {
+            let meta = match gate(ctx, caller, after, Action::Read).await {
                 Ok(x) => x,
                 Err(r) => return r,
             };
-            api_agent(ctx, req, caller, &meta)
+            api_agent(ctx, req, caller, &meta).await
         }
-        "PATCH" => api_patch_agent(ctx, caller, after, body),
-        "DELETE" => api_delete_agent(ctx, caller, after, req.query()),
+        "PATCH" => api_patch_agent(ctx, caller, after, body).await,
+        "DELETE" => api_delete_agent(ctx, caller, after, req.query()).await,
         _ => Resp::text(405, "method not allowed"),
     }
 }
 
 // ── Authentication ──
 
-pub(crate) fn api_login(ctx: &Ctx, req: &Req, body: &[u8]) -> Resp {
+pub(crate) async fn api_login(ctx: &Ctx, req: &Req, body: &[u8]) -> Resp {
     let Some(v) = json_body(body) else {
         return Resp::err(400, "want a JSON body");
     };
@@ -227,12 +240,14 @@ pub(crate) fn api_login(ctx: &Ctx, req: &Req, body: &[u8]) -> Resp {
         return Resp::err(400, "want username and password");
     };
     // argon2 is slow on purpose — leaving its concurrency uncapped hands out a CPU/memory amplifier.
+    // Hold an async permit across the verify (which runs the KDF on the blocking pool): the wait for a
+    // slot yields the worker rather than blocking it.
     let verified = {
-        let _slot = Permit::acquire(ctx.login_gate.clone());
-        auth::verify_login(&ctx.store, &username, &password)
+        let _slot = ctx.login_gate.acquire().await.expect("login gate semaphore is never closed");
+        auth::verify_login(&ctx.store, &username, &password).await
     };
     let Some(user) = verified else {
-        audit::append(ctx.root(), &store::normalize_username(&username), audit::LOGIN_FAILED, None, &req.host());
+        audit_append(ctx.root(), &store::normalize_username(&username), audit::LOGIN_FAILED, None, &req.host()).await;
         // Don't say whether the user doesn't exist or the password is wrong — that hands the
         // brute-forcer a username dictionary.
         return Resp::err(401, "wrong username or password");
@@ -240,17 +255,17 @@ pub(crate) fn api_login(ctx: &Ctx, req: &Req, body: &[u8]) -> Resp {
     let Ok(sid) = ctx.sessions.create(&user.username) else {
         return Resp::err(503, "couldn't create a session, try again shortly");
     };
-    audit::append(ctx.root(), &user.username, audit::LOGIN, None, "");
+    audit_append(ctx.root(), &user.username, audit::LOGIN, None, "").await;
     Resp::json(serde_json::json!({ "username": user.username, "is_admin": user.is_admin }))
         .with("Set-Cookie", &websession::set_cookie(&sid, ctx.cfg.tls))
 }
 
-pub(crate) fn api_logout(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
+pub(crate) async fn api_logout(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     if let Some(sid) = req.sid() {
         ctx.sessions.revoke(&sid);
     }
     if let Some(u) = &caller.user {
-        audit::append(ctx.root(), u, audit::LOGOUT, None, "");
+        audit_append(ctx.root(), u, audit::LOGOUT, None, "").await;
     }
     Resp::no_content().with("Set-Cookie", &websession::clear_cookie(ctx.cfg.tls))
 }
@@ -264,7 +279,7 @@ pub(crate) fn api_me(caller: &Caller) -> Resp {
 
 // ── agents ──
 
-pub(crate) fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
+pub(crate) async fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     let page = match page_params(req.query()) {
         Ok(p) => p,
         Err(r) => return r,
@@ -274,45 +289,66 @@ pub(crate) fn api_agents(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     // decided in the same place.
     //
     // Filtered before paging, never after: a page that hides its rejects would hand out short pages
-    // and let a caller infer, from the gaps, exactly how many agents they cannot see.
-    let visible: Vec<String> = list_agents(ctx.root())
-        .into_iter()
-        .filter(|n| acl::decide(caller, &ctx.store.agent_or_unowned(n).to_acl(), Action::Read).allowed())
-        .filter(|n| page.after.as_deref().is_none_or(|a| n.as_str() > a))
-        .collect();
+    // and let a caller infer, from the gaps, exactly how many agents they cannot see. (A loop, not an
+    // iterator chain: the ACL read is an async store call.)
+    // The ACL filter needs each agent's metadata (an async store read), so collect (name, meta) as we
+    // go; the meta is reused when the row is built.
+    let mut visible: Vec<(String, AgentMeta)> = Vec::new();
+    for n in list_agents(ctx.root()) {
+        let meta = ctx.store.agent_or_unowned(&n).await;
+        if !acl::decide(caller, &meta.to_acl(), Action::Read).allowed() {
+            continue;
+        }
+        if page.after.as_deref().is_none_or(|a| n.as_str() > a) {
+            visible.push((n, meta));
+        }
+    }
     let has_more = visible.len() > page.limit;
-    let window: Vec<String> = visible.into_iter().take(page.limit).collect();
-    let next_cursor = has_more.then(|| window.last().map(|n| cursor_encode(n))).flatten();
+    let window: Vec<(String, AgentMeta)> = visible.into_iter().take(page.limit).collect();
+    let next_cursor = has_more.then(|| window.last().map(|(n, _)| cursor_encode(n))).flatten();
 
-    let items: Vec<serde_json::Value> = window
-        .iter()
-        .map(|n| {
-            let meta = ctx.store.agent_or_unowned(n);
-            let repo = repo_path(ctx.root(), n);
-            let (count, when, subject) = if has_head(&repo) {
-                let (w, s) = last_activity(&repo);
-                (session_refs(&repo).len(), w, s)
-            } else {
-                (0, String::new(), String::new())
-            };
-            let (aid, aid_source) = agent_aid(&repo);
-            serde_json::json!({
-                "name": n,
-                "aid": aid,
-                "aid_source": aid_source,
-                "sessions": count,
-                "when": when,
-                "subject": subject,
-                "visibility": meta.visibility,
-                "lifecycle": meta.lifecycle().as_str(),
-                "description": meta.description,
-                "forked_from": meta.forked_from,
-                "stars": meta.stars.len(),
-                "starred": caller.user.as_ref().is_some_and(|u| meta.stars.contains(u)),
-                "role": effective_role(caller, &meta),
+    // The per-agent git reads (has_head / last_activity / session_refs / agent_aid) each shell out, so
+    // one request over N agents is ~3N subprocesses. Run the whole fan-out on the blocking pool and
+    // hand back the collected fields; the store reads above already ran async.
+    let root = ctx.root().to_path_buf();
+    let names: Vec<String> = window.iter().map(|(n, _)| n.clone()).collect();
+    let git_info: Vec<(usize, String, String, Option<String>, &'static str)> = tokio::task::spawn_blocking(move || {
+        names
+            .into_iter()
+            .map(|n| {
+                let repo = repo_path(&root, &n);
+                let (count, when, subject) = if has_head(&repo) {
+                    let (w, s) = last_activity(&repo);
+                    (session_refs(&repo).len(), w, s)
+                } else {
+                    (0, String::new(), String::new())
+                };
+                let (aid, aid_source) = agent_aid(&repo);
+                (count, when, subject, aid, aid_source)
             })
-        })
-        .collect();
+            .collect()
+    })
+    .await
+    .unwrap();
+
+    let mut items: Vec<serde_json::Value> = Vec::with_capacity(window.len());
+    for ((n, meta), (count, when, subject, aid, aid_source)) in window.iter().zip(git_info) {
+        items.push(serde_json::json!({
+            "name": n,
+            "aid": aid,
+            "aid_source": aid_source,
+            "sessions": count,
+            "when": when,
+            "subject": subject,
+            "visibility": meta.visibility,
+            "lifecycle": meta.lifecycle().as_str(),
+            "description": meta.description,
+            "forked_from": meta.forked_from,
+            "stars": meta.stars.len(),
+            "starred": caller.user.as_ref().is_some_and(|u| meta.stars.contains(u)),
+            "role": effective_role(caller, meta),
+        }));
+    }
     Resp::json(serde_json::json!({
         "agents": items,
         "host": req.host(),
@@ -334,7 +370,7 @@ pub(crate) fn effective_role(caller: &Caller, meta: &AgentMeta) -> Option<&'stat
     meta.role_of(user).map(|r| r.as_str())
 }
 
-pub(crate) fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body: &[u8]) -> Resp {
+pub(crate) async fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body: &[u8]) -> Resp {
     let Some(user) = caller.user.clone() else {
         return Resp::err(401, "login required");
     };
@@ -360,14 +396,14 @@ pub(crate) fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body: &[u8
     let hypothetical =
         AgentAcl { name: name.clone(), owner: Some(user.clone()), visibility, lifecycle: Lifecycle::Active, members: vec![] };
     if let Decision::Deny(d) = acl::decide(caller, &hypothetical, Action::Write) {
-        audit_deny(ctx, &user, Some(&name), Action::Write, d);
+        audit_deny(ctx, &user, Some(&name), Action::Write, d).await;
         return Resp::err(403, d.reason());
     }
-    match create_agent(&ctx.store, &name, &user, visibility) {
+    match create_agent(&ctx.store, &name, &user, visibility).await {
         Ok(_) => {
-            audit::append(ctx.root(), &user, audit::AGENT_CREATE, Some(&name), &format!("visibility={}", visibility.as_str()));
+            audit_append(ctx.root(), &user, audit::AGENT_CREATE, Some(&name), &format!("visibility={}", visibility.as_str())).await;
             let repo = repo_path(ctx.root(), &name);
-            let (aid, aid_source) = agent_aid(&repo);
+            let (aid, aid_source) = tokio::task::spawn_blocking(move || agent_aid(&repo)).await.unwrap();
             Resp::json_status(
                 201,
                 serde_json::json!({
@@ -389,45 +425,84 @@ pub(crate) fn clone_url(ctx: &Ctx, req: &Req, name: &str) -> String {
     format!("{}://{}/{name}.git", if ctx.cfg.tls { "https" } else { "http" }, req.host())
 }
 
-pub(crate) fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta) -> Resp {
+/// Everything the agent-detail response reads out of the repo (git + fs). Collected inside one
+/// `spawn_blocking` so the whole subprocess fan-out stays off the async workers.
+struct AgentView {
+    sessions: Vec<serde_json::Value>,
+    history: Vec<serde_json::Value>,
+    readme: Option<String>,
+    environments: Vec<serde_json::Value>,
+    branches: Vec<serde_json::Value>,
+    size_bytes: u64,
+    runtimes: Vec<String>,
+    total: usize,
+    scanned: usize,
+    scan_capped: bool,
+}
+
+pub(crate) async fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta) -> Resp {
     let name = &meta.name;
-    let repo = repo_path(ctx.root(), name);
     let query = req.query();
     let search = param(query, "q").map(|q| q.replace('+', " ")).unwrap_or_default();
     let pageno: usize = param(query, "page").and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
-    let refs = if has_head(&repo) { session_refs(&repo) } else { vec![] };
 
-    // The hit set: no search = page straight through (git show only the current page); with a
-    // search = scan the content (capped).
-    let (window, total): (Vec<&SessionRef>, usize) = if search.is_empty() {
-        let start = (pageno - 1) * PER_PAGE;
-        (refs.iter().skip(start).take(PER_PAGE).collect(), refs.len())
-    } else {
-        let mut hits = vec![];
-        for r in refs.iter().take(SEARCH_SCAN_CAP) {
-            if load_session(&repo, &r.path, None).map(|b| b.contains(&search)).unwrap_or(false) {
-                hits.push(r);
+    // The aid reconcile is a store read+write, so it runs async (it offloads its own git read). Its
+    // result is independent of the session/history reads below, so ordering it first is fine.
+    let (aid, aid_source, aid_status) = sync_aid(ctx, meta, &caller.user.clone().unwrap_or_else(|| "anonymous".into())).await;
+
+    // All the per-repo git/fs reads (has_head, session_refs, load_session, session_summary,
+    // recent_log, readme, environments, branches, size_bytes, runtimes) shell out — one bounded
+    // spawn_blocking does the lot and returns the rendered pieces.
+    let root = ctx.root().to_path_buf();
+    let name_for_git = meta.name.clone();
+    let search2 = search.clone();
+    let v: AgentView = tokio::task::spawn_blocking(move || {
+        let repo = repo_path(&root, &name_for_git);
+        let refs = if has_head(&repo) { session_refs(&repo) } else { vec![] };
+        // The hit set: no search = page straight through (git show only the current page); with a
+        // search = scan the content (capped).
+        let (window, total): (Vec<&SessionRef>, usize) = if search2.is_empty() {
+            let start = (pageno - 1) * PER_PAGE;
+            (refs.iter().skip(start).take(PER_PAGE).collect(), refs.len())
+        } else {
+            let mut hits = vec![];
+            for r in refs.iter().take(SEARCH_SCAN_CAP) {
+                if load_session(&repo, &r.path, None).map(|b| b.contains(&search2)).unwrap_or(false) {
+                    hits.push(r);
+                }
             }
+            let total = hits.len();
+            let start = (pageno - 1) * PER_PAGE;
+            (hits.into_iter().skip(start).take(PER_PAGE).collect(), total)
+        };
+        let sessions: Vec<serde_json::Value> = window
+            .iter()
+            .filter_map(|r| {
+                let jsonl = load_session(&repo, &r.path, None)?;
+                Some(session_summary(&repo, r, &jsonl))
+            })
+            .collect();
+        let history: Vec<serde_json::Value> = recent_log(&repo, 10)
+            .into_iter()
+            .map(|(sha, subject)| serde_json::json!({ "sha": sha, "subject": subject }))
+            .collect();
+        AgentView {
+            sessions,
+            history,
+            readme: readme(&repo),
+            environments: environments(&repo, &refs),
+            branches: branches(&repo),
+            size_bytes: size_bytes(&repo),
+            runtimes: runtimes(&refs),
+            total,
+            // With a search, `total` counts the hits among the sessions actually scanned — so say how
+            // many that was, and whether the cap cut it short. The count alone cannot tell you.
+            scanned: if search2.is_empty() { refs.len() } else { refs.len().min(SEARCH_SCAN_CAP) },
+            scan_capped: !search2.is_empty() && refs.len() > SEARCH_SCAN_CAP,
         }
-        let total = hits.len();
-        let start = (pageno - 1) * PER_PAGE;
-        (hits.into_iter().skip(start).take(PER_PAGE).collect(), total)
-    };
-
-    let sessions: Vec<serde_json::Value> = window
-        .iter()
-        .filter_map(|r| {
-            let jsonl = load_session(&repo, &r.path, None)?;
-            Some(session_summary(&repo, r, &jsonl))
-        })
-        .collect();
-
-    let history: Vec<serde_json::Value> = recent_log(&repo, 10)
-        .into_iter()
-        .map(|(sha, subject)| serde_json::json!({ "sha": sha, "subject": subject }))
-        .collect();
-
-    let (aid, aid_source, aid_status) = sync_aid(ctx, meta, &caller.user.clone().unwrap_or_else(|| "anonymous".into()));
+    })
+    .await
+    .unwrap();
 
     let members: Vec<serde_json::Value> = meta
         .members
@@ -446,26 +521,24 @@ pub(crate) fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta)
         "lifecycle": meta.lifecycle().as_str(),
         "description": meta.description,
         "forked_from": meta.forked_from,
-        "readme": readme(&repo),
+        "readme": v.readme,
         "stars": meta.stars.len(),
         "starred": caller.user.as_ref().is_some_and(|u| meta.stars.contains(u)),
         "owner": meta.owner,
         "members": members,
         "role": effective_role(caller, meta),
-        "environments": environments(&repo, &refs),
-        "branches": branches(&repo),
-        "size_bytes": size_bytes(&repo),
-        "runtimes": runtimes(&refs),
-        "total": total,
+        "environments": v.environments,
+        "branches": v.branches,
+        "size_bytes": v.size_bytes,
+        "runtimes": v.runtimes,
+        "total": v.total,
         "page": pageno,
         "per_page": PER_PAGE,
-        // With a search, `total` counts the hits among the sessions actually scanned — so say how
-        // many that was, and whether the cap cut it short. The count alone cannot tell you.
-        "scanned": if search.is_empty() { refs.len() } else { refs.len().min(SEARCH_SCAN_CAP) },
+        "scanned": v.scanned,
         "scan_cap": SEARCH_SCAN_CAP,
-        "scan_capped": !search.is_empty() && refs.len() > SEARCH_SCAN_CAP,
-        "sessions": sessions,
-        "history": history,
+        "scan_capped": v.scan_capped,
+        "sessions": v.sessions,
+        "history": v.history,
     }))
 }
 
@@ -478,9 +551,10 @@ pub(crate) fn api_agent(ctx: &Ctx, req: &Req, caller: &Caller, meta: &AgentMeta)
 /// this does is the IO around it.
 ///
 /// `status`: "ok" | "learned" | "replaced" | "conflict".
-pub(crate) fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<String>, &'static str, &'static str) {
+pub(crate) async fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<String>, &'static str, &'static str) {
     let repo = repo_path(ctx.root(), &meta.name);
-    let (seen, source) = agent_aid(&repo);
+    // agent_aid shells out to `git show HEAD:agent.toml`; keep it off the async worker.
+    let (seen, source) = tokio::task::spawn_blocking(move || agent_aid(&repo)).await.unwrap();
 
     // Nothing to decide and nothing to write: the store said nothing this time, or it said what the
     // cache already holds. Taking the lock on every read of every agent would make a GET a file write.
@@ -514,31 +588,34 @@ pub(crate) fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<Stri
     let mut newly_conflicted = false;
     // The cache write stays best-effort, as before: the store is the authority, so a verdict whose
     // write failed is still the truth about what was read, and the next sync reconciles again.
-    let _ = ctx.store.update_agents(|list| {
-        let cached = list.iter().find(|m| m.name == name).and_then(|m| m.aid.clone());
-        let holder = seen
-            .as_deref()
-            .and_then(|a| list.iter().find(|m| m.aid.as_deref() == Some(a)))
-            .map(|m| m.name.clone());
-        let lineage = list.iter().find(|m| m.name == name).and_then(|m| m.forked_from_aid.clone());
-        verdict = identity::reconcile(&name, cached.as_deref(), seen.as_deref(), holder.as_deref(), lineage.as_deref());
-        let Some(m) = list.iter_mut().find(|m| m.name == name) else {
-            return;
-        };
-        match &verdict {
-            identity::AidVerdict::Learn(a) | identity::AidVerdict::Replaced { now: a, .. } => {
-                m.aid = Some(a.clone());
-                // Whatever collision was reported is over: this agent now holds an aid of its own,
-                // so the next one deserves a fresh alert.
-                m.aid_conflict = None;
+    let _ = ctx
+        .store
+        .update_agents(|list| {
+            let cached = list.iter().find(|m| m.name == name).and_then(|m| m.aid.clone());
+            let holder = seen
+                .as_deref()
+                .and_then(|a| list.iter().find(|m| m.aid.as_deref() == Some(a)))
+                .map(|m| m.name.clone());
+            let lineage = list.iter().find(|m| m.name == name).and_then(|m| m.forked_from_aid.clone());
+            verdict = identity::reconcile(&name, cached.as_deref(), seen.as_deref(), holder.as_deref(), lineage.as_deref());
+            let Some(m) = list.iter_mut().find(|m| m.name == name) else {
+                return;
+            };
+            match &verdict {
+                identity::AidVerdict::Learn(a) | identity::AidVerdict::Replaced { now: a, .. } => {
+                    m.aid = Some(a.clone());
+                    // Whatever collision was reported is over: this agent now holds an aid of its own,
+                    // so the next one deserves a fresh alert.
+                    m.aid_conflict = None;
+                }
+                identity::AidVerdict::Conflict { aid, .. } => {
+                    newly_conflicted = m.aid_conflict.as_deref() != Some(aid.as_str());
+                    m.aid_conflict = Some(aid.clone());
+                }
+                identity::AidVerdict::Inherited { .. } | identity::AidVerdict::Unchanged => {}
             }
-            identity::AidVerdict::Conflict { aid, .. } => {
-                newly_conflicted = m.aid_conflict.as_deref() != Some(aid.as_str());
-                m.aid_conflict = Some(aid.clone());
-            }
-            identity::AidVerdict::Inherited { .. } | identity::AidVerdict::Unchanged => {}
-        }
-    });
+        })
+        .await;
 
     match verdict {
         // Re-read under the lock, the cache already agreed — the race this section exists to close.
@@ -547,13 +624,13 @@ pub(crate) fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<Stri
             None => (None, source, "ok"),
         },
         identity::AidVerdict::Learn(a) => {
-            audit::append(ctx.root(), actor, audit::AGENT_AID_LEARNED, Some(&meta.name), &a);
+            audit_append(ctx.root(), actor, audit::AGENT_AID_LEARNED, Some(&meta.name), &a).await;
             (Some(a), source, "learned")
         }
         identity::AidVerdict::Replaced { was, now } => {
             // The store is the authority, so the cache follows it — but the response only says
             // "replaced" this once, and the audit log is what makes it still findable tomorrow.
-            audit::append(ctx.root(), actor, audit::AGENT_AID_REPLACED, Some(&meta.name), &format!("{was} → {now}"));
+            audit_append(ctx.root(), actor, audit::AGENT_AID_REPLACED, Some(&meta.name), &format!("{was} → {now}")).await;
             (Some(now), source, "replaced")
         }
         identity::AidVerdict::Conflict { aid, held_by } => {
@@ -562,13 +639,14 @@ pub(crate) fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<Stri
             // alerts on under thousands of copies of itself — so polling a conflicted agent became a
             // way to drown out the alert that names you.
             if newly_conflicted {
-                audit::append(
+                audit_append(
                     ctx.root(),
                     actor,
                     audit::AGENT_AID_CONFLICT,
                     Some(&meta.name),
                     &format!("{aid} is already held by {held_by}"),
-                );
+                )
+                .await;
             }
             // Deliberately does **not** name the other agent in the response: the caller may have no
             // permission to know it exists, and "which name holds this aid" is exactly what the
@@ -586,16 +664,16 @@ pub(crate) fn sync_aid(ctx: &Ctx, meta: &AgentMeta, actor: &str) -> (Option<Stri
 /// This is what makes a rename safe: a `.agit.toml` records the **aid**, and asks here for whatever
 /// name that memory currently answers to. Routes through the normal gate on the resolved agent, so
 /// an aid is not an oracle for the existence of agents you cannot read.
-pub(crate) fn api_agent_by_aid(ctx: &Ctx, req: &Req, caller: &Caller, aid: &str) -> Resp {
+pub(crate) async fn api_agent_by_aid(ctx: &Ctx, req: &Req, caller: &Caller, aid: &str) -> Resp {
     if !identity::is_aid(aid) {
         return Resp::err(400, "not an aid (want agt_<id>)");
     }
     // Unresolvable and unreadable must look the same, for the same reason gate() hides existence:
     // otherwise this endpoint enumerates the private agents by aid instead of by name.
-    let Some(meta) = ctx.store.agent_by_aid(aid) else {
+    let Some(meta) = ctx.store.agent_by_aid(aid).await else {
         return Resp::err(404, "not found");
     };
-    let meta = match gate(ctx, caller, &meta.name, Action::Read) {
+    let meta = match gate(ctx, caller, &meta.name, Action::Read).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -608,8 +686,8 @@ pub(crate) fn api_agent_by_aid(ctx: &Ctx, req: &Req, caller: &Caller, aid: &str)
     }))
 }
 
-pub(crate) fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Manage) {
+pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+    let meta = match gate(ctx, caller, name, Action::Manage).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -623,10 +701,10 @@ pub(crate) fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8
             return Resp::err(400, "visibility must be private or public");
         };
         if vis.as_str() != meta.visibility {
-            if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.visibility = vis.as_str().to_string()) {
+            if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.visibility = vis.as_str().to_string()).await {
                 return resp;
             }
-            audit::append(ctx.root(), &actor, audit::AGENT_VISIBILITY, Some(&meta.name), &format!("{} → {}", meta.visibility, vis.as_str()));
+            audit_append(ctx.root(), &actor, audit::AGENT_VISIBILITY, Some(&meta.name), &format!("{} → {}", meta.visibility, vis.as_str())).await;
         }
     }
 
@@ -637,10 +715,10 @@ pub(crate) fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8
             Ok(x) => x,
             Err(e) => return Resp::err(400, &format!("description {e}")),
         };
-        if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.description = d.clone()) {
+        if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.description = d.clone()).await {
             return resp;
         }
-        audit::append(ctx.root(), &actor, audit::AGENT_DESCRIBE, Some(&meta.name), d.as_deref().unwrap_or("(cleared)"));
+        audit_append(ctx.root(), &actor, audit::AGENT_DESCRIBE, Some(&meta.name), d.as_deref().unwrap_or("(cleared)")).await;
     }
 
     if let Some(newname) = str_field(&v, "name") {
@@ -648,7 +726,7 @@ pub(crate) fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8
             if !valid_agent_name(&newname) {
                 return Resp::err(400, "invalid name ([A-Za-z0-9._-] only, no .. and no leading dot)");
             }
-            if name_taken(ctx, &newname) {
+            if name_taken(ctx, &newname).await {
                 return Resp::err(409, "that name is already taken");
             }
             // Reserve the new name atomically — check and rename the record together under the lock, so
@@ -658,74 +736,87 @@ pub(crate) fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8
             // A rename is a metadata edit, not a new identity: only the label moves. The aid is
             // deliberately untouched (it lives in the store's agent.toml), so everything keyed on
             // identity survives.
-            let reserved = ctx.store.update_agents(|list| {
-                if list.iter().any(|m| m.name == newname) {
-                    return false;
-                }
-                if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
-                    m.name = newname.clone();
-                }
-                true
-            });
+            let reserved = ctx
+                .store
+                .update_agents(|list| {
+                    if list.iter().any(|m| m.name == newname) {
+                        return false;
+                    }
+                    if let Some(m) = list.iter_mut().find(|m| m.name == meta.name) {
+                        m.name = newname.clone();
+                    }
+                    true
+                })
+                .await;
             match reserved {
                 Ok(true) => {}
                 Ok(false) => return Resp::err(409, "that name is already taken"),
                 Err(_) => return Resp::err(500, "failed to write agents.json"),
             }
-            // Move the repo dir to match the record. On failure, roll the name back so the record and
-            // the directory never disagree.
-            if std::fs::rename(repo_path(ctx.root(), &meta.name), repo_path(ctx.root(), &newname)).is_err() {
-                let _ = ctx.store.update_agents(|list| {
-                    if let Some(m) = list.iter_mut().find(|m| m.name == newname) {
-                        m.name = meta.name.clone();
-                    }
-                });
+            // Move the repo dir to match the record (a blocking fs op, off the async worker). On
+            // failure, roll the name back so the record and the directory never disagree.
+            let from = repo_path(ctx.root(), &meta.name);
+            let to = repo_path(ctx.root(), &newname);
+            let moved = tokio::task::spawn_blocking(move || std::fs::rename(from, to).is_ok()).await.unwrap_or(false);
+            if !moved {
+                let _ = ctx
+                    .store
+                    .update_agents(|list| {
+                        if let Some(m) = list.iter_mut().find(|m| m.name == newname) {
+                            m.name = meta.name.clone();
+                        }
+                    })
+                    .await;
                 return Resp::err(500, "rename failed (the repo directory won't move)");
             }
             // Tokens are bound to the **name**. A rename doesn't change identity (the aid lives in
             // the store), so the bindings have to follow — otherwise one rename silently mutes every
             // CI token.
-            let _ = ctx.store.update_tokens(|toks| {
-                for t in toks.iter_mut().filter(|t| t.agent.as_deref() == Some(meta.name.as_str())) {
-                    t.agent = Some(newname.clone());
-                }
-            });
+            let _ = ctx
+                .store
+                .update_tokens(|toks| {
+                    for t in toks.iter_mut().filter(|t| t.agent.as_deref() == Some(meta.name.as_str())) {
+                        t.agent = Some(newname.clone());
+                    }
+                })
+                .await;
             // MR endpoints carry both aid and name; the names are labels and have to follow too.
-            let _ = ctx.store.rename_in_mrs(&meta.name, &newname);
-            audit::append(ctx.root(), &actor, audit::AGENT_RENAME, Some(&newname), &format!("{} → {newname}", meta.name));
+            let _ = ctx.store.rename_in_mrs(&meta.name, &newname).await;
+            audit_append(ctx.root(), &actor, audit::AGENT_RENAME, Some(&newname), &format!("{} → {newname}", meta.name)).await;
             // Echo the aid back: the whole point of the rename being safe is that identity did not
             // move, and a caller should be able to see that rather than take it on faith.
             return Resp::json(serde_json::json!({ "name": newname, "renamed_from": meta.name, "aid": meta.aid }));
         }
     }
 
-    let fresh = ctx.store.agent_or_unowned(&meta.name);
+    let fresh = ctx.store.agent_or_unowned(&meta.name).await;
     Resp::json(serde_json::json!({ "name": fresh.name, "visibility": fresh.visibility, "owner": fresh.owner }))
 }
 
 /// Is this name spoken for? **Includes soft-deleted agents**, whose whole point is that the name
 /// stays theirs: hand it to someone else and the restore has nowhere to land, while every token and
 /// `.agit.toml` still pointing at the name silently starts addressing a stranger's agent.
-pub(crate) fn name_taken(ctx: &Ctx, name: &str) -> bool {
-    ctx.store.agent(name).is_some() || repo_path(ctx.root(), name).exists()
+pub(crate) async fn name_taken(ctx: &Ctx, name: &str) -> bool {
+    ctx.store.agent(name).await.is_some() || repo_path(ctx.root(), name).exists()
 }
 
 /// Mutate the agents.json record for `name` under the lock, mapping a write failure to a 500. The
 /// find-by-name / err-to-500 boilerplate that every field-editing handler otherwise repeats.
-pub(crate) fn edit_agent(ctx: &Ctx, name: &str, f: impl FnOnce(&mut AgentMeta)) -> Result<(), Resp> {
+pub(crate) async fn edit_agent(ctx: &Ctx, name: &str, f: impl FnOnce(&mut AgentMeta)) -> Result<(), Resp> {
     ctx.store
         .update_agents(|list| {
             if let Some(m) = list.iter_mut().find(|m| m.name == name) {
                 f(m);
             }
         })
+        .await
         .map_err(|_| Resp::err(500, "failed to write agents.json"))
 }
 
 /// Move an agent between lifecycle states. The state itself is enforced in `acl::decide` — this only
 /// writes it down.
-pub(crate) fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Lifecycle, from: &[Lifecycle], action: &'static str) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Manage) {
+pub(crate) async fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Lifecycle, from: &[Lifecycle], action: &'static str) -> Resp {
+    let meta = match gate(ctx, caller, name, Action::Manage).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -734,11 +825,11 @@ pub(crate) fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Lifecycl
     if !from.contains(&meta.lifecycle()) {
         return Resp::err(409, &format!("this agent is {}", meta.lifecycle().as_str()));
     }
-    if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.lifecycle = to.as_str().to_string()) {
+    if let Err(resp) = edit_agent(ctx, &meta.name, |m| m.lifecycle = to.as_str().to_string()).await {
         return resp;
     }
     let actor = caller.user.clone().unwrap_or_default();
-    audit::append(ctx.root(), &actor, action, Some(&meta.name), &format!("{} → {}", meta.lifecycle().as_str(), to.as_str()));
+    audit_append(ctx.root(), &actor, action, Some(&meta.name), &format!("{} → {}", meta.lifecycle().as_str(), to.as_str())).await;
     Resp::json(serde_json::json!({ "name": meta.name, "lifecycle": to.as_str(), "aid": meta.aid }))
 }
 
@@ -747,34 +838,36 @@ pub(crate) fn set_lifecycle(ctx: &Ctx, caller: &Caller, name: &str, to: Lifecycl
 ///
 /// Destroying the bytes is `?purge=true`, and only from here — two steps, because the one-step version
 /// of this is how a memory nobody meant to lose gets lost.
-pub(crate) fn api_delete_agent(ctx: &Ctx, caller: &Caller, name: &str, query: &str) -> Resp {
+pub(crate) async fn api_delete_agent(ctx: &Ctx, caller: &Caller, name: &str, query: &str) -> Resp {
     if param(query, "purge").as_deref() == Some("true") {
-        return api_purge_agent(ctx, caller, name);
+        return api_purge_agent(ctx, caller, name).await;
     }
-    set_lifecycle(ctx, caller, name, Lifecycle::Deleted, &[Lifecycle::Active, Lifecycle::Archived], audit::AGENT_DELETE)
+    set_lifecycle(ctx, caller, name, Lifecycle::Deleted, &[Lifecycle::Active, Lifecycle::Archived], audit::AGENT_DELETE).await
 }
 
 /// The irreversible one: the bytes go. Only reachable for an already soft-deleted agent, so nothing
 /// live can be destroyed by a single mistyped verb.
-pub(crate) fn api_purge_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Manage) {
+pub(crate) async fn api_purge_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
+    let meta = match gate(ctx, caller, name, Action::Manage).await {
         Ok(x) => x,
         Err(r) => return r,
     };
     if meta.lifecycle() != Lifecycle::Deleted {
         return Resp::err(409, "purge only empties the trash: delete this agent first, then purge it");
     }
-    if std::fs::remove_dir_all(repo_path(ctx.root(), &meta.name)).is_err() {
+    let dir = repo_path(ctx.root(), &meta.name);
+    let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir).is_ok()).await.unwrap_or(false);
+    if !removed {
         return Resp::err(500, "can't remove the repo directory");
     }
-    let _ = ctx.store.update_agents(|list| list.retain(|m| m.name != meta.name));
+    let _ = ctx.store.update_agents(|list| list.retain(|m| m.name != meta.name)).await;
     // Tokens bound to this name must die with it: otherwise, when someone later creates an agent
     // with the same name, the old tokens would **automatically** gain rights on that new agent (the
     // name was recycled, but the token still keys off the name).
-    let _ = ctx.store.update_tokens(|toks| toks.retain(|t| t.agent.as_deref() != Some(meta.name.as_str())));
+    let _ = ctx.store.update_tokens(|toks| toks.retain(|t| t.agent.as_deref() != Some(meta.name.as_str()))).await;
     // Same reasoning for MRs targeting it: a recycled name must not inherit the old agent's reviews.
-    let _ = ctx.store.update_mrs(|mrs| mrs.retain(|m| m.target.agent != meta.name));
-    audit::append(ctx.root(), &caller.user.clone().unwrap_or_default(), audit::AGENT_PURGE, Some(&meta.name), "");
+    let _ = ctx.store.update_mrs(|mrs| mrs.retain(|m| m.target.agent != meta.name)).await;
+    audit_append(ctx.root(), &caller.user.clone().unwrap_or_default(), audit::AGENT_PURGE, Some(&meta.name), "").await;
     Resp::no_content()
 }
 
@@ -790,10 +883,10 @@ pub(crate) fn api_purge_agent(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
 /// agent.toml, so the fork wears the source's identity until someone rebinds it locally
 /// (`agit a rebind`) and pushes — until then `sync_aid` reports it as a conflict and refuses to cache
 /// it, which is exactly right: two agents may never share one aid, and the Hub does not mint them.
-pub(crate) fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, body: &[u8]) -> Resp {
     // You cannot fork what you cannot read — otherwise fork is an oracle for private agents, and a
     // way to walk off with one.
-    let source = match gate(ctx, caller, name, Action::Read) {
+    let source = match gate(ctx, caller, name, Action::Read).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -802,7 +895,7 @@ pub(crate) fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, 
     };
     // A fork is a write the caller performs, so a read-only token must not get to do it.
     if caller.token.as_ref().is_some_and(|t| t.scope != Scope::Write) {
-        audit_deny(ctx, &user, Some(name), Action::Write, Deny::TokenScope);
+        audit_deny(ctx, &user, Some(name), Action::Write, Deny::TokenScope).await;
         return Resp::err(403, Deny::TokenScope.reason());
     }
     let fork = match json_body(body).as_ref().and_then(|v| str_field(v, "name")) {
@@ -812,62 +905,82 @@ pub(crate) fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, 
     if !valid_agent_name(&fork) {
         return Resp::err(400, "invalid name ([A-Za-z0-9._-] only, no .. and no leading dot)");
     }
-    if name_taken(ctx, &fork) {
+    if name_taken(ctx, &fork).await {
         return Resp::err(409, "that name is already taken");
     }
     let dst = repo_path(ctx.root(), &fork);
-    let ok = Command::new("git")
-        .args(["clone", "-q", "--bare"])
-        .arg(repo_path(ctx.root(), &source.name))
-        .arg(&dst)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        let _ = std::fs::remove_dir_all(&dst);
+    // `git clone --bare` + the two `git config`/`remote` calls + install_pre_receive + reading the
+    // source's aid all shell out or touch the fs. Run the whole lot on the blocking pool: it returns
+    // None if the clone failed (already cleaned up), else the source's aid (the fork's lineage).
+    let clone_out: Option<Option<String>> = {
+        let src = repo_path(ctx.root(), &source.name);
+        let dst = dst.clone();
+        let root = ctx.root().to_path_buf();
+        let fork = fork.clone();
+        tokio::task::spawn_blocking(move || {
+            let ok = Command::new("git")
+                .args(["clone", "-q", "--bare"])
+                .arg(&src)
+                .arg(&dst)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                let _ = std::fs::remove_dir_all(&dst);
+                return None;
+            }
+            let _ = Command::new("git").arg("-C").arg(&dst).args(["config", "http.receivepack", "true"]).status();
+            // A bare clone records its origin. The fork is its own agent on its own disk — leaving a
+            // remote pointing at the source would make its `--not --all` scan bound, and its pushes
+            // routable, through somebody else's repo.
+            let _ = Command::new("git").arg("-C").arg(&dst).args(["remote", "remove", "origin"]).status();
+            install_pre_receive(&dst, &root, &fork);
+            // The identity the clone carries. Recorded as lineage so `identity::reconcile` can tell
+            // this fork's inherited aid from a stolen one — see `AgentMeta::forked_from_aid`. Read from
+            // the source repo rather than from `source.aid`, which is only the Hub's cache.
+            let (src_aid, _) = agent_aid(&src);
+            Some(src_aid)
+        })
+        .await
+        .unwrap()
+    };
+    let Some(src_aid) = clone_out else {
         return Resp::err(500, "git clone --bare failed");
-    }
-    let _ = Command::new("git").arg("-C").arg(&dst).args(["config", "http.receivepack", "true"]).status();
-    // A bare clone records its origin. The fork is its own agent on its own disk — leaving a remote
-    // pointing at the source would make its `--not --all` scan bound, and its pushes routable,
-    // through somebody else's repo.
-    let _ = Command::new("git").arg("-C").arg(&dst).args(["remote", "remove", "origin"]).status();
-    install_pre_receive(&dst, ctx.root(), &fork);
-
-    // The identity the clone carries. Recorded as lineage so `identity::reconcile` can tell this
-    // fork's inherited aid from a stolen one — see `AgentMeta::forked_from_aid`. Read from the source
-    // repo rather than from `source.aid`, which is only the Hub's cache and may not have been
-    // populated yet.
-    let (src_aid, _) = agent_aid(&repo_path(ctx.root(), &source.name));
+    };
     // Private by default, whatever the source was: forking a public agent is not a decision to
     // publish your copy of it.
     // Authoritative name check, atomic with the insert. The `name_taken` above is only a fast fail; a
     // fork that raced us to this name between there and here must not produce a second record.
-    let r = ctx.store.update_agents(|list| {
-        if list.iter().any(|a| a.name == fork) {
-            return false;
-        }
-        list.push(AgentMeta {
-            forked_from: Some(source.name.clone()),
-            forked_from_aid: src_aid.clone(),
-            description: source.description.clone(),
-            ..AgentMeta::new(&fork, Some(&user), Visibility::Private)
-        });
-        true
-    });
+    let r = ctx
+        .store
+        .update_agents(|list| {
+            if list.iter().any(|a| a.name == fork) {
+                return false;
+            }
+            list.push(AgentMeta {
+                forked_from: Some(source.name.clone()),
+                forked_from_aid: src_aid.clone(),
+                description: source.description.clone(),
+                ..AgentMeta::new(&fork, Some(&user), Visibility::Private)
+            });
+            true
+        })
+        .await;
     match r {
         Ok(true) => {}
         Ok(false) => {
-            let _ = std::fs::remove_dir_all(&dst);
+            let d = dst.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(d)).await;
             return Resp::err(409, "that name is already taken");
         }
         Err(_) => {
-            let _ = std::fs::remove_dir_all(&dst);
+            let d = dst.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(d)).await;
             return Resp::err(500, "failed to write agents.json");
         }
     }
-    audit::append(ctx.root(), &user, audit::AGENT_FORK, Some(&fork), &format!("forked from {}", source.name));
-    let (aid, aid_source) = agent_aid(&dst);
+    audit_append(ctx.root(), &user, audit::AGENT_FORK, Some(&fork), &format!("forked from {}", source.name)).await;
+    let (aid, aid_source) = tokio::task::spawn_blocking(move || agent_aid(&dst)).await.unwrap();
     Resp::json_status(
         201,
         serde_json::json!({
@@ -902,12 +1015,12 @@ pub(crate) fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: &str, 
 /// bookmark something would make the feature useless for exactly the agents worth bookmarking. It
 /// still writes hub state, so it takes an identity and refuses a read-only token, same as an MR
 /// comment (see `mutation_actor`).
-pub(crate) fn api_star_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Read) {
+pub(crate) async fn api_star_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+    let meta = match gate(ctx, caller, name, Action::Read).await {
         Ok(x) => x,
         Err(r) => return r,
     };
-    let actor = match mutation_actor(ctx, caller, name) {
+    let actor = match mutation_actor(ctx, caller, name).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -918,11 +1031,13 @@ pub(crate) fn api_star_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]
         if on {
             m.stars.push(who.clone());
         }
-    }) {
+    })
+    .await
+    {
         return resp;
     }
-    audit::append(ctx.root(), &actor, audit::AGENT_STAR, Some(&meta.name), if on { "starred" } else { "unstarred" });
-    let fresh = ctx.store.agent_or_unowned(&meta.name);
+    audit_append(ctx.root(), &actor, audit::AGENT_STAR, Some(&meta.name), if on { "starred" } else { "unstarred" }).await;
+    let fresh = ctx.store.agent_or_unowned(&meta.name).await;
     Resp::json(serde_json::json!({ "name": meta.name, "starred": on, "stars": fresh.stars.len() }))
 }
 
@@ -935,8 +1050,8 @@ pub(crate) fn api_star_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]
 /// grant — hands the new owner an agent that someone else still controls without saying so. The way
 /// back is for the new owner to add them, or for the site admin to step in; both are deliberate acts
 /// by someone who still has the rights, which is the property worth keeping.
-pub(crate) fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
-    let meta = match gate(ctx, caller, name, Action::Manage) {
+pub(crate) async fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+    let meta = match gate(ctx, caller, name, Action::Manage).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -946,7 +1061,7 @@ pub(crate) fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &
     let to = store::normalize_username(&to);
     // Only a real, existing user — the same rule members follow, and for the same reason: an agent
     // owned by a name nobody holds is an agent whoever registers that name later inherits.
-    if ctx.store.user(&to).is_none() {
+    if ctx.store.user(&to).await.is_none() {
         return Resp::err(400, &format!("no such user: {to}"));
     }
     if meta.owner.as_deref() == Some(to.as_str()) {
@@ -958,17 +1073,20 @@ pub(crate) fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &
         // The new owner's membership row, if any, is now noise at best and a demotion at worst (owner
         // outranks every role) — drop it rather than leave two answers to "what may they do".
         m.members.retain(|x| x.username != target);
-    }) {
+    })
+    .await
+    {
         return resp;
     }
     let actor = caller.user.clone().unwrap_or_default();
-    audit::append(
+    audit_append(
         ctx.root(),
         &actor,
         audit::AGENT_TRANSFER,
         Some(&meta.name),
         &format!("{} → {to}", from.as_deref().unwrap_or("(unowned)")),
-    );
+    )
+    .await;
     Resp::json(serde_json::json!({
         "name": meta.name,
         "owner": to,
@@ -981,12 +1099,12 @@ pub(crate) fn api_transfer_agent(ctx: &Ctx, caller: &Caller, name: &str, body: &
 
 // ── members ──
 
-pub(crate) fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
+pub(crate) async fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
     let actor = caller.user.clone().unwrap_or_default();
     // GET only needs read (the member list is already shown to readers in the agent detail);
     // adding/removing needs Manage.
     let action = if method == "GET" { Action::Read } else { Action::Manage };
-    let meta = match gate(ctx, caller, name, action) {
+    let meta = match gate(ctx, caller, name, action).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -1012,7 +1130,7 @@ pub(crate) fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, me
             // Only real, existing users can be added — otherwise agents.json collects a pile of
             // misspelled names, and whoever really gets that name later **automatically** inherits
             // the grant.
-            if ctx.store.user(&username).is_none() {
+            if ctx.store.user(&username).await.is_none() {
                 return Resp::err(400, "no such user");
             }
             if meta.owner.as_deref() == Some(username.as_str()) {
@@ -1023,11 +1141,13 @@ pub(crate) fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, me
                     Some(x) => x.role = role.as_str().to_string(),
                     None => m.members.push(Member { username: username.clone(), role: role.as_str().to_string() }),
                 }
-            }) {
+            })
+            .await
+            {
                 return resp;
             }
-            audit::append(ctx.root(), &actor, audit::MEMBER_ADD, Some(&meta.name), &format!("{username}={}", role.as_str()));
-            let fresh = ctx.store.agent_or_unowned(&meta.name);
+            audit_append(ctx.root(), &actor, audit::MEMBER_ADD, Some(&meta.name), &format!("{username}={}", role.as_str())).await;
+            let fresh = ctx.store.agent_or_unowned(&meta.name).await;
             Resp::json(serde_json::json!(fresh
                 .members
                 .iter()
@@ -1046,11 +1166,12 @@ pub(crate) fn api_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, me
                     }
                     None => false,
                 })
+                .await
                 .unwrap_or(false);
             if !removed {
                 return Resp::err(404, "that person isn't a member");
             }
-            audit::append(ctx.root(), &actor, audit::MEMBER_REMOVE, Some(&meta.name), &username);
+            audit_append(ctx.root(), &actor, audit::MEMBER_REMOVE, Some(&meta.name), &username).await;
             Resp::no_content()
         }
         _ => Resp::text(405, "method not allowed"),
@@ -1070,64 +1191,76 @@ pub(crate) const XSEARCH_MAX_HITS: usize = 50;
 ///
 /// The permission is per agent and decided by `acl::decide`, exactly like everywhere else: an agent
 /// you cannot read contributes nothing, and cannot even be inferred from a hit count.
-pub(crate) fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
+pub(crate) async fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     let q = param(req.query(), "q").map(|q| q.replace('+', " ")).unwrap_or_default();
     let q = q.trim().to_lowercase();
     if q.len() < 2 {
         return Resp::err(400, "want q, at least 2 characters");
     }
-    let mut hits: Vec<serde_json::Value> = vec![];
-    let mut scanned = 0usize;
-    let mut capped = false;
-
-    'agents: for name in list_agents(ctx.root()) {
-        let meta = ctx.store.agent_or_unowned(&name);
-        if !acl::decide(caller, &meta.to_acl(), Action::Read).allowed() {
-            continue;
-        }
-        let repo = repo_path(ctx.root(), &name);
-        if !has_head(&repo) {
-            continue;
-        }
-        for r in session_refs(&repo) {
-            if scanned >= XSEARCH_SCAN_CAP || hits.len() >= XSEARCH_MAX_HITS {
-                capped = true;
-                break 'agents;
-            }
-            scanned += 1;
-            let Some(jsonl) = load_session(&repo, &r.path, None) else {
-                continue;
-            };
-            let d = digest(&r.runtime, &r.id, &jsonl);
-            let conclusion = d.texts.last().cloned().unwrap_or_default();
-            // Where it matched is worth reporting: "in a prompt" and "in a filename" are different
-            // memories, and the UI can say which.
-            let mut fields = vec![];
-            if d.prompts.iter().any(|p| p.to_lowercase().contains(&q)) {
-                fields.push("prompt");
-            }
-            if conclusion.to_lowercase().contains(&q) {
-                fields.push("conclusion");
-            }
-            if d.files.iter().any(|f| f.to_lowercase().contains(&q)) {
-                fields.push("file");
-            }
-            if fields.is_empty() {
-                continue;
-            }
-            hits.push(serde_json::json!({
-                "agent": name,
-                "aid": meta.aid,
-                "id": d.id,
-                "env": r.env,
-                "runtime": r.runtime,
-                "matched": fields,
-                "title": d.prompts.first().map(|s| first_line(s)).unwrap_or_default(),
-                "conclusion": clip(&conclusion, 200),
-                "files": d.files.iter().filter(|f| f.to_lowercase().contains(&q)).take(5).cloned().collect::<Vec<_>>(),
-            }));
+    // Decide readability async (each per-agent ACL is a store read), then hand the whole
+    // subprocess-heavy scan (has_head + session_refs + load_session + digest, capped) to the blocking
+    // pool in one shot.
+    let mut readable: Vec<(String, Option<String>)> = Vec::new();
+    for name in list_agents(ctx.root()) {
+        let meta = ctx.store.agent_or_unowned(&name).await;
+        if acl::decide(caller, &meta.to_acl(), Action::Read).allowed() {
+            readable.push((name, meta.aid.clone()));
         }
     }
+    let root = ctx.root().to_path_buf();
+    let qc = q.clone();
+    let (hits, scanned, capped): (Vec<serde_json::Value>, usize, bool) = tokio::task::spawn_blocking(move || {
+        let mut hits: Vec<serde_json::Value> = vec![];
+        let mut scanned = 0usize;
+        let mut capped = false;
+        'agents: for (name, aid) in &readable {
+            let repo = repo_path(&root, name);
+            if !has_head(&repo) {
+                continue;
+            }
+            for r in session_refs(&repo) {
+                if scanned >= XSEARCH_SCAN_CAP || hits.len() >= XSEARCH_MAX_HITS {
+                    capped = true;
+                    break 'agents;
+                }
+                scanned += 1;
+                let Some(jsonl) = load_session(&repo, &r.path, None) else {
+                    continue;
+                };
+                let d = digest(&r.runtime, &r.id, &jsonl);
+                let conclusion = d.texts.last().cloned().unwrap_or_default();
+                // Where it matched is worth reporting: "in a prompt" and "in a filename" are different
+                // memories, and the UI can say which.
+                let mut fields = vec![];
+                if d.prompts.iter().any(|p| p.to_lowercase().contains(&qc)) {
+                    fields.push("prompt");
+                }
+                if conclusion.to_lowercase().contains(&qc) {
+                    fields.push("conclusion");
+                }
+                if d.files.iter().any(|f| f.to_lowercase().contains(&qc)) {
+                    fields.push("file");
+                }
+                if fields.is_empty() {
+                    continue;
+                }
+                hits.push(serde_json::json!({
+                    "agent": name,
+                    "aid": aid,
+                    "id": d.id,
+                    "env": r.env,
+                    "runtime": r.runtime,
+                    "matched": fields,
+                    "title": d.prompts.first().map(|s| first_line(s)).unwrap_or_default(),
+                    "conclusion": clip(&conclusion, 200),
+                    "files": d.files.iter().filter(|f| f.to_lowercase().contains(&qc)).take(5).cloned().collect::<Vec<_>>(),
+                }));
+            }
+        }
+        (hits, scanned, capped)
+    })
+    .await
+    .unwrap();
 
     Resp::json(serde_json::json!({
         "q": q,
@@ -1157,7 +1290,7 @@ pub(crate) fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
 /// since anyone who may read the review may take part in it. That tier is about *who may join the
 /// discussion* — it is not a claim that a comment is not a write, so every POST here additionally
 /// clears `mutation_actor`. Nothing here merges anything: see the module docs on `agit::hub::mr`.
-pub(crate) fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, query: &str, body: &[u8]) -> Resp {
+pub(crate) async fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, query: &str, body: &[u8]) -> Resp {
     // The action this route needs, decided **before** the agent is fetched, so the gate is the first
     // thing that happens on every path.
     let action = match (method, tail) {
@@ -1167,13 +1300,13 @@ pub(crate) fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method
         ("POST", t) if t.ends_with("/close") => Action::Write,
         _ => return Resp::text(405, "method not allowed"),
     };
-    let meta = match gate(ctx, caller, name, action) {
+    let meta = match gate(ctx, caller, name, action).await {
         Ok(x) => x,
         Err(r) => return r,
     };
     // Every POST below mutates hub state, whichever tier `gate` authorized it at.
     let actor = match method {
-        "POST" => match mutation_actor(ctx, caller, name) {
+        "POST" => match mutation_actor(ctx, caller, name).await {
             Ok(a) => a,
             Err(r) => return r,
         },
@@ -1181,8 +1314,8 @@ pub(crate) fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method
     };
 
     match (method, tail) {
-        ("GET", "") => api_mr_list(ctx, caller, &meta, query),
-        ("POST", "") => api_mr_open(ctx, caller, &meta, &actor, body),
+        ("GET", "") => api_mr_list(ctx, caller, &meta, query).await,
+        ("POST", "") => api_mr_open(ctx, caller, &meta, &actor, body).await,
         _ => {
             // mrs/<id> | mrs/<id>/comments | mrs/<id>/close
             let rest = match tail.strip_prefix('/') {
@@ -1197,9 +1330,9 @@ pub(crate) fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method
                 return Resp::err(404, "not found");
             };
             match (method, sub) {
-                ("GET", "") => api_mr_detail(ctx, caller, &meta, id),
-                ("POST", "comments") => api_mr_comment(ctx, &meta, id, &actor, body),
-                ("POST", "close") => api_mr_close(ctx, caller, &meta, id, &actor, body),
+                ("GET", "") => api_mr_detail(ctx, caller, &meta, id).await,
+                ("POST", "comments") => api_mr_comment(ctx, &meta, id, &actor, body).await,
+                ("POST", "close") => api_mr_close(ctx, caller, &meta, id, &actor, body).await,
                 _ => Resp::text(405, "method not allowed"),
             }
         }
@@ -1218,13 +1351,13 @@ pub(crate) fn api_mrs(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method
 ///     `Action::Write`, so a route gated at Read never reaches that rule — see acl.rs's
 ///     `read_token_never_writes_even_for_the_owner`. The cap is an intersection, not a maximum, so it
 ///     has to be applied where the write actually happens.
-pub(crate) fn mutation_actor(ctx: &Ctx, caller: &Caller, name: &str) -> Result<String, Resp> {
+pub(crate) async fn mutation_actor(ctx: &Ctx, caller: &Caller, name: &str) -> Result<String, Resp> {
     let Some(actor) = caller.user.clone() else {
-        audit_deny(ctx, "anonymous", Some(name), Action::Write, Deny::Anonymous);
+        audit_deny(ctx, "anonymous", Some(name), Action::Write, Deny::Anonymous).await;
         return Err(Resp::err(401, "login required"));
     };
     if caller.token.as_ref().is_some_and(|t| t.scope != Scope::Write) {
-        audit_deny(ctx, &actor, Some(name), Action::Write, Deny::TokenScope);
+        audit_deny(ctx, &actor, Some(name), Action::Write, Deny::TokenScope).await;
         return Err(Resp::err(403, Deny::TokenScope.reason()));
     }
     Ok(actor)
@@ -1232,7 +1365,7 @@ pub(crate) fn mutation_actor(ctx: &Ctx, caller: &Caller, name: &str) -> Result<S
 
 /// The list view: no transcripts. They are the big field, and nobody reading an index wants every
 /// merge dialogue on the agent shipped along with it.
-pub(crate) fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, query: &str) -> Resp {
+pub(crate) async fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, query: &str) -> Resp {
     let page = match page_params(query) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1245,28 +1378,30 @@ pub(crate) fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, query: &
         Some(Err(_)) => return Resp::err(400, "invalid cursor"),
     };
     let all: Vec<mr::Mr> =
-        ctx.store.mrs_for(&meta.name).into_iter().filter(|m| after.is_none_or(|a| m.id > a)).collect();
+        ctx.store.mrs_for(&meta.name).await.into_iter().filter(|m| after.is_none_or(|a| m.id > a)).collect();
     let has_more = all.len() > page.limit;
     let window: Vec<mr::Mr> = all.into_iter().take(page.limit).collect();
     let next_cursor = has_more.then(|| window.last().map(|m| cursor_encode(&m.id.to_string()))).flatten();
 
-    let items: Vec<serde_json::Value> = window
-        .iter()
-        .map(|m| {
-            serde_json::json!({
-                "id": m.id,
-                "title": m.title,
-                "author": m.author,
-                "state": m.state,
-                "created": m.created,
-                "updated": m.updated,
-                "source": mr_endpoint_json(ctx, caller, &m.source),
-                "target": mr_endpoint_json(ctx, caller, &m.target),
-                "comments": m.comments.len(),
-                "has_transcript": m.dialogue_transcript.is_some() && can_read_agent(ctx, caller, &m.source.agent),
-            })
-        })
-        .collect();
+    // A loop, not an iterator chain: each row's per-reader redaction is an async store read.
+    let mut items: Vec<serde_json::Value> = Vec::with_capacity(window.len());
+    for m in &window {
+        let source = mr_endpoint_json(ctx, caller, &m.source).await;
+        let target = mr_endpoint_json(ctx, caller, &m.target).await;
+        let has_transcript = m.dialogue_transcript.is_some() && can_read_agent(ctx, caller, &m.source.agent).await;
+        items.push(serde_json::json!({
+            "id": m.id,
+            "title": m.title,
+            "author": m.author,
+            "state": m.state,
+            "created": m.created,
+            "updated": m.updated,
+            "source": source,
+            "target": target,
+            "comments": m.comments.len(),
+            "has_transcript": has_transcript,
+        }));
+    }
     Resp::json(serde_json::json!({
         "agent": meta.name,
         "mrs": items,
@@ -1275,8 +1410,8 @@ pub(crate) fn api_mr_list(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, query: &
     }))
 }
 
-pub(crate) fn can_read_agent(ctx: &Ctx, caller: &Caller, agent: &str) -> bool {
-    acl::decide(caller, &ctx.store.agent_or_unowned(agent).to_acl(), Action::Read).allowed()
+pub(crate) async fn can_read_agent(ctx: &Ctx, caller: &Caller, agent: &str) -> bool {
+    acl::decide(caller, &ctx.store.agent_or_unowned(agent).await.to_acl(), Action::Read).allowed()
 }
 
 /// Serialize one endpoint **for this reader**, not for the person who opened the MR.
@@ -1286,19 +1421,21 @@ pub(crate) fn can_read_agent(ctx: &Ctx, caller: &Caller, agent: &str) -> bool {
 /// who can read the *target* reads the object. Deciding again per reader is what keeps `gate`'s rule —
 /// existence is itself a secret — true of the MR views too; checking only the opener leaves the name,
 /// aid and ref of a private agent readable by anonymous.
-pub(crate) fn mr_endpoint_json(ctx: &Ctx, caller: &Caller, e: &mr::Endpoint) -> serde_json::Value {
-    if !can_read_agent(ctx, caller, &e.agent) {
+pub(crate) async fn mr_endpoint_json(ctx: &Ctx, caller: &Caller, e: &mr::Endpoint) -> serde_json::Value {
+    if !can_read_agent(ctx, caller, &e.agent).await {
         return serde_json::json!({ "aid": null, "agent": null, "ref": null, "redacted": true });
     }
     serde_json::json!({ "aid": e.aid, "agent": e.agent, "ref": e.git_ref })
 }
 
-pub(crate) fn mr_json(ctx: &Ctx, caller: &Caller, m: &mr::Mr) -> serde_json::Value {
+pub(crate) async fn mr_json(ctx: &Ctx, caller: &Caller, m: &mr::Mr) -> serde_json::Value {
     // The transcript is the dialogue `agit a merge` held *between the two sides*, so it quotes the
     // source by construction — a reader who may not know the source exists may not read it either.
     // Withheld whole rather than filtered: there is no reliable way to strip one agent's voice out of
     // free text, and a partial redaction that looks complete is worse than an honest absence.
-    let show_source = can_read_agent(ctx, caller, &m.source.agent);
+    let show_source = can_read_agent(ctx, caller, &m.source.agent).await;
+    let source = mr_endpoint_json(ctx, caller, &m.source).await;
+    let target = mr_endpoint_json(ctx, caller, &m.target).await;
     serde_json::json!({
         "id": m.id,
         "title": m.title,
@@ -1306,8 +1443,8 @@ pub(crate) fn mr_json(ctx: &Ctx, caller: &Caller, m: &mr::Mr) -> serde_json::Val
         "state": m.state,
         "created": m.created,
         "updated": m.updated,
-        "source": mr_endpoint_json(ctx, caller, &m.source),
-        "target": mr_endpoint_json(ctx, caller, &m.target),
+        "source": source,
+        "target": target,
         "dialogue_transcript": if show_source { m.dialogue_transcript.clone() } else { None },
         "transcript_redacted": !show_source && m.dialogue_transcript.is_some(),
         "comments": m.comments.iter().map(|c| serde_json::json!({
@@ -1319,7 +1456,7 @@ pub(crate) fn mr_json(ctx: &Ctx, caller: &Caller, m: &mr::Mr) -> serde_json::Val
     })
 }
 
-pub(crate) fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, actor: &str, body: &[u8]) -> Resp {
+pub(crate) async fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, actor: &str, body: &[u8]) -> Resp {
     let Some(v) = json_body(body) else {
         return Resp::err(400, "want a JSON body");
     };
@@ -1337,7 +1474,7 @@ pub(crate) fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, actor: &
     // The source is a real agent on this Hub, and **the caller must be able to read it**: an MR
     // carries the source's identity and ref into an object other people will read, so proposing from
     // an agent you cannot see would leak that it exists.
-    let source = match gate(ctx, caller, &source_name, Action::Read) {
+    let source = match gate(ctx, caller, &source_name, Action::Read).await {
         Ok(x) => x,
         Err(r) => return r,
     };
@@ -1361,15 +1498,15 @@ pub(crate) fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, actor: &
         },
     };
 
-    let open_now = ctx.store.mrs_for(&meta.name).iter().filter(|m| m.is_open()).count();
+    let open_now = ctx.store.mrs_for(&meta.name).await.iter().filter(|m| m.is_open()).count();
     if open_now >= mr::OPEN_MAX {
         return Resp::err(429, &format!("this agent already has {} open merge requests", mr::OPEN_MAX));
     }
 
     // Snapshot both identities now. Names get renamed; the aid is what still says, a year later,
     // which two memories this review was actually between.
-    let src_aid = sync_aid(ctx, &source, actor).0;
-    let tgt_aid = sync_aid(ctx, meta, actor).0;
+    let src_aid = sync_aid(ctx, &source, actor).await.0;
+    let tgt_aid = sync_aid(ctx, meta, actor).await.0;
     let now = store::now_iso();
     let rec = ctx.store.update_mrs(|mrs| {
         let id = mr::next_id(mrs, &meta.name);
@@ -1387,28 +1524,29 @@ pub(crate) fn api_mr_open(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, actor: &
         };
         mrs.push(rec.clone());
         rec
-    });
+    }).await;
     let Ok(rec) = rec else {
         return Resp::err(500, "failed to write mrs.json");
     };
-    audit::append(
+    audit_append(
         ctx.root(),
         actor,
         audit::MR_OPEN,
         Some(&meta.name),
         &format!("#{} {} ← {}:{}", rec.id, title, source.name, source_ref),
-    );
-    Resp::json_status(201, mr_json(ctx, caller, &rec))
+    )
+    .await;
+    Resp::json_status(201, mr_json(ctx, caller, &rec).await)
 }
 
-pub(crate) fn api_mr_detail(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, id: usize) -> Resp {
-    match ctx.store.mrs_for(&meta.name).into_iter().find(|m| m.id == id) {
-        Some(m) => Resp::json(mr_json(ctx, caller, &m)),
+pub(crate) async fn api_mr_detail(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, id: usize) -> Resp {
+    match ctx.store.mrs_for(&meta.name).await.into_iter().find(|m| m.id == id) {
+        Some(m) => Resp::json(mr_json(ctx, caller, &m).await),
         None => Resp::err(404, "not found"),
     }
 }
 
-pub(crate) fn api_mr_comment(ctx: &Ctx, meta: &AgentMeta, id: usize, actor: &str, body: &[u8]) -> Resp {
+pub(crate) async fn api_mr_comment(ctx: &Ctx, meta: &AgentMeta, id: usize, actor: &str, body: &[u8]) -> Resp {
     let Some(v) = json_body(body) else {
         return Resp::err(400, "want a JSON body");
     };
@@ -1437,10 +1575,10 @@ pub(crate) fn api_mr_comment(ctx: &Ctx, meta: &AgentMeta, id: usize, actor: &str
         m.comments.push(c.clone());
         m.updated = store::now_iso();
         Ok(c)
-    });
+    }).await;
     match out {
         Ok(Ok(c)) => {
-            audit::append(ctx.root(), actor, audit::MR_COMMENT, Some(&meta.name), &format!("#{id} comment {}", c.id));
+            audit_append(ctx.root(), actor, audit::MR_COMMENT, Some(&meta.name), &format!("#{id} comment {}", c.id)).await;
             Resp::json_status(201, serde_json::json!({ "id": c.id, "author": c.author, "body": c.body, "created": c.created }))
         }
         Ok(Err(r)) => r,
@@ -1453,7 +1591,7 @@ pub(crate) fn api_mr_comment(ctx: &Ctx, meta: &AgentMeta, id: usize, actor: &str
 /// `{"state": "merged"}` does **not** merge anything — it records that someone ran `agit a merge`
 /// locally and pushed the result. The Hub has no model and no working tree; claiming otherwise here
 /// would be the lie that turns this object into a fake engine.
-pub(crate) fn api_mr_close(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, id: usize, actor: &str, body: &[u8]) -> Resp {
+pub(crate) async fn api_mr_close(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, id: usize, actor: &str, body: &[u8]) -> Resp {
     let state = match json_body(body).as_ref().and_then(|v| str_field(v, "state")) {
         None => mr::State::Closed,
         Some(s) => match mr::State::parse(&s) {
@@ -1473,12 +1611,12 @@ pub(crate) fn api_mr_close(ctx: &Ctx, caller: &Caller, meta: &AgentMeta, id: usi
         m.state = state.as_str().to_string();
         m.updated = store::now_iso();
         Ok(m.clone())
-    });
+    }).await;
     match out {
         Ok(Ok(m)) => {
             let action = if state == mr::State::Merged { audit::MR_MERGED } else { audit::MR_CLOSE };
-            audit::append(ctx.root(), actor, action, Some(&meta.name), &format!("#{id} {}", state.as_str()));
-            Resp::json(mr_json(ctx, caller, &m))
+            audit_append(ctx.root(), actor, action, Some(&meta.name), &format!("#{id} {}", state.as_str())).await;
+            Resp::json(mr_json(ctx, caller, &m).await)
         }
         Ok(Err(r)) => r,
         Err(_) => Resp::err(500, "failed to write mrs.json"),
@@ -1524,7 +1662,7 @@ pub(crate) fn valid_ref_name(r: &str) -> bool {
 
 // ── tokens ──
 
-pub(crate) fn api_tokens(ctx: &Ctx, caller: &Caller) -> Resp {
+pub(crate) async fn api_tokens(ctx: &Ctx, caller: &Caller) -> Resp {
     let Some(user) = caller.user.as_deref() else {
         return Resp::err(401, "login required");
     };
@@ -1532,6 +1670,7 @@ pub(crate) fn api_tokens(ctx: &Ctx, caller: &Caller) -> Resp {
     let items: Vec<serde_json::Value> = ctx
         .store
         .tokens()
+        .await
         .iter()
         .filter(|t| caller.is_admin || t.owner.as_deref() == Some(user))
         .map(|t| {
@@ -1552,7 +1691,7 @@ pub(crate) fn api_tokens(ctx: &Ctx, caller: &Caller) -> Resp {
     Resp::json(serde_json::json!(items))
 }
 
-pub(crate) fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
+pub(crate) async fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
     let Some(user) = caller.user.clone() else {
         return Resp::err(401, "login required");
     };
@@ -1574,7 +1713,7 @@ pub(crate) fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp 
     let agent = str_field(&v, "agent");
     if let Some(a) = &agent {
         // You can only issue tokens for agents you can see.
-        if let Err(r) = gate(ctx, caller, a, Action::Read) {
+        if let Err(r) = gate(ctx, caller, a, Action::Read).await {
             return r;
         }
     }
@@ -1585,9 +1724,9 @@ pub(crate) fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp 
             _ => return Resp::err(400, "ttl_days wants an integer in 1..3650"),
         },
     };
-    match issue_token(&ctx.store, &name, &user, agent.as_deref(), scope, ttl_days) {
+    match issue_token(&ctx.store, &name, &user, agent.as_deref(), scope, ttl_days).await {
         Ok(secret) => {
-            audit::append(ctx.root(), &user, audit::TOKEN_CREATE, agent.as_deref(), &format!("name={name} scope={}", scope.as_str()));
+            audit_append(ctx.root(), &user, audit::TOKEN_CREATE, agent.as_deref(), &format!("name={name} scope={}", scope.as_str())).await;
             // The plaintext appears this once — the server keeps only the sha256 digest, which
             // nobody can turn back.
             Resp::json_status(201, serde_json::json!({ "token": secret }))
@@ -1596,30 +1735,30 @@ pub(crate) fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp 
     }
 }
 
-pub(crate) fn api_revoke_token(ctx: &Ctx, caller: &Caller, id: &str) -> Resp {
+pub(crate) async fn api_revoke_token(ctx: &Ctx, caller: &Caller, id: &str) -> Resp {
     let Some(user) = caller.user.clone() else {
         return Resp::err(401, "login required");
     };
-    let Some(t) = ctx.store.tokens().into_iter().find(|t| t.id == id) else {
+    let Some(t) = ctx.store.tokens().await.into_iter().find(|t| t.id == id) else {
         return Resp::err(404, "not found");
     };
     // Your own token, or the site admin.
     if !caller.is_admin && t.owner.as_deref() != Some(user.as_str()) {
         return Resp::err(404, "not found");
     }
-    let _ = ctx.store.update_tokens(|toks| toks.retain(|x| x.id != id));
-    audit::append(ctx.root(), &user, audit::TOKEN_REVOKE, t.agent.as_deref(), &format!("id={id} name={}", t.name));
+    let _ = ctx.store.update_tokens(|toks| toks.retain(|x| x.id != id)).await;
+    audit_append(ctx.root(), &user, audit::TOKEN_REVOKE, t.agent.as_deref(), &format!("id={id} name={}", t.name)).await;
     Resp::no_content()
 }
 
 // ── audit ──
 
-pub(crate) fn api_audit(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
+pub(crate) async fn api_audit(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     let limit: usize = param(req.query(), "limit").and_then(|s| s.parse().ok()).unwrap_or(100).clamp(1, 1000);
     match param(req.query(), "agent") {
         // One agent's audit log: needs Manage on that agent (owner / member admin / site admin).
         Some(name) => {
-            let meta = match gate(ctx, caller, &name, Action::Manage) {
+            let meta = match gate(ctx, caller, &name, Action::Manage).await {
                 Ok(x) => x,
                 Err(r) => return r,
             };
