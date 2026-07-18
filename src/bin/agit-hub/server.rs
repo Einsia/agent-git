@@ -163,6 +163,7 @@ async fn startup_banner(ctx: &Ctx, addr: SocketAddr) {
     println!("  listen:  {addr}{}", if cfg.tls { " (TLS terminated in front)" } else { "" });
     println!("  web:     {}://{}/", if cfg.tls { "https" } else { "http" }, display_host(cfg));
     println!("  root:    {}", root.display());
+    println!("  store:   {}", store.describe());
     println!("  blobs:   {}", ctx.blobs.describe());
     println!("  hosting: {} agents ({public} public)", agents.len());
     println!("  users:   {} ({} admins)", users.len(), users.iter().filter(|u| u.is_admin).count());

@@ -555,6 +555,24 @@ impl Store {
         }
     }
 
+    /// One-word backend name for status banners and admin messages (`sqlite` / `postgres`).
+    pub fn backend(&self) -> &'static str {
+        match self {
+            Store::Sqlite(_) => "sqlite",
+            Store::Pg(_) => "postgres",
+        }
+    }
+
+    /// Human-readable description of where credentials actually land, for CLI success messages and the
+    /// startup banner. The SQLite backend writes the `hub.db` file under `<root>` (0600); the Postgres
+    /// backend writes to the configured database — never a `users.json` file in either case.
+    pub fn describe(&self) -> String {
+        match self {
+            Store::Sqlite(_) => format!("SQLite {} (0600)", self.root().join("hub.db").display()),
+            Store::Pg(_) => "Postgres (AGIT_HUB_DB)".to_string(),
+        }
+    }
+
     /// Create tables (idempotent) and stamp schema_version. Run once at boot; forces the lazy pool
     /// to establish its first connection, so a bad `AGIT_HUB_DB` surfaces here with a clear error.
     pub async fn migrate(&self) -> io::Result<()> {

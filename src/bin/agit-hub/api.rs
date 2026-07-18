@@ -886,7 +886,7 @@ pub(crate) async fn api_patch_agent(ctx: &Ctx, caller: &Caller, name: &str, body
             match reserved {
                 Ok(true) => {}
                 Ok(false) => return Resp::err(409, "that name is already taken"),
-                Err(_) => return Resp::err(500, "failed to write agents.json"),
+                Err(_) => return Resp::err(500, "failed to persist the agent"),
             }
             // Move the repo dir to match the record (a blocking fs op, off the async worker). On
             // failure, roll the name back so the record and the directory never disagree.
@@ -963,7 +963,7 @@ pub(crate) async fn edit_agent(ctx: &Ctx, name: &str, f: impl FnOnce(&mut AgentM
             }
         })
         .await
-        .map_err(|_| Resp::err(500, "failed to write agents.json"))
+        .map_err(|_| Resp::err(500, "failed to persist the agent"))
 }
 
 /// Move an agent between lifecycle states. The state itself is enforced in `acl::decide` — this only
@@ -1138,7 +1138,7 @@ pub(crate) async fn api_fork_agent(ctx: &Ctx, req: &Req, caller: &Caller, name: 
         Err(_) => {
             let d = dst.clone();
             let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(d)).await;
-            return Resp::err(500, "failed to write agents.json");
+            return Resp::err(500, "failed to persist the agent");
         }
     }
     audit_append(ctx.root(), &user, audit::AGENT_FORK, Some(&fork), &format!("forked from {}", source.name)).await;

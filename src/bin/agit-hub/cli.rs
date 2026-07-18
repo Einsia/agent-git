@@ -84,12 +84,12 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
             };
             let user = User { username: username.clone(), pw_hash, salt, kdf: kdf_id, is_admin, created: store::now_iso() };
             if let Err(e) = store.add_user(user).await {
-                eprintln!("failed to write users.json: {e}");
+                eprintln!("failed to persist the user to {}: {e}", store.backend());
                 return 1;
             }
             audit::append(root, "cli", audit::USER_ADD, None, &format!("{username} admin={is_admin}"));
             println!("created user {username}{}", if is_admin { " (site admin)" } else { "" });
-            println!("  The password is derived with argon2id and stored in users.json (0600); the plaintext never hits disk.");
+            println!("  The password is derived with argon2id and stored in {}; the plaintext never hits disk.", store.describe());
             0
         }
         Some("list") => {
@@ -265,7 +265,7 @@ pub(crate) async fn create_agent(store: &Store, name: &str, owner: &str, visibil
             Ok(!existed)
         })
         .await
-        .map_err(|e| format!("failed to write agents.json: {e}"))?
+        .map_err(|e| format!("failed to persist the agent: {e}"))?
 }
 
 pub(crate) fn list_cmd(root: &Path) -> i32 {
@@ -430,7 +430,7 @@ async fn token_cmd_async(root: &Path, args: &[String]) -> i32 {
                     1
                 }
                 Err(e) => {
-                    eprintln!("failed to write auth.json: {e}");
+                    eprintln!("failed to persist the token change: {e}");
                     1
                 }
             }
@@ -462,6 +462,6 @@ pub(crate) async fn issue_token(store: &Store, name: &str, owner: &str, agent: O
         expires,
         last_used: None,
     };
-    store.update_tokens(|t| t.push(rec)).await.map_err(|e| format!("failed to write auth.json: {e}"))?;
+    store.update_tokens(|t| t.push(rec)).await.map_err(|e| format!("failed to persist the token: {e}"))?;
     Ok(secret)
 }
