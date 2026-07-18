@@ -215,6 +215,12 @@ fn dispatch(argv: Vec<String>) -> i32 {
             commands::scan_cmd(scope, staged, &paths)
         }
         "hook-scan" => commands::hook_scan(args.iter().any(|a| a == "--staged")),
+
+        // ── crypt-clean / crypt-smudge: the agit-crypt filter drivers. Scope-INDEPENDENT: git invokes
+        //    them as `filter.agit-crypt.{clean,smudge}`, never the user. stdin→stdout binary pipes,
+        //    keyed from $AGIT_HOME. Routed here beside hook-scan (also git-invoked). ──
+        "crypt-clean" => commands::crypt_clean(),
+        "crypt-smudge" => commands::crypt_smudge(),
         "workspace" => match args.first().map(|s| s.as_str()) {
             Some("log") => commands::workspace_log(),
             Some("restore") => commands::workspace_restore(args.get(1).map(|s| s.as_str())),
@@ -268,6 +274,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    adopts its identity. (Raw `git clone` here would make a nested repo that resolves to
         //    nothing, which is exactly what this replaces.) ──
         "clone" if scope == Scope::Agent => agent_clone(args),
+
+        // ── encrypt (agent scope): opt-in at-rest encryption of the store — a convergent git
+        //    clean/smudge filter (git-crypt style). Enables/wires the filter, mints/exports/imports the
+        //    symmetric key. Ciphertext is what a push publishes; only coherent for a no-hub setup. ──
+        "encrypt" if scope == Scope::Agent => commands::agent_encrypt(args),
 
         // ── log / diff (agent scope): a raw `git log`/`git diff` on the store is a wall of jsonl bytes,
         //    so by default these render the SESSION view — `a log` a timeline of the store's sessions,

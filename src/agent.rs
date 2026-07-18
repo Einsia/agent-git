@@ -1520,7 +1520,7 @@ pub fn machine_pubkey_hex() -> Result<String> {
 
 /// Write a private file created with 0600 from the start (no world-readable window). On non-unix the
 /// permission bits do not apply, so it is a plain write there.
-fn write_secret_0600(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_secret_0600(path: &Path, contents: &str) -> Result<()> {
     let body = format!("{contents}\n");
     #[cfg(unix)]
     {

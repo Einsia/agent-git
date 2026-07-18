@@ -47,6 +47,14 @@ argon2 = "0.5.3"
 # Client-side provenance: a per-machine ed25519 identity signs each captured session.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+# Opt-in at-rest encryption of the agent store (Feature C). A convergent git clean/smudge filter:
+# XChaCha20-Poly1305 AEAD (pure-Rust, hermetic — matches the tokio-rustls / no-system-OpenSSL stance),
+# with the nonce derived deterministically from the plaintext (HMAC-SHA256) so the clean filter is a
+# pure function and git never sees the working tree as perpetually modified. HKDF splits the 32-byte
+# master into domain-separated K_enc / K_mac. sha2/hex/rand are already dependencies above.
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
 
 [dev-dependencies]
 tempfile = "3"

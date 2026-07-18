@@ -815,7 +815,7 @@ pub fn scan_text_allow(text: &str, entropy: bool, allow: &Allowlist) -> Vec<Find
 
 /// 二进制就跳过 —— 比按扩展名放行稳:.env / .pem / .key / .sh / .yaml / .toml / 无扩展名
 /// 的文件全都装得下密钥,旧的 (md|jsonl|json|txt) 白名单把它们统统漏掉。
-fn is_probably_binary(bytes: &[u8]) -> bool {
+pub fn is_probably_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|&b| b == 0)
 }
 

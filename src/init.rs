@@ -203,7 +203,7 @@ pub(crate) fn install_hooks(store: &Path) -> Result<()> {
 
 /// POSIX sh single-quote escaping: the only dangerous character is `'` itself; break out with `'\''` and rejoin.
 /// Double quotes wouldn't stop `$` / backticks / `"` in a path; inside single quotes these are all literal.
-fn sh_single_quote(s: &str) -> String {
+pub(crate) fn sh_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 

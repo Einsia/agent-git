@@ -8,7 +8,7 @@ use crate::scan;
 use crate::scope::{self, Scope};
 use crate::ui;
 use crate::{errln, out, outln};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -91,6 +91,15 @@ fn staged_findings(root: &Path, allow: &scan::Allowlist) -> Vec<(String, scan::F
         let (code, content) = scope::git_in_status(root, &["show", &format!(":{name}")]);
         if code != 0 {
             continue; // can't extract this blob (very rare), skip rather than abort
+        }
+        // Skip binary/encrypted blobs exactly as the whole-tree `scan_file_allow` path does (scan.rs).
+        // On an agit-crypt store the staged blob is ciphertext: high-entropy bytes that would trip the
+        // `high-entropy-string` rule on essentially every session and block every commit/push. The
+        // AGITCRYPT magic's trailing NUL (and the binary AEAD tag) guarantee a NUL in the first bytes,
+        // so `is_probably_binary` returns true and the gate no longer sees plaintext here — which is the
+        // documented behaviour: the content is protected by encryption instead of by the scanner.
+        if scan::is_probably_binary(content.as_bytes()) {
+            continue;
         }
         for f in scan::scan_text_allow(&content, true, allow) {
             v.push((name.to_string(), f));
@@ -1366,6 +1375,340 @@ fn exec(cmd: &str) -> Result<i32> {
     Ok(status.code().unwrap_or(0))
 }
 
+// ─────────────────────── crypt: opt-in at-rest store encryption (Feature C) ───────────────────────
+
+/// The git clean filter driver (`filter.agit-crypt.clean`). Reads plaintext on stdin, writes convergent
+/// ciphertext on stdout. Invoked by git at staging, never by a human — so stdout carries RAW BYTES, the
+/// one deliberate exception to the outln!/errln! sink rule (a git filter is a binary pipe). Keyed from
+/// `$AGIT_HOME` regardless of cwd (git runs filters with cwd = store top). A failure exits nonzero so
+/// `filter.agit-crypt.required=true` makes git abort rather than stage plaintext.
+pub fn crypt_clean() -> Result<i32> {
+    use std::io::{Read, Write};
+    let mut input = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut input)
+        .context("crypt-clean: reading stdin")?;
+    let keys = crate::crypt::keys_for_filter(&scope::agit_home()?)?;
+    let out = crate::crypt::seal(&keys, &input);
+    std::io::stdout()
+        .lock()
+        .write_all(&out)
+        .context("crypt-clean: writing stdout")?;
+    Ok(0)
+}
+
+/// The git smudge filter driver (`filter.agit-crypt.smudge`). Reads committed bytes on stdin, writes
+/// plaintext on stdout. If stdin does NOT begin with the AGITCRYPT magic it is emitted unchanged — this
+/// keeps checkout working on blobs committed before encryption was enabled, or a clone whose filter is
+/// wired but whose key predates a given file. Raw bytes on stdout (see crypt_clean). A decrypt failure
+/// (wrong/absent key, tampering) exits nonzero so `required=true` aborts the checkout loudly rather than
+/// writing ciphertext into the working tree.
+pub fn crypt_smudge() -> Result<i32> {
+    use std::io::{Read, Write};
+    let mut input = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut input)
+        .context("crypt-smudge: reading stdin")?;
+
+    // Robustness rule: pass through anything that is not agit-crypt output, without needing a key.
+    if !crate::crypt::is_ciphertext(&input) {
+        std::io::stdout()
+            .lock()
+            .write_all(&input)
+            .context("crypt-smudge: writing stdout")?;
+        return Ok(0);
+    }
+
+    let keys = match crate::crypt::keys_for_filter(&scope::agit_home()?) {
+        Ok(k) => k,
+        Err(e) => {
+            errln!("agit crypt-smudge: {e:#}");
+            return Ok(1); // required=true → git aborts the checkout
+        }
+    };
+    match crate::crypt::open(&keys, &input) {
+        Ok(plain) => {
+            std::io::stdout()
+                .lock()
+                .write_all(&plain)
+                .context("crypt-smudge: writing stdout")?;
+            Ok(0)
+        }
+        Err(e) => {
+            errln!("agit crypt-smudge: {e:#}");
+            Ok(1) // never write ciphertext-as-plaintext; nonzero → git aborts
+        }
+    }
+}
+
+/// The `.gitattributes` line that binds sessions to the filter. `-text` disables git's EOL
+/// normalization so the clean/smudge round-trip is byte-exact (EOL munging before clean breaks
+/// convergence). Committed, so a clone already carries the pattern; only the driver + key are local.
+const CRYPT_ATTR_LINE: &str = "sessions/** filter=agit-crypt -text";
+const CRYPT_FILTER_NAME: &str = "agit-crypt";
+
+/// `agit a encrypt [--export [<file>]] [--import <keyfile>] [--force] [--yes]`.
+pub fn agent_encrypt(args: &[String]) -> Result<i32> {
+    let home = scope::agit_home()?;
+    let yes = args.iter().any(|a| a == "--yes" || a == "-y");
+    let force = args.iter().any(|a| a == "--force");
+
+    if let Some(i) = args.iter().position(|a| a == "--export") {
+        // The optional file argument is the next token that is not itself a flag.
+        let file = args.get(i + 1).filter(|s| !s.starts_with('-')).map(|s| s.as_str());
+        return crypt_export(&home, file);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--import") {
+        let Some(keyfile) = args.get(i + 1).filter(|s| !s.starts_with('-')) else {
+            bail!("agit a encrypt --import needs a key file: agit a encrypt --import <keyfile>");
+        };
+        return crypt_import(&home, Path::new(keyfile), force, yes);
+    }
+
+    crypt_enable(&home, yes)
+}
+
+/// Print the two mandatory, non-negotiable warnings (req.5) before encryption does anything.
+fn crypt_print_warnings() {
+    errln!("agit encrypt — read both before continuing:");
+    errln!(
+        "  (1) The hub cannot render or server-side-scan an encrypted store — it never holds the key.\n\
+         \x20     Encryption is only coherent for a no-hub, public-remote setup; you are trading hub\n\
+         \x20     features for at-rest confidentiality."
+    );
+    errln!(
+        "  (2) Your local secret gate now scans ENCRYPTED content, so it no longer sees plaintext\n\
+         \x20     secrets in these sessions — the content is protected by encryption instead of by the\n\
+         \x20     scanner."
+    );
+}
+
+/// A yes/no gate honoured by `--yes` non-interactively; refuses (never hangs) when it cannot ask.
+fn crypt_confirm(prompt: &str, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !ui::interactive() {
+        bail!("{prompt}\n  refusing without confirmation — re-run with --yes to proceed non-interactively");
+    }
+    out!("{prompt} [y/N] ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading confirmation")?;
+    if !matches!(line.trim(), "y" | "Y" | "yes" | "Yes") {
+        bail!("aborted — encryption not enabled");
+    }
+    Ok(())
+}
+
+/// Is the local filter driver already wired for this store?
+fn crypt_filter_wired(store: &Path) -> bool {
+    let (code, val) = scope::git_in_status(store, &["config", "--get", "filter.agit-crypt.clean"]);
+    code == 0 && !val.trim().is_empty()
+}
+
+/// Set the three local `filter.agit-crypt.*` configs to invoke this very agit binary as the driver.
+fn crypt_wire_filter(store: &Path) -> Result<()> {
+    let exe = std::env::current_exe().context("could not locate agit's own path")?;
+    let q = crate::init::sh_single_quote(&exe.to_string_lossy());
+    scope::git_in(store, &["config", "filter.agit-crypt.clean", &format!("{q} crypt-clean")])?;
+    scope::git_in(store, &["config", "filter.agit-crypt.smudge", &format!("{q} crypt-smudge")])?;
+    // required=true: if the filter can't run (key missing, decrypt fails) git ABORTS rather than
+    // silently committing plaintext or checking out ciphertext — the whole point of "never silently".
+    scope::git_in(store, &["config", "filter.agit-crypt.required", "true"])?;
+    Ok(())
+}
+
+/// Ensure `.gitattributes` at the store root carries the sessions filter line (merge, don't clobber).
+/// Returns true if the file was created or the line appended.
+fn crypt_write_gitattributes(store: &Path) -> Result<bool> {
+    let path = store.join(".gitattributes");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("sessions/**") && t.contains("filter=agit-crypt")
+    }) {
+        return Ok(false);
+    }
+    let mut s = existing;
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s.push_str(CRYPT_ATTR_LINE);
+    s.push('\n');
+    std::fs::write(&path, s).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(true)
+}
+
+/// Commit staged changes in `store` under a message, via `-F <tempfile>` (never `-m`, per the repo's
+/// commit-message hygiene). No-op friendly: the caller checks there is something staged.
+fn crypt_commit(store: &Path, message: &str) -> Result<()> {
+    let mut msg = tempfile::NamedTempFile::new().context("cannot create a commit-message temp file")?;
+    use std::io::Write;
+    msg.write_all(message.as_bytes())?;
+    msg.flush()?;
+    // --no-verify: the message-carrying commit does not need the pre-commit scan (agit's own gate runs
+    // on the paths it stages elsewhere); this keeps enabling encryption from tripping git's hook.
+    scope::git_in(
+        store,
+        &["commit", "--no-verify", "-F", msg.path().to_string_lossy().as_ref()],
+    )?;
+    Ok(())
+}
+
+/// `agit a encrypt` — enable/wire encryption on the resolved store. Idempotent.
+fn crypt_enable(home: &Path, yes: bool) -> Result<i32> {
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+
+    let key_present = crate::crypt::read_master(home)?.is_some();
+    let attr_present = store.join(".gitattributes").exists()
+        && std::fs::read_to_string(store.join(".gitattributes"))
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.trim().starts_with("sessions/**") && l.contains("filter=agit-crypt"));
+    let filter_present = crypt_filter_wired(&store);
+
+    if key_present && attr_present && filter_present {
+        outln!("agit-crypt is already enabled on {} ({}).", a.name, a.aid);
+        outln!("  key        {}", crate::crypt::key_path(home).display());
+        outln!("  filter     filter.agit-crypt.{{clean,smudge,required}} set locally");
+        outln!("  attributes sessions/** filter=agit-crypt -text (committed)");
+        outln!("  Nothing to do. Share the key out of band with `agit a encrypt --export`.");
+        return Ok(0);
+    }
+
+    crypt_print_warnings();
+
+    // Hub-remote gate: an encrypted store pushes ciphertext the hub cannot use. Warn + require confirm.
+    if agent::store_remotes(&store).iter().any(|(name, _)| name == "hub") {
+        crypt_confirm(
+            "This store has a `hub` remote, which will receive ciphertext it cannot render or scan. Enable encryption anyway?",
+            yes,
+        )?;
+    } else {
+        crypt_confirm("Enable at-rest encryption on this store?", yes)?;
+    }
+
+    // (4) mint the key if absent.
+    let minted = !key_present;
+    let _ = crate::crypt::load_or_create_master(home)?;
+    if minted {
+        errln!(
+            "  ⚠ minted a NEW symmetric key at {}. BACK IT UP NOW (password manager / Signal).\n\
+             \x20     There is no escrow and no recovery: losing this key loses every blob it encrypts.\n\
+             \x20     It is machine-global, never committed, never pushed.",
+            crate::crypt::key_path(home).display()
+        );
+    }
+
+    let _lock = crate::session::lock_store(&store)?;
+
+    // (5) write/merge .gitattributes, (6) set the three local filter configs.
+    let attr_changed = crypt_write_gitattributes(&store)?;
+    crypt_wire_filter(&store)?;
+
+    // (7) commit .gitattributes.
+    let _ = scope::git_in_status(&store, &["add", "--", ".gitattributes"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(&store, "chore(crypt): enable agit-crypt on sessions\n\nCommits sessions/** as ciphertext via a convergent clean/smudge filter.")?;
+        if attr_changed {
+            outln!("  committed .gitattributes (sessions/** filter=agit-crypt -text)");
+        }
+    }
+
+    // (8) re-encrypt already-tracked plaintext: --renormalize pushes existing blobs through the clean
+    // filter. Warn that HISTORY still holds the old plaintext (going-forward at-rest encryption).
+    let _ = scope::git_in_status(&store, &["add", "--renormalize", "--", "sessions"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(
+            &store,
+            "chore(crypt): re-encrypt tracked sessions\n\nGoing-forward at-rest encryption. Prior commits still hold plaintext; a full purge needs git-filter-repo.",
+        )?;
+        outln!("  re-encrypted already-tracked sessions (git add --renormalize)");
+        errln!(
+            "  ⚠ git HISTORY still holds the old plaintext. This is going-forward encryption; a full\n\
+             \x20     purge of past blobs needs git-filter-repo (out of scope)."
+        );
+    }
+
+    outln!("agit-crypt enabled on {} ({}).", a.name, a.aid);
+    outln!("  Share the key with teammates out of band: `agit a encrypt --export <file>`.");
+    Ok(0)
+}
+
+/// `agit a encrypt --export [<file>]` — reveal the symmetric master for out-of-band sharing.
+fn crypt_export(home: &Path, file: Option<&str>) -> Result<i32> {
+    let master = crate::crypt::load_or_create_master(home)?;
+    let hex_key = hex::encode(master);
+    errln!(
+        "agit-crypt master key — this IS the secret that decrypts every encrypted store.\n\
+         \x20 Distribute it out of band (password manager / Signal). NEVER commit or push it."
+    );
+    match file {
+        Some(f) => {
+            crate::agent::write_secret_0600(Path::new(f), &hex_key)?;
+            outln!("  wrote the key (0600) to {f}");
+        }
+        None => {
+            // The raw payload goes to stdout deliberately (this IS the key), one hex line.
+            outln!("{hex_key}");
+        }
+    }
+    Ok(0)
+}
+
+/// `agit a encrypt --import <keyfile>` — install a teammate's key, then wire the local filter and
+/// re-checkout so a clone goes from raw ciphertext to decrypted working tree.
+fn crypt_import(home: &Path, keyfile: &Path, force: bool, yes: bool) -> Result<i32> {
+    let text = std::fs::read_to_string(keyfile)
+        .with_context(|| format!("cannot read key file {}", keyfile.display()))?;
+    let raw = hex::decode(text.trim())
+        .with_context(|| format!("{} is not valid hex", keyfile.display()))?;
+    let incoming: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{} is not a 32-byte key", keyfile.display()))?;
+
+    if let Some(existing) = crate::crypt::read_master(home)? {
+        if existing != incoming && !force {
+            bail!(
+                "a DIFFERENT crypt key already exists at {}.\n\
+                 \x20      Overwriting it orphans everything encrypted under the old key. Re-run with --force to replace it.",
+                crate::crypt::key_path(home).display()
+            );
+        }
+    }
+
+    std::fs::create_dir_all(crate::crypt::key_path(home).parent().unwrap())?;
+    crate::agent::write_secret_0600(&crate::crypt::key_path(home), &hex::encode(incoming))?;
+    outln!("installed the crypt key at {}", crate::crypt::key_path(home).display());
+
+    // Wire the local filter for the resolved store and offer to re-checkout so ciphertext in the
+    // working tree becomes plaintext. A missing store (import before clone) is not fatal — the key is in.
+    match agent::resolve(None) {
+        Ok(a) => {
+            crypt_wire_filter(&a.store)?;
+            outln!("  wired filter.agit-crypt.{{clean,smudge,required}} for {} ({})", a.name, a.aid);
+            if crypt_confirm("Re-checkout sessions/** now to decrypt the working tree?", yes).is_ok() {
+                let (code, _) = scope::git_in_status(&a.store, &["checkout", "--", "sessions"]);
+                if code == 0 {
+                    outln!("  re-checked-out sessions/** (now decrypted)");
+                } else {
+                    errln!("  ⚠ could not re-checkout sessions/** — run `git checkout -- .` in the store yourself");
+                }
+            }
+        }
+        Err(_) => {
+            outln!("  (no agent resolves here yet — after `agit a clone <name>`, run `agit a encrypt` to wire the filter)");
+        }
+    }
+    Ok(0)
+}
+
 #[cfg(test)]
 mod launch_record_tests {
     use super::*;
@@ -1419,6 +1762,49 @@ mod launch_record_tests {
         let note = fallback.note().expect("a guess MUST be reported");
         assert!(note.contains("no launch record"), "{note}");
         assert!(note.contains("api"), "the note must name the agent it filed under: {note}");
+    }
+}
+
+#[cfg(test)]
+mod crypt_gate_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git").arg("-C").arg(dir).args(args).status().unwrap().success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// Test 9 — regression guard for the push-breaking interaction. A staged AGITCRYPT blob is
+    /// high-entropy ciphertext that would trip the `high-entropy-string` rule on every encrypted
+    /// session and block every commit/push. The staged scan path must skip it (via is_probably_binary),
+    /// while the SAME bytes in plaintext must still be caught — proving the seal is what suppresses it.
+    #[test]
+    fn staged_ciphertext_is_skipped_but_plaintext_is_not() {
+        let keys = crate::crypt::derive_subkeys(&[3u8; 32]);
+        let secret = b"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY0000\n";
+
+        // Plaintext staged → the gate DOES find it (control).
+        let plain = tempfile::tempdir().unwrap();
+        git(plain.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(plain.path().join("sessions")).unwrap();
+        std::fs::write(plain.path().join("sessions/s.jsonl"), secret).unwrap();
+        git(plain.path(), &["add", "sessions/s.jsonl"]);
+        let allow = scan::Allowlist::load(plain.path());
+        assert!(
+            !staged_findings(plain.path(), &allow).is_empty(),
+            "the plaintext secret must trip the gate, or this test proves nothing"
+        );
+
+        // Sealed staged → the gate finds NOTHING (the content is protected by encryption instead).
+        let enc = tempfile::tempdir().unwrap();
+        git(enc.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(enc.path().join("sessions")).unwrap();
+        std::fs::write(enc.path().join("sessions/s.jsonl"), crate::crypt::seal(&keys, secret)).unwrap();
+        git(enc.path(), &["add", "sessions/s.jsonl"]);
+        let allow = scan::Allowlist::load(enc.path());
+        let findings = staged_findings(enc.path(), &allow);
+        assert!(findings.is_empty(), "encrypted blob must yield no findings, got {}", findings.len());
     }
 }
 
