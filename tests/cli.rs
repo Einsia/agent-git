@@ -863,6 +863,56 @@ fn a_pull_fast_forwards_but_refuses_to_textually_merge_diverged_sessions() {
     assert_eq!(parents.split_whitespace().count(), 2, "HEAD must not be a merge commit: {parents}");
 }
 
+/// A bare `agit a push` fans out to EVERY configured remote (a shared origin + a personal hub), records
+/// both into the committed binding with origin primary, and a per-remote failure is reported but never
+/// aborts the others — the command's exit follows the PRIMARY (origin) push.
+#[test]
+fn push_fans_out_to_all_remotes_and_a_failure_is_non_fatal() {
+    let r = Repo::new();
+
+    // Two bare "hubs": origin (the shared anchor) and hub (a personal central hub).
+    r.sh("git init -q --bare -b main origin.git");
+    r.sh("git init -q --bare -b main hub.git");
+    let origin = r.path().join("origin.git");
+    let hub = r.path().join("hub.git");
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", origin.to_str().unwrap()]).0, 0);
+    assert_eq!(r.agit(&["a", "remote", "add", "hub", hub.to_str().unwrap()]).0, 0);
+
+    // Bare push → fan out. Both bare repos must receive the store's `main`.
+    let (code, out, err) = r.agit(&["a", "push"]);
+    assert_eq!(code, 0, "the fan-out push must succeed on the primary: {err}");
+    assert!(out.contains("pushed origin") && out.contains("pushed hub"), "both remotes reported: {out}");
+    let head = r.git_agent(&["rev-parse", "HEAD"]);
+    assert_eq!(r.git_at(&origin, &["rev-parse", "main"]), head, "origin must have the branch");
+    assert_eq!(r.git_at(&hub, &["rev-parse", "main"]), head, "hub must have the branch");
+
+    // The binding records BOTH remotes, origin marked primary (sub-table form for 2+ remotes).
+    let binding = std::fs::read_to_string(r.path().join(".agit.toml")).unwrap();
+    assert!(binding.contains("[[agent.remote]]"), "multi-remote uses sub-tables:\n{binding}");
+    assert!(binding.contains("name    = \"origin\""), "origin recorded:\n{binding}");
+    assert!(binding.contains("name    = \"hub\""), "hub recorded:\n{binding}");
+    assert!(binding.contains("primary = true"), "the anchor is marked primary:\n{binding}");
+
+    // Repoint hub at a path that cannot receive a push, add a commit, and fan out again: hub's push is
+    // rejected (reported, not fatal), origin still gets the commit, and the command still exits 0.
+    assert_eq!(r.agit(&["a", "remote", "set-url", "hub", "/nonexistent/nope.git"]).0, 0);
+    r.git_agent(&["commit", "--allow-empty", "--no-verify", "-m", "another session"]);
+    let head2 = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, err) = r.agit(&["a", "push"]);
+    assert_eq!(code, 0, "a non-primary rejection must NOT change the exit (origin still succeeded): {err}");
+    assert!(out.contains("pushed origin"), "origin still pushed: {out}");
+    assert!(err.contains("push to hub rejected") && err.contains("not fatal"), "hub failure is reported, not fatal: {err}");
+    assert_eq!(r.git_at(&origin, &["rev-parse", "main"]), head2, "origin advanced despite hub failing");
+
+    // `--to <name>` targets a single remote. Give origin an upstream first (git-style passthrough,
+    // route (b) — preserved verbatim), then a targeted push to it is the command's anchor and does NOT
+    // fan out (no per-remote "pushed …" lines).
+    assert_eq!(r.agit(&["a", "push", "-u", "origin", "main"]).0, 0, "route (b) passthrough sets origin upstream");
+    let (code, out, err) = r.agit(&["a", "push", "--to", "origin"]);
+    assert_eq!(code, 0, "a targeted push to a reachable remote must succeed: {err}");
+    assert!(!out.contains("pushed origin"), "a targeted push must not fan out: {out}");
+}
+
 /// A minimal but valid Claude session: two lines carrying `sid` and a distinctive note.
 fn claude_session(sid: &str, note: &str) -> String {
     format!(

@@ -738,42 +738,131 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
         return Ok(1);
     }
 
-    // The push, verbatim. Inherited stdio: a push is where credential helpers prompt, and capturing
-    // would both swallow git's errors and block the prompt. `--no-verify` skips git's now-redundant
-    // pre-push hook (we just gated the tree); the hook stays installed for a raw `git push`.
-    let mut push_args: Vec<&str> = vec!["push", "--no-verify"];
-    push_args.extend(args.iter().map(String::as_str));
-    let code = scope::git_in_inherit(&a.store, &push_args);
-    if code != 0 {
-        return Ok(code);
+    // Split agit-native `--to <name>` out of what git sees, then classify the rest: `flags` start with
+    // `-` (--force, --tags), `positionals` are a git-style remote/refspec the user typed.
+    let mut to: Option<String> = None;
+    let mut flags: Vec<String> = Vec::new();
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let x = &args[i];
+        if x == "--to" {
+            to = args.get(i + 1).cloned();
+            i += 2;
+            continue;
+        }
+        if let Some(v) = x.strip_prefix("--to=") {
+            to = Some(v.to_string());
+        } else if x.starts_with('-') {
+            flags.push(x.clone());
+        } else {
+            positionals.push(x.clone());
+        }
+        i += 1;
     }
 
-    // Reconcile the binding with origin only inside an environment — a bare store has nowhere to write
-    // one, and that is not an error.
-    if let Ok(env) = scope::env_root() {
-        match agent::sync_origin_to_binding(&a.aid, &env)? {
-            agent::BindingSync::Recorded { locator, stripped } => {
-                println!(
-                    "  bound  {} → {locator}   (commit {}: teammates clone the agent from here)",
-                    a.name,
-                    agent::BINDING_FILE
-                );
-                if stripped {
-                    eprintln!(
-                        "  note: credentials stripped from the recorded remote — {} is committed.",
-                        agent::BINDING_FILE
-                    );
-                    eprintln!("        The store keeps the full URL locally; your teammates' git supplies their own.");
-                }
-            }
-            agent::BindingSync::NotShareable(url) => eprintln!(
-                "  note: origin ({url}) is not a transport agit will record in {} — binding left unchanged.",
-                agent::BINDING_FILE
-            ),
-            agent::BindingSync::NoOrigin | agent::BindingSync::Unchanged(_) => {}
+    // Inherited stdio throughout: a push is where credential helpers prompt, and capturing would both
+    // swallow git's errors and block the prompt. `--no-verify` skips git's now-redundant pre-push hook
+    // (we just gated the tree); the hook stays installed for a raw `git push`.
+    let (exit, record) = if let Some(name) = to {
+        // (a) Targeted single push — the command's identity anchor.
+        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        pa.extend(flags.iter().map(String::as_str));
+        pa.push(&name);
+        let code = scope::git_in_inherit(&a.store, &pa);
+        (code, code == 0)
+    } else if !positionals.is_empty() {
+        // (b) Git-style passthrough — today's behavior, preserved verbatim.
+        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        pa.extend(args.iter().map(String::as_str));
+        let code = scope::git_in_inherit(&a.store, &pa);
+        (code, code == 0)
+    } else {
+        // (c) Bare push — fan out to every configured remote. A per-remote rejection is reported but
+        // never fatal; the exit reflects the PRIMARY remote's push (always recorded after the loop).
+        (push_fanout(&a, &flags), true)
+    };
+
+    // Reconcile ALL of the store's remotes into the binding, only inside an environment — a bare store
+    // has nowhere to write one, and that is not an error.
+    if record {
+        if let Ok(env) = scope::env_root() {
+            let summary = agent::sync_remotes_to_binding(&a.aid, &env)?;
+            print_sync_summary(&a.name, &summary);
         }
     }
-    Ok(0)
+    Ok(exit)
+}
+
+/// Fan a bare `agit a push` out to every git remote the store has: an explicit `<name> <branch>`
+/// refspec per remote (a freshly `remote add`-ed hub has no upstream, so a bare `git push <name>` under
+/// `push.default=simple` would error). Each remote's success/failure is printed and non-fatal; the
+/// returned exit is the PRIMARY remote's push code — the command's identity anchor.
+fn push_fanout(a: &agit::agent::Agent, flags: &[String]) -> i32 {
+    use agit::agent;
+    let remotes = agent::store_remotes(&a.store);
+    // No remotes: fall back to today's plain push (whatever upstream the store has, or git's own error).
+    if remotes.is_empty() {
+        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        pa.extend(flags.iter().map(String::as_str));
+        return scope::git_in_inherit(&a.store, &pa);
+    }
+    let (bcode, branch) = scope::git_in_status(&a.store, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let branch = branch.trim().to_string();
+    // A detached HEAD (or a failed rev-parse) has no branch to fan out; fall back to a plain push.
+    if bcode != 0 || branch.is_empty() || branch == "HEAD" {
+        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        pa.extend(flags.iter().map(String::as_str));
+        return scope::git_in_inherit(&a.store, &pa);
+    }
+    let primary = agent::primary_remote_name(&a.store);
+    let mut anchor = 0;
+    for (name, _url) in &remotes {
+        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        pa.extend(flags.iter().map(String::as_str));
+        pa.push(name.as_str());
+        pa.push(&branch);
+        let code = scope::git_in_inherit(&a.store, &pa);
+        if code == 0 {
+            println!("  pushed {name}");
+        } else {
+            // A non-owner's push to a personal hub returns non-zero from the ACL 403 — shown, not fatal.
+            eprintln!("  push to {name} rejected (exit {code}) — reported, not fatal");
+        }
+        if primary.as_deref() == Some(name.as_str()) {
+            anchor = code;
+        }
+    }
+    anchor
+}
+
+/// The "skipped remote" note, BY NAME ONLY. A remote is often skipped because its URL carries a secret
+/// credential-stripping can't remove (e.g. a `?private_token=` query), and this note prints on every
+/// push, so it must never echo the raw URL or it leaks the secret to the terminal and CI logs.
+fn skipped_note(name: &str, bf: &str) -> String {
+    format!("  note: remote {name} is not a transport agit will record in {bf} — left unchanged.")
+}
+
+/// Print what `sync_remotes_to_binding` recorded/skipped. Recorded lines only appear on a change (an
+/// idempotent re-push is silent); a skipped remote is a standing problem worth repeating every push.
+fn print_sync_summary(agent_name: &str, s: &agit::agent::RemoteSyncSummary) {
+    let bf = agit::agent::BINDING_FILE;
+    if s.changed {
+        for r in &s.recorded {
+            let tag = if r.primary { "  (primary — clone/pull anchor)" } else { "" };
+            println!("  bound  {agent_name} → {}{tag}", r.locator);
+        }
+        if !s.recorded.is_empty() {
+            println!("         (commit {bf}: teammates clone the agent from here)");
+        }
+        if s.recorded.iter().any(|r| r.stripped) {
+            eprintln!("  note: credentials stripped from a recorded remote — {bf} is committed.");
+            eprintln!("        The store keeps the full URL locally; your teammates' git supplies their own.");
+        }
+    }
+    for (name, _url) in &s.skipped {
+        eprintln!("{}", skipped_note(name, bf));
+    }
 }
 
 /// `agit a pull [git-pull-args…]` — the agent-context pull. A bare `git pull` on the store would do a
@@ -943,3 +1032,22 @@ the only one present, else they ask.
 
   `a` is a subcommand, so it cannot be transposed: agit a commit (agent store) vs agit commit -a (code repo, -a is git's stage-all).
   The old `agit -a <args>` flag still works as a deprecated alias.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a skipped remote note must NEVER echo the remote URL. A remote is often skipped
+    /// because its URL carries a secret credential-stripping can't remove, and the note prints on every
+    /// push, so echoing the URL would leak the secret to the terminal and CI logs.
+    #[test]
+    fn skipped_note_never_echoes_the_remote_url() {
+        let note = skipped_note("hub", ".agit.toml");
+        assert!(note.contains("hub"), "names the remote: {note}");
+        assert!(!note.contains("://"), "must not contain a URL scheme: {note}");
+        assert!(
+            !note.to_lowercase().contains("token") && !note.contains('@') && !note.contains('?'),
+            "must not leak credential-bearing URL parts: {note}"
+        );
+    }
+}

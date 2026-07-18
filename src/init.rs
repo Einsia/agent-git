@@ -91,7 +91,7 @@ fn track_declared(env: &Path) -> Result<Option<agent::Agent>> {
             }
             continue;
         }
-        if entry.remote.is_none() {
+        if entry.primary_url().is_none() {
             errln!("  · {} is declared but has no remote to clone — skipping (its owner has not published it)", entry.name);
             continue;
         }

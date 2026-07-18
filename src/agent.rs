@@ -168,6 +168,37 @@ fn store_remote(store: &Path) -> Option<String> {
     }
 }
 
+/// Every git remote configured on the store, as `(name, url)` in git's own listing order (which is
+/// alphabetical). Empty URLs are skipped. This is the multi-remote counterpart to `store_remote` — the
+/// push fan-out and the binding sync both enumerate remotes through here.
+pub fn store_remotes(store: &Path) -> Vec<(String, String)> {
+    let (code, names) = scope::git_in_status(store, &["remote"]);
+    if code != 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for name in names.lines().map(str::trim).filter(|n| !n.is_empty()) {
+        let (c, url) = scope::git_in_status(store, &["remote", "get-url", name]);
+        let url = url.trim();
+        if c == 0 && !url.is_empty() {
+            out.push((name.to_string(), url.to_string()));
+        }
+    }
+    out
+}
+
+/// The name of the store's primary remote — its identity anchor. `origin` if present (the anchor
+/// `clone`/`pull` track by construction), otherwise the first remote in git's alphabetical order.
+/// None only when the store has no remotes at all.
+pub fn primary_remote_name(store: &Path) -> Option<String> {
+    let remotes = store_remotes(store);
+    if remotes.iter().any(|(n, _)| n == "origin") {
+        Some("origin".to_string())
+    } else {
+        remotes.first().map(|(n, _)| n.clone())
+    }
+}
+
 fn agent_at(store: PathBuf, id: StoreIdentity) -> Agent {
     Agent {
         remote: store_remote(&store),
@@ -292,13 +323,47 @@ pub fn clear_active(env_root: &Path) -> Result<()> {
 // Binding — .agit.toml, committed at the code-repo root
 // ---------------------------------------------------------------------------------------------
 
-/// One `[[agent]]` entry. `id` is the **integrity check**: if the store behind `remote` carries a
-/// different aid, agit refuses rather than binding you to a different agent wearing the same name.
+/// One named remote recorded next to an agent in the committed binding. A store can push to several
+/// remotes (a shared team repo, a personal central hub); exactly one is the `primary` — the identity
+/// anchor that `clone`/`pull` resolve from. The others are additional read locators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundRemote {
+    pub name: String,
+    pub url: String,
+    pub primary: bool,
+}
+
+/// One `[[agent]]` entry. `id` is the **integrity check**: if the store behind the primary remote
+/// carries a different aid, agit refuses rather than binding you to a different agent wearing the same
+/// name. `remotes` is list-aware: zero, one, or many, with exactly one primary whenever any exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundAgent {
     pub id: String,
     pub name: String,
-    pub remote: Option<String>,
+    pub remotes: Vec<BoundRemote>,
+}
+
+impl BoundAgent {
+    /// The identity anchor: the remote marked primary, else the first (a hand-edited file with none
+    /// marked still resolves deterministically).
+    pub fn primary(&self) -> Option<&BoundRemote> {
+        self.remotes.iter().find(|r| r.primary).or_else(|| self.remotes.first())
+    }
+
+    /// The primary remote's URL — what a fresh clone resolves a bare name to.
+    pub fn primary_url(&self) -> Option<&str> {
+        self.primary().map(|r| r.url.as_str())
+    }
+
+    /// Build a single-remote entry from an optional URL, recording it as the sole primary `origin`.
+    /// This is the clone/init/rebind path: they only ever record the store's own origin.
+    fn single(id: String, name: String, url: Option<String>) -> BoundAgent {
+        let remotes = url
+            .into_iter()
+            .map(|u| BoundRemote { name: "origin".into(), url: u, primary: true })
+            .collect();
+        BoundAgent { id, name, remotes }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,8 +395,9 @@ impl Binding {
     pub fn save(&self, env_root: &Path) -> Result<()> {
         for a in &self.agents {
             check_toml_value("name", &a.name)?;
-            if let Some(r) = &a.remote {
-                check_toml_value("remote", r)?;
+            for r in &a.remotes {
+                check_toml_value("remote name", &r.name)?;
+                check_toml_value("remote url", &r.url)?;
             }
         }
         if let Some(d) = &self.default {
@@ -355,7 +421,14 @@ impl Binding {
                 if let Some(arr) = inner.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
                     section = arr.trim().to_string();
                     if section == "agent" {
-                        b.agents.push(BoundAgent { id: String::new(), name: String::new(), remote: None });
+                        b.agents.push(BoundAgent { id: String::new(), name: String::new(), remotes: Vec::new() });
+                    } else if section == "agent.remote" {
+                        // A remote sub-table belongs to the agent opened just above. A malformed file
+                        // with a `[[agent.remote]]` before any `[[agent]]` has nowhere to hang it —
+                        // skip, matching the None-guards below.
+                        if let Some(agent) = b.agents.last_mut() {
+                            agent.remotes.push(BoundRemote { name: String::new(), url: String::new(), primary: false });
+                        }
                     }
                 } else {
                     section = inner.to_string();
@@ -376,7 +449,31 @@ impl Binding {
                     match k {
                         "id" => cur.id = v,
                         "name" => cur.name = v,
-                        "remote" => cur.remote = Some(v).filter(|s| !s.is_empty()),
+                        // The LEGACY single-remote line: `remote = "<url>"` under [[agent]] becomes one
+                        // primary origin remote, so old files parse unchanged. An empty value falls
+                        // through to `_` (no remote), matching the old `remote: None` behavior.
+                        "remote" if !v.is_empty() => {
+                            cur.remotes.push(BoundRemote { name: "origin".into(), url: v, primary: true });
+                        }
+                        _ => {}
+                    }
+                }
+                ("agent.remote", _) => {
+                    let Some(agent) = b.agents.last_mut() else { continue };
+                    let Some(r) = agent.remotes.last_mut() else { continue };
+                    match k {
+                        "name" => {
+                            if let Some(v) = unquote(v) {
+                                r.name = v;
+                            }
+                        }
+                        "url" => {
+                            if let Some(v) = unquote(v) {
+                                r.url = v;
+                            }
+                        }
+                        // A bare bool: `primary = true` (unquote returns None for it, by design).
+                        "primary" => r.primary = v.trim() == "true",
                         _ => {}
                     }
                 }
@@ -386,6 +483,35 @@ impl Binding {
         }
         if b.version > BINDING_VERSION {
             bail!("{BINDING_FILE} is version {} — this agit understands {BINDING_VERSION}. Upgrade agit.", b.version);
+        }
+        // Normalize each agent's remotes so downstream code can assume the invariants — even for a
+        // hand-edited file: drop empty-url entries, dedupe by name (last wins), and guarantee exactly
+        // one primary whenever at least one remote exists.
+        for a in &mut b.agents {
+            a.remotes.retain(|r| !r.url.is_empty());
+            let mut deduped: Vec<BoundRemote> = Vec::new();
+            for r in a.remotes.drain(..) {
+                match deduped.iter_mut().find(|e| e.name == r.name) {
+                    Some(existing) => *existing = r, // last wins, keeping first-seen position
+                    None => deduped.push(r),
+                }
+            }
+            a.remotes = deduped;
+            let mut have_primary = false;
+            for r in &mut a.remotes {
+                if r.primary {
+                    if have_primary {
+                        r.primary = false; // keep only the first primary
+                    } else {
+                        have_primary = true;
+                    }
+                }
+            }
+            if !have_primary {
+                if let Some(first) = a.remotes.first_mut() {
+                    first.primary = true;
+                }
+            }
         }
         for a in &b.agents {
             if !is_aid(&a.id) {
@@ -410,8 +536,26 @@ impl Binding {
             s.push_str("\n[[agent]]\n");
             s.push_str(&format!("id     = \"{}\"\n", a.id));
             s.push_str(&format!("name   = \"{}\"\n", a.name));
-            if let Some(r) = &a.remote {
-                s.push_str(&format!("remote = \"{r}\"\n"));
+            // Three rules, chosen so a single-remote binding stays byte-identical to what agit wrote
+            // before multi-remote existed (old files round-trip, old agit still reads them):
+            //   0 remotes                -> emit nothing.
+            //   exactly 1 named "origin" -> the LEGACY `remote = "<url>"` line.
+            //   otherwise                -> one [[agent.remote]] sub-table each, primary on the anchor.
+            match a.remotes.as_slice() {
+                [] => {}
+                [r] if r.name == "origin" => {
+                    s.push_str(&format!("remote = \"{}\"\n", r.url));
+                }
+                remotes => {
+                    for r in remotes {
+                        s.push_str("[[agent.remote]]\n");
+                        s.push_str(&format!("name    = \"{}\"\n", r.name));
+                        s.push_str(&format!("url     = \"{}\"\n", r.url));
+                        if r.primary {
+                            s.push_str("primary = true\n");
+                        }
+                    }
+                }
             }
         }
         if let Some(d) = &self.default {
@@ -457,7 +601,7 @@ pub fn check_binding(bound: &BoundAgent, actual_aid: &str) -> Result<()> {
          \x20      If intentional: agit agent rebind {} --remote <url>",
         bound.id,
         bound.name,
-        bound.remote.as_deref().unwrap_or("the local store"),
+        bound.primary_url().unwrap_or("the local store"),
         actual_aid,
         bound.name
     );
@@ -485,7 +629,7 @@ pub fn check_resolved(binding: &Binding, agent: &Agent) -> Result<()> {
 pub fn bind_here(agent: &Agent, env_root: &Path, set_default: bool) -> Result<()> {
     crate::init::ensure_gitignore(env_root)?;
     let mut b = Binding::load(env_root)?.unwrap_or_default();
-    b.upsert(BoundAgent { id: agent.aid.clone(), name: agent.name.clone(), remote: agent.remote.clone() });
+    b.upsert(BoundAgent::single(agent.aid.clone(), agent.name.clone(), agent.remote.clone()));
     if set_default || b.default.is_none() {
         b.default = Some(agent.name.clone());
     }
@@ -738,7 +882,7 @@ pub fn clone_agent(target: &str, activate: bool) -> Result<Agent> {
                 binding
                     .as_ref()
                     .and_then(|b| b.find(target))
-                    .and_then(|e| e.remote.clone())
+                    .and_then(|e| e.primary_url().map(str::to_string))
                     .with_context(|| {
                         format!(
                             "no agent `{target}` on this machine, and {BINDING_FILE} declares no remote for it.\n\
@@ -940,51 +1084,107 @@ fn committed_locator(url: &str) -> Result<String> {
     Ok(loc)
 }
 
-/// The result of reconciling the committed binding with the store's own `origin`.
+/// One remote recorded (or that would be recorded) into the committed binding by a push sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BindingSync {
-    /// No `origin` on the store — nothing a clone could be pointed at.
-    NoOrigin,
-    /// `origin` is set but is not a transport agit will write into a committed file (an `ext::`
-    /// helper, a `-`-leading URL). The binding is left untouched; the offending URL is carried back
-    /// so the caller can say why. A local push still works — this only refuses to *record* it.
-    NotShareable(String),
-    /// The binding already records this locator; nothing was written.
-    Unchanged(String),
-    /// The binding was updated to this credential-stripped locator. `stripped` is true when a
-    /// credential was removed from the store's raw origin on the way in.
-    Recorded { locator: String, stripped: bool },
+pub struct RecordedRemote {
+    pub name: String,
+    /// The credential-stripped locator actually written to the binding.
+    pub locator: String,
+    pub primary: bool,
+    /// True when a credential was removed from the store's raw remote URL on the way in.
+    pub stripped: bool,
 }
 
-/// Reconcile the committed binding with the store's current `origin`: if `origin` is a shareable
-/// transport, record its credential-stripped locator next to the aid, so a teammate's fresh clone can
-/// find this agent. Idempotent — an unchanged origin writes nothing.
+/// The result of reconciling the committed binding with ALL of the store's git remotes. Replaces the
+/// single-remote `BindingSync`: a store may push to several remotes, so the sync records each shareable
+/// one and reports the rest, marking the primary (the `origin`/first-remote identity anchor).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteSyncSummary {
+    /// The remotes recorded next to the aid (empty when the store had none, or none were shareable).
+    pub recorded: Vec<RecordedRemote>,
+    /// `(name, raw url)` for each remote skipped because it is not a transport agit will write into a
+    /// committed file (an `ext::`/`-` helper, or a URL still carrying a secret after stripping). The
+    /// local push to it is git's own business — this only refuses to *record* it.
+    pub skipped: Vec<(String, String)>,
+    /// Whether the binding's stored remotes for this agent actually changed.
+    pub changed: bool,
+}
+
+/// Reconcile the committed binding with EVERY git remote on the store: record each shareable remote's
+/// credential-stripped locator next to the aid (marking the `origin`/first-remote primary), so a
+/// teammate's fresh clone can find this agent and its extra read locators. Idempotent — an unchanged
+/// remote set writes nothing.
 ///
-/// This is what makes `agit a push` the agent-context push rather than a bare git push: the locator is
-/// only useful to anyone else once it is committed next to the aid, and a push is exactly the moment a
-/// store first gains (or changes) the remote worth recording.
-pub fn sync_origin_to_binding(aid: &str, env_root: &Path) -> Result<BindingSync> {
-    sync_origin_to_binding_in(&scope::agit_home()?, aid, env_root)
+/// This is what makes `agit a push` the agent-context push rather than a bare git push: the locators are
+/// only useful to anyone else once committed next to the aid, and a push is exactly the moment a store
+/// first gains (or changes) the remotes worth recording.
+pub fn sync_remotes_to_binding(aid: &str, env_root: &Path) -> Result<RemoteSyncSummary> {
+    sync_remotes_to_binding_in(&scope::agit_home()?, aid, env_root)
 }
 
-fn sync_origin_to_binding_in(home: &Path, aid: &str, env_root: &Path) -> Result<BindingSync> {
-    // Re-read from the store's own origin, so this is the same answer every other reader gets.
+fn sync_remotes_to_binding_in(home: &Path, aid: &str, env_root: &Path) -> Result<RemoteSyncSummary> {
+    // Re-read from the store's own remotes, so this is the same answer every other reader gets.
     let a = find_in(home, aid)?;
-    let Some(raw) = a.remote.clone() else { return Ok(BindingSync::NoOrigin) };
-    // The binding is COMMITTED and cloned by other machines: an `ext::`/`-` origin must never land in
-    // it (that is the RCE-on-clone vector). Refuse to record it — the local push is git's own business.
-    if check_remote(&raw).is_err() {
-        return Ok(BindingSync::NotShareable(raw));
+    let raw_remotes = store_remotes(&a.store);
+    let primary_name = primary_remote_name(&a.store);
+    let mut summary = RemoteSyncSummary::default();
+    let mut bound: Vec<BoundRemote> = Vec::new();
+    let mut stripped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (name, raw) in &raw_remotes {
+        // An `ext::`/`-` remote must never land in the COMMITTED binding (the RCE-on-clone vector), and
+        // `committed_locator` refuses anything still holding a secret after credential stripping. Either
+        // is reported and skipped — one bad extra remote never aborts recording the good ones.
+        if check_remote(raw).is_err() {
+            summary.skipped.push((name.clone(), raw.clone()));
+            continue;
+        }
+        let locator = match committed_locator(raw) {
+            Ok(loc) => loc,
+            Err(_) => {
+                summary.skipped.push((name.clone(), raw.clone()));
+                continue;
+            }
+        };
+        if &locator != raw {
+            stripped.insert(name.clone());
+        }
+        let primary = primary_name.as_deref() == Some(name.as_str());
+        bound.push(BoundRemote { name: name.clone(), url: locator, primary });
     }
-    let locator = committed_locator(&raw)?;
+    // The primary (origin) may itself have been skipped; guarantee exactly one primary among what we
+    // can actually record, so the binding always has a resolvable anchor.
+    if !bound.iter().any(|r| r.primary) {
+        if let Some(first) = bound.first_mut() {
+            first.primary = true;
+        }
+    }
+    summary.recorded = bound
+        .iter()
+        .map(|r| RecordedRemote {
+            name: r.name.clone(),
+            locator: r.url.clone(),
+            primary: r.primary,
+            stripped: stripped.contains(&r.name),
+        })
+        .collect();
+
+    // Compare against what the binding already records for this agent.
     let current = Binding::load(env_root)?
-        .and_then(|b| b.agents.into_iter().find(|e| e.id == a.aid).and_then(|e| e.remote));
-    if current.as_deref() == Some(locator.as_str()) {
-        return Ok(BindingSync::Unchanged(locator));
+        .and_then(|b| b.agents.into_iter().find(|e| e.id == a.aid).map(|e| e.remotes));
+    summary.changed = current.as_deref() != Some(bound.as_slice());
+
+    // Only write when there is something shareable to record and it changed. A store with no shareable
+    // remote must not wipe what a previous push committed — leave the binding untouched.
+    if !bound.is_empty() && summary.changed {
+        crate::init::ensure_gitignore(env_root)?;
+        let mut b = Binding::load(env_root)?.unwrap_or_default();
+        b.upsert(BoundAgent { id: a.aid.clone(), name: a.name.clone(), remotes: bound });
+        if b.default.is_none() {
+            b.default = Some(a.name.clone());
+        }
+        b.save(env_root)?;
     }
-    let stripped = locator != raw;
-    bind_here(&Agent { remote: Some(locator.clone()), ..a }, env_root, false)?;
-    Ok(BindingSync::Recorded { locator, stripped })
+    Ok(summary)
 }
 
 
@@ -1013,12 +1213,15 @@ pub fn rename(old: &str, new: &str) -> Result<Agent> {
     // pointing at nothing.
     if let Ok(env) = scope::env_root() {
         if let Some(mut b) = Binding::load(&env)? {
-            if b.find(&agent.aid).is_some() {
+            // Rename is a metadata edit on a fixed aid: preserve whatever remotes the binding already
+            // records (the fan-out may have recorded several) rather than collapsing to the store's
+            // origin — only the label changes.
+            if let Some(remotes) = b.find(&agent.aid).map(|e| e.remotes.clone()) {
                 let was_default = b.default.as_deref() == Some(old);
                 b.upsert(BoundAgent {
                     id: agent.aid.clone(),
                     name: agent.name.clone(),
-                    remote: agent.remote.clone(),
+                    remotes,
                 });
                 if was_default {
                     b.default = Some(agent.name.clone());
@@ -1245,7 +1448,7 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
         }
         None => agent.remote.as_deref().map(committed_locator).transpose()?,
     };
-    b.upsert(BoundAgent { id: agent.aid.clone(), name: agent.name.clone(), remote: committed.clone() });
+    b.upsert(BoundAgent::single(agent.aid.clone(), agent.name.clone(), committed.clone()));
     b.save(&env)?;
     write_active(&env, &agent.aid)?;
     // Return the LOCATOR, not the store's raw origin: a caller printing `remote` must not echo a token
@@ -1446,17 +1649,17 @@ mod tests {
     #[test]
     fn upsert_replaces_on_either_the_aid_or_the_name() {
         let mut b = Binding::default();
-        b.upsert(BoundAgent { id: "agt_old".into(), name: "frontend".into(), remote: None });
+        b.upsert(BoundAgent { id: "agt_old".into(), name: "frontend".into(), remotes: vec![] });
         // rebind: same name, new aid → replaces, does not append.
-        b.upsert(BoundAgent { id: "agt_new".into(), name: "frontend".into(), remote: None });
+        b.upsert(BoundAgent { id: "agt_new".into(), name: "frontend".into(), remotes: vec![] });
         assert_eq!(b.agents.len(), 1, "a rebind left a duplicate name: {:?}", b.agents);
         assert_eq!(b.agents[0].id, "agt_new");
         // rename: same aid, new name → replaces the same slot.
-        b.upsert(BoundAgent { id: "agt_new".into(), name: "web".into(), remote: None });
+        b.upsert(BoundAgent { id: "agt_new".into(), name: "web".into(), remotes: vec![] });
         assert_eq!(b.agents.len(), 1, "a rename left a duplicate aid: {:?}", b.agents);
         assert_eq!(b.agents[0].name, "web");
         // a genuinely different agent is a new entry.
-        b.upsert(BoundAgent { id: "agt_other".into(), name: "api".into(), remote: None });
+        b.upsert(BoundAgent { id: "agt_other".into(), name: "api".into(), remotes: vec![] });
         assert_eq!(b.agents.len(), 2);
     }
 
@@ -1468,10 +1671,14 @@ mod tests {
                 BoundAgent {
                     id: "agt_0190f3a1-4c2b-7f1e-8a3d-9b2c1d4e5f60".into(),
                     name: "frontend".into(),
-                    remote: Some("https://hub.acme.com/frontend.git".into()),
+                    remotes: vec![BoundRemote {
+                        name: "origin".into(),
+                        url: "https://hub.acme.com/frontend.git".into(),
+                        primary: true,
+                    }],
                 },
                 // No remote: an agent exists before it is published.
-                BoundAgent { id: "agt_0190f4b7-9d81-7c02-b6aa-2f5e8c7d3a11".into(), name: "api".into(), remote: None },
+                BoundAgent { id: "agt_0190f4b7-9d81-7c02-b6aa-2f5e8c7d3a11".into(), name: "api".into(), remotes: vec![] },
             ],
             default: Some("api".into()),
         };
@@ -1492,7 +1699,7 @@ agent = "frontend"        # what a FRESH clone activates
         let p = Binding::parse(doc).unwrap();
         assert_eq!(p.agents.len(), 1);
         assert_eq!(p.agents[0].name, "frontend");
-        assert_eq!(p.agents[0].remote.as_deref(), Some("https://hub.acme.com/frontend.git"));
+        assert_eq!(p.agents[0].primary_url(), Some("https://hub.acme.com/frontend.git"));
         assert_eq!(p.default.as_deref(), Some("frontend"), "the trailing comment is not part of the value");
 
         let d = tmp();
@@ -1518,7 +1725,7 @@ agent = "frontend"        # what a FRESH clone activates
         let bound = BoundAgent {
             id: "agt_01J".into(),
             name: "frontend".into(),
-            remote: Some("https://hub/frontend.git".into()),
+            remotes: vec![BoundRemote { name: "origin".into(), url: "https://hub/frontend.git".into(), primary: true }],
         };
         assert!(check_binding(&bound, "agt_01J").is_ok());
         let e = check_binding(&bound, "agt_02X").unwrap_err().to_string();
@@ -1693,7 +1900,8 @@ agent = "frontend"        # what a FRESH clone activates
         bind_here(&a, &env, false).unwrap();
 
         // No origin yet — a push has nothing to point a clone at.
-        assert_eq!(sync_origin_to_binding_in(h.path(), &a.aid, &env).unwrap(), BindingSync::NoOrigin);
+        let s = sync_remotes_to_binding_in(h.path(), &a.aid, &env).unwrap();
+        assert!(s.recorded.is_empty() && !s.changed, "no remote, nothing recorded: {s:?}");
 
         // `git remote add` sets an origin that carries a credential, as a person typing a token URL would.
         scope::git_in(
@@ -1703,33 +1911,253 @@ agent = "frontend"        # what a FRESH clone activates
         .unwrap();
 
         // The first push records the locator with the credential stripped out.
-        match sync_origin_to_binding_in(h.path(), &a.aid, &env).unwrap() {
-            BindingSync::Recorded { locator, stripped } => {
-                assert!(stripped, "a credential in the origin must be stripped on the way into the binding");
-                assert_eq!(locator, "https://hub.example.com/frontend.git");
-                assert!(!locator.contains("ghp_"), "no token may reach the committed binding: {locator}");
-            }
-            other => panic!("expected Recorded, got {other:?}"),
-        }
+        let s = sync_remotes_to_binding_in(h.path(), &a.aid, &env).unwrap();
+        assert!(s.changed, "the first push must record the origin");
+        assert_eq!(s.recorded.len(), 1);
+        let rec = &s.recorded[0];
+        assert!(rec.stripped, "a credential in the origin must be stripped on the way into the binding");
+        assert!(rec.primary, "the sole origin is the primary anchor");
+        assert_eq!(rec.locator, "https://hub.example.com/frontend.git");
+        assert!(!rec.locator.contains("ghp_"), "no token may reach the committed binding: {}", rec.locator);
         let b = Binding::load(&env).unwrap().unwrap();
-        assert_eq!(b.agents[0].remote.as_deref(), Some("https://hub.example.com/frontend.git"));
+        assert_eq!(b.agents[0].primary_url(), Some("https://hub.example.com/frontend.git"));
 
         // Idempotent: pushing again with an unchanged origin writes nothing.
-        assert!(matches!(
-            sync_origin_to_binding_in(h.path(), &a.aid, &env).unwrap(),
-            BindingSync::Unchanged(_)
-        ));
+        let s = sync_remotes_to_binding_in(h.path(), &a.aid, &env).unwrap();
+        assert!(!s.changed, "an unchanged remote set must not rewrite the binding: {s:?}");
 
         // An `ext::` origin (the RCE-on-clone transport) is refused for the committed file — the local
         // push is git's business, but agit will not hand a teammate a shell command to clone.
         scope::git_in(&a.store, &["remote", "set-url", "origin", "ext::sh -c evil"]).unwrap();
-        match sync_origin_to_binding_in(h.path(), &a.aid, &env).unwrap() {
-            BindingSync::NotShareable(url) => assert!(url.contains("ext::"), "got: {url}"),
-            other => panic!("expected NotShareable, got {other:?}"),
-        }
+        let s = sync_remotes_to_binding_in(h.path(), &a.aid, &env).unwrap();
+        assert!(s.recorded.is_empty(), "an ext:: origin is not recorded");
+        assert_eq!(s.skipped.len(), 1);
+        assert!(s.skipped[0].1.contains("ext::"), "got: {:?}", s.skipped);
         // ...and the last good locator still stands, untouched.
         let b = Binding::load(&env).unwrap().unwrap();
-        assert_eq!(b.agents[0].remote.as_deref(), Some("https://hub.example.com/frontend.git"));
+        assert_eq!(b.agents[0].primary_url(), Some("https://hub.example.com/frontend.git"));
+    }
+
+    // ---- multi-remote bindings -------------------------------------------------------------------
+
+    /// An OLD single-remote file (`remote = "url"`) parses as one primary origin remote, and re-emits
+    /// the identical legacy line — never a `[[agent.remote]]` sub-table. This is the back-compat anchor.
+    #[test]
+    fn parses_legacy_single_remote_as_one_primary() {
+        let doc = "\
+version = 1
+
+[[agent]]
+id     = \"agt_0190f3a1-4c2b-7f1e-8a3d-9b2c1d4e5f60\"
+name   = \"frontend\"
+remote = \"https://hub.acme.com/frontend.git\"
+";
+        let p = Binding::parse(doc).unwrap();
+        assert_eq!(p.agents.len(), 1);
+        assert_eq!(p.agents[0].remotes.len(), 1);
+        assert_eq!(p.agents[0].remotes[0].name, "origin");
+        assert!(p.agents[0].remotes[0].primary, "the sole remote is the primary anchor");
+        assert_eq!(p.agents[0].primary_url(), Some("https://hub.acme.com/frontend.git"));
+
+        // Re-serializes to the identical legacy line — no sub-table, byte-for-byte round-trip.
+        let out = p.to_toml();
+        assert!(out.contains("remote = \"https://hub.acme.com/frontend.git\""), "got:\n{out}");
+        assert!(!out.contains("[[agent.remote]]"), "a single origin must stay legacy-shaped:\n{out}");
+        assert_eq!(Binding::parse(&out).unwrap(), p, "legacy form must round-trip");
+    }
+
+    /// Two `[[agent.remote]]` sub-tables parse into two remotes with exactly one primary, and round-trip
+    /// through the sub-table form.
+    #[test]
+    fn parses_and_roundtrips_multi_remote_subtables() {
+        let doc = "\
+version = 1
+
+[[agent]]
+id     = \"agt_0190f3a1-4c2b-7f1e-8a3d-9b2c1d4e5f60\"
+name   = \"frontend\"
+[[agent.remote]]
+name    = \"origin\"
+url     = \"https://git.acme.com/frontend.git\"
+primary = true
+[[agent.remote]]
+name    = \"hub\"
+url     = \"https://hub.alice.dev/frontend.git\"
+";
+        let p = Binding::parse(doc).unwrap();
+        assert_eq!(p.agents.len(), 1);
+        let rs = &p.agents[0].remotes;
+        assert_eq!(rs.len(), 2, "both remotes must parse: {rs:?}");
+        assert_eq!(rs.iter().filter(|r| r.primary).count(), 1, "exactly one primary");
+        assert!(rs.iter().find(|r| r.name == "origin").unwrap().primary, "origin is the primary");
+        assert!(!rs.iter().find(|r| r.name == "hub").unwrap().primary);
+        assert_eq!(p.agents[0].primary_url(), Some("https://git.acme.com/frontend.git"));
+
+        // A non-legacy remote set serializes as sub-tables and round-trips.
+        let out = p.to_toml();
+        assert!(out.contains("[[agent.remote]]"), "multi-remote must use sub-tables:\n{out}");
+        assert!(!out.contains("remote = \""), "no legacy line for a multi-remote agent:\n{out}");
+        assert_eq!(Binding::parse(&out).unwrap(), p, "multi-remote must round-trip");
+    }
+
+    /// Normalization guarantees exactly one primary even for a hand-edited file: none marked → the first
+    /// wins; several marked → only the first survives.
+    #[test]
+    fn normalize_enforces_single_primary() {
+        // Zero primary=true anywhere → the first remote becomes primary.
+        let none = "\
+[[agent]]
+id     = \"agt_0190f3a1-4c2b-7f1e-8a3d-9b2c1d4e5f60\"
+name   = \"frontend\"
+[[agent.remote]]
+name    = \"origin\"
+url     = \"https://a/x.git\"
+[[agent.remote]]
+name    = \"hub\"
+url     = \"https://b/x.git\"
+";
+        let p = Binding::parse(none).unwrap();
+        assert_eq!(p.agents[0].remotes.iter().filter(|r| r.primary).count(), 1);
+        assert!(p.agents[0].remotes[0].primary, "the first remote is promoted when none is marked");
+
+        // Two primary=true → only the first is kept.
+        let two = "\
+[[agent]]
+id     = \"agt_0190f3a1-4c2b-7f1e-8a3d-9b2c1d4e5f60\"
+name   = \"frontend\"
+[[agent.remote]]
+name    = \"origin\"
+url     = \"https://a/x.git\"
+primary = true
+[[agent.remote]]
+name    = \"hub\"
+url     = \"https://b/x.git\"
+primary = true
+";
+        let p = Binding::parse(two).unwrap();
+        assert_eq!(p.agents[0].remotes.iter().filter(|r| r.primary).count(), 1, "only one primary survives");
+        assert_eq!(p.agents[0].primary().unwrap().name, "origin", "the first primary wins");
+    }
+
+    /// A store with two remotes records BOTH into the binding, origin marked primary, each stripped
+    /// through `committed_locator`; `primary_url()` resolves the origin.
+    #[test]
+    fn sync_records_all_store_remotes_origin_primary() {
+        let h = tmp();
+        let d = tmp();
+        let env = env_repo(d.path());
+        let a = new_agent_in(h.path(), "frontend").unwrap();
+        let bare_a = d.path().join("a.git");
+        let bare_b = d.path().join("b.git");
+        std::fs::create_dir_all(&bare_a).unwrap();
+        std::fs::create_dir_all(&bare_b).unwrap();
+        scope::git_in(&bare_a, &["init", "-q", "--bare"]).unwrap();
+        scope::git_in(&bare_b, &["init", "-q", "--bare"]).unwrap();
+        scope::git_in(&a.store, &["remote", "add", "origin", &format!("file://{}", bare_a.display())]).unwrap();
+        scope::git_in(&a.store, &["remote", "add", "hub", &format!("file://{}", bare_b.display())]).unwrap();
+
+        let s = sync_remotes_to_binding_in(h.path(), &a.aid, &env).unwrap();
+        assert!(s.changed);
+        assert_eq!(s.recorded.len(), 2, "both remotes recorded: {:?}", s.recorded);
+        let b = Binding::load(&env).unwrap().unwrap();
+        let e = b.find("frontend").unwrap();
+        assert_eq!(e.remotes.len(), 2);
+        assert!(e.remotes.iter().find(|r| r.name == "origin").unwrap().primary, "origin is primary");
+        assert!(!e.remotes.iter().find(|r| r.name == "hub").unwrap().primary);
+        assert_eq!(e.primary_url(), Some(format!("file://{}", bare_a.display()).as_str()));
+    }
+
+    /// A credentialed hub remote is token-stripped on the way into the binding; the origin is untouched.
+    #[test]
+    fn sync_strips_credentials_per_remote() {
+        let h = tmp();
+        let d = tmp();
+        let env = env_repo(d.path());
+        let a = new_agent_in(h.path(), "frontend").unwrap();
+        scope::git_in(&a.store, &["remote", "add", "origin", "https://git.acme.com/frontend.git"]).unwrap();
+        scope::git_in(
+            &a.store,
+            &["remote", "add", "hub", "https://alice:ghp_secrettoken00000000000000000000@hub.alice.dev/frontend.git"],
+        )
+        .unwrap();
+
+        let s = sync_remotes_to_binding_in(h.path(), &a.aid, &env).unwrap();
+        let b = Binding::load(&env).unwrap().unwrap();
+        let e = b.find("frontend").unwrap();
+        let hub = e.remotes.iter().find(|r| r.name == "hub").unwrap();
+        assert_eq!(hub.url, "https://hub.alice.dev/frontend.git", "the hub token must be stripped");
+        assert!(!hub.url.contains("ghp_"), "no token may reach the binding: {}", hub.url);
+        let origin = e.remotes.iter().find(|r| r.name == "origin").unwrap();
+        assert_eq!(origin.url, "https://git.acme.com/frontend.git", "the origin is unaffected");
+        assert!(origin.primary);
+        assert!(s.recorded.iter().any(|r| r.name == "hub" && r.stripped), "hub must be reported stripped");
+    }
+
+    /// A good origin plus a non-shareable `ext::` extra: the origin is still recorded, the ext:: hub is
+    /// reported skipped, and the binding is not corrupted.
+    #[test]
+    fn sync_skips_a_nonshareable_extra_without_aborting() {
+        let h = tmp();
+        let d = tmp();
+        let env = env_repo(d.path());
+        let a = new_agent_in(h.path(), "frontend").unwrap();
+        scope::git_in(&a.store, &["remote", "add", "origin", "https://git.acme.com/frontend.git"]).unwrap();
+        scope::git_in(&a.store, &["remote", "add", "hub", "ext::sh -c evil"]).unwrap();
+
+        let s = sync_remotes_to_binding_in(h.path(), &a.aid, &env).unwrap();
+        assert_eq!(s.recorded.len(), 1, "only the shareable origin is recorded: {:?}", s.recorded);
+        assert_eq!(s.recorded[0].name, "origin");
+        assert!(s.recorded[0].primary);
+        assert_eq!(s.skipped.len(), 1, "the ext:: hub is skipped: {:?}", s.skipped);
+        assert_eq!(s.skipped[0].0, "hub");
+        assert!(s.skipped[0].1.contains("ext::"));
+        // The binding parses cleanly and carries only the good remote.
+        let b = Binding::load(&env).unwrap().unwrap();
+        let e = b.find("frontend").unwrap();
+        assert_eq!(e.remotes.len(), 1);
+        assert_eq!(e.primary_url(), Some("https://git.acme.com/frontend.git"));
+    }
+
+    /// `primary_remote_name` designates the anchor: `origin` when present, else the first in git's
+    /// alphabetical order; `store_remotes` lists every remote with its URL.
+    #[test]
+    fn store_remotes_and_primary_name_designate_the_anchor() {
+        let h = tmp();
+        let a = new_agent_in(h.path(), "frontend").unwrap();
+        assert!(store_remotes(&a.store).is_empty(), "a fresh store has no remotes");
+        assert_eq!(primary_remote_name(&a.store), None);
+
+        // No origin: the first in git's alphabetical order (`alpha` before `zeta`) is the anchor.
+        scope::git_in(&a.store, &["remote", "add", "zeta", "https://z/x.git"]).unwrap();
+        scope::git_in(&a.store, &["remote", "add", "alpha", "https://a/x.git"]).unwrap();
+        let names: Vec<String> = store_remotes(&a.store).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["alpha".to_string(), "zeta".to_string()], "git lists alphabetically");
+        assert_eq!(primary_remote_name(&a.store).as_deref(), Some("alpha"));
+
+        // Add origin: it always wins the anchor, wherever it sorts.
+        scope::git_in(&a.store, &["remote", "add", "origin", "https://o/x.git"]).unwrap();
+        assert_eq!(primary_remote_name(&a.store).as_deref(), Some("origin"));
+    }
+
+    /// The resolution a bare `agit a clone <name>` performs: a binding with two remotes resolves to the
+    /// PRIMARY (origin) url — the shared anchor a teammate without hub write can still reach.
+    #[test]
+    fn clone_resolves_primary() {
+        let b = Binding {
+            version: 1,
+            agents: vec![BoundAgent {
+                id: "agt_0190f3a1-4c2b-7f1e-8a3d-9b2c1d4e5f60".into(),
+                name: "frontend".into(),
+                remotes: vec![
+                    BoundRemote { name: "hub".into(), url: "https://hub.alice.dev/frontend.git".into(), primary: false },
+                    BoundRemote { name: "origin".into(), url: "https://git.acme.com/frontend.git".into(), primary: true },
+                ],
+            }],
+            default: Some("frontend".into()),
+        };
+        // clone_agent looks up `find(target).primary_url()` — the origin, not the personal hub.
+        let resolved = b.find("frontend").and_then(|e| e.primary_url().map(str::to_string));
+        assert_eq!(resolved.as_deref(), Some("https://git.acme.com/frontend.git"));
     }
 
     #[test]
@@ -1740,7 +2168,7 @@ agent = "frontend"        # what a FRESH clone activates
         let a = new_agent_in(h.path(), "frontend").unwrap();
         bind_here(&a, &env, false).unwrap();
         let b = Binding::load(&env).unwrap().unwrap();
-        assert_eq!(b.agents, vec![BoundAgent { id: a.aid.clone(), name: "frontend".into(), remote: None }]);
+        assert_eq!(b.agents, vec![BoundAgent { id: a.aid.clone(), name: "frontend".into(), remotes: vec![] }]);
         assert_eq!(b.default.as_deref(), Some("frontend"), "the first agent bound becomes the default");
 
         // Upsert matches on the id: a rename edits the entry, it does not add a second.
@@ -1767,7 +2195,7 @@ agent = "frontend"        # what a FRESH clone activates
             agents: vec![BoundAgent {
                 id: "agt_0190f3a1-4c2b-7f1e-8a3d-9b2c1d4e5f60".into(),
                 name: "frontend".into(),
-                remote: Some("https://hub/frontend.git".into()),
+                remotes: vec![BoundRemote { name: "origin".into(), url: "https://hub/frontend.git".into(), primary: true }],
             }],
             default: Some("frontend".into()),
         };
@@ -1789,7 +2217,7 @@ agent = "frontend"        # what a FRESH clone activates
 
         // An entry that agrees on the id is settled, whatever label it wears (a stale rename hint).
         let ok = Binding {
-            agents: vec![BoundAgent { id: a.aid.clone(), name: "old-label".into(), remote: None }],
+            agents: vec![BoundAgent { id: a.aid.clone(), name: "old-label".into(), remotes: vec![] }],
             ..Binding::default()
         };
         assert_eq!(resolve_in(h.path(), Some(&a.aid), None, None, Some(&ok)).unwrap().aid, a.aid);
