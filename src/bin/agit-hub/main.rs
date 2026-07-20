@@ -553,6 +553,10 @@ mod h4_tests {
             // Mirror production's tight registration bucket, so the per-IP throttle is exercised for real.
             register_rl: Arc::new(TokenBuckets::with_rate(REGISTER_RATE_PER_SEC, REGISTER_BURST)),
             metrics: Arc::new(agit::hub::metrics::Metrics::new()),
+            escrow: crate::server::EscrowKeypair {
+                secret: [7u8; 32],
+                public: agit::agent::x25519_public_from_secret(&[7u8; 32]),
+            },
         }));
         (dir, ctx)
     }
@@ -694,6 +698,8 @@ mod h4_tests {
                     ],
                     created: now_iso(),
                     current_kek_gen: 0,
+                    recovery_x25519: String::new(),
+                    escrow_mode: "none".into(),
                 })
             })
             .await
@@ -972,6 +978,10 @@ mod h3_tests {
             token_rl: Arc::new(TokenBuckets::new()),
             register_rl: Arc::new(TokenBuckets::new()),
             metrics: Arc::new(agit::hub::metrics::Metrics::new()),
+            escrow: crate::server::EscrowKeypair {
+                secret: [7u8; 32],
+                public: agit::agent::x25519_public_from_secret(&[7u8; 32]),
+            },
         }));
         (dir, ctx)
     }
@@ -1217,6 +1227,8 @@ mod h3_tests {
                     ],
                     created: now_iso(),
                     current_kek_gen: 0,
+                    recovery_x25519: String::new(),
+                    escrow_mode: "none".into(),
                 })
             })
             .await
@@ -1322,6 +1334,10 @@ mod obs_tests {
             token_rl: Arc::new(TokenBuckets::new()),
             register_rl: Arc::new(TokenBuckets::new()),
             metrics: Arc::new(Metrics::new()),
+            escrow: crate::server::EscrowKeypair {
+                secret: [7u8; 32],
+                public: agit::agent::x25519_public_from_secret(&[7u8; 32]),
+            },
         }));
         (dir, ctx)
     }

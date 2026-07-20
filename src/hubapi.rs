@@ -182,10 +182,15 @@ impl HubEndpoint {
     /// `POST /api/orgs/<org>/kek/envelopes` — publish a Team-KEK generation's per-member envelopes.
     /// `envelopes` is an array of `{recipient, wrapped_kek, recipient_epoch}`.
     pub fn post_kek_envelopes(&self, org: &str, gen: i64, envelopes: serde_json::Value) -> Result<serde_json::Value> {
+        self.post_json(&format!("/api/orgs/{org}/kek/envelopes"), &serde_json::json!({ "gen": gen, "envelopes": envelopes }))
+    }
+
+    /// A `POST` of a JSON body returning the parsed 2xx response (an error carries the hub's message) —
+    /// the shared shape behind the Wave-5 org/escrow writes below.
+    fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let auth = self.require_auth()?;
-        let url = format!("{}/api/orgs/{org}/kek/envelopes", self.base);
-        let body = serde_json::json!({ "gen": gen, "envelopes": envelopes });
-        let payload = serde_json::to_string(&body).context("serializing kek envelopes body")?;
+        let url = format!("{}{path}", self.base);
+        let payload = serde_json::to_string(body).context("serializing request body")?;
         let mut resp = http_agent()
             .post(&url)
             .header("Authorization", &auth.header_value())
@@ -195,6 +200,78 @@ impl HubEndpoint {
         let status = resp.status().as_u16();
         let text = resp.body_mut().read_to_string().unwrap_or_default();
         ok_json(status, &text, &url)
+    }
+
+    /// `GET /api/escrow/pubkey` — the hub's escrow PUBLIC key (hex), the recipient a hub-assist client
+    /// seals its content key TO (encryption-recipients Wave 5).
+    pub fn escrow_pubkey(&self) -> Result<String> {
+        let auth = self.require_auth()?;
+        let url = format!("{}/api/escrow/pubkey", self.base);
+        let mut resp = http_agent()
+            .get(&url)
+            .header("Authorization", &auth.header_value())
+            .call()
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        let v = ok_json(status, &text, &url)?;
+        v.get("pubkey")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string())
+            .context("the hub returned no escrow pubkey")
+    }
+
+    /// `POST /api/orgs/<org>/recovery` `{key}` — set the org's OFFLINE recovery recipient (owner-only).
+    pub fn set_org_recovery(&self, org: &str, key: &str) -> Result<serde_json::Value> {
+        self.post_json(&format!("/api/orgs/{org}/recovery"), &serde_json::json!({ "key": key }))
+    }
+
+    /// `DELETE /api/orgs/<org>/recovery` — clear the org's OFFLINE recovery recipient (owner-only).
+    pub fn clear_org_recovery(&self, org: &str) -> Result<serde_json::Value> {
+        let auth = self.require_auth()?;
+        let url = format!("{}/api/orgs/{org}/recovery", self.base);
+        let mut resp = http_agent()
+            .delete(&url)
+            .header("Authorization", &auth.header_value())
+            .call()
+            .with_context(|| format!("DELETE {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        ok_json(status, &text, &url)
+    }
+
+    /// `POST /api/orgs/<org>/escrow` `{mode}` — set the org's hub-assist escrow mode (owner-only).
+    pub fn set_org_escrow(&self, org: &str, mode: &str) -> Result<serde_json::Value> {
+        self.post_json(&format!("/api/orgs/{org}/escrow"), &serde_json::json!({ "mode": mode }))
+    }
+
+    /// `POST /api/agent/<owner>/<name>/keys/escrow` `{kid, wrapped_ck}` — store a content key sealed to the
+    /// hub escrow key (hub-assist escrow).
+    pub fn post_escrow_key(&self, owner: &str, name: &str, kid: u32, wrapped_ck: &str) -> Result<serde_json::Value> {
+        self.post_json(
+            &format!("/api/agent/{owner}/{name}/keys/escrow"),
+            &serde_json::json!({ "kid": kid, "wrapped_ck": wrapped_ck }),
+        )
+    }
+
+    /// `POST /api/agent/<owner>/<name>/keys/release` — release the escrowed content keys the caller may
+    /// read. `Ok(None)` on 404 (not permitted / not a hub-assist session), the `{released:[...]}` payload
+    /// otherwise. Fail-closed at the hub: it only releases what `acl::decide(_, Read)` allows.
+    pub fn release_keys(&self, owner: &str, name: &str) -> Result<Option<serde_json::Value>> {
+        let auth = self.require_auth()?;
+        let url = format!("{}/api/agent/{owner}/{name}/keys/release", self.base);
+        let mut resp = http_agent()
+            .post(&url)
+            .header("Authorization", &auth.header_value())
+            .header("Content-Type", "application/json")
+            .send("{}")
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        if status == 404 || status == 403 {
+            return Ok(None);
+        }
+        ok_json(status, &text, &url).map(Some)
     }
 }
 

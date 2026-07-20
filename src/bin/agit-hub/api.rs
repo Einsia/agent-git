@@ -104,6 +104,9 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         // prefix route below. All require an authenticated caller.
         ("POST", "identity/enroll") => return api_identity_enroll(ctx, caller, body).await,
         ("GET", "identity") => return api_identity_list(ctx, req, caller).await,
+        // The hub's escrow PUBLIC key (encryption-recipients Wave 5, hub-assist escrow). Any authenticated
+        // caller may read it — it is a public key a hub-assist client seals its content key TO.
+        ("GET", "escrow/pubkey") => return api_escrow_pubkey(ctx, caller).await,
         _ => {}
     }
     // identity/<user> — a single registry lookup. GET only; POST enroll is the exact route above and
@@ -142,6 +145,15 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
             if tail.is_empty() || tail.starts_with('/') {
                 return api_org_kek(ctx, caller, name, tail, m, req.query(), body).await;
             }
+        }
+        // orgs/<org>/recovery — the OPT-IN offline recovery recipient (Wave 5). Owner-only to set/clear;
+        // any member may show. Exact suffix, so a stray /recoveryXYZ does not match.
+        if let Some(name) = after.strip_suffix("/recovery") {
+            return api_org_recovery(ctx, caller, name, m, body).await;
+        }
+        // orgs/<org>/escrow — the OPT-IN hub-assist escrow mode (Wave 5). Owner-only to set.
+        if let Some(name) = after.strip_suffix("/escrow") {
+            return api_org_escrow(ctx, caller, name, m, body).await;
         }
         return match m {
             "GET" => api_org_get(ctx, caller, after).await,
@@ -287,6 +299,18 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         if tail.is_empty() || tail.starts_with('/') {
             return api_members(ctx, caller, owner, name, tail, m, body).await;
         }
+    }
+
+    // agent/<owner>/<name>/keys/<escrow|release> — the OPT-IN hub-assist escrow endpoints (Wave 5).
+    // `keys/escrow` (POST, Write-gated) stores a content key sealed to the hub escrow key; `keys/release`
+    // (POST, Read-gated — the SAME acl::decide gate as git fetch) releases escrowed CKs to a reader,
+    // fail-closed. Both require the owning org to be in `escrow_mode = 'hub-assist'`.
+    if let Some((name, tail)) = after.split_once("/keys/") {
+        return match (m, tail) {
+            ("POST", "escrow") => api_keys_escrow(ctx, caller, owner, name, body).await,
+            ("POST", "release") => api_keys_release(ctx, caller, owner, name).await,
+            _ => Resp::text(405, "method not allowed"),
+        };
     }
 
     // agent/<owner>/<name>/<verb> — the lifecycle verbs. Each is its own route rather than a PATCH
@@ -2112,6 +2136,8 @@ pub(crate) async fn api_orgs_create(ctx: &Ctx, caller: &Caller, body: &[u8]) -> 
                 members: vec![OrgMember { username: user.clone(), role: "admin".into() }],
                 created: store::now_iso(),
                 current_kek_gen: 0,
+                recovery_x25519: String::new(),
+                escrow_mode: "none".into(),
             });
             true
         })
@@ -2135,9 +2161,15 @@ pub(crate) async fn api_org_get(ctx: &Ctx, caller: &Caller, name: &str) -> Resp 
     let org = ctx.store.org(name).await;
     let visible = |o: &Org| caller.is_admin || caller.user.as_deref().is_some_and(|u| o.is_member(u));
     match org {
-        Some(o) if visible(&o) => {
-            Resp::json(serde_json::json!({ "name": o.name, "created": o.created, "members": org_members_json(&o) }))
-        }
+        Some(o) if visible(&o) => Resp::json(serde_json::json!({
+            "name": o.name,
+            "created": o.created,
+            "members": org_members_json(&o),
+            // Wave-5 opt-in state (both default to unset/none). The client reads recovery_x25519 during
+            // `team rekey` to add the `@recovery` envelope, and escrow_mode to gate `a escrow enable`.
+            "recovery_x25519": o.recovery_x25519,
+            "escrow_mode": o.escrow_mode,
+        })),
         _ => Resp::err(404, "not found"),
     }
 }
@@ -2271,6 +2303,231 @@ async fn api_org_kek_publish(ctx: &Ctx, caller: &Caller, org: &Org, actor: &str,
     )
     .await;
     Resp::json(serde_json::json!({ "org": org.name, "gen": gen, "envelopes": rows.len(), "current": gen }))
+}
+
+// ── Wave-5 opt-in escape hatches (both OFF by default; neither changes any wave-1..4 behavior) ──
+//
+// Feature 1: a per-org OFFLINE recovery recipient re-trusts an offline admin (NOT the hub) — the client
+// seals TK to it during `team rekey`; the hub only files the ciphertext under `@recovery`, and the org
+// still stores only a public key. Feature 2: hub-assist escrow re-trusts the HUB — the client seals its
+// content key to the hub escrow PUBLIC key, and the hub releases it under the SAME `acl::decide(_, Read)`
+// gate git fetch uses, fail-closed. Both are settable only by an org OWNER (an org admin, the ownership
+// role — mirrors `api_org_transfer`/`api_org_delete`).
+
+/// `GET /api/escrow/pubkey` — the hub's escrow PUBLIC key (hex). Any authenticated caller may read it; it
+/// is a public key a hub-assist client seals its content key TO, so disclosing it grants nothing.
+async fn api_escrow_pubkey(ctx: &Ctx, caller: &Caller) -> Resp {
+    if caller.user.is_none() {
+        return Resp::err(401, "login required");
+    }
+    Resp::json(serde_json::json!({ "pubkey": hex::encode(ctx.escrow.public) }))
+}
+
+/// `/api/orgs/<org>/recovery` — the OPT-IN offline recovery recipient (Wave 5, feature 1). GET shows it to
+/// any member (empty = unset, the default); POST `{key}` sets a hex X25519 pubkey (OWNER-only); DELETE
+/// clears it (OWNER-only). Existence non-disclosure: a missing/invisible org is a 404 like everywhere.
+async fn api_org_recovery(ctx: &Ctx, caller: &Caller, name: &str, method: &str, body: &[u8]) -> Resp {
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let Some(org) = ctx.store.org(name).await else {
+        return Resp::err(404, "not found");
+    };
+    if !(caller.is_admin || org.is_member(&user)) {
+        return Resp::err(404, "not found");
+    }
+    let is_owner = caller.is_admin || org.is_admin(&user);
+    match method {
+        "GET" => Resp::json(serde_json::json!({ "org": org.name, "recovery_x25519": org.recovery_x25519 })),
+        "POST" => {
+            if !is_owner {
+                return Resp::err(403, "only an org owner may set the offline recovery recipient");
+            }
+            let Some(v) = json_body(body) else {
+                return Resp::err(400, "want a JSON body");
+            };
+            let Some(key) = str_field(&v, "key") else {
+                return Resp::err(400, "want key (hex X25519 pubkey)");
+            };
+            let key = key.trim().to_ascii_lowercase();
+            // Refuse anything that is not a 32-byte hex X25519 pubkey — a junk key would silently never open.
+            if hex::decode(&key).ok().filter(|b| b.len() == 32).is_none() {
+                return Resp::err(400, "key must be a 64-hex-char (32-byte) X25519 public key");
+            }
+            let orgname = org.name.clone();
+            let key2 = key.clone();
+            let done = ctx
+                .store
+                .update_orgs(move |list| match list.iter_mut().find(|o| o.name == orgname) {
+                    Some(o) => {
+                        o.recovery_x25519 = key2.clone();
+                        true
+                    }
+                    None => false,
+                })
+                .await
+                .unwrap_or(false);
+            if !done {
+                return Resp::err(404, "not found");
+            }
+            audit_append(ctx.root(), &user, audit::ORG_RECOVERY_SET, None, &format!("org={}", org.name)).await;
+            Resp::json(serde_json::json!({ "org": org.name, "recovery_x25519": key }))
+        }
+        "DELETE" => {
+            if !is_owner {
+                return Resp::err(403, "only an org owner may clear the offline recovery recipient");
+            }
+            let orgname = org.name.clone();
+            let done = ctx
+                .store
+                .update_orgs(move |list| match list.iter_mut().find(|o| o.name == orgname) {
+                    Some(o) => {
+                        o.recovery_x25519 = String::new();
+                        true
+                    }
+                    None => false,
+                })
+                .await
+                .unwrap_or(false);
+            if !done {
+                return Resp::err(404, "not found");
+            }
+            audit_append(ctx.root(), &user, audit::ORG_RECOVERY_CLEAR, None, &format!("org={}", org.name)).await;
+            Resp::json(serde_json::json!({ "org": org.name, "recovery_x25519": "" }))
+        }
+        _ => Resp::text(405, "method not allowed"),
+    }
+}
+
+/// `/api/orgs/<org>/escrow` — the OPT-IN hub-assist escrow mode (Wave 5, feature 2). GET shows the mode to
+/// any member; POST `{mode}` sets it to `none` | `hub-assist` (OWNER-only). Turning it on re-trusts the
+/// hub with the ability to release the org's escrowed session keys under the ACL gate.
+async fn api_org_escrow(ctx: &Ctx, caller: &Caller, name: &str, method: &str, body: &[u8]) -> Resp {
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let Some(org) = ctx.store.org(name).await else {
+        return Resp::err(404, "not found");
+    };
+    if !(caller.is_admin || org.is_member(&user)) {
+        return Resp::err(404, "not found");
+    }
+    let is_owner = caller.is_admin || org.is_admin(&user);
+    match method {
+        "GET" => Resp::json(serde_json::json!({ "org": org.name, "escrow_mode": org.escrow_mode })),
+        "POST" => {
+            if !is_owner {
+                return Resp::err(403, "only an org owner may change the escrow mode");
+            }
+            let Some(v) = json_body(body) else {
+                return Resp::err(400, "want a JSON body");
+            };
+            let Some(mode) = str_field(&v, "mode") else {
+                return Resp::err(400, "want mode (none | hub-assist)");
+            };
+            let mode = mode.trim().to_string();
+            if mode != "none" && mode != "hub-assist" {
+                return Resp::err(400, "mode must be none or hub-assist");
+            }
+            let orgname = org.name.clone();
+            let mode2 = mode.clone();
+            let done = ctx
+                .store
+                .update_orgs(move |list| match list.iter_mut().find(|o| o.name == orgname) {
+                    Some(o) => {
+                        o.escrow_mode = mode2.clone();
+                        true
+                    }
+                    None => false,
+                })
+                .await
+                .unwrap_or(false);
+            if !done {
+                return Resp::err(404, "not found");
+            }
+            audit_append(ctx.root(), &user, audit::ORG_ESCROW_MODE, None, &format!("org={} mode={mode}", org.name)).await;
+            Resp::json(serde_json::json!({ "org": org.name, "escrow_mode": mode }))
+        }
+        _ => Resp::text(405, "method not allowed"),
+    }
+}
+
+/// Whether an agent's OWNING ORG is in hub-assist escrow mode. A user-owned (non-org) agent has no org, so
+/// it is never hub-assist — fail-closed, so escrow/release never apply outside an opted-in org.
+async fn org_hub_assist(ctx: &Ctx, meta: &AgentMeta) -> bool {
+    match meta.org_owner() {
+        Some(org) => ctx.store.org(org).await.map(|o| o.escrow_mode == "hub-assist").unwrap_or(false),
+        None => false,
+    }
+}
+
+/// `POST /api/agent/<owner>/<name>/keys/escrow` `{ kid, wrapped_ck }` — store one session content key
+/// sealed to the hub escrow key (Wave 5, hub-assist escrow). WRITE-gated (only a writer may escrow), and
+/// only when the owning org is in `escrow_mode = 'hub-assist'`. `wrapped_ck` is ciphertext the hub cannot
+/// open without its escrow SECRET, so this never hands the hub a plaintext key at rest.
+async fn api_keys_escrow(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, body: &[u8]) -> Resp {
+    let meta = match gate(ctx, caller, owner, name, Action::Write).await {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    // Escrow is meaningful ONLY for a hub-assist org: refuse otherwise (the caller can already write, so a
+    // 403 discloses nothing new).
+    if !org_hub_assist(ctx, &meta).await {
+        return Resp::err(403, "hub-assist escrow is not enabled for this session's org");
+    }
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(kid) = v.get("kid").and_then(|k| k.as_i64()).filter(|k| *k >= 0) else {
+        return Resp::err(400, "want a non-negative integer kid");
+    };
+    let Some(wrapped_ck) = str_field(&v, "wrapped_ck") else {
+        return Resp::err(400, "want wrapped_ck");
+    };
+    if wrapped_ck.is_empty() || wrapped_ck.len() > KEK_WRAP_MAX {
+        return Resp::err(400, "wrapped_ck is missing or too large");
+    }
+    let key = store::EscrowKey {
+        owner: owner.to_string(),
+        name: name.to_string(),
+        kid,
+        wrapped_ck,
+        created: store::now_iso(),
+    };
+    if ctx.store.upsert_escrow_key(&key).await.is_err() {
+        return Resp::err(500, "couldn't store the escrowed key");
+    }
+    let actor = caller.user.clone().unwrap_or_default();
+    audit_append(ctx.root(), &actor, audit::KEYS_ESCROW, Some(&format!("{owner}/{name}")), &format!("kid={kid}")).await;
+    Resp::json(serde_json::json!({ "owner": owner, "name": name, "kid": kid }))
+}
+
+/// `POST /api/agent/<owner>/<name>/keys/release` — release every escrowed content key this caller may read
+/// (Wave 5, hub-assist escrow). Gated by the SAME `acl::decide(_, Read)` as git fetch (via `gate`), so it
+/// NEVER releases a plaintext CK to a caller who cannot already fetch the ciphertext, and it is FAIL-CLOSED:
+/// any denial is the gate's own 403/404 non-disclosing response. When the owning org is not in hub-assist
+/// mode, it is a 404 (the escrow surface is not even disclosed). Returns `{ released: [{kid, ck}] }`.
+async fn api_keys_release(ctx: &Ctx, caller: &Caller, owner: &str, name: &str) -> Resp {
+    let meta = match gate(ctx, caller, owner, name, Action::Read).await {
+        Ok(m) => m,
+        // The exact fetch gate's fail-closed response (403 for a reader denied more, 404 non-disclosing).
+        Err(resp) => return resp,
+    };
+    // Hub-assist off → the escrow surface does not exist for this session (non-disclosing 404).
+    if !org_hub_assist(ctx, &meta).await {
+        return Resp::err(404, "not found");
+    }
+    let rows = ctx.store.get_escrow_keys(owner, name).await;
+    let mut released = Vec::new();
+    for r in &rows {
+        // Open with the hub escrow SECRET. A row that will not open is skipped, never a plaintext leak.
+        if let Ok(ck) = agit::keybox::open_tk_envelope(&r.wrapped_ck, &ctx.escrow.secret) {
+            released.push(serde_json::json!({ "kid": r.kid, "ck": hex::encode(ck) }));
+        }
+    }
+    let actor = caller.user.clone().unwrap_or_default();
+    audit_append(ctx.root(), &actor, audit::KEYS_RELEASE, Some(&format!("{owner}/{name}")), &format!("released={}", released.len())).await;
+    Resp::json(serde_json::json!({ "released": released }))
 }
 
 /// `/api/orgs/<name>/members[/<username>]` — the org membership routes. Authorization here is an ORG
@@ -3516,6 +3773,13 @@ mod tests {
             token_rl: Arc::new(TokenBuckets::new()),
             register_rl: Arc::new(TokenBuckets::with_rate(REGISTER_RATE_PER_SEC, REGISTER_BURST)),
             metrics: Arc::new(Metrics::new()),
+            escrow: {
+                // A deterministic-enough test escrow keypair: a fixed secret is fine here (the tests
+                // seal to `escrow.public` and open with `escrow.secret`, so only self-consistency matters).
+                let secret = [7u8; 32];
+                let public = agit::agent::x25519_public_from_secret(&secret);
+                crate::server::EscrowKeypair { secret, public }
+            },
         }));
         (dir, ctx)
     }
@@ -4081,7 +4345,7 @@ mod tests {
         let members: Vec<OrgMember> =
             members.iter().map(|(u, r)| OrgMember { username: (*u).into(), role: (*r).into() }).collect();
         ctx.store
-            .update_orgs(|list| list.push(Org { name: name.clone(), members: members.clone(), created: store::now_iso(), current_kek_gen: 0 }))
+            .update_orgs(|list| list.push(Org { name: name.clone(), members: members.clone(), created: store::now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into() }))
             .await
             .unwrap();
     }
@@ -4164,5 +4428,124 @@ mod tests {
         assert_eq!(api_org_kek(&ctx, &caller("alice", false), "acme", "/envelopes", "POST", "", &kek_body(1, &["alice", "bob"])).await.status, 200);
         assert_eq!(ctx.store.get_current_kek_gen("acme").await, 1, "a same-gen republish must not bump");
         assert!(ctx.store.get_team_kek_envelope("acme", 1, "bob").await.is_some(), "the joined member now has an envelope");
+    }
+
+    // ── Wave-5 opt-in escrow / recovery (both OFF by default) ──
+
+    /// Setting the escrow mode and the recovery recipient are BOTH owner-only: a plain org member is 403,
+    /// the owner (an org admin) succeeds, and a non-member is 404 (existence non-disclosure, never 403).
+    #[tokio::test]
+    async fn wave5_escrow_mode_and_recovery_are_owner_only() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        add_user(&ctx, "bob", "bob-password-12", false).await;
+        add_user(&ctx, "carol", "carol-password-1", false).await;
+        mk_org(&ctx, "acme", &[("alice", "admin"), ("bob", "member")]).await;
+
+        // Default OFF, and any member may read it.
+        let show = api_org_escrow(&ctx, &caller("bob", false), "acme", "GET", &[]).await;
+        assert_eq!(show.status, 200);
+        assert_eq!(json_of(&show)["escrow_mode"], "none", "escrow is off by default");
+
+        // A plain member cannot set escrow mode → 403; the mode stays none.
+        let denied = api_org_escrow(&ctx, &caller("bob", false), "acme", "POST", &body(serde_json::json!({ "mode": "hub-assist" }))).await;
+        assert_eq!(denied.status, 403, "a non-owner member must be refused");
+        assert_eq!(ctx.store.org("acme").await.unwrap().escrow_mode, "none");
+
+        // The owner (admin) sets it → 200.
+        let ok = api_org_escrow(&ctx, &caller("alice", false), "acme", "POST", &body(serde_json::json!({ "mode": "hub-assist" }))).await;
+        assert_eq!(ok.status, 200);
+        assert_eq!(ctx.store.org("acme").await.unwrap().escrow_mode, "hub-assist");
+        // An unknown mode is rejected.
+        assert_eq!(api_org_escrow(&ctx, &caller("alice", false), "acme", "POST", &body(serde_json::json!({ "mode": "sideways" }))).await.status, 400);
+
+        // Recovery recipient: a plain member is 403; the owner sets a valid hex key.
+        let key = hex::encode([9u8; 32]);
+        assert_eq!(
+            api_org_recovery(&ctx, &caller("bob", false), "acme", "POST", &body(serde_json::json!({ "key": key }))).await.status,
+            403,
+            "a non-owner cannot set the recovery recipient"
+        );
+        assert_eq!(ctx.store.org("acme").await.unwrap().recovery_x25519, "", "still unset after the refused set");
+        let set = api_org_recovery(&ctx, &caller("alice", false), "acme", "POST", &body(serde_json::json!({ "key": key }))).await;
+        assert_eq!(set.status, 200);
+        assert_eq!(ctx.store.org("acme").await.unwrap().recovery_x25519, key);
+        // Junk (not 32-byte hex) is refused.
+        assert_eq!(api_org_recovery(&ctx, &caller("alice", false), "acme", "POST", &body(serde_json::json!({ "key": "nothex" }))).await.status, 400);
+        // Owner clears it.
+        assert_eq!(api_org_recovery(&ctx, &caller("alice", false), "acme", "DELETE", &[]).await.status, 200);
+        assert_eq!(ctx.store.org("acme").await.unwrap().recovery_x25519, "");
+
+        // A NON-member is 404 on both (never 403 — the org's existence is not disclosed).
+        assert_eq!(api_org_escrow(&ctx, &caller("carol", false), "acme", "POST", &body(serde_json::json!({ "mode": "hub-assist" }))).await.status, 404);
+        assert_eq!(api_org_recovery(&ctx, &caller("carol", false), "acme", "POST", &body(serde_json::json!({ "key": key }))).await.status, 404);
+    }
+
+    /// The hub-assist RELEASE path: with the org in hub-assist mode and a CK escrowed, the hub returns the
+    /// exact content key to an ACL READER, and is FAIL-CLOSED (404, non-disclosing, no key) for a caller
+    /// who cannot read the session.
+    #[tokio::test]
+    async fn wave5_hub_assist_release_returns_ck_to_reader_and_denies_a_non_reader() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        add_user(&ctx, "bob", "bob-password-12", false).await;
+        add_user(&ctx, "carol", "carol-password-1", false).await;
+        mk_org(&ctx, "acme", &[("alice", "admin"), ("bob", "member")]).await;
+        create_agent_with_aid(&ctx, "org:acme", "frontend", Visibility::Private, "agt_fe1").await;
+
+        // Owner turns on hub-assist.
+        assert_eq!(api_org_escrow(&ctx, &caller("alice", false), "acme", "POST", &body(serde_json::json!({ "mode": "hub-assist" }))).await.status, 200);
+
+        // The owner (a writer) escrows a content key sealed to the hub escrow pubkey, exactly as the client would.
+        let ck = [42u8; 32];
+        let wrapped = agit::keybox::seal_tk_for_member(&ck, &ctx.escrow.public).unwrap();
+        let esc = api_keys_escrow(&ctx, &caller("alice", false), "acme", "frontend", &body(serde_json::json!({ "kid": 0, "wrapped_ck": wrapped }))).await;
+        assert_eq!(esc.status, 200, "the owner escrows: {}", String::from_utf8_lossy(&esc.body));
+
+        // bob (an org member = ACL reader) releases → gets the EXACT CK back.
+        let rel = api_keys_release(&ctx, &caller("bob", false), "acme", "frontend").await;
+        assert_eq!(rel.status, 200);
+        let arr = json_of(&rel)["released"].as_array().unwrap().clone();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["kid"], 0);
+        assert_eq!(arr[0]["ck"], hex::encode(ck), "the hub releases the exact escrowed CK to a reader");
+
+        // carol (not a member, cannot read) → fail-closed 404, and the CK never appears in the body.
+        let denied = api_keys_release(&ctx, &caller("carol", false), "acme", "frontend").await;
+        assert_eq!(denied.status, 404, "a non-reader is refused, non-disclosing");
+        assert!(!String::from_utf8_lossy(&denied.body).contains(&hex::encode(ck)), "no CK leaks to a non-reader");
+    }
+
+    /// Escrow is inert unless the org opted in: with the org in the default `none` mode, an upload is 403
+    /// (a session never escrows) and RELEASE is 404 even for a reader with a planted escrow row (the escrow
+    /// surface is not disclosed). Turning the mode ON later makes release work — proving the gate is the mode.
+    #[tokio::test]
+    async fn wave5_escrow_is_off_unless_org_is_hub_assist() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        add_user(&ctx, "bob", "bob-password-12", false).await;
+        mk_org(&ctx, "acme", &[("alice", "admin"), ("bob", "member")]).await;
+        create_agent_with_aid(&ctx, "org:acme", "frontend", Visibility::Private, "agt_fe1").await;
+
+        // Mode is `none` (default). The owner (a writer) cannot escrow → 403.
+        let ck = [7u8; 32];
+        let wrapped = agit::keybox::seal_tk_for_member(&ck, &ctx.escrow.public).unwrap();
+        let esc = api_keys_escrow(&ctx, &caller("alice", false), "acme", "frontend", &body(serde_json::json!({ "kid": 0, "wrapped_ck": wrapped.clone() }))).await;
+        assert_eq!(esc.status, 403, "a session never escrows unless the org is hub-assist");
+
+        // Plant an escrow row directly (bypassing the endpoint) to prove RELEASE still 404s while mode=none,
+        // even for a reader — so the mode, not just the upload path, is the gate.
+        ctx.store
+            .upsert_escrow_key(&store::EscrowKey { owner: "acme".into(), name: "frontend".into(), kid: 0, wrapped_ck: wrapped.clone(), created: store::now_iso() })
+            .await
+            .unwrap();
+        let rel = api_keys_release(&ctx, &caller("bob", false), "acme", "frontend").await;
+        assert_eq!(rel.status, 404, "release is 404 while the org is not hub-assist, even for a reader");
+
+        // Flip the mode ON — now the same reader's release returns the CK.
+        assert_eq!(api_org_escrow(&ctx, &caller("alice", false), "acme", "POST", &body(serde_json::json!({ "mode": "hub-assist" }))).await.status, 200);
+        let rel = api_keys_release(&ctx, &caller("bob", false), "acme", "frontend").await;
+        assert_eq!(rel.status, 200);
+        assert_eq!(json_of(&rel)["released"].as_array().unwrap()[0]["ck"], hex::encode(ck));
     }
 }

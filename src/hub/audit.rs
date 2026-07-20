@@ -94,6 +94,13 @@ pub const ORG_DELETE: &str = "org.delete";
 /// The detail records the generation and how many recipient envelopes were stored — ciphertext only,
 /// the hub never sees the plaintext TK.
 pub const ORG_KEK_PUBLISH: &str = "org.kek.publish";
+/// Wave-5 opt-in escape hatches. An org owner set/cleared the offline recovery recipient, changed the
+/// hub-assist escrow mode, or the hub released an escrowed content key to an ACL reader.
+pub const ORG_RECOVERY_SET: &str = "org.recovery.set";
+pub const ORG_RECOVERY_CLEAR: &str = "org.recovery.clear";
+pub const ORG_ESCROW_MODE: &str = "org.escrow.mode";
+pub const KEYS_ESCROW: &str = "keys.escrow";
+pub const KEYS_RELEASE: &str = "keys.release";
 pub const TOKEN_CREATE: &str = "token.create";
 pub const TOKEN_REVOKE: &str = "token.revoke";
 pub const GIT_FETCH: &str = "git.fetch";

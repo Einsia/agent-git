@@ -290,6 +290,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         "readers" if scope == Scope::Agent => commands::readers_cmd(args),
         "rekey" if scope == Scope::Agent => commands::rekey_cmd(args),
 
+        // ── escrow (agent scope): OPT-IN hub-assist key escrow (encryption-recipients Wave 5). `enable`
+        //    wraps this session's content key under the hub escrow key and uploads it, but ONLY if the
+        //    owning org is in hub-assist mode. Re-trusts the hub; off by default. ──
+        "escrow" if scope == Scope::Agent => commands::escrow_cmd(args),
+
         // ── log / diff (agent scope): a raw `git log`/`git diff` on the store is a wall of jsonl bytes,
         //    so by default these render the SESSION view — `a log` a timeline of the store's sessions,
         //    `a diff` the prompts + edits ADDED between two refs. `--raw` (or `--git`) drops the flag and

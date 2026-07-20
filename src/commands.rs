@@ -2369,7 +2369,35 @@ fn seal_tk_to_members(
             "recipient_epoch": epoch,
         }));
     }
+    // Wave 5, feature 1: if (and ONLY if) the org has an OPT-IN offline recovery recipient set, seal TK to
+    // it too as an extra `@recovery` envelope. Unset (the default) ⇒ no extra envelope ⇒ exactly Wave 3/4.
+    if let Some(rec) = recovery_envelope(&org_json, tk)? {
+        envelopes.push(rec);
+    }
     Ok((envelopes, skipped))
+}
+
+/// Build the reserved `@recovery` Team-KEK envelope when the org has an OPT-IN offline recovery recipient
+/// (Wave 5, feature 1): TK sealed to the org's recovery X25519 pubkey. Returns `None` when unset (the
+/// default) — then team rekey/sync behave EXACTLY as Wave 3/4 with NO recovery envelope. Pure, so the
+/// "unset ⇒ none; set ⇒ one @recovery envelope" invariant is unit-testable without a hub.
+///
+/// SECURITY: sealing to this key RE-TRUSTS an OFFLINE admin (not the hub) and WEAKENS forward secrecy for
+/// the team — whoever holds the matching offline SECRET can decrypt every TK generation they were sealed
+/// to. It is off unless an org owner explicitly registers a recovery key with `agit hub org recovery set`.
+fn recovery_envelope(org_json: &serde_json::Value, tk: &[u8; 32]) -> Result<Option<serde_json::Value>> {
+    let hexkey = org_json.get("recovery_x25519").and_then(|k| k.as_str()).unwrap_or("").trim();
+    if hexkey.is_empty() {
+        return Ok(None);
+    }
+    let key = crate::keybox::decode_x25519_hex(hexkey)
+        .context("the org's recovery_x25519 recipient is not a valid X25519 pubkey")?;
+    let wrapped = crate::keybox::seal_tk_for_member(tk, &key)?;
+    Ok(Some(serde_json::json!({
+        "recipient": crate::hub::store::RECOVERY_RECIPIENT,
+        "wrapped_kek": wrapped,
+        "recipient_epoch": 0,
+    })))
 }
 
 /// `agit hub <team ...|doctor>` — hub-side operations that are not per-agent git.
@@ -2377,13 +2405,104 @@ pub fn hub_cmd(args: &[String]) -> Result<i32> {
     match args.first().map(|s| s.as_str()) {
         Some("team") => hub_team_cmd(&args[1..]),
         Some("doctor") => hub_doctor(&args[1..]),
+        Some("org") => hub_org_cmd(&args[1..]),
         Some(other) => {
             errln!("agit hub: unknown subcommand `{other}`");
             errln!("  usage: agit hub team rekey <org> [--rekey-all]  ·  team sync <org>  ·  doctor [--org <org>] [--check] [--fix]");
+            errln!("         agit hub org recovery set <org> --key <hex>  ·  recovery clear|show <org>  ·  escrow <org> --mode hub-assist|none");
             Ok(2)
         }
         None => {
             errln!("usage: agit hub team rekey <org> [--rekey-all]  ·  team sync <org>  ·  doctor [--org <org>] [--check] [--fix]");
+            errln!("       agit hub org recovery set <org> --key <hex>  ·  recovery clear|show <org>  ·  escrow <org> --mode hub-assist|none");
+            Ok(2)
+        }
+    }
+}
+
+/// `agit hub org <recovery|escrow> …` — the Wave-5 opt-in org escape hatches (both OFF by default). Every
+/// verb here is OWNER-only at the hub (a non-owner is a 403); these commands only carry the request.
+///
+/// `recovery set <org> --key <hex>` registers an OFFLINE recovery X25519 pubkey (re-trusts an offline
+/// admin, NOT the hub) so `team rekey` seals TK to it too; `recovery clear <org>` removes it; `recovery
+/// show <org>` prints it. `escrow <org> --mode hub-assist|none` flips hub-assist key release for the org
+/// (re-trusts the HUB). See the design doc's Wave-5 section.
+fn hub_org_cmd(args: &[String]) -> Result<i32> {
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    match args.first().map(|s| s.as_str()) {
+        Some("recovery") => {
+            let sub = args.get(1).map(|s| s.as_str());
+            // The org is the first bare positional after the verb.
+            let org = args.iter().skip(2).find(|s| !s.starts_with('-')).map(|s| s.trim()).filter(|s| !s.is_empty());
+            match (sub, org) {
+                (Some("set"), Some(org)) => {
+                    let Some(key) = flag_value(args, "--key") else {
+                        errln!("usage: agit hub org recovery set <org> --key <hex-x25519>");
+                        return Ok(2);
+                    };
+                    // Validate locally so a typo fails fast with a clear message before the round-trip.
+                    let key = key.trim().to_ascii_lowercase();
+                    if crate::keybox::decode_x25519_hex(&key).is_err() {
+                        bail!("--key must be a 64-hex-char (32-byte) X25519 public key");
+                    }
+                    ep.set_org_recovery(org, &key)?;
+                    outln!("set the offline recovery recipient for {org}.");
+                    outln!("  ⚠ this RE-TRUSTS whoever holds the matching offline SECRET: they can decrypt every");
+                    outln!("    future team-KEK generation `agit hub team rekey {org}` seals (weakens forward secrecy).");
+                    Ok(0)
+                }
+                (Some("clear"), Some(org)) => {
+                    ep.clear_org_recovery(org)?;
+                    outln!("cleared the offline recovery recipient for {org} (future rekeys emit no @recovery envelope).");
+                    Ok(0)
+                }
+                (Some("show"), Some(org)) => {
+                    let org_json = ep.get_org(org)?.with_context(|| format!("cannot read org `{org}` (are you a member?)"))?;
+                    let rec = org_json.get("recovery_x25519").and_then(|k| k.as_str()).unwrap_or("");
+                    if rec.is_empty() {
+                        outln!("{org}: no offline recovery recipient set (the default).");
+                    } else {
+                        outln!("{org}: offline recovery recipient = {rec}");
+                    }
+                    Ok(0)
+                }
+                _ => {
+                    errln!("usage: agit hub org recovery set <org> --key <hex>  ·  recovery clear <org>  ·  recovery show <org>");
+                    Ok(2)
+                }
+            }
+        }
+        Some("escrow") => {
+            let org = args.iter().skip(1).find(|s| !s.starts_with('-')).map(|s| s.trim()).filter(|s| !s.is_empty());
+            let Some(org) = org else {
+                errln!("usage: agit hub org escrow <org> --mode hub-assist|none");
+                return Ok(2);
+            };
+            let Some(mode) = flag_value(args, "--mode") else {
+                errln!("usage: agit hub org escrow <org> --mode hub-assist|none");
+                return Ok(2);
+            };
+            let mode = mode.trim();
+            if mode != "hub-assist" && mode != "none" {
+                bail!("--mode must be hub-assist or none");
+            }
+            ep.set_org_escrow(org, mode)?;
+            if mode == "hub-assist" {
+                outln!("{org}: escrow mode = hub-assist.");
+                outln!("  ⚠ this RE-TRUSTS the hub: for sessions whose owner runs `agit a escrow enable`, the hub");
+                outln!("    can RELEASE the content key to any caller the ACL lets read (via `agit crypt unlock`).");
+            } else {
+                outln!("{org}: escrow mode = none (hub-assist key release is off; existing escrow rows go unused).");
+            }
+            Ok(0)
+        }
+        Some(other) => {
+            errln!("agit hub org: unknown subcommand `{other}`");
+            errln!("  usage: agit hub org recovery set|clear|show <org>  ·  escrow <org> --mode hub-assist|none");
+            Ok(2)
+        }
+        None => {
+            errln!("usage: agit hub org recovery set|clear|show <org>  ·  escrow <org> --mode hub-assist|none");
             Ok(2)
         }
     }
@@ -3149,6 +3268,97 @@ pub fn crypt_cmd(args: &[String]) -> Result<i32> {
     }
 }
 
+/// `agit a escrow <enable>` — the OPT-IN hub-assist escrow verb (encryption-recipients Wave 5, feature 2).
+pub fn escrow_cmd(args: &[String]) -> Result<i32> {
+    match args.first().map(|s| s.as_str()) {
+        Some("enable") => escrow_enable(),
+        None => {
+            errln!("usage: agit a escrow enable");
+            Ok(2)
+        }
+        Some(other) => {
+            errln!("agit a escrow: unknown subcommand `{other}`");
+            errln!("  usage: agit a escrow enable");
+            Ok(2)
+        }
+    }
+}
+
+/// `agit a escrow enable` — wrap this session's content key(s) under the HUB escrow key and upload them, so
+/// the hub can later RELEASE them to an ACL reader (`agit crypt unlock` fallback). ONLY permitted when the
+/// owning org is in `escrow_mode = 'hub-assist'` (fail-closed: a session never escrows otherwise). This
+/// RE-TRUSTS the hub — it is the one path that gives retroactive-for-unfetched revocation and hub-backed
+/// recovery. The hub only ever stores CIPHERTEXT (CK sealed to its escrow PUBLIC key).
+fn escrow_enable() -> Result<i32> {
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+    let (owner, name) = owner_and_name_of(&store)?;
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    // Hub-assist must be ON for the owning org — a session never escrows unless the org opted in.
+    let org_json = ep
+        .get_org(&owner)
+        .with_context(|| format!("cannot read owning org `{owner}`"))?
+        .with_context(|| format!("owning org `{owner}` is not visible to you (are you a member?)"))?;
+    let mode = org_json.get("escrow_mode").and_then(|m| m.as_str()).unwrap_or("none");
+    if mode != "hub-assist" {
+        bail!(
+            "hub-assist escrow is not enabled for org `{owner}` (mode = {mode}).\n\
+             \x20      An org owner must run `agit hub org escrow {owner} --mode hub-assist` first — this\n\
+             \x20      RE-TRUSTS the hub, so it is a deliberate per-org decision."
+        );
+    }
+    // This session must be keybox-encrypted (there must be a content key to escrow).
+    let (_kp, ring) = require_session_keyring(&store)?;
+    // Seal every content-key generation to the hub escrow pubkey and upload, so ALL kids are releasable.
+    let hexpub = ep.escrow_pubkey()?;
+    let pubkey = crate::keybox::decode_x25519_hex(&hexpub).context("the hub returned an invalid escrow pubkey")?;
+    let mut escrowed = 0usize;
+    for k in &ring.keys {
+        let wrapped = crate::keybox::seal_tk_for_member(&k.master, &pubkey)?;
+        ep.post_escrow_key(&owner, &name, k.id, &wrapped)
+            .with_context(|| format!("uploading escrowed content key kid {}", k.id))?;
+        escrowed += 1;
+    }
+    outln!("hub-assist escrow enabled for {} ({}): escrowed {escrowed} content-key generation(s).", a.name, a.aid);
+    outln!("  ⚠ this RE-TRUSTS the hub: it can now RELEASE these keys to any caller the ACL lets read this");
+    outln!("    session (they unlock via `agit crypt unlock`). Remove that reader from the ACL and the hub");
+    outln!("    refuses future release — the one path with retroactive-for-unfetched revocation.");
+    Ok(0)
+}
+
+/// Wave-5 FALLBACK for `agit crypt unlock`: ask the hub to RELEASE this session's escrowed content keys
+/// (hub-assist escrow). Works only when the owning org is in hub-assist mode AND the caller passes the
+/// hub's `acl::decide(_, Read)` gate — the hub is fail-closed. Returns a keyring built from the released
+/// keys, or `None` when the hub releases nothing (not a hub-assist session, not permitted, none escrowed).
+fn try_hub_assist_release(store: &Path) -> Result<Option<crate::crypt::Keyring>> {
+    let Ok((owner, name)) = owner_and_name_of(store) else {
+        return Ok(None); // no hub remote → no hub-assist path
+    };
+    let Ok(ep) = crate::hubapi::HubEndpoint::resolve() else {
+        return Ok(None);
+    };
+    let Some(released) = ep.release_keys(&owner, &name)? else {
+        return Ok(None); // 403/404 → the hub refused (fail-closed), no keyring
+    };
+    let arr = released.get("released").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+    let mut keys: Vec<crate::crypt::KeyringEntry> = Vec::new();
+    for e in &arr {
+        let (Some(kid), Some(ck_hex)) = (e.get("kid").and_then(|k| k.as_i64()), e.get("ck").and_then(|c| c.as_str())) else {
+            continue;
+        };
+        let Some(raw) = hex::decode(ck_hex.trim()).ok().filter(|b| b.len() == 32) else {
+            continue;
+        };
+        let master: [u8; 32] = raw.try_into().expect("checked length 32");
+        keys.push(crate::crypt::KeyringEntry { id: kid as u32, master });
+    }
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let current = keys.iter().map(|k| k.id).max().expect("non-empty");
+    Ok(Some(crate::crypt::Keyring { current, keys }))
+}
+
 /// `agit crypt unlock` — recover this machine's content keys from the committed keybox and write them to
 /// the repo-local keyring, so the crypt filter can decrypt the session. FAIL-CLOSED: if I am not a reader
 /// (no stanza opens with my identity), NO keyring is written and the smudge path stays locked — never a
@@ -3169,14 +3379,27 @@ fn crypt_unlock() -> Result<i32> {
     let secret = agent::derive_x25519_secret(&sk);
     // Team stanzas resolve their content key through the org's Team KEK: the local TK cache, else a
     // fetch+unwrap of my own team_keks envelope. Fail-closed — an unavailable TK contributes nothing.
-    let Some(ring) = crate::keybox::recover_keyring_with(&stanzas, &secret, |org, gen| obtain_tk(&home, org, gen).ok()) else {
-        bail!(
-            "you are not a reader of this encrypted session — none of the {} keybox stanza(s) open with\n\
-             \x20      this machine's identity (nor a team KEK you can obtain). The keyring was NOT written;\n\
-             \x20      the session stays locked. Publish your key (agit identity enroll) and ask a reader to\n\
-             \x20      `agit a readers add <you>`, or join the owning org and run `agit hub team sync <org>`.",
-            stanzas.len()
-        );
+    let ring = match crate::keybox::recover_keyring_with(&stanzas, &secret, |org, gen| obtain_tk(&home, org, gen).ok()) {
+        Some(r) => r,
+        // Wave-5 FALLBACK: a hub-assist session may still unlock by asking the hub to RELEASE its content
+        // keys to an ACL reader, even when no keybox stanza opens with this machine's identity. The hub is
+        // fail-closed (only releases what `acl::decide(_, Read)` allows); if it releases nothing, we keep
+        // the original fail-closed error and write NO keyring.
+        None => match try_hub_assist_release(&store)? {
+            Some(r) => {
+                outln!("  no keybox stanza opened with this machine — unlocked via hub-assist escrow release");
+                outln!("  (the hub RE-TRUSTS path: the hub released the content key under the ACL Read gate).");
+                r
+            }
+            None => bail!(
+                "you are not a reader of this encrypted session — none of the {} keybox stanza(s) open with\n\
+                 \x20      this machine's identity (nor a team KEK you can obtain, nor a hub-assist escrow\n\
+                 \x20      release). The keyring was NOT written; the session stays locked. Publish your key\n\
+                 \x20      (agit identity enroll) and ask a reader to `agit a readers add <you>`, or join the\n\
+                 \x20      owning org and run `agit hub team sync <org>`.",
+                stanzas.len()
+            ),
+        },
     };
     let kp = store_keyring_path(&store)?;
     let recovered = ring.keys.len();
@@ -3801,5 +4024,33 @@ mod wave4_tests {
         );
         // The old gen-1 stanza is RETAINED (forward-only: past readers keep past access).
         assert_eq!(crate::keybox::teams_at(&stanzas, 0), vec![("acme".to_string(), 1)], "gen-1 stanza kept");
+    }
+
+    // ── Wave 5, feature 1: the OPT-IN offline recovery envelope ──
+
+    /// The default (recovery unset) emits NO `@recovery` envelope — team rekey/sync are byte-for-byte
+    /// Wave 3/4. Setting a recovery recipient makes it emit exactly one `@recovery` envelope, and whoever
+    /// holds the matching offline SECRET can unwrap the current TK from it.
+    #[test]
+    fn recovery_envelope_is_absent_by_default_and_one_when_set() {
+        let tk = [0x3Cu8; 32];
+        // Unset (the default): no envelope, in either the missing-field or the empty-string form.
+        assert!(recovery_envelope(&serde_json::json!({ "name": "acme" }), &tk).unwrap().is_none(), "missing field ⇒ no envelope");
+        assert!(recovery_envelope(&serde_json::json!({ "recovery_x25519": "" }), &tk).unwrap().is_none(), "empty ⇒ no envelope");
+
+        // Set: exactly one @recovery envelope, and the offline recovery holder can open it back to TK.
+        let secret = [0x5Du8; 32];
+        let pubk = crate::agent::x25519_public_from_secret(&secret);
+        let org = serde_json::json!({ "recovery_x25519": hex::encode(pubk) });
+        let env = recovery_envelope(&org, &tk).unwrap().expect("a set recovery recipient ⇒ one envelope");
+        assert_eq!(env["recipient"], "@recovery", "filed under the reserved @recovery id");
+        let wrapped = env["wrapped_kek"].as_str().unwrap();
+        assert_eq!(
+            crate::keybox::open_tk_envelope(wrapped, &secret).unwrap(),
+            tk,
+            "the offline recovery holder unwraps the current TK from the @recovery envelope"
+        );
+        // Junk recovery key is a loud error, never a silent skip.
+        assert!(recovery_envelope(&serde_json::json!({ "recovery_x25519": "nothex" }), &tk).is_err());
     }
 }

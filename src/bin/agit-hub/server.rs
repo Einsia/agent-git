@@ -59,6 +59,61 @@ pub(crate) struct CtxInner {
     /// `Arc` so the per-request middleware and every handler that records share one instance; all its
     /// fields are atomics, so no lock is taken on the hot path.
     pub(crate) metrics: Arc<Metrics>,
+    /// The per-hub escrow X25519 keypair (encryption-recipients Wave 5, hub-assist escrow). Generated
+    /// once at boot and persisted under the data dir (`escrow_x25519`, `0600`). The PUBLIC half is served
+    /// at `GET /api/escrow/pubkey` so a hub-assist client can seal its content key TO the hub; the PRIVATE
+    /// half NEVER leaves the process and is the only key that can open an escrowed CK for release. At-rest
+    /// protection of this secret is OUT OF SCOPE (same posture as the TOTP secret and password material):
+    /// a hub with hub-assist escrow ENABLED for an org has, by design, chosen to trust the hub with the
+    /// ability to release those sessions' keys under the ACL gate.
+    pub(crate) escrow: EscrowKeypair,
+}
+
+/// The hub's escrow keypair. `secret` is a raw 32-byte X25519 scalar (clamped on use via `mul_clamped`);
+/// `public` is its X25519 public. Both are plain bytes so a handler can seal/open with the `keybox`
+/// primitives without holding a lock.
+#[derive(Clone)]
+pub(crate) struct EscrowKeypair {
+    pub(crate) secret: [u8; 32],
+    pub(crate) public: [u8; 32],
+}
+
+/// Load the per-hub escrow X25519 keypair from `<root>/escrow_x25519`, or generate + persist a fresh one
+/// (`0600`) on first boot. The file holds the 32-byte secret as hex. A corrupt/short file is a hard boot
+/// error rather than a silent re-generation (re-generating would strand every already-escrowed CK).
+fn load_or_create_escrow_keypair(root: &Path) -> std::io::Result<EscrowKeypair> {
+    let path = root.join("escrow_x25519");
+    let secret: [u8; 32] = match std::fs::read_to_string(&path) {
+        Ok(t) => {
+            let raw = hex::decode(t.trim()).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: not valid hex: {e}", path.display()))
+            })?;
+            raw.as_slice().try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: escrow key is not 32 bytes", path.display()))
+            })?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let s = agit::crypt::random_master().map_err(|e| std::io::Error::other(e.to_string()))?;
+            // Write the secret hex at 0600 (owner-only), the same at-rest guarantee the DB gets.
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, format!("{}\n", hex::encode(s)))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::fs::rename(&tmp, &path)?;
+            s
+        }
+        Err(e) => return Err(e),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    let public = agit::agent::x25519_public_from_secret(&secret);
+    Ok(EscrowKeypair { secret, public })
 }
 
 #[derive(Clone)]
@@ -270,6 +325,14 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
                 return 1;
             }
         };
+        let escrow = match load_or_create_escrow_keypair(root) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to load the hub escrow key");
+                eprintln!("failed to load the hub escrow key: {e}");
+                return 1;
+            }
+        };
         let ctx = Ctx(Arc::new(CtxInner {
             store,
             blobs,
@@ -280,6 +343,7 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
             token_rl: Arc::new(TokenBuckets::new()),
             register_rl: Arc::new(TokenBuckets::with_rate(REGISTER_RATE_PER_SEC, REGISTER_BURST)),
             metrics: Arc::new(Metrics::new()),
+            escrow,
         }));
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,

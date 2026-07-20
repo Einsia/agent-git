@@ -166,7 +166,35 @@ pub struct Org {
     /// snapshot-rewrite preserves it across an unrelated member edit rather than resetting it to 0.
     #[serde(default)]
     pub current_kek_gen: i64,
+    /// OPT-IN offline recovery recipient (encryption-recipients Wave 5, feature 1). Hex-encoded 32-byte
+    /// X25519 public key held OFFLINE by an org owner (paper / air-gapped device); EMPTY = unset (the
+    /// default, exactly the wave-1..4 behavior). When set, `agit hub team rekey` additionally seals the
+    /// Team KEK to this key under the reserved `@recovery` recipient, so whoever holds the matching
+    /// offline SECRET can re-seal the current TK to a lost-key member's fresh pubkey. This RE-TRUSTS the
+    /// offline admin and WEAKENS forward secrecy for the team: the offline holder can decrypt every TK
+    /// generation they were sealed to. Only the hub's PUBLIC half of nothing lives here — it is the
+    /// recovery party's own public key, so the hub still never sees a plaintext TK.
+    #[serde(default)]
+    pub recovery_x25519: String,
+    /// OPT-IN hub-assist escrow mode (encryption-recipients Wave 5, feature 2): `"none"` (the default,
+    /// byte-for-byte wave-1..4 behavior) or `"hub-assist"`. When `hub-assist`, a session owner MAY wrap
+    /// its content key under the hub's escrow key and store it, and the hub RELEASES that CK to any caller
+    /// who passes the SAME `acl::decide(_, Read)` gate as git fetch. This RE-TRUSTS the hub and is the one
+    /// path that gives retroactive-for-unfetched revocation. Settable only by an org owner.
+    #[serde(default = "escrow_mode_none")]
+    pub escrow_mode: String,
 }
+
+/// The default (and only opt-out) escrow mode: `none`. A dedicated fn so `#[serde(default)]` on a
+/// deserialized org with no `escrow_mode` field reads back as the safe off state, never an empty string.
+fn escrow_mode_none() -> String {
+    "none".to_string()
+}
+
+/// The reserved recipient id under which a per-org offline recovery envelope is filed in `team_keks`
+/// (encryption-recipients Wave 5). It begins with `@`, which `valid_username` forbids, so it can never
+/// collide with a real member's envelope.
+pub const RECOVERY_RECIPIENT: &str = "@recovery";
 
 /// One member's envelope of a Team KEK generation (encryption-recipients Wave 3): `wrapped_kek` is the
 /// TK_gen X25519-sealed to `recipient`'s pubkey — CIPHERTEXT only, so the hub never holds a plaintext
@@ -179,6 +207,22 @@ pub struct TeamKekEnvelope {
     pub wrapped_kek: String,
     #[serde(default)]
     pub recipient_epoch: i64,
+    #[serde(default)]
+    pub created: String,
+}
+
+/// One session's content key sealed under the HUB's escrow public key (encryption-recipients Wave 5,
+/// hub-assist escrow). `wrapped_ck` is CIPHERTEXT ONLY — CK X25519-sealed to the hub's per-hub escrow
+/// public key, packed exactly like a `team_keks` envelope (`epk‖nonce‖ciphertext`, base64), so only the
+/// hub PRIVATE key can open it. Keyed on (owner_ns, name, kid): one row per session content-key
+/// generation. Only ever written when the owning org is in `escrow_mode = 'hub-assist'` and the owner
+/// opts in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EscrowKey {
+    pub owner: String,
+    pub name: String,
+    pub kid: i64,
+    pub wrapped_ck: String,
     #[serde(default)]
     pub created: String,
 }
@@ -631,6 +675,24 @@ fn row_org(r: &impl Cols) -> Org {
         created: r.text("created"),
         // Fail-safe: a store that predates the column reads back as gen 0 (no TK), never an error.
         current_kek_gen: r.int("current_kek_gen"),
+        // Fail-safe defaults (Wave 5): a store predating these columns reads back unset/off — exactly
+        // the wave-1..4 behavior. `r.text` yields "" for a missing/NULL column; an empty escrow_mode is
+        // normalized to "none" here so downstream comparisons never see the empty string.
+        recovery_x25519: r.text("recovery_x25519"),
+        escrow_mode: {
+            let m = r.text("escrow_mode");
+            if m.is_empty() { escrow_mode_none() } else { m }
+        },
+    }
+}
+
+fn row_escrow_key(r: &impl Cols) -> EscrowKey {
+    EscrowKey {
+        owner: r.text("owner"),
+        name: r.text("name"),
+        kid: r.int("kid"),
+        wrapped_ck: r.text("wrapped_ck"),
+        created: r.text("created"),
     }
 }
 
@@ -711,9 +773,14 @@ const DDL: &[&str] = &[
     // org has never minted a TK. Added additively (a fresh DB gets it here; older stores get it via the
     // `ORG_COLUMNS` back-fill, like the TOTP columns). BIGINT for the same strict-decode reason as every
     // other integer column.
+    // recovery_x25519 (opt-in offline recovery recipient, Wave 5) defaults to '' = unset; escrow_mode
+    // (opt-in hub-assist escrow, Wave 5) defaults to 'none' = off. Both are additive (fresh DBs get them
+    // here; older stores get them via the `ORG_COLUMNS` back-fill), and with the defaults every wave-1..4
+    // behavior is byte-for-byte unchanged.
     "CREATE TABLE IF NOT EXISTS orgs (\
        name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', created TEXT NOT NULL DEFAULT '', \
-       current_kek_gen BIGINT NOT NULL DEFAULT 0)",
+       current_kek_gen BIGINT NOT NULL DEFAULT 0, \
+       recovery_x25519 TEXT NOT NULL DEFAULT '', escrow_mode TEXT NOT NULL DEFAULT 'none')",
     // Org invitations (the consent flow). id is the unguessable accept/decline handle; status is one
     // of pending|accepted|declined|revoked. Added additively to DDL (a whole new table, unlike the
     // TOTP columns) so a fresh DB gets it and every existing store gets it created at boot via the
@@ -740,6 +807,13 @@ const DDL: &[&str] = &[
        recipient_epoch BIGINT NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '', \
        PRIMARY KEY (org, gen, recipient))",
     "CREATE INDEX IF NOT EXISTS team_keks_org_gen ON team_keks(org, gen)",
+    // Per-session content keys sealed under the HUB escrow public key (encryption-recipients Wave 5,
+    // hub-assist escrow). One row per (owner_ns, name, kid); `wrapped_ck` is CIPHERTEXT only. Populated
+    // only for sessions whose owning org opted into `escrow_mode = 'hub-assist'` and whose owner opted in.
+    // Added additively like `team_keks` — no schema-version bump.
+    "CREATE TABLE IF NOT EXISTS escrow_keys (\
+       owner TEXT NOT NULL, name TEXT NOT NULL, kid BIGINT NOT NULL, wrapped_ck TEXT NOT NULL, \
+       created TEXT NOT NULL DEFAULT '', PRIMARY KEY (owner, name, kid))",
 ];
 
 /// The second-factor columns, added onto a `users` table that predates them. A **fresh** DB already
@@ -758,7 +832,12 @@ const TOTP_COLUMNS: &[&str] = &[
 /// back-filled at boot exactly like [`TOTP_COLUMNS`]. A **fresh** DB already has them (they are in
 /// `DDL`); this migrates older stores. Idempotent by construction: Postgres uses `ADD COLUMN IF NOT
 /// EXISTS`; SQLite ignores the "duplicate column" error, so re-running is a no-op.
-const ORG_COLUMNS: &[&str] = &["current_kek_gen BIGINT NOT NULL DEFAULT 0"];
+const ORG_COLUMNS: &[&str] = &[
+    "current_kek_gen BIGINT NOT NULL DEFAULT 0",
+    // Wave 5 opt-in escape hatches. Defaults keep every wave-1..4 behavior byte-for-byte unchanged.
+    "recovery_x25519 TEXT NOT NULL DEFAULT ''",
+    "escrow_mode TEXT NOT NULL DEFAULT 'none'",
+];
 
 /// Stamp the schema version idempotently. A single fixed row (id=1) plus `ON CONFLICT DO NOTHING`,
 /// **not** read-MAX-then-INSERT: two Hubs booting against one fresh Postgres at the same moment would
@@ -1285,6 +1364,25 @@ impl Store {
             Store::Pg(s) => s.set_current_kek_gen(&org, gen).await,
         }
     }
+
+    /// Upsert one session's hub-escrowed content key (encryption-recipients Wave 5). Idempotent on the
+    /// (owner, name, kid) PK: re-escrowing the same kid overwrites the ciphertext. `wrapped_ck` is CK
+    /// sealed to the hub escrow public key — ciphertext only.
+    pub async fn upsert_escrow_key(&self, key: &EscrowKey) -> io::Result<()> {
+        match self {
+            Store::Sqlite(s) => s.upsert_escrow_key(key).await,
+            Store::Pg(s) => s.upsert_escrow_key(key).await,
+        }
+    }
+
+    /// Every hub-escrowed content-key row for one session, ascending by kid. Empty if the session has no
+    /// escrowed keys (the default — escrow is opt-in).
+    pub async fn get_escrow_keys(&self, owner: &str, name: &str) -> Vec<EscrowKey> {
+        match self {
+            Store::Sqlite(s) => s.get_escrow_keys(owner, name).await,
+            Store::Pg(s) => s.get_escrow_keys(owner, name).await,
+        }
+    }
 }
 
 // ─────────────────────────── SQLite backend ───────────────────────────
@@ -1619,11 +1717,13 @@ impl SqliteStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM orgs").execute(&mut *tx).await.map_err(err)?;
         for o in &list {
-            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen) VALUES (?, ?, ?, ?)")
+            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen, recovery_x25519, escrow_mode) VALUES (?, ?, ?, ?, ?, ?)")
                 .bind(&o.name)
                 .bind(serde_json::to_string(&o.members).unwrap_or_else(|_| "[]".into()))
                 .bind(&o.created)
                 .bind(o.current_kek_gen)
+                .bind(&o.recovery_x25519)
+                .bind(&o.escrow_mode)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -1787,6 +1887,37 @@ impl SqliteStore {
             .map_err(err)?;
         tx.commit().await.map_err(err)?;
         Ok(())
+    }
+
+    async fn upsert_escrow_key(&self, key: &EscrowKey) -> io::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        sqlx::query(
+            "INSERT INTO escrow_keys (owner, name, kid, wrapped_ck, created) VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(owner, name, kid) DO UPDATE SET wrapped_ck = excluded.wrapped_ck",
+        )
+        .bind(&key.owner)
+        .bind(&key.name)
+        .bind(key.kid)
+        .bind(&key.wrapped_ck)
+        .bind(&key.created)
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(())
+    }
+
+    async fn get_escrow_keys(&self, owner: &str, name: &str) -> Vec<EscrowKey> {
+        match sqlx::query("SELECT * FROM escrow_keys WHERE owner = ? AND name = ? ORDER BY kid ASC")
+            .bind(owner)
+            .bind(name)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows.iter().map(row_escrow_key).collect(),
+            Err(_) => vec![],
+        }
     }
 }
 
@@ -2093,11 +2224,13 @@ impl PgStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM orgs").execute(&mut *tx).await.map_err(err)?;
         for o in &list {
-            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen) VALUES ($1, $2, $3, $4)")
+            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen, recovery_x25519, escrow_mode) VALUES ($1, $2, $3, $4, $5, $6)")
                 .bind(&o.name)
                 .bind(serde_json::to_string(&o.members).unwrap_or_else(|_| "[]".into()))
                 .bind(&o.created)
                 .bind(o.current_kek_gen)
+                .bind(&o.recovery_x25519)
+                .bind(&o.escrow_mode)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -2258,6 +2391,37 @@ impl PgStore {
             .map_err(err)?;
         tx.commit().await.map_err(err)?;
         Ok(())
+    }
+
+    async fn upsert_escrow_key(&self, key: &EscrowKey) -> io::Result<()> {
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        sqlx::query(
+            "INSERT INTO escrow_keys (owner, name, kid, wrapped_ck, created) VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (owner, name, kid) DO UPDATE SET wrapped_ck = excluded.wrapped_ck",
+        )
+        .bind(&key.owner)
+        .bind(&key.name)
+        .bind(key.kid)
+        .bind(&key.wrapped_ck)
+        .bind(&key.created)
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(())
+    }
+
+    async fn get_escrow_keys(&self, owner: &str, name: &str) -> Vec<EscrowKey> {
+        match sqlx::query("SELECT * FROM escrow_keys WHERE owner = $1 AND name = $2 ORDER BY kid ASC")
+            .bind(owner)
+            .bind(name)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows.iter().map(row_escrow_key).collect(),
+            Err(_) => vec![],
+        }
     }
 }
 
@@ -2827,6 +2991,8 @@ mod tests {
                 members: vec![org_member("bob", "admin"), org_member("carol", "member")],
                 created: now_iso(),
                 current_kek_gen: 0,
+                recovery_x25519: String::new(),
+                escrow_mode: "none".into(),
             });
         })
         .await
@@ -2884,10 +3050,61 @@ mod tests {
         assert!(s.list_team_kek_gens("nope").await.is_empty());
     }
 
+    /// Wave-5 store guards. A fresh org reads back with the escape hatches OFF (recovery unset, escrow
+    /// `none`) — byte-for-byte the wave-1..4 default — and both survive the whole-table `update_orgs`
+    /// snapshot rewrite once set. Escrow keys round-trip on their (owner, name, kid) PK, idempotently.
+    #[tokio::test]
+    async fn wave5_org_escape_hatches_default_off_and_persist() {
+        let (_d, s) = tmp_store().await;
+        s.update_orgs(|l| l.push(Org { name: "acme".into(), members: vec![org_member("alice", "admin")], created: now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into() }))
+            .await
+            .unwrap();
+        // Default OFF.
+        let o = s.org("acme").await.unwrap();
+        assert_eq!(o.recovery_x25519, "", "recovery is unset by default");
+        assert_eq!(o.escrow_mode, "none", "escrow is off by default");
+
+        // Set both, then prove they survive an unrelated member edit (the snapshot-rewrite hazard).
+        s.update_orgs(|l| {
+            let o = l.iter_mut().find(|o| o.name == "acme").unwrap();
+            o.recovery_x25519 = "ab".repeat(32);
+            o.escrow_mode = "hub-assist".into();
+        })
+        .await
+        .unwrap();
+        s.update_orgs(|l| l.iter_mut().find(|o| o.name == "acme").unwrap().members.push(org_member("bob", "member")))
+            .await
+            .unwrap();
+        let o = s.org("acme").await.unwrap();
+        assert_eq!(o.recovery_x25519, "ab".repeat(32), "recovery survives a member edit");
+        assert_eq!(o.escrow_mode, "hub-assist", "escrow mode survives a member edit");
+    }
+
+    #[tokio::test]
+    async fn wave5_escrow_keys_roundtrip_and_upsert_is_idempotent() {
+        let (_d, s) = tmp_store().await;
+        assert!(s.get_escrow_keys("acme", "frontend").await.is_empty(), "no escrow keys by default");
+        let mk = |kid: i64, w: &str| EscrowKey { owner: "acme".into(), name: "frontend".into(), kid, wrapped_ck: w.into(), created: now_iso() };
+        s.upsert_escrow_key(&mk(0, "seal-0")).await.unwrap();
+        s.upsert_escrow_key(&mk(1, "seal-1")).await.unwrap();
+        let rows = s.get_escrow_keys("acme", "frontend").await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kid, 0);
+        assert_eq!(rows[0].wrapped_ck, "seal-0");
+        assert_eq!(rows[1].wrapped_ck, "seal-1");
+        // Re-escrowing the same kid overwrites, never duplicates.
+        s.upsert_escrow_key(&mk(0, "seal-0-v2")).await.unwrap();
+        let rows = s.get_escrow_keys("acme", "frontend").await;
+        assert_eq!(rows.len(), 2, "same (owner,name,kid) is an upsert, not a new row");
+        assert_eq!(rows[0].wrapped_ck, "seal-0-v2");
+        // A different agent has its own, separate rows.
+        assert!(s.get_escrow_keys("acme", "backend").await.is_empty());
+    }
+
     #[tokio::test]
     async fn current_kek_gen_bumps_monotonically_and_survives_org_edits() {
         let (_d, s) = tmp_store().await;
-        s.update_orgs(|l| l.push(Org { name: "acme".into(), members: vec![org_member("alice", "admin")], created: now_iso(), current_kek_gen: 0 }))
+        s.update_orgs(|l| l.push(Org { name: "acme".into(), members: vec![org_member("alice", "admin")], created: now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into() }))
             .await
             .unwrap();
         assert_eq!(s.get_current_kek_gen("acme").await, 0);
@@ -2936,7 +3153,7 @@ mod tests {
             let s = s.clone();
             handles.push(tokio::spawn(async move {
                 s.update_orgs(move |list| {
-                    list.push(Org { name: format!("org{i}"), members: vec![], created: now_iso(), current_kek_gen: 0 });
+                    list.push(Org { name: format!("org{i}"), members: vec![], created: now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into() });
                 })
                 .await
                 .unwrap();
@@ -2958,6 +3175,8 @@ mod tests {
             members: vec![org_member("bob", "admin"), org_member("carol", "member"), org_member("mallory", "bogus")],
             created: now_iso(),
             current_kek_gen: 0,
+            recovery_x25519: String::new(),
+            escrow_mode: "none".into(),
         };
         let m = AgentMeta {
             members: vec![Member { username: "carol".into(), role: "read".into() }, Member { username: "dave".into(), role: "admin".into() }],
