@@ -2450,8 +2450,19 @@ impl PgStore {
         }
         let mut tx = self.pool.begin().await.map_err(err)?;
         Self::lock(&mut tx).await?;
-        // Re-check under the advisory lock (a peer boot may have reshaped it between our check and the lock).
-        if sqlx::query("SELECT key_fpr FROM identity_keys LIMIT 1").fetch_optional(&mut *tx).await.is_ok() {
+        // Re-check under the advisory lock (a peer boot may have reshaped it between our check and the
+        // lock). Probe the CATALOG, not `SELECT key_fpr`: on a legacy table that column is absent, and a
+        // failed statement aborts THIS Postgres transaction — every later statement in the rebuild then
+        // dies with "current transaction is aborted". information_schema never errors, so the tx stays
+        // usable. (The pre-lock guard above is on the autocommit pool, where a failed probe is isolated.)
+        let already = sqlx::query(
+            "SELECT 1 FROM information_schema.columns WHERE table_name = 'identity_keys' AND column_name = 'key_fpr'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(err)?
+        .is_some();
+        if already {
             return Ok(());
         }
         let olds = sqlx::query(
