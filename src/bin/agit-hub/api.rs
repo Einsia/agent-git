@@ -6,6 +6,7 @@ use std::process::Command;
 
 use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny, Lifecycle, Role, Scope, Visibility};
 use agit::hub::blob::{self, BLOB_MAX};
+use agit::hub::metrics::AuthResult;
 use agit::hub::net::valid_agent_name;
 use agit::hub::store::{AgentMeta, Member, Org, OrgMember, User};
 use agit::hub::{audit, auth, identity, kdf, mr, session as websession, store};
@@ -295,6 +296,8 @@ pub(crate) async fn api_login(ctx: &Ctx, req: &Req, body: &[u8]) -> Resp {
         auth::verify_login(&ctx.store, &username, &password).await
     };
     let Some(user) = verified else {
+        ctx.metrics.record_auth(AuthResult::LoginFail);
+        tracing::warn!(user = %store::normalize_username(&username), "login failed");
         audit_append(ctx.root(), &store::normalize_username(&username), audit::LOGIN_FAILED, None, &req.host()).await;
         // Don't say whether the user doesn't exist or the password is wrong — that hands the
         // brute-forcer a username dictionary.
@@ -303,6 +306,8 @@ pub(crate) async fn api_login(ctx: &Ctx, req: &Req, body: &[u8]) -> Resp {
     let Ok(sid) = ctx.sessions.create(&user.username) else {
         return Resp::err(503, "couldn't create a session, try again shortly");
     };
+    ctx.metrics.record_auth(AuthResult::LoginOk);
+    tracing::info!(user = %user.username, admin = user.is_admin, "login success");
     audit_append(ctx.root(), &user.username, audit::LOGIN, None, "").await;
     Resp::json(serde_json::json!({ "username": user.username, "is_admin": user.is_admin }))
         .with("Set-Cookie", &websession::set_cookie(&sid, ctx.cfg.tls))
@@ -393,6 +398,7 @@ pub(crate) async fn api_register(ctx: &Ctx, client_ip: Option<IpAddr>, body: &[u
     let Ok(sid) = ctx.sessions.create(&username) else {
         return Resp::err(503, "couldn't create a session, try again shortly");
     };
+    tracing::info!(user = %username, "registration");
     audit_append(ctx.root(), &username, audit::USER_REGISTER, None, "").await;
     Resp::json(serde_json::json!({ "username": username, "is_admin": false }))
         .with("Set-Cookie", &websession::set_cookie(&sid, ctx.cfg.tls))

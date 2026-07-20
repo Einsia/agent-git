@@ -3,6 +3,7 @@
 //! git smart-http ahead of the SPA. This band replaces the hand-rolled route()/api() dispatch band.
 #![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 use std::net::{IpAddr, SocketAddr};
+use std::time::Instant;
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::{self, Next};
@@ -11,6 +12,7 @@ use axum::routing::{any, get};
 use axum::Router;
 
 use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny};
+use agit::hub::metrics::AuthResult;
 use agit::hub::blob::BLOB_MAX;
 use agit::hub::net::{self, valid_agent_name};
 use agit::hub::store::{valid_username, AgentMeta};
@@ -102,6 +104,7 @@ pub(crate) fn deny_resp(caller: &Caller, acl: &AgentAcl, d: Deny) -> Resp {
 /// the connection/auth middleware and the global concurrency cap.
 pub(crate) fn build(ctx: Ctx) -> Router {
     Router::new()
+        .route("/metrics", get(metrics_handler))
         .route("/assets/app.js", get(asset_js))
         .route("/assets/app.css", get(asset_css))
         .route("/favicon.ico", get(favicon))
@@ -109,9 +112,70 @@ pub(crate) fn build(ctx: Ctx) -> Router {
         .fallback(git_or_spa)
         // Innermost first: identity + connection admission established once per request...
         .layer(middleware::from_fn_with_state(ctx.clone(), gate_conn_and_auth))
-        // ...then the global concurrency cap wraps it (replaces the accept-time Semaphore).
+        // ...the global concurrency cap wraps it (replaces the accept-time Semaphore)...
         .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONN))
+        // ...and the observability layer is outermost, so it times and counts every request that
+        // arrives (including any rejected by the layers within) and always runs.
+        .layer(middleware::from_fn_with_state(ctx.clone(), observe))
         .with_state(ctx)
+}
+
+/// A coarse, **bounded** route label for logs. The real path carries unbounded owner/agent segments;
+/// this folds it to one of a fixed handful of buckets so a log pipeline (and any future
+/// route-labelled metric) can never be flooded with per-agent cardinality.
+fn route_label(path: &str) -> &'static str {
+    if path == "/metrics" {
+        "/metrics"
+    } else if path == "/favicon.ico" {
+        "/favicon.ico"
+    } else if path.starts_with("/assets/") {
+        "/assets"
+    } else if path == "/api" || path.starts_with("/api/") {
+        "/api"
+    } else if path == "/" {
+        "/"
+    } else {
+        "git-or-spa"
+    }
+}
+
+/// Per-request observability: time the request, record `http_requests_total{method,status}` + the
+/// latency histogram, and emit a structured start/end pair. Labels are bounded (method folded to a
+/// closed set, status folded to its class inside `Metrics`); the request path is **not** used as a
+/// metric label — only as a coarse `route` field on the log line — so no request can grow the metric
+/// families. No secrets/PII are logged: method, coarse route, status, and latency only.
+async fn observe(State(ctx): State<Ctx>, req: Request, next: Next) -> Response {
+    let method = req.method().as_str().to_string();
+    let route = route_label(req.uri().path());
+    let start = Instant::now();
+    tracing::debug!(%method, route, "request start");
+    let resp = next.run(req).await;
+    let status = resp.status().as_u16();
+    let secs = start.elapsed().as_secs_f64();
+    ctx.metrics.record_request(&method, status, secs);
+    let latency_ms = secs * 1_000.0;
+    if status >= 500 {
+        tracing::error!(%method, route, status, latency_ms, "request end");
+    } else {
+        tracing::info!(%method, route, status, latency_ms, "request end");
+    }
+    resp
+}
+
+/// `GET /metrics` — Prometheus text exposition, **admin-gated** through the same auth every other
+/// route uses (the `Caller` the middleware already established). This is deliberately *not*
+/// world-readable: request counts, auth-failure rates and latency are operational intelligence, so a
+/// non-admin caller gets the same `404` a missing route would (non-disclosure — `/metrics` is not even
+/// advertised as existing). A Prometheus scraper authenticates with an **admin user's API token**
+/// (`agit-hub token add --user <admin>`), which carries `is_admin`, so no separate metrics secret or
+/// extra bind is introduced.
+async fn metrics_handler(State(ctx): State<Ctx>, req: Request) -> Response {
+    let (parts, _body) = req.into_parts();
+    let caller = caller_of(&parts);
+    if !caller.is_admin {
+        return Resp::err(404, "not found").into_response();
+    }
+    Resp::new(200, "text/plain; version=0.0.4; charset=utf-8", ctx.metrics.render().into_bytes()).into_response()
 }
 
 async fn asset_js() -> Response {
@@ -157,6 +221,10 @@ async fn gate_conn_and_auth(State(ctx): State<Ctx>, req: Request, next: Next) ->
 
     // (d) Token bookkeeping + per-token budget (keyed on token id, not IP).
     if let Some(id) = authn.token_id.clone() {
+        // A token that matched a real, usable grant. `id` is the token's *identifier* (e.g. `tok_1`),
+        // never the plaintext secret, so it is safe to log.
+        ctx.metrics.record_auth(AuthResult::TokenOk);
+        tracing::info!(token_id = %id, "token accepted");
         auth::touch_token(&ctx.store, &id).await;
         if !ctx.token_rl.allow(&id) {
             return Resp::text(
@@ -166,6 +234,12 @@ async fn gate_conn_and_auth(State(ctx): State<Ctx>, req: Request, next: Next) ->
             .with("Retry-After", "1")
             .into_response();
         }
+    } else if !secrets.is_empty() && authn.caller.user.is_none() {
+        // Credentials were presented in the Authorization header but resolved to nobody: an
+        // unusable/expired/unknown token (a live session would have won and set `caller.user`). Count
+        // and log the denial — without the header contents, which may carry the secret.
+        ctx.metrics.record_auth(AuthResult::TokenDenied);
+        tracing::warn!("token denied");
     }
 
     // (e) Hand the Caller to the handlers via extensions, then run the inner service with the IpGuard
@@ -257,6 +331,12 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
             }
             Decision::Deny(d) => {
                 audit_deny(&ctx, &actor, Some(&scoped), action, d).await;
+                // A push (receive-pack) refused at the authorization gate. Counted by outcome only —
+                // `scoped`/`actor` go to the structured log (bounded metric labels, richer logs).
+                if action == Action::Write {
+                    ctx.metrics.record_git_push(false);
+                    tracing::warn!(agent = %scoped, actor = %actor, reason = %d.reason(), "git push rejected");
+                }
                 // A git client only prompts for credentials on 401 + WWW-Authenticate.
                 return git_deny_resp(&caller, d).into_response();
             }
@@ -265,6 +345,12 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
         // its pack never reached memory — the body-before-auth DoS).
         if reqo.content_length > MAX_BODY {
             return Resp::text(413, "payload too large").into_response();
+        }
+        // Push authorized (the secret scan still runs later in the out-of-process pre-receive hook;
+        // this counts the authorization outcome, which is the in-process signal we have).
+        if action == Action::Write {
+            ctx.metrics.record_git_push(true);
+            tracing::info!(agent = %scoped, actor = %actor, "git push accepted");
         }
         audit_append(
             ctx.root(),

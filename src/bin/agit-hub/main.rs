@@ -545,6 +545,7 @@ mod h4_tests {
             token_rl: Arc::new(TokenBuckets::new()),
             // Mirror production's tight registration bucket, so the per-IP throttle is exercised for real.
             register_rl: Arc::new(TokenBuckets::with_rate(REGISTER_RATE_PER_SEC, REGISTER_BURST)),
+            metrics: Arc::new(agit::hub::metrics::Metrics::new()),
         }));
         (dir, ctx)
     }
@@ -790,6 +791,7 @@ mod h3_tests {
             login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
             token_rl: Arc::new(TokenBuckets::new()),
             register_rl: Arc::new(TokenBuckets::new()),
+            metrics: Arc::new(agit::hub::metrics::Metrics::new()),
         }));
         (dir, ctx)
     }
@@ -1076,5 +1078,125 @@ mod h3_tests {
             api(&ctx, &req("POST", "/api/agent/alice/mine/transfer", 0), "agent/alice/mine/transfer", &Caller::user("alice"), None, br#"{"org":"secret"}"#).await;
         assert_eq!(missing.status, 404, "no such org → 404");
         assert_eq!(forbidden.status, missing.status, "a non-member can't tell 'secret exists' from 'no such org'");
+    }
+}
+
+/// Observability wave: the `/metrics` endpoint (gate + valid exposition), the per-request counter, and
+/// the logging init. These drive the real router through `tower`'s `oneshot`, so the observe
+/// middleware and the admin gate are exercised end-to-end, not in isolation.
+#[cfg(test)]
+mod obs_tests {
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::util::ServiceExt; // oneshot
+
+    use agit::hub::blob::Blobs;
+    use agit::hub::metrics::Metrics;
+    use agit::hub::session::{self, Sessions};
+    use agit::hub::store::{now_iso, Store, User};
+    use agit::hub::kdf;
+
+    use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC};
+    use crate::router::build;
+    use crate::server::{init_tracing, Cfg, Ctx, CtxInner};
+
+    /// A Ctx whose store already holds one admin user named `admin` (password irrelevant — tests mint
+    /// the session directly).
+    async fn ctx_with_admin() -> (tempfile::TempDir, Ctx) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_sqlite(dir.path()).await.unwrap();
+        let salt = kdf::gen_salt().unwrap();
+        let kdf_id = kdf::current_kdf_id();
+        store
+            .add_user(User {
+                username: "admin".into(),
+                pw_hash: kdf::hash_password("password-123", &salt, &kdf_id).unwrap(),
+                salt,
+                kdf: kdf_id,
+                is_admin: true,
+                created: now_iso(),
+            })
+            .await
+            .unwrap();
+        let blobs = Blobs::open(dir.path()).await.unwrap();
+        let cfg = Cfg {
+            host: "127.0.0.1".parse::<IpAddr>().unwrap(),
+            port: 0,
+            tls: false,
+            insecure: false,
+            trusted_proxies: vec![],
+            registration: false,
+        };
+        let ctx = Ctx(Arc::new(CtxInner {
+            store,
+            blobs,
+            cfg,
+            sessions: Sessions::new(),
+            limiter: Arc::new(ConnLimiter::default()),
+            login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
+            token_rl: Arc::new(TokenBuckets::new()),
+            register_rl: Arc::new(TokenBuckets::new()),
+            metrics: Arc::new(Metrics::new()),
+        }));
+        (dir, ctx)
+    }
+
+    async fn body_string(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn logging_init_is_idempotent_and_does_not_panic() {
+        // `try_init` under the hood, so a second call (or a call after another test initialised the
+        // global subscriber) is a harmless no-op rather than a panic.
+        init_tracing();
+        init_tracing();
+    }
+
+    #[tokio::test]
+    async fn metrics_is_admin_gated_and_returns_valid_exposition() {
+        let (_d, ctx) = ctx_with_admin().await;
+        let app = build(ctx.clone());
+
+        // Anonymous → 404: the gate must keep /metrics from being world-readable, and it must not even
+        // advertise that the route exists.
+        let anon =
+            app.clone().oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(anon.status(), 404, "/metrics must not be reachable without the admin gate");
+
+        // Admin session → 200 + valid Prometheus exposition text.
+        let sid = ctx.sessions.create("admin").unwrap();
+        let req = Request::builder()
+            .uri("/metrics")
+            .header("cookie", format!("{}={sid}", session::COOKIE))
+            .body(Body::empty())
+            .unwrap();
+        let ok = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(ok.status(), 200, "an admin may scrape /metrics");
+        let text = body_string(ok).await;
+        assert!(text.contains("# TYPE http_requests_total counter"), "exposition:\n{text}");
+        assert!(text.contains("# TYPE http_request_duration_seconds histogram"));
+        assert!(text.contains("http_request_duration_seconds_bucket{le=\"+Inf\"}"));
+        assert!(text.contains("# TYPE auth_attempts_total counter"));
+        assert!(text.contains("# TYPE git_push_total counter"));
+        assert!(text.contains("secret_scan_rejects_total"));
+        assert!(text.contains("agit_hub_build_info"));
+    }
+
+    #[tokio::test]
+    async fn a_request_increments_http_requests_total() {
+        let (_d, ctx) = ctx_with_admin().await;
+        let app = build(ctx.clone());
+        // One anonymous request through the whole stack: /api/me with no creds → 401.
+        let r = app.clone().oneshot(Request::builder().uri("/api/me").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(), 401);
+        // The observe middleware should have counted it, folded to method + status class.
+        let dump = ctx.metrics.render();
+        assert!(dump.contains("http_requests_total{method=\"GET\",status=\"4xx\"} 1"), "metrics dump:\n{dump}");
+        assert!(dump.contains("http_request_duration_seconds_count 1"));
     }
 }

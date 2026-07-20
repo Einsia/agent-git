@@ -22,6 +22,7 @@ pub mod blob;
 pub mod auth;
 pub mod identity;
 pub mod kdf;
+pub mod metrics;
 pub mod mr;
 pub mod net;
 pub mod session;

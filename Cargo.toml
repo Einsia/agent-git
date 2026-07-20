@@ -55,6 +55,12 @@ rand = "0.8"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
+# Observability for agit-hub: structured logging via `tracing`, with an env-driven subscriber
+# (`AGIT_HUB_LOG` filter, `AGIT_HUB_LOG_FORMAT=json|pretty`). `tracing-subscriber` default features
+# already carry `fmt`, `ansi`, and `env-filter`; `json` is opted in for the JSON log format. Metrics
+# are hand-rolled on atomics (src/hub/metrics.rs) — no metrics crate is pulled in.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"

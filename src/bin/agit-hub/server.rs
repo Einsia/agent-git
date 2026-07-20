@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agit::hub::blob::Blobs;
+use agit::hub::metrics::Metrics;
 use agit::hub::net;
 use agit::hub::session::Sessions;
 use agit::hub::store::{self, Store};
@@ -54,6 +55,10 @@ pub(crate) struct CtxInner {
     /// `--open-registration` hub. A tight token bucket keyed on the client IP throttles a sweep to a
     /// trickle without troubling a real person who signs up once.
     pub(crate) register_rl: Arc<TokenBuckets>,
+    /// Process-wide observability counters (Prometheus text exposition at `/metrics`). Behind an
+    /// `Arc` so the per-request middleware and every handler that records share one instance; all its
+    /// fields are atomics, so no lock is taken on the hot path.
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 #[derive(Clone)]
@@ -199,11 +204,38 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Install the process-wide `tracing` subscriber, exactly once.
+///
+/// Configuration is env-only so it needs no flags and no config file:
+///   - `AGIT_HUB_LOG` — the filter directive (default `info`); any `tracing_subscriber` `EnvFilter`
+///     syntax works, e.g. `AGIT_HUB_LOG=agit_hub=debug,info`.
+///   - `AGIT_HUB_LOG_FORMAT` — `pretty` (human, default) or `json` (one JSON object per line, for a
+///     log pipeline).
+///
+/// `try_init` is used rather than `init` so a second call (a test that boots two contexts, say) is a
+/// harmless no-op instead of a panic — hence this never returns an error and never aborts a boot.
+/// Logs go to **stderr** so the human-readable startup banner (`println!`) on stdout is untouched.
+pub(crate) fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_env("AGIT_HUB_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let json = std::env::var("AGIT_HUB_LOG_FORMAT")
+        .map(|v| v.trim().eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let builder = fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    // Two separate `try_init` arms: the JSON and pretty formatters are different concrete types, so
+    // they cannot share one `builder` binding.
+    let _ = if json { builder.json().try_init() } else { builder.try_init() };
+}
+
 /// Rewritten boot: build the shared context, a multi-thread tokio runtime, and the axum app. The CLI
 /// path stays sync (this is called from `run()`), so the runtime is built here rather than via
 /// `#[tokio::main]`.
 pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
+    // Structured logging comes up first thing, so every event below (boot failures included) is
+    // captured in the configured format.
+    init_tracing();
     if let Err(e) = store::ensure_root(root) {
+        tracing::error!(root = %root.display(), error = %e, "failed to create root");
         eprintln!("failed to create root {}: {e}", root.display());
         return 1;
     }
@@ -225,6 +257,7 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
         let store = match Store::open(root).await {
             Ok(s) => s,
             Err(e) => {
+                tracing::error!(error = %e, "failed to open the metadata database");
                 eprintln!("failed to open the metadata database: {e}");
                 return 1;
             }
@@ -232,6 +265,7 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
         let blobs = match Blobs::open(root).await {
             Ok(b) => b,
             Err(e) => {
+                tracing::error!(error = %e, "failed to open blob storage");
                 eprintln!("failed to open blob storage: {e}");
                 return 1;
             }
@@ -245,15 +279,23 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
             login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
             token_rl: Arc::new(TokenBuckets::new()),
             register_rl: Arc::new(TokenBuckets::with_rate(REGISTER_RATE_PER_SEC, REGISTER_BURST)),
+            metrics: Arc::new(Metrics::new()),
         }));
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
+                tracing::error!(%addr, error = %e, "failed to bind");
                 eprintln!("failed to bind {addr}: {e}");
                 return 1;
             }
         };
         startup_banner(&ctx, addr).await;
+        tracing::info!(
+            %addr,
+            tls = ctx.cfg.tls,
+            registration = ctx.cfg.registration,
+            "agit-hub serving"
+        );
         let app = crate::router::build(ctx);
         match axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(shutdown_signal())
@@ -261,6 +303,7 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
         {
             Ok(()) => 0,
             Err(e) => {
+                tracing::error!(error = %e, "server error");
                 eprintln!("server error: {e}");
                 1
             }
