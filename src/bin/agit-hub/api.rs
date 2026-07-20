@@ -136,6 +136,13 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
                 _ => Resp::text(405, "method not allowed"),
             };
         }
+        // orgs/<org>/kek/<envelopes|envelope|gens> — the Team-KEK endpoints (Wave 3). Same tail guard
+        // as /members: "/kek..." only, so a stray /kekXYZ does not slip through.
+        if let Some((name, tail)) = after.split_once("/kek") {
+            if tail.is_empty() || tail.starts_with('/') {
+                return api_org_kek(ctx, caller, name, tail, m, req.query(), body).await;
+            }
+        }
         return match m {
             "GET" => api_org_get(ctx, caller, after).await,
             "DELETE" => api_org_delete(ctx, caller, after).await,
@@ -2104,6 +2111,7 @@ pub(crate) async fn api_orgs_create(ctx: &Ctx, caller: &Caller, body: &[u8]) -> 
                 name: name.clone(),
                 members: vec![OrgMember { username: user.clone(), role: "admin".into() }],
                 created: store::now_iso(),
+                current_kek_gen: 0,
             });
             true
         })
@@ -2132,6 +2140,137 @@ pub(crate) async fn api_org_get(ctx: &Ctx, caller: &Caller, name: &str) -> Resp 
         }
         _ => Resp::err(404, "not found"),
     }
+}
+
+// ── Team-KEK envelopes (encryption-recipients Wave 3) ──
+//
+// The hub stores CIPHERTEXT only: the client computes every X25519 seal of TK, the hub just files the
+// per-member rows and tracks `current_kek_gen`. Authorization is an ORG gate (never `acl::decide`):
+// publishing needs org-admin; fetching your OWN envelope / listing your gens needs only membership. A
+// caller who cannot see the org gets the same 404 as a missing one (existence non-disclosure).
+
+/// The most envelopes one publish may carry, and the largest a single `wrapped_kek` string may be. A
+/// TK envelope packs epk(32)‖nonce(24)‖ciphertext(48) base64'd (~140 chars); the bound is generous.
+const KEK_ENVELOPES_MAX: usize = 4096;
+const KEK_WRAP_MAX: usize = 1024;
+
+/// `/api/orgs/<org>/kek/<envelopes|envelope|gens>` — dispatch the three Team-KEK routes behind one
+/// membership gate.
+pub(crate) async fn api_org_kek(
+    ctx: &Ctx,
+    caller: &Caller,
+    name: &str,
+    tail: &str,
+    method: &str,
+    query: &str,
+    body: &[u8],
+) -> Resp {
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    // 404 for a missing org OR one the caller can't see — existence non-disclosure, as everywhere else.
+    let Some(org) = ctx.store.org(name).await else {
+        return Resp::err(404, "not found");
+    };
+    if !(caller.is_admin || org.is_member(&user)) {
+        return Resp::err(404, "not found");
+    }
+    let sub = tail.strip_prefix('/').unwrap_or("");
+    match (method, sub) {
+        ("POST", "envelopes") => api_org_kek_publish(ctx, caller, &org, &user, body).await,
+        // A member may fetch ONLY their OWN envelope: the recipient is the authenticated caller, never
+        // read from the query. A missing gen envelope (or a gen the caller has none for) is a 404.
+        ("GET", "envelope") => {
+            let Some(gen) = param(query, "gen").and_then(|g| g.trim().parse::<i64>().ok()) else {
+                return Resp::err(400, "want gen=<generation>");
+            };
+            match ctx.store.get_team_kek_envelope(&org.name, gen, &user).await {
+                Some(e) => Resp::json(serde_json::json!({
+                    "gen": e.gen,
+                    "wrapped_kek": e.wrapped_kek,
+                    "recipient_epoch": e.recipient_epoch,
+                })),
+                None => Resp::err(404, "not found"),
+            }
+        }
+        // The generations available to THIS caller — the ones they hold an envelope for — plus the org's
+        // active generation so the client can pick the newest to wrap under.
+        ("GET", "gens") => {
+            let mut mine = Vec::new();
+            for g in ctx.store.list_team_kek_gens(&org.name).await {
+                if ctx.store.get_team_kek_envelope(&org.name, g, &user).await.is_some() {
+                    mine.push(g);
+                }
+            }
+            Resp::json(serde_json::json!({ "gens": mine, "current": org.current_kek_gen }))
+        }
+        _ => Resp::text(405, "method not allowed"),
+    }
+}
+
+/// `POST /api/orgs/<org>/kek/envelopes` `{ gen, envelopes:[{recipient, wrapped_kek, recipient_epoch}] }`
+/// — ORG-ADMIN publishes a Team-KEK generation. The client computed every seal; the hub stores only the
+/// ciphertext rows and advances `current_kek_gen` to `gen`. `gen` behind the current one is refused
+/// (409); `gen == current` is an idempotent republish; `gen > current` advances the active generation.
+async fn api_org_kek_publish(ctx: &Ctx, caller: &Caller, org: &Org, actor: &str, body: &[u8]) -> Resp {
+    // The membership 404 already ran in the caller; a plain member who is not an admin is a 403.
+    if !(caller.is_admin || org.is_admin(actor)) {
+        return Resp::err(403, "must be an org admin to publish team-KEK envelopes");
+    }
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(gen) = v.get("gen").and_then(|x| x.as_i64()).filter(|g| *g >= 1) else {
+        return Resp::err(400, "want a positive integer gen");
+    };
+    let current = ctx.store.get_current_kek_gen(&org.name).await;
+    if gen < current {
+        return Resp::err(409, &format!("gen {gen} is behind the current generation {current}"));
+    }
+    let Some(arr) = v.get("envelopes").and_then(|e| e.as_array()) else {
+        return Resp::err(400, "want envelopes: [{recipient, wrapped_kek, recipient_epoch}]");
+    };
+    if arr.is_empty() {
+        return Resp::err(400, "envelopes must not be empty");
+    }
+    if arr.len() > KEK_ENVELOPES_MAX {
+        return Resp::err(400, "too many envelopes in one publish");
+    }
+    let mut rows = Vec::with_capacity(arr.len());
+    for e in arr {
+        let (Some(recipient), Some(wrapped_kek)) = (str_field(e, "recipient"), str_field(e, "wrapped_kek")) else {
+            return Resp::err(400, "each envelope needs recipient and wrapped_kek");
+        };
+        if wrapped_kek.is_empty() || wrapped_kek.len() > KEK_WRAP_MAX {
+            return Resp::err(400, "wrapped_kek is missing or too large");
+        }
+        let recipient_epoch = e.get("recipient_epoch").and_then(|x| x.as_i64()).unwrap_or(0);
+        rows.push(store::TeamKekEnvelope {
+            org: org.name.clone(),
+            gen,
+            recipient,
+            wrapped_kek,
+            recipient_epoch,
+            created: store::now_iso(),
+        });
+    }
+    if ctx.store.upsert_team_kek_envelopes(&org.name, gen, &rows).await.is_err() {
+        return Resp::err(500, "couldn't store the team-KEK envelopes");
+    }
+    // Advance the active generation ONLY after the envelopes are stored, so a reader never observes
+    // current == gen without any envelopes to fetch.
+    if ctx.store.set_current_kek_gen(&org.name, gen).await.is_err() {
+        return Resp::err(500, "couldn't advance the team-KEK generation");
+    }
+    audit_append(
+        ctx.root(),
+        actor,
+        audit::ORG_KEK_PUBLISH,
+        None,
+        &format!("org={} gen={gen} envelopes={}", org.name, rows.len()),
+    )
+    .await;
+    Resp::json(serde_json::json!({ "org": org.name, "gen": gen, "envelopes": rows.len(), "current": gen }))
 }
 
 /// `/api/orgs/<name>/members[/<username>]` — the org membership routes. Authorization here is an ORG
@@ -3932,5 +4071,98 @@ mod tests {
             401,
             "enroll requires a logged-in caller"
         );
+    }
+
+    // ── Team-KEK envelopes (encryption-recipients Wave 3) ──
+
+    /// Plant an org with the given (username, role) members, current_kek_gen = 0.
+    async fn mk_org(ctx: &Ctx, name: &str, members: &[(&str, &str)]) {
+        let name = name.to_string();
+        let members: Vec<OrgMember> =
+            members.iter().map(|(u, r)| OrgMember { username: (*u).into(), role: (*r).into() }).collect();
+        ctx.store
+            .update_orgs(|list| list.push(Org { name: name.clone(), members: members.clone(), created: store::now_iso(), current_kek_gen: 0 }))
+            .await
+            .unwrap();
+    }
+
+    /// A publish body sealing gen `g` to each named recipient (ciphertext is opaque to the hub).
+    fn kek_body(g: i64, recipients: &[&str]) -> Vec<u8> {
+        let envelopes: Vec<serde_json::Value> = recipients
+            .iter()
+            .map(|r| serde_json::json!({ "recipient": r, "wrapped_kek": format!("wrap-for-{r}"), "recipient_epoch": 0 }))
+            .collect();
+        body(serde_json::json!({ "gen": g, "envelopes": envelopes }))
+    }
+
+    /// Publishing envelopes is ORG-ADMIN only: a plain member is 403, an admin succeeds and the org's
+    /// current generation advances monotonically.
+    #[tokio::test]
+    async fn kek_publish_is_org_admin_only_and_bumps_generation() {
+        let (_d, ctx) = harness().await;
+        mk_org(&ctx, "acme", &[("alice", "admin"), ("bob", "member")]).await;
+
+        // A plain member cannot publish → 403 (they pass the membership gate but not the admin one).
+        let r = api_org_kek(&ctx, &caller("bob", false), "acme", "/envelopes", "POST", "", &kek_body(1, &["alice", "bob"])).await;
+        assert_eq!(r.status, 403, "a non-admin member must be refused publishing");
+        assert_eq!(ctx.store.get_current_kek_gen("acme").await, 0, "a refused publish must not advance the generation");
+
+        // The admin publishes gen 1 → 200, current advances to 1.
+        let r = api_org_kek(&ctx, &caller("alice", false), "acme", "/envelopes", "POST", "", &kek_body(1, &["alice", "bob"])).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(ctx.store.get_current_kek_gen("acme").await, 1);
+
+        // Advancing to gen 2 works; a stale gen (1, now behind) is refused and does NOT roll back current.
+        assert_eq!(api_org_kek(&ctx, &caller("alice", false), "acme", "/envelopes", "POST", "", &kek_body(2, &["alice"])).await.status, 200);
+        assert_eq!(ctx.store.get_current_kek_gen("acme").await, 2);
+        assert_eq!(api_org_kek(&ctx, &caller("alice", false), "acme", "/envelopes", "POST", "", &kek_body(1, &["alice"])).await.status, 409);
+        assert_eq!(ctx.store.get_current_kek_gen("acme").await, 2, "a behind-gen publish must not roll the generation back");
+    }
+
+    /// A member may fetch ONLY their OWN envelope — the recipient is the authenticated caller, never
+    /// another member — and a non-member is 404 on both envelope and gens (existence non-disclosure).
+    #[tokio::test]
+    async fn kek_fetch_is_own_envelope_only_and_membership_gated() {
+        let (_d, ctx) = harness().await;
+        mk_org(&ctx, "acme", &[("alice", "admin"), ("bob", "member")]).await;
+        assert_eq!(api_org_kek(&ctx, &caller("alice", false), "acme", "/envelopes", "POST", "", &kek_body(1, &["alice", "bob"])).await.status, 200);
+
+        // bob fetches his own envelope → 200, and it is HIS ciphertext, never alice's.
+        let r = api_org_kek(&ctx, &caller("bob", false), "acme", "/envelope", "GET", "gen=1", &[]).await;
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["wrapped_kek"], "wrap-for-bob", "a member gets their OWN envelope");
+        assert_eq!(v["gen"], 1);
+
+        // There is no way to ask for another recipient's envelope: the recipient is always the caller,
+        // so alice's row is invisible to bob. bob at a gen he has no envelope for → 404.
+        assert_eq!(api_org_kek(&ctx, &caller("bob", false), "acme", "/envelope", "GET", "gen=2", &[]).await.status, 404);
+
+        // gens lists only bob's own generations, plus the org's current gen.
+        let g = api_org_kek(&ctx, &caller("bob", false), "acme", "/gens", "GET", "", &[]).await;
+        assert_eq!(g.status, 200);
+        let gv: serde_json::Value = serde_json::from_slice(&g.body).unwrap();
+        assert_eq!(gv["gens"], serde_json::json!([1]));
+        assert_eq!(gv["current"], 1);
+
+        // A NON-member (carol) is 404 on envelope AND gens — the org's existence is not disclosed.
+        add_user(&ctx, "carol", "carol-password-1", false).await;
+        assert_eq!(api_org_kek(&ctx, &caller("carol", false), "acme", "/envelope", "GET", "gen=1", &[]).await.status, 404);
+        assert_eq!(api_org_kek(&ctx, &caller("carol", false), "acme", "/gens", "GET", "", &[]).await.status, 404);
+        assert_eq!(api_org_kek(&ctx, &caller("carol", false), "acme", "/envelopes", "POST", "", &kek_body(2, &["carol"])).await.status, 404, "a non-member cannot even see the org to publish");
+    }
+
+    /// Republishing the CURRENT generation (the `hub team sync` join path) is idempotent: it does not
+    /// advance the generation and adds the new member's envelope.
+    #[tokio::test]
+    async fn kek_republish_current_generation_is_idempotent_join() {
+        let (_d, ctx) = harness().await;
+        mk_org(&ctx, "acme", &[("alice", "admin")]).await;
+        assert_eq!(api_org_kek(&ctx, &caller("alice", false), "acme", "/envelopes", "POST", "", &kek_body(1, &["alice"])).await.status, 200);
+        assert_eq!(ctx.store.get_current_kek_gen("acme").await, 1);
+        // bob joins: republish gen 1 sealing to both. Allowed (gen == current), no bump.
+        assert_eq!(api_org_kek(&ctx, &caller("alice", false), "acme", "/envelopes", "POST", "", &kek_body(1, &["alice", "bob"])).await.status, 200);
+        assert_eq!(ctx.store.get_current_kek_gen("acme").await, 1, "a same-gen republish must not bump");
+        assert!(ctx.store.get_team_kek_envelope("acme", 1, "bob").await.is_some(), "the joined member now has an envelope");
     }
 }

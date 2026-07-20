@@ -161,6 +161,26 @@ pub struct Org {
     pub members: Vec<OrgMember>,
     #[serde(default)]
     pub created: String,
+    /// The org's active Team-KEK generation (encryption-recipients Wave 3). 0 = no TK has ever been
+    /// minted. Carried on the struct (not just a bare column) so the whole-table `update_orgs`
+    /// snapshot-rewrite preserves it across an unrelated member edit rather than resetting it to 0.
+    #[serde(default)]
+    pub current_kek_gen: i64,
+}
+
+/// One member's envelope of a Team KEK generation (encryption-recipients Wave 3): `wrapped_kek` is the
+/// TK_gen X25519-sealed to `recipient`'s pubkey — CIPHERTEXT only, so the hub never holds a plaintext
+/// TK. `recipient_epoch` is the identity-key epoch the seal targeted (stale-envelope detection).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamKekEnvelope {
+    pub org: String,
+    pub gen: i64,
+    pub recipient: String,
+    pub wrapped_kek: String,
+    #[serde(default)]
+    pub recipient_epoch: i64,
+    #[serde(default)]
+    pub created: String,
 }
 
 /// A pending (or resolved) invitation into an org — the consent flow that replaces the silent
@@ -605,7 +625,24 @@ fn row_mr(r: &impl Cols) -> Option<Mr> {
 }
 
 fn row_org(r: &impl Cols) -> Org {
-    Org { name: r.text("name"), members: parse_json_vec(&r.text("members")), created: r.text("created") }
+    Org {
+        name: r.text("name"),
+        members: parse_json_vec(&r.text("members")),
+        created: r.text("created"),
+        // Fail-safe: a store that predates the column reads back as gen 0 (no TK), never an error.
+        current_kek_gen: r.int("current_kek_gen"),
+    }
+}
+
+fn row_team_kek(r: &impl Cols) -> TeamKekEnvelope {
+    TeamKekEnvelope {
+        org: r.text("org"),
+        gen: r.int("gen"),
+        recipient: r.text("recipient"),
+        wrapped_kek: r.text("wrapped_kek"),
+        recipient_epoch: r.int("recipient_epoch"),
+        created: r.text("created"),
+    }
 }
 
 fn row_identity_key(r: &impl Cols) -> IdentityKey {
@@ -670,8 +707,13 @@ const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS mrs (\
        target_owner TEXT NOT NULL, target_agent TEXT NOT NULL, id BIGINT NOT NULL, data TEXT NOT NULL, \
        PRIMARY KEY (target_owner, target_agent, id))",
+    // current_kek_gen is the org's active Team-KEK generation (encryption-recipients Wave 3): 0 = the
+    // org has never minted a TK. Added additively (a fresh DB gets it here; older stores get it via the
+    // `ORG_COLUMNS` back-fill, like the TOTP columns). BIGINT for the same strict-decode reason as every
+    // other integer column.
     "CREATE TABLE IF NOT EXISTS orgs (\
-       name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', created TEXT NOT NULL DEFAULT '')",
+       name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', created TEXT NOT NULL DEFAULT '', \
+       current_kek_gen BIGINT NOT NULL DEFAULT 0)",
     // Org invitations (the consent flow). id is the unguessable accept/decline handle; status is one
     // of pending|accepted|declined|revoked. Added additively to DDL (a whole new table, unlike the
     // TOTP columns) so a fresh DB gets it and every existing store gets it created at boot via the
@@ -689,6 +731,15 @@ const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS identity_keys (\
        username TEXT PRIMARY KEY, ed25519_pub TEXT NOT NULL, x25519_pub TEXT NOT NULL, \
        epoch BIGINT NOT NULL DEFAULT 0, enroll_sig TEXT NOT NULL, created TEXT NOT NULL DEFAULT '', revoked TEXT)",
+    // Per-org Team-KEK envelopes (encryption-recipients Wave 3): one row per (org, generation, member),
+    // holding TK_gen X25519-sealed to that member's pubkey. `wrapped_kek` is CIPHERTEXT only — the hub
+    // never sees a plaintext TK. `recipient_epoch` records which identity-key epoch the seal targeted, so
+    // a client can detect a stale envelope after a key rotation. Added additively like `invitations`.
+    "CREATE TABLE IF NOT EXISTS team_keks (\
+       org TEXT NOT NULL, gen BIGINT NOT NULL, recipient TEXT NOT NULL, wrapped_kek TEXT NOT NULL, \
+       recipient_epoch BIGINT NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '', \
+       PRIMARY KEY (org, gen, recipient))",
+    "CREATE INDEX IF NOT EXISTS team_keks_org_gen ON team_keks(org, gen)",
 ];
 
 /// The second-factor columns, added onto a `users` table that predates them. A **fresh** DB already
@@ -702,6 +753,12 @@ const TOTP_COLUMNS: &[&str] = &[
     "totp_enabled BIGINT NOT NULL DEFAULT 0",
     "totp_backup_codes TEXT NOT NULL DEFAULT '[]'",
 ];
+
+/// The org columns added onto an `orgs` table that predates them (encryption-recipients Wave 3),
+/// back-filled at boot exactly like [`TOTP_COLUMNS`]. A **fresh** DB already has them (they are in
+/// `DDL`); this migrates older stores. Idempotent by construction: Postgres uses `ADD COLUMN IF NOT
+/// EXISTS`; SQLite ignores the "duplicate column" error, so re-running is a no-op.
+const ORG_COLUMNS: &[&str] = &["current_kek_gen BIGINT NOT NULL DEFAULT 0"];
 
 /// Stamp the schema version idempotently. A single fixed row (id=1) plus `ON CONFLICT DO NOTHING`,
 /// **not** read-MAX-then-INSERT: two Hubs booting against one fresh Postgres at the same moment would
@@ -1174,6 +1231,60 @@ impl Store {
             Store::Pg(s) => s.upsert_identity_key(row).await,
         }
     }
+
+    // ── team-KEK envelopes (encryption-recipients Wave 3) ──
+    //
+    // Targeted upserts/gets, keyed by (org, gen, recipient), sharing the exact write critical section
+    // every other writer uses (the SQLite async write mutex / the Postgres advisory-lock transaction).
+    // The hub only ever stores CIPHERTEXT `wrapped_kek` — the client computes every X25519 seal.
+
+    /// Upsert a batch of TK_gen envelopes for `org` (one row per recipient). Idempotent on the
+    /// (org, gen, recipient) PK: republishing overwrites the ciphertext. `org` is normalized to the
+    /// canonical name namespace, exactly like [`Store::org`].
+    pub async fn upsert_team_kek_envelopes(&self, org: &str, gen: i64, rows: &[TeamKekEnvelope]) -> io::Result<()> {
+        let org = normalize_username(org);
+        match self {
+            Store::Sqlite(s) => s.upsert_team_kek_envelopes(&org, gen, rows).await,
+            Store::Pg(s) => s.upsert_team_kek_envelopes(&org, gen, rows).await,
+        }
+    }
+
+    /// One recipient's own envelope of TK at `gen`, or `None` if none exists. Callers must scope this
+    /// to the AUTHENTICATED recipient — the store returns whatever row is asked for; the API layer owns
+    /// the "you may fetch only your own" rule.
+    pub async fn get_team_kek_envelope(&self, org: &str, gen: i64, recipient: &str) -> Option<TeamKekEnvelope> {
+        let org = normalize_username(org);
+        let recipient = normalize_username(recipient);
+        match self {
+            Store::Sqlite(s) => s.get_team_kek_envelope(&org, gen, &recipient).await,
+            Store::Pg(s) => s.get_team_kek_envelope(&org, gen, &recipient).await,
+        }
+    }
+
+    /// The distinct TK generations `org` has any envelopes for, ascending. Empty if the org has never
+    /// published a TK.
+    pub async fn list_team_kek_gens(&self, org: &str) -> Vec<i64> {
+        let org = normalize_username(org);
+        match self {
+            Store::Sqlite(s) => s.list_team_kek_gens(&org).await,
+            Store::Pg(s) => s.list_team_kek_gens(&org).await,
+        }
+    }
+
+    /// The org's active Team-KEK generation (0 = never minted, or unknown org).
+    pub async fn get_current_kek_gen(&self, org: &str) -> i64 {
+        self.org(org).await.map(|o| o.current_kek_gen).unwrap_or(0)
+    }
+
+    /// Set the org's active Team-KEK generation. Runs in the same write critical section as every other
+    /// org write; a missing org is a no-op (the caller has already resolved it).
+    pub async fn set_current_kek_gen(&self, org: &str, gen: i64) -> io::Result<()> {
+        let org = normalize_username(org);
+        match self {
+            Store::Sqlite(s) => s.set_current_kek_gen(&org, gen).await,
+            Store::Pg(s) => s.set_current_kek_gen(&org, gen).await,
+        }
+    }
 }
 
 // ─────────────────────────── SQLite backend ───────────────────────────
@@ -1223,6 +1334,11 @@ impl SqliteStore {
         // ignored (SQLite has no ADD COLUMN IF NOT EXISTS).
         for &col in TOTP_COLUMNS {
             let _ = sqlx::query(&format!("ALTER TABLE users ADD COLUMN {col}")).execute(&self.pool).await;
+        }
+        // Back-fill the Wave-3 org columns onto stores predating them (no-op on a fresh DB, where the DDL
+        // above already added them — SQLite then errors "duplicate column", which is expected/ignored).
+        for &col in ORG_COLUMNS {
+            let _ = sqlx::query(&format!("ALTER TABLE orgs ADD COLUMN {col}")).execute(&self.pool).await;
         }
         // create_if_missing may not honor the mode; tighten hub.db AND its WAL sidecars to 0600, the
         // same guarantee write_secret_atomic gave the old JSON files. The DDL/stamp above already
@@ -1503,10 +1619,11 @@ impl SqliteStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM orgs").execute(&mut *tx).await.map_err(err)?;
         for o in &list {
-            sqlx::query("INSERT INTO orgs (name, members, created) VALUES (?, ?, ?)")
+            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen) VALUES (?, ?, ?, ?)")
                 .bind(&o.name)
                 .bind(serde_json::to_string(&o.members).unwrap_or_else(|_| "[]".into()))
                 .bind(&o.created)
+                .bind(o.current_kek_gen)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -1607,6 +1724,70 @@ impl SqliteStore {
         tx.commit().await.map_err(err)?;
         Ok(EnrollOutcome::Applied)
     }
+
+    async fn upsert_team_kek_envelopes(&self, org: &str, gen: i64, rows: &[TeamKekEnvelope]) -> io::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO team_keks (org, gen, recipient, wrapped_kek, recipient_epoch, created) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(org, gen, recipient) DO UPDATE SET \
+                   wrapped_kek = excluded.wrapped_kek, recipient_epoch = excluded.recipient_epoch",
+            )
+            .bind(org)
+            .bind(gen)
+            .bind(normalize_username(&row.recipient))
+            .bind(&row.wrapped_kek)
+            .bind(row.recipient_epoch)
+            .bind(&row.created)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        Ok(())
+    }
+
+    async fn get_team_kek_envelope(&self, org: &str, gen: i64, recipient: &str) -> Option<TeamKekEnvelope> {
+        match sqlx::query("SELECT * FROM team_keks WHERE org = ? AND gen = ? AND recipient = ?")
+            .bind(org)
+            .bind(gen)
+            .bind(recipient)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(r)) => Some(row_team_kek(&r)),
+            _ => None,
+        }
+    }
+
+    async fn list_team_kek_gens(&self, org: &str) -> Vec<i64> {
+        match sqlx::query("SELECT DISTINCT gen FROM team_keks WHERE org = ? ORDER BY gen ASC")
+            .bind(org)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows.iter().map(|r| r.int("gen")).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    async fn set_current_kek_gen(&self, org: &str, gen: i64) -> io::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        // Monotonic at the SQL level: only ever advance the generation, so a stale concurrent publish
+        // cannot roll it back even if it passed the API-layer check. gen <= current is a silent no-op.
+        sqlx::query("UPDATE orgs SET current_kek_gen = ? WHERE name = ? AND ? > current_kek_gen")
+            .bind(gen)
+            .bind(org)
+            .bind(gen)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(())
+    }
 }
 
 // ─────────────────────────── Postgres backend ───────────────────────────
@@ -1642,6 +1823,11 @@ impl PgStore {
         // native IF NOT EXISTS, so this is cleanly idempotent without swallowing errors.
         for &col in TOTP_COLUMNS {
             sqlx::query(&format!("ALTER TABLE users ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
+        }
+        // Back-fill the Wave-3 org columns onto stores predating them (no-op on a fresh DB). Postgres has
+        // a native IF NOT EXISTS, so this is cleanly idempotent without swallowing errors.
+        for &col in ORG_COLUMNS {
+            sqlx::query(&format!("ALTER TABLE orgs ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
         }
         Ok(())
     }
@@ -1907,10 +2093,11 @@ impl PgStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM orgs").execute(&mut *tx).await.map_err(err)?;
         for o in &list {
-            sqlx::query("INSERT INTO orgs (name, members, created) VALUES ($1, $2, $3)")
+            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen) VALUES ($1, $2, $3, $4)")
                 .bind(&o.name)
                 .bind(serde_json::to_string(&o.members).unwrap_or_else(|_| "[]".into()))
                 .bind(&o.created)
+                .bind(o.current_kek_gen)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -2008,6 +2195,69 @@ impl PgStore {
         .map_err(err)?;
         tx.commit().await.map_err(err)?;
         Ok(EnrollOutcome::Applied)
+    }
+
+    async fn upsert_team_kek_envelopes(&self, org: &str, gen: i64, rows: &[TeamKekEnvelope]) -> io::Result<()> {
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO team_keks (org, gen, recipient, wrapped_kek, recipient_epoch, created) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (org, gen, recipient) DO UPDATE SET \
+                   wrapped_kek = excluded.wrapped_kek, recipient_epoch = excluded.recipient_epoch",
+            )
+            .bind(org)
+            .bind(gen)
+            .bind(normalize_username(&row.recipient))
+            .bind(&row.wrapped_kek)
+            .bind(row.recipient_epoch)
+            .bind(&row.created)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        Ok(())
+    }
+
+    async fn get_team_kek_envelope(&self, org: &str, gen: i64, recipient: &str) -> Option<TeamKekEnvelope> {
+        match sqlx::query("SELECT * FROM team_keks WHERE org = $1 AND gen = $2 AND recipient = $3")
+            .bind(org)
+            .bind(gen)
+            .bind(recipient)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(r)) => Some(row_team_kek(&r)),
+            _ => None,
+        }
+    }
+
+    async fn list_team_kek_gens(&self, org: &str) -> Vec<i64> {
+        match sqlx::query("SELECT DISTINCT gen FROM team_keks WHERE org = $1 ORDER BY gen ASC")
+            .bind(org)
+            .fetch_all(&self.pool)
+            .await
+        {
+            Ok(rows) => rows.iter().map(|r| r.int("gen")).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    async fn set_current_kek_gen(&self, org: &str, gen: i64) -> io::Result<()> {
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        // Monotonic at the SQL level: only ever advance the generation, so a stale concurrent publish
+        // cannot roll it back even if it passed the API-layer check. gen <= current is a silent no-op.
+        sqlx::query("UPDATE orgs SET current_kek_gen = $1 WHERE name = $2 AND $1 > current_kek_gen")
+            .bind(gen)
+            .bind(org)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(())
     }
 }
 
@@ -2576,6 +2826,7 @@ mod tests {
                 name: "acme".into(),
                 members: vec![org_member("bob", "admin"), org_member("carol", "member")],
                 created: now_iso(),
+                current_kek_gen: 0,
             });
         })
         .await
@@ -2588,6 +2839,81 @@ mod tests {
         // Lookup is case-insensitive, like user().
         assert!(s.org("ACME").await.is_some());
         assert_eq!(s.orgs().await.len(), 1);
+    }
+
+    fn kek_row(org: &str, gen: i64, recipient: &str, wrapped: &str, epoch: i64) -> TeamKekEnvelope {
+        TeamKekEnvelope {
+            org: org.into(),
+            gen,
+            recipient: recipient.into(),
+            wrapped_kek: wrapped.into(),
+            recipient_epoch: epoch,
+            created: now_iso(),
+        }
+    }
+
+    #[tokio::test]
+    async fn team_keks_roundtrip_and_upsert_is_idempotent() {
+        let (_d, s) = tmp_store().await;
+        s.upsert_team_kek_envelopes(
+            "acme",
+            1,
+            &[kek_row("acme", 1, "alice", "seal-a1", 3), kek_row("acme", 1, "bob", "seal-b1", 0)],
+        )
+        .await
+        .unwrap();
+        let a = s.get_team_kek_envelope("acme", 1, "alice").await.unwrap();
+        assert_eq!(a.wrapped_kek, "seal-a1");
+        assert_eq!(a.recipient_epoch, 3);
+        assert_eq!(s.get_team_kek_envelope("acme", 1, "bob").await.unwrap().wrapped_kek, "seal-b1");
+        // A recipient with no row, and a gen with no rows, are both None (non-disclosing).
+        assert!(s.get_team_kek_envelope("acme", 1, "carol").await.is_none());
+        assert!(s.get_team_kek_envelope("acme", 2, "alice").await.is_none());
+        // Case-insensitive recipient lookup, like every other username.
+        assert!(s.get_team_kek_envelope("ACME", 1, "ALICE").await.is_some());
+
+        // Re-publishing overwrites the ciphertext for the same (org, gen, recipient) PK, never duplicates.
+        s.upsert_team_kek_envelopes("acme", 1, &[kek_row("acme", 1, "alice", "seal-a1-v2", 4)]).await.unwrap();
+        let a2 = s.get_team_kek_envelope("acme", 1, "alice").await.unwrap();
+        assert_eq!(a2.wrapped_kek, "seal-a1-v2");
+        assert_eq!(a2.recipient_epoch, 4);
+
+        // A second generation coexists; list_team_kek_gens reports both, ascending.
+        s.upsert_team_kek_envelopes("acme", 2, &[kek_row("acme", 2, "alice", "seal-a2", 4)]).await.unwrap();
+        assert_eq!(s.list_team_kek_gens("acme").await, vec![1, 2]);
+        assert!(s.list_team_kek_gens("nope").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn current_kek_gen_bumps_monotonically_and_survives_org_edits() {
+        let (_d, s) = tmp_store().await;
+        s.update_orgs(|l| l.push(Org { name: "acme".into(), members: vec![org_member("alice", "admin")], created: now_iso(), current_kek_gen: 0 }))
+            .await
+            .unwrap();
+        assert_eq!(s.get_current_kek_gen("acme").await, 0);
+        s.set_current_kek_gen("acme", 1).await.unwrap();
+        assert_eq!(s.get_current_kek_gen("acme").await, 1);
+        s.set_current_kek_gen("acme", 2).await.unwrap();
+        assert_eq!(s.get_current_kek_gen("acme").await, 2);
+
+        // SQL-level monotonicity: a stale (lower) generation must NOT roll the current back, and an
+        // equal generation is an idempotent no-op — the guard defends even a caller that skips the API check.
+        s.set_current_kek_gen("acme", 1).await.unwrap();
+        assert_eq!(s.get_current_kek_gen("acme").await, 2, "a lower gen must not roll back the current");
+        s.set_current_kek_gen("acme", 2).await.unwrap();
+        assert_eq!(s.get_current_kek_gen("acme").await, 2, "an equal gen is a no-op");
+
+        // The regression this guards: an unrelated whole-table org rewrite (adding a member) must NOT
+        // reset current_kek_gen to its DEFAULT 0 — the generation is carried on the struct and re-INSERTed.
+        s.update_orgs(|l| {
+            if let Some(o) = l.iter_mut().find(|o| o.name == "acme") {
+                o.members.push(org_member("bob", "member"));
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.get_current_kek_gen("acme").await, 2, "a member edit must preserve the KEK generation");
+        assert_eq!(s.org("acme").await.unwrap().members.len(), 2);
     }
 
     #[tokio::test]
@@ -2610,7 +2936,7 @@ mod tests {
             let s = s.clone();
             handles.push(tokio::spawn(async move {
                 s.update_orgs(move |list| {
-                    list.push(Org { name: format!("org{i}"), members: vec![], created: now_iso() });
+                    list.push(Org { name: format!("org{i}"), members: vec![], created: now_iso(), current_kek_gen: 0 });
                 })
                 .await
                 .unwrap();
@@ -2631,6 +2957,7 @@ mod tests {
             name: "acme".into(),
             members: vec![org_member("bob", "admin"), org_member("carol", "member"), org_member("mallory", "bogus")],
             created: now_iso(),
+            current_kek_gen: 0,
         };
         let m = AgentMeta {
             members: vec![Member { username: "carol".into(), role: "read".into() }, Member { username: "dave".into(), role: "admin".into() }],

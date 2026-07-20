@@ -90,6 +90,10 @@ pub const ORG_TRANSFER: &str = "org.transfer";
 /// An org was deleted (refused while it still owns agents). Memberships and pending invitations go
 /// with it.
 pub const ORG_DELETE: &str = "org.delete";
+/// An org admin published a Team-KEK generation's per-member envelopes (encryption-recipients Wave 3).
+/// The detail records the generation and how many recipient envelopes were stored — ciphertext only,
+/// the hub never sees the plaintext TK.
+pub const ORG_KEK_PUBLISH: &str = "org.kek.publish";
 pub const TOKEN_CREATE: &str = "token.create";
 pub const TOKEN_REVOKE: &str = "token.revoke";
 pub const GIT_FETCH: &str = "git.fetch";

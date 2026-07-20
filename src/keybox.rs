@@ -34,6 +34,10 @@ use crate::crypt::{Keyring, KeyringEntry};
 /// Domain-separated HKDF label: the ECDH shared secret is expanded under this to key the wrap AEAD, so
 /// keybox wraps never share key bytes with any other agit KDF use.
 const WRAP_INFO: &[u8] = b"agit-keybox/v1/wrap";
+/// Domain-separated HKDF label for the TEAM wrap: TK is expanded under this to key the AEAD that seals
+/// CK in a team stanza (Wave 3). Distinct from `WRAP_INFO` so a team-wrap subkey never coincides with an
+/// individual-wrap subkey even for identical input bytes.
+const TEAM_WRAP_INFO: &[u8] = b"agit-keybox/v1/team";
 /// Keybox wire version carried in every stanza's `v` field.
 const KEYBOX_V: u32 = 1;
 
@@ -61,11 +65,24 @@ pub struct PublicStanza {
     pub key: [u8; 32],
 }
 
+/// A team content-key stanza (Wave 3): CK sealed under the org's Team KEK generation `gen`, keyed by an
+/// HKDF-SHA256 subkey of TK_gen. Opening it needs TK_gen, which a member obtains by unwrapping their own
+/// `team_keks` envelope (or from the local TK cache). `org`/`gen` name which TK to fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamStanza {
+    pub kid: u32,
+    pub org: String,
+    pub gen: i64,
+    pub nonce: [u8; 24],
+    pub wrap: Vec<u8>,
+}
+
 /// One keybox line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stanza {
     User(UserStanza),
     Public(PublicStanza),
+    Team(TeamStanza),
 }
 
 impl Stanza {
@@ -74,6 +91,7 @@ impl Stanza {
         match self {
             Stanza::User(u) => u.kid,
             Stanza::Public(p) => p.kid,
+            Stanza::Team(t) => t.kid,
         }
     }
 
@@ -95,6 +113,15 @@ impl Stanza {
                 "kid": p.kid,
                 "t": "public",
                 "key": hex::encode(p.key),
+            }),
+            Stanza::Team(t) => serde_json::json!({
+                "v": KEYBOX_V,
+                "kid": t.kid,
+                "t": "team",
+                "org": t.org,
+                "gen": t.gen,
+                "nonce": b64_encode(&t.nonce),
+                "wrap": b64_encode(&t.wrap),
             }),
         }
     }
@@ -132,7 +159,14 @@ impl Stanza {
                     .map_err(|_| anyhow::anyhow!("keybox: public `key` is not 32 bytes"))?;
                 Ok(Stanza::Public(PublicStanza { kid, key }))
             }
-            other => bail!("keybox: unknown stanza type `{other}` (this build understands `user` and `public`)"),
+            "team" => {
+                let org = field_str(&v, "org")?.to_string();
+                let gen = v.get("gen").and_then(|x| x.as_i64()).context("keybox: team stanza has no numeric `gen`")?;
+                let nonce = b64_decode_array::<24>(field_str(&v, "nonce")?, "nonce")?;
+                let wrap = b64_decode(field_str(&v, "wrap")?).context("keybox: `wrap` is not valid base64")?;
+                Ok(Stanza::Team(TeamStanza { kid, org, gen, nonce, wrap }))
+            }
+            other => bail!("keybox: unknown stanza type `{other}` (this build understands `user`, `public`, and `team`)"),
         }
     }
 }
@@ -239,6 +273,79 @@ pub fn public_stanza(ck: &[u8; 32], kid: u32) -> Stanza {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The team wrap: CK sealed under a Team KEK (symmetric), and TK sealed to each member (X25519)
+// ---------------------------------------------------------------------------------------------
+
+/// The 32-byte AEAD key that seals CK in a team stanza: an HKDF-SHA256 subkey of TK under a domain
+/// label, so the raw group key TK is never used directly as an AEAD key and a team-wrap subkey can never
+/// collide with any individual-wrap subkey.
+fn team_wrap_key(tk: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, tk);
+    let mut key = [0u8; 32];
+    hk.expand(TEAM_WRAP_INFO, &mut key).expect("32 is a valid HKDF-SHA256 output length");
+    key
+}
+
+/// Seal a content key under a Team KEK: HKDF-SHA256 a wrap subkey from TK, then XChaCha20-Poly1305 the
+/// 32-byte CK under a fresh random nonce. Returns the `(nonce, wrap)` a team stanza records. Random (not
+/// convergent) nonce: this is a one-shot wrap, so a fresh nonce is correct and required.
+pub fn wrap_ck_under_tk(ck: &[u8; 32], tk: &[u8; 32]) -> Result<([u8; 24], Vec<u8>)> {
+    let key = team_wrap_key(tk);
+    let nonce = random_nonce()?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let wrap = cipher
+        .encrypt(XNonce::from_slice(&nonce), ck.as_ref())
+        .map_err(|_| anyhow::anyhow!("keybox: wrapping the content key under the team KEK failed"))?;
+    Ok((nonce, wrap))
+}
+
+/// Recover the content key from a team stanza using the Team KEK. A failed AEAD tag (wrong TK gen, or
+/// tampered) is a plain error so the caller can fail closed.
+pub fn unwrap_ck_with_tk(stanza: &TeamStanza, tk: &[u8; 32]) -> Result<[u8; 32]> {
+    let key = team_wrap_key(tk);
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let pt = cipher
+        .decrypt(XNonce::from_slice(&stanza.nonce), stanza.wrap.as_ref())
+        .map_err(|_| anyhow::anyhow!("keybox: this team stanza does not open with the supplied team KEK"))?;
+    pt.as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("keybox: unwrapped content key is not 32 bytes"))
+}
+
+/// Build a team stanza: CK sealed under TK_gen for `org`.
+pub fn team_stanza(ck: &[u8; 32], kid: u32, org: &str, gen: i64, tk: &[u8; 32]) -> Result<Stanza> {
+    let (nonce, wrap) = wrap_ck_under_tk(ck, tk)?;
+    Ok(Stanza::Team(TeamStanza { kid, org: org.to_string(), gen, nonce, wrap }))
+}
+
+/// Seal a Team KEK to one member exactly like an individual content-key wrap (fresh ephemeral X25519,
+/// ECDH, HKDF, XChaCha20-Poly1305) and pack the result into the single `wrapped_kek` string a
+/// `team_keks` row stores: base64 of `epk(32) ‖ nonce(24) ‖ ciphertext(48)`.
+pub fn seal_tk_for_member(tk: &[u8; 32], member_x25519_pub: &[u8; 32]) -> Result<String> {
+    let w = wrap_ck_for_user(tk, member_x25519_pub)?;
+    let mut packed = Vec::with_capacity(32 + 24 + w.wrap.len());
+    packed.extend_from_slice(&w.epk);
+    packed.extend_from_slice(&w.nonce);
+    packed.extend_from_slice(&w.wrap);
+    Ok(b64_encode(&packed))
+}
+
+/// Open a `team_keks` envelope (`epk ‖ nonce ‖ ciphertext`, base64) with my X25519 secret, recovering
+/// the 32-byte Team KEK. The inverse of [`seal_tk_for_member`].
+pub fn open_tk_envelope(wrapped_kek: &str, my_x25519_secret: &[u8; 32]) -> Result<[u8; 32]> {
+    let raw = b64_decode(wrapped_kek).context("team-KEK envelope is not valid base64")?;
+    if raw.len() < 32 + 24 + 16 {
+        bail!("team-KEK envelope is too short to be a valid seal");
+    }
+    let epk: [u8; 32] = raw[..32].try_into().expect("checked length");
+    let nonce: [u8; 24] = raw[32..56].try_into().expect("checked length");
+    let wrap = raw[56..].to_vec();
+    // Reuse the individual-wrap opener: the packed pieces are exactly a UserStanza's crypto fields.
+    let stanza = UserStanza { kid: 0, to: String::new(), epoch: 0, epk, nonce, wrap };
+    unwrap_ck(&stanza, my_x25519_secret)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Keybox file: .agit/keybox.jsonl
 // ---------------------------------------------------------------------------------------------
 
@@ -312,15 +419,39 @@ pub fn is_public_at(stanzas: &[Stanza], kid: u32) -> bool {
     stanzas.iter().any(|s| matches!(s, Stanza::Public(p) if p.kid == kid))
 }
 
+/// The `(org, gen)` team stanzas present at `kid` — the team-readable groups for that generation.
+pub fn teams_at(stanzas: &[Stanza], kid: u32) -> Vec<(String, i64)> {
+    stanzas
+        .iter()
+        .filter_map(|s| match s {
+            Stanza::Team(t) if t.kid == kid => Some((t.org.clone(), t.gen)),
+            _ => None,
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Unlock: recover the repo-local keyring from a keybox + my identity
 // ---------------------------------------------------------------------------------------------
 
-/// Recover the per-session keyring from a keybox using my X25519 secret: the content key for every kid I
-/// can open (public stanzas, or user stanzas wrapped to me), with `current` = the highest recovered kid
-/// (the newest generation I may seal under). `None` when I can open NONE — fail-closed: the caller MUST
-/// NOT write a keyring, so the smudge filter stays locked and refuses ciphertext.
+/// Recover the per-session keyring from a keybox using my X25519 secret, opening only the SELF-CONTAINED
+/// stanzas (public, or user stanzas wrapped to me). Team stanzas need a Team KEK this function is not
+/// given, so it skips them — use [`recover_keyring_with`] for the team-aware path. `None` when I can open
+/// NONE — fail-closed: the caller MUST NOT write a keyring, so the smudge filter stays locked.
 pub fn recover_keyring(stanzas: &[Stanza], my_x25519_secret: &[u8; 32]) -> Option<Keyring> {
+    // A `None`-returning TK provider: team stanzas contribute nothing (fail-closed) in the no-hub path.
+    recover_keyring_with(stanzas, my_x25519_secret, |_org, _gen| None)
+}
+
+/// Recover the per-session keyring, additionally opening TEAM stanzas via `tk_for(org, gen)` — the
+/// caller's Team-KEK resolver (a local TK cache, or a fetch+unwrap of the caller's `team_keks` envelope).
+/// `current` = the highest recovered kid. `None` when NONE opens — fail-closed. A team stanza whose TK is
+/// unavailable (resolver returns `None`, or the AEAD tag fails) simply contributes nothing; it is never a
+/// silent success.
+pub fn recover_keyring_with<F>(stanzas: &[Stanza], my_x25519_secret: &[u8; 32], mut tk_for: F) -> Option<Keyring>
+where
+    F: FnMut(&str, i64) -> Option<[u8; 32]>,
+{
     let mut cks: BTreeMap<u32, [u8; 32]> = BTreeMap::new();
     for s in stanzas {
         match s {
@@ -330,6 +461,13 @@ pub fn recover_keyring(stanzas: &[Stanza], my_x25519_secret: &[u8; 32]) -> Optio
             Stanza::User(u) => {
                 if let Ok(ck) = unwrap_ck(u, my_x25519_secret) {
                     cks.entry(u.kid).or_insert(ck);
+                }
+            }
+            Stanza::Team(t) => {
+                if let Some(tk) = tk_for(&t.org, t.gen) {
+                    if let Ok(ck) = unwrap_ck_with_tk(t, &tk) {
+                        cks.entry(t.kid).or_insert(ck);
+                    }
                 }
             }
         }
@@ -461,6 +599,59 @@ pub fn pin_user(home: &Path, user: &str, key_override: Option<&str>, repin: bool
             Ok(candidate)
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Team-KEK cache: the unwrapped TK per (org, gen), so unlock does not refetch every time
+// ---------------------------------------------------------------------------------------------
+
+/// `$AGIT_HOME/crypt/tk/<org>/<gen>` — the on-disk cache of an UNWRAPPED Team KEK, `0600`, never
+/// committed (it lives under `$AGIT_HOME`, outside any repo). Sharing it across repos is safe and
+/// desirable: one org's TK opens every team-wrapped session that org owns. `org` is validated to a safe
+/// path segment (usernames/org names share the `resolve_recipient` namespace) so a crafted name cannot
+/// escape the cache dir.
+fn tk_cache_path(home: &Path, org: &str, gen: i64) -> Result<PathBuf> {
+    let o = org.trim();
+    let ok = !o.is_empty()
+        && o != "."
+        && o != ".."
+        && !o.contains('/')
+        && !o.contains('\\')
+        && o.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if !ok {
+        bail!("`{org}` is not a usable org name for a team-KEK cache path");
+    }
+    if gen < 0 {
+        bail!("a team-KEK generation cannot be negative");
+    }
+    Ok(home.join("crypt").join("tk").join(o).join(gen.to_string()))
+}
+
+/// The cached unwrapped TK for `(org, gen)`, or `None` if this machine has not cached it. A corrupt/
+/// wrong-length cache file reads as `None` (a re-fetch will overwrite it) rather than erroring.
+pub fn read_cached_tk(home: &Path, org: &str, gen: i64) -> Result<Option<[u8; 32]>> {
+    let path = tk_cache_path(home, org, gen)?;
+    match std::fs::read_to_string(&path) {
+        Ok(t) => Ok(hex::decode(t.trim()).ok().and_then(|raw| raw.as_slice().try_into().ok())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot read team-KEK cache {}", path.display())),
+    }
+}
+
+/// Cache an unwrapped TK for `(org, gen)` at `0600`. Best-effort permissions on non-unix.
+pub fn write_cached_tk(home: &Path, org: &str, gen: i64, tk: &[u8; 32]) -> Result<()> {
+    let path = tk_cache_path(home, org, gen)?;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).with_context(|| format!("cannot create {}", d.display()))?;
+    }
+    std::fs::write(&path, format!("{}\n", hex::encode(tk)))
+        .with_context(|| format!("cannot write team-KEK cache {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -658,6 +849,119 @@ mod tests {
         let got2 = resolve_recipient(home.path(), "bob", Some(&hex::encode(k2)), true).unwrap();
         assert_eq!(got2, k2);
         assert_eq!(read_pin(home.path(), "bob").unwrap(), Some(k2), "repin updates the pin");
+    }
+
+    // ── Team KEK (Wave 3) ──
+
+    // The team wrap round-trips under the correct TK, and a different TK cannot open it.
+    #[test]
+    fn team_wrap_round_trips_only_under_the_right_tk() {
+        let ck = [0x33u8; 32];
+        let tk = [0x44u8; 32];
+        let other_tk = [0x45u8; 32];
+        let (nonce, wrap) = wrap_ck_under_tk(&ck, &tk).unwrap();
+        let stanza = TeamStanza { kid: 0, org: "acme".into(), gen: 1, nonce, wrap };
+        assert_eq!(unwrap_ck_with_tk(&stanza, &tk).unwrap(), ck, "the right TK opens it");
+        assert!(unwrap_ck_with_tk(&stanza, &other_tk).is_err(), "a different TK must NOT open it");
+    }
+
+    // A TK sealed to a member is opened by that member's X25519 secret, and not by anyone else's.
+    #[test]
+    fn tk_sealed_to_member_is_opened_only_by_that_member() {
+        let tk = [0x55u8; 32];
+        let (bob_secret, bob_pub) = identity_secret(10);
+        let (mallory_secret, _) = identity_secret(11);
+        let env = seal_tk_for_member(&tk, &bob_pub).unwrap();
+        assert_eq!(open_tk_envelope(&env, &bob_secret).unwrap(), tk, "bob recovers the TK from his envelope");
+        assert!(open_tk_envelope(&env, &mallory_secret).is_err(), "a non-recipient cannot open the envelope");
+    }
+
+    // The team stanza round-trips through its JSON wire form.
+    #[test]
+    fn team_stanza_json_round_trips() {
+        let ck = [0x66u8; 32];
+        let tk = [0x77u8; 32];
+        let s = team_stanza(&ck, 4, "acme", 2, &tk).unwrap();
+        let line = s.to_line();
+        assert!(!line.contains('\n'), "a stanza must be one line");
+        assert_eq!(Stanza::from_line(&line).unwrap(), s, "team stanza must round-trip through JSON");
+    }
+
+    // The full team flow at the crypto layer: TK gen1 sealed to alice+bob (members); a session CK is
+    // wrapped under TK into a team stanza. A member obtains TK from their envelope, then recover_keyring_with
+    // unlocks the CK; a NON-member (no envelope, no TK) is fail-closed. After a rekey to gen2 sealed to
+    // alice ONLY (bob removed), a new team stanza under gen2 is unreadable to bob — no gen2 envelope.
+    #[test]
+    fn full_team_flow_membership_join_and_removal() {
+        let (alice_secret, alice_pub) = identity_secret(20);
+        let (bob_secret, bob_pub) = identity_secret(21);
+
+        // gen 1: TK sealed to both members.
+        let tk1 = [0xA1u8; 32];
+        let alice_env1 = seal_tk_for_member(&tk1, &alice_pub).unwrap();
+        let bob_env1 = seal_tk_for_member(&tk1, &bob_pub).unwrap();
+
+        // A session CK wrapped under TK gen1 as a team stanza at kid 0.
+        let ck0 = [0x01u8; 32];
+        let stanzas = vec![team_stanza(&ck0, 0, "acme", 1, &tk1).unwrap()];
+
+        // A member opens their envelope → TK → and recover_keyring_with unlocks CK.
+        let alice_tk = open_tk_envelope(&alice_env1, &alice_secret).unwrap();
+        let ring = recover_keyring_with(&stanzas, &alice_secret, |org, gen| {
+            (org == "acme" && gen == 1).then_some(alice_tk)
+        })
+        .expect("a team member unlocks the team-wrapped CK");
+        assert_eq!(ring.current_master(), ck0);
+        // bob is also a member at gen1.
+        let bob_tk = open_tk_envelope(&bob_env1, &bob_secret).unwrap();
+        assert_eq!(bob_tk, tk1);
+
+        // A NON-member has no envelope and no TK: the resolver returns None → fail-closed (no keyring).
+        let (mallory_secret, _) = identity_secret(22);
+        assert!(
+            recover_keyring_with(&stanzas, &mallory_secret, |_, _| None).is_none(),
+            "a non-member with no TK recovers nothing (fail-closed)"
+        );
+
+        // REKEY to gen 2, sealed to alice ONLY (bob is removed from the roster). A new session sealed
+        // under gen 2 is opened by alice but NOT by bob — bob has no gen-2 envelope.
+        let tk2 = [0xA2u8; 32];
+        let alice_env2 = seal_tk_for_member(&tk2, &alice_pub).unwrap();
+        let ck_new = [0x02u8; 32];
+        let gen2_stanzas = vec![team_stanza(&ck_new, 0, "acme", 2, &tk2).unwrap()];
+
+        let alice_tk2 = open_tk_envelope(&alice_env2, &alice_secret).unwrap();
+        assert_eq!(
+            recover_keyring_with(&gen2_stanzas, &alice_secret, |_, _| Some(alice_tk2)).unwrap().current_master(),
+            ck_new,
+            "the still-enrolled member opens gen-2 content"
+        );
+        // bob's only TK is gen1's; it cannot open a gen-2 team stanza, and he has no gen-2 envelope.
+        assert!(
+            recover_keyring_with(&gen2_stanzas, &bob_secret, |_org, gen| (gen == 1).then_some(bob_tk)).is_none(),
+            "a removed member cannot unlock content sealed under the new generation"
+        );
+    }
+
+    // The TK cache round-trips per (org, gen) and is written 0600.
+    #[test]
+    fn tk_cache_round_trips() {
+        let home = tempfile::tempdir().unwrap();
+        let tk = [0x9Cu8; 32];
+        assert!(read_cached_tk(home.path(), "acme", 1).unwrap().is_none(), "cold cache is empty");
+        write_cached_tk(home.path(), "acme", 1, &tk).unwrap();
+        assert_eq!(read_cached_tk(home.path(), "acme", 1).unwrap(), Some(tk));
+        // A different (org, gen) is a distinct slot.
+        assert!(read_cached_tk(home.path(), "acme", 2).unwrap().is_none());
+        assert!(read_cached_tk(home.path(), "other", 1).unwrap().is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = home.path().join("crypt").join("tk").join("acme").join("1");
+            assert_eq!(std::fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o600, "TK cache must be 0600");
+        }
+        // A path-escaping org name is refused.
+        assert!(read_cached_tk(home.path(), "../evil", 1).is_err());
     }
 
     #[test]

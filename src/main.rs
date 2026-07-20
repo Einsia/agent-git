@@ -321,6 +321,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    self-signs, and upserts the caller's own row; `show [<user>]` prints fingerprints. ──
         "identity" => commands::identity_cmd(args),
 
+        // ── hub: hub-side operations beyond per-agent git. `hub team rekey <org>` rotates the org's
+        //    Team KEK (gen++, re-seals to members); `hub team sync <org>` seals the current TK to members
+        //    who lack an envelope (encryption-recipients Wave 3). ──
+        "hub" => commands::hub_cmd(args),
+
         // ── shadow: route `git` through `agit` in your interactive shell (cross-platform). ──
         "shadow" => agit::shadow::run(args),
 

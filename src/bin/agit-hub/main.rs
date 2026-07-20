@@ -693,6 +693,7 @@ mod h4_tests {
                         OrgMember { username: "bob".into(), role: "member".into() },
                     ],
                     created: now_iso(),
+                    current_kek_gen: 0,
                 })
             })
             .await
@@ -1215,6 +1216,7 @@ mod h3_tests {
                         OrgMember { username: member.into(), role: "member".into() },
                     ],
                     created: now_iso(),
+                    current_kek_gen: 0,
                 })
             })
             .await

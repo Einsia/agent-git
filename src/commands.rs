@@ -1735,9 +1735,10 @@ pub fn agent_encrypt(args: &[String]) -> Result<i32> {
         return crypt_import(&home, Path::new(keyfile), force, yes);
     }
 
-    // Per-session keybox encryption: `--readers a,b` and/or `--public`. Distinct from the machine-global
-    // key path (`agit a encrypt` with no readers) — this mints a per-session content key into a repo-local
-    // keyring and commits a keybox wrapping it to the named readers.
+    // Per-session keybox encryption: `--team`, `--readers a,b`, and/or `--public`. Distinct from the
+    // machine-global key path (`agit a encrypt` with no flags) — this mints a per-session content key into
+    // a repo-local keyring and commits a keybox wrapping it to the named recipients.
+    let team = args.iter().any(|a| a == "--team");
     let public = args.iter().any(|a| a == "--public");
     let readers: Vec<String> = match args.iter().position(|a| a == "--readers") {
         Some(i) => args
@@ -1746,8 +1747,13 @@ pub fn agent_encrypt(args: &[String]) -> Result<i32> {
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    if args.iter().any(|a| a == "--readers") && readers.is_empty() && !public {
-        bail!("agit a encrypt --readers needs a comma-separated list of users (or add --public)");
+    if args.iter().any(|a| a == "--readers") && readers.is_empty() && !public && !team {
+        bail!("agit a encrypt --readers needs a comma-separated list of users (or add --public / --team)");
+    }
+    if team {
+        // Wrap the session CK under the owning org's CURRENT Team KEK and write a team stanza. `--team`
+        // may be combined with `--readers`/`--public` (all wrap the same kid-0 CK).
+        return crypt_enable_keybox_team(&home, flag_value(args, "--org").as_deref(), &readers, public, yes);
     }
     if public || !readers.is_empty() {
         return crypt_enable_keybox(&home, &readers, public, yes);
@@ -2139,6 +2145,301 @@ fn crypt_enable_keybox(home: &Path, readers: &[String], public: bool, yes: bool)
     Ok(0)
 }
 
+// ─────────────────────── Team KEK (encryption-recipients Wave 3): owning-org resolution, TK obtain ───────────────────────
+
+/// The owner segment of a store's primary remote URL — the account (a user OR an org) a session lives
+/// under. `https://host/acme/frontend.git` → `acme`. Errors clearly when the store has no hub remote.
+fn owning_owner_of(store: &Path) -> Result<String> {
+    let primary = agent::primary_remote_name(store);
+    let remotes = agent::store_remotes(store);
+    let url = match primary {
+        Some(n) => remotes.into_iter().find(|(rn, _)| *rn == n).map(|(_, u)| u),
+        None => remotes.into_iter().next().map(|(_, u)| u),
+    }
+    .context(
+        "this session has no hub remote to read an owning org from.\n\
+         \x20      Push it first (`agit a push`), or name the org: `--org <name>`.",
+    )?;
+    owner_from_url(&url)
+}
+
+/// Parse the owner (first path segment) out of an `scheme://[userinfo@]authority/owner/name(.git)` URL.
+fn owner_from_url(url: &str) -> Result<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let path = rest
+        .split_once('/')
+        .map(|(_, p)| p)
+        .context("the hub remote URL has no path to read an owning org from")?;
+    let first = path.split('/').next().unwrap_or("").trim().trim_end_matches(".git");
+    if first.is_empty() {
+        bail!("could not read an owning org from the hub remote URL");
+    }
+    Ok(first.to_string())
+}
+
+/// Obtain the unwrapped Team KEK for `(org, gen)`: the local cache first, else fetch the caller's OWN
+/// `team_keks` envelope from the hub and unwrap it with this machine's X25519 secret, caching the result.
+/// Fail-closed: a missing envelope (not a member, or the gen is not sealed to the caller) is an error.
+fn obtain_tk(home: &Path, org: &str, gen: i64) -> Result<[u8; 32]> {
+    if let Some(tk) = crate::keybox::read_cached_tk(home, org, gen)? {
+        return Ok(tk);
+    }
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    let env = ep.get_kek_envelope(org, gen)?.with_context(|| {
+        format!(
+            "no team-KEK envelope for you at org `{org}` generation {gen} — you are not a member, or this\n\
+             \x20      generation was not sealed to you. Ask an admin to run `agit hub team sync {org}`."
+        )
+    })?;
+    let wrapped = env
+        .get("wrapped_kek")
+        .and_then(|w| w.as_str())
+        .context("the hub returned a team-KEK envelope with no wrapped_kek")?;
+    let sk = agent::machine_signing_key()?;
+    let secret = agent::derive_x25519_secret(&sk);
+    let tk = crate::keybox::open_tk_envelope(wrapped, &secret)
+        .context("could not unwrap your team-KEK envelope with this machine's identity")?;
+    crate::keybox::write_cached_tk(home, org, gen, &tk)?;
+    Ok(tk)
+}
+
+/// Seal `tk` to every current member of `org` (TOFU-pinning each fetched pubkey), returning the JSON
+/// envelope array to publish plus the members skipped for having no enrolled identity key. Used by both
+/// `hub team rekey` (a fresh TK) and `hub team sync` (the current TK).
+fn seal_tk_to_members(
+    home: &Path,
+    ep: &crate::hubapi::HubEndpoint,
+    org: &str,
+    tk: &[u8; 32],
+) -> Result<(Vec<serde_json::Value>, Vec<String>)> {
+    let org_json = ep
+        .get_org(org)?
+        .with_context(|| format!("cannot read org `{org}` — are you a member/admin of it?"))?;
+    let members = org_json.get("members").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    if members.is_empty() {
+        bail!("org `{org}` has no members to seal a team KEK to");
+    }
+    let mut envelopes = Vec::new();
+    let mut skipped = Vec::new();
+    for m in &members {
+        let Some(uname) = m.get("username").and_then(|u| u.as_str()).filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        // Fetch the member's enrolled identity (x25519 pubkey + epoch). No enrolled key → skip loudly.
+        let idv = match ep.get_identity(uname)? {
+            Some(v) => v,
+            None => {
+                skipped.push(uname.to_string());
+                continue;
+            }
+        };
+        let x_hex = idv.get("x25519_pub").and_then(|x| x.as_str()).unwrap_or("");
+        let epoch = idv.get("epoch").and_then(|e| e.as_i64()).unwrap_or(0);
+        if x_hex.is_empty() {
+            skipped.push(uname.to_string());
+            continue;
+        }
+        // TOFU-pin the fetched key (hard-fail on a changed pubkey) exactly like the individual path.
+        let key = crate::keybox::resolve_recipient(home, uname, Some(x_hex), false)
+            .with_context(|| format!("resolving team member `{uname}`'s key"))?;
+        let wrapped = crate::keybox::seal_tk_for_member(tk, &key)?;
+        envelopes.push(serde_json::json!({
+            "recipient": uname,
+            "wrapped_kek": wrapped,
+            "recipient_epoch": epoch,
+        }));
+    }
+    Ok((envelopes, skipped))
+}
+
+/// `agit hub <team ...>` — hub-side operations that are not per-agent git.
+pub fn hub_cmd(args: &[String]) -> Result<i32> {
+    match args.first().map(|s| s.as_str()) {
+        Some("team") => hub_team_cmd(&args[1..]),
+        Some(other) => {
+            errln!("agit hub: unknown subcommand `{other}`");
+            errln!("  usage: agit hub team rekey <org>   ·   agit hub team sync <org>");
+            Ok(2)
+        }
+        None => {
+            errln!("usage: agit hub team rekey <org>   ·   agit hub team sync <org>");
+            Ok(2)
+        }
+    }
+}
+
+/// `agit hub team <rekey|sync> <org>`.
+fn hub_team_cmd(args: &[String]) -> Result<i32> {
+    let sub = args.first().map(|s| s.as_str());
+    let org = args.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
+    match (sub, org) {
+        (Some("rekey"), Some(o)) => hub_team_rekey(o),
+        (Some("sync"), Some(o)) => hub_team_sync(o),
+        (Some("rekey"), None) => {
+            errln!("usage: agit hub team rekey <org>");
+            Ok(2)
+        }
+        (Some("sync"), None) => {
+            errln!("usage: agit hub team sync <org>");
+            Ok(2)
+        }
+        _ => {
+            errln!("agit hub team: rekey <org>  ·  sync <org>");
+            Ok(2)
+        }
+    }
+}
+
+/// `agit hub team rekey <org>` — ROTATE the org's Team KEK: mint a fresh random TK at gen = current+1,
+/// seal it to EVERY current member's X25519 pubkey, publish the envelopes, and advance current_kek_gen.
+/// O(members). This is the removal/rotation path: a removed member is simply absent from the new roster,
+/// so gets no new-gen envelope and cannot open content sealed under the new generation.
+fn hub_team_rekey(org: &str) -> Result<i32> {
+    let home = scope::agit_home()?;
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    let current = ep
+        .kek_gens(org)
+        .with_context(|| format!("cannot read the team-KEK state of `{org}` (are you a member/admin?)"))?
+        .get("current")
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0);
+    let next = current + 1;
+
+    let tk = crate::crypt::random_master()?;
+    let (envelopes, skipped) = seal_tk_to_members(&home, &ep, org, &tk)?;
+    if envelopes.is_empty() {
+        bail!(
+            "no member of `{org}` has an enrolled identity key to seal the team KEK to.\n\
+             \x20      Ask members to run `agit identity enroll` first."
+        );
+    }
+    let sealed = envelopes.len();
+    ep.post_kek_envelopes(org, next, serde_json::Value::Array(envelopes))
+        .with_context(|| format!("publishing team-KEK generation {next} for `{org}`"))?;
+    // Cache the new TK locally so we do not immediately refetch our own envelope.
+    crate::keybox::write_cached_tk(&home, org, next, &tk)?;
+    outln!("rotated team KEK for {org}: generation {next}, sealed to {sealed} member(s).");
+    if !skipped.is_empty() {
+        outln!("  skipped (no enrolled identity key): {}", skipped.join(", "));
+    }
+    outln!("  a removed member (absent from the roster) gets no gen-{next} envelope and cannot open new content.");
+    Ok(0)
+}
+
+/// `agit hub team sync <org>` — JOIN: seal the CURRENT-gen TK to the org's members (no gen bump), so a
+/// newly-added member gains an envelope and can unlock every team-wrapped session. Requires the caller
+/// can obtain the current TK (a member with an envelope) AND publish (org-admin). Idempotent: republishing
+/// the current generation re-seals existing members harmlessly (same TK, fresh ephemeral).
+fn hub_team_sync(org: &str) -> Result<i32> {
+    let home = scope::agit_home()?;
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    let current = ep
+        .kek_gens(org)
+        .with_context(|| format!("cannot read the team-KEK state of `{org}` (are you a member/admin?)"))?
+        .get("current")
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0);
+    if current < 1 {
+        bail!("org `{org}` has no team KEK yet — run `agit hub team rekey {org}` first.");
+    }
+    // The caller must hold a current-gen envelope to obtain TK (fail-closed if they do not).
+    let tk = obtain_tk(&home, org, current).with_context(|| {
+        format!("you need a gen-{current} envelope to sync `{org}` — ask an admin to run `agit hub team rekey {org}`")
+    })?;
+    let (envelopes, skipped) = seal_tk_to_members(&home, &ep, org, &tk)?;
+    if envelopes.is_empty() {
+        bail!("no member of `{org}` has an enrolled identity key to seal the team KEK to.");
+    }
+    let sealed = envelopes.len();
+    ep.post_kek_envelopes(org, current, serde_json::Value::Array(envelopes))
+        .with_context(|| format!("republishing team-KEK generation {current} for `{org}`"))?;
+    outln!("synced team KEK for {org}: generation {current}, sealed to {sealed} member(s).");
+    if !skipped.is_empty() {
+        outln!("  skipped (no enrolled identity key): {}", skipped.join(", "));
+    }
+    Ok(0)
+}
+
+/// The org's active Team-KEK generation, or a clear "run rekey first" error when the org has none. Used
+/// by the `--team` encrypt/readers paths.
+fn org_current_tk_gen(ep: &crate::hubapi::HubEndpoint, org: &str) -> Result<i64> {
+    let current = ep
+        .kek_gens(org)
+        .with_context(|| format!("cannot read the team KEK for org `{org}` (are you a member?)"))?
+        .get("current")
+        .and_then(|c| c.as_i64())
+        .unwrap_or(0);
+    if current < 1 {
+        bail!(
+            "org `{org}` has no team KEK yet.\n\
+             \x20      An org admin must run `agit hub team rekey {org}` first, then retry."
+        );
+    }
+    Ok(current)
+}
+
+/// `agit a encrypt --team [--org <name>] [--readers a,b] [--public]` — enable PER-SESSION keybox
+/// encryption wrapping the kid-0 CK under the OWNING ORG's current Team KEK (plus any named readers /
+/// public). The org defaults to the session's remote owner. Errors clearly if the org has no TK yet.
+fn crypt_enable_keybox_team(home: &Path, org_override: Option<&str>, readers: &[String], public: bool, yes: bool) -> Result<i32> {
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+    let kp = store_keyring_path(&store)?;
+    if kp.exists() {
+        bail!(
+            "this session already has a per-session keyring at {}.\n\
+             \x20      Add a team stanza with `agit a readers add --team`, or rotate with `agit a rekey`.",
+            kp.display()
+        );
+    }
+    let org = match org_override {
+        Some(o) => o.to_string(),
+        None => owning_owner_of(&store)?,
+    };
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    let gen = org_current_tk_gen(&ep, &org)?;
+    let tk = obtain_tk(home, &org, gen)?;
+
+    crypt_print_warnings();
+    crypt_confirm("Enable per-session keybox (team) encryption on this store?", yes)?;
+
+    let ck = crate::crypt::random_master()?;
+    crate::crypt::init_repo_keyring_at(&kp, ck)?;
+
+    let mut stanzas = vec![crate::keybox::team_stanza(&ck, 0, &org, gen, &tk)?];
+    if public {
+        stanzas.push(crate::keybox::public_stanza(&ck, 0));
+    }
+    for r in readers {
+        let key = crate::keybox::resolve_recipient(home, r, None, false)
+            .with_context(|| format!("resolving reader `{r}`"))?;
+        stanzas.push(crate::keybox::user_stanza(&ck, 0, r, 0, &key)?);
+        outln!("  wrapped the content key to {r}");
+    }
+    crate::keybox::write_keybox(&store, &stanzas)?;
+
+    let _lock = crate::session::lock_store(&store)?;
+    let _ = crypt_write_gitattributes(&store)?;
+    let _ = keybox_write_gitattributes(&store)?;
+    crypt_wire_filter(&store)?;
+
+    let _ = scope::git_in_status(&store, &["add", "--", ".gitattributes", ".agit/keybox.jsonl"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(
+            &store,
+            "chore(crypt): enable per-session keybox encryption (team)\n\nMints a per-session content key, wraps it under the org's team KEK, and commits the keybox.",
+        )?;
+    }
+    let _ = scope::git_in_status(&store, &["add", "--renormalize", "--", "sessions"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(&store, "chore(crypt): re-encrypt tracked sessions under the per-session key")?;
+    }
+
+    outln!("per-session keybox (team) encryption enabled on {} ({}) for org {org} (gen {gen}).", a.name, a.aid);
+    outln!("  team members unlock after cloning with `agit crypt unlock`.");
+    Ok(0)
+}
+
 /// `agit a readers <add|rm|ls>` — manage a keybox-encrypted session's reader set.
 pub fn readers_cmd(args: &[String]) -> Result<i32> {
     let home = scope::agit_home()?;
@@ -2148,7 +2449,7 @@ pub fn readers_cmd(args: &[String]) -> Result<i32> {
         Some("ls") | Some("list") | None => readers_ls(),
         Some(other) => {
             errln!("agit readers: unknown subcommand `{other}`");
-            errln!("  usage: agit a readers add <user>|--public [--key HEX] [--repin]  ·  rm <user>|--public  ·  ls");
+            errln!("  usage: agit a readers add <user>|--public|--team [--key HEX] [--repin]  ·  rm <user>|--public  ·  ls");
             Ok(2)
         }
     }
@@ -2163,12 +2464,32 @@ fn readers_add(home: &Path, args: &[String]) -> Result<i32> {
     let ck = ring.current_master();
     let kid = ring.current;
 
+    let team = args.iter().any(|x| x == "--team");
     let public = args.iter().any(|x| x == "--public");
     let repin = args.iter().any(|x| x == "--repin");
     let key_override = flag_value(args, "--key");
 
     let _lock = crate::session::lock_store(&store)?;
-    if public {
+    if team {
+        // Wrap the CURRENT content key under the owning org's current Team KEK and append a team stanza.
+        let org = match flag_value(args, "--org") {
+            Some(o) => o,
+            None => owning_owner_of(&store)?,
+        };
+        let ep = crate::hubapi::HubEndpoint::resolve()?;
+        let gen = org_current_tk_gen(&ep, &org)?;
+        let existing = crate::keybox::read_keybox(&store)?;
+        if existing
+            .iter()
+            .any(|s| matches!(s, crate::keybox::Stanza::Team(t) if t.kid == kid && t.org == org && t.gen == gen))
+        {
+            outln!("already team-wrapped at kid {kid} (org {org} gen {gen}) — nothing to do.");
+            return Ok(0);
+        }
+        let tk = obtain_tk(home, &org, gen)?;
+        crate::keybox::append_stanza(&store, &crate::keybox::team_stanza(&ck, kid, &org, gen, &tk)?)?;
+        outln!("  wrapped the current content key (kid {kid}) to team {org} (gen {gen}) — no content re-encrypted");
+    } else if public {
         if crate::keybox::is_public_at(&crate::keybox::read_keybox(&store)?, kid) {
             outln!("already public at kid {kid} — nothing to do.");
             return Ok(0);
@@ -2280,8 +2601,13 @@ fn readers_ls() -> Result<i32> {
     for kid in kids {
         let readers = crate::keybox::readers_at(&stanzas, kid);
         let public = crate::keybox::is_public_at(&stanzas, kid);
+        let teams = crate::keybox::teams_at(&stanzas, kid);
         let marker = if Some(kid) == cur { " (current)" } else { "" };
-        let who = if readers.is_empty() { "—".to_string() } else { readers.join(", ") };
+        let mut parts = readers.clone();
+        for (org, gen) in &teams {
+            parts.push(format!("team:{org}@{gen}"));
+        }
+        let who = if parts.is_empty() { "—".to_string() } else { parts.join(", ") };
         outln!("  kid {kid}{marker}: {who}{}", if public { " [public]" } else { "" });
     }
     Ok(0)
@@ -2358,13 +2684,17 @@ fn crypt_unlock() -> Result<i32> {
         );
         return Ok(0);
     }
+    let home = scope::agit_home()?;
     let sk = agent::machine_signing_key()?;
     let secret = agent::derive_x25519_secret(&sk);
-    let Some(ring) = crate::keybox::recover_keyring(&stanzas, &secret) else {
+    // Team stanzas resolve their content key through the org's Team KEK: the local TK cache, else a
+    // fetch+unwrap of my own team_keks envelope. Fail-closed — an unavailable TK contributes nothing.
+    let Some(ring) = crate::keybox::recover_keyring_with(&stanzas, &secret, |org, gen| obtain_tk(&home, org, gen).ok()) else {
         bail!(
             "you are not a reader of this encrypted session — none of the {} keybox stanza(s) open with\n\
-             \x20      this machine's identity. The keyring was NOT written; the session stays locked.\n\
-             \x20      Publish your key (agit identity enroll) and ask a reader to `agit a readers add <you>`.",
+             \x20      this machine's identity (nor a team KEK you can obtain). The keyring was NOT written;\n\
+             \x20      the session stays locked. Publish your key (agit identity enroll) and ask a reader to\n\
+             \x20      `agit a readers add <you>`, or join the owning org and run `agit hub team sync <org>`.",
             stanzas.len()
         );
     };

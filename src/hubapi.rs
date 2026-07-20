@@ -126,6 +126,69 @@ impl HubEndpoint {
         }
         ok_json(status, &text, &url).map(Some)
     }
+
+    /// A `GET` returning the parsed JSON on 2xx, `Ok(None)` on 404, an error otherwise — the shared shape
+    /// behind the org/kek reads below.
+    fn get_opt(&self, path: &str) -> Result<Option<serde_json::Value>> {
+        let auth = self.require_auth()?;
+        let url = format!("{}{path}", self.base);
+        let mut resp = http_agent()
+            .get(&url)
+            .header("Authorization", &auth.header_value())
+            .call()
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        if status == 404 {
+            return Ok(None);
+        }
+        ok_json(status, &text, &url).map(Some)
+    }
+
+    /// `GET /api/orgs/<org>` — the org roster the caller can see (members + name). `Ok(None)` on 404
+    /// (unknown org, or one the caller is not a member of).
+    pub fn get_org(&self, org: &str) -> Result<Option<serde_json::Value>> {
+        self.get_opt(&format!("/api/orgs/{org}"))
+    }
+
+    /// `GET /api/orgs/<org>/kek/gens` — `{ gens: [...], current: G }`: the generations the caller holds
+    /// an envelope for, plus the org's active generation.
+    pub fn kek_gens(&self, org: &str) -> Result<serde_json::Value> {
+        let auth = self.require_auth()?;
+        let url = format!("{}/api/orgs/{org}/kek/gens", self.base);
+        let mut resp = http_agent()
+            .get(&url)
+            .header("Authorization", &auth.header_value())
+            .call()
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        ok_json(status, &text, &url)
+    }
+
+    /// `GET /api/orgs/<org>/kek/envelope?gen=G` — the CALLER'S OWN envelope of TK_gen. `Ok(None)` on 404
+    /// (not a member, or no envelope at that generation).
+    pub fn get_kek_envelope(&self, org: &str, gen: i64) -> Result<Option<serde_json::Value>> {
+        self.get_opt(&format!("/api/orgs/{org}/kek/envelope?gen={gen}"))
+    }
+
+    /// `POST /api/orgs/<org>/kek/envelopes` — publish a Team-KEK generation's per-member envelopes.
+    /// `envelopes` is an array of `{recipient, wrapped_kek, recipient_epoch}`.
+    pub fn post_kek_envelopes(&self, org: &str, gen: i64, envelopes: serde_json::Value) -> Result<serde_json::Value> {
+        let auth = self.require_auth()?;
+        let url = format!("{}/api/orgs/{org}/kek/envelopes", self.base);
+        let body = serde_json::json!({ "gen": gen, "envelopes": envelopes });
+        let payload = serde_json::to_string(&body).context("serializing kek envelopes body")?;
+        let mut resp = http_agent()
+            .post(&url)
+            .header("Authorization", &auth.header_value())
+            .header("Content-Type", "application/json")
+            .send(&payload)
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        ok_json(status, &text, &url)
+    }
 }
 
 /// A ureq agent that surfaces 4xx/5xx as a normal `Response` (so we can read the hub's error body)
