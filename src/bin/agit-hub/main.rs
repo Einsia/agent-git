@@ -16,7 +16,7 @@ mod smarthttp;
 
 use std::path::PathBuf;
 
-use crate::cli::{add_cmd, list_cmd, token_cmd, user_cmd};
+use crate::cli::{add_cmd, list_cmd, org_cmd, token_cmd, user_cmd};
 use crate::scan::pre_receive_cmd;
 use crate::server::serve_cmd;
 
@@ -37,6 +37,7 @@ pub(crate) fn run() -> i32 {
         "list" => list_cmd(&root),
         "token" => token_cmd(&root, &args),
         "user" => user_cmd(&root, &args),
+        "org" => org_cmd(&root, &args),
         "pre-receive" => pre_receive_cmd(&root, &args),
         "-h" | "--help" => {
             print_help();
@@ -62,7 +63,11 @@ pub(crate) fn print_help() {
          agit-hub token add <name> [--user <owner>] [--agent <owner>/<name>]\n\
                             [--read|--write] [--ttl-days N]   issue an access token\n\
          agit-hub token list                                  list tokens (metadata only)\n\
-         agit-hub token rm <id>                               revoke a token\n\n\
+         agit-hub token rm <id>                               revoke a token\n\
+         agit-hub org invite <org> <user> [--role R]          invite a user into an org (pending)\n\
+         agit-hub org invitations <org>                       list an org's pending invitations\n\
+         agit-hub org transfer <org> <new_owner>              hand org ownership to a member\n\
+         agit-hub org rm <org>                                delete an empty org\n\n\
          First step: agit-hub user add <you> --admin\n\
          Hosted repos are bare git. Publish with: agit -a push http://HOST:PORT/<owner>/<name>.git (with a write token)\n\n\
          Listens on 127.0.0.1 only by default. Serving the network needs --host 0.0.0.0, and without TLS also --insecure."
@@ -515,7 +520,9 @@ mod h4_tests {
     use agit::hub::store::{now_iso, Org, OrgMember, Store, User};
     use agit::hub::{auth, kdf};
 
-    use crate::api::{api_org_members, api_orgs_create, api_register};
+    use crate::api::{
+        api_me_invitations, api_org_delete, api_org_invitations, api_org_members, api_org_transfer, api_orgs_create, api_register,
+    };
     use crate::cli::create_agent;
     use crate::http::Resp;
     use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC, REGISTER_BURST, REGISTER_RATE_PER_SEC};
@@ -751,6 +758,177 @@ mod h4_tests {
         let org = ctx.store.org("acme").await.unwrap();
         assert!(!org.is_admin("alice"), "alice is now a plain member");
         assert!(org.is_admin("bob"), "bob remains the org admin");
+    }
+
+    // ── org invitations (the consent flow) ──
+
+    fn body_json(r: &Resp) -> serde_json::Value {
+        serde_json::from_slice(&r.body).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Stand up an org "acme" owned by alice (admin) with the given extra members, all real users.
+    async fn org_with(ctx: &Ctx, members: &[(&str, &str)]) {
+        add_user(&ctx.store, "alice").await;
+        assert_eq!(api_orgs_create(ctx, &Caller::user("alice"), br#"{"name":"acme"}"#).await.status, 201);
+        for (u, role) in members {
+            add_user(&ctx.store, u).await;
+            let body = format!(r#"{{"username":"{u}","role":"{role}"}}"#);
+            assert_eq!(
+                api_org_members(ctx, &Caller::user("alice"), "acme", "", "POST", body.as_bytes()).await.status,
+                200,
+                "seed member {u}"
+            );
+        }
+    }
+
+    /// admin invite → PENDING; the invited user accepts → member with the invited role.
+    #[tokio::test]
+    async fn invite_then_accept_makes_a_member_with_the_invited_role() {
+        let (_d, ctx) = test_ctx(false).await;
+        org_with(&ctx, &[]).await;
+        add_user(&ctx.store, "bob").await;
+        let r = api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"admin"}"#).await;
+        assert_eq!(r.status, 201, "an admin can invite");
+        let id = body_json(&r)["id"].as_str().unwrap().to_string();
+        // The invitation is pending and shows up for bob (and in the org's list), but no membership yet.
+        assert!(!ctx.store.org("acme").await.unwrap().is_member("bob"), "an invite is not a membership");
+        let mine = api_me_invitations(&ctx, &Caller::user("bob")).await;
+        assert!(body_json(&mine).as_array().unwrap().iter().any(|i| i["id"] == id.as_str()), "bob sees his own invite");
+        // bob accepts → he becomes a member with the invited role (admin).
+        let tail = format!("/{id}/accept");
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("bob"), "acme", &tail, "POST", b"").await.status, 200);
+        let org = ctx.store.org("acme").await.unwrap();
+        assert!(org.is_member("bob") && org.is_admin("bob"), "bob is now an admin member");
+        // The invitation is consumed — a replay accept finds nothing pending.
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("bob"), "acme", &tail, "POST", b"").await.status, 404);
+        assert!(!body_json(&api_me_invitations(&ctx, &Caller::user("bob")).await).as_array().unwrap().iter().any(|i| i["id"] == id.as_str()));
+    }
+
+    /// A NON-invited user may not accept someone else's invitation.
+    #[tokio::test]
+    async fn a_stranger_cannot_accept_someone_elses_invitation() {
+        let (_d, ctx) = test_ctx(false).await;
+        org_with(&ctx, &[]).await;
+        add_user(&ctx.store, "bob").await;
+        add_user(&ctx.store, "eve").await;
+        let r = api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"member"}"#).await;
+        let id = body_json(&r)["id"].as_str().unwrap().to_string();
+        // eve tries to accept bob's invitation — refused, and nobody is added.
+        let tail = format!("/{id}/accept");
+        let status = api_org_invitations(&ctx, &Caller::user("eve"), "acme", &tail, "POST", b"").await.status;
+        assert!(status == 403 || status == 404, "a non-invitee cannot accept (got {status})");
+        let org = ctx.store.org("acme").await.unwrap();
+        assert!(!org.is_member("eve") && !org.is_member("bob"), "the invite is untouched and unconsumed");
+        // ...and bob can still accept his own afterwards.
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("bob"), "acme", &tail, "POST", b"").await.status, 200);
+        assert!(ctx.store.org("acme").await.unwrap().is_member("bob"));
+    }
+
+    /// A non-admin member cannot invite anyone.
+    #[tokio::test]
+    async fn a_non_admin_cannot_invite() {
+        let (_d, ctx) = test_ctx(false).await;
+        org_with(&ctx, &[("bob", "member")]).await;
+        add_user(&ctx.store, "carol").await;
+        let r = api_org_invitations(&ctx, &Caller::user("bob"), "acme", "", "POST", br#"{"username":"carol","role":"member"}"#).await;
+        assert_eq!(r.status, 403, "a plain member cannot invite");
+        // A total stranger gets the non-disclosure 404, not a 403.
+        add_user(&ctx.store, "eve").await;
+        let r = api_org_invitations(&ctx, &Caller::user("eve"), "acme", "", "POST", br#"{"username":"carol","role":"member"}"#).await;
+        assert_eq!(r.status, 404, "a non-member can't even tell the org exists");
+    }
+
+    /// Inviting someone who is already a member is rejected.
+    #[tokio::test]
+    async fn inviting_an_existing_member_is_rejected() {
+        let (_d, ctx) = test_ctx(false).await;
+        org_with(&ctx, &[("bob", "member")]).await;
+        let r = api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"admin"}"#).await;
+        assert_eq!(r.status, 409, "bob is already a member");
+        // Inviting an unknown account is a 400 (only real users, like member-add).
+        let r = api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"ghost","role":"member"}"#).await;
+        assert_eq!(r.status, 400);
+        // A duplicate pending invite is refused too.
+        add_user(&ctx.store, "carol").await;
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"carol"}"#).await.status, 201);
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"carol"}"#).await.status, 409);
+    }
+
+    /// Declining leaves no membership and consumes the invite.
+    #[tokio::test]
+    async fn decline_leaves_no_membership() {
+        let (_d, ctx) = test_ctx(false).await;
+        org_with(&ctx, &[]).await;
+        add_user(&ctx.store, "bob").await;
+        let r = api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"member"}"#).await;
+        let id = body_json(&r)["id"].as_str().unwrap().to_string();
+        let tail = format!("/{id}/decline");
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("bob"), "acme", &tail, "POST", b"").await.status, 200);
+        assert!(!ctx.store.org("acme").await.unwrap().is_member("bob"), "decline grants nothing");
+        // The invite is no longer pending, so it can't be accepted after the fact.
+        let accept = format!("/{id}/accept");
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("bob"), "acme", &accept, "POST", b"").await.status, 404);
+    }
+
+    /// An admin revokes a still-pending invitation; it stops being pending and cannot be accepted.
+    #[tokio::test]
+    async fn revoke_removes_a_pending_invite() {
+        let (_d, ctx) = test_ctx(false).await;
+        org_with(&ctx, &[]).await;
+        add_user(&ctx.store, "bob").await;
+        let r = api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"member"}"#).await;
+        let id = body_json(&r)["id"].as_str().unwrap().to_string();
+        let tail = format!("/{id}");
+        // A non-admin cannot revoke.
+        assert!(matches!(api_org_invitations(&ctx, &Caller::user("bob"), "acme", &tail, "DELETE", b"").await.status, 403 | 404));
+        // The admin revokes it.
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("alice"), "acme", &tail, "DELETE", b"").await.status, 204);
+        // It's gone from the pending listing, and bob can no longer accept it.
+        let listing = api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "GET", b"").await;
+        assert!(body_json(&listing).as_array().unwrap().is_empty(), "no pending invites remain");
+        let accept = format!("/{id}/accept");
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("bob"), "acme", &accept, "POST", b"").await.status, 404);
+    }
+
+    /// Transfer hands ownership to an existing member and rejects a non-member / unknown account.
+    #[tokio::test]
+    async fn transfer_moves_ownership_to_a_member_and_rejects_a_non_member() {
+        let (_d, ctx) = test_ctx(false).await;
+        org_with(&ctx, &[("bob", "member")]).await;
+        // Reject an unknown account.
+        assert_eq!(api_org_transfer(&ctx, &Caller::user("alice"), "acme", br#"{"new_owner":"ghost"}"#).await.status, 400);
+        // Reject a real user who is not a member.
+        add_user(&ctx.store, "eve").await;
+        assert_eq!(api_org_transfer(&ctx, &Caller::user("alice"), "acme", br#"{"new_owner":"eve"}"#).await.status, 400);
+        // A non-admin cannot initiate a transfer.
+        assert_eq!(api_org_transfer(&ctx, &Caller::user("bob"), "acme", br#"{"new_owner":"bob"}"#).await.status, 403);
+        // The owner hands off to bob (a member): bob becomes admin, alice steps down to member.
+        assert_eq!(api_org_transfer(&ctx, &Caller::user("alice"), "acme", br#"{"new_owner":"bob"}"#).await.status, 200);
+        let org = ctx.store.org("acme").await.unwrap();
+        assert!(org.is_admin("bob"), "bob now owns the org");
+        assert!(org.is_member("alice") && !org.is_admin("alice"), "alice stepped down to a plain member");
+    }
+
+    /// Delete is refused while the org owns an agent, and succeeds once empty — sweeping memberships and
+    /// pending invitations.
+    #[tokio::test]
+    async fn delete_is_refused_while_nonempty_then_succeeds_and_cleans_up() {
+        let (_d, ctx) = test_ctx(false).await;
+        org_with(&ctx, &[("bob", "member")]).await;
+        add_user(&ctx.store, "carol").await;
+        // A dangling pending invitation, to prove it gets swept.
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"carol"}"#).await.status, 201);
+        // The org owns an agent → delete is refused with 409.
+        create_agent(&ctx.store, "shared", "org:acme", Visibility::Private).await.unwrap();
+        assert_eq!(api_org_delete(&ctx, &Caller::user("alice"), "acme").await.status, 409, "cannot delete while it owns agents");
+        assert!(ctx.store.org("acme").await.is_some(), "the refused delete left the org intact");
+        // A non-admin cannot delete either.
+        assert_eq!(api_org_delete(&ctx, &Caller::user("bob"), "acme").await.status, 403);
+        // Move the agent away, then delete succeeds and cleans up memberships + invitations.
+        crate::api::api_transfer_agent(&ctx, &Caller::user("alice"), "acme", "shared", br#"{"to":"alice"}"#).await;
+        assert_eq!(api_org_delete(&ctx, &Caller::user("alice"), "acme").await.status, 204, "an empty org deletes");
+        assert!(ctx.store.org("acme").await.is_none(), "the org is gone (memberships with it)");
+        assert!(ctx.store.invitations().await.iter().all(|i| i.org != "acme"), "pending invitations were swept");
     }
 }
 

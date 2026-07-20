@@ -163,6 +163,36 @@ pub struct Org {
     pub created: String,
 }
 
+/// A pending (or resolved) invitation into an org — the consent flow that replaces the silent
+/// admin-add. An admin creates one PENDING row; the invited user alone flips it to `accepted` (which
+/// mints the membership) or `declined`; an admin may `revoke` a still-pending one. The row is kept
+/// after it resolves (status is a durable record, not a delete) — only `org rm` sweeps them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Invitation {
+    /// Unguessable id (`inv_<hex>`), minted server-side like a token id — it is the accept/decline
+    /// handle handed to the invitee, so it must not be enumerable.
+    pub id: String,
+    /// The org, by its normalized name.
+    pub org: String,
+    /// The invited user's normalized username.
+    pub invitee: String,
+    /// The org role the membership gets on accept — "member" | "admin".
+    pub role: String,
+    /// "pending" | "accepted" | "declined" | "revoked".
+    pub status: String,
+    /// The admin who issued it.
+    pub created_by: String,
+    #[serde(default)]
+    pub created: String,
+}
+
+impl Invitation {
+    /// Whether this invitation is still awaiting the invitee's decision.
+    pub fn is_pending(&self) -> bool {
+        self.status == "pending"
+    }
+}
+
 impl Org {
     /// Whether `user` can manage the org (add/remove members, and manage every agent it owns).
     pub fn is_admin(&self, user: &str) -> bool {
@@ -398,6 +428,12 @@ pub fn new_token_id() -> io::Result<String> {
     Ok(format!("tok_{}", &super::kdf::gen_secret()?[..12]))
 }
 
+/// Mint an invitation id: `inv_` + 16 CSPRNG hex chars. Unguessable, mirroring [`new_token_id`] — the
+/// id is the accept/decline handle, so it must not be enumerable.
+pub fn new_invite_id() -> io::Result<String> {
+    Ok(format!("inv_{}", &super::kdf::gen_secret()?[..16]))
+}
+
 /// root is a credential directory: 0700, owner-only. When the directory already exists the mode has
 /// no effect (mode only applies at creation), so tighten it explicitly afterwards.
 pub fn ensure_root(root: &Path) -> io::Result<()> {
@@ -537,6 +573,18 @@ fn row_org(r: &impl Cols) -> Org {
     Org { name: r.text("name"), members: parse_json_vec(&r.text("members")), created: r.text("created") }
 }
 
+fn row_invitation(r: &impl Cols) -> Invitation {
+    Invitation {
+        id: r.text("id"),
+        org: r.text("org"),
+        invitee: r.text("invitee"),
+        role: r.text("role"),
+        status: r.text("status"),
+        created_by: r.text("created_by"),
+        created: r.text("created"),
+    }
+}
+
 // ─────────────────────────── schema ───────────────────────────
 
 /// One portable migration set for both backends. Only portable constructs are used (no SERIAL /
@@ -577,6 +625,15 @@ const DDL: &[&str] = &[
        PRIMARY KEY (target_owner, target_agent, id))",
     "CREATE TABLE IF NOT EXISTS orgs (\
        name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', created TEXT NOT NULL DEFAULT '')",
+    // Org invitations (the consent flow). id is the unguessable accept/decline handle; status is one
+    // of pending|accepted|declined|revoked. Added additively to DDL (a whole new table, unlike the
+    // TOTP columns) so a fresh DB gets it and every existing store gets it created at boot via the
+    // `CREATE TABLE IF NOT EXISTS` — no version bump or back-fill migration needed.
+    "CREATE TABLE IF NOT EXISTS invitations (\
+       id TEXT PRIMARY KEY, org TEXT NOT NULL, invitee TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', \
+       status TEXT NOT NULL DEFAULT 'pending', created_by TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '')",
+    "CREATE INDEX IF NOT EXISTS invitations_org ON invitations(org)",
+    "CREATE INDEX IF NOT EXISTS invitations_invitee ON invitations(invitee)",
 ];
 
 /// The second-factor columns, added onto a `users` table that predates them. A **fresh** DB already
@@ -1004,6 +1061,25 @@ impl Store {
             Store::Pg(s) => s.update_orgs(f).await,
         }
     }
+
+    // ── org invitations ──
+
+    pub async fn invitations(&self) -> Vec<Invitation> {
+        match self {
+            Store::Sqlite(s) => s.invitations().await,
+            Store::Pg(s) => s.invitations().await,
+        }
+    }
+
+    pub async fn update_invitations<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<Invitation>) -> R,
+    {
+        match self {
+            Store::Sqlite(s) => s.update_invitations(f).await,
+            Store::Pg(s) => s.update_invitations(f).await,
+        }
+    }
 }
 
 // ─────────────────────────── SQLite backend ───────────────────────────
@@ -1344,6 +1420,42 @@ impl SqliteStore {
         tx.commit().await.map_err(err)?;
         Ok(r)
     }
+
+    async fn invitations(&self) -> Vec<Invitation> {
+        match sqlx::query("SELECT * FROM invitations").fetch_all(&self.pool).await {
+            Ok(rows) => rows.iter().map(row_invitation).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    async fn update_invitations<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<Invitation>) -> R,
+    {
+        // Same snapshot-rewrite critical section as the other four writers: the async write mutex, then
+        // a tracked transaction so a dropped handler future auto-rolls back instead of wedging the pool.
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        let rows = sqlx::query("SELECT * FROM invitations").fetch_all(&mut *tx).await.map_err(err)?;
+        let mut list: Vec<Invitation> = rows.iter().map(row_invitation).collect();
+        let r = f(&mut list);
+        sqlx::query("DELETE FROM invitations").execute(&mut *tx).await.map_err(err)?;
+        for i in &list {
+            sqlx::query("INSERT INTO invitations (id, org, invitee, role, status, created_by, created) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                .bind(&i.id)
+                .bind(&i.org)
+                .bind(&i.invitee)
+                .bind(&i.role)
+                .bind(&i.status)
+                .bind(&i.created_by)
+                .bind(&i.created)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        Ok(r)
+    }
 }
 
 // ─────────────────────────── Postgres backend ───────────────────────────
@@ -1648,6 +1760,42 @@ impl PgStore {
                 .bind(&o.name)
                 .bind(serde_json::to_string(&o.members).unwrap_or_else(|_| "[]".into()))
                 .bind(&o.created)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        Ok(r)
+    }
+
+    async fn invitations(&self) -> Vec<Invitation> {
+        match sqlx::query("SELECT * FROM invitations").fetch_all(&self.pool).await {
+            Ok(rows) => rows.iter().map(row_invitation).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    async fn update_invitations<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<Invitation>) -> R,
+    {
+        // The same single advisory-lock critical section every other read-modify-write runs in, so an
+        // accept (invitations rewrite + orgs rewrite) can't interleave with a concurrent org edit.
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        let rows = sqlx::query("SELECT * FROM invitations").fetch_all(&mut *tx).await.map_err(err)?;
+        let mut list: Vec<Invitation> = rows.iter().map(row_invitation).collect();
+        let r = f(&mut list);
+        sqlx::query("DELETE FROM invitations").execute(&mut *tx).await.map_err(err)?;
+        for i in &list {
+            sqlx::query("INSERT INTO invitations (id, org, invitee, role, status, created_by, created) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+                .bind(&i.id)
+                .bind(&i.org)
+                .bind(&i.invitee)
+                .bind(&i.role)
+                .bind(&i.status)
+                .bind(&i.created_by)
+                .bind(&i.created)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;

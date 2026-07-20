@@ -74,6 +74,20 @@ pub const MEMBER_REMOVE: &str = "member.remove";
 pub const ORG_CREATE: &str = "org.create";
 pub const ORG_MEMBER_ADD: &str = "org.member.add";
 pub const ORG_MEMBER_REMOVE: &str = "org.member.remove";
+/// The invitation consent flow. `invite` = an admin issued a pending invitation; `accept` = the
+/// invited user accepted and became a member; `decline` = the invited user declined (no membership);
+/// `revoke` = an admin cancelled a still-pending invitation.
+pub const ORG_INVITE: &str = "org.invite";
+pub const ORG_INVITE_ACCEPT: &str = "org.invite.accept";
+pub const ORG_INVITE_DECLINE: &str = "org.invite.decline";
+pub const ORG_INVITE_REVOKE: &str = "org.invite.revoke";
+/// Ownership handoff: the current owner (an org admin) promoted an existing member to admin and
+/// stepped down to a plain member. Kept distinct from member edits — it can lock the old owner out of
+/// managing the org.
+pub const ORG_TRANSFER: &str = "org.transfer";
+/// An org was deleted (refused while it still owns agents). Memberships and pending invitations go
+/// with it.
+pub const ORG_DELETE: &str = "org.delete";
 pub const TOKEN_CREATE: &str = "token.create";
 pub const TOKEN_REVOKE: &str = "token.revoke";
 pub const GIT_FETCH: &str = "git.fetch";

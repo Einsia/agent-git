@@ -8,7 +8,7 @@ use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny, Lifecycle, 
 use agit::hub::blob::{self, BLOB_MAX};
 use agit::hub::metrics::AuthResult;
 use agit::hub::net::valid_agent_name;
-use agit::hub::store::{AgentMeta, Member, Org, OrgMember, User};
+use agit::hub::store::{AgentMeta, Invitation, Member, Org, OrgMember, User};
 use agit::hub::{audit, auth, identity, kdf, mr, session as websession, store, totp};
 
 use crate::cli::{create_agent, issue_token, list_agents, repo_path};
@@ -86,6 +86,7 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("POST", "register") => return api_register(ctx, client_ip, body).await,
         ("POST", "logout") => return api_logout(ctx, req, caller).await,
         ("GET", "me") => return api_me(caller),
+        ("GET", "me/invitations") => return api_me_invitations(ctx, caller).await,
         ("POST", "me/password") => return api_me_password(ctx, req, caller, body).await,
         ("POST", "me/2fa/enroll") => return api_2fa_enroll(ctx, caller).await,
         ("POST", "me/2fa/confirm") => return api_2fa_confirm(ctx, caller, body).await,
@@ -108,8 +109,23 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
                 return api_org_members(ctx, caller, name, tail, m, body).await;
             }
         }
+        // orgs/<org>/invitations[/<id>[/accept|/decline]] — tail is "" or "/<id>..." only, so a
+        // stray /invitationsXYZ does not slip through (same guard as /members).
+        if let Some((name, tail)) = after.split_once("/invitations") {
+            if tail.is_empty() || tail.starts_with('/') {
+                return api_org_invitations(ctx, caller, name, tail, m, body).await;
+            }
+        }
+        // orgs/<org>/transfer — hand ownership to an existing member.
+        if let Some(name) = after.strip_suffix("/transfer") {
+            return match m {
+                "POST" => api_org_transfer(ctx, caller, name, body).await,
+                _ => Resp::text(405, "method not allowed"),
+            };
+        }
         return match m {
             "GET" => api_org_get(ctx, caller, after).await,
+            "DELETE" => api_org_delete(ctx, caller, after).await,
             _ => Resp::text(405, "method not allowed"),
         };
     }
@@ -2108,6 +2124,372 @@ enum RmOutcome {
 enum SetRoleOutcome {
     Ok,
     LastAdmin,
+}
+
+// ── org invitations (the consent flow) ──
+
+/// Serialize one invitation for the API. Never leaks anything the caller can't already see (org name,
+/// their own username, the offered role).
+fn invitation_json(i: &Invitation) -> serde_json::Value {
+    serde_json::json!({
+        "id": i.id,
+        "org": i.org,
+        "username": i.invitee,
+        "role": i.role,
+        "status": i.status,
+        "created_by": i.created_by,
+        "created": i.created,
+    })
+}
+
+/// `GET /api/me/invitations` — the caller's own pending invitations. Self-scoped, so it needs only a
+/// logged-in session (no org membership — the whole point is you are not a member yet).
+pub(crate) async fn api_me_invitations(ctx: &Ctx, caller: &Caller) -> Resp {
+    let Some(user) = caller.user.as_deref() else {
+        return Resp::err(401, "login required");
+    };
+    let items: Vec<serde_json::Value> = ctx
+        .store
+        .invitations()
+        .await
+        .into_iter()
+        .filter(|i| i.invitee == user && i.is_pending())
+        .map(|i| invitation_json(&i))
+        .collect();
+    Resp::json(serde_json::json!(items))
+}
+
+/// The outcome of an invitee-driven state transition (accept/decline), so a missing/resolved
+/// invitation, a wrong invitee, and a success can be told apart after the atomic `update_invitations`.
+enum InviteOutcome {
+    /// Accepted — carries the role to grant when minting the membership.
+    Accepted(String),
+    /// The invitee-driven transition succeeded without a role payload (decline).
+    Ok,
+    /// No pending invitation with that id under this org.
+    NotFound,
+    /// The invitation exists and is pending, but belongs to someone else.
+    NotYours,
+}
+
+/// `/api/orgs/<org>/invitations[/<id>[/accept|/decline]]` — the invitation routes.
+///
+/// Two distinct authorization models share this entry point:
+///   - **admin actions** (list / create / revoke) require the caller to be an org admin (or site
+///     admin), and hide a missing/invisible org behind a uniform 404, exactly like `api_org_members`.
+///   - **invitee actions** (accept / decline) are gated by the invitation itself: only the named
+///     invitee may act, and the unguessable id is the handle — so these do NOT require org membership
+///     (the invitee is not a member yet).
+pub(crate) async fn api_org_invitations(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let orgname = store::normalize_username(name);
+    let sub = tail.strip_prefix('/');
+    match (method, sub) {
+        // ── admin actions on the collection ──
+        ("GET", None) | ("POST", None) => {
+            // 404 for a missing org OR one the caller can't see — existence non-disclosure, as in
+            // api_org_members. Managing invitations then needs org-admin (a plain member gets 403).
+            let Some(org) = ctx.store.org(&orgname).await else {
+                return Resp::err(404, "not found");
+            };
+            if !(caller.is_admin || org.is_member(&user)) {
+                return Resp::err(404, "not found");
+            }
+            if !(caller.is_admin || org.is_admin(&user)) {
+                return Resp::err(403, "must be an org admin to manage invitations");
+            }
+            if method == "GET" {
+                let items: Vec<serde_json::Value> = ctx
+                    .store
+                    .invitations()
+                    .await
+                    .into_iter()
+                    .filter(|i| i.org == org.name && i.is_pending())
+                    .map(|i| invitation_json(&i))
+                    .collect();
+                return Resp::json(serde_json::json!(items));
+            }
+            api_org_invite_create(ctx, &user, &org, body).await
+        }
+        // ── invitee / admin actions on a specific invitation ──
+        (_, Some(rest)) => {
+            let (id, action) = match rest.split_once('/') {
+                Some((id, act)) => (id, Some(act)),
+                None => (rest, None),
+            };
+            match (method, action) {
+                ("POST", Some("accept")) => api_org_invite_respond(ctx, &user, &orgname, id, true).await,
+                ("POST", Some("decline")) => api_org_invite_respond(ctx, &user, &orgname, id, false).await,
+                ("DELETE", None) => api_org_invite_revoke(ctx, caller, &user, &orgname, id).await,
+                _ => Resp::text(405, "method not allowed"),
+            }
+        }
+        _ => Resp::text(405, "method not allowed"),
+    }
+}
+
+/// `POST /api/orgs/<org>/invitations` — an org admin invites a user with a target role. Creates a
+/// PENDING invitation; the invitee alone can accept it. Caller is already known to be an org admin.
+async fn api_org_invite_create(ctx: &Ctx, actor: &str, org: &Org, body: &[u8]) -> Resp {
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(username) = str_field(&v, "username") else {
+        return Resp::err(400, "want username");
+    };
+    let username = store::normalize_username(&username);
+    // Role defaults to "member" when omitted, mirroring the org member roles.
+    let role = str_field(&v, "role").unwrap_or_else(|| "member".into());
+    if role != "member" && role != "admin" {
+        return Resp::err(400, "role must be member or admin");
+    }
+    // Only a real, existing user — the same rule member-add follows, so an org can't accumulate
+    // invitations for misspelled names that whoever registers them later inherits.
+    if ctx.store.user(&username).await.is_none() {
+        return Resp::err(400, "no such user");
+    }
+    if org.is_member(&username) {
+        return Resp::err(409, "that person is already a member");
+    }
+    let id = match store::new_invite_id() {
+        Ok(id) => id,
+        Err(_) => return Resp::err(500, "couldn't mint an invitation id"),
+    };
+    let invite = Invitation {
+        id: id.clone(),
+        org: org.name.clone(),
+        invitee: username.clone(),
+        role: role.clone(),
+        status: "pending".into(),
+        created_by: actor.to_string(),
+        created: store::now_iso(),
+    };
+    // Atomic create: refuse a second pending invitation for the same (org, user) under the lock, so two
+    // racing invites can't both land.
+    let created = ctx
+        .store
+        .update_invitations(|list| {
+            if list.iter().any(|i| i.org == invite.org && i.invitee == invite.invitee && i.is_pending()) {
+                return false;
+            }
+            list.push(invite.clone());
+            true
+        })
+        .await;
+    match created {
+        Ok(true) => {
+            audit_append(ctx.root(), actor, audit::ORG_INVITE, None, &format!("org={} {username}={role} id={id}", org.name)).await;
+            Resp::json_status(201, invitation_json(&invite))
+        }
+        Ok(false) => Resp::err(409, "that person already has a pending invitation"),
+        Err(_) => Resp::err(500, "couldn't create the invitation"),
+    }
+}
+
+/// Accept (`accept = true`) or decline an invitation. ONLY the named invitee may act. On accept the
+/// membership is minted with the invited role; on decline nothing is granted. Both mark the invitation
+/// resolved atomically, so it can't be replayed.
+async fn api_org_invite_respond(ctx: &Ctx, user: &str, orgname: &str, id: &str, accept: bool) -> Resp {
+    let next = if accept { "accepted" } else { "declined" };
+    // Flip the invitation state under the lock, capturing the role for the membership mint. Matching on
+    // id + org + pending inside the lock makes a double-accept impossible.
+    let outcome = ctx
+        .store
+        .update_invitations(|list| {
+            let Some(inv) = list.iter_mut().find(|i| i.id == id && i.org == orgname) else {
+                return InviteOutcome::NotFound;
+            };
+            if !inv.is_pending() {
+                return InviteOutcome::NotFound;
+            }
+            if inv.invitee != user {
+                return InviteOutcome::NotYours;
+            }
+            inv.status = next.to_string();
+            if accept {
+                InviteOutcome::Accepted(inv.role.clone())
+            } else {
+                InviteOutcome::Ok
+            }
+        })
+        .await;
+    match outcome {
+        Ok(InviteOutcome::Accepted(role)) => {
+            // Mint the membership. Idempotent by username, and never downgrades an existing admin.
+            let (orgname, user, role) = (orgname.to_string(), user.to_string(), role);
+            let added = ctx
+                .store
+                .update_orgs(|list| {
+                    let Some(o) = list.iter_mut().find(|o| o.name == orgname) else {
+                        return false; // org vanished between accept and mint (e.g. deleted) — nothing to grant
+                    };
+                    match o.members.iter_mut().find(|m| m.username == user) {
+                        Some(m) => {
+                            if m.role != "admin" {
+                                m.role = role.clone();
+                            }
+                        }
+                        None => o.members.push(OrgMember { username: user.clone(), role: role.clone() }),
+                    }
+                    true
+                })
+                .await
+                .unwrap_or(false);
+            if !added {
+                return Resp::err(404, "not found");
+            }
+            audit_append(ctx.root(), &user, audit::ORG_INVITE_ACCEPT, None, &format!("org={orgname} {user}={role} id={id}")).await;
+            Resp::json(serde_json::json!({ "org": orgname, "username": user, "role": role, "status": "accepted" }))
+        }
+        Ok(InviteOutcome::Ok) => {
+            audit_append(ctx.root(), user, audit::ORG_INVITE_DECLINE, None, &format!("org={orgname} {user} id={id}")).await;
+            Resp::json(serde_json::json!({ "org": orgname, "username": user, "status": "declined" }))
+        }
+        // A pending invitation that exists but isn't yours: the id is an unguessable secret, so a clear
+        // 403 is safe and more useful than hiding it.
+        Ok(InviteOutcome::NotYours) => Resp::err(403, "that invitation isn't yours"),
+        Ok(InviteOutcome::NotFound) => Resp::err(404, "not found"),
+        Err(_) => Resp::err(500, "couldn't update the invitation"),
+    }
+}
+
+/// `DELETE /api/orgs/<org>/invitations/<id>` — an org admin revokes a still-pending invitation. The
+/// row is marked `revoked` (a durable record), which drops it out of every pending listing.
+async fn api_org_invite_revoke(ctx: &Ctx, caller: &Caller, user: &str, orgname: &str, id: &str) -> Resp {
+    let Some(org) = ctx.store.org(orgname).await else {
+        return Resp::err(404, "not found");
+    };
+    if !(caller.is_admin || org.is_member(user)) {
+        return Resp::err(404, "not found");
+    }
+    if !(caller.is_admin || org.is_admin(user)) {
+        return Resp::err(403, "must be an org admin to revoke invitations");
+    }
+    let revoked = ctx
+        .store
+        .update_invitations(|list| match list.iter_mut().find(|i| i.id == id && i.org == org.name && i.is_pending()) {
+            Some(inv) => {
+                inv.status = "revoked".into();
+                true
+            }
+            None => false,
+        })
+        .await
+        .unwrap_or(false);
+    if !revoked {
+        return Resp::err(404, "no such pending invitation");
+    }
+    audit_append(ctx.root(), user, audit::ORG_INVITE_REVOKE, None, &format!("org={orgname} id={id}")).await;
+    Resp::no_content()
+}
+
+// ── org transfer + delete ──
+
+/// `POST /api/orgs/<org>/transfer { new_owner }` — hand ownership to another EXISTING MEMBER.
+///
+/// The org model has no single "owner" field: ownership is the admin role (the creator is the first
+/// admin). So a transfer promotes `new_owner` to admin and steps the caller down to a plain member —
+/// the honest reading of "hand ownership over". Because the new admin is set in the SAME update, the
+/// org never passes through a state with no admin, so the last-admin guard is never tripped.
+pub(crate) async fn api_org_transfer(ctx: &Ctx, caller: &Caller, name: &str, body: &[u8]) -> Resp {
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    // 404 for a missing org OR one the caller can't see — existence non-disclosure, as elsewhere.
+    let Some(org) = ctx.store.org(name).await else {
+        return Resp::err(404, "not found");
+    };
+    if !(caller.is_admin || org.is_member(&user)) {
+        return Resp::err(404, "not found");
+    }
+    // Only the current owner (an org admin) may hand ownership over.
+    if !(caller.is_admin || org.is_admin(&user)) {
+        return Resp::err(403, "only an org admin may transfer ownership");
+    }
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(new_owner) = str_field(&v, "new_owner") else {
+        return Resp::err(400, "want new_owner");
+    };
+    let new_owner = store::normalize_username(&new_owner);
+    // Reject an unknown account and a non-member alike — you can only hand the org to someone already
+    // in it.
+    if ctx.store.user(&new_owner).await.is_none() {
+        return Resp::err(400, "no such user");
+    }
+    if !org.is_member(&new_owner) {
+        return Resp::err(400, "the new owner must already be a member of the org");
+    }
+    if new_owner == user {
+        return Resp::err(409, "you already own this org");
+    }
+    let orgname = org.name.clone();
+    // Promote new_owner to admin and demote the caller to member, atomically. A site admin acting on an
+    // org they don't belong to has no membership row to demote — that's fine, the promotion is the
+    // load-bearing half.
+    let done = ctx
+        .store
+        .update_orgs(|list| {
+            let Some(o) = list.iter_mut().find(|o| o.name == orgname) else {
+                return false;
+            };
+            match o.members.iter_mut().find(|m| m.username == new_owner) {
+                Some(m) => m.role = "admin".into(),
+                None => return false, // membership vanished mid-flight
+            }
+            if let Some(m) = o.members.iter_mut().find(|m| m.username == user) {
+                m.role = "member".into();
+            }
+            true
+        })
+        .await
+        .unwrap_or(false);
+    if !done {
+        return Resp::err(404, "not found");
+    }
+    audit_append(ctx.root(), &user, audit::ORG_TRANSFER, None, &format!("org={orgname} {user} → {new_owner}")).await;
+    let fresh = ctx.store.org(&orgname).await;
+    Resp::json(serde_json::json!({
+        "name": orgname,
+        "new_owner": new_owner,
+        "previous_owner": user,
+        "members": fresh.as_ref().map(org_members_json).unwrap_or_else(|| serde_json::json!([])),
+    }))
+}
+
+/// `DELETE /api/orgs/<org>` — owner (an org admin) only. Refuses while the org still owns any agents,
+/// so no repo/blob data is orphaned — the caller must transfer or delete those first. On success the
+/// org row (and with it every membership) and every invitation for the org are swept.
+pub(crate) async fn api_org_delete(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let Some(org) = ctx.store.org(name).await else {
+        return Resp::err(404, "not found");
+    };
+    if !(caller.is_admin || org.is_member(&user)) {
+        return Resp::err(404, "not found");
+    }
+    if !(caller.is_admin || org.is_admin(&user)) {
+        return Resp::err(403, "only an org admin may delete the org");
+    }
+    // Refuse-if-nonempty: an org that still owns agents cannot be deleted, or those repos and blobs are
+    // orphaned. Any lifecycle counts (archived/soft-deleted repos still hold bytes on disk).
+    let owns = ctx.store.agents().await.iter().any(|a| a.org_owner() == Some(org.name.as_str()));
+    if owns {
+        return Resp::err(409, "this org still owns agents — transfer or delete them first");
+    }
+    let orgname = org.name.clone();
+    if ctx.store.update_orgs(|list| list.retain(|o| o.name != orgname)).await.is_err() {
+        return Resp::err(500, "couldn't delete the org");
+    }
+    // Sweep pending (and resolved) invitations for the gone org so no dangling rows survive it.
+    let _ = ctx.store.update_invitations(|list| list.retain(|i| i.org != orgname)).await;
+    audit_append(ctx.root(), &user, audit::ORG_DELETE, None, &format!("org={orgname}")).await;
+    Resp::no_content()
 }
 
 // ── cross-agent search ──

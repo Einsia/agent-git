@@ -6,7 +6,7 @@ use std::io::Write as _;
 
 use agit::hub::acl::{Lifecycle, Scope, Visibility};
 use agit::hub::net::valid_agent_name;
-use agit::hub::store::{AgentMeta, Store, TokenRec, User};
+use agit::hub::store::{AgentMeta, Invitation, OrgMember, Store, TokenRec, User};
 use agit::hub::{audit, kdf, store};
 
 use crate::{flag, has_flag, positional};
@@ -590,4 +590,199 @@ pub(crate) async fn issue_token(store: &Store, name: &str, owner: &str, agent: O
     };
     store.update_tokens(|t| t.push(rec)).await.map_err(|e| format!("failed to persist the token: {e}"))?;
     Ok(secret)
+}
+
+// ─────────────────────────── CLI: org ───────────────────────────
+
+pub(crate) fn org_cmd(root: &Path, args: &[String]) -> i32 {
+    run_async(org_cmd_async(root, args))
+}
+
+/// Org administration from the host: invite/list/transfer/delete. Runs as the operator (audit actor
+/// "cli"), so it does not gate on org membership — it is the server-side admin door, mirroring the
+/// `user`/`token` subcommands.
+async fn org_cmd_async(root: &Path, args: &[String]) -> i32 {
+    let store = match open_store(root).await {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match args.get(1).map(|s| s.as_str()) {
+        Some("invite") => {
+            let (Some(orgname), Some(username)) = (positional(args, 2), positional(args, 3)) else {
+                eprintln!("usage: agit-hub org invite <org> <user> [--role member|admin]");
+                return 2;
+            };
+            let orgname = store::normalize_username(orgname);
+            let username = store::normalize_username(username);
+            let role = flag(args, "--role").unwrap_or_else(|| "member".into());
+            if role != "member" && role != "admin" {
+                eprintln!("role must be member or admin");
+                return 2;
+            }
+            let Some(org) = store.org(&orgname).await else {
+                eprintln!("no such org: {orgname}");
+                return 1;
+            };
+            if store.user(&username).await.is_none() {
+                eprintln!("no such user: {username} (invitations only go to existing accounts)");
+                return 1;
+            }
+            if org.is_member(&username) {
+                eprintln!("{username} is already a member of {orgname}");
+                return 1;
+            }
+            let id = match store::new_invite_id() {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("couldn't mint an invitation id: {e}");
+                    return 1;
+                }
+            };
+            let invite = Invitation {
+                id: id.clone(),
+                org: org.name.clone(),
+                invitee: username.clone(),
+                role: role.clone(),
+                status: "pending".into(),
+                created_by: "cli".into(),
+                created: store::now_iso(),
+            };
+            let created = store
+                .update_invitations(|list| {
+                    if list.iter().any(|i| i.org == invite.org && i.invitee == invite.invitee && i.is_pending()) {
+                        return false;
+                    }
+                    list.push(invite.clone());
+                    true
+                })
+                .await;
+            match created {
+                Ok(true) => {
+                    audit::append(root, "cli", audit::ORG_INVITE, None, &format!("org={orgname} {username}={role} id={id}"));
+                    println!("invited {username} to {orgname} as {role} (pending) — id {id}");
+                    println!("  {username} accepts via POST /api/orgs/{orgname}/invitations/{id}/accept");
+                    0
+                }
+                Ok(false) => {
+                    eprintln!("{username} already has a pending invitation to {orgname}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("failed to persist the invitation: {e}");
+                    1
+                }
+            }
+        }
+        Some("invitations") => {
+            let Some(orgname) = positional(args, 2) else {
+                eprintln!("usage: agit-hub org invitations <org>");
+                return 2;
+            };
+            let orgname = store::normalize_username(orgname);
+            if store.org(&orgname).await.is_none() {
+                eprintln!("no such org: {orgname}");
+                return 1;
+            }
+            let pending: Vec<Invitation> =
+                store.invitations().await.into_iter().filter(|i| i.org == orgname && i.is_pending()).collect();
+            if pending.is_empty() {
+                println!("no pending invitations for {orgname}.");
+            }
+            for i in &pending {
+                println!("{:<22} {:<16} role={:<7} by={} at {}", i.id, i.invitee, i.role, i.created_by, i.created);
+            }
+            0
+        }
+        Some("transfer") => {
+            let (Some(orgname), Some(new_owner)) = (positional(args, 2), positional(args, 3)) else {
+                eprintln!("usage: agit-hub org transfer <org> <new_owner>");
+                return 2;
+            };
+            let orgname = store::normalize_username(orgname);
+            let new_owner = store::normalize_username(new_owner);
+            let Some(org) = store.org(&orgname).await else {
+                eprintln!("no such org: {orgname}");
+                return 1;
+            };
+            if store.user(&new_owner).await.is_none() {
+                eprintln!("no such user: {new_owner}");
+                return 1;
+            }
+            if !org.is_member(&new_owner) {
+                eprintln!("{new_owner} must already be a member of {orgname} to become its owner");
+                return 1;
+            }
+            // Operator-forced handoff: new_owner becomes the sole admin (owner). Every other admin is
+            // stepped down to member, so the org ends owned by exactly new_owner.
+            let done = store
+                .update_orgs(|list| {
+                    let Some(o) = list.iter_mut().find(|o| o.name == orgname) else {
+                        return false;
+                    };
+                    for m in o.members.iter_mut() {
+                        m.role = if m.username == new_owner { "admin".into() } else { "member".into() };
+                    }
+                    // If new_owner somehow lost their row mid-flight, re-add as admin.
+                    if !o.members.iter().any(|m| m.username == new_owner) {
+                        o.members.push(OrgMember { username: new_owner.clone(), role: "admin".into() });
+                    }
+                    true
+                })
+                .await
+                .unwrap_or(false);
+            if !done {
+                eprintln!("no such org: {orgname}");
+                return 1;
+            }
+            audit::append(root, "cli", audit::ORG_TRANSFER, None, &format!("org={orgname} → {new_owner}"));
+            println!("{orgname} is now owned by {new_owner} (its sole admin)");
+            0
+        }
+        Some("rm") => {
+            let Some(orgname) = positional(args, 2) else {
+                eprintln!("usage: agit-hub org rm <org>");
+                return 2;
+            };
+            let orgname = store::normalize_username(orgname);
+            if store.org(&orgname).await.is_none() {
+                eprintln!("no such org: {orgname}");
+                return 1;
+            }
+            // Refuse-if-nonempty: an org that still owns agents cannot be deleted, or those repos/blobs
+            // are orphaned. Transfer or delete them first.
+            let owned: Vec<String> =
+                store.agents().await.iter().filter(|a| a.org_owner() == Some(orgname.as_str())).map(|a| a.name.clone()).collect();
+            if !owned.is_empty() {
+                eprintln!("{orgname} still owns {} agent(s): {}", owned.len(), owned.join(", "));
+                eprintln!("transfer or delete them first (agit-hub does not orphan repo data).");
+                return 1;
+            }
+            if let Err(e) = store.update_orgs(|list| list.retain(|o| o.name != orgname)).await {
+                eprintln!("failed to delete the org: {e}");
+                return 1;
+            }
+            let _ = store.update_invitations(|list| list.retain(|i| i.org != orgname)).await;
+            audit::append(root, "cli", audit::ORG_DELETE, None, &format!("org={orgname}"));
+            println!("deleted org {orgname} (memberships and pending invitations cleaned up)");
+            0
+        }
+        Some("list") => {
+            let orgs = store.orgs().await;
+            if orgs.is_empty() {
+                println!("no orgs yet.");
+            }
+            for o in &orgs {
+                let admins: Vec<&str> = o.members.iter().filter(|m| m.role == "admin").map(|m| m.username.as_str()).collect();
+                println!("{:<20} members={:<3} admins={}", o.name, o.members.len(), admins.join(","));
+            }
+            0
+        }
+        _ => {
+            eprintln!("usage: agit-hub org invite <org> <user> [--role member|admin]");
+            eprintln!("       agit-hub org invitations <org>");
+            eprintln!("       agit-hub org transfer <org> <new_owner>");
+            eprintln!("       agit-hub org rm <org> | agit-hub org list");
+            2
+        }
+    }
 }
