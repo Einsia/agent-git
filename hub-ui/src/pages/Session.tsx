@@ -4,9 +4,11 @@ import { GitCompare } from "lucide-react"
 
 import { api } from "@/lib/api"
 import { useGuarded } from "@/lib/useGuarded"
+import { useAsync } from "@/lib/useAsync"
 import { Crumb } from "@/components/Crumb"
 import { SpineReadout } from "@/components/Spine"
 import { ProvChips } from "@/components/ProvChips"
+import { ProvenanceBadge } from "@/components/ProvenanceBadge"
 import { Forbidden, LoadError } from "@/components/States"
 
 export function Session() {
@@ -17,6 +19,10 @@ export function Session() {
     () => api.session(owner, name, id, at),
     [owner, name, id, at]
   )
+  // The live, registry-classified provenance verdict, fetched alongside the session (its own read so a
+  // slow registry lookup never holds up the transcript). Best-effort: a failure just hides the badge —
+  // the session gate above already owns the 401/403 routing, so this needn't redirect.
+  const prov = useAsync(() => api.sessionProvenance(owner, name, id, at), [owner, name, id, at])
 
   if (forbidden) return <Forbidden what={`${owner}/${name}`} />
 
@@ -32,7 +38,7 @@ export function Session() {
           <div className="mb-5">
             <span className="eyebrow">session</span>
             <h1 className="mt-1 break-all font-mono text-xl font-bold tracking-tight">{data.id}</h1>
-            <div className="mt-2.5">
+            <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
               <ProvChips
                 runtime={data.runtime}
                 model={data.model}
@@ -40,6 +46,7 @@ export function Session() {
                 author={data.author}
                 when={data.when}
               />
+              {prov.data && <ProvenanceBadge verdict={prov.data} />}
             </div>
           </div>
 

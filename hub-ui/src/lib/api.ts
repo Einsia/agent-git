@@ -183,6 +183,41 @@ export interface SessionDetail {
   pinned?: string
 }
 
+/// The live provenance verdict for a session, as `provenance_verdict_json` (src/bin/agit-hub/content.rs)
+/// serializes it — the REGISTRY-CLASSIFIED answer from GET .../session/<id>/provenance. `status` is the
+/// authoritative one-word verdict; the other fields are present only for the verdicts that carry them.
+///   - verified_as        — signed by the registered, EMAIL-VERIFIED key of `username` (carries username).
+///   - key_mismatch        — signed by a key that is NOT the registered key of the claimed committer email
+///                           (a possible forgery). NEVER rendered as verified. Carries email + claimed_username.
+///   - signed_unregistered — a valid self-signature whose committer email maps to no verified account.
+///   - verified            — self-verify only (signature + content intact), no hub attribution.
+///   - unsigned            — no provenance sidecar.
+///   - content_tampered / bad_signature — the transcript or signature does not check out.
+export type ProvenanceStatus =
+  | "verified_as"
+  | "key_mismatch"
+  | "signed_unregistered"
+  | "verified"
+  | "unsigned"
+  | "content_tampered"
+  | "bad_signature"
+
+export interface ProvenanceVerdict {
+  status: ProvenanceStatus
+  summary: string
+  /// Present on verified_as: the attributed account.
+  username?: string
+  /// Present on verified / verified_as / signed_unregistered.
+  email?: string
+  aid?: string
+  pubkey?: string
+  /// Present on key_mismatch: the account the committer email is registered to.
+  claimed_username?: string
+  /// Present on content_tampered.
+  recorded_digest?: string
+  actual_digest?: string
+}
+
 export interface SessionDiff {
   from: string
   to: string
@@ -534,6 +569,13 @@ export const api = {
   session: (owner: string, name: string, id: string, at?: string) =>
     get<SessionDetail>(
       `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/session/${encodeURIComponent(id)}${at ? `?at=${at}` : ""}`
+    ),
+  // The live, registry-classified provenance verdict — "verified as <person>" / "key mismatch" / etc.
+  // Distinct from the self-verify field embedded in `session(...)`: this one resolves the committer email
+  // against the hub identity registry server-side (route: GET .../session/<id>/provenance in api.rs).
+  sessionProvenance: (owner: string, name: string, id: string, at?: string) =>
+    get<ProvenanceVerdict>(
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/session/${encodeURIComponent(id)}/provenance${at ? `?at=${at}` : ""}`
     ),
   diff: (owner: string, name: string, id: string, from: string, to: string) =>
     get<SessionDiff>(

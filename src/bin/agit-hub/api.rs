@@ -13,7 +13,7 @@ use agit::hub::{audit, auth, identity, kdf, mr, session as websession, store, to
 
 use crate::cli::{create_agent, issue_token, list_agents, repo_path};
 use crate::gitplumb::*;
-use crate::content::{api_compare, api_diff, api_raw, api_session, session_summary};
+use crate::content::{api_compare, api_diff, api_raw, api_session, provenance_verdict_json, session_self_provenance, session_summary};
 use crate::http::{Req, Resp};
 use crate::router::{audit_append, audit_deny, gate};
 use crate::scan::install_pre_receive;
@@ -271,6 +271,26 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         };
         let (root, seg, name, tail, query) =
             (ctx.root().to_path_buf(), meta.seg().to_string(), meta.name.clone(), tail.to_string(), req.query().to_string());
+
+        // agent/<owner>/<name>/session/<id>/provenance — the REGISTRY-CLASSIFIED verdict ("verified as
+        // <person>" / "key mismatch"), which needs the store and so can't run inside the sync content
+        // helper. The git self-verify runs on the blocking pool; the registry lookup + attribution runs
+        // here, async, against `ctx.store`. See `classify_read_status`.
+        if let Some(id) = tail.strip_suffix("/provenance") {
+            let id = id.to_string();
+            let self_status = tokio::task::spawn_blocking(move || {
+                let repo = repo_path(&root, &seg, &name);
+                has_head(&repo).then(|| session_self_provenance(&repo, &id, &query)).flatten()
+            })
+            .await
+            .unwrap();
+            let Some(self_status) = self_status else {
+                return Resp::err(404, "not found");
+            };
+            let classified = classify_read_status(&ctx.store, self_status).await;
+            return Resp::json(provenance_verdict_json(&classified));
+        }
+
         return tokio::task::spawn_blocking(move || {
             let repo = repo_path(&root, &seg, &name);
             if !has_head(&repo) {
@@ -374,6 +394,32 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         "DELETE" => api_delete_agent(ctx, caller, owner, after, req.query()).await,
         _ => Resp::text(405, "method not allowed"),
     }
+}
+
+/// Attribute a self-verified session against the identity registry — the server-side "verified as
+/// <person>" step, run live on the SESSION read path (the push-time equivalent lives in `prov.rs`).
+///
+/// A `Verified { email, .. }` self-status is upgraded by resolving the committer email to a VERIFIED
+/// account (`store.get_identity_key_by_email` is verified-only after the email-verify wave, so an
+/// unverified or squatted email resolves to nothing) and comparing keys:
+///   - registered key EQUALS the provenance pubkey  → `VerifiedAs` (a real, verified account),
+///   - registered but the key DIFFERS               → `KeyMismatch` (a forgery — never rendered green),
+///   - no verified account for that email           → `SignedUnregistered`.
+/// The hub IS the registry, so it compares against its own stored key (`trusted_pubkey = None`; TOFU is
+/// the client's job). Any non-`Verified` self-status (Unsigned / ContentTampered / BadSignature) passes
+/// through unchanged — there is nothing to attribute.
+async fn classify_read_status(
+    store: &store::Store,
+    self_status: agit::commands::ProvenanceStatus,
+) -> agit::commands::ProvenanceStatus {
+    let agit::commands::ProvenanceStatus::Verified { email, .. } = &self_status else {
+        return self_status;
+    };
+    let registered = store.get_identity_key_by_email(email).await.map(|k| agit::commands::RegisteredIdentity {
+        username: k.username,
+        ed25519_pub: k.ed25519_pub,
+    });
+    agit::commands::attribute_with_registry(self_status, registered, None)
 }
 
 // ── Authentication ──
@@ -4831,5 +4877,132 @@ mod tests {
         let ok = api_admin_verify_email(&ctx, &caller("root", true), "alice").await;
         assert_eq!(ok.status, 200);
         assert!(ctx.store.user("alice").await.unwrap().email_verified);
+    }
+
+    // ── live registry attribution on the SESSION read path (classify_read_status) ──
+    //
+    // These pin the property the whole wave exists for: the surfaced session verdict is classified
+    // against the identity registry, not just self-verified, and a forgery (KeyMismatch) is NEVER
+    // upgraded to a positive attribution. They exercise `classify_read_status` — the exact async step
+    // the `session/<id>/provenance` handler runs against `ctx.store` — with a self-verified `Verified`
+    // as its input (the git self-verify is covered by `content.rs`/the client; here the store is under
+    // test). The email-verify tie-in is exercised directly: `get_identity_key_by_email` is verified-only.
+
+    use agit::commands::ProvenanceStatus as PS;
+
+    /// Enroll `user`'s signing key against `email`, optionally verifying the email. Mirrors the enroll +
+    /// verify path a real account goes through, so attribution is gated exactly as production gates it.
+    async fn enroll_identity(ctx: &Ctx, user: &str, ed25519_pub: &str, email: &str, verified: bool) {
+        add_user(ctx, user, "a-long-enough-password", false).await;
+        ctx.store
+            .upsert_identity_key(store::IdentityKey {
+                username: user.into(),
+                ed25519_pub: ed25519_pub.into(),
+                x25519_pub: "b".repeat(64),
+                epoch: 0,
+                enroll_sig: "sig".into(),
+                created: store::now_iso(),
+                revoked: None,
+                email: email.into(),
+            })
+            .await
+            .unwrap();
+        if verified {
+            ctx.store.set_email_verified(user, true).await.unwrap();
+        }
+    }
+
+    fn verified_self(email: &str, pubkey: &str) -> PS {
+        PS::Verified { aid: "agt_01".into(), email: email.into(), pubkey: pubkey.into() }
+    }
+
+    /// VERIFIED_AS: the committer email maps (verified) to an account whose registered ed25519 key EQUALS
+    /// the provenance pubkey — a real, verified account. The verdict carries the attributed username.
+    #[tokio::test]
+    async fn read_classifies_verified_as_on_key_match() {
+        let (_d, ctx) = harness().await;
+        let key = "aa".repeat(32);
+        enroll_identity(&ctx, "alice", &key, "alice@corp.com", true).await;
+
+        let out = classify_read_status(&ctx.store, verified_self("alice@corp.com", &key)).await;
+        match out {
+            PS::VerifiedAs { username, email, pubkey, .. } => {
+                assert_eq!(username, "alice");
+                assert_eq!(email, "alice@corp.com");
+                assert_eq!(pubkey, key);
+            }
+            other => panic!("expected VerifiedAs, got {other:?}"),
+        }
+        // And the JSON the SPA reads carries the positive word + username, never "verified".
+        let v = provenance_verdict_json(&classify_read_status(&ctx.store, verified_self("alice@corp.com", &key)).await);
+        assert_eq!(v["status"], "verified_as");
+        assert_eq!(v["username"], "alice");
+    }
+
+    /// KEY_MISMATCH (the anti-forgery property): the email maps to a registered, verified account whose
+    /// key DIFFERS from the signing key. It must classify as KeyMismatch — never VerifiedAs — and the
+    /// rendered word must be "key_mismatch", never "verified"/"verified_as".
+    #[tokio::test]
+    async fn read_classifies_key_mismatch_and_never_verified() {
+        let (_d, ctx) = harness().await;
+        let registered = "aa".repeat(32);
+        let forged = "bb".repeat(32); // signed by a DIFFERENT key than alice's registered one
+        enroll_identity(&ctx, "alice", &registered, "alice@corp.com", true).await;
+
+        let out = classify_read_status(&ctx.store, verified_self("alice@corp.com", &forged)).await;
+        match &out {
+            PS::KeyMismatch { email, claimed_username, .. } => {
+                assert_eq!(email, "alice@corp.com");
+                assert_eq!(claimed_username, "alice");
+            }
+            other => panic!("a forgery must be KeyMismatch, got {other:?}"),
+        }
+        let v = provenance_verdict_json(&out);
+        assert_eq!(v["status"], "key_mismatch", "a forgery is NEVER rendered green");
+        assert_ne!(v["status"], "verified");
+        assert_ne!(v["status"], "verified_as");
+    }
+
+    /// SIGNED_UNREGISTERED: a validly self-signed session whose committer email maps to NO account
+    /// degrades to signed-unregistered — a signature with no hub attribution, never a false "verified as".
+    #[tokio::test]
+    async fn read_classifies_signed_unregistered_when_email_unknown() {
+        let (_d, ctx) = harness().await;
+        let key = "aa".repeat(32);
+        // Nobody enrolled nobody@corp.com.
+        let out = classify_read_status(&ctx.store, verified_self("nobody@corp.com", &key)).await;
+        assert!(matches!(out, PS::SignedUnregistered { .. }), "unknown email → signed_unregistered, got {out:?}");
+        let v = provenance_verdict_json(&out);
+        assert_eq!(v["status"], "signed_unregistered");
+    }
+
+    /// The email-verify tie-in: an UNVERIFIED email (a registered key exists, but the account never
+    /// verified the address) is SIGNED_UNREGISTERED, NOT verified_as — even though the key would match.
+    /// This inherits `get_identity_key_by_email`'s verified-only gate; a squatter can't mint attribution.
+    #[tokio::test]
+    async fn read_unverified_email_is_signed_unregistered_not_verified_as() {
+        let (_d, ctx) = harness().await;
+        let key = "aa".repeat(32);
+        // alice enrolls the matching key but never verifies the email.
+        enroll_identity(&ctx, "alice", &key, "alice@corp.com", false).await;
+
+        let out = classify_read_status(&ctx.store, verified_self("alice@corp.com", &key)).await;
+        assert!(
+            matches!(out, PS::SignedUnregistered { .. }),
+            "an unverified email must NOT attribute even on a key match, got {out:?}"
+        );
+        let v = provenance_verdict_json(&out);
+        assert_eq!(v["status"], "signed_unregistered");
+    }
+
+    /// A non-`Verified` self-status (nothing to attribute) passes through untouched: no false upgrade,
+    /// no store lookup that could change the verdict. Unsigned stays unsigned even with a live registry.
+    #[tokio::test]
+    async fn read_passes_non_verified_status_through() {
+        let (_d, ctx) = harness().await;
+        let out = classify_read_status(&ctx.store, PS::Unsigned).await;
+        assert!(matches!(out, PS::Unsigned));
+        let out = classify_read_status(&ctx.store, PS::BadSignature).await;
+        assert!(matches!(out, PS::BadSignature));
     }
 }

@@ -74,17 +74,59 @@ pub(crate) fn api_session(repo: &Path, id: &str, query: &str) -> Resp {
 /// loaded at). Reads the committed `<id>.agit.json` sidecar, self-verifies the signature against the
 /// transcript, and reports a legible verdict. A session with no sidecar/provenance is `unsigned` — never
 /// an error, matching the client's graceful-degradation contract.
+///
+/// This is the PURE SELF-VERIFY path (signature + content intact), with no registry call — the honest
+/// answer for a sync caller with no store. The registry-attributed verdict ("verified as <person>" /
+/// "key mismatch") is produced by the async read path in `api.rs`, which resolves the committer email
+/// against the identity registry and re-classifies via [`provenance_self_status`] +
+/// [`agit::commands::attribute_with_registry`].
 fn provenance_verdict(repo: &Path, path: &str, jsonl: &str, at: Option<&str>) -> serde_json::Value {
-    let sidecar_path = match path.strip_suffix(".jsonl") {
-        Some(stem) => format!("{stem}.agit.json"),
-        None => return serde_json::json!({ "status": "unsigned" }),
+    provenance_verdict_json(&provenance_self_status(repo, path, jsonl, at))
+}
+
+/// Self-verify a session's provenance (signature + content-digest) against its committed `<id>.agit.json`
+/// sidecar, at the same revision the transcript was loaded at. A missing sidecar/provenance yields
+/// [`agit::commands::ProvenanceStatus::Unsigned`] — never an error. This is the pure, registry-free step
+/// the async read path then attributes against the identity registry.
+pub(crate) fn provenance_self_status(
+    repo: &Path,
+    path: &str,
+    jsonl: &str,
+    at: Option<&str>,
+) -> agit::commands::ProvenanceStatus {
+    let Some(stem) = path.strip_suffix(".jsonl") else {
+        return agit::commands::ProvenanceStatus::Unsigned;
     };
+    let sidecar_path = format!("{stem}.agit.json");
     let prov = load_session(repo, &sidecar_path, at)
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|v| serde_json::from_value::<agit::commands::Provenance>(v.get("provenance")?.clone()).ok());
-    let status = agit::commands::verify_provenance(jsonl, prov.as_ref());
+    agit::commands::verify_provenance(jsonl, prov.as_ref())
+}
+
+/// Resolve a session by id, load its transcript at `at` (from the `?at=<rev>` query), and self-verify its
+/// provenance. `None` only when the session id or revision does not exist (a 404) — a session that simply
+/// has no signature returns `Some(Unsigned)`. The async read path calls this on the blocking pool (it
+/// shells out to git), then attributes the result against the registry off-thread.
+pub(crate) fn session_self_provenance(
+    repo: &Path,
+    id: &str,
+    query: &str,
+) -> Option<agit::commands::ProvenanceStatus> {
+    let r = session_refs(repo).into_iter().find(|r| r.id == id)?;
+    let at = param(query, "at");
+    let jsonl = load_session(repo, &r.path, at.as_deref())?;
+    Some(provenance_self_status(repo, &r.path, &jsonl, at.as_deref()))
+}
+
+/// Render a [`agit::commands::ProvenanceStatus`] to the JSON verdict the SPA reads: a one-word `status`
+/// (`verified` / `verified_as` / `key_mismatch` / `signed_unregistered` / `unsigned` / `content_tampered`
+/// / `bad_signature`), a human `summary`, and the fields specific to that verdict. This is the SINGLE
+/// word-mapping shared by the sync self-verify helper and the async registry-classified read path, so a
+/// `KeyMismatch` (a forgery) can NEVER be emitted as `verified`/`verified_as` from either path.
+pub(crate) fn provenance_verdict_json(status: &agit::commands::ProvenanceStatus) -> serde_json::Value {
     use agit::commands::ProvenanceStatus as S;
-    let (word, extra) = match &status {
+    let (word, extra) = match status {
         S::Verified { aid, email, pubkey } => (
             "verified",
             serde_json::json!({ "aid": aid, "email": email, "pubkey": pubkey }),
@@ -95,9 +137,9 @@ fn provenance_verdict(repo: &Path, path: &str, jsonl: &str, at: Option<&str>) ->
             serde_json::json!({ "recorded_digest": recorded, "actual_digest": actual }),
         ),
         S::BadSignature => ("bad_signature", serde_json::json!({})),
-        // The registry-classified variants are not produced by the pure self-verify used on this sync
-        // read path today, but map them honestly anyway: a KeyMismatch (a forgery) must NEVER render as
-        // "verified", so that wiring the registry in here later cannot silently turn a forgery green.
+        // The registry-classified variants come from the async read path (`api.rs`), which attributes a
+        // self-verified session against the identity registry. A KeyMismatch (a forgery) is mapped to its
+        // OWN word — never "verified"/"verified_as" — so no path can turn a forgery green.
         S::VerifiedAs { username, aid, email, pubkey } => (
             "verified_as",
             serde_json::json!({ "username": username, "aid": aid, "email": email, "pubkey": pubkey }),
