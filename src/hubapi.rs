@@ -151,6 +151,13 @@ impl HubEndpoint {
         self.get_opt(&format!("/api/orgs/{org}"))
     }
 
+    /// `GET /api/agent/<owner>/<name>` — an agent's detail, including its ACL `members` (the axis-1
+    /// authorized-fetcher grants). `Ok(None)` on 404 (unknown agent, or one the caller cannot see).
+    /// Used by `agit hub doctor` to reconcile the ACL against the keybox reader set.
+    pub fn get_agent(&self, owner: &str, name: &str) -> Result<Option<serde_json::Value>> {
+        self.get_opt(&format!("/api/agent/{owner}/{name}"))
+    }
+
     /// `GET /api/orgs/<org>/kek/gens` — `{ gens: [...], current: G }`: the generations the caller holds
     /// an envelope for, plus the org's active generation.
     pub fn kek_gens(&self, org: &str) -> Result<serde_json::Value> {

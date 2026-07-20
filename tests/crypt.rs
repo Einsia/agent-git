@@ -273,29 +273,29 @@ fn export_import_roundtrips_key_and_second_home_decrypts() {
     assert!(decrypted.contains(MARKER), "the imported key must decrypt to the original plaintext");
 }
 
-// Test 15 — encrypting a store that has a `hub` remote requires --yes in non-interactive mode.
+// Test 15 — a store with a `hub` remote whose hub cannot be reached/confirmed must NOT silently fall back
+// to a machine-only key on zero-config `agit a encrypt` (teammates could never decrypt it). It refuses
+// with an actionable error, WITH OR WITHOUT --yes, and never wires the filter. (The legitimate no-hub
+// machine-global path — encrypt --yes on a remote-less store proceeds — is covered by the tests below,
+// e.g. checkout_fails_loudly_without_the_key.)
 #[test]
-fn hub_remote_requires_confirmation() {
+fn hub_remote_encrypt_refuses_silent_machine_global() {
     let r = Repo::new();
-    // Give the store a `hub` remote (the repo's convention).
+    // A `hub` remote is present, but the host is unreachable (owner resolves, org-ness cannot be confirmed).
     assert_eq!(r.git_agent(&["remote", "add", "hub", "https://example.invalid/agent.git"]).0, 0);
 
-    // Non-interactive without --yes: the gate must refuse (nonzero) and NOT enable.
-    let (code, _out, err) = r.agit(&["a", "encrypt"]);
-    assert_ne!(code, 0, "a hub-remote store must not enable without confirmation");
-    assert!(
-        err.contains("hub") || err.contains("confirmation") || err.contains("--yes"),
-        "the refusal must explain the hub gate: {err}"
-    );
-    assert!(
-        r.config_get("filter.agit-crypt.clean").is_empty(),
-        "the filter must not have been wired on refusal"
-    );
-
-    // With --yes it proceeds.
-    let (code, _o, err) = r.agit(&["a", "encrypt", "--yes"]);
-    assert_eq!(code, 0, "encrypt --yes should proceed past the hub gate: {err}");
-    assert!(!r.config_get("filter.agit-crypt.clean").is_empty());
+    for args in [&["a", "encrypt"][..], &["a", "encrypt", "--yes"][..]] {
+        let (code, _out, err) = r.agit(args);
+        assert_ne!(code, 0, "a hub-remote store must not silently machine-global encrypt ({args:?}): {err}");
+        assert!(
+            err.contains("hub") || err.contains("team") || err.contains("confirm"),
+            "the refusal must explain the hub/team gate ({args:?}): {err}"
+        );
+        assert!(
+            r.config_get("filter.agit-crypt.clean").is_empty(),
+            "the filter must not have been wired on refusal ({args:?})"
+        );
+    }
 }
 
 // Test 16 — with the key removed, checkout of an encrypted path fails loudly (required=true) rather

@@ -71,8 +71,19 @@ fn scan_targets(root: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
         .filter_entry(|e| e.file_name() != ".git")
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
+        .filter(|e| !is_self_encrypted_artifact(&e.path().strip_prefix(root).unwrap_or(e.path()).to_string_lossy()))
         .map(|e| e.path().to_path_buf())
         .collect()
+}
+
+/// The committed keybox (`.agit/keybox.jsonl`) is wrap-ciphertext BY DESIGN — one-shot X25519/AEAD
+/// envelopes of the content key, already excluded from the crypt filter. Its base64 wraps are
+/// high-entropy and would otherwise trip the `high-entropy-string` rule on EVERY keybox-encrypted store,
+/// blocking commit and push (client hook + hub pre-receive), exactly as an AGITCRYPT ciphertext blob
+/// would if the scan did not already skip it. So the secret scan skips this self-encrypting artifact.
+fn is_self_encrypted_artifact(rel: &str) -> bool {
+    let rel = rel.replace('\\', "/");
+    rel == crate::keybox::KEYBOX_REL
 }
 
 /// Findings in the git INDEX — what a commit is about to write, not what sits in the working tree.
@@ -89,6 +100,11 @@ fn staged_findings(root: &Path, allow: &scan::Allowlist) -> Vec<(String, scan::F
     );
     let mut v = Vec::new();
     for name in out.split('\0').filter(|s| !s.is_empty()) {
+        // The committed keybox is wrap-ciphertext (see is_self_encrypted_artifact) — never a plaintext
+        // finding; skip it exactly as the binary/ciphertext branch below skips an AGITCRYPT blob.
+        if is_self_encrypted_artifact(name) {
+            continue;
+        }
         let (code, content) = scope::git_in_status(root, &["show", &format!(":{name}")]);
         if code != 0 {
             continue; // can't extract this blob (very rare), skip rather than abort
@@ -1759,7 +1775,79 @@ pub fn agent_encrypt(args: &[String]) -> Result<i32> {
         return crypt_enable_keybox(&home, &readers, public, yes);
     }
 
-    crypt_enable(&home, yes)
+    // Zero-config (Wave 4): no --team/--readers/--public. The DEFAULT reader set now depends on the
+    // session's owning scope — team-readable (not public) under an org, explicit for a personal owner.
+    crypt_enable_zero_config(&home, yes)
+}
+
+/// The reader set a no-flag `agit a encrypt` defaults to, decided from the session's owning scope. Pure
+/// (no I/O) so the zero-config POLICY is unit-testable: the network probes that produce its inputs live
+/// in [`crypt_enable_zero_config`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DefaultTarget {
+    /// No hub remote at all: the machine-global no-hub encryption path (unchanged Wave-1/2 behavior).
+    MachineGlobal,
+    /// The owning scope is an ORG the hub recognizes: wrap the CK under its Team KEK (a team stanza), so
+    /// the zero-config result is "readable to the team, not the public". Carries the org name.
+    Team(String),
+    /// A personal owner (not an org): there is no team to default to, so the user must name readers.
+    /// Carries the owner for the message.
+    RequireExplicit(String),
+}
+
+/// Decide the zero-config default reader set. `owner` is `None` when the store has no hub remote; `is_org`
+/// is whether the hub recognizes that owner as an org the caller can see. Team when org, explicit when
+/// personal, machine-global when there is no hub at all.
+fn default_target(owner: Option<&str>, is_org: bool) -> DefaultTarget {
+    match owner {
+        None => DefaultTarget::MachineGlobal,
+        Some(o) if is_org => DefaultTarget::Team(o.to_string()),
+        Some(o) => DefaultTarget::RequireExplicit(o.to_string()),
+    }
+}
+
+/// `agit a encrypt` with NO --team/--readers/--public — the zero-config team default. Resolves the
+/// session's owning scope, then dispatches per [`default_target`]: a team stanza under the owning org
+/// (erroring actionably if the org has no Team KEK yet), an explicit-readers demand for a personal owner,
+/// or the machine-global path when there is no hub remote.
+fn crypt_enable_zero_config(home: &Path, yes: bool) -> Result<i32> {
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+    // No hub remote → the machine-global no-hub encryption path (there is no org to default to).
+    let owner = match owning_owner_of(&store) {
+        Ok(o) => o,
+        Err(_) => return crypt_enable(home, yes),
+    };
+    // Is the owning scope an org the hub recognizes (and the caller can see)? A member's GET returns the
+    // roster; a personal owner (or an unknown/invisible org) 404s → Ok(None). We have a hub remote (owner
+    // resolved), so a hub we cannot reach or authenticate to must NOT silently downgrade to a machine-only
+    // key that teammates could never decrypt — that would defeat the zero-config team default at exit 0.
+    // Refuse with an actionable error and let the user retry or choose the reader set explicitly.
+    let is_org = match crate::hubapi::HubEndpoint::resolve().and_then(|ep| ep.get_org(&owner)) {
+        Ok(org) => org.is_some(),
+        Err(e) => bail!(
+            "could not confirm whether `{owner}` is a team: the hub is unreachable or your login is \
+             not valid ({e:#}).\n\
+             \x20      Refusing to silently encrypt to a machine-only key your teammates cannot decrypt.\n\
+             \x20      Re-run once the hub is reachable, or choose the reader set explicitly:\n\
+             \x20        agit a encrypt --team            readable to your org's team\n\
+             \x20        agit a encrypt --readers <a,b>   wrap to specific people\n\
+             \x20        agit a encrypt --public          readable to anyone with the repo"
+        ),
+    };
+    match default_target(Some(&owner), is_org) {
+        // Team default: crypt_enable_keybox_team already errors actionably ("run agit hub team rekey")
+        // when the org has no Team KEK yet, so a zero-config encrypt never silently falls back.
+        DefaultTarget::Team(org) => crypt_enable_keybox_team(home, Some(&org), &[], false, yes),
+        DefaultTarget::RequireExplicit(o) => bail!(
+            "`{o}` is a personal account, not a team — there is no team reader set to default to.\n\
+             \x20      Name who can read this session explicitly:\n\
+             \x20        agit a encrypt --readers <a,b>   wrap the content key to specific people\n\
+             \x20        agit a encrypt --public          readable to anyone who has the repo\n\
+             \x20      (or `agit a encrypt --team` if `{o}` is actually an org you belong to)."
+        ),
+        DefaultTarget::MachineGlobal => crypt_enable(home, yes),
+    }
 }
 
 /// Print the two mandatory, non-negotiable warnings (req.5) before encryption does anything.
@@ -2177,6 +2265,38 @@ fn owner_from_url(url: &str) -> Result<String> {
     Ok(first.to_string())
 }
 
+/// Parse `(owner, name)` — the first two path segments — out of a hub remote URL. `name` has any `.git`
+/// suffix stripped. Errors clearly when the URL has no `<owner>/<name>` path.
+fn owner_and_name_from_url(url: &str) -> Result<(String, String)> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let path = rest
+        .split_once('/')
+        .map(|(_, p)| p)
+        .context("the hub remote URL has no `<owner>/<name>` path")?;
+    let mut segs = path.split('/').filter(|s| !s.is_empty());
+    let owner = segs.next().unwrap_or("").trim().to_string();
+    let name = segs.next().unwrap_or("").trim().trim_end_matches(".git").to_string();
+    if owner.is_empty() || name.is_empty() {
+        bail!("could not read `<owner>/<name>` from the hub remote URL");
+    }
+    Ok((owner, name))
+}
+
+/// The `(owner, name)` a store's primary hub remote points at.
+fn owner_and_name_of(store: &Path) -> Result<(String, String)> {
+    let primary = agent::primary_remote_name(store);
+    let remotes = agent::store_remotes(store);
+    let url = match primary {
+        Some(n) => remotes.into_iter().find(|(rn, _)| *rn == n).map(|(_, u)| u),
+        None => remotes.into_iter().next().map(|(_, u)| u),
+    }
+    .context(
+        "this session has no hub remote — `agit hub doctor` reconciles a pushed session's ACL against\n\
+         \x20      its keybox. Push it first (`agit a push`).",
+    )?;
+    owner_and_name_from_url(&url)
+}
+
 /// Obtain the unwrapped Team KEK for `(org, gen)`: the local cache first, else fetch the caller's OWN
 /// `team_keks` envelope from the hub and unwrap it with this machine's X25519 secret, caching the result.
 /// Fail-closed: a missing envelope (not a member, or the gen is not sealed to the caller) is an error.
@@ -2252,31 +2372,35 @@ fn seal_tk_to_members(
     Ok((envelopes, skipped))
 }
 
-/// `agit hub <team ...>` — hub-side operations that are not per-agent git.
+/// `agit hub <team ...|doctor>` — hub-side operations that are not per-agent git.
 pub fn hub_cmd(args: &[String]) -> Result<i32> {
     match args.first().map(|s| s.as_str()) {
         Some("team") => hub_team_cmd(&args[1..]),
+        Some("doctor") => hub_doctor(&args[1..]),
         Some(other) => {
             errln!("agit hub: unknown subcommand `{other}`");
-            errln!("  usage: agit hub team rekey <org>   ·   agit hub team sync <org>");
+            errln!("  usage: agit hub team rekey <org> [--rekey-all]  ·  team sync <org>  ·  doctor [--org <org>] [--check] [--fix]");
             Ok(2)
         }
         None => {
-            errln!("usage: agit hub team rekey <org>   ·   agit hub team sync <org>");
+            errln!("usage: agit hub team rekey <org> [--rekey-all]  ·  team sync <org>  ·  doctor [--org <org>] [--check] [--fix]");
             Ok(2)
         }
     }
 }
 
-/// `agit hub team <rekey|sync> <org>`.
+/// `agit hub team <rekey|sync> <org> [--rekey-all]`.
 fn hub_team_cmd(args: &[String]) -> Result<i32> {
     let sub = args.first().map(|s| s.as_str());
-    let org = args.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
+    // The org is the first bare positional (so `rekey --rekey-all acme` and `rekey acme --rekey-all`
+    // both work); `--rekey-all` is the labeled O(sessions) panic button.
+    let org = args.iter().skip(1).find(|s| !s.starts_with('-')).map(|s| s.trim()).filter(|s| !s.is_empty());
+    let rekey_all = args.iter().any(|a| a == "--rekey-all");
     match (sub, org) {
-        (Some("rekey"), Some(o)) => hub_team_rekey(o),
+        (Some("rekey"), Some(o)) => hub_team_rekey(o, rekey_all),
         (Some("sync"), Some(o)) => hub_team_sync(o),
         (Some("rekey"), None) => {
-            errln!("usage: agit hub team rekey <org>");
+            errln!("usage: agit hub team rekey <org> [--rekey-all]");
             Ok(2)
         }
         (Some("sync"), None) => {
@@ -2284,7 +2408,7 @@ fn hub_team_cmd(args: &[String]) -> Result<i32> {
             Ok(2)
         }
         _ => {
-            errln!("agit hub team: rekey <org>  ·  sync <org>");
+            errln!("agit hub team: rekey <org> [--rekey-all]  ·  sync <org>");
             Ok(2)
         }
     }
@@ -2294,7 +2418,7 @@ fn hub_team_cmd(args: &[String]) -> Result<i32> {
 /// seal it to EVERY current member's X25519 pubkey, publish the envelopes, and advance current_kek_gen.
 /// O(members). This is the removal/rotation path: a removed member is simply absent from the new roster,
 /// so gets no new-gen envelope and cannot open content sealed under the new generation.
-fn hub_team_rekey(org: &str) -> Result<i32> {
+fn hub_team_rekey(org: &str, rekey_all: bool) -> Result<i32> {
     let home = scope::agit_home()?;
     let ep = crate::hubapi::HubEndpoint::resolve()?;
     let current = ep
@@ -2323,7 +2447,119 @@ fn hub_team_rekey(org: &str) -> Result<i32> {
         outln!("  skipped (no enrolled identity key): {}", skipped.join(", "));
     }
     outln!("  a removed member (absent from the roster) gets no gen-{next} envelope and cannot open new content.");
+
+    // `--rekey-all`: the labeled O(sessions) panic button. Rotate the CK of every LOCALLY-available
+    // team-encrypted session bound to this org and re-wrap under the new TK. Plain rekey (no flag) is the
+    // TK-generation-only Wave-3 behavior — a removed member is already locked out of new content.
+    if rekey_all {
+        let failed = rekey_local_team_sessions(&home, org, next, &tk)?;
+        if failed > 0 {
+            errln!(
+                "  ⚠ {failed} local session(s) could NOT be rekeyed (each left UNCHANGED on its old key —\n\
+                 \x20     no corruption). Their new content is not yet under the rotated team key. Fix the\n\
+                 \x20     cause (often a TOFU mismatch: `agit identity pin <user> --repin`) and re-run\n\
+                 \x20     `agit hub team rekey {org} --rekey-all`."
+            );
+            return Ok(1);
+        }
+    }
     Ok(0)
+}
+
+/// `--rekey-all` bulk form: rotate the content key of every LOCALLY-available team-encrypted session
+/// bound to `org`, re-wrapping under the freshly-rotated TK (`new_gen`/`tk`) and committing each. Reports
+/// which sessions were rekeyed and warns that sessions NOT present on this machine were not touched (they
+/// rekey on their own next local `agit a rekey`). Enumerates via the machine's agent registry.
+fn rekey_local_team_sessions(home: &Path, org: &str, new_gen: i64, tk: &[u8; 32]) -> Result<usize> {
+    let agents = agent::list().unwrap_or_default();
+    let mut rekeyed: Vec<(String, String, u32)> = Vec::new();
+    let mut failed = 0usize;
+    for a in &agents {
+        // Only sessions whose CURRENT keyring generation carries a team stanza for THIS org qualify.
+        let Some(kp) = crate::crypt::repo_keyring_path_from(&a.store) else { continue };
+        let Ok(Some(ring)) = crate::crypt::load_keyring_at(&kp) else { continue };
+        let stanzas = crate::keybox::read_keybox(&a.store).unwrap_or_default();
+        let bound = stanzas
+            .iter()
+            .any(|s| matches!(s, crate::keybox::Stanza::Team(t) if t.org == org && t.kid == ring.current));
+        if !bound {
+            continue;
+        }
+        match rekey_one_team_session(home, &a.store, org, new_gen, tk) {
+            Ok(new_kid) => rekeyed.push((a.name.clone(), a.aid.clone(), new_kid)),
+            Err(e) => {
+                failed += 1;
+                errln!("  ⚠ could not rekey {} ({}): {e:#}", a.name, a.aid);
+            }
+        }
+    }
+    if rekeyed.is_empty() {
+        outln!("  --rekey-all: no locally-available team session bound to {org} to rotate.");
+    } else {
+        outln!("  --rekey-all: rotated the content key of {} local session(s) under gen {new_gen}:", rekeyed.len());
+        for (name, aid, kid) in &rekeyed {
+            outln!("      {name} ({aid}) → kid {kid}");
+        }
+    }
+    outln!(
+        "  ⚠ sessions NOT present on this machine were NOT rekeyed — they rotate on their next local\n\
+         \x20     `agit a rekey` (or a later `--rekey-all` run on the machine that has them)."
+    );
+    Ok(failed)
+}
+
+/// Rotate ONE team-encrypted session's CK and re-wrap: mint CK', bump the repo-local keyring, RETAIN every
+/// old stanza (past readers keep past access, forward-only), then append a team stanza under
+/// `(org, new_gen, tk)` at the new kid plus re-wrap CK' to the session's current individual readers and
+/// public flag. Commits only the keybox line. Returns the new kid. Other orgs' team stanzas are NOT
+/// re-emitted here (their TK is not in hand); they rotate on that org's own `--rekey-all`.
+fn rekey_one_team_session(home: &Path, store: &Path, org: &str, new_gen: i64, tk: &[u8; 32]) -> Result<u32> {
+    let kp = store_keyring_path(store)?;
+    let existing = crate::keybox::read_keybox(store)?;
+    let ring = crate::crypt::load_keyring_at(&kp)?
+        .context("this team session has no repo-local keyring to rotate")?;
+    let cur_kid = ring.current;
+    let readers = crate::keybox::readers_at(&existing, cur_kid);
+    let keep_public = crate::keybox::is_public_at(&existing, cur_kid);
+
+    let _lock = crate::session::lock_store(store)?;
+
+    // Resolve EVERY individual reader's key BEFORE touching the keyring. resolve_recipient can bail (a TOFU
+    // key mismatch, an unreachable hub); if that happened after rotate_keyring_at, the keyring would sit at
+    // a new kid with no matching keybox stanza — content sealed under it would be unreadable by everyone,
+    // author included. Doing all the fallible work first means a failure aborts with the session UNCHANGED.
+    let reader_keys: Vec<(&String, [u8; 32])> = readers
+        .iter()
+        .map(|r| {
+            crate::keybox::resolve_recipient(home, r, None, false)
+                .with_context(|| format!("re-wrapping CK' to reader `{r}`"))
+                .map(|k| (r, k))
+        })
+        .collect::<Result<_>>()?;
+
+    // All recipients resolved — from here on only local, effectively-infallible work (RNG + AEAD + an
+    // atomic keybox write). Mint CK', rotate the keyring, then seal the full stanza set under the new kid.
+    let ck_prime = crate::crypt::random_master()?;
+    let new_kid = crate::crypt::rotate_keyring_at(&kp, ck_prime)?;
+
+    let mut stanzas = existing;
+    stanzas.push(crate::keybox::team_stanza(&ck_prime, new_kid, org, new_gen, tk)?);
+    if keep_public {
+        stanzas.push(crate::keybox::public_stanza(&ck_prime, new_kid));
+    }
+    for (r, key) in &reader_keys {
+        stanzas.push(crate::keybox::user_stanza(&ck_prime, new_kid, r, 0, key)?);
+    }
+    crate::keybox::write_keybox(store, &stanzas)?;
+
+    let _ = scope::git_in_status(store, &["add", "--", ".agit/keybox.jsonl"]);
+    if scope::git_in_status(store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(
+            store,
+            "chore(crypt): team rekey-all rotate session content key\n\nRotates CK and re-wraps under the new team-KEK generation; new commits seal under the new key-id.",
+        )?;
+    }
+    Ok(new_kid)
 }
 
 /// `agit hub team sync <org>` — JOIN: seal the CURRENT-gen TK to the org's members (no gen bump), so a
@@ -2369,6 +2605,13 @@ fn org_current_tk_gen(ep: &crate::hubapi::HubEndpoint, org: &str) -> Result<i64>
         .get("current")
         .and_then(|c| c.as_i64())
         .unwrap_or(0);
+    require_tk_gen(current, org)
+}
+
+/// Validate an org's reported current Team-KEK generation: a usable gen is `>= 1`; a `0`/absent gen means
+/// the org has never rotated a TK, which is an ACTIONABLE error (run `agit hub team rekey`) rather than a
+/// silent fall-back to owner-only or public. Pure so the zero-config/team no-TK path is unit-testable.
+fn require_tk_gen(current: i64, org: &str) -> Result<i64> {
     if current < 1 {
         bail!(
             "org `{org}` has no team KEK yet.\n\
@@ -2376,6 +2619,243 @@ fn org_current_tk_gen(ep: &crate::hubapi::HubEndpoint, org: &str) -> Result<i64>
         );
     }
     Ok(current)
+}
+
+// ─────────────────────── hub doctor (Wave 4): axis-1 (ACL) vs axis-2 (keybox) drift reconciliation ───────────────────────
+
+/// The two drift classes `agit hub doctor` reconciles for one session. Pure data, produced by
+/// [`reconcile`]: a fully authorized-but-undecryptable member, and a decryptable-but-unauthorized reader.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DoctorDrift {
+    /// Authorized to FETCH (org member / ACL reader) but has NO keybox stanza — cannot decrypt.
+    member_without_stanza: Vec<String>,
+    /// Holds a keybox `user` stanza but is NOT an authorized fetcher — the hub refuses them the bytes.
+    stanza_without_membership: Vec<String>,
+}
+
+impl DoctorDrift {
+    fn has_drift(&self) -> bool {
+        !self.member_without_stanza.is_empty() || !self.stanza_without_membership.is_empty()
+    }
+}
+
+/// Reconcile axis-1 (who may fetch) against axis-2 (who can decrypt) for one session. `authorized` is the
+/// folded fetch set (org members ∪ agent ACL readers ∪ personal owner). `user_readers` are the keybox
+/// `user`-stanza names; `team_covered` are the org members a `team` stanza covers; `public` is whether a
+/// public stanza makes the CK readable to anyone who has the repo. Pure — no I/O — so the reconciliation
+/// policy is unit-testable independently of the hub.
+fn reconcile(
+    authorized: &std::collections::BTreeSet<String>,
+    user_readers: &std::collections::BTreeSet<String>,
+    team_covered: &std::collections::BTreeSet<String>,
+    public: bool,
+) -> DoctorDrift {
+    // A public session hands the CK to anyone with the repo, so every authorized fetcher can decrypt →
+    // no member-without-stanza. Otherwise coverage is the union of individual + team coverage.
+    let covered: std::collections::BTreeSet<String> = if public {
+        authorized.clone()
+    } else {
+        user_readers.union(team_covered).cloned().collect()
+    };
+    let mut member_without_stanza: Vec<String> = authorized.difference(&covered).cloned().collect();
+    let mut stanza_without_membership: Vec<String> = user_readers.difference(authorized).cloned().collect();
+    member_without_stanza.sort();
+    stanza_without_membership.sort();
+    DoctorDrift { member_without_stanza, stanza_without_membership }
+}
+
+/// `agit hub doctor [--org <org>] [--check] [--fix]` — reconcile axis-1 authorization (hub ACL / org
+/// membership) against axis-2 confidentiality (keybox stanzas). Read-only by default. `--org` audits
+/// every LOCALLY-available session bound to that org; the default is the current session. `--check` exits
+/// non-zero when drift remains (a CI/user gate). `--fix` `readers add`s the missing members but NEVER
+/// auto-removes readers (that advice is printed for the user to act on explicitly).
+fn hub_doctor(args: &[String]) -> Result<i32> {
+    let home = scope::agit_home()?;
+    let check = args.iter().any(|a| a == "--check");
+    let fix = args.iter().any(|a| a == "--fix");
+    let org_filter = flag_value(args, "--org");
+
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+
+    let targets: Vec<agent::Agent> = match &org_filter {
+        Some(org) => {
+            let v: Vec<agent::Agent> = agent::list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| owning_owner_of(&a.store).ok().as_deref() == Some(org.as_str()))
+                .collect();
+            if v.is_empty() {
+                outln!("hub doctor: no locally-available session bound to org `{org}` to audit.");
+            }
+            v
+        }
+        None => vec![agent::resolve(None)?],
+    };
+
+    let mut any_drift = false;
+    for a in &targets {
+        match doctor_one(&home, &ep, a, fix) {
+            Ok(has_drift) => any_drift |= has_drift,
+            Err(e) => {
+                errln!("hub doctor: {} ({}): {e:#}", a.name, a.aid);
+                any_drift = true; // an audit that could not complete is not "clean"
+            }
+        }
+    }
+
+    // --check gates on drift; without it, doctor is a report and exits 0.
+    if check && any_drift {
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+/// Audit ONE session: derive the folded fetch set from the hub, the keybox coverage from disk, reconcile
+/// them, print a report, and (with `fix`) `readers add` the missing members. Returns whether drift
+/// REMAINS after any fix (so `--check` can gate on it).
+fn doctor_one(home: &Path, ep: &crate::hubapi::HubEndpoint, a: &agent::Agent, fix: bool) -> Result<bool> {
+    use std::collections::BTreeSet;
+    let store = &a.store;
+    let stanzas = crate::keybox::read_keybox(store)?;
+    outln!("── hub doctor: {} ({}) ──", a.name, a.aid);
+    if stanzas.is_empty() {
+        outln!("  not keybox-encrypted — no confidentiality axis to reconcile.");
+        return Ok(false);
+    }
+    let (owner, name) = owner_and_name_of(store)?;
+
+    // axis-1: the folded fetch set = agent ACL members ∪ (org members when org-owned) ∪ personal owner.
+    let mut authorized: BTreeSet<String> = BTreeSet::new();
+    let agent_json = ep
+        .get_agent(&owner, &name)?
+        .with_context(|| format!("cannot read agent `{owner}/{name}` from the hub (is it pushed, and are you a reader?)"))?;
+    if let Some(ms) = agent_json.get("members").and_then(|m| m.as_array()) {
+        for m in ms {
+            if let Some(u) = m.get("username").and_then(|u| u.as_str()) {
+                authorized.insert(u.to_string());
+            }
+        }
+    }
+    let org_json = ep.get_org(&owner)?;
+    let is_org = org_json.is_some();
+    let mut org_members: BTreeSet<String> = BTreeSet::new();
+    if let Some(org_json) = &org_json {
+        if let Some(ms) = org_json.get("members").and_then(|m| m.as_array()) {
+            for m in ms {
+                if let Some(u) = m.get("username").and_then(|u| u.as_str()) {
+                    org_members.insert(u.to_string());
+                    authorized.insert(u.to_string());
+                }
+            }
+        }
+    } else {
+        // A personal owner is themselves an authorized fetcher; an org owner name is not a user.
+        authorized.insert(owner.clone());
+    }
+
+    // axis-2: keybox coverage at the CURRENT kid (fall back to the highest stanza kid when there is no
+    // local keyring, e.g. an unrelated machine auditing via --org).
+    let cur_kid = crate::crypt::repo_keyring_path_from(store)
+        .and_then(|p| crate::crypt::load_keyring_at(&p).ok().flatten())
+        .map(|r| r.current)
+        .unwrap_or_else(|| stanzas.iter().map(|s| s.kid()).max().unwrap_or(0));
+    let user_readers: BTreeSet<String> = crate::keybox::readers_at(&stanzas, cur_kid).into_iter().collect();
+    let public = crate::keybox::is_public_at(&stanzas, cur_kid);
+    let teams = crate::keybox::teams_at(&stanzas, cur_kid);
+    // A team stanza for the owning org covers that org's members (they hold, or should hold, an envelope).
+    let team_covered: BTreeSet<String> =
+        if teams.iter().any(|(o, _)| o == &owner) { org_members.clone() } else { BTreeSet::new() };
+
+    let drift = reconcile(&authorized, &user_readers, &team_covered, public);
+
+    let readers_line = if user_readers.is_empty() {
+        "—".to_string()
+    } else {
+        user_readers.iter().cloned().collect::<Vec<_>>().join(", ")
+    };
+    let team_line = if teams.is_empty() {
+        String::new()
+    } else {
+        format!("  team: {}", teams.iter().map(|(o, g)| format!("{o}@{g}")).collect::<Vec<_>>().join(", "))
+    };
+    outln!(
+        "  owner {owner}{}  ·  kid {cur_kid}  ·  readers: {readers_line}{}{team_line}",
+        if is_org { " (org)" } else { " (user)" },
+        if public { " [public]" } else { "" }
+    );
+
+    // Team-stanza freshness + my-envelope check.
+    for (o, g) in &teams {
+        if let Ok(v) = ep.kek_gens(o) {
+            let cur = v.get("current").and_then(|c| c.as_i64()).unwrap_or(0);
+            if *g != cur {
+                outln!(
+                    "  ⚠ STALE-GEN: team stanza for {o} is gen {g}, org current is {cur} — run\n\
+                     \x20     `agit hub team rekey {o} --rekey-all` (or `agit a rekey`) to seal under the current gen."
+                );
+            }
+        }
+        match ep.get_kek_envelope(o, *g) {
+            Ok(Some(_)) => {}
+            Ok(None) => outln!(
+                "  ⚠ you hold NO gen-{g} team-KEK envelope for {o} — you cannot open this team stanza\n\
+                 \x20     (ask an admin to `agit hub team sync {o}`)."
+            ),
+            Err(_) => {}
+        }
+    }
+
+    if !drift.has_drift() {
+        outln!("  ✓ no drift: every authorized fetcher can decrypt, and every reader is authorized.");
+    }
+    if !drift.member_without_stanza.is_empty() {
+        outln!(
+            "  ✗ MEMBER-WITHOUT-STANZA (authorized to fetch, CANNOT decrypt): {}",
+            drift.member_without_stanza.join(", ")
+        );
+    }
+    if !drift.stanza_without_membership.is_empty() {
+        outln!(
+            "  ✗ STANZA-WITHOUT-MEMBERSHIP (holds a key, the hub REFUSES the bytes): {}",
+            drift.stanza_without_membership.join(", ")
+        );
+        outln!(
+            "    advisory: `agit a readers rm <user>` (eager rotation) if they should not read, or grant\n\
+             \x20    them fetch access on the hub. `--fix` never removes a reader for you."
+        );
+    }
+
+    // --fix: readers add the missing members only (never auto-remove readers).
+    let mut fixed: Vec<String> = Vec::new();
+    if fix && !drift.member_without_stanza.is_empty() {
+        let (_kp, ring) = require_session_keyring(store)?;
+        let ck = ring.current_master();
+        let kid = ring.current;
+        let _lock = crate::session::lock_store(store)?;
+        for u in &drift.member_without_stanza {
+            match crate::keybox::resolve_recipient(home, u, None, false) {
+                Ok(key) => {
+                    crate::keybox::append_stanza(store, &crate::keybox::user_stanza(&ck, kid, u, 0, &key)?)?;
+                    fixed.push(u.clone());
+                }
+                Err(e) => errln!("    --fix: could not wrap the content key to {u}: {e:#}"),
+            }
+        }
+        if !fixed.is_empty() {
+            let _ = scope::git_in_status(store, &["add", "--", ".agit/keybox.jsonl"]);
+            if scope::git_in_status(store, &["diff", "--cached", "--quiet"]).0 != 0 {
+                crypt_commit(
+                    store,
+                    "chore(crypt): hub doctor --fix add authorized members as readers\n\nWraps the current content key to org members / ACL readers that had no keybox stanza (append only).",
+                )?;
+            }
+            outln!("  --fix: added {} reader stanza(s): {}", fixed.len(), fixed.join(", "));
+        }
+    }
+
+    // Drift that REMAINS after the fix: the un-added members + the (never-auto-removed) extras.
+    let remaining_members = drift.member_without_stanza.len() - fixed.len();
+    Ok(remaining_members > 0 || !drift.stanza_without_membership.is_empty())
 }
 
 /// `agit a encrypt --team [--org <name>] [--readers a,b] [--public]` — enable PER-SESSION keybox
@@ -3155,5 +3635,171 @@ mod install_id_tests {
             );
             assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{rt}: non-hex: {id}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wave4_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── item 1: zero-config default reader set ──
+
+    // No hub remote → machine-global; an org owner → team; a personal owner → require explicit.
+    #[test]
+    fn zero_config_default_target_by_owning_scope() {
+        assert_eq!(default_target(None, false), DefaultTarget::MachineGlobal, "no remote → machine-global");
+        assert_eq!(
+            default_target(Some("acme"), true),
+            DefaultTarget::Team("acme".into()),
+            "an org owner defaults to the TEAM reader set (not public, not owner-only)"
+        );
+        assert_eq!(
+            default_target(Some("alice"), false),
+            DefaultTarget::RequireExplicit("alice".into()),
+            "a personal owner has no team to default to — the user must name readers"
+        );
+    }
+
+    // The team default builds exactly one TEAM stanza for kid 0 — not public, not an individual owner
+    // stanza. This is the concrete "readable to the team, not the public" result of a zero-config encrypt.
+    #[test]
+    fn zero_config_team_stanza_is_team_only_not_public_or_owner() {
+        let ck = [0x5Au8; 32];
+        let tk = [0x6Bu8; 32];
+        // The stanza set crypt_enable_keybox_team builds with no --readers/--public: a single team stanza.
+        let stanzas = vec![crate::keybox::team_stanza(&ck, 0, "acme", 1, &tk).unwrap()];
+        assert_eq!(stanzas.len(), 1, "zero-config wraps to the team only");
+        assert!(matches!(stanzas[0], crate::keybox::Stanza::Team(_)), "the sole stanza is a team stanza");
+        assert!(!crate::keybox::is_public_at(&stanzas, 0), "zero-config is NOT public");
+        assert!(crate::keybox::readers_at(&stanzas, 0).is_empty(), "zero-config wraps to NO individual owner");
+        assert_eq!(crate::keybox::teams_at(&stanzas, 0), vec![("acme".to_string(), 1)], "team acme@1");
+    }
+
+    // An org with NO Team KEK yet is an ACTIONABLE error, never a silent fall-back to owner-only/public.
+    #[test]
+    fn zero_config_org_without_tk_errors_actionably() {
+        let err = require_tk_gen(0, "acme").unwrap_err().to_string();
+        assert!(err.contains("no team KEK"), "must name the missing TK: {err}");
+        assert!(err.contains("agit hub team rekey acme"), "must tell the user the fix: {err}");
+        // A real generation is accepted.
+        assert_eq!(require_tk_gen(1, "acme").unwrap(), 1);
+        assert_eq!(require_tk_gen(7, "acme").unwrap(), 7);
+    }
+
+    // The committed keybox is wrap-ciphertext and MUST be skipped by the secret scanners, or its
+    // high-entropy base64 refuses every keybox-encrypted commit/push (client hook + hub pre-receive).
+    #[test]
+    fn keybox_is_excluded_from_the_secret_scan() {
+        assert!(is_self_encrypted_artifact(crate::keybox::KEYBOX_REL), "the keybox path is a self-encrypted artifact");
+        assert!(is_self_encrypted_artifact(".agit/keybox.jsonl"), "the exact committed path is skipped");
+        assert!(is_self_encrypted_artifact(".agit\\keybox.jsonl"), "a windows-separator path is skipped too");
+        assert!(!is_self_encrypted_artifact("sessions/web/s.jsonl"), "a real session is NOT skipped");
+        assert!(!is_self_encrypted_artifact(".agit/other.json"), "only the keybox is skipped, not all of .agit/");
+    }
+
+    // ── item 2: hub doctor drift reconciliation ──
+
+    // A member authorized to fetch but with no stanza is MEMBER-WITHOUT-STANZA; a keybox reader who is not
+    // authorized is STANZA-WITHOUT-MEMBERSHIP; a matched set has no drift.
+    #[test]
+    fn reconcile_detects_both_drift_classes_and_a_clean_case() {
+        // member-without-stanza: alice+bob+carol may fetch, only alice has a stanza.
+        let d = reconcile(&set(&["alice", "bob", "carol"]), &set(&["alice"]), &set(&[]), false);
+        assert_eq!(d.member_without_stanza, vec!["bob".to_string(), "carol".to_string()]);
+        assert!(d.stanza_without_membership.is_empty());
+        assert!(d.has_drift());
+
+        // stanza-without-membership: only alice may fetch, but mallory also holds a stanza.
+        let d = reconcile(&set(&["alice"]), &set(&["alice", "mallory"]), &set(&[]), false);
+        assert!(d.member_without_stanza.is_empty());
+        assert_eq!(d.stanza_without_membership, vec!["mallory".to_string()]);
+        assert!(d.has_drift());
+
+        // clean: the authorized set and the reader set match exactly → no drift, so --check exits zero.
+        let d = reconcile(&set(&["alice", "bob"]), &set(&["alice", "bob"]), &set(&[]), false);
+        assert!(!d.has_drift(), "a matched ACL/keybox has no drift");
+    }
+
+    // A team stanza covers the org's members: an org member is NOT member-without-stanza when a team
+    // stanza covers them, and a public stanza covers every authorized fetcher.
+    #[test]
+    fn reconcile_team_and_public_coverage() {
+        // bob has no individual stanza but the team covers him → no member-without-stanza.
+        let d = reconcile(&set(&["alice", "bob"]), &set(&["alice"]), &set(&["alice", "bob"]), false);
+        assert!(!d.has_drift(), "a team stanza covers the org members: {d:?}");
+
+        // public: even with no individual/team coverage, everyone authorized can decrypt.
+        let d = reconcile(&set(&["alice", "bob", "carol"]), &set(&[]), &set(&[]), true);
+        assert!(d.member_without_stanza.is_empty(), "public covers every authorized fetcher");
+    }
+
+    // ── item 3: team rekey --rekey-all rotates a local team session's CK under the new gen ──
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn rekey_all_rotates_a_local_team_session_ck_under_the_new_gen() {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        // A committer identity local to THIS repo (never global — see the repo's test hygiene).
+        git(repo, &["config", "user.email", "t@t"]);
+        git(repo, &["config", "user.name", "t"]);
+
+        // A team-only session: keyring gen 0 with CK0, keybox wrapping CK0 under TK gen 1 for org acme.
+        let ck0 = [0x11u8; 32];
+        let tk1 = [0xA1u8; 32];
+        let kp = crate::crypt::repo_keyring_path_from(repo).expect("repo-local keyring path");
+        crate::crypt::init_repo_keyring_at(&kp, ck0).unwrap();
+        crate::keybox::write_keybox(repo, &[crate::keybox::team_stanza(&ck0, 0, "acme", 1, &tk1).unwrap()]).unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-qm", "team session"]);
+
+        // Rotate: mint TK gen 2 and rekey this one session under it (the --rekey-all inner step).
+        let tk2 = [0xA2u8; 32];
+        let new_kid = rekey_one_team_session(home.path(), repo, "acme", 2, &tk2).unwrap();
+        assert!(new_kid > 0, "the content key rotated to a new generation");
+
+        let stanzas = crate::keybox::read_keybox(repo).unwrap();
+        let ck_prime = crate::crypt::load_keyring_at(&kp).unwrap().unwrap().current_master();
+        assert_ne!(ck_prime, ck0, "the content key was actually rotated");
+
+        // The new team stanza is at the new kid under gen 2, and TK gen 2 opens it to recover CK'.
+        assert_eq!(
+            crate::keybox::teams_at(&stanzas, new_kid),
+            vec![("acme".to_string(), 2)],
+            "the session is re-wrapped under the NEW team-KEK generation"
+        );
+        let team_new = stanzas
+            .iter()
+            .find_map(|s| match s {
+                crate::keybox::Stanza::Team(t) if t.kid == new_kid => Some(t.clone()),
+                _ => None,
+            })
+            .expect("a team stanza at the new kid");
+        assert_eq!(
+            crate::keybox::unwrap_ck_with_tk(&team_new, &tk2).unwrap(),
+            ck_prime,
+            "the new-gen TK opens the new team stanza to the rotated CK'"
+        );
+        // The old gen-1 stanza is RETAINED (forward-only: past readers keep past access).
+        assert_eq!(crate::keybox::teams_at(&stanzas, 0), vec![("acme".to_string(), 1)], "gen-1 stanza kept");
     }
 }

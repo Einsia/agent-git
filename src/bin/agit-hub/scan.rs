@@ -203,6 +203,14 @@ pub(crate) fn scan_push(repo: &Path, news: &[String]) -> ScanReport {
         if skip.iter().any(|s| s == path) {
             continue;
         }
+        // The committed keybox (`.agit/keybox.jsonl`) is wrap-ciphertext BY DESIGN — one-shot AEAD/X25519
+        // envelopes of a session content key, already excluded from the crypt filter. Its base64 wraps are
+        // high-entropy and would otherwise REFUSE every team/keybox-encrypted push here on the server
+        // (where --no-verify cannot reach), which is precisely how the live e2e caught this. Skip the
+        // self-encrypting artifact, exactly as an AGITCRYPT ciphertext blob is skipped downstream.
+        if path == agit::keybox::KEYBOX_REL {
+            continue;
+        }
         if want.len() >= SCAN_MAX_BLOBS {
             // One entry, not one per blob: the tail of an oversized push is unbounded, and naming the
             // first object past the bound is what an operator needs to act on it anyway.

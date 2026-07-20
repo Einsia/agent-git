@@ -389,7 +389,12 @@ pub fn write_keybox(store: &Path, stanzas: &[Stanza]) -> Result<()> {
         s.push_str(&st.to_line());
         s.push('\n');
     }
-    std::fs::write(&path, s).with_context(|| format!("cannot write {}", path.display()))
+    // Atomic replace: write a sibling temp then rename, so a crash mid-write can never leave a truncated
+    // keybox (which, paired with a rotated keyring, would make a session unreadable). Same-dir rename is
+    // atomic on the local filesystems git stores live on.
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, &s).with_context(|| format!("cannot write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))
 }
 
 /// Append one stanza to the store's keybox WITHOUT rewriting existing lines — the O(1) `readers add`
