@@ -643,6 +643,150 @@ fn secret_blocked_through_agit_push_before_touching_the_remote() {
     assert!(err.contains("AGIT_ALLOW_SECRETS"), "the override must be disclosed: {err}");
 }
 
+/// The range gate is the whole point of scanning what's PUBLISHED, not the working tree: a secret
+/// committed with a raw `git commit --no-verify` and then DELETED from the working tree leaves the tree
+/// clean, but the committed blob still ships on push. A working-tree scan sees nothing; the range scan
+/// reads the blob out of the pushed commit and blocks. The disclosed override still publishes it.
+#[test]
+fn committed_then_deleted_secret_is_caught_by_the_push_range_scan() {
+    let r = Repo::new();
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    let hub = hub_path.to_str().unwrap();
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub]).0, 0, "remote add");
+
+    // Sneak a secret in with a raw no-verify commit, then delete it from the working tree and commit the
+    // deletion. The store's working tree is now clean — a whole-tree scan would find nothing.
+    r.write_agent(
+        "sessions/claude-code/leak.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n",
+    );
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "snuck a secret in"]);
+    std::fs::remove_file(r.agent().join("sessions/claude-code/leak.jsonl")).unwrap();
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "deleted it from the working tree"]);
+    // Prove the working tree really is clean: only the whole-tree scan-clean case matters here.
+    assert!(
+        !r.agent().join("sessions/claude-code/leak.jsonl").exists(),
+        "the secret file must be gone from the working tree"
+    );
+
+    // The range scan reads the committed blob out of the range being pushed and refuses.
+    let (code, _out, err) = r.agit(&["a", "push", "-u", "origin", "main"]);
+    assert_ne!(code, 0, "the range scan must catch a committed-then-deleted secret: {err}");
+    assert!(err.contains("secret gate") || err.contains("aws"), "{err}");
+    assert!(
+        r.git_at(&hub_path, &["rev-parse", "--verify", "refs/heads/main"]).is_empty(),
+        "nothing may have reached the remote: {err}"
+    );
+
+    // The disclosed override still publishes it — legibly.
+    let (code, _o, err) = r.agit_env(&[("AGIT_ALLOW_SECRETS", "1")], &["a", "push", "-u", "origin", "main"]);
+    assert_eq!(code, 0, "the disclosed override must let the push through: {err}");
+    assert!(err.contains("AGIT_ALLOW_SECRETS"), "the override must be disclosed: {err}");
+}
+
+/// Regression: the range gate scans the SOURCE ref of the refspec being pushed, not always HEAD. A
+/// secret on a NON-HEAD branch pushed by name (`agit a push origin leak`) must be caught, or a HEAD-only
+/// scan would let it slip out.
+#[test]
+fn push_of_a_non_head_branch_scans_that_branch_not_head() {
+    let r = Repo::new();
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    let hub = hub_path.to_str().unwrap();
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub]).0, 0, "remote add");
+    assert_eq!(r.agit(&["a", "push", "-u", "origin", "main"]).0, 0, "clean main pushes");
+
+    // A secret on a side branch that is NOT reachable from HEAD.
+    r.git_agent(&["checkout", "-q", "-b", "leak"]);
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n",
+    );
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "secret on a side branch"]);
+    r.git_agent(&["checkout", "-q", "main"]); // HEAD is back on clean main; leak is non-HEAD
+
+    // Pushing the side branch by name must scan `leak` (not HEAD) and refuse.
+    let (code, _o, err) = r.agit(&["a", "push", "origin", "leak"]);
+    assert_ne!(code, 0, "pushing a non-HEAD branch must scan THAT branch: {err}");
+    assert!(err.contains("secret gate") || err.contains("aws"), "{err}");
+    assert!(
+        r.git_at(&hub_path, &["rev-parse", "--verify", "refs/heads/leak"]).is_empty(),
+        "the secret branch must not have reached the remote: {err}"
+    );
+}
+
+/// A clean committed range publishes with no friction: the range gate reads the new session blobs, finds
+/// nothing, and the push reaches the remote.
+#[test]
+fn clean_committed_range_pushes_fine() {
+    let r = Repo::new();
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    let hub = hub_path.to_str().unwrap();
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub]).0, 0, "remote add");
+
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"claude found the deadlock\"}}\n",
+    );
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "a clean session"]);
+
+    let (code, _out, err) = r.agit(&["a", "push", "-u", "origin", "main"]);
+    assert_eq!(code, 0, "a clean committed range must push: {err}");
+    assert!(
+        !r.git_at(&hub_path, &["rev-parse", "--verify", "refs/heads/main"]).is_empty(),
+        "the branch must have reached the remote"
+    );
+}
+
+/// The range is what's NEW to the remote, not the whole history: a secret that was ALREADY published
+/// must not re-block every later push. After the secret lands on the remote (via the disclosed override),
+/// a subsequent CLEAN commit pushes without the gate re-scanning — and re-blocking on — the old history.
+#[test]
+fn already_pushed_secret_is_not_rescanned_on_the_next_push() {
+    let r = Repo::new();
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    let hub = hub_path.to_str().unwrap();
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub]).0, 0, "remote add");
+
+    // A secret commit, published with the disclosed override — the remote now HAS this history.
+    r.write_agent(
+        "sessions/claude-code/leak.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n",
+    );
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "the secret, published once"]);
+    let (code, _o, err) = r.agit_env(&[("AGIT_ALLOW_SECRETS", "1")], &["a", "push", "-u", "origin", "main"]);
+    assert_eq!(code, 0, "the override must land the secret on the remote: {err}");
+
+    // Now a clean commit on top. The range is only this new commit; the already-pushed secret is NOT in
+    // it, so the push must NOT be blocked (a whole-history rescan would wrongly re-flag the old blob).
+    r.write_agent(
+        "sessions/claude-code/clean.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"just a normal follow-up\"}}\n",
+    );
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "a clean follow-up"]);
+
+    let (code, _out, err) = r.agit(&["a", "push", "origin", "main"]);
+    assert_eq!(
+        code, 0,
+        "the next clean push must not be re-blocked by already-published history: {err}"
+    );
+    // Both commits are now on the remote.
+    assert_eq!(
+        r.git_at(&hub_path, &["log", "-1", "--format=%s", "main"]),
+        "a clean follow-up",
+        "the clean follow-up must have reached the remote"
+    );
+}
+
 /// The pragma / allowlist escape stays intact through the wrapper gate — a false positive marked with
 /// `agit:allow-secret` on the line still commits, exactly as it did through the git hook.
 #[test]

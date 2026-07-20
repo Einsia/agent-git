@@ -9,6 +9,7 @@ use crate::scope::{self, Scope};
 use crate::ui;
 use crate::{errln, out, outln};
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -108,7 +109,7 @@ fn staged_findings(root: &Path, allow: &scan::Allowlist) -> Vec<(String, scan::F
     v
 }
 
-/// Findings across a set of working-tree files — what a push is about to publish.
+/// Findings across a set of working-tree files — what a whole-tree `agit scan` covers.
 fn tree_findings(
     root: &Path,
     allow: &scan::Allowlist,
@@ -125,6 +126,98 @@ fn tree_findings(
         }
     }
     Ok(v)
+}
+
+/// The session blobs a push will PUBLISH: `(blob_sha, path)` for every blob under `sessions/` that is
+/// reachable from HEAD but NOT already on the target remote(s). This is the object set git's own pack
+/// negotiation would send, computed with `git rev-list --objects HEAD --not --remotes=<remote>`:
+///
+///  * First push (no remote-tracking ref for that remote yet) → `--not --remotes=<r>` excludes nothing,
+///    so the range is everything reachable from HEAD.
+///  * Nothing new (the remote already has HEAD) → the range is empty, so no blob is read and the whole
+///    history is never rescanned.
+///  * Multi-remote fan-out → the union over remotes of each remote's "new to it" set (deduped by sha),
+///    i.e. everything that will be published to at least one remote.
+///
+/// The path prefix is filtered in code rather than via a `-- sessions` pathspec: a pathspec triggers
+/// history simplification and can hide blob versions we must scan. Tree objects share the `sessions/`
+/// prefix but are dropped later — `git cat-file blob` fails on them.
+fn range_session_blobs(store: &Path, sources: &[String], remotes: &[String]) -> Vec<(String, String)> {
+    // The TIPS to scan from are the source refs of the refspecs actually being pushed, NOT always HEAD:
+    // `agit a push origin leak` publishes `leak`, so a HEAD-only scan would miss a secret on a non-HEAD
+    // branch. An empty `sources` (a bare push, or no explicit refspec) means the current branch, HEAD.
+    let tips: Vec<String> = if sources.is_empty() {
+        vec!["HEAD".to_string()]
+    } else {
+        sources.to_vec()
+    };
+    // One rev-list per (tip, remote) = objects that tip has and the remote lacks; empty remotes = the
+    // whole tip (a first push to a remote with no tracking ref).
+    let mut ranges: Vec<Vec<String>> = Vec::new();
+    for tip in &tips {
+        if remotes.is_empty() {
+            ranges.push(vec![tip.clone()]);
+        } else {
+            for r in remotes {
+                ranges.push(vec![tip.clone(), "--not".to_string(), format!("--remotes={r}")]);
+            }
+        }
+    }
+    let prefix = format!("{}/", crate::session::SESSIONS_SUBDIR);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for range in &ranges {
+        let mut args: Vec<&str> = vec!["rev-list", "--objects"];
+        args.extend(range.iter().map(String::as_str));
+        let (code, listing) = scope::git_in_status(store, &args);
+        if code != 0 {
+            continue;
+        }
+        for line in listing.lines() {
+            // `--objects` prints `<sha> <path>` for blobs/trees (bare `<sha>` for commits).
+            let Some((sha, path)) = line.split_once(' ') else {
+                continue;
+            };
+            if sha.is_empty() || !path.starts_with(&prefix) {
+                continue;
+            }
+            if seen.insert(sha.to_string()) {
+                out.push((sha.to_string(), path.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Findings in the blobs a push will actually publish — the push backstop. Reads each session blob in
+/// the range (`git cat-file blob <sha>`) and scans its CONTENT, so a secret that was committed (e.g. via
+/// a raw `git commit --no-verify`) and then deleted from the working tree is still caught, and an
+/// uncommitted working-tree secret that will never be pushed no longer blocks the push.
+///
+/// Encryption: on an agit-crypt store the committed blob is ciphertext whose AGITCRYPT magic carries a
+/// NUL, so `is_probably_binary` skips it exactly as the staged/tree paths do — a ciphertext blob is never
+/// a plaintext finding, which is the documented behaviour (content is protected by encryption, not the
+/// scanner). Tree objects that slipped through the prefix filter fail `cat-file blob` and are skipped.
+fn range_findings(
+    store: &Path,
+    sources: &[String],
+    remotes: &[String],
+    allow: &scan::Allowlist,
+) -> Vec<(String, scan::Finding)> {
+    let mut v = Vec::new();
+    for (sha, path) in range_session_blobs(store, sources, remotes) {
+        let (code, content) = scope::git_in_status(store, &["cat-file", "blob", &sha]);
+        if code != 0 {
+            continue; // a tree object under the sessions/ prefix, or an unreadable blob — skip
+        }
+        if scan::is_probably_binary(content.as_bytes()) {
+            continue; // binary or agit-crypt ciphertext — not a plaintext finding
+        }
+        for f in scan::scan_text_allow(&content, true, allow) {
+            v.push((path.clone(), f));
+        }
+    }
+    v
 }
 
 // ─────────────────────── The non-bypassable wrapper secret gate ───────────────────────
@@ -182,8 +275,29 @@ pub fn secret_gate(store: &Path, staged: bool, verb: &str) -> Result<Gate> {
     } else {
         tree_findings(store, &allow, &scan_targets(store, &[]))?
     };
+    Ok(decide_gate(findings, verb))
+}
+
+/// The push backstop: scan what will actually be PUBLISHED — the session blobs in the commit range the
+/// target `remotes` do not yet have — instead of the working tree. This catches a secret committed with a
+/// raw `git commit --no-verify` and then deleted from the working tree (a working-tree scan sees nothing,
+/// but the committed blob still ships), and it does NOT block on an uncommitted working-tree secret that
+/// would never be pushed. An empty `remotes` slice scans everything reachable from HEAD.
+///
+/// Like `secret_gate`, it REUSES scan.rs wholesale (Allowlist + scan_text_allow), so the in-file
+/// `agit:allow-secret` pragma and `.agit-allow-secrets` allowlist still suppress known-safe hits, and the
+/// disclosed `AGIT_ALLOW_SECRETS` override still applies. The in-process commit/snap gates remain the
+/// primary defense; this hardens the push so a committed-then-deleted secret can't slip out.
+pub fn secret_gate_range(store: &Path, sources: &[String], remotes: &[String], verb: &str) -> Result<Gate> {
+    let allow = scan::Allowlist::load(store);
+    Ok(decide_gate(range_findings(store, sources, remotes, &allow), verb))
+}
+
+/// Shared tail for every secret gate: disclose the findings, then honor the visible `AGIT_ALLOW_SECRETS`
+/// override or refuse. Empty findings → Clean.
+fn decide_gate(findings: Vec<(String, scan::Finding)>, verb: &str) -> Gate {
     if findings.is_empty() {
-        return Ok(Gate::Clean);
+        return Gate::Clean;
     }
 
     errln!("agit: secret gate — suspected secrets in what you are about to {verb}:");
@@ -196,7 +310,7 @@ pub fn secret_gate(store: &Path, staged: bool, verb: &str) -> Result<Gate> {
             "  {ALLOW_ENV} is set — gate BYPASSED for this {verb}. This override is explicit and auditable \
              (unlike git --no-verify, which leaves no trace). You own the consequences: pushing publishes these to the team."
         );
-        Ok(Gate::Overridden)
+        Gate::Overridden
     } else {
         errln!(
             "{} suspected. Fix them, mark a false positive with a `{}` pragma or a `{}` entry, or — to override \
@@ -205,7 +319,7 @@ pub fn secret_gate(store: &Path, staged: bool, verb: &str) -> Result<Gate> {
             scan::ALLOW_PRAGMA,
             scan::ALLOW_FILE,
         );
-        Ok(Gate::Blocked(findings.len()))
+        Gate::Blocked(findings.len())
     }
 }
 

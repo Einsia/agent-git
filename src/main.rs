@@ -737,17 +737,17 @@ fn stage_commit_inputs(store: &std::path::Path, args: &[String]) {
     }
 }
 
+/// The SOURCE ref of a git refspec `[+]<src>[:<dst>]` — the local ref being published. A bare `:<dst>`
+/// (a branch delete) has no source and publishes nothing to scan, so it yields None.
+fn refspec_source(spec: &str) -> Option<String> {
+    let s = spec.strip_prefix('+').unwrap_or(spec);
+    let src = s.split(':').next().unwrap_or(s);
+    (!src.is_empty()).then(|| src.to_string())
+}
+
 fn agent_push(args: &[String]) -> anyhow::Result<i32> {
     use agit::agent;
     let a = agent::resolve(None)?;
-
-    // The gate runs BEFORE git — a bare `git push` fires only the pre-push hook, which `--no-verify`
-    // skips, and agit's own push must not offer that silent exit. Pushing publishes the store to the
-    // team, so this is the last line before a secret in a transcript leaves the machine. Blocked →
-    // refuse without touching the remote; the visible AGIT_ALLOW_SECRETS override is disclosed by the gate.
-    if !agit::commands::secret_gate(&a.store, false, "push")?.allowed() {
-        return Ok(1);
-    }
 
     // Split agit-native `--to <name>` out of what git sees, then classify the rest: `flags` start with
     // `-` (--force, --tags), `positionals` are a git-style remote/refspec the user typed.
@@ -782,6 +782,48 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
             positionals.push(x.clone());
         }
         i += 1;
+    }
+
+    // The gate runs BEFORE git — a bare `git push` fires only the pre-push hook, which `--no-verify`
+    // skips, and agit's own push must not offer that silent exit. Pushing publishes the store to the
+    // team, so this is the last line before a secret in a transcript leaves the machine. It scans the
+    // COMMIT RANGE about to be published (the session blobs HEAD has that the target remotes don't),
+    // NOT the working tree: that catches a secret committed with a raw `git commit --no-verify` and then
+    // deleted from the working tree (which a working-tree scan misses), and it won't block on an
+    // uncommitted working-tree secret that would never ship. Blocked → refuse without touching the
+    // remote; the visible AGIT_ALLOW_SECRETS override is disclosed by the gate.
+    let gate_remotes: Vec<String> = if let Some(name) = &to {
+        vec![name.clone()]
+    } else if let Some(remote) = positionals.first() {
+        // git-style `push <remote> [refspec...]`: the first positional is the remote.
+        vec![remote.clone()]
+    } else {
+        // Bare push fans out to every configured remote; the range is the union of what each still lacks.
+        agent::store_remotes(&a.store)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    };
+    // The SOURCE refs actually being published decide what range to scan, NOT always HEAD. With `--to`
+    // every positional is a refspec (the remote is `to`); git-style, positionals[0] is the remote and the
+    // rest are refspecs. `--all`/`--mirror` pushes every branch, so scan every local branch tip. No
+    // refspec means the current branch (HEAD). Without this, `agit a push origin leak` (a non-HEAD
+    // branch) would ship a secret a HEAD-only scan never looked at.
+    let refspecs: &[String] = if to.is_some() {
+        &positionals
+    } else if positionals.len() > 1 {
+        &positionals[1..]
+    } else {
+        &[]
+    };
+    let gate_sources: Vec<String> = if flags.iter().any(|f| f == "--all" || f == "--mirror") {
+        let (_c, out) = agit::scope::git_in_status(&a.store, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
+        out.lines().map(str::to_string).collect()
+    } else {
+        refspecs.iter().filter_map(|s| refspec_source(s)).collect()
+    };
+    if !agit::commands::secret_gate_range(&a.store, &gate_sources, &gate_remotes, "push")?.allowed() {
+        return Ok(1);
     }
 
     // Inherited stdio throughout: a push is where credential helpers prompt, and capturing would both
