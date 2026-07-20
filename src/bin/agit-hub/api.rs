@@ -103,6 +103,10 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         // the list form reads a batch (`?users=a,b,c`). The single-user GET is the `identity/<user>`
         // prefix route below. All require an authenticated caller.
         ("POST", "identity/enroll") => return api_identity_enroll(ctx, caller, body).await,
+        // by-email resolves a committer email to the registered account owning it — the lookup that turns
+        // provenance's "signed by this key" into "verified as this person". Exact route, matched BEFORE the
+        // `identity/<user>` prefix so `by-email` is never read as a username.
+        ("GET", "identity/by-email") => return api_identity_by_email(ctx, req, caller).await,
         ("GET", "identity") => return api_identity_list(ctx, req, caller).await,
         // The hub's escrow PUBLIC key (encryption-recipients Wave 5, hub-assist escrow). Any authenticated
         // caller may read it — it is a public key a hub-assist client seals its content key TO.
@@ -864,6 +868,7 @@ fn identity_json(k: &store::IdentityKey) -> serde_json::Value {
         "epoch": k.epoch,
         "enroll_sig": k.enroll_sig,
         "revoked": k.revoked,
+        "email": k.email,
     })
 }
 
@@ -906,6 +911,13 @@ pub(crate) async fn api_identity_enroll(ctx: &Ctx, caller: &Caller, body: &[u8])
     if !agit::agent::verify_hex(&ed25519_pub, &msg, &enroll_sig) {
         return Resp::err(400, "enroll_sig does not verify against the submitted ed25519_pub");
     }
+    // The committer email is optional and self-asserted (NOT covered by enroll_sig): it is the bridge from
+    // a session's committer to this account for provenance attribution. Absent/blank = unset. The store
+    // normalizes it (trim + lowercase) on write. An oversized value is refused to bound the row.
+    let email = str_field(&v, "email").unwrap_or_default();
+    if email.len() > 320 {
+        return Resp::err(400, "email is too long (max 320 chars)");
+    }
     let row = store::IdentityKey {
         username: username.clone(),
         ed25519_pub,
@@ -914,6 +926,7 @@ pub(crate) async fn api_identity_enroll(ctx: &Ctx, caller: &Caller, body: &[u8])
         enroll_sig,
         created: store::now_iso(),
         revoked: None,
+        email,
     };
     match ctx.store.upsert_identity_key(row).await {
         Ok(store::EnrollOutcome::Applied) => {}
@@ -933,6 +946,27 @@ pub(crate) async fn api_identity_get(ctx: &Ctx, caller: &Caller, user: &str) -> 
         return Resp::err(401, "login required");
     }
     match ctx.store.get_identity_key(user).await {
+        Some(k) => Resp::json(identity_json(&k)),
+        None => Resp::err(404, "not found"),
+    }
+}
+
+/// `GET /api/identity/by-email?email=<committer-email>` — resolve a committer email to the registered
+/// account owning it. Any authenticated caller may read (the pubkeys and the email→account mapping are
+/// both needed to verify attribution, and registration already publishes them). An email that maps to no
+/// registered account — or to more than one (ambiguous) — is a normal 404, the same non-disclosing
+/// not-found the single-user GET returns, so this is no more of an enumeration oracle than enrollment
+/// already is.
+pub(crate) async fn api_identity_by_email(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
+    if caller.user.is_none() {
+        return Resp::err(401, "login required");
+    }
+    let Some(raw) = param(req.query(), "email").filter(|s| !s.trim().is_empty()) else {
+        return Resp::err(400, "want an email query parameter");
+    };
+    // The value arrives percent-encoded (`dev%40x.com`); decode before the store normalizes and matches.
+    let email = agit::hub::net::percent_decode_lossy(&raw);
+    match ctx.store.get_identity_key_by_email(&email).await {
         Some(k) => Resp::json(identity_json(&k)),
         None => Resp::err(404, "not found"),
     }
@@ -4547,5 +4581,47 @@ mod tests {
         let rel = api_keys_release(&ctx, &caller("bob", false), "acme", "frontend").await;
         assert_eq!(rel.status, 200);
         assert_eq!(json_of(&rel)["released"].as_array().unwrap()[0]["ck"], hex::encode(ck));
+    }
+
+    /// Enroll publishes a committer email, and `by-email` resolves that email back to the account — the
+    /// bridge provenance verification consults. Non-disclosing: an unknown email is a plain 404, and an
+    /// anonymous caller is refused.
+    #[tokio::test]
+    async fn identity_enroll_with_email_then_lookup_by_email() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+
+        // A real ed25519 keypair so the possession proof (enroll_sig) verifies.
+        let home = tempfile::tempdir().unwrap();
+        let sk = agit::agent::load_or_create_signing_key(home.path()).unwrap();
+        let ed_pub = hex::encode(sk.verifying_key().to_bytes());
+        let x_pub = "ab".repeat(32);
+        let enroll_sig = agit::agent::sign_hex(&sk, &agit::agent::identity_enroll_message("alice", 0, &ed_pub, &x_pub));
+        let enrolled = api_identity_enroll(
+            &ctx,
+            &caller("alice", false),
+            &body(serde_json::json!({ "ed25519_pub": ed_pub, "x25519_pub": x_pub, "epoch": 0, "enroll_sig": enroll_sig, "email": "Alice@Corp.com" })),
+        )
+        .await;
+        assert_eq!(enrolled.status, 200);
+
+        let by_email = |email: &str| {
+            let mut r = req("GET", None);
+            r.target = format!("/api/identity/by-email?email={email}");
+            r
+        };
+        // The committer email (percent-encoded, mixed case) resolves back to alice with her signing key.
+        let hit = api_identity_by_email(&ctx, &by_email("Alice%40corp.com"), &caller("bob", false)).await;
+        assert_eq!(hit.status, 200, "any authenticated caller may resolve an email");
+        let v = json_of(&hit);
+        assert_eq!(v["username"], "alice");
+        assert_eq!(v["ed25519_pub"], ed_pub);
+
+        // An email nobody enrolled is a normal not-found, not an oracle.
+        let miss = api_identity_by_email(&ctx, &by_email("ghost%40corp.com"), &caller("bob", false)).await;
+        assert_eq!(miss.status, 404);
+        // Anonymous is refused before any lookup.
+        let anon = api_identity_by_email(&ctx, &by_email("alice%40corp.com"), &Caller::anonymous()).await;
+        assert_eq!(anon.status, 401);
     }
 }

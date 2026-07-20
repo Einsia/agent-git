@@ -127,6 +127,14 @@ impl HubEndpoint {
         ok_json(status, &text, &url).map(Some)
     }
 
+    /// `GET /api/identity/by-email?email=<committer-email>` — resolve a committer email to the registered
+    /// account owning it (`{ username, ed25519_pub, x25519_pub, epoch }`). `Ok(None)` on 404 (the email
+    /// maps to no registered account — a normal not-found, not an oracle). This is the lookup that turns
+    /// provenance's "signed by this key" into "verified as this person".
+    pub fn get_identity_by_email(&self, email: &str) -> Result<Option<serde_json::Value>> {
+        self.get_opt(&format!("/api/identity/by-email?email={}", percent_encode_query(email)))
+    }
+
     /// A `GET` returning the parsed JSON on 2xx, `Ok(None)` on 404, an error otherwise — the shared shape
     /// behind the org/kek reads below.
     fn get_opt(&self, path: &str) -> Result<Option<serde_json::Value>> {
@@ -362,6 +370,22 @@ fn parse_http_url(url: &str) -> Result<(String, Option<Auth>)> {
     Ok((base, auth))
 }
 
+/// Percent-encode a value for a URL query slot. An email carries `@`, `+`, and `.` — `.` is safe in a
+/// query, but `@`/`+` and anything non-alphanumeric must be escaped so the value reaches the hub intact
+/// (a raw `+` would otherwise decode to a space). Unreserved chars (RFC 3986) pass through.
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Standard base64 (RFC 4648, with padding). Hand-rolled to keep the client hermetic — the only place
 /// the client needs to ENCODE base64 is the HTTP Basic `Authorization` header.
 fn base64_encode(input: &[u8]) -> String {
@@ -383,6 +407,14 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_encodes_an_email_for_a_query_slot() {
+        // `@` and `+` must escape (a raw `+` would decode to a space); unreserved chars pass through.
+        assert_eq!(percent_encode_query("alice@corp.com"), "alice%40corp.com");
+        assert_eq!(percent_encode_query("a+b@x.io"), "a%2Bb%40x.io");
+        assert_eq!(percent_encode_query("plain.name-1_2~"), "plain.name-1_2~");
+    }
 
     #[test]
     fn base64_matches_known_vectors() {

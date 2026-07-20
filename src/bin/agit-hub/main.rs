@@ -9,6 +9,7 @@ mod content;
 mod gitplumb;
 mod http;
 mod limits;
+mod prov;
 mod router;
 mod scan;
 mod server;

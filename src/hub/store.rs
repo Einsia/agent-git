@@ -115,6 +115,13 @@ pub fn owner_ns(owner: &str) -> &str {
     owner.strip_prefix("org:").unwrap_or(owner)
 }
 
+/// Canonicalize a committer email for storage and lookup: trim surrounding whitespace and lowercase it.
+/// Email local-parts are technically case-sensitive, but in practice nobody relies on that, and git
+/// commits are attributed case-insensitively here — so "Dev@X.com" and "dev@x.com" address one identity.
+pub fn normalize_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
 pub fn normalize_username(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
@@ -279,6 +286,17 @@ pub struct IdentityKey {
     pub created: String,
     #[serde(default)]
     pub revoked: Option<String>,
+    /// The account's git committer email, self-asserted at enroll time (empty for a legacy row that
+    /// pre-dates this column, or a client that sent none). It is the bridge from a session's committer
+    /// email to a registered identity: provenance verification asks "does this email map to a registered
+    /// account, and is the signing key that account's key?". Stored NORMALIZED (trimmed, lowercased).
+    ///
+    /// NOTE: this is NOT part of `enroll_sig` (the possession proof), so it is a self-asserted attribute —
+    /// the hub does not verify email ownership (it has no email-verification flow). The forgery it defends
+    /// against is a session signed by a key that is not the registered key of the claimed email; email
+    /// squatting is a separate, documented limitation.
+    #[serde(default)]
+    pub email: String,
 }
 
 /// The outcome of an [`Store::upsert_identity_key`]: either the row was written, or it was refused
@@ -716,6 +734,7 @@ fn row_identity_key(r: &impl Cols) -> IdentityKey {
         enroll_sig: r.text("enroll_sig"),
         created: r.text("created"),
         revoked: r.opt("revoked"),
+        email: r.text("email"),
     }
 }
 
@@ -795,9 +814,14 @@ const DDL: &[&str] = &[
     // lookup AND (Wave 2+) encryption recipient key-wrapping. Added additively (a whole new table, like
     // invitations) via CREATE TABLE IF NOT EXISTS — no schema-version bump or back-fill. epoch is
     // BIGINT for the same strict-decode reason the other integer columns are (see the note above).
+    // `email` (added additively, back-filled onto older stores by `IDENTITY_COLUMNS`) is the account's
+    // self-asserted committer email, the bridge from a session's committer to a registered identity for
+    // provenance attribution. Defaults to '' = unset, so every wave-1 row and behavior is unchanged.
     "CREATE TABLE IF NOT EXISTS identity_keys (\
        username TEXT PRIMARY KEY, ed25519_pub TEXT NOT NULL, x25519_pub TEXT NOT NULL, \
-       epoch BIGINT NOT NULL DEFAULT 0, enroll_sig TEXT NOT NULL, created TEXT NOT NULL DEFAULT '', revoked TEXT)",
+       epoch BIGINT NOT NULL DEFAULT 0, enroll_sig TEXT NOT NULL, created TEXT NOT NULL DEFAULT '', revoked TEXT, \
+       email TEXT NOT NULL DEFAULT '')",
+    "CREATE INDEX IF NOT EXISTS identity_keys_email ON identity_keys(email)",
     // Per-org Team-KEK envelopes (encryption-recipients Wave 3): one row per (org, generation, member),
     // holding TK_gen X25519-sealed to that member's pubkey. `wrapped_kek` is CIPHERTEXT only — the hub
     // never sees a plaintext TK. `recipient_epoch` records which identity-key epoch the seal targeted, so
@@ -838,6 +862,12 @@ const ORG_COLUMNS: &[&str] = &[
     "recovery_x25519 TEXT NOT NULL DEFAULT ''",
     "escrow_mode TEXT NOT NULL DEFAULT 'none'",
 ];
+
+/// The identity_keys columns added onto a registry that predates them (provenance signed-push
+/// verification), back-filled at boot exactly like [`ORG_COLUMNS`]. A **fresh** DB already has them (in
+/// `DDL`); this migrates older stores. Idempotent: Postgres uses `ADD COLUMN IF NOT EXISTS`; SQLite
+/// ignores the "duplicate column" error. With the '' default, every wave-1 enrollment is unchanged.
+const IDENTITY_COLUMNS: &[&str] = &["email TEXT NOT NULL DEFAULT ''"];
 
 /// Stamp the schema version idempotently. A single fixed row (id=1) plus `ON CONFLICT DO NOTHING`,
 /// **not** read-MAX-then-INSERT: two Hubs booting against one fresh Postgres at the same moment would
@@ -1017,6 +1047,20 @@ impl Store {
         let store = Store::Sqlite(SqliteStore::connect(root.to_path_buf())?);
         store.migrate().await?;
         Ok(store)
+    }
+
+    /// Open the configured backend WITHOUT running migrations — a read-only handle for a short-lived,
+    /// out-of-process reader (the pre-receive provenance check) that must not take the schema write locks
+    /// the serving process already owns. Honors `AGIT_HUB_DB` exactly like [`Store::open`]. The reader
+    /// only ever runs SELECTs; on SQLite those are WAL reads that never block the writer, so a push's
+    /// provenance lookup cannot stall or be stalled by the live hub. A registry column the serving hub has
+    /// not yet added simply makes a SELECT error, which every caller treats as "no attribution".
+    pub async fn open_readonly(root: &Path) -> io::Result<Store> {
+        ensure_root(root)?;
+        Ok(match std::env::var("AGIT_HUB_DB") {
+            Ok(url) if is_pg_url(&url) => Store::Pg(PgStore::connect(&url, root.to_path_buf())?),
+            _ => Store::Sqlite(SqliteStore::connect(root.to_path_buf())?),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -1305,9 +1349,28 @@ impl Store {
     /// `created` is preserved across a replace — only the first enrollment stamps it.
     pub async fn upsert_identity_key(&self, mut row: IdentityKey) -> io::Result<EnrollOutcome> {
         row.username = normalize_username(&row.username);
+        // The committer email is the attribution key; normalize it the same way (trim + lowercase) so a
+        // by-email lookup matches regardless of the case git recorded the committer under.
+        row.email = normalize_email(&row.email);
         match self {
             Store::Sqlite(s) => s.upsert_identity_key(row).await,
             Store::Pg(s) => s.upsert_identity_key(row).await,
+        }
+    }
+
+    /// The registry row whose committer `email` matches, or `None` when the email maps to no registered
+    /// account. Email is normalized (trim + lowercase) before matching. A blank email never matches (it
+    /// is the "unset" sentinel for legacy rows), and an ambiguous email shared by two accounts also
+    /// yields `None` — an email that does not map to exactly one account is not attributable. This is the
+    /// server-side lookup behind provenance verification and the `by-email` endpoint.
+    pub async fn get_identity_key_by_email(&self, email: &str) -> Option<IdentityKey> {
+        let e = normalize_email(email);
+        if e.is_empty() {
+            return None;
+        }
+        match self {
+            Store::Sqlite(s) => s.get_identity_key_by_email(&e).await,
+            Store::Pg(s) => s.get_identity_key_by_email(&e).await,
         }
     }
 
@@ -1437,6 +1500,11 @@ impl SqliteStore {
         // above already added them — SQLite then errors "duplicate column", which is expected/ignored).
         for &col in ORG_COLUMNS {
             let _ = sqlx::query(&format!("ALTER TABLE orgs ADD COLUMN {col}")).execute(&self.pool).await;
+        }
+        // Back-fill the identity_keys email column onto registries predating provenance verification
+        // (no-op / "duplicate column" on a fresh DB, expected and ignored, exactly like the columns above).
+        for &col in IDENTITY_COLUMNS {
+            let _ = sqlx::query(&format!("ALTER TABLE identity_keys ADD COLUMN {col}")).execute(&self.pool).await;
         }
         // create_if_missing may not honor the mode; tighten hub.db AND its WAL sidecars to 0600, the
         // same guarantee write_secret_atomic gave the old JSON files. The DDL/stamp above already
@@ -1805,11 +1873,12 @@ impl SqliteStore {
         // ON CONFLICT keeps the original `created` (only the first enrollment stamps it) and refreshes
         // every other column — including clearing `revoked`, so re-enrolling un-revokes.
         sqlx::query(
-            "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+            "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked, email) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(username) DO UPDATE SET \
                ed25519_pub = excluded.ed25519_pub, x25519_pub = excluded.x25519_pub, \
-               epoch = excluded.epoch, enroll_sig = excluded.enroll_sig, revoked = excluded.revoked",
+               epoch = excluded.epoch, enroll_sig = excluded.enroll_sig, revoked = excluded.revoked, \
+               email = excluded.email",
         )
         .bind(&row.username)
         .bind(&row.ed25519_pub)
@@ -1818,11 +1887,26 @@ impl SqliteStore {
         .bind(&row.enroll_sig)
         .bind(&row.created)
         .bind(&row.revoked)
+        .bind(&row.email)
         .execute(&mut *tx)
         .await
         .map_err(err)?;
         tx.commit().await.map_err(err)?;
         Ok(EnrollOutcome::Applied)
+    }
+
+    async fn get_identity_key_by_email(&self, email: &str) -> Option<IdentityKey> {
+        // Two rows sharing an email is an ambiguous attribution — return neither. `LIMIT 2` is enough to
+        // tell "exactly one" from "more than one" without scanning the whole match set.
+        let rows = sqlx::query("SELECT * FROM identity_keys WHERE email = ? AND email <> '' LIMIT 2")
+            .bind(email)
+            .fetch_all(&self.pool)
+            .await
+            .ok()?;
+        match rows.as_slice() {
+            [only] => Some(row_identity_key(only)),
+            _ => None,
+        }
     }
 
     async fn upsert_team_kek_envelopes(&self, org: &str, gen: i64, rows: &[TeamKekEnvelope]) -> io::Result<()> {
@@ -1959,6 +2043,11 @@ impl PgStore {
         // a native IF NOT EXISTS, so this is cleanly idempotent without swallowing errors.
         for &col in ORG_COLUMNS {
             sqlx::query(&format!("ALTER TABLE orgs ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
+        }
+        // Back-fill the identity_keys email column onto registries predating provenance verification
+        // (no-op on a fresh DB). Postgres has a native IF NOT EXISTS, so this is cleanly idempotent.
+        for &col in IDENTITY_COLUMNS {
+            sqlx::query(&format!("ALTER TABLE identity_keys ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
         }
         Ok(())
     }
@@ -2310,11 +2399,12 @@ impl PgStore {
         }
         // ON CONFLICT keeps the original `created` and refreshes the rest, clearing `revoked`.
         sqlx::query(
-            "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+            "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked, email) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (username) DO UPDATE SET \
                ed25519_pub = excluded.ed25519_pub, x25519_pub = excluded.x25519_pub, \
-               epoch = excluded.epoch, enroll_sig = excluded.enroll_sig, revoked = excluded.revoked",
+               epoch = excluded.epoch, enroll_sig = excluded.enroll_sig, revoked = excluded.revoked, \
+               email = excluded.email",
         )
         .bind(&row.username)
         .bind(&row.ed25519_pub)
@@ -2323,11 +2413,24 @@ impl PgStore {
         .bind(&row.enroll_sig)
         .bind(&row.created)
         .bind(&row.revoked)
+        .bind(&row.email)
         .execute(&mut *tx)
         .await
         .map_err(err)?;
         tx.commit().await.map_err(err)?;
         Ok(EnrollOutcome::Applied)
+    }
+
+    async fn get_identity_key_by_email(&self, email: &str) -> Option<IdentityKey> {
+        let rows = sqlx::query("SELECT * FROM identity_keys WHERE email = $1 AND email <> '' LIMIT 2")
+            .bind(email)
+            .fetch_all(&self.pool)
+            .await
+            .ok()?;
+        match rows.as_slice() {
+            [only] => Some(row_identity_key(only)),
+            _ => None,
+        }
     }
 
     async fn upsert_team_kek_envelopes(&self, org: &str, gen: i64, rows: &[TeamKekEnvelope]) -> io::Result<()> {
@@ -3218,6 +3321,7 @@ mod tests {
             enroll_sig: "sig".into(),
             created: now_iso(),
             revoked: Some("tombstone".into()),
+            email: String::new(),
         };
 
         // First enrollment lands, normalized to "alice".
@@ -3245,6 +3349,38 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].username, "alice");
         assert!(s.get_identity_key("nobody").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_lookup_by_email_maps_committer_to_account() {
+        let (_d, s) = tmp_store().await;
+        let enroll = |user: &str, ed: &str, email: &str| IdentityKey {
+            username: user.into(),
+            ed25519_pub: ed.into(),
+            x25519_pub: "b".repeat(64),
+            epoch: 0,
+            enroll_sig: "sig".into(),
+            created: now_iso(),
+            revoked: None,
+            email: email.into(),
+        };
+        s.upsert_identity_key(enroll("alice", &"a".repeat(64), "Alice@Corp.com")).await.unwrap();
+        s.upsert_identity_key(enroll("bob", &"b".repeat(64), "bob@corp.com")).await.unwrap();
+
+        // A committer email resolves to the enrolling account; the match is case/space-insensitive.
+        let hit = s.get_identity_key_by_email("  alice@corp.com ").await.expect("alice's email maps to alice");
+        assert_eq!(hit.username, "alice");
+        assert_eq!(hit.ed25519_pub, "a".repeat(64));
+        assert_eq!(hit.email, "alice@corp.com", "email is stored normalized");
+
+        // An email nobody enrolled, and a blank email, both map to nothing.
+        assert!(s.get_identity_key_by_email("ghost@corp.com").await.is_none());
+        assert!(s.get_identity_key_by_email("").await.is_none());
+
+        // Ambiguity: two accounts claiming one email is not attributable — the lookup returns neither.
+        s.upsert_identity_key(enroll("carol", &"c".repeat(64), "shared@corp.com")).await.unwrap();
+        s.upsert_identity_key(enroll("dave", &"d".repeat(64), "shared@corp.com")).await.unwrap();
+        assert!(s.get_identity_key_by_email("shared@corp.com").await.is_none(), "an ambiguous email is not a hit");
     }
 
     #[test]

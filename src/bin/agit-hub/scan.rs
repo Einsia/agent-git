@@ -77,6 +77,21 @@ pub(crate) fn pre_receive_cmd(root: &Path, args: &[String]) -> i32 {
     let report = scan_push(&repo, &news);
     // REMOTE_USER is set for http-backend and inherited all the way down to this hook.
     let actor = std::env::var("REMOTE_USER").unwrap_or_else(|_| "unknown".into());
+
+    // Signed-push provenance verification: record a per-session verdict for every pushed session that
+    // carries provenance, and — only when the operator opted into enforcement — REFUSE a push that
+    // carries a positive key mismatch (a forgery). Runs before the secret-scan verdict is acted on so a
+    // clean push still gets its provenance recorded; best-effort, so it never fails a push on its own
+    // except the enforced-mismatch case.
+    if let Some(reject) = crate::prov::verify_pushed_provenance(root, &repo, &news, &actor, &scoped) {
+        eprintln!();
+        eprint!("{reject}");
+        eprintln!();
+        eprintln!("Nothing was written — no ref moved. This gate is on the server, so --no-verify does not reach it.");
+        eprintln!();
+        return 1;
+    }
+
     if report.findings.is_empty() && !report.incomplete() {
         return 0;
     }

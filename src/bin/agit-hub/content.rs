@@ -61,7 +61,63 @@ pub(crate) fn api_session(repo: &Path, id: &str, query: &str) -> Resp {
         "spine": spine_string(&r.runtime, &jsonl),
         "revisions": revisions,
         "pinned": at,
+        // The cryptographic provenance verdict, queryable on the session itself. This is the SELF-VERIFY
+        // status (signature + content intact), computed on read at the same revision — pure, no registry
+        // call. The authoritative registry attribution ("verified as <person>" / "key mismatch") is
+        // RECORDED at push time (the `provenance.verify` audit event); surfacing it live here would need
+        // the registry in this sync read path and is left as a followup.
+        "provenance": provenance_verdict(repo, &r.path, &jsonl, at.as_deref()),
     }))
+}
+
+/// The cryptographic provenance verdict for a session, read at `at` (the same revision the transcript was
+/// loaded at). Reads the committed `<id>.agit.json` sidecar, self-verifies the signature against the
+/// transcript, and reports a legible verdict. A session with no sidecar/provenance is `unsigned` — never
+/// an error, matching the client's graceful-degradation contract.
+fn provenance_verdict(repo: &Path, path: &str, jsonl: &str, at: Option<&str>) -> serde_json::Value {
+    let sidecar_path = match path.strip_suffix(".jsonl") {
+        Some(stem) => format!("{stem}.agit.json"),
+        None => return serde_json::json!({ "status": "unsigned" }),
+    };
+    let prov = load_session(repo, &sidecar_path, at)
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| serde_json::from_value::<agit::commands::Provenance>(v.get("provenance")?.clone()).ok());
+    let status = agit::commands::verify_provenance(jsonl, prov.as_ref());
+    use agit::commands::ProvenanceStatus as S;
+    let (word, extra) = match &status {
+        S::Verified { aid, email, pubkey } => (
+            "verified",
+            serde_json::json!({ "aid": aid, "email": email, "pubkey": pubkey }),
+        ),
+        S::Unsigned => ("unsigned", serde_json::json!({})),
+        S::ContentTampered { recorded, actual } => (
+            "content_tampered",
+            serde_json::json!({ "recorded_digest": recorded, "actual_digest": actual }),
+        ),
+        S::BadSignature => ("bad_signature", serde_json::json!({})),
+        // The registry-classified variants are not produced by the pure self-verify used on this sync
+        // read path today, but map them honestly anyway: a KeyMismatch (a forgery) must NEVER render as
+        // "verified", so that wiring the registry in here later cannot silently turn a forgery green.
+        S::VerifiedAs { username, aid, email, pubkey } => (
+            "verified_as",
+            serde_json::json!({ "username": username, "aid": aid, "email": email, "pubkey": pubkey }),
+        ),
+        S::KeyMismatch { email, claimed_username, .. } => (
+            "key_mismatch",
+            serde_json::json!({ "email": email, "claimed_username": claimed_username }),
+        ),
+        S::SignedUnregistered { aid, email, pubkey } => (
+            "signed_unregistered",
+            serde_json::json!({ "aid": aid, "email": email, "pubkey": pubkey }),
+        ),
+    };
+    let mut obj = serde_json::json!({ "status": word, "summary": status.summary() });
+    if let (Some(o), Some(e)) = (obj.as_object_mut(), extra.as_object()) {
+        for (k, val) in e {
+            o.insert(k.clone(), val.clone());
+        }
+    }
+    obj
 }
 
 /// Bytes served by the raw route in one response. A store holds transcripts, not releases.

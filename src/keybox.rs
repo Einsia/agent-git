@@ -532,10 +532,16 @@ pub fn write_pin(home: &Path, user: &str, key: &[u8; 32]) -> Result<()> {
 
 /// Decode a 32-byte X25519 pubkey from hex, with a loud error on bad hex / wrong length.
 pub fn decode_x25519_hex(hexstr: &str) -> Result<[u8; 32]> {
-    let raw = hex::decode(hexstr.trim()).context("not valid hex for an X25519 public key")?;
+    decode_pub32_hex(hexstr).context("not valid hex for an X25519 public key")
+}
+
+/// Decode any 32-byte public key from hex (X25519 or ed25519), with a loud error on bad hex / wrong
+/// length. The key type is the caller's business; on the wire both are 32 raw bytes.
+pub fn decode_pub32_hex(hexstr: &str) -> Result<[u8; 32]> {
+    let raw = hex::decode(hexstr.trim()).context("not valid hex for a 32-byte public key")?;
     raw.as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("an X25519 public key must be 32 bytes"))
+        .map_err(|_| anyhow::anyhow!("a 32-byte public key must be exactly 32 bytes"))
 }
 
 /// Best-effort fetch of a user's published X25519 pubkey from the hub registry. `None` on any failure
@@ -602,6 +608,80 @@ pub fn pin_user(home: &Path, user: &str, key_override: Option<&str>, repin: bool
         _ => {
             write_pin(home, user, &candidate)?;
             Ok(candidate)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Provenance signing-key pins: TOFU for the ed25519 key the hub attributes a person's sessions to
+// ---------------------------------------------------------------------------------------------
+//
+// Kept in a SEPARATE directory from the encryption (X25519) pins: a person's ed25519 signing key and
+// their X25519 wrapping key are different keys, and pinning one must never be read back as the other.
+
+/// `$AGIT_HOME/identity/prov-pins/` — one file per account, holding that account's hex ed25519 pubkey as
+/// last seen in the hub registry. The trust anchor for "verified as <person>".
+fn prov_pins_dir(home: &Path) -> PathBuf {
+    home.join("identity").join("prov-pins")
+}
+
+fn prov_pin_path(home: &Path, user: &str) -> Result<PathBuf> {
+    let u = user.trim();
+    let ok = !u.is_empty()
+        && u != "."
+        && u != ".."
+        && !u.contains('/')
+        && !u.contains('\\')
+        && u.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if !ok {
+        bail!("`{user}` is not a usable username for a provenance-key pin");
+    }
+    Ok(prov_pins_dir(home).join(u))
+}
+
+/// The pinned ed25519 provenance key for `user`, or `None` if this machine has never pinned them.
+pub fn read_prov_pin(home: &Path, user: &str) -> Result<Option<[u8; 32]>> {
+    let path = prov_pin_path(home, user)?;
+    match std::fs::read_to_string(&path) {
+        Ok(t) => Ok(Some(decode_pub32_hex(t.trim())?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot read provenance pin {}", path.display())),
+    }
+}
+
+/// Pin (or, with `repin`, re-pin) `user`'s ed25519 provenance key.
+pub fn write_prov_pin(home: &Path, user: &str, key: &[u8; 32]) -> Result<()> {
+    let path = prov_pin_path(home, user)?;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).with_context(|| format!("cannot create {}", d.display()))?;
+    }
+    std::fs::write(&path, format!("{}\n", hex::encode(key)))
+        .with_context(|| format!("cannot write provenance pin {}", path.display()))
+}
+
+/// TOFU for a person's REGISTERED ed25519 signing key: the key the hub says owns `user`'s attribution.
+/// First sighting pins it and returns it; a later sighting that DIFFERS from the pin is a HARD failure
+/// (a hub key-substitution) carrying a re-pin instruction, unless `repin`. Returns the trusted (pinned)
+/// key, which is what a caller must compare a provenance signature's pubkey against.
+pub fn pin_provenance_key(home: &Path, user: &str, key: &[u8; 32], repin: bool) -> Result<[u8; 32]> {
+    match read_prov_pin(home, user)? {
+        Some(pin) if &pin == key => Ok(pin),
+        Some(_) if repin => {
+            write_prov_pin(home, user, key)?;
+            Ok(*key)
+        }
+        Some(pin) => bail!(
+            "TOFU: the registered signing key for `{user}` DIFFERS from the pinned key\n\
+             \x20      pinned  {}\n\
+             \x20      This blocks a hub key-substitution attributing sessions to a swapped key. If the\n\
+             \x20      rotation is real, verify the fingerprint out of band, then re-pin:\n\
+             \x20      agit provenance verify <session> --repin",
+            hex::encode(pin)
+        ),
+        None => {
+            // First sighting: pin it (TOFU).
+            write_prov_pin(home, user, key)?;
+            Ok(*key)
         }
     }
 }

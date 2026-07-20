@@ -115,6 +115,10 @@ pub const BLOB_CORRUPT: &str = "blob.corrupt";
 /// A push the server-side secret scan turned away. The client hook is `--no-verify`-able, so this
 /// row is the only durable trace that someone tried.
 pub const GIT_PUSH_REJECTED: &str = "git.push.rejected";
+/// A pushed session's cryptographic provenance was verified against the identity registry at receive
+/// time. The detail carries the per-session verdict (verified-as / key-mismatch / signed-unregistered /
+/// bad-signature) — the server-side "Verified" record, recorded whether or not enforcement is on.
+pub const PROVENANCE_VERIFY: &str = "provenance.verify";
 /// Identity events. The Hub never mints an aid — it only ever reports what it read out of the store,
 /// and these say what it made of it.
 pub const AGENT_AID_LEARNED: &str = "agent.aid.learned";

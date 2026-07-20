@@ -65,9 +65,10 @@ fn needs_write(path: &str, query: &str) -> bool {
     path.ends_with("/git-receive-pack") || percent_decode_lossy(query).contains("git-receive-pack")
 }
 
-/// Percent-decoding. Escapes it cannot decode are left as-is — the point here is only "does this
-/// mention receive-pack?", not faithful reconstruction.
-fn percent_decode_lossy(s: &str) -> String {
+/// Percent-decoding. Escapes it cannot decode are left as-is — faithful enough for a query value like a
+/// committer email (`dev%40x.com` → `dev@x.com`). Does NOT turn `+` into a space (callers that need a
+/// form-encoded space must handle it); an email carries no spaces, so this is exactly right there.
+pub fn percent_decode_lossy(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

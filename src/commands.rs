@@ -988,7 +988,22 @@ pub fn sign_provenance(
 /// session degrades to `Unsigned`, mirroring the "attribution fallback is never silent" contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvenanceStatus {
+    /// Self-verify passed: the content is intact and the signature matches the RECORDED key. This says
+    /// nothing about WHO that key belongs to — that is the registry's job (`VerifiedAs`/`KeyMismatch`).
     Verified { aid: String, email: String, pubkey: String },
+    /// Registry-attributed: self-verify passed AND the provenance `pubkey` IS the ed25519 key the hub
+    /// registry has for the account that owns the committer `email`. This is the only "verified as a
+    /// person" verdict — "signed by alice's registered key".
+    VerifiedAs { username: String, aid: String, email: String, pubkey: String },
+    /// The security-critical case: self-verify passed, and the committer `email` DOES map to a registered
+    /// account, but that account's registered ed25519 key DIFFERS from the provenance `pubkey`. The
+    /// session was signed by a key that is NOT the claimed identity's registered key — a possible forgery
+    /// / impersonation. Never a pass.
+    KeyMismatch { email: String, claimed_username: String, registered_pubkey: String, actual_pubkey: String },
+    /// Self-verify passed, but the committer `email` maps to NO registered account (or no hub was
+    /// reachable). Falls back to today's self-verify meaning: the signature is internally consistent, but
+    /// there is nothing to attribute it TO. Never "verified as a person".
+    SignedUnregistered { aid: String, email: String, pubkey: String },
     /// No signature to check (a session captured before signing, or with no key available at capture).
     Unsigned,
     /// The transcript's current digest differs from the one signed: the content changed after signing.
@@ -1005,6 +1020,17 @@ impl ProvenanceStatus {
             ProvenanceStatus::Verified { aid, pubkey, .. } => {
                 format!("verified · signed for {aid} by key {}", short_key(pubkey))
             }
+            ProvenanceStatus::VerifiedAs { username, email, .. } => {
+                format!("VERIFIED AS {username} <{email}> · signed by {username}'s registered key")
+            }
+            ProvenanceStatus::KeyMismatch { claimed_username, .. } => {
+                format!(
+                    "KEY MISMATCH · signed by a key that is NOT {claimed_username}'s registered key (possible forgery)"
+                )
+            }
+            ProvenanceStatus::SignedUnregistered { email, pubkey, .. } => {
+                format!("signed · {email} maps to no registered account; self-verified only (key {})", short_key(pubkey))
+            }
             ProvenanceStatus::Unsigned => "unverified · no signature recorded".to_string(),
             ProvenanceStatus::ContentTampered { .. } => {
                 "UNVERIFIED · content changed since it was signed (tampered)".to_string()
@@ -1014,9 +1040,30 @@ impl ProvenanceStatus {
             }
         }
     }
+    /// Whether the signature + content self-verify passed (regardless of registry attribution). Both
+    /// `Verified` and the registry-classified `VerifiedAs`/`SignedUnregistered` imply a good self-verify;
+    /// `KeyMismatch` does NOT (its signature is valid over its own key, but that key is not the claimed
+    /// person's — so it is not a pass).
     pub fn is_verified(&self) -> bool {
-        matches!(self, ProvenanceStatus::Verified { .. })
+        matches!(
+            self,
+            ProvenanceStatus::Verified { .. }
+                | ProvenanceStatus::VerifiedAs { .. }
+                | ProvenanceStatus::SignedUnregistered { .. }
+        )
     }
+    /// Whether the hub registry positively attributed this to a person: only `VerifiedAs`.
+    pub fn is_attributed(&self) -> bool {
+        matches!(self, ProvenanceStatus::VerifiedAs { .. })
+    }
+}
+
+/// A registered identity as the hub publishes it: the account username and its ed25519 signing pubkey
+/// (hex). Resolved from a committer email via the registry's `by-email` lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredIdentity {
+    pub username: String,
+    pub ed25519_pub: String,
 }
 
 fn short_key(pubkey: &str) -> String {
@@ -1048,6 +1095,100 @@ pub fn verify_provenance(content: &str, p: Option<&Provenance>) -> ProvenanceSta
     }
 }
 
+/// Verify a provenance record's signature ALONE, against its own recorded `content_digest` — without the
+/// transcript on hand. This is the SERVER's check on a push: it proves the signed tuple is internally
+/// consistent (the recorded pubkey really signed `(digest ‖ aid ‖ email ‖ started)`), which is all the
+/// hub needs to then attribute the key to a person. Content-tamper (transcript vs recorded digest) stays
+/// the client's read-time job — [`verify_provenance`] — since only the client holds the transcript.
+pub fn verify_provenance_signature(p: &Provenance) -> bool {
+    let msg = provenance_message(&p.content_digest, &p.aid, &p.email, &p.started);
+    agent::verify_hex(&p.pubkey, &msg, &p.sig)
+}
+
+/// Compare two hex pubkeys for equality, case-insensitively (hub and client may differ in hex case). A
+/// non-hex value never equals anything — it cannot be a real key.
+fn same_pubkey(a: &str, b: &str) -> bool {
+    !a.is_empty() && a.eq_ignore_ascii_case(b)
+}
+
+/// The pure attribution step, shared by the client and the hub: given a self-verify status and the
+/// registry's answer for the committer email, upgrade a `Verified` into `VerifiedAs` / `KeyMismatch` /
+/// `SignedUnregistered`. Everything non-`Verified` (Unsigned/Tampered/BadSignature) passes through
+/// unchanged. `registered` is the account the email maps to, or `None` when it maps to nothing (or the
+/// caller could not reach the registry — offline degrades to `SignedUnregistered`, never a false
+/// "verified as"). `trusted_pubkey`, when set, is the key to compare against instead of
+/// `registered.ed25519_pub` — the CLIENT passes its TOFU-pinned copy so a hub key-substitution cannot
+/// manufacture a false match; the hub passes `None` (it IS the registry).
+pub fn attribute_with_registry(
+    self_status: ProvenanceStatus,
+    registered: Option<RegisteredIdentity>,
+    trusted_pubkey: Option<&str>,
+) -> ProvenanceStatus {
+    let ProvenanceStatus::Verified { aid, email, pubkey } = self_status else {
+        return self_status;
+    };
+    let Some(reg) = registered else {
+        return ProvenanceStatus::SignedUnregistered { aid, email, pubkey };
+    };
+    let registered_pubkey = trusted_pubkey.unwrap_or(&reg.ed25519_pub);
+    if same_pubkey(&pubkey, registered_pubkey) {
+        ProvenanceStatus::VerifiedAs { username: reg.username, aid, email, pubkey }
+    } else {
+        ProvenanceStatus::KeyMismatch {
+            email,
+            claimed_username: reg.username,
+            registered_pubkey: registered_pubkey.to_string(),
+            actual_pubkey: pubkey,
+        }
+    }
+}
+
+/// Self-verify a session's provenance and then attribute it against the identity registry — the full
+/// "verified as person X" path. `lookup` resolves a committer email to the registered account owning it
+/// (`Ok(Some)` = registered, `Ok(None)` = no account, `Err` = no hub / unreachable — both non-hits
+/// degrade to `SignedUnregistered`, so an offline verify is never a false attribution).
+///
+/// TOFU: the registered ed25519 key the hub hands back is pinned on first sighting; a CHANGED registered
+/// key is a HARD failure (an `Err` from this function) unless `repin` — matching the encryption
+/// recipient-pinning decision, so a hub cannot silently swap the key it attributes a session to. The
+/// comparison then uses the pinned copy, not the freshly-fetched one.
+pub fn verify_provenance_with_registry<F>(
+    home: &Path,
+    content: &str,
+    p: Option<&Provenance>,
+    repin: bool,
+    lookup: F,
+) -> Result<ProvenanceStatus>
+where
+    F: FnOnce(&str) -> Result<Option<RegisteredIdentity>>,
+{
+    let self_status = verify_provenance(content, p);
+    let ProvenanceStatus::Verified { email, .. } = &self_status else {
+        // Unsigned / tampered / bad-signature: nothing to attribute.
+        return Ok(self_status);
+    };
+    // Non-hits (unknown email, or no hub reachable) degrade to self-verify only — never a false pass.
+    let registered = match lookup(email) {
+        Ok(Some(reg)) => reg,
+        Ok(None) | Err(_) => {
+            return Ok(attribute_with_registry(self_status, None, None));
+        }
+    };
+    // TOFU-pin the account's registered ed25519 key; a changed key HARD-FAILS (Err) unless re-pinned.
+    let pinned = pin_registered_ed25519(home, &registered, repin)?;
+    Ok(attribute_with_registry(self_status, Some(registered), Some(&pinned)))
+}
+
+/// TOFU-pin an account's registered ed25519 signing key, returning the trusted (pinned) key as hex. First
+/// sighting pins it; a later sighting that DIFFERS is a hard error carrying a re-pin instruction, unless
+/// `repin`. Reuses the same on-disk pin discipline the encryption recipient pins use.
+fn pin_registered_ed25519(home: &Path, reg: &RegisteredIdentity, repin: bool) -> Result<String> {
+    let key = crate::keybox::decode_pub32_hex(&reg.ed25519_pub)
+        .with_context(|| format!("the hub returned a malformed ed25519 key for {}", reg.username))?;
+    let trusted = crate::keybox::pin_provenance_key(home, &reg.username, &key, repin)?;
+    Ok(hex::encode(trusted))
+}
+
 /// The committer email the store commits under, read never written (agit must not touch git identity).
 /// Falls back to the store default when git has nothing configured, so signing always has a stable field.
 pub fn committer_email(store: &Path) -> String {
@@ -1071,11 +1212,11 @@ pub fn sidecar_provenance(transcript: &Path) -> Option<Provenance> {
 /// for `key`/no-arg, and a non-zero code only when an explicit `verify` finds a session NOT verified.
 pub fn provenance_cmd(args: &[String]) -> Result<i32> {
     match args.first().map(|s| s.as_str()) {
-        Some("verify") => provenance_verify(args.get(1).map(|s| s.as_str())),
+        Some("verify") => provenance_verify(&args[1..]),
         Some("key") | Some("show") | None => provenance_key(),
         Some(other) => {
             errln!("agit provenance: unknown subcommand `{other}`");
-            errln!("  usage: agit provenance verify <session>   ·   agit provenance key");
+            errln!("  usage: agit provenance verify <session> [--repin]   ·   agit provenance key");
             Ok(2)
         }
     }
@@ -1158,16 +1299,25 @@ fn identity_enroll(rotate: bool) -> Result<i32> {
 
     let msg = agent::identity_enroll_message(&username, epoch, &ed_pub, &x_pub);
     let enroll_sig = agent::sign_hex(&sk, &msg);
+    // Publish the committer email too (best-effort — an override hub with no active agent has none): it is
+    // the bridge that lets a teammate verifying a session's provenance resolve its committer to THIS
+    // account. Not part of `enroll_sig` (the possession proof), so the Wave-1 signing format is unchanged;
+    // it is a self-asserted attribute the server stores alongside the keys.
+    let email = agent::resolve(None).map(|a| committer_email(&a.store)).unwrap_or_default();
     let body = serde_json::json!({
         "ed25519_pub": ed_pub,
         "x25519_pub": x_pub,
         "epoch": epoch,
         "enroll_sig": enroll_sig,
+        "email": email,
     });
     ep.enroll(&body)?;
     outln!("enrolled {username} in the hub identity registry at epoch {epoch}");
     outln!("  ed25519  {ed_pub}");
     outln!("  x25519   {x_pub}");
+    if !email.is_empty() {
+        outln!("  email    {email}  (attribution: sessions you commit under this email verify as {username})");
+    }
     Ok(0)
 }
 
@@ -1249,30 +1399,75 @@ fn hub_enrollment_status(local_ed_pub: &str) -> Result<Option<String>> {
 
 /// Resolve `<session>` to a transcript on disk — a direct path, a sidecar path, or a session id in the
 /// resolved agent's store — then self-verify its provenance.
-fn provenance_verify(session: Option<&str>) -> Result<i32> {
-    let Some(sel) = session.map(str::trim).filter(|s| !s.is_empty()) else {
-        anyhow::bail!("agit provenance verify: name a session\n  usage: agit provenance verify <session-path|id>");
+fn provenance_verify(args: &[String]) -> Result<i32> {
+    let repin = args.iter().any(|a| a == "--repin");
+    let Some(sel) = first_positional(args).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        anyhow::bail!("agit provenance verify: name a session\n  usage: agit provenance verify <session-path|id> [--repin]");
     };
-    let transcript = resolve_session_transcript(sel)?;
+    let transcript = resolve_session_transcript(&sel)?;
     let content = std::fs::read_to_string(&transcript)
         .with_context(|| format!("cannot read session {}", transcript.display()))?;
-    let status = verify_provenance(&content, sidecar_provenance(&transcript).as_ref());
+    let prov = sidecar_provenance(&transcript);
+
+    // Consult the hub identity registry to upgrade a good self-verify into "verified as <person>". No hub
+    // reachable degrades to `SignedUnregistered` (self-verify only), never a false attribution. A TOFU
+    // pin change on the registered key is a hard error (the `?`), matching the encryption decision.
+    let home = scope::agit_home()?;
+    let endpoint = crate::hubapi::HubEndpoint::resolve();
+    let status = verify_provenance_with_registry(&home, &content, prov.as_ref(), repin, |email| {
+        match &endpoint {
+            Ok(ep) => ep.get_identity_by_email(email).map(|opt| opt.map(registered_from_json)),
+            // No hub configured/reachable: fall back to self-verify (SignedUnregistered), never block.
+            Err(_) => Ok(None),
+        }
+    })?;
 
     outln!("session {}", transcript.display());
     outln!("  {}", status.summary());
-    if let ProvenanceStatus::Verified { email, .. } = &status {
-        outln!("  committer {email}");
+    match &status {
+        ProvenanceStatus::VerifiedAs { username, email, pubkey, .. } => {
+            outln!("  identity  {username} <{email}>");
+            outln!("  key       {pubkey}");
+        }
+        ProvenanceStatus::KeyMismatch { email, claimed_username, registered_pubkey, actual_pubkey } => {
+            errln!("  committer      {email} (registered to {claimed_username})");
+            errln!("  registered key {registered_pubkey}");
+            errln!("  signing key    {actual_pubkey}");
+            errln!("  this session was signed by a key that is NOT {claimed_username}'s registered key.");
+        }
+        ProvenanceStatus::SignedUnregistered { email, pubkey, .. } => {
+            outln!("  committer {email}");
+            outln!("  key       {pubkey}");
+        }
+        ProvenanceStatus::Verified { email, .. } => outln!("  committer {email}"),
+        ProvenanceStatus::ContentTampered { recorded, actual } => {
+            outln!("  signed digest  {recorded}");
+            outln!("  current digest {actual}");
+        }
+        ProvenanceStatus::Unsigned | ProvenanceStatus::BadSignature => {}
     }
-    if let ProvenanceStatus::ContentTampered { recorded, actual } = &status {
-        outln!("  signed digest  {recorded}");
-        outln!("  current digest {actual}");
-    }
-    // Never block: an unsigned session is a soft "unverified" (exit 0, like the attribution fallback); a
-    // signature that is present but does NOT check out is a hard failure worth a non-zero code.
+    // Never block a soft "unverified" (unsigned/unregistered → exit 0, like the attribution fallback). A
+    // signature that is present but does NOT check out, and a KEY MISMATCH (a possible forgery), are hard
+    // failures worth a non-zero code.
     Ok(match status {
-        ProvenanceStatus::Verified { .. } | ProvenanceStatus::Unsigned => 0,
-        ProvenanceStatus::ContentTampered { .. } | ProvenanceStatus::BadSignature => 1,
+        ProvenanceStatus::Verified { .. }
+        | ProvenanceStatus::VerifiedAs { .. }
+        | ProvenanceStatus::SignedUnregistered { .. }
+        | ProvenanceStatus::Unsigned => 0,
+        ProvenanceStatus::ContentTampered { .. }
+        | ProvenanceStatus::BadSignature
+        | ProvenanceStatus::KeyMismatch { .. } => 1,
     })
+}
+
+/// Extract a [`RegisteredIdentity`] from a hub `by-email` / identity JSON row. Missing fields become
+/// empty strings — a row with no `ed25519_pub` then compares equal to nothing, so it classifies as a
+/// mismatch rather than a false pass.
+fn registered_from_json(v: serde_json::Value) -> RegisteredIdentity {
+    RegisteredIdentity {
+        username: field(&v, "username").to_string(),
+        ed25519_pub: field(&v, "ed25519_pub").to_string(),
+    }
 }
 
 /// A session selector is a filesystem path (to the transcript or its sidecar) when one exists, else a
@@ -3604,6 +3799,153 @@ mod provenance_tests {
         let first = key(home.path());
         let again = key(home.path());
         assert_eq!(first.to_bytes(), again.to_bytes(), "the key must not rotate on reload");
+    }
+
+    // ── registry attribution: "signed by this key" → "verified as this person" ──
+
+    fn reg(username: &str, ed25519_pub: &str) -> RegisteredIdentity {
+        RegisteredIdentity { username: username.into(), ed25519_pub: ed25519_pub.into() }
+    }
+
+    /// The committer email maps to a registered account whose key IS the one that signed the session →
+    /// `VerifiedAs`. The only "verified as a person" verdict.
+    #[test]
+    fn a_matching_registered_key_verifies_as_the_person() {
+        let home = tempfile::tempdir().unwrap();
+        let k = key(home.path());
+        let pubkey = hex::encode(k.verifying_key().to_bytes());
+        let content = "transcript\n";
+        let p = sign_provenance(&k, content, "agt_01", "alice@corp.com", "t0");
+
+        let status = verify_provenance_with_registry(home.path(), content, Some(&p), false, |email| {
+            assert_eq!(email, "alice@corp.com");
+            Ok(Some(reg("alice", &pubkey)))
+        })
+        .unwrap();
+        match status {
+            ProvenanceStatus::VerifiedAs { username, aid, email, .. } => {
+                assert_eq!(username, "alice");
+                assert_eq!(aid, "agt_01");
+                assert_eq!(email, "alice@corp.com");
+            }
+            other => panic!("expected VerifiedAs, got {other:?}"),
+        }
+    }
+
+    /// The anti-forgery property: the email maps to a registered account, but its key DIFFERS from the
+    /// signing key → `KeyMismatch`, never `VerifiedAs`. This is the impersonation case.
+    #[test]
+    fn a_differing_registered_key_is_a_key_mismatch_not_verified() {
+        let home = tempfile::tempdir().unwrap();
+        let signer = key(home.path());
+        let content = "transcript\n";
+        let p = sign_provenance(&signer, content, "agt_01", "alice@corp.com", "t0");
+        // alice's registered key is some OTHER key, not the one that signed this session.
+        let alices_real_key = "22".repeat(32);
+
+        let status = verify_provenance_with_registry(home.path(), content, Some(&p), false, |_email| {
+            Ok(Some(reg("alice", &alices_real_key)))
+        })
+        .unwrap();
+        assert!(!status.is_verified(), "a key mismatch is NOT a pass: {status:?}");
+        match status {
+            ProvenanceStatus::KeyMismatch { claimed_username, registered_pubkey, actual_pubkey, .. } => {
+                assert_eq!(claimed_username, "alice");
+                assert_eq!(registered_pubkey, alices_real_key);
+                assert_eq!(actual_pubkey, p.pubkey);
+            }
+            other => panic!("expected KeyMismatch, got {other:?}"),
+        }
+    }
+
+    /// The email maps to no registered account → `SignedUnregistered`: the signature is internally
+    /// consistent, but there is nobody to attribute it to. Falls back to self-verify meaning.
+    #[test]
+    fn an_unregistered_email_is_signed_unregistered() {
+        let home = tempfile::tempdir().unwrap();
+        let k = key(home.path());
+        let content = "transcript\n";
+        let p = sign_provenance(&k, content, "agt_01", "nobody@corp.com", "t0");
+
+        let status =
+            verify_provenance_with_registry(home.path(), content, Some(&p), false, |_email| Ok(None)).unwrap();
+        assert!(matches!(status, ProvenanceStatus::SignedUnregistered { .. }), "{status:?}");
+        assert!(status.is_verified(), "self-verify still holds; it is just unattributed");
+    }
+
+    /// Offline / no hub reachable (the lookup errors) → `SignedUnregistered`, NEVER a false "verified as".
+    #[test]
+    fn offline_falls_back_to_signed_unregistered_never_verified_as() {
+        let home = tempfile::tempdir().unwrap();
+        let k = key(home.path());
+        let content = "transcript\n";
+        let p = sign_provenance(&k, content, "agt_01", "alice@corp.com", "t0");
+
+        let status = verify_provenance_with_registry(home.path(), content, Some(&p), false, |_email| {
+            anyhow::bail!("no hub reachable")
+        })
+        .unwrap();
+        assert!(matches!(status, ProvenanceStatus::SignedUnregistered { .. }), "{status:?}");
+        assert!(!status.is_attributed(), "an offline verify must never positively attribute");
+    }
+
+    /// A tampered transcript stays `ContentTampered` and a bad signature stays `BadSignature` even on the
+    /// registry path — the registry is never consulted for a session that does not self-verify.
+    #[test]
+    fn registry_path_preserves_tamper_and_bad_signature() {
+        let home = tempfile::tempdir().unwrap();
+        let k = key(home.path());
+        let p = sign_provenance(&k, "original\n", "agt_01", "alice@corp.com", "t0");
+        let called = std::cell::Cell::new(false);
+
+        let tampered = verify_provenance_with_registry(home.path(), "edited\n", Some(&p), false, |_e| {
+            called.set(true);
+            Ok(Some(reg("alice", &p.pubkey)))
+        })
+        .unwrap();
+        assert!(matches!(tampered, ProvenanceStatus::ContentTampered { .. }), "{tampered:?}");
+        assert!(!called.get(), "a session that does not self-verify must never hit the registry");
+
+        let mut bad = sign_provenance(&k, "c\n", "agt_01", "alice@corp.com", "t0");
+        bad.sig = "00".repeat(64);
+        let badsig =
+            verify_provenance_with_registry(home.path(), "c\n", Some(&bad), false, |_e| Ok(None)).unwrap();
+        assert_eq!(badsig, ProvenanceStatus::BadSignature);
+    }
+
+    /// TOFU: once a person's registered key is pinned, a CHANGED registered key HARD-FAILS the verify
+    /// (an `Err` with a re-pin instruction) — a hub cannot silently swap the key it attributes sessions
+    /// to. `--repin` accepts the new key.
+    #[test]
+    fn a_changed_registered_key_hard_fails_until_repinned() {
+        let home = tempfile::tempdir().unwrap();
+        let k = key(home.path());
+        let pubkey = hex::encode(k.verifying_key().to_bytes());
+        let content = "transcript\n";
+        let p = sign_provenance(&k, content, "agt_01", "alice@corp.com", "t0");
+
+        // First sighting pins alice's registered key.
+        let first = verify_provenance_with_registry(home.path(), content, Some(&p), false, |_e| {
+            Ok(Some(reg("alice", &pubkey)))
+        })
+        .unwrap();
+        assert!(matches!(first, ProvenanceStatus::VerifiedAs { .. }), "{first:?}");
+
+        // The hub now hands back a DIFFERENT registered key for alice — a possible key-substitution.
+        let rotated = "33".repeat(32);
+        let err = verify_provenance_with_registry(home.path(), content, Some(&p), false, |_e| {
+            Ok(Some(reg("alice", &rotated)))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("--repin"), "the hard failure must instruct a re-pin: {err}");
+
+        // With --repin, the new key is accepted (and this session then mismatches it, as its signer key
+        // is the old one — a key-mismatch, correctly, not a silent pass).
+        let after = verify_provenance_with_registry(home.path(), content, Some(&p), true, |_e| {
+            Ok(Some(reg("alice", &rotated)))
+        })
+        .unwrap();
+        assert!(matches!(after, ProvenanceStatus::KeyMismatch { .. }), "{after:?}");
     }
 }
 
