@@ -108,7 +108,7 @@ mod tests {
     use crate::scan::*;
     use crate::server::*;
 
-    use agit::hub::acl::{AgentAcl, Caller, Deny, Lifecycle, Role, Scope, Visibility};
+    use agit::hub::acl::{Action, AgentAcl, Caller, Deny, Lifecycle, Role, Scope, Visibility};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn anonymous_denial_is_401_so_the_spa_can_offer_login() {
-        let r = deny_resp(&Caller::anonymous(), &private_acl(), Deny::Anonymous);
+        let r = deny_resp(&Caller::anonymous(), &private_acl(), "alice", "secret", Action::Read, Deny::Anonymous);
         assert_eq!(r.status, 401);
     }
 
@@ -213,7 +213,7 @@ mod tests {
     fn denied_stranger_gets_404_not_403() {
         // A 403 admits "this agent exists" — that's an interface for enumerating private agent names.
         // Anyone who can't read gets a 404, identical to "doesn't exist".
-        let r = deny_resp(&Caller::user("eve"), &private_acl(), Deny::NoGrant);
+        let r = deny_resp(&Caller::user("eve"), &private_acl(), "alice", "secret", Action::Read, Deny::NoGrant);
         assert_eq!(r.status, 404);
     }
 
@@ -227,25 +227,29 @@ mod tests {
             lifecycle: Lifecycle::Active,
             members: vec![("bob".into(), Role::Read)],
         };
-        let r = deny_resp(&Caller::user("bob"), &acl, Deny::NoGrant);
+        let r = deny_resp(&Caller::user("bob"), &acl, "alice", "secret", Action::Write, Deny::NoGrant);
         assert_eq!(r.status, 403);
+        // The 403 body now names who they are, the agent, and the remedy.
+        let msg = String::from_utf8_lossy(&r.body);
+        assert!(msg.contains("bob"), "names the caller: {msg}");
+        assert!(msg.contains("alice/secret"), "names the agent: {msg}");
     }
 
     #[test]
     fn token_denials_on_a_readable_agent_are_403() {
         let caller = Caller::user("alice").with_token(None, Scope::Read);
-        assert_eq!(deny_resp(&caller, &private_acl(), Deny::TokenScope).status, 403);
-        assert_eq!(deny_resp(&caller, &private_acl(), Deny::TokenCannotManage).status, 403);
+        assert_eq!(deny_resp(&caller, &private_acl(), "alice", "secret", Action::Write, Deny::TokenScope).status, 403);
+        assert_eq!(deny_resp(&caller, &private_acl(), "alice", "secret", Action::Manage, Deny::TokenCannotManage).status, 403);
     }
 
     #[test]
     fn git_anonymous_denial_challenges_so_git_asks_for_credentials() {
         // Without this header, `git clone` won't ask the user for a password, it just errors out.
-        let r = git_deny_resp(&Caller::anonymous(), Deny::Anonymous);
+        let r = git_deny_resp(&Caller::anonymous(), "alice", "secret", Action::Write, Deny::Anonymous);
         assert_eq!(r.status, 401);
         assert!(r.extra.iter().any(|(k, v)| k == "WWW-Authenticate" && v.contains("Basic")));
         // Don't challenge someone already authenticated — asking for the password again yields the same answer.
-        let r = git_deny_resp(&Caller::user("eve"), Deny::NoGrant);
+        let r = git_deny_resp(&Caller::user("eve"), "alice", "secret", Action::Write, Deny::NoGrant);
         assert_eq!(r.status, 403);
         assert!(r.extra.is_empty());
     }

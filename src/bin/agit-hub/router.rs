@@ -20,7 +20,7 @@ use agit::hub::{audit, auth};
 
 use crate::api::{agent_acl, api};
 use crate::cli::repo_path;
-use crate::http::{credentials, git_deny_resp, req_from_parts, Resp};
+use crate::http::{authz_denied_msg, credentials, git_deny_resp, req_from_parts, Resp};
 use crate::limits::{API_MAX_BODY, MAX_BODY, MAX_CONN};
 use crate::server::Ctx;
 use crate::smarthttp::git_http;
@@ -83,20 +83,24 @@ pub(crate) async fn gate(ctx: &Ctx, caller: &Caller, owner: &str, name: &str, ac
         Decision::Deny(d) => {
             let actor = caller.user.clone().unwrap_or_else(|| "anonymous".into());
             audit_deny(ctx, &actor, Some(&format!("{owner}/{name}")), action, d).await;
-            Err(deny_resp(caller, &acl, d))
+            Err(deny_resp(caller, &acl, owner, name, action, d))
         }
     }
 }
 
-pub(crate) fn deny_resp(caller: &Caller, acl: &AgentAcl, d: Deny) -> Resp {
+pub(crate) fn deny_resp(caller: &Caller, acl: &AgentAcl, owner: &str, name: &str, action: Action, d: Deny) -> Resp {
     // Someone who can read but is denied a write/manage → tell them 403 (they already know this
     // agent exists).
     // Someone who can't even read → 404, not even admitting it exists.
     let can_read = acl::decide(caller, acl, Action::Read).allowed();
     match (d, can_read) {
+        // The existence-masking arms stay BYTE-IDENTICAL: a 401/404 here must not vary by who is
+        // asking, or the difference becomes an enumeration oracle for private agent names.
         (Deny::Anonymous, false) => Resp::err(401, "login required"),
         (_, false) => Resp::err(404, "not found"),
-        (_, true) => Resp::err(403, d.reason()),
+        // They can already see the agent, so nothing is left to hide — name who they are, the agent,
+        // and the remedy instead of the bare reason.
+        (_, true) => Resp::err(403, &authz_denied_msg(caller, owner, name, action, d)),
     }
 }
 
@@ -338,7 +342,7 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
                     tracing::warn!(agent = %scoped, actor = %actor, reason = %d.reason(), "git push rejected");
                 }
                 // A git client only prompts for credentials on 401 + WWW-Authenticate.
-                return git_deny_resp(&caller, d).into_response();
+                return git_deny_resp(&caller, owner, name, action, d).into_response();
             }
         }
         // Authorized already; only now may the body be touched (an unauthorized push got a 401 above and

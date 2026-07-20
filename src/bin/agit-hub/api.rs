@@ -3935,8 +3935,14 @@ pub(crate) async fn api_create_token(ctx: &Ctx, caller: &Caller, body: &[u8]) ->
             let Some((a_owner, a_name)) = spec.split_once('/') else {
                 return Resp::err(400, "agent must be owner/name (e.g. alice/frontend)");
             };
-            // You can only issue tokens for agents you can see.
-            let meta = match gate(ctx, caller, a_owner, a_name, Action::Read).await {
+            // Bind at the action the token will actually take: a WRITE token must be REFUSED now if
+            // the caller can only READ the target (e.g. a public agent they don't own), instead of
+            // minting a token that 403s at the first push. A READ token still only needs Read.
+            let bind_action = match scope {
+                Scope::Write => Action::Write,
+                Scope::Read => Action::Read,
+            };
+            let meta = match gate(ctx, caller, a_owner, a_name, bind_action).await {
                 Ok(m) => m,
                 Err(r) => return r,
             };
@@ -5339,5 +5345,62 @@ mod tests {
         assert_eq!(r.status, 201);
         let repo = repo_path(ctx.root(), "alice", "reserved");
         assert!(git(&repo, &["rev-parse", "--verify", "HEAD"]).is_none(), "initialize=false leaves an empty bare repo");
+    }
+
+    // ── token binding is gated at the token's own scope (FIX 3) ──
+
+    /// A WRITE token bound to an agent the caller can only READ (a public agent they don't own) is
+    /// REFUSED at creation — not minted to 403 later at the first push. The gate now runs at
+    /// Action::Write for a write-scoped token, and bob can only read alice's public agent.
+    #[tokio::test]
+    async fn write_token_bound_to_a_public_agent_you_only_read_is_refused() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        add_user(&ctx, "bob", "bob-password-1", false).await;
+        create_agent(&ctx.store, "frontend", "alice", Visibility::Public).await.unwrap();
+        let r = api_create_token(
+            &ctx,
+            &caller("bob", false),
+            &body(serde_json::json!({ "name": "ci", "scope": "write", "agent": "alice/frontend" })),
+        )
+        .await;
+        // bob CAN read alice/frontend (it's public), so this is a 403 (not the 404 existence-mask),
+        // and no token is issued.
+        assert_eq!(r.status, 403, "a write token for an agent you can only read is refused now");
+        assert!(ctx.store.tokens().await.is_empty(), "no token was persisted");
+    }
+
+    /// A READ token bound to that SAME public agent still SUCCEEDS: read-scoped only needs Read, which
+    /// bob has.
+    #[tokio::test]
+    async fn read_token_bound_to_a_public_agent_you_can_read_succeeds() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        add_user(&ctx, "bob", "bob-password-1", false).await;
+        create_agent(&ctx.store, "frontend", "alice", Visibility::Public).await.unwrap();
+        let r = api_create_token(
+            &ctx,
+            &caller("bob", false),
+            &body(serde_json::json!({ "name": "ci", "scope": "read", "agent": "alice/frontend" })),
+        )
+        .await;
+        assert_eq!(r.status, 201, "a read token for an agent you can read is fine");
+        assert_eq!(ctx.store.tokens().await.len(), 1, "the read token was persisted");
+    }
+
+    /// A WRITE token bound to an agent the caller OWNS still SUCCEEDS: the owner has Write.
+    #[tokio::test]
+    async fn write_token_bound_to_an_agent_you_own_succeeds() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        create_agent(&ctx.store, "frontend", "alice", Visibility::Private).await.unwrap();
+        let r = api_create_token(
+            &ctx,
+            &caller("alice", false),
+            &body(serde_json::json!({ "name": "ci", "scope": "write", "agent": "alice/frontend" })),
+        )
+        .await;
+        assert_eq!(r.status, 201, "the owner can mint a write token bound to their own agent");
+        assert_eq!(ctx.store.tokens().await.len(), 1, "the write token was persisted");
     }
 }
