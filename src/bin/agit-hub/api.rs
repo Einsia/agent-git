@@ -86,6 +86,7 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("POST", "register") => return api_register(ctx, client_ip, body).await,
         ("POST", "logout") => return api_logout(ctx, req, caller).await,
         ("GET", "me") => return api_me(caller),
+        ("POST", "me/password") => return api_me_password(ctx, req, caller, body).await,
         ("GET", "agents") => return api_agents(ctx, req, caller).await,
         ("POST", "agents") => return api_create_agent(ctx, req, caller, body).await,
         ("GET", "tokens") => return api_tokens(ctx, caller).await,
@@ -114,6 +115,17 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
             "DELETE" => api_revoke_token(ctx, caller, id).await,
             _ => Resp::text(405, "method not allowed"),
         };
+    }
+    // users/<username>/password — admin-only credential reset (the account-recovery door). The only
+    // /api/users/... route; a username has no '/', so `<username>/password` is the only shape.
+    if let Some(after) = rest.strip_prefix("users/") {
+        if let Some(username) = after.strip_suffix("/password") {
+            return match m {
+                "POST" => api_admin_set_password(ctx, caller, username, body).await,
+                _ => Resp::text(405, "method not allowed"),
+            };
+        }
+        return Resp::err(404, "not found");
     }
     let Some(after) = rest.strip_prefix("agent/") else {
         return Resp::err(404, "not found");
@@ -402,6 +414,121 @@ pub(crate) async fn api_register(ctx: &Ctx, client_ip: Option<IpAddr>, body: &[u
     audit_append(ctx.root(), &username, audit::USER_REGISTER, None, "").await;
     Resp::json(serde_json::json!({ "username": username, "is_admin": false }))
         .with("Set-Cookie", &websession::set_cookie(&sid, ctx.cfg.tls))
+}
+
+/// Derive a fresh salt + argon2 hash for `password`, run under the login gate + blocking pool (the
+/// same CPU/memory-amplifier defense `api_login`/`api_register` use — argon2 is deliberately slow, so
+/// uncapped concurrency is a DoS lever). Returns `(pw_hash, salt, kdf_id)` or an error `Resp`. The
+/// caller has already length-checked, so this is purely the crypto step both password-write paths
+/// share.
+async fn hash_new_password(ctx: &Ctx, password: &str) -> Result<(String, String, String), Resp> {
+    let Ok(salt) = kdf::gen_salt() else {
+        return Err(Resp::err(500, "no system entropy available, try again shortly"));
+    };
+    let kdf_id = kdf::current_kdf_id();
+    let (pw, salt2, kdf2) = (password.to_string(), salt.clone(), kdf_id.clone());
+    let hashed = {
+        let _slot = ctx.login_gate.acquire().await.expect("login gate semaphore is never closed");
+        tokio::task::spawn_blocking(move || kdf::hash_password(&pw, &salt2, &kdf2)).await.unwrap()
+    };
+    match hashed {
+        Some(pw_hash) => Ok((pw_hash, salt, kdf_id)),
+        None => Err(Resp::err(500, "password derivation failed")),
+    }
+}
+
+/// `POST /api/me/password` — self-service password change for the logged-in user.
+///
+/// Body: `{ old_password, new_password }`. The old password is verified through the SAME argon2 path
+/// as login (`auth::verify_login`); a wrong one is a 401, a too-short new one a 400 (the shared
+/// `store::MIN_PASSWORD_LEN`). On success the new password is re-hashed with a fresh salt and the
+/// current kdf, and every OTHER browser session for the account is revoked — the session that made
+/// the change stays signed in, so rotating your password kicks a stolen cookie without logging you
+/// out of the tab you did it from.
+pub(crate) async fn api_me_password(ctx: &Ctx, req: &Req, caller: &Caller, body: &[u8]) -> Resp {
+    let Some(username) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let (Some(old_password), Some(new_password)) = (str_field(&v, "old_password"), str_field(&v, "new_password")) else {
+        return Resp::err(400, "want old_password and new_password");
+    };
+    // Verify the CURRENT password first — under the login gate, exactly like `api_login`, so this
+    // endpoint is not an uncapped argon2 amplifier either. A wrong old password is a flat 401; we do
+    // not say whether it was the password (there is nothing to enumerate — the user is already known).
+    let verified = {
+        let _slot = ctx.login_gate.acquire().await.expect("login gate semaphore is never closed");
+        auth::verify_login(&ctx.store, &username, &old_password).await
+    };
+    if verified.is_none() {
+        audit_append(ctx.root(), &username, audit::LOGIN_FAILED, None, "password change: wrong old password").await;
+        return Resp::err(401, "old password is wrong");
+    }
+    // Enforce the same minimum the CLI and registration use, via the one shared constant.
+    if new_password.chars().count() < store::MIN_PASSWORD_LEN {
+        return Resp::err(400, "password too short (at least 8 characters)");
+    }
+    let (pw_hash, salt, kdf_id) = match hash_new_password(ctx, &new_password).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match ctx.store.set_password(&username, &pw_hash, &salt, &kdf_id).await {
+        // verify_login just succeeded, so the row exists; a false here would be a concurrent delete.
+        Ok(true) => {}
+        Ok(false) => return Resp::err(404, "no such user"),
+        Err(_) => return Resp::err(500, "couldn't update the password"),
+    }
+    // Kick every OTHER session for this account (a rotated password should invalidate a leaked
+    // cookie), keeping the caller's own session alive so they are not logged out mid-change.
+    let revoked = ctx.sessions.revoke_user(&username, req.sid().as_deref());
+    tracing::info!(user = %username, revoked_sessions = revoked, "password changed");
+    audit_append(ctx.root(), &username, audit::USER_PASSWORD, None, &format!("revoked {revoked} other session(s)")).await;
+    Resp::json(serde_json::json!({ "ok": true, "revoked_sessions": revoked }))
+}
+
+/// `POST /api/users/<username>/password` — admin-only credential reset (the recovery path for a
+/// locked-out user). Body: `{ new_password }`. Gated on `caller.is_admin`; no old password is asked
+/// for (the whole point is that the user cannot supply it). Re-hashes with argon2 and revokes ALL of
+/// the target's sessions — a reset is a lockout/recovery action, so any existing sign-in should die
+/// with the old password.
+pub(crate) async fn api_admin_set_password(ctx: &Ctx, caller: &Caller, username: &str, body: &[u8]) -> Resp {
+    let Some(actor) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    if !caller.is_admin {
+        return Resp::err(403, "admin only");
+    }
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(new_password) = str_field(&v, "new_password") else {
+        return Resp::err(400, "want new_password");
+    };
+    if new_password.chars().count() < store::MIN_PASSWORD_LEN {
+        return Resp::err(400, "password too short (at least 8 characters)");
+    }
+    let target = store::normalize_username(username);
+    // An admin already sees every account (they can `user list`), so telling them a name is unknown
+    // leaks nothing — a plain 404 is the honest answer.
+    if ctx.store.user(&target).await.is_none() {
+        return Resp::err(404, "no such user");
+    }
+    let (pw_hash, salt, kdf_id) = match hash_new_password(ctx, &new_password).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match ctx.store.set_password(&target, &pw_hash, &salt, &kdf_id).await {
+        Ok(true) => {}
+        Ok(false) => return Resp::err(404, "no such user"),
+        Err(_) => return Resp::err(500, "couldn't update the password"),
+    }
+    // A reset locks the old credential out everywhere: revoke every one of the target's sessions.
+    let revoked = ctx.sessions.revoke_user(&target, None);
+    tracing::info!(actor = %actor, user = %target, revoked_sessions = revoked, "admin password reset");
+    audit_append(ctx.root(), &actor, audit::USER_PASSWORD_RESET, None, &format!("reset {target}; revoked {revoked} session(s)")).await;
+    Resp::json(serde_json::json!({ "ok": true, "user": target, "revoked_sessions": revoked }))
 }
 
 /// Resolve an agent's effective ACL, folding in the owning org's members when it is org-owned. **This
@@ -854,11 +981,21 @@ pub(crate) async fn api_agent_by_aid(ctx: &Ctx, req: &Req, caller: &Caller, aid:
     let Some(meta) = ctx.store.agent_by_aid(aid).await else {
         return Resp::err(404, "not found");
     };
+    // A caller who cannot read the resolved agent must not tell a known-but-private aid from an unknown
+    // one. Decide readability SILENTLY here rather than via gate(): gate() writes an audit-deny fs
+    // record (and does deny-response work) on a private hit but NOT on an unknown aid, which is itself an
+    // existence oracle (a persistent side-effect and a timing tell) even when both return an identical
+    // 404. This endpoint is a convenience lookup, so a denied by-aid read is simply an unaudited 404,
+    // exactly what the unknown-aid branch above returns.
     let seg = meta.seg().to_string();
-    let meta = match gate(ctx, caller, &seg, &meta.name, Action::Read).await {
-        Ok(x) => x,
-        Err(r) => return r,
-    };
+    if !acl::decide(caller, &agent_acl(ctx, &meta).await, Action::Read).allowed() {
+        return Resp::err(404, "not found");
+    }
+    // Post-decision repo-existence check, same as gate(): an authorized caller still 404s on an empty
+    // namespace without it ever being an oracle for the unauthorized (who already 404'd above).
+    if !repo_path(ctx.root(), &seg, &meta.name).exists() {
+        return Resp::err(404, "not found");
+    }
     Resp::json(serde_json::json!({
         "aid": aid,
         "name": meta.name,
@@ -2448,4 +2585,231 @@ pub(crate) fn json_body(body: &[u8]) -> Option<serde_json::Value> {
 
 pub(crate) fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::Req;
+    use crate::limits::{ConnLimiter, TokenBuckets, LOGIN_CONC, REGISTER_BURST, REGISTER_RATE_PER_SEC};
+    use crate::server::{Cfg, Ctx, CtxInner};
+    use agit::hub::acl::{Caller, Visibility};
+    use agit::hub::blob::Blobs;
+    use agit::hub::metrics::Metrics;
+    use agit::hub::session::Sessions;
+    use agit::hub::store::{Store, User};
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    /// An in-process Ctx over a fresh SQLite store + fs blobs, enough to drive the handlers directly.
+    async fn harness() -> (tempfile::TempDir, Ctx) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_sqlite(dir.path()).await.unwrap();
+        let blobs = Blobs::open(dir.path()).await.unwrap();
+        let cfg = Cfg { host: IpAddr::from([127, 0, 0, 1]), port: 8177, tls: false, insecure: false, trusted_proxies: vec![], registration: false };
+        let ctx = Ctx(Arc::new(CtxInner {
+            store,
+            blobs,
+            cfg,
+            sessions: Sessions::new(),
+            limiter: Arc::new(ConnLimiter::default()),
+            login_gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONC)),
+            token_rl: Arc::new(TokenBuckets::new()),
+            register_rl: Arc::new(TokenBuckets::with_rate(REGISTER_RATE_PER_SEC, REGISTER_BURST)),
+            metrics: Arc::new(Metrics::new()),
+        }));
+        (dir, ctx)
+    }
+
+    async fn add_user(ctx: &Ctx, name: &str, pw: &str, admin: bool) {
+        let salt = kdf::gen_salt().unwrap();
+        let kdf_id = kdf::current_kdf_id();
+        let pw_hash = kdf::hash_password(pw, &salt, &kdf_id).unwrap();
+        ctx.store
+            .add_user(User { username: name.into(), pw_hash, salt, kdf: kdf_id, is_admin: admin, created: store::now_iso() })
+            .await
+            .unwrap();
+    }
+
+    async fn create_agent_with_aid(ctx: &Ctx, owner: &str, name: &str, vis: Visibility, aid: &str) {
+        crate::cli::create_agent(&ctx.store, name, owner, vis).await.unwrap();
+        ctx.store
+            .update_agents(|list| {
+                if let Some(m) = list.iter_mut().find(|m| m.matches(owner, name)) {
+                    m.aid = Some(aid.into());
+                }
+            })
+            .await
+            .unwrap();
+    }
+
+    fn caller(user: &str, admin: bool) -> Caller {
+        Caller { user: Some(user.into()), is_admin: admin, token: None }
+    }
+
+    fn req(method: &str, sid: Option<&str>) -> Req {
+        let mut headers = vec![("host".to_string(), "localhost:8177".to_string())];
+        if let Some(s) = sid {
+            headers.push(("cookie".to_string(), format!("agit_session={s}")));
+        }
+        Req { method: method.to_string(), target: "/".to_string(), headers, content_length: 0 }
+    }
+
+    fn body(v: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&v).unwrap()
+    }
+
+    // ── self-service password change ──
+
+    #[tokio::test]
+    async fn self_password_change_succeeds_and_rotates_the_login() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "old-password-1", false).await;
+        let resp = api_me_password(
+            &ctx,
+            &req("POST", None),
+            &caller("alice", false),
+            &body(serde_json::json!({ "old_password": "old-password-1", "new_password": "new-password-2" })),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        // The new password logs in; the old one no longer does.
+        assert!(auth::verify_login(&ctx.store, "alice", "new-password-2").await.is_some(), "new password works");
+        assert!(auth::verify_login(&ctx.store, "alice", "old-password-1").await.is_none(), "old password is dead");
+    }
+
+    #[tokio::test]
+    async fn self_password_change_wrong_old_is_401() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "old-password-1", false).await;
+        let resp = api_me_password(
+            &ctx,
+            &req("POST", None),
+            &caller("alice", false),
+            &body(serde_json::json!({ "old_password": "not-the-password", "new_password": "new-password-2" })),
+        )
+        .await;
+        assert_eq!(resp.status, 401);
+        // Nothing changed: the old password still works, the attempted new one does not.
+        assert!(auth::verify_login(&ctx.store, "alice", "old-password-1").await.is_some());
+        assert!(auth::verify_login(&ctx.store, "alice", "new-password-2").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn self_password_change_short_new_is_400() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "old-password-1", false).await;
+        let resp = api_me_password(
+            &ctx,
+            &req("POST", None),
+            &caller("alice", false),
+            // Correct old password, so we reach the length check; "short" is under MIN_PASSWORD_LEN.
+            &body(serde_json::json!({ "old_password": "old-password-1", "new_password": "short" })),
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+        assert!(auth::verify_login(&ctx.store, "alice", "old-password-1").await.is_some(), "unchanged");
+    }
+
+    #[tokio::test]
+    async fn self_password_change_requires_a_logged_in_user() {
+        let (_d, ctx) = harness().await;
+        let resp = api_me_password(
+            &ctx,
+            &req("POST", None),
+            &Caller::anonymous(),
+            &body(serde_json::json!({ "old_password": "x", "new_password": "new-password-2" })),
+        )
+        .await;
+        assert_eq!(resp.status, 401);
+    }
+
+    #[tokio::test]
+    async fn self_password_change_revokes_other_sessions_but_keeps_current() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "old-password-1", false).await;
+        let current = ctx.sessions.create("alice").unwrap();
+        let other = ctx.sessions.create("alice").unwrap();
+        let resp = api_me_password(
+            &ctx,
+            &req("POST", Some(&current)),
+            &caller("alice", false),
+            &body(serde_json::json!({ "old_password": "old-password-1", "new_password": "new-password-2" })),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(ctx.sessions.lookup(&current).as_deref(), Some("alice"), "the session that changed the password stays alive");
+        assert_eq!(ctx.sessions.lookup(&other), None, "every other session for the account is kicked");
+    }
+
+    // ── admin-mediated reset ──
+
+    #[tokio::test]
+    async fn admin_reset_lets_the_user_log_in_and_refuses_non_admins() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "root", "root-password-1", true).await;
+        add_user(&ctx, "bob", "bob-old-pass-1", false).await;
+
+        // A non-admin caller cannot reset anyone's password.
+        let denied = api_admin_set_password(&ctx, &caller("bob", false), "bob", &body(serde_json::json!({ "new_password": "hijacked-pass-1" }))).await;
+        assert_eq!(denied.status, 403);
+        // An anonymous caller is refused before anything else.
+        let anon = api_admin_set_password(&ctx, &Caller::anonymous(), "bob", &body(serde_json::json!({ "new_password": "hijacked-pass-1" }))).await;
+        assert_eq!(anon.status, 401);
+        // Neither attempt touched the password.
+        assert!(auth::verify_login(&ctx.store, "bob", "bob-old-pass-1").await.is_some());
+
+        // The admin resets it; bob can now log in with the new password, not the old one.
+        let ok = api_admin_set_password(&ctx, &caller("root", true), "bob", &body(serde_json::json!({ "new_password": "bob-new-pass-2" }))).await;
+        assert_eq!(ok.status, 200);
+        assert!(auth::verify_login(&ctx.store, "bob", "bob-new-pass-2").await.is_some(), "new password works");
+        assert!(auth::verify_login(&ctx.store, "bob", "bob-old-pass-1").await.is_none(), "old password is dead");
+
+        // A too-short reset is refused (the same shared minimum).
+        let short = api_admin_set_password(&ctx, &caller("root", true), "bob", &body(serde_json::json!({ "new_password": "short" }))).await;
+        assert_eq!(short.status, 400);
+        // An unknown user is a plain 404 (an admin already sees every account).
+        let missing = api_admin_set_password(&ctx, &caller("root", true), "ghost", &body(serde_json::json!({ "new_password": "whatever-pass-1" }))).await;
+        assert_eq!(missing.status, 404);
+    }
+
+    // ── by-aid non-disclosure ──
+
+    #[tokio::test]
+    async fn by_aid_is_not_an_existence_oracle() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        add_user(&ctx, "bob", "bob-password-1", false).await;
+        create_agent_with_aid(&ctx, "alice", "secret", Visibility::Private, "agt_secret1").await;
+
+        // An anonymous caller must not tell a known-but-private aid from an unknown one: same status,
+        // byte-identical body.
+        let anon = Caller::anonymous();
+        let priv_hit = api_agent_by_aid(&ctx, &req("GET", None), &anon, "agt_secret1").await;
+        let unknown = api_agent_by_aid(&ctx, &req("GET", None), &anon, "agt_nosuchaid").await;
+        assert_eq!(priv_hit.status, 404, "a private agent's aid does not resolve for anon");
+        assert_eq!(unknown.status, 404, "an unknown aid is 404");
+        assert_eq!(priv_hit.body, unknown.body, "the two are byte-identical — no existence oracle");
+
+        // An authenticated non-owner is likewise given the same 404 for private vs unknown.
+        let as_bob = caller("bob", false);
+        let bob_priv = api_agent_by_aid(&ctx, &req("GET", None), &as_bob, "agt_secret1").await;
+        let bob_unknown = api_agent_by_aid(&ctx, &req("GET", None), &as_bob, "agt_nosuchaid").await;
+        assert_eq!(bob_priv.status, 404);
+        assert_eq!(bob_priv.body, bob_unknown.body);
+
+        // No observable SIDE-EFFECT either: a private-aid probe must write NO audit-deny (an unknown aid
+        // writes none, so an audit entry for a private hit would itself be an existence oracle, distinct
+        // from the identical 404). By-aid decides readability silently, never through the auditing gate.
+        let trail = agit::hub::audit::query(ctx.root(), Some("alice/secret"), 100);
+        assert!(trail.is_empty(), "a by-aid probe of a private agent must leave no audit trail: {} entries", trail.len());
+
+        // The owner still resolves their own private agent by aid.
+        let owner = api_agent_by_aid(&ctx, &req("GET", None), &caller("alice", false), "agt_secret1").await;
+        assert_eq!(owner.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&owner.body).unwrap();
+        assert_eq!(v["name"], "secret");
+        assert_eq!(v["aid"], "agt_secret1");
+        assert_eq!(v["visibility"], "private");
+    }
 }

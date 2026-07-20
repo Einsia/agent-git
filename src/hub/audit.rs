@@ -38,6 +38,13 @@ pub const USER_ADD: &str = "user.add";
 /// Self-service signup (POST /api/register). Distinct from `user.add` (the admin CLI path), so the
 /// audit log shows which door a new account came through.
 pub const USER_REGISTER: &str = "user.register";
+/// Self-service password change (POST /api/me/password) — the logged-in user rotated their own
+/// password after proving the old one.
+pub const USER_PASSWORD: &str = "user.password";
+/// Admin-mediated password reset (CLI `user passwd` or POST /api/users/<u>/password) — a site admin
+/// set another user's password. This is the account-recovery door, kept distinct from the
+/// self-service change so the audit log shows an admin acted on someone else's credential.
+pub const USER_PASSWORD_RESET: &str = "user.password.reset";
 pub const AGENT_CREATE: &str = "agent.create";
 pub const AGENT_DELETE: &str = "agent.delete";
 pub const AGENT_RENAME: &str = "agent.rename";

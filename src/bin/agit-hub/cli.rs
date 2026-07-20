@@ -102,6 +102,55 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
             println!("  The password is derived with argon2id and stored in {}; the plaintext never hits disk.", store.describe());
             0
         }
+        Some("passwd") => {
+            // Admin-mediated password reset (the recovery door for a locked-out user). Reads the new
+            // password from the tty/stdin only, **never from argv** — exactly like `user add`.
+            let Some(name) = positional(args, 2) else {
+                eprintln!("usage: agit-hub user passwd <name>");
+                return 2;
+            };
+            let username = store::normalize_username(name);
+            if store.user(&username).await.is_none() {
+                eprintln!("no such user: {username} (try `agit-hub user list`)");
+                return 1;
+            }
+            let password = match read_new_password() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            let salt = match kdf::gen_salt() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("no system entropy available, refusing to reset the password: {e}");
+                    return 1;
+                }
+            };
+            let kdf_id = kdf::current_kdf_id();
+            let Some(pw_hash) = kdf::hash_password(&password, &salt, &kdf_id) else {
+                eprintln!("password derivation failed (kdf={kdf_id})");
+                return 1;
+            };
+            match store.set_password(&username, &pw_hash, &salt, &kdf_id).await {
+                Ok(true) => {}
+                // Raced a delete between the existence check and the write.
+                Ok(false) => {
+                    eprintln!("no such user: {username}");
+                    return 1;
+                }
+                Err(e) => {
+                    eprintln!("failed to persist the password to {}: {e}", store.backend());
+                    return 1;
+                }
+            }
+            audit::append(root, "cli", audit::USER_PASSWORD_RESET, None, &format!("reset {username}"));
+            println!("reset the password for {username}.");
+            println!("  Re-derived with argon2id and stored in {}; the plaintext never hits disk.", store.describe());
+            println!("  Any live browser session for {username} keeps running until the server restarts; the CLI cannot reach the in-memory session table.");
+            0
+        }
         Some("list") => {
             let users = store.users().await;
             if users.is_empty() {
@@ -113,7 +162,7 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
             0
         }
         _ => {
-            eprintln!("usage: agit-hub user add <name> [--admin] | agit-hub user list");
+            eprintln!("usage: agit-hub user add <name> [--admin] | agit-hub user passwd <name> | agit-hub user list");
             2
         }
     }

@@ -783,6 +783,37 @@ impl Store {
         }
     }
 
+    /// Read-modify-write the users table in one transaction — the same serialization discipline the
+    /// other `update_*` methods use (SQLite async write mutex + tracked tx; Postgres advisory-lock
+    /// tx). The closure runs synchronously between the read and the atomic rewrite and must not call
+    /// back into `Store`.
+    pub async fn update_users<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<User>) -> R,
+    {
+        match self {
+            Store::Sqlite(s) => s.update_users(f).await,
+            Store::Pg(s) => s.update_users(f).await,
+        }
+    }
+
+    /// Set a user's password material (hash + salt + kdf), leaving every other field untouched.
+    /// Returns `Ok(true)` if the user existed and was updated, `Ok(false)` if no such user. The
+    /// username is normalized like every other lookup, so "Alice" and "alice" address one account.
+    pub async fn set_password(&self, username: &str, pw_hash: &str, salt: &str, kdf: &str) -> io::Result<bool> {
+        let u = normalize_username(username);
+        self.update_users(|users| match users.iter_mut().find(|x| x.username == u) {
+            Some(user) => {
+                user.pw_hash = pw_hash.to_string();
+                user.salt = salt.to_string();
+                user.kdf = kdf.to_string();
+                true
+            }
+            None => false,
+        })
+        .await
+    }
+
     // ── agent metadata ──
 
     pub async fn agents(&self) -> Vec<AgentMeta> {
@@ -1082,6 +1113,34 @@ impl SqliteStore {
         Ok(())
     }
 
+    async fn update_users<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<User>) -> R,
+    {
+        // Same read-modify-write critical section as the other writers: the async write mutex, then a
+        // tracked transaction that auto-rolls back if the handler future is dropped mid-write.
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        let rows = sqlx::query("SELECT * FROM users").fetch_all(&mut *tx).await.map_err(err)?;
+        let mut list: Vec<User> = rows.iter().map(row_user).collect();
+        let r = f(&mut list);
+        sqlx::query("DELETE FROM users").execute(&mut *tx).await.map_err(err)?;
+        for u in &list {
+            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created) VALUES (?, ?, ?, ?, ?, ?)")
+                .bind(&u.username)
+                .bind(&u.pw_hash)
+                .bind(&u.salt)
+                .bind(&u.kdf)
+                .bind(u.is_admin as i64)
+                .bind(&u.created)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        Ok(r)
+    }
+
     async fn agents(&self) -> Vec<AgentMeta> {
         match sqlx::query("SELECT * FROM agents").fetch_all(&self.pool).await {
             Ok(rows) => rows.iter().map(row_agent).collect(),
@@ -1358,6 +1417,33 @@ impl PgStore {
         Ok(())
     }
 
+    async fn update_users<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&mut Vec<User>) -> R,
+    {
+        // The same single advisory-lock critical section every other read-modify-write runs in.
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        let rows = sqlx::query("SELECT * FROM users").fetch_all(&mut *tx).await.map_err(err)?;
+        let mut list: Vec<User> = rows.iter().map(row_user).collect();
+        let r = f(&mut list);
+        sqlx::query("DELETE FROM users").execute(&mut *tx).await.map_err(err)?;
+        for u in &list {
+            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created) VALUES ($1, $2, $3, $4, $5, $6)")
+                .bind(&u.username)
+                .bind(&u.pw_hash)
+                .bind(&u.salt)
+                .bind(&u.kdf)
+                .bind(u.is_admin as i64)
+                .bind(&u.created)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+        }
+        tx.commit().await.map_err(err)?;
+        Ok(r)
+    }
+
     async fn agents(&self) -> Vec<AgentMeta> {
         match sqlx::query("SELECT * FROM agents").fetch_all(&self.pool).await {
             Ok(rows) => rows.iter().map(row_agent).collect(),
@@ -1554,6 +1640,33 @@ mod tests {
         assert!(s.user("ALICE").await.is_some());
         assert!(s.user("Alice").await.is_some());
         assert!(s.user("bob").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_password_updates_only_the_pw_material_and_reports_missing() {
+        let (_d, s) = tmp_store().await;
+        s.add_user(User {
+            username: "alice".into(),
+            pw_hash: "old_hash".into(),
+            salt: "old_salt".into(),
+            kdf: "old_kdf".into(),
+            is_admin: true,
+            created: "2026-01-01T00:00:00Z".into(),
+        })
+        .await
+        .unwrap();
+        // Case-insensitive, like every other lookup — "ALICE" addresses the same row.
+        assert!(s.set_password("ALICE", "new_hash", "new_salt", "new_kdf").await.unwrap());
+        let u = s.user("alice").await.unwrap();
+        assert_eq!(u.pw_hash, "new_hash");
+        assert_eq!(u.salt, "new_salt");
+        assert_eq!(u.kdf, "new_kdf");
+        // Untouched fields survive the rewrite.
+        assert!(u.is_admin, "admin bit must not be disturbed by a password change");
+        assert_eq!(u.created, "2026-01-01T00:00:00Z");
+        // A missing user reports false rather than silently creating one.
+        assert!(!s.set_password("ghost", "h", "s", "k").await.unwrap());
+        assert!(s.user("ghost").await.is_none());
     }
 
     #[tokio::test]

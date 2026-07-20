@@ -79,6 +79,19 @@ impl Sessions {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
     }
 
+    /// Revoke every session belonging to `user`, except the one whose sid is `keep` (the caller's
+    /// current session). This is what a password change calls: rotating the credential kicks every
+    /// OTHER browser the account was signed in on, while the browser that just changed the password
+    /// stays logged in. Returns the number of sessions revoked. `keep` is matched by its digest, the
+    /// same value the table is keyed on.
+    pub fn revoke_user(&self, user: &str, keep: Option<&str>) -> usize {
+        let keep_key = keep.map(crate::convo::sha256_hex);
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = m.len();
+        m.retain(|key, s| s.user != user || Some(key) == keep_key.as_ref());
+        before - m.len()
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
@@ -174,6 +187,26 @@ mod tests {
         s.revoke(&a);
         assert_eq!(s.lookup(&a), None);
         assert_eq!(s.lookup(&b).as_deref(), Some("bob"), "revoking one must not affect the others");
+    }
+
+    #[test]
+    fn revoke_user_kicks_other_sessions_but_keeps_the_current_one() {
+        // A password change must invalidate the account's other browsers while leaving the one that
+        // performed the change signed in.
+        let s = Sessions::new();
+        let a1 = s.create("alice").unwrap();
+        let a2 = s.create("alice").unwrap();
+        let a3 = s.create("alice").unwrap();
+        let bob = s.create("bob").unwrap();
+        let revoked = s.revoke_user("alice", Some(&a1));
+        assert_eq!(revoked, 2, "alice's two other sessions are gone");
+        assert_eq!(s.lookup(&a1).as_deref(), Some("alice"), "the kept session survives");
+        assert_eq!(s.lookup(&a2), None);
+        assert_eq!(s.lookup(&a3), None);
+        assert_eq!(s.lookup(&bob).as_deref(), Some("bob"), "another user is untouched");
+        // With no session to keep, every one of the user's sessions goes.
+        assert_eq!(s.revoke_user("alice", None), 1);
+        assert_eq!(s.lookup(&a1), None);
     }
 
     #[test]
