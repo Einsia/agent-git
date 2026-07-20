@@ -1,9 +1,10 @@
 import { useEffect, useState, type FormEvent } from "react"
-import { Link, useParams, useSearchParams } from "react-router-dom"
-import { Lock, Search, Settings2 } from "lucide-react"
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
+import { GitFork, GitPullRequest, Lock, Search, Settings2, Star } from "lucide-react"
 
 import { api } from "@/lib/api"
 import { useGuarded } from "@/lib/useGuarded"
+import { useSession } from "@/lib/session"
 import { Input } from "@/components/ui/input"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -21,7 +22,7 @@ export function Agent() {
 
   useEffect(() => setQuery(q), [q])
 
-  const { data, loading, error, status, forbidden } = useGuarded(
+  const { data, loading, error, status, forbidden, reload } = useGuarded(
     () => api.agent(owner, name, page, q),
     [owner, name, page, q]
   )
@@ -80,6 +81,17 @@ export function Agent() {
             </div>
             <Button type="submit">Search</Button>
           </form>
+          {data && <StarButton owner={owner} name={name} starred={data.starred} stars={data.stars} onDone={reload} />}
+          {data && <ForkButton owner={owner} name={name} />}
+          {/* Merge requests are readable by anyone who can read the agent. */}
+          <Link
+            to={`/agent/${owner}/${name}/mrs`}
+            aria-label="Merge requests"
+            title="Merge requests"
+            className={cn(buttonVariants({ variant: "ghost", size: "icon" }))}
+          >
+            <GitPullRequest className="size-4" />
+          </Link>
           {/* Settings is readable by anyone who can read the agent; it just shows less to
               someone who can't administer it. */}
           <Link
@@ -148,5 +160,96 @@ agit -a merge origin/main`}
         </aside>
       </div>
     </div>
+  )
+}
+
+// Star is the caller's own bookmark: gated at Read, so it needs only a sign-in (the server refuses an
+// anonymous or read-only-token caller). Signed out, the count still shows, read-only.
+function StarButton({
+  owner,
+  name,
+  starred,
+  stars,
+  onDone,
+}: {
+  owner: string
+  name: string
+  starred: boolean
+  stars: number
+  onDone: () => void
+}) {
+  const { me } = useSession()
+  const [busy, setBusy] = useState(false)
+
+  async function toggle() {
+    setBusy(true)
+    try {
+      await api.starAgent(owner, name, !starred)
+      onDone()
+    } catch {
+      // A failed star is not worth a wall; the count just won't move.
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!me) {
+    return (
+      <Badge variant="muted" className="gap-1 font-mono text-[0.72rem]">
+        <Star className="size-3.5" />
+        {stars}
+      </Badge>
+    )
+  }
+  return (
+    <Button
+      variant={starred ? "secondary" : "outline"}
+      size="sm"
+      disabled={busy}
+      onClick={toggle}
+      aria-pressed={starred}
+      title={starred ? "Unstar" : "Star"}
+    >
+      <Star className={cn("size-4", starred && "fill-current text-primary")} />
+      <span className="font-mono tabular-nums">{stars}</span>
+    </Button>
+  )
+}
+
+// Fork is a write the caller performs into their own namespace; the server needs a sign-in and a
+// write token. The 201 carries the fork's full_name to route to.
+function ForkButton({ owner, name }: { owner: string; name: string }) {
+  const { me } = useSession()
+  const nav = useNavigate()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState("")
+
+  if (!me) return null
+
+  async function fork() {
+    setBusy(true)
+    setError("")
+    try {
+      const rec = await api.forkAgent(owner, name)
+      const [forkOwner, forkName] = rec.full_name.split("/")
+      nav(`/agent/${forkOwner}/${forkName}`)
+    } catch (err) {
+      setError(String((err as Error)?.message ?? err))
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      <Button variant="outline" size="sm" disabled={busy} onClick={fork} title="Fork into your namespace">
+        <GitFork className="size-4" />
+        {busy ? "Forking…" : "Fork"}
+      </Button>
+      {error && (
+        <span role="alert" className="text-xs text-destructive">
+          {error}
+        </span>
+      )}
+    </>
   )
 }

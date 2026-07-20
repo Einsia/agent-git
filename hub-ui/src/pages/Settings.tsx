@@ -1,8 +1,8 @@
 import { useState, type ReactNode, type FormEvent } from "react"
 import { Link, useNavigate, useParams } from "react-router-dom"
-import { GitBranch, Globe, Lock, Trash2, UserPlus } from "lucide-react"
+import { Archive, ArchiveRestore, ArrowRightLeft, GitBranch, Globe, Lock, RotateCcw, Trash2, UserPlus } from "lucide-react"
 
-import { api, type AgentPage, type Member, type Role, type Visibility } from "@/lib/api"
+import { api, type AgentPage, type Lifecycle, type Member, type Role, type Visibility } from "@/lib/api"
 import { useGuarded } from "@/lib/useGuarded"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -68,6 +68,8 @@ export function Settings() {
       <Members data={data} owner={owner} name={name} canAdmin={canAdmin} reload={reload} />
       {canAdmin && <Rename owner={owner} name={name} />}
       {canAdmin && <VisibilityControl owner={owner} name={name} current={data.visibility} reload={reload} />}
+      {canAdmin && <LifecycleControl owner={owner} name={name} current={data.lifecycle} reload={reload} />}
+      {canAdmin && <Transfer owner={owner} name={name} reload={reload} />}
       {canAdmin && <Danger owner={owner} name={name} />}
     </div>
   )
@@ -469,6 +471,139 @@ function VisibilityControl({
           ? "Anyone who can reach this hub can read every session here."
           : "Only the owner and members can read it."}
       </p>
+      {error && (
+        <p role="alert" className="mt-2 text-sm text-destructive">
+          {error}
+        </p>
+      )}
+    </Section>
+  )
+}
+
+// Lifecycle moves are Manage-gated on the server; this section only shows for an admin/owner, and the
+// legal next step depends on where the agent is now (active → archived, archived → active, deleted →
+// restored). Restore only appears if a deleted agent is somehow still on screen.
+function LifecycleControl({
+  owner,
+  name,
+  current,
+  reload,
+}: {
+  owner: string
+  name: string
+  current: Lifecycle
+  reload: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState("")
+
+  async function run(fn: () => Promise<unknown>) {
+    setBusy(true)
+    setError("")
+    try {
+      await fn()
+      reload()
+    } catch (err) {
+      setError(String((err as Error)?.message ?? err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Section
+      title="lifecycle"
+      desc="Archiving makes an agent read-only without deleting it. Deleting moves it to the trash, from which it can be restored."
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant="muted" className="font-mono text-[0.6rem]">
+          {current}
+        </Badge>
+        {current === "active" && (
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => run(() => api.archiveAgent(owner, name))}>
+            <Archive />
+            Archive
+          </Button>
+        )}
+        {current === "archived" && (
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => run(() => api.unarchiveAgent(owner, name))}>
+            <ArchiveRestore />
+            Unarchive
+          </Button>
+        )}
+        {current === "deleted" && (
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => run(() => api.restoreAgent(owner, name))}>
+            <RotateCcw />
+            Restore
+          </Button>
+        )}
+      </div>
+      {error && (
+        <p role="alert" className="mt-2 text-sm text-destructive">
+          {error}
+        </p>
+      )}
+    </Section>
+  )
+}
+
+// Transfer ownership to another user or an org. Manage-gated; the aid does not move, so existing
+// clones keep resolving. The previous owner keeps nothing — say so.
+function Transfer({ owner, name, reload }: { owner: string; name: string; reload: () => void }) {
+  const nav = useNavigate()
+  const [kind, setKind] = useState<"user" | "org">("user")
+  const [dest, setDest] = useState("")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState("")
+
+  async function submit(e: FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError("")
+    try {
+      const target = dest.trim()
+      const rec = await api.transferAgent(owner, name, kind === "org" ? { org: target } : { to: target })
+      const [newOwner, newName] = rec.full_name.split("/")
+      reload()
+      // The owner segment changed, so the URL did too — land on the new home.
+      nav(`/agent/${newOwner}/${newName}/settings`, { replace: true })
+    } catch (err) {
+      setError(String((err as Error)?.message ?? err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Section
+      title="transfer ownership"
+      desc="The aid doesn't change; existing clones keep working. The previous owner keeps no access — the new owner (or a site admin) must re-add them."
+    >
+      <form onSubmit={submit} className="flex flex-wrap items-end gap-2">
+        <label className="flex flex-col gap-1.5">
+          <span className="eyebrow">to</span>
+          <Select
+            value={kind}
+            onChange={(e) => setKind(e.target.value as "user" | "org")}
+            className="w-[110px]"
+            aria-label="Transfer target kind"
+          >
+            <option value="user">a user</option>
+            <option value="org">an org</option>
+          </Select>
+        </label>
+        <Input
+          value={dest}
+          onChange={(e) => setDest(e.target.value)}
+          placeholder={kind === "org" ? "org name" : "username"}
+          className="w-[220px]"
+          required
+        />
+        <Button type="submit" variant="outline" disabled={busy || !dest.trim()}>
+          <ArrowRightLeft />
+          {busy ? "Transferring…" : "Transfer"}
+        </Button>
+      </form>
       {error && (
         <p role="alert" className="mt-2 text-sm text-destructive">
           {error}

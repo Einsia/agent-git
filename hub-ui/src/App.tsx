@@ -8,6 +8,8 @@ import { Register } from "@/pages/Register"
 import { Orgs } from "@/pages/Orgs"
 import { NewAgent } from "@/pages/NewAgent"
 import { Agent } from "@/pages/Agent"
+import { Mrs } from "@/pages/Mrs"
+import { MrDetail } from "@/pages/MrDetail"
 import { Settings } from "@/pages/Settings"
 import { Session } from "@/pages/Session"
 import { Diff } from "@/pages/Diff"
@@ -28,6 +30,8 @@ export default function App() {
             <Route path="/tokens" element={<Tokens />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/agent/:owner/:name" element={<Agent />} />
+            <Route path="/agent/:owner/:name/mrs" element={<Mrs />} />
+            <Route path="/agent/:owner/:name/mrs/:id" element={<MrDetail />} />
             <Route path="/agent/:owner/:name/settings" element={<Settings />} />
             <Route path="/agent/:owner/:name/session/:id" element={<Session />} />
             <Route path="/agent/:owner/:name/session/:id/diff" element={<Diff />} />

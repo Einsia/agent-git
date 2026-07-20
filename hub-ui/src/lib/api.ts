@@ -5,6 +5,9 @@
 // grant), the type says so.
 
 export type Visibility = "private" | "public"
+/// An agent's lifecycle, as `Lifecycle::as_str` writes it (src/hub/acl.rs). "deleted" is the trash,
+/// not a purge — a deleted agent can still be restored.
+export type Lifecycle = "active" | "archived" | "deleted"
 /// A membership grant. The owner is not a member — ownership is separate.
 export type Role = "read" | "write" | "admin"
 /// What the caller may do here, as the server computed it. null = no explicit grant
@@ -100,6 +103,16 @@ export interface AgentPage {
   aid_source: string
   clone_url: string
   visibility: Visibility
+  /// active / archived / deleted — governs whether writes are refused (see acl.rs). The action
+  /// panel keys the archive ↔ unarchive ↔ restore controls off this.
+  lifecycle: Lifecycle
+  /// null until the owner sets one; the server sends the raw Option<String> through.
+  description: string | null
+  /// The name the agent was forked from, or null. A bare name, not a scoped id.
+  forked_from: string | null
+  /// How many callers have starred it, and whether the current caller is one (false when signed out).
+  stars: number
+  starred: boolean
   owner: string | null
   members: Member[]
   role: EffectiveRole | null
@@ -183,6 +196,71 @@ export interface AuditEntry {
   detail: string
 }
 
+// ── merge requests ──
+// A review object parked against a *target* agent. The Hub merges nothing — see src/hub/mr.rs. Every
+// shape below is what api_mr_* in src/bin/agit-hub/api.rs serializes.
+
+/// "open" | "merged" | "closed". A raw string, because the server stores it as one and lets an
+/// unknown value degrade to "not open" rather than fail the record.
+export type MrState = "open" | "merged" | "closed"
+
+/// One end of an MR, serialized **for the reading caller**. When the caller can't read that side's
+/// agent the server nulls every field and sets `redacted` — existence is itself a secret.
+export interface MrEndpoint {
+  aid: string | null
+  owner: string | null
+  agent: string | null
+  full_name: string | null
+  ref: string | null
+  redacted?: boolean
+}
+
+export interface MrComment {
+  id: number
+  author: string
+  body: string
+  created: string
+}
+
+/// A row in the MR index: `comments` is the count, and there is no transcript (the list omits the big
+/// field). `state` is the raw stored string.
+export interface MrSummary {
+  id: number
+  title: string
+  author: string
+  state: string
+  created: string
+  updated: string
+  source: MrEndpoint
+  target: MrEndpoint
+  comments: number
+  has_transcript: boolean
+}
+
+export interface MrList {
+  agent: string
+  mrs: MrSummary[]
+  has_more: boolean
+  /// Pass straight back as the `cursor` of the next page; null when there is no more.
+  next_cursor: string | null
+}
+
+/// The full MR: `comments` is the whole thread, and the transcript is present unless the caller can't
+/// read the source (then it's null and `transcript_redacted` is true).
+export interface MrDetail {
+  id: number
+  title: string
+  author: string
+  state: string
+  created: string
+  updated: string
+  source: MrEndpoint
+  target: MrEndpoint
+  dialogue_transcript: string | null
+  transcript_redacted: boolean
+  comments: MrComment[]
+}
+
 /// Carries the HTTP status, because the status *is* the meaning here: 401 = not signed in,
 /// 403 = signed in and refused, 404 = gone or never visible to you (the server deliberately
 /// gives the same answer for both).
@@ -220,6 +298,13 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 const get = <T,>(url: string) => request<T>(url)
+
+/// The three lifecycle verbs share a route shape and a response shape.
+const lifecycle = (owner: string, name: string, verb: "archive" | "unarchive" | "restore") =>
+  request<{ name: string; full_name: string; lifecycle: Lifecycle; aid: string | null }>(
+    `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${verb}`,
+    { method: "POST" }
+  )
 
 export const api = {
   // ── auth ──
@@ -319,5 +404,65 @@ export const api = {
   diff: (owner: string, name: string, id: string, from: string, to: string) =>
     get<SessionDiff>(
       `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/session/${encodeURIComponent(id)}/diff?from=${from}&to=${to}`
+    ),
+
+  // ── merge requests ──
+  // Keyed on the TARGET agent (owner/name) — that's the memory being changed, so its ACL governs.
+  // Listing/reading needs Read; opening/closing needs Write; commenting needs Read + a write token.
+  mrs: (owner: string, name: string, cursor?: string) =>
+    get<MrList>(
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/mrs${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`
+    ),
+  mr: (owner: string, name: string, id: number) =>
+    get<MrDetail>(`/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/mrs/${id}`),
+  // `source` is the agent the change comes from, as "owner/name". Refs default to main server-side.
+  // The 201 carries the full MR (detail shape).
+  openMr: (
+    owner: string,
+    name: string,
+    body: { title: string; source: string; source_ref?: string; target_ref?: string; dialogue_transcript?: string }
+  ) =>
+    request<MrDetail>(`/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/mrs`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // The 201 is the new comment alone, not the whole MR.
+  commentMr: (owner: string, name: string, id: number, comment: string) =>
+    request<MrComment>(`/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/mrs/${id}/comments`, {
+      method: "POST",
+      body: JSON.stringify({ body: comment }),
+    }),
+  // "closed" settles it; "merged" *records* that someone ran `agit a merge` locally — the Hub merges
+  // nothing. Answers the fresh MR (detail shape).
+  closeMr: (owner: string, name: string, id: number, state: "closed" | "merged") =>
+    request<MrDetail>(`/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/mrs/${id}/close`, {
+      method: "POST",
+      body: JSON.stringify({ state }),
+    }),
+
+  // ── agent actions ──
+  // Fork: any caller who can read it, signed in with a write token. The 201 carries the fork's
+  // `full_name` to route to.
+  forkAgent: (owner: string, name: string, forkName?: string) =>
+    request<{ name: string; owner: string; full_name: string; forked_from: string }>(
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/fork`,
+      { method: "POST", body: JSON.stringify(forkName ? { name: forkName } : {}) }
+    ),
+  // Star / unstar, per caller. Gated at Read (it's the caller's own bookmark). Answers the fresh count.
+  starAgent: (owner: string, name: string, starred: boolean) =>
+    request<{ name: string; full_name: string; starred: boolean; stars: number }>(
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/star`,
+      { method: "POST", body: JSON.stringify({ starred }) }
+    ),
+  // Lifecycle moves, each Manage-gated (owner/admin). Answers {name, full_name, lifecycle, aid}.
+  archiveAgent: (owner: string, name: string) => lifecycle(owner, name, "archive"),
+  unarchiveAgent: (owner: string, name: string) => lifecycle(owner, name, "unarchive"),
+  restoreAgent: (owner: string, name: string) => lifecycle(owner, name, "restore"),
+  // Transfer ownership to another user (`to`) or an org (`org`) — mutually exclusive. Manage-gated;
+  // the aid does not move. Answers {name, owner, full_name, previous_owner, aid}.
+  transferAgent: (owner: string, name: string, dest: { to: string } | { org: string }) =>
+    request<{ name: string; owner: string; full_name: string; previous_owner: string | null; aid: string | null }>(
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/transfer`,
+      { method: "POST", body: JSON.stringify(dest) }
     ),
 }
