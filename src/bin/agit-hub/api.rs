@@ -99,7 +99,20 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("GET", "search") => return api_search(ctx, req, caller).await,
         ("GET", "orgs") => return api_orgs_list(ctx, caller).await,
         ("POST", "orgs") => return api_orgs_create(ctx, caller, body).await,
+        // Shared identity registry (encryption-recipients Wave 1). Enroll upserts the CALLER's own row;
+        // the list form reads a batch (`?users=a,b,c`). The single-user GET is the `identity/<user>`
+        // prefix route below. All require an authenticated caller.
+        ("POST", "identity/enroll") => return api_identity_enroll(ctx, caller, body).await,
+        ("GET", "identity") => return api_identity_list(ctx, req, caller).await,
         _ => {}
+    }
+    // identity/<user> — a single registry lookup. GET only; POST enroll is the exact route above and
+    // never reaches here, so a `<user>` is always a real username (which has no '/').
+    if let Some(user) = rest.strip_prefix("identity/") {
+        return match m {
+            "GET" => api_identity_get(ctx, caller, user).await,
+            _ => Resp::text(405, "method not allowed"),
+        };
     }
     // orgs/<name> and orgs/<name>/members[/<username>] — before the agent/ block, since an org name
     // is not an agent name.
@@ -788,6 +801,128 @@ pub(crate) async fn api_admin_2fa_disable(ctx: &Ctx, caller: &Caller, username: 
     tracing::info!(actor = %actor, user = %target, "admin cleared 2FA");
     audit_append(ctx.root(), &actor, audit::TWOFA_ADMIN_DISABLE, None, &format!("cleared 2FA for {target}")).await;
     Resp::json(serde_json::json!({ "ok": true, "user": target, "enabled": false }))
+}
+
+// ── shared identity registry (encryption-recipients Wave 1) ──
+//
+// The ONE registry serving both provenance signing-key lookup and (Wave 2+) encryption recipient
+// key-wrapping. Enroll writes the CALLER's own row and proves possession; the gets are public reads for
+// any authenticated caller (public keys are public).
+
+/// The largest hex field the registry accepts, and the exact lengths for each fixed-width value. An
+/// ed25519/X25519 public key is 32 bytes (64 hex chars); an ed25519 signature is 64 bytes (128 hex).
+const ED25519_PUB_HEX: usize = 64;
+const X25519_PUB_HEX: usize = 64;
+const ENROLL_SIG_HEX: usize = 128;
+/// The most usernames one batch lookup will resolve — bounds the work a single request can trigger.
+const IDENTITY_BATCH_MAX: usize = 256;
+
+/// Whether `s` is exactly `n` lowercase/uppercase hex characters. Rejects both an oversized field and a
+/// non-hex one, so the registry only ever stores well-formed, fixed-width public material.
+fn is_hex_len(s: &str, n: usize) -> bool {
+    s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The public shape of a registry row: pubkeys are public, so every field is disclosable to any
+/// authenticated caller. This is the lookup both provenance-verify and (later) recipient-wrap consume.
+fn identity_json(k: &store::IdentityKey) -> serde_json::Value {
+    serde_json::json!({
+        "username": k.username,
+        "ed25519_pub": k.ed25519_pub,
+        "x25519_pub": k.x25519_pub,
+        "epoch": k.epoch,
+        "enroll_sig": k.enroll_sig,
+        "revoked": k.revoked,
+    })
+}
+
+/// `POST /api/identity/enroll` `{ ed25519_pub, x25519_pub, epoch, enroll_sig }` — publish/rotate the
+/// CALLER's own registry row. Authenticated; the username is the authenticated caller and is NEVER read
+/// from the body, so a user can only ever enroll a key under their own name.
+///
+/// The server re-derives `enroll_sig`'s message from the caller's username + the submitted fields and
+/// verifies it against the SUBMITTED `ed25519_pub` (possession proof), then requires a strictly higher
+/// epoch than any stored one (monotonic, no rollback). A bad/oversized field, a failed signature, or a
+/// stale epoch is a 400 — the hub can only ever replace a row, never mint a valid one.
+pub(crate) async fn api_identity_enroll(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
+    let Some(username) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let (Some(ed25519_pub), Some(x25519_pub)) = (str_field(&v, "ed25519_pub"), str_field(&v, "x25519_pub")) else {
+        return Resp::err(400, "want ed25519_pub and x25519_pub");
+    };
+    let Some(enroll_sig) = str_field(&v, "enroll_sig") else {
+        return Resp::err(400, "want enroll_sig");
+    };
+    // epoch is a non-negative integer; a missing/negative/oversized one is a 400 (the JSON number is
+    // read as i64, so a value beyond i64 fails `as_i64` and lands here).
+    let Some(epoch) = v.get("epoch").and_then(|x| x.as_i64()).filter(|e| *e >= 0) else {
+        return Resp::err(400, "want a non-negative integer epoch");
+    };
+    if !is_hex_len(&ed25519_pub, ED25519_PUB_HEX) || !is_hex_len(&x25519_pub, X25519_PUB_HEX) {
+        return Resp::err(400, "ed25519_pub and x25519_pub must each be 32-byte hex (64 chars)");
+    }
+    if !is_hex_len(&enroll_sig, ENROLL_SIG_HEX) {
+        return Resp::err(400, "enroll_sig must be a 64-byte ed25519 signature (128 hex chars)");
+    }
+    // Possession proof: verify enroll_sig over (username ‖ epoch ‖ ed25519_pub ‖ x25519_pub) against
+    // the SUBMITTED ed25519_pub. The username is the authenticated caller, so a signature made for a
+    // different name will not verify here.
+    let msg = agit::agent::identity_enroll_message(&username, epoch, &ed25519_pub, &x25519_pub);
+    if !agit::agent::verify_hex(&ed25519_pub, &msg, &enroll_sig) {
+        return Resp::err(400, "enroll_sig does not verify against the submitted ed25519_pub");
+    }
+    let row = store::IdentityKey {
+        username: username.clone(),
+        ed25519_pub,
+        x25519_pub,
+        epoch,
+        enroll_sig,
+        created: store::now_iso(),
+        revoked: None,
+    };
+    match ctx.store.upsert_identity_key(row).await {
+        Ok(store::EnrollOutcome::Applied) => {}
+        Ok(store::EnrollOutcome::StaleEpoch { stored }) => {
+            return Resp::err(400, &format!("epoch {epoch} does not advance the enrolled epoch {stored}"));
+        }
+        Err(_) => return Resp::err(500, "couldn't record the identity key"),
+    }
+    audit_append(ctx.root(), &username, audit::IDENTITY_ENROLL, None, &format!("epoch={epoch}")).await;
+    Resp::json(serde_json::json!({ "username": username, "epoch": epoch }))
+}
+
+/// `GET /api/identity/<user>` — one person's published public keys. Any authenticated caller may read
+/// (pubkeys are public). An unknown user is a 404, matching the hub's non-disclosure elsewhere.
+pub(crate) async fn api_identity_get(ctx: &Ctx, caller: &Caller, user: &str) -> Resp {
+    if caller.user.is_none() {
+        return Resp::err(401, "login required");
+    }
+    match ctx.store.get_identity_key(user).await {
+        Some(k) => Resp::json(identity_json(&k)),
+        None => Resp::err(404, "not found"),
+    }
+}
+
+/// `GET /api/identity?users=a,b,c` — a batch lookup. Any authenticated caller may read. Unknown users
+/// are simply omitted from `keys` (non-disclosing); the batch is capped at [`IDENTITY_BATCH_MAX`].
+pub(crate) async fn api_identity_list(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
+    if caller.user.is_none() {
+        return Resp::err(401, "login required");
+    }
+    let raw = param(req.query(), "users").unwrap_or_default();
+    let names: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(IDENTITY_BATCH_MAX)
+        .collect();
+    let keys = ctx.store.get_identity_keys(&names).await;
+    let arr: Vec<serde_json::Value> = keys.iter().map(identity_json).collect();
+    Resp::json(serde_json::json!({ "keys": arr }))
 }
 
 /// Resolve an agent's effective ACL, folding in the owning org's members when it is org-owned. **This
@@ -3628,5 +3763,174 @@ mod tests {
         assert_eq!(v["name"], "secret");
         assert_eq!(v["aid"], "agt_secret1");
         assert_eq!(v["visibility"], "private");
+    }
+
+    // ── shared identity registry (encryption-recipients Wave 1) ──
+
+    /// Build a VALID signed enroll body for a fresh identity minted under `home`, signing the tuple as
+    /// `username`. Returns the body plus the derived (ed25519_pub, x25519_pub) hex for assertions.
+    fn signed_identity(home: &std::path::Path, username: &str, epoch: i64) -> (serde_json::Value, String, String) {
+        let sk = agit::agent::load_or_create_signing_key(home).unwrap();
+        let ed = hex::encode(sk.verifying_key().to_bytes());
+        let x = hex::encode(agit::agent::x25519_public_from_secret(&agit::agent::derive_x25519_secret(&sk)));
+        let msg = agit::agent::identity_enroll_message(username, epoch, &ed, &x);
+        let sig = agit::agent::sign_hex(&sk, &msg);
+        (serde_json::json!({ "ed25519_pub": ed, "x25519_pub": x, "epoch": epoch, "enroll_sig": sig }), ed, x)
+    }
+
+    fn get_req(target: &str) -> Req {
+        Req { method: "GET".into(), target: target.into(), headers: vec![("host".into(), "localhost:8177".into())], content_length: 0 }
+    }
+
+    /// The happy path: enroll writes the CALLER's own row, and GET returns those exact pubkeys.
+    #[tokio::test]
+    async fn identity_enroll_stores_the_callers_row_and_get_returns_it() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "pw-alice-1234", false).await;
+        let home = tempfile::tempdir().unwrap();
+        let (b, ed, x) = signed_identity(home.path(), "alice", 0);
+
+        let resp = api_identity_enroll(&ctx, &caller("alice", false), &body(b)).await;
+        assert_eq!(resp.status, 200, "enroll should succeed: {}", String::from_utf8_lossy(&resp.body));
+
+        // Stored under the caller's username, with the submitted public halves.
+        let row = ctx.store.get_identity_key("alice").await.expect("alice is enrolled");
+        assert_eq!(row.ed25519_pub, ed);
+        assert_eq!(row.x25519_pub, x);
+        assert_eq!(row.epoch, 0);
+
+        // GET /api/identity/<user> returns the enrolled pubkeys to any authenticated caller.
+        let got = api_identity_get(&ctx, &caller("bob", false), "alice").await;
+        assert_eq!(got.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&got.body).unwrap();
+        assert_eq!(v["ed25519_pub"], ed);
+        assert_eq!(v["x25519_pub"], x);
+        assert_eq!(v["epoch"], 0);
+        assert_eq!(v["username"], "alice");
+    }
+
+    /// The anti-mint property: a signature that does not verify against the SUBMITTED ed25519_pub is
+    /// refused, and nothing is stored — the hub can only replace a row, never forge one.
+    #[tokio::test]
+    async fn identity_enroll_rejects_a_signature_that_does_not_verify() {
+        let (_d, ctx) = harness().await;
+        let home = tempfile::tempdir().unwrap();
+        let (mut b, _ed, _x) = signed_identity(home.path(), "alice", 0);
+        b["enroll_sig"] = serde_json::json!("00".repeat(64)); // well-formed length, but not a real signature
+        let resp = api_identity_enroll(&ctx, &caller("alice", false), &body(b)).await;
+        assert_eq!(resp.status, 400, "a non-verifying enroll_sig must be refused");
+        assert!(ctx.store.get_identity_key("alice").await.is_none(), "nothing is stored on rejection");
+    }
+
+    /// The hub cannot bind a submitted pubkey it does not hold the private key for: a signature made by a
+    /// DIFFERENT key than the submitted ed25519_pub does not verify, so no valid row can be minted.
+    #[tokio::test]
+    async fn identity_enroll_cannot_be_minted_with_a_foreign_signature() {
+        let (_d, ctx) = harness().await;
+        let ha = tempfile::tempdir().unwrap();
+        let hb = tempfile::tempdir().unwrap();
+        let (b_a, ed_a, x_a) = signed_identity(ha.path(), "alice", 0);
+        // Sign alice's exact tuple with a foreign key (hb). It is a real signature — just not by the key
+        // whose public half is submitted — so verification against ed_a fails.
+        let skb = agit::agent::load_or_create_signing_key(hb.path()).unwrap();
+        let foreign_sig = agit::agent::sign_hex(&skb, &agit::agent::identity_enroll_message("alice", 0, &ed_a, &x_a));
+        let mut forged = b_a;
+        forged["enroll_sig"] = serde_json::json!(foreign_sig);
+        let resp = api_identity_enroll(&ctx, &caller("alice", false), &body(forged)).await;
+        assert_eq!(resp.status, 400, "a signature not made by the submitted key must be refused");
+        assert!(ctx.store.get_identity_key("alice").await.is_none());
+    }
+
+    /// The epoch is monotonic: an epoch equal to or below the stored one is refused (no rollback), and
+    /// the stored row is untouched; only a strictly higher epoch replaces it.
+    #[tokio::test]
+    async fn identity_enroll_rejects_a_non_advancing_epoch() {
+        let (_d, ctx) = harness().await;
+        let home = tempfile::tempdir().unwrap();
+
+        let (b5, ed5, _x) = signed_identity(home.path(), "alice", 5);
+        assert_eq!(api_identity_enroll(&ctx, &caller("alice", false), &body(b5)).await.status, 200);
+
+        // Equal epoch → refused.
+        let (b5b, _, _) = signed_identity(home.path(), "alice", 5);
+        assert_eq!(api_identity_enroll(&ctx, &caller("alice", false), &body(b5b)).await.status, 400);
+        // Lower epoch → refused.
+        let (b3, _, _) = signed_identity(home.path(), "alice", 3);
+        assert_eq!(api_identity_enroll(&ctx, &caller("alice", false), &body(b3)).await.status, 400);
+
+        // The stored row is still epoch 5 with the original key.
+        let row = ctx.store.get_identity_key("alice").await.unwrap();
+        assert_eq!(row.epoch, 5);
+        assert_eq!(row.ed25519_pub, ed5);
+
+        // A strictly higher epoch is accepted.
+        let (b6, _, _) = signed_identity(home.path(), "alice", 6);
+        assert_eq!(api_identity_enroll(&ctx, &caller("alice", false), &body(b6)).await.status, 200);
+        assert_eq!(ctx.store.get_identity_key("alice").await.unwrap().epoch, 6);
+    }
+
+    /// A user cannot enroll a key under another username: the body username (if any) is ignored and the
+    /// row always lands under the authenticated caller.
+    #[tokio::test]
+    async fn a_user_cannot_enroll_a_key_under_another_username() {
+        let (_d, ctx) = harness().await;
+        let home = tempfile::tempdir().unwrap();
+        // alice authenticates and signs for her OWN caller identity, but stuffs "username":"bob" in the body.
+        let (mut b, ed, _x) = signed_identity(home.path(), "alice", 0);
+        b["username"] = serde_json::json!("bob");
+        let resp = api_identity_enroll(&ctx, &caller("alice", false), &body(b)).await;
+        assert_eq!(resp.status, 200, "the enroll succeeds — but as the caller, never the body name");
+        // The row lands under the caller (alice); bob has nothing.
+        assert_eq!(ctx.store.get_identity_key("alice").await.unwrap().ed25519_pub, ed);
+        assert!(ctx.store.get_identity_key("bob").await.is_none(), "the body username must be ignored");
+    }
+
+    /// The complementary guard: a signature bound to a DIFFERENT username than the caller does not verify
+    /// against the caller identity, so it cannot enroll a key for someone else.
+    #[tokio::test]
+    async fn a_signature_bound_to_another_username_does_not_verify() {
+        let (_d, ctx) = harness().await;
+        let home = tempfile::tempdir().unwrap();
+        // Sign the tuple AS "bob" (username=bob in the signed message), then submit it as caller alice.
+        let (b_as_bob, _ed, _x) = signed_identity(home.path(), "bob", 0);
+        let resp = api_identity_enroll(&ctx, &caller("alice", false), &body(b_as_bob)).await;
+        assert_eq!(resp.status, 400, "a signature over a different username must not verify for this caller");
+        assert!(ctx.store.get_identity_key("alice").await.is_none());
+        assert!(ctx.store.get_identity_key("bob").await.is_none());
+    }
+
+    /// Unknown users are non-disclosing: a single GET is a 404, and a batch GET omits them rather than
+    /// signaling their absence. A batch lookup also returns exactly the known rows.
+    #[tokio::test]
+    async fn identity_lookup_is_non_disclosing_for_unknown_users() {
+        let (_d, ctx) = harness().await;
+        let home = tempfile::tempdir().unwrap();
+        let (b, ed, _x) = signed_identity(home.path(), "alice", 0);
+        assert_eq!(api_identity_enroll(&ctx, &caller("alice", false), &body(b)).await.status, 200);
+
+        // Single GET of an unknown user → 404.
+        assert_eq!(api_identity_get(&ctx, &caller("alice", false), "ghost").await.status, 404);
+
+        // Batch GET: known present, unknowns omitted (not padded, not signaled).
+        let batch = api_identity_list(&ctx, &get_req("/api/identity?users=alice,ghost,phantom"), &caller("alice", false)).await;
+        assert_eq!(batch.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&batch.body).unwrap();
+        let keys = v["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1, "only the known user is returned");
+        assert_eq!(keys[0]["username"], "alice");
+        assert_eq!(keys[0]["ed25519_pub"], ed);
+    }
+
+    /// Reads require an authenticated caller (pubkeys are public, but only to logged-in callers).
+    #[tokio::test]
+    async fn identity_reads_require_authentication() {
+        let (_d, ctx) = harness().await;
+        assert_eq!(api_identity_get(&ctx, &Caller::anonymous(), "alice").await.status, 401);
+        assert_eq!(api_identity_list(&ctx, &get_req("/api/identity?users=alice"), &Caller::anonymous()).await.status, 401);
+        assert_eq!(
+            api_identity_enroll(&ctx, &Caller::anonymous(), &body(serde_json::json!({}))).await.status,
+            401,
+            "enroll requires a logged-in caller"
+        );
     }
 }

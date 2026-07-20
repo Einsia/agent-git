@@ -306,6 +306,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    reports "unverified", never blocks. ──
         "provenance" => commands::provenance_cmd(args),
 
+        // ── identity: publish/inspect this machine's public keys in the shared hub identity registry
+        //    (encryption-recipients Wave 1). `enroll [--rotate]` derives the ed25519 + X25519 halves,
+        //    self-signs, and upserts the caller's own row; `show [<user>]` prints fingerprints. ──
+        "identity" => commands::identity_cmd(args),
+
         // ── shadow: route `git` through `agit` in your interactive shell (cross-platform). ──
         "shadow" => agit::shadow::run(args),
 

@@ -24,6 +24,7 @@ pub mod crypt;
 pub mod environment;
 pub mod harness;
 pub mod hub;
+pub mod hubapi;
 pub mod init;
 pub mod llm;
 pub mod output;

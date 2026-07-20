@@ -53,6 +53,8 @@ pub const TWOFA_ENROLL: &str = "user.2fa.enroll";
 pub const TWOFA_ENABLE: &str = "user.2fa.enable";
 pub const TWOFA_DISABLE: &str = "user.2fa.disable";
 pub const TWOFA_ADMIN_DISABLE: &str = "user.2fa.admin.disable";
+/// A user published (or rotated) their public keys in the shared identity registry.
+pub const IDENTITY_ENROLL: &str = "user.identity.enroll";
 pub const AGENT_CREATE: &str = "agent.create";
 pub const AGENT_DELETE: &str = "agent.delete";
 pub const AGENT_RENAME: &str = "agent.rename";

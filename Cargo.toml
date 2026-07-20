@@ -52,6 +52,16 @@ totp-rs = { version = "5", default-features = false, features = ["otpauth", "gen
 # Client-side provenance: a per-machine ed25519 identity signs each captured session.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+# Encryption-recipients Wave 1: derive an X25519 encryption keypair from the same ed25519 identity
+# secret via the standard ed25519->curve25519 (Edwards->Montgomery) map. Already a transitive dep (of
+# ed25519-dalek); pinned directly so the clamp/basepoint helpers (`clamp_integer`, `X25519_BASEPOINT`,
+# `mul_clamped`, `EdwardsPoint::to_montgomery`) are used from the library rather than hand-rolled.
+curve25519-dalek = "4"
+# Minimal blocking HTTP client for the `agit identity` commands (enroll/lookup against the hub's JSON
+# API). rustls only (default-features off) to match the hermetic no-system-OpenSSL stance the rest of
+# the build takes (rust-s3/tokio-rustls). The server (agit-hub) keeps its hand-rolled http layer; this
+# is the client half, which previously had no HTTP client at all.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # Opt-in at-rest encryption of the agent store (Feature C). A convergent git clean/smudge filter:
 # XChaCha20-Poly1305 AEAD (pure-Rust, hermetic — matches the tokio-rustls / no-system-OpenSSL stance),
 # with the nonce derived deterministically from the plaintext (HMAC-SHA256) so the clean filter is a

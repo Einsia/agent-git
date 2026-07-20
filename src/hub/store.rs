@@ -193,6 +193,41 @@ impl Invitation {
     }
 }
 
+/// A person's published public keys in the ONE shared identity registry (encryption-recipients design,
+/// Wave 1). It serves two lookups from a single row: provenance signing-key verification (the
+/// `ed25519_pub`) and encryption recipient key-wrapping (the `x25519_pub`, used from Wave 2). Only ever
+/// public halves live here; the private key never leaves the client.
+///
+/// `enroll_sig = ed25519_sign(username ‖ epoch ‖ ed25519_pub ‖ x25519_pub)` over the exact bytes of
+/// [`crate::agent::identity_enroll_message`], verified server-side against the SUBMITTED `ed25519_pub`
+/// — so a write proves possession of the private key and the hub can only replace a row, never mint a
+/// valid one. `epoch` is monotonic (a higher epoch is a key rotation; a lower or equal one is refused),
+/// and `revoked` is a set-once tombstone timestamp (unused in Wave 1, carried for later waves).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct IdentityKey {
+    pub username: String,
+    pub ed25519_pub: String,
+    pub x25519_pub: String,
+    #[serde(default)]
+    pub epoch: i64,
+    pub enroll_sig: String,
+    #[serde(default)]
+    pub created: String,
+    #[serde(default)]
+    pub revoked: Option<String>,
+}
+
+/// The outcome of an [`Store::upsert_identity_key`]: either the row was written, or it was refused
+/// because the submitted epoch does not strictly advance the stored one (monotonic, no rollback). The
+/// check is performed under the same write lock as the write, so it is race-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollOutcome {
+    /// The row was created (first enrollment) or replaced (a strictly higher epoch).
+    Applied,
+    /// Rejected: `submitted <= stored`. Carries the stored epoch so the API can explain the refusal.
+    StaleEpoch { stored: i64 },
+}
+
 impl Org {
     /// Whether `user` can manage the org (add/remove members, and manage every agent it owns).
     pub fn is_admin(&self, user: &str) -> bool {
@@ -573,6 +608,18 @@ fn row_org(r: &impl Cols) -> Org {
     Org { name: r.text("name"), members: parse_json_vec(&r.text("members")), created: r.text("created") }
 }
 
+fn row_identity_key(r: &impl Cols) -> IdentityKey {
+    IdentityKey {
+        username: r.text("username"),
+        ed25519_pub: r.text("ed25519_pub"),
+        x25519_pub: r.text("x25519_pub"),
+        epoch: r.int("epoch"),
+        enroll_sig: r.text("enroll_sig"),
+        created: r.text("created"),
+        revoked: r.opt("revoked"),
+    }
+}
+
 fn row_invitation(r: &impl Cols) -> Invitation {
     Invitation {
         id: r.text("id"),
@@ -634,6 +681,14 @@ const DDL: &[&str] = &[
        status TEXT NOT NULL DEFAULT 'pending', created_by TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '')",
     "CREATE INDEX IF NOT EXISTS invitations_org ON invitations(org)",
     "CREATE INDEX IF NOT EXISTS invitations_invitee ON invitations(invitee)",
+    // The ONE shared identity registry (encryption-recipients design, Wave 1): a person's published
+    // ed25519 + X25519 public halves, self-signed via enroll_sig. Serves BOTH provenance signing-key
+    // lookup AND (Wave 2+) encryption recipient key-wrapping. Added additively (a whole new table, like
+    // invitations) via CREATE TABLE IF NOT EXISTS — no schema-version bump or back-fill. epoch is
+    // BIGINT for the same strict-decode reason the other integer columns are (see the note above).
+    "CREATE TABLE IF NOT EXISTS identity_keys (\
+       username TEXT PRIMARY KEY, ed25519_pub TEXT NOT NULL, x25519_pub TEXT NOT NULL, \
+       epoch BIGINT NOT NULL DEFAULT 0, enroll_sig TEXT NOT NULL, created TEXT NOT NULL DEFAULT '', revoked TEXT)",
 ];
 
 /// The second-factor columns, added onto a `users` table that predates them. A **fresh** DB already
@@ -1080,6 +1135,45 @@ impl Store {
             Store::Pg(s) => s.update_invitations(f).await,
         }
     }
+
+    // ── identity registry ──
+    //
+    // Targeted upsert/gets (not the whole-table snapshot the other tables use): the registry is keyed
+    // by username with one row per person and can grow large, so a per-enroll table rewrite would be
+    // wasteful. The write still runs in the exact same critical section every other writer uses (the
+    // SQLite async write mutex / the Postgres advisory-lock transaction), and the monotonic epoch check
+    // happens inside that section so it is race-free.
+
+    /// The registry row for one user, or `None` if they never enrolled. Username is normalized, so a
+    /// lookup matches regardless of case, exactly like [`Store::user`].
+    pub async fn get_identity_key(&self, username: &str) -> Option<IdentityKey> {
+        match self {
+            Store::Sqlite(s) => s.get_identity_key(&normalize_username(username)).await,
+            Store::Pg(s) => s.get_identity_key(&normalize_username(username)).await,
+        }
+    }
+
+    /// The registry rows for a batch of users. Unknown users are simply omitted (non-disclosing) —
+    /// the result is not padded and order is not guaranteed. Duplicate/blank names are harmless.
+    pub async fn get_identity_keys(&self, usernames: &[String]) -> Vec<IdentityKey> {
+        let names: Vec<String> = usernames.iter().map(|u| normalize_username(u)).filter(|u| !u.is_empty()).collect();
+        match self {
+            Store::Sqlite(s) => s.get_identity_keys(&names).await,
+            Store::Pg(s) => s.get_identity_keys(&names).await,
+        }
+    }
+
+    /// Upsert the caller's own registry row, refusing a non-advancing epoch (monotonic, no rollback).
+    /// The `username` is normalized here so the PK is canonical. The signature/possession check is the
+    /// API layer's job (it is stateless crypto); this method owns only the atomic monotonic write.
+    /// `created` is preserved across a replace — only the first enrollment stamps it.
+    pub async fn upsert_identity_key(&self, mut row: IdentityKey) -> io::Result<EnrollOutcome> {
+        row.username = normalize_username(&row.username);
+        match self {
+            Store::Sqlite(s) => s.upsert_identity_key(row).await,
+            Store::Pg(s) => s.upsert_identity_key(row).await,
+        }
+    }
 }
 
 // ─────────────────────────── SQLite backend ───────────────────────────
@@ -1456,6 +1550,63 @@ impl SqliteStore {
         tx.commit().await.map_err(err)?;
         Ok(r)
     }
+
+    async fn get_identity_key(&self, username: &str) -> Option<IdentityKey> {
+        match sqlx::query("SELECT * FROM identity_keys WHERE username = ?").bind(username).fetch_optional(&self.pool).await {
+            Ok(Some(r)) => Some(row_identity_key(&r)),
+            _ => None,
+        }
+    }
+
+    async fn get_identity_keys(&self, usernames: &[String]) -> Vec<IdentityKey> {
+        let mut out = Vec::with_capacity(usernames.len());
+        for u in usernames {
+            if let Some(k) = self.get_identity_key(u).await {
+                out.push(k);
+            }
+        }
+        out
+    }
+
+    async fn upsert_identity_key(&self, row: IdentityKey) -> io::Result<EnrollOutcome> {
+        // The same read-modify-write critical section every other writer runs in: the async write
+        // mutex, then a tracked transaction. The epoch read + the write share the one transaction, so
+        // the monotonic check cannot be raced by a concurrent enroll.
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        let stored: Option<i64> = sqlx::query("SELECT epoch FROM identity_keys WHERE username = ?")
+            .bind(&row.username)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(err)?
+            .map(|r| r.int("epoch"));
+        if let Some(stored) = stored {
+            if row.epoch <= stored {
+                return Ok(EnrollOutcome::StaleEpoch { stored });
+            }
+        }
+        // ON CONFLICT keeps the original `created` (only the first enrollment stamps it) and refreshes
+        // every other column — including clearing `revoked`, so re-enrolling un-revokes.
+        sqlx::query(
+            "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(username) DO UPDATE SET \
+               ed25519_pub = excluded.ed25519_pub, x25519_pub = excluded.x25519_pub, \
+               epoch = excluded.epoch, enroll_sig = excluded.enroll_sig, revoked = excluded.revoked",
+        )
+        .bind(&row.username)
+        .bind(&row.ed25519_pub)
+        .bind(&row.x25519_pub)
+        .bind(row.epoch)
+        .bind(&row.enroll_sig)
+        .bind(&row.created)
+        .bind(&row.revoked)
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(EnrollOutcome::Applied)
+    }
 }
 
 // ─────────────────────────── Postgres backend ───────────────────────────
@@ -1802,6 +1953,61 @@ impl PgStore {
         }
         tx.commit().await.map_err(err)?;
         Ok(r)
+    }
+
+    async fn get_identity_key(&self, username: &str) -> Option<IdentityKey> {
+        match sqlx::query("SELECT * FROM identity_keys WHERE username = $1").bind(username).fetch_optional(&self.pool).await {
+            Ok(Some(r)) => Some(row_identity_key(&r)),
+            _ => None,
+        }
+    }
+
+    async fn get_identity_keys(&self, usernames: &[String]) -> Vec<IdentityKey> {
+        let mut out = Vec::with_capacity(usernames.len());
+        for u in usernames {
+            if let Some(k) = self.get_identity_key(u).await {
+                out.push(k);
+            }
+        }
+        out
+    }
+
+    async fn upsert_identity_key(&self, row: IdentityKey) -> io::Result<EnrollOutcome> {
+        // The one global advisory-lock critical section every read-modify-write runs in, so the epoch
+        // read + the write are one atomic section and the monotonic check cannot be raced.
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        let stored: Option<i64> = sqlx::query("SELECT epoch FROM identity_keys WHERE username = $1")
+            .bind(&row.username)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(err)?
+            .map(|r| r.int("epoch"));
+        if let Some(stored) = stored {
+            if row.epoch <= stored {
+                return Ok(EnrollOutcome::StaleEpoch { stored });
+            }
+        }
+        // ON CONFLICT keeps the original `created` and refreshes the rest, clearing `revoked`.
+        sqlx::query(
+            "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (username) DO UPDATE SET \
+               ed25519_pub = excluded.ed25519_pub, x25519_pub = excluded.x25519_pub, \
+               epoch = excluded.epoch, enroll_sig = excluded.enroll_sig, revoked = excluded.revoked",
+        )
+        .bind(&row.username)
+        .bind(&row.ed25519_pub)
+        .bind(&row.x25519_pub)
+        .bind(row.epoch)
+        .bind(&row.enroll_sig)
+        .bind(&row.created)
+        .bind(&row.revoked)
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(EnrollOutcome::Applied)
     }
 }
 
@@ -2450,6 +2656,49 @@ mod tests {
         assert_eq!(a.owner, b.owner);
         assert_eq!(a.visibility, b.visibility);
         assert_eq!(a.members, b.members);
+    }
+
+    /// The registry upsert is a monotonic replace that preserves `created` and clears `revoked`, and
+    /// the batch get returns exactly the known rows (unknowns omitted). This exercises the Store layer
+    /// directly; the API-level possession/signature checks are covered in the api tests.
+    #[tokio::test]
+    async fn identity_upsert_is_monotonic_and_preserves_created() {
+        let (_d, s) = tmp_store().await;
+        let row = |epoch: i64, ed: &str| IdentityKey {
+            username: "Alice".into(), // deliberately mixed-case: the facade normalizes it
+            ed25519_pub: ed.into(),
+            x25519_pub: "b".repeat(64),
+            epoch,
+            enroll_sig: "sig".into(),
+            created: now_iso(),
+            revoked: Some("tombstone".into()),
+        };
+
+        // First enrollment lands, normalized to "alice".
+        assert_eq!(s.upsert_identity_key(row(0, &"a".repeat(64))).await.unwrap(), EnrollOutcome::Applied);
+        let first = s.get_identity_key("alice").await.unwrap();
+        assert_eq!(first.username, "alice");
+        let created0 = first.created.clone();
+
+        // A non-advancing epoch is refused and changes nothing.
+        assert_eq!(
+            s.upsert_identity_key(row(0, &"c".repeat(64))).await.unwrap(),
+            EnrollOutcome::StaleEpoch { stored: 0 }
+        );
+        assert_eq!(s.get_identity_key("alice").await.unwrap().ed25519_pub, "a".repeat(64));
+
+        // A higher epoch replaces the key but keeps the original `created` (only first enroll stamps it).
+        assert_eq!(s.upsert_identity_key(row(1, &"d".repeat(64))).await.unwrap(), EnrollOutcome::Applied);
+        let bumped = s.get_identity_key("alice").await.unwrap();
+        assert_eq!(bumped.epoch, 1);
+        assert_eq!(bumped.ed25519_pub, "d".repeat(64));
+        assert_eq!(bumped.created, created0, "created is preserved across a replace");
+
+        // Batch get returns only known users; an unknown one is omitted, not padded.
+        let batch = s.get_identity_keys(&["alice".into(), "nobody".into()]).await;
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].username, "alice");
+        assert!(s.get_identity_key("nobody").await.is_none());
     }
 
     #[test]

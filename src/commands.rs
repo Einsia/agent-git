@@ -1075,6 +1075,145 @@ fn provenance_key() -> Result<i32> {
     Ok(0)
 }
 
+// ─────────────────────── Identity registry: enroll/show against the hub (encryption-recipients Wave 1) ───────────────────────
+
+/// `agit identity enroll [--rotate]` / `agit identity show [<user>]` — the client half of the shared
+/// identity registry. The registry publishes this machine's ed25519 + X25519 PUBLIC keys so teammates
+/// can verify provenance signatures and (later) wrap encryption content-keys to them. The private key
+/// never leaves the machine.
+pub fn identity_cmd(args: &[String]) -> Result<i32> {
+    let sub = args.first().map(|s| s.as_str());
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+    match sub {
+        Some("enroll") => identity_enroll(rest.iter().any(|a| a == "--rotate")),
+        Some("show") => identity_show(rest.first().map(|s| s.trim()).filter(|s| !s.is_empty())),
+        // No subcommand = show my own local identity + enrollment status, the friendliest default.
+        None => identity_show(None),
+        Some(other) => {
+            errln!("agit identity: unknown subcommand `{other}`");
+            errln!("  usage: agit identity enroll [--rotate]   ·   agit identity show [<user>]");
+            Ok(2)
+        }
+    }
+}
+
+/// The pubkeys of THIS machine's identity, deriving the X25519 half from the same ed25519 secret.
+fn local_identity_pubkeys() -> Result<(String, String)> {
+    Ok((agent::machine_pubkey_hex()?, agent::machine_x25519_pubkey_hex()?))
+}
+
+fn field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+/// Publish (or rotate) this machine's public keys in the hub registry. `enroll_sig` signs
+/// `(username ‖ epoch ‖ ed25519_pub ‖ x25519_pub)` with the machine key, proving possession; the
+/// `username` is the hub account the client authenticates as (learned from `GET /api/me`), because the
+/// server verifies the signature against that caller identity — a signature bound to any other name is
+/// rejected. The epoch is monotonic: a fresh enrollment starts at 0, `--rotate` bumps past the stored one.
+fn identity_enroll(rotate: bool) -> Result<i32> {
+    let sk = agent::machine_signing_key()?;
+    let (ed_pub, x_pub) = local_identity_pubkeys()?;
+
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    let username = ep.me()?;
+    let current = ep.get_identity(&username)?;
+    let cur_epoch = current.as_ref().and_then(|v| v.get("epoch").and_then(|e| e.as_i64()));
+
+    let epoch = match (cur_epoch, rotate) {
+        (None, _) => 0,
+        (Some(stored), true) => stored + 1,
+        (Some(stored), false) => {
+            let same = current
+                .as_ref()
+                .map(|v| field(v, "ed25519_pub") == ed_pub && field(v, "x25519_pub") == x_pub)
+                .unwrap_or(false);
+            if same {
+                outln!("already enrolled as {username} at epoch {stored} (keys unchanged).");
+                outln!("  use `agit identity enroll --rotate` to publish a new epoch.");
+                return Ok(0);
+            }
+            errln!("your local identity differs from the enrolled epoch {stored} on the hub.");
+            errln!("  re-run with `--rotate` to publish these keys as epoch {}.", stored + 1);
+            return Ok(1);
+        }
+    };
+
+    let msg = agent::identity_enroll_message(&username, epoch, &ed_pub, &x_pub);
+    let enroll_sig = agent::sign_hex(&sk, &msg);
+    let body = serde_json::json!({
+        "ed25519_pub": ed_pub,
+        "x25519_pub": x_pub,
+        "epoch": epoch,
+        "enroll_sig": enroll_sig,
+    });
+    ep.enroll(&body)?;
+    outln!("enrolled {username} in the hub identity registry at epoch {epoch}");
+    outln!("  ed25519  {ed_pub}");
+    outln!("  x25519   {x_pub}");
+    Ok(0)
+}
+
+/// Show an identity: with no `<user>`, this machine's local keys plus its hub enrollment status (a
+/// best-effort lookup — a machine with no hub still prints its local identity); with `<user>`, that
+/// person's published keys fetched from the hub.
+fn identity_show(user: Option<&str>) -> Result<i32> {
+    match user {
+        None => {
+            let (ed_pub, x_pub) = local_identity_pubkeys()?;
+            outln!("this machine's identity");
+            outln!("  ed25519  {ed_pub}");
+            outln!("  x25519   {x_pub}");
+            outln!("  stored   {}", scope::agit_home()?.join("identity").join("ed25519").display());
+            // Enrollment status is a courtesy: never fail `show` just because no hub is reachable.
+            match hub_enrollment_status(&ed_pub) {
+                Ok(Some(line)) => outln!("  {line}"),
+                Ok(None) => outln!("  not enrolled on the hub yet — run `agit identity enroll`."),
+                Err(_) => outln!("  (no hub configured; showing local identity only)"),
+            }
+            Ok(0)
+        }
+        Some(u) => {
+            let ep = crate::hubapi::HubEndpoint::resolve()?;
+            match ep.get_identity(u)? {
+                Some(v) => {
+                    outln!("{u}");
+                    outln!("  ed25519  {}", field(&v, "ed25519_pub"));
+                    outln!("  x25519   {}", field(&v, "x25519_pub"));
+                    outln!("  epoch    {}", v.get("epoch").and_then(|e| e.as_i64()).unwrap_or(0));
+                    if let Some(revoked) = v.get("revoked").and_then(|r| r.as_str()) {
+                        outln!("  REVOKED  {revoked}");
+                    }
+                    Ok(0)
+                }
+                None => {
+                    errln!("no identity enrolled for {u} on the hub.");
+                    Ok(1)
+                }
+            }
+        }
+    }
+}
+
+/// The one-line hub enrollment status for a local ed25519 pubkey: `Some(line)` when enrolled,
+/// `None` when the hub has no row for us, `Err` when no hub is reachable/configured.
+fn hub_enrollment_status(local_ed_pub: &str) -> Result<Option<String>> {
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    let username = ep.me()?;
+    match ep.get_identity(&username)? {
+        Some(v) => {
+            let epoch = v.get("epoch").and_then(|e| e.as_i64()).unwrap_or(0);
+            let verdict = if field(&v, "ed25519_pub") == local_ed_pub {
+                "matches this machine"
+            } else {
+                "DIFFERS from this machine — rotate to republish"
+            };
+            Ok(Some(format!("enrolled as {username} at epoch {epoch} ({verdict})")))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Resolve `<session>` to a transcript on disk — a direct path, a sidecar path, or a session id in the
 /// resolved agent's store — then self-verify its provenance.
 fn provenance_verify(session: Option<&str>) -> Result<i32> {

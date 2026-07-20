@@ -1,0 +1,303 @@
+//! A minimal blocking HTTP client to an agit hub's JSON API — the client half agit never had.
+//!
+//! The client authenticates to a hub for git over HTTP Basic (a token in the password field of the
+//! remote URL, `https://user:token@host/owner/name.git`); this module authenticates to the SAME hub the
+//! SAME way for the JSON API, so `agit identity enroll` needs no separate login. The hub base URL and
+//! credential are resolved from the active agent's bound remote, with `AGIT_HUB_URL` / `AGIT_HUB_TOKEN`
+//! as overrides. No-hub / no-remote is a clear error, never a panic.
+
+use anyhow::{bail, Context, Result};
+
+/// How to authenticate to the hub. `Basic` mirrors git's `user:token` password-field auth; `Bearer`
+/// is the `AGIT_HUB_TOKEN` override. The hub accepts either (see its `credentials()` extractor).
+#[derive(Debug, Clone)]
+pub enum Auth {
+    Basic { user: String, pass: String },
+    Bearer(String),
+}
+
+impl Auth {
+    /// The `Authorization` header value this credential presents.
+    fn header_value(&self) -> String {
+        match self {
+            Auth::Basic { user, pass } => format!("Basic {}", base64_encode(format!("{user}:{pass}").as_bytes())),
+            Auth::Bearer(t) => format!("Bearer {t}"),
+        }
+    }
+}
+
+/// A resolved hub endpoint: the API base (`scheme://authority`, no path, no credentials) plus the
+/// credential to present. `auth` is `None` only for a hub reachable anonymously — every write path here
+/// requires it and says so.
+#[derive(Debug, Clone)]
+pub struct HubEndpoint {
+    pub base: String,
+    pub auth: Option<Auth>,
+}
+
+impl HubEndpoint {
+    /// Resolve the endpoint from the environment overrides, else the active agent's primary remote.
+    ///
+    /// `AGIT_HUB_URL` (if set) names the hub; otherwise the active agent's primary remote does. Either
+    /// way the URL is parsed into `scheme://authority` + optional `user:token` userinfo. `AGIT_HUB_TOKEN`
+    /// (if set) overrides the credential as a bearer token. A non-http(s) remote (ssh) has no JSON API
+    /// reachable this way and is a clear error.
+    pub fn resolve() -> Result<HubEndpoint> {
+        let env_url = std::env::var("AGIT_HUB_URL").ok().filter(|s| !s.trim().is_empty());
+        let source = match env_url {
+            Some(u) => u,
+            None => {
+                let agent = crate::agent::resolve(None).context("no active agent to find a hub remote from")?;
+                hub_remote_of(&agent).context(
+                    "this agent has no hub remote to enroll against.\n\
+                     \x20 push it to a hub first (agit a push), or set AGIT_HUB_URL (and AGIT_HUB_TOKEN).",
+                )?
+            }
+        };
+        let (base, url_auth) = parse_http_url(&source)?;
+        // AGIT_HUB_TOKEN overrides any credential parsed from the URL, as a bearer token.
+        let auth = match std::env::var("AGIT_HUB_TOKEN").ok().filter(|s| !s.trim().is_empty()) {
+            Some(t) => Some(Auth::Bearer(t.trim().to_string())),
+            None => url_auth,
+        };
+        Ok(HubEndpoint { base, auth })
+    }
+
+    fn require_auth(&self) -> Result<&Auth> {
+        self.auth.as_ref().context(
+            "no hub credential found.\n\
+             \x20 put a token in the remote URL's password field, or set AGIT_HUB_TOKEN.",
+        )
+    }
+
+    /// `GET /api/me` — the authenticated caller's username. Enrollment binds `enroll_sig` to exactly
+    /// this name (the server verifies against the caller identity), so the client must sign with the
+    /// account it actually authenticates as, not a guess from the URL userinfo.
+    pub fn me(&self) -> Result<String> {
+        let auth = self.require_auth()?;
+        let url = format!("{}/api/me", self.base);
+        let mut resp = http_agent()
+            .get(&url)
+            .header("Authorization", &auth.header_value())
+            .call()
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        let v = ok_json(status, &text, &url)?;
+        v.get("username")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string())
+            .context("the hub did not identify the authenticated user (GET /api/me returned no username)")
+    }
+
+    /// `POST /api/identity/enroll`. Returns the parsed JSON response on 2xx; a non-2xx is an error
+    /// carrying the hub's message.
+    pub fn enroll(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        let auth = self.require_auth()?;
+        let url = format!("{}/api/identity/enroll", self.base);
+        // Serialize the body ourselves (serde_json is already a dependency) and send it as an explicit
+        // application/json string, rather than pulling in ureq's `json` feature just for `send_json`.
+        let payload = serde_json::to_string(body).context("serializing enroll body")?;
+        let mut resp = http_agent()
+            .post(&url)
+            .header("Authorization", &auth.header_value())
+            .header("Content-Type", "application/json")
+            .send(&payload)
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        ok_json(status, &text, &url)
+    }
+
+    /// `GET /api/identity/<user>`. `Ok(None)` on 404 (unknown user), the parsed row on 2xx, an error on
+    /// any other status.
+    pub fn get_identity(&self, user: &str) -> Result<Option<serde_json::Value>> {
+        let auth = self.require_auth()?;
+        let url = format!("{}/api/identity/{user}", self.base);
+        let mut resp = http_agent()
+            .get(&url)
+            .header("Authorization", &auth.header_value())
+            .call()
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        if status == 404 {
+            return Ok(None);
+        }
+        ok_json(status, &text, &url).map(Some)
+    }
+}
+
+/// A ureq agent that surfaces 4xx/5xx as a normal `Response` (so we can read the hub's error body)
+/// rather than ureq's default of turning them into `Err(StatusCode)`.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder().http_status_as_error(false).build().into()
+}
+
+/// Parse a 2xx body as JSON, or turn a non-2xx into an error carrying the hub's `error` message.
+fn ok_json(status: u16, text: &str, url: &str) -> Result<serde_json::Value> {
+    if (200..300).contains(&status) {
+        return serde_json::from_str(text).with_context(|| format!("{url}: hub returned status {status} with a non-JSON body"));
+    }
+    let msg = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+        .unwrap_or_else(|| text.trim().to_string());
+    if msg.is_empty() {
+        bail!("{url}: hub returned status {status}");
+    }
+    bail!("{url}: hub returned status {status}: {msg}");
+}
+
+/// The hub remote of an agent: its primary remote's raw URL (with any credential), for base + auth
+/// resolution. `None` when the store has no remote at all.
+fn hub_remote_of(agent: &crate::agent::Agent) -> Option<String> {
+    let remotes = crate::agent::store_remotes(&agent.store);
+    let primary = crate::agent::primary_remote_name(&agent.store);
+    match primary {
+        Some(name) => remotes.into_iter().find(|(n, _)| *n == name).map(|(_, url)| url),
+        None => remotes.into_iter().next().map(|(_, url)| url),
+    }
+}
+
+/// Split an http(s) URL into `(base, auth)` where `base` is `scheme://authority` (no path, no userinfo)
+/// and `auth` is a `Basic` credential when the URL carried `user:token` userinfo. A non-http(s) URL is
+/// an error: the JSON API is not reachable over ssh.
+/// Replace any `user:token@` userinfo with `***@` so a URL is safe to put in an error
+/// message. A credentialed remote must never echo its token into stderr/logs.
+fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (rest, None),
+    };
+    let shown = match authority.rsplit_once('@') {
+        Some((_, host)) => format!("***@{host}"),
+        None => authority.to_string(),
+    };
+    match path {
+        Some(p) => format!("{scheme}://{shown}/{p}"),
+        None => format!("{scheme}://{shown}"),
+    }
+}
+
+fn parse_http_url(url: &str) -> Result<(String, Option<Auth>)> {
+    let url = url.trim();
+    let (scheme, rest) = url
+        .split_once("://")
+        .filter(|(s, _)| *s == "http" || *s == "https")
+        .with_context(|| {
+            let shown = redact_url(url);
+            format!("the hub remote {shown:?} is not an http(s) URL — set AGIT_HUB_URL to the hub's https address")
+        })?;
+    // Userinfo lives only in the authority (up to the first '/'); the path is everything after.
+    let authority = rest.split_once('/').map(|(a, _)| a).unwrap_or(rest);
+    // The userinfo/host boundary is the LAST '@' (a password may itself contain '@').
+    let (userinfo, host) = match authority.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, authority),
+    };
+    if host.is_empty() {
+        let shown = redact_url(url);
+        bail!("the hub remote {shown:?} has no host");
+    }
+    let base = format!("{scheme}://{host}");
+    // Only a `user:token` userinfo yields a usable Basic credential; a bare username (no token) does not.
+    let auth = userinfo.and_then(|ui| ui.split_once(':')).and_then(|(u, p)| {
+        if p.is_empty() {
+            None
+        } else {
+            Some(Auth::Basic { user: u.to_string(), pass: p.to_string() })
+        }
+    });
+    Ok((base, auth))
+}
+
+/// Standard base64 (RFC 4648, with padding). Hand-rolled to keep the client hermetic — the only place
+/// the client needs to ENCODE base64 is the HTTP Basic `Authorization` header.
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // The exact vector the hub's own decode test uses: "git:secret123".
+        assert_eq!(base64_encode(b"git:secret123"), "Z2l0OnNlY3JldDEyMw==");
+    }
+
+    #[test]
+    fn parses_https_url_with_credentials() {
+        let (base, auth) = parse_http_url("https://alice:tok_abc@hub.example.com/alice/frontend.git").unwrap();
+        assert_eq!(base, "https://hub.example.com");
+        match auth {
+            Some(Auth::Basic { user, pass }) => {
+                assert_eq!(user, "alice");
+                assert_eq!(pass, "tok_abc");
+            }
+            other => panic!("expected Basic auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_the_port_and_drops_the_path() {
+        let (base, auth) = parse_http_url("http://localhost:8567/bob/api.git").unwrap();
+        assert_eq!(base, "http://localhost:8567");
+        assert!(auth.is_none(), "no userinfo means no credential");
+    }
+
+    #[test]
+    fn a_password_may_contain_an_at_sign() {
+        // The userinfo/host split must be the LAST '@', or part of the token leaks into the host.
+        let (base, auth) = parse_http_url("https://u:p@ss@hub.example.com/x/y.git").unwrap();
+        assert_eq!(base, "https://hub.example.com");
+        match auth {
+            Some(Auth::Basic { user, pass }) => {
+                assert_eq!(user, "u");
+                assert_eq!(pass, "p@ss");
+            }
+            other => panic!("expected Basic auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_urls_are_rejected_with_guidance() {
+        let e = parse_http_url("git@github.com:alice/frontend.git").unwrap_err().to_string();
+        assert!(e.contains("not an http(s) URL"), "got: {e}");
+    }
+
+    #[test]
+    fn parse_errors_never_echo_the_credential() {
+        // A credentialed but non-http scheme, and a credentialed empty-host URL, must both
+        // redact the token out of the error message.
+        let e = parse_http_url("ftp://alice:s3cr3t-token@hub.example.com/x").unwrap_err().to_string();
+        assert!(!e.contains("s3cr3t-token"), "token leaked into parse error: {e}");
+        assert!(e.contains("***@hub.example.com"), "userinfo should be redacted: {e}");
+        let e2 = parse_http_url("https://bob:hunter2@/no/host").unwrap_err().to_string();
+        assert!(!e2.contains("hunter2"), "token leaked into no-host error: {e2}");
+    }
+}

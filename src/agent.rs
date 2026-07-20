@@ -1581,6 +1581,68 @@ pub fn verify_hex(pubkey_hex: &str, message: &[u8], sig_hex: &str) -> bool {
     vk.verify(message, &sig).is_ok()
 }
 
+// ---------------------------------------------------------------------------------------------
+// Encryption identity: the X25519 half, derived from the SAME ed25519 secret (Wave 1)
+// ---------------------------------------------------------------------------------------------
+//
+// The encryption-recipients design (docs/plans/2026-07-20-encryption-recipients-design.md) folds one
+// on-disk secret into two roles: the ed25519 key above signs pushes/provenance, and an X25519 keypair
+// DERIVED from the same secret unwraps content keys (Wave 2+). Deriving rather than minting a second
+// key means one thing to back up and one registry row per person.
+//
+// The map is the standard ed25519 -> curve25519 (Edwards -> Montgomery) one, computed with
+// curve25519-dalek's own clamp/basepoint helpers rather than a hand-rolled clamp:
+//   * secret scalar = clamp_integer(SHA-512(seed)[..32]) — byte-for-byte the ed25519 signing scalar,
+//   * public        = secret · Montgomery-basepoint, which equals to_montgomery(ed25519_public).
+// Determinism falls out of both steps being pure functions of the seed.
+
+use curve25519_dalek::constants::X25519_BASEPOINT;
+use curve25519_dalek::edwards::CompressedEdwardsY;
+use curve25519_dalek::scalar::clamp_integer;
+use sha2::{Digest, Sha512};
+
+/// The 32-byte X25519 secret scalar derived from this machine's ed25519 signing key. Pure and
+/// deterministic: the same signing key always yields the same scalar. Already clamped, so it is a
+/// valid X25519 scalar ready for ECDH (Wave 2+ key-unwrap). Never uploaded — only its public half is.
+pub fn derive_x25519_secret(signing: &SigningKey) -> [u8; 32] {
+    // The ed25519 secret scalar derivation: SHA-512 the 32-byte seed, take the low 32 bytes, clamp.
+    let hash = Sha512::digest(signing.to_bytes());
+    let mut prefix = [0u8; 32];
+    prefix.copy_from_slice(&hash[..32]);
+    clamp_integer(prefix)
+}
+
+/// The X25519 public key for an already-derived secret scalar: `scalar · basepoint`. `mul_clamped`
+/// clamps again, which is idempotent on an already-clamped scalar, so this stays the plain basepoint
+/// multiplication of `derive_x25519_secret`'s output.
+pub fn x25519_public_from_secret(secret: &[u8; 32]) -> [u8; 32] {
+    X25519_BASEPOINT.mul_clamped(*secret).0
+}
+
+/// The birational cross-check: the X25519 public that corresponds to an ed25519 public key, via
+/// Edwards decompression + `to_montgomery`. Equal to `x25519_public_from_secret(derive_x25519_secret)`
+/// for the same identity. Returns `None` for a public key that is not a valid Edwards point.
+pub fn x25519_public_from_ed25519_public(ed_pub: &[u8; 32]) -> Option<[u8; 32]> {
+    Some(CompressedEdwardsY(*ed_pub).decompress()?.to_montgomery().0)
+}
+
+/// This machine's X25519 public key as hex, minting/deriving from the ed25519 identity as needed.
+pub fn machine_x25519_pubkey_hex() -> Result<String> {
+    let sk = machine_signing_key()?;
+    Ok(hex::encode(x25519_public_from_secret(&derive_x25519_secret(&sk))))
+}
+
+/// The exact bytes signed by an identity-registry enrollment: `enroll_sig` proves the caller holds the
+/// private ed25519 key for the `ed25519_pub` it submits, binding it to the `x25519_pub`, the `epoch`,
+/// and the `username`. A version tag domain-separates it from provenance (and every other agit
+/// signature); newline joins are unambiguous because a username has no newline (see `valid_username`),
+/// the pubkeys are hex, and the epoch is decimal. The client computes it, the hub re-computes and
+/// verifies it against the SUBMITTED `ed25519_pub`, so the hub can only ever replace a row, never mint
+/// a valid one for a key it does not hold.
+pub fn identity_enroll_message(username: &str, epoch: i64, ed25519_pub: &str, x25519_pub: &str) -> Vec<u8> {
+    format!("agit-identity-enroll-v1\n{username}\n{epoch}\n{ed25519_pub}\n{x25519_pub}").into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,6 +1687,39 @@ mod tests {
         let pk = hex::encode(k1.verifying_key().to_bytes());
         assert!(verify_hex(&pk, b"hello", &sig), "a valid signature must verify");
         assert!(!verify_hex(&pk, b"tampered", &sig), "a different message must not verify");
+    }
+
+    /// The X25519 derivation is a pure function of the ed25519 secret (deterministic), and the public
+    /// it produces is genuinely `scalar · basepoint` — proved two ways: directly via the basepoint
+    /// multiplication, and independently via the birational `to_montgomery(ed25519_public)` map. If the
+    /// clamp or the map were wrong these two would diverge.
+    #[test]
+    fn x25519_derivation_is_deterministic_and_public_matches_the_scalar() {
+        let h = tmp();
+        let sk = load_or_create_signing_key(h.path()).unwrap();
+
+        // Deterministic: the same key yields the same secret and public every time.
+        let s1 = derive_x25519_secret(&sk);
+        let s2 = derive_x25519_secret(&sk);
+        assert_eq!(s1, s2, "the derived X25519 secret must be stable for a given identity");
+
+        let pub_from_scalar = x25519_public_from_secret(&s1);
+        assert_eq!(pub_from_scalar, x25519_public_from_secret(&s2), "the derived public must be stable");
+
+        // The public is the scalar's basepoint multiple: cross-check it against the Edwards->Montgomery
+        // image of the ed25519 public key, which is the same point by the birational equivalence.
+        let ed_pub = sk.verifying_key().to_bytes();
+        let via_montgomery = x25519_public_from_ed25519_public(&ed_pub).expect("ed25519 public is a valid point");
+        assert_eq!(pub_from_scalar, via_montgomery, "scalar-basepoint public must equal to_montgomery(ed_public)");
+
+        // The clamp is real: a valid X25519 scalar has its low 3 bits cleared and the top two bits fixed.
+        assert_eq!(s1[0] & 0b0000_0111, 0, "low 3 bits must be clamped off");
+        assert_eq!(s1[31] & 0b1100_0000, 0b0100_0000, "high bits must be clamped");
+
+        // A different identity derives a different keypair (no accidental constant).
+        let h2 = tmp();
+        let sk2 = load_or_create_signing_key(h2.path()).unwrap();
+        assert_ne!(pub_from_scalar, x25519_public_from_secret(&derive_x25519_secret(&sk2)), "distinct identities differ");
     }
 
     #[test]
