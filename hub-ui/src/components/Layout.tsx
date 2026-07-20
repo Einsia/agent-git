@@ -3,6 +3,7 @@ import { Link, NavLink, useLocation, useNavigate } from "react-router-dom"
 import { LogOut, Moon, Sun } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { InvitationsInbox } from "@/components/InvitationsInbox"
 import { useSession } from "@/lib/session"
 import { cn } from "@/lib/utils"
 
@@ -26,6 +27,10 @@ function Nav({ isAdmin }: { isAdmin: boolean }) {
     <nav className="flex items-center gap-1">
       <Tab to="/orgs">orgs</Tab>
       <Tab to="/tokens">tokens</Tab>
+      <Tab to="/account">account</Tab>
+      {/* Admin tools are server-gated (403 for a non-admin); only offer the link to an admin rather
+          than route them into a wall. The server stays the real gate regardless. */}
+      {isAdmin && <Tab to="/admin">admin</Tab>}
       {isAdmin && <Tab to="/audit">audit</Tab>}
     </nav>
   )
@@ -80,6 +85,7 @@ export function Layout({ children }: { children: ReactNode }) {
                     <span className="text-foreground/80">{me.username}</span>
                     {me.is_admin && <span className="eyebrow">admin</span>}
                   </span>
+                  <InvitationsInbox />
                   <Button variant="ghost" size="icon" onClick={signOut} aria-label="Sign out" title="Sign out">
                     <LogOut />
                   </Button>

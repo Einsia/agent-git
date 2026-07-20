@@ -14,6 +14,8 @@ import { Settings } from "@/pages/Settings"
 import { Session } from "@/pages/Session"
 import { Diff } from "@/pages/Diff"
 import { Tokens } from "@/pages/Tokens"
+import { Account } from "@/pages/Account"
+import { Admin } from "@/pages/Admin"
 import { Audit } from "@/pages/Audit"
 
 export default function App() {
@@ -28,6 +30,8 @@ export default function App() {
             <Route path="/new" element={<NewAgent />} />
             <Route path="/orgs" element={<Orgs />} />
             <Route path="/tokens" element={<Tokens />} />
+            <Route path="/account" element={<Account />} />
+            <Route path="/admin" element={<Admin />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/agent/:owner/:name" element={<Agent />} />
             <Route path="/agent/:owner/:name/mrs" element={<Mrs />} />

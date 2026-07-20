@@ -41,6 +41,33 @@ export interface Org {
   members: OrgMember[]
 }
 
+/// A pending org invitation, exactly as `invitation_json` (src/bin/agit-hub/api.rs) serializes it.
+/// `username` is the invitee; `role` is the org role they'd get on accept. Both the invitee's own
+/// list (GET /api/me/invitations) and an org admin's list (GET /api/orgs/<org>/invitations) return
+/// this shape, filtered to `status == "pending"`.
+export interface Invitation {
+  id: string
+  org: string
+  username: string
+  role: OrgRole
+  status: string
+  created_by: string
+  created: string
+}
+
+/// The org's opt-in, hub-side crypto settings — the two fields GET /api/orgs/<name> adds beyond the
+/// list shape (they are NOT in GET /api/orgs). `escrow_mode` gates whether the hub may release
+/// escrowed session keys under the ACL; `recovery_x25519` is the offline recovery recipient's public
+/// key (empty = unset). Only these two are server-side and admin-manageable from a browser — the
+/// per-session reader set lives in the client's keybox and is never exposed here.
+export type EscrowMode = "none" | "hub-assist"
+export interface OrgCrypto {
+  name: string
+  escrow_mode: EscrowMode
+  /// Empty string = no offline recovery recipient set. A 64-hex-char (32-byte) X25519 pubkey when set.
+  recovery_x25519: string
+}
+
 export interface AgentSummary {
   name: string
   /// The full owner string — a bare username, or "org:<name>" for an org-owned agent. null only
@@ -308,14 +335,62 @@ const lifecycle = (owner: string, name: string, verb: "archive" | "unarchive" | 
 
 export const api = {
   // ── auth ──
-  login: (username: string, password: string) =>
-    request<Me>("/api/login", { method: "POST", body: JSON.stringify({ username, password }) }),
+  // `code` is the second factor, sent only when the account has 2FA on: a current TOTP or an unused
+  // backup code. Password alone against a 2FA account is a 401 {"error":"2fa_required"} (the server
+  // never issues a session for it) — the Login page reads that string to advance to the code step.
+  login: (username: string, password: string, code?: string) =>
+    request<Me>("/api/login", {
+      method: "POST",
+      body: JSON.stringify(code ? { username, password, code } : { username, password }),
+    }),
   // Self-service signup. On 200 the server sets the session cookie and answers the Me shape
   // ({username, is_admin:false}); 403 = registration disabled, 409 = taken, 400 = invalid.
   register: (username: string, password: string) =>
     request<Me>("/api/register", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<void>("/api/logout", { method: "POST" }),
   me: () => get<Me>("/api/me"),
+
+  // ── two-factor auth (TOTP) ──
+  // There is deliberately no "is 2FA on?" read endpoint (GET /api/me returns only {username,
+  // is_admin}). The Settings card drives state off the flow instead: enroll answers the QR when 2FA
+  // is off, or 409 "already enabled" when it's on.
+  //
+  // Begin enrollment: stores a PENDING secret (2FA not yet active) and returns it + the otpauth://
+  // provisioning URI to render as a QR. 409 if 2FA is already active (disable first).
+  enroll2fa: () =>
+    request<{ secret: string; otpauth_uri: string; issuer: string; account: string | null }>(
+      "/api/me/2fa/enroll",
+      { method: "POST" }
+    ),
+  // Verify a 6-digit TOTP against the pending secret. On success 2FA goes active and the 10 one-time
+  // backup codes are returned ONCE (only their digests are stored) — show them and never re-fetch.
+  confirm2fa: (code: string) =>
+    request<{ enabled: boolean; backup_codes: string[] }>("/api/me/2fa/confirm", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    }),
+  // Turn the caller's own 2FA off. Any ONE of a current TOTP, an unused backup code, or the account
+  // password proves control. 401 on a wrong proof; 400 if 2FA wasn't on.
+  disable2fa: (codeOrPassword: string) =>
+    request<{ enabled: boolean }>("/api/me/2fa/disable", {
+      method: "POST",
+      body: JSON.stringify({ code_or_password: codeOrPassword }),
+    }),
+
+  // ── invitations (invitee side) ──
+  // The caller's own pending org invitations. Self-scoped: needs only a sign-in (you aren't a member
+  // of the inviting org yet). 401 signed out.
+  myInvitations: () => get<Invitation[]>("/api/me/invitations"),
+  // Accept / decline one of the caller's invitations. The unguessable id is the handle; only the named
+  // invitee may act. Accept mints the membership; both answer the settled invitation.
+  acceptInvitation: (org: string, id: string) =>
+    request<unknown>(`/api/orgs/${encodeURIComponent(org)}/invitations/${encodeURIComponent(id)}/accept`, {
+      method: "POST",
+    }),
+  declineInvitation: (org: string, id: string) =>
+    request<unknown>(`/api/orgs/${encodeURIComponent(org)}/invitations/${encodeURIComponent(id)}/decline`, {
+      method: "POST",
+    }),
 
   // ── agents ──
   // Identity is (owner, name): every agent path is /api/agent/<owner>/<name>, where <owner> is the
@@ -377,6 +452,48 @@ export const api = {
   // 204 on success; 409 if it would leave the org with no admin.
   removeOrgMember: (name: string, username: string) =>
     request<void>(`/api/orgs/${encodeURIComponent(name)}/members/${encodeURIComponent(username)}`, {
+      method: "DELETE",
+    }),
+
+  // ── org invitations (admin side) ──
+  // GET lists the org's pending invitations; POST invites a user with a target org role. Org-admin
+  // gated (403 for a plain member, uniform 404 for an org the caller can't see). POST 201 carries the
+  // new invitation; 400 no-such-user / bad role, 409 already a member / already invited.
+  orgInvitations: (org: string) => get<Invitation[]>(`/api/orgs/${encodeURIComponent(org)}/invitations`),
+  inviteOrgMember: (org: string, username: string, role: OrgRole) =>
+    request<Invitation>(`/api/orgs/${encodeURIComponent(org)}/invitations`, {
+      method: "POST",
+      body: JSON.stringify({ username, role }),
+    }),
+  // Revoke a still-pending invitation (org-admin). 204 on success.
+  revokeInvitation: (org: string, id: string) =>
+    request<void>(`/api/orgs/${encodeURIComponent(org)}/invitations/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+
+  // ── org crypto (opt-in, hub-side) ──
+  // GET /api/orgs/<name> returns the crypto fields alongside the roster; pull them typed for the
+  // escrow/recovery controls. (There are also dedicated GET .../escrow and .../recovery routes, but the
+  // detail already carries both, so one call does.)
+  orgCrypto: (name: string) => get<Org & OrgCrypto>(`/api/orgs/${encodeURIComponent(name)}`),
+  // Set the hub-assist escrow mode. Owner-only (403 otherwise). "hub-assist" re-trusts the hub to
+  // release the org's escrowed session keys under the ACL gate; "none" turns it off. Answers {org,
+  // escrow_mode}.
+  setEscrowMode: (org: string, mode: EscrowMode) =>
+    request<{ org: string; escrow_mode: EscrowMode }>(`/api/orgs/${encodeURIComponent(org)}/escrow`, {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    }),
+  // Set the offline recovery recipient — a 64-hex-char (32-byte) X25519 public key the client seals
+  // the team key to during `team rekey`. Owner-only. Answers {org, recovery_x25519}.
+  setRecoveryRecipient: (org: string, key: string) =>
+    request<{ org: string; recovery_x25519: string }>(`/api/orgs/${encodeURIComponent(org)}/recovery`, {
+      method: "POST",
+      body: JSON.stringify({ key }),
+    }),
+  // Clear the offline recovery recipient (owner-only). Answers {org, recovery_x25519:""}.
+  clearRecoveryRecipient: (org: string) =>
+    request<{ org: string; recovery_x25519: string }>(`/api/orgs/${encodeURIComponent(org)}/recovery`, {
       method: "DELETE",
     }),
 
@@ -464,5 +581,26 @@ export const api = {
     request<{ name: string; owner: string; full_name: string; previous_owner: string | null; aid: string | null }>(
       `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/transfer`,
       { method: "POST", body: JSON.stringify(dest) }
+    ),
+
+  // ── admin user recovery ──
+  // Site-admin only, and the SERVER is the gate (both 403 for a non-admin regardless of any client
+  // check). These are the only two per-user admin doors the HTTP API exposes — there is deliberately
+  // NO list-users / disable-account endpoint here; the full roster and account enable/disable live in
+  // the `agit-hub user` CLI on the host.
+  //
+  // Clear a user's 2FA — recovery for someone locked out of their authenticator. Answers {ok, user,
+  // enabled:false}; 404 for an unknown user.
+  adminDisable2fa: (username: string) =>
+    request<{ ok: boolean; user: string; enabled: boolean }>(
+      `/api/users/${encodeURIComponent(username)}/2fa-disable`,
+      { method: "POST" }
+    ),
+  // Reset a user's password (a lockout/recovery action) — revokes all of that user's sessions.
+  // Answers {ok, user, revoked_sessions}; 400 too-short, 404 unknown user.
+  adminSetPassword: (username: string, newPassword: string) =>
+    request<{ ok: boolean; user: string; revoked_sessions: number }>(
+      `/api/users/${encodeURIComponent(username)}/password`,
+      { method: "POST", body: JSON.stringify({ new_password: newPassword }) }
     ),
 }

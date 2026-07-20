@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react"
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
-import { GitFork, GitPullRequest, Lock, Search, Settings2, Star } from "lucide-react"
+import { GitFork, GitPullRequest, Lock, Search, Settings2, ShieldCheck, Star } from "lucide-react"
 
 import { api } from "@/lib/api"
 import { useGuarded } from "@/lib/useGuarded"
@@ -157,9 +157,50 @@ agit -a merge origin/main`}
               </li>
             ))}
           </ul>
+
+          {data && <EncryptionInfo owner={data.owner} />}
         </aside>
       </div>
     </div>
+  )
+}
+
+// Encryption visibility, read-only. The hub deliberately never holds the session keys, and it exposes
+// no per-agent reader set or team generation over the API — that state lives in each client's keybox.
+// So this is an honest, informational panel, not a management surface: it points at the `agit a
+// readers …` CLI (the only place readers can be changed) and, for an org-owned agent, at the org page
+// where the server-side escrow/recovery settings live. There is no client-side readers add/rm here —
+// the browser has no keys to wrap.
+function EncryptionInfo({ owner }: { owner: string | null }) {
+  const org = owner?.startsWith("org:") ? owner.slice("org:".length) : null
+  return (
+    <section className="mt-6">
+      <h3 className="eyebrow mb-2">encryption</h3>
+      <div className="rounded-md border bg-card p-3">
+        <Badge variant="muted" className="gap-1">
+          <ShieldCheck className="size-3" />
+          end-to-end
+        </Badge>
+        <p className="mt-2 text-[0.78rem] leading-relaxed text-muted-foreground">
+          Sessions can be encrypted per-session before they reach the hub — it stores only ciphertext
+          and never holds the keys, so it can't report who the readers are.
+        </p>
+        <p className="mt-2 text-[0.78rem] leading-relaxed text-muted-foreground">
+          Manage readers from the CLI:{" "}
+          <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.72rem]">agit a readers …</code>
+        </p>
+        {org && (
+          <p className="mt-2 text-[0.78rem] leading-relaxed text-muted-foreground">
+            Owned by <span className="font-mono text-foreground/80">{org}</span> — hub-assist escrow and
+            offline recovery are set on the{" "}
+            <Link to="/orgs" className="text-primary hover:underline">
+              org page
+            </Link>
+            .
+          </p>
+        )}
+      </div>
+    </section>
   )
 }
 
