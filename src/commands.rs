@@ -3447,6 +3447,316 @@ pub fn rekey_cmd(_args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+// ─────────────────────── purge-history: rewrite the store so no plaintext survives in history ───────────────────────
+
+/// A yes/no gate for the DESTRUCTIVE purge, honoured by `--yes` non-interactively and refusing (never
+/// hanging) when it cannot ask. Returns whether the caller confirmed.
+fn purge_confirm(prompt: &str, yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !ui::interactive() {
+        bail!("{prompt}\n  refusing without confirmation — re-run with --yes to proceed non-interactively");
+    }
+    out!("{prompt} [y/N] ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).context("reading confirmation")?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes"))
+}
+
+/// Is `git filter-repo` runnable? (`git filter-repo --version` exits 0.) Detected so we prefer it over the
+/// slower, gotcha-laden `git filter-branch`, falling back to filter-branch (always present) when absent.
+fn filter_repo_available() -> bool {
+    std::process::Command::new("git")
+        .args(["filter-repo", "--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Internal, git-invoked helper: the `--index-filter` body of the filter-branch purge backend. Re-seals
+/// every `sessions/**` blob in the CURRENT index (`GIT_INDEX_FILE`) through the clean filter under the
+/// current keyring, so no historical revision of a crypt-filtered path retains plaintext. Blobs already
+/// ciphertext (carrying the AGITCRYPT magic) are left byte-for-byte untouched, and NOTHING outside
+/// `sessions/**` is read or written — the keybox at `.agit/keybox.jsonl` must stay plaintext for the
+/// unlock bootstrap. git runs this with `GIT_DIR` + `GIT_INDEX_FILE` in the environment, so every inner
+/// `git` call inherits them (no `-C`, no cwd assumptions). A failure exits nonzero so filter-branch aborts
+/// the rewrite rather than dropping a session from history.
+pub fn crypt_purge_index() -> Result<i32> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let keys = crate::crypt::keys_for_filter(&scope::agit_home()?)?;
+
+    // NUL-delimited index entries under sessions/: "<mode> <sha> <stage>\t<path>\0".
+    let listed = Command::new("git")
+        .args(["ls-files", "-s", "-z", "--", "sessions"])
+        .output()
+        .context("crypt-purge-index: git ls-files")?;
+    if !listed.status.success() {
+        bail!(
+            "crypt-purge-index: git ls-files failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        );
+    }
+
+    let mut updates: Vec<(String, String, String)> = Vec::new(); // (mode, new-sha, path)
+    for entry in listed.stdout.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(entry) else { continue };
+        let Some((meta, path)) = text.split_once('\t') else { continue };
+        let mut it = meta.split_whitespace();
+        let (Some(mode), Some(sha)) = (it.next(), it.next()) else { continue };
+
+        // Read the blob bytes and skip anything already sealed (convergent + idempotent, but skipping
+        // keeps a rotated key's retired-key blobs intact rather than re-sealing them under the new key).
+        let blob = Command::new("git")
+            .args(["cat-file", "blob", sha])
+            .output()
+            .context("crypt-purge-index: git cat-file")?;
+        if !blob.status.success() {
+            bail!("crypt-purge-index: cat-file {sha} failed");
+        }
+        if crate::crypt::is_ciphertext(&blob.stdout) {
+            continue;
+        }
+
+        let sealed = crate::crypt::seal(&keys, &blob.stdout);
+        let mut child = Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .context("crypt-purge-index: git hash-object")?;
+        child
+            .stdin
+            .take()
+            .context("crypt-purge-index: hash-object stdin")?
+            .write_all(&sealed)?;
+        let ho = child.wait_with_output()?;
+        if !ho.status.success() {
+            bail!("crypt-purge-index: git hash-object failed");
+        }
+        let new_sha = String::from_utf8_lossy(&ho.stdout).trim().to_string();
+        updates.push((mode.to_string(), new_sha, path.to_string()));
+    }
+
+    for (mode, new_sha, path) in &updates {
+        // Classic three-argument cacheinfo form so a path containing a comma cannot be mis-split.
+        let st = Command::new("git")
+            .args(["update-index", "--cacheinfo", mode, new_sha, path])
+            .status()
+            .context("crypt-purge-index: git update-index")?;
+        if !st.success() {
+            bail!("crypt-purge-index: git update-index failed for {path}");
+        }
+    }
+    Ok(0)
+}
+
+/// `agit a purge-history [--yes]` — guard-railed history rewrite that re-encrypts EVERY historical
+/// revision of `sessions/**` so no plaintext of an encrypted transcript survives in ANY commit.
+///
+/// `agit a encrypt` is forward-only: commits made before encryption was enabled still hold plaintext
+/// blobs that `git cat-file` recovers from history. This scrubs that by re-running the clean filter across
+/// history under the current keyring. It NEVER auto-pushes; it prints the exact force-push command(s) for
+/// the user to run after they have reviewed the rewrite.
+pub fn purge_history_cmd(args: &[String]) -> Result<i32> {
+    let yes = args.iter().any(|a| a == "--yes" || a == "-y");
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+
+    // ── PRECONDITION 1: the session MUST be per-session encrypted (repo-local keyring + a keybox). ──
+    // Without both there is no keyring to seal under and nothing this command can purge.
+    let kp = store_keyring_path(&store)?;
+    let has_keyring = crate::crypt::load_keyring_at(&kp)?.is_some();
+    let has_keybox = !crate::keybox::read_keybox(&store)?.is_empty();
+    if !has_keyring || !has_keybox {
+        bail!(
+            "nothing to purge: this session is not per-session encrypted.\n\
+             \x20      purge-history re-seals sessions/** under the repo-local keyring, which needs a keybox\n\
+             \x20      + keyring. Enable it first, then re-run:\n\
+             \x20        agit a encrypt --readers <a,b>   wrap the content key to specific people\n\
+             \x20        agit a encrypt --public          readable to anyone who has the repo\n\
+             \x20        agit a encrypt --team            readable to your org's team"
+        );
+    }
+
+    // ── PRECONDITION 2: a history rewrite needs a CLEAN working tree. ──
+    let (code, status) = scope::git_in_status(&store, &["status", "--porcelain"]);
+    if code != 0 {
+        bail!("could not read git status of {} (is it a git repo?)", store.display());
+    }
+    if !status.trim().is_empty() {
+        bail!(
+            "the store working tree is dirty — a history rewrite needs a clean tree.\n\
+             \x20      Commit or discard changes in {} first, then re-run. Outstanding:\n{}",
+            store.display(),
+            status
+        );
+    }
+
+    // ── LOUD WARNINGS + CONFIRMATION (honoured by --yes; refuses rather than hangs when it cannot ask). ──
+    errln!("agit a purge-history — DESTRUCTIVE, IRREVERSIBLE rewrite of this store's ENTIRE git history.");
+    errln!(
+        "  It re-runs every commit's sessions/** through the encryption clean filter so pre-encryption\n\
+         \x20     plaintext (and blobs under retired keys) no longer exist in ANY commit. Consequences:\n\
+         \x20       • EVERY commit SHA in this store changes — this is a full history rewrite;\n\
+         \x20       • you MUST force-push afterwards, and every existing clone must RE-CLONE (not pull);\n\
+         \x20       • provenance signatures / verdicts recorded against the OLD commit SHAs may need\n\
+         \x20         re-verification;\n\
+         \x20       • it cannot be undone except from a backup. BACK UP THE STORE FIRST."
+    );
+    if !purge_confirm("Rewrite history and purge sessions/** plaintext now?", yes)? {
+        errln!("aborted — history not rewritten.");
+        return Ok(1);
+    }
+
+    // Capture the pieces we need to report BEFORE the rewrite: filter-repo strips remotes, and the branch
+    // ref is what the force-push targets.
+    let (_bc, branch) = scope::git_in_status(&store, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let branch = {
+        let b = branch.trim();
+        if b.is_empty() || b == "HEAD" { "main".to_string() } else { b.to_string() }
+    };
+    let remotes = agent::store_remotes(&store);
+
+    let _lock = crate::session::lock_store(&store)?;
+
+    // ── THE REWRITE ── prefer git filter-repo; else fall back to the always-present git filter-branch.
+    let exe = std::env::current_exe().context("could not locate agit's own path")?;
+    let backend = if filter_repo_available() {
+        run_filter_repo_purge(&store, &exe)?;
+        "git filter-repo"
+    } else {
+        run_filter_branch_purge(&store, &exe)?;
+        "git filter-branch"
+    };
+
+    // Leave the working tree checked out AND decryptable: reset to the rewritten HEAD so the smudge filter
+    // recovers the original plaintext from the now-ciphertext blobs (purge changed only what is STORED in
+    // history, not the plaintext you see). The tree was clean (precondition), so nothing is lost.
+    let _ = scope::git_in_status(&store, &["reset", "--hard"]);
+
+    outln!(
+        "history rewritten via {backend}: every sessions/** revision re-encrypted under the current keyring."
+    );
+    outln!("  the working tree is still decryptable — checkout runs the smudge filter as before.");
+
+    // ── DO NOT auto-push. Print the exact force-push command(s) for the user to run after reviewing. ──
+    outln!("  NOT pushed. Review the rewrite, then force-push yourself:");
+    if remotes.is_empty() {
+        outln!(
+            "    (no remote configured — add one, then) git -C {} push --force <remote> {branch}",
+            store.display()
+        );
+    } else {
+        for (name, _url) in &remotes {
+            outln!("    git -C {} push --force {name} {branch}", store.display());
+        }
+    }
+    errln!(
+        "  ⚠ every teammate must RE-CLONE — a pull cannot reconcile a rewritten history — and any\n\
+         \x20     provenance signatures / verdicts recorded against the old commit SHAs may need\n\
+         \x20     re-verification."
+    );
+    Ok(0)
+}
+
+/// The filter-branch purge backend (always available). Its `--index-filter` re-stages sessions/** through
+/// `agit crypt-purge-index`, so the crypt filter + keyring are in force for every historical revision.
+/// `-f` overwrites any leftover refs/original from a prior run; the squelch var quiets filter-branch's
+/// standard scary banner (we print our own, more specific warnings above).
+fn run_filter_branch_purge(store: &Path, exe: &Path) -> Result<()> {
+    use std::process::Command;
+
+    // Neutralize benign filter-phantom diffs before filter-branch's clean-work-tree gate runs. git skips
+    // clean/smudge filters on ZERO-LENGTH files, so a tracked empty file under the sessions/** crypt filter
+    // (e.g. the store's `sessions/.gitkeep`, committed as ciphertext) reads as perpetually modified to
+    // `git diff-files` even though `git status` (the caller's precondition) considers the tree clean. Mark
+    // those phantom paths assume-unchanged for the rewrite, then clear the flag afterward.
+    let (_c, phantom) = scope::git_in_status(store, &["diff-files", "--name-only", "-z"]);
+    let phantom_paths: Vec<String> =
+        phantom.split('\0').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    for p in &phantom_paths {
+        let _ = scope::git_in_status(store, &["update-index", "--assume-unchanged", "--", p]);
+    }
+
+    let index_filter = format!(
+        "{} crypt-purge-index",
+        crate::init::sh_single_quote(&exe.to_string_lossy())
+    );
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(store)
+        .args(["filter-branch", "-f", "--index-filter", &index_filter, "--", "--all"])
+        .env("FILTER_BRANCH_SQUELCH_WARNING", "1")
+        .status()
+        .context("running git filter-branch");
+
+    // Clear the assume-unchanged bits regardless of the rewrite's outcome, so normal operation resumes.
+    for p in &phantom_paths {
+        let _ = scope::git_in_status(store, &["update-index", "--no-assume-unchanged", "--", p]);
+    }
+
+    let status = status?;
+    if !status.success() {
+        bail!(
+            "git filter-branch exited {} — history was NOT rewritten.",
+            status.code().unwrap_or(-1)
+        );
+    }
+
+    // filter-branch keeps the PRE-rewrite commits under refs/original/ as a backup, and the reflog still
+    // references them — so the old plaintext blobs stay reachable (and `git cat-file`-recoverable) until
+    // they are dropped. Delete the backup refs, expire every reflog, and prune, so no historical commit
+    // retains plaintext. (git filter-repo does this itself; filter-branch requires it explicitly.)
+    let (_c, origs) =
+        scope::git_in_status(store, &["for-each-ref", "--format=%(refname)", "refs/original/"]);
+    for r in origs.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = scope::git_in_status(store, &["update-ref", "-d", r]);
+    }
+    let _ = scope::git_in_status(store, &["reflog", "expire", "--expire=now", "--all"]);
+    let _ = scope::git_in_status(store, &["gc", "--prune=now"]);
+    Ok(())
+}
+
+/// The filter-repo purge backend (preferred when installed). git-filter-repo does not re-apply
+/// gitattributes filters, so the blob callback seals explicitly by invoking `agit crypt-clean`. It is
+/// content-safe: it leaves anything already ciphertext (AGITCRYPT magic) and anything that is not a
+/// session JSONL object untouched, and it skips the keybox — whose stanzas carry a top-level `"kid"` field
+/// that a transcript's first object never has — so the wrap-ciphertext keybox is never double-encrypted.
+/// `--force` because filter-repo refuses on a non-fresh clone; this is an explicit, confirmed rewrite.
+fn run_filter_repo_purge(store: &Path, exe: &Path) -> Result<()> {
+    use std::process::Command;
+    let callback = "import os, subprocess\n\
+        MAGIC = b\"AGITCRYPT\\x00\"\n\
+        d = blob.data\n\
+        first = d.split(b\"\\n\", 1)[0]\n\
+        if (not d.startswith(MAGIC)) and d[:1] == b\"{\" and b'\"kid\"' not in first:\n\
+        \x20   blob.data = subprocess.run([os.environ[\"AGIT_SELF\"], \"crypt-clean\"], input=d, stdout=subprocess.PIPE, check=True).stdout\n";
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(store)
+        .args(["filter-repo", "--force", "--blob-callback", callback])
+        .env("AGIT_SELF", exe)
+        .status()
+        .context("running git filter-repo")?;
+    if !status.success() {
+        bail!(
+            "git filter-repo exited {} — history was NOT rewritten.",
+            status.code().unwrap_or(-1)
+        );
+    }
+    Ok(())
+}
+
 /// `agit crypt <unlock>` — the per-session keybox client verb.
 pub fn crypt_cmd(args: &[String]) -> Result<i32> {
     match args.first().map(|s| s.as_str()) {

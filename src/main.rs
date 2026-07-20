@@ -221,6 +221,9 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    keyed from $AGIT_HOME. Routed here beside hook-scan (also git-invoked). ──
         "crypt-clean" => commands::crypt_clean(),
         "crypt-smudge" => commands::crypt_smudge(),
+        // The `--index-filter` body of `agit a purge-history`'s filter-branch backend: re-seals sessions/**
+        // in the current index. git-invoked (never a human), keyed from $AGIT_HOME + the repo-local keyring.
+        "crypt-purge-index" => commands::crypt_purge_index(),
 
         // ── crypt: the per-session keybox client verb. `crypt unlock` recovers this machine's content
         //    keys from the committed keybox into the repo-local keyring, so the filter can decrypt.
@@ -289,6 +292,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    O(1) keybox append; rm is an eager CK rotation) and rotate the content key. ──
         "readers" if scope == Scope::Agent => commands::readers_cmd(args),
         "rekey" if scope == Scope::Agent => commands::rekey_cmd(args),
+
+        // ── purge-history (agent scope): guard-railed history rewrite that re-encrypts every historical
+        //    revision of sessions/** so no pre-encryption plaintext survives in any commit. Never
+        //    auto-pushes — it prints the exact force-push command(s) to run after review. ──
+        "purge-history" if scope == Scope::Agent => commands::purge_history_cmd(args),
 
         // ── escrow (agent scope): OPT-IN hub-assist key escrow (encryption-recipients Wave 5). `enable`
         //    wraps this session's content key under the hub escrow key and uploads it, but ONLY if the
@@ -1052,86 +1060,11 @@ fn agent_encrypt_rotate(args: &[String]) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-/// `agit a encrypt --purge-history [--yes]` — rewrite git history to remove pre-encryption plaintext
-/// (or blobs under a retired key) via `git filter-repo`. Rewrites every commit and needs a force-push, so
-/// it demands an explicit confirmation (`--yes` non-interactively) and prints install instructions when
-/// `git filter-repo` is absent.
+/// `agit a encrypt --purge-history [--yes]` — back-compat alias for the first-class `agit a purge-history`
+/// command. The guard-railed rewrite (per-session precondition, clean-tree gate, filter-repo/filter-branch
+/// backend, exact force-push instructions) lives in `commands::purge_history_cmd`; this just forwards.
 fn agent_encrypt_purge_history(args: &[String]) -> anyhow::Result<i32> {
-    use agit::agent;
-    let yes = args.iter().any(|a| a == "--yes" || a == "-y");
-    let a = agent::resolve(None)?;
-    let store = a.store.clone();
-
-    // `git filter-repo` is a separate install; without it we cannot rewrite history — print how to get it.
-    if !filter_repo_available() {
-        eprintln!("git-filter-repo is not installed — it is required to rewrite history.");
-        eprintln!("  Install it, then re-run:");
-        eprintln!("    pip install git-filter-repo         # or");
-        eprintln!("    brew install git-filter-repo         # macOS");
-        eprintln!("    apt-get install git-filter-repo      # Debian/Ubuntu");
-        eprintln!("  See https://github.com/newren/git-filter-repo for other platforms.");
-        return Ok(1);
-    }
-
-    eprintln!("agit encrypt --purge-history — DESTRUCTIVE: this REWRITES this store's ENTIRE git history.");
-    eprintln!(
-        "  It re-runs every commit through the encryption clean filter so pre-encryption plaintext (and\n\
-         \x20     blobs under retired keys) no longer exist in ANY commit. Consequences:\n\
-         \x20       • every commit SHA changes — this is a history rewrite;\n\
-         \x20       • you MUST `agit a push --force` afterwards, and every teammate must re-clone;\n\
-         \x20       • it cannot be undone except from a backup. BACK UP THE STORE FIRST."
-    );
-    if !confirm_or_yes("Rewrite history and purge pre-encryption plaintext now?", yes)? {
-        eprintln!("aborted — history not rewritten");
-        return Ok(1);
-    }
-
-    // Re-run every historical blob through agit's own clean filter via a filter-repo blob-callback.
-    // git-filter-repo does not re-apply gitattributes filters, so we seal explicitly. The callback is
-    // path-safe by content: it leaves anything already ciphertext (starts with the AGITCRYPT magic) and
-    // anything that is not session JSONL (session files begin with `{`) untouched, so non-session blobs
-    // (.gitattributes, README, .agit.toml) are never encrypted. `agit crypt-clean` seals under the
-    // CURRENT key, keyed from $AGIT_HOME regardless of cwd. `--force` because filter-repo refuses on a
-    // non-fresh clone; this is an explicit, confirmed rewrite.
-    let exe = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("could not locate agit's own path: {e}"))?;
-    let callback = "import os, subprocess\n\
-        MAGIC = b\"AGITCRYPT\\x00\"\n\
-        d = blob.data\n\
-        if (not d.startswith(MAGIC)) and d[:1] == b\"{\":\n\
-        \x20   blob.data = subprocess.run([os.environ[\"AGIT_SELF\"], \"crypt-clean\"], input=d, stdout=subprocess.PIPE, check=True).stdout\n";
-    let code = {
-        use std::process::Command;
-        Command::new("git")
-            .arg("-C")
-            .arg(&store)
-            .args(["filter-repo", "--force", "--blob-callback", callback])
-            .env("AGIT_SELF", &exe)
-            .status()
-            .map(|s| s.code().unwrap_or(1))
-            .unwrap_or(1)
-    };
-    if code != 0 {
-        eprintln!("git filter-repo exited {code} — history was NOT rewritten.");
-        return Ok(code);
-    }
-    println!("  history rewritten: every commit re-encrypted through the clean filter.");
-    eprintln!(
-        "  ⚠ NEXT: `agit a push --force` to publish the rewritten history, and tell every teammate to\n\
-         \x20     re-clone — their old clones still hold the pre-purge plaintext."
-    );
-    Ok(0)
-}
-
-/// Is `git filter-repo` runnable? (`git filter-repo --version` exits 0.)
-fn filter_repo_available() -> bool {
-    std::process::Command::new("git")
-        .args(["filter-repo", "--version"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    commands::purge_history_cmd(args)
 }
 
 /// `agit a pull [git-pull-args…]` — the agent-context pull. A bare `git pull` on the store would do a
