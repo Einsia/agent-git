@@ -411,7 +411,7 @@ fn convert_for_install(
 }
 
 pub fn convert_cmd(
-    src: &Path,
+    sel: Option<&str>,
     from: Option<String>,
     to: &str,
     cwd_override: Option<String>,
@@ -419,6 +419,10 @@ pub fn convert_cmd(
 ) -> Result<i32> {
     use crate::convo;
 
+    // Unified resolution: a file path / session id -> that transcript; an agent NAME -> its latest
+    // session; no selector -> the active agent's latest session.
+    let src = resolve_session_selector(sel)?;
+    let src = src.as_path();
     let text = std::fs::read_to_string(src)
         .map_err(|e| anyhow::anyhow!("failed to read source session {}: {e}", src.display()))?;
     let from = match from {
@@ -726,11 +730,16 @@ pub fn convert_watch(interval_secs: u64) -> Result<i32> {
     }
 }
 
-/// `agit resume <src-session> [--as <rt>] [--cwd <path>] [--exec]` -- the universal loader: install a
+/// `agit resume [<sel>] [--as <rt>] [--cwd <path>] [--exec]` -- the universal loader: install a
 /// session so a runtime can resume it (converting across runtimes when `--as` differs from the source),
 /// then print or (with --exec) launch the resume command. A thin, first-class wrapper over convert/register.
+///
+/// `<sel>` follows the unified resolution (see [`classify_session_selector`]): a file path or session
+/// id is unchanged, an agent NAME resumes that agent's latest session, and NO argument resumes the
+/// ACTIVE agent's latest session. (`agit start`, by contrast, launches a fresh runtime here carrying
+/// that latest context; `agit resume` continues the existing session record itself.)
 pub fn resume_cmd(
-    src: &Path,
+    sel: Option<&str>,
     as_rt: Option<String>,
     cwd_override: Option<String>,
     env_override: Option<String>,
@@ -739,6 +748,8 @@ pub fn resume_cmd(
 ) -> Result<i32> {
     use crate::convo;
 
+    let src = resolve_session_selector(sel)?;
+    let src = src.as_path();
     let text = std::fs::read_to_string(src)
         .map_err(|e| anyhow::anyhow!("failed to read source session {}: {e}", src.display()))?;
     let from = infer_runtime(&text)
@@ -1230,16 +1241,18 @@ pub fn sidecar_provenance(transcript: &Path) -> Option<Provenance> {
     serde_json::from_value(v.get("provenance")?.clone()).ok()
 }
 
-/// `agit provenance [verify <session> | key]` — self-verify a captured session's signature, or show this
-/// machine's public key. Verification never blocks: an unsigned or tampered session reports and returns 0
-/// for `key`/no-arg, and a non-zero code only when an explicit `verify` finds a session NOT verified.
+/// `agit provenance [verify [<session|agent>] | key]` — self-verify a captured session's signature, or
+/// show this machine's public key. `verify` with no argument checks the active agent's latest session,
+/// with an agent name checks every session that agent has, and with a path/id checks that one session.
+/// Verification never blocks: an unsigned or tampered session reports and returns 0 for `key`/no-arg,
+/// and a non-zero code only when a `verify` finds a session NOT verified.
 pub fn provenance_cmd(args: &[String]) -> Result<i32> {
     match args.first().map(|s| s.as_str()) {
         Some("verify") => provenance_verify(&args[1..]),
         Some("key") | Some("show") | None => provenance_key(),
         Some(other) => {
             errln!("agit provenance: unknown subcommand `{other}`");
-            errln!("  usage: agit provenance verify <session> [--repin]   ·   agit provenance key");
+            errln!("  usage: agit provenance verify [<session|agent>] [--repin]   ·   agit provenance key");
             Ok(2)
         }
     }
@@ -1527,31 +1540,58 @@ fn hub_enrollment_status(local_ed_pub: &str) -> Result<Option<String>> {
     }
 }
 
-/// Resolve `<session>` to a transcript on disk — a direct path, a sidecar path, or a session id in the
-/// resolved agent's store — then self-verify its provenance.
+/// `agit provenance verify [<sel>] [--repin]` — self-verify a captured session's signature. `<sel>`
+/// follows the unified resolution (see [`classify_session_selector`]): a file path or session id
+/// verifies THAT session (unchanged); NO argument verifies the ACTIVE agent's LATEST session; a known
+/// AGENT NAME verifies EVERY session that agent has (whole-agent mode — non-zero if any is unverified).
 fn provenance_verify(args: &[String]) -> Result<i32> {
     let repin = args.iter().any(|a| a == "--repin");
-    let Some(sel) = first_positional(args).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
-        anyhow::bail!("agit provenance verify: name a session\n  usage: agit provenance verify <session-path|id> [--repin]");
-    };
-    let transcript = resolve_session_transcript(&sel)?;
-    let content = std::fs::read_to_string(&transcript)
-        .with_context(|| format!("cannot read session {}", transcript.display()))?;
-    let prov = sidecar_provenance(&transcript);
+    let sel = first_positional(args).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    match classify_session_selector(sel.as_deref())? {
+        SessionTarget::One(transcript) => provenance_verify_one(&transcript, repin),
+        SessionTarget::ActiveLatest(agent) => {
+            provenance_verify_one(&agent_latest_transcript(&agent)?, repin)
+        }
+        SessionTarget::Agent(agent) => provenance_verify_agent(&agent, repin),
+    }
+}
 
-    // Consult the hub identity registry to upgrade a good self-verify into "verified as <person>". No hub
-    // reachable degrades to `SignedUnregistered` (self-verify only), never a false attribution. A TOFU
-    // pin change on the registered key is a hard error (the `?`), matching the encryption decision.
+/// Verify one transcript's provenance against the hub registry — no printing, just the status.
+///
+/// Consults the hub identity registry to upgrade a good self-verify into "verified as <person>". No hub
+/// reachable degrades to `SignedUnregistered` (self-verify only), never a false attribution. A TOFU pin
+/// change on the registered key is a hard error (the `?`), matching the encryption decision.
+fn verify_transcript(transcript: &Path, repin: bool) -> Result<ProvenanceStatus> {
+    let content = std::fs::read_to_string(transcript)
+        .with_context(|| format!("cannot read session {}", transcript.display()))?;
+    let prov = sidecar_provenance(transcript);
     let home = scope::agit_home()?;
     let endpoint = crate::hubapi::HubEndpoint::resolve();
-    let status = verify_provenance_with_registry(&home, &content, prov.as_ref(), repin, |email| {
-        match &endpoint {
-            Ok(ep) => ep.get_identity_by_email(email).map(|opt| opt.map(registered_from_json)),
-            // No hub configured/reachable: fall back to self-verify (SignedUnregistered), never block.
-            Err(_) => Ok(None),
-        }
-    })?;
+    verify_provenance_with_registry(&home, &content, prov.as_ref(), repin, |email| match &endpoint {
+        Ok(ep) => ep.get_identity_by_email(email).map(|opt| opt.map(registered_from_json)),
+        // No hub configured/reachable: fall back to self-verify (SignedUnregistered), never block.
+        Err(_) => Ok(None),
+    })
+}
 
+/// The exit code for a verification status. A soft "unverified" (unsigned/unregistered) exits 0, like
+/// the attribution fallback; a signature that is present but does NOT check out, and a KEY MISMATCH (a
+/// possible forgery), are hard failures worth a non-zero code.
+fn provenance_exit_code(status: &ProvenanceStatus) -> i32 {
+    match status {
+        ProvenanceStatus::Verified { .. }
+        | ProvenanceStatus::VerifiedAs { .. }
+        | ProvenanceStatus::SignedUnregistered { .. }
+        | ProvenanceStatus::Unsigned => 0,
+        ProvenanceStatus::ContentTampered { .. }
+        | ProvenanceStatus::BadSignature
+        | ProvenanceStatus::KeyMismatch { .. } => 1,
+    }
+}
+
+/// Verify a single session and print its full report. Returns the exit code.
+fn provenance_verify_one(transcript: &Path, repin: bool) -> Result<i32> {
+    let status = verify_transcript(transcript, repin)?;
     outln!("session {}", transcript.display());
     outln!("  {}", status.summary());
     match &status {
@@ -1576,18 +1616,37 @@ fn provenance_verify(args: &[String]) -> Result<i32> {
         }
         ProvenanceStatus::Unsigned | ProvenanceStatus::BadSignature => {}
     }
-    // Never block a soft "unverified" (unsigned/unregistered → exit 0, like the attribution fallback). A
-    // signature that is present but does NOT check out, and a KEY MISMATCH (a possible forgery), are hard
-    // failures worth a non-zero code.
-    Ok(match status {
-        ProvenanceStatus::Verified { .. }
-        | ProvenanceStatus::VerifiedAs { .. }
-        | ProvenanceStatus::SignedUnregistered { .. }
-        | ProvenanceStatus::Unsigned => 0,
-        ProvenanceStatus::ContentTampered { .. }
-        | ProvenanceStatus::BadSignature
-        | ProvenanceStatus::KeyMismatch { .. } => 1,
-    })
+    Ok(provenance_exit_code(&status))
+}
+
+/// Whole-agent mode: verify EVERY session an agent has, one verdict line each, newest first. Returns a
+/// non-zero code if ANY session did not verify — so `agit provenance verify <agent>` is a single gate
+/// over that agent's whole recorded history.
+fn provenance_verify_agent(agent: &agent::Agent, repin: bool) -> Result<i32> {
+    let mut sessions = store_sessions(&agent.store);
+    if sessions.is_empty() {
+        anyhow::bail!(
+            "agent `{}` has no sessions yet — nothing to verify (run one, or `agit a log` to list)",
+            agent.name
+        );
+    }
+    // Newest first, matching the session views (recency is recorded, not mtimed).
+    sessions.sort_by_key(|s| std::cmp::Reverse((s.last_activity, s.mtime)));
+
+    outln!("verifying {} session(s) for agent `{}`", sessions.len(), agent.name);
+    let mut worst = 0;
+    for s in &sessions {
+        let status = verify_transcript(&s.path, repin)?;
+        let code = provenance_exit_code(&status);
+        worst = worst.max(code);
+        let id = s.path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mark = if code == 0 { "ok  " } else { "FAIL" };
+        outln!("  {mark}  {id}  {}", status.summary());
+    }
+    if worst != 0 {
+        errln!("\n  at least one session did NOT verify.");
+    }
+    Ok(worst)
 }
 
 /// Extract a [`RegisteredIdentity`] from a hub `by-email` / identity JSON response. The response carries
@@ -1615,32 +1674,102 @@ fn registered_from_json(v: serde_json::Value) -> RegisteredIdentity {
     RegisteredIdentity { username, ed25519_keys: keys }
 }
 
-/// A session selector is a filesystem path (to the transcript or its sidecar) when one exists, else a
-/// bare session id looked up in the resolved agent's store.
-fn resolve_session_transcript(sel: &str) -> Result<PathBuf> {
+/// The sidecar-to-transcript mapping: when `p` is an `<id>.agit.json` sidecar sitting next to its
+/// `<id>.jsonl`, point back at the transcript; otherwise `p` is itself the transcript.
+fn transcript_from_path(p: &Path) -> PathBuf {
+    if p.extension().map(|e| e == "json").unwrap_or(false)
+        && p.file_stem().map(|s| Path::new(s).extension().map(|e| e == "agit").unwrap_or(false)).unwrap_or(false)
+    {
+        let jsonl = p.with_file_name(format!(
+            "{}.jsonl",
+            p.file_stem().and_then(|s| Path::new(s).file_stem()).unwrap_or_default().to_string_lossy()
+        ));
+        if jsonl.is_file() {
+            return jsonl;
+        }
+    }
+    p.to_path_buf()
+}
+
+/// A bare session id looked up in a store: the transcript whose file stem is exactly `id`.
+fn session_id_in_store(store: &Path, id: &str) -> Option<PathBuf> {
+    store_sessions(store)
+        .into_iter()
+        .find(|s| s.path.file_stem().map(|n| n == id).unwrap_or(false))
+        .map(|s| s.path)
+}
+
+/// What a `<session>` selector points at, before it becomes a concrete transcript. The three commands
+/// that take one (`convert`, `resume`, `provenance verify`) share this classification, so a file path,
+/// a session id, an agent NAME, and an absent selector all mean the same thing everywhere; they differ
+/// only in what they do with a whole agent (its latest session, or verify-every-session).
+enum SessionTarget {
+    /// A concrete transcript: a file path, a sidecar path, or a session id in the resolved agent's store.
+    One(PathBuf),
+    /// A known agent named on the command line. convert/resume take its latest session; provenance
+    /// verify checks every session it has.
+    Agent(Box<agent::Agent>),
+    /// No selector at all: the active agent.
+    ActiveLatest(Box<agent::Agent>),
+}
+
+/// Classify an optional `<session>` selector — the ONE shared resolver. Order, most specific first:
+/// 1. a file path that exists on disk -> that transcript (sidecar `<id>.agit.json` -> `<id>.jsonl`);
+/// 2. a session id present in the resolved (active / `--agent`) agent's store -> that session;
+/// 3. a known agent NAME on this machine (the same name lookup `agit a switch` uses) -> that agent;
+/// 4. absent -> the active agent.
+///
+/// Rungs 1 and 2 are exactly today's behavior for an explicit path/id. Anything that matches none of
+/// the four is a clear error naming what was tried.
+fn classify_session_selector(sel: Option<&str>) -> Result<SessionTarget> {
+    let Some(sel) = sel.map(str::trim).filter(|s| !s.is_empty()) else {
+        // 4. no selector -> the active agent.
+        return Ok(SessionTarget::ActiveLatest(Box::new(agent::resolve(None)?)));
+    };
+    // 1. a filesystem path (transcript or its sidecar).
     let p = Path::new(sel);
     if p.is_file() {
-        // A sidecar was passed: point back at its transcript (`<id>.agit.json` → `<id>.jsonl`).
-        if p.extension().map(|e| e == "json").unwrap_or(false)
-            && p.file_stem().map(|s| Path::new(s).extension().map(|e| e == "agit").unwrap_or(false)).unwrap_or(false)
-        {
-            let jsonl = p.with_file_name(format!(
-                "{}.jsonl",
-                p.file_stem().and_then(|s| Path::new(s).file_stem()).unwrap_or_default().to_string_lossy()
-            ));
-            if jsonl.is_file() {
-                return Ok(jsonl);
-            }
-        }
-        return Ok(p.to_path_buf());
+        return Ok(SessionTarget::One(transcript_from_path(p)));
     }
-    // Not a path: treat it as a session id in the resolved agent's store.
-    let store = agent::resolve(None)?.store;
-    store_sessions(&store)
-        .into_iter()
-        .find(|s| s.path.file_stem().map(|n| n == sel).unwrap_or(false))
-        .map(|s| s.path)
-        .with_context(|| format!("no session `{sel}` here — pass a transcript path, or a session id in this agent's store"))
+    // 2. a session id in the ACTIVE agent's store — only if there is an active agent. A missing active
+    //    agent must NOT abort: naming a known agent (rung 3) should resolve on its own.
+    let active = agent::resolve(None).ok();
+    if let Some(a) = &active {
+        if let Some(path) = session_id_in_store(&a.store, sel) {
+            return Ok(SessionTarget::One(path));
+        }
+    }
+    // 3. a known agent name.
+    if let Ok(named) = agent::info(sel) {
+        return Ok(SessionTarget::Agent(Box::new(named)));
+    }
+    // Nothing matched — say what was tried.
+    match &active {
+        Some(a) => anyhow::bail!(
+            "no session or agent `{sel}` — not a transcript path, not a session id in the active agent `{}`'s store, and not a known agent name.\n  run a session, or `agit a log` to list what this agent has.",
+            a.name
+        ),
+        None => anyhow::bail!(
+            "no session or agent `{sel}` — not a transcript path and not a known agent name (and no active agent to look up a session id in).\n  `agit a list` shows this machine's agents."
+        ),
+    }
+}
+
+/// The latest session in an agent's store, or a clear error when it has none yet.
+fn agent_latest_transcript(agent: &agent::Agent) -> Result<PathBuf> {
+    latest_session(&agent.store).map(|s| s.path).with_context(|| {
+        format!("agent `{}` has no sessions yet — run one, or `agit a log` to list", agent.name)
+    })
+}
+
+/// Resolve an optional `<session>` selector to a single transcript, used by `convert` and `resume`.
+/// A file path or session id -> that transcript; an agent NAME -> that agent's latest session; absent
+/// -> the active agent's latest session. See [`classify_session_selector`] for the full order.
+fn resolve_session_selector(sel: Option<&str>) -> Result<PathBuf> {
+    match classify_session_selector(sel)? {
+        SessionTarget::One(p) => Ok(p),
+        SessionTarget::Agent(a) | SessionTarget::ActiveLatest(a) => agent_latest_transcript(&a),
+    }
 }
 
 // ─────────────────────── start: the agent's latest session, here ───────────────────────

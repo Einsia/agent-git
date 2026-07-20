@@ -374,22 +374,22 @@ fn dispatch(argv: Vec<String>) -> i32 {
             commands::convert_watch(interval)
         }
         "convert" => match parse_convert(args) {
-            Some((src, from, to, cwd, write)) => {
-                commands::convert_cmd(&src, from, &to, cwd, write)
+            Some((sel, from, to, cwd, write)) => {
+                commands::convert_cmd(sel.as_deref(), from, &to, cwd, write)
             }
             None => {
-                eprintln!("usage: agit convert <src-session> --to claude-code|codex [--from RT] [--cwd PATH] [--write]  (or --watch [--interval N] to auto-convert both ways)");
+                eprintln!("usage: agit convert [<session|agent>] --to claude-code|codex [--from RT] [--cwd PATH] [--write]\n  (no session -> the active agent's latest; an agent name -> that agent's latest; --watch [--interval N] to auto-convert both ways)");
                 Ok(2)
             }
         },
 
         // ── resume: load a session into a runtime and continue (the universal loader) ──
         "resume" => match parse_resume(args) {
-            Some((src, as_rt, cwd, env, exec, relocate)) => {
-                commands::resume_cmd(&src, as_rt, cwd, env, exec, relocate)
+            Some((sel, as_rt, cwd, env, exec, relocate)) => {
+                commands::resume_cmd(sel.as_deref(), as_rt, cwd, env, exec, relocate)
             }
             None => {
-                eprintln!("usage: agit resume <src-session> [--as claude-code|codex] [--env PATH] [--relocate] [--cwd PATH] [--exec]");
+                eprintln!("usage: agit resume [<session|agent>] [--as claude-code|codex] [--env PATH] [--relocate] [--cwd PATH] [--exec]\n  (no session -> the active agent's latest; an agent name -> that agent's latest)");
                 Ok(2)
             }
         },
@@ -563,11 +563,12 @@ fn parse_harness(args: &[String]) -> HarnessArgs {
     (sub, rt, force, from_env)
 }
 
-/// convert arguments: positional src + --to (required) + --from/--cwd/--write.
-/// Returns None when src or --to is missing.
-type ConvertArgs = (PathBuf, Option<String>, String, Option<String>, bool);
+/// convert arguments: OPTIONAL positional selector + --to (required) + --from/--cwd/--write.
+/// The selector is a session path/id or an agent name (resolved client-side); absent means the active
+/// agent's latest session. Returns None only when --to is missing.
+type ConvertArgs = (Option<String>, Option<String>, String, Option<String>, bool);
 fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
-    let mut src = None;
+    let mut sel = None;
     let mut from = None;
     let mut to = None;
     let mut cwd = None;
@@ -592,21 +593,22 @@ fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
                 i += 1;
             }
             other => {
-                if src.is_none() && !other.starts_with('-') {
-                    src = Some(PathBuf::from(other));
+                if sel.is_none() && !other.starts_with('-') {
+                    sel = Some(other.to_string());
                 }
                 i += 1;
             }
         }
     }
-    Some((src?, from, to?, cwd, write))
+    Some((sel, from, to?, cwd, write))
 }
 
-/// resume arguments: positional src + --as <rt> / --cwd <path> / --env <path> / --exec.
-/// Returns None when src is missing.
-type ResumeArgs = (PathBuf, Option<String>, Option<String>, Option<String>, bool, bool);
+/// resume arguments: OPTIONAL positional selector + --as <rt> / --cwd <path> / --env <path> / --exec.
+/// The selector is a session path/id or an agent name (resolved client-side); absent means the active
+/// agent's latest session. Always returns Some — resume has no required argument.
+type ResumeArgs = (Option<String>, Option<String>, Option<String>, Option<String>, bool, bool);
 fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
-    let mut src = None;
+    let mut sel = None;
     let mut as_rt = None;
     let mut cwd = None;
     let mut env = None;
@@ -636,14 +638,14 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
                 i += 1;
             }
             other => {
-                if src.is_none() && !other.starts_with('-') {
-                    src = Some(PathBuf::from(other));
+                if sel.is_none() && !other.starts_with('-') {
+                    sel = Some(other.to_string());
                 }
                 i += 1;
             }
         }
     }
-    Some((src?, as_rt, cwd, env, exec, relocate))
+    Some((sel, as_rt, cwd, env, exec, relocate))
 }
 
 /// `agit harness [show|apply] [--from <rt>]` — which runtime's harness is resolved against what was
@@ -1346,9 +1348,9 @@ the only one present, else they ask.
   agit harness [apply]     Show, or apply, the captured harness (MCP/skills/config); apply asks first (--force to skip)
   agit adapter             List runtime adapters
   agit shadow [install]    Route `git` through `agit` in your shell so every git command versions agent context (uninstall / status to manage)
-  agit convert <src> --to <rt>  Convert a session into one another runtime can resume (--write to persist; --watch auto-converts both ways in the background)
-  agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime; --env <path> to run this agent against a different repo; --relocate if it's the same project moved; --exec to launch)
-  agit provenance verify <session>  Check a captured session's signature against its recorded key (unsigned → unverified, never blocks); `agit provenance key` shows this machine's public key
+  agit convert [<session|agent>] --to <rt>  Convert a session into one another runtime can resume (default: the active agent's latest; an agent name picks that agent's latest; --write to persist; --watch auto-converts both ways in the background)
+  agit resume [<session|agent>]  Load a session into a runtime and continue (default: the active agent's latest; an agent name picks that agent's latest; --as <rt> to switch runtime; --env <path> to run this agent against a different repo; --relocate if it's the same project moved; --exec to launch). `agit start` launches a fresh runtime here carrying that latest context instead
+  agit provenance verify [<session|agent>]  Check a captured session's signature against its recorded key (default: the active agent's latest; an agent name verifies ALL its sessions; unsigned → unverified, never blocks); `agit provenance key` shows this machine's public key
 
   agit <git-args>          Run git transparently on the code repository (Environment). `agit clone <target>` also adopts an agit agent store (a positively-identified hub URL, or a known agent name) as an agent; --git forces the raw git clone
   agit clone --git <url>   Force a raw git clone (never adopt it as an agent)

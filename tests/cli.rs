@@ -1621,3 +1621,108 @@ fn provenance_key_prints_a_stable_public_key() {
     let (_, out2, _) = r.agit(&["provenance", "key"]);
     assert_eq!(out, out2, "the machine key must be stable across calls");
 }
+
+// ─────────────── unified session selector: default to the active agent, or name an agent ───────────────
+
+/// The client-side session resolver, exercised through `agit convert`/`resume`: a file path and a
+/// session id are UNCHANGED, an agent NAME picks that agent's latest, NO selector picks the active
+/// agent's latest, and an unknown selector is a clear error. No UUID hunting required.
+#[test]
+fn convert_and_resume_default_to_active_latest_and_accept_agent_names() {
+    let r = Repo::new(); // active agent = testmemory
+
+    // testmemory gets a session of its own.
+    let home1 = r.path().join("home1");
+    seed_claude_session(&r, &home1, "mainsess", "testmemory work");
+    assert_eq!(r.agit_env(&[("HOME", home1.to_str().unwrap())], &["a", "snap"]).0, 0, "snap testmemory");
+
+    // frontend: a second agent this machine knows, with its own distinct session.
+    assert_eq!(r.agit(&["a", "init", "frontend"]).0, 0, "init frontend");
+    assert_eq!(r.agit(&["a", "switch", "frontend"]).0, 0, "switch to frontend");
+    let home2 = r.path().join("home2");
+    seed_claude_session(&r, &home2, "frontsess", "frontend work");
+    assert_eq!(r.agit_env(&[("HOME", home2.to_str().unwrap())], &["a", "snap"]).0, 0, "snap frontend");
+    assert_eq!(r.agit(&["a", "switch", "testmemory"]).0, 0, "back to testmemory as active");
+
+    // (d) No selector -> the ACTIVE agent's latest (testmemory -> mainsess), not a usage error.
+    let (code, out, err) = r.agit(&["convert", "--to", "codex"]);
+    assert_eq!(code, 0, "bare convert resolves the active agent's latest: {err}{out}");
+    assert!(out.contains("mainsess"), "converts testmemory's latest session: {out}");
+
+    // (c) A known agent NAME -> that agent's latest (frontend -> frontsess).
+    let (code, out, err) = r.agit(&["convert", "frontend", "--to", "codex"]);
+    assert_eq!(code, 0, "agent-name convert resolves that agent's latest: {err}{out}");
+    assert!(out.contains("frontsess"), "converts frontend's latest session: {out}");
+
+    // (a) A session id in the active agent's store -> that session (unchanged).
+    let (code, out, err) = r.agit(&["convert", "mainsess", "--to", "codex"]);
+    assert_eq!(code, 0, "session-id convert unchanged: {err}{out}");
+    assert!(out.contains("mainsess"), "converts the named session: {out}");
+
+    // (b) A file path -> that transcript (unchanged).
+    let loose = r.path().join("loose.jsonl");
+    std::fs::write(
+        &loose,
+        "{\"type\":\"user\",\"sessionId\":\"loose\",\"cwd\":\"/tmp\",\"message\":{\"content\":\"hi\"}}\n",
+    )
+    .unwrap();
+    let (code, out, err) = r.agit(&["convert", loose.to_str().unwrap(), "--to", "codex"]);
+    assert_eq!(code, 0, "explicit-path convert unchanged: {err}{out}");
+    assert!(out.contains("loose.jsonl"), "converts the explicit file: {out}");
+
+    // (e) An unknown selector -> a clear error naming what was tried.
+    let (code, _out, err) = r.agit(&["convert", "nonesuch", "--to", "codex"]);
+    assert_ne!(code, 0, "an unknown selector is an error, not a silent default");
+    assert!(err.contains("no session or agent `nonesuch`"), "names what was tried: {err}");
+
+    // resume mirrors it: no positional resolves the active agent's latest (not a usage error) ...
+    let (code, out, err) = r.agit(&["resume"]);
+    assert_eq!(code, 0, "bare resume resolves the active agent's latest: {err}{out}");
+    assert!(out.contains("Resume:"), "prints a resume command: {out}");
+    // ... and an agent name resolves that agent's latest.
+    let (code, out, err) = r.agit(&["resume", "frontend"]);
+    assert_eq!(code, 0, "resume by agent name: {err}{out}");
+    assert!(out.contains("Resume:"), "prints a resume command: {out}");
+}
+
+/// `agit provenance verify`: no argument verifies the ACTIVE agent's latest session; an agent NAME
+/// verifies EVERY session that agent has (whole-agent mode) and returns non-zero if any is unverified.
+#[test]
+fn provenance_verify_defaults_to_active_and_verifies_a_whole_agent_by_name() {
+    let r = Repo::new(); // active agent = testmemory
+    let home1 = r.path().join("home1");
+    seed_claude_session(&r, &home1, "mainsess", "testmemory work");
+    assert_eq!(r.agit_env(&[("HOME", home1.to_str().unwrap())], &["a", "snap"]).0, 0, "snap testmemory");
+
+    // No argument -> verify the active agent's latest (snap signed it, so it verifies, exit 0).
+    let (code, out, err) = r.agit(&["provenance", "verify"]);
+    assert_eq!(code, 0, "no-arg verify checks the active agent's latest and passes: {err}{out}");
+    assert!(out.contains("mainsess"), "verifies the active agent's latest session: {out}");
+    assert!(out.contains("verified"), "a snapped session verifies: {out}");
+
+    // A second agent with two sessions of its own.
+    assert_eq!(r.agit(&["a", "init", "frontend"]).0, 0, "init frontend");
+    assert_eq!(r.agit(&["a", "switch", "frontend"]).0, 0, "switch to frontend");
+    let home2 = r.path().join("home2");
+    seed_claude_session(&r, &home2, "frontA", "frontend work A");
+    seed_claude_session(&r, &home2, "frontB", "frontend work B");
+    assert_eq!(r.agit_env(&[("HOME", home2.to_str().unwrap())], &["a", "snap"]).0, 0, "snap frontend");
+    // Grab one of frontend's committed transcripts while frontend is the active store, to tamper later.
+    let front_b = captured_transcript(&r, "claude-code", "frontB.jsonl");
+    assert_eq!(r.agit(&["a", "switch", "testmemory"]).0, 0, "back to testmemory as active");
+
+    // A known agent NAME -> verify ALL of that agent's sessions; all intact -> exit 0.
+    let (code, out, err) = r.agit(&["provenance", "verify", "frontend"]);
+    assert_eq!(code, 0, "whole-agent verify passes when every session verifies: {err}{out}");
+    assert!(out.contains("agent `frontend`"), "names the agent: {out}");
+    assert!(out.contains("frontA") && out.contains("frontB"), "lists every session: {out}");
+
+    // Tamper one of frontend's sessions after it was signed: whole-agent verify must now fail loudly.
+    let mut content = std::fs::read_to_string(&front_b).unwrap();
+    content.push_str("{\"type\":\"user\",\"message\":{\"content\":\"forged line\"}}\n");
+    std::fs::write(&front_b, content).unwrap();
+
+    let (code, out, _err) = r.agit(&["provenance", "verify", "frontend"]);
+    assert_ne!(code, 0, "one tampered session makes the whole-agent verify fail: {out}");
+    assert!(out.contains("FAIL"), "flags the bad session in the per-session verdict: {out}");
+}
