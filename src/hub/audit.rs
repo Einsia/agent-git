@@ -45,6 +45,14 @@ pub const USER_PASSWORD: &str = "user.password";
 /// set another user's password. This is the account-recovery door, kept distinct from the
 /// self-service change so the audit log shows an admin acted on someone else's credential.
 pub const USER_PASSWORD_RESET: &str = "user.password.reset";
+/// Two-factor lifecycle. `enroll` = a pending TOTP secret was generated (not yet active); `enable` =
+/// a code confirmed it and 2FA is now active (backup codes minted); `disable` = the user turned their
+/// own 2FA off (with a code or password); `admin.disable` = a site admin cleared a locked-out user's
+/// 2FA (CLI `user 2fa-disable` or the admin API) — kept distinct so the log shows an admin acted.
+pub const TWOFA_ENROLL: &str = "user.2fa.enroll";
+pub const TWOFA_ENABLE: &str = "user.2fa.enable";
+pub const TWOFA_DISABLE: &str = "user.2fa.disable";
+pub const TWOFA_ADMIN_DISABLE: &str = "user.2fa.admin.disable";
 pub const AGENT_CREATE: &str = "agent.create";
 pub const AGENT_DELETE: &str = "agent.delete";
 pub const AGENT_RENAME: &str = "agent.rename";

@@ -47,7 +47,7 @@ fn is_expired(iso: &str) -> bool {
 
 // ─────────────────────────── users ───────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct User {
     pub username: String,
     pub pw_hash: String,
@@ -59,6 +59,23 @@ pub struct User {
     pub is_admin: bool,
     #[serde(default)]
     pub created: String,
+    /// The user's TOTP shared secret (base32, RFC 4648), or `None` if 2FA was never enrolled. Present
+    /// while enrollment is PENDING (secret set, [`totp_enabled`](Self::totp_enabled) still false) and
+    /// while 2FA is ACTIVE. This is a **symmetric secret** the server must hold in the clear to verify
+    /// codes — it cannot be hashed like a password. It is therefore as sensitive as `pw_hash` and is
+    /// stored the same way (in the users table, same file-mode/serialization discipline).
+    /// NOTE: at-rest DB encryption is out of scope; this column holds the secret unencrypted, exactly
+    /// as the password material is stored.
+    #[serde(default)]
+    pub totp_secret: Option<String>,
+    /// Whether 2FA is ACTIVE. A non-null `totp_secret` with this `false` means an enrollment is pending
+    /// (generated but not yet confirmed) and login is NOT yet gated on a second factor.
+    #[serde(default)]
+    pub totp_enabled: bool,
+    /// sha256 digests of the one-time backup codes — never the plaintext (which is shown once, at
+    /// confirm). A consumed code's digest is removed from this list.
+    #[serde(default)]
+    pub totp_backup_codes: Vec<String>,
 }
 
 /// Username rules: lowercase [a-z0-9._-], 2..=32, no leading dot. Login names are case-insensitive →
@@ -450,6 +467,12 @@ fn parse_json_vec<T: for<'de> Deserialize<'de>>(s: &str) -> Vec<T> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+/// Serialize a slice to a JSON TEXT column value; an (unreachable) serialization failure degrades to
+/// an empty array rather than corrupting the row. The inverse of [`parse_json_vec`].
+fn json_text<T: Serialize>(v: &[T]) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string())
+}
+
 fn row_user(r: &impl Cols) -> User {
     User {
         username: r.text("username"),
@@ -458,6 +481,11 @@ fn row_user(r: &impl Cols) -> User {
         kdf: r.text("kdf"),
         is_admin: r.int("is_admin") != 0,
         created: r.text("created"),
+        // The Cols readers are fail-safe (a missing column yields the empty value), so even a store
+        // that predates `add_totp_columns` reads back as "no 2FA" rather than erroring.
+        totp_secret: r.opt("totp_secret"),
+        totp_enabled: r.int("totp_enabled") != 0,
+        totp_backup_codes: parse_json_vec(&r.text("totp_backup_codes")),
     }
 }
 
@@ -521,9 +549,13 @@ fn row_org(r: &impl Cols) -> Org {
 /// boot). SQLite treats "BIGINT" as INTEGER affinity, so the same DDL is correct there.
 const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS schema_version (id INTEGER PRIMARY KEY, version BIGINT NOT NULL)",
+    // totp_* are the second-factor columns (added additively; also back-filled onto existing DBs by
+    // `add_totp_columns`). totp_secret is nullable (null = never enrolled); totp_enabled is the active
+    // flag; totp_backup_codes is a JSON array of sha256 digests. See User for the sensitivity note.
     "CREATE TABLE IF NOT EXISTS users (\
        username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, salt TEXT NOT NULL, \
-       kdf TEXT NOT NULL, is_admin BIGINT NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '')",
+       kdf TEXT NOT NULL, is_admin BIGINT NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '', \
+       totp_secret TEXT, totp_enabled BIGINT NOT NULL DEFAULT 0, totp_backup_codes TEXT NOT NULL DEFAULT '[]')",
     // Identity is (owner, name): a composite PRIMARY KEY, and owner is NOT NULL (it is the namespace).
     // No surrogate id — `update_agents` rewrites the whole table every write, so a surrogate would be
     // re-minted each time and buys nothing; the composite PK fits the snapshot model on both backends.
@@ -545,6 +577,18 @@ const DDL: &[&str] = &[
        PRIMARY KEY (target_owner, target_agent, id))",
     "CREATE TABLE IF NOT EXISTS orgs (\
        name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', created TEXT NOT NULL DEFAULT '')",
+];
+
+/// The second-factor columns, added onto a `users` table that predates them. A **fresh** DB already
+/// has them (they are in `DDL`); this back-fills older stores at boot. Idempotent by construction:
+/// Postgres uses `ADD COLUMN IF NOT EXISTS`; SQLite (which has no such clause for ADD COLUMN) simply
+/// ignores the "duplicate column" error, so re-running against an already-migrated store is a no-op.
+/// Not version-gated on purpose — a fresh DB stamped at the current version still gets its `users`
+/// table straight from `DDL`, so keying the back-fill off `schema_version` would double-add there.
+const TOTP_COLUMNS: &[&str] = &[
+    "totp_secret TEXT",
+    "totp_enabled BIGINT NOT NULL DEFAULT 0",
+    "totp_backup_codes TEXT NOT NULL DEFAULT '[]'",
 ];
 
 /// Stamp the schema version idempotently. A single fixed row (id=1) plus `ON CONFLICT DO NOTHING`,
@@ -1004,6 +1048,12 @@ impl SqliteStore {
         }
         sqlx::query(STAMP_VERSION).execute(&self.pool).await.map_err(err)?;
         self.migrate_v2().await?;
+        // Back-fill the 2FA columns onto stores created before they existed. On a fresh DB the DDL
+        // above already created them, so the ADD COLUMN fails with "duplicate column" — expected and
+        // ignored (SQLite has no ADD COLUMN IF NOT EXISTS).
+        for &col in TOTP_COLUMNS {
+            let _ = sqlx::query(&format!("ALTER TABLE users ADD COLUMN {col}")).execute(&self.pool).await;
+        }
         // create_if_missing may not honor the mode; tighten hub.db AND its WAL sidecars to 0600, the
         // same guarantee write_secret_atomic gave the old JSON files. The DDL/stamp above already
         // wrote, so in WAL mode the -wal/-shm sidecars now exist and get locked down too.
@@ -1094,13 +1144,16 @@ impl SqliteStore {
         if existing.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("user already exists: {}", user.username)));
         }
-        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created) VALUES (?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&user.username)
             .bind(&user.pw_hash)
             .bind(&user.salt)
             .bind(&user.kdf)
             .bind(user.is_admin as i64)
             .bind(&user.created)
+            .bind(&user.totp_secret)
+            .bind(user.totp_enabled as i64)
+            .bind(json_text(&user.totp_backup_codes))
             .execute(&mut *tx)
             .await
             .map_err(|e| match &e {
@@ -1126,13 +1179,16 @@ impl SqliteStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM users").execute(&mut *tx).await.map_err(err)?;
         for u in &list {
-            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created) VALUES (?, ?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 .bind(&u.username)
                 .bind(&u.pw_hash)
                 .bind(&u.salt)
                 .bind(&u.kdf)
                 .bind(u.is_admin as i64)
                 .bind(&u.created)
+                .bind(&u.totp_secret)
+                .bind(u.totp_enabled as i64)
+                .bind(json_text(&u.totp_backup_codes))
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -1319,6 +1375,11 @@ impl PgStore {
         // Idempotent single-row stamp — no read-MAX-then-INSERT race under concurrent boot.
         sqlx::query(STAMP_VERSION).execute(&self.pool).await.map_err(err)?;
         self.migrate_v2().await?;
+        // Back-fill the 2FA columns onto stores predating them (no-op on a fresh DB). Postgres has a
+        // native IF NOT EXISTS, so this is cleanly idempotent without swallowing errors.
+        for &col in TOTP_COLUMNS {
+            sqlx::query(&format!("ALTER TABLE users ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
+        }
         Ok(())
     }
 
@@ -1398,13 +1459,16 @@ impl PgStore {
         if existing.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("user already exists: {}", user.username)));
         }
-        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created) VALUES ($1, $2, $3, $4, $5, $6)")
+        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
             .bind(&user.username)
             .bind(&user.pw_hash)
             .bind(&user.salt)
             .bind(&user.kdf)
             .bind(user.is_admin as i64)
             .bind(&user.created)
+            .bind(&user.totp_secret)
+            .bind(user.totp_enabled as i64)
+            .bind(json_text(&user.totp_backup_codes))
             .execute(&mut *tx)
             .await
             .map_err(|e| match &e {
@@ -1429,13 +1493,16 @@ impl PgStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM users").execute(&mut *tx).await.map_err(err)?;
         for u in &list {
-            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created) VALUES ($1, $2, $3, $4, $5, $6)")
+            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
                 .bind(&u.username)
                 .bind(&u.pw_hash)
                 .bind(&u.salt)
                 .bind(&u.kdf)
                 .bind(u.is_admin as i64)
                 .bind(&u.created)
+                .bind(&u.totp_secret)
+                .bind(u.totp_enabled as i64)
+                .bind(json_text(&u.totp_backup_codes))
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -1634,6 +1701,7 @@ mod tests {
             kdf: "k".into(),
             is_admin: true,
             created: now_iso(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1652,6 +1720,7 @@ mod tests {
             kdf: "old_kdf".into(),
             is_admin: true,
             created: "2026-01-01T00:00:00Z".into(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1679,6 +1748,7 @@ mod tests {
             kdf: "k".into(),
             is_admin: false,
             created: now_iso(),
+            ..Default::default()
         };
         s.add_user(u.clone()).await.unwrap();
         let e = s.add_user(u).await.unwrap_err();
@@ -1697,6 +1767,7 @@ mod tests {
             kdf: "k".into(),
             is_admin: true,
             created: now_iso(),
+            ..Default::default()
         })
         .await
         .unwrap();

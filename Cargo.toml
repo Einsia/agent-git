@@ -44,6 +44,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 walkdir = "2"
 once_cell = "1"
 argon2 = "0.5.3"
+# TOTP (RFC 6238) second factor for agit-hub. A well-reviewed, RFC-compliant crate — no hand-rolled
+# OTP. `default-features = false` keeps the build hermetic: `otpauth` pulls only the pure-Rust `url`
+# crate (provisioning-URI generation), `gen_secret` the CSPRNG secret generator. The `qr`/`image`
+# features are deliberately NOT enabled (they drag in an image encoder we do not want).
+totp-rs = { version = "5", default-features = false, features = ["otpauth", "gen_secret"] }
 # Client-side provenance: a per-machine ed25519 identity signs each captured session.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"

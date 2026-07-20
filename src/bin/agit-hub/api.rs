@@ -9,7 +9,7 @@ use agit::hub::blob::{self, BLOB_MAX};
 use agit::hub::metrics::AuthResult;
 use agit::hub::net::valid_agent_name;
 use agit::hub::store::{AgentMeta, Member, Org, OrgMember, User};
-use agit::hub::{audit, auth, identity, kdf, mr, session as websession, store};
+use agit::hub::{audit, auth, identity, kdf, mr, session as websession, store, totp};
 
 use crate::cli::{create_agent, issue_token, list_agents, repo_path};
 use crate::gitplumb::*;
@@ -87,6 +87,9 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("POST", "logout") => return api_logout(ctx, req, caller).await,
         ("GET", "me") => return api_me(caller),
         ("POST", "me/password") => return api_me_password(ctx, req, caller, body).await,
+        ("POST", "me/2fa/enroll") => return api_2fa_enroll(ctx, caller).await,
+        ("POST", "me/2fa/confirm") => return api_2fa_confirm(ctx, caller, body).await,
+        ("POST", "me/2fa/disable") => return api_2fa_disable(ctx, caller, body).await,
         ("GET", "agents") => return api_agents(ctx, req, caller).await,
         ("POST", "agents") => return api_create_agent(ctx, req, caller, body).await,
         ("GET", "tokens") => return api_tokens(ctx, caller).await,
@@ -122,6 +125,13 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         if let Some(username) = after.strip_suffix("/password") {
             return match m {
                 "POST" => api_admin_set_password(ctx, caller, username, body).await,
+                _ => Resp::text(405, "method not allowed"),
+            };
+        }
+        // Admin recovery for a user locked out of their authenticator: clear their 2FA.
+        if let Some(username) = after.strip_suffix("/2fa-disable") {
+            return match m {
+                "POST" => api_admin_2fa_disable(ctx, caller, username).await,
                 _ => Resp::text(405, "method not allowed"),
             };
         }
@@ -315,6 +325,41 @@ pub(crate) async fn api_login(ctx: &Ctx, req: &Req, body: &[u8]) -> Resp {
         // brute-forcer a username dictionary.
         return Resp::err(401, "wrong username or password");
     };
+    // Second factor: once 2FA is active, a correct password alone is NOT sufficient. Require a `code`
+    // (a current TOTP or an unused backup code). A missing/wrong code is a flat 401
+    // {"error":"2fa_required"} and NO session — so an attacker holding only the password still cannot
+    // get in. (It does reveal to someone who already has the correct password that 2FA is on; that is
+    // inherent and acceptable — what must never leak is a session.)
+    if user.totp_enabled {
+        let Some(code) = str_field(&v, "code") else {
+            return two_factor_required(ctx, &user.username).await;
+        };
+        let secret = user.totp_secret.clone().unwrap_or_default();
+        let ok = if totp::verify(&secret, &user.username, &code) {
+            true
+        } else {
+            // Backup code: verify AND consume it atomically inside the users write lock, so two
+            // concurrent logins can never both spend the same one-time code (the stale read above is
+            // not trusted for the mutation).
+            let uname = user.username.clone();
+            ctx.store
+                .update_users(move |users| match users.iter_mut().find(|u| u.username == uname) {
+                    Some(u) => match totp::consume_backup_code(&code, &u.totp_backup_codes) {
+                        Some(remaining) => {
+                            u.totp_backup_codes = remaining;
+                            true
+                        }
+                        None => false,
+                    },
+                    None => false,
+                })
+                .await
+                .unwrap_or(false)
+        };
+        if !ok {
+            return two_factor_required(ctx, &user.username).await;
+        }
+    }
     let Ok(sid) = ctx.sessions.create(&user.username) else {
         return Resp::err(503, "couldn't create a session, try again shortly");
     };
@@ -399,7 +444,7 @@ pub(crate) async fn api_register(ctx: &Ctx, client_ip: Option<IpAddr>, body: &[u
         return Resp::err(500, "password derivation failed");
     };
     // is_admin: false is the security invariant — never read any admin field from the body.
-    let user = User { username: username.clone(), pw_hash, salt, kdf: kdf_id, is_admin: false, created: store::now_iso() };
+    let user = User { username: username.clone(), pw_hash, salt, kdf: kdf_id, is_admin: false, created: store::now_iso(), ..Default::default() };
     match ctx.store.add_user(user).await {
         Ok(()) => {}
         // The username PRIMARY KEY makes this race-safe: a duplicate is always a clean AlreadyExists,
@@ -529,6 +574,204 @@ pub(crate) async fn api_admin_set_password(ctx: &Ctx, caller: &Caller, username:
     tracing::info!(actor = %actor, user = %target, revoked_sessions = revoked, "admin password reset");
     audit_append(ctx.root(), &actor, audit::USER_PASSWORD_RESET, None, &format!("reset {target}; revoked {revoked} session(s)")).await;
     Resp::json(serde_json::json!({ "ok": true, "user": target, "revoked_sessions": revoked }))
+}
+
+// ── Two-factor authentication (TOTP) ──
+
+/// The uniform "second factor required / wrong" outcome for [`api_login`]: a 401 with the exact
+/// `{"error":"2fa_required"}` body and never a session. Records a failed-auth metric + audit line.
+async fn two_factor_required(ctx: &Ctx, username: &str) -> Resp {
+    ctx.metrics.record_auth(AuthResult::LoginFail);
+    tracing::warn!(user = %username, "login blocked: second factor required or wrong");
+    audit_append(ctx.root(), username, audit::LOGIN_FAILED, None, "second factor required or wrong").await;
+    Resp::err(401, "2fa_required")
+}
+
+/// `POST /api/me/2fa/enroll` — begin TOTP enrollment for the logged-in caller. Generates a fresh
+/// secret, stores it **PENDING** (secret set, 2FA not yet active), and returns the secret + an
+/// `otpauth://totp/agit-hub:<username>?...` provisioning URI for an authenticator app. It does NOT
+/// activate 2FA — that needs [`api_2fa_confirm`]. Re-enrolling overwrites a prior *pending* secret,
+/// but refuses to clobber an ALREADY-ACTIVE 2FA (disable it first) so a stray call cannot silently
+/// swap out a working authenticator.
+pub(crate) async fn api_2fa_enroll(ctx: &Ctx, caller: &Caller) -> Resp {
+    let Some(username) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let secret = totp::gen_secret();
+    let Some(uri) = totp::provisioning_uri(&secret, &username) else {
+        return Resp::err(500, "couldn't build the provisioning URI");
+    };
+    // Persist the pending secret under the write lock; refuse if 2FA is already active.
+    let sec = secret.clone();
+    let outcome = ctx
+        .store
+        .update_users(move |users| match users.iter_mut().find(|u| u.username == username) {
+            None => Err(404),
+            Some(u) if u.totp_enabled => Err(409),
+            Some(u) => {
+                u.totp_secret = Some(sec);
+                u.totp_enabled = false;
+                u.totp_backup_codes = vec![];
+                Ok(())
+            }
+        })
+        .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(409)) => return Resp::err(409, "2FA is already enabled; disable it first to re-enroll"),
+        Ok(Err(_)) => return Resp::err(404, "no such user"),
+        Err(_) => return Resp::err(500, "couldn't start enrollment"),
+    }
+    audit_append(ctx.root(), caller.user.as_deref().unwrap_or(""), audit::TWOFA_ENROLL, None, "").await;
+    Resp::json(serde_json::json!({
+        "secret": secret,
+        "otpauth_uri": uri,
+        "issuer": totp::ISSUER,
+        "account": caller.user,
+    }))
+}
+
+/// `POST /api/me/2fa/confirm` `{ code }` — verify a 6-digit TOTP against the PENDING secret (±1 time
+/// step for clock skew). On success 2FA goes **active** and 10 one-time backup codes are minted and
+/// returned **once** (only their sha256 digests are stored). No pending enrollment → 400; a wrong
+/// code → 401.
+pub(crate) async fn api_2fa_confirm(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
+    let Some(username) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(code) = str_field(&v, "code") else {
+        return Resp::err(400, "want a 6-digit code");
+    };
+    let Some(user) = ctx.store.user(&username).await else {
+        return Resp::err(404, "no such user");
+    };
+    if user.totp_enabled {
+        return Resp::err(409, "2FA is already enabled");
+    }
+    let Some(secret) = user.totp_secret.clone() else {
+        return Resp::err(400, "no pending enrollment; call enroll first");
+    };
+    if !totp::verify(&secret, &username, &code) {
+        return Resp::err(401, "that code is not valid");
+    }
+    let (plain, hashes) = match totp::gen_backup_codes(totp::BACKUP_CODES) {
+        Ok(x) => x,
+        Err(_) => return Resp::err(500, "no system entropy available, try again shortly"),
+    };
+    // Activate under the write lock, re-checking the pending secret has not rotated under us (a
+    // concurrent re-enroll) — the code proved control of *this* secret, so activating a different one
+    // would be wrong.
+    let activated = ctx
+        .store
+        .update_users(move |users| match users.iter_mut().find(|u| u.username == username) {
+            Some(u) if !u.totp_enabled && u.totp_secret.as_deref() == Some(secret.as_str()) => {
+                u.totp_enabled = true;
+                u.totp_backup_codes = hashes;
+                true
+            }
+            _ => false,
+        })
+        .await;
+    match activated {
+        Ok(true) => {}
+        Ok(false) => return Resp::err(409, "enrollment changed; start over"),
+        Err(_) => return Resp::err(500, "couldn't activate 2FA"),
+    }
+    audit_append(ctx.root(), caller.user.as_deref().unwrap_or(""), audit::TWOFA_ENABLE, None, &format!("{} backup codes issued", plain.len())).await;
+    Resp::json(serde_json::json!({ "enabled": true, "backup_codes": plain }))
+}
+
+/// `POST /api/me/2fa/disable` `{ code_or_password }` — turn the caller's own 2FA off. Any ONE of a
+/// current TOTP code, an unused backup code, or the account password proves control. On success the
+/// secret and backup-code digests are cleared. A missing/wrong proof → 401.
+pub(crate) async fn api_2fa_disable(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
+    let Some(username) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(proof) = str_field(&v, "code_or_password") else {
+        return Resp::err(400, "want code_or_password");
+    };
+    let Some(user) = ctx.store.user(&username).await else {
+        return Resp::err(404, "no such user");
+    };
+    if !user.totp_enabled {
+        return Resp::err(400, "2FA is not enabled");
+    }
+    let secret = user.totp_secret.clone().unwrap_or_default();
+    // Try the cheap checks (TOTP, then backup code) before spending an argon2 verify on the password.
+    let ok = if totp::verify(&secret, &username, &proof) || totp::consume_backup_code(&proof, &user.totp_backup_codes).is_some() {
+        true
+    } else {
+        // Password fallback, under the login gate + blocking pool exactly like `api_login`, so this is
+        // not an uncapped argon2 amplifier.
+        let _slot = ctx.login_gate.acquire().await.expect("login gate semaphore is never closed");
+        auth::verify_login(&ctx.store, &username, &proof).await.is_some()
+    };
+    if !ok {
+        return Resp::err(401, "that code or password is not valid");
+    }
+    let cleared = ctx
+        .store
+        .update_users(move |users| match users.iter_mut().find(|u| u.username == username) {
+            Some(u) => {
+                u.totp_secret = None;
+                u.totp_enabled = false;
+                u.totp_backup_codes = vec![];
+                true
+            }
+            None => false,
+        })
+        .await;
+    match cleared {
+        Ok(true) => {}
+        Ok(false) => return Resp::err(404, "no such user"),
+        Err(_) => return Resp::err(500, "couldn't disable 2FA"),
+    }
+    audit_append(ctx.root(), caller.user.as_deref().unwrap_or(""), audit::TWOFA_DISABLE, None, "").await;
+    Resp::json(serde_json::json!({ "enabled": false }))
+}
+
+/// `POST /api/users/<username>/2fa-disable` — admin-only recovery for a user locked out of their
+/// authenticator. Clears the target's 2FA entirely (secret, active flag, backup codes). Gated on
+/// `caller.is_admin`; no code is asked for (the point is the user cannot supply one). The sibling of
+/// the admin password-reset door.
+pub(crate) async fn api_admin_2fa_disable(ctx: &Ctx, caller: &Caller, username: &str) -> Resp {
+    let Some(actor) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    if !caller.is_admin {
+        return Resp::err(403, "admin only");
+    }
+    let target = store::normalize_username(username);
+    // An admin already sees every account, so a plain 404 for an unknown name leaks nothing.
+    if ctx.store.user(&target).await.is_none() {
+        return Resp::err(404, "no such user");
+    }
+    let t = target.clone();
+    let cleared = ctx
+        .store
+        .update_users(move |users| match users.iter_mut().find(|u| u.username == t) {
+            Some(u) => {
+                u.totp_secret = None;
+                u.totp_enabled = false;
+                u.totp_backup_codes = vec![];
+                true
+            }
+            None => false,
+        })
+        .await;
+    if cleared.is_err() {
+        return Resp::err(500, "couldn't clear 2FA");
+    }
+    tracing::info!(actor = %actor, user = %target, "admin cleared 2FA");
+    audit_append(ctx.root(), &actor, audit::TWOFA_ADMIN_DISABLE, None, &format!("cleared 2FA for {target}")).await;
+    Resp::json(serde_json::json!({ "ok": true, "user": target, "enabled": false }))
 }
 
 /// Resolve an agent's effective ACL, folding in the owning org's members when it is org-owned. **This
@@ -2626,7 +2869,7 @@ mod tests {
         let kdf_id = kdf::current_kdf_id();
         let pw_hash = kdf::hash_password(pw, &salt, &kdf_id).unwrap();
         ctx.store
-            .add_user(User { username: name.into(), pw_hash, salt, kdf: kdf_id, is_admin: admin, created: store::now_iso() })
+            .add_user(User { username: name.into(), pw_hash, salt, kdf: kdf_id, is_admin: admin, created: store::now_iso(), ..Default::default() })
             .await
             .unwrap();
     }
@@ -2722,6 +2965,198 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status, 401);
+    }
+
+    // ── two-factor authentication (TOTP) ──
+
+    /// Parse a Resp's JSON body (tests only).
+    fn json_of(resp: &Resp) -> serde_json::Value {
+        serde_json::from_slice(&resp.body).expect("response body is JSON")
+    }
+
+    /// Drive enroll → confirm to leave `name` with ACTIVE 2FA. Returns (secret, backup_codes).
+    async fn activate_2fa(ctx: &Ctx, name: &str) -> (String, Vec<String>) {
+        let enroll = api_2fa_enroll(ctx, &caller(name, false)).await;
+        assert_eq!(enroll.status, 200, "enroll ok");
+        let secret = json_of(&enroll)["secret"].as_str().unwrap().to_string();
+        let code = totp::current_code(&secret, name).unwrap();
+        let confirm = api_2fa_confirm(ctx, &caller(name, false), &body(serde_json::json!({ "code": code }))).await;
+        assert_eq!(confirm.status, 200, "confirm ok");
+        let codes: Vec<String> = json_of(&confirm)["backup_codes"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+        (secret, codes)
+    }
+
+    #[tokio::test]
+    async fn enroll_is_pending_not_active_and_returns_a_provisioning_uri() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let resp = api_2fa_enroll(&ctx, &caller("alice", false)).await;
+        assert_eq!(resp.status, 200);
+        let v = json_of(&resp);
+        assert!(v["secret"].as_str().is_some(), "secret returned once at enroll");
+        let uri = v["otpauth_uri"].as_str().unwrap();
+        assert!(uri.starts_with("otpauth://totp/agit-hub:alice"), "{uri}");
+        assert!(uri.contains("issuer=agit-hub"), "{uri}");
+        // Pending, NOT active: a secret is stored but 2FA is off, so login is not yet gated.
+        let u = ctx.store.user("alice").await.unwrap();
+        assert!(u.totp_secret.is_some(), "pending secret stored");
+        assert!(!u.totp_enabled, "enroll must NOT activate 2FA");
+        assert!(u.totp_backup_codes.is_empty(), "no backup codes until confirm");
+    }
+
+    #[tokio::test]
+    async fn confirm_with_a_valid_code_activates_and_returns_backup_codes() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let (_secret, codes) = activate_2fa(&ctx, "alice").await;
+        assert_eq!(codes.len(), totp::BACKUP_CODES, "10 backup codes returned once");
+        let u = ctx.store.user("alice").await.unwrap();
+        assert!(u.totp_enabled, "2FA is active after a confirmed code");
+        assert_eq!(u.totp_backup_codes.len(), totp::BACKUP_CODES);
+        // Only DIGESTS are stored — no backup-code plaintext lives in the record.
+        for plain in &codes {
+            assert!(!u.totp_backup_codes.contains(plain), "backup-code plaintext must never be stored");
+            assert!(u.totp_backup_codes.contains(&totp::hash_backup_code(plain)), "the digest is what's stored");
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_with_a_wrong_code_is_401_and_stays_pending() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        api_2fa_enroll(&ctx, &caller("alice", false)).await;
+        let resp = api_2fa_confirm(&ctx, &caller("alice", false), &body(serde_json::json!({ "code": "000000" }))).await;
+        // A wrong code is a 4xx and 2FA stays inactive (fail closed).
+        assert!(resp.status == 401 || resp.status == 400, "got {}", resp.status);
+        assert!(!ctx.store.user("alice").await.unwrap().totp_enabled);
+    }
+
+    #[tokio::test]
+    async fn login_with_password_alone_when_2fa_on_is_401_2fa_required() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        activate_2fa(&ctx, "alice").await;
+        // Correct password, no code: must be refused with the non-enumerating signal and NO session.
+        let resp = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "alice", "password": "alice-password-1" }))).await;
+        assert_eq!(resp.status, 401, "password alone is not enough once 2FA is on");
+        assert_eq!(json_of(&resp)["error"].as_str(), Some("2fa_required"));
+        assert!(!resp.extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("set-cookie")), "no session cookie is handed out");
+    }
+
+    #[tokio::test]
+    async fn login_with_wrong_code_when_2fa_on_is_401_2fa_required() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        activate_2fa(&ctx, "alice").await;
+        let resp = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "alice", "password": "alice-password-1", "code": "000000" }))).await;
+        assert_eq!(resp.status, 401);
+        assert_eq!(json_of(&resp)["error"].as_str(), Some("2fa_required"));
+    }
+
+    #[tokio::test]
+    async fn login_with_password_and_valid_totp_is_a_200_session() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let (secret, _codes) = activate_2fa(&ctx, "alice").await;
+        let code = totp::current_code(&secret, "alice").unwrap();
+        let resp = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "alice", "password": "alice-password-1", "code": code }))).await;
+        assert_eq!(resp.status, 200, "password + valid TOTP logs in");
+        assert!(resp.extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("set-cookie")), "a session cookie is set");
+    }
+
+    #[tokio::test]
+    async fn a_backup_code_logs_in_once_then_is_rejected() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let (_secret, codes) = activate_2fa(&ctx, "alice").await;
+        let code = codes[0].clone();
+        // First use: succeeds.
+        let ok = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "alice", "password": "alice-password-1", "code": code }))).await;
+        assert_eq!(ok.status, 200, "a backup code works once");
+        // It is now marked used (one consumed).
+        assert_eq!(ctx.store.user("alice").await.unwrap().totp_backup_codes.len(), totp::BACKUP_CODES - 1);
+        // Second use of the SAME code: rejected.
+        let again = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "alice", "password": "alice-password-1", "code": codes[0] }))).await;
+        assert_eq!(again.status, 401, "a spent backup code no longer logs in");
+        assert_eq!(json_of(&again)["error"].as_str(), Some("2fa_required"));
+    }
+
+    #[tokio::test]
+    async fn disable_with_a_valid_totp_turns_2fa_off() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let (secret, _codes) = activate_2fa(&ctx, "alice").await;
+        let code = totp::current_code(&secret, "alice").unwrap();
+        let resp = api_2fa_disable(&ctx, &caller("alice", false), &body(serde_json::json!({ "code_or_password": code }))).await;
+        assert_eq!(resp.status, 200);
+        let u = ctx.store.user("alice").await.unwrap();
+        assert!(!u.totp_enabled && u.totp_secret.is_none() && u.totp_backup_codes.is_empty(), "2FA fully cleared");
+        // And now a plain password login works again.
+        let login = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "alice", "password": "alice-password-1" }))).await;
+        assert_eq!(login.status, 200);
+    }
+
+    #[tokio::test]
+    async fn disable_with_the_password_also_works() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        activate_2fa(&ctx, "alice").await;
+        let resp = api_2fa_disable(&ctx, &caller("alice", false), &body(serde_json::json!({ "code_or_password": "alice-password-1" }))).await;
+        assert_eq!(resp.status, 200);
+        assert!(!ctx.store.user("alice").await.unwrap().totp_enabled);
+    }
+
+    #[tokio::test]
+    async fn disable_with_a_wrong_proof_is_401_and_2fa_stays_on() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        activate_2fa(&ctx, "alice").await;
+        let resp = api_2fa_disable(&ctx, &caller("alice", false), &body(serde_json::json!({ "code_or_password": "000000" }))).await;
+        assert_eq!(resp.status, 401);
+        assert!(ctx.store.user("alice").await.unwrap().totp_enabled, "2FA must survive a failed disable");
+    }
+
+    #[tokio::test]
+    async fn admin_2fa_disable_clears_a_locked_out_users_2fa() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "root", "root-password-1", true).await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        activate_2fa(&ctx, "alice").await;
+        // A non-admin cannot use the recovery door.
+        let denied = api_admin_2fa_disable(&ctx, &caller("alice", false), "alice").await;
+        assert_eq!(denied.status, 403);
+        // The admin clears it.
+        let resp = api_admin_2fa_disable(&ctx, &caller("root", true), "alice").await;
+        assert_eq!(resp.status, 200);
+        assert!(!ctx.store.user("alice").await.unwrap().totp_enabled, "admin recovery cleared 2FA");
+        // Alice can now log in with just her password.
+        let login = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "alice", "password": "alice-password-1" }))).await;
+        assert_eq!(login.status, 200);
+    }
+
+    #[tokio::test]
+    async fn secret_and_backup_plaintext_never_appear_after_enroll_confirm() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let (secret, codes) = activate_2fa(&ctx, "alice").await;
+        // /api/me never carries secret material.
+        let me = json_of(&api_me(&caller("alice", false)));
+        let me_s = serde_json::to_string(&me).unwrap();
+        assert!(!me_s.contains(&secret), "/api/me must not leak the TOTP secret");
+        for c in &codes {
+            assert!(!me_s.contains(c.as_str()), "/api/me must not leak a backup code");
+        }
+        // A subsequent login response carries no secret material either.
+        let code = totp::current_code(&secret, "alice").unwrap();
+        let login = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "alice", "password": "alice-password-1", "code": code }))).await;
+        let login_s = String::from_utf8_lossy(&login.body);
+        assert!(!login_s.contains(&secret), "login response must not leak the TOTP secret");
+        for c in &codes {
+            assert!(!login_s.contains(c.as_str()), "login response must not leak a backup code");
+        }
+        // Re-enroll is refused while active (no fresh secret is minted behind the user's back).
+        let reenroll = api_2fa_enroll(&ctx, &caller("alice", false)).await;
+        assert_eq!(reenroll.status, 409, "cannot re-enroll while 2FA is active");
     }
 
     #[tokio::test]

@@ -92,7 +92,7 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
                 eprintln!("password derivation failed (kdf={kdf_id})");
                 return 1;
             };
-            let user = User { username: username.clone(), pw_hash, salt, kdf: kdf_id, is_admin, created: store::now_iso() };
+            let user = User { username: username.clone(), pw_hash, salt, kdf: kdf_id, is_admin, created: store::now_iso(), ..Default::default() };
             if let Err(e) = store.add_user(user).await {
                 eprintln!("failed to persist the user to {}: {e}", store.backend());
                 return 1;
@@ -151,18 +151,60 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
             println!("  Any live browser session for {username} keeps running until the server restarts; the CLI cannot reach the in-memory session table.");
             0
         }
+        Some("2fa-disable") => {
+            // Admin recovery for a user locked out of their authenticator: clear their 2FA entirely.
+            // No code is asked for — the point is the user cannot supply one.
+            let Some(name) = positional(args, 2) else {
+                eprintln!("usage: agit-hub user 2fa-disable <name>");
+                return 2;
+            };
+            let username = store::normalize_username(name);
+            if store.user(&username).await.is_none() {
+                eprintln!("no such user: {username} (try `agit-hub user list`)");
+                return 1;
+            }
+            let uname = username.clone();
+            let cleared = store
+                .update_users(move |users| match users.iter_mut().find(|u| u.username == uname) {
+                    Some(u) => {
+                        let was = u.totp_enabled || u.totp_secret.is_some();
+                        u.totp_secret = None;
+                        u.totp_enabled = false;
+                        u.totp_backup_codes = vec![];
+                        was
+                    }
+                    None => false,
+                })
+                .await;
+            match cleared {
+                Ok(was) => {
+                    audit::append(root, "cli", audit::TWOFA_ADMIN_DISABLE, None, &format!("cleared 2FA for {username}"));
+                    if was {
+                        println!("cleared 2FA for {username}. They can log in with just their password now, and re-enroll from the UI.");
+                    } else {
+                        println!("{username} did not have 2FA enabled; nothing to clear.");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("failed to update the user in {}: {e}", store.backend());
+                    1
+                }
+            }
+        }
         Some("list") => {
             let users = store.users().await;
             if users.is_empty() {
                 println!("no users yet. `agit-hub user add <you> --admin` creates the first one.");
             }
             for u in users {
-                println!("{:<20} {:<8} {}", u.username, if u.is_admin { "admin" } else { "user" }, u.created);
+                let twofa = if u.totp_enabled { "2fa" } else { "—" };
+                println!("{:<20} {:<8} {:<4} {}", u.username, if u.is_admin { "admin" } else { "user" }, twofa, u.created);
             }
             0
         }
         _ => {
-            eprintln!("usage: agit-hub user add <name> [--admin] | agit-hub user passwd <name> | agit-hub user list");
+            eprintln!("usage: agit-hub user add <name> [--admin] | agit-hub user passwd <name> | agit-hub user 2fa-disable <name> | agit-hub user list");
             2
         }
     }

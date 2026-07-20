@@ -561,6 +561,7 @@ mod h4_tests {
                 kdf: kdf_id,
                 is_admin: false,
                 created: now_iso(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1118,6 +1119,7 @@ mod obs_tests {
                 kdf: kdf_id,
                 is_admin: true,
                 created: now_iso(),
+                ..Default::default()
             })
             .await
             .unwrap();

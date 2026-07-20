@@ -161,6 +161,7 @@ mod tests {
                 kdf: kdf_id,
                 is_admin: admin,
                 created: now_iso(),
+                ..Default::default()
             })
             .await
             .unwrap();
