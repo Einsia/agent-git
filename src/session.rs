@@ -167,20 +167,6 @@ struct Owned {
     by: Option<Attribution>,
 }
 
-impl Routed {
-    /// The command that actually commits what was just written. `agit a` resolves the legacy nested
-    /// store, so it is the right hint for that store and the wrong one for any other.
-    fn commit_hint(&self, rt: &str) -> String {
-        match self.agent {
-            None => format!("agit a add -A && agit a commit -m 'snap {rt} sessions'"),
-            Some(_) => {
-                let s = self.store.display();
-                format!("git -C {s} add -A && git -C {s} commit -m 'snap {rt} sessions'")
-            }
-        }
-    }
-}
-
 /// A repo from before agent identity: nothing here names an agent, so there is nothing to attribute
 /// against and the legacy nested store is the only place its sessions can go. The cutover (§12, `agit a
 /// import`) deletes this branch; until then, refusing would strand every repo that predates identity.
@@ -310,23 +296,22 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
         return Ok(0);
     }
 
+    // How many snapshots this run actually committed; commit_snap stamps each `● snapped … (#n)`.
+    let mut count = 0u64;
     for r in &routed {
         if let Some(n) = &r.note {
             errln!("  note   : {n}");
         }
-        // Held across mirror + harness capture: everything this pass writes into the store.
+        // Held across mirror + harness capture + commit: everything this pass writes into the store,
+        // and the read-modify-write commit_snap does on the store's index and HEAD.
         let _lock = lock_store(&r.store)?;
-        let (stats, hits, dst) = mirror_owned(&rt, env, r)?;
+        let (stats, _hits, dst) = mirror_owned(&rt, env, r)?;
         let who = match &r.agent {
             Some(a) => format!("   ({a} · {} session(s))", r.sessions.len()),
             None => String::new(),
         };
         outln!("  target : {}{who}", dst.display());
         outln!("  files  : {} files ({} updated / {} added), {} bytes", stats.total, stats.updated, stats.added, stats.bytes);
-        if hits > 0 {
-            errln!("  ⚠ {hits} suspected secret(s) mirrored into the store — `agit a commit` will REFUSE these until resolved (snap only mirrors; it did NOT commit).");
-            errln!("     Run `agit -a scan` to see them; fix, add an `agit:allow-secret` pragma or a `.agit-allow-secrets` entry, or override with AGIT_ALLOW_SECRETS=1.");
-        }
 
         // Capture the harness (MCP servers / skills / config) alongside the sessions, redacting
         // secrets. The harness is project-scoped, so every agent that worked here carries its own
@@ -344,7 +329,13 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
                 Err(e) => errln!("  ⚠ harness capture skipped: {e:#}"),
             }
         }
-        outln!("\n  Commit: {}", r.commit_hint(&rt));
+
+        // Mirror AND commit in one step, the same mirror → stage → gate → commit the watch tick runs.
+        // commit_snap takes no lock of its own — it assumes the caller holds the store lock (the
+        // `_lock` above), so calling it here is correct and re-locking would deadlock. Nothing staged
+        // is a clean no-op (no empty commit); a suspected secret blocks the commit, leaves the mirror
+        // on disk, and discloses the AGIT_ALLOW_SECRETS override — commit_snap warns for all of these.
+        commit_snap(&r.store, &rt, &mut count);
     }
     Ok(0)
 }
@@ -1204,6 +1195,35 @@ mod routing_tests {
             assert_eq!(routed.len(), 1);
             assert_eq!(routed[0].store, fe.store, "the store is keyed by aid, so a rename never moves it");
             assert_eq!(routed[0].agent.as_deref(), Some("frontend"), "the report must use the current label");
+        });
+    }
+
+    /// The watch tick (capture_pass) mirrors AND commits — the daemon path manual `snap` now matches.
+    /// Guards against regressing the auto-commit half of the watcher: one settled capture must advance
+    /// the store's HEAD with an `auto-snap` commit, and count how many it committed.
+    #[test]
+    fn capture_pass_mirrors_and_commits_the_dump() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
+            std::fs::create_dir_all(&slug).unwrap();
+            std::fs::write(slug.join("s1.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
+            crate::commands::record_launch("s1", &fe.aid, "frontend", &env, "claude-code", None).unwrap();
+
+            let before = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+            let mut count = 0u64;
+            capture_pass("claude-code", &env, false, &mut count).unwrap();
+
+            assert_eq!(count, 1, "one settled capture must record one commit");
+            let after = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+            assert_ne!(before, after, "capture_pass must commit — the store's HEAD must advance");
+            let subject = scope::git_in(&fe.store, &["log", "-1", "--format=%s"]).unwrap();
+            assert!(subject.starts_with("auto-snap claude-code"), "the commit must be the auto-snap: {subject}");
         });
     }
 }

@@ -1006,6 +1006,88 @@ fn snap_with_no_sessions_anywhere_names_both_runtimes() {
     assert!(err.contains("claude-code, codex"), "should name both runtimes in one breath: {err}");
 }
 
+// ───────────── `agit a snap` mirrors AND commits (gated), in one step ─────────────
+
+/// The behaviour change: a manual `agit a snap` of a clean session now COMMITS what it mirrored,
+/// matching the watch daemon. Before, snap only mirrored and printed a separate commit hint; now the
+/// store's HEAD advances with an `auto-snap` commit and the tree is left clean.
+#[test]
+fn snap_of_a_clean_session_commits_what_it_mirrored() {
+    let r = Repo::new();
+    let home = r.path().join("cchome");
+    seed_claude_session(&r, &home, "clean1", "honest work");
+
+    let before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
+    assert_eq!(code, 0, "snap must succeed: {err}{out}");
+
+    let after = r.git_agent(&["rev-parse", "HEAD"]);
+    assert_ne!(before, after, "snap must create a commit — HEAD must advance: {out}{err}");
+    let subject = r.git_agent(&["log", "-1", "--format=%s"]);
+    assert!(subject.starts_with("auto-snap claude-code"), "the commit must be the auto-snap: {subject}");
+    // Committed, not merely mirrored: no separate `agit a commit` step is left dangling.
+    assert!(r.captured("claude-code", "clean1.jsonl"), "the session must be mirrored: {out}");
+    assert!(
+        r.git_agent(&["status", "--porcelain"]).is_empty(),
+        "snap must leave a clean tree, not staged/untracked work waiting for a commit: {out}"
+    );
+    // And it must NOT print the old mirror-only commit hint.
+    assert!(!out.contains("agit a commit"), "snap no longer tells the user to commit separately: {out}");
+}
+
+/// A snap of a session that trips the secret gate must NOT commit: the dump is mirrored to disk and
+/// the block is disclosed, but held out of history — exactly commit_snap's contract. The disclosed
+/// AGIT_ALLOW_SECRETS override then commits it.
+#[test]
+fn snap_of_a_secret_session_is_mirrored_but_not_committed() {
+    let r = Repo::new();
+    let home = r.path().join("cchome");
+    seed_claude_session(&r, &home, "leak1", "key AKIAIOSFODNN7EXAMPLE");
+
+    let before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, _out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
+    assert_eq!(code, 0, "the snap itself does not fail — the mirror still happened: {err}");
+    assert_eq!(
+        r.git_agent(&["rev-parse", "HEAD"]),
+        before,
+        "a suspected secret must NOT be committed — HEAD must not move: {err}"
+    );
+    assert!(err.contains("not committed"), "the block must be disclosed in words: {err}");
+    assert!(r.captured("claude-code", "leak1.jsonl"), "the dump is still mirrored to disk regardless: {err}");
+
+    // The disclosed override commits it.
+    let (code, _o, err) =
+        r.agit_env(&[("HOME", home.to_str().unwrap()), ("AGIT_ALLOW_SECRETS", "1")], &["a", "snap"]);
+    assert_eq!(code, 0, "override snap must succeed: {err}");
+    assert_ne!(
+        r.git_agent(&["rev-parse", "HEAD"]),
+        before,
+        "AGIT_ALLOW_SECRETS=1 must let the held-back commit through: {err}"
+    );
+    assert!(r.git_agent(&["log", "-1", "--format=%s"]).starts_with("auto-snap claude-code"));
+}
+
+/// Idempotent: re-snapping with nothing new must make NO commit. The store's coalesce (nothing staged
+/// → no-op) means snap never writes an empty commit.
+#[test]
+fn snap_with_nothing_changed_makes_no_new_commit() {
+    let r = Repo::new();
+    let home = r.path().join("cchome");
+    seed_claude_session(&r, &home, "once", "work");
+
+    assert_eq!(r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]).0, 0, "first snap");
+    let head = r.git_agent(&["rev-parse", "HEAD"]);
+
+    // Second snap, same dump, nothing new to capture.
+    let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
+    assert_eq!(code, 0, "a no-op snap must still exit 0: {err}{out}");
+    assert_eq!(
+        r.git_agent(&["rev-parse", "HEAD"]),
+        head,
+        "a nothing-changed snap must not create an empty commit: {out}"
+    );
+}
+
 /// `harness apply` rewrites the project's own .mcp.json / .claude, so with both runtimes captured and
 /// no --from it must refuse and name them — not quietly apply claude's.
 #[test]

@@ -42,11 +42,13 @@ mkdir demo && cd demo && git init -q && echo "# Demo" > README.md && git add -A 
 agit init
 
 # 3. Do some AI work here with claude-code or codex (or resume an existing session).
-#    Then capture that work into the Agent Store:
+#    One command captures AND commits that work into the Agent Store (gated: a suspected
+#    secret is mirrored to disk but held out of history until you resolve it):
 agit a snap
 ```
 
 **They see:** `agit a status` — this repo, its agent, the captured sessions, last activity.
+(`agit a snap` already committed them — there is no separate commit step.)
 
 ```bash
 agit a status
