@@ -14,7 +14,7 @@ Anything not listed here is passed through to git: `agit <git-args>` runs on the
 |---|---|
 | `agit init [--agent <name>]` | Set up this repo: clone the agents `.agit.toml` declares, or mint the first with `--agent`. |
 | `agit start [--agent <name>] [--as <runtime>]` | Launch a session already carrying the agent's context. |
-| `agit snap [--from <runtime>]` | Snapshot this project's sessions into the store by hand. |
+| `agit snap [--from <runtime>]` | Capture this project's sessions into the store by hand: mirror and commit them in one gated step (a suspected secret is mirrored to disk but held out of history). |
 | `agit watch [--daemon\|--stop\|--status] [--no-convert]` | Hands-off auto-snap and auto-convert; `--daemon` runs it in the background. |
 | `agit convert <src> --to <runtime> [--write]` | Rewrite a session into the other runtime's format. |
 | `agit resume <src> [--as <runtime>] [--exec]` | Load a session into a runtime and continue it. |
@@ -26,7 +26,8 @@ Anything not listed here is passed through to git: `agit <git-args>` runs on the
 | `agit provenance verify <session>` | Self-verify a captured session's signature. See [Security](security.html). |
 
 Set up capture once with `agit watch --daemon`: it snapshots new sessions as you work and converts
-them between runtimes so either CLI can resume them. `agit snap` is the manual alternative.
+them between runtimes so either CLI can resume them. `agit snap` is the manual alternative, and mirrors
+and commits in one gated step just as the daemon does.
 
 `agit a commit`, `agit a push`, and every snapshot scan the content for secrets in-process before
 handing off to git, so the scan holds even when git's own hook is skipped. The visible override is
@@ -45,7 +46,7 @@ handing off to git, so the scan holds even when git's own hook is skipped. The v
 | `agit a rename <old> <new>` | Rename an agent. |
 | `agit a log [--raw\|--git]` | The store's sessions as a timeline, most recent first: runtime, when, where it ran, its opening prompt, and its tool activity. `--raw` (or `--git`) falls back to a plain `git log` on the store. |
 | `agit a diff [<from>] [<to>] [--raw\|--git]` | The session-level change between two refs: the prompts and edits added, not a line-by-line diff of the transcript bytes. With no refs it uses this repo's unpushed range. `--raw` (or `--git`) falls back to a plain `git diff`. |
-| `agit a push` | Push the store's sessions and record its remote in `.agit.toml` (credentials stripped). Scans for secrets first. |
+| `agit a push [<remote>\|<url>]` | Push the store's sessions and record the remote in `.agit.toml` (credentials stripped). With no refspec it pushes the current branch (a fresh store needs no `-u`); with no remote it fans out to every bound remote, naming each. Scans for secrets first, and on a hub push rejected for auth it points at the hub's token page. |
 | `agit a pull` | Fast-forward pull; divergence routes to `agit a merge`. |
 | `agit a fetch` | Fetch, and report which sessions arrived. |
 | `agit a rebind [--remote <url>] [--new-id]` | Repair a binding's identity, or give a fork its own aid. See [Migration](migration.html). |

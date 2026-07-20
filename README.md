@@ -83,7 +83,7 @@ Anything agit does not recognize as its own verb is passed straight through to g
 |---|---|
 | `agit init [--agent <name>]` | Set up this repo: clone the agents `.agit.toml` declares, or mint the first one with `--agent`. |
 | `agit start [--agent <name>] [--as <runtime>]` | Launch a session already carrying the agent's context. |
-| `agit snap [--from <runtime>]` | Snapshot this project's sessions into the store by hand. |
+| `agit snap [--from <runtime>]` | Capture this project's sessions into the store by hand: mirror and commit in one gated step. |
 | `agit watch [--daemon\|--stop\|--status] [--no-convert]` | Hands-off capture and runtime conversion; `--daemon` backgrounds it. |
 | `agit convert <src> --to <runtime> [--write]` | Rewrite a session into the other runtime's format. |
 | `agit resume <src> [--as <runtime>] [--exec]` | Load a session into a runtime and continue it. |
@@ -148,6 +148,10 @@ agit a push -u origin HEAD          # records the remote in .agit.toml, credenti
 git add .agit.toml && git commit    # commit the binding so teammates get the agent
 ```
 
+Once the remote is bound you can drop the refspec: `agit a push` sends the current branch, and with more
+than one remote bound a bare `agit a push` fans out to every one, naming each. If a hub rejects the push
+for authentication, agit points you at its token page.
+
 A teammate, on a fresh clone of the **code** repo, already has the binding. One command sets them up:
 
 ```bash
@@ -172,7 +176,7 @@ To pull a single agent instead of all of them, use `agit a clone frontend`. Its 
 
 ## Security
 
-Sessions can carry secrets: a `.env` the agent read, a token it printed. `agit a commit`, `agit a push`, and every snapshot scan the content in-process before delegating to git, so the scan holds even when git's own hook is skipped with `--no-verify`. The one way through is `AGIT_ALLOW_SECRETS=1`, a visible override that agit discloses every time it honors it (unlike `git --no-verify`, which leaves no trace). Known-safe hits can be exempted with a `.agit-allow-secrets` allowlist or an `agit:allow-secret` pragma. The hub scans again on the way in, so a secret cannot land in a shared repo by accident.
+Sessions can carry secrets: a `.env` the agent read, a token it printed. `agit a commit`, `agit a push`, and every snapshot scan the content in-process before delegating to git, so the scan holds even when git's own hook is skipped with `--no-verify`. The way through the local gate is `AGIT_ALLOW_SECRETS=1`, a visible override that agit discloses every time it honors it (unlike `git --no-verify`, which leaves no trace). Known-safe hits can be exempted with a `.agit-allow-secrets` allowlist or an `agit:allow-secret` pragma, both of which the hub honors too. The hub scans again on the way in (a client-side override does not reach it), so a secret cannot land in a shared repo by accident.
 
 Provenance ties a captured session to the machine that produced it: each machine has an ed25519 key (`agit provenance key`) that signs sessions as they are captured, and `agit provenance verify <session>` self-verifies one. See [Security](docs/guide/security.md).
 

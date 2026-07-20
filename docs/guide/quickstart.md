@@ -44,8 +44,9 @@ either CLI stays resumable in the other. After this you never run a capture comm
 
 Pass `--no-convert` to snapshot only and skip the runtime conversion.
 
-Without the daemon you capture by hand: `agit snap` copies the runtime's current session files into the
-store, then `agit a commit -am "auth flow"` commits them. The daemon just does both for you.
+Without the daemon you capture by hand with `agit snap`: it copies the runtime's current session files
+into the store and commits them, running the secret gate first exactly as the daemon does. It is the
+same capture, just triggered by hand instead of on a timer.
 
 ## Work
 
@@ -73,7 +74,8 @@ git add .agit.toml && git commit -m "declare the frontend agent"
 ```
 
 `agit a push` records the remote into `.agit.toml` as it pushes, with credentials stripped. Commit that
-file so teammates get the agent and know where to clone it. Later pushes send only new sessions.
+file so teammates get the agent and know where to clone it. Later pushes are a bare `agit a push` (no
+refspec needed) and send only new sessions.
 `agit a pull` fast-forwards; if the histories have diverged it routes you to `agit a merge`.
 
 For a shared server with a web UI and per-agent permissions, see [The hub](../hub.html).

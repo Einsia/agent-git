@@ -407,12 +407,20 @@ git pull
 HUB_DOMAIN=hub.example.com docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-**systemd:** drop in the new binary and restart.
+**systemd:** back up the running binary, drop in the new one, and restart. Keeping the
+previous binary is your rollback: if the new one does not come up, one `install` of the
+backup plus a restart is back to where you were.
 
 ```sh
+sudo cp -p /usr/local/bin/agit-hub /usr/local/bin/agit-hub.bak   # rollback point
 sudo install -m 0755 target/release/agit-hub /usr/local/bin/agit-hub
 sudo systemctl restart agit-hub.service
 ```
+
+A migration runs inside a transaction and fails closed: if one cannot complete, the boot
+aborts and no ref or row is half-written, so the previous binary starts cleanly against
+the unchanged data. `systemctl is-active agit-hub` after a restart is the check that the
+migration went through.
 
 You never run a migration by hand. On start the hub reports anything needing
 attention: users with no accounts, old unowned repos to claim (`agit-hub add <name>

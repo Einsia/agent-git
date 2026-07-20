@@ -25,28 +25,36 @@ gate is the last check before a secret in a transcript is committed to the store
 
 ### When the gate finds something
 
-The gate prints each suspected secret (the file, line, rule, and an excerpt) and refuses. You then have
-three ways forward:
+The gate prints each suspected secret (the file, line, rule, and an excerpt) and refuses, stating
+plainly that the action did not happen: a blocked `agit a commit` creates no commit, and a blocked push
+sends nothing. You then have three ways forward:
 
 - **Fix it.** Remove the secret from the session and try again.
 - **Mark a false positive.** If a hit is known-safe (a documentation example, a placeholder), exempt it
   with an `agit:allow-secret` pragma on that line, or add an entry to the store's `.agit-allow-secrets`
-  allowlist file. The pragma exempts one physical line; the allowlist exempts a matched string.
-- **Override the whole gate.** Re-run with `AGIT_ALLOW_SECRETS=1` (`true` and `yes` also count) to let
-  the action through despite the findings.
+  allowlist file. The pragma exempts one physical line; the allowlist exempts a matched string. Both are
+  read by the hub's gate too (the pragma travels in the commit; the allowlist lives in the bare repo),
+  so a false positive marked this way clears the local *and* the server check.
+- **Override the local gate.** Re-run with `AGIT_ALLOW_SECRETS=1` (`true` and `yes` also count) to let
+  the action through despite the findings. This clears agit's *local* gate only; a push to a hub still
+  meets the hub's own server-side gate, which the flag cannot reach ([On the hub](#on-the-hub)).
 
 `AGIT_ALLOW_SECRETS` is a visible, auditable override, not a silent bypass. agit discloses it every
-time it honors it: which action, which findings, and that pushing publishes them to the team. That is
-the difference from git's `--no-verify`, which leaves no trace. The escape stays on the record instead
-of being hidden at a coarser grain.
+time it honors it: which action, which findings, and that you own the consequences. That is the
+difference from git's `--no-verify`, which leaves no trace. The escape stays on the record instead of
+being hidden at a coarser grain.
 
 Run the scan by hand any time with `agit scan`.
 
 ### On the hub
 
 When you push to a [hub](../hub.html), it scans again server-side on the way in and rejects a push that
-carries a secret, so the backstop holds even for a client that never ran the gate. Secret scanning
-recognizes known secret shapes; it is a strong backstop, not a guarantee against a novel one.
+carries a secret, so the backstop holds even for a client that never ran the gate, or one that cleared
+its own gate with `AGIT_ALLOW_SECRETS`, which is a client-side flag and does not travel to the server.
+A genuine false positive gets past the hub gate the same way it gets past the local one: the
+`agit:allow-secret` pragma rides along in the commit, or the operator adds the string to the bare repo's
+`.agit-allow-secrets`. Secret scanning recognizes known secret shapes; it is a strong backstop, not a
+guarantee against a novel one.
 
 ## Provenance
 

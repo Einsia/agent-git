@@ -72,6 +72,12 @@ through one authorization decision, `acl::decide(caller, agent, action) -> Allow
 | Owner | yes | yes | yes |
 | Site admin | yes | yes | yes |
 
+When `decide` denies, the reason comes back named and actionable rather than as a bare rejection: a
+refused push tells you which account it authenticated as and what it lacks (`denied: authenticated as
+'bob', but that account has no write access to alice/frontend`), so a wrong token, a missing grant, and
+a read-only scope are easy to tell apart. Existence is still not disclosed: an agent you cannot read is
+answered identically whether it is private or absent.
+
 There are two kinds of credential:
 
 - **Cookie sessions, for people.** `POST /api/login` returns an `HttpOnly; SameSite=Lax` cookie (also
@@ -79,7 +85,10 @@ There are two kinds of credential:
   log out. Passwords live in `users.json` (mode 0600), hashed with argon2id and a per-user salt.
 - **Tokens, for git and scripts.** Sent as `Authorization: Bearer <token>`, or typed into git's
   password prompt (any username works). A token can be bound to a single agent, given a TTL, and
-  revoked. The server stores only its sha256 digest; the plaintext is shown once, at creation.
+  revoked; the binding is checked against the token's own scope at creation, so a write token can only be
+  bound to an agent you can already write, so you cannot mint one against an agent you only read and have
+  it fail later at push. The server stores only its sha256 digest; the plaintext is shown once, at
+  creation.
 
 A token is an **upper bound** on permission, never a source of it: effective permission is the token's
 scope intersected with the owner's own permission. A read-only token in an admin's hands still only
@@ -111,10 +120,12 @@ grant admin, which stays CLI-only. With registration off, `POST /api/register` i
 
 Sessions can carry secrets: a `.env` the agent read, a token it printed. The hub scans every push
 server-side and rejects it if it finds one, so a leaked credential cannot land in a shared repo even
-when someone bypasses the local hook with `--no-verify`. The scan covers blob content, commit messages,
-author and committer identity, and tag messages — a secret in any of those channels is refused. It
-fails closed: a push it cannot fully scan (an oversized blob, an unreadable object) is rejected rather
-than waved through.
+when someone cleared the local checks (git's `--no-verify`, or agit's own `AGIT_ALLOW_SECRETS`), neither
+of which reaches the server. A false positive gets past this gate the way it gets past the local one:
+an `agit:allow-secret` pragma travels in the commit, or the operator allowlists the string in the bare
+repo's `.agit-allow-secrets`. The scan covers blob content, commit messages, author and committer
+identity, and tag messages; a secret in any of those channels is refused. It fails closed: a push it
+cannot fully scan (an oversized blob, an unreadable object) is rejected rather than waved through.
 
 ## Blob storage
 

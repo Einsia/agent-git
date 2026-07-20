@@ -243,10 +243,11 @@ Walk the mentor through, logged in at https://agit.anggita.org:
 ---
 
 ### Notes / caveats to keep the demo smooth
-- Create the hub store **before** `agit a push` (create reserves the name; push populates it).
-  Cloning a *never-pushed* store errors "no agent.toml" — push first. *(Being improved: a
-  "create with an empty agent" option + a graceful clone message are in flight.)*
-- Enrolling from a second machine currently **replaces** your registered key (single-key today);
-  a multi-key "SSH-keys" model is in flight — until it lands, enroll from the machine you'll demo from.
+- Create the hub store **before** `agit a push` (create reserves the name; push populates it). At
+  creation you can check **"initialize with an empty agent"** so a teammate can clone it before your
+  first push, and a clone of a not-yet-initialized store now explains what to do instead of erroring.
+- Enrolling from a second machine **adds** that machine's device key to your account (the multi-key
+  "SSH-keys" model), so provenance verifies against any machine you enrolled; a second machine no longer
+  replaces your key.
 - Email verification has no SMTP wired yet: grab the verify link from the hub logs /
   `agit-hub user verify-link <you>` when demoing the verified badge.
