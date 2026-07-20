@@ -18,6 +18,11 @@ export type Scope = "read" | "write"
 export interface Me {
   username: string
   is_admin: boolean
+  // The account's registered committer email (self-asserted at `agit identity enroll`), or "" if none.
+  email?: string
+  // Whether that email has been VERIFIED. Attribution in provenance verification is gated on this — an
+  // unverified (possibly squatted) email is not attributed. Drives the Verified / Unverified badge.
+  email_verified?: boolean
 }
 
 export interface Member {
@@ -349,6 +354,18 @@ export const api = {
     request<Me>("/api/register", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<void>("/api/logout", { method: "POST" }),
   me: () => get<Me>("/api/me"),
+
+  // ── email verification ──
+  // Consume a verification token (the unguessable capability from the emailed link — paste either the
+  // full link or the bare token). 400 on an unknown/expired/spent token. On 200 the account is verified.
+  verifyEmail: (token: string) =>
+    request<{ ok: boolean; username: string; email: string; email_verified: boolean }>("/api/verify-email", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+    }),
+  // Mint + deliver (operator-forwarded) a fresh verification link for the signed-in caller's email. The
+  // token is never returned here — an operator forwards the logged/printed link. 400 if no email on file.
+  resendEmailVerification: () => request<{ ok: boolean }>("/api/me/verify/resend", { method: "POST" }),
 
   // ── two-factor auth (TOTP) ──
   // There is deliberately no "is 2FA on?" read endpoint (GET /api/me returns only {username,

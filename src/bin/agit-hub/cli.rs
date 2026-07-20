@@ -98,9 +98,65 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
                 return 1;
             }
             audit::append(root, "cli", audit::USER_ADD, None, &format!("{username} admin={is_admin}"));
+            // Mint a verification token at account creation. A CLI-added account has no email on file yet
+            // (the registry email is self-asserted at `agit identity enroll`), so this is a no-op here; the
+            // token is minted lazily once an email is enrolled, or on `user verify-link` / a UI resend.
+            let _ = crate::emailverify::mint_and_deliver(&store, &username).await;
             println!("created user {username}{}", if is_admin { " (site admin)" } else { "" });
             println!("  The password is derived with argon2id and stored in {}; the plaintext never hits disk.", store.describe());
             0
+        }
+        Some("verify-email") => {
+            // Admin/host force-verify: mark a user's email VERIFIED out-of-band (the operator vouch). This
+            // is the anti-squatting gate for provenance attribution — see store::get_identity_key_by_email.
+            let Some(name) = positional(args, 2) else {
+                eprintln!("usage: agit-hub user verify-email <name>");
+                return 2;
+            };
+            let username = store::normalize_username(name);
+            if store.user(&username).await.is_none() {
+                eprintln!("no such user: {username} (try `agit-hub user list`)");
+                return 1;
+            }
+            match store.set_email_verified(&username, true).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!("no such user: {username}");
+                    return 1;
+                }
+                Err(e) => {
+                    eprintln!("failed to record the verification in {}: {e}", store.backend());
+                    return 1;
+                }
+            }
+            audit::append(root, "cli", audit::USER_EMAIL_VERIFY, None, &format!("admin force-verified {username}"));
+            println!("marked {username}'s email as verified.");
+            println!("  Their committer email is now attributable in provenance verification (verified-as {username}).");
+            0
+        }
+        Some("verify-link") => {
+            // Print the current verification URL for the operator to forward to the address being proven —
+            // the hermetic, no-SMTP delivery path. Mints a fresh single-use token each call.
+            let Some(name) = positional(args, 2) else {
+                eprintln!("usage: agit-hub user verify-link <name>");
+                return 2;
+            };
+            let username = store::normalize_username(name);
+            if store.user(&username).await.is_none() {
+                eprintln!("no such user: {username} (try `agit-hub user list`)");
+                return 1;
+            }
+            match crate::emailverify::mint_and_deliver(&store, &username).await {
+                Some(url) => {
+                    println!("{url}");
+                    eprintln!("Forward this single-use link to {username}'s email address; it expires in 24h.");
+                    0
+                }
+                None => {
+                    eprintln!("{username} has no email on file yet. They must `agit identity enroll` with an email first.");
+                    1
+                }
+            }
         }
         Some("passwd") => {
             // Admin-mediated password reset (the recovery door for a locked-out user). Reads the new
@@ -204,7 +260,7 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
             0
         }
         _ => {
-            eprintln!("usage: agit-hub user add <name> [--admin] | agit-hub user passwd <name> | agit-hub user 2fa-disable <name> | agit-hub user list");
+            eprintln!("usage: agit-hub user add <name> [--admin] | agit-hub user passwd <name> | agit-hub user 2fa-disable <name> | agit-hub user verify-email <name> | agit-hub user verify-link <name> | agit-hub user list");
             2
         }
     }

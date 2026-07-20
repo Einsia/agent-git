@@ -55,6 +55,12 @@ pub const TWOFA_DISABLE: &str = "user.2fa.disable";
 pub const TWOFA_ADMIN_DISABLE: &str = "user.2fa.admin.disable";
 /// A user published (or rotated) their public keys in the shared identity registry.
 pub const IDENTITY_ENROLL: &str = "user.identity.enroll";
+/// Email-verification lifecycle. `verify` = an account's email was marked VERIFIED (a token was consumed,
+/// or a site admin force-verified it — the detail records which); `resend` = a fresh verification token
+/// was minted and delivered for an account. Verification is the anti-squatting gate for provenance
+/// attribution, so both transitions are auditable.
+pub const USER_EMAIL_VERIFY: &str = "user.email.verify";
+pub const USER_EMAIL_RESEND: &str = "user.email.resend";
 pub const AGENT_CREATE: &str = "agent.create";
 pub const AGENT_DELETE: &str = "agent.delete";
 pub const AGENT_RENAME: &str = "agent.rename";

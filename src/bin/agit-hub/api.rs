@@ -85,9 +85,13 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("POST", "login") => return api_login(ctx, req, body).await,
         ("POST", "register") => return api_register(ctx, client_ip, body).await,
         ("POST", "logout") => return api_logout(ctx, req, caller).await,
-        ("GET", "me") => return api_me(caller),
+        ("GET", "me") => return api_me(ctx, caller).await,
         ("GET", "me/invitations") => return api_me_invitations(ctx, caller).await,
         ("POST", "me/password") => return api_me_password(ctx, req, caller, body).await,
+        // Consume a verification token (the capability is the auth — no session needed) and mint a fresh
+        // one for the logged-in caller. See the email-squatting defense in store::get_identity_key_by_email.
+        ("POST", "verify-email") => return api_verify_email(ctx, body).await,
+        ("POST", "me/verify/resend") => return api_me_verify_resend(ctx, caller).await,
         ("POST", "me/2fa/enroll") => return api_2fa_enroll(ctx, caller).await,
         ("POST", "me/2fa/confirm") => return api_2fa_confirm(ctx, caller, body).await,
         ("POST", "me/2fa/disable") => return api_2fa_disable(ctx, caller, body).await,
@@ -184,6 +188,13 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         if let Some(username) = after.strip_suffix("/2fa-disable") {
             return match m {
                 "POST" => api_admin_2fa_disable(ctx, caller, username).await,
+                _ => Resp::text(405, "method not allowed"),
+            };
+        }
+        // Admin force-mark a user's email verified (the out-of-band operator vouch).
+        if let Some(username) = after.strip_suffix("/verify-email") {
+            return match m {
+                "POST" => api_admin_verify_email(ctx, caller, username).await,
                 _ => Resp::text(405, "method not allowed"),
             };
         }
@@ -444,11 +455,24 @@ pub(crate) async fn api_logout(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     Resp::no_content().with("Set-Cookie", &websession::clear_cookie(ctx.cfg.tls))
 }
 
-pub(crate) fn api_me(caller: &Caller) -> Resp {
-    match &caller.user {
-        Some(u) => Resp::json(serde_json::json!({ "username": u, "is_admin": caller.is_admin })),
-        None => Resp::err(401, "not logged in"),
-    }
+/// `GET /api/me` — the logged-in caller's own account facts. Includes `email` (the account's registered
+/// committer email, from the identity registry, or `""` if none is enrolled) and `email_verified` (the
+/// anti-squatting gate) so the Account page can render the Verified / Unverified badge and its resend
+/// affordance without a second round-trip.
+pub(crate) async fn api_me(ctx: &Ctx, caller: &Caller) -> Resp {
+    let Some(u) = &caller.user else {
+        return Resp::err(401, "not logged in");
+    };
+    // The email of record lives in the identity registry (self-asserted at enroll); email_verified lives
+    // on the users row. Both read tolerate a missing row (fresh account not yet enrolled → "" / false).
+    let email = ctx.store.get_identity_key(u).await.map(|k| k.email).unwrap_or_default();
+    let email_verified = ctx.store.user(u).await.map(|user| user.email_verified).unwrap_or(false);
+    Resp::json(serde_json::json!({
+        "username": u,
+        "is_admin": caller.is_admin,
+        "email": email,
+        "email_verified": email_verified,
+    }))
 }
 
 /// `POST /api/register` — self-service signup. Creates a **normal, non-admin** user and logs them in
@@ -521,6 +545,11 @@ pub(crate) async fn api_register(ctx: &Ctx, client_ip: Option<IpAddr>, body: &[u
     };
     tracing::info!(user = %username, "registration");
     audit_append(ctx.root(), &username, audit::USER_REGISTER, None, "").await;
+    // Mint a verification token at account creation. A fresh registrant has no email on file yet (the
+    // registry email is self-asserted later, at `identity enroll`), so this is a no-op here and the token
+    // is minted lazily once an email is enrolled or an explicit resend is requested. The token is NEVER
+    // returned in this response body — that would defeat verification.
+    let _ = crate::emailverify::mint_and_deliver(&ctx.store, &username).await;
     Resp::json(serde_json::json!({ "username": username, "is_admin": false }))
         .with("Set-Cookie", &websession::set_cookie(&sid, ctx.cfg.tls))
 }
@@ -838,6 +867,74 @@ pub(crate) async fn api_admin_2fa_disable(ctx: &Ctx, caller: &Caller, username: 
     Resp::json(serde_json::json!({ "ok": true, "user": target, "enabled": false }))
 }
 
+/// `POST /api/verify-email` `{ token }` — consume an email-verification token and mark the owning account
+/// verified. UNAUTHENTICATED: the unguessable token IS the capability (like an org invitation id), so no
+/// session is required — anyone holding the link can complete the proof. The token is single-use and
+/// expiring; an unknown or expired one is a flat 400. Idempotent-safe: verifying an already-verified
+/// account is fine (the flag is simply set true again), but a spent token cannot be replayed.
+pub(crate) async fn api_verify_email(ctx: &Ctx, body: &[u8]) -> Resp {
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(token) = str_field(&v, "token").filter(|s| !s.trim().is_empty()) else {
+        return Resp::err(400, "want a verification token");
+    };
+    let Some((username, email)) = ctx.store.consume_email_token(&token).await else {
+        return Resp::err(400, "invalid or expired verification token");
+    };
+    match ctx.store.set_email_verified(&username, true).await {
+        // The token proved this account, so the row exists; a false here would be a concurrent delete.
+        Ok(true) => {}
+        Ok(false) => return Resp::err(404, "no such user"),
+        Err(_) => return Resp::err(500, "couldn't record the verification"),
+    }
+    tracing::info!(user = %username, "email verified via token");
+    audit_append(ctx.root(), &username, audit::USER_EMAIL_VERIFY, None, "verified via token").await;
+    Resp::json(serde_json::json!({ "ok": true, "username": username, "email": email, "email_verified": true }))
+}
+
+/// `POST /api/me/verify/resend` — mint + deliver a fresh verification token for the logged-in caller's
+/// registered email (the operator-forwarded delivery: the URL is logged and printable via the CLI). The
+/// token is NEVER returned in the response — that would defeat verification. A caller with no email on
+/// file yet (identity not enrolled) is a 400 with a hint.
+pub(crate) async fn api_me_verify_resend(ctx: &Ctx, caller: &Caller) -> Resp {
+    let Some(username) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    match crate::emailverify::mint_and_deliver(&ctx.store, &username).await {
+        Some(_url) => {
+            audit_append(ctx.root(), &username, audit::USER_EMAIL_RESEND, None, "self-service resend").await;
+            Resp::json(serde_json::json!({ "ok": true }))
+        }
+        None => Resp::err(400, "no email on file to verify — enroll an identity email first (agit identity enroll)"),
+    }
+}
+
+/// `POST /api/users/<username>/verify-email` — admin-only force-verify (the out-of-band operator vouch,
+/// e.g. after confirming the address by hand). Gated on `caller.is_admin`; sets the target's
+/// `email_verified` directly, no token consumed. The sibling of the admin password-reset / 2FA-disable
+/// doors. Idempotent: force-verifying an already-verified account is a no-op success.
+pub(crate) async fn api_admin_verify_email(ctx: &Ctx, caller: &Caller, username: &str) -> Resp {
+    let Some(actor) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    if !caller.is_admin {
+        return Resp::err(403, "admin only");
+    }
+    let target = store::normalize_username(username);
+    if ctx.store.user(&target).await.is_none() {
+        return Resp::err(404, "no such user");
+    }
+    match ctx.store.set_email_verified(&target, true).await {
+        Ok(true) => {}
+        Ok(false) => return Resp::err(404, "no such user"),
+        Err(_) => return Resp::err(500, "couldn't record the verification"),
+    }
+    tracing::info!(actor = %actor, user = %target, "admin force-verified email");
+    audit_append(ctx.root(), &actor, audit::USER_EMAIL_VERIFY, None, &format!("admin force-verified {target}")).await;
+    Resp::json(serde_json::json!({ "ok": true, "user": target, "email_verified": true }))
+}
+
 // ── shared identity registry (encryption-recipients Wave 1) ──
 //
 // The ONE registry serving both provenance signing-key lookup and (Wave 2+) encryption recipient
@@ -918,6 +1015,10 @@ pub(crate) async fn api_identity_enroll(ctx: &Ctx, caller: &Caller, body: &[u8])
     if email.len() > 320 {
         return Resp::err(400, "email is too long (max 320 chars)");
     }
+    // Capture the previously-enrolled email BEFORE the upsert overwrites it, so we can tell whether this
+    // enroll CHANGES the address. Normalized both sides, matching how the store stores + matches emails.
+    let new_email = store::normalize_email(&email);
+    let prev_email = ctx.store.get_identity_key(&username).await.map(|k| store::normalize_email(&k.email)).unwrap_or_default();
     let row = store::IdentityKey {
         username: username.clone(),
         ed25519_pub,
@@ -936,6 +1037,17 @@ pub(crate) async fn api_identity_enroll(ctx: &Ctx, caller: &Caller, body: &[u8])
         Err(_) => return Resp::err(500, "couldn't record the identity key"),
     }
     audit_append(ctx.root(), &username, audit::IDENTITY_ENROLL, None, &format!("epoch={epoch}")).await;
+    // Anti-squatting: a CHANGED committer email must be RE-PROVEN. Reset `email_verified` to false and mint
+    // a fresh verification token whenever the enrolled email differs from the prior one — otherwise a user
+    // could verify address A, then re-enroll claiming address B and keep the verified flag, re-opening the
+    // squatting hole. An unchanged email leaves the verified state (and any prior proof) untouched.
+    if new_email != prev_email {
+        let _ = ctx.store.set_email_verified(&username, false).await;
+        if !new_email.is_empty() {
+            let _ = crate::emailverify::deliver(&ctx.store, &username, &new_email).await;
+            audit_append(ctx.root(), &username, audit::USER_EMAIL_RESEND, None, "identity enroll changed the email").await;
+        }
+    }
     Resp::json(serde_json::json!({ "username": username, "epoch": epoch }))
 }
 
@@ -4094,7 +4206,7 @@ mod tests {
         add_user(&ctx, "alice", "alice-password-1", false).await;
         let (secret, codes) = activate_2fa(&ctx, "alice").await;
         // /api/me never carries secret material.
-        let me = json_of(&api_me(&caller("alice", false)));
+        let me = json_of(&api_me(&ctx, &caller("alice", false)).await);
         let me_s = serde_json::to_string(&me).unwrap();
         assert!(!me_s.contains(&secret), "/api/me must not leak the TOTP secret");
         for c in &codes {
@@ -4610,9 +4722,16 @@ mod tests {
             r.target = format!("/api/identity/by-email?email={email}");
             r
         };
+        // The email-squatting defense: an enrolled-but-UNVERIFIED email is NOT attributable, so the lookup
+        // is a normal 404 (a squatter who never controls the mailbox never clears this gate).
+        let before = api_identity_by_email(&ctx, &by_email("Alice%40corp.com"), &caller("bob", false)).await;
+        assert_eq!(before.status, 404, "an unverified email must not attribute (anti-squatting)");
+
+        // Verify alice's email out-of-band (admin force-verify here), then the lookup resolves.
+        ctx.store.set_email_verified("alice", true).await.unwrap();
         // The committer email (percent-encoded, mixed case) resolves back to alice with her signing key.
         let hit = api_identity_by_email(&ctx, &by_email("Alice%40corp.com"), &caller("bob", false)).await;
-        assert_eq!(hit.status, 200, "any authenticated caller may resolve an email");
+        assert_eq!(hit.status, 200, "a verified email resolves for any authenticated caller");
         let v = json_of(&hit);
         assert_eq!(v["username"], "alice");
         assert_eq!(v["ed25519_pub"], ed_pub);
@@ -4623,5 +4742,94 @@ mod tests {
         // Anonymous is refused before any lookup.
         let anon = api_identity_by_email(&ctx, &by_email("alice%40corp.com"), &Caller::anonymous()).await;
         assert_eq!(anon.status, 401);
+    }
+
+    // ── email verification ──
+
+    /// Enroll an email, resend a token (operator-forwarded), consume it via POST /api/verify-email, and
+    /// confirm the account is now verified and its email is attributable. Also covers the single-use +
+    /// bad-token 400s and that /api/me exposes email + email_verified.
+    #[tokio::test]
+    async fn email_verification_flow_end_to_end() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let home = tempfile::tempdir().unwrap();
+        let sk = agit::agent::load_or_create_signing_key(home.path()).unwrap();
+        let ed_pub = hex::encode(sk.verifying_key().to_bytes());
+        let x_pub = "ab".repeat(32);
+        let enroll_sig = agit::agent::sign_hex(&sk, &agit::agent::identity_enroll_message("alice", 0, &ed_pub, &x_pub));
+        api_identity_enroll(
+            &ctx,
+            &caller("alice", false),
+            &body(serde_json::json!({ "ed25519_pub": ed_pub, "x25519_pub": x_pub, "epoch": 0, "enroll_sig": enroll_sig, "email": "alice@corp.com" })),
+        )
+        .await;
+
+        // /api/me exposes the email and the (still false) verified flag.
+        let me = json_of(&api_me(&ctx, &caller("alice", false)).await);
+        assert_eq!(me["email"], "alice@corp.com");
+        assert_eq!(me["email_verified"], false);
+
+        // A bad token is a flat 400.
+        assert_eq!(api_verify_email(&ctx, &body(serde_json::json!({ "token": "evt_nope" }))).await.status, 400);
+
+        // Resend mints a fresh token (delivered out-of-band); the response never carries the token.
+        let resend = api_me_verify_resend(&ctx, &caller("alice", false)).await;
+        assert_eq!(resend.status, 200);
+        assert!(!String::from_utf8_lossy(&resend.body).contains("evt_"), "the token is never returned in the response");
+
+        // Pull the delivered token straight from the store (stands in for the operator forwarding it),
+        // consume it, and confirm the account flips to verified.
+        let token = ctx.store.mint_email_token("alice", "alice@corp.com", std::time::Duration::from_secs(3600)).await.unwrap();
+        let ok = api_verify_email(&ctx, &body(serde_json::json!({ "token": token.clone() }))).await;
+        assert_eq!(ok.status, 200);
+        assert!(ctx.store.user("alice").await.unwrap().email_verified, "the token consume marks the account verified");
+        // Single-use: replaying the same token is a 400.
+        assert_eq!(api_verify_email(&ctx, &body(serde_json::json!({ "token": token }))).await.status, 400);
+
+        // /api/me now reports verified, and the email is attributable.
+        assert_eq!(json_of(&api_me(&ctx, &caller("alice", false)).await)["email_verified"], true);
+        assert!(ctx.store.get_identity_key_by_email("alice@corp.com").await.is_some());
+    }
+
+    /// Re-enrolling with a DIFFERENT email must RESET verification (the squatting hole otherwise reopens:
+    /// verify address A, then claim address B keeping the verified flag).
+    #[tokio::test]
+    async fn re_enroll_with_a_new_email_resets_verification() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let home = tempfile::tempdir().unwrap();
+        let sk = agit::agent::load_or_create_signing_key(home.path()).unwrap();
+        let ed_pub = hex::encode(sk.verifying_key().to_bytes());
+        let x_pub = "ab".repeat(32);
+        let enroll = |epoch: i64, email: &str| {
+            let sig = agit::agent::sign_hex(&sk, &agit::agent::identity_enroll_message("alice", epoch, &ed_pub, &x_pub));
+            body(serde_json::json!({ "ed25519_pub": ed_pub, "x25519_pub": x_pub, "epoch": epoch, "enroll_sig": sig, "email": email }))
+        };
+        api_identity_enroll(&ctx, &caller("alice", false), &enroll(0, "alice@corp.com")).await;
+        ctx.store.set_email_verified("alice", true).await.unwrap();
+        assert!(ctx.store.get_identity_key_by_email("alice@corp.com").await.is_some());
+
+        // Re-enroll (advancing epoch) claiming a NEW email → verification is reset, neither email attributes.
+        assert_eq!(api_identity_enroll(&ctx, &caller("alice", false), &enroll(1, "ceo@corp.com")).await.status, 200);
+        assert!(!ctx.store.user("alice").await.unwrap().email_verified, "changing the email resets verification");
+        assert!(ctx.store.get_identity_key_by_email("ceo@corp.com").await.is_none(), "the new (unverified) email does not attribute");
+    }
+
+    /// Admin force-verify (POST /api/users/<u>/verify-email) is admin-gated and flips the flag.
+    #[tokio::test]
+    async fn admin_verify_email_is_admin_gated() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        add_user(&ctx, "root", "root-password-1", true).await;
+
+        // A non-admin cannot force-verify.
+        assert_eq!(api_admin_verify_email(&ctx, &caller("alice", false), "alice").await.status, 403);
+        // Unknown user is a 404 for an admin.
+        assert_eq!(api_admin_verify_email(&ctx, &caller("root", true), "ghost").await.status, 404);
+        // An admin flips it.
+        let ok = api_admin_verify_email(&ctx, &caller("root", true), "alice").await;
+        assert_eq!(ok.status, 200);
+        assert!(ctx.store.user("alice").await.unwrap().email_verified);
     }
 }

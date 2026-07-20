@@ -6,6 +6,7 @@
 mod api;
 mod cli;
 mod content;
+mod emailverify;
 mod gitplumb;
 mod http;
 mod limits;
@@ -58,6 +59,8 @@ pub(crate) fn print_help() {
          agit-hub serve [--host 127.0.0.1] [--port 8177] [--root ~/.agit-hub]\n\
                         [--tls] [--insecure] [--trusted-proxy IP,IP]      start the Hub\n\
          agit-hub user add <name> [--admin]                   add a user (asks for the password)\n\
+         agit-hub user verify-email <name>                    force-mark a user's email verified (admin vouch)\n\
+         agit-hub user verify-link <name>                     print a verification link to forward to the user\n\
          agit-hub user list                                   list users\n\
          agit-hub add <name> [--owner <user>] [--public]      new Agent Store (private by default)\n\
          agit-hub list                                        list hosted agents\n\

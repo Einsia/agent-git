@@ -76,6 +76,15 @@ pub struct User {
     /// confirm). A consumed code's digest is removed from this list.
     #[serde(default)]
     pub totp_backup_codes: Vec<String>,
+    /// Whether this account's email has been VERIFIED (a challenge token minted for the address was
+    /// consumed, or an admin force-marked it). `false` for every account until it verifies. This is the
+    /// anti-squatting gate: [`Store::get_identity_key_by_email`] attributes a self-asserted committer
+    /// email to an account ONLY when this is `true`, so an UNVERIFIED (possibly squatted) email resolves
+    /// to no identity and provenance degrades to `SignedUnregistered` instead of a false `VerifiedAs`.
+    /// Added additively (back-filled onto older stores by `USER_COLUMNS`), so every pre-existing account
+    /// reads back UNVERIFIED — the safe default.
+    #[serde(default)]
+    pub email_verified: bool,
 }
 
 /// Username rules: lowercase [a-z0-9._-], 2..=32, no leading dot. Login names are case-insensitive →
@@ -639,7 +648,24 @@ fn row_user(r: &impl Cols) -> User {
         totp_secret: r.opt("totp_secret"),
         totp_enabled: r.int("totp_enabled") != 0,
         totp_backup_codes: parse_json_vec(&r.text("totp_backup_codes")),
+        // Fail-safe like every other Cols read: a store that predates `USER_COLUMNS` has no
+        // `email_verified` column, which reads back as 0 → UNVERIFIED, the safe default.
+        email_verified: r.int("email_verified") != 0,
     }
+}
+
+/// One row of the single-use, expiring email-verification token store. The `token` is a CSPRNG value
+/// (a random capability, not a secret to hash) that the operator forwards to the address being proven;
+/// consuming it marks the owning account's email verified. Single-use (deleted on consume) and expiring
+/// (`expires`), so a leaked-but-stale link cannot be replayed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailVerifyToken {
+    pub token: String,
+    pub username: String,
+    pub email: String,
+    pub expires: String,
+    #[serde(default)]
+    pub created: String,
 }
 
 fn row_agent(r: &impl Cols) -> AgentMeta {
@@ -765,10 +791,13 @@ const DDL: &[&str] = &[
     // totp_* are the second-factor columns (added additively; also back-filled onto existing DBs by
     // `add_totp_columns`). totp_secret is nullable (null = never enrolled); totp_enabled is the active
     // flag; totp_backup_codes is a JSON array of sha256 digests. See User for the sensitivity note.
+    // email_verified is the anti-squatting gate (added additively; also back-filled onto existing DBs by
+    // `USER_COLUMNS`, exactly like the totp_* columns). 0 = unverified (the default), 1 = verified.
     "CREATE TABLE IF NOT EXISTS users (\
        username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, salt TEXT NOT NULL, \
        kdf TEXT NOT NULL, is_admin BIGINT NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '', \
-       totp_secret TEXT, totp_enabled BIGINT NOT NULL DEFAULT 0, totp_backup_codes TEXT NOT NULL DEFAULT '[]')",
+       totp_secret TEXT, totp_enabled BIGINT NOT NULL DEFAULT 0, totp_backup_codes TEXT NOT NULL DEFAULT '[]', \
+       email_verified BIGINT NOT NULL DEFAULT 0)",
     // Identity is (owner, name): a composite PRIMARY KEY, and owner is NOT NULL (it is the namespace).
     // No surrogate id — `update_agents` rewrites the whole table every write, so a surrogate would be
     // re-minted each time and buys nothing; the composite PK fits the snapshot model on both backends.
@@ -809,6 +838,13 @@ const DDL: &[&str] = &[
        status TEXT NOT NULL DEFAULT 'pending', created_by TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT '')",
     "CREATE INDEX IF NOT EXISTS invitations_org ON invitations(org)",
     "CREATE INDEX IF NOT EXISTS invitations_invitee ON invitations(invitee)",
+    // The single-use, expiring email-verification token store. `token` is the CSPRNG capability handed to
+    // the operator to forward; `expires` gates replay of a stale link; the row is DELETED on consume so a
+    // token is single-use. Added additively as a whole new table (like `invitations`) via CREATE TABLE IF
+    // NOT EXISTS — a fresh DB gets it here and every existing store gets it at boot, no version bump.
+    "CREATE TABLE IF NOT EXISTS email_verify_tokens (\
+       token TEXT PRIMARY KEY, username TEXT NOT NULL, email TEXT NOT NULL, \
+       expires TEXT NOT NULL, created TEXT NOT NULL DEFAULT '')",
     // The ONE shared identity registry (encryption-recipients design, Wave 1): a person's published
     // ed25519 + X25519 public halves, self-signed via enroll_sig. Serves BOTH provenance signing-key
     // lookup AND (Wave 2+) encryption recipient key-wrapping. Added additively (a whole new table, like
@@ -854,6 +890,13 @@ const TOTP_COLUMNS: &[&str] = &[
     "totp_enabled BIGINT NOT NULL DEFAULT 0",
     "totp_backup_codes TEXT NOT NULL DEFAULT '[]'",
 ];
+
+/// The email-verification column added onto a `users` table that predates it (email-verification wave),
+/// back-filled at boot exactly like [`TOTP_COLUMNS`]. A **fresh** DB already has it (it is in `DDL`);
+/// this migrates older stores. Idempotent by construction: Postgres uses `ADD COLUMN IF NOT EXISTS`;
+/// SQLite ignores the "duplicate column" error. With the DEFAULT 0, every pre-existing account reads
+/// back UNVERIFIED — the safe anti-squatting default.
+const USER_COLUMNS: &[&str] = &["email_verified BIGINT NOT NULL DEFAULT 0"];
 
 /// The org columns added onto an `orgs` table that predates them (encryption-recipients Wave 3),
 /// back-filled at boot exactly like [`TOTP_COLUMNS`]. A **fresh** DB already has them (they are in
@@ -1158,6 +1201,62 @@ impl Store {
         .await
     }
 
+    /// Set a user's `email_verified` flag, leaving every other field untouched. `Ok(true)` if the user
+    /// existed, `Ok(false)` if not. Username is normalized like every other lookup. This is the one write
+    /// that flips the anti-squatting gate — driven by consuming a verification token, an authenticated
+    /// re-enroll that CHANGES the email (reset to false), or an admin force-verify (set to true).
+    pub async fn set_email_verified(&self, username: &str, verified: bool) -> io::Result<bool> {
+        let u = normalize_username(username);
+        self.update_users(move |users| match users.iter_mut().find(|x| x.username == u) {
+            Some(user) => {
+                user.email_verified = verified;
+                true
+            }
+            None => false,
+        })
+        .await
+    }
+
+    // ── email-verification tokens ──
+    //
+    // A single-use, expiring token store (targeted insert/delete, not the whole-table snapshot), sharing
+    // the exact write critical section every other writer uses. The token is a CSPRNG capability handed to
+    // the operator to forward to the address being proven; consuming it deletes the row (single-use) and
+    // yields the (username, email) to mark verified. The token is NEVER returned to an unauthenticated
+    // registrant — that would defeat verification.
+
+    /// Mint a fresh verification token for `(username, email)` that expires after `ttl`, and return it.
+    /// Username + email are normalized so the consumed pair matches the account and the by-email lookup.
+    pub async fn mint_email_token(&self, username: &str, email: &str, ttl: Duration) -> io::Result<String> {
+        let username = normalize_username(username);
+        let email = normalize_email(email);
+        // A random capability, not a secret to hash: 32 CSPRNG bytes as hex, prefixed for legibility.
+        let token = format!("evt_{}", super::kdf::gen_secret()?);
+        let expires = (chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::hours(24)))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let row = EmailVerifyToken { token: token.clone(), username, email, expires, created: now_iso() };
+        match self {
+            Store::Sqlite(s) => s.mint_email_token(&row).await?,
+            Store::Pg(s) => s.mint_email_token(&row).await?,
+        }
+        Ok(token)
+    }
+
+    /// Consume a verification token: delete it (single-use) and return the `(username, email)` it proved,
+    /// or `None` for an unknown or expired token. The delete happens even for an expired token (cleanup);
+    /// an expired one still yields `None`, so a stale link can never mark an account verified.
+    pub async fn consume_email_token(&self, token: &str) -> Option<(String, String)> {
+        let token = token.trim();
+        if token.is_empty() {
+            return None;
+        }
+        match self {
+            Store::Sqlite(s) => s.consume_email_token(token).await,
+            Store::Pg(s) => s.consume_email_token(token).await,
+        }
+    }
+
     // ── agent metadata ──
 
     pub async fn agents(&self) -> Vec<AgentMeta> {
@@ -1371,15 +1470,31 @@ impl Store {
     /// is the "unset" sentinel for legacy rows), and an ambiguous email shared by two accounts also
     /// yields `None` — an email that does not map to exactly one account is not attributable. This is the
     /// server-side lookup behind provenance verification and the `by-email` endpoint.
+    ///
+    /// **The email-squatting defense.** The registry `email` is SELF-ASSERTED at enroll time (it is not
+    /// covered by `enroll_sig`), so anyone can enroll a key claiming `ceo@corp.com`. Attribution here is
+    /// therefore gated on VERIFICATION: the matched account's `users.email_verified` must be `true`, or
+    /// this returns `None`. An unverified (possibly squatted) email resolves to NO identity, so provenance
+    /// verification degrades that session to `SignedUnregistered` instead of minting a false `VerifiedAs`.
+    /// Verification is proven out-of-band (a token minted for the address and consumed), so a squatter who
+    /// never controls the mailbox never clears this gate. The ambiguity rule still applies first: an email
+    /// on 2+ accounts is not attributable regardless of any account's verified state.
     pub async fn get_identity_key_by_email(&self, email: &str) -> Option<IdentityKey> {
         let e = normalize_email(email);
         if e.is_empty() {
             return None;
         }
-        match self {
+        let key = match self {
             Store::Sqlite(s) => s.get_identity_key_by_email(&e).await,
             Store::Pg(s) => s.get_identity_key_by_email(&e).await,
+        }?;
+        // Anti-squatting gate: attribute ONLY when the matched account has VERIFIED this email. An account
+        // with no users row, or with `email_verified = false`, resolves to no identity.
+        let user = self.user(&key.username).await?;
+        if !user.email_verified {
+            return None;
         }
+        Some(key)
     }
 
     // ── team-KEK envelopes (encryption-recipients Wave 3) ──
@@ -1504,6 +1619,11 @@ impl SqliteStore {
         for &col in TOTP_COLUMNS {
             let _ = sqlx::query(&format!("ALTER TABLE users ADD COLUMN {col}")).execute(&self.pool).await;
         }
+        // Back-fill the email_verified column onto stores predating email verification (no-op /
+        // "duplicate column" on a fresh DB, expected and ignored, exactly like the TOTP columns).
+        for &col in USER_COLUMNS {
+            let _ = sqlx::query(&format!("ALTER TABLE users ADD COLUMN {col}")).execute(&self.pool).await;
+        }
         // Back-fill the Wave-3 org columns onto stores predating them (no-op on a fresh DB, where the DDL
         // above already added them — SQLite then errors "duplicate column", which is expected/ignored).
         for &col in ORG_COLUMNS {
@@ -1607,7 +1727,7 @@ impl SqliteStore {
         if existing.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("user already exists: {}", user.username)));
         }
-        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&user.username)
             .bind(&user.pw_hash)
             .bind(&user.salt)
@@ -1617,6 +1737,7 @@ impl SqliteStore {
             .bind(&user.totp_secret)
             .bind(user.totp_enabled as i64)
             .bind(json_text(&user.totp_backup_codes))
+            .bind(user.email_verified as i64)
             .execute(&mut *tx)
             .await
             .map_err(|e| match &e {
@@ -1642,7 +1763,7 @@ impl SqliteStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM users").execute(&mut *tx).await.map_err(err)?;
         for u in &list {
-            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 .bind(&u.username)
                 .bind(&u.pw_hash)
                 .bind(&u.salt)
@@ -1652,6 +1773,7 @@ impl SqliteStore {
                 .bind(&u.totp_secret)
                 .bind(u.totp_enabled as i64)
                 .bind(json_text(&u.totp_backup_codes))
+                .bind(u.email_verified as i64)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -1920,6 +2042,41 @@ impl SqliteStore {
         }
     }
 
+    async fn mint_email_token(&self, row: &EmailVerifyToken) -> io::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        sqlx::query("INSERT INTO email_verify_tokens (token, username, email, expires, created) VALUES (?, ?, ?, ?, ?)")
+            .bind(&row.token)
+            .bind(&row.username)
+            .bind(&row.email)
+            .bind(&row.expires)
+            .bind(&row.created)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(())
+    }
+
+    async fn consume_email_token(&self, token: &str) -> Option<(String, String)> {
+        // Single-use: read + DELETE in one write-locked transaction so two racing consumers cannot both
+        // succeed. The expiry check happens AFTER the delete (a stale token is cleaned up either way), so
+        // an expired token yields None even though it was removed.
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.ok()?;
+        let row = sqlx::query("SELECT username, email, expires FROM email_verify_tokens WHERE token = ?")
+            .bind(token)
+            .fetch_optional(&mut *tx)
+            .await
+            .ok()??;
+        sqlx::query("DELETE FROM email_verify_tokens WHERE token = ?").bind(token).execute(&mut *tx).await.ok()?;
+        tx.commit().await.ok()?;
+        if is_expired(&row.text("expires")) {
+            return None;
+        }
+        Some((row.text("username"), row.text("email")))
+    }
+
     async fn upsert_team_kek_envelopes(&self, org: &str, gen: i64, rows: &[TeamKekEnvelope]) -> io::Result<()> {
         let _guard = self.write_lock.lock().await;
         let mut tx = self.pool.begin().await.map_err(err)?;
@@ -2050,6 +2207,11 @@ impl PgStore {
         for &col in TOTP_COLUMNS {
             sqlx::query(&format!("ALTER TABLE users ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
         }
+        // Back-fill the email_verified column onto stores predating email verification (no-op on a fresh
+        // DB). Postgres has a native IF NOT EXISTS, so this is cleanly idempotent without swallowing errors.
+        for &col in USER_COLUMNS {
+            sqlx::query(&format!("ALTER TABLE users ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
+        }
         // Back-fill the Wave-3 org columns onto stores predating them (no-op on a fresh DB). Postgres has
         // a native IF NOT EXISTS, so this is cleanly idempotent without swallowing errors.
         for &col in ORG_COLUMNS {
@@ -2141,7 +2303,7 @@ impl PgStore {
         if existing.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("user already exists: {}", user.username)));
         }
-        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
+        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
             .bind(&user.username)
             .bind(&user.pw_hash)
             .bind(&user.salt)
@@ -2151,6 +2313,7 @@ impl PgStore {
             .bind(&user.totp_secret)
             .bind(user.totp_enabled as i64)
             .bind(json_text(&user.totp_backup_codes))
+            .bind(user.email_verified as i64)
             .execute(&mut *tx)
             .await
             .map_err(|e| match &e {
@@ -2175,7 +2338,7 @@ impl PgStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM users").execute(&mut *tx).await.map_err(err)?;
         for u in &list {
-            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
+            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
                 .bind(&u.username)
                 .bind(&u.pw_hash)
                 .bind(&u.salt)
@@ -2185,6 +2348,7 @@ impl PgStore {
                 .bind(&u.totp_secret)
                 .bind(u.totp_enabled as i64)
                 .bind(json_text(&u.totp_backup_codes))
+                .bind(u.email_verified as i64)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -2446,6 +2610,41 @@ impl PgStore {
         }
     }
 
+    async fn mint_email_token(&self, row: &EmailVerifyToken) -> io::Result<()> {
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        sqlx::query("INSERT INTO email_verify_tokens (token, username, email, expires, created) VALUES ($1, $2, $3, $4, $5)")
+            .bind(&row.token)
+            .bind(&row.username)
+            .bind(&row.email)
+            .bind(&row.expires)
+            .bind(&row.created)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(())
+    }
+
+    async fn consume_email_token(&self, token: &str) -> Option<(String, String)> {
+        // Single-use: read + DELETE in one advisory-locked transaction so two racing consumers cannot both
+        // succeed. The expiry check happens AFTER the delete, so an expired token yields None even though
+        // it was removed.
+        let mut tx = self.pool.begin().await.ok()?;
+        Self::lock(&mut tx).await.ok()?;
+        let row = sqlx::query("SELECT username, email, expires FROM email_verify_tokens WHERE token = $1")
+            .bind(token)
+            .fetch_optional(&mut *tx)
+            .await
+            .ok()??;
+        sqlx::query("DELETE FROM email_verify_tokens WHERE token = $1").bind(token).execute(&mut *tx).await.ok()?;
+        tx.commit().await.ok()?;
+        if is_expired(&row.text("expires")) {
+            return None;
+        }
+        Some((row.text("username"), row.text("email")))
+    }
+
     async fn upsert_team_kek_envelopes(&self, org: &str, gen: i64, rows: &[TeamKekEnvelope]) -> io::Result<()> {
         let mut tx = self.pool.begin().await.map_err(err)?;
         Self::lock(&mut tx).await?;
@@ -2549,6 +2748,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open_sqlite(d.path()).await.unwrap();
         (d, s)
+    }
+
+    /// Create a minimal user row (no real credentials) — enough for the email-verified gate, which only
+    /// reads `users.email_verified` for the account an enrolled email maps to.
+    async fn add_named_user(s: &Store, name: &str) {
+        s.add_user(User { username: name.into(), created: now_iso(), ..Default::default() }).await.unwrap();
     }
 
     /// Run a raw statement against the SQLite backend — the test-only escape hatch used to plant a
@@ -3377,8 +3582,21 @@ mod tests {
             revoked: None,
             email: email.into(),
         };
+        // Accounts must exist AND have a VERIFIED email — attribution is now gated on verification (the
+        // anti-squatting property), so an enrolled-but-unverified email maps to nothing.
+        for u in ["alice", "bob"] {
+            add_named_user(&s, u).await;
+        }
         s.upsert_identity_key(enroll("alice", &"a".repeat(64), "Alice@Corp.com")).await.unwrap();
         s.upsert_identity_key(enroll("bob", &"b".repeat(64), "bob@corp.com")).await.unwrap();
+
+        // Before verification, an exact unique match still resolves to nothing (the squatting defense).
+        assert!(
+            s.get_identity_key_by_email("alice@corp.com").await.is_none(),
+            "an UNVERIFIED email is not attributable even on an exact unique match"
+        );
+        s.set_email_verified("alice", true).await.unwrap();
+        s.set_email_verified("bob", true).await.unwrap();
 
         // A committer email resolves to the enrolling account; the match is case/space-insensitive.
         let hit = s.get_identity_key_by_email("  alice@corp.com ").await.expect("alice's email maps to alice");
@@ -3390,10 +3608,81 @@ mod tests {
         assert!(s.get_identity_key_by_email("ghost@corp.com").await.is_none());
         assert!(s.get_identity_key_by_email("").await.is_none());
 
-        // Ambiguity: two accounts claiming one email is not attributable — the lookup returns neither.
+        // Ambiguity: two accounts claiming one email is not attributable — even when both are verified,
+        // and the ambiguity rule fires before the verified gate.
+        for u in ["carol", "dave"] {
+            add_named_user(&s, u).await;
+            s.set_email_verified(u, true).await.unwrap();
+        }
         s.upsert_identity_key(enroll("carol", &"c".repeat(64), "shared@corp.com")).await.unwrap();
         s.upsert_identity_key(enroll("dave", &"d".repeat(64), "shared@corp.com")).await.unwrap();
         assert!(s.get_identity_key_by_email("shared@corp.com").await.is_none(), "an ambiguous email is not a hit");
+    }
+
+    #[tokio::test]
+    async fn a_newly_created_account_is_unverified() {
+        let (_d, s) = tmp_store().await;
+        add_named_user(&s, "alice").await;
+        assert!(!s.user("alice").await.unwrap().email_verified, "a fresh account starts UNVERIFIED");
+        // set_email_verified flips it, and reports whether the user existed.
+        assert!(s.set_email_verified("alice", true).await.unwrap());
+        assert!(s.user("alice").await.unwrap().email_verified);
+        assert!(s.set_email_verified("alice", false).await.unwrap());
+        assert!(!s.user("alice").await.unwrap().email_verified);
+        // A missing user reports false rather than silently creating one.
+        assert!(!s.set_email_verified("ghost", true).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn email_token_is_single_use_and_expiring() {
+        let (_d, s) = tmp_store().await;
+        // A valid token consumes exactly once and yields the (username, email) it proved.
+        let token = s.mint_email_token("Alice", "Alice@Corp.com", Duration::from_secs(3600)).await.unwrap();
+        assert!(token.starts_with("evt_"), "token is a legible CSPRNG capability");
+        let got = s.consume_email_token(&token).await.expect("a valid token consumes");
+        assert_eq!(got, ("alice".to_string(), "alice@corp.com".to_string()), "username + email are normalized");
+        // Single-use: a second consume of the same token is None (the row was deleted on first use).
+        assert!(s.consume_email_token(&token).await.is_none(), "a token is single-use");
+        // An unknown/garbage token is None, not an error.
+        assert!(s.consume_email_token("evt_nope").await.is_none());
+        assert!(s.consume_email_token("").await.is_none());
+
+        // An already-expired token (ttl 0) is refused even on its first use.
+        let expired = s.mint_email_token("bob", "bob@corp.com", Duration::from_secs(0)).await.unwrap();
+        assert!(s.consume_email_token(&expired).await.is_none(), "an expired token is never accepted");
+        // ...and it was still cleaned up, so a retry is also None.
+        assert!(s.consume_email_token(&expired).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn by_email_attributes_only_after_verification() {
+        // The end-to-end anti-squatting property at the store layer: enroll an email, and it is NOT
+        // attributable until the account verifies. A token consume marks it verified.
+        let (_d, s) = tmp_store().await;
+        add_named_user(&s, "alice").await;
+        s.upsert_identity_key(IdentityKey {
+            username: "alice".into(),
+            ed25519_pub: "a".repeat(64),
+            x25519_pub: "b".repeat(64),
+            epoch: 0,
+            enroll_sig: "sig".into(),
+            created: now_iso(),
+            revoked: None,
+            email: "alice@corp.com".into(),
+        })
+        .await
+        .unwrap();
+        // Unverified: an exact unique match resolves to no identity.
+        assert!(s.get_identity_key_by_email("alice@corp.com").await.is_none());
+        // Verify by minting + consuming a token, then flipping the flag (the api layer does this pairing).
+        let token = s.mint_email_token("alice", "alice@corp.com", Duration::from_secs(3600)).await.unwrap();
+        let (user, _email) = s.consume_email_token(&token).await.unwrap();
+        s.set_email_verified(&user, true).await.unwrap();
+        // Now it attributes.
+        assert_eq!(s.get_identity_key_by_email("alice@corp.com").await.unwrap().username, "alice");
+        // Revoking verification closes the door again.
+        s.set_email_verified("alice", false).await.unwrap();
+        assert!(s.get_identity_key_by_email("alice@corp.com").await.is_none());
     }
 
     #[tokio::test]
@@ -3410,7 +3699,9 @@ mod tests {
                 .await
                 .expect("migrate must recover a registry that predates the email column");
         }
-        // The column (and its lookup) are restored — an enroll with an email round-trips.
+        // The column (and its lookup) are restored — an enroll with a VERIFIED email round-trips.
+        add_named_user(&s, "erin").await;
+        s.set_email_verified("erin", true).await.unwrap();
         s.upsert_identity_key(IdentityKey {
             username: "erin".into(),
             ed25519_pub: "e".repeat(64),

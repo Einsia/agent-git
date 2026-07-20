@@ -1,6 +1,15 @@
 import { useState, type ReactNode } from "react"
 import { QRCodeSVG } from "qrcode.react"
-import { KeyRound, ShieldCheck, ShieldOff, ShieldPlus, TriangleAlert } from "lucide-react"
+import {
+  KeyRound,
+  MailCheck,
+  MailWarning,
+  Send,
+  ShieldCheck,
+  ShieldOff,
+  ShieldPlus,
+  TriangleAlert,
+} from "lucide-react"
 
 import { ApiError, api } from "@/lib/api"
 import { useSession } from "@/lib/session"
@@ -54,8 +63,161 @@ export function Account() {
         </p>
       </header>
 
+      <EmailCard />
       <TwoFactorCard />
     </div>
+  )
+}
+
+// A pasted verification value may be the whole emailed link or the bare token. Pull the token out of a
+// `...?token=<t>` URL; otherwise take the trimmed input as-is.
+function extractToken(pasted: string): string {
+  const s = pasted.trim()
+  const m = s.match(/[?&]token=([^&\s]+)/)
+  return m ? decodeURIComponent(m[1]) : s
+}
+
+// The email card: shows the account's registered email with a Verified / Unverified badge (from
+// GET /api/me), and — while unverified — a Resend button plus a field to paste the token/link. This is
+// the account-facing half of the email-squatting defense: only a VERIFIED email is attributed in
+// provenance verification (see src/hub/store.rs::get_identity_key_by_email).
+function EmailCard() {
+  const { me, refresh } = useSession()
+  const [pasted, setPasted] = useState("")
+  const [busy, setBusy] = useState<"resend" | "verify" | null>(null)
+  const [error, setError] = useState("")
+  const [notice, setNotice] = useState("")
+
+  const email = me?.email ?? ""
+  const verified = !!me?.email_verified
+
+  async function resend() {
+    setBusy("resend")
+    setError("")
+    setNotice("")
+    try {
+      await api.resendEmailVerification()
+      setNotice(
+        "A fresh verification link was generated. Your hub operator forwards it to your email address — paste the token or link below once you have it."
+      )
+    } catch (err) {
+      setError(String((err as Error)?.message ?? err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function verify() {
+    const token = extractToken(pasted)
+    if (!token || busy) return
+    setBusy("verify")
+    setError("")
+    setNotice("")
+    try {
+      await api.verifyEmail(token)
+      setPasted("")
+      await refresh() // flip the badge to Verified
+    } catch (err) {
+      setError(String((err as Error)?.message ?? err))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <section>
+      <Eyebrow className="mb-1.5">email</Eyebrow>
+      <div className="rounded-lg border bg-card p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex items-start gap-3">
+            {verified ? (
+              <MailCheck className="mt-0.5 size-5 shrink-0 text-primary" />
+            ) : (
+              <MailWarning className="mt-0.5 size-5 shrink-0 text-kind-warn" />
+            )}
+            <div>
+              <p className="font-semibold">Committer email</p>
+              <p className="mt-0.5 max-w-[54ch] text-sm text-muted-foreground">
+                {email ? (
+                  <>
+                    <span className="font-mono text-foreground">{email}</span> is the address your signed
+                    sessions are attributed under. It must be verified before the hub will attribute pushes
+                    to you.
+                  </>
+                ) : (
+                  <>
+                    No email on file yet. Enroll a signing identity with an email (
+                    <code className="font-mono">agit identity enroll</code>) to attribute your pushes to
+                    this account.
+                  </>
+                )}
+              </p>
+            </div>
+          </div>
+          {email &&
+            (verified ? (
+              <Badge variant="default" className="gap-1">
+                <MailCheck className="size-3" />
+                Verified
+              </Badge>
+            ) : (
+              <Badge variant="outline" className="gap-1 border-kind-warn/40 text-kind-warn">
+                <MailWarning className="size-3" />
+                Unverified
+              </Badge>
+            ))}
+        </div>
+
+        {email && !verified && (
+          <div className="mt-5 flex flex-col gap-4 rounded-lg border bg-muted/30 p-5">
+            <Alert variant="warn">
+              <TriangleAlert />
+              <AlertTitle>Verify your email to be attributable</AlertTitle>
+              <AlertDescription>
+                Until it's verified, an unrecognized (possibly squatted) email is not trusted: your signed
+                sessions show as unregistered rather than verified-as {me?.username}.
+              </AlertDescription>
+            </Alert>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <Button variant="outline" size="sm" onClick={resend} disabled={busy !== null}>
+                <Send />
+                {busy === "resend" ? "Sending…" : "Resend verification link"}
+              </Button>
+              <p className="text-xs text-muted-foreground">
+                The link is delivered by your hub operator (hermetic hubs don't send mail directly).
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="verify-token">Paste the token or link from your email</Label>
+              <div className="flex flex-wrap items-center gap-2">
+                <Input
+                  id="verify-token"
+                  value={pasted}
+                  onChange={(e) => setPasted(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && verify()}
+                  placeholder="evt_… or https://…/verify-email?token=evt_…"
+                  autoComplete="off"
+                  className="min-w-[18rem] flex-1 font-mono"
+                />
+                <Button onClick={verify} disabled={busy !== null || !pasted.trim()}>
+                  <MailCheck />
+                  {busy === "verify" ? "Verifying…" : "Verify"}
+                </Button>
+              </div>
+            </div>
+
+            {notice && <p className="text-sm text-muted-foreground">{notice}</p>}
+            {error && (
+              <p role="alert" className="text-sm text-destructive">
+                {error}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    </section>
   )
 }
 
