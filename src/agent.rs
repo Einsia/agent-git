@@ -411,6 +411,10 @@ impl Binding {
     pub fn parse(text: &str) -> Result<Binding> {
         let mut b = Binding { version: BINDING_VERSION, agents: Vec::new(), default: None };
         let mut section = String::new();
+        // Whether the CURRENT agent has opened any `[[agent.remote]]` sub-table yet. Reset on each new
+        // `[[agent]]`. The first sub-table means the sub-tables are authoritative and any remote already
+        // collected from the redundant forward-compat `remote = "…"` line must be dropped.
+        let mut saw_subtable_for_current = false;
         for line in text.lines() {
             let line = crate::hub::identity::strip_comment(line).trim();
             if line.is_empty() {
@@ -422,11 +426,20 @@ impl Binding {
                     section = arr.trim().to_string();
                     if section == "agent" {
                         b.agents.push(BoundAgent { id: String::new(), name: String::new(), remotes: Vec::new() });
+                        saw_subtable_for_current = false;
                     } else if section == "agent.remote" {
                         // A remote sub-table belongs to the agent opened just above. A malformed file
                         // with a `[[agent.remote]]` before any `[[agent]]` has nowhere to hang it —
                         // skip, matching the None-guards below.
                         if let Some(agent) = b.agents.last_mut() {
+                            if !saw_subtable_for_current {
+                                // First sub-table for this agent: the sub-tables are authoritative, so any
+                                // remote already collected came from the redundant forward-compat
+                                // `remote = "<primary-url>"` line (a duplicate of the primary). Drop it so
+                                // it does not survive as a phantom `origin` remote.
+                                agent.remotes.clear();
+                                saw_subtable_for_current = true;
+                            }
                             agent.remotes.push(BoundRemote { name: String::new(), url: String::new(), primary: false });
                         }
                     }
@@ -540,13 +553,21 @@ impl Binding {
             // before multi-remote existed (old files round-trip, old agit still reads them):
             //   0 remotes                -> emit nothing.
             //   exactly 1 named "origin" -> the LEGACY `remote = "<url>"` line.
-            //   otherwise                -> one [[agent.remote]] sub-table each, primary on the anchor.
+            //   otherwise                -> the LEGACY `remote = "<primary-url>"` line for forward-compat
+            //                               PLUS one [[agent.remote]] sub-table each, primary on the anchor.
             match a.remotes.as_slice() {
                 [] => {}
                 [r] if r.name == "origin" => {
                     s.push_str(&format!("remote = \"{}\"\n", r.url));
                 }
                 remotes => {
+                    // Forward-compat: also emit the primary URL as the legacy `remote = "…"` line, so an
+                    // OLDER agit — which reads only that line and would otherwise see NO remote and drop
+                    // them all on the next rewrite — still finds the primary. A current agit parses the
+                    // sub-tables (authoritative) and treats this line as redundant (see `parse`).
+                    if let Some(p) = a.primary() {
+                        s.push_str(&format!("remote = \"{}\"\n", p.url));
+                    }
                     for r in remotes {
                         s.push_str("[[agent.remote]]\n");
                         s.push_str(&format!("name    = \"{}\"\n", r.name));
@@ -1993,11 +2014,67 @@ url     = \"https://hub.alice.dev/frontend.git\"
         assert!(!rs.iter().find(|r| r.name == "hub").unwrap().primary);
         assert_eq!(p.agents[0].primary_url(), Some("https://git.acme.com/frontend.git"));
 
-        // A non-legacy remote set serializes as sub-tables and round-trips.
+        // A non-legacy remote set serializes as sub-tables AND a redundant forward-compat legacy line
+        // carrying the primary URL, and still round-trips through a current parse.
         let out = p.to_toml();
         assert!(out.contains("[[agent.remote]]"), "multi-remote must use sub-tables:\n{out}");
-        assert!(!out.contains("remote = \""), "no legacy line for a multi-remote agent:\n{out}");
+        assert!(
+            out.contains("remote = \"https://git.acme.com/frontend.git\""),
+            "the forward-compat legacy line must carry the primary URL:\n{out}"
+        );
         assert_eq!(Binding::parse(&out).unwrap(), p, "multi-remote must round-trip");
+    }
+
+    /// Forward-compat anchor: a multi-remote binding emits BOTH the legacy `remote = "<primary-url>"`
+    /// line AND the `[[agent.remote]]` sub-tables. A current agit parses the sub-tables and treats the
+    /// legacy line as redundant (no phantom `origin`); an OLD agit — which reads ONLY the legacy line —
+    /// still finds the primary, so it never drops the remotes on a rewrite.
+    #[test]
+    fn multi_remote_carries_legacy_line_for_old_agit() {
+        // A multi-remote agent whose primary is NOT named "origin" — the hard case, where a naive legacy
+        // duplicate would otherwise resurrect as a phantom `origin` remote.
+        let p = Binding {
+            version: 1,
+            agents: vec![BoundAgent {
+                id: "agt_0190f3a1-4c2b-7f1e-8a3d-9b2c1d4e5f60".into(),
+                name: "frontend".into(),
+                remotes: vec![
+                    BoundRemote { name: "hub".into(), url: "https://hub.alice.dev/f.git".into(), primary: true },
+                    BoundRemote { name: "backup".into(), url: "https://b/f.git".into(), primary: false },
+                ],
+            }],
+            default: None,
+        };
+        let out = p.to_toml();
+
+        // BOTH forms present: the legacy line (primary URL) and the sub-tables.
+        assert!(out.contains("[[agent.remote]]"), "sub-tables present:\n{out}");
+        assert!(
+            out.contains("remote = \"https://hub.alice.dev/f.git\""),
+            "legacy line carries the PRIMARY url:\n{out}"
+        );
+
+        // A CURRENT parse: the sub-tables are authoritative, the legacy line is redundant — exactly two
+        // remotes, no phantom `origin`, and it round-trips.
+        let cur = Binding::parse(&out).unwrap();
+        assert_eq!(cur, p, "current agit round-trips, dropping the redundant legacy line");
+        assert_eq!(cur.agents[0].remotes.len(), 2, "no phantom origin remote resurrected");
+        assert!(!cur.agents[0].remotes.iter().any(|r| r.name == "origin"));
+
+        // An OLD agit understands ONLY the legacy `remote = "…"` line under `[[agent]]`. Simulate it by
+        // stripping the sub-tables: it still finds the PRIMARY, so it never binds to nothing.
+        let legacy_only: String = out
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with("[[agent.remote]]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let old = Binding::parse(&legacy_only).unwrap();
+        assert_eq!(old.agents.len(), 1);
+        assert_eq!(
+            old.agents[0].primary_url(),
+            Some("https://hub.alice.dev/f.git"),
+            "an old agit reads the primary from the legacy line"
+        );
     }
 
     /// Normalization guarantees exactly one primary even for a hand-edited file: none marked → the first

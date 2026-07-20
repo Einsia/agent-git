@@ -168,7 +168,12 @@ fn committed_blob_is_ciphertext_worktree_is_plaintext_and_status_clean() {
     // Committed blob: ciphertext, self-describing magic, and NOT the plaintext marker.
     let blob = r.committed_bytes(&rel);
     assert!(blob.starts_with(b"AGITCRYPT\x00"), "committed blob must start with the AGITCRYPT magic");
-    assert_eq!(blob[10], 1, "wire version byte must be 1");
+    assert_eq!(blob[10], 2, "wire version byte must be 2 (keyed format carrying the key-id)");
+    assert_eq!(
+        u32::from_le_bytes(blob[11..15].try_into().unwrap()),
+        0,
+        "a freshly enabled store seals under key-id 0"
+    );
     let blob_str = String::from_utf8_lossy(&blob);
     assert!(!blob_str.contains(MARKER), "the plaintext marker must NOT survive into the committed blob");
 
@@ -318,4 +323,56 @@ fn checkout_fails_loudly_without_the_key() {
             "a failed smudge must never leave ciphertext in the working tree"
         );
     }
+}
+
+// Test 17 — key rotation, end to end: `a encrypt --rotate` mints a new current key (retaining the old),
+// the on-disk key file becomes a keyring, going-forward blobs seal under the NEW key-id, and a blob
+// committed under the OLD key still checks out (the retired key decrypts it).
+#[test]
+fn rotate_re_encrypts_forward_and_old_blobs_still_decrypt() {
+    let r = Repo::new();
+    assert_eq!(r.agit(&["a", "encrypt", "--yes"]).0, 0);
+
+    // Commit a session under the original key (id 0).
+    r.write_session("sessions/proj/claude-code/sess.jsonl", &transcript());
+    let rel = find_rel(&r.agent(), "sess.jsonl");
+    assert_eq!(r.git_agent(&["add", "--", &rel]).0, 0);
+    assert_eq!(r.agit(&["a", "commit", "-m", "snap"]).0, 0);
+    let pre_rotate = r.git_agent(&["rev-parse", "HEAD"]).1.trim().to_string();
+
+    // The committed blob is v2 under key-id 0.
+    let blob0 = r.committed_bytes(&rel);
+    assert_eq!(blob0[10], 2, "pre-rotate blob is the keyed wire (v2)");
+    assert_eq!(u32::from_le_bytes(blob0[11..15].try_into().unwrap()), 0, "sealed under key-id 0");
+
+    // Rotate: mint a new current key, retaining the old, and re-encrypt the working tree.
+    let (code, out, err) = r.agit(&["a", "encrypt", "--rotate", "--yes"]);
+    assert_eq!(code, 0, "rotate should succeed: {err}");
+    assert!(out.contains("key-id 1"), "rotate reports the new current key-id: {out}");
+
+    // The key file is now a keyring: a `current = 1` line and BOTH keys retained.
+    let keyfile = std::fs::read_to_string(r.path().join("agit-home/crypt/agit-crypt.key")).unwrap();
+    assert!(keyfile.contains("current = 1"), "keyring names the new current key:\n{keyfile}");
+    assert!(keyfile.contains("key 0 =") && keyfile.contains("key 1 ="), "both keys retained:\n{keyfile}");
+
+    // Going-forward: the re-encrypted committed blob is now sealed under key-id 1.
+    let blob1 = r.committed_bytes(&rel);
+    assert_eq!(blob1[10], 2, "post-rotate blob is still v2");
+    assert_eq!(u32::from_le_bytes(blob1[11..15].try_into().unwrap()), 1, "re-encrypted under the new key-id 1");
+    assert_ne!(blob0, blob1, "the ciphertext changed under the new key");
+
+    // git status is clean after rotation (convergence holds under the new current key).
+    let status = r.git_agent(&["status", "--porcelain"]).1;
+    assert!(status.trim().is_empty(), "status must be clean after rotation, got:\n{status}");
+
+    // The OLD blob (committed under key-id 0) still decrypts: check out the pre-rotate commit's version
+    // and confirm the working tree is plaintext — the retired key is what makes this possible.
+    std::fs::remove_file(r.agent().join(&rel)).unwrap();
+    assert_eq!(
+        r.git_agent(&["checkout", &pre_rotate, "--", &rel]).0,
+        0,
+        "checkout of a pre-rotation (key-id 0) blob must succeed via the retired key"
+    );
+    let wt = std::fs::read_to_string(r.agent().join(&rel)).unwrap();
+    assert!(wt.contains(MARKER), "the retired key must decrypt the old blob to plaintext");
 }

@@ -278,7 +278,7 @@ fn dispatch(argv: Vec<String>) -> i32 {
         // ── encrypt (agent scope): opt-in at-rest encryption of the store — a convergent git
         //    clean/smudge filter (git-crypt style). Enables/wires the filter, mints/exports/imports the
         //    symmetric key. Ciphertext is what a push publishes; only coherent for a no-hub setup. ──
-        "encrypt" if scope == Scope::Agent => commands::agent_encrypt(args),
+        "encrypt" if scope == Scope::Agent => agent_encrypt(args),
 
         // ── log / diff (agent scope): a raw `git log`/`git diff` on the store is a wall of jsonl bytes,
         //    so by default these render the SESSION view — `a log` a timeline of the store's sessions,
@@ -758,11 +758,23 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
     while i < args.len() {
         let x = &args[i];
         if x == "--to" {
-            to = args.get(i + 1).cloned();
+            // A bare `--to` with nothing after it is a usage error, not a silent fall-through to the
+            // fan-out (which would push to EVERY remote, the opposite of what `--to` asks for).
+            let Some(v) = args.get(i + 1) else {
+                anyhow::bail!(
+                    "agit a push --to needs a remote name: agit a push --to <name> [refspec...]"
+                );
+            };
+            to = Some(v.clone());
             i += 2;
             continue;
         }
         if let Some(v) = x.strip_prefix("--to=") {
+            if v.is_empty() {
+                anyhow::bail!(
+                    "agit a push --to needs a remote name: agit a push --to <name> [refspec...]"
+                );
+            }
             to = Some(v.to_string());
         } else if x.starts_with('-') {
             flags.push(x.clone());
@@ -776,10 +788,13 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
     // swallow git's errors and block the prompt. `--no-verify` skips git's now-redundant pre-push hook
     // (we just gated the tree); the hook stays installed for a raw `git push`.
     let (exit, record) = if let Some(name) = to {
-        // (a) Targeted single push — the command's identity anchor.
+        // (a) Targeted single push — the command's identity anchor. Any positional refspec the user
+        // typed (`--to hub main`, `--to hub HEAD:review`) rides along AFTER the remote name, so a
+        // targeted push is not silently narrowed to a bare `git push <remote>`.
         let mut pa: Vec<&str> = vec!["push", "--no-verify"];
         pa.extend(flags.iter().map(String::as_str));
         pa.push(&name);
+        pa.extend(positionals.iter().map(String::as_str));
         let code = scope::git_in_inherit(&a.store, &pa);
         (code, code == 0)
     } else if !positionals.is_empty() {
@@ -874,6 +889,182 @@ fn print_sync_summary(agent_name: &str, s: &agit::agent::RemoteSyncSummary) {
     for (name, _url) in &s.skipped {
         eprintln!("{}", skipped_note(name, bf));
     }
+}
+
+/// `agit a encrypt […]` — the encryption lifecycle verb. `--rotate` and `--purge-history` are the two
+/// lifecycle operations handled here; everything else (enable/wire, --export/--import) delegates to the
+/// base implementation unchanged.
+fn agent_encrypt(args: &[String]) -> anyhow::Result<i32> {
+    if args.iter().any(|a| a == "--rotate") {
+        return agent_encrypt_rotate(args);
+    }
+    if args.iter().any(|a| a == "--purge-history") {
+        return agent_encrypt_purge_history(args);
+    }
+    commands::agent_encrypt(args)
+}
+
+/// A yes/no gate honoured by `--yes`/`-y` non-interactively; refuses (never hangs) when it cannot ask.
+fn confirm_or_yes(prompt: &str, yes: bool) -> anyhow::Result<bool> {
+    use std::io::Write;
+    if yes {
+        return Ok(true);
+    }
+    if !ui::interactive() {
+        anyhow::bail!(
+            "{prompt}\n  refusing without confirmation — re-run with --yes to proceed non-interactively"
+        );
+    }
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes"))
+}
+
+/// Commit whatever is staged in `store` under `message`, via `-F <tempfile>` (never `-m`, per the repo's
+/// commit-message hygiene). The caller stages + checks there is something to commit.
+fn commit_store(store: &std::path::Path, message: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut msg = tempfile::NamedTempFile::new()?;
+    msg.write_all(message.as_bytes())?;
+    msg.flush()?;
+    scope::git_in(store, &["commit", "--no-verify", "-F", msg.path().to_string_lossy().as_ref()])?;
+    Ok(())
+}
+
+/// `agit a encrypt --rotate [--yes]` — mint a NEW current key (retiring the old for decrypt-only) and
+/// re-encrypt this store's working tree under it via `git add --renormalize`. Going-forward blobs use the
+/// new key; every blob a retired key sealed (history, or a not-yet-renormalized clone) still decrypts.
+fn agent_encrypt_rotate(args: &[String]) -> anyhow::Result<i32> {
+    use agit::{agent, crypt};
+    let home = scope::agit_home()?;
+    let yes = args.iter().any(|a| a == "--yes" || a == "-y");
+
+    // Rotation only makes sense once encryption is enabled — there is otherwise no key to rotate.
+    if crypt::read_master(&home)?.is_none() {
+        anyhow::bail!(
+            "agit-crypt is not enabled on this machine — run `agit a encrypt` first, then --rotate"
+        );
+    }
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+
+    eprintln!("agit encrypt --rotate — mint a new key and re-encrypt this store's working tree.");
+    eprintln!(
+        "  Retired keys are kept LOCALLY so history / not-yet-renormalized blobs still decrypt; only\n\
+         \x20     new writes use the new key. Afterwards you must `agit a push` and re-share the key\n\
+         \x20     (`agit a encrypt --export <file>`) so teammates can decrypt going-forward blobs."
+    );
+    if !confirm_or_yes("Rotate the crypt key and re-encrypt this store now?", yes)? {
+        eprintln!("aborted — key not rotated");
+        return Ok(1);
+    }
+
+    let _lock = session::lock_store(&store)?;
+    let new_id = crypt::rotate_key(&home)?;
+    println!("  minted key-id {new_id} (now current); every prior key retained for decrypt only.");
+
+    // Re-encrypt the tracked working tree under the new current key: --renormalize pushes every tracked
+    // sessions blob back through the clean filter, which now seals under the new key.
+    let _ = scope::git_in_status(&store, &["add", "--renormalize", "--", "sessions"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        commit_store(
+            &store,
+            "chore(crypt): rotate key and re-encrypt sessions\n\nThe new current key seals going-forward blobs; retired keys are kept locally to decrypt prior and history blobs.",
+        )?;
+        println!("  re-encrypted tracked sessions under key-id {new_id} (git add --renormalize)");
+    } else {
+        println!("  no tracked sessions to re-encrypt.");
+    }
+    eprintln!(
+        "  ⚠ BACK UP and re-share the new key now: `agit a encrypt --export <file>`, then `agit a push`.\n\
+         \x20     git HISTORY still holds blobs under the retired key; `agit a encrypt --purge-history`\n\
+         \x20     rewrites them out if you need pre-rotation plaintext/ciphertext gone."
+    );
+    Ok(0)
+}
+
+/// `agit a encrypt --purge-history [--yes]` — rewrite git history to remove pre-encryption plaintext
+/// (or blobs under a retired key) via `git filter-repo`. Rewrites every commit and needs a force-push, so
+/// it demands an explicit confirmation (`--yes` non-interactively) and prints install instructions when
+/// `git filter-repo` is absent.
+fn agent_encrypt_purge_history(args: &[String]) -> anyhow::Result<i32> {
+    use agit::agent;
+    let yes = args.iter().any(|a| a == "--yes" || a == "-y");
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+
+    // `git filter-repo` is a separate install; without it we cannot rewrite history — print how to get it.
+    if !filter_repo_available() {
+        eprintln!("git-filter-repo is not installed — it is required to rewrite history.");
+        eprintln!("  Install it, then re-run:");
+        eprintln!("    pip install git-filter-repo         # or");
+        eprintln!("    brew install git-filter-repo         # macOS");
+        eprintln!("    apt-get install git-filter-repo      # Debian/Ubuntu");
+        eprintln!("  See https://github.com/newren/git-filter-repo for other platforms.");
+        return Ok(1);
+    }
+
+    eprintln!("agit encrypt --purge-history — DESTRUCTIVE: this REWRITES this store's ENTIRE git history.");
+    eprintln!(
+        "  It re-runs every commit through the encryption clean filter so pre-encryption plaintext (and\n\
+         \x20     blobs under retired keys) no longer exist in ANY commit. Consequences:\n\
+         \x20       • every commit SHA changes — this is a history rewrite;\n\
+         \x20       • you MUST `agit a push --force` afterwards, and every teammate must re-clone;\n\
+         \x20       • it cannot be undone except from a backup. BACK UP THE STORE FIRST."
+    );
+    if !confirm_or_yes("Rewrite history and purge pre-encryption plaintext now?", yes)? {
+        eprintln!("aborted — history not rewritten");
+        return Ok(1);
+    }
+
+    // Re-run every historical blob through agit's own clean filter via a filter-repo blob-callback.
+    // git-filter-repo does not re-apply gitattributes filters, so we seal explicitly. The callback is
+    // path-safe by content: it leaves anything already ciphertext (starts with the AGITCRYPT magic) and
+    // anything that is not session JSONL (session files begin with `{`) untouched, so non-session blobs
+    // (.gitattributes, README, .agit.toml) are never encrypted. `agit crypt-clean` seals under the
+    // CURRENT key, keyed from $AGIT_HOME regardless of cwd. `--force` because filter-repo refuses on a
+    // non-fresh clone; this is an explicit, confirmed rewrite.
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("could not locate agit's own path: {e}"))?;
+    let callback = "import os, subprocess\n\
+        MAGIC = b\"AGITCRYPT\\x00\"\n\
+        d = blob.data\n\
+        if (not d.startswith(MAGIC)) and d[:1] == b\"{\":\n\
+        \x20   blob.data = subprocess.run([os.environ[\"AGIT_SELF\"], \"crypt-clean\"], input=d, stdout=subprocess.PIPE, check=True).stdout\n";
+    let code = {
+        use std::process::Command;
+        Command::new("git")
+            .arg("-C")
+            .arg(&store)
+            .args(["filter-repo", "--force", "--blob-callback", callback])
+            .env("AGIT_SELF", &exe)
+            .status()
+            .map(|s| s.code().unwrap_or(1))
+            .unwrap_or(1)
+    };
+    if code != 0 {
+        eprintln!("git filter-repo exited {code} — history was NOT rewritten.");
+        return Ok(code);
+    }
+    println!("  history rewritten: every commit re-encrypted through the clean filter.");
+    eprintln!(
+        "  ⚠ NEXT: `agit a push --force` to publish the rewritten history, and tell every teammate to\n\
+         \x20     re-clone — their old clones still hold the pre-purge plaintext."
+    );
+    Ok(0)
+}
+
+/// Is `git filter-repo` runnable? (`git filter-repo --version` exits 0.)
+fn filter_repo_available() -> bool {
+    std::process::Command::new("git")
+        .args(["filter-repo", "--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// `agit a pull [git-pull-args…]` — the agent-context pull. A bare `git pull` on the store would do a

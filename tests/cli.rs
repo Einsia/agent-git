@@ -911,6 +911,24 @@ fn push_fans_out_to_all_remotes_and_a_failure_is_non_fatal() {
     let (code, out, err) = r.agit(&["a", "push", "--to", "origin"]);
     assert_eq!(code, 0, "a targeted push to a reachable remote must succeed: {err}");
     assert!(!out.contains("pushed origin"), "a targeted push must not fan out: {out}");
+
+    // `--to <name> <refspec…>` must PASS the positional refspec through to the targeted push — not drop
+    // it. A `HEAD:refs/heads/review` refspec creates a `review` branch on origin that a bare
+    // `git push origin` (upstream = main) would never create, so its existence proves the passthrough.
+    let head3 = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, _out, err) = r.agit(&["a", "push", "--to", "origin", "HEAD:refs/heads/review"]);
+    assert_eq!(code, 0, "a targeted push with a refspec must succeed: {err}");
+    assert_eq!(
+        r.git_at(&origin, &["rev-parse", "review"]),
+        head3,
+        "the refspec must be forwarded — origin must now carry the `review` branch"
+    );
+
+    // `--to` given as the FINAL arg with no following value is a usage error, never a silent fall-through
+    // to the fan-out (which would push to every remote — the opposite of a targeted push).
+    let (code, _out, err) = r.agit(&["a", "push", "--to"]);
+    assert_ne!(code, 0, "a bare --to must error, not fan out");
+    assert!(err.contains("--to needs a remote name"), "the error must name the missing value: {err}");
 }
 
 /// A minimal but valid Claude session: two lines carrying `sid` and a distinctive note.
