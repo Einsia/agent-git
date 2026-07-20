@@ -2,7 +2,7 @@
 //!
 //! Spike verified (2026-07-15, see docs/plans): both CLIs **scan the directory + resolve by id**, so there's no index to maintain.
 //!   - Claude: `~/.claude/projects/<slug>/<uuid>.jsonl`, `claude --resume <uuid>`. Verified end-to-end.
-//!   - Codex : `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl`, `codex exec resume <uuid>`.
+//!   - Codex : `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl`, `codex resume <uuid>` (interactive).
 //!            The place/resolve mechanism works; "whether history is really loaded" awaits acceptance after `codex login`.
 
 use crate::adapter::claude_code;
@@ -48,8 +48,13 @@ fn install_codex(id: &str, cwd: &Path, bytes: &str) -> Result<ResumeHandle> {
     std::fs::write(&path, bytes)?;
     Ok(ResumeHandle {
         path,
-        // `codex exec resume <id>` -- the verb matches the module doc and what the spike verified.
-        // The `codex resume` we printed before is not an exec subcommand; copying it verbatim makes resume fail.
-        resume_cmd: format!("(cd {} && codex exec resume {id})", cwd.display()),
+        // INTERACTIVE resume: `codex resume <id>` (current codex CLI: `codex resume [SESSION_ID] [PROMPT]`,
+        // prompt optional) opens the TUI carrying the session -- which is what `agit start`/`resume` want.
+        // The old `codex exec resume <id>` is codex's NON-interactive one-shot mode and REQUIRES a prompt,
+        // so a promptless `agit start --as codex` died with "No prompt provided". `codex resume` resolves
+        // the same rollout files by id (the recursive sessions/ scan), so the on-disk install is unchanged;
+        // only the launch verb differs. (Earlier note that `codex resume` "makes resume fail" was on an
+        // older codex without the `resume` subcommand.)
+        resume_cmd: format!("(cd {} && codex resume {id})", cwd.display()),
     })
 }
