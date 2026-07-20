@@ -821,7 +821,10 @@ const DDL: &[&str] = &[
        username TEXT PRIMARY KEY, ed25519_pub TEXT NOT NULL, x25519_pub TEXT NOT NULL, \
        epoch BIGINT NOT NULL DEFAULT 0, enroll_sig TEXT NOT NULL, created TEXT NOT NULL DEFAULT '', revoked TEXT, \
        email TEXT NOT NULL DEFAULT '')",
-    "CREATE INDEX IF NOT EXISTS identity_keys_email ON identity_keys(email)",
+    // NOTE: the index on `email` is NOT here. `email` is a back-filled column (IDENTITY_COLUMNS), and on
+    // an existing store CREATE TABLE IF NOT EXISTS is a no-op so `email` does not exist until the back-fill
+    // runs. Creating the index in the DDL (before the back-fill) would fail with "no such column: email".
+    // It is created via IDENTITY_EMAIL_INDEX after the back-fill in both migrate() paths.
     // Per-org Team-KEK envelopes (encryption-recipients Wave 3): one row per (org, generation, member),
     // holding TK_gen X25519-sealed to that member's pubkey. `wrapped_kek` is CIPHERTEXT only — the hub
     // never sees a plaintext TK. `recipient_epoch` records which identity-key epoch the seal targeted, so
@@ -868,6 +871,11 @@ const ORG_COLUMNS: &[&str] = &[
 /// `DDL`); this migrates older stores. Idempotent: Postgres uses `ADD COLUMN IF NOT EXISTS`; SQLite
 /// ignores the "duplicate column" error. With the '' default, every wave-1 enrollment is unchanged.
 const IDENTITY_COLUMNS: &[&str] = &["email TEXT NOT NULL DEFAULT ''"];
+
+/// The index on identity_keys.email, created AFTER `IDENTITY_COLUMNS` back-fills the column (not in
+/// `DDL`): on an existing store the column does not exist until the back-fill runs, so an in-DDL index
+/// would fail with "no such column: email" before the ALTER. Idempotent (IF NOT EXISTS).
+const IDENTITY_EMAIL_INDEX: &str = "CREATE INDEX IF NOT EXISTS identity_keys_email ON identity_keys(email)";
 
 /// Stamp the schema version idempotently. A single fixed row (id=1) plus `ON CONFLICT DO NOTHING`,
 /// **not** read-MAX-then-INSERT: two Hubs booting against one fresh Postgres at the same moment would
@@ -1506,6 +1514,9 @@ impl SqliteStore {
         for &col in IDENTITY_COLUMNS {
             let _ = sqlx::query(&format!("ALTER TABLE identity_keys ADD COLUMN {col}")).execute(&self.pool).await;
         }
+        // Now that `email` is guaranteed to exist (fresh via DDL, or just back-filled above), its index
+        // is safe to create. Doing this in DDL would fail "no such column: email" on an existing store.
+        sqlx::query(IDENTITY_EMAIL_INDEX).execute(&self.pool).await.map_err(err)?;
         // create_if_missing may not honor the mode; tighten hub.db AND its WAL sidecars to 0600, the
         // same guarantee write_secret_atomic gave the old JSON files. The DDL/stamp above already
         // wrote, so in WAL mode the -wal/-shm sidecars now exist and get locked down too.
@@ -2049,6 +2060,8 @@ impl PgStore {
         for &col in IDENTITY_COLUMNS {
             sqlx::query(&format!("ALTER TABLE identity_keys ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
         }
+        // Create the email index only after the column is guaranteed present (see IDENTITY_EMAIL_INDEX).
+        sqlx::query(IDENTITY_EMAIL_INDEX).execute(&self.pool).await.map_err(err)?;
         Ok(())
     }
 
@@ -3381,6 +3394,37 @@ mod tests {
         s.upsert_identity_key(enroll("carol", &"c".repeat(64), "shared@corp.com")).await.unwrap();
         s.upsert_identity_key(enroll("dave", &"d".repeat(64), "shared@corp.com")).await.unwrap();
         assert!(s.get_identity_key_by_email("shared@corp.com").await.is_none(), "an ambiguous email is not a hit");
+    }
+
+    #[tokio::test]
+    async fn migrate_recovers_an_identity_keys_that_predates_the_email_column() {
+        // Upgrade path: a Wave-1 registry has identity_keys WITHOUT the provenance `email` column and no
+        // email index. Re-running migrate must NOT fail on "no such column: email" (the index-before-
+        // back-fill bug this test guards) and must restore both the column and its index.
+        let (_d, s) = tmp_store().await;
+        raw_exec(&s, "DROP INDEX IF EXISTS identity_keys_email").await;
+        raw_exec(&s, "ALTER TABLE identity_keys DROP COLUMN email").await;
+        if let Store::Sqlite(inner) = &s {
+            inner
+                .migrate()
+                .await
+                .expect("migrate must recover a registry that predates the email column");
+        }
+        // The column (and its lookup) are restored — an enroll with an email round-trips.
+        s.upsert_identity_key(IdentityKey {
+            username: "erin".into(),
+            ed25519_pub: "e".repeat(64),
+            x25519_pub: "b".repeat(64),
+            epoch: 0,
+            enroll_sig: "sig".into(),
+            created: now_iso(),
+            revoked: None,
+            email: "erin@corp.com".into(),
+        })
+        .await
+        .unwrap();
+        let hit = s.get_identity_key_by_email("erin@corp.com").await.expect("email lookup works post-migrate");
+        assert_eq!(hit.username, "erin");
     }
 
     #[test]
