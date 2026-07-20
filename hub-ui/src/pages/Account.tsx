@@ -4,6 +4,7 @@ import {
   KeyRound,
   MailCheck,
   MailWarning,
+  Plus,
   Send,
   ShieldCheck,
   ShieldOff,
@@ -78,14 +79,19 @@ function shortFpr(fpr: string): string {
 }
 
 // The signing-keys card: the account's registered device keys (SSH-keys style, many per account), each
-// with its label, fingerprint, and when it was added, plus a per-key Revoke. New keys are added from the
-// CLI (`agit identity enroll`) — the private half never leaves the machine — so this page only lists and
-// revokes. A revoked key stops verifying the owner's sessions and loses encryption access on the next
-// rewrap. Mirrors GitHub's "SSH and GPG keys" screen.
+// with its label, fingerprint, and when it was added, plus a per-key Revoke. A key is PASTED in here from a
+// block the CLI prints OFFLINE (`agit identity register <you>`) — the private half never leaves the
+// machine, and the pasted block carries only public halves + a possession signature. This logged-in web
+// session authenticates the add; the hub verifies the block's signature over THIS account's username, so a
+// block signed for someone else is refused. A revoked key stops verifying the owner's sessions and loses
+// encryption access on the next rewrap. Mirrors GitHub's "SSH and GPG keys" screen.
 function SigningKeysCard({ username }: { username: string }) {
   const [keys, setKeys] = useState<SigningKey[] | null>(null)
   const [error, setError] = useState("")
   const [revoking, setRevoking] = useState<string | null>(null)
+  const [pasted, setPasted] = useState("")
+  const [adding, setAdding] = useState(false)
+  const [addError, setAddError] = useState("")
 
   async function load() {
     setError("")
@@ -122,6 +128,37 @@ function SigningKeysCard({ username }: { username: string }) {
     }
   }
 
+  // Parse the pasted block ourselves first, so a malformed paste gives a clear "not valid JSON" message
+  // rather than a confusing server 400. The hub is the real authority on the block's signature and epoch —
+  // a bad signature (e.g. a block signed for a different account) surfaces as the server's own 400 wording.
+  async function addKey() {
+    setAddError("")
+    const text = pasted.trim()
+    if (!text) {
+      setAddError("Paste the block printed by `agit identity register <you>` first.")
+      return
+    }
+    let block: unknown
+    try {
+      block = JSON.parse(text)
+    } catch {
+      setAddError("That doesn't look like a valid block — paste the whole one-line JSON from `agit identity register`.")
+      return
+    }
+    setAdding(true)
+    try {
+      await api.addSigningKey(block)
+      setPasted("")
+      await load()
+    } catch (err) {
+      // The hub's own wording: "enroll_sig does not verify against the submitted ed25519_pub" (wrong
+      // account / tampered block), a stale-epoch message, or a field-shape complaint.
+      setAddError(String((err as Error)?.message ?? err))
+    } finally {
+      setAdding(false)
+    }
+  }
+
   return (
     <section>
       <Eyebrow className="mb-1.5">signing keys</Eyebrow>
@@ -131,12 +168,43 @@ function SigningKeysCard({ username }: { username: string }) {
           <div className="min-w-0 flex-1">
             <p className="font-semibold">Device keys</p>
             <p className="mt-0.5 max-w-[58ch] text-sm text-muted-foreground">
-              One key per machine you enroll. A session is attributed to you when it's signed by{" "}
-              <em>any</em> of these keys, so a second laptop no longer clobbers the first. Add one from a
-              machine with <code className="font-mono">agit identity enroll</code> — the private half never
-              leaves it.
+              One key per machine you register. A session is attributed to you when it's signed by{" "}
+              <em>any</em> of these keys, so a second laptop no longer clobbers the first. On a machine, run{" "}
+              <code className="font-mono">agit identity register {username}</code> and paste the block it
+              prints below — the private half never leaves that machine.
             </p>
           </div>
+        </div>
+
+        <div className="mt-5 rounded-lg border bg-muted/20 p-4">
+          <Label htmlFor="add-signing-key" className="text-sm font-medium">
+            Add a signing key
+          </Label>
+          <p className="mt-1 max-w-[58ch] text-xs text-muted-foreground">
+            Paste the one-line block from <code className="font-mono">agit identity register {username}</code>.
+            It carries only your device's public keys and a signature — never a secret.
+          </p>
+          <textarea
+            id="add-signing-key"
+            value={pasted}
+            onChange={(e) => setPasted(e.target.value)}
+            placeholder={'{"ed25519_pub":"…","x25519_pub":"…","epoch":…,"enroll_sig":"…","label":"…"}'}
+            rows={3}
+            spellCheck={false}
+            className="mt-2 flex w-full rounded-md border bg-transparent px-3 py-2 font-mono text-xs shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={adding}
+          />
+          <div className="mt-2 flex items-center justify-end">
+            <Button size="sm" onClick={() => void addKey()} disabled={adding || !pasted.trim()}>
+              <Plus />
+              {adding ? "Adding…" : "Add key"}
+            </Button>
+          </div>
+          {addError && (
+            <p role="alert" className="mt-2 text-sm text-destructive">
+              {addError}
+            </p>
+          )}
         </div>
 
         <div className="mt-5">
@@ -146,8 +214,9 @@ function SigningKeysCard({ username }: { username: string }) {
             <div className="rounded-lg border bg-muted/30 p-5">
               <p className="text-sm font-medium">No device keys yet</p>
               <p className="mt-1 max-w-[54ch] text-sm text-muted-foreground">
-                Run <code className="font-mono">agit identity enroll</code> on a machine to publish its
-                signing key here. Until then, your signed sessions show as unregistered.
+                Run <code className="font-mono">agit identity register {username}</code> on a machine and
+                paste its block above to publish a signing key. Until then, your signed sessions show as
+                unregistered.
               </p>
             </div>
           ) : (
@@ -269,9 +338,9 @@ function EmailCard() {
                   </>
                 ) : (
                   <>
-                    No email on file yet. Enroll a signing identity with an email (
-                    <code className="font-mono">agit identity enroll</code>) to attribute your pushes to
-                    this account.
+                    No email on file yet, so pushes signed by your keys show as signed but aren't yet
+                    attributed to a verified address. (Setting a committer email is moving to account
+                    registration; adding a signing key above does not set it.)
                   </>
                 )}
               </p>

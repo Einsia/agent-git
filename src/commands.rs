@@ -1270,15 +1270,16 @@ fn provenance_key() -> Result<i32> {
 
 // ─────────────────────── Identity registry: enroll/show against the hub (encryption-recipients Wave 1) ───────────────────────
 
-/// `agit identity enroll [--rotate]` / `agit identity show [<user>]` — the client half of the shared
+/// `agit identity register <you>` / `agit identity show [<user>]` — the client half of the shared
 /// identity registry. The registry publishes this machine's ed25519 + X25519 PUBLIC keys so teammates
 /// can verify provenance signatures and (later) wrap encryption content-keys to them. The private key
-/// never leaves the machine.
+/// never leaves the machine. `register` is OFFLINE: it PRINTS a signed enroll block to paste into the
+/// hub web UI (where you are already logged in), rather than POSTing it — no token, no network call.
 pub fn identity_cmd(args: &[String]) -> Result<i32> {
     let sub = args.first().map(|s| s.as_str());
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
     match sub {
-        Some("enroll") => identity_enroll(rest.iter().any(|a| a == "--rotate"), flag_value(rest, "--label")),
+        Some("register") => identity_register(rest),
         Some("keys") => identity_keys(),
         Some("revoke") => identity_revoke(rest),
         Some("show") => identity_show(rest.first().map(|s| s.trim()).filter(|s| !s.is_empty())),
@@ -1288,7 +1289,7 @@ pub fn identity_cmd(args: &[String]) -> Result<i32> {
         Some(other) => {
             errln!("agit identity: unknown subcommand `{other}`");
             errln!(
-                "  usage: agit identity enroll [--label <name>] [--rotate]   ·   keys   ·   \
+                "  usage: agit identity register <you> [--label <name>]   ·   keys   ·   \
                  revoke <fpr-or-label>   ·   show [<user>]   ·   pin <user> [--repin] [--key HEX]"
             );
             Ok(2)
@@ -1325,69 +1326,77 @@ fn field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("")
 }
 
-/// ADD this machine's public keys to the hub registry as a DEVICE key (SSH-keys style) — never
-/// overwriting the account's OTHER device keys. `enroll_sig` signs `(username ‖ epoch ‖ ed25519_pub ‖
-/// x25519_pub)` with the machine key, proving possession; the `username` is the hub account the client
-/// authenticates as (learned from `GET /api/me`), because the server verifies the signature against that
-/// caller identity. The epoch is monotonic PER DEVICE KEY: a NEW machine starts this key at 0, and
-/// `--rotate` bumps past THIS machine's stored epoch. Re-enrolling an unchanged machine is idempotent.
-/// `label` names the device (defaulting to the hostname); it is self-asserted, not part of `enroll_sig`.
-fn identity_enroll(rotate: bool, label: Option<String>) -> Result<i32> {
+/// A client-side monotonic epoch: nanoseconds since the Unix epoch, as an i64. Every fresh invocation
+/// reads a strictly greater value (wall-clock nanos always advance between two process runs), so a
+/// re-printed block always out-ranks the previous one and the hub's per-key monotonic-epoch check accepts
+/// the updated paste. Falls back to a small nonzero floor on the (impossible in practice) pre-1970 clock.
+fn register_epoch() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(1)
+}
+
+/// `agit identity register <you> [--label <name>]` — OFFLINE. Build and PRINT a paste-able enroll block
+/// for the hub account `<you>`, for the user to paste into the hub web UI (Account -> Signing keys -> Add
+/// a signing key), where their logged-in session authenticates the add. NO network call, NO token.
+///
+/// The block is `{ ed25519_pub, x25519_pub, epoch, enroll_sig, label }`. `enroll_sig` signs
+/// `(username ‖ epoch ‖ ed25519_pub ‖ x25519_pub)` with THIS machine's key — the SAME bytes the hub's
+/// `POST /api/identity/enroll` re-derives and verifies against the submitted `ed25519_pub`. The username
+/// is REQUIRED and is baked into the signed bytes: the hub verifies the signature over the SESSION
+/// username, so a block signed for one account cannot be pasted under another — that binding is the point.
+/// `epoch` is a client-side monotonic value (nanos), so a re-print always advances and the hub accepts the
+/// updated re-paste. `label` defaults to the machine hostname; the block carries ONLY public key material
+/// plus the signature — never any private key.
+fn identity_register(args: &[String]) -> Result<i32> {
+    let Some(username) = register_username(args) else {
+        bail!(
+            "agit identity register: name the hub account this key is for\n  \
+             usage: agit identity register <you> [--label <name>]"
+        );
+    };
     let sk = agent::machine_signing_key()?;
     let (ed_pub, x_pub) = local_identity_pubkeys()?;
-
-    let ep = crate::hubapi::HubEndpoint::resolve()?;
-    let username = ep.me()?;
-    // Look for THIS machine's key in the account's device-key set (matched by ed25519 pubkey).
-    let current = ep.get_identity(&username)?;
-    let mine = current.as_ref().and_then(|v| my_device_key(v, &ed_pub));
-    let my_epoch = mine.and_then(|k| k.get("epoch").and_then(|e| e.as_i64()));
-
-    let epoch = match (my_epoch, rotate) {
-        // This machine has no key registered yet → add it as a fresh device key at epoch 0.
-        (None, _) => 0,
-        // Rotate THIS device key past its stored epoch.
-        (Some(stored), true) => stored + 1,
-        // Not rotating and this machine's key is already registered: idempotent no-op (same keys).
-        (Some(stored), false) => {
-            let same_x = mine.map(|k| field(k, "x25519_pub") == x_pub).unwrap_or(false);
-            if same_x {
-                outln!("this machine is already enrolled for {username} at epoch {stored} (key unchanged).");
-                outln!("  use `agit identity enroll --rotate` to publish a new epoch for this device.");
-                return Ok(0);
-            }
-            // Same ed25519 but a changed x25519 (a re-derivation) needs a rotation to republish.
-            errln!("this machine's x25519 key differs from its enrolled epoch {stored} on the hub.");
-            errln!("  re-run with `--rotate` to republish this device key as epoch {}.", stored + 1);
-            return Ok(1);
-        }
-    };
+    let epoch = register_epoch();
+    let device_label = flag_value(args, "--label")
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(default_device_label);
 
     let msg = agent::identity_enroll_message(&username, epoch, &ed_pub, &x_pub);
     let enroll_sig = agent::sign_hex(&sk, &msg);
-    let device_label = label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).unwrap_or_else(default_device_label);
-    // Publish the committer email too (best-effort — an override hub with no active agent has none): it is
-    // the bridge that lets a teammate verifying a session's provenance resolve its committer to THIS
-    // account. Not part of `enroll_sig` (the possession proof), so the Wave-1 signing format is unchanged.
-    let email = agent::resolve(None).map(|a| committer_email(&a.store)).unwrap_or_default();
-    let body = serde_json::json!({
+    let block = serde_json::json!({
         "ed25519_pub": ed_pub,
         "x25519_pub": x_pub,
         "epoch": epoch,
         "enroll_sig": enroll_sig,
-        "email": email,
         "label": device_label,
     });
-    ep.enroll(&body)?;
-    let verb = if my_epoch.is_some() { "device key rotated" } else { "device key added" };
-    outln!("enrolled {username} in the hub identity registry ({verb}, epoch {epoch}, label {device_label:?})");
-    outln!("  ed25519  {ed_pub}");
-    outln!("  x25519   {x_pub}");
-    if !email.is_empty() {
-        outln!("  email    {email}  (attribution: sessions you commit under this email verify as {username})");
-    }
-    outln!("  list your enrolled devices with `agit identity keys`.");
+    // Compact one-line JSON: trivial to copy in a single line. serde_json::to_string is already compact.
+    outln!("{}", serde_json::to_string(&block)?);
+    outln!("");
+    outln!("paste this into the hub: Account -> Signing keys -> Add a signing key");
+    outln!("  (signed for {username:?} on device {device_label:?}; contains only public keys — no secret leaves this machine)");
     Ok(0)
+}
+
+/// The `<you>` positional for `register`, skipping the `--label <value>` pair so the username is found
+/// whichever side of the flag it lands on.
+fn register_username(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--label" {
+            it.next(); // consume the flag's value
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        let t = a.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    None
 }
 
 /// `agit identity keys` — list THIS account's enrolled device keys (fingerprint, label, when), marking the
@@ -1397,12 +1406,12 @@ fn identity_keys() -> Result<i32> {
     let ep = crate::hubapi::HubEndpoint::resolve()?;
     let username = ep.me()?;
     let Some(set) = ep.get_identity(&username)? else {
-        outln!("no device keys enrolled for {username} yet — run `agit identity enroll`.");
+        outln!("no device keys enrolled for {username} yet — run `agit identity register {username}` and paste the block into the hub.");
         return Ok(0);
     };
     let keys = set.get("keys").and_then(|k| k.as_array()).cloned().unwrap_or_default();
     if keys.is_empty() {
-        outln!("no device keys enrolled for {username} yet — run `agit identity enroll`.");
+        outln!("no device keys enrolled for {username} yet — run `agit identity register {username}` and paste the block into the hub.");
         return Ok(0);
     }
     outln!("device keys for {username}");
@@ -1483,7 +1492,7 @@ fn identity_show(user: Option<&str>) -> Result<i32> {
             // Enrollment status is a courtesy: never fail `show` just because no hub is reachable.
             match hub_enrollment_status(&ed_pub) {
                 Ok(Some(line)) => outln!("  {line}"),
-                Ok(None) => outln!("  not enrolled on the hub yet — run `agit identity enroll`."),
+                Ok(None) => outln!("  not enrolled on the hub yet — run `agit identity register <you>` and paste the block into the hub web UI."),
                 Err(_) => outln!("  (no hub configured; showing local identity only)"),
             }
             Ok(0)
@@ -1534,7 +1543,7 @@ fn hub_enrollment_status(local_ed_pub: &str) -> Result<Option<String>> {
             Ok(Some(format!("enrolled as {username} at epoch {epoch} ({count} device key(s); this machine is one)")))
         }
         None if count > 0 => Ok(Some(format!(
-            "enrolled as {username} with {count} device key(s), but NOT this machine — run `agit identity enroll`"
+            "enrolled as {username} with {count} device key(s), but NOT this machine — run `agit identity register {username}` and paste the block into the hub"
         ))),
         None => Ok(None),
     }
@@ -2657,7 +2666,7 @@ fn crypt_enable_keybox(home: &Path, readers: &[String], public: bool, yes: bool)
                 readers.push(me);
             }
             _ => outln!(
-                "  note: to unlock a fresh clone on another machine, enroll (`agit identity enroll`) and \
+                "  note: to unlock a fresh clone on another machine, register (`agit identity register <you>`, paste into the hub) and \
                  add yourself (`agit a readers add <you>`), or encrypt with --public."
             ),
         }
@@ -3022,7 +3031,7 @@ fn hub_team_rekey(org: &str, rekey_all: bool) -> Result<i32> {
     if envelopes.is_empty() {
         bail!(
             "no member of `{org}` has an enrolled identity key to seal the team KEK to.\n\
-             \x20      Ask members to run `agit identity enroll` first."
+             \x20      Ask members to run `agit identity register <them>` and paste the block into the hub first."
         );
     }
     let sealed = envelopes.len();
@@ -4174,7 +4183,7 @@ fn crypt_unlock() -> Result<i32> {
                 "you are not a reader of this encrypted session — none of the {} keybox stanza(s) open with\n\
                  \x20      this machine's identity (nor a team KEK you can obtain, nor a hub-assist escrow\n\
                  \x20      release). The keyring was NOT written; the session stays locked. Publish your key\n\
-                 \x20      (agit identity enroll) and ask a reader to `agit a readers add <you>`, or join the\n\
+                 \x20      (agit identity register <you>, pasted into the hub) and ask a reader to `agit a readers add <you>`, or join the\n\
                  \x20      owning org and run `agit hub team sync <org>`.",
                 stanzas.len()
             ),

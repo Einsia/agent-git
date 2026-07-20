@@ -2,7 +2,7 @@
 //!
 //! The client authenticates to a hub for git over HTTP Basic (a token in the password field of the
 //! remote URL, `https://user:token@host/owner/name.git`); this module authenticates to the SAME hub the
-//! SAME way for the JSON API, so `agit identity enroll` needs no separate login. The hub base URL and
+//! SAME way for the JSON API (`agit identity keys` / `revoke` / `pin`), needing no separate login. The hub base URL and
 //! credential are resolved from the active agent's bound remote, with `AGIT_HUB_URL` / `AGIT_HUB_TOKEN`
 //! as overrides. No-hub / no-remote is a clear error, never a panic.
 
@@ -159,25 +159,6 @@ impl HubEndpoint {
             .and_then(|u| u.as_str())
             .map(|s| s.to_string())
             .context("the hub did not identify the authenticated user (GET /api/me returned no username)")
-    }
-
-    /// `POST /api/identity/enroll`. Returns the parsed JSON response on 2xx; a non-2xx is an error
-    /// carrying the hub's message.
-    pub fn enroll(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
-        let auth = self.require_auth()?;
-        let url = format!("{}/api/identity/enroll", self.base);
-        // Serialize the body ourselves (serde_json is already a dependency) and send it as an explicit
-        // application/json string, rather than pulling in ureq's `json` feature just for `send_json`.
-        let payload = serde_json::to_string(body).context("serializing enroll body")?;
-        let mut resp = http_agent()
-            .post(&url)
-            .header("Authorization", &auth.header_value())
-            .header("Content-Type", "application/json")
-            .send(&payload)
-            .with_context(|| format!("POST {url}"))?;
-        let status = resp.status().as_u16();
-        let text = resp.body_mut().read_to_string().unwrap_or_default();
-        ok_json(status, &text, &url)
     }
 
     /// `DELETE /api/identity/keys/<key_fpr>` — revoke ONE of the caller's own device keys. Returns the

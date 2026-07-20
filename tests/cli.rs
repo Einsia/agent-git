@@ -1726,3 +1726,101 @@ fn provenance_verify_defaults_to_active_and_verifies_a_whole_agent_by_name() {
     assert_ne!(code, 0, "one tampered session makes the whole-agent verify fail: {out}");
     assert!(out.contains("FAIL"), "flags the bad session in the per-session verdict: {out}");
 }
+
+// ─────────────────────── agit identity register: the OFFLINE paste flow (idpaste wave) ───────────────────────
+
+/// The first `{`-prefixed line of `identity register`'s output, parsed as JSON. That line is the compact,
+/// paste-able enroll block; the rest is the human instruction.
+fn register_block(out: &str) -> serde_json::Value {
+    let line = out.lines().find(|l| l.trim_start().starts_with('{')).unwrap_or_else(|| panic!("a JSON block line in: {out}"));
+    serde_json::from_str(line).unwrap_or_else(|_| panic!("the register block is valid JSON: {line}"))
+}
+
+/// `agit identity register <you>` is OFFLINE and prints a block whose `enroll_sig` VERIFIES over
+/// (username ‖ epoch ‖ ed25519_pub ‖ x25519_pub) against the printed `ed25519_pub` — the exact bytes the
+/// hub re-derives — so the web paste carries a real possession proof. The signature is BOUND to the named
+/// account: re-derived under a different username it must NOT verify.
+#[test]
+fn identity_register_prints_a_verifiable_enroll_block() {
+    let r = Repo::new();
+    let (code, out, err) = r.agit(&["identity", "register", "alice"]);
+    assert_eq!(code, 0, "register must succeed with no network: {err}");
+    let v = register_block(&out);
+    let ed = v["ed25519_pub"].as_str().expect("ed25519_pub");
+    let x = v["x25519_pub"].as_str().expect("x25519_pub");
+    let epoch = v["epoch"].as_i64().expect("epoch is an integer");
+    let sig = v["enroll_sig"].as_str().expect("enroll_sig");
+    assert!(!v["label"].as_str().unwrap_or_default().is_empty(), "a device label defaults to the hostname: {out}");
+
+    // Round-trip: re-derive the signed bytes and verify against the PRINTED public key.
+    let msg = agit::agent::identity_enroll_message("alice", epoch, ed, x);
+    assert!(
+        agit::agent::verify_hex(ed, &msg, sig),
+        "enroll_sig must verify over (username‖epoch‖ed‖x) against the printed ed25519_pub"
+    );
+    // The block is bound to the account it was signed for: another username breaks the signature.
+    let wrong = agit::agent::identity_enroll_message("mallory", epoch, ed, x);
+    assert!(!agit::agent::verify_hex(ed, &wrong, sig), "a block signed for `alice` must not verify under another account");
+
+    // It points the user at the web paste, and makes NO network call (no hub is configured here, yet code == 0).
+    assert!(out.contains("paste this into the hub"), "prints the paste instruction: {out}");
+}
+
+/// The printed block is safe to paste in the clear: it carries ONLY the public key halves, the epoch, the
+/// signature and a label — never any private key material. The machine's on-disk private seed must appear
+/// nowhere in the output.
+#[test]
+fn identity_register_block_has_no_private_key_material() {
+    let r = Repo::new();
+    let (code, out, err) = r.agit(&["identity", "register", "alice"]);
+    assert_eq!(code, 0, "{err}");
+    let v = register_block(&out);
+    let obj = v.as_object().expect("the block is a JSON object");
+    let mut fields: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        ["ed25519_pub", "enroll_sig", "epoch", "label", "x25519_pub"],
+        "only public halves + epoch + sig + label — no private field"
+    );
+
+    // The private ed25519 seed on disk must never be printed, in any field or anywhere in stdout.
+    let priv_hex = std::fs::read_to_string(r.path().join("agit-home/identity/ed25519")).expect("the machine key was minted");
+    let priv_hex = priv_hex.trim();
+    assert!(!priv_hex.is_empty(), "the machine private key exists on disk");
+    assert!(!out.contains(priv_hex), "the machine's private key must never appear in the printed block");
+    for val in obj.values() {
+        if let Some(s) = val.as_str() {
+            assert_ne!(s, priv_hex, "no printed field may equal the private seed");
+        }
+    }
+}
+
+/// Re-running `register` yields a strictly HIGHER epoch (client-side monotonic), so a re-paste always
+/// out-ranks the previous block and the hub's per-key monotonic-epoch check accepts the update.
+#[test]
+fn identity_register_epoch_is_monotonic_across_runs() {
+    let r = Repo::new();
+    let epoch_of = |r: &Repo| -> i64 {
+        let (code, out, err) = r.agit(&["identity", "register", "alice"]);
+        assert_eq!(code, 0, "{err}");
+        register_block(&out)["epoch"].as_i64().expect("epoch")
+    };
+    let first = epoch_of(&r);
+    let second = epoch_of(&r);
+    assert!(second > first, "a re-print must produce a strictly higher epoch ({second} > {first})");
+}
+
+/// The token-requiring `agit identity enroll` is GONE: the subcommand no longer dispatches. It is now an
+/// unknown-subcommand usage error (non-zero), never a hidden POST — and the usage advertises `register`.
+#[test]
+fn identity_enroll_command_is_removed() {
+    let r = Repo::new();
+    let (code, _out, err) = r.agit(&["identity", "enroll"]);
+    assert_ne!(code, 0, "enroll must no longer be a valid subcommand");
+    assert!(
+        err.contains("unknown subcommand") && err.contains("enroll"),
+        "reports `enroll` as unknown: {err}"
+    );
+    assert!(err.contains("register"), "the usage line points at the new register command: {err}");
+}

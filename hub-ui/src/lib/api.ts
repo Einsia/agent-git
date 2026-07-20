@@ -18,7 +18,7 @@ export type Scope = "read" | "write"
 export interface Me {
   username: string
   is_admin: boolean
-  // The account's registered committer email (self-asserted at `agit identity enroll`), or "" if none.
+  // The account's registered committer email (self-asserted on the hub when a device key is registered), or "" if none.
   email?: string
   // Whether that email has been VERIFIED. Attribution in provenance verification is gated on this — an
   // unverified (possibly squatted) email is not attributed. Drives the Verified / Unverified badge.
@@ -438,6 +438,17 @@ export const api = {
   // read a user's set; the Account page reads its OWN. 404 when the account has no non-revoked key.
   signingKeys: (username: string) =>
     request<IdentitySet>(`/api/identity/${encodeURIComponent(username)}`),
+  // Add (enroll) a signing key from a pasted CLI block. The block is produced OFFLINE by
+  // `agit identity register <you>` and pasted here verbatim: { ed25519_pub, x25519_pub, epoch, enroll_sig,
+  // label }. The logged-in session authenticates the add — no token — and the hub verifies enroll_sig over
+  // the SESSION username, so a block signed for a DIFFERENT account fails the signature check and is
+  // refused (400). Response: { username, epoch, key_fpr }. This is the primary, web-first path to publish a
+  // device key; the block never carries any private key material.
+  addSigningKey: (block: unknown) =>
+    request<{ username: string; epoch: number; key_fpr: string }>("/api/identity/enroll", {
+      method: "POST",
+      body: JSON.stringify(block),
+    }),
   // Revoke ONE of the CALLER's own device keys by fingerprint. Caller-only at the hub; a non-owner cannot
   // revoke. 404 when the fingerprint names no live key of the caller's.
   revokeSigningKey: (keyFpr: string) =>
