@@ -885,7 +885,11 @@ fn scaffold_store(store: &Path, id: &StoreIdentity) -> Result<()> {
 ///
 /// Tracking **activates** by default (`--no-use` opts out): `track` then `use` was two commands for
 /// one intent.
-pub fn clone_agent(target: &str, activate: bool) -> Result<Agent> {
+///
+/// `init` is the `--init` mode: mint a fresh agent INTO an empty store and push, rather than adopt an
+/// existing one. It only makes sense for a URL/binding target whose store is empty — a target already on
+/// disk, or a store that already carries an agent, is refused (drop `--init` to adopt it).
+pub fn clone_agent(target: &str, activate: bool, init: bool) -> Result<Agent> {
     let home = scope::agit_home()?;
     let env = scope::env_root().ok();
     let binding = match env.as_deref() {
@@ -895,6 +899,10 @@ pub fn clone_agent(target: &str, activate: bool) -> Result<Agent> {
 
     let agent = match find_in(&home, target) {
         // Already on disk: `track` is idempotent, and re-cloning would be a second copy of one memory.
+        // `--init` on a target this machine already has is contradictory — there is nothing empty to mint.
+        Ok(_) if !looks_like_url(target) && init => bail!(
+            "`{target}` already has an agent on this machine — drop --init to use it (agit a clone {target})."
+        ),
         Ok(a) if !looks_like_url(target) => a,
         _ => {
             let url = if looks_like_url(target) {
@@ -911,7 +919,7 @@ pub fn clone_agent(target: &str, activate: bool) -> Result<Agent> {
                         )
                     })?
             };
-            clone_in(&home, &url)?
+            clone_in(&home, &url, init)?
         }
     };
 
@@ -930,6 +938,27 @@ pub fn clone_agent(target: &str, activate: bool) -> Result<Agent> {
 /// A URL, or a name? `track` must not treat `frontend` as a relative path.
 fn looks_like_url(t: &str) -> bool {
     t.contains("://") || t.contains('@') || t.starts_with('/') || t.starts_with('.') || t.starts_with('~')
+}
+
+/// Does this bare target name a KNOWN agent — one already on this machine, or one the committed binding
+/// declares? This is the cheap, network-free half of `agit clone <target>`'s smart routing: a bare name
+/// that resolves to a local agent (or a `[[agent]]` the team committed) is adopted via the agent path
+/// instead of git-cloning a directory called `<name>`. A URL is NEVER a "known name" here — URLs are
+/// classified by probing the hub — and an unknown name returns `false`, so git's own clone still runs.
+pub fn is_known_local_agent(target: &str) -> bool {
+    let t = target.trim();
+    if t.is_empty() || looks_like_url(t) {
+        return false;
+    }
+    let Ok(home) = scope::agit_home() else {
+        return false;
+    };
+    if find_in(&home, t).is_ok() {
+        return true;
+    }
+    // A committed binding that declares this agent (by name or aid) is adoptable by name — a fresh clone
+    // gets its team's agents exactly this way.
+    matches!(scope::env_root().ok().and_then(|e| Binding::load(&e).ok().flatten()), Some(b) if b.find(t).is_some())
 }
 
 /// Transports agit will hand to `git clone`. An allowlist, because the danger is a REMOTE THIS MACHINE
@@ -981,7 +1010,11 @@ fn check_remote(url: &str) -> Result<()> {
 }
 
 /// Clone into a temp dir first: the destination is keyed by the aid, which only the clone can tell us.
-fn clone_in(home: &Path, url: &str) -> Result<Agent> {
+///
+/// `init` (the `--init` mode) mints a fresh agent into an EMPTY store and pushes, instead of adopting an
+/// existing one. Whether `init` is set or not, an empty store (created but never pushed to) is surfaced as
+/// a clear, actionable message rather than the raw `agent.toml … No such file` os-error.
+fn clone_in(home: &Path, url: &str, init: bool) -> Result<Agent> {
     check_remote(url)?;
     let tmp = home.join("tmp").join(format!("clone-{}", convo::fresh_id(url)));
     std::fs::create_dir_all(tmp.parent().unwrap_or(home))?;
@@ -1002,7 +1035,32 @@ fn clone_in(home: &Path, url: &str) -> Result<Agent> {
         .unwrap_or(false);
     if !ok {
         let _ = std::fs::remove_dir_all(&tmp);
-        bail!("git clone {url} failed");
+        bail!("git clone {} failed", crate::hubapi::redact_url(url));
+    }
+    // An EMPTY store: the clone succeeded but the remote published NO refs at all — a hub store created
+    // but never pushed to. This is the case that used to die with a raw `agent.toml … No such file (os
+    // error 2)` after read_identity found nothing. Detect it BY EMPTINESS (no refs), distinct from "a git
+    // repo that is not an agent store" (which HAS commits, just no agent.toml). `--init` mints a fresh
+    // agent into it; without `--init`, surface the actionable message.
+    let has_any_ref = !scope::git_in_status(&tmp, &["for-each-ref"]).1.trim().is_empty();
+    if !has_any_ref {
+        let _ = std::fs::remove_dir_all(&tmp);
+        if init {
+            return init_into_empty_store(home, url);
+        }
+        let shown = crate::hubapi::redact_url(url);
+        bail!(
+            "{shown} is an empty store - nothing has been pushed to it yet.\n\
+             \x20      Initialize a fresh agent here with `agit a clone --init {shown}`,\n\
+             \x20      or push an existing agent with `agit a push {shown}`."
+        );
+    }
+    // The store is not empty. `--init` asked to mint into an empty one, so refuse rather than silently
+    // adopt an agent the caller did not expect to already exist.
+    if init {
+        let _ = std::fs::remove_dir_all(&tmp);
+        let shown = crate::hubapi::redact_url(url);
+        bail!("{shown} already has an agent — drop --init to adopt it (agit a clone {shown}).");
     }
     // A store IS just a git repo, and a self-hosted bare hub (`git init --bare` with
     // `init.defaultBranch` unset) has HEAD → `refs/heads/master` while agit's stores are on `main`. The
@@ -1023,7 +1081,7 @@ fn clone_in(home: &Path, url: &str) -> Result<Agent> {
         Ok(id) => id,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e).with_context(|| format!("{url} is not an agent store"));
+            return Err(e).with_context(|| format!("{} is not an agent store", crate::hubapi::redact_url(url)));
         }
     };
     let dest = agents_dir_in(home).join(&id.aid);
@@ -1041,6 +1099,63 @@ fn clone_in(home: &Path, url: &str) -> Result<Agent> {
     crate::init::install_hooks(&dest)?;
     registry_put(home, &id.name, &id.aid)?;
     Ok(agent_at(dest, id))
+}
+
+/// `agit a clone --init <url>` into an EMPTY store: mint a fresh agent locally (fresh aid + agent.toml,
+/// the same `new_agent_in` path a bare `agit a init` uses), point its `origin` at `<url>`, and push so the
+/// once-empty store becomes a valid, adoptable agent. The name is derived from the store URL's last path
+/// segment (a store URL is `.../<name>.git`); a collision or an unusable segment falls back to a minted
+/// name, so `--init` always succeeds against an empty store.
+fn init_into_empty_store(home: &Path, url: &str) -> Result<Agent> {
+    let shown = crate::hubapi::redact_url(url);
+    let name = mint_name_for(home, url);
+    let a = new_agent_in(home, &name)?;
+    // Point the fresh store at the empty remote and publish it. A push failure here leaves a perfectly
+    // good LOCAL agent behind (the mint already succeeded), so report it but keep the agent.
+    scope::git_in(&a.store, &["remote", "add", "origin", url])
+        .with_context(|| format!("failed to set origin to {shown}"))?;
+    let branch = scope::git_in_status(&a.store, &["rev-parse", "--abbrev-ref", "HEAD"]).1.trim().to_string();
+    let branch = if branch.is_empty() { "main".to_string() } else { branch };
+    let code = scope::git_in_inherit(&a.store, &["push", "--no-verify", "-u", "origin", &branch]);
+    if code != 0 {
+        bail!(
+            "minted {} ({}) locally, but the push to {shown} failed (exit {code}).\n\
+             \x20      Fix the remote, then publish it with `agit a push`.",
+            a.name,
+            a.aid
+        );
+    }
+    Ok(a)
+}
+
+/// The agent name to mint for `agit a clone --init <url>`: the store URL's last path segment with a
+/// trailing `.git` removed (`https://hub/alice/frontend.git` → `frontend`), when it is a usable, free
+/// name; otherwise a minted `agent-<short>` fallback that is guaranteed usable and unique.
+fn mint_name_for(home: &Path, url: &str) -> String {
+    let derived = store_name_from_url(url).filter(|n| is_usable_name(n) && find_in(home, n).is_err());
+    if let Some(n) = derived {
+        return n;
+    }
+    // No usable/free name from the URL — mint one. A few attempts makes a collision vanishingly unlikely.
+    for _ in 0..16 {
+        let cand = format!("agent-{}", &mint_aid()[4..12]);
+        if is_usable_name(&cand) && find_in(home, &cand).is_err() {
+            return cand;
+        }
+    }
+    format!("agent-{}", &mint_aid()[4..20])
+}
+
+/// The last path segment of a store URL, with any `.git` suffix stripped — the natural agent name for a
+/// store published at `.../<name>.git`. `None` when the URL carries no usable segment.
+fn store_name_from_url(url: &str) -> Option<String> {
+    // Drop any `?query`/`#fragment`, then take the final path segment. Works for http(s)/ssh/scp/local.
+    let path = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/');
+    // scp syntax `user@host:owner/name.git` puts the path after the LAST ':'; a URL path after the LAST
+    // '/'. Taking the segment after whichever separator comes last handles both.
+    let seg = path.rsplit(['/', ':']).next().unwrap_or(path);
+    let seg = seg.strip_suffix(".git").unwrap_or(seg);
+    (!seg.is_empty()).then(|| seg.to_string())
 }
 
 /// `agit a rename <old> <new>` — metadata only. The store is keyed by the aid, so nothing moves and
@@ -2449,6 +2564,76 @@ primary = true
                 "agit a init must install {hook} — a store minted without it scans nothing, silently"
             );
         }
+    }
+
+    /// A bare `git init --bare` repo cloned by agit: the store exists but nothing was ever pushed. This
+    /// must NOT die with the raw `agent.toml … No such file (os error 2)` — it is the empty-store case,
+    /// and the message must be clear and actionable (`--init` to mint, `agit a push` to publish).
+    #[test]
+    fn cloning_an_empty_store_reports_it_actionably_not_an_os_error() {
+        let h = tmp();
+        let d = tmp();
+        let bare = d.path().join("empty.git");
+        Command::new("git").args(["init", "--bare", "-q", "-b", "main"]).arg(&bare).status().unwrap();
+
+        let e = clone_in(h.path(), bare.to_str().unwrap(), false).unwrap_err().to_string();
+        assert!(e.contains("empty store"), "must name the empty-store case: {e}");
+        assert!(e.contains("--init"), "must point at --init to mint one: {e}");
+        assert!(e.contains("agit a push"), "must point at push to publish an existing one: {e}");
+        assert!(!e.contains("os error"), "must not surface the raw os-error: {e}");
+        assert!(!e.contains("No such file"), "must not surface the raw os-error: {e}");
+    }
+
+    /// `agit a clone --init <empty-store>` mints a fresh agent into it and pushes, so the once-empty
+    /// store becomes a valid, adoptable agent — a second machine can clone it by identity.
+    #[test]
+    fn init_mints_a_fresh_agent_into_an_empty_store_and_publishes_it() {
+        let h1 = tmp();
+        let d = tmp();
+        let bare = d.path().join("frontend.git");
+        Command::new("git").args(["init", "--bare", "-q", "-b", "main"]).arg(&bare).status().unwrap();
+
+        // --init against the empty store mints locally and pushes.
+        let a = clone_in(h1.path(), bare.to_str().unwrap(), true).unwrap();
+        assert!(a.aid.starts_with("agt_"), "a fresh identity was minted: {}", a.aid);
+        assert_eq!(a.name, "frontend", "the name is derived from the store URL's last segment");
+        assert!(read_identity(&a.store).unwrap().aid == a.aid, "the local store carries the minted identity");
+
+        // The store is no longer empty: the bare remote now has an agent.toml on main.
+        let toml = scope::git_in(&bare, &["show", "main:agent.toml"]).unwrap();
+        assert!(toml.contains(&a.aid), "the pushed store publishes the minted aid: {toml}");
+
+        // And a DIFFERENT machine can now adopt it by a plain clone (no --init) — it is a real agent.
+        let h2 = tmp();
+        let adopted = clone_in(h2.path(), bare.to_str().unwrap(), false).unwrap();
+        assert_eq!(adopted.aid, a.aid, "the second machine adopts the same identity");
+    }
+
+    /// `--init` is only for an EMPTY store. Pointed at a store that already carries an agent, it must
+    /// refuse (drop --init to adopt it), never silently mint a colliding second identity.
+    #[test]
+    fn init_refuses_a_store_that_already_has_an_agent() {
+        let h1 = tmp();
+        let d = tmp();
+        let bare = d.path().join("taken.git");
+        Command::new("git").args(["init", "--bare", "-q", "-b", "main"]).arg(&bare).status().unwrap();
+        // Populate the store with a real agent first.
+        clone_in(h1.path(), bare.to_str().unwrap(), true).unwrap();
+
+        // A second --init against the now-populated store is refused.
+        let h2 = tmp();
+        let e = clone_in(h2.path(), bare.to_str().unwrap(), true).unwrap_err().to_string();
+        assert!(e.contains("already has an agent"), "must refuse a non-empty store under --init: {e}");
+        assert!(e.contains("--init"), "must tell the user to drop --init: {e}");
+    }
+
+    #[test]
+    fn store_name_is_derived_from_the_url_last_segment() {
+        assert_eq!(store_name_from_url("https://hub/alice/frontend.git").as_deref(), Some("frontend"));
+        assert_eq!(store_name_from_url("https://hub/alice/frontend").as_deref(), Some("frontend"));
+        assert_eq!(store_name_from_url("git@github.com:me/payments-api.git").as_deref(), Some("payments-api"));
+        assert_eq!(store_name_from_url("/srv/agents/infra.git/").as_deref(), Some("infra"));
+        assert_eq!(store_name_from_url("https://hub/x/y.git?token=zzz").as_deref(), Some("y"));
     }
 
     #[test]

@@ -189,10 +189,13 @@ fn dispatch(argv: Vec<String>) -> i32 {
                 .cloned();
             init::run_named(agent)
         }
-        // No `"clone"` arm: `agit clone <url>` is git's clone, on the code repo, like every other
-        // unclaimed verb. It used to mean "clone the team's Agent Store into <env>/.agit/agent" — which
-        // shadowed git's own verb (the thing `track` not `add` and `info` not `show` exist to avoid) and,
-        // after the cutover, built a store at a path nothing resolves. `agit a clone <url>` is the memory.
+        // ── clone (default/Environment scope): git's clone, but smart about agit-hub AGENT STORES. A raw
+        //    `git clone <hub-store-url>` silently makes a nested git repo that resolves to no agent; so a
+        //    POSITIVELY-identified agit-hub store URL, or a bare name that is a KNOWN local agent/binding,
+        //    is adopted as an agent (agit a clone) instead. `--git` forces the raw passthrough clone, and
+        //    any other target is unchanged git passthrough. (Only the default scope: `agit a clone` is the
+        //    explicit agent path above, and never reaches here.) ──
+        "clone" if scope == Scope::Environment => clone_cmd(rest, args),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(0)
@@ -393,6 +396,16 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── Agent-store management verbs, checked before passthrough so they never reach git ──
         v if scope == Scope::Agent && AGENT_MGMT_VERBS.contains(&v) => agent_mgmt(v, args),
+
+        // ── url-bearing passthrough verbs (Environment scope): a bare `agit fetch/pull/push <url>` or
+        //    `agit remote add <name> <url>` against a POSITIVELY-identified agit-hub store is legitimate
+        //    (the code repo can share a git host with a store), so it is NEVER hijacked — but a one-line
+        //    hint points at `agit a <verb>`, which operates on the agent. The git passthrough then runs
+        //    unchanged. A remote NAME (origin) or a non-hub URL prints nothing. ──
+        "fetch" | "pull" | "push" | "remote" if scope == Scope::Environment => {
+            hint_if_hub_url(cmd, args);
+            passthrough::run(scope, rest)
+        }
 
         // ── Everything else: transparently pass through to the corresponding repo's git ──
         _ => passthrough::run(scope, rest),
@@ -691,15 +704,129 @@ fn agent_init(args: &[String]) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// `agit clone <target>` (default scope) — git's clone, made smart about agit-hub AGENT STORES.
+///
+/// A raw `git clone <hub-store-url>` silently makes a nested git repo that resolves to no agent, so a
+/// target that is (a) a POSITIVELY-identified agit-hub store URL or (b) a bare name that is a KNOWN local
+/// agent/binding is adopted via the agent path instead, with a one-line note. `--git` forces the raw
+/// passthrough clone; any other target is unchanged git passthrough. Detection is fail-safe: an
+/// unprobeable/offline host, or anything not positively an agit-hub, falls through to git untouched.
+fn clone_cmd(rest: &[String], args: &[String]) -> anyhow::Result<i32> {
+    use agit::agent;
+    // `--git` is the escape hatch: strip it and run the raw git clone verbatim, no probing at all.
+    if args.iter().any(|a| a == "--git") {
+        let git_args: Vec<String> = rest.iter().filter(|a| *a != "--git").cloned().collect();
+        return passthrough::run(Scope::Environment, &git_args);
+    }
+    // No identifiable repository argument → nothing to classify; let git handle it (e.g. `clone --help`).
+    let Some(target) = clone_target(args) else {
+        return passthrough::run(Scope::Environment, rest);
+    };
+    // (b) a bare KNOWN agent/binding name (cheap, network-free), then (a) a positively-identified hub
+    // store URL (a short, bounded probe). Anything else stays a raw git clone.
+    let is_agent = agent::is_known_local_agent(&target) || agit::hubapi::is_hub_store_url(&target);
+    if !is_agent {
+        return passthrough::run(Scope::Environment, rest);
+    }
+    eprintln!(
+        "detected an agit agent store - adopting it as an agent (agit a clone); use --git for a raw git clone"
+    );
+    let a = agent::clone_agent(&target, !args.iter().any(|x| x == "--no-switch"), false)?;
+    println!("cloned {} ({})", a.name, a.aid);
+    println!("  store {}", a.store.display());
+    Ok(0)
+}
+
+/// The repository argument of a git-clone-style invocation — the first positional that is not an option
+/// (nor an option's value). Value-taking clone options are skipped so their value is never mistaken for
+/// the repo, and agit-native flags (`--git`, `--no-switch`) are ignored. `None` when there is no
+/// positional (e.g. `agit clone --help`). A misread here only ever costs a redirect (the result is not a
+/// known agent nor a hub URL → plain passthrough), never a wrong hijack.
+fn clone_target(args: &[String]) -> Option<String> {
+    // git-clone options that consume the following token as their value.
+    const TAKES_VALUE: &[&str] = &[
+        "-b", "--branch", "-o", "--origin", "-u", "--upload-pack", "--depth", "--reference",
+        "--reference-if-able", "--separate-git-dir", "-c", "--config", "-j", "--jobs",
+        "--shallow-since", "--shallow-exclude", "--template", "--filter", "--bundle-uri", "--server-option",
+    ];
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            // Everything after `--` is positional; the first is the repository.
+            return args.get(i + 1).cloned();
+        }
+        if a == "--git" || a == "--no-switch" {
+            i += 1; // agit-native, not git's — skip.
+            continue;
+        }
+        if a.starts_with("--") && a.contains('=') {
+            i += 1; // `--opt=value` is one token.
+            continue;
+        }
+        if a.starts_with('-') {
+            i += if TAKES_VALUE.contains(&a.as_str()) && i + 1 < args.len() { 2 } else { 1 };
+            continue;
+        }
+        return Some(a.clone());
+    }
+    None
+}
+
+/// Print the hub-store hint for a url-bearing passthrough verb (`fetch`/`pull`/`push`/`remote add`) when
+/// its target is a POSITIVELY-identified agit-hub store URL. Only a URL the user typed literally is
+/// probed — a remote NAME (`origin`) is not a URL, so it never triggers a network call. Never hijacks:
+/// the caller runs the git passthrough regardless.
+fn hint_if_hub_url(cmd: &str, args: &[String]) {
+    let Some(url) = hub_url_candidate(cmd, args) else {
+        return;
+    };
+    if agit::hubapi::is_hub_store_url(&url) {
+        let shown = agit::hubapi::redact_url(&url);
+        eprintln!("{shown} is an agit agent store - `agit a {cmd}` operates on the agent");
+    }
+}
+
+/// The URL a url-bearing passthrough verb points at, if any. For `remote` it is the store URL of a
+/// `remote add <name> <url>` (the SECOND positional after `add`); for `fetch`/`pull`/`push` it is the
+/// first positional (the `<repository>`). Returns `None` when there is no positional URL to consider.
+fn hub_url_candidate(cmd: &str, args: &[String]) -> Option<String> {
+    let positionals: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
+    if cmd == "remote" {
+        // Only `remote add <name> <url>` carries a store URL; `remote -v`, `remove`, etc. do not.
+        if args.first().map(String::as_str) != Some("add") {
+            return None;
+        }
+        // Positionals are `add`, `<name>`, `<url>`: the store URL is the third.
+        return positionals.get(2).cloned();
+    }
+    // fetch/pull/push <repository>: the first positional (a remote name is not a URL and won't probe).
+    positionals.into_iter().next()
+}
+
 /// `agit a clone <name|url>` — clone an agent's store by identity (the git-native name for `track`). A
 /// bare name resolves through the committed binding; a URL clones that store and adopts its identity.
+///
+/// `--init` is the empty-store path: when `<url>` is a store created but never pushed to, mint a fresh
+/// agent into it and push, so the store becomes adoptable. `--no-switch` opts out of activating it here.
 fn agent_clone(args: &[String]) -> anyhow::Result<i32> {
     use agit::agent;
-    let Some(target) = args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-        anyhow::bail!("agit a clone: name an agent or a store URL — agit a clone <name|url>");
+    // The target is the first positional; `--init` / `--no-switch` are agit-native flags, not a target.
+    let Some(target) = args
+        .iter()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty() && !s.starts_with("--"))
+    else {
+        anyhow::bail!("agit a clone: name an agent or a store URL — agit a clone [--init] <name|url>");
     };
-    let a = agent::clone_agent(target, !args.iter().any(|x| x == "--no-switch"))?;
-    println!("cloned {} ({})", a.name, a.aid);
+    let init = args.iter().any(|x| x == "--init");
+    let a = agent::clone_agent(target, !args.iter().any(|x| x == "--no-switch"), init)?;
+    if init {
+        // The store was empty; a fresh agent was minted into it and pushed.
+        println!("minted {} ({}) into the empty store and pushed it", a.name, a.aid);
+    } else {
+        println!("cloned {} ({})", a.name, a.aid);
+    }
     println!("  store {}", a.store.display());
     Ok(0)
 }
@@ -1210,7 +1337,7 @@ the only one present, else they ask.
   agit a push / pull       Push your sessions to, and pull the team's back from, the shared store (the Agent Store is just a git repo)
   agit start               Launch a session HERE already carrying this agent's latest context, from whatever repo it was last in (--agent <name> picks the agent for this invocation only; --as <rt> switches runtime)
   agit a merge <target>    Merge this agent's memory with <target>'s by dialogue (alias: sync); <target> is an agent name or a ref — never a code branch. Same agent → the histories merge too; a different agent → dialogue only, both stay intact (--agent X / --ref X disambiguate)
-  agit a clone <url>       Clone an agent published on a hub (its memory, by identity)
+  agit a clone <url>       Clone an agent published on a hub (its memory, by identity); --init mints a fresh agent into an EMPTY store and pushes it
   agit a scan [--staged]   Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
   agit workspace restore [N]  Roll both repos back together to a pairing's joint state
@@ -1223,7 +1350,8 @@ the only one present, else they ask.
   agit resume <src>        Load a session into a runtime and continue (--as <rt> to switch runtime; --env <path> to run this agent against a different repo; --relocate if it's the same project moved; --exec to launch)
   agit provenance verify <session>  Check a captured session's signature against its recorded key (unsigned → unverified, never blocks); `agit provenance key` shows this machine's public key
 
-  agit <git-args>          Run git transparently on the code repository (Environment)
+  agit <git-args>          Run git transparently on the code repository (Environment). `agit clone <target>` also adopts an agit agent store (a positively-identified hub URL, or a known agent name) as an agent; --git forces the raw git clone
+  agit clone --git <url>   Force a raw git clone (never adopt it as an agent)
   agit agent <git-args>    Run isomorphic git on the Agent Store — `agit a` is the alias (agit a log · agit a add -A · agit a commit · agit a push)
 
   agit a status            Overview of this repo: its agents, which is active, each one's sessions + last activity + live-watcher, and the active store's unpushed/ahead-behind

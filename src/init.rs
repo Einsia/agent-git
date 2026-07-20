@@ -95,7 +95,7 @@ fn track_declared(env: &Path) -> Result<Option<agent::Agent>> {
             errln!("  · {} is declared but has no remote to clone — skipping (its owner has not published it)", entry.name);
             continue;
         }
-        match agent::clone_agent(&entry.name, false) {
+        match agent::clone_agent(&entry.name, false, false) {
             Ok(a) => {
                 outln!("  ✓ cloned {} ({})", a.name, a.aid);
                 got.push(a);

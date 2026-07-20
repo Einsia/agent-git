@@ -353,6 +353,57 @@ fn clone_is_gits_clone_and_works_outside_a_repo() {
     );
 }
 
+/// `agit clone <known-local-agent-name>` is smart: a bare name that resolves to an agent this machine
+/// already has (or the committed binding declares) is ADOPTED via the agent path, not raw-git-cloned into
+/// a directory named after it. The redirect note names what happened and how to force the raw clone.
+#[test]
+fn clone_of_a_known_local_agent_name_routes_to_the_agent_path() {
+    let r = Repo::new(); // mints + binds "testmemory" here
+    let (code, out, err) = r.agit(&["clone", "testmemory"]);
+    assert_eq!(code, 0, "clone of a known agent name should adopt it, not fail: {err}");
+    assert!(err.contains("detected an agit agent store"), "must print the redirect note: {err}");
+    assert!(out.contains("cloned testmemory"), "must adopt the agent by identity: {out}");
+}
+
+/// `--git` forces the raw passthrough git clone, even for a target that WOULD redirect. It is stripped
+/// and handed to git verbatim BEFORE any hub probe, so git clones a local path `testmemory` (which does
+/// not exist → git's own error) and the smart redirect never fires.
+#[test]
+fn clone_git_flag_forces_raw_passthrough_and_never_redirects() {
+    let r = Repo::new();
+    // Without --git the same target redirects (proven above); with --git it must not.
+    let (code, _out, err) = r.agit(&["clone", "--git", "testmemory"]);
+    assert_ne!(code, 0, "raw git clone of a nonexistent local path must fail with git's own error");
+    assert!(!err.contains("detected an agit agent store"), "--git must force passthrough, not redirect: {err}");
+}
+
+/// `agit a clone <empty-store>` (a store created but never pushed to) must NOT die with the raw
+/// `agent.toml … No such file (os error 2)`. It surfaces a clear, actionable message; and `--init` mints
+/// a fresh agent into the empty store and pushes, so the once-empty store becomes a real, adoptable agent.
+#[test]
+fn agent_clone_of_an_empty_store_is_actionable_and_init_mints_into_it() {
+    let r = Repo::new();
+    let bare = r.path().join("empty.git");
+    Command::new("git").args(["init", "--bare", "-q", "-b", "main"]).arg(&bare).status().unwrap();
+    let bare_url = bare.to_str().unwrap();
+
+    // Plain adopt of an empty store → the clear message, not the raw os-error.
+    let (code, _out, err) = r.agit(&["a", "clone", bare_url]);
+    assert_ne!(code, 0, "adopting an empty store must fail cleanly");
+    assert!(err.contains("empty store"), "must name the empty-store case: {err}");
+    assert!(err.contains("--init"), "must point at --init: {err}");
+    assert!(!err.contains("os error") && !err.contains("No such file"), "must not surface the raw os-error: {err}");
+
+    // --init mints a fresh agent into it and pushes.
+    let (ic, iout, ierr) = r.agit(&["a", "clone", "--init", bare_url]);
+    assert_eq!(ic, 0, "--init should mint+push into the empty store: {ierr}");
+    assert!(iout.contains("minted") && iout.contains("empty store"), "reports the minted agent: {iout}");
+
+    // The store now publishes a real identity on main — it is adoptable.
+    let toml = Command::new("git").arg("-C").arg(&bare).args(["show", "main:agent.toml"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&toml.stdout).contains("agt_"), "the once-empty store now carries an identity");
+}
+
 // ─────────────────── `agit a` — the subcommand that replaces `-a` ───────────────────
 
 /// The whole point of the subcommand: `agit a <git-verb>` reaches the store exactly as `agit -a` did.

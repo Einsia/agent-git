@@ -7,6 +7,77 @@
 //! as overrides. No-hub / no-remote is a clear error, never a panic.
 
 use anyhow::{bail, Context, Result};
+use std::time::Duration;
+
+/// How long the hub-store probe (`is_hub_store_url`) waits before giving up. A POSITIVE-identification
+/// probe must never hang a `git clone`: unreachable/slow host → treat as NOT a hub and fall through to
+/// passthrough. Short on purpose.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Does this URL's origin POSITIVELY identify as an agit-hub agent store?
+///
+/// The one signal that separates an agit-hub from a generic git host (github, gitlab, a plain http git
+/// backend) is the JSON shape of `GET <base>/api/me`: `{username,...}` when the credential authenticates,
+/// `{"error":...}` with a 401 when it does not. A generic host answers `/api/me` with an HTML 404, a
+/// plain-text body, or nothing — none of which parse to that shape. This is a POSITIVE probe, never a
+/// path-shape guess: a non-http(s) URL, a network failure, a timeout, or any non-agit response all return
+/// `false` so the caller falls back to git passthrough. Bounded by [`PROBE_TIMEOUT`], so it never hangs.
+pub fn is_hub_store_url(url: &str) -> bool {
+    is_hub_store_url_timeout(url, PROBE_TIMEOUT)
+}
+
+/// [`is_hub_store_url`] with an explicit timeout — the seam tests drive against a local server.
+pub fn is_hub_store_url_timeout(url: &str, timeout: Duration) -> bool {
+    // Only an http(s) origin has a JSON API reachable this way; ssh/scp/local paths never do. A parse
+    // error here (a bare name, an ssh URL, a garbage string) is a fast, network-free `false`.
+    let Ok((base, auth)) = parse_http_url(url) else {
+        return false;
+    };
+    probe_hub_me(&base, auth.as_ref(), timeout)
+}
+
+/// GET `<base>/api/me` (presenting `auth` if the URL carried a credential) and decide, from the response,
+/// whether the origin is an agit-hub. Any transport failure is a silent `false`.
+fn probe_hub_me(base: &str, auth: Option<&Auth>, timeout: Duration) -> bool {
+    let url = format!("{base}/api/me");
+    let agent = probe_agent(timeout);
+    let mut req = agent.get(&url);
+    if let Some(a) = auth {
+        req = req.header("Authorization", &a.header_value());
+    }
+    let Ok(mut resp) = req.call() else {
+        return false;
+    };
+    let status = resp.status().as_u16();
+    let text = resp.body_mut().read_to_string().unwrap_or_default();
+    is_hub_me_shape(status, &text)
+}
+
+/// The agit-hub `GET /api/me` signature. Authenticated → 200 with a `username` string; anonymous → 401
+/// with an `error` string (`{"error":"not logged in"}`). A generic git host cannot produce EITHER: it has
+/// no `/api/me`, so it answers with HTML, a 404 page, or a plain-text body that does not parse to a JSON
+/// object carrying these keys at these statuses. Pinning the status (200-with-username / 401-with-error)
+/// rather than accepting any `{"error":...}` keeps a random host's catch-all 404 JSON from false-matching.
+fn is_hub_me_shape(status: u16, body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    let has_str = |k: &str| obj.get(k).and_then(|x| x.as_str()).is_some();
+    (status == 200 && has_str("username")) || (status == 401 && has_str("error"))
+}
+
+/// A ureq agent for the hub probe: 4xx/5xx surface as a normal `Response` (we read the body), and every
+/// stage of the request is bounded by `timeout` so an unreachable host fails fast instead of hanging.
+fn probe_agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .build()
+        .into()
+}
 
 /// How to authenticate to the hub. `Basic` mirrors git's `user:token` password-field auth; `Bearer`
 /// is the `AGIT_HUB_TOKEN` override. The hub accepts either (see its `credentials()` extractor).
@@ -336,7 +407,7 @@ fn hub_remote_of(agent: &crate::agent::Agent) -> Option<String> {
 /// an error: the JSON API is not reachable over ssh.
 /// Replace any `user:token@` userinfo with `***@` so a URL is safe to put in an error
 /// message. A credentialed remote must never echo its token into stderr/logs.
-fn redact_url(url: &str) -> String {
+pub fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
@@ -494,5 +565,96 @@ mod tests {
         assert!(e.contains("***@hub.example.com"), "userinfo should be redacted: {e}");
         let e2 = parse_http_url("https://bob:hunter2@/no/host").unwrap_err().to_string();
         assert!(!e2.contains("hunter2"), "token leaked into no-host error: {e2}");
+    }
+
+    #[test]
+    fn hub_me_shape_recognizes_the_agit_hub_and_rejects_everything_else() {
+        // The two agit-hub answers: authed 200 with a username, anonymous 401 with an error.
+        assert!(is_hub_me_shape(200, r#"{"username":"alice","is_admin":false,"key_count":1}"#));
+        assert!(is_hub_me_shape(401, r#"{"error":"not logged in"}"#));
+
+        // A generic host cannot forge this. A 404 catch-all that happens to be JSON is NOT a hub
+        // (status is pinned): only 401 carries the anonymous `error`, only 200 the `username`.
+        assert!(!is_hub_me_shape(404, r#"{"error":"not found"}"#));
+        assert!(!is_hub_me_shape(200, r#"{"error":"not found"}"#));
+        assert!(!is_hub_me_shape(401, r#"{"username":"alice"}"#));
+        // HTML / plain-text / empty bodies (what github, gitlab, a git http backend return) never parse.
+        assert!(!is_hub_me_shape(404, "<!DOCTYPE html><title>Not Found</title>"));
+        assert!(!is_hub_me_shape(200, ""));
+        assert!(!is_hub_me_shape(401, "Authentication failed"));
+        // A JSON array/scalar is not the object shape.
+        assert!(!is_hub_me_shape(200, r#"["username"]"#));
+        assert!(!is_hub_me_shape(200, "42"));
+    }
+
+    /// The classification given a real (local) server, exercising the whole network path: a stubbed
+    /// agit-hub `/api/me` is identified TRUE; a stubbed generic host (HTML 404 at /api/me) is FALSE.
+    #[test]
+    fn is_hub_store_url_probes_a_local_server() {
+        // (1) A local stand-in for an agit-hub: 401 {"error":"not logged in"} at /api/me.
+        let hub = stub_server(vec![(
+            "/api/me",
+            401,
+            "application/json",
+            r#"{"error":"not logged in"}"#,
+        )]);
+        assert!(
+            is_hub_store_url_timeout(&format!("http://{}/alice/frontend.git", hub.addr), PROBE_TIMEOUT),
+            "a positively-identified agit-hub store URL must classify TRUE"
+        );
+
+        // (2) A local stand-in for a generic git host: an HTML 404 at /api/me.
+        let git = stub_server(vec![("/api/me", 404, "text/html", "<html>404</html>")]);
+        assert!(
+            !is_hub_store_url_timeout(&format!("http://{}/me/frontend.git", git.addr), PROBE_TIMEOUT),
+            "a generic git host must NOT be misidentified as an agit-hub"
+        );
+    }
+
+    #[test]
+    fn non_http_and_unreachable_targets_are_false_and_do_not_hang() {
+        // Non-http(s) inputs are a fast, network-free FALSE (no probe at all).
+        for t in ["frontend", "git@github.com:me/f.git", "/srv/agents/f.git", "ssh://h/x.git", ""] {
+            assert!(!is_hub_store_url(t), "{t:?} must be a network-free FALSE");
+        }
+        // An unreachable host must fail fast (bounded by the timeout), never hang. Port 1 is not served.
+        let start = std::time::Instant::now();
+        assert!(!is_hub_store_url_timeout("http://127.0.0.1:1/x.git", Duration::from_millis(400)));
+        assert!(start.elapsed() < Duration::from_secs(5), "the probe must not hang on an unreachable host");
+    }
+
+    /// A throwaway one-request-per-connection HTTP server for the probe tests. Serves canned responses
+    /// keyed by request path; unknown paths get a 404. Runs on a background thread until dropped.
+    struct StubServer {
+        addr: String,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    fn stub_server(routes: Vec<(&'static str, u16, &'static str, &'static str)>) -> StubServer {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/");
+                let (status, ctype, body) = routes
+                    .iter()
+                    .find(|(p, _, _, _)| *p == path)
+                    .map(|(_, s, c, b)| (*s, *c, *b))
+                    .unwrap_or((404, "text/plain", "not found"));
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                // One request per test is enough; keep serving in case a probe retries.
+            }
+        });
+        StubServer { addr, _handle: handle }
     }
 }
