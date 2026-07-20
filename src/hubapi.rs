@@ -109,8 +109,24 @@ impl HubEndpoint {
         ok_json(status, &text, &url)
     }
 
-    /// `GET /api/identity/<user>`. `Ok(None)` on 404 (unknown user), the parsed row on 2xx, an error on
-    /// any other status.
+    /// `DELETE /api/identity/keys/<key_fpr>` — revoke ONE of the caller's own device keys. Returns the
+    /// parsed JSON on 2xx; a non-2xx (e.g. 404 unknown key) is an error carrying the hub's message.
+    pub fn revoke_identity_key(&self, key_fpr: &str) -> Result<serde_json::Value> {
+        let auth = self.require_auth()?;
+        let url = format!("{}/api/identity/keys/{key_fpr}", self.base);
+        let mut resp = http_agent()
+            .delete(&url)
+            .header("Authorization", &auth.header_value())
+            .call()
+            .with_context(|| format!("DELETE {url}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        ok_json(status, &text, &url)
+    }
+
+    /// `GET /api/identity/<user>`. `Ok(None)` on 404 (unknown user), the parsed device-key SET
+    /// (`{ username, keys: [...], + the primary key's fields at top level }`) on 2xx, an error on any
+    /// other status.
     pub fn get_identity(&self, user: &str) -> Result<Option<serde_json::Value>> {
         let auth = self.require_auth()?;
         let url = format!("{}/api/identity/{user}", self.base);
@@ -128,9 +144,9 @@ impl HubEndpoint {
     }
 
     /// `GET /api/identity/by-email?email=<committer-email>` — resolve a committer email to the registered
-    /// account owning it (`{ username, ed25519_pub, x25519_pub, epoch }`). `Ok(None)` on 404 (the email
-    /// maps to no registered account — a normal not-found, not an oracle). This is the lookup that turns
-    /// provenance's "signed by this key" into "verified as this person".
+    /// account owning it, with its device-key SET (`{ username, keys: [...], + the primary key's fields }`).
+    /// `Ok(None)` on 404 (the email maps to no VERIFIED account — a normal not-found, not an oracle). This
+    /// is the lookup that turns provenance's "signed by this key" into "verified as this person" (match ANY).
     pub fn get_identity_by_email(&self, email: &str) -> Result<Option<serde_json::Value>> {
         self.get_opt(&format!("/api/identity/by-email?email={}", percent_encode_query(email)))
     }

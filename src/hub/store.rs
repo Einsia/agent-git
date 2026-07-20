@@ -78,7 +78,7 @@ pub struct User {
     pub totp_backup_codes: Vec<String>,
     /// Whether this account's email has been VERIFIED (a challenge token minted for the address was
     /// consumed, or an admin force-marked it). `false` for every account until it verifies. This is the
-    /// anti-squatting gate: [`Store::get_identity_key_by_email`] attributes a self-asserted committer
+    /// anti-squatting gate: [`Store::get_identity_keys_by_email`] attributes a self-asserted committer
     /// email to an account ONLY when this is `true`, so an UNVERIFIED (possibly squatted) email resolves
     /// to no identity and provenance degrades to `SignedUnregistered` instead of a false `VerifiedAs`.
     /// Added additively (back-filled onto older stores by `USER_COLUMNS`), so every pre-existing account
@@ -133,6 +133,16 @@ pub fn normalize_email(email: &str) -> String {
 
 pub fn normalize_username(name: &str) -> String {
     name.trim().to_ascii_lowercase()
+}
+
+/// A stable device-key fingerprint for the composite `(username, key_fpr)` primary key: the hex of the
+/// first 16 bytes of `sha256(ed25519_pub)`. Deterministic and collision-resistant enough to key one
+/// device key per account row, and short enough to name on a command line (`agit identity revoke <fpr>`)
+/// or an account page. Computed over the hex string as stored, so the same key always maps to the same
+/// fingerprint regardless of who submits it.
+pub fn ed25519_fingerprint(ed25519_pub: &str) -> String {
+    // sha256_hex yields 64 hex chars (32 bytes); the first 32 are the first 16 bytes — a 128-bit tag.
+    crate::convo::sha256_hex(ed25519_pub.trim())[..32].to_string()
 }
 
 /// Minimum password length. Hoisted here so the CLI (`read_new_password`) and self-service
@@ -273,21 +283,40 @@ impl Invitation {
     }
 }
 
-/// A person's published public keys in the ONE shared identity registry (encryption-recipients design,
-/// Wave 1). It serves two lookups from a single row: provenance signing-key verification (the
-/// `ed25519_pub`) and encryption recipient key-wrapping (the `x25519_pub`, used from Wave 2). Only ever
-/// public halves live here; the private key never leaves the client.
+/// One DEVICE key a person has published in the ONE shared identity registry (encryption-recipients
+/// design, Wave 1). It serves two lookups: provenance signing-key verification (the `ed25519_pub`) and
+/// encryption recipient key-wrapping (the `x25519_pub`, used from Wave 2). Only ever public halves live
+/// here; the private key never leaves the client.
+///
+/// **Many keys per account (SSH-keys style).** An account registers a SET of device keys, one per
+/// machine, keyed by the composite `(username, key_fpr)` — so enrolling from a second machine ADDS a key
+/// rather than overwriting the first, and provenance verification matches a session's signing key against
+/// ANY of the account's non-revoked device keys. (Before this, `identity_keys` was `PRIMARY KEY(username)`
+/// with a single key, so a second machine silently clobbered the first and every session signed on the
+/// first machine then falsely read "key mismatch".)
 ///
 /// `enroll_sig = ed25519_sign(username ‖ epoch ‖ ed25519_pub ‖ x25519_pub)` over the exact bytes of
 /// [`crate::agent::identity_enroll_message`], verified server-side against the SUBMITTED `ed25519_pub`
 /// — so a write proves possession of the private key and the hub can only replace a row, never mint a
-/// valid one. `epoch` is monotonic (a higher epoch is a key rotation; a lower or equal one is refused),
-/// and `revoked` is a set-once tombstone timestamp (unused in Wave 1, carried for later waves).
+/// valid one. `epoch` is monotonic PER DEVICE KEY (a higher epoch is a rotation of THAT key; a lower or
+/// equal one is refused), and `revoked` is a set-once tombstone timestamp — a revoked device key no
+/// longer counts as a provenance match (revocation actually de-attributes its sessions).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct IdentityKey {
     pub username: String,
+    /// A stable per-device fingerprint of `ed25519_pub` — the second half of the composite primary key
+    /// `(username, key_fpr)`, so ONE account can register MANY device keys (GitHub-SSH-keys style) without
+    /// a second machine's enrollment overwriting the first. Derived by [`ed25519_fingerprint`] (the hex of
+    /// the first 16 bytes of `sha256(ed25519_pub)`); the facade fills it in when a caller leaves it blank.
+    #[serde(default)]
+    pub key_fpr: String,
     pub ed25519_pub: String,
     pub x25519_pub: String,
+    /// A human label for the device this key lives on (the machine hostname by default), self-asserted at
+    /// enroll time — the "which of my machines is this?" hint the account page and `agit identity keys`
+    /// render. Empty for a legacy single-key row back-filled to `'default'` on migration.
+    #[serde(default)]
+    pub label: String,
     #[serde(default)]
     pub epoch: i64,
     pub enroll_sig: String,
@@ -308,7 +337,7 @@ pub struct IdentityKey {
     pub email: String,
 }
 
-/// The outcome of an [`Store::upsert_identity_key`]: either the row was written, or it was refused
+/// The outcome of an [`Store::add_identity_key`]: either the row was written, or it was refused
 /// because the submitted epoch does not strictly advance the stored one (monotonic, no rollback). The
 /// check is performed under the same write lock as the write, so it is race-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -754,8 +783,10 @@ fn row_team_kek(r: &impl Cols) -> TeamKekEnvelope {
 fn row_identity_key(r: &impl Cols) -> IdentityKey {
     IdentityKey {
         username: r.text("username"),
+        key_fpr: r.text("key_fpr"),
         ed25519_pub: r.text("ed25519_pub"),
         x25519_pub: r.text("x25519_pub"),
+        label: r.text("label"),
         epoch: r.int("epoch"),
         enroll_sig: r.text("enroll_sig"),
         created: r.text("created"),
@@ -847,16 +878,9 @@ const DDL: &[&str] = &[
        expires TEXT NOT NULL, created TEXT NOT NULL DEFAULT '')",
     // The ONE shared identity registry (encryption-recipients design, Wave 1): a person's published
     // ed25519 + X25519 public halves, self-signed via enroll_sig. Serves BOTH provenance signing-key
-    // lookup AND (Wave 2+) encryption recipient key-wrapping. Added additively (a whole new table, like
-    // invitations) via CREATE TABLE IF NOT EXISTS — no schema-version bump or back-fill. epoch is
-    // BIGINT for the same strict-decode reason the other integer columns are (see the note above).
-    // `email` (added additively, back-filled onto older stores by `IDENTITY_COLUMNS`) is the account's
-    // self-asserted committer email, the bridge from a session's committer to a registered identity for
-    // provenance attribution. Defaults to '' = unset, so every wave-1 row and behavior is unchanged.
-    "CREATE TABLE IF NOT EXISTS identity_keys (\
-       username TEXT PRIMARY KEY, ed25519_pub TEXT NOT NULL, x25519_pub TEXT NOT NULL, \
-       epoch BIGINT NOT NULL DEFAULT 0, enroll_sig TEXT NOT NULL, created TEXT NOT NULL DEFAULT '', revoked TEXT, \
-       email TEXT NOT NULL DEFAULT '')",
+    // lookup AND (Wave 2+) encryption recipient key-wrapping. The primary key is COMPOSITE
+    // `(username, key_fpr)` — ONE account, MANY device keys (SSH-keys style) — see IDENTITY_KEYS_DDL.
+    IDENTITY_KEYS_DDL,
     // NOTE: the index on `email` is NOT here. `email` is a back-filled column (IDENTITY_COLUMNS), and on
     // an existing store CREATE TABLE IF NOT EXISTS is a no-op so `email` does not exist until the back-fill
     // runs. Creating the index in the DDL (before the back-fill) would fail with "no such column: email".
@@ -909,10 +933,24 @@ const ORG_COLUMNS: &[&str] = &[
     "escrow_mode TEXT NOT NULL DEFAULT 'none'",
 ];
 
+/// The `identity_keys` table, one DDL shared by both backends. The primary key is COMPOSITE
+/// `(username, key_fpr)`: one account registers MANY device keys (SSH-keys style), one row per device. A
+/// FRESH DB gets this shape straight from `DDL`; a store that still has the OLD single-key shape
+/// (`PRIMARY KEY(username)`, no `key_fpr`/`label`) is rebuilt into this shape at boot by
+/// `migrate_identity_keys_multikey`. epoch is BIGINT for the same strict-decode reason as every other
+/// integer column; `label`/`email` default to '' so a back-filled legacy row is well-formed.
+const IDENTITY_KEYS_DDL: &str = "CREATE TABLE IF NOT EXISTS identity_keys (\
+   username TEXT NOT NULL, key_fpr TEXT NOT NULL, ed25519_pub TEXT NOT NULL, x25519_pub TEXT NOT NULL, \
+   label TEXT NOT NULL DEFAULT '', epoch BIGINT NOT NULL DEFAULT 0, enroll_sig TEXT NOT NULL, \
+   created TEXT NOT NULL DEFAULT '', revoked TEXT, email TEXT NOT NULL DEFAULT '', \
+   PRIMARY KEY (username, key_fpr))";
+
 /// The identity_keys columns added onto a registry that predates them (provenance signed-push
 /// verification), back-filled at boot exactly like [`ORG_COLUMNS`]. A **fresh** DB already has them (in
 /// `DDL`); this migrates older stores. Idempotent: Postgres uses `ADD COLUMN IF NOT EXISTS`; SQLite
 /// ignores the "duplicate column" error. With the '' default, every wave-1 enrollment is unchanged.
+/// Run BEFORE `migrate_identity_keys_multikey` so a legacy single-key table has its `email` column before
+/// the multi-key rebuild copies rows out of it.
 const IDENTITY_COLUMNS: &[&str] = &["email TEXT NOT NULL DEFAULT ''"];
 
 /// The index on identity_keys.email, created AFTER `IDENTITY_COLUMNS` back-fills the column (not in
@@ -1423,78 +1461,127 @@ impl Store {
         }
     }
 
-    // ── identity registry ──
+    // ── identity registry (MANY device keys per account) ──
     //
-    // Targeted upsert/gets (not the whole-table snapshot the other tables use): the registry is keyed
-    // by username with one row per person and can grow large, so a per-enroll table rewrite would be
-    // wasteful. The write still runs in the exact same critical section every other writer uses (the
-    // SQLite async write mutex / the Postgres advisory-lock transaction), and the monotonic epoch check
+    // Targeted per-key upsert/gets (not the whole-table snapshot the other tables use): the registry is
+    // keyed by the composite `(username, key_fpr)` and can grow large, so a per-enroll table rewrite would
+    // be wasteful. Each write runs in the exact same critical section every other writer uses (the SQLite
+    // async write mutex / the Postgres advisory-lock transaction), and the monotonic per-key epoch check
     // happens inside that section so it is race-free.
 
-    /// The registry row for one user, or `None` if they never enrolled. Username is normalized, so a
-    /// lookup matches regardless of case, exactly like [`Store::user`].
-    pub async fn get_identity_key(&self, username: &str) -> Option<IdentityKey> {
+    /// The account's PRIMARY device key — its latest non-revoked key (used by `GET /api/me`, the enroll
+    /// email-change check, and encryption recipient wrapping, which stays single-effective-key this wave).
+    /// `None` when the account has enrolled no key, or has revoked them all. Username is normalized.
+    pub async fn get_primary_identity_key(&self, username: &str) -> Option<IdentityKey> {
+        let u = normalize_username(username);
         match self {
-            Store::Sqlite(s) => s.get_identity_key(&normalize_username(username)).await,
-            Store::Pg(s) => s.get_identity_key(&normalize_username(username)).await,
+            Store::Sqlite(s) => s.get_primary_identity_key(&u).await,
+            Store::Pg(s) => s.get_primary_identity_key(&u).await,
         }
     }
 
-    /// The registry rows for a batch of users. Unknown users are simply omitted (non-disclosing) —
+    /// Back-compat alias for the account's primary device key. Kept so call sites that meant "the
+    /// account's key" resolve to its latest non-revoked device key under the multi-key registry.
+    pub async fn get_identity_key(&self, username: &str) -> Option<IdentityKey> {
+        self.get_primary_identity_key(username).await
+    }
+
+    /// Every NON-REVOKED device key of one account, latest first. Empty for an account that never enrolled
+    /// or has revoked them all. Username is normalized.
+    pub async fn list_identity_keys(&self, username: &str) -> Vec<IdentityKey> {
+        let u = normalize_username(username);
+        match self {
+            Store::Sqlite(s) => s.list_identity_keys(&u).await,
+            Store::Pg(s) => s.list_identity_keys(&u).await,
+        }
+    }
+
+    /// The primary device key for a batch of users. Unknown users are simply omitted (non-disclosing) —
     /// the result is not padded and order is not guaranteed. Duplicate/blank names are harmless.
     pub async fn get_identity_keys(&self, usernames: &[String]) -> Vec<IdentityKey> {
         let names: Vec<String> = usernames.iter().map(|u| normalize_username(u)).filter(|u| !u.is_empty()).collect();
-        match self {
-            Store::Sqlite(s) => s.get_identity_keys(&names).await,
-            Store::Pg(s) => s.get_identity_keys(&names).await,
+        let mut out = Vec::with_capacity(names.len());
+        for n in names {
+            if let Some(k) = self.get_primary_identity_key(&n).await {
+                out.push(k);
+            }
         }
+        out
     }
 
-    /// Upsert the caller's own registry row, refusing a non-advancing epoch (monotonic, no rollback).
-    /// The `username` is normalized here so the PK is canonical. The signature/possession check is the
-    /// API layer's job (it is stateless crypto); this method owns only the atomic monotonic write.
-    /// `created` is preserved across a replace — only the first enrollment stamps it.
-    pub async fn upsert_identity_key(&self, mut row: IdentityKey) -> io::Result<EnrollOutcome> {
+    /// ADD (or idempotently re-enroll) the caller's own device key, keyed by `(username, key_fpr)`. Adding
+    /// a key NEVER overwrites the caller's OTHER device keys — that is the whole point of the multi-key
+    /// registry. Re-enrolling the SAME device key (same `key_fpr`) refreshes its x25519/label/email and
+    /// requires a strictly higher epoch (monotonic PER KEY, no rollback); `created` is preserved and any
+    /// prior `revoked` tombstone is cleared, so re-enrolling un-revokes. The signature/possession check is
+    /// the API layer's job; this method owns only the atomic monotonic write. `key_fpr` is filled from
+    /// `ed25519_pub` when the caller leaves it blank.
+    pub async fn add_identity_key(&self, mut row: IdentityKey) -> io::Result<EnrollOutcome> {
         row.username = normalize_username(&row.username);
         // The committer email is the attribution key; normalize it the same way (trim + lowercase) so a
         // by-email lookup matches regardless of the case git recorded the committer under.
         row.email = normalize_email(&row.email);
+        if row.key_fpr.trim().is_empty() {
+            row.key_fpr = ed25519_fingerprint(&row.ed25519_pub);
+        }
         match self {
-            Store::Sqlite(s) => s.upsert_identity_key(row).await,
-            Store::Pg(s) => s.upsert_identity_key(row).await,
+            Store::Sqlite(s) => s.add_identity_key(row).await,
+            Store::Pg(s) => s.add_identity_key(row).await,
         }
     }
 
-    /// The registry row whose committer `email` matches, or `None` when the email maps to no registered
-    /// account. Email is normalized (trim + lowercase) before matching. A blank email never matches (it
-    /// is the "unset" sentinel for legacy rows), and an ambiguous email shared by two accounts also
-    /// yields `None` — an email that does not map to exactly one account is not attributable. This is the
-    /// server-side lookup behind provenance verification and the `by-email` endpoint.
+    /// Revoke ONE of an account's device keys (tombstone it). `Ok(true)` when a matching, not-already-
+    /// revoked key was tombstoned; `Ok(false)` when the account has no such live key. Caller-only: the API
+    /// passes the AUTHENTICATED caller as `username`, so a non-owner can never revoke someone else's key
+    /// (a `(username, key_fpr)` naming another account's key simply matches no row of the caller's).
+    pub async fn revoke_identity_key(&self, username: &str, key_fpr: &str) -> io::Result<bool> {
+        let u = normalize_username(username);
+        let fpr = key_fpr.trim().to_string();
+        if fpr.is_empty() {
+            return Ok(false);
+        }
+        match self {
+            Store::Sqlite(s) => s.revoke_identity_key(&u, &fpr).await,
+            Store::Pg(s) => s.revoke_identity_key(&u, &fpr).await,
+        }
+    }
+
+    /// ALL non-revoked device keys of the VERIFIED account owning `email`, latest first — the server-side
+    /// lookup behind provenance match-ANY and the `by-email` endpoint. Empty when the email maps to no
+    /// account, to an unverified account, or (ambiguously) to 2+ accounts.
     ///
-    /// **The email-squatting defense.** The registry `email` is SELF-ASSERTED at enroll time (it is not
-    /// covered by `enroll_sig`), so anyone can enroll a key claiming `ceo@corp.com`. Attribution here is
-    /// therefore gated on VERIFICATION: the matched account's `users.email_verified` must be `true`, or
-    /// this returns `None`. An unverified (possibly squatted) email resolves to NO identity, so provenance
-    /// verification degrades that session to `SignedUnregistered` instead of minting a false `VerifiedAs`.
-    /// Verification is proven out-of-band (a token minted for the address and consumed), so a squatter who
-    /// never controls the mailbox never clears this gate. The ambiguity rule still applies first: an email
-    /// on 2+ accounts is not attributable regardless of any account's verified state.
-    pub async fn get_identity_key_by_email(&self, email: &str) -> Option<IdentityKey> {
+    /// Email is normalized (trim + lowercase) before matching. A blank email never matches (the "unset"
+    /// sentinel). A revoked key does not count toward ownership resolution — an account whose only key for
+    /// this email is revoked does not own it here.
+    ///
+    /// **The email-squatting defense.** The registry `email` is SELF-ASSERTED at enroll time (not covered
+    /// by `enroll_sig`), so anyone can enroll a key claiming `ceo@corp.com`. Attribution is therefore gated
+    /// on VERIFICATION: the owning account's `users.email_verified` must be `true`, or this returns empty.
+    /// An unverified (possibly squatted) email resolves to NO keys, so provenance verification degrades that
+    /// session to `SignedUnregistered` instead of minting a false `VerifiedAs`. The ambiguity rule applies
+    /// first: an email on 2+ accounts is not attributable regardless of any account's verified state.
+    pub async fn get_identity_keys_by_email(&self, email: &str) -> Vec<IdentityKey> {
         let e = normalize_email(email);
         if e.is_empty() {
-            return None;
+            return vec![];
         }
-        let key = match self {
-            Store::Sqlite(s) => s.get_identity_key_by_email(&e).await,
-            Store::Pg(s) => s.get_identity_key_by_email(&e).await,
-        }?;
-        // Anti-squatting gate: attribute ONLY when the matched account has VERIFIED this email. An account
-        // with no users row, or with `email_verified = false`, resolves to no identity.
-        let user = self.user(&key.username).await?;
-        if !user.email_verified {
-            return None;
+        // Resolve the email to EXACTLY ONE owning account (ambiguity → nothing). Only non-revoked keys
+        // count toward ownership.
+        let owner = match self {
+            Store::Sqlite(s) => s.identity_email_owner(&e).await,
+            Store::Pg(s) => s.identity_email_owner(&e).await,
+        };
+        let Some(owner) = owner else {
+            return vec![];
+        };
+        // Anti-squatting gate: attribute ONLY when the owning account has VERIFIED this email.
+        match self.user(&owner).await {
+            Some(u) if u.email_verified => {}
+            _ => return vec![],
         }
-        Some(key)
+        // Return the whole SET of the owner's non-revoked device keys — a session signed by ANY of them is
+        // this person's.
+        self.list_identity_keys(&owner).await
     }
 
     // ── team-KEK envelopes (encryption-recipients Wave 3) ──
@@ -1631,11 +1718,16 @@ impl SqliteStore {
         }
         // Back-fill the identity_keys email column onto registries predating provenance verification
         // (no-op / "duplicate column" on a fresh DB, expected and ignored, exactly like the columns above).
+        // Runs BEFORE the multi-key rebuild so a legacy single-key table has `email` before its rows are
+        // copied across.
         for &col in IDENTITY_COLUMNS {
             let _ = sqlx::query(&format!("ALTER TABLE identity_keys ADD COLUMN {col}")).execute(&self.pool).await;
         }
-        // Now that `email` is guaranteed to exist (fresh via DDL, or just back-filled above), its index
-        // is safe to create. Doing this in DDL would fail "no such column: email" on an existing store.
+        // Reshape a legacy single-key identity_keys (PRIMARY KEY(username)) into the multi-key composite
+        // shape, back-filling key_fpr + label='default' for each existing row. No-op once already reshaped.
+        self.migrate_identity_keys_multikey().await?;
+        // Now that `email` is guaranteed to exist (fresh via DDL, or just back-filled above) on the FINAL
+        // (reshaped) table, its index is safe to create. Doing this in DDL would fail "no such column".
         sqlx::query(IDENTITY_EMAIL_INDEX).execute(&self.pool).await.map_err(err)?;
         // create_if_missing may not honor the mode; tighten hub.db AND its WAL sidecars to 0600, the
         // same guarantee write_secret_atomic gave the old JSON files. The DDL/stamp above already
@@ -1652,6 +1744,62 @@ impl SqliteStore {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Reshape a legacy single-key `identity_keys` (`PRIMARY KEY(username)`, no `key_fpr`/`label`) into the
+    /// multi-key composite shape (`PRIMARY KEY(username, key_fpr)`). SQLite cannot change a primary key in
+    /// place, so this rebuilds the table: rename the old one aside, create the new shape via
+    /// `IDENTITY_KEYS_DDL`, copy each old row across with `key_fpr` derived from its `ed25519_pub` and
+    /// `label = 'default'` (one device key per old row), then drop the old table. Detection is by the
+    /// presence of the `key_fpr` column — a fresh DB (already the new shape) and an already-reshaped store
+    /// both no-op. The whole rebuild runs under the write lock, so a concurrent boot cannot interleave.
+    async fn migrate_identity_keys_multikey(&self) -> io::Result<()> {
+        // A `SELECT key_fpr` that errors means the column is absent → legacy shape. Ok(_) (even 0 rows)
+        // means the new shape is already present.
+        if sqlx::query("SELECT key_fpr FROM identity_keys LIMIT 1").fetch_optional(&self.pool).await.is_ok() {
+            return Ok(());
+        }
+        let _guard = self.write_lock.lock().await;
+        // Re-check under the lock (another booting process may have just reshaped it).
+        if sqlx::query("SELECT key_fpr FROM identity_keys LIMIT 1").fetch_optional(&self.pool).await.is_ok() {
+            return Ok(());
+        }
+        // The legacy table has `email` (the IDENTITY_COLUMNS back-fill ran just before us). Read every row.
+        let olds = sqlx::query(
+            "SELECT username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked, email FROM identity_keys",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(err)?;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        // Drop the pre-existing email index (it is bound to the old table name; recreating it later on the
+        // new table would otherwise collide) and rename the legacy table aside.
+        sqlx::query("DROP INDEX IF EXISTS identity_keys_email").execute(&mut *tx).await.map_err(err)?;
+        sqlx::query("ALTER TABLE identity_keys RENAME TO identity_keys_legacy").execute(&mut *tx).await.map_err(err)?;
+        sqlx::query(IDENTITY_KEYS_DDL).execute(&mut *tx).await.map_err(err)?;
+        for r in &olds {
+            let ed = r.text("ed25519_pub");
+            let fpr = ed25519_fingerprint(&ed);
+            sqlx::query(
+                "INSERT INTO identity_keys (username, key_fpr, ed25519_pub, x25519_pub, label, epoch, enroll_sig, created, revoked, email) \
+                 VALUES (?, ?, ?, ?, 'default', ?, ?, ?, ?, ?)",
+            )
+            .bind(r.text("username"))
+            .bind(&fpr)
+            .bind(&ed)
+            .bind(r.text("x25519_pub"))
+            .bind(r.int("epoch"))
+            .bind(r.text("enroll_sig"))
+            .bind(r.text("created"))
+            .bind(r.opt("revoked"))
+            .bind(r.text("email"))
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        }
+        sqlx::query("DROP TABLE identity_keys_legacy").execute(&mut *tx).await.map_err(err)?;
+        tx.commit().await.map_err(err)?;
         Ok(())
     }
 
@@ -1969,31 +2117,42 @@ impl SqliteStore {
         Ok(r)
     }
 
-    async fn get_identity_key(&self, username: &str) -> Option<IdentityKey> {
-        match sqlx::query("SELECT * FROM identity_keys WHERE username = ?").bind(username).fetch_optional(&self.pool).await {
-            Ok(Some(r)) => Some(row_identity_key(&r)),
-            _ => None,
-        }
+    async fn get_primary_identity_key(&self, username: &str) -> Option<IdentityKey> {
+        // The account's latest non-revoked device key: newest `created` first, `key_fpr` as a stable
+        // tiebreak when two keys share a (second-resolution) timestamp.
+        let row = sqlx::query(
+            "SELECT * FROM identity_keys WHERE username = ? AND (revoked IS NULL OR revoked = '') \
+             ORDER BY created DESC, key_fpr DESC LIMIT 1",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+        Some(row_identity_key(&row))
     }
 
-    async fn get_identity_keys(&self, usernames: &[String]) -> Vec<IdentityKey> {
-        let mut out = Vec::with_capacity(usernames.len());
-        for u in usernames {
-            if let Some(k) = self.get_identity_key(u).await {
-                out.push(k);
-            }
-        }
-        out
+    async fn list_identity_keys(&self, username: &str) -> Vec<IdentityKey> {
+        let rows = sqlx::query(
+            "SELECT * FROM identity_keys WHERE username = ? AND (revoked IS NULL OR revoked = '') \
+             ORDER BY created DESC, key_fpr DESC",
+        )
+        .bind(username)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.iter().map(row_identity_key).collect()
     }
 
-    async fn upsert_identity_key(&self, row: IdentityKey) -> io::Result<EnrollOutcome> {
+    async fn add_identity_key(&self, row: IdentityKey) -> io::Result<EnrollOutcome> {
         // The same read-modify-write critical section every other writer runs in: the async write
-        // mutex, then a tracked transaction. The epoch read + the write share the one transaction, so
-        // the monotonic check cannot be raced by a concurrent enroll.
+        // mutex, then a tracked transaction. The per-key epoch read + the write share the one transaction,
+        // so the monotonic check cannot be raced by a concurrent enroll. Keyed on (username, key_fpr), so
+        // adding a NEW device key never touches the account's OTHER keys.
         let _guard = self.write_lock.lock().await;
         let mut tx = self.pool.begin().await.map_err(err)?;
-        let stored: Option<i64> = sqlx::query("SELECT epoch FROM identity_keys WHERE username = ?")
+        let stored: Option<i64> = sqlx::query("SELECT epoch FROM identity_keys WHERE username = ? AND key_fpr = ?")
             .bind(&row.username)
+            .bind(&row.key_fpr)
             .fetch_optional(&mut *tx)
             .await
             .map_err(err)?
@@ -2003,19 +2162,21 @@ impl SqliteStore {
                 return Ok(EnrollOutcome::StaleEpoch { stored });
             }
         }
-        // ON CONFLICT keeps the original `created` (only the first enrollment stamps it) and refreshes
-        // every other column — including clearing `revoked`, so re-enrolling un-revokes.
+        // ON CONFLICT on the COMPOSITE key keeps this device's original `created` (only its first enroll
+        // stamps it) and refreshes the rest — including clearing `revoked`, so re-enrolling un-revokes.
         sqlx::query(
-            "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked, email) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(username) DO UPDATE SET \
-               ed25519_pub = excluded.ed25519_pub, x25519_pub = excluded.x25519_pub, \
+            "INSERT INTO identity_keys (username, key_fpr, ed25519_pub, x25519_pub, label, epoch, enroll_sig, created, revoked, email) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(username, key_fpr) DO UPDATE SET \
+               ed25519_pub = excluded.ed25519_pub, x25519_pub = excluded.x25519_pub, label = excluded.label, \
                epoch = excluded.epoch, enroll_sig = excluded.enroll_sig, revoked = excluded.revoked, \
                email = excluded.email",
         )
         .bind(&row.username)
+        .bind(&row.key_fpr)
         .bind(&row.ed25519_pub)
         .bind(&row.x25519_pub)
+        .bind(&row.label)
         .bind(row.epoch)
         .bind(&row.enroll_sig)
         .bind(&row.created)
@@ -2028,16 +2189,36 @@ impl SqliteStore {
         Ok(EnrollOutcome::Applied)
     }
 
-    async fn get_identity_key_by_email(&self, email: &str) -> Option<IdentityKey> {
-        // Two rows sharing an email is an ambiguous attribution — return neither. `LIMIT 2` is enough to
-        // tell "exactly one" from "more than one" without scanning the whole match set.
-        let rows = sqlx::query("SELECT * FROM identity_keys WHERE email = ? AND email <> '' LIMIT 2")
-            .bind(email)
-            .fetch_all(&self.pool)
-            .await
-            .ok()?;
+    async fn revoke_identity_key(&self, username: &str, key_fpr: &str) -> io::Result<bool> {
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        let res = sqlx::query(
+            "UPDATE identity_keys SET revoked = ? WHERE username = ? AND key_fpr = ? \
+             AND (revoked IS NULL OR revoked = '')",
+        )
+        .bind(now_iso())
+        .bind(username)
+        .bind(key_fpr)
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn identity_email_owner(&self, email: &str) -> Option<String> {
+        // The single account owning `email` via a NON-REVOKED key, or None when the email maps to zero or
+        // (ambiguously) 2+ distinct accounts. `LIMIT 2` distinguishes "exactly one" from "more than one".
+        let rows = sqlx::query(
+            "SELECT DISTINCT username FROM identity_keys \
+             WHERE email = ? AND email <> '' AND (revoked IS NULL OR revoked = '') LIMIT 2",
+        )
+        .bind(email)
+        .fetch_all(&self.pool)
+        .await
+        .ok()?;
         match rows.as_slice() {
-            [only] => Some(row_identity_key(only)),
+            [only] => Some(only.text("username")),
             _ => None,
         }
     }
@@ -2218,12 +2399,65 @@ impl PgStore {
             sqlx::query(&format!("ALTER TABLE orgs ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
         }
         // Back-fill the identity_keys email column onto registries predating provenance verification
-        // (no-op on a fresh DB). Postgres has a native IF NOT EXISTS, so this is cleanly idempotent.
+        // (no-op on a fresh DB). Postgres has a native IF NOT EXISTS, so this is cleanly idempotent. Runs
+        // BEFORE the multi-key rebuild so a legacy single-key table has `email` before its rows are copied.
         for &col in IDENTITY_COLUMNS {
             sqlx::query(&format!("ALTER TABLE identity_keys ADD COLUMN IF NOT EXISTS {col}")).execute(&self.pool).await.map_err(err)?;
         }
-        // Create the email index only after the column is guaranteed present (see IDENTITY_EMAIL_INDEX).
+        // Reshape a legacy single-key identity_keys into the multi-key composite shape (back-filling
+        // key_fpr + label='default' per row). No-op once already reshaped.
+        self.migrate_identity_keys_multikey().await?;
+        // Create the email index only after the column is guaranteed present on the FINAL (reshaped) table.
         sqlx::query(IDENTITY_EMAIL_INDEX).execute(&self.pool).await.map_err(err)?;
+        Ok(())
+    }
+
+    /// Reshape a legacy single-key `identity_keys` into the multi-key composite shape, the Postgres twin of
+    /// [`SqliteStore::migrate_identity_keys_multikey`]. Detected by the absence of `key_fpr`; runs under the
+    /// one global advisory lock so two hubs booting against one Postgres serialize. Rebuilds via rename +
+    /// `IDENTITY_KEYS_DDL` + per-row copy (key_fpr from ed25519_pub, label='default') rather than an
+    /// in-place PK swap, so it mirrors the SQLite path exactly and needs no pgcrypto for the fingerprint.
+    async fn migrate_identity_keys_multikey(&self) -> io::Result<()> {
+        if sqlx::query("SELECT key_fpr FROM identity_keys LIMIT 1").fetch_optional(&self.pool).await.is_ok() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        // Re-check under the advisory lock (a peer boot may have reshaped it between our check and the lock).
+        if sqlx::query("SELECT key_fpr FROM identity_keys LIMIT 1").fetch_optional(&mut *tx).await.is_ok() {
+            return Ok(());
+        }
+        let olds = sqlx::query(
+            "SELECT username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked, email FROM identity_keys",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(err)?;
+        sqlx::query("DROP INDEX IF EXISTS identity_keys_email").execute(&mut *tx).await.map_err(err)?;
+        sqlx::query("ALTER TABLE identity_keys RENAME TO identity_keys_legacy").execute(&mut *tx).await.map_err(err)?;
+        sqlx::query(IDENTITY_KEYS_DDL).execute(&mut *tx).await.map_err(err)?;
+        for r in &olds {
+            let ed = r.text("ed25519_pub");
+            let fpr = ed25519_fingerprint(&ed);
+            sqlx::query(
+                "INSERT INTO identity_keys (username, key_fpr, ed25519_pub, x25519_pub, label, epoch, enroll_sig, created, revoked, email) \
+                 VALUES ($1, $2, $3, $4, 'default', $5, $6, $7, $8, $9)",
+            )
+            .bind(r.text("username"))
+            .bind(&fpr)
+            .bind(&ed)
+            .bind(r.text("x25519_pub"))
+            .bind(r.int("epoch"))
+            .bind(r.text("enroll_sig"))
+            .bind(r.text("created"))
+            .bind(r.opt("revoked"))
+            .bind(r.text("email"))
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        }
+        sqlx::query("DROP TABLE identity_keys_legacy").execute(&mut *tx).await.map_err(err)?;
+        tx.commit().await.map_err(err)?;
         Ok(())
     }
 
@@ -2541,30 +2775,39 @@ impl PgStore {
         Ok(r)
     }
 
-    async fn get_identity_key(&self, username: &str) -> Option<IdentityKey> {
-        match sqlx::query("SELECT * FROM identity_keys WHERE username = $1").bind(username).fetch_optional(&self.pool).await {
-            Ok(Some(r)) => Some(row_identity_key(&r)),
-            _ => None,
-        }
+    async fn get_primary_identity_key(&self, username: &str) -> Option<IdentityKey> {
+        let row = sqlx::query(
+            "SELECT * FROM identity_keys WHERE username = $1 AND (revoked IS NULL OR revoked = '') \
+             ORDER BY created DESC, key_fpr DESC LIMIT 1",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()??;
+        Some(row_identity_key(&row))
     }
 
-    async fn get_identity_keys(&self, usernames: &[String]) -> Vec<IdentityKey> {
-        let mut out = Vec::with_capacity(usernames.len());
-        for u in usernames {
-            if let Some(k) = self.get_identity_key(u).await {
-                out.push(k);
-            }
-        }
-        out
+    async fn list_identity_keys(&self, username: &str) -> Vec<IdentityKey> {
+        let rows = sqlx::query(
+            "SELECT * FROM identity_keys WHERE username = $1 AND (revoked IS NULL OR revoked = '') \
+             ORDER BY created DESC, key_fpr DESC",
+        )
+        .bind(username)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.iter().map(row_identity_key).collect()
     }
 
-    async fn upsert_identity_key(&self, row: IdentityKey) -> io::Result<EnrollOutcome> {
-        // The one global advisory-lock critical section every read-modify-write runs in, so the epoch
-        // read + the write are one atomic section and the monotonic check cannot be raced.
+    async fn add_identity_key(&self, row: IdentityKey) -> io::Result<EnrollOutcome> {
+        // The one global advisory-lock critical section every read-modify-write runs in, so the per-key
+        // epoch read + the write are one atomic section and the monotonic check cannot be raced. Keyed on
+        // (username, key_fpr), so adding a NEW device key never touches the account's OTHER keys.
         let mut tx = self.pool.begin().await.map_err(err)?;
         Self::lock(&mut tx).await?;
-        let stored: Option<i64> = sqlx::query("SELECT epoch FROM identity_keys WHERE username = $1")
+        let stored: Option<i64> = sqlx::query("SELECT epoch FROM identity_keys WHERE username = $1 AND key_fpr = $2")
             .bind(&row.username)
+            .bind(&row.key_fpr)
             .fetch_optional(&mut *tx)
             .await
             .map_err(err)?
@@ -2574,18 +2817,21 @@ impl PgStore {
                 return Ok(EnrollOutcome::StaleEpoch { stored });
             }
         }
-        // ON CONFLICT keeps the original `created` and refreshes the rest, clearing `revoked`.
+        // ON CONFLICT on the COMPOSITE key keeps this device's original `created` and refreshes the rest,
+        // clearing `revoked` (re-enrolling un-revokes).
         sqlx::query(
-            "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, revoked, email) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT (username) DO UPDATE SET \
-               ed25519_pub = excluded.ed25519_pub, x25519_pub = excluded.x25519_pub, \
+            "INSERT INTO identity_keys (username, key_fpr, ed25519_pub, x25519_pub, label, epoch, enroll_sig, created, revoked, email) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             ON CONFLICT (username, key_fpr) DO UPDATE SET \
+               ed25519_pub = excluded.ed25519_pub, x25519_pub = excluded.x25519_pub, label = excluded.label, \
                epoch = excluded.epoch, enroll_sig = excluded.enroll_sig, revoked = excluded.revoked, \
                email = excluded.email",
         )
         .bind(&row.username)
+        .bind(&row.key_fpr)
         .bind(&row.ed25519_pub)
         .bind(&row.x25519_pub)
+        .bind(&row.label)
         .bind(row.epoch)
         .bind(&row.enroll_sig)
         .bind(&row.created)
@@ -2598,14 +2844,34 @@ impl PgStore {
         Ok(EnrollOutcome::Applied)
     }
 
-    async fn get_identity_key_by_email(&self, email: &str) -> Option<IdentityKey> {
-        let rows = sqlx::query("SELECT * FROM identity_keys WHERE email = $1 AND email <> '' LIMIT 2")
-            .bind(email)
-            .fetch_all(&self.pool)
-            .await
-            .ok()?;
+    async fn revoke_identity_key(&self, username: &str, key_fpr: &str) -> io::Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        let res = sqlx::query(
+            "UPDATE identity_keys SET revoked = $1 WHERE username = $2 AND key_fpr = $3 \
+             AND (revoked IS NULL OR revoked = '')",
+        )
+        .bind(now_iso())
+        .bind(username)
+        .bind(key_fpr)
+        .execute(&mut *tx)
+        .await
+        .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn identity_email_owner(&self, email: &str) -> Option<String> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT username FROM identity_keys \
+             WHERE email = $1 AND email <> '' AND (revoked IS NULL OR revoked = '') LIMIT 2",
+        )
+        .bind(email)
+        .fetch_all(&self.pool)
+        .await
+        .ok()?;
         match rows.as_slice() {
-            [only] => Some(row_identity_key(only)),
+            [only] => Some(only.text("username")),
             _ => None,
         }
     }
@@ -3525,98 +3791,155 @@ mod tests {
         assert_eq!(a.members, b.members);
     }
 
-    /// The registry upsert is a monotonic replace that preserves `created` and clears `revoked`, and
-    /// the batch get returns exactly the known rows (unknowns omitted). This exercises the Store layer
-    /// directly; the API-level possession/signature checks are covered in the api tests.
-    #[tokio::test]
-    async fn identity_upsert_is_monotonic_and_preserves_created() {
-        let (_d, s) = tmp_store().await;
-        let row = |epoch: i64, ed: &str| IdentityKey {
-            username: "Alice".into(), // deliberately mixed-case: the facade normalizes it
+    /// Build a device-key row. `created` is passed explicitly so tests can order the primary-key
+    /// tiebreak deterministically (now_iso has only second resolution).
+    fn ik(user: &str, ed: &str, email: &str, epoch: i64, created: &str) -> IdentityKey {
+        IdentityKey {
+            username: user.into(),
+            key_fpr: String::new(), // the facade derives it from ed25519_pub
             ed25519_pub: ed.into(),
             x25519_pub: "b".repeat(64),
+            label: String::new(),
             epoch,
             enroll_sig: "sig".into(),
-            created: now_iso(),
-            revoked: Some("tombstone".into()),
-            email: String::new(),
-        };
+            created: created.into(),
+            revoked: None,
+            email: email.into(),
+        }
+    }
 
-        // First enrollment lands, normalized to "alice".
-        assert_eq!(s.upsert_identity_key(row(0, &"a".repeat(64))).await.unwrap(), EnrollOutcome::Applied);
-        let first = s.get_identity_key("alice").await.unwrap();
-        assert_eq!(first.username, "alice");
-        let created0 = first.created.clone();
+    /// Per-DEVICE-KEY monotonicity: re-enrolling the SAME device key (same ed → same key_fpr) refuses a
+    /// non-advancing epoch and preserves `created`; a strictly higher epoch replaces that key's row. A
+    /// DIFFERENT key is a separate row, never a monotonic conflict.
+    #[tokio::test]
+    async fn identity_add_is_monotonic_per_key_and_preserves_created() {
+        let (_d, s) = tmp_store().await;
+        let k = "a".repeat(64);
+        let first = ik("Alice", &k, "", 0, &now_iso()); // mixed-case: the facade normalizes it
+        assert_eq!(s.add_identity_key(first).await.unwrap(), EnrollOutcome::Applied);
+        let stored0 = s.get_primary_identity_key("alice").await.unwrap();
+        assert_eq!(stored0.username, "alice");
+        assert!(!stored0.key_fpr.is_empty(), "the facade filled in a fingerprint");
+        let created0 = stored0.created.clone();
 
-        // A non-advancing epoch is refused and changes nothing.
+        // A non-advancing epoch for the SAME key is refused and changes nothing.
         assert_eq!(
-            s.upsert_identity_key(row(0, &"c".repeat(64))).await.unwrap(),
+            s.add_identity_key(ik("alice", &k, "", 0, &now_iso())).await.unwrap(),
             EnrollOutcome::StaleEpoch { stored: 0 }
         );
-        assert_eq!(s.get_identity_key("alice").await.unwrap().ed25519_pub, "a".repeat(64));
-
-        // A higher epoch replaces the key but keeps the original `created` (only first enroll stamps it).
-        assert_eq!(s.upsert_identity_key(row(1, &"d".repeat(64))).await.unwrap(), EnrollOutcome::Applied);
-        let bumped = s.get_identity_key("alice").await.unwrap();
+        // A strictly higher epoch for the SAME key replaces that key's row, keeping the original `created`.
+        assert_eq!(s.add_identity_key(ik("alice", &k, "", 1, &now_iso())).await.unwrap(), EnrollOutcome::Applied);
+        let bumped = s.get_primary_identity_key("alice").await.unwrap();
         assert_eq!(bumped.epoch, 1);
-        assert_eq!(bumped.ed25519_pub, "d".repeat(64));
-        assert_eq!(bumped.created, created0, "created is preserved across a replace");
+        assert_eq!(bumped.created, created0, "created is preserved across a same-key replace");
+        assert_eq!(s.list_identity_keys("alice").await.len(), 1, "a same-key rotation is still ONE device key");
 
-        // Batch get returns only known users; an unknown one is omitted, not padded.
+        // Batch primary get returns only known users; an unknown one is omitted, not padded.
         let batch = s.get_identity_keys(&["alice".into(), "nobody".into()]).await;
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].username, "alice");
-        assert!(s.get_identity_key("nobody").await.is_none());
+        assert!(s.get_primary_identity_key("nobody").await.is_none());
+    }
+
+    /// Enrolling TWO different device keys for one account registers BOTH (neither overwrites the other) —
+    /// the whole point of the SSH-keys reshape. The primary is the latest non-revoked key.
+    #[tokio::test]
+    async fn enrolling_two_keys_registers_both() {
+        let (_d, s) = tmp_store().await;
+        let laptop = "a".repeat(64);
+        let desktop = "c".repeat(64);
+        s.add_identity_key(ik("alice", &laptop, "", 0, "2026-01-01T00:00:00Z")).await.unwrap();
+        s.add_identity_key(ik("alice", &desktop, "", 0, "2026-02-01T00:00:00Z")).await.unwrap();
+
+        let keys = s.list_identity_keys("alice").await;
+        assert_eq!(keys.len(), 2, "both device keys are registered; neither clobbers the other");
+        let eds: std::collections::HashSet<_> = keys.iter().map(|k| k.ed25519_pub.clone()).collect();
+        assert!(eds.contains(&laptop) && eds.contains(&desktop));
+        // The primary is the LATEST non-revoked key (newest `created`).
+        assert_eq!(s.get_primary_identity_key("alice").await.unwrap().ed25519_pub, desktop);
+    }
+
+    /// `get_primary_identity_key` returns the latest NON-REVOKED key: revoking the newest falls back to the
+    /// next, and revoking all of them yields None.
+    #[tokio::test]
+    async fn get_primary_identity_key_returns_latest_nonrevoked() {
+        let (_d, s) = tmp_store().await;
+        let old = "a".repeat(64);
+        let new = "c".repeat(64);
+        s.add_identity_key(ik("alice", &old, "", 0, "2026-01-01T00:00:00Z")).await.unwrap();
+        s.add_identity_key(ik("alice", &new, "", 0, "2026-02-01T00:00:00Z")).await.unwrap();
+        assert_eq!(s.get_primary_identity_key("alice").await.unwrap().ed25519_pub, new);
+        // Revoke the newest → the primary falls back to the older key.
+        let new_fpr = ed25519_fingerprint(&new);
+        assert!(s.revoke_identity_key("alice", &new_fpr).await.unwrap());
+        assert_eq!(s.get_primary_identity_key("alice").await.unwrap().ed25519_pub, old);
+        // Revoke the last one → no primary at all.
+        assert!(s.revoke_identity_key("alice", &ed25519_fingerprint(&old)).await.unwrap());
+        assert!(s.get_primary_identity_key("alice").await.is_none());
+    }
+
+    /// A user cannot revoke ANOTHER user's key: revoke is scoped to `(caller, key_fpr)`, so bob naming
+    /// alice's fingerprint tombstones nothing.
+    #[tokio::test]
+    async fn revoke_is_caller_scoped_and_cannot_touch_another_users_key() {
+        let (_d, s) = tmp_store().await;
+        let alice_key = "a".repeat(64);
+        s.add_identity_key(ik("alice", &alice_key, "", 0, &now_iso())).await.unwrap();
+        let fpr = ed25519_fingerprint(&alice_key);
+        // bob tries to revoke alice's key by fingerprint — nothing matches HIS rows.
+        assert!(!s.revoke_identity_key("bob", &fpr).await.unwrap(), "a non-owner revokes nothing");
+        assert_eq!(s.list_identity_keys("alice").await.len(), 1, "alice's key is untouched");
+        // alice can revoke her own.
+        assert!(s.revoke_identity_key("alice", &fpr).await.unwrap());
+        assert!(s.list_identity_keys("alice").await.is_empty());
     }
 
     #[tokio::test]
-    async fn identity_lookup_by_email_maps_committer_to_account() {
+    async fn identity_lookup_by_email_maps_committer_to_all_account_keys() {
         let (_d, s) = tmp_store().await;
-        let enroll = |user: &str, ed: &str, email: &str| IdentityKey {
-            username: user.into(),
-            ed25519_pub: ed.into(),
-            x25519_pub: "b".repeat(64),
-            epoch: 0,
-            enroll_sig: "sig".into(),
-            created: now_iso(),
-            revoked: None,
-            email: email.into(),
-        };
-        // Accounts must exist AND have a VERIFIED email — attribution is now gated on verification (the
+        // Accounts must exist AND have a VERIFIED email — attribution is gated on verification (the
         // anti-squatting property), so an enrolled-but-unverified email maps to nothing.
         for u in ["alice", "bob"] {
             add_named_user(&s, u).await;
         }
-        s.upsert_identity_key(enroll("alice", &"a".repeat(64), "Alice@Corp.com")).await.unwrap();
-        s.upsert_identity_key(enroll("bob", &"b".repeat(64), "bob@corp.com")).await.unwrap();
+        // alice enrolls TWO device keys under the same committer email.
+        s.add_identity_key(ik("alice", &"a".repeat(64), "Alice@Corp.com", 0, "2026-01-01T00:00:00Z")).await.unwrap();
+        s.add_identity_key(ik("alice", &"e".repeat(64), "Alice@Corp.com", 0, "2026-02-01T00:00:00Z")).await.unwrap();
+        s.add_identity_key(ik("bob", &"b".repeat(64), "bob@corp.com", 0, &now_iso())).await.unwrap();
 
-        // Before verification, an exact unique match still resolves to nothing (the squatting defense).
+        // Before verification, even an unambiguous match resolves to nothing (the squatting defense).
         assert!(
-            s.get_identity_key_by_email("alice@corp.com").await.is_none(),
-            "an UNVERIFIED email is not attributable even on an exact unique match"
+            s.get_identity_keys_by_email("alice@corp.com").await.is_empty(),
+            "an UNVERIFIED email is not attributable"
         );
         s.set_email_verified("alice", true).await.unwrap();
         s.set_email_verified("bob", true).await.unwrap();
 
-        // A committer email resolves to the enrolling account; the match is case/space-insensitive.
-        let hit = s.get_identity_key_by_email("  alice@corp.com ").await.expect("alice's email maps to alice");
-        assert_eq!(hit.username, "alice");
-        assert_eq!(hit.ed25519_pub, "a".repeat(64));
-        assert_eq!(hit.email, "alice@corp.com", "email is stored normalized");
+        // The committer email resolves to ALL of alice's non-revoked device keys; match is case/space-insensitive.
+        let hits = s.get_identity_keys_by_email("  alice@corp.com ").await;
+        assert_eq!(hits.len(), 2, "both of alice's device keys are returned");
+        assert!(hits.iter().all(|k| k.username == "alice"));
+        let eds: std::collections::HashSet<_> = hits.iter().map(|k| k.ed25519_pub.clone()).collect();
+        assert!(eds.contains(&"a".repeat(64)) && eds.contains(&"e".repeat(64)));
+
+        // Revoking one key drops it from the set but keeps the account attributable via the rest.
+        assert!(s.revoke_identity_key("alice", &ed25519_fingerprint(&"a".repeat(64))).await.unwrap());
+        let after = s.get_identity_keys_by_email("alice@corp.com").await;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].ed25519_pub, "e".repeat(64));
 
         // An email nobody enrolled, and a blank email, both map to nothing.
-        assert!(s.get_identity_key_by_email("ghost@corp.com").await.is_none());
-        assert!(s.get_identity_key_by_email("").await.is_none());
+        assert!(s.get_identity_keys_by_email("ghost@corp.com").await.is_empty());
+        assert!(s.get_identity_keys_by_email("").await.is_empty());
 
-        // Ambiguity: two accounts claiming one email is not attributable — even when both are verified,
-        // and the ambiguity rule fires before the verified gate.
+        // Ambiguity: two accounts claiming one email is not attributable — even when both are verified.
         for u in ["carol", "dave"] {
             add_named_user(&s, u).await;
             s.set_email_verified(u, true).await.unwrap();
         }
-        s.upsert_identity_key(enroll("carol", &"c".repeat(64), "shared@corp.com")).await.unwrap();
-        s.upsert_identity_key(enroll("dave", &"d".repeat(64), "shared@corp.com")).await.unwrap();
-        assert!(s.get_identity_key_by_email("shared@corp.com").await.is_none(), "an ambiguous email is not a hit");
+        s.add_identity_key(ik("carol", &"c".repeat(64), "shared@corp.com", 0, &now_iso())).await.unwrap();
+        s.add_identity_key(ik("dave", &"d".repeat(64), "shared@corp.com", 0, &now_iso())).await.unwrap();
+        assert!(s.get_identity_keys_by_email("shared@corp.com").await.is_empty(), "an ambiguous email is not a hit");
     }
 
     #[tokio::test]
@@ -3660,36 +3983,27 @@ mod tests {
         // attributable until the account verifies. A token consume marks it verified.
         let (_d, s) = tmp_store().await;
         add_named_user(&s, "alice").await;
-        s.upsert_identity_key(IdentityKey {
-            username: "alice".into(),
-            ed25519_pub: "a".repeat(64),
-            x25519_pub: "b".repeat(64),
-            epoch: 0,
-            enroll_sig: "sig".into(),
-            created: now_iso(),
-            revoked: None,
-            email: "alice@corp.com".into(),
-        })
-        .await
-        .unwrap();
+        s.add_identity_key(ik("alice", &"a".repeat(64), "alice@corp.com", 0, &now_iso())).await.unwrap();
         // Unverified: an exact unique match resolves to no identity.
-        assert!(s.get_identity_key_by_email("alice@corp.com").await.is_none());
+        assert!(s.get_identity_keys_by_email("alice@corp.com").await.is_empty());
         // Verify by minting + consuming a token, then flipping the flag (the api layer does this pairing).
         let token = s.mint_email_token("alice", "alice@corp.com", Duration::from_secs(3600)).await.unwrap();
         let (user, _email) = s.consume_email_token(&token).await.unwrap();
         s.set_email_verified(&user, true).await.unwrap();
         // Now it attributes.
-        assert_eq!(s.get_identity_key_by_email("alice@corp.com").await.unwrap().username, "alice");
+        let hits = s.get_identity_keys_by_email("alice@corp.com").await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].username, "alice");
         // Revoking verification closes the door again.
         s.set_email_verified("alice", false).await.unwrap();
-        assert!(s.get_identity_key_by_email("alice@corp.com").await.is_none());
+        assert!(s.get_identity_keys_by_email("alice@corp.com").await.is_empty());
     }
 
     #[tokio::test]
     async fn migrate_recovers_an_identity_keys_that_predates_the_email_column() {
-        // Upgrade path: a Wave-1 registry has identity_keys WITHOUT the provenance `email` column and no
-        // email index. Re-running migrate must NOT fail on "no such column: email" (the index-before-
-        // back-fill bug this test guards) and must restore both the column and its index.
+        // Upgrade path: a registry has identity_keys WITHOUT the provenance `email` column and no email
+        // index. Re-running migrate must NOT fail on "no such column: email" (the index-before-back-fill
+        // bug this test guards) and must restore both the column and its index.
         let (_d, s) = tmp_store().await;
         raw_exec(&s, "DROP INDEX IF EXISTS identity_keys_email").await;
         raw_exec(&s, "ALTER TABLE identity_keys DROP COLUMN email").await;
@@ -3702,20 +4016,63 @@ mod tests {
         // The column (and its lookup) are restored — an enroll with a VERIFIED email round-trips.
         add_named_user(&s, "erin").await;
         s.set_email_verified("erin", true).await.unwrap();
-        s.upsert_identity_key(IdentityKey {
-            username: "erin".into(),
-            ed25519_pub: "e".repeat(64),
-            x25519_pub: "b".repeat(64),
-            epoch: 0,
-            enroll_sig: "sig".into(),
-            created: now_iso(),
-            revoked: None,
-            email: "erin@corp.com".into(),
-        })
-        .await
-        .unwrap();
-        let hit = s.get_identity_key_by_email("erin@corp.com").await.expect("email lookup works post-migrate");
-        assert_eq!(hit.username, "erin");
+        s.add_identity_key(ik("erin", &"e".repeat(64), "erin@corp.com", 0, &now_iso())).await.unwrap();
+        let hits = s.get_identity_keys_by_email("erin@corp.com").await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].username, "erin");
+    }
+
+    /// The SSH-keys reshape migration: a LEGACY single-key `identity_keys` (`PRIMARY KEY(username)`, no
+    /// `key_fpr`/`label`) with an existing row is rebuilt into the multi-key composite shape at boot —
+    /// key_fpr back-filled from the row's ed25519_pub, label 'default' — and the pre-reshape enrollment
+    /// still verifies (resolves by email, and the fingerprint is stable/derivable).
+    #[tokio::test]
+    async fn migrate_reshapes_a_legacy_single_key_table() {
+        let (_d, s) = tmp_store().await;
+        add_named_user(&s, "frank").await;
+        s.set_email_verified("frank", true).await.unwrap();
+        // Hand-build the OLD single-key table shape and plant a pre-reshape row in it. The `email` column
+        // is present (this store predates only the multi-key reshape, not email verification).
+        raw_exec(&s, "DROP INDEX IF EXISTS identity_keys_email").await;
+        raw_exec(&s, "DROP TABLE identity_keys").await;
+        raw_exec(
+            &s,
+            "CREATE TABLE identity_keys (\
+               username TEXT PRIMARY KEY, ed25519_pub TEXT NOT NULL, x25519_pub TEXT NOT NULL, \
+               epoch BIGINT NOT NULL DEFAULT 0, enroll_sig TEXT NOT NULL, created TEXT NOT NULL DEFAULT '', \
+               revoked TEXT, email TEXT NOT NULL DEFAULT '')",
+        )
+        .await;
+        let ed = "f".repeat(64);
+        raw_exec(
+            &s,
+            &format!(
+                "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, email) \
+                 VALUES ('frank', '{ed}', '{}', 2, 'sig', '2026-01-01T00:00:00Z', 'frank@corp.com')",
+                "b".repeat(64)
+            ),
+        )
+        .await;
+
+        // Re-run migrate: it must reshape the legacy table into the composite shape without losing the row.
+        if let Store::Sqlite(inner) = &s {
+            inner.migrate().await.expect("migrate must reshape a legacy single-key identity_keys");
+        }
+
+        // The pre-reshape enrollment survives as one device key: key_fpr back-filled, label 'default'.
+        let keys = s.list_identity_keys("frank").await;
+        assert_eq!(keys.len(), 1, "the legacy row becomes exactly one device key");
+        assert_eq!(keys[0].ed25519_pub, ed);
+        assert_eq!(keys[0].key_fpr, ed25519_fingerprint(&ed), "key_fpr is derived from the row's ed25519_pub");
+        assert_eq!(keys[0].label, "default", "a back-filled legacy row is labelled 'default'");
+        assert_eq!(keys[0].epoch, 2, "the rotation epoch is preserved");
+        // It still verifies by email (the whole point — a pre-reshape row is not de-attributed).
+        let hits = s.get_identity_keys_by_email("frank@corp.com").await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].username, "frank");
+        // And the reshaped table now supports a SECOND device key for the same account.
+        s.add_identity_key(ik("frank", &"a".repeat(64), "frank@corp.com", 0, "2026-03-01T00:00:00Z")).await.unwrap();
+        assert_eq!(s.list_identity_keys("frank").await.len(), 2, "the reshaped table is truly multi-key");
     }
 
     #[test]

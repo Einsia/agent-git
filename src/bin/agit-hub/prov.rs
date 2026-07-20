@@ -201,9 +201,12 @@ fn resolve_registry(root: &Path, pushed: &[PushedProvenance]) -> Vec<Option<Regi
         };
         let mut out = Vec::with_capacity(pushed.len());
         for item in pushed {
-            let reg = store.get_identity_key_by_email(&item.prov.email).await.map(|k| RegisteredIdentity {
-                username: k.username,
-                ed25519_pub: k.ed25519_pub,
+            // The committer email's VERIFIED account and its whole device-key SET (empty when unknown /
+            // unverified / ambiguous) — a push signed by ANY of the account's keys attributes to them.
+            let keys = store.get_identity_keys_by_email(&item.prov.email).await;
+            let reg = keys.first().map(|k| RegisteredIdentity {
+                username: k.username.clone(),
+                ed25519_keys: keys.iter().map(|k| k.ed25519_pub.clone()).collect(),
             });
             out.push(reg);
         }
@@ -235,7 +238,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (p, pubkey) = signed(home.path(), "alice@corp.com");
         let pushed = vec![PushedProvenance { session: "sess1".into(), prov: p }];
-        let reg = vec![Some(RegisteredIdentity { username: "alice".into(), ed25519_pub: pubkey })];
+        // alice has two device keys registered; the signing key is one of them — match ANY.
+        let reg = vec![Some(RegisteredIdentity {
+            username: "alice".into(),
+            ed25519_keys: vec!["11".repeat(32), pubkey],
+        })];
 
         let out = record_and_enforce(root.path(), "alice", "alice/web", &pushed, &reg, true);
         assert!(out.is_none(), "a matching key is not a forgery — never rejected");
@@ -254,7 +261,7 @@ mod tests {
         // alice is registered with a DIFFERENT key than the one that signed this session.
         let other = "11".repeat(32);
         let pushed = vec![PushedProvenance { session: "sess1".into(), prov: p }];
-        let reg = vec![Some(RegisteredIdentity { username: "alice".into(), ed25519_pub: other })];
+        let reg = vec![Some(RegisteredIdentity { username: "alice".into(), ed25519_keys: vec![other] })];
 
         let out = record_and_enforce(root.path(), "mallory", "alice/web", &pushed, &reg, true);
         let msg = out.expect("a positive key mismatch must be refused under enforcement");

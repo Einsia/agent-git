@@ -23,6 +23,31 @@ export interface Me {
   // Whether that email has been VERIFIED. Attribution in provenance verification is gated on this — an
   // unverified (possibly squatted) email is not attributed. Drives the Verified / Unverified badge.
   email_verified?: boolean
+  // How many device (signing) keys the account has registered (SSH-keys style, many per account).
+  key_count?: number
+}
+
+// One registered device key (SSH-keys style: an account registers many, one per machine). Public halves
+// only. `key_fpr` is the stable fingerprint used to revoke it; `label` is the device's self-asserted name.
+export interface SigningKey {
+  username: string
+  key_fpr: string
+  ed25519_pub: string
+  x25519_pub: string
+  label: string
+  epoch: number
+  created: string
+  revoked: string | null
+}
+
+// The device-key SET a `GET /api/identity/<user>` returns: the `keys` array (non-revoked, latest first)
+// plus the primary key's fields mirrored at the top level (the single-effective-key encryption path).
+export interface IdentitySet {
+  username: string
+  ed25519_pub: string
+  x25519_pub: string
+  epoch: number
+  keys: SigningKey[]
 }
 
 export interface Member {
@@ -401,6 +426,19 @@ export const api = {
   // Mint + deliver (operator-forwarded) a fresh verification link for the signed-in caller's email. The
   // token is never returned here — an operator forwards the logged/printed link. 400 if no email on file.
   resendEmailVerification: () => request<{ ok: boolean }>("/api/me/verify/resend", { method: "POST" }),
+
+  // ── signing keys (device keys, SSH-keys style) ──
+  // The account's registered device-key SET (public halves only), latest first. Any signed-in caller may
+  // read a user's set; the Account page reads its OWN. 404 when the account has no non-revoked key.
+  signingKeys: (username: string) =>
+    request<IdentitySet>(`/api/identity/${encodeURIComponent(username)}`),
+  // Revoke ONE of the CALLER's own device keys by fingerprint. Caller-only at the hub; a non-owner cannot
+  // revoke. 404 when the fingerprint names no live key of the caller's.
+  revokeSigningKey: (keyFpr: string) =>
+    request<{ username: string; key_fpr: string; revoked: boolean }>(
+      `/api/identity/keys/${encodeURIComponent(keyFpr)}`,
+      { method: "DELETE" }
+    ),
 
   // ── two-factor auth (TOTP) ──
   // There is deliberately no "is 2FA on?" read endpoint (GET /api/me returns only {username,

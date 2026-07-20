@@ -1058,12 +1058,16 @@ impl ProvenanceStatus {
     }
 }
 
-/// A registered identity as the hub publishes it: the account username and its ed25519 signing pubkey
-/// (hex). Resolved from a committer email via the registry's `by-email` lookup.
+/// A registered identity as the hub publishes it: the account username and the SET of ed25519 signing
+/// pubkeys (hex) it has registered — one per device key (SSH-keys style). Resolved from a committer email
+/// via the registry's `by-email` lookup. A session's signing key attributes to this person when it EQUALS
+/// ANY of these keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredIdentity {
     pub username: String,
-    pub ed25519_pub: String,
+    /// Every NON-REVOKED device key the account has registered. A revoked key is never included, so it can
+    /// never count as a provenance match (revocation actually de-attributes its sessions).
+    pub ed25519_keys: Vec<String>,
 }
 
 fn short_key(pubkey: &str) -> String {
@@ -1116,13 +1120,21 @@ fn same_pubkey(a: &str, b: &str) -> bool {
 /// `SignedUnregistered`. Everything non-`Verified` (Unsigned/Tampered/BadSignature) passes through
 /// unchanged. `registered` is the account the email maps to, or `None` when it maps to nothing (or the
 /// caller could not reach the registry — offline degrades to `SignedUnregistered`, never a false
-/// "verified as"). `trusted_pubkey`, when set, is the key to compare against instead of
-/// `registered.ed25519_pub` — the CLIENT passes its TOFU-pinned copy so a hub key-substitution cannot
-/// manufacture a false match; the hub passes `None` (it IS the registry).
+/// "verified as").
+///
+/// **Match ANY device key.** The session attributes to the person when its signing key EQUALS ANY of the
+/// account's registered keys — so a session signed on a second enrolled machine is still `VerifiedAs`, not
+/// a false `KeyMismatch`. It is `KeyMismatch` only when the email maps to a registered account but the
+/// signing key matches NONE of its keys (a possible forgery). A revoked key is never in the set, so it
+/// never counts as a match.
+///
+/// `trusted_keys`, when set, is the set to compare against instead of `registered.ed25519_keys` — the
+/// CLIENT passes its TOFU-pinned copy so a hub key-substitution cannot manufacture a false match; the hub
+/// passes `None` (it IS the registry).
 pub fn attribute_with_registry(
     self_status: ProvenanceStatus,
     registered: Option<RegisteredIdentity>,
-    trusted_pubkey: Option<&str>,
+    trusted_keys: Option<&[String]>,
 ) -> ProvenanceStatus {
     let ProvenanceStatus::Verified { aid, email, pubkey } = self_status else {
         return self_status;
@@ -1130,14 +1142,16 @@ pub fn attribute_with_registry(
     let Some(reg) = registered else {
         return ProvenanceStatus::SignedUnregistered { aid, email, pubkey };
     };
-    let registered_pubkey = trusted_pubkey.unwrap_or(&reg.ed25519_pub);
-    if same_pubkey(&pubkey, registered_pubkey) {
+    let candidates: &[String] = trusted_keys.unwrap_or(&reg.ed25519_keys);
+    if candidates.iter().any(|k| same_pubkey(&pubkey, k)) {
         ProvenanceStatus::VerifiedAs { username: reg.username, aid, email, pubkey }
     } else {
         ProvenanceStatus::KeyMismatch {
             email,
             claimed_username: reg.username,
-            registered_pubkey: registered_pubkey.to_string(),
+            // A representative registered key for the message (the account may have several); the point is
+            // simply that NONE of them is the signing key.
+            registered_pubkey: candidates.first().cloned().unwrap_or_default(),
             actual_pubkey: pubkey,
         }
     }
@@ -1174,19 +1188,28 @@ where
             return Ok(attribute_with_registry(self_status, None, None));
         }
     };
-    // TOFU-pin the account's registered ed25519 key; a changed key HARD-FAILS (Err) unless re-pinned.
-    let pinned = pin_registered_ed25519(home, &registered, repin)?;
-    Ok(attribute_with_registry(self_status, Some(registered), Some(&pinned)))
+    // TOFU-pin the account's registered key SET; a changed set HARD-FAILS (Err) unless re-pinned, so a hub
+    // cannot silently swap (or inject) a key it attributes sessions to. The comparison then uses the
+    // pinned/confirmed set, not a freshly-fetched one that could differ.
+    let trusted = pin_registered_key_set(home, &registered, repin)?;
+    Ok(attribute_with_registry(self_status, Some(registered), Some(&trusted)))
 }
 
-/// TOFU-pin an account's registered ed25519 signing key, returning the trusted (pinned) key as hex. First
-/// sighting pins it; a later sighting that DIFFERS is a hard error carrying a re-pin instruction, unless
-/// `repin`. Reuses the same on-disk pin discipline the encryption recipient pins use.
-fn pin_registered_ed25519(home: &Path, reg: &RegisteredIdentity, repin: bool) -> Result<String> {
-    let key = crate::keybox::decode_pub32_hex(&reg.ed25519_pub)
-        .with_context(|| format!("the hub returned a malformed ed25519 key for {}", reg.username))?;
-    let trusted = crate::keybox::pin_provenance_key(home, &reg.username, &key, repin)?;
-    Ok(hex::encode(trusted))
+/// TOFU-pin an account's registered ed25519 signing-key SET, returning the trusted (pinned) set. The pin
+/// anchor is a fingerprint over the sorted set — reusing the existing single-key provenance-pin file as a
+/// set anchor — so ANY change to the set (a key added OR removed OR swapped) is a hard error carrying a
+/// re-pin instruction, unless `repin`. First sighting pins it. On success the fetched set matched the
+/// pinned fingerprint, so the returned set is the trusted one to attribute against.
+fn pin_registered_key_set(home: &Path, reg: &RegisteredIdentity, repin: bool) -> Result<Vec<String>> {
+    let mut keys = reg.ed25519_keys.clone();
+    keys.sort();
+    keys.dedup();
+    // Fingerprint the sorted set as a 32-byte value and TOFU-pin THAT via the existing prov-key pin.
+    let fp_hex = crate::convo::sha256_hex(&keys.join("\n"));
+    let fp = crate::keybox::decode_pub32_hex(&fp_hex)
+        .context("internal: sha256 of the registered key set is not 32 bytes")?;
+    crate::keybox::pin_provenance_key(home, &reg.username, &fp, repin)?;
+    Ok(keys)
 }
 
 /// The committer email the store commits under, read never written (agit must not touch git identity).
@@ -1242,17 +1265,42 @@ pub fn identity_cmd(args: &[String]) -> Result<i32> {
     let sub = args.first().map(|s| s.as_str());
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
     match sub {
-        Some("enroll") => identity_enroll(rest.iter().any(|a| a == "--rotate")),
+        Some("enroll") => identity_enroll(rest.iter().any(|a| a == "--rotate"), flag_value(rest, "--label")),
+        Some("keys") => identity_keys(),
+        Some("revoke") => identity_revoke(rest),
         Some("show") => identity_show(rest.first().map(|s| s.trim()).filter(|s| !s.is_empty())),
         Some("pin") => identity_pin(rest),
         // No subcommand = show my own local identity + enrollment status, the friendliest default.
         None => identity_show(None),
         Some(other) => {
             errln!("agit identity: unknown subcommand `{other}`");
-            errln!("  usage: agit identity enroll [--rotate]   ·   show [<user>]   ·   pin <user> [--repin] [--key HEX]");
+            errln!(
+                "  usage: agit identity enroll [--label <name>] [--rotate]   ·   keys   ·   \
+                 revoke <fpr-or-label>   ·   show [<user>]   ·   pin <user> [--repin] [--key HEX]"
+            );
             Ok(2)
         }
     }
+}
+
+/// A default device label for a freshly enrolled key: this machine's hostname, so `agit identity keys`
+/// reads like GitHub's SSH-key list ("work-laptop", "ci-runner"). Falls back to a generic name when the
+/// hostname is not discoverable — a label is a cosmetic hint, never load-bearing.
+fn default_device_label() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "this-device".to_string())
+}
+
+/// This machine's registered device key within a fetched identity set (matched by ed25519 pubkey), if the
+/// account has already enrolled it. Returns the matching entry from the response's `keys` array.
+fn my_device_key<'a>(set: &'a serde_json::Value, my_ed_pub: &str) -> Option<&'a serde_json::Value> {
+    set.get("keys")?.as_array()?.iter().find(|k| field(k, "ed25519_pub") == my_ed_pub)
 }
 
 /// The pubkeys of THIS machine's identity, deriving the X25519 half from the same ed25519 secret.
@@ -1264,45 +1312,50 @@ fn field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("")
 }
 
-/// Publish (or rotate) this machine's public keys in the hub registry. `enroll_sig` signs
-/// `(username ‖ epoch ‖ ed25519_pub ‖ x25519_pub)` with the machine key, proving possession; the
-/// `username` is the hub account the client authenticates as (learned from `GET /api/me`), because the
-/// server verifies the signature against that caller identity — a signature bound to any other name is
-/// rejected. The epoch is monotonic: a fresh enrollment starts at 0, `--rotate` bumps past the stored one.
-fn identity_enroll(rotate: bool) -> Result<i32> {
+/// ADD this machine's public keys to the hub registry as a DEVICE key (SSH-keys style) — never
+/// overwriting the account's OTHER device keys. `enroll_sig` signs `(username ‖ epoch ‖ ed25519_pub ‖
+/// x25519_pub)` with the machine key, proving possession; the `username` is the hub account the client
+/// authenticates as (learned from `GET /api/me`), because the server verifies the signature against that
+/// caller identity. The epoch is monotonic PER DEVICE KEY: a NEW machine starts this key at 0, and
+/// `--rotate` bumps past THIS machine's stored epoch. Re-enrolling an unchanged machine is idempotent.
+/// `label` names the device (defaulting to the hostname); it is self-asserted, not part of `enroll_sig`.
+fn identity_enroll(rotate: bool, label: Option<String>) -> Result<i32> {
     let sk = agent::machine_signing_key()?;
     let (ed_pub, x_pub) = local_identity_pubkeys()?;
 
     let ep = crate::hubapi::HubEndpoint::resolve()?;
     let username = ep.me()?;
+    // Look for THIS machine's key in the account's device-key set (matched by ed25519 pubkey).
     let current = ep.get_identity(&username)?;
-    let cur_epoch = current.as_ref().and_then(|v| v.get("epoch").and_then(|e| e.as_i64()));
+    let mine = current.as_ref().and_then(|v| my_device_key(v, &ed_pub));
+    let my_epoch = mine.and_then(|k| k.get("epoch").and_then(|e| e.as_i64()));
 
-    let epoch = match (cur_epoch, rotate) {
+    let epoch = match (my_epoch, rotate) {
+        // This machine has no key registered yet → add it as a fresh device key at epoch 0.
         (None, _) => 0,
+        // Rotate THIS device key past its stored epoch.
         (Some(stored), true) => stored + 1,
+        // Not rotating and this machine's key is already registered: idempotent no-op (same keys).
         (Some(stored), false) => {
-            let same = current
-                .as_ref()
-                .map(|v| field(v, "ed25519_pub") == ed_pub && field(v, "x25519_pub") == x_pub)
-                .unwrap_or(false);
-            if same {
-                outln!("already enrolled as {username} at epoch {stored} (keys unchanged).");
-                outln!("  use `agit identity enroll --rotate` to publish a new epoch.");
+            let same_x = mine.map(|k| field(k, "x25519_pub") == x_pub).unwrap_or(false);
+            if same_x {
+                outln!("this machine is already enrolled for {username} at epoch {stored} (key unchanged).");
+                outln!("  use `agit identity enroll --rotate` to publish a new epoch for this device.");
                 return Ok(0);
             }
-            errln!("your local identity differs from the enrolled epoch {stored} on the hub.");
-            errln!("  re-run with `--rotate` to publish these keys as epoch {}.", stored + 1);
+            // Same ed25519 but a changed x25519 (a re-derivation) needs a rotation to republish.
+            errln!("this machine's x25519 key differs from its enrolled epoch {stored} on the hub.");
+            errln!("  re-run with `--rotate` to republish this device key as epoch {}.", stored + 1);
             return Ok(1);
         }
     };
 
     let msg = agent::identity_enroll_message(&username, epoch, &ed_pub, &x_pub);
     let enroll_sig = agent::sign_hex(&sk, &msg);
+    let device_label = label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).unwrap_or_else(default_device_label);
     // Publish the committer email too (best-effort — an override hub with no active agent has none): it is
     // the bridge that lets a teammate verifying a session's provenance resolve its committer to THIS
-    // account. Not part of `enroll_sig` (the possession proof), so the Wave-1 signing format is unchanged;
-    // it is a self-asserted attribute the server stores alongside the keys.
+    // account. Not part of `enroll_sig` (the possession proof), so the Wave-1 signing format is unchanged.
     let email = agent::resolve(None).map(|a| committer_email(&a.store)).unwrap_or_default();
     let body = serde_json::json!({
         "ed25519_pub": ed_pub,
@@ -1310,14 +1363,80 @@ fn identity_enroll(rotate: bool) -> Result<i32> {
         "epoch": epoch,
         "enroll_sig": enroll_sig,
         "email": email,
+        "label": device_label,
     });
     ep.enroll(&body)?;
-    outln!("enrolled {username} in the hub identity registry at epoch {epoch}");
+    let verb = if my_epoch.is_some() { "device key rotated" } else { "device key added" };
+    outln!("enrolled {username} in the hub identity registry ({verb}, epoch {epoch}, label {device_label:?})");
     outln!("  ed25519  {ed_pub}");
     outln!("  x25519   {x_pub}");
     if !email.is_empty() {
         outln!("  email    {email}  (attribution: sessions you commit under this email verify as {username})");
     }
+    outln!("  list your enrolled devices with `agit identity keys`.");
+    Ok(0)
+}
+
+/// `agit identity keys` — list THIS account's enrolled device keys (fingerprint, label, when), marking the
+/// one that lives on this machine. The read half of the SSH-keys UX.
+fn identity_keys() -> Result<i32> {
+    let (my_ed_pub, _) = local_identity_pubkeys()?;
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    let username = ep.me()?;
+    let Some(set) = ep.get_identity(&username)? else {
+        outln!("no device keys enrolled for {username} yet — run `agit identity enroll`.");
+        return Ok(0);
+    };
+    let keys = set.get("keys").and_then(|k| k.as_array()).cloned().unwrap_or_default();
+    if keys.is_empty() {
+        outln!("no device keys enrolled for {username} yet — run `agit identity enroll`.");
+        return Ok(0);
+    }
+    outln!("device keys for {username}");
+    for k in &keys {
+        let fpr = field(k, "key_fpr");
+        let label = field(k, "label");
+        let created = field(k, "created");
+        let mine = if field(k, "ed25519_pub") == my_ed_pub { "  (this device)" } else { "" };
+        let label_show = if label.is_empty() { "-".to_string() } else { label.to_string() };
+        outln!("  {fpr}  {label_show}  added {created}{mine}");
+    }
+    outln!("  revoke one with `agit identity revoke <fpr-or-label>`.");
+    Ok(0)
+}
+
+/// `agit identity revoke <fpr-or-label>` — revoke ONE of MY enrolled device keys, named by its
+/// fingerprint (full or a unique prefix) or its label. Caller-only at the hub; a non-owner cannot revoke.
+fn identity_revoke(args: &[String]) -> Result<i32> {
+    let Some(sel) = first_positional(args).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        bail!("agit identity revoke: name a key by fingerprint or label\n  usage: agit identity revoke <fpr-or-label>");
+    };
+    let ep = crate::hubapi::HubEndpoint::resolve()?;
+    let username = ep.me()?;
+    let set = ep.get_identity(&username)?;
+    let keys = set.as_ref().and_then(|v| v.get("keys")).and_then(|k| k.as_array()).cloned().unwrap_or_default();
+    // Resolve the selector to exactly one enrolled key: an exact/prefix fingerprint match, or a label match.
+    let matches: Vec<&serde_json::Value> = keys
+        .iter()
+        .filter(|k| {
+            let fpr = field(k, "key_fpr");
+            fpr == sel || fpr.starts_with(&sel) || field(k, "label") == sel
+        })
+        .collect();
+    let fpr = match matches.as_slice() {
+        [] => {
+            errln!("no enrolled device key matches {sel:?}. List them with `agit identity keys`.");
+            return Ok(1);
+        }
+        [only] => field(only, "key_fpr").to_string(),
+        many => {
+            errln!("{sel:?} matches {} device keys — use a full fingerprint from `agit identity keys`.", many.len());
+            return Ok(1);
+        }
+    };
+    ep.revoke_identity_key(&fpr)?;
+    outln!("revoked device key {fpr} for {username}.");
+    outln!("  sessions signed by that key no longer verify as you; its encryption access is cut on the next rewrap.");
     Ok(0)
 }
 
@@ -1360,12 +1479,20 @@ fn identity_show(user: Option<&str>) -> Result<i32> {
             let ep = crate::hubapi::HubEndpoint::resolve()?;
             match ep.get_identity(u)? {
                 Some(v) => {
-                    outln!("{u}");
-                    outln!("  ed25519  {}", field(&v, "ed25519_pub"));
-                    outln!("  x25519   {}", field(&v, "x25519_pub"));
-                    outln!("  epoch    {}", v.get("epoch").and_then(|e| e.as_i64()).unwrap_or(0));
-                    if let Some(revoked) = v.get("revoked").and_then(|r| r.as_str()) {
-                        outln!("  REVOKED  {revoked}");
+                    let keys = v.get("keys").and_then(|k| k.as_array()).cloned().unwrap_or_default();
+                    outln!("{u} — {} device key(s)", keys.len());
+                    for k in &keys {
+                        outln!("  {}  {}", field(k, "key_fpr"), {
+                            let l = field(k, "label");
+                            if l.is_empty() { "-".to_string() } else { l.to_string() }
+                        });
+                        outln!("    ed25519  {}", field(k, "ed25519_pub"));
+                        outln!("    x25519   {}", field(k, "x25519_pub"));
+                        outln!("    epoch    {}", k.get("epoch").and_then(|e| e.as_i64()).unwrap_or(0));
+                    }
+                    if keys.is_empty() {
+                        errln!("no identity enrolled for {u} on the hub.");
+                        return Ok(1);
                     }
                     Ok(0)
                 }
@@ -1378,21 +1505,24 @@ fn identity_show(user: Option<&str>) -> Result<i32> {
     }
 }
 
-/// The one-line hub enrollment status for a local ed25519 pubkey: `Some(line)` when enrolled,
-/// `None` when the hub has no row for us, `Err` when no hub is reachable/configured.
+/// The one-line hub enrollment status for a local ed25519 pubkey: `Some(line)` when THIS machine's key is
+/// enrolled in the account's device-key set, `None` when it is not (or the account has no keys), `Err`
+/// when no hub is reachable/configured.
 fn hub_enrollment_status(local_ed_pub: &str) -> Result<Option<String>> {
     let ep = crate::hubapi::HubEndpoint::resolve()?;
     let username = ep.me()?;
-    match ep.get_identity(&username)? {
-        Some(v) => {
-            let epoch = v.get("epoch").and_then(|e| e.as_i64()).unwrap_or(0);
-            let verdict = if field(&v, "ed25519_pub") == local_ed_pub {
-                "matches this machine"
-            } else {
-                "DIFFERS from this machine — rotate to republish"
-            };
-            Ok(Some(format!("enrolled as {username} at epoch {epoch} ({verdict})")))
+    let Some(set) = ep.get_identity(&username)? else {
+        return Ok(None);
+    };
+    let count = set.get("keys").and_then(|k| k.as_array()).map(|a| a.len()).unwrap_or(0);
+    match my_device_key(&set, local_ed_pub) {
+        Some(k) => {
+            let epoch = k.get("epoch").and_then(|e| e.as_i64()).unwrap_or(0);
+            Ok(Some(format!("enrolled as {username} at epoch {epoch} ({count} device key(s); this machine is one)")))
         }
+        None if count > 0 => Ok(Some(format!(
+            "enrolled as {username} with {count} device key(s), but NOT this machine — run `agit identity enroll`"
+        ))),
         None => Ok(None),
     }
 }
@@ -1460,14 +1590,29 @@ fn provenance_verify(args: &[String]) -> Result<i32> {
     })
 }
 
-/// Extract a [`RegisteredIdentity`] from a hub `by-email` / identity JSON row. Missing fields become
-/// empty strings — a row with no `ed25519_pub` then compares equal to nothing, so it classifies as a
-/// mismatch rather than a false pass.
+/// Extract a [`RegisteredIdentity`] from a hub `by-email` / identity JSON response. The response carries
+/// the account plus its `keys` array (the device-key set); we collect every `ed25519_pub`. Missing keys
+/// collapse to an empty set — which compares equal to nothing, so it classifies as a mismatch rather than
+/// a false pass. `username` is read from the top level, falling back to the first key's username.
 fn registered_from_json(v: serde_json::Value) -> RegisteredIdentity {
-    RegisteredIdentity {
-        username: field(&v, "username").to_string(),
-        ed25519_pub: field(&v, "ed25519_pub").to_string(),
-    }
+    let keys = v
+        .get("keys")
+        .and_then(|k| k.as_array())
+        .map(|arr| arr.iter().filter_map(|k| k.get("ed25519_pub").and_then(|e| e.as_str()).map(String::from)).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let username = {
+        let top = field(&v, "username");
+        if !top.is_empty() {
+            top.to_string()
+        } else {
+            v.get("keys")
+                .and_then(|k| k.as_array())
+                .and_then(|arr| arr.first())
+                .map(|k| field(k, "username").to_string())
+                .unwrap_or_default()
+        }
+    };
+    RegisteredIdentity { username, ed25519_keys: keys }
 }
 
 /// A session selector is a filesystem path (to the transcript or its sidecar) when one exists, else a
@@ -4114,7 +4259,11 @@ mod provenance_tests {
     // ── registry attribution: "signed by this key" → "verified as this person" ──
 
     fn reg(username: &str, ed25519_pub: &str) -> RegisteredIdentity {
-        RegisteredIdentity { username: username.into(), ed25519_pub: ed25519_pub.into() }
+        RegisteredIdentity { username: username.into(), ed25519_keys: vec![ed25519_pub.into()] }
+    }
+
+    fn reg_set(username: &str, keys: &[&str]) -> RegisteredIdentity {
+        RegisteredIdentity { username: username.into(), ed25519_keys: keys.iter().map(|k| k.to_string()).collect() }
     }
 
     /// The committer email maps to a registered account whose key IS the one that signed the session →
@@ -4142,8 +4291,31 @@ mod provenance_tests {
         }
     }
 
-    /// The anti-forgery property: the email maps to a registered account, but its key DIFFERS from the
-    /// signing key → `KeyMismatch`, never `VerifiedAs`. This is the impersonation case.
+    /// Match-ANY: an account with SEVERAL registered device keys verifies-as the person when the session's
+    /// signing key equals ANY of them — a session signed on a second enrolled machine is NOT a false
+    /// mismatch. This is the whole point of the SSH-keys reshape.
+    #[test]
+    fn a_session_signed_by_any_registered_device_key_verifies_as_the_person() {
+        let home = tempfile::tempdir().unwrap();
+        let signer = key(home.path());
+        let signing_pubkey = hex::encode(signer.verifying_key().to_bytes());
+        let content = "transcript\n";
+        let p = sign_provenance(&signer, content, "agt_01", "alice@corp.com", "t0");
+        // alice has two device keys registered; the SECOND is this machine's — a match on it must verify.
+        let other_device = "11".repeat(32);
+
+        let status = verify_provenance_with_registry(home.path(), content, Some(&p), false, |_email| {
+            Ok(Some(reg_set("alice", &[&other_device, &signing_pubkey])))
+        })
+        .unwrap();
+        match status {
+            ProvenanceStatus::VerifiedAs { username, .. } => assert_eq!(username, "alice"),
+            other => panic!("a match on ANY registered device key must be VerifiedAs, got {other:?}"),
+        }
+    }
+
+    /// The anti-forgery property: the email maps to a registered account, but the signing key matches NONE
+    /// of its device keys → `KeyMismatch`, never `VerifiedAs`. This is the impersonation case.
     #[test]
     fn a_differing_registered_key_is_a_key_mismatch_not_verified() {
         let home = tempfile::tempdir().unwrap();

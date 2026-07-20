@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react"
+import { useEffect, useState, type ReactNode } from "react"
 import { QRCodeSVG } from "qrcode.react"
 import {
   KeyRound,
@@ -8,10 +8,11 @@ import {
   ShieldCheck,
   ShieldOff,
   ShieldPlus,
+  Trash2,
   TriangleAlert,
 } from "lucide-react"
 
-import { ApiError, api } from "@/lib/api"
+import { ApiError, api, type SigningKey } from "@/lib/api"
 import { useSession } from "@/lib/session"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -64,8 +65,130 @@ export function Account() {
       </header>
 
       <EmailCard />
+      <SigningKeysCard username={me.username} />
       <TwoFactorCard />
     </div>
+  )
+}
+
+// A shortened, monospace fingerprint for display — the full value is on the clipboard / in `agit identity
+// keys`. A device key's fingerprint is already short (32 hex chars); we group it for legibility.
+function shortFpr(fpr: string): string {
+  return fpr.length > 20 ? `${fpr.slice(0, 20)}…` : fpr
+}
+
+// The signing-keys card: the account's registered device keys (SSH-keys style, many per account), each
+// with its label, fingerprint, and when it was added, plus a per-key Revoke. New keys are added from the
+// CLI (`agit identity enroll`) — the private half never leaves the machine — so this page only lists and
+// revokes. A revoked key stops verifying the owner's sessions and loses encryption access on the next
+// rewrap. Mirrors GitHub's "SSH and GPG keys" screen.
+function SigningKeysCard({ username }: { username: string }) {
+  const [keys, setKeys] = useState<SigningKey[] | null>(null)
+  const [error, setError] = useState("")
+  const [revoking, setRevoking] = useState<string | null>(null)
+
+  async function load() {
+    setError("")
+    try {
+      const set = await api.signingKeys(username)
+      setKeys(set.keys)
+    } catch (err) {
+      // 404 = the account has no non-revoked device key yet. That's not an error — show the empty state.
+      if (err instanceof ApiError && err.status === 404) {
+        setKeys([])
+      } else {
+        setError(String((err as Error)?.message ?? err))
+        setKeys([])
+      }
+    }
+  }
+
+  useEffect(() => {
+    void load()
+    // Reload when the account changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [username])
+
+  async function revoke(fpr: string) {
+    setRevoking(fpr)
+    setError("")
+    try {
+      await api.revokeSigningKey(fpr)
+      await load()
+    } catch (err) {
+      setError(String((err as Error)?.message ?? err))
+    } finally {
+      setRevoking(null)
+    }
+  }
+
+  return (
+    <section>
+      <Eyebrow className="mb-1.5">signing keys</Eyebrow>
+      <div className="rounded-lg border bg-card p-5">
+        <div className="flex items-start gap-3">
+          <KeyRound className="mt-0.5 size-5 shrink-0 text-primary" />
+          <div className="min-w-0 flex-1">
+            <p className="font-semibold">Device keys</p>
+            <p className="mt-0.5 max-w-[58ch] text-sm text-muted-foreground">
+              One key per machine you enroll. A session is attributed to you when it's signed by{" "}
+              <em>any</em> of these keys, so a second laptop no longer clobbers the first. Add one from a
+              machine with <code className="font-mono">agit identity enroll</code> — the private half never
+              leaves it.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-5">
+          {keys === null ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : keys.length === 0 ? (
+            <div className="rounded-lg border bg-muted/30 p-5">
+              <p className="text-sm font-medium">No device keys yet</p>
+              <p className="mt-1 max-w-[54ch] text-sm text-muted-foreground">
+                Run <code className="font-mono">agit identity enroll</code> on a machine to publish its
+                signing key here. Until then, your signed sessions show as unregistered.
+              </p>
+            </div>
+          ) : (
+            <ul className="flex flex-col divide-y rounded-lg border">
+              {keys.map((k) => (
+                <li key={k.key_fpr} className="flex flex-wrap items-center justify-between gap-3 p-4">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-semibold">{k.label || "unlabelled device"}</span>
+                      <Badge variant="outline" className="font-mono text-xs">
+                        {shortFpr(k.key_fpr)}
+                      </Badge>
+                    </div>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Added {k.created || "unknown"}
+                      {k.epoch > 0 ? ` · rotated to epoch ${k.epoch}` : ""}
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => revoke(k.key_fpr)}
+                    disabled={revoking !== null}
+                    className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  >
+                    <Trash2 />
+                    {revoking === k.key_fpr ? "Revoking…" : "Revoke"}
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {error && (
+          <p role="alert" className="mt-3 text-sm text-destructive">
+            {error}
+          </p>
+        )}
+      </div>
+    </section>
   )
 }
 

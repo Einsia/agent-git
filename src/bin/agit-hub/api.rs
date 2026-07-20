@@ -89,7 +89,7 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("GET", "me/invitations") => return api_me_invitations(ctx, caller).await,
         ("POST", "me/password") => return api_me_password(ctx, req, caller, body).await,
         // Consume a verification token (the capability is the auth — no session needed) and mint a fresh
-        // one for the logged-in caller. See the email-squatting defense in store::get_identity_key_by_email.
+        // one for the logged-in caller. See the email-squatting defense in store::get_identity_keys_by_email.
         ("POST", "verify-email") => return api_verify_email(ctx, body).await,
         ("POST", "me/verify/resend") => return api_me_verify_resend(ctx, caller).await,
         ("POST", "me/2fa/enroll") => return api_2fa_enroll(ctx, caller).await,
@@ -116,6 +116,14 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         // caller may read it — it is a public key a hub-assist client seals its content key TO.
         ("GET", "escrow/pubkey") => return api_escrow_pubkey(ctx, caller).await,
         _ => {}
+    }
+    // identity/keys/<key_fpr> — revoke ONE of the caller's device keys. Matched BEFORE the identity/<user>
+    // prefix so a `<user>` is never read as "keys".
+    if let Some(fpr) = rest.strip_prefix("identity/keys/") {
+        return match m {
+            "DELETE" => api_identity_revoke_key(ctx, caller, fpr).await,
+            _ => Resp::text(405, "method not allowed"),
+        };
     }
     // identity/<user> — a single registry lookup. GET only; POST enroll is the exact route above and
     // never reaches here, so a `<user>` is always a real username (which has no '/').
@@ -400,7 +408,7 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
 /// <person>" step, run live on the SESSION read path (the push-time equivalent lives in `prov.rs`).
 ///
 /// A `Verified { email, .. }` self-status is upgraded by resolving the committer email to a VERIFIED
-/// account (`store.get_identity_key_by_email` is verified-only after the email-verify wave, so an
+/// account (`store.get_identity_keys_by_email` is verified-only after the email-verify wave, so an
 /// unverified or squatted email resolves to nothing) and comparing keys:
 ///   - registered key EQUALS the provenance pubkey  → `VerifiedAs` (a real, verified account),
 ///   - registered but the key DIFFERS               → `KeyMismatch` (a forgery — never rendered green),
@@ -415,9 +423,13 @@ async fn classify_read_status(
     let agit::commands::ProvenanceStatus::Verified { email, .. } = &self_status else {
         return self_status;
     };
-    let registered = store.get_identity_key_by_email(email).await.map(|k| agit::commands::RegisteredIdentity {
-        username: k.username,
-        ed25519_pub: k.ed25519_pub,
+    // Resolve the committer email to the VERIFIED account's whole device-key SET (empty when unknown /
+    // unverified / ambiguous), then attribute match-ANY. The hub IS the registry, so it compares against
+    // its own stored keys directly (`trusted_keys = None`; TOFU is the client's job).
+    let keys = store.get_identity_keys_by_email(email).await;
+    let registered = keys.first().map(|k| agit::commands::RegisteredIdentity {
+        username: k.username.clone(),
+        ed25519_keys: keys.iter().map(|k| k.ed25519_pub.clone()).collect(),
     });
     agit::commands::attribute_with_registry(self_status, registered, None)
 }
@@ -509,15 +521,18 @@ pub(crate) async fn api_me(ctx: &Ctx, caller: &Caller) -> Resp {
     let Some(u) = &caller.user else {
         return Resp::err(401, "not logged in");
     };
-    // The email of record lives in the identity registry (self-asserted at enroll); email_verified lives
-    // on the users row. Both read tolerate a missing row (fresh account not yet enrolled → "" / false).
-    let email = ctx.store.get_identity_key(u).await.map(|k| k.email).unwrap_or_default();
+    // The email of record is the PRIMARY device key's committer email (self-asserted at enroll);
+    // email_verified lives on the users row. Both reads tolerate a missing row (fresh account not yet
+    // enrolled → "" / false). `key_count` is how many device keys the account has registered.
+    let keys = ctx.store.list_identity_keys(u).await;
+    let email = ctx.store.get_primary_identity_key(u).await.map(|k| k.email).unwrap_or_default();
     let email_verified = ctx.store.user(u).await.map(|user| user.email_verified).unwrap_or(false);
     Resp::json(serde_json::json!({
         "username": u,
         "is_admin": caller.is_admin,
         "email": email,
         "email_verified": email_verified,
+        "key_count": keys.len(),
     }))
 }
 
@@ -1001,17 +1016,35 @@ fn is_hex_len(s: &str, n: usize) -> bool {
     s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The public shape of a registry row: pubkeys are public, so every field is disclosable to any
-/// authenticated caller. This is the lookup both provenance-verify and (later) recipient-wrap consume.
+/// The public shape of one registry DEVICE key: pubkeys are public, so every field is disclosable to any
+/// authenticated caller. This is the row both provenance-verify and (later) recipient-wrap consume.
 fn identity_json(k: &store::IdentityKey) -> serde_json::Value {
     serde_json::json!({
         "username": k.username,
+        "key_fpr": k.key_fpr,
         "ed25519_pub": k.ed25519_pub,
         "x25519_pub": k.x25519_pub,
+        "label": k.label,
         "epoch": k.epoch,
         "enroll_sig": k.enroll_sig,
         "revoked": k.revoked,
+        "created": k.created,
         "email": k.email,
+    })
+}
+
+/// The public shape of an account's device-key SET: the `keys` array (one entry per non-revoked device
+/// key), plus the PRIMARY key's fields mirrored at the top level for back-compat with single-key readers
+/// (the encryption path's `hub_x25519`, which wraps to the primary device key this wave). `keys[0]` is the
+/// primary (the list is latest-first). Callers must have at least one key — an empty set is a 404 upstream.
+fn identity_set_json(keys: &[store::IdentityKey]) -> serde_json::Value {
+    let primary = &keys[0];
+    serde_json::json!({
+        "username": primary.username,
+        "ed25519_pub": primary.ed25519_pub,
+        "x25519_pub": primary.x25519_pub,
+        "epoch": primary.epoch,
+        "keys": keys.iter().map(identity_json).collect::<Vec<_>>(),
     })
 }
 
@@ -1061,28 +1094,38 @@ pub(crate) async fn api_identity_enroll(ctx: &Ctx, caller: &Caller, body: &[u8])
     if email.len() > 320 {
         return Resp::err(400, "email is too long (max 320 chars)");
     }
-    // Capture the previously-enrolled email BEFORE the upsert overwrites it, so we can tell whether this
-    // enroll CHANGES the address. Normalized both sides, matching how the store stores + matches emails.
+    // An optional device label (the machine hostname by default, client-side) — self-asserted, bounded.
+    let label = str_field(&v, "label").unwrap_or_default();
+    if label.len() > 64 {
+        return Resp::err(400, "label is too long (max 64 chars)");
+    }
+    let key_fpr = store::ed25519_fingerprint(&ed25519_pub);
+    // Capture the account's PRIMARY-key email BEFORE the add, so we can tell whether this enroll CHANGES the
+    // account's asserted address. Normalized both sides, matching how the store stores + matches emails.
     let new_email = store::normalize_email(&email);
-    let prev_email = ctx.store.get_identity_key(&username).await.map(|k| store::normalize_email(&k.email)).unwrap_or_default();
+    let prev_email = ctx.store.get_primary_identity_key(&username).await.map(|k| store::normalize_email(&k.email)).unwrap_or_default();
     let row = store::IdentityKey {
         username: username.clone(),
+        key_fpr: key_fpr.clone(),
         ed25519_pub,
         x25519_pub,
+        label,
         epoch,
         enroll_sig,
         created: store::now_iso(),
         revoked: None,
         email,
     };
-    match ctx.store.upsert_identity_key(row).await {
+    // ADD a device key for the caller — this never overwrites the caller's OTHER keys, and (since username
+    // is the authenticated caller) never another user's key.
+    match ctx.store.add_identity_key(row).await {
         Ok(store::EnrollOutcome::Applied) => {}
         Ok(store::EnrollOutcome::StaleEpoch { stored }) => {
-            return Resp::err(400, &format!("epoch {epoch} does not advance the enrolled epoch {stored}"));
+            return Resp::err(400, &format!("epoch {epoch} does not advance this device key's enrolled epoch {stored}"));
         }
         Err(_) => return Resp::err(500, "couldn't record the identity key"),
     }
-    audit_append(ctx.root(), &username, audit::IDENTITY_ENROLL, None, &format!("epoch={epoch}")).await;
+    audit_append(ctx.root(), &username, audit::IDENTITY_ENROLL, None, &format!("epoch={epoch} key_fpr={key_fpr}")).await;
     // Anti-squatting: a CHANGED committer email must be RE-PROVEN. Reset `email_verified` to false and mint
     // a fresh verification token whenever the enrolled email differs from the prior one — otherwise a user
     // could verify address A, then re-enroll claiming address B and keep the verified flag, re-opening the
@@ -1094,27 +1137,45 @@ pub(crate) async fn api_identity_enroll(ctx: &Ctx, caller: &Caller, body: &[u8])
             audit_append(ctx.root(), &username, audit::USER_EMAIL_RESEND, None, "identity enroll changed the email").await;
         }
     }
-    Resp::json(serde_json::json!({ "username": username, "epoch": epoch }))
+    Resp::json(serde_json::json!({ "username": username, "epoch": epoch, "key_fpr": key_fpr }))
 }
 
-/// `GET /api/identity/<user>` — one person's published public keys. Any authenticated caller may read
-/// (pubkeys are public). An unknown user is a 404, matching the hub's non-disclosure elsewhere.
+/// `GET /api/identity/<user>` — one person's published device-key SET (`{ username, keys: [...], + the
+/// primary key's fields at top level }`). Any authenticated caller may read (pubkeys are public). An
+/// account with no non-revoked key is a 404, matching the hub's non-disclosure elsewhere.
 pub(crate) async fn api_identity_get(ctx: &Ctx, caller: &Caller, user: &str) -> Resp {
     if caller.user.is_none() {
         return Resp::err(401, "login required");
     }
-    match ctx.store.get_identity_key(user).await {
-        Some(k) => Resp::json(identity_json(&k)),
-        None => Resp::err(404, "not found"),
+    let keys = ctx.store.list_identity_keys(user).await;
+    if keys.is_empty() {
+        return Resp::err(404, "not found");
+    }
+    Resp::json(identity_set_json(&keys))
+}
+
+/// `DELETE /api/identity/keys/<key_fpr>` — revoke ONE of the CALLER's own device keys. Caller-only: the
+/// username is the authenticated caller, so a non-owner can never revoke someone else's key. A fingerprint
+/// that names no live key of the caller's is a 404 (idempotent / non-disclosing).
+pub(crate) async fn api_identity_revoke_key(ctx: &Ctx, caller: &Caller, key_fpr: &str) -> Resp {
+    let Some(username) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    match ctx.store.revoke_identity_key(&username, key_fpr).await {
+        Ok(true) => {
+            audit_append(ctx.root(), &username, audit::IDENTITY_REVOKE, None, &format!("key_fpr={key_fpr}")).await;
+            Resp::json(serde_json::json!({ "username": username, "key_fpr": key_fpr, "revoked": true }))
+        }
+        Ok(false) => Resp::err(404, "no such device key for this account"),
+        Err(_) => Resp::err(500, "couldn't revoke the identity key"),
     }
 }
 
 /// `GET /api/identity/by-email?email=<committer-email>` — resolve a committer email to the registered
-/// account owning it. Any authenticated caller may read (the pubkeys and the email→account mapping are
-/// both needed to verify attribution, and registration already publishes them). An email that maps to no
-/// registered account — or to more than one (ambiguous) — is a normal 404, the same non-disclosing
-/// not-found the single-user GET returns, so this is no more of an enumeration oracle than enrollment
-/// already is.
+/// account owning it, returning the account + its device-key SET. Any authenticated caller may read (the
+/// pubkeys and the email→account mapping are both needed to verify attribution, and registration already
+/// publishes them). An email that maps to no VERIFIED account — or to more than one (ambiguous) — is a
+/// normal 404, the same non-disclosing not-found the single-user GET returns.
 pub(crate) async fn api_identity_by_email(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
     if caller.user.is_none() {
         return Resp::err(401, "login required");
@@ -1124,10 +1185,11 @@ pub(crate) async fn api_identity_by_email(ctx: &Ctx, req: &Req, caller: &Caller)
     };
     // The value arrives percent-encoded (`dev%40x.com`); decode before the store normalizes and matches.
     let email = agit::hub::net::percent_decode_lossy(&raw);
-    match ctx.store.get_identity_key_by_email(&email).await {
-        Some(k) => Resp::json(identity_json(&k)),
-        None => Resp::err(404, "not found"),
+    let keys = ctx.store.get_identity_keys_by_email(&email).await;
+    if keys.is_empty() {
+        return Resp::err(404, "not found");
     }
+    Resp::json(identity_set_json(&keys))
 }
 
 /// `GET /api/identity?users=a,b,c` — a batch lookup. Any authenticated caller may read. Unknown users
@@ -4835,7 +4897,7 @@ mod tests {
 
         // /api/me now reports verified, and the email is attributable.
         assert_eq!(json_of(&api_me(&ctx, &caller("alice", false)).await)["email_verified"], true);
-        assert!(ctx.store.get_identity_key_by_email("alice@corp.com").await.is_some());
+        assert!(!ctx.store.get_identity_keys_by_email("alice@corp.com").await.is_empty());
     }
 
     /// Re-enrolling with a DIFFERENT email must RESET verification (the squatting hole otherwise reopens:
@@ -4854,12 +4916,12 @@ mod tests {
         };
         api_identity_enroll(&ctx, &caller("alice", false), &enroll(0, "alice@corp.com")).await;
         ctx.store.set_email_verified("alice", true).await.unwrap();
-        assert!(ctx.store.get_identity_key_by_email("alice@corp.com").await.is_some());
+        assert!(!ctx.store.get_identity_keys_by_email("alice@corp.com").await.is_empty());
 
         // Re-enroll (advancing epoch) claiming a NEW email → verification is reset, neither email attributes.
         assert_eq!(api_identity_enroll(&ctx, &caller("alice", false), &enroll(1, "ceo@corp.com")).await.status, 200);
         assert!(!ctx.store.user("alice").await.unwrap().email_verified, "changing the email resets verification");
-        assert!(ctx.store.get_identity_key_by_email("ceo@corp.com").await.is_none(), "the new (unverified) email does not attribute");
+        assert!(ctx.store.get_identity_keys_by_email("ceo@corp.com").await.is_empty(), "the new (unverified) email does not attribute");
     }
 
     /// Admin force-verify (POST /api/users/<u>/verify-email) is admin-gated and flips the flag.
@@ -4886,7 +4948,7 @@ mod tests {
     // upgraded to a positive attribution. They exercise `classify_read_status` — the exact async step
     // the `session/<id>/provenance` handler runs against `ctx.store` — with a self-verified `Verified`
     // as its input (the git self-verify is covered by `content.rs`/the client; here the store is under
-    // test). The email-verify tie-in is exercised directly: `get_identity_key_by_email` is verified-only.
+    // test). The email-verify tie-in is exercised directly: `get_identity_keys_by_email` is verified-only.
 
     use agit::commands::ProvenanceStatus as PS;
 
@@ -4895,10 +4957,12 @@ mod tests {
     async fn enroll_identity(ctx: &Ctx, user: &str, ed25519_pub: &str, email: &str, verified: bool) {
         add_user(ctx, user, "a-long-enough-password", false).await;
         ctx.store
-            .upsert_identity_key(store::IdentityKey {
+            .add_identity_key(store::IdentityKey {
                 username: user.into(),
+                key_fpr: String::new(), // the facade derives it
                 ed25519_pub: ed25519_pub.into(),
                 x25519_pub: "b".repeat(64),
+                label: "test".into(),
                 epoch: 0,
                 enroll_sig: "sig".into(),
                 created: store::now_iso(),
@@ -4978,7 +5042,7 @@ mod tests {
 
     /// The email-verify tie-in: an UNVERIFIED email (a registered key exists, but the account never
     /// verified the address) is SIGNED_UNREGISTERED, NOT verified_as — even though the key would match.
-    /// This inherits `get_identity_key_by_email`'s verified-only gate; a squatter can't mint attribution.
+    /// This inherits `get_identity_keys_by_email`'s verified-only gate; a squatter can't mint attribution.
     #[tokio::test]
     async fn read_unverified_email_is_signed_unregistered_not_verified_as() {
         let (_d, ctx) = harness().await;

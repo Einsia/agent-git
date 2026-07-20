@@ -108,7 +108,7 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
         }
         Some("verify-email") => {
             // Admin/host force-verify: mark a user's email VERIFIED out-of-band (the operator vouch). This
-            // is the anti-squatting gate for provenance attribution — see store::get_identity_key_by_email.
+            // is the anti-squatting gate for provenance attribution — see store::get_identity_keys_by_email.
             let Some(name) = positional(args, 2) else {
                 eprintln!("usage: agit-hub user verify-email <name>");
                 return 2;

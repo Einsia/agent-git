@@ -547,9 +547,16 @@ pub fn decode_pub32_hex(hexstr: &str) -> Result<[u8; 32]> {
 /// Best-effort fetch of a user's published X25519 pubkey from the hub registry. `None` on any failure
 /// (no hub configured, unreachable, unknown user, malformed row) — offline resolution then falls back to
 /// the local pin.
+///
+/// The account now registers MANY device keys, but encryption stays single-effective-key this wave: the
+/// `GET /api/identity/<user>` response mirrors the account's PRIMARY device key (its latest non-revoked
+/// key, the server's `get_primary_identity_key`) at the top-level `x25519_pub`, so this wraps to that one
+/// device. Wrapping to ALL of a recipient's devices is a deliberate follow-up; today encryption targets
+/// the primary device key.
 fn hub_x25519(user: &str) -> Option<[u8; 32]> {
     let ep = crate::hubapi::HubEndpoint::resolve().ok()?;
     let v = ep.get_identity(user).ok()??;
+    // Top-level `x25519_pub` is the primary device key's — see get_primary_identity_key on the hub.
     let hexs = v.get("x25519_pub").and_then(|x| x.as_str())?;
     decode_x25519_hex(hexs).ok()
 }

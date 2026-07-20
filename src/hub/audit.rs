@@ -53,8 +53,10 @@ pub const TWOFA_ENROLL: &str = "user.2fa.enroll";
 pub const TWOFA_ENABLE: &str = "user.2fa.enable";
 pub const TWOFA_DISABLE: &str = "user.2fa.disable";
 pub const TWOFA_ADMIN_DISABLE: &str = "user.2fa.admin.disable";
-/// A user published (or rotated) their public keys in the shared identity registry.
+/// A user added (or rotated) a DEVICE key in the shared identity registry (SSH-keys style: many keys per
+/// account). `enroll` = a key was added/rotated; `revoke` = one of the account's device keys was revoked.
 pub const IDENTITY_ENROLL: &str = "user.identity.enroll";
+pub const IDENTITY_REVOKE: &str = "user.identity.revoke";
 /// Email-verification lifecycle. `verify` = an account's email was marked VERIFIED (a token was consumed,
 /// or a site admin force-verified it — the detail records which); `resend` = a fresh verification token
 /// was minted and delivered for an account. Verification is the anti-squatting gate for provenance
