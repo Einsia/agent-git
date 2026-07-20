@@ -171,6 +171,10 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         if let Some(name) = after.strip_suffix("/escrow") {
             return api_org_escrow(ctx, caller, name, m, body).await;
         }
+        // orgs/<org>/settings — org policy knobs (today: members_can_create). Org-admin only to change.
+        if let Some(name) = after.strip_suffix("/settings") {
+            return api_org_settings(ctx, caller, name, m, body).await;
+        }
         return match m {
             "GET" => api_org_get(ctx, caller, after).await,
             "DELETE" => api_org_delete(ctx, caller, after).await,
@@ -1354,10 +1358,19 @@ pub(crate) async fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body
         None => None,
     };
     if let Some(o) = &org {
-        if !o.is_admin(&user) {
-            return Resp::err(403, "must be an org admin to create agents under it");
+        // Creating under an org is allowed for an org admin (or a site admin), OR for a plain member
+        // when the org's `members_can_create` policy permits it (the GitHub default). A member who is
+        // refused gets a distinct 403 — they already know the org exists (the 404 non-disclosure above
+        // has already let them through), so naming the policy leaks nothing.
+        let may_create = caller.is_admin || o.is_admin(&user) || (o.is_member(&user) && o.members_can_create != 0);
+        if !may_create {
+            return Resp::err(403, "this org only lets admins create agents");
         }
     }
+    // Whether to bootstrap the fresh bare repo into an immediately-cloneable, sessionless agent store
+    // (one commit carrying an agent.toml with a minted aid). Default FALSE: the plain create is a name
+    // reservation for pushing an EXISTING agent, and initializing it would collide with that push.
+    let initialize = v.get("initialize").and_then(|x| x.as_bool()).unwrap_or(false);
     let owner = match &org {
         Some(o) => format!("org:{}", o.name),
         None => user.clone(),
@@ -1376,20 +1389,45 @@ pub(crate) async fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body
     }
     let seg = store::owner_ns(&owner).to_string();
     match create_agent(&ctx.store, &name, &owner, visibility).await {
-        Ok(_) => {
-            audit_append(ctx.root(), &user, audit::AGENT_CREATE, Some(&format!("{seg}/{name}")), &format!("visibility={} owner={owner}", visibility.as_str())).await;
+        Ok(created) => {
+            audit_append(ctx.root(), &user, audit::AGENT_CREATE, Some(&format!("{seg}/{name}")), &format!("visibility={} owner={owner} initialize={initialize}", visibility.as_str())).await;
             let repo = repo_path(ctx.root(), &seg, &name);
-            let (aid, aid_source) = tokio::task::spawn_blocking(move || agent_aid(&repo)).await.unwrap();
+            // Bootstrap (initialize=true) mints an aid + commits agent.toml so the store is immediately
+            // cloneable; otherwise the aid is read out of whatever the empty repo has (None for a fresh
+            // reservation). Both the bootstrap and the read shell out to git, so they run on the blocking
+            // pool. On a bootstrap failure the reservation still stands — report it as not-initialized.
+            let name_for_git = name.clone();
+            let (aid, aid_source, initialized) = tokio::task::spawn_blocking(move || {
+                // Only bootstrap a repo we just CREATED. If create_agent merely re-recorded a claimed,
+                // pre-existing repo (created=false), initializing would force a fresh orphan root over its
+                // history and mint a conflicting aid -- so skip it, exactly as the CLI does.
+                if initialize && created {
+                    match initialize_store(&repo, &name_for_git) {
+                        Ok(aid) => (Some(aid), "agent.toml", true),
+                        Err(_) => {
+                            let (aid, src) = agent_aid(&repo);
+                            (aid, src, false)
+                        }
+                    }
+                } else {
+                    let (aid, src) = agent_aid(&repo);
+                    (aid, src, false)
+                }
+            })
+            .await
+            .unwrap();
             Resp::json_status(
                 201,
                 serde_json::json!({
                     "name": name,
                     "owner": owner,
                     "full_name": format!("{seg}/{name}"),
-                    // An empty repo has no agent.toml yet — the aid only exists once the client
-                    // pushes it. Report null honestly.
+                    // An un-initialized empty repo has no agent.toml yet — the aid only exists once the
+                    // client pushes it (or `initialize` bootstraps one). Report null honestly.
                     "aid": aid,
                     "aid_source": aid_source,
+                    // Whether the hub bootstrapped a valid, immediately-cloneable store on create.
+                    "initialized": initialized,
                     "clone_url": clone_url(ctx, req, &seg, &name),
                     "visibility": visibility.as_str(),
                 }),
@@ -2392,6 +2430,9 @@ pub(crate) async fn api_orgs_create(ctx: &Ctx, caller: &Caller, body: &[u8]) -> 
                 current_kek_gen: 0,
                 recovery_x25519: String::new(),
                 escrow_mode: "none".into(),
+                // Members can create by default — the GitHub default. An admin can restrict it later
+                // via POST /api/orgs/<org>/settings.
+                members_can_create: 1,
             });
             true
         })
@@ -2423,6 +2464,9 @@ pub(crate) async fn api_org_get(ctx: &Ctx, caller: &Caller, name: &str) -> Resp 
             // `team rekey` to add the `@recovery` envelope, and escrow_mode to gate `a escrow enable`.
             "recovery_x25519": o.recovery_x25519,
             "escrow_mode": o.escrow_mode,
+            // Member-create policy (bool for the UI toggle): true = members may create agents under the
+            // org (the GitHub default), false = admins only.
+            "members_can_create": o.members_can_create != 0,
         })),
         _ => Resp::err(404, "not found"),
     }
@@ -2701,6 +2745,56 @@ async fn api_org_escrow(ctx: &Ctx, caller: &Caller, name: &str, method: &str, bo
             }
             audit_append(ctx.root(), &user, audit::ORG_ESCROW_MODE, None, &format!("org={} mode={mode}", org.name)).await;
             Resp::json(serde_json::json!({ "org": org.name, "escrow_mode": mode }))
+        }
+        _ => Resp::text(405, "method not allowed"),
+    }
+}
+
+/// `/api/orgs/<org>/settings` — the org's policy knobs. Today the one knob is `members_can_create`
+/// (whether a plain member may create agents under the org). GET shows it to any member; POST
+/// `{ members_can_create: bool }` sets it (ORG-ADMIN only). A missing/invisible org is the uniform 404
+/// (existence non-disclosure) every other org route gives.
+async fn api_org_settings(ctx: &Ctx, caller: &Caller, name: &str, method: &str, body: &[u8]) -> Resp {
+    let Some(user) = caller.user.clone() else {
+        return Resp::err(401, "login required");
+    };
+    let Some(org) = ctx.store.org(name).await else {
+        return Resp::err(404, "not found");
+    };
+    if !(caller.is_admin || org.is_member(&user)) {
+        return Resp::err(404, "not found");
+    }
+    let is_admin = caller.is_admin || org.is_admin(&user);
+    match method {
+        "GET" => Resp::json(serde_json::json!({ "org": org.name, "members_can_create": org.members_can_create != 0 })),
+        "POST" => {
+            if !is_admin {
+                return Resp::err(403, "must be an org admin to change org settings");
+            }
+            let Some(v) = json_body(body) else {
+                return Resp::err(400, "want a JSON body");
+            };
+            let Some(allow) = v.get("members_can_create").and_then(|x| x.as_bool()) else {
+                return Resp::err(400, "want members_can_create (boolean)");
+            };
+            let orgname = org.name.clone();
+            let val: i64 = if allow { 1 } else { 0 };
+            let done = ctx
+                .store
+                .update_orgs(move |list| match list.iter_mut().find(|o| o.name == orgname) {
+                    Some(o) => {
+                        o.members_can_create = val;
+                        true
+                    }
+                    None => false,
+                })
+                .await
+                .unwrap_or(false);
+            if !done {
+                return Resp::err(404, "not found");
+            }
+            audit_append(ctx.root(), &user, audit::ORG_SETTINGS, None, &format!("org={} members_can_create={allow}", org.name)).await;
+            Resp::json(serde_json::json!({ "org": org.name, "members_can_create": allow }))
         }
         _ => Resp::text(405, "method not allowed"),
     }
@@ -4599,7 +4693,7 @@ mod tests {
         let members: Vec<OrgMember> =
             members.iter().map(|(u, r)| OrgMember { username: (*u).into(), role: (*r).into() }).collect();
         ctx.store
-            .update_orgs(|list| list.push(Org { name: name.clone(), members: members.clone(), created: store::now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into() }))
+            .update_orgs(|list| list.push(Org { name: name.clone(), members: members.clone(), created: store::now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into(), members_can_create: 1 }))
             .await
             .unwrap();
     }
@@ -5068,5 +5162,166 @@ mod tests {
         assert!(matches!(out, PS::Unsigned));
         let out = classify_read_status(&ctx.store, PS::BadSignature).await;
         assert!(matches!(out, PS::BadSignature));
+    }
+
+    // ── agent-store creation: member-create policy + initialize-on-create ──
+
+    /// Plant an org (via `mk_org`) then set its `members_can_create` policy directly in the store, so a
+    /// test can drive both the permissive (1) and admins-only (0) states.
+    async fn mk_org_policy(ctx: &Ctx, name: &str, members: &[(&str, &str)], members_can_create: i64) {
+        mk_org(ctx, name, members).await;
+        let n = name.to_string();
+        ctx.store
+            .update_orgs(move |list| {
+                if let Some(o) = list.iter_mut().find(|o| o.name == n) {
+                    o.members_can_create = members_can_create;
+                }
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A plain member (non-admin) MAY create an agent under the org when `members_can_create = 1` (the
+    /// GitHub default). The agent lands owned by `org:<name>`.
+    #[tokio::test]
+    async fn org_member_can_create_when_policy_allows() {
+        let (_d, ctx) = harness().await;
+        mk_org_policy(&ctx, "acme", &[("alice", "admin"), ("bob", "member")], 1).await;
+        let r = api_create_agent(&ctx, &req("POST", None), &caller("bob", false), &body(serde_json::json!({ "name": "svc", "org": "acme" }))).await;
+        assert_eq!(r.status, 201, "a member creates under the org when members_can_create=1");
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["owner"], "org:acme");
+        assert_eq!(v["full_name"], "acme/svc");
+    }
+
+    /// A plain member is REFUSED (403) when `members_can_create = 0`; the distinct 403 (not the 404) is
+    /// fine because they already proved membership, so it discloses nothing new.
+    #[tokio::test]
+    async fn org_member_cannot_create_when_policy_forbids() {
+        let (_d, ctx) = harness().await;
+        mk_org_policy(&ctx, "acme", &[("alice", "admin"), ("bob", "member")], 0).await;
+        let r = api_create_agent(&ctx, &req("POST", None), &caller("bob", false), &body(serde_json::json!({ "name": "svc", "org": "acme" }))).await;
+        assert_eq!(r.status, 403, "a member is refused when members_can_create=0");
+        // Nothing was created.
+        assert!(ctx.store.agent_scoped("acme", "svc").await.is_none());
+    }
+
+    /// An org ADMIN always creates, even under the admins-only policy.
+    #[tokio::test]
+    async fn org_admin_always_creates_regardless_of_policy() {
+        let (_d, ctx) = harness().await;
+        mk_org_policy(&ctx, "acme", &[("alice", "admin"), ("bob", "member")], 0).await;
+        let r = api_create_agent(&ctx, &req("POST", None), &caller("alice", false), &body(serde_json::json!({ "name": "svc", "org": "acme" }))).await;
+        assert_eq!(r.status, 201, "an org admin creates even when members_can_create=0");
+    }
+
+    /// A NON-member gets the uniform, non-disclosing 404 — a missing org and one the caller can't see are
+    /// indistinguishable, so create can't be used to probe which orgs exist.
+    #[tokio::test]
+    async fn org_nonmember_gets_nondisclosing_404_on_create() {
+        let (_d, ctx) = harness().await;
+        mk_org_policy(&ctx, "acme", &[("alice", "admin")], 1).await;
+        let r = api_create_agent(&ctx, &req("POST", None), &caller("mallory", false), &body(serde_json::json!({ "name": "svc", "org": "acme" }))).await;
+        assert_eq!(r.status, 404, "a non-member can't tell the org exists");
+        // A create aimed at a truly-missing org is the SAME 404 — no distinguishing the two.
+        let r2 = api_create_agent(&ctx, &req("POST", None), &caller("mallory", false), &body(serde_json::json!({ "name": "svc", "org": "ghost" }))).await;
+        assert_eq!(r2.status, 404);
+    }
+
+    /// Only an org admin may toggle `members_can_create`: a plain member is 403 (policy unchanged), a
+    /// non-member is the non-disclosing 404, and the admin's change sticks AND is enforced on the next
+    /// member create.
+    #[tokio::test]
+    async fn only_org_admin_toggles_member_create_policy() {
+        let (_d, ctx) = harness().await;
+        mk_org_policy(&ctx, "acme", &[("alice", "admin"), ("bob", "member")], 1).await;
+
+        // A plain member cannot change it.
+        let r = api_org_settings(&ctx, &caller("bob", false), "acme", "POST", &body(serde_json::json!({ "members_can_create": false }))).await;
+        assert_eq!(r.status, 403, "a member cannot change org settings");
+        assert_eq!(ctx.store.org("acme").await.unwrap().members_can_create, 1, "a refused toggle leaves the policy alone");
+
+        // A non-member gets the uniform 404 (existence non-disclosure).
+        let r = api_org_settings(&ctx, &caller("mallory", false), "acme", "POST", &body(serde_json::json!({ "members_can_create": false }))).await;
+        assert_eq!(r.status, 404);
+
+        // The admin sets admins-only, and it persists.
+        let r = api_org_settings(&ctx, &caller("alice", false), "acme", "POST", &body(serde_json::json!({ "members_can_create": false }))).await;
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["members_can_create"], false);
+        assert_eq!(ctx.store.org("acme").await.unwrap().members_can_create, 0);
+
+        // And the policy is now enforced end-to-end: the member's create is refused.
+        let c = api_create_agent(&ctx, &req("POST", None), &caller("bob", false), &body(serde_json::json!({ "name": "svc", "org": "acme" }))).await;
+        assert_eq!(c.status, 403, "the new policy is enforced on the next member create");
+    }
+
+    /// GET on the settings route shows the policy to any member; the org GET carries it too (as a bool).
+    #[tokio::test]
+    async fn member_create_policy_is_readable() {
+        let (_d, ctx) = harness().await;
+        mk_org_policy(&ctx, "acme", &[("alice", "admin"), ("bob", "member")], 0).await;
+        let r = api_org_settings(&ctx, &caller("bob", false), "acme", "GET", &[]).await;
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["members_can_create"], false, "a member reads the current policy");
+        let g = api_org_get(&ctx, &caller("bob", false), "acme").await;
+        let gv: serde_json::Value = serde_json::from_slice(&g.body).unwrap();
+        assert_eq!(gv["members_can_create"], false, "the org GET surfaces the policy as a bool");
+    }
+
+    /// `initialize = true` bootstraps a valid, immediately-cloneable store: its default branch has a
+    /// commit whose HEAD tree contains an `agent.toml` carrying an `agt_` aid — i.e. the store is
+    /// adoptable (a plain clone would find the identity), closing the create-then-clone chicken-and-egg.
+    #[tokio::test]
+    async fn create_initialize_true_bootstraps_adoptable_store() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let r = api_create_agent(&ctx, &req("POST", None), &caller("alice", false), &body(serde_json::json!({ "name": "fresh", "initialize": true }))).await;
+        assert_eq!(r.status, 201);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["initialized"], true, "the response reports it was initialized");
+        let aid = v["aid"].as_str().expect("a bootstrapped store reports its minted aid");
+        assert!(aid.starts_with("agt_"), "the minted aid is agt_-shaped: {aid}");
+
+        // The repo has a real commit on its default branch, and its HEAD tree carries agent.toml.
+        // (`rev-parse --verify HEAD` fails on an unborn branch, unlike the bare `rev-parse HEAD`.)
+        let repo = repo_path(ctx.root(), "alice", "fresh");
+        assert!(git(&repo, &["rev-parse", "--verify", "HEAD"]).is_some(), "an initialized store has a commit on its default branch");
+        let tree = git(&repo, &["ls-tree", "--name-only", "HEAD"]).unwrap();
+        assert!(tree.lines().any(|l| l == "agent.toml"), "HEAD tree contains agent.toml (adoptable): {tree:?}");
+
+        // The committed agent.toml parses to the SAME agt_ aid the response reported — the store is
+        // identified and adoptable, not a placeholder.
+        let (read_aid, src) = agent_aid(&repo);
+        assert_eq!(read_aid.as_deref(), Some(aid), "the committed agent.toml carries the reported aid");
+        assert_eq!(src, "agent.toml");
+    }
+
+    /// The default (no `initialize`) leaves an EMPTY bare repo — no commits, no aid — exactly as before:
+    /// a bare name reservation for pushing an existing agent.
+    #[tokio::test]
+    async fn create_default_leaves_empty_bare_repo() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let r = api_create_agent(&ctx, &req("POST", None), &caller("alice", false), &body(serde_json::json!({ "name": "reserved" }))).await;
+        assert_eq!(r.status, 201);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["initialized"], false, "omitting initialize defaults to a bare reservation");
+        assert!(v["aid"].is_null(), "an empty repo has no aid yet");
+        let repo = repo_path(ctx.root(), "alice", "reserved");
+        assert!(git(&repo, &["rev-parse", "--verify", "HEAD"]).is_none(), "the default create leaves an empty bare repo with no commits");
+    }
+
+    /// `initialize = false` explicitly is the same bare reservation as omitting it.
+    #[tokio::test]
+    async fn create_initialize_false_is_bare_reservation() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let r = api_create_agent(&ctx, &req("POST", None), &caller("alice", false), &body(serde_json::json!({ "name": "reserved", "initialize": false }))).await;
+        assert_eq!(r.status, 201);
+        let repo = repo_path(ctx.root(), "alice", "reserved");
+        assert!(git(&repo, &["rev-parse", "--verify", "HEAD"]).is_none(), "initialize=false leaves an empty bare repo");
     }
 }

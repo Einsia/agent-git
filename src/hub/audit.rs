@@ -107,6 +107,8 @@ pub const ORG_KEK_PUBLISH: &str = "org.kek.publish";
 pub const ORG_RECOVERY_SET: &str = "org.recovery.set";
 pub const ORG_RECOVERY_CLEAR: &str = "org.recovery.clear";
 pub const ORG_ESCROW_MODE: &str = "org.escrow.mode";
+/// An org admin changed an org policy knob (today: members_can_create).
+pub const ORG_SETTINGS: &str = "org.settings";
 pub const KEYS_ESCROW: &str = "keys.escrow";
 pub const KEYS_RELEASE: &str = "keys.release";
 pub const TOKEN_CREATE: &str = "token.create";

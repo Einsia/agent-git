@@ -62,7 +62,8 @@ pub(crate) fn print_help() {
          agit-hub user verify-email <name>                    force-mark a user's email verified (admin vouch)\n\
          agit-hub user verify-link <name>                     print a verification link to forward to the user\n\
          agit-hub user list                                   list users\n\
-         agit-hub add <name> [--owner <user>] [--public]      new Agent Store (private by default)\n\
+         agit-hub add <name> [--owner <user>] [--public] [--initialize]\n\
+                                                              new Agent Store (private by default; --initialize commits an agent.toml so it clones immediately)\n\
          agit-hub list                                        list hosted agents\n\
          agit-hub token add <name> [--user <owner>] [--agent <owner>/<name>]\n\
                             [--read|--write] [--ttl-days N]   issue an access token\n\
@@ -704,6 +705,7 @@ mod h4_tests {
                     current_kek_gen: 0,
                     recovery_x25519: String::new(),
                     escrow_mode: "none".into(),
+                    members_can_create: 1,
                 })
             })
             .await
@@ -1233,6 +1235,7 @@ mod h3_tests {
                     current_kek_gen: 0,
                     recovery_x25519: String::new(),
                     escrow_mode: "none".into(),
+                    members_can_create: 1,
                 })
             })
             .await
@@ -1253,10 +1256,25 @@ mod h3_tests {
         assert_eq!(missing.status, 404, "no such org → 404");
         assert_eq!(forbidden.status, missing.status, "an existing org a stranger can't see is indistinguishable from a missing one");
 
-        // A member who merely lacks org-admin still gets a distinct 403 — they already know it exists.
+        // With the default members-can-create policy (GitHub default), a plain member creates fine.
         let member = api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("bob"), None, br#"{"name":"z","org":"acme"}"#).await;
-        assert_eq!(member.status, 403, "a member who isn't an org admin is told so, not hidden");
-        // The successful path is unchanged: the org admin creates the org-owned agent.
+        assert_eq!(member.status, 201, "a member creates under the org when members_can_create is on");
+
+        // Flip the org to admins-only: the member now gets a DISTINCT 403 (not the non-disclosing 404) —
+        // they already proved membership, so being told the policy leaks nothing.
+        ctx.store
+            .update_orgs(|list| {
+                if let Some(o) = list.iter_mut().find(|o| o.name == "acme") {
+                    o.members_can_create = 0;
+                }
+            })
+            .await
+            .unwrap();
+        let restricted = api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("bob"), None, br#"{"name":"z2","org":"acme"}"#).await;
+        assert_eq!(restricted.status, 403, "under admins-only, a member is told so (403), not hidden (404)");
+        assert_ne!(restricted.status, missing.status, "the member's 403 is distinct from the non-member's 404");
+
+        // The org admin creates the org-owned agent regardless of policy.
         let admin = api(&ctx, &req("POST", "/api/agents", 0), "agents", &Caller::user("alice"), None, br#"{"name":"w","org":"acme"}"#).await;
         assert_eq!(admin.status, 201, "the org admin still creates org-owned agents");
     }

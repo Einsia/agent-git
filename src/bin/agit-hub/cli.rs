@@ -338,7 +338,7 @@ pub(crate) fn add_cmd(root: &Path, args: &[String]) -> i32 {
 
 async fn add_cmd_async(root: &Path, args: &[String]) -> i32 {
     let Some(name) = positional(args, 1) else {
-        eprintln!("usage: agit-hub add <name> [--owner <user>] [--public]");
+        eprintln!("usage: agit-hub add <name> [--owner <user>] [--public] [--initialize]");
         return 2;
     };
     let store = match open_store(root).await {
@@ -354,10 +354,13 @@ async fn add_cmd_async(root: &Path, args: &[String]) -> i32 {
     };
     // Private by default — transcripts are sensitive data, so going public must be an explicit act.
     let visibility = if has_flag(args, "--public") { Visibility::Public } else { Visibility::Private };
+    // Off by default: a plain `add` reserves the name for pushing an EXISTING agent; --initialize
+    // bootstraps a fresh, immediately-cloneable store instead (an initial commit with agent.toml).
+    let initialize = has_flag(args, "--initialize");
     let seg = owner.username.clone(); // a user-owned agent's namespace segment is the bare username
     match create_agent(&store, name, &owner.username, visibility).await {
         Ok(created) => {
-            audit::append(root, "cli", audit::AGENT_CREATE, Some(name), &format!("owner={} visibility={}", owner.username, visibility.as_str()));
+            audit::append(root, "cli", audit::AGENT_CREATE, Some(name), &format!("owner={} visibility={} initialize={initialize}", owner.username, visibility.as_str()));
             if created {
                 println!("now hosting {seg}/{name}  →  {}", repo_path(root, &seg, name).display());
             } else {
@@ -367,6 +370,22 @@ async fn add_cmd_async(root: &Path, args: &[String]) -> i32 {
             println!("  visibility: {}", visibility.as_str());
             if visibility == Visibility::Public {
                 println!("  ⚠ public = anyone who can reach this port can read all of its transcripts.");
+            }
+            // Bootstrap AFTER the metadata is recorded, and only on a freshly created (not claimed) repo:
+            // claiming an existing repo must not overwrite whatever identity it already carries.
+            if initialize {
+                if !created {
+                    println!("  note: --initialize skipped — claimed an existing repo, leaving its history untouched.");
+                } else {
+                    match crate::gitplumb::initialize_store(&repo_path(root, &seg, name), name) {
+                        Ok(aid) => {
+                            println!("  initialized: {aid}  (agent.toml committed on main — clone works immediately)");
+                        }
+                        Err(e) => {
+                            eprintln!("  ⚠ initialize failed: {e} — the name is reserved but the store is still empty.");
+                        }
+                    }
+                }
             }
             println!("Publish (needs a write token, see `agit-hub token add`):");
             println!("  agit -a remote add origin http://localhost:8177/{seg}/{name}.git");

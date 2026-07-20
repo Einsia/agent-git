@@ -298,8 +298,77 @@ function OrgCard({
         </p>
       )}
 
+      {canManage && <MemberCreateControl org={org.name} />}
       {canManage && <OrgInvitations org={org.name} />}
       {canManage && <OrgCrypto org={org.name} />}
+    </div>
+  )
+}
+
+// The org's member-create policy: whether a plain member (not just an admin) may create agents under
+// the org. Admin-only (this whole card only renders to a manager). The current value comes off the org
+// detail (GET /api/orgs/<name> now carries members_can_create); the toggle hits POST .../settings.
+function MemberCreateControl({ org }: { org: string }) {
+  const { data, loading, error, reload } = useAsync(() => api.orgCrypto(org), [org])
+  const [busy, setBusy] = useState(false)
+  const [actionError, setActionError] = useState("")
+
+  async function set(next: boolean) {
+    if (busy || data?.members_can_create === next) return
+    setBusy(true)
+    setActionError("")
+    try {
+      await api.setMemberCreate(org, next)
+      reload()
+    } catch (err) {
+      setActionError(String((err as Error)?.message ?? err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="mt-5 border-t pt-4">
+      <Eyebrow className="mb-2">member permissions</Eyebrow>
+      {loading && <p className="text-sm text-muted-foreground">Loading…</p>}
+      {error && <p className="text-sm text-muted-foreground">Couldn't load org settings.</p>}
+      {data && (
+        <div className="rounded-lg border bg-card/60 p-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium">Members can create agents</span>
+            <Badge variant={data.members_can_create ? "default" : "muted"} className="font-mono text-[0.6rem]">
+              {data.members_can_create ? "on" : "off"}
+            </Badge>
+          </div>
+          <p className="mt-1.5 max-w-[62ch] text-[0.78rem] text-muted-foreground">
+            When on, any member may create agents owned by this org. When off, only admins can.
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Button
+              variant={data.members_can_create ? "default" : "outline"}
+              size="sm"
+              disabled={busy}
+              onClick={() => set(true)}
+            >
+              <UserPlus />
+              Members
+            </Button>
+            <Button
+              variant={!data.members_can_create ? "default" : "outline"}
+              size="sm"
+              disabled={busy}
+              onClick={() => set(false)}
+            >
+              Admins only
+            </Button>
+          </div>
+          {actionError && (
+            <p role="alert" className="mt-2 text-sm text-destructive">
+              {actionError}
+            </p>
+          )}
+        </div>
+      )}
     </div>
   )
 }

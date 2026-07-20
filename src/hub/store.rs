@@ -209,12 +209,26 @@ pub struct Org {
     /// path that gives retroactive-for-unfetched revocation. Settable only by an org owner.
     #[serde(default = "escrow_mode_none")]
     pub escrow_mode: String,
+    /// Whether a plain (non-admin) MEMBER may create agents under the org. `1` = yes (the GitHub
+    /// default — members can create), `0` = admins only. Stored as BIGINT for the same strict-decode
+    /// reason as every other integer column. Additive: a fresh DB gets the column from `DDL`, older
+    /// stores from the `ORG_COLUMNS` back-fill (DEFAULT 1), so every pre-existing org reads back as
+    /// members-can-create — the permissive GitHub default, unchanged from before this field existed.
+    #[serde(default = "members_can_create_default")]
+    pub members_can_create: i64,
 }
 
 /// The default (and only opt-out) escrow mode: `none`. A dedicated fn so `#[serde(default)]` on a
 /// deserialized org with no `escrow_mode` field reads back as the safe off state, never an empty string.
 fn escrow_mode_none() -> String {
     "none".to_string()
+}
+
+/// The default for `Org::members_can_create`: `1` (members CAN create, the GitHub default). A dedicated
+/// fn so `#[serde(default)]` on a deserialized org that predates the field reads back permissive rather
+/// than as `0` (admins-only), keeping the pre-field behavior.
+fn members_can_create_default() -> i64 {
+    1
 }
 
 /// The reserved recipient id under which a per-org offline recovery envelope is filed in `team_keks`
@@ -756,6 +770,11 @@ fn row_org(r: &impl Cols) -> Org {
             let m = r.text("escrow_mode");
             if m.is_empty() { escrow_mode_none() } else { m }
         },
+        // Fail-safe: a store that predates the column (before the back-fill runs) reads back as 0. That
+        // would be the RESTRICTIVE reading (admins-only), the opposite of the GitHub default this field
+        // preserves — but the `ORG_COLUMNS` back-fill (DEFAULT 1) runs at boot before any request is
+        // served, so every legacy row is 1 by the time it is read here.
+        members_can_create: r.int("members_can_create"),
     }
 }
 
@@ -856,10 +875,14 @@ const DDL: &[&str] = &[
     // (opt-in hub-assist escrow, Wave 5) defaults to 'none' = off. Both are additive (fresh DBs get them
     // here; older stores get them via the `ORG_COLUMNS` back-fill), and with the defaults every wave-1..4
     // behavior is byte-for-byte unchanged.
+    // members_can_create (1 = a plain member may create agents under the org, the GitHub default; 0 =
+    // admins only) is additive like the Wave-5 columns above: a fresh DB gets it here, older stores get
+    // it via the `ORG_COLUMNS` back-fill (DEFAULT 1), so every pre-existing org stays members-can-create.
     "CREATE TABLE IF NOT EXISTS orgs (\
        name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', created TEXT NOT NULL DEFAULT '', \
        current_kek_gen BIGINT NOT NULL DEFAULT 0, \
-       recovery_x25519 TEXT NOT NULL DEFAULT '', escrow_mode TEXT NOT NULL DEFAULT 'none')",
+       recovery_x25519 TEXT NOT NULL DEFAULT '', escrow_mode TEXT NOT NULL DEFAULT 'none', \
+       members_can_create BIGINT NOT NULL DEFAULT 1)",
     // Org invitations (the consent flow). id is the unguessable accept/decline handle; status is one
     // of pending|accepted|declined|revoked. Added additively to DDL (a whole new table, unlike the
     // TOTP columns) so a fresh DB gets it and every existing store gets it created at boot via the
@@ -931,6 +954,9 @@ const ORG_COLUMNS: &[&str] = &[
     // Wave 5 opt-in escape hatches. Defaults keep every wave-1..4 behavior byte-for-byte unchanged.
     "recovery_x25519 TEXT NOT NULL DEFAULT ''",
     "escrow_mode TEXT NOT NULL DEFAULT 'none'",
+    // Member-create policy. DEFAULT 1 = members CAN create (the GitHub default), so every org that
+    // predates this column stays permissive after the back-fill.
+    "members_can_create BIGINT NOT NULL DEFAULT 1",
 ];
 
 /// The `identity_keys` table, one DDL shared by both backends. The primary key is COMPOSITE
@@ -2066,13 +2092,14 @@ impl SqliteStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM orgs").execute(&mut *tx).await.map_err(err)?;
         for o in &list {
-            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen, recovery_x25519, escrow_mode) VALUES (?, ?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen, recovery_x25519, escrow_mode, members_can_create) VALUES (?, ?, ?, ?, ?, ?, ?)")
                 .bind(&o.name)
                 .bind(serde_json::to_string(&o.members).unwrap_or_else(|_| "[]".into()))
                 .bind(&o.created)
                 .bind(o.current_kek_gen)
                 .bind(&o.recovery_x25519)
                 .bind(&o.escrow_mode)
+                .bind(o.members_can_create)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -2724,13 +2751,14 @@ impl PgStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM orgs").execute(&mut *tx).await.map_err(err)?;
         for o in &list {
-            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen, recovery_x25519, escrow_mode) VALUES ($1, $2, $3, $4, $5, $6)")
+            sqlx::query("INSERT INTO orgs (name, members, created, current_kek_gen, recovery_x25519, escrow_mode, members_can_create) VALUES ($1, $2, $3, $4, $5, $6, $7)")
                 .bind(&o.name)
                 .bind(serde_json::to_string(&o.members).unwrap_or_else(|_| "[]".into()))
                 .bind(&o.created)
                 .bind(o.current_kek_gen)
                 .bind(&o.recovery_x25519)
                 .bind(&o.escrow_mode)
+                .bind(o.members_can_create)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -3580,6 +3608,7 @@ mod tests {
                 current_kek_gen: 0,
                 recovery_x25519: String::new(),
                 escrow_mode: "none".into(),
+                members_can_create: 1,
             });
         })
         .await
@@ -3643,7 +3672,7 @@ mod tests {
     #[tokio::test]
     async fn wave5_org_escape_hatches_default_off_and_persist() {
         let (_d, s) = tmp_store().await;
-        s.update_orgs(|l| l.push(Org { name: "acme".into(), members: vec![org_member("alice", "admin")], created: now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into() }))
+        s.update_orgs(|l| l.push(Org { name: "acme".into(), members: vec![org_member("alice", "admin")], created: now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into(), members_can_create: 1 }))
             .await
             .unwrap();
         // Default OFF.
@@ -3691,7 +3720,7 @@ mod tests {
     #[tokio::test]
     async fn current_kek_gen_bumps_monotonically_and_survives_org_edits() {
         let (_d, s) = tmp_store().await;
-        s.update_orgs(|l| l.push(Org { name: "acme".into(), members: vec![org_member("alice", "admin")], created: now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into() }))
+        s.update_orgs(|l| l.push(Org { name: "acme".into(), members: vec![org_member("alice", "admin")], created: now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into(), members_can_create: 1 }))
             .await
             .unwrap();
         assert_eq!(s.get_current_kek_gen("acme").await, 0);
@@ -3740,7 +3769,7 @@ mod tests {
             let s = s.clone();
             handles.push(tokio::spawn(async move {
                 s.update_orgs(move |list| {
-                    list.push(Org { name: format!("org{i}"), members: vec![], created: now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into() });
+                    list.push(Org { name: format!("org{i}"), members: vec![], created: now_iso(), current_kek_gen: 0, recovery_x25519: String::new(), escrow_mode: "none".into(), members_can_create: 1 });
                 })
                 .await
                 .unwrap();
@@ -3764,6 +3793,7 @@ mod tests {
             current_kek_gen: 0,
             recovery_x25519: String::new(),
             escrow_mode: "none".into(),
+            members_can_create: 1,
         };
         let m = AgentMeta {
             members: vec![Member { username: "carol".into(), role: "read".into() }, Member { username: "dave".into(), role: "admin".into() }],

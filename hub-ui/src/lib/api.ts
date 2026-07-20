@@ -96,6 +96,9 @@ export interface OrgCrypto {
   escrow_mode: EscrowMode
   /// Empty string = no offline recovery recipient set. A 64-hex-char (32-byte) X25519 pubkey when set.
   recovery_x25519: string
+  /// Whether a plain member may create agents under the org (the GitHub default). false = admins only.
+  /// Surfaced on GET /api/orgs/<name>; toggled by an org admin via POST .../settings.
+  members_can_create: boolean
 }
 
 export interface AgentSummary {
@@ -262,6 +265,9 @@ export interface CreatedAgent {
   full_name: string
   aid: string | null
   aid_source: string
+  /// Whether the hub bootstrapped an immediately-cloneable store (agent.toml committed) on create.
+  /// false for a bare name reservation.
+  initialized: boolean
   clone_url: string
   visibility: Visibility
 }
@@ -490,9 +496,19 @@ export const api = {
     get<AgentPage>(
       `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}?page=${page}&q=${encodeURIComponent(q)}`
     ),
-  // The 201 carries {name, owner, full_name, ...} — callers route off `full_name`.
-  createAgent: (name: string, visibility: Visibility) =>
-    request<CreatedAgent>("/api/agents", { method: "POST", body: JSON.stringify({ name, visibility }) }),
+  // The 201 carries {name, owner, full_name, initialized, ...} — callers route off `full_name`.
+  // `opts.org` (omit for a personal agent) owns it under that org; `opts.initialize` (default false on
+  // the wire) bootstraps an immediately-cloneable store instead of a bare name reservation.
+  createAgent: (name: string, visibility: Visibility, opts: { org?: string; initialize?: boolean } = {}) =>
+    request<CreatedAgent>("/api/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        visibility,
+        ...(opts.org ? { org: opts.org } : {}),
+        ...(opts.initialize !== undefined ? { initialize: opts.initialize } : {}),
+      }),
+    }),
   // Rename answers {name, renamed_from}; a visibility change answers {name, visibility, owner}.
   // Neither is worth a type: callers reload or navigate.
   patchAgent: (owner: string, name: string, patch: { name?: string; visibility?: Visibility }) =>
@@ -585,6 +601,15 @@ export const api = {
   clearRecoveryRecipient: (org: string) =>
     request<{ org: string; recovery_x25519: string }>(`/api/orgs/${encodeURIComponent(org)}/recovery`, {
       method: "DELETE",
+    }),
+
+  // ── org settings ──
+  // Toggle whether a plain member may create agents under the org (org-admin only; 403 otherwise).
+  // Answers {org, members_can_create}.
+  setMemberCreate: (org: string, allow: boolean) =>
+    request<{ org: string; members_can_create: boolean }>(`/api/orgs/${encodeURIComponent(org)}/settings`, {
+      method: "POST",
+      body: JSON.stringify({ members_can_create: allow }),
     }),
 
   // ── tokens ──
