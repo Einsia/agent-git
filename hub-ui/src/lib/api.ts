@@ -548,9 +548,10 @@ export const api = {
     }),
   org: (name: string) => get<Org>(`/api/orgs/${encodeURIComponent(name)}`),
   orgMembers: (name: string) => get<OrgMember[]>(`/api/orgs/${encodeURIComponent(name)}/members`),
-  // POST doubles as "change role": an existing member's role is overwritten in place. Returns the
-  // fresh roster. Org-admin gated (403), 400 if the role or username is bad / user doesn't exist.
-  addOrgMember: (name: string, username: string, role: OrgRole) =>
+  // Change an EXISTING member's role in place; returns the fresh roster. Membership is
+  // invitation-only, so this POST can NOT add a stranger — a non-member is refused (409, guidance to
+  // invite). Org-admin gated (403), 400 if the role is bad, 409 to demote the org's last admin.
+  setOrgMemberRole: (name: string, username: string, role: OrgRole) =>
     request<OrgMember[]>(`/api/orgs/${encodeURIComponent(name)}/members`, {
       method: "POST",
       body: JSON.stringify({ username, role }),

@@ -2881,6 +2881,10 @@ async fn api_keys_release(ctx: &Ctx, caller: &Caller, owner: &str, name: &str) -
 /// `/api/orgs/<name>/members[/<username>]` — the org membership routes. Authorization here is an ORG
 /// gate (`is_admin` on the org), NOT `acl::decide` — decide stays agent-only. Managing members needs
 /// org-admin (or site admin); listing needs only membership.
+///
+/// Membership is **invitation-only**: `POST` here changes an EXISTING member's role but can NOT add a
+/// stranger — a POST for a non-member is refused with guidance to invite instead. The only paths that
+/// mint a NEW membership are invitation ACCEPT and org TRANSFER (to an already-existing member).
 pub(crate) async fn api_org_members(ctx: &Ctx, caller: &Caller, name: &str, tail: &str, method: &str, body: &[u8]) -> Resp {
     let Some(user) = caller.user.clone() else {
         return Resp::err(401, "login required");
@@ -2935,8 +2939,11 @@ pub(crate) async fn api_org_members(ctx: &Ctx, caller: &Caller, name: &str, tail
                         }
                     }
                     match o.members.iter_mut().find(|m| m.username == username) {
+                        // Existing member → a role change, unchanged.
                         Some(m) => m.role = role.clone(),
-                        None => o.members.push(OrgMember { username: username.clone(), role: role.clone() }),
+                        // Membership is invitation-only: this endpoint no longer adds a stranger. The
+                        // only ways in are invitation ACCEPT and org TRANSFER (to an existing member).
+                        None => return SetRoleOutcome::NotMember,
                     }
                     SetRoleOutcome::Ok
                 })
@@ -2944,6 +2951,12 @@ pub(crate) async fn api_org_members(ctx: &Ctx, caller: &Caller, name: &str, tail
             match outcome {
                 Ok(SetRoleOutcome::Ok) => {}
                 Ok(SetRoleOutcome::LastAdmin) => return Resp::err(409, "an org must keep at least one admin"),
+                Ok(SetRoleOutcome::NotMember) => {
+                    return Resp::err(
+                        409,
+                        "membership is invitation-only: add members with `agit-hub org invite <org> <user>` (POST /api/orgs/<org>/invitations), then have them accept",
+                    );
+                }
                 Err(_e) => return Resp::err(500, "couldn't update the org"),
             }
             audit_append(ctx.root(), &user, audit::ORG_MEMBER_ADD, None, &format!("org={} {username}={role}", org.name)).await;
@@ -2998,11 +3011,14 @@ enum RmOutcome {
     NotMember,
 }
 
-/// The result of an org role change, so the last-admin guard (demoting the sole admin) can be told
-/// apart from an ordinary add-or-update after the atomic `update_orgs`.
+/// The result of an org role change, so the last-admin guard (demoting the sole admin) and the
+/// invitation-only guard (the target is not a member, so this is not a role change) can be told apart
+/// from an ordinary in-place update after the atomic `update_orgs`.
 enum SetRoleOutcome {
     Ok,
     LastAdmin,
+    /// The target username is not already a member — refuse, since membership is invitation-only.
+    NotMember,
 }
 
 // ── org invitations (the consent flow) ──

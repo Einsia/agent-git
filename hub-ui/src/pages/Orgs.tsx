@@ -166,32 +166,14 @@ function OrgCard({
   // Managing the roster needs org-admin (or a site admin), the same gate the server enforces.
   const canManage = siteAdmin || org.members.some((m) => m.username === me && m.role === "admin")
 
-  const [username, setUsername] = useState("")
-  const [role, setRole] = useState<OrgRole>("member")
-  const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
 
-  async function add(e: FormEvent) {
-    e.preventDefault()
-    setBusy(true)
-    setError("")
-    try {
-      await api.addOrgMember(org.name, username.trim(), role)
-      setUsername("")
-      setRole("member")
-      reload()
-    } catch (err) {
-      setError(String((err as Error)?.message ?? err))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  // POST overwrites an existing member's role, so a change is the same call as an add.
+  // Membership is invitation-only — an existing member's role can be changed here, but new members
+  // join only by accepting an invitation (see OrgInvitations below). The POST changes a role in place.
   async function changeRole(m: OrgMember, next: OrgRole) {
     setError("")
     try {
-      await api.addOrgMember(org.name, m.username, next)
+      await api.setOrgMemberRole(org.name, m.username, next)
       reload()
     } catch (err) {
       setError(String((err as Error)?.message ?? err))
@@ -263,34 +245,6 @@ function OrgCard({
           </div>
         ))}
       </div>
-
-      {canManage && (
-        <form onSubmit={add} className="mt-3 flex flex-wrap items-center gap-2">
-          <Input
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            placeholder="username"
-            className="w-[200px]"
-            required
-          />
-          <Select
-            value={role}
-            onChange={(e) => setRole(e.target.value as OrgRole)}
-            className="w-[120px]"
-            aria-label="Role for the new member"
-          >
-            {ORG_ROLES.map((r) => (
-              <option key={r} value={r}>
-                {r}
-              </option>
-            ))}
-          </Select>
-          <Button type="submit" variant="outline" disabled={busy || !username.trim()}>
-            <UserPlus />
-            Add directly
-          </Button>
-        </form>
-      )}
 
       {error && (
         <p role="alert" className="mt-2 text-sm text-destructive">

@@ -732,15 +732,40 @@ mod h4_tests {
     #[tokio::test]
     async fn org_member_management_is_admin_only_and_needs_a_real_user() {
         let (_d, ctx) = test_ctx(false).await;
-        add_user(&ctx.store, "alice").await;
-        add_user(&ctx.store, "bob").await;
-        assert_eq!(api_orgs_create(&ctx, &Caller::user("alice"), br#"{"name":"acme"}"#).await.status, 201);
-        // The org admin adds bob.
-        assert_eq!(api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"member"}"#).await.status, 200);
-        // A non-admin member cannot add anyone.
+        // Membership is invitation-only: org_with seeds alice (admin) and brings bob in via invite → accept.
+        org_with(&ctx, &[("bob", "member")]).await;
+        // A non-admin member cannot manage the roster.
         assert_eq!(api_org_members(&ctx, &Caller::user("bob"), "acme", "", "POST", br#"{"username":"alice","role":"admin"}"#).await.status, 403);
-        // Adding a user who does not exist is refused.
+        // Managing a user who does not exist is refused.
         assert_eq!(api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"ghost","role":"member"}"#).await.status, 400);
+        // A role change for an EXISTING member still succeeds — bob is promoted to admin in place.
+        assert_eq!(api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"admin"}"#).await.status, 200);
+        assert!(ctx.store.org("acme").await.unwrap().is_admin("bob"), "bob's role change took effect");
+    }
+
+    /// Invitation-only: a POST to the members endpoint can change an existing member's role, but it can
+    /// NOT add a stranger — that path is refused with a 4xx pointing at the invitation flow, and nobody
+    /// is added behind the caller's back.
+    #[tokio::test]
+    async fn org_member_post_cannot_add_a_non_member() {
+        let (_d, ctx) = test_ctx(false).await;
+        add_user(&ctx.store, "alice").await;
+        add_user(&ctx.store, "carol").await;
+        assert_eq!(api_orgs_create(&ctx, &Caller::user("alice"), br#"{"name":"acme"}"#).await.status, 201);
+        // carol is a real, registered user but NOT a member. A direct add is refused (4xx), not a silent
+        // membership grant.
+        let r = api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"carol","role":"member"}"#).await;
+        assert_eq!(r.status, 409, "adding a non-member via POST is refused");
+        let msg = String::from_utf8_lossy(&r.body);
+        assert!(msg.contains("invit"), "the refusal points the admin at the invitation flow: {msg}");
+        assert!(!ctx.store.org("acme").await.unwrap().is_member("carol"), "the refused add granted nothing");
+        // The invitation path still works: alice invites carol, carol accepts, and only then is she a member.
+        let inv = api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"carol","role":"member"}"#).await;
+        assert_eq!(inv.status, 201);
+        let id = body_json(&inv)["id"].as_str().unwrap().to_string();
+        let tail = format!("/{id}/accept");
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("carol"), "acme", &tail, "POST", b"").await.status, 200);
+        assert!(ctx.store.org("acme").await.unwrap().is_member("carol"), "invite → accept adds the membership");
     }
 
     #[tokio::test]
@@ -763,8 +788,14 @@ mod h4_tests {
         let r = api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"alice","role":"member"}"#).await;
         assert_eq!(r.status, 409, "demoting the only admin would orphan the org");
         assert!(ctx.store.org("acme").await.unwrap().is_admin("alice"), "the refused demotion left alice an admin");
-        // Promote bob so there are two admins.
-        assert_eq!(api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"admin"}"#).await.status, 200);
+        // Bring bob in as a second admin the invitation-only way (invite → accept), so there are two
+        // admins and demoting alice no longer orphans the org.
+        let inv = api_org_invitations(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"bob","role":"admin"}"#).await;
+        assert_eq!(inv.status, 201);
+        let id = body_json(&inv)["id"].as_str().unwrap().to_string();
+        let accept = format!("/{id}/accept");
+        assert_eq!(api_org_invitations(&ctx, &Caller::user("bob"), "acme", &accept, "POST", b"").await.status, 200);
+        assert!(ctx.store.org("acme").await.unwrap().is_admin("bob"), "bob joined as an admin");
         // Now demoting alice is fine — bob still holds the org.
         let r = api_org_members(&ctx, &Caller::user("alice"), "acme", "", "POST", br#"{"username":"alice","role":"member"}"#).await;
         assert_eq!(r.status, 200, "demoting a non-last admin succeeds");
@@ -780,16 +811,22 @@ mod h4_tests {
     }
 
     /// Stand up an org "acme" owned by alice (admin) with the given extra members, all real users.
+    /// Membership is invitation-only, so each seed member joins the only sanctioned way: alice invites
+    /// them, and the invitee accepts.
     async fn org_with(ctx: &Ctx, members: &[(&str, &str)]) {
         add_user(&ctx.store, "alice").await;
         assert_eq!(api_orgs_create(ctx, &Caller::user("alice"), br#"{"name":"acme"}"#).await.status, 201);
         for (u, role) in members {
             add_user(&ctx.store, u).await;
             let body = format!(r#"{{"username":"{u}","role":"{role}"}}"#);
+            let inv = api_org_invitations(ctx, &Caller::user("alice"), "acme", "", "POST", body.as_bytes()).await;
+            assert_eq!(inv.status, 201, "invite member {u}");
+            let id = body_json(&inv)["id"].as_str().unwrap().to_string();
+            let tail = format!("/{id}/accept");
             assert_eq!(
-                api_org_members(ctx, &Caller::user("alice"), "acme", "", "POST", body.as_bytes()).await.status,
+                api_org_invitations(ctx, &Caller::user(u), "acme", &tail, "POST", b"").await.status,
                 200,
-                "seed member {u}"
+                "accept member {u}"
             );
         }
     }
