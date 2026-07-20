@@ -118,3 +118,96 @@ jobs:
         run: cargo build --release --bin agit-hub
       - name: Run hub end-to-end acceptance
         run: ./demo/hub-e2e.sh
+
+  hub-live:
+    name: hub live (Postgres + Garage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Proves the PRODUCTION storage backends (Postgres for the store, Garage/S3 for blobs) on every
+    # push, not just via a hand-run script. demo/hub-e2e.sh already covers the SQLite/fs default; this
+    # job runs scripts/hub-live-e2e.sh (~103 checks) against a REAL Postgres 16 and a REAL Garage
+    # single-node cluster, including live proofs the default can't make: Postgres persistence across a
+    # hub restart, no plaintext password/token in Postgres (psql), and blobs physically present in the
+    # Garage bucket (rename moves the object's prefix, purge deletes it).
+    #
+    # Credentials here are EPHEMERAL and CI-ONLY: Postgres uses a throwaway user/password below and
+    # Garage mints a fresh access/secret key per run (captured into $GITHUB_ENV). No real secrets.
+    services:
+      # Postgres runs as a health-checked service container; the runner publishes it on localhost:5432.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agithub
+          POSTGRES_PASSWORD: agithub
+          POSTGRES_DB: agithub
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agithub -d agithub"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # The hub reads these; the script defaults match but we set them explicitly for clarity. The S3
+      # access/secret are injected at runtime by the Garage init step via $GITHUB_ENV.
+      AGIT_HUB_DB: postgres://agithub:agithub@127.0.0.1:5432/agithub
+      AGIT_HUB_BIN: ${{ github.workspace }}/target/release/agit-hub
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hub-live
+      # The live script drives Postgres with `psql` (over TCP, via AGIT_HUB_DB) and inspects the
+      # Garage bucket with the `aws` CLI. Both are usually preinstalled on ubuntu-latest; install
+      # defensively only if missing so the job is robust across runner image changes.
+      - name: Install e2e client tools (psql, awscli)
+        run: |
+          need_apt=0
+          command -v psql >/dev/null || need_apt=1
+          command -v aws  >/dev/null || need_apt=1
+          if [ "$need_apt" = 1 ]; then sudo apt-get update; fi
+          command -v psql >/dev/null || sudo apt-get install -y postgresql-client
+          command -v aws  >/dev/null || sudo apt-get install -y awscli
+          for t in git curl aws psql; do
+            command -v "$t" >/dev/null || { echo "missing required tool: $t" >&2; exit 1; }
+          done
+      - name: Build agit-hub (release)
+        run: cargo build --release --bin agit-hub
+      # Garage can't be a plain `services:` container: it needs a config file (not available until
+      # after checkout) and a one-time layout/bucket/key init that must run AFTER the node is up and
+      # must capture the freshly-minted S3 key. So we start it with `docker run` and initialize it in
+      # this step, reusing the repo's own deploy/garage.toml (single-node, replication_factor 1).
+      - name: Start Garage (S3 blob backend) + init layout/bucket/key
+        run: |
+          set -euo pipefail
+          docker run -d --name garage \
+            -p 127.0.0.1:3900:3900 \
+            -v "$PWD/deploy/garage.toml:/etc/garage.toml:ro" \
+            dxflrs/garage:v1.0.1
+          # Wait until the node answers RPC (layout/bucket/key commands need a live node).
+          for i in $(seq 1 60); do
+            if docker exec garage /garage status >/dev/null 2>&1; then ready=1; break; fi
+            sleep 1
+          done
+          [ "${ready:-0}" = 1 ] || { echo "garage did not become ready"; docker logs garage; exit 1; }
+          # Single-node layout: assign the node capacity, then create the bucket and a fresh key.
+          NODE_ID="$(docker exec garage /garage node id -q | cut -d@ -f1)"
+          docker exec garage /garage layout assign -z dc1 -c 1G "$NODE_ID"
+          docker exec garage /garage layout apply --version 1
+          docker exec garage /garage bucket create agit-blobs
+          docker exec garage /garage key create ci-key
+          docker exec garage /garage bucket allow --read --write agit-blobs --key ci-key
+          ACCESS="$(docker exec garage /garage key info ci-key --show-secret | sed -n 's/^Key ID: //p')"
+          SECRET="$(docker exec garage /garage key info ci-key --show-secret | sed -n 's/^Secret key: //p')"
+          [ -n "$ACCESS" ] && [ -n "$SECRET" ] || { echo "failed to capture Garage key"; exit 1; }
+          {
+            echo "AGIT_HUB_S3_ENDPOINT=http://127.0.0.1:3900"
+            echo "AGIT_HUB_S3_BUCKET=agit-blobs"
+            echo "AGIT_HUB_S3_REGION=garage"
+            echo "AGIT_HUB_S3_ACCESS_KEY=$ACCESS"
+            echo "AGIT_HUB_S3_SECRET_KEY=$SECRET"
+          } >> "$GITHUB_ENV"
+      - name: Run live Postgres + Garage end-to-end (scripts/hub-live-e2e.sh)
+        run: ./scripts/hub-live-e2e.sh
