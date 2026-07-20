@@ -324,8 +324,8 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
         outln!("  target : {}{who}", dst.display());
         outln!("  files  : {} files ({} updated / {} added), {} bytes", stats.total, stats.updated, stats.added, stats.bytes);
         if hits > 0 {
-            errln!("  ⚠ Found {hits} likely secrets — the session transcript carries sensitive content the agent has seen.");
-            errln!("     This will be blocked again before push; run `agit -a scan` first to check, or clear it from the transcript.");
+            errln!("  ⚠ {hits} suspected secret(s) mirrored into the store — `agit a commit` will REFUSE these until resolved (snap only mirrors; it did NOT commit).");
+            errln!("     Run `agit -a scan` to see them; fix, add an `agit:allow-secret` pragma or a `.agit-allow-secrets` entry, or override with AGIT_ALLOW_SECRETS=1.");
         }
 
         // Capture the harness (MCP servers / skills / config) alongside the sessions, redacting

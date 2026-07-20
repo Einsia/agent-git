@@ -283,6 +283,10 @@ fn noise_field(key: &str) -> bool {
             | "leafuuid"
             | "sessionid"
             | "session_id"
+            // claude-code stamps `bridgeSessionId:"cse_..."` into every transcript; it is a session
+            // identifier like the keys above (carries no access), and its `cse_...` value trips the
+            // generic high-entropy rule — exempt the exact key only.
+            | "bridgesessionid"
             | "requestid"
             | "request_id"
             | "id"
@@ -1152,6 +1156,29 @@ mod tests {
         assert!(
             hits.contains(&"high-entropy-string") || hits.contains(&"assigned-secret"),
             "不透明凭据必须被抓到(实得 {hits:?})"
+        );
+    }
+
+    /// claude-code stamps `bridgeSessionId:"cse_..."` into every transcript. The `cse_...` value is a
+    /// high-entropy string, but the KEY is a session identifier (no access) — the exemption is key-scoped,
+    /// so the SAME value under a non-noise key like `api_key` must still fire.
+    #[test]
+    fn bridge_session_id_is_exempt_but_the_exemption_is_key_scoped() {
+        // 同一枚高熵串,只是键名不同。
+        let high_entropy = "cse_Zx8Z4pQ1mV7bLr3TnW2yJhKd5Fs6Gc9A";
+
+        let bridge = format!(r#"{{"bridgeSessionId":"{high_entropy}"}}"#);
+        let hits = rules_hit(&bridge);
+        assert!(
+            !hits.contains(&"high-entropy-string"),
+            "bridgeSessionId 的值不该被熵规则命中(实得 {hits:?})"
+        );
+
+        let leaked = format!(r#"{{"api_key":"{high_entropy}"}}"#);
+        let hits = rules_hit(&leaked);
+        assert!(
+            hits.contains(&"high-entropy-string"),
+            "同样的串放在非噪声键 api_key 下必须照报,证明豁免是按键作用域而非全局(实得 {hits:?})"
         );
     }
 

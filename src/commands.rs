@@ -326,10 +326,25 @@ fn decide_gate(findings: Vec<(String, scan::Finding)>, verb: &str) -> Gate {
             "  {ALLOW_ENV} is set — gate BYPASSED for this {verb}. This override is explicit and auditable \
              (unlike git --no-verify, which leaves no trace). You own the consequences: pushing publishes these to the team."
         );
+        if verb == "push" {
+            errln!(
+                "  note: the hub runs its own server-side secret gate that this flag does not bypass; if it \
+                 refuses, mark the line with an `{}` pragma (it travels with the commit) or ask the hub operator \
+                 to allowlist the finding.",
+                scan::ALLOW_PRAGMA,
+            );
+        }
         Gate::Overridden
     } else {
+        // State plainly that the action did NOT happen, so a blocked gate is never read as success.
+        let not_done = match verb {
+            "commit" => "No commit was created.",
+            "push" => "Nothing was pushed.",
+            "snap" => "Nothing was committed.",
+            _ => "The action did not complete.",
+        };
         errln!(
-            "{} suspected. Fix them, mark a false positive with a `{}` pragma or a `{}` entry, or — to override \
+            "{not_done} {} suspected. Fix them, mark a false positive with a `{}` pragma or a `{}` entry, or — to override \
              this gate wholesale — re-run with {ALLOW_ENV}=1 (disclosed and auditable, not a silent bypass).",
             findings.len(),
             scan::ALLOW_PRAGMA,
@@ -5014,5 +5029,58 @@ mod wave4_tests {
         );
         // Junk recovery key is a loud error, never a silent skip.
         assert!(recovery_envelope(&serde_json::json!({ "recovery_x25519": "nothex" }), &tk).is_err());
+    }
+}
+
+#[cfg(test)]
+mod secretux_gate_tests {
+    use super::*;
+    use crate::output::testing::capture;
+
+    fn finding() -> (String, scan::Finding) {
+        (
+            "sessions/x.jsonl".to_string(),
+            scan::Finding { rule: "high-entropy-string", line: 1, excerpt: "Zx8Z…redacted".into() },
+        )
+    }
+
+    // AGIT_ALLOW_SECRETS is process-global, so it is mutated only while holding the capture guard
+    // (which serializes every output-capturing test) and cleared before the guard drops.
+    fn gate_under_override(on: bool, verb: &str) -> (Gate, String) {
+        let cap = capture();
+        if on {
+            std::env::set_var(ALLOW_ENV, "1");
+        } else {
+            std::env::remove_var(ALLOW_ENV);
+        }
+        let gate = decide_gate(vec![finding()], verb);
+        std::env::remove_var(ALLOW_ENV);
+        let err = cap.err();
+        (gate, err)
+    }
+
+    /// A blocked commit must state plainly that no commit happened, so a refused gate is never read as
+    /// success (the snap→commit→push confusion this wave fixes).
+    #[test]
+    fn blocked_commit_says_no_commit_was_created() {
+        let (gate, err) = gate_under_override(false, "commit");
+        assert!(matches!(gate, Gate::Blocked(1)));
+        assert!(err.contains("No commit was created."), "got: {err:?}");
+    }
+
+    /// The push override must warn that the hub runs its own server-side gate this flag cannot reach.
+    #[test]
+    fn push_override_carries_the_server_gate_note() {
+        let (gate, err) = gate_under_override(true, "push");
+        assert!(matches!(gate, Gate::Overridden));
+        assert!(err.contains("server-side secret gate"), "got: {err:?}");
+    }
+
+    /// A commit override is accurate for the local gate — it must NOT carry the hub/server-gate note.
+    #[test]
+    fn commit_override_omits_the_server_gate_note() {
+        let (gate, err) = gate_under_override(true, "commit");
+        assert!(matches!(gate, Gate::Overridden));
+        assert!(!err.contains("server-side secret gate"), "commit override must not mention the hub gate: {err:?}");
     }
 }

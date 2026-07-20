@@ -660,6 +660,39 @@ fn visible_override_lets_a_secret_commit_through_and_discloses_it() {
     assert!(err.to_lowercase().contains("bypass"), "the disclosure must name what it did: {err}");
 }
 
+/// Root-cause regression: claude-code stamps `bridgeSessionId:"cse_..."` into EVERY transcript. The
+/// `cse_...` value is high-entropy, so before the fix the generic entropy rule flagged it and the gate
+/// REFUSED every real claude-code session. It must now commit cleanly — the key is a session id, exempt.
+#[test]
+fn real_claude_code_bridge_session_id_does_not_trip_the_gate() {
+    let r = Repo::new();
+    std::fs::remove_file(r.agent().join(".git/hooks/pre-commit")).ok();
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
+        "{\"type\":\"user\",\"bridgeSessionId\":\"cse_Zx8Z4pQ1mV7bLr3TnW2yJhKd5Fs6Gc9A\",\"message\":{\"content\":\"hello\"}}\n",
+    );
+    r.agit(&["-a", "add", "-A"]);
+    let (code, _out, err) = r.agit(&["-a", "commit", "-m", "real claude-code session"]);
+    assert_eq!(code, 0, "bridgeSessionId must not be flagged as a secret: {err}");
+    assert_eq!(r.git_agent(&["log", "-1", "--format=%s"]), "real claude-code session");
+}
+
+/// Legibility: a blocked commit must say IN WORDS that no commit was created, so the snap→commit→push
+/// flow never looks like success when the gate actually refused.
+#[test]
+fn blocked_commit_states_no_commit_was_created() {
+    let r = Repo::new();
+    std::fs::remove_file(r.agent().join(".git/hooks/pre-commit")).ok();
+    r.write_agent(
+        "sessions/claude-code/s.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"key AKIAIOSFODNN7EXAMPLE\"}}\n",
+    );
+    r.agit(&["-a", "add", "-A"]);
+    let (code, _out, err) = r.agit(&["-a", "commit", "-m", "leak"]);
+    assert_ne!(code, 0, "a staged secret must block: {err}");
+    assert!(err.contains("No commit was created."), "the block must state nothing was committed: {err}");
+}
+
 /// The push gate: `agit a push` scans the store tree before touching the remote, so a committed secret
 /// cannot be published even though the commit that carried it slipped in with `--no-verify`. Bare `git
 /// push` fires only the pre-push hook, which `--no-verify` skips — agit's push must not.
