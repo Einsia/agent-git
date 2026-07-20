@@ -527,6 +527,12 @@ fn cross_to_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
         "payload": {
             "id": opts.new_id, "timestamp": CTS, "cwd": cwd,
             "originator": "agit-convert", "cli_version": "0.0.0",
+            // `codex resume` (interactive) reads the model provider FROM the session_meta to bootstrap the
+            // TUI; a converted rollout with none makes it die with "Model provider `` not found". Real
+            // codex rollouts carry model_provider="openai" (codex's default), so write it -- codex then
+            // picks the provider's default model. Overridable at launch with `codex resume <id> -c
+            // model_provider=<x>` for a non-openai provider.
+            "model_provider": "openai",
             "instructions": ir.system_prompt.clone(), "git": {"branch": branch}
         }
     })
@@ -611,6 +617,32 @@ mod tests {
         let kinds: Vec<&EventKind> = ir.events.iter().flat_map(|e| e.kinds.iter()).collect();
         assert!(kinds.iter().any(|k| matches!(k, EventKind::UserPrompt(p) if p == "do the thing")));
         assert!(kinds.iter().any(|k| matches!(k, EventKind::ToolCall { .. })));
+    }
+
+    #[test]
+    fn cross_to_codex_writes_a_model_provider_for_resume() {
+        // `codex resume` (interactive) reads the model provider from session_meta to bootstrap; a
+        // converted rollout with none makes it die "Model provider `` not found". So the emitted
+        // session_meta must carry model_provider (codex's default: openai).
+        let ir = read_conversation(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"S1\",\"cwd\":\"/p\",\"git\":{\"branch\":\"main\"}}}\n",
+        );
+        let opts = ConvertOpts { cwd: None, new_id: "S1".into() };
+        let out = cross_to_codex(&ir, &opts);
+        let meta: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(meta["payload"]["model_provider"], "openai", "converted session_meta must carry a model provider");
+    }
+
+    #[test]
+    fn same_vendor_codex_preserves_an_existing_model_provider() {
+        // "openai only if missing": a codex->codex conversion is raw replay, so a session that ALREADY
+        // carries a provider (e.g. a self-hosted "oss" one) keeps it -- we never overwrite it with openai.
+        let src = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"S1\",\"cwd\":\"/p\",\"model_provider\":\"oss\",\"git\":{\"branch\":\"main\"}}}\n";
+        let ir = read_conversation(src);
+        let opts = ConvertOpts { cwd: None, new_id: "S1".into() };
+        let out = same_vendor_codex(&ir, &opts);
+        let meta: serde_json::Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+        assert_eq!(meta["payload"]["model_provider"], "oss", "same-vendor replay must preserve the source provider, not force openai");
     }
 
     #[test]
