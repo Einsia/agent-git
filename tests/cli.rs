@@ -1077,6 +1077,8 @@ fn push_fans_out_to_all_remotes_and_a_failure_is_non_fatal() {
     let (code, out, err) = r.agit(&["a", "push"]);
     assert_eq!(code, 0, "the fan-out push must succeed on the primary: {err}");
     assert!(out.contains("pushed origin") && out.contains("pushed hub"), "both remotes reported: {out}");
+    // The fan-out announces each target by name BEFORE pushing, so a multi-remote push is never a surprise.
+    assert!(out.contains("pushing to origin") && out.contains("pushing to hub"), "each target announced: {out}");
     let head = r.git_agent(&["rev-parse", "HEAD"]);
     assert_eq!(r.git_at(&origin, &["rev-parse", "main"]), head, "origin must have the branch");
     assert_eq!(r.git_at(&hub, &["rev-parse", "main"]), head, "hub must have the branch");
@@ -1124,6 +1126,113 @@ fn push_fans_out_to_all_remotes_and_a_failure_is_non_fatal() {
     let (code, _out, err) = r.agit(&["a", "push", "--to"]);
     assert_ne!(code, 0, "a bare --to must error, not fan out");
     assert!(err.contains("--to needs a remote name"), "the error must name the missing value: {err}");
+}
+
+/// `agit a push <url>` names ONLY a URL and NO refspec, against a fresh `main` with no upstream. It must
+/// DEFAULT the refspec to the current branch (so git carries `main`), not fall through to a bare
+/// `git push` that dies with 'The current branch main has no upstream branch'.
+#[test]
+fn push_url_with_no_refspec_pushes_the_current_branch() {
+    let r = Repo::new();
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    let hub = hub_path.to_str().unwrap();
+
+    // No `remote add` at all: the URL is the only positional, and there is no upstream.
+    let (code, out, err) = r.agit(&["a", "push", hub]);
+    assert_eq!(code, 0, "push <url> with no refspec must push the current branch: {out}{err}");
+    assert!(!err.contains("no upstream"), "the default refspec must avoid git's no-upstream error: {err}");
+    let head = r.git_agent(&["rev-parse", "HEAD"]);
+    assert_eq!(r.git_at(&hub_path, &["rev-parse", "main"]), head, "the bare repo received the current branch");
+}
+
+/// `agit a push origin` (a remote, no refspec, no upstream) likewise defaults to the current branch; and
+/// `-u` sets the upstream tracking ref while a plain push does not.
+#[test]
+fn push_remote_with_no_refspec_defaults_to_current_branch_and_u_sets_upstream() {
+    // (1) Plain `push <remote>` with no refspec: pushes main, sets NO upstream.
+    let r = Repo::new();
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_path = r.path().join("hub.git");
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub_path.to_str().unwrap()]).0, 0, "remote add");
+    let (code, out, err) = r.agit(&["a", "push", "origin"]);
+    assert_eq!(code, 0, "push <remote> with no refspec must push the current branch: {out}{err}");
+    assert!(!err.contains("no upstream"), "the default refspec must avoid git's no-upstream error: {err}");
+    let head = r.git_agent(&["rev-parse", "HEAD"]);
+    assert_eq!(r.git_at(&hub_path, &["rev-parse", "main"]), head, "the bare repo received main");
+    assert!(r.git_agent(&["config", "--get", "branch.main.merge"]).is_empty(), "a plain push sets no upstream");
+
+    // (2) `-u` sets the upstream tracking ref (still no refspec typed).
+    let r2 = Repo::new();
+    r2.sh("git init -q --bare -b main hub.git");
+    let hub2 = r2.path().join("hub.git");
+    assert_eq!(r2.agit(&["a", "remote", "add", "origin", hub2.to_str().unwrap()]).0, 0, "remote add");
+    let (code, out, err) = r2.agit(&["a", "push", "-u", "origin"]);
+    assert_eq!(code, 0, "push -u <remote> with no refspec must succeed: {out}{err}");
+    assert_eq!(r2.git_agent(&["config", "--get", "branch.main.merge"]), "refs/heads/main", "-u set the upstream branch");
+    assert_eq!(r2.git_agent(&["config", "--get", "branch.main.remote"]), "origin", "-u set the upstream remote");
+}
+
+/// A one-connection-per-request HTTP stub that answers EVERY request with 401: `/api/me` gets the
+/// agit-hub anonymous shape (so the client positively identifies it as a hub AND sees the credential
+/// rejected), and git's `/info/refs` fetch gets a plain 401 so `git push` fails with an auth error.
+struct StubHub {
+    addr: String,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+fn stub_hub() -> StubHub {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/");
+            let (ctype, body) = if path.starts_with("/api/me") {
+                ("application/json", r#"{"error":"not logged in"}"#)
+            } else {
+                ("text/plain", "credentials required")
+            };
+            let resp = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    StubHub { addr, _handle: handle }
+}
+
+/// When a push to a positively-identified agit-hub FAILS because the credential is rejected, agit prints
+/// a one-line hint pointing at the web `/tokens` page (the client cannot run the server-side
+/// `agit-hub token add`). The hint fires ONLY on an auth failure to a hub — never on a non-hub failure.
+#[test]
+fn hub_auth_failure_prints_the_write_token_hint() {
+    let hub = stub_hub();
+    let r = Repo::new();
+    let url = format!("http://{}/alice/frontend.git", hub.addr);
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", &url]).0, 0, "remote add");
+
+    // GIT_TERMINAL_PROMPT=0 so git fails fast on the 401 instead of trying to prompt for a credential.
+    let (code, out, err) = r.agit_env(&[("GIT_TERMINAL_PROMPT", "0")], &["a", "push", "origin"]);
+    let all = format!("{out}{err}");
+    assert_ne!(code, 0, "a push to a hub that rejects the credential must fail: {all}");
+    assert!(all.contains("WRITE TOKEN"), "the hint names the write token: {all}");
+    assert!(
+        all.contains(&format!("http://{}/tokens", hub.addr)),
+        "the hint points at the hub web /tokens page: {all}"
+    );
+
+    // A failure to a NON-hub target (a local path) must NOT print the hub hint.
+    assert_eq!(r.agit(&["a", "remote", "set-url", "origin", "/nonexistent/nope.git"]).0, 0, "repoint origin");
+    let (code, out, err) = r.agit_env(&[("GIT_TERMINAL_PROMPT", "0")], &["a", "push", "origin"]);
+    let all = format!("{out}{err}");
+    assert_ne!(code, 0, "the local push still fails");
+    assert!(!all.contains("WRITE TOKEN"), "no hub hint for a non-hub failure: {all}");
 }
 
 /// A minimal but valid Claude session: two lines carrying `sid` and a distinctive note.

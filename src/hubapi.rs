@@ -53,6 +53,34 @@ fn probe_hub_me(base: &str, auth: Option<&Auth>, timeout: Duration) -> bool {
     is_hub_me_shape(status, &text)
 }
 
+/// Does the credential carried by `url` AUTHENTICATE to the agit-hub at its origin? True only on a
+/// `200`-with-`username` `GET /api/me`; a `401` (missing / rejected token) or any transport failure is
+/// `false`. This is how a client tells an AUTHENTICATION failure ("the token the URL carries is not
+/// accepted") apart from every other push error, so the write-token hint fires only when the credential
+/// is actually the problem — never on a non-fast-forward or a network blip. Bounded by [`PROBE_TIMEOUT`].
+pub fn hub_credential_accepted(url: &str) -> bool {
+    hub_credential_accepted_timeout(url, PROBE_TIMEOUT)
+}
+
+/// [`hub_credential_accepted`] with an explicit timeout — the seam tests drive against a local server.
+pub fn hub_credential_accepted_timeout(url: &str, timeout: Duration) -> bool {
+    let Ok((base, auth)) = parse_http_url(url) else {
+        return false;
+    };
+    let agent = probe_agent(timeout);
+    let mut req = agent.get(&format!("{base}/api/me"));
+    if let Some(a) = auth.as_ref() {
+        req = req.header("Authorization", &a.header_value());
+    }
+    let Ok(mut resp) = req.call() else {
+        return false;
+    };
+    let status = resp.status().as_u16();
+    let text = resp.body_mut().read_to_string().unwrap_or_default();
+    // Only the authenticated shape counts; is_hub_me_shape also accepts the anonymous 401, so pin 200.
+    status == 200 && is_hub_me_shape(status, &text)
+}
+
 /// The agit-hub `GET /api/me` signature. Authenticated → 200 with a `username` string; anonymous → 401
 /// with an `error` string (`{"error":"not logged in"}`). A generic git host cannot produce EITHER: it has
 /// no `/api/me`, so it answers with HTML, a 404 page, or a plain-text body that does not parse to a JSON
@@ -404,6 +432,13 @@ pub fn redact_url(url: &str) -> String {
         Some(p) => format!("{scheme}://{shown}/{p}"),
         None => format!("{scheme}://{shown}"),
     }
+}
+
+/// The hub's WEB origin for a store URL — `scheme://host[:port]`, credential-free and path-free — where
+/// a user creates a token (`<base>/tokens`). `None` for a non-http(s) URL (ssh / local path / bare name),
+/// which has no web token page. Credential-free by construction, so it is safe to print verbatim.
+pub fn hub_web_base(url: &str) -> Option<String> {
+    parse_http_url(url).ok().map(|(base, _)| base)
 }
 
 fn parse_http_url(url: &str) -> Result<(String, Option<Auth>)> {

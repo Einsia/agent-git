@@ -1000,12 +1000,28 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
         pa.push(&name);
         pa.extend(positionals.iter().map(String::as_str));
         let code = scope::git_in_inherit(&a.store, &pa);
+        if code != 0 {
+            hub_auth_hint(&a.store, &name);
+        }
         (code, code == 0)
     } else if !positionals.is_empty() {
-        // (b) Git-style passthrough — today's behavior, preserved verbatim.
+        // (b) Git-style `push <remote> [refspec...]`. When the user named ONLY a remote/url and NO
+        // refspec, default the refspec to the current branch: a fresh branch with no upstream would
+        // otherwise die with git's 'The current branch has no upstream branch'. With `-u` (already in
+        // `flags`) this also sets the upstream. A refspec the user DID type (`origin main`,
+        // `origin HEAD:x`) is passed through verbatim — untouched.
+        let default_refspec: Option<String> =
+            (positionals.len() == 1).then(|| current_branch(&a.store));
         let mut pa: Vec<&str> = vec!["push", "--no-verify"];
-        pa.extend(args.iter().map(String::as_str));
+        pa.extend(flags.iter().map(String::as_str));
+        pa.extend(positionals.iter().map(String::as_str));
+        if let Some(spec) = default_refspec.as_deref() {
+            pa.push(spec);
+        }
         let code = scope::git_in_inherit(&a.store, &pa);
+        if code != 0 {
+            hub_auth_hint(&a.store, &positionals[0]);
+        }
         (code, code == 0)
     } else {
         // (c) Bare push — fan out to every configured remote. A per-remote rejection is reported but
@@ -1024,10 +1040,58 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
     Ok(exit)
 }
 
+/// HEAD's branch, for defaulting a bare `push <remote>`'s refspec. `symbolic-ref --short HEAD` names the
+/// checked-out branch; a detached HEAD (or any failure) falls back to the literal `HEAD`, which git
+/// resolves to the current commit so the push still names a source.
+fn current_branch(store: &std::path::Path) -> String {
+    let (code, out) = scope::git_in_status(store, &["symbolic-ref", "--short", "HEAD"]);
+    let b = out.trim();
+    if code == 0 && !b.is_empty() {
+        b.to_string()
+    } else {
+        "HEAD".to_string()
+    }
+}
+
+/// A push `target` (a configured remote NAME or a literal URL) resolved to its URL, for the hub probe.
+/// A configured remote wins (its stored URL carries the credential); otherwise an explicit `scheme://`
+/// URL is taken as-is. A bare name that is no configured remote yields None — nothing to probe.
+fn resolve_remote_url(store: &std::path::Path, target: &str) -> Option<String> {
+    if let Some((_, url)) = agit::agent::store_remotes(store).into_iter().find(|(n, _)| n == target) {
+        return Some(url);
+    }
+    target.contains("://").then(|| target.to_string())
+}
+
+/// After a FAILED push to `target`, print a one-line client-facing hint IFF the target is a
+/// positively-identified agit-hub that REJECTED the credential (an authentication failure). git's own
+/// error already reached the terminal (inherited stdio); this only appends guidance git cannot give —
+/// the hub's server-side `remote:` message points at `agit-hub token add`, which a client user cannot
+/// run. The web `/tokens` page is where they actually mint a write token. Non-http targets (local paths,
+/// ssh) are a fast network-free no-op; the probe never fires except on a real hub-push failure.
+fn hub_auth_hint(store: &std::path::Path, target: &str) {
+    let Some(url) = resolve_remote_url(store, target) else {
+        return;
+    };
+    hub_auth_hint_url(&url);
+}
+
+/// [`hub_auth_hint`] for a call site that already holds the target URL (the fan-out).
+fn hub_auth_hint_url(url: &str) {
+    if agit::hubapi::is_hub_store_url(url) && !agit::hubapi::hub_credential_accepted(url) {
+        if let Some(base) = agit::hubapi::hub_web_base(url) {
+            eprintln!(
+                "hint: this hub needs a WRITE TOKEN in the password field -- create one at {base}/tokens (username can be anything)"
+            );
+        }
+    }
+}
+
 /// Fan a bare `agit a push` out to every git remote the store has: an explicit `<name> <branch>`
 /// refspec per remote (a freshly `remote add`-ed hub has no upstream, so a bare `git push <name>` under
-/// `push.default=simple` would error). Each remote's success/failure is printed and non-fatal; the
-/// returned exit is the PRIMARY remote's push code — the command's identity anchor.
+/// `push.default=simple` would error). Each remote's TARGET is announced (credentials redacted) before
+/// the push and its success/failure printed after; a per-remote failure is non-fatal. The returned exit
+/// is the PRIMARY remote's push code — the command's identity anchor.
 fn push_fanout(a: &agit::agent::Agent, flags: &[String]) -> i32 {
     use agit::agent;
     let remotes = agent::store_remotes(&a.store);
@@ -1047,7 +1111,10 @@ fn push_fanout(a: &agit::agent::Agent, flags: &[String]) -> i32 {
     }
     let primary = agent::primary_remote_name(&a.store);
     let mut anchor = 0;
-    for (name, _url) in &remotes {
+    for (name, url) in &remotes {
+        // Announce the target BEFORE the push so the multi-remote fan-out is never a surprise; the URL
+        // is redacted so a credential in it never reaches the terminal or CI logs.
+        println!("→ pushing to {name} ({})", agit::hubapi::redact_url(url));
         let mut pa: Vec<&str> = vec!["push", "--no-verify"];
         pa.extend(flags.iter().map(String::as_str));
         pa.push(name.as_str());
@@ -1058,6 +1125,7 @@ fn push_fanout(a: &agit::agent::Agent, flags: &[String]) -> i32 {
         } else {
             // A non-owner's push to a personal hub returns non-zero from the ACL 403 — shown, not fatal.
             eprintln!("  push to {name} rejected (exit {code}) — reported, not fatal");
+            hub_auth_hint_url(url);
         }
         if primary.as_deref() == Some(name.as_str()) {
             anchor = code;
