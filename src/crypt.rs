@@ -229,21 +229,25 @@ fn parse_keyring(text: &str, path: &Path) -> Result<Keyring> {
     Ok(Keyring { current, keys })
 }
 
-/// Read the on-disk key material as a keyring, or `None` if the file is absent.
-pub fn load_keyring(home: &Path) -> Result<Option<Keyring>> {
-    let path = key_path(home);
-    let text = match std::fs::read_to_string(&path) {
+/// Read a keyring from an explicit file path, or `None` if the file is absent. A corrupt file is a loud
+/// error (never a silent `None`) — see `parse_keyring`.
+pub fn load_keyring_at(path: &Path) -> Result<Option<Keyring>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
     };
-    parse_keyring(&text, &path).map(Some)
+    parse_keyring(&text, path).map(Some)
 }
 
-/// Persist a keyring (0600), sorted by id, with the loud never-commit header.
-pub fn save_keyring(home: &Path, ring: &Keyring) -> Result<()> {
-    std::fs::create_dir_all(crypt_dir(home))
-        .with_context(|| format!("cannot create {}", crypt_dir(home).display()))?;
+/// Read the machine-global key material as a keyring, or `None` if the file is absent.
+pub fn load_keyring(home: &Path) -> Result<Option<Keyring>> {
+    load_keyring_at(&key_path(home))
+}
+
+/// The serialized keyring: `current`, then one `key <id> = <hex>` per entry, sorted by id, under the
+/// loud never-commit header. The bytes `save_keyring_at` writes (0600).
+fn format_keyring(ring: &Keyring) -> String {
     let mut s = String::from(
         "# agit crypt keyring — the CURRENT key plus retired keys (decrypt-only).\n\
          # NEVER commit or push this file. No escrow: losing it loses every encrypted blob.\n",
@@ -254,7 +258,57 @@ pub fn save_keyring(home: &Path, ring: &Keyring) -> Result<()> {
     for e in &sorted {
         s.push_str(&format!("key {} = {}\n", e.id, hex::encode(e.master)));
     }
-    crate::agent::write_secret_0600(&key_path(home), &s)
+    s
+}
+
+/// Persist a keyring (0600), sorted by id, to an explicit path — the machine-global crypt key OR a
+/// per-session repo-local keyring (`.git/agit-crypt/keyring`). Creates the parent dir.
+pub fn save_keyring_at(path: &Path, ring: &Keyring) -> Result<()> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).with_context(|| format!("cannot create {}", d.display()))?;
+    }
+    crate::agent::write_secret_0600(path, &format_keyring(ring))
+}
+
+/// Persist the machine-global keyring (0600).
+pub fn save_keyring(home: &Path, ring: &Keyring) -> Result<()> {
+    save_keyring_at(&key_path(home), ring)
+}
+
+/// The repo-local keyring path `.git/agit-crypt/keyring`, resolved from `cwd`. git runs the clean/smudge
+/// filter with cwd = the store's working-tree top, so this finds the keyring the per-session keybox
+/// wrote (`crypt unlock`). `None` when `cwd` is not inside a git repo.
+pub fn repo_keyring_path_from(cwd: &Path) -> Option<PathBuf> {
+    let (code, gitdir) = crate::scope::git_in_status(cwd, &["rev-parse", "--git-dir"]);
+    if code != 0 || gitdir.trim().is_empty() {
+        return None;
+    }
+    let gd = PathBuf::from(gitdir.trim());
+    let gd = if gd.is_absolute() { gd } else { cwd.join(gd) };
+    Some(gd.join("agit-crypt").join("keyring"))
+}
+
+/// `repo_keyring_path_from(current_dir)` — what the filter resolves at runtime.
+pub fn repo_keyring_path() -> Option<PathBuf> {
+    repo_keyring_path_from(&std::env::current_dir().ok()?)
+}
+
+/// Mint (or overwrite) the repo-local keyring at `path` with a single generation-0 content key. This is
+/// the per-session CK `encrypt --readers/--public` mints; `rotate_keyring_at` advances it.
+pub fn init_repo_keyring_at(path: &Path, master: [u8; 32]) -> Result<()> {
+    let ring = Keyring { current: 0, keys: vec![KeyringEntry { id: 0, master }] };
+    save_keyring_at(path, &ring)
+}
+
+/// Rotate the keyring at `path`: mint `new_master` as the new CURRENT generation, retaining every prior
+/// key for decrypt-only, and return the new key-id (== the new CK generation). The keybox rekey /
+/// reader-removal primitive, applied to a repo-local per-session keyring.
+pub fn rotate_keyring_at(path: &Path, new_master: [u8; 32]) -> Result<u32> {
+    let mut ring = load_keyring_at(path)?
+        .ok_or_else(|| anyhow::anyhow!("no keyring at {} to rotate", path.display()))?;
+    let id = ring.rotate(new_master);
+    save_keyring_at(path, &ring)?;
+    Ok(id)
 }
 
 /// Read + hex-decode + validate the CURRENT 32-byte master, or `None` if the file is absent. Works over
@@ -336,10 +390,20 @@ pub fn derive_keyring(ring: &Keyring) -> Keys {
 /// clean and smudge run under `required=true`: if the key is missing, git must ABORT rather than stage
 /// plaintext or check out ciphertext, so a missing key is a loud error here, not a fresh mint.
 pub fn keys_for_filter(home: &Path) -> Result<Keys> {
+    // A per-session keybox stores its content-key generations in a REPO-LOCAL keyring, resolved BEFORE
+    // the machine-global one: git runs the filter at the store top, so cwd finds `.git/agit-crypt/keyring`
+    // (written by `agit crypt unlock` / `encrypt --readers`). The legacy global-key path is the fallback,
+    // so a pre-keybox store (v1 + key-id 0) keeps working byte-for-byte.
+    if let Some(p) = repo_keyring_path() {
+        if let Some(ring) = load_keyring_at(&p)? {
+            return Ok(derive_keyring(&ring));
+        }
+    }
     let ring = load_keyring(home)?.ok_or_else(|| {
         anyhow::anyhow!(
             "no crypt key at {} — this store's filter is wired but the key is absent.\n\
-             \x20      Import a teammate's key with `agit a encrypt --import <keyfile>`, or `agit a encrypt` to mint one.",
+             \x20      Run `agit crypt unlock` (per-session keybox), import a teammate's key with\n\
+             \x20      `agit a encrypt --import <keyfile>`, or `agit a encrypt` to mint one.",
             key_path(home).display()
         )
     })?;

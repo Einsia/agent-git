@@ -1087,11 +1087,12 @@ pub fn identity_cmd(args: &[String]) -> Result<i32> {
     match sub {
         Some("enroll") => identity_enroll(rest.iter().any(|a| a == "--rotate")),
         Some("show") => identity_show(rest.first().map(|s| s.trim()).filter(|s| !s.is_empty())),
+        Some("pin") => identity_pin(rest),
         // No subcommand = show my own local identity + enrollment status, the friendliest default.
         None => identity_show(None),
         Some(other) => {
             errln!("agit identity: unknown subcommand `{other}`");
-            errln!("  usage: agit identity enroll [--rotate]   ·   agit identity show [<user>]");
+            errln!("  usage: agit identity enroll [--rotate]   ·   show [<user>]   ·   pin <user> [--repin] [--key HEX]");
             Ok(2)
         }
     }
@@ -1151,6 +1152,22 @@ fn identity_enroll(rotate: bool) -> Result<i32> {
     outln!("enrolled {username} in the hub identity registry at epoch {epoch}");
     outln!("  ed25519  {ed_pub}");
     outln!("  x25519   {x_pub}");
+    Ok(0)
+}
+
+/// `agit identity pin <user> [--repin] [--key HEX]` — TOFU-pin a recipient's X25519 pubkey for wrapping.
+/// With `--key`, pin that exact hex key (offline); otherwise fetch it from the hub registry. A CHANGED
+/// key is a HARD failure unless `--repin` is given after an out-of-band fingerprint check.
+fn identity_pin(args: &[String]) -> Result<i32> {
+    let home = scope::agit_home()?;
+    let repin = args.iter().any(|a| a == "--repin");
+    let key = flag_value(args, "--key");
+    let Some(user) = first_positional(args) else {
+        bail!("agit identity pin: name a <user>\n  usage: agit identity pin <user> [--repin] [--key <hex-x25519-pub>]");
+    };
+    let k = crate::keybox::pin_user(&home, &user, key.as_deref(), repin)?;
+    outln!("pinned {user}");
+    outln!("  x25519  {}", hex::encode(k));
     Ok(0)
 }
 
@@ -1718,6 +1735,24 @@ pub fn agent_encrypt(args: &[String]) -> Result<i32> {
         return crypt_import(&home, Path::new(keyfile), force, yes);
     }
 
+    // Per-session keybox encryption: `--readers a,b` and/or `--public`. Distinct from the machine-global
+    // key path (`agit a encrypt` with no readers) — this mints a per-session content key into a repo-local
+    // keyring and commits a keybox wrapping it to the named readers.
+    let public = args.iter().any(|a| a == "--public");
+    let readers: Vec<String> = match args.iter().position(|a| a == "--readers") {
+        Some(i) => args
+            .get(i + 1)
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if args.iter().any(|a| a == "--readers") && readers.is_empty() && !public {
+        bail!("agit a encrypt --readers needs a comma-separated list of users (or add --public)");
+    }
+    if public || !readers.is_empty() {
+        return crypt_enable_keybox(&home, &readers, public, yes);
+    }
+
     crypt_enable(&home, yes)
 }
 
@@ -1959,6 +1994,391 @@ fn crypt_import(home: &Path, keyfile: &Path, force: bool, yes: bool) -> Result<i
             outln!("  (no agent resolves here yet — after `agit a clone <name>`, run `agit a encrypt` to wire the filter)");
         }
     }
+    Ok(0)
+}
+
+// ─────────────────────── Per-session keybox: encrypt --readers/--public, readers, rekey, unlock ───────────────────────
+
+/// The `.gitattributes` line excluding the committed keybox from the crypt filter: it is already
+/// wrap-ciphertext, and filtering it would double-encrypt and deadlock the bootstrap.
+const KEYBOX_ATTR_LINE: &str = "/.agit/keybox.jsonl -filter";
+
+/// The next non-flag positional argument's value for `--name <value>` (a value that is itself a flag is
+/// treated as absent).
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .filter(|s| !s.starts_with('-'))
+        .cloned()
+}
+
+/// The first bare (non-`-`) positional argument.
+fn first_positional(args: &[String]) -> Option<String> {
+    args.iter().find(|a| !a.starts_with('-')).cloned()
+}
+
+/// Ensure `.gitattributes` carries the keybox exclusion (`/.agit/keybox.jsonl -filter`). Returns true if
+/// the line was added.
+fn keybox_write_gitattributes(store: &Path) -> Result<bool> {
+    let path = store.join(".gitattributes");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| {
+        let t = l.trim();
+        t.starts_with("/.agit/keybox.jsonl") && t.contains("-filter")
+    }) {
+        return Ok(false);
+    }
+    let mut s = existing;
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s.push_str(KEYBOX_ATTR_LINE);
+    s.push('\n');
+    std::fs::write(&path, s).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(true)
+}
+
+/// The resolved store's repo-local keyring path, or a clear error if the store is not a git repo.
+fn store_keyring_path(store: &Path) -> Result<PathBuf> {
+    crate::crypt::repo_keyring_path_from(store)
+        .context("cannot resolve the repo-local keyring path (is the store a git repo?)")
+}
+
+/// Load the repo-local keyring, or an actionable error when this session is not keybox-encrypted.
+fn require_session_keyring(store: &Path) -> Result<(PathBuf, crate::crypt::Keyring)> {
+    let kp = store_keyring_path(store)?;
+    let ring = crate::crypt::load_keyring_at(&kp)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "this session is not keybox-encrypted (no {}).\n\
+             \x20      Enable it first: agit a encrypt --readers <a,b> | --public",
+            kp.display()
+        )
+    })?;
+    Ok((kp, ring))
+}
+
+/// `agit a encrypt --readers a,b | --public` — enable PER-SESSION keybox encryption: mint a fresh content
+/// key (CK, generation 0) into the repo-local keyring, wrap it to each named reader (X25519) and/or write
+/// a public stanza, install the filter + committed keybox, and re-encrypt tracked sessions under CK.
+fn crypt_enable_keybox(home: &Path, readers: &[String], public: bool, yes: bool) -> Result<i32> {
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+    let kp = store_keyring_path(&store)?;
+    if kp.exists() {
+        bail!(
+            "this session already has a per-session keyring at {}.\n\
+             \x20      Manage readers with `agit a readers add/rm` or rotate with `agit a rekey`.",
+            kp.display()
+        );
+    }
+
+    crypt_print_warnings();
+    crypt_confirm("Enable per-session keybox encryption on this store?", yes)?;
+
+    // Mint CK gen 0 into the repo-local keyring BEFORE any `git add`: the clean filter reads it from there.
+    let ck = crate::crypt::random_master()?;
+    crate::crypt::init_repo_keyring_at(&kp, ck)?;
+
+    // The owner must be able to unlock a fresh clone from the keybox alone (the repo-local keyring is
+    // never pushed). Best-effort: if the owner has a hub identity AND an enrolled key, add them as a
+    // normal reader so rekey/rm re-resolve it like any other. Public sessions need no self-stanza (the CK
+    // is already recoverable from the repo). Any failure just prints guidance -- it never blocks encrypt.
+    let mut readers: Vec<String> = readers.to_vec();
+    if !public {
+        let me = crate::hubapi::HubEndpoint::resolve().ok().and_then(|ep| ep.me().ok());
+        match me {
+            Some(me) if readers.iter().any(|r| r == &me) => {} // already an explicit reader
+            Some(me) if crate::keybox::resolve_recipient(home, &me, None, false).is_ok() => {
+                outln!("  including you ({me}) as a reader — you can unlock a fresh clone");
+                readers.push(me);
+            }
+            _ => outln!(
+                "  note: to unlock a fresh clone on another machine, enroll (`agit identity enroll`) and \
+                 add yourself (`agit a readers add <you>`), or encrypt with --public."
+            ),
+        }
+    }
+
+    // Build the keybox stanzas for kid 0 (resolve + TOFU-pin each reader).
+    let mut stanzas = Vec::new();
+    if public {
+        stanzas.push(crate::keybox::public_stanza(&ck, 0));
+    }
+    for r in &readers {
+        let key = crate::keybox::resolve_recipient(home, r, None, false)
+            .with_context(|| format!("resolving reader `{r}`"))?;
+        stanzas.push(crate::keybox::user_stanza(&ck, 0, r, 0, &key)?);
+        outln!("  wrapped the content key to {r}");
+    }
+    if public {
+        outln!("  wrote a public stanza (anyone with the repo can read)");
+    }
+    crate::keybox::write_keybox(&store, &stanzas)?;
+
+    let _lock = crate::session::lock_store(&store)?;
+    let _ = crypt_write_gitattributes(&store)?;
+    let _ = keybox_write_gitattributes(&store)?;
+    crypt_wire_filter(&store)?;
+
+    // Commit the keybox + attributes first, then renormalize tracked sessions under CK.
+    let _ = scope::git_in_status(&store, &["add", "--", ".gitattributes", ".agit/keybox.jsonl"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(
+            &store,
+            "chore(crypt): enable per-session keybox encryption\n\nMints a per-session content key, wraps it to the readers, and commits the keybox.",
+        )?;
+    }
+    let _ = scope::git_in_status(&store, &["add", "--renormalize", "--", "sessions"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(&store, "chore(crypt): re-encrypt tracked sessions under the per-session key")?;
+    }
+
+    outln!("per-session keybox encryption enabled on {} ({}).", a.name, a.aid);
+    outln!("  readers unlock after cloning with `agit crypt unlock`.");
+    Ok(0)
+}
+
+/// `agit a readers <add|rm|ls>` — manage a keybox-encrypted session's reader set.
+pub fn readers_cmd(args: &[String]) -> Result<i32> {
+    let home = scope::agit_home()?;
+    match args.first().map(|s| s.as_str()) {
+        Some("add") => readers_add(&home, &args[1..]),
+        Some("rm") | Some("remove") => readers_rm(&home, &args[1..]),
+        Some("ls") | Some("list") | None => readers_ls(),
+        Some(other) => {
+            errln!("agit readers: unknown subcommand `{other}`");
+            errln!("  usage: agit a readers add <user>|--public [--key HEX] [--repin]  ·  rm <user>|--public  ·  ls");
+            Ok(2)
+        }
+    }
+}
+
+/// `agit a readers add <user>|--public` — wrap the CURRENT content key to a new reader and append its
+/// stanza. O(1): existing encrypted blobs are NOT re-cleaned (the keybox line is the only change).
+fn readers_add(home: &Path, args: &[String]) -> Result<i32> {
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+    let (_kp, ring) = require_session_keyring(&store)?;
+    let ck = ring.current_master();
+    let kid = ring.current;
+
+    let public = args.iter().any(|x| x == "--public");
+    let repin = args.iter().any(|x| x == "--repin");
+    let key_override = flag_value(args, "--key");
+
+    let _lock = crate::session::lock_store(&store)?;
+    if public {
+        if crate::keybox::is_public_at(&crate::keybox::read_keybox(&store)?, kid) {
+            outln!("already public at kid {kid} — nothing to do.");
+            return Ok(0);
+        }
+        crate::keybox::append_stanza(&store, &crate::keybox::public_stanza(&ck, kid))?;
+        outln!("  added a public stanza at kid {kid}");
+    } else {
+        let Some(user) = first_positional(args) else {
+            bail!("agit a readers add: name a <user>, or pass --public");
+        };
+        let key = crate::keybox::resolve_recipient(home, &user, key_override.as_deref(), repin)?;
+        crate::keybox::append_stanza(&store, &crate::keybox::user_stanza(&ck, kid, &user, 0, &key)?)?;
+        outln!("  wrapped the current content key (kid {kid}) to {user} — no content re-encrypted");
+    }
+
+    // Commit ONLY the keybox line.
+    let _ = scope::git_in_status(&store, &["add", "--", ".agit/keybox.jsonl"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(&store, "chore(crypt): add a session reader (keybox append, no re-encryption)")?;
+    }
+    Ok(0)
+}
+
+/// `agit a readers rm <user>|--public` — EAGER rotation: rotate the content key to a new generation and
+/// re-wrap CK' to the REMAINING readers only. The removed reader's key opens no new commits; their old
+/// kid's stanza is retained, so already-committed content stays readable by them (forward-only).
+fn readers_rm(home: &Path, args: &[String]) -> Result<i32> {
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+    let (kp, ring) = require_session_keyring(&store)?;
+    let cur_kid = ring.current;
+
+    let drop_public = args.iter().any(|x| x == "--public");
+    let user = first_positional(args);
+    if user.is_none() && !drop_public {
+        bail!("agit a readers rm: name a <user>, or pass --public");
+    }
+
+    let existing = crate::keybox::read_keybox(&store)?;
+    let mut remaining = crate::keybox::readers_at(&existing, cur_kid);
+    let mut keep_public = crate::keybox::is_public_at(&existing, cur_kid);
+    if drop_public {
+        keep_public = false;
+    }
+    let mut removed_name = None;
+    if let Some(u) = &user {
+        let before = remaining.len();
+        remaining.retain(|r| r != u);
+        if remaining.len() != before {
+            removed_name = Some(u.clone());
+        }
+    }
+
+    let _lock = crate::session::lock_store(&store)?;
+    // Eager rotation: mint CK' as the new current generation.
+    let ck_prime = crate::crypt::random_master()?;
+    let new_kid = crate::crypt::rotate_keyring_at(&kp, ck_prime)?;
+
+    // Retain every OLD stanza (removed reader keeps their old-kid access), and re-wrap CK' to the
+    // remaining readers only (+ public if it survives).
+    let mut stanzas = existing;
+    if keep_public {
+        stanzas.push(crate::keybox::public_stanza(&ck_prime, new_kid));
+    }
+    for r in &remaining {
+        let key = crate::keybox::resolve_recipient(home, r, None, false)
+            .with_context(|| format!("re-wrapping CK' to remaining reader `{r}`"))?;
+        stanzas.push(crate::keybox::user_stanza(&ck_prime, new_kid, r, 0, &key)?);
+    }
+    crate::keybox::write_keybox(&store, &stanzas)?;
+
+    let _ = scope::git_in_status(&store, &["add", "--", ".agit/keybox.jsonl"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(
+            &store,
+            "chore(crypt): remove a session reader (eager CK rotation)\n\nRotates the content key and re-wraps only to remaining readers; new commits seal under the new key-id, which the removed reader cannot open.",
+        )?;
+    }
+    match (removed_name, drop_public) {
+        (Some(u), _) => outln!(
+            "  removed {u}: rotated to kid {new_kid}, re-wrapped to {} remaining reader(s){}",
+            remaining.len(),
+            if keep_public { " + public" } else { "" }
+        ),
+        (None, true) => outln!("  removed public access: rotated to kid {new_kid}"),
+        (None, false) => outln!(
+            "  {} was not a current reader; rotated to kid {new_kid} anyway (re-wrapped to {} reader(s))",
+            user.as_deref().unwrap_or("(none)"),
+            remaining.len()
+        ),
+    }
+    Ok(0)
+}
+
+/// `agit a readers ls` — list the current reader set (and historical generations) of the keybox.
+fn readers_ls() -> Result<i32> {
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+    let stanzas = crate::keybox::read_keybox(&store)?;
+    if stanzas.is_empty() {
+        outln!("no keybox — {} ({}) is not per-session encrypted.", a.name, a.aid);
+        return Ok(0);
+    }
+    let cur = crate::crypt::repo_keyring_path_from(&store)
+        .and_then(|p| crate::crypt::load_keyring_at(&p).ok().flatten())
+        .map(|r| r.current);
+    let kids: std::collections::BTreeSet<u32> = stanzas.iter().map(|s| s.kid()).collect();
+    outln!("keybox for {} ({})", a.name, a.aid);
+    for kid in kids {
+        let readers = crate::keybox::readers_at(&stanzas, kid);
+        let public = crate::keybox::is_public_at(&stanzas, kid);
+        let marker = if Some(kid) == cur { " (current)" } else { "" };
+        let who = if readers.is_empty() { "—".to_string() } else { readers.join(", ") };
+        outln!("  kid {kid}{marker}: {who}{}", if public { " [public]" } else { "" });
+    }
+    Ok(0)
+}
+
+/// `agit a rekey` — rotate the content key and re-wrap CK' to ALL current readers.
+pub fn rekey_cmd(_args: &[String]) -> Result<i32> {
+    let home = scope::agit_home()?;
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+    let (kp, ring) = require_session_keyring(&store)?;
+    let cur_kid = ring.current;
+    let existing = crate::keybox::read_keybox(&store)?;
+    let readers = crate::keybox::readers_at(&existing, cur_kid);
+    let keep_public = crate::keybox::is_public_at(&existing, cur_kid);
+
+    let _lock = crate::session::lock_store(&store)?;
+    let ck_prime = crate::crypt::random_master()?;
+    let new_kid = crate::crypt::rotate_keyring_at(&kp, ck_prime)?;
+
+    let mut stanzas = existing;
+    if keep_public {
+        stanzas.push(crate::keybox::public_stanza(&ck_prime, new_kid));
+    }
+    for r in &readers {
+        let key = crate::keybox::resolve_recipient(&home, r, None, false)?;
+        stanzas.push(crate::keybox::user_stanza(&ck_prime, new_kid, r, 0, &key)?);
+    }
+    crate::keybox::write_keybox(&store, &stanzas)?;
+
+    let _ = scope::git_in_status(&store, &["add", "--", ".agit/keybox.jsonl"]);
+    if scope::git_in_status(&store, &["diff", "--cached", "--quiet"]).0 != 0 {
+        crypt_commit(
+            &store,
+            "chore(crypt): rekey the session content key\n\nRotates CK and re-wraps to all current readers; new commits seal under the new key-id.",
+        )?;
+    }
+    outln!(
+        "rekeyed to kid {new_kid}: re-wrapped to {} reader(s){}.",
+        readers.len(),
+        if keep_public { " + public" } else { "" }
+    );
+    Ok(0)
+}
+
+/// `agit crypt <unlock>` — the per-session keybox client verb.
+pub fn crypt_cmd(args: &[String]) -> Result<i32> {
+    match args.first().map(|s| s.as_str()) {
+        Some("unlock") => crypt_unlock(),
+        None => {
+            errln!("usage: agit crypt unlock");
+            Ok(2)
+        }
+        Some(other) => {
+            errln!("agit crypt: unknown subcommand `{other}`");
+            errln!("  usage: agit crypt unlock");
+            Ok(2)
+        }
+    }
+}
+
+/// `agit crypt unlock` — recover this machine's content keys from the committed keybox and write them to
+/// the repo-local keyring, so the crypt filter can decrypt the session. FAIL-CLOSED: if I am not a reader
+/// (no stanza opens with my identity), NO keyring is written and the smudge path stays locked — never a
+/// silent plaintext leak.
+fn crypt_unlock() -> Result<i32> {
+    let a = agent::resolve(None)?;
+    let store = a.store.clone();
+    let stanzas = crate::keybox::read_keybox(&store)?;
+    if stanzas.is_empty() {
+        outln!(
+            "no keybox at {} — nothing to unlock (this session is not per-session encrypted).",
+            crate::keybox::keybox_path(&store).display()
+        );
+        return Ok(0);
+    }
+    let sk = agent::machine_signing_key()?;
+    let secret = agent::derive_x25519_secret(&sk);
+    let Some(ring) = crate::keybox::recover_keyring(&stanzas, &secret) else {
+        bail!(
+            "you are not a reader of this encrypted session — none of the {} keybox stanza(s) open with\n\
+             \x20      this machine's identity. The keyring was NOT written; the session stays locked.\n\
+             \x20      Publish your key (agit identity enroll) and ask a reader to `agit a readers add <you>`.",
+            stanzas.len()
+        );
+    };
+    let kp = store_keyring_path(&store)?;
+    let recovered = ring.keys.len();
+    let current = ring.current;
+    crate::crypt::save_keyring_at(&kp, &ring)?;
+    crypt_wire_filter(&store)?;
+    // Re-checkout sessions so any ciphertext in the working tree becomes plaintext under the recovered keys.
+    let (code, _) = scope::git_in_status(&store, &["checkout", "--", "sessions"]);
+    if code != 0 {
+        errln!("  ⚠ wrote the keyring but could not re-checkout sessions/** — run `git checkout -- .` in the store");
+    }
+    outln!("unlocked {} ({}): recovered {recovered} content key(s), current kid {current}.", a.name, a.aid);
     Ok(0)
 }
 

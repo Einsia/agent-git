@@ -26,6 +26,7 @@ pub mod harness;
 pub mod hub;
 pub mod hubapi;
 pub mod init;
+pub mod keybox;
 pub mod llm;
 pub mod output;
 pub mod passthrough;

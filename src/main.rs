@@ -221,6 +221,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    keyed from $AGIT_HOME. Routed here beside hook-scan (also git-invoked). ──
         "crypt-clean" => commands::crypt_clean(),
         "crypt-smudge" => commands::crypt_smudge(),
+
+        // ── crypt: the per-session keybox client verb. `crypt unlock` recovers this machine's content
+        //    keys from the committed keybox into the repo-local keyring, so the filter can decrypt.
+        //    Scope-independent — it resolves the active agent itself. ──
+        "crypt" => commands::crypt_cmd(args),
         "workspace" => match args.first().map(|s| s.as_str()) {
             Some("log") => commands::workspace_log(),
             Some("restore") => commands::workspace_restore(args.get(1).map(|s| s.as_str())),
@@ -279,6 +284,11 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    clean/smudge filter (git-crypt style). Enables/wires the filter, mints/exports/imports the
         //    symmetric key. Ciphertext is what a push publishes; only coherent for a no-hub setup. ──
         "encrypt" if scope == Scope::Agent => agent_encrypt(args),
+
+        // ── readers / rekey (agent scope): manage a per-session keybox — add/remove readers (add is an
+        //    O(1) keybox append; rm is an eager CK rotation) and rotate the content key. ──
+        "readers" if scope == Scope::Agent => commands::readers_cmd(args),
+        "rekey" if scope == Scope::Agent => commands::rekey_cmd(args),
 
         // ── log / diff (agent scope): a raw `git log`/`git diff` on the store is a wall of jsonl bytes,
         //    so by default these render the SESSION view — `a log` a timeline of the store's sessions,
