@@ -113,6 +113,65 @@ export interface OrgCrypto {
   members_can_create: boolean
 }
 
+/// The org VIEW (GET /api/orgs/<name>/overview): the org's members plus every agent the caller may
+/// Read that is owned by the org OR by one of its members. Exactly what `api_org_overview`
+/// (src/bin/agit-hub/api.rs) serializes — the agent list is ACL-filtered server-side before it is ever
+/// counted, so a private agent the caller cannot see contributes no row and no count.
+export interface OrgOverviewAgent {
+  /// The full owner string — "org:<name>" for an org-owned agent, or a bare username for a member's
+  /// personal agent. Route to the agent page with the owner_ns (strip the "org:" prefix), not this.
+  owner: string
+  name: string
+  /// null until the agent has an agent.toml pushed (a bare name reservation has no identity yet).
+  aid: string | null
+  visibility: Visibility
+  sessions: number
+  /// What the caller may do here, as the server computed it. null = no explicit grant.
+  role: EffectiveRole | null
+  /// true when the owner is a bare username (a member's personal agent), false for the org's own.
+  personal: boolean
+  /// The distinct env slugs from this agent's session tree, first-appearance order.
+  environments: string[]
+}
+export interface OrgOverview {
+  name: string
+  /// ISO timestamp string, as the store keeps it (Org.created).
+  created: string
+  members: OrgMember[]
+  agents: OrgOverviewAgent[]
+}
+
+/// One agent attached to a code repo in the index (GET /api/repos), deduped per env: the owner+name
+/// and how many of that env's sessions are this agent's.
+export interface RepoAgent {
+  /// The full owner string ("org:<name>" or a bare username). Strip "org:" for the agent-page route.
+  owner: string
+  name: string
+  sessions: number
+}
+/// One row of the code-repo index: an env slug aggregated across every readable agent that touched it.
+/// Exactly what `api_repos` (src/bin/agit-hub/api.rs) serializes.
+export interface Repo {
+  /// The env slug (the path-derived partition key the UI already shows).
+  env: string
+  /// The representative human-readable path, read once from the env's newest session's cwd. null when
+  /// no session carried a cwd (old-layout sessions, or a parse miss).
+  cwd: string | null
+  total_sessions: number
+  /// A relative "2d ago" string of the env's newest activity across all its agents.
+  last: string
+  agents: RepoAgent[]
+}
+export interface ReposIndex {
+  repos: Repo[]
+  /// The newest-first list was truncated to the server's cap; older repos are omitted.
+  has_more: boolean
+  /// How many sessions the scan walked.
+  scanned: number
+  /// The scan hit its cap and stopped; the totals may be short of the true figures.
+  capped: boolean
+}
+
 export interface AgentSummary {
   name: string
   /// The full owner string — a bare username, or "org:<name>" for an org-owned agent. null only
@@ -588,6 +647,10 @@ export const api = {
       body: JSON.stringify({ name }),
     }),
   org: (name: string) => get<Org>(`/api/orgs/${encodeURIComponent(name)}`),
+  // The org VIEW: members + every readable agent owned by the org or one of its members. Member-or-site-
+  // admin gated; a missing org and one the caller may not see both answer 404 (existence non-disclosure),
+  // so useGuarded's 403 branch never fires here — a non-member simply gets the 404 error state.
+  orgOverview: (name: string) => get<OrgOverview>(`/api/orgs/${encodeURIComponent(name)}/overview`),
   orgMembers: (name: string) => get<OrgMember[]>(`/api/orgs/${encodeURIComponent(name)}/members`),
   // Change an EXISTING member's role in place; returns the fresh roster. Membership is
   // invitation-only, so this POST can NOT add a stranger — a non-member is refused (409, guidance to
@@ -653,6 +716,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ members_can_create: allow }),
     }),
+
+  // ── code-repo index ──
+  // The cross-agent view of code repos: one row per env slug, aggregated over every agent the caller may
+  // Read. Open to any caller (anonymous sees public-only); the ACL filter is the whole gate, so there is
+  // no 401/403 to route — a signed-out caller just gets the public slice.
+  repos: () => get<ReposIndex>("/api/repos"),
 
   // ── tokens ──
   tokens: () => get<TokenInfo[]>("/api/tokens"),

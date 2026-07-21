@@ -7,6 +7,8 @@ import { Login } from "@/pages/Login"
 import { Register } from "@/pages/Register"
 import { ResetPassword } from "@/pages/ResetPassword"
 import { Orgs } from "@/pages/Orgs"
+import { OrgDetail } from "@/pages/OrgDetail"
+import { Repos } from "@/pages/Repos"
 import { NewAgent } from "@/pages/NewAgent"
 import { Agent } from "@/pages/Agent"
 import { Mrs } from "@/pages/Mrs"
@@ -31,6 +33,8 @@ export default function App() {
             <Route path="/reset-password" element={<ResetPassword />} />
             <Route path="/new" element={<NewAgent />} />
             <Route path="/orgs" element={<Orgs />} />
+            <Route path="/orgs/:name" element={<OrgDetail />} />
+            <Route path="/repos" element={<Repos />} />
             <Route path="/tokens" element={<Tokens />} />
             <Route path="/account" element={<Account />} />
             <Route path="/admin" element={<Admin />} />

@@ -26,6 +26,7 @@ function Nav({ isAdmin }: { isAdmin: boolean }) {
   return (
     <nav className="flex items-center gap-1">
       <Tab to="/orgs">orgs</Tab>
+      <Tab to="/repos">repos</Tab>
       <Tab to="/tokens">tokens</Tab>
       <Tab to="/account">account</Tab>
       {/* Admin tools are server-gated (403 for a non-admin); only offer the link to an admin rather

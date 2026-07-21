@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from "react"
+import { Link } from "react-router-dom"
 import { Building2, KeyRound, Mail, Plus, ShieldAlert, Trash2, UserPlus } from "lucide-react"
 
 import { api, type EscrowMode, type Org, type OrgMember, type OrgRole } from "@/lib/api"
@@ -195,7 +196,11 @@ function OrgCard({
     <div className="rounded-lg border bg-card p-4">
       <div className="mb-3 flex flex-wrap items-center gap-2.5">
         <Building2 className="size-4 text-muted-foreground" />
-        <h2 className="font-mono text-lg font-semibold">{org.name}</h2>
+        <h2 className="font-mono text-lg font-semibold">
+          <Link to={`/orgs/${encodeURIComponent(org.name)}`} className="hover:text-primary hover:underline">
+            {org.name}
+          </Link>
+        </h2>
         <Badge variant="muted" className="text-[0.6rem]">
           {org.members.length} {org.members.length === 1 ? "member" : "members"}
         </Badge>
