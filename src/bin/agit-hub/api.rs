@@ -88,6 +88,11 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("GET", "me") => return api_me(ctx, caller).await,
         ("GET", "me/invitations") => return api_me_invitations(ctx, caller).await,
         ("POST", "me/password") => return api_me_password(ctx, req, caller, body).await,
+        // Self-service password reset for a LOCKED-OUT user (no session, no old password). The unguessable
+        // token forwarded by the operator is the only authority. `request` mints+delivers a reset link and
+        // is anti-enumeration (always a generic 200); `consume` spends the token to set a new password.
+        ("POST", "password-reset/request") => return api_password_reset_request(ctx, client_ip, body).await,
+        ("POST", "password-reset/consume") => return api_password_reset_consume(ctx, body).await,
         // Consume a verification token (the capability is the auth — no session needed) and mint a fresh
         // one for the logged-in caller. See the email-squatting defense in store::get_identity_keys_by_email.
         ("POST", "verify-email") => return api_verify_email(ctx, body).await,
@@ -732,6 +737,85 @@ pub(crate) async fn api_admin_set_password(ctx: &Ctx, caller: &Caller, username:
     tracing::info!(actor = %actor, user = %target, revoked_sessions = revoked, "admin password reset");
     audit_append(ctx.root(), &actor, audit::USER_PASSWORD_RESET, None, &format!("reset {target}; revoked {revoked} session(s)")).await;
     Resp::json(serde_json::json!({ "ok": true, "user": target, "revoked_sessions": revoked }))
+}
+
+/// `POST /api/password-reset/request` `{ username }` — self-service password-reset request for a
+/// LOCKED-OUT user. UNAUTHENTICATED (the whole point is you cannot log in) and **anti-enumeration**: it
+/// ALWAYS answers a generic 200 with a byte-identical body whether or not the account exists, so it can
+/// never be used as a username oracle. When the account DOES exist, a single-use reset token is minted
+/// and delivered operator-forwarded (the `<base>/reset-password?token=` link is logged/printed, same
+/// hermetic stub as email verification); when it does not, nothing is minted and nothing is disclosed.
+///
+/// Rate-limited per-IP on the SAME budget as registration (`ctx.register_rl`), charged BEFORE the store
+/// lookup — both are unauthenticated, cheap-to-retry abuse surfaces, and charging first keeps the
+/// throttle independent of whether the account exists (so the 429 leaks nothing either). A missing client
+/// IP fails open, exactly like registration and the connection limiter.
+pub(crate) async fn api_password_reset_request(ctx: &Ctx, client_ip: Option<IpAddr>, body: &[u8]) -> Resp {
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let Some(raw) = str_field(&v, "username") else {
+        return Resp::err(400, "want a username");
+    };
+    // Charge the per-IP budget BEFORE touching the store, so a sweep is throttled and the rate check is
+    // identical for existing and non-existent accounts (no enumeration via timing or 429 vs 200 keyed on
+    // the username — the bucket is keyed on the IP only).
+    if let Some(ip) = client_ip {
+        if !ctx.register_rl.allow(&ip.to_string()) {
+            return Resp::err(429, "too many password-reset requests from your address; slow down").with("Retry-After", "60");
+        }
+    }
+    let username = store::normalize_username(&raw);
+    // Only mint+deliver when the account actually exists; stay SILENT either way. The generic response
+    // below is the same bytes on both branches, so the caller cannot tell existence from the answer.
+    if ctx.store.user(&username).await.is_some() && crate::resetpw::mint_and_deliver(&ctx.store, &username).await.is_some() {
+        audit_append(ctx.root(), &username, audit::USER_PASSWORD_RESET, None, "reset link requested (operator-forwarded)").await;
+    }
+    // The ONE generic answer. Identical on every path so existence never leaks. Do NOT branch this.
+    Resp::json(serde_json::json!({ "ok": true, "message": "if that account exists, a password reset link was generated" }))
+}
+
+/// `POST /api/password-reset/consume` `{ token, new_password }` — spend a reset token to set a new
+/// password for a locked-out user. UNAUTHENTICATED: the unguessable single-use token IS the authority,
+/// so — unlike `api_me_password` — **no old password is required**; a valid token IS required. The new
+/// password is re-hashed with a fresh salt and the current kdf (the SAME path as the admin reset), and
+/// EVERY session for the account is revoked (a reset is a recovery action — any live sign-in dies with
+/// the old credential). Enforces the shared minimum password length; a weak/empty one is a 400 and the
+/// token is left UNSPENT so the user can retry with a stronger password.
+pub(crate) async fn api_password_reset_consume(ctx: &Ctx, body: &[u8]) -> Resp {
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let (Some(token), Some(new_password)) = (str_field(&v, "token"), str_field(&v, "new_password")) else {
+        return Resp::err(400, "want token and new_password");
+    };
+    // Enforce the same minimum the CLI, registration and every other password path use, via the one
+    // shared constant — checked BEFORE consuming the token so a rejected weak password does not burn the
+    // single-use capability.
+    if new_password.chars().count() < store::MIN_PASSWORD_LEN {
+        return Resp::err(400, "password too short (at least 8 characters)");
+    }
+    // Validate + spend the token (single-use, unexpired). This is the ONLY authorization for the write;
+    // a wrong/expired/spent token is a flat 400 and no password changes.
+    let Some(username) = ctx.store.consume_password_reset_token(&token).await else {
+        return Resp::err(400, "invalid or expired reset token");
+    };
+    let (pw_hash, salt, kdf_id) = match hash_new_password(ctx, &new_password).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match ctx.store.set_password(&username, &pw_hash, &salt, &kdf_id).await {
+        Ok(true) => {}
+        // The token proved this account existed when minted; a false here is a concurrent delete.
+        Ok(false) => return Resp::err(404, "no such user"),
+        Err(_) => return Resp::err(500, "couldn't update the password"),
+    }
+    // A reset locks the old credential out everywhere: revoke every one of the account's sessions (there
+    // is no "current" session to preserve — the caller was logged out).
+    let revoked = ctx.sessions.revoke_user(&username, None);
+    tracing::info!(user = %username, revoked_sessions = revoked, "password reset via token");
+    audit_append(ctx.root(), &username, audit::USER_PASSWORD_RESET, None, &format!("reset via token; revoked {revoked} session(s)")).await;
+    Resp::json(serde_json::json!({ "ok": true, "revoked_sessions": revoked }))
 }
 
 // ── Two-factor authentication (TOTP) ──
@@ -4255,6 +4339,101 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status, 401);
+    }
+
+    // ── self-service password reset (operator-forwarded token) ──
+
+    /// The anti-enumeration property: a reset request for a real account and for an unknown one return
+    /// BYTE-IDENTICAL responses (same status, same body), and only the real account mints a token.
+    #[tokio::test]
+    async fn password_reset_request_is_anti_enumeration() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+
+        let exists = api_password_reset_request(&ctx, None, &body(serde_json::json!({ "username": "alice" }))).await;
+        // The existing account minted exactly one consumable token (the link is delivered out-of-band; the
+        // response never carries it).
+        assert_eq!(exists.status, 200);
+        assert!(!String::from_utf8_lossy(&exists.body).contains("prt_"), "the token is never returned in the response");
+        assert_eq!(ctx.store.password_reset_token_count().await, 1, "an existing account mints a reset token");
+
+        let ghost = api_password_reset_request(&ctx, None, &body(serde_json::json!({ "username": "nobody" }))).await;
+        // Same 200, and — critically — a BYTE-IDENTICAL body, so the answer is not an existence oracle.
+        assert_eq!(ghost.status, exists.status, "status is identical for existing and unknown accounts");
+        assert_eq!(ghost.body, exists.body, "body is byte-identical (anti-enumeration)");
+        assert_eq!(ctx.store.password_reset_token_count().await, 1, "an unknown account mints NOTHING");
+    }
+
+    /// A valid token sets the new password (login flips old→new), invalidates ALL sessions, is single-use,
+    /// and — the separation invariant — an email-verify token can NOT be spent here.
+    #[tokio::test]
+    async fn password_reset_consume_sets_password_and_kills_sessions() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "old-password-1", false).await;
+        // A live session that a reset must kick.
+        let sid = ctx.sessions.create("alice").unwrap();
+        assert_eq!(ctx.sessions.lookup(&sid).as_deref(), Some("alice"));
+
+        // Mint the token the operator would forward (stands in for the delivered link).
+        let token = ctx.store.mint_password_reset_token("alice", std::time::Duration::from_secs(3600)).await.unwrap();
+
+        // A too-short new password is a 400 and does NOT burn the token.
+        let short = api_password_reset_consume(&ctx, &body(serde_json::json!({ "token": token.clone(), "new_password": "short" }))).await;
+        assert_eq!(short.status, 400);
+
+        // The valid consume sets the new password with NO old password supplied.
+        let ok = api_password_reset_consume(&ctx, &body(serde_json::json!({ "token": token.clone(), "new_password": "new-password-2" }))).await;
+        assert_eq!(ok.status, 200);
+        assert!(auth::verify_login(&ctx.store, "alice", "new-password-2").await.is_some(), "the new password works");
+        assert!(auth::verify_login(&ctx.store, "alice", "old-password-1").await.is_none(), "the old password is dead");
+        // Every session is revoked — a reset is a recovery action.
+        assert!(ctx.sessions.lookup(&sid).is_none(), "the reset invalidates existing sessions");
+
+        // Single-use: replaying the same token is a 400.
+        assert_eq!(api_password_reset_consume(&ctx, &body(serde_json::json!({ "token": token, "new_password": "another-pass-3" }))).await.status, 400);
+    }
+
+    /// Cross-space rejection AT THE API LAYER: an email-verification token is not a reset token (and an
+    /// expired reset token is refused), so leaking a verify link can never reset a password.
+    #[tokio::test]
+    async fn password_reset_consume_rejects_verify_tokens_and_expired() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "old-password-1", false).await;
+
+        // An email-verify token (evt_) can NOT be consumed as a reset token.
+        let evt = ctx.store.mint_email_token("alice", "alice@corp.com", std::time::Duration::from_secs(3600)).await.unwrap();
+        let cross = api_password_reset_consume(&ctx, &body(serde_json::json!({ "token": evt, "new_password": "new-password-2" }))).await;
+        assert_eq!(cross.status, 400, "an email-verify token is not a reset token");
+        assert!(auth::verify_login(&ctx.store, "alice", "old-password-1").await.is_some(), "the password did not change");
+
+        // A reset token (prt_) can NOT be consumed as an email-verify token.
+        let prt = ctx.store.mint_password_reset_token("alice", std::time::Duration::from_secs(3600)).await.unwrap();
+        assert_eq!(api_verify_email(&ctx, &body(serde_json::json!({ "token": prt }))).await.status, 400, "a reset token is not a verify token");
+
+        // An already-expired reset token (ttl 0) is refused.
+        let expired = ctx.store.mint_password_reset_token("alice", std::time::Duration::from_secs(0)).await.unwrap();
+        assert_eq!(api_password_reset_consume(&ctx, &body(serde_json::json!({ "token": expired, "new_password": "new-password-2" }))).await.status, 400);
+        assert!(auth::verify_login(&ctx.store, "alice", "old-password-1").await.is_some(), "still unchanged");
+    }
+
+    /// The request endpoint is rate-limited per-IP on the same budget as registration.
+    #[tokio::test]
+    async fn password_reset_request_is_rate_limited_per_ip() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        let flooder: IpAddr = "203.0.113.9".parse().unwrap();
+        let mut statuses = Vec::new();
+        for _ in 0..(crate::limits::REGISTER_BURST as usize + 4) {
+            statuses.push(api_password_reset_request(&ctx, Some(flooder), &body(serde_json::json!({ "username": "alice" }))).await.status);
+        }
+        assert_eq!(statuses[0], 200, "the first request from an IP is allowed");
+        assert!(statuses.contains(&429), "a sustained sweep from one IP is throttled (429)");
+        assert_eq!(*statuses.last().unwrap(), 429, "once the bucket drains, the throttle sticks");
+        // A different IP keeps its own bucket.
+        let other: IpAddr = "203.0.113.10".parse().unwrap();
+        assert_eq!(api_password_reset_request(&ctx, Some(other), &body(serde_json::json!({ "username": "alice" }))).await.status, 200);
+        // A missing client IP fails open, exactly like registration.
+        assert_eq!(api_password_reset_request(&ctx, None, &body(serde_json::json!({ "username": "alice" }))).await.status, 200);
     }
 
     // ── two-factor authentication (TOTP) ──

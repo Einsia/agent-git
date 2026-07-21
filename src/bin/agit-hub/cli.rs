@@ -158,6 +158,33 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
                 }
             }
         }
+        Some("reset-link") => {
+            // Print a single-use PASSWORD-RESET link for the operator to forward to a locked-out user —
+            // the hermetic, no-SMTP self-service recovery path (the sibling of `verify-link`). Mints a
+            // fresh reset token each call. Distinct from `passwd`: this hands the user a link to set
+            // their OWN new password, rather than the operator choosing it.
+            let Some(name) = positional(args, 2) else {
+                eprintln!("usage: agit-hub user reset-link <name>");
+                return 2;
+            };
+            let username = store::normalize_username(name);
+            if store.user(&username).await.is_none() {
+                eprintln!("no such user: {username} (try `agit-hub user list`)");
+                return 1;
+            }
+            match crate::resetpw::mint_and_deliver(&store, &username).await {
+                Some(url) => {
+                    println!("{url}");
+                    eprintln!("Forward this single-use link to {username}; it lets them set a new password and expires in 1h.");
+                    audit::append(root, "cli", audit::USER_PASSWORD_RESET, None, &format!("reset link minted for {username}"));
+                    0
+                }
+                None => {
+                    eprintln!("failed to mint a reset token for {username} (no system entropy?).");
+                    1
+                }
+            }
+        }
         Some("passwd") => {
             // Admin-mediated password reset (the recovery door for a locked-out user). Reads the new
             // password from the tty/stdin only, **never from argv** — exactly like `user add`.
@@ -260,7 +287,7 @@ async fn user_cmd_async(root: &Path, args: &[String]) -> i32 {
             0
         }
         _ => {
-            eprintln!("usage: agit-hub user add <name> [--admin] | agit-hub user passwd <name> | agit-hub user 2fa-disable <name> | agit-hub user verify-email <name> | agit-hub user verify-link <name> | agit-hub user list");
+            eprintln!("usage: agit-hub user add <name> [--admin] | agit-hub user passwd <name> | agit-hub user reset-link <name> | agit-hub user 2fa-disable <name> | agit-hub user verify-email <name> | agit-hub user verify-link <name> | agit-hub user list");
             2
         }
     }

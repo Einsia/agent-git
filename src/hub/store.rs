@@ -717,6 +717,20 @@ pub struct EmailVerifyToken {
     pub created: String,
 }
 
+/// One row of the single-use, expiring PASSWORD-RESET token store. Structurally a sibling of
+/// [`EmailVerifyToken`] but living in its OWN table with a `prt_` prefix, so a reset capability and a
+/// verification capability are never interchangeable. Consuming it (deleting the row) authorizes setting
+/// a fresh password for `username` without the old one. Single-use + expiring, so a leaked-but-stale
+/// link cannot be replayed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PasswordResetToken {
+    pub token: String,
+    pub username: String,
+    pub expires: String,
+    #[serde(default)]
+    pub created: String,
+}
+
 fn row_agent(r: &impl Cols) -> AgentMeta {
     let visibility = r.text("visibility");
     let lifecycle = r.text("lifecycle");
@@ -904,6 +918,15 @@ const DDL: &[&str] = &[
     // NOT EXISTS — a fresh DB gets it here and every existing store gets it at boot, no version bump.
     "CREATE TABLE IF NOT EXISTS email_verify_tokens (\
        token TEXT PRIMARY KEY, username TEXT NOT NULL, email TEXT NOT NULL, \
+       expires TEXT NOT NULL, created TEXT NOT NULL DEFAULT '')",
+    // The single-use, expiring PASSWORD-RESET token store — a SEPARATE space from email-verify tokens
+    // (distinct table + `prt_` prefix), so an email-verification token can NEVER be replayed to reset a
+    // password and vice-versa: the two consume paths query disjoint tables. `token` is the CSPRNG
+    // capability the operator forwards; `expires` gates a stale link; the row is DELETED on consume so a
+    // token is single-use. No `email` column — a reset targets the account, not an address. Added
+    // additively like every other table above, so no schema-version bump.
+    "CREATE TABLE IF NOT EXISTS password_reset_tokens (\
+       token TEXT PRIMARY KEY, username TEXT NOT NULL, \
        expires TEXT NOT NULL, created TEXT NOT NULL DEFAULT '')",
     // The ONE shared identity registry (encryption-recipients design, Wave 1): a person's published
     // ed25519 + X25519 public halves, self-signed via enroll_sig. Serves BOTH provenance signing-key
@@ -1335,6 +1358,57 @@ impl Store {
         match self {
             Store::Sqlite(s) => s.consume_email_token(token).await,
             Store::Pg(s) => s.consume_email_token(token).await,
+        }
+    }
+
+    // ── password-reset tokens ──
+    //
+    // A SEPARATE single-use, expiring token space from the email-verification tokens above (distinct
+    // table + `prt_` prefix). The two never cross: `consume_password_reset_token` only reads
+    // `password_reset_tokens`, so an `evt_` verification token is not present there and can never reset a
+    // password, and `consume_email_token` only reads `email_verify_tokens`, so a `prt_` reset token can
+    // never mark an email verified. The token is a CSPRNG capability the operator forwards to a
+    // locked-out user; consuming it authorizes a password set WITHOUT the old password.
+
+    /// Mint a fresh password-reset token for `username` that expires after `ttl`, and return it. Username
+    /// is normalized like every other lookup so the consumed row addresses the same account.
+    pub async fn mint_password_reset_token(&self, username: &str, ttl: Duration) -> io::Result<String> {
+        let username = normalize_username(username);
+        // A random capability, not a secret to hash: 32 CSPRNG bytes as hex, prefixed for legibility and
+        // to keep the reset-token space textually distinct from the `evt_` verification space.
+        let token = format!("prt_{}", super::kdf::gen_secret()?);
+        let expires = (chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::hours(1)))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let row = PasswordResetToken { token: token.clone(), username, expires, created: now_iso() };
+        match self {
+            Store::Sqlite(s) => s.mint_password_reset_token(&row).await?,
+            Store::Pg(s) => s.mint_password_reset_token(&row).await?,
+        }
+        Ok(token)
+    }
+
+    /// Consume a password-reset token: delete it (single-use) and return the `username` it authorizes, or
+    /// `None` for an unknown or expired token. The delete happens even for an expired token (cleanup); an
+    /// expired one still yields `None`, so a stale link can never reset a password.
+    pub async fn consume_password_reset_token(&self, token: &str) -> Option<String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return None;
+        }
+        match self {
+            Store::Sqlite(s) => s.consume_password_reset_token(token).await,
+            Store::Pg(s) => s.consume_password_reset_token(token).await,
+        }
+    }
+
+    /// How many live (not-yet-consumed) password-reset tokens exist. An observability/test seam: the
+    /// anti-enumeration request path mints for a real account and NOTHING for an unknown one, and this is
+    /// the honest way to assert that without exposing the tokens themselves.
+    pub async fn password_reset_token_count(&self) -> usize {
+        match self {
+            Store::Sqlite(s) => s.password_reset_token_count().await,
+            Store::Pg(s) => s.password_reset_token_count().await,
         }
     }
 
@@ -2320,6 +2394,44 @@ impl SqliteStore {
         Some((row.text("username"), row.text("email")))
     }
 
+    async fn mint_password_reset_token(&self, row: &PasswordResetToken) -> io::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        sqlx::query("INSERT INTO password_reset_tokens (token, username, expires, created) VALUES (?, ?, ?, ?)")
+            .bind(&row.token)
+            .bind(&row.username)
+            .bind(&row.expires)
+            .bind(&row.created)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(())
+    }
+
+    async fn consume_password_reset_token(&self, token: &str) -> Option<String> {
+        // Single-use: read + DELETE in one write-locked transaction so two racing consumers cannot both
+        // succeed. The expiry check happens AFTER the delete (a stale token is cleaned up either way), so
+        // an expired token yields None even though it was removed.
+        let _guard = self.write_lock.lock().await;
+        let mut tx = self.pool.begin().await.ok()?;
+        let row = sqlx::query("SELECT username, expires FROM password_reset_tokens WHERE token = ?")
+            .bind(token)
+            .fetch_optional(&mut *tx)
+            .await
+            .ok()??;
+        sqlx::query("DELETE FROM password_reset_tokens WHERE token = ?").bind(token).execute(&mut *tx).await.ok()?;
+        tx.commit().await.ok()?;
+        if is_expired(&row.text("expires")) {
+            return None;
+        }
+        Some(row.text("username"))
+    }
+
+    async fn password_reset_token_count(&self) -> usize {
+        sqlx::query("SELECT token FROM password_reset_tokens").fetch_all(&self.pool).await.map(|r| r.len()).unwrap_or(0)
+    }
+
     async fn upsert_team_kek_envelopes(&self, org: &str, gen: i64, rows: &[TeamKekEnvelope]) -> io::Result<()> {
         let _guard = self.write_lock.lock().await;
         let mut tx = self.pool.begin().await.map_err(err)?;
@@ -2983,6 +3095,44 @@ impl PgStore {
             return None;
         }
         Some((row.text("username"), row.text("email")))
+    }
+
+    async fn mint_password_reset_token(&self, row: &PasswordResetToken) -> io::Result<()> {
+        let mut tx = self.pool.begin().await.map_err(err)?;
+        Self::lock(&mut tx).await?;
+        sqlx::query("INSERT INTO password_reset_tokens (token, username, expires, created) VALUES ($1, $2, $3, $4)")
+            .bind(&row.token)
+            .bind(&row.username)
+            .bind(&row.expires)
+            .bind(&row.created)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+        tx.commit().await.map_err(err)?;
+        Ok(())
+    }
+
+    async fn consume_password_reset_token(&self, token: &str) -> Option<String> {
+        // Single-use: read + DELETE in one advisory-locked transaction so two racing consumers cannot both
+        // succeed. The expiry check happens AFTER the delete, so an expired token yields None even though
+        // it was removed.
+        let mut tx = self.pool.begin().await.ok()?;
+        Self::lock(&mut tx).await.ok()?;
+        let row = sqlx::query("SELECT username, expires FROM password_reset_tokens WHERE token = $1")
+            .bind(token)
+            .fetch_optional(&mut *tx)
+            .await
+            .ok()??;
+        sqlx::query("DELETE FROM password_reset_tokens WHERE token = $1").bind(token).execute(&mut *tx).await.ok()?;
+        tx.commit().await.ok()?;
+        if is_expired(&row.text("expires")) {
+            return None;
+        }
+        Some(row.text("username"))
+    }
+
+    async fn password_reset_token_count(&self) -> usize {
+        sqlx::query("SELECT token FROM password_reset_tokens").fetch_all(&self.pool).await.map(|r| r.len()).unwrap_or(0)
     }
 
     async fn upsert_team_kek_envelopes(&self, org: &str, gen: i64, rows: &[TeamKekEnvelope]) -> io::Result<()> {
@@ -4051,6 +4201,40 @@ mod tests {
         assert!(s.consume_email_token(&expired).await.is_none(), "an expired token is never accepted");
         // ...and it was still cleaned up, so a retry is also None.
         assert!(s.consume_email_token(&expired).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn password_reset_token_is_single_use_and_expiring() {
+        let (_d, s) = tmp_store().await;
+        // A valid token consumes exactly once and yields the (normalized) username it authorizes.
+        let token = s.mint_password_reset_token("Alice", Duration::from_secs(3600)).await.unwrap();
+        assert!(token.starts_with("prt_"), "reset token carries the distinct prt_ prefix");
+        assert_eq!(s.consume_password_reset_token(&token).await.as_deref(), Some("alice"), "username is normalized");
+        // Single-use: a second consume of the same token is None (the row was deleted on first use).
+        assert!(s.consume_password_reset_token(&token).await.is_none(), "a reset token is single-use");
+        // Unknown/garbage tokens are None, not an error.
+        assert!(s.consume_password_reset_token("prt_nope").await.is_none());
+        assert!(s.consume_password_reset_token("").await.is_none());
+        // An already-expired token (ttl 0) is refused even on its first use, and cleaned up.
+        let expired = s.mint_password_reset_token("bob", Duration::from_secs(0)).await.unwrap();
+        assert!(s.consume_password_reset_token(&expired).await.is_none(), "an expired reset token is never accepted");
+        assert!(s.consume_password_reset_token(&expired).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_and_verify_token_spaces_never_cross() {
+        // The core separation invariant: the two token spaces are DISJOINT tables. A verification token
+        // can never be consumed as a reset token, and a reset token can never be consumed as a
+        // verification token — so leaking one can never grant the other's authority.
+        let (_d, s) = tmp_store().await;
+        let evt = s.mint_email_token("alice", "alice@corp.com", Duration::from_secs(3600)).await.unwrap();
+        let prt = s.mint_password_reset_token("alice", Duration::from_secs(3600)).await.unwrap();
+        // Cross-consume: each is rejected by the OTHER space's consumer.
+        assert!(s.consume_password_reset_token(&evt).await.is_none(), "an email-verify token is NOT a reset token");
+        assert!(s.consume_email_token(&prt).await.is_none(), "a reset token is NOT an email-verify token");
+        // A failed cross-consume must not have burned the token in its own space: each still works there.
+        assert!(s.consume_email_token(&evt).await.is_some(), "the verify token still consumes in its own space");
+        assert_eq!(s.consume_password_reset_token(&prt).await.as_deref(), Some("alice"), "the reset token still consumes in its own space");
     }
 
     #[tokio::test]

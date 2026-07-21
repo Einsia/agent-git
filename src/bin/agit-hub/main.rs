@@ -12,6 +12,7 @@ mod gitplumb;
 mod http;
 mod limits;
 mod prov;
+mod resetpw;
 mod router;
 mod scan;
 mod server;
@@ -64,6 +65,7 @@ pub(crate) fn print_help() {
          agit-hub user add <name> [--admin]                   add a user (asks for the password)\n\
          agit-hub user verify-email <name>                    force-mark a user's email verified (admin vouch)\n\
          agit-hub user verify-link <name>                     print a verification link to forward to the user\n\
+         agit-hub user reset-link <name>                      print a password-reset link to forward to the user\n\
          agit-hub user list                                   list users\n\
          agit-hub add <name> [--owner <user>] [--public] [--initialize]\n\
                                                               new Agent Store (private by default; --initialize commits an agent.toml so it clones immediately)\n\

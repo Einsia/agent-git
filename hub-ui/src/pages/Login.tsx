@@ -114,6 +114,10 @@ export function Login() {
           <Button type="submit" disabled={busy || !username || !password} className="mt-1">
             {busy ? "Signing in…" : "Sign in"}
           </Button>
+
+          <Link to="/reset-password" className="text-center text-[0.8rem] text-muted-foreground hover:text-foreground">
+            Forgot your password?
+          </Link>
         </form>
       ) : (
         <form onSubmit={submitCode} className="flex flex-col gap-4 rounded-lg border bg-card p-5">

@@ -5,6 +5,7 @@ import { SessionProvider } from "@/lib/session"
 import { Home } from "@/pages/Home"
 import { Login } from "@/pages/Login"
 import { Register } from "@/pages/Register"
+import { ResetPassword } from "@/pages/ResetPassword"
 import { Orgs } from "@/pages/Orgs"
 import { NewAgent } from "@/pages/NewAgent"
 import { Agent } from "@/pages/Agent"
@@ -27,6 +28,7 @@ export default function App() {
             <Route path="/" element={<Home />} />
             <Route path="/login" element={<Login />} />
             <Route path="/register" element={<Register />} />
+            <Route path="/reset-password" element={<ResetPassword />} />
             <Route path="/new" element={<NewAgent />} />
             <Route path="/orgs" element={<Orgs />} />
             <Route path="/tokens" element={<Tokens />} />

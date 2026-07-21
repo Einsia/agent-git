@@ -433,6 +433,24 @@ export const api = {
   // token is never returned here — an operator forwards the logged/printed link. 400 if no email on file.
   resendEmailVerification: () => request<{ ok: boolean }>("/api/me/verify/resend", { method: "POST" }),
 
+  // ── password reset (locked-out recovery, operator-forwarded token) ──
+  // Request a reset link for a locked-out account. UNAUTHENTICATED and anti-enumeration: ALWAYS a generic
+  // 200 whether or not the account exists, so it can never confirm a username. The reset link is delivered
+  // out-of-band (logged/printed for an operator to forward) — never returned here.
+  requestPasswordReset: (username: string) =>
+    request<{ ok: boolean; message: string }>("/api/password-reset/request", {
+      method: "POST",
+      body: JSON.stringify({ username }),
+    }),
+  // Spend a reset token (the unguessable capability from the forwarded link) to set a NEW password — no
+  // old password required, a valid token IS. 400 on an unknown/expired/spent token or a too-short password.
+  // On 200 every session for the account is revoked, so the user re-authenticates with the new password.
+  consumePasswordReset: (token: string, newPassword: string) =>
+    request<{ ok: boolean; revoked_sessions: number }>("/api/password-reset/consume", {
+      method: "POST",
+      body: JSON.stringify({ token, new_password: newPassword }),
+    }),
+
   // ── signing keys (device keys, SSH-keys style) ──
   // The account's registered device-key SET (public halves only), latest first. Any signed-in caller may
   // read a user's set; the Account page reads its OWN. 404 when the account has no non-revoked key.
