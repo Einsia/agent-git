@@ -88,8 +88,57 @@ fn read(runtime: &str, text: &str) -> Option<Distilled> {
     Some(distill(&ir))
 }
 
+/// The subset of `git log` options the SESSION timeline can honor. `git a log` is not a byte-level
+/// `git log`, so most of git's flags have no session-level meaning; the ones that do are mapped here,
+/// and anything else is surfaced (never silently swallowed) — see `agent_log`.
+struct LogOpts {
+    /// `-n <N>` / `-<N>` / `-n<N>`: cap the session list to the N most recent. `None` = all.
+    limit: Option<usize>,
+    /// `--oneline`: one physical line per session (no header, no blank lines).
+    oneline: bool,
+    /// A revision or range positional (`HEAD~1`, a sha, `A..B`): scope the list to sessions changed in
+    /// that range. A bare rev `R` means `R..HEAD` (the sessions new since R).
+    range: Option<String>,
+}
+
+/// Parse `agit a log` arguments into the options the session view honors. A dash flag the view cannot
+/// map is NOT swallowed (git-parity): a one-line note points at `--raw`, and parsing continues so the
+/// flags that DO map still take effect.
+fn parse_log_opts(args: &[String]) -> LogOpts {
+    let mut opts = LogOpts { limit: None, oneline: false, range: None };
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--oneline" {
+            opts.oneline = true;
+            i += 1;
+        } else if a == "-n" {
+            // `-n <N>`
+            opts.limit = args.get(i + 1).and_then(|s| s.parse::<usize>().ok());
+            i += 2;
+        } else if let Some(n) = a.strip_prefix("-n").filter(|s| !s.is_empty()).and_then(|s| s.parse::<usize>().ok()) {
+            // `-n<N>` glued
+            opts.limit = Some(n);
+            i += 1;
+        } else if let Some(n) = a.strip_prefix('-').filter(|s| !s.is_empty()).and_then(|s| s.parse::<usize>().ok()) {
+            // `-<N>`
+            opts.limit = Some(n);
+            i += 1;
+        } else if a.starts_with('-') {
+            eprintln!("note: agit a log does not map '{a}'; use `agit a log --raw` for the git log.");
+            i += 1;
+        } else {
+            // A revision or range positional scopes the list (last one wins).
+            opts.range = Some(a.to_string());
+            i += 1;
+        }
+    }
+    opts
+}
+
 /// `agit a log` — the store's sessions as a timeline, most recent first.
-pub fn agent_log(_args: &[String]) -> Result<i32> {
+pub fn agent_log(args: &[String]) -> Result<i32> {
+    let opts = parse_log_opts(args);
     let agent = crate::agent::resolve(None)?;
     let mut sessions = commands::store_sessions(&agent.store);
     // Most recent first, by what the store RECORDS (recency), not the filesystem — the same ordering
@@ -98,6 +147,59 @@ pub fn agent_log(_args: &[String]) -> Result<i32> {
 
     if sessions.is_empty() {
         println!("{} has no sessions yet: agit start, then agit a snap.", ui::bold(&agent.name));
+        return Ok(0);
+    }
+
+    // A revision positional scopes the list to sessions that CHANGED in the range. A bare rev `R`
+    // becomes `R..HEAD` (what is new since R); a `..`/`...` positional is a range already.
+    if let Some(rev) = &opts.range {
+        let spec = if rev.contains("..") { rev.clone() } else { format!("{rev}..HEAD") };
+        let (code, out) =
+            scope::git_in_status(&agent.store, &["diff", "--name-only", &spec, "--", "sessions"]);
+        if code != 0 {
+            anyhow::bail!(
+                "could not scope to {spec} on the store: check the ref (or use `agit a log --raw` for the git log)."
+            );
+        }
+        let changed: std::collections::HashSet<&str> = out.lines().collect();
+        sessions.retain(|s| {
+            s.path
+                .strip_prefix(&agent.store)
+                .ok()
+                .and_then(|rel| rel.to_str())
+                .map(|rel| changed.contains(rel))
+                .unwrap_or(false)
+        });
+    }
+
+    // `-n <N>` / `-<N>`: keep the N most recent (after scoping, before rendering).
+    if let Some(n) = opts.limit {
+        sessions.truncate(n);
+    }
+
+    // `--oneline`: exactly one line per session, no header or blank lines — the pipe-friendly form.
+    if opts.oneline {
+        for s in &sessions {
+            let text = std::fs::read_to_string(&s.path).unwrap_or_default();
+            let gist = convo::read_conversation(s.runtime, &text)
+                .ok()
+                .map(|ir| distill(&ir))
+                .and_then(|d| d.prompts.first().cloned())
+                .map(|g| ui::one_line(&g, 60))
+                .unwrap_or_else(|| "(no prompt)".to_string());
+            println!(
+                "{} {} {} {}",
+                ui::accent(&short_id(&s.path)),
+                s.runtime,
+                ui::dim(&ui::ago(s.recency())),
+                ui::dim(&format!("\"{gist}\""))
+            );
+        }
+        return Ok(0);
+    }
+
+    if sessions.is_empty() {
+        println!("{} · no sessions in that range.", ui::bold(&agent.name));
         return Ok(0);
     }
 
@@ -164,17 +266,35 @@ pub fn agent_diff(args: &[String]) -> Result<i32> {
     let agent = crate::agent::resolve(None)?;
     let store = &agent.store;
     let refs: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).map(String::as_str).collect();
-    let (from, to) = match refs.as_slice() {
-        [] => (default_from(store), "HEAD".to_string()),
-        [a] => ((*a).to_string(), "HEAD".to_string()),
-        [a, b, ..] => ((*a).to_string(), (*b).to_string()),
+    // `diff_range` is what we hand `git diff` (a single `A..B`/`A...B` token, or two endpoint refs);
+    // `from`/`to` are the endpoints we `git show` each side of and print in the header. A single
+    // positional that ALREADY contains `..`/`...` is a range: pass it through verbatim, never append
+    // `..HEAD` (that produced the doubled `HEAD~2..HEAD..HEAD` git error).
+    let (diff_range, from, to): (Vec<String>, String, String) = match refs.as_slice() {
+        [] => {
+            let f = default_from(store);
+            (vec![f.clone(), "HEAD".to_string()], f, "HEAD".to_string())
+        }
+        [a] if a.contains("..") => {
+            let sep = if a.contains("...") { "..." } else { ".." };
+            let (l, r) = a.split_once(sep).unwrap_or((a, ""));
+            let from = if l.is_empty() { "HEAD".to_string() } else { l.to_string() };
+            let to = if r.is_empty() { "HEAD".to_string() } else { r.to_string() };
+            (vec![(*a).to_string()], from, to)
+        }
+        [a] => (vec![(*a).to_string(), "HEAD".to_string()], (*a).to_string(), "HEAD".to_string()),
+        [a, b, ..] => (
+            vec![(*a).to_string(), (*b).to_string()],
+            (*a).to_string(),
+            (*b).to_string(),
+        ),
     };
 
-    // Which session files differ between the two refs, restricted to `sessions/`.
-    let (code, out) = scope::git_in_status(
-        store,
-        &["diff", "--name-status", &from, &to, "--", "sessions"],
-    );
+    // Which session files differ across the range, restricted to `sessions/`.
+    let mut diff_args: Vec<&str> = vec!["diff", "--name-status"];
+    diff_args.extend(diff_range.iter().map(String::as_str));
+    diff_args.extend(["--", "sessions"]);
+    let (code, out) = scope::git_in_status(store, &diff_args);
     if code != 0 {
         anyhow::bail!(
             "could not diff {from}..{to} on the store: check the refs (or use `agit a diff --raw` for the git diff)."
@@ -276,6 +396,13 @@ fn show(store: &Path, r: &str, path: &str) -> Option<String> {
 fn runtime_of(path: &str) -> Option<&'static str> {
     let parent = Path::new(path).parent()?.file_name()?.to_str()?;
     session::runtimes().into_iter().find(|rt| *rt == parent)
+}
+
+/// A short, stable handle for a session in the `--oneline` view: the transcript's file stem, clipped to
+/// the first 8 chars (a UUID stem is otherwise a screenful). Not a git oid — the session IS the unit.
+fn short_id(path: &Path) -> String {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+    stem.chars().take(8).collect()
 }
 
 /// "a, b, c" up to three files, then "a, b and N more" — an edit list is context, not an inventory.

@@ -22,6 +22,14 @@ use std::path::PathBuf;
 use std::process::exit;
 
 fn main() {
+    // git-parity: Rust's runtime IGNORES SIGPIPE, so the first `println!` into a closed pipe
+    // (`agit a log | head`, `| less`, `| grep -m1`) fails and the print macro PANICS
+    // ("failed printing to stdout: Broken pipe", exit 101). Reset the disposition to the default
+    // BEFORE any output so the process is simply killed by SIGPIPE, exactly like git.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     exit(dispatch(argv));
 }
@@ -345,15 +353,15 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── watch: fully hands-off — watch both runtimes' dumps, auto-snap + auto-convert both ways.
         //    --daemon runs it forever in the background; --stop / --status manage it. ──
-        "watch" => {
-            let (interval, convert, harness, action) = parse_watch(args);
-            match action {
+        "watch" => match parse_watch(args) {
+            Ok((interval, convert, harness, action)) => match action {
                 1 => session::watch_daemon(interval, convert, harness),
                 2 => session::watch_stop(),
                 3 => session::watch_status(),
                 _ => session::watch(interval, convert, harness),
-            }
-        }
+            },
+            Err(ctl) => Ok(ctl.emit(WATCH_USAGE)),
+        },
 
         // ── harness: show / apply the captured MCP + skills + config (part of Agent State) ──
         "harness" => {
@@ -363,13 +371,22 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── Convert a session across runtimes (resume it in another CLI); --watch = auto-convert worker ──
         "convert" if args.iter().any(|a| a == "--watch") => {
-            let interval = args
-                .iter()
-                .position(|a| a == "--interval")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5);
-            commands::convert_watch(interval)
+            // The auto-convert worker is an infinite, side-effecting loop. `--help`/`-h` must PRINT
+            // usage and launch NOTHING; an unknown flag is rejected, not swallowed into the loop
+            // (git-parity) — never a silent fall-through into the watcher.
+            if args.iter().any(|a| a == "--help" || a == "-h") {
+                Ok(ParseCtl::Help.emit(CONVERT_USAGE))
+            } else if let Some(bad) = watch_convert_unknown_flag(args) {
+                Ok(ParseCtl::Unknown(bad).emit(CONVERT_USAGE))
+            } else {
+                let interval = args
+                    .iter()
+                    .position(|a| a == "--interval")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(5);
+                commands::convert_watch(interval)
+            }
         }
         "convert" => match parse_convert(args) {
             Ok((sel, from, to, cwd, write)) => {
@@ -454,6 +471,7 @@ const SNAP_USAGE: &str = "usage: agit a snap [<runtime>] [--from <runtime>] [--w
 const CONVERT_USAGE: &str = "usage: agit convert [<session|agent>] --to claude-code|codex [--from RT] [--cwd PATH] [--write]\n  (no session -> the active agent's latest; an agent name -> that agent's latest; --watch [--interval N] to auto-convert both ways)";
 const RESUME_USAGE: &str = "usage: agit resume [<session|agent>] [--as claude-code|codex] [--env PATH] [--relocate] [--cwd PATH] [--exec]\n  (no session -> the active agent's latest; an agent name -> that agent's latest)";
 const INIT_USAGE: &str = "usage: agit init [--agent <name>]   (prepare this repo: clone or select its agent, install the secret hooks)";
+const WATCH_USAGE: &str = "usage: agit watch [--interval <n>] [--no-convert] [--no-harness] [--daemon|--background] [--stop] [--status]\n  (hands-off: watch both runtimes' dumps, auto-snap + auto-convert both ways; --daemon runs it in the background, --stop/--status manage it)";
 const MERGE_USAGE: &str = "usage: agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice] [--dry-run]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref (--agent X / --ref X disambiguate); --quick shortens the dialogue; --splice skips the model and just combines both sessions' context; --dry-run/--preview shows what the merge would do without running the model)";
 
 /// start arguments: `--agent <name|aid>` (this invocation only — it does NOT flip the default, or two
@@ -545,7 +563,7 @@ fn parse_snap(args: &[String]) -> Result<SnapArgs, ParseCtl> {
 /// `--daemon`/`--background` (1), `--stop` (2), `--status` (3); default run (0).
 /// Returns (interval, do-convert, capture-harness, action).
 type WatchArgs = (u64, bool, bool, u8);
-fn parse_watch(args: &[String]) -> WatchArgs {
+fn parse_watch(args: &[String]) -> Result<WatchArgs, ParseCtl> {
     let mut interval = 5u64;
     let mut convert = true;
     let mut harness = true;
@@ -577,10 +595,33 @@ fn parse_watch(args: &[String]) -> WatchArgs {
                 action = 3;
                 i += 1;
             }
+            // `--help`/`-h` must PRINT usage and LAUNCH NOTHING: watch is an infinite, side-effecting
+            // loop (it writes auto-snap commits), so a swallowed flag that falls into it is a footgun.
+            "--help" | "-h" => return Err(ParseCtl::Help),
+            // An unknown dash flag is REJECTED, not swallowed into the watcher (git-parity), exactly
+            // like init/snap/scan/convert. A misspelled `--stpo` must not silently start the daemon.
+            other if other.starts_with('-') => return Err(ParseCtl::Unknown(other.to_string())),
+            // watch takes no positional; ignore a stray bare word, as before.
             _ => i += 1,
         }
     }
-    (interval, convert, harness, action)
+    Ok((interval, convert, harness, action))
+}
+
+/// The first dash argument in a `convert --watch` invocation that is neither `--watch` nor `--interval`
+/// (whose numeric value is skipped). The auto-convert worker honors only those two, so any other flag is
+/// an error, not a silent no-op that still enters the infinite loop.
+fn watch_convert_unknown_flag(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval" => i += 2, // skip the flag and its numeric value
+            "--watch" => i += 1,
+            a if a.starts_with('-') => return Some(a.to_string()),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// harness arguments: an optional subcommand positional (`show`/`apply`, default `show`), `--from <rt>`,

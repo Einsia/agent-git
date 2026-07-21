@@ -209,7 +209,7 @@ impl Partition {
         match (&self.env, &self.slug) {
             (Some(e), _) => e.clone(),
             (None, Some(s)) => format!("(checkout {s})"),
-            (None, None) => "(a checkout from before agit partitioned the harness — agit cannot tell which)".to_string(),
+            (None, None) => "(a checkout from before agit partitioned the harness: agit cannot tell which)".to_string(),
         }
     }
 }
@@ -309,7 +309,7 @@ fn copy_prose(src: &Path, dst: &Path, label: &str, report: &mut Report) -> Resul
     }
     let text = std::fs::read_to_string(src)?;
     if !crate::scan::scan_text_opts(&text, true).is_empty() {
-        report.warnings.push(format!("{label} NOT captured — contains a suspected secret; remove it and re-snap"));
+        report.warnings.push(format!("{label} NOT captured: contains a suspected secret; remove it and re-snap"));
         return Ok(());
     }
     if let Some(parent) = dst.parent() {
@@ -340,12 +340,12 @@ fn copy_tree_scanned(src: &Path, dst: &Path, label: &str, report: &mut Report) -
                     report.redactions.extend(reds);
                     report.files += 1;
                 }
-                Err(_) => report.warnings.push(format!("{label}/{} NOT captured — unparseable JSON", rel.display())),
+                Err(_) => report.warnings.push(format!("{label}/{} NOT captured: unparseable JSON", rel.display())),
             }
             continue;
         }
         if !crate::scan::scan_text_opts(&text, true).is_empty() {
-            report.warnings.push(format!("{label}/{} NOT captured — contains a suspected secret", rel.display()));
+            report.warnings.push(format!("{label}/{} NOT captured: contains a suspected secret", rel.display()));
             continue;
         }
         std::fs::copy(entry.path(), &target)?;
@@ -399,7 +399,7 @@ pub fn show(agent: &Path, env: &Path, runtime: &str) -> Result<i32> {
     let others = other_partitions(agent, env, &rt);
     match &own {
         Some(p) => {
-            outln!("Captured harness ({rt}, project scope) — this checkout, {}:", env.display());
+            outln!("Captured harness ({rt}, project scope): this checkout, {}:", env.display());
             let (servers, skills, commands, secrets) = summarize(p);
             outln!("  MCP servers : {servers}");
             outln!("  skills      : {skills}");
@@ -415,7 +415,7 @@ pub fn show(agent: &Path, env: &Path, runtime: &str) -> Result<i32> {
         // read as contradicting each other — a dead end announced directly above the thing it denies.
         // One sentence, so the user reconciles nothing.
         None => outln!(
-            "Nothing captured in this checkout yet ({}) — but this agent carries a {rt} harness from elsewhere:",
+            "Nothing captured in this checkout yet ({}): but this agent carries a {rt} harness from elsewhere:",
             env.display()
         ),
     }
@@ -425,7 +425,7 @@ pub fn show(agent: &Path, env: &Path, runtime: &str) -> Result<i32> {
         }
         for p in &others {
             let (servers, skills, commands, secrets) = summarize(p);
-            outln!("  {} — {servers} MCP server(s), {skills} skill(s), {commands} command(s), {secrets} secret(s){}", p.label(), when(p));
+            outln!("  {}: {servers} MCP server(s), {skills} skill(s), {commands} command(s), {secrets} secret(s){}", p.label(), when(p));
         }
         outln!(
             "\n  {}",
@@ -475,7 +475,7 @@ fn select(
             if !interactive {
                 bail!(
                     "Nothing captured in this checkout ({}), and this agent captured a {rt} harness in {} others:\n  {}\n\
-                     Which of them this checkout should adopt is not agit's to guess — say which with --from-env <checkout>.",
+                     Which of them this checkout should adopt is not agit's to guess: say which with --from-env <checkout>.",
                     env.display(),
                     others.len(),
                     labels.join("\n  ")
@@ -523,7 +523,7 @@ pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool, from_env: Opt
     let src = chosen.project();
     let (servers, skills, commands, secrets) = summarize(&chosen);
     if !is_own {
-        outln!("Adopting the harness this agent captured in {}{} — this checkout ({}) has none of its own.", chosen.label(), when(&chosen), env.display());
+        outln!("Adopting the harness this agent captured in {}{}: this checkout ({}) has none of its own.", chosen.label(), when(&chosen), env.display());
     }
     outln!("Captured harness ({rt}): {servers} MCP servers, {skills} skills, {commands} commands, {secrets} secret(s) to provide.");
 
@@ -564,7 +564,7 @@ pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool, from_env: Opt
 
     // settings.json can carry hooks (executable). Never auto-apply — surface it.
     if src.join("settings.json").is_file() {
-        skipped.push("settings.json (may contain hooks that run commands — review and apply manually)".into());
+        skipped.push("settings.json (may contain hooks that run commands: review and apply manually)".into());
     }
 
     outln!("\nApplied: {}", if applied.is_empty() { "(nothing)".into() } else { applied.join(", ") });
@@ -572,7 +572,7 @@ pub fn apply(agent: &Path, env: &Path, runtime: &str, force: bool, from_env: Opt
         outln!("  skipped: {s}");
     }
     for u in &unresolved {
-        errln!("  ⚠ secret not provided: {u} — left as a placeholder in .mcp.json (set ${u} or edit it in)");
+        errln!("  ⚠ secret not provided: {u}: left as a placeholder in .mcp.json (set ${u} or edit it in)");
     }
     Ok(if unresolved.is_empty() { 0 } else { 1 })
 }
@@ -630,7 +630,7 @@ pub fn merge_mcp(captured: &str, local_path: &Path, conflicts: &mut Vec<String>)
                     local_servers.insert(name.clone(), def.clone());
                 }
                 Some(existing) if existing == def => {}
-                Some(_) => conflicts.push(format!("MCP server '{name}' differs from local — kept local")),
+                Some(_) => conflicts.push(format!("MCP server '{name}' differs from local: kept local")),
             }
         }
     }

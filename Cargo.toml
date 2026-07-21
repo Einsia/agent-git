@@ -52,6 +52,10 @@ totp-rs = { version = "5", default-features = false, features = ["otpauth", "gen
 # Client-side provenance: a per-machine ed25519 identity signs each captured session.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+# git-parity: reset the SIGPIPE disposition to SIG_DFL at startup so piping long native output into
+# head/less/grep -m1 terminates cleanly (like git) instead of Rust's default panic on EPIPE
+# ("failed printing to stdout: Broken pipe"). Already a transitive dep; pinned directly for the call.
+libc = "0.2"
 # Encryption-recipients Wave 1: derive an X25519 encryption keypair from the same ed25519 identity
 # secret via the standard ed25519->curve25519 (Edwards->Montgomery) map. Already a transitive dep (of
 # ed25519-dalek); pinned directly so the clamp/basepoint helpers (`clamp_integer`, `X25519_BASEPOINT`,

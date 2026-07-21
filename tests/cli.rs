@@ -1947,6 +1947,147 @@ fn a_diff_shows_session_level_changes_and_raw_falls_back_to_git() {
     assert!(raw.contains("sessionId"), "`a diff --raw` is the byte-level git diff: {raw}");
 }
 
+/// git-parity: Rust ignores SIGPIPE, so `agit a log | head` USED to panic on the first write into the
+/// closed pipe ("failed printing to stdout: Broken pipe", exit 101). With SIGPIPE reset to the default,
+/// piping long native output into a reader that closes early terminates cleanly (killed by SIGPIPE, no
+/// panic), exactly like git. Enough sessions that the output far exceeds the OS pipe buffer, so the
+/// child is still writing when the reader closes — the exact condition that triggered the panic.
+#[test]
+fn a_log_piped_into_a_short_reader_does_not_panic_on_broken_pipe() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let r = Repo::new();
+    let dir = r.agent().join("sessions/claude-code");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..800 {
+        std::fs::write(
+            dir.join(format!("s{i:04}.jsonl")),
+            session_with("investigate the broken pipe handling", "/code/web/pipe.rs", "2026-07-16T09:00:00Z"),
+        )
+        .unwrap();
+    }
+
+    let mut c = r.cmd(BIN);
+    c.args(["a", "log"]).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    // Read exactly one line, then drop the reader (and the stdout handle) — closing the read end. The
+    // child, still writing the remaining ~800 sessions, hits the closed pipe.
+    {
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+    }
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(101), "piping `a log` into a short reader must not panic (exit 101): stderr={err}");
+    assert!(
+        !err.contains("Broken pipe") && !err.contains("panicked"),
+        "no broken-pipe panic on the native stdout write path: stderr={err}"
+    );
+}
+
+/// git-parity: `agit a log` must HONOR the common `git log` shaping flags, not discard them. `-n <N>`
+/// truncates to the N most recent sessions, `--oneline` emits one line per session, and a revision
+/// positional scopes the list to the sessions changed in that range.
+#[test]
+fn a_log_honors_n_oneline_and_a_revision_scope() {
+    let r = Repo::new();
+    let commit = |r: &Repo, msg: &str| {
+        r.git_agent(&["add", "-A"]);
+        r.git_agent(&["commit", "--no-verify", "-m", msg]);
+    };
+    r.write_agent("sessions/claude-code/s1.jsonl", &session_with("first prompt alpha", "/code/web/a.rs", "2026-07-10T09:00:00Z"));
+    commit(&r, "s1");
+    r.write_agent("sessions/claude-code/s2.jsonl", &session_with("second prompt beta", "/code/web/b.rs", "2026-07-12T09:00:00Z"));
+    commit(&r, "s2");
+    r.write_agent("sessions/claude-code/s3.jsonl", &session_with("third prompt gamma", "/code/web/c.rs", "2026-07-16T09:00:00Z"));
+    commit(&r, "s3");
+
+    let (_, full, _) = r.agit(&["a", "log"]);
+    assert!(full.contains("alpha") && full.contains("beta") && full.contains("gamma"), "bare log lists every session: {full}");
+
+    // `-n 1`: fewer session lines than the full listing, and keeps only the MOST RECENT session.
+    let (code, limited, err) = r.agit(&["a", "log", "-n", "1"]);
+    assert_eq!(code, 0, "`a log -n 1` must succeed: {err}");
+    assert!(limited.lines().count() < full.lines().count(), "-n 1 yields fewer lines than bare log:\nfull=\n{full}\nlimited=\n{limited}");
+    assert!(limited.contains("gamma"), "-n 1 keeps the newest session: {limited}");
+    assert!(!limited.contains("alpha"), "-n 1 drops the older sessions: {limited}");
+
+    // `--oneline`: exactly one physical line per session (3 sessions -> 3 non-empty lines).
+    let (code, oneline, err) = r.agit(&["a", "log", "--oneline"]);
+    assert_eq!(code, 0, "`a log --oneline` must succeed: {err}");
+    let lines = oneline.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(lines, 3, "--oneline is one line per session: {oneline}");
+    assert!(oneline.contains("gamma") && oneline.contains("alpha"), "every session shows on its one line: {oneline}");
+
+    // A revision positional scopes the list: `HEAD~1` means `HEAD~1..HEAD`, i.e. only the last commit's
+    // session (gamma), never the sessions outside the range.
+    let (code, scoped, err) = r.agit(&["a", "log", "HEAD~1"]);
+    assert_eq!(code, 0, "a revision-scoped log must succeed: {err}");
+    assert!(scoped.contains("gamma"), "the range covers the newest session: {scoped}");
+    assert!(!scoped.contains("alpha"), "the range excludes sessions outside it: {scoped}");
+    assert!(scoped.lines().count() < full.lines().count(), "a revision genuinely scopes the list: {scoped}");
+}
+
+/// git-parity: a SINGLE range positional (`agit a diff HEAD~2..HEAD`) must be passed through as the
+/// range, not turned into `from` with `..HEAD` appended (which produced the doubled `HEAD~2..HEAD..HEAD`
+/// git error). The two-argument form `a diff A B` must keep working.
+#[test]
+fn a_diff_accepts_a_range_positional_without_doubling_the_ref() {
+    let r = Repo::new();
+    r.write_agent("sessions/claude-code/d1.jsonl", &session_with("added session one", "/code/web/one.rs", "2026-07-14T09:00:00Z"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "d1"]);
+    r.write_agent("sessions/claude-code/d2.jsonl", &session_with("added session two", "/code/web/two.rs", "2026-07-16T09:00:00Z"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "d2"]);
+
+    // Single `A..B` range positional: diffs cleanly, no doubled ref.
+    let (code, out, err) = r.agit(&["a", "diff", "HEAD~2..HEAD"]);
+    assert_eq!(code, 0, "a single `A..B` range positional must diff cleanly: {err}");
+    assert!(!err.contains("HEAD~2..HEAD..HEAD"), "the range must not be doubled: {err}");
+    assert!(out.contains("added session one") && out.contains("added session two"), "the range covers both added sessions: {out}");
+
+    // The two-arg form still works.
+    let (code2, out2, err2) = r.agit(&["a", "diff", "HEAD~2", "HEAD"]);
+    assert_eq!(code2, 0, "the two-arg diff form still works: {err2}");
+    assert!(out2.contains("added session two"), "the two-arg diff covers the newer session: {out2}");
+}
+
+/// Footgun guard: `agit watch` runs an infinite, side-effecting loop (it writes auto-snap commits).
+/// `--help`/`-h` must PRINT usage and launch NOTHING; an unknown flag must be rejected non-zero, not
+/// swallowed into the loop. `agit convert --watch --help` must likewise print usage, not enter the
+/// auto-convert worker.
+#[test]
+fn watch_help_and_unknown_flags_never_enter_the_loop() {
+    let r = Repo::new();
+    let before = r.git_agent(&["rev-parse", "HEAD"]);
+
+    let (code, out, _) = r.agit(&["watch", "--help"]);
+    assert_eq!(code, 0, "`watch --help` must exit 0");
+    assert!(out.contains("usage: agit watch"), "`watch --help` prints usage: {out}");
+
+    let (code_h, out_h, _) = r.agit(&["watch", "-h"]);
+    assert_eq!(code_h, 0, "`watch -h` must exit 0");
+    assert!(out_h.contains("usage: agit watch"), "`watch -h` prints usage: {out_h}");
+
+    // No side effect: the store's HEAD must not have moved (no auto-snap commit).
+    let after = r.git_agent(&["rev-parse", "HEAD"]);
+    assert_eq!(before, after, "`watch --help` must not write a store commit: {before} -> {after}");
+
+    // An unknown flag is rejected non-zero and named, not started as a daemon.
+    let (code_bad, _, err_bad) = r.agit(&["watch", "--bogus"]);
+    assert_ne!(code_bad, 0, "an unknown watch flag must be rejected: {err_bad}");
+    assert!(err_bad.contains("unknown option"), "and the offending flag is named: {err_bad}");
+
+    // `convert --watch --help` must print usage and NOT enter the auto-convert worker.
+    let (code_cw, out_cw, _) = r.agit(&["convert", "--watch", "--help"]);
+    assert_eq!(code_cw, 0, "`convert --watch --help` must exit 0");
+    assert!(out_cw.contains("usage: agit convert"), "`convert --watch --help` prints usage: {out_cw}");
+    let after_cw = r.git_agent(&["rev-parse", "HEAD"]);
+    assert_eq!(before, after_cw, "`convert --watch --help` must not write a store commit");
+}
+
 // ─────────────────────── `agit a rebind` — binding-repair e2e coverage ───────────────────────
 
 /// A stale but well-formed aid, standing in for the identity a committed binding still records after a
@@ -2537,7 +2678,10 @@ fn diverged_pull_suggests_the_upstream_ref_not_the_agent_name() {
 #[test]
 fn no_user_facing_string_carries_an_em_dash() {
     let root = env!("CARGO_MANIFEST_DIR");
-    let files = ["init.rs", "session.rs", "sync.rs", "commands.rs", "main.rs", "view.rs", "agent.rs"];
+    let files = [
+        "init.rs", "session.rs", "sync.rs", "commands.rs", "main.rs", "view.rs", "agent.rs",
+        "adapter/mod.rs", "shadow.rs", "harness.rs",
+    ];
     let mut offenders: Vec<String> = Vec::new();
     for f in files {
         let path = format!("{root}/src/{f}");

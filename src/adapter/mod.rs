@@ -85,13 +85,13 @@ struct Registered {
 const REGISTRY: &[Registered] = &[
     Registered {
         name: "claude-code",
-        desc: "Claude Code — parses ~/.claude/projects/<slug>/<session>.jsonl (implemented)",
+        desc: "Claude Code: parses ~/.claude/projects/<slug>/<session>.jsonl (implemented)",
         aliases: &["claude", "cc"],
         make: || Box::new(claude_code::ClaudeCode),
     },
     Registered {
         name: "codex",
-        desc: "Codex — parses ~/.codex/sessions/*/rollout-*.jsonl (filters projects by cwd) (implemented)",
+        desc: "Codex: parses ~/.codex/sessions/*/rollout-*.jsonl (filters projects by cwd) (implemented)",
         aliases: &[],
         make: || Box::new(codex::Codex),
     },

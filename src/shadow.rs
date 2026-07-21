@@ -174,7 +174,7 @@ fn on_path(cmd: &str) -> bool {
 pub fn install(shell: Option<Shell>) -> Result<i32> {
     let shell = shell
         .or_else(detect)
-        .context("could not detect your shell — pass --shell bash|zsh|fish|powershell")?;
+        .context("could not detect your shell: pass --shell bash|zsh|fish|powershell")?;
     let path = profile_path(shell)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
@@ -191,7 +191,7 @@ pub fn install(shell: Option<Shell>) -> Result<i32> {
         path.display()
     );
     if !on_path("agit") {
-        eprintln!("  note: `agit` is not on your PATH — the shadow calls it by name, so add it first.");
+        eprintln!("  note: `agit` is not on your PATH: the shadow calls it by name, so add it first.");
     }
     println!("Start a new shell (or re-source the profile). `command git …` always runs pure git.");
     Ok(0)
@@ -226,7 +226,7 @@ pub fn status() -> Result<i32> {
     for s in ALL {
         let Ok(path) = profile_path(s) else { continue };
         if std::fs::read_to_string(&path).map(|c| c.contains(BEGIN)).unwrap_or(false) {
-            println!("● installed ({}) — {}", s.label(), path.display());
+            println!("● installed ({}): {}", s.label(), path.display());
             any = true;
         }
     }
@@ -246,7 +246,7 @@ pub fn run(args: &[String]) -> Result<i32> {
             "--shell" if i + 1 < args.len() => {
                 shell = Shell::parse(&args[i + 1]);
                 if shell.is_none() {
-                    bail!("unknown shell `{}` — use bash|zsh|fish|powershell", args[i + 1]);
+                    bail!("unknown shell `{}`: use bash|zsh|fish|powershell", args[i + 1]);
                 }
                 i += 2;
             }

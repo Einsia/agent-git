@@ -29,6 +29,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "once_cell",
  "rand 0.8.7",
  "regex",
