@@ -484,6 +484,23 @@ fn fuse(store: &Path, target: &Target) -> Result<i32> {
             "FETCH_HEAD".to_string()
         }
     };
+    // Gate the history-join itself: a raw `git merge` would splice the peer branch's commits into the
+    // Agent Store's history with no scan, so a secret committed on that branch/ref would enter the store
+    // via the fuse (the merged-session commit is gated separately, but this history-join is not). Scan the
+    // INCOMING range only — commits reachable from `spec` but NOT already in the store's HEAD — with the
+    // same range-scanner the push gate uses, so a secret already living in HEAD is not re-flagged.
+    //
+    // The range is expressed as the two-dot revision `HEAD..spec` in the `sources` slice with an EMPTY
+    // `remotes`: `secret_gate_range`'s `remotes` are `git rev-list --remotes=<pattern>` GLOBS (they name
+    // remote-tracking refs), so passing "HEAD" there matches no ref and excludes nothing — it would scan
+    // the whole reachable history and wrongly re-flag secrets already in HEAD. `HEAD..spec` is the exact
+    // set of commits the merge would add.
+    let gate = crate::commands::secret_gate_range(store, &[format!("HEAD..{spec}")], &[], "merge")?;
+    if !gate.allowed() {
+        // The gate already disclosed the findings on stderr. Never run the merge: the secret must not
+        // enter the store's history. Exit non-zero so the merge reflects the block.
+        return Ok(1);
+    }
     outln!("\nMerging the histories (same agent):");
     let rc = scope::git_in_inherit(store, &["merge", &spec]);
     if rc != 0 {

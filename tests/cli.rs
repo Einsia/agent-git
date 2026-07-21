@@ -1599,6 +1599,112 @@ fn a_merge_splice_gates_a_merged_secret_out_of_history() {
     assert!(!leaked, "the secret must not be committed anywhere in the store: {tracked}");
 }
 
+// ─────────────────── the fuse (history-join) secret gate ───────────────────
+
+/// Build a SAME-AGENT `peer` branch that is strictly ahead of `main` by ONE commit carrying `note` inside
+/// a codex session. Because the divergent session is a codex one, `agit a merge peer --from claude-code`
+/// finds an EMPTY claude tail and takes the early-return path straight into the git fuse — isolating the
+/// history-join gate from the merged-session snap gate. Returns to `main` with the store's HEAD unmoved,
+/// so a caller can record `HEAD` before invoking the merge. `--no-verify` puts the (possibly secret)
+/// session into the peer's history without agit's own commit gate touching it — exactly the raw-commit
+/// threat the fuse gate must catch.
+fn peer_ahead_by_codex_session(r: &Repo, file: &str, note: &str) {
+    r.git_agent(&["checkout", "-q", "-b", "peer"]);
+    r.write_agent(file, &claude_session("PEER", note));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "peer codex session"]);
+    r.git_agent(&["checkout", "-q", "main"]);
+}
+
+/// Is `sub` reachable in any blob under `sessions/` at the store's HEAD? Proves whether a secret entered
+/// (or stayed out of) the fused history, independent of the working tree.
+fn head_sessions_contain(r: &Repo, sub: &str) -> bool {
+    let tracked = r.git_agent(&["ls-tree", "-r", "--name-only", "HEAD", "--", "sessions"]);
+    tracked
+        .lines()
+        .any(|f| r.git_agent(&["show", &format!("HEAD:{f}")]).contains(sub))
+}
+
+/// The core hole this wave closes: the same-agent fuse runs a raw `git merge` on the Agent Store with no
+/// scan, so a secret committed on the PEER branch would enter the store's git history via the fuse alone
+/// (the merged-session commit is gated separately; the history-join was not). The fuse gate must scan the
+/// incoming commits and REFUSE — the merge must not run, HEAD must not move, and the peer's secret blob
+/// must never become reachable from HEAD.
+#[test]
+fn a_merge_fuse_refuses_a_secret_committed_on_the_peer_branch() {
+    let r = Repo::new();
+    peer_ahead_by_codex_session(&r, "sessions/codex/leak.jsonl", "aws key AKIAIOSFODNN7EXAMPLE on the peer");
+
+    let head_before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--splice"]);
+
+    assert_ne!(code, 0, "the fuse must refuse to join a history carrying a secret: {out}{err}");
+    assert!(
+        err.contains("secret gate") || err.contains("suspected") || err.contains("AKIA"),
+        "the fuse must disclose the block: {err}{out}"
+    );
+    // The `git merge` did NOT run: HEAD is exactly where it was, and the peer's secret blob is unreachable.
+    assert_eq!(r.git_agent(&["rev-parse", "HEAD"]), head_before, "a blocked fuse must not advance HEAD");
+    assert!(
+        !head_sessions_contain(&r, "AKIAIOSFODNN7EXAMPLE"),
+        "the peer's secret must never become reachable from the store's HEAD"
+    );
+}
+
+/// The visible override is honored for the fuse exactly as for every other gate: `AGIT_ALLOW_SECRETS=1`
+/// lets the history-join proceed (disclosed on stderr), so the peer's commits join HEAD.
+#[test]
+fn a_merge_fuse_lets_the_join_through_under_the_visible_override() {
+    let r = Repo::new();
+    peer_ahead_by_codex_session(&r, "sessions/codex/leak.jsonl", "aws key AKIAIOSFODNN7EXAMPLE on the peer");
+
+    let head_before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, err) =
+        r.agit_env(&[("AGIT_ALLOW_SECRETS", "1")], &["a", "merge", "peer", "--from", "claude-code", "--splice"]);
+
+    assert_eq!(code, 0, "the override must let the fuse through: {out}{err}");
+    assert_ne!(r.git_agent(&["rev-parse", "HEAD"]), head_before, "the histories must join: HEAD advances");
+    assert!(
+        head_sessions_contain(&r, "AKIAIOSFODNN7EXAMPLE"),
+        "with the override the peer's commit (secret and all) joins HEAD"
+    );
+}
+
+/// A CLEAN peer branch still fuses on the early-return path — the gate must not break an ordinary
+/// same-agent history-join that carries no secret.
+#[test]
+fn a_merge_fuse_still_joins_a_clean_peer_history() {
+    let r = Repo::new();
+    peer_ahead_by_codex_session(&r, "sessions/codex/work.jsonl", "peer found the deadlock");
+
+    let head_before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--splice"]);
+
+    assert_eq!(code, 0, "a clean same-agent fuse must still succeed: {out}{err}");
+    assert_ne!(r.git_agent(&["rev-parse", "HEAD"]), head_before, "a clean fuse must join the histories: HEAD advances");
+    assert!(head_sessions_contain(&r, "peer found the deadlock"), "the peer's clean session joins HEAD");
+}
+
+/// The fuse gate scans only the INCOMING range (`HEAD..spec`), not the whole reachable history: a secret
+/// that ALREADY lives in the store's HEAD must not be re-flagged by the fuse when the peer only adds a
+/// clean commit on top. (This is the case a whole-history scan would wrongly block.)
+#[test]
+fn a_merge_fuse_does_not_reflag_a_secret_already_in_head() {
+    let r = Repo::new();
+    // A secret already committed into the store's HEAD (raw --no-verify, as if it predates the gate).
+    r.write_agent("sessions/codex/old.jsonl", &claude_session("OLD", "aws key AKIAIOSFODNN7EXAMPLE already in history"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "pre-existing secret in HEAD"]);
+    // The peer adds only a CLEAN commit on top of that HEAD.
+    peer_ahead_by_codex_session(&r, "sessions/codex/work.jsonl", "peer found the deadlock");
+
+    let head_before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--splice"]);
+
+    assert_eq!(code, 0, "the fuse must not re-flag a secret already in HEAD when the incoming range is clean: {out}{err}");
+    assert_ne!(r.git_agent(&["rev-parse", "HEAD"]), head_before, "the clean incoming commit fuses: HEAD advances");
+}
+
 /// `--dry-run` is a pure preview: it reports what the merge WOULD do (target, mode, each side's sessions,
 /// whether the histories would fuse) and returns 0 WITHOUT spending the model, installing a session,
 /// writing a transcript/ledger, or fusing the histories. Proven end to end — no `claude`/`codex` is
