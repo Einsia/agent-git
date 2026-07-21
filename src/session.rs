@@ -709,18 +709,8 @@ fn gated_commit(store: &Path, subject: &str, verb: &str) -> CommitOutcome {
     // refuse git-style BEFORE committing: no commit, no staged leftovers. agit's own bookkeeping commits
     // carry an explicit `-c user.email=agit@local`, so they are unaffected — only real session captures
     // pass through this gate.
-    if crate::commands::committer_email(store).is_empty() {
-        errln!(
-            "{}",
-            ui::warn(
-                "agit: your committer identity is unset, so a session can't be attributed.\n  \
-                 set it like git:  git config --global user.email you@example.com\n  \
-                 \x20                git config --global user.name  \"Your Name\"\n  \
-                 (or per agent:    agit a config user.email you@example.com)\n\
-                 this email is your provenance identity; register your device key with\n\
-                 \"agit identity register <you>\" so \"agit a provenance\" can verify it."
-            )
-        );
+    if crate::commands::committer_identity_unset(store) {
+        crate::commands::warn_committer_identity_unset();
         let _ = scope::git_in_status(store, &["reset", "-q"]); // unstage: no committed, no staged leftovers
         return CommitOutcome::Blocked;
     }
@@ -1553,6 +1543,9 @@ mod routing_tests {
         let env = envd.path().to_path_buf();
 
         testenv::with(home.path(), agit_home.path(), || {
+            // Ignore a machine-level /etc/gitconfig too, so a system user.email on the CI box can't
+            // resolve an identity behind the removed $HOME/.gitconfig and defeat the precondition.
+            std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
             let fe = crate::agent::init_agent("frontend").unwrap();
             // Strip this HOME's git identity so nothing resolves user.email anywhere.
             let _ = std::fs::remove_file(home.path().join(".gitconfig"));
@@ -1585,6 +1578,7 @@ mod routing_tests {
                 0,
                 "the gate must leave NO staged content behind"
             );
+            std::env::remove_var("GIT_CONFIG_NOSYSTEM");
         });
     }
 }

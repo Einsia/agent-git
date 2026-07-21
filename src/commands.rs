@@ -1296,6 +1296,30 @@ pub fn committer_email(store: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// True when the store has no committer identity to attribute a session to — git's `user.email` resolves
+/// to nothing (local → global). The snap/merge gate and `agit a commit` both refuse in this case, so a
+/// session capture never lands in history unattributed. agit's own bookkeeping commits are exempt: they
+/// pass an explicit `-c user.email=agit@local`, so they never read this.
+pub fn committer_identity_unset(store: &Path) -> bool {
+    committer_email(store).is_empty()
+}
+
+/// The git-style refusal shown when the committer identity is unset, shared by the snap/merge gate and
+/// `agit a commit` so every session-writing path guides the user the same way.
+pub fn warn_committer_identity_unset() {
+    errln!(
+        "{}",
+        ui::warn(
+            "agit: your committer identity is unset, so a session can't be attributed.\n  \
+             set it like git:  git config --global user.email you@example.com\n  \
+             \x20                git config --global user.name  \"Your Name\"\n  \
+             (or per agent:    agit a config user.email you@example.com)\n\
+             this email is your provenance identity; register your device key with\n\
+             \"agit identity register <you>\" so \"agit a provenance\" can verify it."
+        )
+    );
+}
+
 /// Read the `provenance` block from a session's sidecar, if it has one. Absent sidecar, unparsable JSON,
 /// or a sidecar with no provenance all yield `None` — the caller reports "unsigned", never fails.
 pub fn sidecar_provenance(transcript: &Path) -> Option<Provenance> {

@@ -951,6 +951,14 @@ fn agent_clone(args: &[String]) -> anyhow::Result<i32> {
 fn agent_commit(args: &[String]) -> anyhow::Result<i32> {
     use agit::agent;
     let a = agent::resolve(None)?;
+    // A store commit carries a session; without a committer identity it could never be attributed, so
+    // refuse git-style BEFORE staging anything (the snap/merge gate does the same). This closes the one
+    // path that could otherwise commit a mirror's unattributed sidecar past that gate. agit's own
+    // bookkeeping commits are unaffected: they carry an explicit `-c user.email=agit@local`.
+    if commands::committer_identity_unset(&a.store) {
+        commands::warn_committer_identity_unset();
+        return Ok(2);
+    }
     // `git commit -a` and `git commit <pathspec>` stage content AT COMMIT TIME, after a pre-commit index
     // scan runs, and the `--no-verify` below skips git's own hook. So stage that content into the index
     // NOW, before the gate, so the scan sees exactly what the commit will contain. The commit re-stages

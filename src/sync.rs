@@ -502,7 +502,11 @@ fn fuse(store: &Path, target: &Target) -> Result<i32> {
         return Ok(1);
     }
     outln!("\nMerging the histories (same agent):");
-    let rc = scope::git_in_inherit(store, &["merge", &spec]);
+    // A non-fast-forward fuse creates a merge commit. That commit is agit's structural join of two session
+    // DAGs, not a session capture (the reconciled session is committed separately), so it carries agit's
+    // own identity — it stays labeled agit and never fails on a machine with no user git identity.
+    let merge_args = [crate::agent::AGIT_META_IDENT.as_slice(), &["merge", &spec]].concat();
+    let rc = scope::git_in_inherit(store, &merge_args);
     if rc != 0 {
         errln!(
             "{}",
