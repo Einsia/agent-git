@@ -652,13 +652,46 @@ fn capture_pass(rt: &str, env: &Path, capture_harness: bool, count: &mut u64) ->
 /// `snap && push` chain (and `set -e`) never proceeds as if the snap landed. `false` means committed, or
 /// nothing to commit (a clean no-op). Either way the mirror on disk is left untouched.
 fn commit_snap(agent: &Path, rt: &str, count: &mut u64) -> bool {
-    let _ = scope::git_in_status(agent, &["add", "-A"]);
+    let ts = now_iso();
+    match gated_commit(agent, &format!("auto-snap {rt} {ts}"), "snap") {
+        CommitOutcome::Committed => {
+            *count += 1;
+            outln!("  {} snapped {ts}  (#{count})", ui::accent("●"));
+            false
+        }
+        CommitOutcome::NothingStaged => false,
+        CommitOutcome::Blocked => true,
+    }
+}
+
+/// The outcome of the one gated-commit primitive.
+enum CommitOutcome {
+    /// The staged index was committed.
+    Committed,
+    /// Nothing was staged — a clean no-op (never an empty commit).
+    NothingStaged,
+    /// Staged content was held OUT of history: the secret gate blocked it, the gate errored, or git
+    /// refused. The mirror on disk is left untouched; the index is unstaged so a loop does not spin on it.
+    Blocked,
+}
+
+/// Stage everything in the store, gate the staged index for secrets, and commit it with `subject`.
+///
+/// The SINGLE gated-commit primitive: `agit a snap` (via `commit_snap`) and the `agit a merge`
+/// merged-session capture (via `commit_merged_session`) both go through it, so the secret gate is
+/// byte-for-byte identical on both paths — the same `secret_gate` over the same staged index. `verb`
+/// only names the action in the gate's own disclosure line; the DETECTION is the same regardless. On a
+/// block or a refusal it warns, unstages (so a watch loop does not spin on it), and leaves the mirror
+/// on disk. The wrapper already gated the index, so it skips git's now-redundant pre-commit hook (the
+/// hook stays installed as the defense for a raw `git commit` that never went through agit).
+fn gated_commit(store: &Path, subject: &str, verb: &str) -> CommitOutcome {
+    let _ = scope::git_in_status(store, &["add", "-A"]);
     // `diff --cached --quiet` exits 1 when something is staged, 0 when nothing is.
-    if scope::git_in_status(agent, &["diff", "--cached", "--quiet"]).0 == 0 {
-        return false;
+    if scope::git_in_status(store, &["diff", "--cached", "--quiet"]).0 == 0 {
+        return CommitOutcome::NothingStaged;
     }
 
-    match crate::commands::secret_gate(agent, true, "snap") {
+    match crate::commands::secret_gate(store, true, verb) {
         Ok(g) if g.allowed() => {}
         Ok(_) => {
             errln!(
@@ -668,31 +701,69 @@ fn commit_snap(agent: &Path, rt: &str, count: &mut u64) -> bool {
                     crate::commands::ALLOW_ENV
                 ))
             );
-            let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
-            return true;
+            let _ = scope::git_in_status(store, &["reset", "-q"]); // unstage so we don't spin on it
+            return CommitOutcome::Blocked;
         }
         Err(e) => {
             errln!("{}", ui::warn(&format!("  ⚠ not committed: secret gate failed to run ({e:#}). agit a scan to see")));
-            let _ = scope::git_in_status(agent, &["reset", "-q"]);
-            return true;
+            let _ = scope::git_in_status(store, &["reset", "-q"]);
+            return CommitOutcome::Blocked;
         }
     }
 
-    let ts = now_iso();
-    // The wrapper already gated the index, so skip git's now-redundant pre-commit hook. The hook stays
-    // installed as the defense for a raw `git commit` that never went through agit.
-    let (rc, _) = scope::git_in_status(
-        agent,
-        &["commit", "--no-verify", "-m", &format!("auto-snap {rt} {ts}")],
-    );
+    let (rc, _) = scope::git_in_status(store, &["commit", "--no-verify", "-m", subject]);
     if rc == 0 {
-        *count += 1;
-        outln!("  {} snapped {ts}  (#{count})", ui::accent("●"));
-        false
+        CommitOutcome::Committed
     } else {
         errln!("{}", ui::warn("  ⚠ not committed: git commit refused it. agit a scan to see"));
-        let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
-        true
+        let _ = scope::git_in_status(store, &["reset", "-q"]); // unstage so we don't spin on it
+        CommitOutcome::Blocked
+    }
+}
+
+/// Capture exactly ONE reconciled merged session into the store partition
+/// `sessions/<env-slug>/<rt>/<id>.jsonl` and commit it through the SAME gate `snap` uses, so an
+/// `agit a merge` produces a commit (git-style): the merged session becomes the agent's latest, so
+/// `latest_session` resolves to it and `agit a log` shows it newest.
+///
+/// It writes EXACTLY the one session, never a blanket snap of the runtime. The dialogue merge revives
+/// temporary A/B copies into the runtime dir that must never enter the store, so the caller hands us the
+/// single merged transcript and nothing else from `sessions/` is staged.
+///
+/// Returns whether the commit was BLOCKED by the secret gate — a merged transcript carrying a secret is
+/// mirrored to disk but kept out of history, exactly as snap does — so the caller can reflect the block
+/// in the merge's exit code. A fresh sidecar records `last_activity = now`, so this merge sorts ahead of
+/// every prior session even when the transcript itself carries no timestamp of its own.
+pub fn commit_merged_session(store: &Path, env: &Path, rt: &str, id: &str, content: &str) -> Result<bool> {
+    let rt = normalize(rt);
+    // Held across the write + the read-modify-write commit, exactly like snap: one store is shared by
+    // every repo that tracks the agent, so a concurrent snap/merge must not race this index and HEAD.
+    let _lock = lock_store(store)?;
+    let part = store.join(SESSIONS_SUBDIR).join(env_slug(env)).join(&rt);
+    std::fs::create_dir_all(&part)?;
+    let dst = part.join(format!("{id}.jsonl"));
+    std::fs::write(&dst, content)?;
+    // The sidecar carries the recency `latest_session` orders by. A merge transcript may have no usable
+    // timestamp of its own, so stamp `now` here to make it unambiguously the newest session.
+    let sidecar = serde_json::json!({
+        "env": env.display().to_string(),
+        "runtime": rt,
+        "last_activity": now_iso(),
+        "source": "merge",
+    });
+    std::fs::write(
+        crate::commands::sidecar_path(&dst),
+        format!("{}\n", serde_json::to_string_pretty(&sidecar)?),
+    )?;
+
+    let ts = now_iso();
+    match gated_commit(store, &format!("merge {rt} {ts}"), "merge") {
+        CommitOutcome::Committed => {
+            outln!("  {} merged session captured into the store", ui::accent("●"));
+            Ok(false)
+        }
+        CommitOutcome::NothingStaged => Ok(false),
+        CommitOutcome::Blocked => Ok(true),
     }
 }
 
@@ -1242,6 +1313,95 @@ mod routing_tests {
             assert_ne!(before, after, "capture_pass must commit; the store's HEAD must advance");
             let subject = scope::git_in(&fe.store, &["log", "-1", "--format=%s"]).unwrap();
             assert!(subject.starts_with("auto-snap claude-code"), "the commit must be the auto-snap: {subject}");
+        });
+    }
+}
+
+#[cfg(test)]
+mod merge_capture_tests {
+    use super::*;
+
+    /// A minimal valid claude transcript carrying a distinctive note.
+    fn transcript(note: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"s\",\"uuid\":\"u1\",\"cwd\":\"/proj\",\"message\":{{\"role\":\"user\",\"content\":\"go\"}}}}\n\
+             {{\"type\":\"assistant\",\"sessionId\":\"s\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"cwd\":\"/proj\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{note}\"}}]}}}}\n"
+        )
+    }
+
+    /// The merge's core promise: `commit_merged_session` makes the merged session the store's LATEST and
+    /// advances HEAD with a real commit — even against an OLDER session that already carries a recorded
+    /// activity (so this proves the ordering, not just that a lone session wins by default).
+    #[test]
+    fn commit_merged_session_becomes_latest_and_advances_head() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            // A pre-existing, committed session with a DATED sidecar — the competitor the merge must beat.
+            let old_dir = fe.store.join(SESSIONS_SUBDIR).join(env_slug(&env)).join("claude-code");
+            std::fs::create_dir_all(&old_dir).unwrap();
+            std::fs::write(old_dir.join("old.jsonl"), transcript("older work")).unwrap();
+            std::fs::write(
+                old_dir.join("old.agit.json"),
+                "{\"last_activity\":\"2020-01-01T00:00:00Z\",\"runtime\":\"claude-code\"}\n",
+            )
+            .unwrap();
+            scope::git_in(&fe.store, &["add", "-A"]).unwrap();
+            scope::git_in(&fe.store, &["commit", "-q", "--no-verify", "-m", "old session"]).unwrap();
+
+            let before = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+            let blocked = commit_merged_session(&fe.store, &env, "claude-code", "merge-xyz", &transcript("reconciled merge"))
+                .unwrap();
+            assert!(!blocked, "a clean merge transcript must commit, not be gated");
+
+            let after = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+            assert_ne!(before, after, "the merge must produce a commit; HEAD must advance");
+
+            let latest = crate::commands::latest_session(&fe.store).expect("the store has sessions");
+            assert_eq!(
+                latest.path.file_stem().unwrap(),
+                "merge-xyz",
+                "the merged session must be the store's LATEST, ahead of the older dated session"
+            );
+            // And it is genuinely in history (committed, tracked), not just on disk.
+            let tracked = scope::git_in(&fe.store, &["ls-files", "--", "sessions"]).unwrap();
+            assert!(tracked.contains("merge-xyz.jsonl"), "the merged session must be committed: {tracked}");
+        });
+    }
+
+    /// The gate is IDENTICAL to snap's: a merged transcript carrying a secret is mirrored to disk but
+    /// held OUT of history, and the store's HEAD does not advance for it.
+    #[test]
+    fn commit_merged_session_with_a_secret_is_mirrored_but_not_committed() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            let before = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+
+            // A real AWS key inside the merged transcript.
+            let secret = transcript("aws key AKIAIOSFODNN7EXAMPLE leaked in the merge");
+            let blocked = commit_merged_session(&fe.store, &env, "claude-code", "merge-secret", &secret).unwrap();
+            assert!(blocked, "a merged transcript carrying a secret must be gated (blocked)");
+
+            let after = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+            assert_eq!(before, after, "the store's HEAD must NOT advance for a gated merge");
+
+            // Mirrored to disk (so nothing is lost)…
+            let dst = fe.store.join(SESSIONS_SUBDIR).join(env_slug(&env)).join("claude-code").join("merge-secret.jsonl");
+            assert!(dst.exists(), "the merged transcript must still be mirrored on disk");
+            // …but kept out of history: not tracked, not staged.
+            let tracked = scope::git_in(&fe.store, &["ls-files", "--", "sessions"]).unwrap();
+            assert!(!tracked.contains("merge-secret.jsonl"), "the secret merge must not be committed: {tracked}");
+            let staged = scope::git_in(&fe.store, &["diff", "--cached", "--name-only"]).unwrap();
+            assert!(staged.trim().is_empty(), "a blocked merge must leave nothing staged to spin on: {staged}");
         });
     }
 }

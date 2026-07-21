@@ -1442,6 +1442,163 @@ fn a_merge_splice_combines_both_sides_without_a_model() {
     }
 }
 
+/// A peer branch that is a DIFFERENT agent: same store, but its `agent.toml` carries another aid, so a
+/// merge against it is DialogueOnly (no fuse). That isolates the merged-session capture from the git
+/// fuse — the ONLY commit the merge makes is the merged session itself.
+fn make_diverged_peer_branch(r: &Repo, peer_note: &str, local_note: &str) {
+    // A base commit both sides fork from, so the merge is grounded in a shared ancestor.
+    r.git_agent(&["commit", "--allow-empty", "--no-verify", "-m", "base"]);
+    // The peer branch: a different agent (its own aid) carrying a diverged session HEAD does not have.
+    r.git_agent(&["checkout", "-q", "-b", "peer"]);
+    r.write_agent(
+        "agent.toml",
+        "[agent]\nid      = \"agt_peer-different-0001\"\nname    = \"peer-agent\"\ncreated = \"2026-01-01T00:00:00Z\"\n",
+    );
+    r.write_agent("sessions/claude-code/team.jsonl", &claude_session("TEAM", peer_note));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "team session"]);
+    // Back on main (our identity + our own diverged session).
+    r.git_agent(&["checkout", "-q", "main"]);
+    r.write_agent("sessions/claude-code/local.jsonl", &claude_session("LOCAL", local_note));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "local session"]);
+}
+
+/// The newest session in the store by RECORDED recency (max sidecar `last_activity`), and its transcript
+/// — the same thing `latest_session` resolves. Returns "" when no session carries a sidecar.
+fn latest_recorded_session_text(r: &Repo) -> String {
+    fn walk(dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.file_name().map(|n| n.to_string_lossy().ends_with(".agit.json")).unwrap_or(false) {
+                if let Ok(txt) = std::fs::read_to_string(&p) {
+                    if let Some(la) = serde_json::from_str::<serde_json::Value>(&txt)
+                        .ok()
+                        .and_then(|v| v.get("last_activity").and_then(|x| x.as_str()).map(str::to_string))
+                    {
+                        out.push((la, p.with_extension("").with_extension("jsonl")));
+                    }
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&r.agent().join("sessions"), &mut found);
+    found.sort();
+    found.last().map(|(_, p)| std::fs::read_to_string(p).unwrap_or_default()).unwrap_or_default()
+}
+
+/// After a successful `agit a merge --splice`, the reconciled MERGED session is captured into the store
+/// and becomes the agent's LATEST/default — a merge produces a commit, git-style. No manual resume+snap:
+/// the store's HEAD advances and the newest recorded session IS the merged one carrying both sides.
+#[test]
+fn a_merge_splice_captures_the_merged_session_as_the_latest_and_commits_it() {
+    let r = Repo::new();
+    make_diverged_peer_branch(&r, "team found the deadlock", "local fixed the parser");
+
+    let head_before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--splice"]);
+    assert_eq!(code, 0, "a clean splice merge must exit 0: {err}{out}");
+    assert!(out.contains("splice (no model)"), "still the no-model path: {out}");
+
+    // The merge produced a commit: HEAD advanced (DialogueOnly, so the only commit is the merged session).
+    let head_after = r.git_agent(&["rev-parse", "HEAD"]);
+    assert_ne!(head_before, head_after, "the merge must commit the merged session; HEAD must advance: {out}");
+
+    // The newest recorded session IS the merged one, carrying BOTH sides — resume-ready as the default.
+    let latest = latest_recorded_session_text(&r);
+    assert!(latest.contains("local fixed the parser"), "latest carries the local side: {latest}");
+    assert!(latest.contains("team found the deadlock"), "latest carries the peer side: {latest}");
+
+    // And it is genuinely committed to history (tracked), not just written to the working tree.
+    let tracked = r.git_agent(&["ls-files", "--", "sessions"]);
+    let merged_committed = tracked.lines().any(|f| {
+        f.ends_with(".jsonl")
+            && r.git_agent(&["show", &format!("HEAD:{f}")]).contains("team found the deadlock")
+    });
+    assert!(merged_committed, "the merged session must be committed into the store: {tracked}");
+}
+
+/// Same-agent divergence (a `peer` branch that KEEPS this agent's aid) resolves to Fuse mode: the merge
+/// must fast-forward the histories AND capture the merged session, exiting 0. Regression for an ordering
+/// bug: capturing the merged session BEFORE the fuse advanced main and turned the fuse into a divergent
+/// 3-way merge that exited 1. Only DialogueOnly splice (no fuse) was covered, so this path slipped.
+#[test]
+fn a_merge_splice_same_agent_fuses_and_exits_clean() {
+    let r = Repo::new();
+    // main: our own session.
+    r.write_agent("sessions/claude-code/local.jsonl", &claude_session("LOCAL", "local fixed the parser"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "local session"]);
+    // A `peer` branch that KEEPS the same agent.toml (same aid, so Fuse) and adds its own session,
+    // branched here so it is strictly ahead of main.
+    r.git_agent(&["checkout", "-q", "-b", "peer"]);
+    r.write_agent("sessions/claude-code/team.jsonl", &claude_session("TEAM", "peer found the deadlock"));
+    r.git_agent(&["add", "-A"]);
+    r.git_agent(&["commit", "--no-verify", "-m", "peer session"]);
+    r.git_agent(&["checkout", "-q", "main"]);
+
+    let head_before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--splice"]);
+    assert_eq!(code, 0, "a same-agent (Fuse) splice merge must exit 0, not conflict on its own capture: {err}{out}");
+    assert!(out.to_lowercase().contains("same agent") || out.to_lowercase().contains("fus"), "must be Fuse mode: {out}");
+    let head_after = r.git_agent(&["rev-parse", "HEAD"]);
+    assert_ne!(head_before, head_after, "HEAD must advance (fuse + the merged-session commit): {out}");
+    let latest = latest_recorded_session_text(&r);
+    assert!(
+        latest.contains("local fixed the parser") && latest.contains("peer found the deadlock"),
+        "the latest session is the merged one carrying both sides: {latest}"
+    );
+}
+
+/// The merge writes EXACTLY the one merged session into the store, never a blanket snap. The runtime
+/// install (`~/.claude/projects`) and, on the dialogue path, the temporary revived A/B copies must NOT
+/// leak into the store. DialogueOnly here, so the peer's own `team.jsonl` also stays out of main.
+#[test]
+fn a_merge_splice_captures_only_the_merged_session_not_the_runtime_or_the_peer() {
+    let r = Repo::new();
+    make_diverged_peer_branch(&r, "team found the deadlock", "local fixed the parser");
+
+    let (code, _out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--splice"]);
+    assert_eq!(code, 0, "splice must succeed: {err}");
+
+    let tracked = r.git_agent(&["ls-files", "--", "sessions"]);
+    // Exactly ONE partitioned merged session was added on top of our own pre-existing flat local session.
+    let partitioned: Vec<&str> = tracked
+        .lines()
+        .filter(|f| f.ends_with(".jsonl") && !f.starts_with("sessions/claude-code/"))
+        .collect();
+    assert_eq!(partitioned.len(), 1, "exactly one merged session must be captured, not a blanket snap: {tracked}");
+    // The peer is a different agent (DialogueOnly): its team.jsonl must not be fused into main's history.
+    assert!(
+        !tracked.contains("team.jsonl"),
+        "DialogueOnly must keep the peer's own session out of this agent's store: {tracked}"
+    );
+}
+
+/// The merge's secret gate is IDENTICAL to snap's: a merged transcript carrying a secret is mirrored to
+/// disk but held OUT of history, the merge exits non-zero, and the store's HEAD does not advance for it.
+#[test]
+fn a_merge_splice_gates_a_merged_secret_out_of_history() {
+    let r = Repo::new();
+    // The peer's session carries a real AWS key; spliced into the merged session, committing it to main
+    // would introduce the secret to this agent's history — the gate must refuse.
+    make_diverged_peer_branch(&r, "aws key AKIAIOSFODNN7EXAMPLE from the peer", "local fixed the parser");
+
+    let head_before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, err) = r.agit(&["a", "merge", "peer", "--from", "claude-code", "--splice"]);
+    assert_ne!(code, 0, "a merged transcript carrying a secret must fail the merge: {out}");
+    assert!(err.contains("secret") || err.contains("suspected") || err.contains("AKIA"), "it discloses the block: {err}{out}");
+
+    // HEAD did not advance: the merged session was kept out of history.
+    assert_eq!(r.git_agent(&["rev-parse", "HEAD"]), head_before, "the store's HEAD must not advance for a gated merge");
+    let tracked = r.git_agent(&["ls-files", "--", "sessions"]);
+    let leaked = tracked.lines().any(|f| f.ends_with(".jsonl") && r.git_agent(&["show", &format!("HEAD:{f}")]).contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(!leaked, "the secret must not be committed anywhere in the store: {tracked}");
+}
+
 /// `--dry-run` is a pure preview: it reports what the merge WOULD do (target, mode, each side's sessions,
 /// whether the histories would fuse) and returns 0 WITHOUT spending the model, installing a session,
 /// writing a transcript/ledger, or fusing the histories. Proven end to end — no `claude`/`codex` is

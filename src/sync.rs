@@ -335,8 +335,15 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
             b_all.len()
         );
         outln!("  {}", resume_cmd(&rt, &env, &new_id));
-        // Same agent: fuse the git histories too, so the two copies become one memory again.
-        return if mode == Mode::Fuse { Ok(fuse(&agent, &target)?) } else { Ok(0) };
+        // Same agent: fuse the git histories FIRST, while main and peer still share a tip so the merge
+        // is a clean fast-forward. Capturing the merged session before the fuse would advance main and
+        // turn the fuse into a divergent 3-way merge (spurious conflict / non-zero exit).
+        let fuse_code = if mode == Mode::Fuse { fuse(&agent, &target)? } else { 0 };
+        // THEN capture the merged session ON TOP so a merge produces a commit (git-style) and the merged
+        // session is the agent's latest/default. Gated like snap: a merged transcript carrying a secret
+        // is mirrored but held out of history, and that blocked commit makes the merge exit non-zero.
+        let blocked = crate::session::commit_merged_session(&agent, &env, &rt, &new_id, &combined)?;
+        return Ok(fuse_code.max(if blocked { 2 } else { 0 }));
     }
 
     // 4. Two worktrees + diffs (when both code branches are present in the repo and differ).
@@ -357,7 +364,9 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
     }
 
     // 5. Revive the voice session per side, bound to its own tree (never touching the user's real sessions).
-    install_copy(&rt, &a_voice, &a.id, &a.cwd)?;
+    // A's installed path is where the reconciled merged state ends up (the dialogue resumes A in place),
+    // so keep it to read back and capture into the store once the reconciliation is done.
+    let a_path = install_copy(&rt, &a_voice, &a.id, &a.cwd)?;
     install_copy(&rt, &b_voice, &b.id, &b.cwd)?;
     errln!(
         "Reviving both sessions (read-only): A={} ({} local) … B={} ({} incoming) …",
@@ -389,12 +398,29 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
     }
     let code = result?;
 
-    // 7. Same agent → the two copies become one memory again. A different agent NEVER gets here: its
-    //    history stays its own, and you merge the CODE yourself.
-    if mode == Mode::Fuse {
-        return Ok(code.max(fuse(&agent, &target)?));
-    }
-    Ok(code)
+    // 7. Same agent: fuse the histories FIRST (a clean fast-forward while main and peer still share a
+    //    tip); capturing the merged session before it would advance main and make the fuse a divergent
+    //    3-way merge. A different agent NEVER fuses: its history stays its own, you merge the CODE.
+    let fuse_code = if mode == Mode::Fuse { fuse(&agent, &target)? } else { 0 };
+
+    // 6b. THEN capture the reconciled A-side session (the merged state, as the dialogue left it on disk)
+    //     ON TOP as the agent's latest/default. EXACTLY one session, never a blanket snap, which would
+    //     drag the temporary revived A/B copies in the runtime into the store. Gated like snap: a merged
+    //     transcript carrying a secret is mirrored but held out of history, and that blocks the exit.
+    let merged_code = match std::fs::read_to_string(&a_path) {
+        Ok(merged) if !merged.trim().is_empty() => {
+            let merged_id = convo::fresh_id("merge");
+            match crate::session::commit_merged_session(&agent, &env, &rt, &merged_id, &merged) {
+                Ok(blocked) => i32::from(blocked) * 2,
+                Err(e) => {
+                    errln!("(merge) could not capture the merged session into the store: {e:#}");
+                    0
+                }
+            }
+        }
+        _ => 0,
+    };
+    Ok(code.max(fuse_code).max(merged_code))
 }
 
 /// State the mode. The user must never have to infer whether their agents just got fused.
@@ -824,13 +850,14 @@ fn splice_sessions(rt: &str, a_text: &str, b_text: &str, new_id: &str, cwd: &Pat
     convo::write_conversation(rt, &ir, &opts)
 }
 
-/// Copy a claude session into a fresh-id session bound to `cwd` (same-vendor replay rewrites id/cwd).
-fn install_copy(rt: &str, src: &str, new_id: &str, cwd: &Path) -> Result<()> {
+/// Copy a claude session into a fresh-id session bound to `cwd` (same-vendor replay rewrites id/cwd),
+/// returning the installed transcript's path so a caller can read the revived (and later dialogue-mutated)
+/// session back — that path is where the merged state lands.
+fn install_copy(rt: &str, src: &str, new_id: &str, cwd: &Path) -> Result<PathBuf> {
     let ir = convo::read_conversation(rt, src)?;
     let opts = ConvertOpts { cwd: Some(cwd.to_string_lossy().into_owned()), new_id: new_id.to_string() };
     let bytes = convo::write_conversation(rt, &ir, &opts)?;
-    crate::register::install(rt, new_id, cwd, &bytes)?;
-    Ok(())
+    Ok(crate::register::install(rt, new_id, cwd, &bytes)?.path)
 }
 
 /// Run one read-only turn of a resumed session (dispatch by runtime); return its reply text.
