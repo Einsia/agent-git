@@ -358,7 +358,15 @@ fn decide_gate(findings: Vec<(String, scan::Finding)>, verb: &str) -> Gate {
 fn finish_scan(total: usize, staged: bool, scanned: usize) -> Result<i32> {
     if total > 0 {
         errln!("\n{total} of them. Once the AgentState is pushed, a teammate who pulls carries them along.");
-        errln!("Fix it. Or use --no-verify to bypass this hook and explicitly own the consequences.");
+        // scan has NO --no-verify — it is a report, not a git hook. The commit/push gates it mirrors have
+        // exactly one disclosed override, AGIT_ALLOW_SECRETS; point there, not at a flag that does not
+        // exist and would walk the user toward silently committing the secret.
+        errln!(
+            "Fix them, mark a false positive with a `{}` pragma or a `{}` entry. The gate that blocks commit/push \
+             has one disclosed override: {ALLOW_ENV}=1 (auditable — there is no --no-verify).",
+            scan::ALLOW_PRAGMA,
+            scan::ALLOW_FILE,
+        );
         return Ok(1);
     }
     if !staged {
@@ -1921,6 +1929,20 @@ pub fn ahead_behind(store: &Path) -> Option<(u64, u64)> {
 /// `ahead_behind` above rather than each reimplementing the rev-list.
 pub fn diverged(store: &Path) -> bool {
     matches!(ahead_behind(store), Some((ahead, behind)) if ahead > 0 && behind > 0)
+}
+
+/// The name of the tracked upstream ref, e.g. `origin/main` — the ref a dialogue merge should reconcile
+/// against when the local and remote sessions have diverged. Returns `None` when there is no upstream.
+///
+/// This exists because the divergence hint must suggest a REF (`agit a merge origin/main`), never the
+/// agent's own NAME: `agit a merge <self-name>` resolves to this same agent and dead-ends with "no local
+/// session to represent it". The upstream remote-tracking ref is the diverged side, so merging it is the
+/// command that actually reconciles.
+pub fn upstream_ref(store: &Path) -> Option<String> {
+    let (code, out) =
+        scope::git_in_status(store, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+    let name = out.trim();
+    (code == 0 && !name.is_empty()).then(|| name.to_string())
 }
 
 /// Best-effort summary of the sessions on the tracked upstream that HEAD does not yet have. Silent if

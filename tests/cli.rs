@@ -1036,8 +1036,10 @@ fn snap_of_a_clean_session_commits_what_it_mirrored() {
 }
 
 /// A snap of a session that trips the secret gate must NOT commit: the dump is mirrored to disk and
-/// the block is disclosed, but held out of history — exactly commit_snap's contract. The disclosed
-/// AGIT_ALLOW_SECRETS override then commits it.
+/// the block is disclosed, but held out of history — exactly commit_snap's contract. And the snap must
+/// EXIT NON-ZERO, so a scripted `snap && push` (and `set -e`) stops here rather than pushing a store
+/// whose latest capture was held back — consistent with `agit a scan`, which exits non-zero on the same
+/// secret. The disclosed AGIT_ALLOW_SECRETS override then commits it (and restores exit 0).
 #[test]
 fn snap_of_a_secret_session_is_mirrored_but_not_committed() {
     let r = Repo::new();
@@ -1046,7 +1048,7 @@ fn snap_of_a_secret_session_is_mirrored_but_not_committed() {
 
     let before = r.git_agent(&["rev-parse", "HEAD"]);
     let (code, _out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
-    assert_eq!(code, 0, "the snap itself does not fail — the mirror still happened: {err}");
+    assert_ne!(code, 0, "a blocked snap must exit non-zero so `snap && push` cannot proceed: {err}");
     assert_eq!(
         r.git_agent(&["rev-parse", "HEAD"]),
         before,
@@ -2047,4 +2049,184 @@ fn identity_enroll_command_is_removed() {
         "reports `enroll` as unknown: {err}"
     );
     assert!(err.contains("register"), "the usage line points at the new register command: {err}");
+}
+
+// ─────────────────── git-parity: native parsers REJECT unknown dash flags ───────────────────
+
+/// SECURITY (FIX 1): `agit a scan --no-verify` / `--bogus` must be REJECTED, not silently turned into a
+/// scan of a nonexistent "file" that reports "no secrets found" at exit 0 — the old behaviour HID real
+/// secrets. The unknown option is named, the exit is non-zero, and a plain scan still finds the secret,
+/// proving the detector was never disabled (only the parser changed).
+#[test]
+fn scan_rejects_unknown_flags_instead_of_hiding_secrets() {
+    let r = Repo::new();
+    r.write_agent("sessions/claude-code/s.jsonl", "{\"content\":\"AKIAIOSFODNN7EXAMPLE\"}\n");
+
+    for bad in ["--no-verify", "--bogus"] {
+        let (code, out, err) = r.agit(&["a", "scan", bad]);
+        let all = format!("{out}{err}");
+        assert_ne!(code, 0, "`agit a scan {bad}` must be rejected, not treated as a file target: {all}");
+        assert!(err.contains(&format!("unknown option '{bad}'")), "must name the unknown option: {all}");
+        assert!(!all.contains("no secrets found"), "a rejected scan must NOT claim the tree is clean: {all}");
+    }
+
+    // The seeded secret is still there and still caught: a plain scan reports it and exits non-zero.
+    let (code, _o, err) = r.agit(&["a", "scan"]);
+    assert_ne!(code, 0, "the seeded secret must still be reported by a plain scan: {err}");
+    assert!(err.contains("aws-access-key-id"), "{err}");
+    // And the report no longer walks the user toward a nonexistent `--no-verify` bypass.
+    assert!(!err.contains("use --no-verify"), "scan must not recommend a --no-verify bypass it does not have: {err}");
+    assert!(!err.contains("bypass this hook"), "scan is a report, not a hook: {err}");
+    assert!(err.contains("AGIT_ALLOW_SECRETS"), "the real, disclosed override must be named: {err}");
+}
+
+/// FIX 2: `agit init --help` (and `-h`) must PRINT usage, exit 0, and touch NOTHING. It used to EXECUTE
+/// init — appending `.agit/` to the repo .gitignore and printing "agit is ready" — because the parser
+/// ignored every arg but `--agent`. Run in a fresh repo that init has never touched, so the side effects
+/// (a created .gitignore, a bound .agit.toml, the success banner) are observable by their absence.
+#[test]
+fn init_help_prints_usage_without_side_effects() {
+    for flag in ["--help", "-h"] {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Repo { dir };
+        r.sh("git init -q -b main .");
+        r.sh("git config user.name dev && git config user.email d@x.com && git config commit.gpgsign false");
+        r.write("app.ts", "x\n");
+        r.sh("git add -A && git commit -qm seed");
+
+        let (code, out, err) = r.agit(&["init", flag]);
+        assert_eq!(code, 0, "`agit init {flag}` must exit 0: {err}");
+        assert!(out.contains("usage") && out.contains("agit init"), "must print init usage: {out}");
+        let all = format!("{out}{err}");
+        assert!(!all.contains("agit is ready"), "`agit init {flag}` must NOT execute init: {all}");
+        assert!(!all.contains("appended to the code repo .gitignore"), "must not edit .gitignore: {all}");
+        assert!(!r.path().join(".gitignore").exists(), "`agit init {flag}` must not create the .gitignore init writes");
+        assert!(!r.path().join(".agit.toml").exists(), "`agit init {flag}` must not bind an agent");
+    }
+}
+
+/// FIX 2: `agit convert <session> --to <rt> --wriet` (a typo of `--write`) must be REJECTED. The old
+/// parser swallowed the unknown flag, so the convert silently DRY-RAN and persisted nothing while exiting
+/// 0 — the user thinks they wrote a resumable session and did not.
+#[test]
+fn convert_rejects_unknown_flag_not_silent_dry_run() {
+    let r = Repo::new();
+    let (code, out, err) = r.agit(&["convert", "somesession", "--to", "claude-code", "--wriet"]);
+    let all = format!("{out}{err}");
+    assert_ne!(code, 0, "a misspelled `--wriet` must be rejected, not silently dry-run at exit 0: {all}");
+    assert!(err.contains("unknown option '--wriet'"), "must name the unknown option: {all}");
+}
+
+/// FIX 2: the other native parsers reject an unknown dash flag rather than swallowing it. `snap
+/// --no-harnes` must not silently keep the harness on; `merge --dry-runn` must not run a REAL merge where
+/// a preview was asked for.
+#[test]
+fn snap_and_merge_reject_unknown_dash_flags() {
+    let r = Repo::new();
+
+    let (sc, so, se) = r.agit(&["a", "snap", "--no-harnes"]);
+    assert_ne!(sc, 0, "snap must reject --no-harnes, not swallow it: {so}{se}");
+    assert!(se.contains("unknown option '--no-harnes'"), "{so}{se}");
+
+    let (mc, mo, me) = r.agit(&["a", "merge", "peer", "--dry-runn"]);
+    assert_ne!(mc, 0, "merge must reject --dry-runn (a swallowed typo runs a REAL merge): {mo}{me}");
+    assert!(me.contains("unknown option '--dry-runn'"), "{mo}{me}");
+}
+
+/// A `--help` on a native command prints usage and exits 0 without side effects (here: without running
+/// snap). The parser stops before any store write.
+#[test]
+fn native_command_help_exits_zero_without_running() {
+    let r = Repo::new();
+    let before = r.git_agent(&["rev-parse", "HEAD"]);
+    let (code, out, _err) = r.agit(&["a", "snap", "--help"]);
+    assert_eq!(code, 0, "snap --help must exit 0");
+    assert!(out.contains("usage") && out.contains("agit a snap"), "must print snap usage: {out}");
+    assert_eq!(r.git_agent(&["rev-parse", "HEAD"]), before, "snap --help must not commit anything");
+}
+
+/// Passthrough is untouched: only the NATIVE parsers reject unknown dash flags. A git verb agit forwards
+/// (`agit a show <flag>`) must reach git verbatim — agit must NOT print its own `unknown option` there,
+/// or every scripted `git … --flag` through the store would break.
+#[test]
+fn passthrough_git_verbs_still_forward_unknown_flags_to_git() {
+    let r = Repo::new();
+    let (_c, out, err) = r.agit(&["a", "show", "--unknownzzz"]);
+    let all = format!("{out}{err}");
+    assert!(
+        !all.contains("unknown option '--unknownzzz'"),
+        "agit must not intercept a passthrough git flag with its own native rejection: {all}"
+    );
+}
+
+/// FIX 4: a snap blocked by the secret gate must EXIT NON-ZERO (so `snap && push` and `set -e` stop),
+/// while a clean snap stays 0. The blocked snap still mirrors to disk and creates no commit.
+#[test]
+fn blocked_snap_exits_nonzero_clean_snap_stays_zero() {
+    let r = Repo::new();
+
+    // Clean snap → exit 0, HEAD advances.
+    let clean = r.path().join("clean-home");
+    seed_claude_session(&r, &clean, "ok1", "honest work");
+    let base = r.git_agent(&["rev-parse", "HEAD"]);
+    let (cc, co, ce) = r.agit_env(&[("HOME", clean.to_str().unwrap())], &["a", "snap"]);
+    assert_eq!(cc, 0, "a clean snap must exit 0: {co}{ce}");
+    let after_clean = r.git_agent(&["rev-parse", "HEAD"]);
+    assert_ne!(base, after_clean, "a clean snap must commit: {co}");
+
+    // Secret snap → non-zero, no new commit, but the dump is still mirrored.
+    let leak = r.path().join("leak-home");
+    seed_claude_session(&r, &leak, "leak2", "key AKIAIOSFODNN7EXAMPLE");
+    let (lc, lo, le) = r.agit_env(&[("HOME", leak.to_str().unwrap())], &["a", "snap"]);
+    assert_ne!(lc, 0, "a snap the gate blocks must exit non-zero: {lo}{le}");
+    assert_eq!(r.git_agent(&["rev-parse", "HEAD"]), after_clean, "a blocked snap must not commit: {le}");
+    assert!(r.captured("claude-code", "leak2.jsonl"), "the blocked dump is still mirrored to disk: {le}");
+}
+
+/// FIX 3: on a DIVERGED store, `agit a pull` must suggest a REF (e.g. `origin/main`) to reconcile, NEVER
+/// the agent's own name — `agit a merge <self-name>` resolves back to this agent and dead-ends. The
+/// suggested ref is the working path, proven by `agit a merge <ref> --dry-run` exiting 0.
+#[test]
+fn diverged_pull_suggests_the_upstream_ref_not_the_agent_name() {
+    let r = Repo::new();
+    let hub = r.path().join("hub.git");
+    r.sh("git init -q --bare -b main hub.git");
+    let hub_str = hub.to_str().unwrap();
+
+    // A session in the store so the merge can resolve a runtime, then publish + track the hub.
+    let home = r.path().join("cchome");
+    seed_claude_session(&r, &home, "base", "shared work");
+    assert_eq!(r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]).0, 0, "seed snap");
+    assert_eq!(r.agit(&["a", "remote", "add", "origin", hub_str]).0, 0, "remote add");
+    r.git_agent(&["push", "-u", "origin", "main"]); // origin/main = the snap commit; upstream set
+
+    // Diverge: a local-only commit AND a remote-only commit the local does not have.
+    r.git_agent(&["-c", "user.name=dev", "-c", "user.email=d@x.com", "commit", "--allow-empty", "-m", "local-only"]);
+    let work = r.path().join("work");
+    Command::new("git").args(["clone", "-q"]).arg(&hub).arg(&work).env("HOME", r.path()).output().unwrap();
+    Command::new("git").arg("-C").arg(&work).env("HOME", r.path())
+        .args(["-c", "user.name=other", "-c", "user.email=o@x.com", "commit", "--allow-empty", "-m", "remote-only"])
+        .output().unwrap();
+    Command::new("git").arg("-C").arg(&work).env("HOME", r.path()).args(["push", "-q", "origin", "main"]).output().unwrap();
+
+    // Pull refuses the ff, detects divergence, and prints the suggestion.
+    let (_c, _o, err) = r.agit(&["a", "pull"]);
+    assert!(err.contains("diverged"), "pull must detect divergence: {err}");
+    let sugg = err
+        .lines()
+        .find(|l| l.contains("agit a merge"))
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| panic!("pull must print a merge suggestion:\n{err}"));
+    let target = sugg.trim_start_matches("agit a merge").trim().to_string();
+
+    // It is a REF (contains `/` or `@`), never the bare agent name.
+    assert!(
+        target.contains('/') || target.contains('@'),
+        "the suggested target must be a ref, not the bare agent name: {target:?}\n{err}"
+    );
+    assert_ne!(target, "testmemory", "must never suggest the agent's own name: {err}");
+
+    // And the suggested ref is the WORKING path: a dry-run merge against it resolves and exits 0.
+    let (mc, mo, me) = r.agit(&["a", "merge", &target, "--dry-run"]);
+    assert_eq!(mc, 0, "merging the suggested ref must work (--dry-run): {mo}{me}");
 }

@@ -272,10 +272,13 @@ pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
             runtime_list()
         );
     }
+    // A blocked snap in ANY runtime propagates as a non-zero exit (see snap_one), so capturing several
+    // runtimes at once never masks a held-back secret behind a peer's clean capture.
+    let mut code = 0;
     for rt in &live {
-        snap_one(rt, &env, capture_harness)?;
+        code = code.max(snap_one(rt, &env, capture_harness)?);
     }
-    Ok(0)
+    Ok(code)
 }
 
 /// `agit a snap --from <runtime>` — mirror one named runtime's dump into the Agent Store.
@@ -298,6 +301,10 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
 
     // How many snapshots this run actually committed; commit_snap stamps each `● snapped … (#n)`.
     let mut count = 0u64;
+    // Whether the gate held any snap out of history. A clean snap exits 0; a blocked one exits non-zero
+    // so `snap && push` and `set -e` stop here (and it is consistent with `agit a scan`, which already
+    // exits non-zero on the same secret). The mirror on disk still happened either way.
+    let mut blocked = false;
     for r in &routed {
         if let Some(n) = &r.note {
             errln!("  note   : {n}");
@@ -335,9 +342,11 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
         // `_lock` above), so calling it here is correct and re-locking would deadlock. Nothing staged
         // is a clean no-op (no empty commit); a suspected secret blocks the commit, leaves the mirror
         // on disk, and discloses the AGIT_ALLOW_SECRETS override — commit_snap warns for all of these.
-        commit_snap(&r.store, &rt, &mut count);
+        blocked |= commit_snap(&r.store, &rt, &mut count);
     }
-    Ok(0)
+    // Non-zero (2) when the gate blocked a snap, so a scripted `snap && push` does not push a store whose
+    // latest capture was held out of history.
+    Ok(if blocked { 2 } else { 0 })
 }
 
 // ─────────────────────── The store lock: one store, many concurrent writers ───────────────────────
@@ -637,11 +646,15 @@ fn capture_pass(rt: &str, env: &Path, capture_harness: bool, count: &mut u64) ->
 /// `--no-verify` skips. Auto-snap owns this commit, so a secret in a transcript the agent just saw is
 /// caught even on the fully hands-off `watch` path. Blocked → mirrored to disk but never committed;
 /// the visible `AGIT_ALLOW_SECRETS` override lets it through and is disclosed by the gate.
-fn commit_snap(agent: &Path, rt: &str, count: &mut u64) {
+/// Returns `true` when staged content was NOT committed because a problem held it back (the secret gate
+/// blocked it, the gate errored, or git refused) — the caller turns that into a non-zero exit so a
+/// `snap && push` chain (and `set -e`) never proceeds as if the snap landed. `false` means committed, or
+/// nothing to commit (a clean no-op). Either way the mirror on disk is left untouched.
+fn commit_snap(agent: &Path, rt: &str, count: &mut u64) -> bool {
     let _ = scope::git_in_status(agent, &["add", "-A"]);
     // `diff --cached --quiet` exits 1 when something is staged, 0 when nothing is.
     if scope::git_in_status(agent, &["diff", "--cached", "--quiet"]).0 == 0 {
-        return;
+        return false;
     }
 
     match crate::commands::secret_gate(agent, true, "snap") {
@@ -653,12 +666,12 @@ fn commit_snap(agent: &Path, rt: &str, count: &mut u64) {
                 crate::commands::ALLOW_ENV
             );
             let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
-            return;
+            return true;
         }
         Err(e) => {
             errln!("  ⚠ auto-snap not committed — secret gate failed to run ({e:#}). `agit -a scan` to see.");
             let _ = scope::git_in_status(agent, &["reset", "-q"]);
-            return;
+            return true;
         }
     }
 
@@ -672,9 +685,11 @@ fn commit_snap(agent: &Path, rt: &str, count: &mut u64) {
     if rc == 0 {
         *count += 1;
         outln!("  ● snapped {ts}  (#{count})");
+        false
     } else {
         errln!("  ⚠ auto-snap not committed — `git commit` refused it. `agit -a scan` to see.");
         let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
+        true
     }
 }
 

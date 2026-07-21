@@ -181,14 +181,12 @@ fn dispatch(argv: Vec<String>) -> i32 {
         "init" if scope == Scope::Agent => agent_init(args),
 
         // ── Top-level native commands (independent of scope) ──
-        "init" => {
-            let agent = args
-                .iter()
-                .position(|a| a == "--agent")
-                .and_then(|i| args.get(i + 1))
-                .cloned();
-            init::run_named(agent)
-        }
+        //    `agit init --help` must PRINT usage and touch nothing — it used to EXECUTE init (appending
+        //    `.agit/` to .gitignore) because the parser ignored every arg but `--agent`. ──
+        "init" => match parse_init(args) {
+            Ok(agent) => init::run_named(agent),
+            Err(ctl) => Ok(ctl.emit(INIT_USAGE)),
+        },
         // ── clone (default/Environment scope): git's clone, but smart about agit-hub AGENT STORES. A raw
         //    `git clone <hub-store-url>` silently makes a nested git repo that resolves to no agent; so a
         //    POSITIVELY-identified agit-hub store URL, or a bare name that is a KNOWN local agent/binding,
@@ -213,10 +211,10 @@ fn dispatch(argv: Vec<String>) -> i32 {
         }
 
         // ── Native verbs that agit adds value to ──
-        "scan" => {
-            let (staged, paths) = parse_scan(args);
-            commands::scan_cmd(scope, staged, &paths)
-        }
+        "scan" => match parse_scan(args) {
+            Ok((staged, paths)) => commands::scan_cmd(scope, staged, &paths),
+            Err(ctl) => Ok(ctl.emit(SCAN_USAGE)),
+        },
         "hook-scan" => commands::hook_scan(args.iter().any(|a| a == "--staged")),
 
         // ── crypt-clean / crypt-smudge: the agit-crypt filter drivers. Scope-INDEPENDENT: git invokes
@@ -240,15 +238,15 @@ fn dispatch(argv: Vec<String>) -> i32 {
 
         // ── snap: mirror the runtime's session dump into the Agent Store (formerly named sync).
         //    --watch runs it continuously (fully automatic snap). ──
-        "snap" => {
-            let (rt, watch, interval, harness) = parse_snap(args);
-            match (watch, rt) {
+        "snap" => match parse_snap(args) {
+            Ok((rt, watch, interval, harness)) => match (watch, rt) {
                 // The watcher polls one runtime's dump; unnamed, `agit watch` is the both-runtimes loop.
                 (true, Some(rt)) => session::snap_watch_checked(&rt, interval, harness),
                 (true, None) => session::watch(interval, false, harness),
                 (false, rt) => session::snap(rt.as_deref(), harness),
-            }
-        }
+            },
+            Err(ctl) => Ok(ctl.emit(SNAP_USAGE)),
+        },
 
         // ── merge: reconcile two diverged agent branches by dialogue (the git-term verb; both sides
         //    truly resume, read-only, only real conflicts prompt you). Only the Agent scope is the
@@ -374,24 +372,18 @@ fn dispatch(argv: Vec<String>) -> i32 {
             commands::convert_watch(interval)
         }
         "convert" => match parse_convert(args) {
-            Some((sel, from, to, cwd, write)) => {
+            Ok((sel, from, to, cwd, write)) => {
                 commands::convert_cmd(sel.as_deref(), from, &to, cwd, write)
             }
-            None => {
-                eprintln!("usage: agit convert [<session|agent>] --to claude-code|codex [--from RT] [--cwd PATH] [--write]\n  (no session -> the active agent's latest; an agent name -> that agent's latest; --watch [--interval N] to auto-convert both ways)");
-                Ok(2)
-            }
+            Err(ctl) => Ok(ctl.emit(CONVERT_USAGE)),
         },
 
         // ── resume: load a session into a runtime and continue (the universal loader) ──
         "resume" => match parse_resume(args) {
-            Some((sel, as_rt, cwd, env, exec, relocate)) => {
+            Ok((sel, as_rt, cwd, env, exec, relocate)) => {
                 commands::resume_cmd(sel.as_deref(), as_rt, cwd, env, exec, relocate)
             }
-            None => {
-                eprintln!("usage: agit resume [<session|agent>] [--as claude-code|codex] [--env PATH] [--relocate] [--cwd PATH] [--exec]\n  (no session -> the active agent's latest; an agent name -> that agent's latest)");
-                Ok(2)
-            }
+            Err(ctl) => Ok(ctl.emit(RESUME_USAGE)),
         },
 
         // ── Agent-store management verbs, checked before passthrough so they never reach git ──
@@ -421,6 +413,49 @@ fn dispatch(argv: Vec<String>) -> i32 {
 }
 
 
+/// How a native argument parser asks dispatch to stop before running the command. git-parity: an
+/// agit-native verb must NEVER silently swallow an unknown/misspelled `-flag` (treating it as a target,
+/// or ignoring it) — that turns `scan --no-verify` into a scan of a nonexistent file that reports "no
+/// secrets found", and `merge --dry-runn` into a REAL merge. Each parser returns `Err(ParseCtl::…)` and
+/// dispatch renders it against that command's own usage.
+enum ParseCtl {
+    /// `--help`/`-h`: print this command's usage to stdout and exit 0 — with ZERO side effects.
+    Help,
+    /// A required argument is missing or invalid: print usage to stderr and exit 2.
+    Usage,
+    /// An unrecognized dash flag: print `unknown option '<flag>'` to stderr and exit 2, exactly like git.
+    Unknown(String),
+}
+
+impl ParseCtl {
+    /// Render this control against a command's usage string, returning the process exit code. `Help`
+    /// goes to stdout (a requested help text is not an error); the two error forms go to stderr.
+    fn emit(self, usage: &str) -> i32 {
+        match self {
+            ParseCtl::Help => {
+                println!("{usage}");
+                0
+            }
+            ParseCtl::Usage => {
+                eprintln!("{usage}");
+                2
+            }
+            ParseCtl::Unknown(flag) => {
+                eprintln!("unknown option '{flag}'");
+                eprintln!("{usage}");
+                2
+            }
+        }
+    }
+}
+
+const SCAN_USAGE: &str = "usage: agit a scan [--staged] [<file>…]   (scan session dumps for secrets)";
+const SNAP_USAGE: &str = "usage: agit a snap [<runtime>] [--from <runtime>] [--watch] [--interval <n>] [--no-harness]   (mirror this project's session dump into the Agent Store)";
+const CONVERT_USAGE: &str = "usage: agit convert [<session|agent>] --to claude-code|codex [--from RT] [--cwd PATH] [--write]\n  (no session -> the active agent's latest; an agent name -> that agent's latest; --watch [--interval N] to auto-convert both ways)";
+const RESUME_USAGE: &str = "usage: agit resume [<session|agent>] [--as claude-code|codex] [--env PATH] [--relocate] [--cwd PATH] [--exec]\n  (no session -> the active agent's latest; an agent name -> that agent's latest)";
+const INIT_USAGE: &str = "usage: agit init [--agent <name>]   (prepare this repo: clone or select its agent, install the secret hooks)";
+const MERGE_USAGE: &str = "usage: agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice] [--dry-run]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref — --agent X / --ref X disambiguate; --quick shortens the dialogue; --splice skips the model and just combines both sessions' context; --dry-run/--preview shows what the merge would do without running the model)";
+
 /// start arguments: `--agent <name|aid>` (this invocation only — it does NOT flip the default, or two
 /// agents in one repo would fight over one pointer) and `--as <runtime>`.
 fn parse_start(args: &[String]) -> (Option<String>, Option<String>) {
@@ -443,13 +478,34 @@ fn parse_start(args: &[String]) -> (Option<String>, Option<String>) {
     (agent, as_rt)
 }
 
+/// init arguments: `--agent <name>` names the agent to clone/select. Everything else is rejected so
+/// `agit init --help` prints usage and runs NOTHING (it used to execute init and edit .gitignore), and a
+/// misspelled flag errors instead of being silently ignored. Non-dash positionals are ignored, as before.
+fn parse_init(args: &[String]) -> Result<Option<String>, ParseCtl> {
+    let mut agent = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agent" if i + 1 < args.len() => {
+                agent = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--help" | "-h" => return Err(ParseCtl::Help),
+            other if other.starts_with('-') => return Err(ParseCtl::Unknown(other.to_string())),
+            _ => i += 1,
+        }
+    }
+    Ok(agent)
+}
+
 /// snap arguments: `--from <rt>` (or a bare positional) names the runtime, else snap captures every
 /// runtime with sessions here; `--watch` runs it continuously, `--interval <n>`, `--no-harness`.
 /// Returns (runtime, watch, interval, capture-harness).
 type SnapArgs = (Option<String>, bool, u64, bool);
-fn parse_snap(args: &[String]) -> SnapArgs {
+fn parse_snap(args: &[String]) -> Result<SnapArgs, ParseCtl> {
     // No default runtime: `--from` (or a bare positional) names one, otherwise snap captures every
-    // runtime that has sessions here. See session::snap.
+    // runtime that has sessions here. See session::snap. An unknown dash flag is REJECTED, not swallowed
+    // — `--no-harnes` (a typo of `--no-harness`) must not silently keep the harness on.
     let mut rt: Option<String> = None;
     let mut watch = false;
     let mut interval = 5u64;
@@ -473,16 +529,16 @@ fn parse_snap(args: &[String]) -> SnapArgs {
                 harness = false;
                 i += 1;
             }
+            "--help" | "-h" => return Err(ParseCtl::Help),
+            other if other.starts_with('-') => return Err(ParseCtl::Unknown(other.to_string())),
+            // a bare positional is shorthand for the runtime: `agit a snap codex`
             other => {
-                // a bare positional is shorthand for the runtime: `agit a snap codex`
-                if !other.starts_with('-') {
-                    rt = Some(other.to_string());
-                }
+                rt = Some(other.to_string());
                 i += 1;
             }
         }
     }
-    (rt, watch, interval, harness)
+    Ok((rt, watch, interval, harness))
 }
 
 /// watch arguments: `--interval <n>`, `--no-convert`, `--no-harness`, and the action selector
@@ -567,7 +623,7 @@ fn parse_harness(args: &[String]) -> HarnessArgs {
 /// The selector is a session path/id or an agent name (resolved client-side); absent means the active
 /// agent's latest session. Returns None only when --to is missing.
 type ConvertArgs = (Option<String>, Option<String>, String, Option<String>, bool);
-fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
+fn parse_convert(args: &[String]) -> Result<ConvertArgs, ParseCtl> {
     let mut sel = None;
     let mut from = None;
     let mut to = None;
@@ -576,38 +632,45 @@ fn parse_convert(args: &[String]) -> Option<ConvertArgs> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--to" => {
-                to = args.get(i + 1).cloned();
+            "--to" if i + 1 < args.len() => {
+                to = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--from" => {
-                from = args.get(i + 1).cloned();
+            "--from" if i + 1 < args.len() => {
+                from = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--cwd" => {
-                cwd = args.get(i + 1).cloned();
+            "--cwd" if i + 1 < args.len() => {
+                cwd = Some(args[i + 1].clone());
                 i += 2;
             }
             "--write" => {
                 write = true;
                 i += 1;
             }
+            "--help" | "-h" => return Err(ParseCtl::Help),
+            // An unknown dash flag is REJECTED, not swallowed — `--wriet` (a typo of `--write`) must not
+            // silently DRY-RUN and persist nothing at exit 0.
+            other if other.starts_with('-') => return Err(ParseCtl::Unknown(other.to_string())),
             other => {
-                if sel.is_none() && !other.starts_with('-') {
+                if sel.is_none() {
                     sel = Some(other.to_string());
                 }
                 i += 1;
             }
         }
     }
-    Some((sel, from, to?, cwd, write))
+    // `--to` is required — a convert with no target runtime is a usage error, not a silent no-op.
+    let to = to.ok_or(ParseCtl::Usage)?;
+    Ok((sel, from, to, cwd, write))
 }
 
 /// resume arguments: OPTIONAL positional selector + --as <rt> / --cwd <path> / --env <path> / --exec.
 /// The selector is a session path/id or an agent name (resolved client-side); absent means the active
-/// agent's latest session. Always returns Some — resume has no required argument.
+/// agent's latest session. resume has no required positional, so it fails only on an unknown flag or
+/// `--help`.
 type ResumeArgs = (Option<String>, Option<String>, Option<String>, Option<String>, bool, bool);
-fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
+fn parse_resume(args: &[String]) -> Result<ResumeArgs, ParseCtl> {
     let mut sel = None;
     let mut as_rt = None;
     let mut cwd = None;
@@ -617,16 +680,16 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--as" => {
-                as_rt = args.get(i + 1).cloned();
+            "--as" if i + 1 < args.len() => {
+                as_rt = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--cwd" => {
-                cwd = args.get(i + 1).cloned();
+            "--cwd" if i + 1 < args.len() => {
+                cwd = Some(args[i + 1].clone());
                 i += 2;
             }
-            "--env" => {
-                env = args.get(i + 1).cloned();
+            "--env" if i + 1 < args.len() => {
+                env = Some(args[i + 1].clone());
                 i += 2;
             }
             "--relocate" => {
@@ -637,15 +700,17 @@ fn parse_resume(args: &[String]) -> Option<ResumeArgs> {
                 exec = true;
                 i += 1;
             }
+            "--help" | "-h" => return Err(ParseCtl::Help),
+            other if other.starts_with('-') => return Err(ParseCtl::Unknown(other.to_string())),
             other => {
-                if sel.is_none() && !other.starts_with('-') {
+                if sel.is_none() {
                     sel = Some(other.to_string());
                 }
                 i += 1;
             }
         }
     }
-    Some((sel, as_rt, cwd, env, exec, relocate))
+    Ok((sel, as_rt, cwd, env, exec, relocate))
 }
 
 /// `agit harness [show|apply] [--from <rt>]` — which runtime's harness is resolved against what was
@@ -1288,7 +1353,12 @@ fn agent_pull(args: &[String]) -> anyhow::Result<i32> {
         eprintln!();
         eprintln!("your sessions and the remote's have diverged — a textual git merge would corrupt the");
         eprintln!("transcripts. Reconcile them by dialogue instead:");
-        eprintln!("  agit a merge {}", a.name);
+        // Suggest the diverged UPSTREAM ref (e.g. `origin/main`), never the agent's own name: `agit a
+        // merge <self-name>` resolves back to this agent and dead-ends with "no local session to
+        // represent it". `@{u}` is the generic fallback when the tracking ref can't be named — still a
+        // ref, still not the agent name.
+        let target = commands::upstream_ref(&a.store).unwrap_or_else(|| "@{u}".to_string());
+        eprintln!("  agit a merge {target}");
     }
     Ok(code)
 }
@@ -1355,8 +1425,19 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
                 dry_run = true;
                 i += 1;
             }
+            "--help" | "-h" => {
+                println!("{MERGE_USAGE}");
+                return Ok(0);
+            }
+            // An unknown dash flag is REJECTED, not swallowed — `--dry-runn` (a typo of `--dry-run`)
+            // must not slip through and run a REAL merge where the user asked for a preview.
+            other if other.starts_with('-') => {
+                eprintln!("unknown option '{other}'");
+                eprintln!("{MERGE_USAGE}");
+                return Ok(2);
+            }
             other => {
-                if reference.is_none() && !other.starts_with('-') {
+                if reference.is_none() {
                     reference = Some(other.to_string());
                 }
                 i += 1;
@@ -1377,23 +1458,28 @@ fn merge_cmd(args: &[String]) -> anyhow::Result<i32> {
             sync::run(&r, &rt, both, quick, splice, dry_run, prefer)
         }
         None => {
-            eprintln!("usage: agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice] [--dry-run]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref — --agent X / --ref X disambiguate; --quick shortens the dialogue; --splice skips the model and just combines both sessions' context; --dry-run/--preview shows what the merge would do without running the model)");
+            eprintln!("{MERGE_USAGE}");
             Ok(2)
         }
     }
 }
 
-fn parse_scan(args: &[String]) -> (bool, Vec<PathBuf>) {
+/// SECURITY: a dash flag agit does not recognize is REJECTED, never turned into a scan target. The old
+/// behaviour turned `agit a scan --no-verify` (and `--bogus`) into a scan of a nonexistent "file", which
+/// found nothing and printed "no secrets found" at exit 0 — HIDING real secrets in the tree. Non-dash
+/// args stay as explicit file targets.
+fn parse_scan(args: &[String]) -> Result<(bool, Vec<PathBuf>), ParseCtl> {
     let mut staged = false;
     let mut paths = Vec::new();
     for a in args {
-        if a == "--staged" {
-            staged = true;
-        } else {
-            paths.push(PathBuf::from(a));
+        match a.as_str() {
+            "--staged" => staged = true,
+            "--help" | "-h" => return Err(ParseCtl::Help),
+            other if other.starts_with('-') => return Err(ParseCtl::Unknown(other.to_string())),
+            other => paths.push(PathBuf::from(other)),
         }
     }
-    (staged, paths)
+    Ok((staged, paths))
 }
 
 const USAGE: &str = "\
