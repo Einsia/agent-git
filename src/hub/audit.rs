@@ -63,6 +63,11 @@ pub const IDENTITY_REVOKE: &str = "user.identity.revoke";
 /// attribution, so both transitions are auditable.
 pub const USER_EMAIL_VERIFY: &str = "user.email.verify";
 pub const USER_EMAIL_RESEND: &str = "user.email.resend";
+/// Admin roster management via the web panel / HTTP API. `disable` = a site admin soft-suspended an
+/// account (it can no longer log in and its live sessions were revoked); `enable` = the suspension was
+/// lifted. Account creation through the panel is logged as `user.add` (the same door as the CLI add).
+pub const USER_DISABLE: &str = "user.disable";
+pub const USER_ENABLE: &str = "user.enable";
 pub const AGENT_CREATE: &str = "agent.create";
 pub const AGENT_DELETE: &str = "agent.delete";
 pub const AGENT_RENAME: &str = "agent.rename";

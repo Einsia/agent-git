@@ -27,6 +27,18 @@ export interface Me {
   key_count?: number
 }
 
+// One row of the admin USER ROSTER (GET /api/users). Non-secret account facts only — never pw_hash,
+// salt, or the TOTP secret. `disabled` is the admin soft-suspend flag: a disabled account keeps its
+// username/agents/history but cannot log in.
+export interface RosterUser {
+  username: string
+  is_admin: boolean
+  totp_enabled: boolean
+  email_verified: boolean
+  disabled: boolean
+  created: string
+}
+
 // One registered device key (SSH-keys style: an account registers many, one per machine). Public halves
 // only. `key_fpr` is the stable fingerprint used to revoke it; `label` is the device's self-asserted name.
 export interface SigningKey {
@@ -737,9 +749,8 @@ export const api = {
 
   // ── admin user recovery ──
   // Site-admin only, and the SERVER is the gate (both 403 for a non-admin regardless of any client
-  // check). These are the only two per-user admin doors the HTTP API exposes — there is deliberately
-  // NO list-users / disable-account endpoint here; the full roster and account enable/disable live in
-  // the `agit-hub user` CLI on the host.
+  // check). These are the two per-user recovery doors; the roster list/create/disable/enable doors are
+  // in the "admin user roster" block below.
   //
   // Clear a user's 2FA — recovery for someone locked out of their authenticator. Answers {ok, user,
   // enabled:false}; 404 for an unknown user.
@@ -754,5 +765,32 @@ export const api = {
     request<{ ok: boolean; user: string; revoked_sessions: number }>(
       `/api/users/${encodeURIComponent(username)}/password`,
       { method: "POST", body: JSON.stringify({ new_password: newPassword }) }
+    ),
+
+  // ── admin user roster (list / create / disable / enable) ──
+  // Every door here is admin-only AND login-session only (a token is refused server-side). The full
+  // account roster, previously CLI-only, now lives in the web Admin panel.
+  //
+  // The whole roster, sorted by username. 403 for a non-admin / a token caller, 401 for anonymous.
+  listUsers: () => get<{ users: RosterUser[] }>("/api/users"),
+  // Create an account. `is_admin` (default false) is honored because the endpoint is already admin-gated.
+  // 200 {ok, user, is_admin}; 400 invalid username / too-short password; 409 taken; 403 non-admin.
+  createUser: (username: string, password: string, isAdmin: boolean) =>
+    request<{ ok: boolean; user: string; is_admin: boolean }>("/api/users", {
+      method: "POST",
+      body: JSON.stringify({ username, password, is_admin: isAdmin }),
+    }),
+  // Soft-suspend an account (revokes its live sessions) — it can no longer log in. 400 if it is the
+  // last remaining admin or your own account; 404 unknown user.
+  disableUser: (username: string) =>
+    request<{ ok: boolean; user: string; disabled: boolean; revoked_sessions: number }>(
+      `/api/users/${encodeURIComponent(username)}/disable`,
+      { method: "POST" }
+    ),
+  // Lift a suspension — the account can log in again.
+  enableUser: (username: string) =>
+    request<{ ok: boolean; user: string; disabled: boolean; revoked_sessions: number }>(
+      `/api/users/${encodeURIComponent(username)}/enable`,
+      { method: "POST" }
     ),
 }

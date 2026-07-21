@@ -91,6 +91,13 @@ pub struct User {
     /// reads back UNVERIFIED — the safe default.
     #[serde(default)]
     pub email_verified: bool,
+    /// Whether this account is DISABLED (soft-suspended by an admin). A disabled account still exists —
+    /// it keeps its username, agents, and history — but cannot log in (see `api_login`, which returns a
+    /// clear 403 once the password itself has been verified, so it is never a password oracle). Default
+    /// `false` (active). Added additively (back-filled onto older stores by `USER_COLUMNS`), so every
+    /// pre-existing account reads back ENABLED — the safe, unchanged default.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// Username rules: lowercase [a-z0-9._-], 2..=32, no leading dot. Login names are case-insensitive →
@@ -700,6 +707,9 @@ fn row_user(r: &impl Cols) -> User {
         // Fail-safe like every other Cols read: a store that predates `USER_COLUMNS` has no
         // `email_verified` column, which reads back as 0 → UNVERIFIED, the safe default.
         email_verified: r.int("email_verified") != 0,
+        // Fail-safe like every other Cols read: a store that predates the `disabled` column reads back
+        // as 0 → ENABLED (active), the safe default that leaves every pre-existing account able to log in.
+        disabled: r.int("disabled") != 0,
     }
 }
 
@@ -863,11 +873,13 @@ const DDL: &[&str] = &[
     // flag; totp_backup_codes is a JSON array of sha256 digests. See User for the sensitivity note.
     // email_verified is the anti-squatting gate (added additively; also back-filled onto existing DBs by
     // `USER_COLUMNS`, exactly like the totp_* columns). 0 = unverified (the default), 1 = verified.
+    // disabled is the admin soft-suspend flag (added additively; also back-filled by `USER_COLUMNS`).
+    // 0 = active (the default), 1 = disabled (cannot log in).
     "CREATE TABLE IF NOT EXISTS users (\
        username TEXT PRIMARY KEY, pw_hash TEXT NOT NULL, salt TEXT NOT NULL, \
        kdf TEXT NOT NULL, is_admin BIGINT NOT NULL DEFAULT 0, created TEXT NOT NULL DEFAULT '', \
        totp_secret TEXT, totp_enabled BIGINT NOT NULL DEFAULT 0, totp_backup_codes TEXT NOT NULL DEFAULT '[]', \
-       email_verified BIGINT NOT NULL DEFAULT 0)",
+       email_verified BIGINT NOT NULL DEFAULT 0, disabled BIGINT NOT NULL DEFAULT 0)",
     // Identity is (owner, name): a composite PRIMARY KEY, and owner is NOT NULL (it is the namespace).
     // No surrogate id — `update_agents` rewrites the whole table every write, so a surrogate would be
     // re-minted each time and buys nothing; the composite PK fits the snapshot model on both backends.
@@ -972,7 +984,10 @@ const TOTP_COLUMNS: &[&str] = &[
 /// this migrates older stores. Idempotent by construction: Postgres uses `ADD COLUMN IF NOT EXISTS`;
 /// SQLite ignores the "duplicate column" error. With the DEFAULT 0, every pre-existing account reads
 /// back UNVERIFIED — the safe anti-squatting default.
-const USER_COLUMNS: &[&str] = &["email_verified BIGINT NOT NULL DEFAULT 0"];
+///
+/// `disabled` (the admin soft-suspend flag) rides the SAME back-fill: a fresh DB gets it from `DDL`,
+/// older stores get it here. DEFAULT 0 = active, so every pre-existing account stays able to log in.
+const USER_COLUMNS: &[&str] = &["email_verified BIGINT NOT NULL DEFAULT 0", "disabled BIGINT NOT NULL DEFAULT 0"];
 
 /// The org columns added onto an `orgs` table that predates them (encryption-recipients Wave 3),
 /// back-filled at boot exactly like [`TOTP_COLUMNS`]. A **fresh** DB already has them (they are in
@@ -1314,6 +1329,23 @@ impl Store {
         self.update_users(move |users| match users.iter_mut().find(|x| x.username == u) {
             Some(user) => {
                 user.email_verified = verified;
+                true
+            }
+            None => false,
+        })
+        .await
+    }
+
+    /// Set a user's `disabled` flag (the admin soft-suspend), leaving every other field untouched.
+    /// `Ok(true)` if the user existed, `Ok(false)` if not. Username is normalized like every other
+    /// lookup. A disabled account cannot log in (`api_login` returns a 403 AFTER verifying the password,
+    /// so this is never a password oracle); enabling it restores login. The caller is responsible for
+    /// revoking the target's live sessions on DISABLE — this only flips the persisted flag.
+    pub async fn set_user_disabled(&self, username: &str, disabled: bool) -> io::Result<bool> {
+        let u = normalize_username(username);
+        self.update_users(move |users| match users.iter_mut().find(|x| x.username == u) {
+            Some(user) => {
+                user.disabled = disabled;
                 true
             }
             None => false,
@@ -2010,7 +2042,7 @@ impl SqliteStore {
         if existing.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("user already exists: {}", user.username)));
         }
-        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified, disabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&user.username)
             .bind(&user.pw_hash)
             .bind(&user.salt)
@@ -2021,6 +2053,7 @@ impl SqliteStore {
             .bind(user.totp_enabled as i64)
             .bind(json_text(&user.totp_backup_codes))
             .bind(user.email_verified as i64)
+            .bind(user.disabled as i64)
             .execute(&mut *tx)
             .await
             .map_err(|e| match &e {
@@ -2046,7 +2079,7 @@ impl SqliteStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM users").execute(&mut *tx).await.map_err(err)?;
         for u in &list {
-            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified, disabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 .bind(&u.username)
                 .bind(&u.pw_hash)
                 .bind(&u.salt)
@@ -2057,6 +2090,7 @@ impl SqliteStore {
                 .bind(u.totp_enabled as i64)
                 .bind(json_text(&u.totp_backup_codes))
                 .bind(u.email_verified as i64)
+                .bind(u.disabled as i64)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -2722,7 +2756,7 @@ impl PgStore {
         if existing.is_some() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("user already exists: {}", user.username)));
         }
-        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
+        sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified, disabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)")
             .bind(&user.username)
             .bind(&user.pw_hash)
             .bind(&user.salt)
@@ -2733,6 +2767,7 @@ impl PgStore {
             .bind(user.totp_enabled as i64)
             .bind(json_text(&user.totp_backup_codes))
             .bind(user.email_verified as i64)
+            .bind(user.disabled as i64)
             .execute(&mut *tx)
             .await
             .map_err(|e| match &e {
@@ -2757,7 +2792,7 @@ impl PgStore {
         let r = f(&mut list);
         sqlx::query("DELETE FROM users").execute(&mut *tx).await.map_err(err)?;
         for u in &list {
-            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
+            sqlx::query("INSERT INTO users (username, pw_hash, salt, kdf, is_admin, created, totp_secret, totp_enabled, totp_backup_codes, email_verified, disabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)")
                 .bind(&u.username)
                 .bind(&u.pw_hash)
                 .bind(&u.salt)
@@ -2768,6 +2803,7 @@ impl PgStore {
                 .bind(u.totp_enabled as i64)
                 .bind(json_text(&u.totp_backup_codes))
                 .bind(u.email_verified as i64)
+                .bind(u.disabled as i64)
                 .execute(&mut *tx)
                 .await
                 .map_err(err)?;
@@ -4257,6 +4293,40 @@ mod tests {
         // Revoking verification closes the door again.
         s.set_email_verified("alice", false).await.unwrap();
         assert!(s.get_identity_keys_by_email("alice@corp.com").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_user_disabled_toggles_and_persists() {
+        let (_d, s) = tmp_store().await;
+        add_named_user(&s, "alice").await;
+        // A fresh account is enabled (disabled == false).
+        assert!(!s.user("alice").await.unwrap().disabled);
+        // Disable it, and the flag round-trips through the DELETE + re-INSERT snapshot rewrite.
+        assert!(s.set_user_disabled("alice", true).await.unwrap());
+        assert!(s.user("alice").await.unwrap().disabled);
+        // Enable restores it; case-insensitive lookup addresses the same account.
+        assert!(s.set_user_disabled("ALICE", false).await.unwrap());
+        assert!(!s.user("alice").await.unwrap().disabled);
+        // An unknown user reports false (no such row), and nothing is created.
+        assert!(!s.set_user_disabled("ghost", true).await.unwrap());
+        assert!(s.user("ghost").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_column_backfills_false() {
+        // Upgrade path: a users table that predates the `disabled` column. Re-running migrate must add it
+        // (idempotent ADD COLUMN IF NOT EXISTS / duplicate-ignored on SQLite) and every pre-existing row
+        // must read back disabled=false — the safe default that leaves old accounts able to log in.
+        let (_d, s) = tmp_store().await;
+        add_named_user(&s, "olduser").await;
+        raw_exec(&s, "ALTER TABLE users DROP COLUMN disabled").await;
+        if let Store::Sqlite(inner) = &s {
+            inner.migrate().await.expect("migrate must back-fill the disabled column");
+        }
+        // The row predating the column reads back ENABLED, and the flag is writable again post-migration.
+        assert!(!s.user("olduser").await.unwrap().disabled, "a pre-column row reads disabled=false");
+        assert!(s.set_user_disabled("olduser", true).await.unwrap());
+        assert!(s.user("olduser").await.unwrap().disabled);
     }
 
     #[tokio::test]

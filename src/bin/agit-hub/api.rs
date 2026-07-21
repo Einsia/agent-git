@@ -108,6 +108,12 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("GET", "search") => return api_search(ctx, req, caller).await,
         ("GET", "orgs") => return api_orgs_list(ctx, caller).await,
         ("POST", "orgs") => return api_orgs_create(ctx, caller, body).await,
+        // The admin USER ROSTER: list every account, or create one. Both are admin-only AND
+        // login-session only (a token — even an admin's — is refused), matching the site-wide audit log
+        // and the per-user recovery doors below. The /disable + /enable toggles are the `users/` prefix
+        // routes further down.
+        ("GET", "users") => return api_users_list(ctx, caller).await,
+        ("POST", "users") => return api_users_create(ctx, caller, body).await,
         // Shared identity registry (encryption-recipients Wave 1). Enroll upserts the CALLER's own row;
         // the list form reads a batch (`?users=a,b,c`). The single-user GET is the `identity/<user>`
         // prefix route below. All require an authenticated caller.
@@ -212,6 +218,20 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         if let Some(username) = after.strip_suffix("/verify-email") {
             return match m {
                 "POST" => api_admin_verify_email(ctx, caller, username).await,
+                _ => Resp::text(405, "method not allowed"),
+            };
+        }
+        // Admin soft-suspend a user (revoking their live sessions) / lift the suspension. Same admin +
+        // login-session gate as the roster list/create above.
+        if let Some(username) = after.strip_suffix("/disable") {
+            return match m {
+                "POST" => api_admin_set_disabled(ctx, caller, username, true).await,
+                _ => Resp::text(405, "method not allowed"),
+            };
+        }
+        if let Some(username) = after.strip_suffix("/enable") {
+            return match m {
+                "POST" => api_admin_set_disabled(ctx, caller, username, false).await,
                 _ => Resp::text(405, "method not allowed"),
             };
         }
@@ -467,6 +487,17 @@ pub(crate) async fn api_login(ctx: &Ctx, req: &Req, body: &[u8]) -> Resp {
         // brute-forcer a username dictionary.
         return Resp::err(401, "wrong username or password");
     };
+    // Disabled (admin soft-suspend): the password was CORRECT (we are past the generic 401), so a clear
+    // 403 here is not a password oracle — only someone who already knows the password learns the account
+    // is suspended, which is inherent and acceptable (same shape as the 2FA-required disclosure below). A
+    // WRONG password never reaches this line; it exits at the generic 401 above. Checked BEFORE the 2FA
+    // gate and BEFORE any session is minted, so a disabled account can never obtain a cookie.
+    if user.disabled {
+        ctx.metrics.record_auth(AuthResult::LoginFail);
+        tracing::warn!(user = %user.username, "login refused: account disabled");
+        audit_append(ctx.root(), &user.username, audit::LOGIN_FAILED, None, "account disabled").await;
+        return Resp::err(403, "this account is disabled; contact an admin");
+    }
     // Second factor: once 2FA is active, a correct password alone is NOT sufficient. Require a `code`
     // (a current TOTP or an unused backup code). A missing/wrong code is a flat 401
     // {"error":"2fa_required"} and NO session — so an attacker holding only the password still cannot
@@ -1082,6 +1113,165 @@ pub(crate) async fn api_admin_verify_email(ctx: &Ctx, caller: &Caller, username:
     tracing::info!(actor = %actor, user = %target, "admin force-verified email");
     audit_append(ctx.root(), &actor, audit::USER_EMAIL_VERIFY, None, &format!("admin force-verified {target}")).await;
     Resp::json(serde_json::json!({ "ok": true, "user": target, "email_verified": true }))
+}
+
+// ── admin user roster (list / create / disable / enable) ──
+//
+// The web Admin panel's account management, previously CLI-only. Every door here is admin-only AND
+// login-session only: a token — even one owned by an admin — is refused, exactly like the site-wide
+// audit log. Issuing/using a token is the automation path; managing the human roster is a person's own
+// session decision, so the `caller.token.is_some()` check below is deliberate, not incidental.
+
+/// The admin-only + login-session gate shared by every roster endpoint. Returns the acting admin's
+/// username on success, or the Resp to return on refusal: 401 for anonymous, 403 for a token caller
+/// (even an admin's — this is a person-at-a-keyboard action), 403 for a non-admin.
+fn require_admin_session(caller: &Caller) -> Result<String, Resp> {
+    let Some(actor) = caller.user.clone() else {
+        return Err(Resp::err(401, "login required"));
+    };
+    // A token is never enough for roster management, mirroring the site-wide audit log gate. Checked
+    // before is_admin so an admin's token is refused as a token, not silently accepted.
+    if caller.token.is_some() {
+        return Err(Resp::err(403, "roster management takes a login session; a token can't do this"));
+    }
+    if !caller.is_admin {
+        return Err(Resp::err(403, "admin only"));
+    }
+    Ok(actor)
+}
+
+/// One roster row: the account facts the panel renders. Only non-secret metadata — never `pw_hash`,
+/// `salt`, or the TOTP secret. `totp_enabled` is the active-2FA flag (not whether an enrollment is
+/// merely pending), matching what `GET /api/me` and the account page already expose about the caller.
+fn roster_json(u: &store::User) -> serde_json::Value {
+    serde_json::json!({
+        "username": u.username,
+        "is_admin": u.is_admin,
+        "totp_enabled": u.totp_enabled,
+        "email_verified": u.email_verified,
+        "disabled": u.disabled,
+        "created": u.created,
+    })
+}
+
+/// `GET /api/users` — the full account roster (admin + login-session only). Answers `{ users: [...] }`,
+/// each row the non-secret facts in [`roster_json`], sorted by username for a stable panel render.
+pub(crate) async fn api_users_list(ctx: &Ctx, caller: &Caller) -> Resp {
+    if let Err(r) = require_admin_session(caller) {
+        return r;
+    }
+    let mut users = ctx.store.users().await;
+    users.sort_by(|a, b| a.username.cmp(&b.username));
+    let rows: Vec<serde_json::Value> = users.iter().map(roster_json).collect();
+    Resp::json(serde_json::json!({ "users": rows }))
+}
+
+/// `POST /api/users` `{ username, password, is_admin? }` — admin creates an account (admin + login-session
+/// only). Reuses registration's exact rules: username validity + reserved-name refusal, the unified
+/// (user ∩ org) taken check, the shared minimum password length, and the argon2 hash under the login gate.
+/// `is_admin` is honored ONLY because the whole endpoint is already admin-gated — a non-admin never
+/// reaches the body parse (they are refused by `require_admin_session`), so this can never be an
+/// escalation door. Unlike self-service registration, this does NOT log the new account in (no session
+/// cookie): the admin stays themselves.
+pub(crate) async fn api_users_create(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
+    let actor = match require_admin_session(caller) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let Some(v) = json_body(body) else {
+        return Resp::err(400, "want a JSON body");
+    };
+    let (Some(raw), Some(password)) = (str_field(&v, "username"), str_field(&v, "password")) else {
+        return Resp::err(400, "want username and password");
+    };
+    let username = store::normalize_username(&raw);
+    if !store::valid_username(&username) {
+        return Resp::err(400, "invalid username (2-32 lowercase [a-z0-9._-], no leading dot)");
+    }
+    if store::is_reserved_account(&username) {
+        return Resp::err(400, "that name is reserved");
+    }
+    // Same minimum as registration / the CLI, via the one shared constant.
+    if password.chars().count() < store::MIN_PASSWORD_LEN {
+        return Resp::err(400, "password too short (at least 8 characters)");
+    }
+    // Unified account namespace: a username and an org name may never share a bare string. Checked here
+    // like registration does; the users PRIMARY KEY makes the user-vs-user race safe (clean AlreadyExists).
+    if ctx.store.org(&username).await.is_some() {
+        return Resp::err(409, "that username is taken");
+    }
+    // `is_admin` defaults to false when the field is absent; only an admin (already gated above) can set it.
+    let is_admin = v.get("is_admin").and_then(|b| b.as_bool()).unwrap_or(false);
+    let (pw_hash, salt, kdf_id) = match hash_new_password(ctx, &password).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let user = store::User {
+        username: username.clone(),
+        pw_hash,
+        salt,
+        kdf: kdf_id,
+        is_admin,
+        created: store::now_iso(),
+        ..Default::default()
+    };
+    match ctx.store.add_user(user).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Resp::err(409, "that username is taken"),
+        Err(_) => return Resp::err(500, "couldn't create the account"),
+    }
+    tracing::info!(actor = %actor, user = %username, admin = is_admin, "admin created user");
+    audit_append(ctx.root(), &actor, audit::USER_ADD, None, &format!("created {username}{}", if is_admin { " (admin)" } else { "" })).await;
+    Resp::json(serde_json::json!({ "ok": true, "user": username, "is_admin": is_admin }))
+}
+
+/// `POST /api/users/<u>/disable` and `/enable` — admin soft-suspend / un-suspend an account (admin +
+/// login-session only). On DISABLE, EVERY one of the target's live sessions is revoked, so a suspension
+/// takes effect immediately rather than waiting for the session TTL. GUARDS on disable: an admin may not
+/// disable their OWN account (self-lockout), and may not disable the LAST remaining admin (which would
+/// leave the hub with no one able to administer it). Enable has no guards. Idempotent: disabling an
+/// already-disabled account (or enabling an active one) is a success that re-asserts the state.
+pub(crate) async fn api_admin_set_disabled(ctx: &Ctx, caller: &Caller, username: &str, disabled: bool) -> Resp {
+    let actor = match require_admin_session(caller) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let target = store::normalize_username(username);
+    let Some(target_user) = ctx.store.user(&target).await else {
+        // An admin already sees every account (they can list the roster), so a plain 404 leaks nothing.
+        return Resp::err(404, "no such user");
+    };
+    if disabled {
+        // Never leave the hub un-administrable: refuse to disable the last ENABLED admin. Count admins who
+        // are not already disabled; if the target is the only one, block it. Checked BEFORE the self guard,
+        // so the sole admin disabling themselves gets the more informative "last admin" message. (A
+        // non-admin target skips this — disabling a normal user can never exhaust the admin set.)
+        if target_user.is_admin {
+            let enabled_admins = ctx.store.users().await.into_iter().filter(|u| u.is_admin && !u.disabled).count();
+            if enabled_admins <= 1 {
+                return Resp::err(400, "can't disable the last remaining admin");
+            }
+        }
+        // An admin locking THEMSELVES out (while other admins remain) is almost always a mistake and
+        // strands their own session; refuse it. Compared on the normalized actor (caller.user is already
+        // the stored, normalized username).
+        if target == store::normalize_username(&actor) {
+            return Resp::err(400, "you can't disable your own account");
+        }
+    }
+    match ctx.store.set_user_disabled(&target, disabled).await {
+        Ok(true) => {}
+        Ok(false) => return Resp::err(404, "no such user"),
+        Err(_) => return Resp::err(500, "couldn't update the account"),
+    }
+    // On disable, kick every live session for the account (recovery/lockout action — a suspended user
+    // must not keep a working cookie). None = keep nothing; the target is not the caller (self-disable is
+    // refused above), so there is no "current" session to preserve.
+    let revoked = if disabled { ctx.sessions.revoke_user(&target, None) } else { 0 };
+    let (action, verb) = if disabled { (audit::USER_DISABLE, "disabled") } else { (audit::USER_ENABLE, "enabled") };
+    tracing::info!(actor = %actor, user = %target, revoked_sessions = revoked, "admin {verb} user");
+    audit_append(ctx.root(), &actor, action, None, &format!("{verb} {target}; revoked {revoked} session(s)")).await;
+    Resp::json(serde_json::json!({ "ok": true, "user": target, "disabled": disabled, "revoked_sessions": revoked }))
 }
 
 // ── shared identity registry (encryption-recipients Wave 1) ──
@@ -5581,5 +5771,130 @@ mod tests {
         .await;
         assert_eq!(r.status, 201, "the owner can mint a write token bound to their own agent");
         assert_eq!(ctx.store.tokens().await.len(), 1, "the write token was persisted");
+    }
+
+    // ── admin user roster (list / create / disable / enable) ──
+
+    #[tokio::test]
+    async fn roster_list_is_admin_and_login_session_only() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "root", "root-password-1", true).await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+
+        // An admin (login session) sees the whole roster.
+        let ok = api_users_list(&ctx, &caller("root", true)).await;
+        assert_eq!(ok.status, 200);
+        let body = String::from_utf8_lossy(&ok.body);
+        assert!(body.contains("\"alice\"") && body.contains("\"root\""), "roster lists every account");
+        assert!(body.contains("disabled"), "each row carries the disabled flag");
+        assert!(!body.contains("pw_hash") && !body.contains("salt"), "no secret material leaks into the roster");
+
+        // A non-admin is refused, an anonymous caller is refused, and an admin's TOKEN is refused
+        // (roster management is login-session only, like the site-wide audit log).
+        assert_eq!(api_users_list(&ctx, &caller("alice", false)).await.status, 403, "non-admin");
+        assert_eq!(api_users_list(&ctx, &Caller::anonymous()).await.status, 401, "anonymous");
+        assert_eq!(
+            api_users_list(&ctx, &caller("root", true).with_token(None, Scope::Read)).await.status,
+            403,
+            "an admin's token can't manage the roster"
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_create_user_enforces_the_rules() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "root", "root-password-1", true).await;
+
+        // The admin creates a normal user; the given password then logs in.
+        let ok = api_users_create(&ctx, &caller("root", true), &body(serde_json::json!({ "username": "bob", "password": "bob-password-1" }))).await;
+        assert_eq!(ok.status, 200);
+        assert!(auth::verify_login(&ctx.store, "bob", "bob-password-1").await.is_some(), "the created account can log in");
+        assert!(!ctx.store.user("bob").await.unwrap().is_admin, "no is_admin field defaults to a normal user");
+
+        // The password-length rule, username validity, and the taken check all bite.
+        assert_eq!(
+            api_users_create(&ctx, &caller("root", true), &body(serde_json::json!({ "username": "carol", "password": "short" }))).await.status,
+            400,
+            "password too short"
+        );
+        assert_eq!(
+            api_users_create(&ctx, &caller("root", true), &body(serde_json::json!({ "username": "A", "password": "carol-password-1" }))).await.status,
+            400,
+            "invalid username"
+        );
+        assert_eq!(
+            api_users_create(&ctx, &caller("root", true), &body(serde_json::json!({ "username": "bob", "password": "another-pass-1" }))).await.status,
+            409,
+            "taken"
+        );
+
+        // An admin may create another admin when they ask for one.
+        let mk_admin = api_users_create(&ctx, &caller("root", true), &body(serde_json::json!({ "username": "dave", "password": "dave-password-1", "is_admin": true }))).await;
+        assert_eq!(mk_admin.status, 200);
+        assert!(ctx.store.user("dave").await.unwrap().is_admin, "is_admin:true from an admin creates an admin");
+
+        // A non-admin can't create anyone — so a non-admin can't create an admin either. The account is
+        // never written.
+        let denied = api_users_create(&ctx, &caller("bob", false), &body(serde_json::json!({ "username": "evil", "password": "evil-password-1", "is_admin": true }))).await;
+        assert_eq!(denied.status, 403);
+        assert!(ctx.store.user("evil").await.is_none(), "the refused create wrote nothing");
+        // An anonymous caller is refused before the body is parsed.
+        assert_eq!(api_users_create(&ctx, &Caller::anonymous(), &body(serde_json::json!({ "username": "x", "password": "y" }))).await.status, 401);
+    }
+
+    #[tokio::test]
+    async fn disable_blocks_login_revokes_sessions_and_enable_restores() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "root", "root-password-1", true).await;
+        add_user(&ctx, "bob", "bob-password-1", false).await;
+        // bob has a live session going in.
+        let sid = ctx.sessions.create("bob").unwrap();
+        assert_eq!(ctx.sessions.lookup(&sid).as_deref(), Some("bob"));
+
+        // The admin disables bob: his live session is revoked and the flag is set.
+        let dis = api_admin_set_disabled(&ctx, &caller("root", true), "bob", true).await;
+        assert_eq!(dis.status, 200);
+        assert_eq!(ctx.sessions.lookup(&sid), None, "disabling revokes the target's live sessions");
+        assert!(ctx.store.user("bob").await.unwrap().disabled);
+
+        // The CORRECT password now yields a 403 disabled (not a session); a WRONG password still yields the
+        // generic 401, so disabling is not a password oracle.
+        let good = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "bob", "password": "bob-password-1" }))).await;
+        assert_eq!(good.status, 403, "a disabled account can't log in even with the right password");
+        assert!(!good.extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("set-cookie")), "no session cookie is issued to a disabled account");
+        let bad = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "bob", "password": "wrong-password-9" }))).await;
+        assert_eq!(bad.status, 401, "a wrong password is still the generic 401 — no oracle");
+
+        // Enable restores login.
+        let en = api_admin_set_disabled(&ctx, &caller("root", true), "bob", false).await;
+        assert_eq!(en.status, 200);
+        assert!(!ctx.store.user("bob").await.unwrap().disabled);
+        let back = api_login(&ctx, &req("POST", None), &body(serde_json::json!({ "username": "bob", "password": "bob-password-1" }))).await;
+        assert_eq!(back.status, 200, "an enabled account logs in again");
+    }
+
+    #[tokio::test]
+    async fn disable_guards_self_and_last_admin() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "root", "root-password-1", true).await;
+
+        // Sole admin disabling themselves is the last-admin case: refused, and root stays enabled.
+        let last = api_admin_set_disabled(&ctx, &caller("root", true), "root", true).await;
+        assert_eq!(last.status, 400, "can't disable the last remaining admin");
+        assert!(!ctx.store.user("root").await.unwrap().disabled, "root is untouched");
+
+        // With a SECOND admin present, root disabling ITSELF is now the self-lockout guard (root2 remains).
+        add_user(&ctx, "root2", "root2-password-1", true).await;
+        let selfd = api_admin_set_disabled(&ctx, &caller("root", true), "root", true).await;
+        assert_eq!(selfd.status, 400, "an admin can't disable their own account");
+        assert!(!ctx.store.user("root").await.unwrap().disabled);
+
+        // But root CAN disable the other admin (two enabled admins → one remains).
+        let other = api_admin_set_disabled(&ctx, &caller("root", true), "root2", true).await;
+        assert_eq!(other.status, 200);
+        assert!(ctx.store.user("root2").await.unwrap().disabled);
+
+        // An unknown target is a plain 404.
+        assert_eq!(api_admin_set_disabled(&ctx, &caller("root", true), "ghost", true).await.status, 404);
     }
 }
