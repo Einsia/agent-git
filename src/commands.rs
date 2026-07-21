@@ -390,9 +390,10 @@ fn infer_runtime(text: &str) -> Option<&'static str> {
 }
 
 /// `agit convert <src> --to <rt> [--from <rt>] [--cwd P] [--write]`
-/// The install id for a materialized session: **always a UUID**, for every runtime.
+/// The install id for a materialized session: a UUID-shaped id that is **deterministic** in
+/// `(source session id, target runtime)`.
 ///
-/// This is a regression lock, not a style choice. `codex exec resume` advertises "UUID **or thread
+/// UUID shape is a regression lock, not a style choice. `codex exec resume` advertises "UUID **or thread
 /// name**", so agit briefly installed codex sessions under a proper name (`feature-a-3f9a2c`). That is
 /// broken, and it fails OPEN — verified against codex 0.144.4 with a fact only the history could know:
 ///   * UUID id, file on disk, absent from codex's index → resume RECALLED the fact (codex reads the file)
@@ -400,11 +401,33 @@ fn infer_runtime(text: &str) -> Option<&'static str> {
 /// Root cause: a non-UUID is resolved as a thread name via ~/.codex/state_5.sqlite (`threads` has
 /// id/rollout_path/title — no name column), and a file agit drops on disk is never indexed there. So a
 /// named install silently starts a FRESH session. A UUID, by contrast, is matched against the rollout
-/// files themselves and works.
+/// files themselves and works. Proper names therefore survive only as a human-facing LABEL (see
+/// convo::proper_name), never as the id.
 ///
-/// Proper names therefore survive only as a human-facing LABEL (see convo::proper_name), never as the id.
-fn install_id(_to_rt: &str, _branch: Option<&str>, _seed: &str) -> String {
-    crate::convo::fresh_id("session")
+/// DETERMINISM is the fix for auto-convert store bloat. The old `fresh_id()` minted a new random UUID on
+/// every pass, so the watcher (whose in-process `seen` set resets on each restart) re-converted the SAME
+/// source into a NEW file, which capture then snapped as a NEW committed session — one source fanned out
+/// into a fresh rollup on every daemon restart. Keying the id on the SOURCE session id (plus the target
+/// runtime) makes re-converting the same source resolve to the SAME id, so `register::install` overwrites
+/// the one file in place and the next snap sees identical content: nothing new to commit. A genuinely-new
+/// source has a different source id, so it still converts to its own id.
+fn install_id(to_rt: &str, source_id: &str) -> String {
+    stable_uuid(&format!("{source_id}\u{0}{to_rt}"))
+}
+
+/// A deterministic UUID-shaped id (8-4-4-4-12) derived from `key`. Same shape as [`crate::convo::fresh_id`]
+/// — version nibble 7, variant nibble 8, so codex/claude both accept it as a real id — but sourced from
+/// `sha256(key)` alone, with no clock or pid, so the SAME key always yields the SAME id.
+fn stable_uuid(key: &str) -> String {
+    let hex = crate::convo::sha256_hex(key);
+    format!(
+        "{}-{}-7{}-8{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[13..16],
+        &hex[17..20],
+        &hex[20..32]
+    )
 }
 
 /// The shared front half of convert / materialize / resume: mint the install id, convert `src` into
@@ -419,7 +442,15 @@ fn convert_for_install(
     cwd_override: Option<String>,
 ) -> Result<(String, String, crate::convo::ConversationIR, PathBuf)> {
     use crate::convo::{self, ConvertOpts};
-    let new_id = install_id(to, convo::peek_branch(text).as_deref(), text);
+    // Key the id on the SOURCE session's own id (its file stem), so re-converting the same source is
+    // idempotent — see `install_id`. A source with no usable file stem (e.g. converting an anonymous
+    // in-memory transcript) falls back to a content hash, which is still stable for identical input.
+    let source_id = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| convo::sha256_hex(text));
+    let new_id = install_id(to, &source_id);
     // Resume/convert install a session to run in THIS environment, not where it was captured. Default
     // the target cwd to the agent's repo root (else the current dir) so BOTH the runtime session slug
     // and the transcript's own cwd point where you resume. Without this a session captured on another
@@ -1668,8 +1699,9 @@ fn provenance_verify_agent(agent: &agent::Agent, repin: bool) -> Result<i32> {
             agent.name
         );
     }
-    // Newest first, matching the session views (recency is recorded, not mtimed).
-    sessions.sort_by_key(|s| std::cmp::Reverse((s.last_activity, s.mtime)));
+    // Newest first, matching the session views (recency is recorded and committed, not mtimed — so this
+    // order is the SAME for every teammate; see `recency_order_key`).
+    sessions.sort_by_key(|s| std::cmp::Reverse(recency_order_key(s)));
 
     outln!("verifying {} session(s) for agent `{}`", sessions.len(), agent.name);
     let mut worst = 0;
@@ -1903,7 +1935,16 @@ pub fn store_sessions(store: &Path) -> Vec<StoredSession> {
 /// order the directory walk happened to produce. A session the store records a time for therefore
 /// always beats one it does not, and mtime only breaks a tie.
 pub fn latest_session(store: &Path) -> Option<StoredSession> {
-    store_sessions(store).into_iter().max_by_key(|s| (s.last_activity, s.mtime))
+    store_sessions(store).into_iter().max_by_key(recency_order_key)
+}
+
+/// The order two teammates must agree on, from values git COMMITS — never the filesystem mtime, which a
+/// clone flattens and a `touch` reorders, so an mtime tiebreak let two peers with a byte-identical store
+/// resolve a different "latest". Recorded recency first (`last_activity`, now never null for a snapped
+/// session), then the session's committed location (`<env>/<runtime>/<id>`) to break a tie deterministically.
+fn recency_order_key(s: &StoredSession) -> (Option<chrono::DateTime<chrono::Utc>>, String) {
+    let stem = s.path.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+    (s.last_activity, format!("{}/{}/{stem}", s.env_slug.as_deref().unwrap_or(""), s.runtime))
 }
 
 // ─────────────────────── ahead/behind — one implementation, shared by status/pull/fetch ───────────────────────
@@ -4702,12 +4743,15 @@ mod start_tests {
         // and a merge transcript is not one either
         write(&s.join("merges/a-b.md"), "# transcript\n");
 
-        // make ordering explicit rather than trusting write order
+        // Ordering comes from COMMITTED recency (the sidecars), not the filesystem: `new` is the latest
+        // because its recorded last_activity is later, regardless of write order or mtime.
+        write(&s.join("web/claude-code/old.agit.json"), "{\"last_activity\":\"2026-07-16T08:00:00.000Z\"}\n");
+        write(&s.join("api/codex/new.agit.json"), "{\"last_activity\":\"2026-07-16T10:00:00.000Z\"}\n");
+        // mtime is deliberately set to DISAGREE with recorded recency, proving the fs no longer decides.
         let newer = std::time::SystemTime::now();
         let older = newer - std::time::Duration::from_secs(7200);
-        filetime(&s.join("web/claude-code/old.jsonl"), older);
-        filetime(&s.join("api/codex/new.jsonl"), newer);
-        filetime(&s.join("api/codex/new/subagents/sub.jsonl"), newer + std::time::Duration::from_secs(60));
+        filetime(&s.join("web/claude-code/old.jsonl"), newer);
+        filetime(&s.join("api/codex/new.jsonl"), older);
 
         let all = store_sessions(store.path());
         assert_eq!(all.len(), 2, "only real sessions: {:?}", all.iter().map(|x| &x.path).collect::<Vec<_>>());
@@ -4718,6 +4762,57 @@ mod start_tests {
         assert_eq!(latest.env_slug.as_deref(), Some("api"), "an env-partitioned store reports where it ran");
         // the newest FILE is a sidecar; it must not become the session we carry
         assert!(!latest.path.to_string_lossy().contains("subagents"));
+    }
+
+    /// Per-teammate `latest` drift (QA: `touch` an older session → it jumps to the top of `a log` with
+    /// the store commit UNCHANGED). Two teammates with a byte-identical store must resolve the SAME
+    /// latest, so ordering must come only from COMMITTED values — never the filesystem mtime, which a
+    /// clone flattens and a `touch` reorders. When recorded recency ties (the timestamp-less case that
+    /// used to be null and fall through to mtime), the committed id breaks it, so a `touch` cannot move it.
+    #[test]
+    fn latest_is_committed_ordered_so_a_touch_cannot_reorder_it() {
+        let store = tempfile::tempdir().unwrap();
+        let d = store.path();
+        git(d, &["init", "-q", "-b", "main", "."]);
+        let s = d.join("sessions/claude-code");
+
+        // Two sessions that TIE on recorded recency — exactly what a pair of timestamp-less snapped
+        // sessions now looks like (both floored, non-null). With only recency to go on, an mtime tiebreak
+        // would let the filesystem decide; the committed id must decide instead.
+        write(&s.join("aaa.jsonl"), "{}\n");
+        write(&s.join("aaa.agit.json"), "{\"last_activity\":\"2026-07-16T10:00:00.000Z\"}\n");
+        write(&s.join("bbb.jsonl"), "{}\n");
+        write(&s.join("bbb.agit.json"), "{\"last_activity\":\"2026-07-16T10:00:00.000Z\"}\n");
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-qm", "two tied sessions"]);
+        let head_before = git(d, &["rev-parse", "HEAD"]);
+
+        let picked = latest_session(d).unwrap().path.file_stem().unwrap().to_string_lossy().into_owned();
+
+        // Now `touch` the OTHER one to be far newer on disk. mtime ordering would flip the answer here.
+        let other = if picked == "aaa" { "bbb" } else { "aaa" };
+        filetime(&s.join(format!("{other}.jsonl")), std::time::SystemTime::now() + std::time::Duration::from_secs(86_400));
+
+        let after = latest_session(d).unwrap().path.file_stem().unwrap().to_string_lossy().into_owned();
+        assert_eq!(after, picked, "a touch reordered `latest`; ordering is still reading the filesystem mtime");
+        assert_eq!(git(d, &["rev-parse", "HEAD"]), head_before, "no commit changed; the reorder would be purely local");
+    }
+
+    /// The other half of the same fix: a snapped session's sidecar `last_activity` is NEVER null, even
+    /// when the transcript carries no timestamp — otherwise the reader falls back to mtime and the drift
+    /// above returns. The floor is a stable committed value, so it does not churn a fresh commit per tick.
+    #[test]
+    fn a_timestampless_snapped_session_still_gets_a_committed_recency() {
+        let store = tempfile::tempdir().unwrap();
+        let s = store.path().join("sessions/claude-code");
+        // A timestamp-less transcript, and its sidecar written with the floor (what the snap now records).
+        write(&s.join("q.jsonl"), "{}\n");
+        write(&s.join("q.agit.json"), &format!("{{\"last_activity\":\"{}\"}}\n", crate::session::NO_ACTIVITY_FLOOR));
+
+        let ss = store_sessions(store.path());
+        assert_eq!(ss.len(), 1);
+        assert!(ss[0].last_activity.is_some(), "a floored sidecar must give a non-null, ord:able recency");
+        assert_ne!(crate::session::NO_ACTIVITY_FLOOR, "", "the floor must be a real committed value, not empty/null");
     }
 
     /// The regression the design calls out: `git log -1 --name-only` prints NOTHING on a merge commit,
@@ -4852,7 +4947,7 @@ mod install_id_tests {
     #[test]
     fn install_id_is_always_a_uuid_even_for_codex() {
         for rt in ["codex", "claude-code"] {
-            let id = install_id(rt, Some("feature-a"), "seed-content");
+            let id = install_id(rt, "feature-a-3f9a2c");
             assert!(!id.starts_with("feature-a"), "{rt}: got a proper name, not a uuid: {id}");
             let parts: Vec<&str> = id.split('-').collect();
             assert_eq!(parts.len(), 5, "{rt}: not uuid-shaped: {id}");
@@ -4863,6 +4958,28 @@ mod install_id_tests {
             );
             assert!(id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{rt}: non-hex: {id}");
         }
+    }
+
+    /// The store-bloat fix: the same source id + target runtime must always resolve to the SAME id, so a
+    /// re-convert overwrites its one file instead of minting a fresh rollup. A different source id (or a
+    /// different target runtime) must resolve elsewhere, or a genuinely-new session would never convert.
+    #[test]
+    fn install_id_is_deterministic_in_source_and_runtime() {
+        assert_eq!(
+            install_id("codex", "src-abc"),
+            install_id("codex", "src-abc"),
+            "same source + runtime must be stable across passes (no fresh UUID per restart)"
+        );
+        assert_ne!(
+            install_id("codex", "src-abc"),
+            install_id("codex", "src-def"),
+            "a different source must get its own id"
+        );
+        assert_ne!(
+            install_id("codex", "src-abc"),
+            install_id("claude-code", "src-abc"),
+            "the same source converted to a different runtime is a different session"
+        );
     }
 }
 

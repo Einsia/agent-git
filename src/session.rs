@@ -494,7 +494,13 @@ fn write_sidecar(dp: &Path, o: &Owned, env: &Path, rt: &str, store: &Path) -> Re
     let mut v = serde_json::json!({
         "env": env.display().to_string(),
         "runtime": rt,
-        "last_activity": last_activity(&o.src),
+        // NEVER null. The sidecar is what a teammate ORDERS by (`latest_session`), and a clone erases
+        // filesystem mtimes — so a null here forced the reader to fall back to the machine's own mtime,
+        // and two teammates with a byte-identical store then resolved a DIFFERENT latest. Record the
+        // transcript's own last activity, or, when it carries no timestamp at all, a stable committed
+        // floor (never `now`, which would churn a fresh commit on every watch tick and still differ per
+        // machine). Either value travels with the store, so everyone orders the same way.
+        "last_activity": last_activity(&o.src).unwrap_or_else(|| NO_ACTIVITY_FLOOR.to_string()),
     });
     if let Some(a) = &o.by {
         v["aid"] = a.aid().into();
@@ -536,6 +542,13 @@ fn sign_captured(dp: &Path, a: &Attribution, store: &Path) -> Option<crate::comm
     };
     Some(crate::commands::sign_provenance(&key, &content, a.aid(), &email, &started))
 }
+
+/// The committed `last_activity` floor for a transcript that records no timestamp of its own. Stable and
+/// content-independent, so it never churns the sidecar into a fresh commit, and committed like any other
+/// sidecar value, so every teammate reads the same one — unlike the filesystem mtime it replaces. A
+/// timestamp-less session therefore sorts below any real one, and ties among such sessions are broken by
+/// their committed id, never by the machine's clock. RFC3339 so it parses like a real recency.
+pub(crate) const NO_ACTIVITY_FLOOR: &str = "1970-01-01T00:00:00Z";
 
 /// When a transcript last did anything: the last record carrying a timestamp. Both runtimes write a
 /// top-level RFC3339 `timestamp` on every record (verified against real dumps from each).
@@ -1260,6 +1273,103 @@ mod routing_tests {
             let recs: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
             let codex = recs.iter().find(|r| r["runtime"] == "codex").expect("claude-code → codex must be recorded");
             assert_eq!(codex["aid"], fe.aid, "agit's own output must be attributed to the agent it converted FROM");
+        });
+    }
+
+    /// Store-bloat regression (QA: 1 source → 18 codex rollups over ~6 restarts). The watcher hands
+    /// `convert_pass` a fresh `seen` set on every restart, so an already-converted source is re-processed
+    /// each time. It must be IDEMPOTENT: the converted copy's id is deterministic in its source, so a
+    /// re-convert overwrites the one installed file instead of minting a new rollup for capture to snap.
+    /// A genuinely-new source, by contrast, must still convert.
+    #[test]
+    fn re_converting_the_same_source_is_idempotent_no_new_rollup() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        // Count the codex rollups agit has installed into the runtime dump — one per DISTINCT conversion.
+        // Each new-id conversion is one more file here, and one more session for the next snap to commit.
+        let count_codex = || -> usize {
+            walkdir::WalkDir::new(home.path().join(".codex/sessions"))
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file() && e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+                .count()
+        };
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            let d = fe.store.join("sessions/claude-code");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("s1.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
+
+            // First pass converts s1 → codex.
+            crate::commands::convert_pass(&fe.store, &env, &mut std::collections::HashSet::new());
+            assert_eq!(count_codex(), 1, "the source converts once");
+            let after_first: Vec<_> = std::fs::read_dir(home.path().join(".codex/sessions/2026/01/01"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+
+            // A watch RESTART: a brand-new `seen`. The old bug re-converted under a fresh random UUID,
+            // leaving a SECOND rollup. Deterministic ids overwrite the one file instead.
+            crate::commands::convert_pass(&fe.store, &env, &mut std::collections::HashSet::new());
+            assert_eq!(count_codex(), 1, "re-converting the same source must NOT add a second rollup");
+            let after_second: Vec<_> = std::fs::read_dir(home.path().join(".codex/sessions/2026/01/01"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(after_first, after_second, "the deterministic id must reuse the same filename");
+
+            // A genuinely-new source still converts to its own file.
+            std::fs::write(d.join("s2.jsonl"), transcript(&env, "2026-07-16T11:00:00.000Z")).unwrap();
+            crate::commands::convert_pass(&fe.store, &env, &mut std::collections::HashSet::new());
+            assert_eq!(count_codex(), 2, "a new source must convert to a new rollup");
+        });
+    }
+
+    /// The snap must record a NON-NULL `last_activity` even for a transcript that carries no timestamp of
+    /// its own — otherwise `latest_session` falls back to the machine mtime and two teammates disagree on
+    /// which session is latest. The recorded value is the stable committed floor, so it also never churns
+    /// a fresh sidecar commit on the next watch tick.
+    #[test]
+    fn snapping_a_timestampless_session_writes_a_non_null_recency() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::init_agent("frontend").unwrap();
+
+            // A claude dump with NO top-level timestamp on any record — `last_activity` reads None.
+            let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
+            std::fs::create_dir_all(&slug).unwrap();
+            let body = format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"content\":\"hi\"}}}}\n",
+                env.display()
+            );
+            std::fs::write(slug.join("s-notime.jsonl"), &body).unwrap();
+            crate::commands::record_launch("s-notime", &fe.aid, "frontend", &env, "claude-code", None).unwrap();
+
+            let (routed, _) = route("claude-code", &env).unwrap();
+            for r in &routed {
+                mirror_owned("claude-code", &env, r).unwrap();
+            }
+
+            let sc = fe.store.join(SESSIONS_SUBDIR).join(env_slug(&env)).join("claude-code").join("s-notime.agit.json");
+            let side: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&sc).unwrap()).unwrap();
+            assert!(!side["last_activity"].is_null(), "a timestamp-less session must NOT record a null recency");
+            assert_eq!(side["last_activity"], NO_ACTIVITY_FLOOR, "it falls back to the stable committed floor");
+
+            // Idempotent: a second snap of the same content must not rewrite the sidecar (no commit churn).
+            let before = std::fs::metadata(&sc).unwrap().modified().unwrap();
+            let (routed2, _) = route("claude-code", &env).unwrap();
+            for r in &routed2 {
+                mirror_owned("claude-code", &env, r).unwrap();
+            }
+            assert_eq!(std::fs::metadata(&sc).unwrap().modified().unwrap(), before, "the floored sidecar must be stable across snaps");
         });
     }
 
