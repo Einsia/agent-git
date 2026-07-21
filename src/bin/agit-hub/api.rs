@@ -106,6 +106,9 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("POST", "tokens") => return api_create_token(ctx, caller, body).await,
         ("GET", "audit") => return api_audit(ctx, req, caller).await,
         ("GET", "search") => return api_search(ctx, req, caller).await,
+        // The cross-agent code-repo index. Open to any caller (anonymous included); only agents the
+        // caller may Read contribute, so the ACL filter - not the route - is the gate.
+        ("GET", "repos") => return api_repos(ctx, caller).await,
         ("GET", "orgs") => return api_orgs_list(ctx, caller).await,
         ("POST", "orgs") => return api_orgs_create(ctx, caller, body).await,
         // The admin USER ROSTER: list every account, or create one. Both are admin-only AND
@@ -185,6 +188,15 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         // orgs/<org>/settings — org policy knobs (today: members_can_create). Org-admin only to change.
         if let Some(name) = after.strip_suffix("/settings") {
             return api_org_settings(ctx, caller, name, m, body).await;
+        }
+        // orgs/<org>/overview - the org view (members + every readable agent owned by the org or its
+        // members). Same membership-or-admin 404 gate as api_org_get. Exact suffix, so a stray
+        // /overviewXYZ does not match.
+        if let Some(name) = after.strip_suffix("/overview") {
+            return match m {
+                "GET" => api_org_overview(ctx, caller, name).await,
+                _ => Resp::text(405, "method not allowed"),
+            };
         }
         return match m {
             "GET" => api_org_get(ctx, caller, after).await,
@@ -2760,7 +2772,7 @@ pub(crate) async fn api_orgs_create(ctx: &Ctx, caller: &Caller, body: &[u8]) -> 
     }
 }
 
-/// `GET /api/orgs/<name>` — org detail. Existence non-disclosure, the same shape as the agent gate: a
+/// `GET /api/orgs/<name>` - org detail. Existence non-disclosure, the same shape as the agent gate: a
 /// missing org and one the caller may not see both answer 404, so org names cannot be enumerated.
 pub(crate) async fn api_org_get(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
     let org = ctx.store.org(name).await;
@@ -2780,6 +2792,107 @@ pub(crate) async fn api_org_get(ctx: &Ctx, caller: &Caller, name: &str) -> Resp 
         })),
         _ => Resp::err(404, "not found"),
     }
+}
+
+/// `GET /api/orgs/<name>/overview` - the org view: its members plus every agent the caller may Read
+/// that is owned by the org OR by one of its members (a member's personal agents included). The gate is
+/// **identical** to [`api_org_get`]: a missing org and one the caller may not see both answer 404, so
+/// membership stays non-disclosing (a non-member cannot tell "no such org" from "not your org").
+///
+/// The security core is that the agent list is **ACL-filtered before it is ever counted**: each agent's
+/// effective ACL (org members folded in via [`agent_acl`]) runs through `acl::decide(_, Read)`, and only
+/// allowed agents make the list. A member's PRIVATE personal agent - which does not inherit org grants -
+/// simply never appears for a caller without an explicit grant, and no count leaks its existence.
+pub(crate) async fn api_org_overview(ctx: &Ctx, caller: &Caller, name: &str) -> Resp {
+    // Existence non-disclosure: missing org and not-a-member both 404, byte-for-byte api_org_get.
+    let Some(org) = ctx.store.org(name).await else {
+        return Resp::err(404, "not found");
+    };
+    if !(caller.is_admin || caller.user.as_deref().is_some_and(|u| org.is_member(u))) {
+        return Resp::err(404, "not found");
+    }
+
+    // The owner strings that "belong to" this org: the org itself (`org:<name>`) and each member's
+    // bare username (their personal namespace). A member's personal agent is only listed when the
+    // caller may Read it - org grants never fold into a personal agent, so a private one stays hidden.
+    let org_owner = format!("org:{}", org.name);
+    let members: std::collections::HashSet<&str> = org.members.iter().map(|m| m.username.as_str()).collect();
+
+    // Filter BEFORE anything is counted (never leak counts of hidden agents), exactly as api_agents does.
+    // The per-agent ACL read is an async store call, so this is a loop, not an iterator chain.
+    let mut visible: Vec<AgentMeta> = Vec::new();
+    for (seg, n) in list_agents(ctx.root()) {
+        let meta = ctx.store.agent_or_unowned(&seg, &n).await;
+        let Some(owner) = meta.owner.as_deref() else {
+            continue; // unowned repos belong to no org member
+        };
+        if owner != org_owner && !members.contains(owner) {
+            continue;
+        }
+        if !acl::decide(caller, &agent_acl(ctx, &meta).await, Action::Read).allowed() {
+            continue;
+        }
+        visible.push(meta);
+    }
+
+    // The session tree per agent shells out (ls-tree), so the whole fan-out runs on the blocking pool in
+    // one shot; each row's session count + distinct env slugs come back for the JSON.
+    let root = ctx.root().to_path_buf();
+    let paths: Vec<(String, String)> = visible.iter().map(|m| (m.seg().to_string(), m.name.clone())).collect();
+    let git_info: Vec<(usize, Vec<String>)> = tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|(seg, n)| {
+                let repo = repo_path(&root, &seg, &n);
+                if !has_head(&repo) {
+                    return (0usize, Vec::<String>::new());
+                }
+                let refs = session_refs(&repo);
+                let count = refs.len();
+                // Distinct env slugs, first-appearance order. Old-layout sessions (env = None) carry no
+                // slug, so they contribute a session count but no environment chip.
+                let mut envs: Vec<String> = Vec::new();
+                for r in &refs {
+                    if let Some(e) = &r.env {
+                        if !envs.contains(e) {
+                            envs.push(e.clone());
+                        }
+                    }
+                }
+                (count, envs)
+            })
+            .collect()
+    })
+    .await
+    .unwrap();
+
+    let agents: Vec<serde_json::Value> = visible
+        .iter()
+        .zip(git_info)
+        .map(|(m, (count, envs))| {
+            let owner = m.owner.clone().unwrap_or_default();
+            // "personal" = a bare username namespace, not `org:<name>`. The org's own agents are not
+            // personal; a member's are.
+            let personal = !owner.starts_with("org:");
+            serde_json::json!({
+                "owner": owner,
+                "name": m.name,
+                "aid": m.aid,
+                "visibility": m.visibility,
+                "sessions": count,
+                "role": effective_role(caller, m),
+                "personal": personal,
+                "environments": envs,
+            })
+        })
+        .collect();
+
+    Resp::json(serde_json::json!({
+        "name": org.name,
+        "created": org.created,
+        "members": org_members_json(&org),
+        "agents": agents,
+    }))
 }
 
 // ── Team-KEK envelopes (encryption-recipients Wave 3) ──
@@ -3821,6 +3934,166 @@ pub(crate) async fn api_search(ctx: &Ctx, req: &Req, caller: &Caller) -> Resp {
         "scanned": scanned,
         "scan_capped": capped,
         "scan_cap": XSEARCH_SCAN_CAP,
+    }))
+}
+
+// ── code-repo index ──
+
+/// How many sessions the cross-agent repo scan may walk before it stops and says so. The fan-out is
+/// bounded the same way `api_search` bounds its content scan: over the cap, the scan halts and the
+/// response's `capped` flag discloses the truncation rather than the counts silently going short.
+pub(crate) const REPOS_SCAN_CAP: usize = 2000;
+
+/// The most repos one response carries. Beyond this the newest-first list is truncated and `has_more`
+/// says so - the oldest repos are the ones dropped.
+pub(crate) const REPOS_MAX: usize = 500;
+
+/// `GET /api/repos` - the code-repo index: one row per environment slug, aggregated across every agent
+/// the caller may Read. There is no repo entity on the hub (an agent IS a bare git repo; the env <-> repo
+/// link lives only inside session paths), so this fans out over `list_agents`, reads each readable
+/// agent's session tree, and groups by env slug: summing sessions, deduping the agents attached to each
+/// env, taking the newest activity, and reading ONE representative `cwd` per env from that env's newest
+/// session (never every transcript).
+///
+/// Auth is open - anonymous is allowed - but "readable" is the whole gate: each agent runs through the
+/// SAME `agent_acl` + `acl::decide(_, Read)` filter as `api_agents`, so a private agent the caller cannot
+/// see contributes no sessions, no agent row, and no env. The scan is capped ([`REPOS_SCAN_CAP`]); the
+/// `scanned`/`capped` fields disclose any truncation rather than the totals silently going short.
+pub(crate) async fn api_repos(ctx: &Ctx, caller: &Caller) -> Resp {
+    // Decide readability async (each per-agent ACL is a store read), then hand the subprocess-heavy
+    // git fan-out to the blocking pool in one shot - exactly the shape of api_search.
+    let mut readable: Vec<(String, String, String)> = Vec::new(); // (owner_display, name, seg)
+    for (seg, name) in list_agents(ctx.root()) {
+        let meta = ctx.store.agent_or_unowned(&seg, &name).await;
+        if acl::decide(caller, &agent_acl(ctx, &meta).await, Action::Read).allowed() {
+            let owner = meta.owner.clone().unwrap_or_else(|| seg.clone());
+            readable.push((owner, name, seg));
+        }
+    }
+
+    let root = ctx.root().to_path_buf();
+    let (repos, scanned, capped, has_more): (Vec<serde_json::Value>, usize, bool, bool) = tokio::task::spawn_blocking(move || {
+        // Per-env accumulator. `agents` is keyed by owner+name so one agent with many sessions in an
+        // env is ONE row; `newest_*` track the winning session for the representative cwd (read once,
+        // after grouping). `last_unix` is the sort/compare key; `last_rel` is what the UI shows.
+        struct Agg {
+            total_sessions: usize,
+            last_unix: i64,
+            last_rel: String,
+            agents: Vec<(String, String, usize)>,
+            newest_repo: std::path::PathBuf,
+            newest_path: String,
+        }
+        let mut groups: std::collections::HashMap<String, Agg> = std::collections::HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        let mut capped = false;
+
+        'agents: for (owner, name, seg) in &readable {
+            let repo = repo_path(&root, seg, name);
+            if !has_head(&repo) {
+                continue;
+            }
+            // Sessions per env for THIS agent, plus the env's newest session file (one scoped git log),
+            // built from the session tree we already have to walk.
+            let refs = session_refs(&repo);
+            let mut per_env: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for r in &refs {
+                if scanned >= REPOS_SCAN_CAP {
+                    capped = true;
+                    break 'agents;
+                }
+                scanned += 1;
+                // Old-layout sessions (env = None) carry no slug - they can't key a repo row.
+                let Some(env) = &r.env else {
+                    continue;
+                };
+                *per_env.entry(env.clone()).or_insert(0) += 1;
+            }
+            for (env, count) in per_env {
+                // The env's newest commit under this agent: one `git log -1` scoped to the env dir gives
+                // the absolute time (%ct, for cross-agent comparison), a relative string (%cr, for the
+                // UI), and the file(s) it touched - the first .jsonl is a representative newest session.
+                let envdir = format!("sessions/{env}");
+                let (unix, rel, newest_path) = git(&repo, &["log", "-1", "--format=%ct\x1f%cr", "--name-only", "--", &format!(":(literal){envdir}")])
+                    .map(|out| {
+                        let mut lines = out.lines();
+                        let head = lines.next().unwrap_or("");
+                        let (ct, cr) = head.split_once('\x1f').unwrap_or(("0", ""));
+                        let unix = ct.trim().parse::<i64>().unwrap_or(0);
+                        let file = lines
+                            .find(|l| l.starts_with(&format!("{envdir}/")) && l.ends_with(".jsonl"))
+                            .unwrap_or("")
+                            .to_string();
+                        (unix, cr.trim().to_string(), file)
+                    })
+                    .unwrap_or((0, String::new(), String::new()));
+
+                if !groups.contains_key(&env) {
+                    order.push(env.clone());
+                }
+                let g = groups.entry(env.clone()).or_insert_with(|| Agg {
+                    total_sessions: 0,
+                    last_unix: i64::MIN,
+                    last_rel: String::new(),
+                    agents: Vec::new(),
+                    newest_repo: repo.clone(),
+                    newest_path: String::new(),
+                });
+                g.total_sessions += count;
+                g.agents.push((owner.clone(), name.clone(), count));
+                // Newest across agents wins the env's `last` AND its representative session.
+                if unix > g.last_unix {
+                    g.last_unix = unix;
+                    g.last_rel = rel;
+                    g.newest_repo = repo.clone();
+                    g.newest_path = newest_path;
+                }
+            }
+        }
+
+        // Sort envs by activity, newest first; truncate to REPOS_MAX (dropping the oldest) and report it.
+        order.sort_by(|a, b| groups[b].last_unix.cmp(&groups[a].last_unix));
+        let has_more = order.len() > REPOS_MAX;
+        order.truncate(REPOS_MAX);
+
+        let repos: Vec<serde_json::Value> = order
+            .into_iter()
+            .map(|env| {
+                let g = groups.remove(&env).expect("env in order is in groups");
+                // ONE transcript read per env: the newest session's cwd, the human-readable path the
+                // lossy slug can't give. The runtime is the 3rd path segment
+                // (`sessions/<env>/<runtime>/<id>.jsonl`), so the right adapter parses it. Absent (no
+                // session / no cwd / parse miss) → null.
+                let runtime = g.newest_path.split('/').nth(2).unwrap_or("").to_string();
+                let cwd = load_session(&g.newest_repo, &g.newest_path, None)
+                    .map(|jsonl| digest(&runtime, &g.newest_path, &jsonl).cwd)
+                    .filter(|c| !c.is_empty());
+                let agents: Vec<serde_json::Value> = g
+                    .agents
+                    .iter()
+                    .map(|(owner, name, sessions)| serde_json::json!({ "owner": owner, "name": name, "sessions": sessions }))
+                    .collect();
+                serde_json::json!({
+                    "env": env,
+                    "cwd": cwd,
+                    "total_sessions": g.total_sessions,
+                    "last": g.last_rel,
+                    "agents": agents,
+                })
+            })
+            .collect();
+
+        (repos, scanned, capped, has_more)
+    })
+    .await
+    .unwrap();
+
+    Resp::json(serde_json::json!({
+        "repos": repos,
+        "has_more": has_more,
+        "scanned": scanned,
+        "capped": capped,
     }))
 }
 
@@ -6047,5 +6320,197 @@ mod tests {
             }
         }
         assert!(saw_429, "the per-IP budget is charged before the lookup and eventually 429s");
+    }
+
+    // ── org overview + code-repo index (hub views) ──
+
+    /// Commit one or more session transcripts into a bare agent repo at
+    /// `sessions/<env>/<runtime>/<id>.jsonl`, each carrying a `cwd`. `unix` is the committer timestamp,
+    /// so callers can order envs deterministically (newest-first). One commit per call, chained onto the
+    /// current HEAD (so repeated calls accumulate history). Pure plumbing over a scratch index; the
+    /// committer identity is passed per-invocation via env vars, never global config.
+    fn seed_sessions(repo: &std::path::Path, unix: i64, files: &[(&str, &str, &str, &str)]) {
+        use std::process::Command;
+        let idx = repo.join("seed-index");
+        let _ = std::fs::remove_file(&idx);
+        // Start the scratch index from the current HEAD tree (if any), so earlier sessions survive.
+        // `--verify` is required: a bare `rev-parse HEAD` succeeds on an unborn branch (prints "HEAD").
+        if git(repo, &["rev-parse", "--verify", "HEAD"]).is_some() {
+            let ok = Command::new("git").arg("-C").arg(repo).env("GIT_INDEX_FILE", &idx).args(["read-tree", "HEAD"]).status().unwrap().success();
+            assert!(ok, "read-tree HEAD");
+        }
+        for (env, runtime, id, cwd) in files {
+            let jsonl = format!("{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{cwd}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n");
+            let tmp = repo.join(format!("seed-{id}.jsonl"));
+            std::fs::write(&tmp, jsonl).unwrap();
+            let out = Command::new("git").arg("-C").arg(repo).args(["hash-object", "-w"]).arg(&tmp).output().unwrap();
+            assert!(out.status.success(), "hash-object");
+            let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+            let _ = std::fs::remove_file(&tmp);
+            let path = format!("sessions/{env}/{runtime}/{id}.jsonl");
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .env("GIT_INDEX_FILE", &idx)
+                .args(["update-index", "--add", "--cacheinfo", &format!("100644,{sha},{path}")])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "update-index {path}");
+        }
+        let out = Command::new("git").arg("-C").arg(repo).env("GIT_INDEX_FILE", &idx).args(["write-tree"]).output().unwrap();
+        assert!(out.status.success(), "write-tree");
+        let tree = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let mut args: Vec<String> = vec!["commit-tree".into(), tree, "-m".into(), "seed sessions".into()];
+        if let Some(head) = git(repo, &["rev-parse", "--verify", "HEAD"]) {
+            args.push("-p".into());
+            args.push(head.trim().to_string());
+        }
+        let date = format!("{unix} +0000");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .env("GIT_AUTHOR_NAME", "seed")
+            .env("GIT_AUTHOR_EMAIL", "seed@test.local")
+            .env("GIT_COMMITTER_NAME", "seed")
+            .env("GIT_COMMITTER_EMAIL", "seed@test.local")
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .args(args.iter().map(|s| s.as_str()))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "commit-tree: {}", String::from_utf8_lossy(&out.stderr));
+        let commit = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let ok = Command::new("git").arg("-C").arg(repo).args(["update-ref", "refs/heads/main", &commit]).status().unwrap().success();
+        assert!(ok, "update-ref");
+        let _ = std::fs::remove_file(&idx);
+    }
+
+    /// The env slug of every repo row in a /api/repos response.
+    fn repo_envs(v: &serde_json::Value) -> Vec<String> {
+        v["repos"].as_array().unwrap().iter().map(|r| r["env"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// The `owner/name` of every agent listed in an org overview response.
+    fn overview_agent_ids(v: &serde_json::Value) -> Vec<String> {
+        v["agents"].as_array().unwrap().iter().map(|a| format!("{}/{}", a["owner"].as_str().unwrap(), a["name"].as_str().unwrap())).collect()
+    }
+
+    /// ACL LEAK (the security core): neither an org-owned PRIVATE agent nor a member's PRIVATE personal
+    /// agent may leak into /api/repos for an anonymous caller; a PUBLIC agent does. Filtering happens
+    /// before any counting, so the hidden agents contribute no env, no agent row, and no session count.
+    #[tokio::test]
+    async fn repos_never_leak_private_agents_to_anonymous() {
+        let (_d, ctx) = harness().await;
+        mk_org(&ctx, "acme", &[("alice", "admin")]).await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+
+        // Org-owned PRIVATE (env priv-org), alice PRIVATE personal (env priv-me), org-owned PUBLIC (env pub).
+        create_agent(&ctx.store, "org-secret", "org:acme", Visibility::Private).await.unwrap();
+        create_agent(&ctx.store, "alice-diary", "alice", Visibility::Private).await.unwrap();
+        create_agent(&ctx.store, "org-pub", "org:acme", Visibility::Public).await.unwrap();
+        seed_sessions(&repo_path(ctx.root(), "acme", "org-secret"), 1_700_000_000, &[("env-priv-org", "claude-code", "s1", "/srv/secret")]);
+        seed_sessions(&repo_path(ctx.root(), "alice", "alice-diary"), 1_700_000_100, &[("env-priv-me", "claude-code", "s2", "/home/alice/diary")]);
+        seed_sessions(&repo_path(ctx.root(), "acme", "org-pub"), 1_700_000_200, &[("env-pub", "claude-code", "s3", "/srv/pub")]);
+
+        let v = json_of(&api_repos(&ctx, &Caller::anonymous()).await);
+        let envs = repo_envs(&v);
+        assert_eq!(envs, vec!["env-pub"], "anonymous sees ONLY the public agent's env; both private envs are absent: {envs:?}");
+        // The public row carries the public agent and nothing else - no hidden agent folded in.
+        let pub_row = &v["repos"].as_array().unwrap()[0];
+        assert_eq!(pub_row["total_sessions"], 1);
+        let agents = pub_row["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["owner"], "org:acme");
+        assert_eq!(agents[0]["name"], "org-pub");
+    }
+
+    /// The org overview is ACL-filtered too: a fellow MEMBER never sees another member's PRIVATE personal
+    /// agent (personal agents do not inherit org grants), while the org-owned agents do surface.
+    #[tokio::test]
+    async fn overview_hides_a_members_private_personal_agent_from_other_members() {
+        let (_d, ctx) = harness().await;
+        mk_org(&ctx, "acme", &[("alice", "admin"), ("bob", "member")]).await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+        add_user(&ctx, "bob", "bob-password-1", false).await;
+
+        create_agent(&ctx.store, "org-pub", "org:acme", Visibility::Public).await.unwrap();
+        create_agent(&ctx.store, "alice-diary", "alice", Visibility::Private).await.unwrap();
+        seed_sessions(&repo_path(ctx.root(), "acme", "org-pub"), 1_700_000_000, &[("env-pub", "claude-code", "s1", "/srv/pub")]);
+        seed_sessions(&repo_path(ctx.root(), "alice", "alice-diary"), 1_700_000_100, &[("env-me", "claude-code", "s2", "/home/alice/diary")]);
+
+        // bob is a member, so he passes the org gate; alice's private personal agent still stays hidden.
+        let v = json_of(&api_org_overview(&ctx, &caller("bob", false), "acme").await);
+        let ids = overview_agent_ids(&v);
+        assert!(ids.contains(&"org:acme/org-pub".to_string()), "the org-owned public agent surfaces: {ids:?}");
+        assert!(!ids.contains(&"alice/alice-diary".to_string()), "a member's private personal agent must NOT leak to another member: {ids:?}");
+    }
+
+    /// ORG 404: the overview gate is byte-identical for a missing org and one the caller may not see, so
+    /// membership cannot be probed. A non-member gets the SAME 404 (status AND body) as a missing org.
+    #[tokio::test]
+    async fn overview_404_for_non_member_is_byte_identical_to_missing_org() {
+        let (_d, ctx) = harness().await;
+        mk_org(&ctx, "acme", &[("alice", "admin")]).await;
+        add_user(&ctx, "bob", "bob-password-1", false).await;
+
+        let non_member = api_org_overview(&ctx, &caller("bob", false), "acme").await;
+        let missing = api_org_overview(&ctx, &caller("bob", false), "ghost-org").await;
+        assert_eq!(non_member.status, 404, "a non-member is refused with 404, never 403 or a body");
+        assert_eq!(missing.status, 404);
+        assert_eq!(non_member.body, missing.body, "non-member 404 is byte-identical to a missing-org 404 (non-disclosure)");
+        // And an anonymous caller is likewise 404, never a leak of the member list.
+        assert_eq!(api_org_overview(&ctx, &Caller::anonymous(), "acme").await.status, 404);
+    }
+
+    /// AGGREGATION: an env touched by TWO agents appears ONCE in /api/repos with both agents listed and
+    /// their sessions SUMMED; and the org overview surfaces both an org-owned agent and a readable member
+    /// personal agent (tagged personal).
+    #[tokio::test]
+    async fn repos_aggregates_two_agents_on_one_env_and_overview_lists_both_kinds() {
+        let (_d, ctx) = harness().await;
+        mk_org(&ctx, "acme", &[("alice", "admin")]).await;
+        add_user(&ctx, "alice", "alice-password-1", false).await;
+
+        // Two agents share ONE env slug with the same cwd: an org-owned agent (2 sessions) and alice's
+        // public personal agent (1 session).
+        create_agent(&ctx.store, "frontend", "org:acme", Visibility::Public).await.unwrap();
+        create_agent(&ctx.store, "api", "alice", Visibility::Public).await.unwrap();
+        seed_sessions(
+            &repo_path(ctx.root(), "acme", "frontend"),
+            1_700_000_000,
+            &[("env-app", "claude-code", "f1", "/home/alice/proj/app"), ("env-app", "claude-code", "f2", "/home/alice/proj/app")],
+        );
+        seed_sessions(&repo_path(ctx.root(), "alice", "api"), 1_700_000_500, &[("env-app", "claude-code", "a1", "/home/alice/proj/app")]);
+
+        // /api/repos (anonymous, both agents public): env-app appears ONCE, both agents, summed sessions.
+        let v = json_of(&api_repos(&ctx, &Caller::anonymous()).await);
+        let repos = v["repos"].as_array().unwrap();
+        let app: Vec<&serde_json::Value> = repos.iter().filter(|r| r["env"] == "env-app").collect();
+        assert_eq!(app.len(), 1, "the shared env appears exactly once: {repos:?}");
+        let row = app[0];
+        assert_eq!(row["total_sessions"], 3, "sessions are summed across both agents (2 + 1)");
+        assert_eq!(row["cwd"], "/home/alice/proj/app", "the representative cwd comes from the newest session's transcript");
+        let names: std::collections::HashSet<String> =
+            row["agents"].as_array().unwrap().iter().map(|a| format!("{}/{}", a["owner"].as_str().unwrap(), a["name"].as_str().unwrap())).collect();
+        assert!(names.contains("org:acme/frontend"), "the org agent is attached: {names:?}");
+        assert!(names.contains("alice/api"), "the personal agent is attached: {names:?}");
+        // Per-agent session counts are preserved.
+        for a in row["agents"].as_array().unwrap() {
+            let want = if a["name"] == "frontend" { 2 } else { 1 };
+            assert_eq!(a["sessions"], want, "per-agent session count for {}", a["name"]);
+        }
+
+        // Org overview (as admin alice) surfaces BOTH the org-owned agent and alice's readable personal
+        // agent, the personal one tagged.
+        let ov = json_of(&api_org_overview(&ctx, &caller("alice", false), "acme").await);
+        let agents = ov["agents"].as_array().unwrap();
+        let frontend = agents.iter().find(|a| a["owner"] == "org:acme" && a["name"] == "frontend").expect("org-owned agent in overview");
+        assert_eq!(frontend["personal"], false, "an org-owned agent is not personal");
+        assert_eq!(frontend["sessions"], 2);
+        assert!(frontend["environments"].as_array().unwrap().iter().any(|e| e == "env-app"), "env slug surfaces on the org agent");
+        let api = agents.iter().find(|a| a["owner"] == "alice" && a["name"] == "api").expect("member personal agent in overview");
+        assert_eq!(api["personal"], true, "a member's personal agent is tagged personal");
+        assert_eq!(api["sessions"], 1);
     }
 }
