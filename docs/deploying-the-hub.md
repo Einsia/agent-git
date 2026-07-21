@@ -361,36 +361,61 @@ Option B — and nothing else.
 
 ## Backups
 
-What to back up depends on the backends you chose, but the data root always holds
-the transcript history and the audit trail (the data root is `/data/.agit-hub`
-inside the container's `hub-data` volume, or `/var/lib/agit-hub` under systemd):
+Use the built-in `agit-hub backup` and `agit-hub restore` commands. They read the
+same `AGIT_HUB_DB` / `AGIT_HUB_S3_ENDPOINT` the server does, so one command captures
+whichever backends you configured. The data root is `/data/.agit-hub` inside the
+container's `hub-data` volume, or `/var/lib/agit-hub` under systemd.
 
-- **The bare repos:** `<name>.git/` under the data root, one per agent, the actual
-  transcript history.
+```sh
+# Take a backup (one 0600 tar.gz; defaults to ./agit-hub-backup-<timestamp>.tgz):
+agit-hub backup --root /var/lib/agit-hub --out /secure/agit-hub-$(date +%F).tgz
+
+# Restore it into a data root (refuses a non-empty root without --force):
+agit-hub restore /secure/agit-hub-2026-01-31.tgz --root /var/lib/agit-hub
+```
+
+Run `restore` with the hub stopped, and with the SAME `AGIT_HUB_DB` set that the
+target hub uses: the command records the metadata backend in the archive and
+refuses a cross-backend restore (a SQLite dump into a Postgres target, or the
+reverse). For Postgres it restores into the database `AGIT_HUB_DB` points at, so
+that variable must be set.
+
+What the tarball contains:
+
+- **The bare repos:** `<owner>/<name>.git/` under the data root, one per agent, the
+  actual transcript history.
 - **`audit.log`:** the append-only audit trail, also under the data root.
-- **The metadata database:** on the default SQLite backend this is `hub.db` (with
-  its `-wal`/`-shm` sidecars, `0600`) under the data root; on the Postgres backend
-  it is the postgres data instead (the `pg-data` volume under compose). It holds
-  password hashes and token digests, so treat this backup as a secret.
-- **Blobs:** on the filesystem backend, `<root>/blobs` under the data root; on the
-  S3/Garage backend, Garage's own storage (the `garage-meta` and `garage-data`
+- **The metadata database:** on the default SQLite backend a consistent `hub.db`
+  snapshot (taken with SQLite's online `VACUUM INTO`, never a raw copy of the live
+  WAL file); on the Postgres backend a `pg_dump` (`metadata.sql`) instead. It holds
+  password hashes and token digests, so the whole tarball is written `0600` and is
+  sensitive even though those digests are not reversible plaintext. Keep it off-host.
+- **Blobs:** on the filesystem backend, `<root>/blobs` is inside the tarball. On the
+  **S3/Garage backend the blobs are external** and are NOT in the tarball: `backup`
+  warns loudly and records `external_blobs: true` in the archive's `manifest.json`.
+  Back Garage's own storage up separately (the `garage-meta` and `garage-data`
   volumes under compose).
 
-For a consistent copy, stop the hub before snapshotting, or use each backend's own
-tool (`pg_dump` for Postgres, `.backup` for SQLite). For the containerised deploy,
-back the data-root volume up by running a throwaway container against it (do the
-same for `pg-data` and the garage volumes if you use those backends):
+Transient files (the `hub.db-wal`/`hub.db-shm` sidecars, folded into the snapshot,
+and any `*.lock`) are excluded, and `restore` guards every archive member against
+path traversal before extracting.
+
+Under the hood these are the manual steps, if you need to do them by hand: for a
+consistent copy stop the hub, then use each backend's own tool (`pg_dump` for
+Postgres, `.backup`/`VACUUM INTO` for SQLite) alongside a `tar` of the data root.
+`pg_dump`/`psql` must be on `PATH` for the Postgres path of the commands above. For
+the containerised deploy you can also snapshot the data-root volume with a throwaway
+container (do the same for `pg-data` and the garage volumes if you use those
+backends):
 
 ```sh
 docker run --rm -v deploy_hub-data:/data -v "$PWD":/backup debian:bookworm-slim \
   tar czf /backup/agit-hub-$(date +%F).tgz -C /data .
 ```
 
-(`deploy_hub-data` is the compose-prefixed volume name — confirm with `docker
+(`deploy_hub-data` is the compose-prefixed volume name; confirm with `docker
 volume ls`.) Restore by extracting the same tarball back into the volume while the
-hub is stopped. Under systemd, stop the service and `tar` up `/var/lib/agit-hub`.
-Keep backups off-host; the token digests and password hashes in them are
-sensitive even though they are not reversible plaintext.
+hub is stopped.
 
 ---
 

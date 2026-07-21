@@ -37,6 +37,12 @@ pub fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// The metadata schema version the running binary writes/expects. Recorded in a backup manifest so a
+/// restore can note (and a future tool could gate on) the shape of the DB it is carrying.
+pub fn schema_version() -> i64 {
+    SCHEMA_VERSION
+}
+
 fn is_expired(iso: &str) -> bool {
     match chrono::DateTime::parse_from_rfc3339(iso) {
         Ok(t) => chrono::Utc::now() >= t.with_timezone(&chrono::Utc),
@@ -1212,6 +1218,17 @@ impl Store {
         }
     }
 
+    /// Take a CONSISTENT snapshot of the SQLite database into `dest` via `VACUUM INTO` — the online,
+    /// transaction-safe copy path that folds any `-wal`/`-shm` state into a single self-contained file
+    /// (never a raw `cp` of a live WAL db). `dest` must not already exist (SQLite refuses to overwrite).
+    /// Errs on a Postgres store: that backend is dumped with `pg_dump`, not this.
+    pub async fn backup_sqlite_to(&self, dest: &Path) -> io::Result<()> {
+        match self {
+            Store::Sqlite(s) => s.backup_to(dest).await,
+            Store::Pg(_) => Err(io::Error::other("backup_sqlite_to is only valid for the SQLite backend")),
+        }
+    }
+
     // ── users ──
 
     pub async fn users(&self) -> Vec<User> {
@@ -1718,6 +1735,24 @@ impl SqliteStore {
 
     fn db_path(&self) -> PathBuf {
         self.root.join("hub.db")
+    }
+
+    /// `VACUUM INTO <dest>`: an online, consistent copy of the whole database (schema + rows) into a
+    /// single file, with any WAL frames folded in. Runs on a normal pooled connection, so it never
+    /// takes the write lock or blocks readers. The path is bound as a value (SQLite has no placeholder
+    /// for it in this statement, so it is single-quote-escaped and inlined). The destination file is
+    /// then tightened to 0600 — it is a verbatim copy of the credential-digest store.
+    async fn backup_to(&self, dest: &Path) -> io::Result<()> {
+        let path = dest.to_str().ok_or_else(|| io::Error::other("backup destination path is not valid UTF-8"))?;
+        // Escape single quotes for the inlined SQL string literal.
+        let escaped = path.replace('\'', "''");
+        sqlx::query(&format!("VACUUM INTO '{escaped}'")).execute(&self.pool).await.map_err(err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
     }
 
     async fn migrate(&self) -> io::Result<()> {

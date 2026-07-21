@@ -4,6 +4,7 @@
 #![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 
 mod api;
+mod backup;
 mod cli;
 mod content;
 mod emailverify;
@@ -40,6 +41,8 @@ pub(crate) fn run() -> i32 {
         "token" => token_cmd(&root, &args),
         "user" => user_cmd(&root, &args),
         "org" => org_cmd(&root, &args),
+        "backup" => crate::backup::backup_cmd(&root, &args),
+        "restore" => crate::backup::restore_cmd(&root, &args),
         "pre-receive" => pre_receive_cmd(&root, &args),
         "-h" | "--help" => {
             print_help();
@@ -72,7 +75,9 @@ pub(crate) fn print_help() {
          agit-hub org invite <org> <user> [--role R]          invite a user into an org (pending)\n\
          agit-hub org invitations <org>                       list an org's pending invitations\n\
          agit-hub org transfer <org> <new_owner>              hand org ownership to a member\n\
-         agit-hub org rm <org>                                delete an empty org\n\n\
+         agit-hub org rm <org>                                delete an empty org\n\
+         agit-hub backup [--out <file.tgz>]                   one tar.gz of the data root + a consistent metadata snapshot (0600, sensitive)\n\
+         agit-hub restore <file.tgz> [--force]                inverse; refuses a non-empty root without --force, refuses a cross-backend restore\n\n\
          First step: agit-hub user add <you> --admin\n\
          Hosted repos are bare git. Publish with: agit -a push http://HOST:PORT/<owner>/<name>.git (with a write token)\n\n\
          Listens on 127.0.0.1 only by default. Serving the network needs --host 0.0.0.0, and without TLS also --insecure."
