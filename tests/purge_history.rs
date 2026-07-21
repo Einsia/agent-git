@@ -42,10 +42,23 @@ impl Repo {
     }
 
     fn cmd(&self, program: &str) -> Command {
+        // Stores inherit the user's git identity (local -> global) instead of a store-local
+        // `agit@local`; point git's GLOBAL config at an isolated file inside this tempdir so every store
+        // spawned here resolves a stable `tester@agit.test` committer email and snap is not refused.
+        // Never touches the developer's real `~/.gitconfig`.
+        let gitconfig = self.path().join(".agit-test-gitconfig");
+        if !gitconfig.exists() {
+            std::fs::write(
+                &gitconfig,
+                "[user]\n\tname = tester\n\temail = tester@agit.test\n[commit]\n\tgpgsign = false\n",
+            )
+            .ok();
+        }
         let mut c = Command::new(program);
         c.current_dir(self.path())
             .env("HOME", self.path())
-            .env("AGIT_HOME", self.path().join("agit-home"));
+            .env("AGIT_HOME", self.path().join("agit-home"))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig);
         c
     }
     fn sh(&self, cmd: &str) -> String {

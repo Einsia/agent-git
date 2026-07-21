@@ -39,10 +39,24 @@ impl Repo {
     }
 
     fn cmd(&self, program: &str) -> Command {
+        // Stores now inherit the user's git identity (local -> global) instead of a store-local
+        // `agit@local`, so point git's GLOBAL config at an isolated file inside this tempdir. Every store
+        // spawned here then resolves a stable `tester@agit.test` committer email (as a real machine's
+        // `~/.gitconfig` would), so snap is attributable and not refused. Never touches the developer's
+        // real `~/.gitconfig`.
+        let gitconfig = self.path().join(".agit-test-gitconfig");
+        if !gitconfig.exists() {
+            std::fs::write(
+                &gitconfig,
+                "[user]\n\tname = tester\n\temail = tester@agit.test\n[commit]\n\tgpgsign = false\n",
+            )
+            .ok();
+        }
         let mut c = Command::new(program);
         c.current_dir(self.path())
             .env("HOME", self.path())
-            .env("AGIT_HOME", self.path().join("agit-home"));
+            .env("AGIT_HOME", self.path().join("agit-home"))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig);
         c
     }
     fn sh(&self, cmd: &str) -> String {
@@ -400,6 +414,14 @@ impl Machine {
         let agit_home = base.path().join("home/agit-home");
         std::fs::create_dir_all(&code).unwrap();
         std::fs::create_dir_all(&home).unwrap();
+        // Stores inherit the user's git identity (local -> global); give this machine's isolated HOME a
+        // global `.gitconfig` so its store resolves a committer email and snap is not refused. This is the
+        // machine's own throwaway HOME, never the developer's real `~/.gitconfig`.
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[user]\n\tname = tester\n\temail = tester@agit.test\n[commit]\n\tgpgsign = false\n",
+        )
+        .unwrap();
         let m = Machine { _base: base, code, home, agit_home };
         m.run_git(&["init", "-q", "-b", "main", "."]);
         m.run_git(&["config", "user.name", "dev"]);

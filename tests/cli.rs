@@ -80,10 +80,25 @@ impl Repo {
     /// session stores. Per-invocation env only: `std::env::set_var` is process-global and would race
     /// across parallel tests.
     fn cmd(&self, program: &str) -> Command {
+        // A store now inherits the user's git identity (local -> global) instead of a store-local
+        // `agit@local`, so a snapped session is attributable to a real committer email. Point git's
+        // GLOBAL config at an ISOLATED file inside this tempdir so every store spawned here resolves a
+        // stable `tester@agit.test`, exactly as a real machine's `~/.gitconfig` would. This survives the
+        // HOME overrides the snap tests use (they repoint HOME at a fake runtime-dump dir) and never
+        // touches the developer's real `~/.gitconfig` (honors "no global git config in tests").
+        let gitconfig = self.path().join(".agit-test-gitconfig");
+        if !gitconfig.exists() {
+            std::fs::write(
+                &gitconfig,
+                "[user]\n\tname = tester\n\temail = tester@agit.test\n[commit]\n\tgpgsign = false\n",
+            )
+            .ok();
+        }
         let mut c = Command::new(program);
         c.current_dir(self.path())
             .env("HOME", self.path())
-            .env("AGIT_HOME", self.path().join("agit-home"));
+            .env("AGIT_HOME", self.path().join("agit-home"))
+            .env("GIT_CONFIG_GLOBAL", &gitconfig);
         c
     }
     fn sh(&self, cmd: &str) -> String {
@@ -2229,6 +2244,72 @@ fn a_snapped_session_is_signed_and_verifies() {
     assert_eq!(code, 0, "a signed, intact session must verify (exit 0): {err}{out}");
     assert!(out.contains("verified"), "must report verified: {out}");
     assert!(!out.contains("UNVERIFIED"), "an intact session is not a failure: {out}");
+}
+
+/// agit's own bookkeeping is NOT attributed to the user. Even though the store inherits the user's git
+/// identity (so a snapped SESSION binds it as the provenance handle), the MINT commit -- agit's own
+/// metadata commit -- is authored by `agit@local`. The two identities must not be confused.
+#[test]
+fn the_mint_commit_is_authored_by_agit_not_the_user() {
+    let r = Repo::new();
+    // The store inherits the user's git identity: this email is what a session snap binds for provenance.
+    let (_, email, _) = r.agit(&["a", "config", "user.email"]);
+    assert_eq!(email.trim(), "tester@agit.test", "the store must inherit the user's git identity");
+    // But agit's mint (the store's first commit) is authored by agit@local, never by the user.
+    let authors = r.git_agent(&["log", "--reverse", "--format=%ae"]);
+    let mint = authors.lines().next().unwrap_or_default();
+    assert_eq!(mint, "agit@local", "the mint commit must be authored by agit@local, not {}", email.trim());
+}
+
+/// A brand-new machine with ZERO git identity must still be able to create an agent. agit's mint commit
+/// carries an explicit `agit`/`agit@local` identity per invocation, so agent creation never depends on
+/// the user having configured git -- and the mint stays authored by agit@local.
+#[test]
+fn agent_creation_succeeds_with_no_git_identity_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let repo = home.join("code");
+    std::fs::create_dir_all(&repo).unwrap();
+    // Force git to resolve NO identity: empty global + system config, no ~/.gitconfig under HOME.
+    let empty = home.join("empty.gitconfig");
+    std::fs::write(&empty, "").unwrap();
+    let run = |program: &str, args: &[&str]| -> (i32, String, String) {
+        let o = Command::new(program)
+            .current_dir(&repo)
+            .env("HOME", home)
+            .env("AGIT_HOME", home.join("agit-home"))
+            .env("GIT_CONFIG_GLOBAL", &empty)
+            .env("GIT_CONFIG_SYSTEM", &empty)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            o.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        )
+    };
+
+    // Seed the code repo. Only THIS commit gets an identity, via -c; nothing is ever configured.
+    assert_eq!(run("git", &["init", "-q", "-b", "main", "."]).0, 0);
+    std::fs::write(repo.join("app.ts"), "x\n").unwrap();
+    assert_eq!(run("git", &["add", "-A"]).0, 0);
+    assert_eq!(run("git", &["-c", "user.name=seed", "-c", "user.email=seed@x", "commit", "-qm", "seed"]).0, 0);
+
+    // Precondition: git truly resolves no committer identity here.
+    let (_, who, _) = run("git", &["config", "user.email"]);
+    assert!(who.trim().is_empty(), "precondition: no git identity in reach, got {who:?}");
+
+    // Agent creation must SUCCEED regardless of the missing identity.
+    let (code, out, err) = run(BIN, &["init", "--agent", "testmemory"]);
+    assert_eq!(code, 0, "agent creation must work with no git identity:\n{out}\n{err}");
+
+    // And the mint commit is authored by agit, not by anyone's identity.
+    let (_, store_top, _) = run(BIN, &["a", "rev-parse", "--show-toplevel"]);
+    let store = store_top.trim();
+    let (_, ae, _) = run("git", &["-C", store, "log", "-1", "--format=%ae"]);
+    assert_eq!(ae.trim(), "agit@local", "the mint commit must be authored by agit@local");
 }
 
 /// Tamper the committed transcript after it was signed: verification must fail loudly (non-zero) and

@@ -1307,7 +1307,15 @@ fn commit_store(store: &std::path::Path, message: &str) -> anyhow::Result<()> {
     let mut msg = tempfile::NamedTempFile::new()?;
     msg.write_all(message.as_bytes())?;
     msg.flush()?;
-    scope::git_in(store, &["commit", "--no-verify", "-F", msg.path().to_string_lossy().as_ref()])?;
+    // Explicit agit identity: this is agit's own bookkeeping, so it stays labeled agit and never fails
+    // when the user has no git identity configured.
+    let path = msg.path().to_string_lossy();
+    let args = [
+        agit::agent::AGIT_META_IDENT.as_slice(),
+        &["commit", "--no-verify", "-F", path.as_ref()],
+    ]
+    .concat();
+    scope::git_in(store, &args)?;
     Ok(())
 }
 

@@ -857,24 +857,30 @@ fn new_agent_in(home: &Path, name: &str) -> Result<Agent> {
     Ok(agent_at(store, id))
 }
 
-/// A store is a git repo whose first commit carries the identity. The user/email are set **locally**:
-/// agit must never touch the developer's global git identity, and a store with no committer config
-/// cannot commit at all.
+/// A store is a git repo whose first commit carries the identity. The store does NOT pin a local
+/// committer identity: it inherits the user's git identity (local → global) the way any git repo does,
+/// so a snapped SESSION is attributed to the person who ran it, not to `agit@local`.
 ///
-/// agit's own metadata commits (mint/rename/adopt) pass `--no-verify`. They stage nothing but the
-/// `agent.toml` agit itself just wrote — an aid, a validated name, a timestamp, with quotes,
-/// backslashes and control characters refused at the door — so there is nothing there to scan. The
-/// gate exists for what the AGENT saw: sessions, which arrive by snap and by the user's own commits,
-/// and which are never part of these.
+/// agit's own metadata commits (mint/rename/adopt) pass an EXPLICIT `-c user.name=agit
+/// -c user.email=agit@local` per invocation, so they stay labeled as agit's bookkeeping regardless of
+/// the user's identity AND never fail on a brand-new machine with no git identity at all (agent
+/// creation must always work). They also pass `--no-verify`: they stage nothing but the `agent.toml`
+/// agit itself just wrote — an aid, a validated name, a timestamp, with quotes, backslashes and control
+/// characters refused at the door — so there is nothing there to scan. The gate exists for what the
+/// AGENT saw: sessions, which arrive by snap and by the user's own commits, never part of these.
+pub const AGIT_META_IDENT: [&str; 4] =
+    ["-c", "user.name=agit", "-c", "user.email=agit@local"];
+
 fn scaffold_store(store: &Path, id: &StoreIdentity) -> Result<()> {
     scope::git_in(store, &["init", "-q", "-b", "main"])?;
-    scope::git_in(store, &["config", "user.name", "agit"])?;
-    scope::git_in(store, &["config", "user.email", "agit@local"])?;
     write_agent_toml(store, id)?;
     std::fs::create_dir_all(store.join("sessions"))?;
     std::fs::write(store.join("sessions/.gitkeep"), "")?;
     scope::git_in(store, &["add", "-A"])?;
-    scope::git_in(store, &["commit", "-q", "--no-verify", "-m", &format!("agit: mint agent {} ({})", id.name, id.aid)])?;
+    let subject = format!("agit: mint agent {} ({})", id.name, id.aid);
+    let mint =
+        [AGIT_META_IDENT.as_slice(), &["commit", "-q", "--no-verify", "-m", &subject]].concat();
+    scope::git_in(store, &mint)?;
     // After the mint commit: the identity is agit's own and has nothing to scan, and a store must not
     // be able to reach its first real session without the gate already in place.
     crate::init::install_hooks(store)
@@ -1382,10 +1388,10 @@ fn rename_in(home: &Path, old: &str, new: &str) -> Result<Agent> {
     let id = StoreIdentity { aid: cur.aid, name: new.to_string(), created: cur.created };
     write_agent_toml(&agent.store, &id)?;
     scope::git_in(&agent.store, &["add", "agent.toml"])?;
-    scope::git_in(
-        &agent.store,
-        &["commit", "-q", "--no-verify", "-m", &format!("agit: rename agent {old} -> {new}")],
-    )?;
+    let subject = format!("agit: rename agent {old} -> {new}");
+    let rename =
+        [AGIT_META_IDENT.as_slice(), &["commit", "-q", "--no-verify", "-m", &subject]].concat();
+    scope::git_in(&agent.store, &rename)?;
     let mut m = registry_load(home);
     m.remove(old);
     m.insert(new.to_string(), id.aid.clone());
@@ -1548,8 +1554,10 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
         move_dir(&agent.store, &dest)?;
         write_agent_toml(&dest, &id)?;
         scope::git_in(&dest, &["add", "agent.toml"])?;
-        scope::git_in(&dest, &["commit", "-q", "--no-verify", "-m",
-            &format!("agit: re-mint identity {} → {} ({})", agent.aid, id.name, fresh)])?;
+        let subject = format!("agit: re-mint identity {} -> {} ({})", agent.aid, id.name, fresh);
+        let remint =
+            [AGIT_META_IDENT.as_slice(), &["commit", "-q", "--no-verify", "-m", &subject]].concat();
+        scope::git_in(&dest, &remint)?;
         // The registry is keyed by NAME, which is unchanged, so this overwrites the old aid mapping;
         // the old aid-keyed directory no longer exists (it was moved), and the cache self-heals via
         // `repair` regardless.

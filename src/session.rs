@@ -704,6 +704,27 @@ fn gated_commit(store: &Path, subject: &str, verb: &str) -> CommitOutcome {
         return CommitOutcome::NothingStaged;
     }
 
+    // The committer email is the session's provenance identity (the handle that bridges its signature to
+    // a hub account). A session captured under an unset identity could never be attributed to anyone, so
+    // refuse git-style BEFORE committing: no commit, no staged leftovers. agit's own bookkeeping commits
+    // carry an explicit `-c user.email=agit@local`, so they are unaffected — only real session captures
+    // pass through this gate.
+    if crate::commands::committer_email(store).is_empty() {
+        errln!(
+            "{}",
+            ui::warn(
+                "agit: your committer identity is unset, so a session can't be attributed.\n  \
+                 set it like git:  git config --global user.email you@example.com\n  \
+                 \x20                git config --global user.name  \"Your Name\"\n  \
+                 (or per agent:    agit a config user.email you@example.com)\n\
+                 this email is your provenance identity; register your device key with\n\
+                 \"agit identity register <you>\" so \"agit a provenance\" can verify it."
+            )
+        );
+        let _ = scope::git_in_status(store, &["reset", "-q"]); // unstage: no committed, no staged leftovers
+        return CommitOutcome::Blocked;
+    }
+
     match crate::commands::secret_gate(store, true, verb) {
         Ok(g) if g.allowed() => {}
         Ok(_) => {
@@ -1165,9 +1186,25 @@ pub(crate) mod testenv {
         let old = [var("HOME"), var("AGIT_HOME")];
         std::env::set_var("HOME", home);
         std::env::set_var("AGIT_HOME", agit_home);
+        // Give this test's ISOLATED HOME a resolvable git identity, so a store scaffolded under it
+        // inherits a committer email the way a real user's machine does (the snap gate now refuses an
+        // unset identity). This is the test's own throwaway `$HOME/.gitconfig`, never the developer's
+        // real one — it honors the "no global git config in tests" rule while making every testenv-based
+        // snap test attributable to a stable `tester@agit.test`.
+        write_test_gitconfig(home);
         f();
         restore("HOME", &old[0]);
         restore("AGIT_HOME", &old[1]);
+    }
+
+    /// Write an isolated `[user]` identity into `$HOME/.gitconfig`. Global git config in this test's own
+    /// temp HOME only; a store created here resolves `user.email` to it, so its snapped sessions are
+    /// attributable without any store-local `agit@local`.
+    fn write_test_gitconfig(home: &Path) {
+        let _ = std::fs::write(
+            home.join(".gitconfig"),
+            "[user]\n\tname = tester\n\temail = tester@agit.test\n",
+        );
     }
 
     fn var(k: &str) -> Option<String> {
@@ -1423,6 +1460,131 @@ mod routing_tests {
             assert_ne!(before, after, "capture_pass must commit; the store's HEAD must advance");
             let subject = scope::git_in(&fe.store, &["log", "-1", "--format=%s"]).unwrap();
             assert!(subject.starts_with("auto-snap claude-code"), "the commit must be the auto-snap: {subject}");
+        });
+    }
+
+    /// `VERIFIED AS <user>` is now reachable end to end. A store created under a HOME whose git identity
+    /// is `tester@agit.test` snaps a session whose provenance record carries THAT email (not the old
+    /// hardcoded `agit@local`). Fed to the attribution step against a registry that maps that email to an
+    /// account holding the session's signing key, it verifies as the person (`VerifiedAs`) — the state the
+    /// old `agit@local` could never reach. The control proves the point: the same content signed under
+    /// `agit@local` maps to no account and stays `SignedUnregistered`.
+    #[test]
+    fn a_snapped_session_binds_the_users_email_and_can_verify_as_the_person() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            // The store inherits the HOME git identity (local -> global), NOT a store-local agit@local.
+            assert_eq!(
+                crate::commands::committer_email(&fe.store),
+                "tester@agit.test",
+                "the store must inherit the user's git identity, not agit@local"
+            );
+
+            let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
+            std::fs::create_dir_all(&slug).unwrap();
+            std::fs::write(slug.join("s1.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
+            crate::commands::record_launch("s1", &fe.aid, "frontend", &env, "claude-code", None).unwrap();
+
+            let (routed, _) = route("claude-code", &env).unwrap();
+            for r in &routed {
+                mirror_owned("claude-code", &env, r).unwrap();
+            }
+
+            let dir = fe.store.join(SESSIONS_SUBDIR).join(env_slug(&env)).join("claude-code");
+            let content = std::fs::read_to_string(dir.join("s1.jsonl")).unwrap();
+            let side: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("s1.agit.json")).unwrap()).unwrap();
+            let prov: crate::commands::Provenance =
+                serde_json::from_value(side["provenance"].clone()).expect("a snapped session must be signed");
+            assert_eq!(prov.email, "tester@agit.test", "the provenance must bind the USER's email");
+            assert_ne!(prov.email, "agit@local", "the old hardcoded handle must NOT be what is signed");
+
+            // A registry that knows tester@agit.test with THIS machine's signing key -> VerifiedAs. The
+            // same answer is reused for the control below, so each call gets its own FnOnce closure.
+            let signing_key = prov.pubkey.clone();
+            let registry = |email: &str| -> anyhow::Result<Option<crate::commands::RegisteredIdentity>> {
+                Ok((email == "tester@agit.test").then(|| crate::commands::RegisteredIdentity {
+                    username: "tester".into(),
+                    ed25519_keys: vec![signing_key.clone()],
+                }))
+            };
+            let status =
+                crate::commands::verify_provenance_with_registry(agit_home.path(), &content, Some(&prov), false, |e| {
+                    registry(e)
+                })
+                .unwrap();
+            assert!(
+                matches!(status, crate::commands::ProvenanceStatus::VerifiedAs { .. }),
+                "the user's email + a matching registered key must verify as the person, got {status:?}"
+            );
+
+            // Control: the OLD behavior signed agit@local, which maps to NO account under the same registry
+            // answer -> SignedUnregistered. This is exactly why VerifiedAs was previously unreachable.
+            let key = crate::agent::machine_signing_key().unwrap();
+            let control = crate::commands::sign_provenance(&key, &content, &fe.aid, "agit@local", &prov.started);
+            let control_status = crate::commands::verify_provenance_with_registry(
+                agit_home.path(),
+                &content,
+                Some(&control),
+                false,
+                |e| registry(e),
+            )
+            .unwrap();
+            assert!(
+                matches!(control_status, crate::commands::ProvenanceStatus::SignedUnregistered { .. }),
+                "agit@local maps to no account, so it must NOT verify as anyone, got {control_status:?}"
+            );
+        });
+    }
+
+    /// The gate: a store under a HOME with NO git identity refuses to snap a session rather than binding it
+    /// to a synthetic handle. It makes NO commit (HEAD does not advance), leaves NO staged content behind,
+    /// and reports a non-zero outcome (`commit_snap` returns `true`) so a scripted `snap && push` stops.
+    #[test]
+    fn snap_refuses_and_makes_no_commit_when_the_committer_identity_is_unset() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            // Strip this HOME's git identity so nothing resolves user.email anywhere.
+            let _ = std::fs::remove_file(home.path().join(".gitconfig"));
+            assert!(
+                crate::commands::committer_email(&fe.store).is_empty(),
+                "precondition: the committer identity must be unset"
+            );
+
+            let slug = home.path().join(".claude/projects").join(claude_code::slug_for(&env));
+            std::fs::create_dir_all(&slug).unwrap();
+            std::fs::write(slug.join("s1.jsonl"), transcript(&env, "2026-07-16T09:00:00.000Z")).unwrap();
+            crate::commands::record_launch("s1", &fe.aid, "frontend", &env, "claude-code", None).unwrap();
+
+            // Mirror the dump (never gated), then attempt the gated commit that snap performs.
+            let (routed, _) = route("claude-code", &env).unwrap();
+            for r in &routed {
+                mirror_owned("claude-code", &env, r).unwrap();
+            }
+
+            let before = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+            let mut count = 0u64;
+            let blocked = commit_snap(&fe.store, "claude-code", &mut count);
+
+            assert!(blocked, "an unattributable snap must report a non-zero outcome");
+            assert_eq!(count, 0, "nothing may be committed when the identity is unset");
+            let after = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+            assert_eq!(before, after, "the store HEAD must not advance");
+            assert_eq!(
+                scope::git_in_status(&fe.store, &["diff", "--cached", "--quiet"]).0,
+                0,
+                "the gate must leave NO staged content behind"
+            );
         });
     }
 }

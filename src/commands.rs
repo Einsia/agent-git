@@ -1284,13 +1284,16 @@ fn pin_registered_key_set(home: &Path, reg: &RegisteredIdentity, repin: bool) ->
 }
 
 /// The committer email the store commits under, read never written (agit must not touch git identity).
-/// Falls back to the store default when git has nothing configured, so signing always has a stable field.
+/// This is the user's git-resolved `user.email` (local → global), exactly like any git repo, and it is
+/// the provenance lookup handle that bridges a signature to a hub account. Empty when git has nothing
+/// configured: the caller (the snap/merge gate) refuses to attribute a session under an unset identity
+/// rather than binding it to a synthetic default.
 pub fn committer_email(store: &Path) -> String {
     scope::git_in(store, &["config", "user.email"])
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "agit@local".to_string())
+        .unwrap_or_default()
 }
 
 /// Read the `provenance` block from a session's sidecar, if it has one. Absent sidecar, unparsable JSON,
@@ -2496,10 +2499,15 @@ fn crypt_commit(store: &Path, message: &str) -> Result<()> {
     msg.flush()?;
     // --no-verify: the message-carrying commit does not need the pre-commit scan (agit's own gate runs
     // on the paths it stages elsewhere); this keeps enabling encryption from tripping git's hook.
-    scope::git_in(
-        store,
-        &["commit", "--no-verify", "-F", msg.path().to_string_lossy().as_ref()],
-    )?;
+    // Explicit agit identity: this is agit's own bookkeeping, so it stays labeled agit and never fails
+    // when the user has no git identity configured.
+    let path = msg.path().to_string_lossy();
+    let args = [
+        crate::agent::AGIT_META_IDENT.as_slice(),
+        &["commit", "--no-verify", "-F", path.as_ref()],
+    ]
+    .concat();
+    scope::git_in(store, &args)?;
     Ok(())
 }
 
