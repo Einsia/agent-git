@@ -996,6 +996,33 @@ fn snap_with_no_from_captures_both_runtimes() {
     assert!(r.captured("claude-code", "cc.jsonl"), "claude-code must be captured: {out}");
 }
 
+/// A session captured on ANOTHER path resumes HERE: agit installs it under the CURRENT environment
+/// (rewriting the transcript's cwd), not the captured path, so `claude --resume` (which resolves a
+/// session by the dir you run it in) can find it. Regression for the collaboration/merge "No
+/// conversation found" break, where a teammate's session (their path) could not be resumed on your
+/// machine because it installed under the capture path's slug.
+#[test]
+fn resume_installs_under_the_current_env_not_the_captured_cwd() {
+    let r = Repo::new();
+    r.agit(&["init", "--agent", "demo"]);
+    let store = r.agit(&["a", "rev-parse", "--show-toplevel"]).1.trim().to_string();
+    let foreign = "/home/someone-else/their-repo";
+    let sdir = std::path::Path::new(&store).join("sessions/claude-code");
+    std::fs::create_dir_all(&sdir).unwrap();
+    let sess = sdir.join("teammate.jsonl");
+    std::fs::write(
+        &sess,
+        format!("{{\"type\":\"user\",\"sessionId\":\"tm\",\"uuid\":\"u1\",\"cwd\":\"{foreign}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"),
+    )
+    .unwrap();
+    let (code, out, err) = r.agit(&["resume", sess.to_str().unwrap(), "--as", "claude-code"]);
+    assert_eq!(code, 0, "resume should succeed: {err}{out}");
+    let installed = installed_claude_sessions(&r);
+    let here = r.path().to_string_lossy().to_string();
+    assert!(installed.contains(&here), "the transcript cwd is rewritten to the current env, not the capture path: {}", &installed[..installed.len().min(300)]);
+    assert!(!installed.contains(foreign), "the captured foreign cwd must be gone after resume here: {}", &installed[..installed.len().min(300)]);
+}
+
 /// No sessions in either runtime: the error names them as peers, alphabetically, and never singles
 /// claude out as the one that was missing.
 #[test]

@@ -420,6 +420,17 @@ fn convert_for_install(
 ) -> Result<(String, String, crate::convo::ConversationIR, PathBuf)> {
     use crate::convo::{self, ConvertOpts};
     let new_id = install_id(to, convo::peek_branch(text).as_deref(), text);
+    // Resume/convert install a session to run in THIS environment, not where it was captured. Default
+    // the target cwd to the agent's repo root (else the current dir) so BOTH the runtime session slug
+    // and the transcript's own cwd point where you resume. Without this a session captured on another
+    // machine or path installs under the CAPTURE path's slug, and `claude --resume` (which resolves by
+    // the dir you run it in) reports "No conversation found" -- the collaboration/merge resume break.
+    let cwd_override = cwd_override.or_else(|| {
+        crate::scope::env_root()
+            .ok()
+            .or_else(|| std::env::current_dir().ok())
+            .map(|p| p.display().to_string())
+    });
     let opts = ConvertOpts { cwd: cwd_override, new_id: new_id.clone() };
     let (out, ir) = convo::convert(src, from, to, &opts)?;
     let cwd = match opts.cwd.clone().or_else(|| ir.cwd.clone()) {
