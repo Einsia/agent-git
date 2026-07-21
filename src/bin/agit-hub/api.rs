@@ -797,10 +797,20 @@ pub(crate) async fn api_password_reset_request(ctx: &Ctx, client_ip: Option<IpAd
         }
     }
     let username = store::normalize_username(&raw);
-    // Only mint+deliver when the account actually exists; stay SILENT either way. The generic response
-    // below is the same bytes on both branches, so the caller cannot tell existence from the answer.
-    if ctx.store.user(&username).await.is_some() && crate::resetpw::mint_and_deliver(&ctx.store, &username).await.is_some() {
-        audit_append(ctx.root(), &username, audit::USER_PASSWORD_RESET, None, "reset link requested (operator-forwarded)").await;
+    // Do COMPARABLE work whether or not the account exists, so response time cannot enumerate accounts.
+    // The hit branch mints a token (a DB INSERT) + appends an audit line; a bare read-only miss branch
+    // used to be ~1000x faster. The miss branch below performs an EQUIVALENT DB write (a throwaway mint,
+    // discarded, never delivered) + an audit append. Only mint+deliver a REAL link for a real account;
+    // stay SILENT either way. The generic response is the SAME bytes on both branches, so the caller
+    // cannot tell existence from the answer.
+    if ctx.store.user(&username).await.is_some() {
+        if crate::resetpw::mint_and_deliver(&ctx.store, &username).await.is_some() {
+            audit_append(ctx.root(), &username, audit::USER_PASSWORD_RESET, None, "reset link requested (operator-forwarded)").await;
+        }
+    } else if crate::resetpw::equalize_nonexistent(&ctx.store).await.is_some() {
+        // Equivalent DB write + audit for a nonexistent account. The actor is a fixed sentinel (never the
+        // attacker-supplied string), and NO link is generated or delivered.
+        audit_append(ctx.root(), "\u{0}nonexistent", audit::USER_PASSWORD_RESET, None, "reset requested for a nonexistent account (no link generated)").await;
     }
     // The ONE generic answer. Identical on every path so existence never leaks. Do NOT branch this.
     Resp::json(serde_json::json!({ "ok": true, "message": "if that account exists, a password reset link was generated" }))
@@ -1059,7 +1069,7 @@ pub(crate) async fn api_verify_email(ctx: &Ctx, body: &[u8]) -> Resp {
     let Some(token) = str_field(&v, "token").filter(|s| !s.trim().is_empty()) else {
         return Resp::err(400, "want a verification token");
     };
-    let Some((username, email)) = ctx.store.consume_email_token(&token).await else {
+    let Some((username, _email)) = ctx.store.consume_email_token(&token).await else {
         return Resp::err(400, "invalid or expired verification token");
     };
     match ctx.store.set_email_verified(&username, true).await {
@@ -1070,7 +1080,9 @@ pub(crate) async fn api_verify_email(ctx: &Ctx, body: &[u8]) -> Resp {
     }
     tracing::info!(user = %username, "email verified via token");
     audit_append(ctx.root(), &username, audit::USER_EMAIL_VERIFY, None, "verified via token").await;
-    Resp::json(serde_json::json!({ "ok": true, "username": username, "email": email, "email_verified": true }))
+    // Minimal body (no username/email echo): this is an UNAUTHENTICATED endpoint, so it must not
+    // confirm which account/email a token belongs to. Mirrors password-reset consume's minimal body.
+    Resp::json(serde_json::json!({ "ok": true, "email_verified": true }))
 }
 
 /// `POST /api/me/verify/resend` — mint + deliver a fresh verification token for the logged-in caller's
@@ -2667,10 +2679,34 @@ pub(crate) async fn api_orgs_list(ctx: &Ctx, caller: &Caller) -> Resp {
 
 /// `POST /api/orgs` — create an org. The creator becomes its first (and only) admin. Org names use the
 /// same rules as usernames, keeping them clean and echo-safe.
+/// An org WRITE (create / invite / members / settings) performed with a bearer TOKEN requires that
+/// token to carry `Write` scope — the exact gate the agent write endpoints use. A login session
+/// (`token == None`) always passes; only a token narrower than Write is refused with a 403. Returns
+/// `Some(resp)` to short-circuit, `None` to proceed.
+fn deny_non_write_token(caller: &Caller) -> Option<Resp> {
+    if caller.token.as_ref().is_some_and(|t| t.scope != Scope::Write) {
+        return Some(Resp::err(403, Deny::TokenScope.reason()));
+    }
+    None
+}
+
+/// A MANAGEMENT-grade org action (transfer, delete) takes a LOGIN SESSION: ANY token — even an
+/// admin's Write token — is refused, mirroring the roster-management and token-minting login-session
+/// rule. Returns `Some(resp)` to short-circuit, `None` to proceed.
+fn deny_any_token(caller: &Caller) -> Option<Resp> {
+    if caller.token.is_some() {
+        return Some(Resp::err(403, "this action takes a login session; a token can't do it"));
+    }
+    None
+}
+
 pub(crate) async fn api_orgs_create(ctx: &Ctx, caller: &Caller, body: &[u8]) -> Resp {
     let Some(user) = caller.user.clone() else {
         return Resp::err(401, "login required");
     };
+    if let Some(r) = deny_non_write_token(caller) {
+        return r;
+    }
     let Some(v) = json_body(body) else {
         return Resp::err(400, "want a JSON body");
     };
@@ -3042,6 +3078,9 @@ async fn api_org_settings(ctx: &Ctx, caller: &Caller, name: &str, method: &str, 
     match method {
         "GET" => Resp::json(serde_json::json!({ "org": org.name, "members_can_create": org.members_can_create != 0 })),
         "POST" => {
+            if let Some(r) = deny_non_write_token(caller) {
+                return r;
+            }
             if !is_admin {
                 return Resp::err(403, "must be an org admin to change org settings");
             }
@@ -3176,6 +3215,9 @@ pub(crate) async fn api_org_members(ctx: &Ctx, caller: &Caller, name: &str, tail
         // Any member (or site admin) may see the roster.
         ("GET", None) => Resp::json(org_members_json(&org)),
         ("POST", None) => {
+            if let Some(r) = deny_non_write_token(caller) {
+                return r;
+            }
             if !can_manage {
                 return Resp::err(403, "must be an org admin to manage members");
             }
@@ -3238,6 +3280,9 @@ pub(crate) async fn api_org_members(ctx: &Ctx, caller: &Caller, name: &str, tail
             Resp::json(org_members_json(&fresh))
         }
         ("DELETE", Some(target_user)) => {
+            if let Some(r) = deny_non_write_token(caller) {
+                return r;
+            }
             if !can_manage {
                 return Resp::err(403, "must be an org admin to manage members");
             }
@@ -3380,6 +3425,10 @@ pub(crate) async fn api_org_invitations(ctx: &Ctx, caller: &Caller, name: &str, 
                     .collect();
                 return Resp::json(serde_json::json!(items));
             }
+            // POST = create an invitation: a write, so a non-write token is refused.
+            if let Some(r) = deny_non_write_token(caller) {
+                return r;
+            }
             api_org_invite_create(ctx, &user, &org, body).await
         }
         // ── invitee / admin actions on a specific invitation ──
@@ -3388,6 +3437,13 @@ pub(crate) async fn api_org_invitations(ctx: &Ctx, caller: &Caller, name: &str, 
                 Some((id, act)) => (id, Some(act)),
                 None => (rest, None),
             };
+            // accept / decline / revoke all MUTATE state (a write), so a non-write token is refused
+            // before any of them run. A login session (token == None) passes as before.
+            if let ("POST" | "DELETE", _) = (method, &action) {
+                if let Some(r) = deny_non_write_token(caller) {
+                    return r;
+                }
+            }
             match (method, action) {
                 ("POST", Some("accept")) => api_org_invite_respond(ctx, &user, &orgname, id, true).await,
                 ("POST", Some("decline")) => api_org_invite_respond(ctx, &user, &orgname, id, false).await,
@@ -3566,6 +3622,10 @@ pub(crate) async fn api_org_transfer(ctx: &Ctx, caller: &Caller, name: &str, bod
     let Some(user) = caller.user.clone() else {
         return Resp::err(401, "login required");
     };
+    // Handing ownership over is management-grade: a login session only, no token (even a Write one).
+    if let Some(r) = deny_any_token(caller) {
+        return r;
+    }
     // 404 for a missing org OR one the caller can't see — existence non-disclosure, as elsewhere.
     let Some(org) = ctx.store.org(name).await else {
         return Resp::err(404, "not found");
@@ -3636,6 +3696,10 @@ pub(crate) async fn api_org_delete(ctx: &Ctx, caller: &Caller, name: &str) -> Re
     let Some(user) = caller.user.clone() else {
         return Resp::err(401, "login required");
     };
+    // Deleting an org is management-grade: a login session only, no token (even a Write one).
+    if let Some(r) = deny_any_token(caller) {
+        return r;
+    }
     let Some(org) = ctx.store.org(name).await else {
         return Resp::err(404, "not found");
     };
@@ -5896,5 +5960,92 @@ mod tests {
 
         // An unknown target is a plain 404.
         assert_eq!(api_admin_set_disabled(&ctx, &caller("root", true), "ghost", true).await.status, 404);
+    }
+
+    // ── org write endpoints honor token scope (Fix 3) ──
+
+    #[tokio::test]
+    async fn org_writes_refuse_a_read_token_but_allow_a_write_token_and_a_login() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "pw-alice-1", false).await; // org admin
+        add_user(&ctx, "bob", "pw-bob-1", false).await; // member
+        add_user(&ctx, "carol", "pw-carol-1", false).await; // invitee / transfer target
+        mk_org(&ctx, "acme", &[("alice", "admin"), ("bob", "member")]).await;
+
+        let read = |u: &str| caller(u, false).with_token(None, Scope::Read);
+        let writ = |u: &str| caller(u, false).with_token(None, Scope::Write);
+
+        // create: a READ token is refused 403; a WRITE token succeeds (201).
+        assert_eq!(api_orgs_create(&ctx, &read("alice"), &body(serde_json::json!({ "name": "readorg" }))).await.status, 403, "read token can't create an org");
+        assert_eq!(api_orgs_create(&ctx, &writ("alice"), &body(serde_json::json!({ "name": "writeorg" }))).await.status, 201, "write token creates an org");
+        assert!(ctx.store.org("readorg").await.is_none(), "the refused create planted nothing");
+
+        // settings POST: read → 403, write → 200; GET stays allowed with a read token.
+        assert_eq!(api_org_settings(&ctx, &read("alice"), "acme", "POST", &body(serde_json::json!({ "members_can_create": false }))).await.status, 403);
+        assert_eq!(api_org_settings(&ctx, &writ("alice"), "acme", "POST", &body(serde_json::json!({ "members_can_create": false }))).await.status, 200);
+        assert_eq!(api_org_settings(&ctx, &read("alice"), "acme", "GET", &[]).await.status, 200, "a read GET is still allowed");
+
+        // members POST (role change): read → 403, write → 200.
+        assert_eq!(api_org_members(&ctx, &read("alice"), "acme", "", "POST", &body(serde_json::json!({ "username": "bob", "role": "admin" }))).await.status, 403);
+        assert_eq!(api_org_members(&ctx, &writ("alice"), "acme", "", "POST", &body(serde_json::json!({ "username": "bob", "role": "admin" }))).await.status, 200);
+        assert_eq!(api_org_members(&ctx, &read("alice"), "acme", "", "GET", &[]).await.status, 200, "a read GET is still allowed");
+        // members DELETE: read → 403 (bob is still a member afterward).
+        assert_eq!(api_org_members(&ctx, &read("alice"), "acme", "/bob", "DELETE", &[]).await.status, 403);
+        assert!(ctx.store.org("acme").await.unwrap().is_member("bob"), "the refused delete removed nobody");
+
+        // invitations POST (create): read → 403, write → 201; GET (admin list) allowed with a read token.
+        assert_eq!(api_org_invitations(&ctx, &read("alice"), "acme", "", "POST", &body(serde_json::json!({ "username": "carol", "role": "member" }))).await.status, 403);
+        let inv = api_org_invitations(&ctx, &writ("alice"), "acme", "", "POST", &body(serde_json::json!({ "username": "carol", "role": "member" }))).await;
+        assert!(inv.status == 200 || inv.status == 201, "write token creates an invitation: {}", inv.status);
+        assert_eq!(api_org_invitations(&ctx, &read("alice"), "acme", "", "GET", &[]).await.status, 200, "a read GET is still allowed");
+
+        // transfer + delete are MANAGEMENT-grade: refused for ANY token (read OR write), allowed only
+        // from a login session (token == None).
+        assert_eq!(api_org_transfer(&ctx, &read("alice"), "acme", &body(serde_json::json!({ "new_owner": "bob" }))).await.status, 403, "read token can't transfer");
+        assert_eq!(api_org_transfer(&ctx, &writ("alice"), "acme", &body(serde_json::json!({ "new_owner": "bob" }))).await.status, 403, "even a write token can't transfer (login-session only)");
+        assert_eq!(api_org_delete(&ctx, &read("alice"), "acme").await.status, 403, "read token can't delete");
+        assert_eq!(api_org_delete(&ctx, &writ("alice"), "acme").await.status, 403, "even a write token can't delete (login-session only)");
+
+        // A login SESSION (no token) still performs the management actions.
+        assert_eq!(api_org_transfer(&ctx, &caller("alice", false), "acme", &body(serde_json::json!({ "new_owner": "bob" }))).await.status, 200, "a login session transfers");
+        // bob is now the admin/owner; a login session deletes an (empty) org (204 no content).
+        assert_eq!(api_org_delete(&ctx, &caller("bob", false), "acme").await.status, 204, "a login session deletes");
+        assert!(ctx.store.org("acme").await.is_none(), "the org is gone");
+    }
+
+    // ── password-reset request equalizes work on the miss path (Fix 4) ──
+
+    #[tokio::test]
+    async fn password_reset_miss_equalizes_work_and_body_is_identical() {
+        let (_d, ctx) = harness().await;
+        add_user(&ctx, "alice", "pw-alice-1", false).await;
+        let ip: Option<IpAddr> = Some(IpAddr::from([127, 0, 0, 1]));
+
+        // Existing account: a real token is minted (count goes up) and the body is the generic answer.
+        let before = ctx.store.password_reset_token_count().await;
+        let hit = api_password_reset_request(&ctx, ip, &body(serde_json::json!({ "username": "alice" }))).await;
+        assert_eq!(hit.status, 200);
+        assert_eq!(ctx.store.password_reset_token_count().await, before + 1, "the hit path mints+keeps a real token");
+
+        // Nonexistent account: the SAME generic body, byte-identical, and the miss path still did the
+        // equalizing DB work (a throwaway mint) which it DISCARDED — so no token lingers from it.
+        let after_hit = ctx.store.password_reset_token_count().await;
+        let miss = api_password_reset_request(&ctx, ip, &body(serde_json::json!({ "username": "ghost-nobody" }))).await;
+        assert_eq!(miss.status, 200);
+        assert_eq!(miss.body, hit.body, "the miss response is byte-identical to the hit response (no enumeration via the body)");
+        assert_eq!(ctx.store.password_reset_token_count().await, after_hit, "the miss path's throwaway token is discarded, leaving no lingering row");
+
+        // The per-IP rate limit is charged BEFORE the lookup: drain the bucket, then even a well-formed
+        // request (existing OR nonexistent user) is a 429 — the throttle does not depend on existence.
+        let flood_ip: Option<IpAddr> = Some(IpAddr::from([10, 0, 0, 9]));
+        let mut saw_429 = false;
+        for _ in 0..(REGISTER_BURST as usize + 2) {
+            let r = api_password_reset_request(&ctx, flood_ip, &body(serde_json::json!({ "username": "alice" }))).await;
+            if r.status == 429 {
+                saw_429 = true;
+                break;
+            }
+        }
+        assert!(saw_429, "the per-IP budget is charged before the lookup and eventually 429s");
     }
 }

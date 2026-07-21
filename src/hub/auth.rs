@@ -38,6 +38,12 @@ pub async fn authenticate(store: &Store, sessions: &Sessions, sid: Option<&str>,
             // Session alive but the user is gone → the session is void. Deleting an account must
             // take effect at once, not wait for the TTL to run out.
             if let Some(u) = store.user(&username).await {
+                // A disabled (admin-suspended) account is void the same way a deleted one is: its
+                // live session must stop authenticating on the spot, not linger until the TTL. Enable
+                // restores it. Mirror the deleted-owner branch → anonymous.
+                if u.disabled {
+                    return Authn::anonymous();
+                }
                 return Authn { caller: user_caller(&u, None), token_id: None };
             }
             sessions.revoke(sid);
@@ -65,6 +71,12 @@ pub async fn authenticate(store: &Store, sessions: &Sessions, sid: Option<&str>,
             let Some(u) = store.user(owner).await else {
                 return Authn::anonymous();
             };
+            // Owner disabled (admin-suspended) → the token stops authenticating, exactly like a
+            // deleted owner. Without this a suspended account's pre-existing bearer token keeps
+            // working and the admin-disable is bypassable. Enable restores it.
+            if u.disabled {
+                return Authn::anonymous();
+            }
             let grant = TokenGrant { agent: t.agent.clone(), scope };
             return Authn { caller: user_caller(&u, Some(grant)), token_id: Some(t.id.clone()) };
         }
@@ -287,6 +299,62 @@ mod tests {
         let f = fixture().await;
         let secret = issue(&f.store, "tok_1", Some("alice"), None, "superuser", None).await;
         assert!(authenticate(&f.store, &f.sessions, None, &[secret]).await.caller.user.is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_owner_token_authenticates_nobody_and_enable_restores() {
+        // A pre-existing bearer token whose owner is DISABLED (admin soft-suspend) must stop
+        // authenticating on the spot — otherwise admin-disable is bypassable via the old token. Enable
+        // restores it. A non-disabled owner's token is unaffected.
+        let f = fixture().await;
+        let secret = issue(&f.store, "tok_1", Some("alice"), Some("proj"), "write", None).await;
+
+        // While enabled: the token authorizes alice.
+        let a = authenticate(&f.store, &f.sessions, None, &[secret.clone()]).await;
+        assert_eq!(a.caller.user.as_deref(), Some("alice"), "an active owner's token authorizes");
+
+        // Disable alice: the SAME token now authenticates nobody.
+        assert!(f.store.set_user_disabled("alice", true).await.unwrap());
+        let a = authenticate(&f.store, &f.sessions, None, &[secret.clone()]).await;
+        assert!(a.caller.user.is_none(), "a disabled owner's token must not authenticate");
+        assert!(a.caller.token.is_none());
+        assert!(a.token_id.is_none());
+
+        // Enable restores it.
+        assert!(f.store.set_user_disabled("alice", false).await.unwrap());
+        let a = authenticate(&f.store, &f.sessions, None, &[secret]).await;
+        assert_eq!(a.caller.user.as_deref(), Some("alice"), "enable restores the token");
+
+        // A different, never-disabled owner's token is unaffected throughout.
+        let root_secret = issue(&f.store, "tok_root", Some("root"), None, "read", None).await;
+        assert_eq!(
+            authenticate(&f.store, &f.sessions, None, &[root_secret]).await.caller.user.as_deref(),
+            Some("root"),
+            "a non-disabled user's token still authorizes"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_users_session_is_dead_and_enable_restores() {
+        // A disabled account's LIVE session must stop authenticating too, not linger until the TTL.
+        let f = fixture().await;
+        let sid = f.sessions.create("alice").unwrap();
+        assert_eq!(
+            authenticate(&f.store, &f.sessions, Some(&sid), &[]).await.caller.user.as_deref(),
+            Some("alice"),
+            "an active user's session identifies them"
+        );
+
+        assert!(f.store.set_user_disabled("alice", true).await.unwrap());
+        let a = authenticate(&f.store, &f.sessions, Some(&sid), &[]).await;
+        assert!(a.caller.user.is_none(), "a disabled user's session must not authenticate");
+
+        assert!(f.store.set_user_disabled("alice", false).await.unwrap());
+        assert_eq!(
+            authenticate(&f.store, &f.sessions, Some(&sid), &[]).await.caller.user.as_deref(),
+            Some("alice"),
+            "enable restores the session"
+        );
     }
 
     #[tokio::test]

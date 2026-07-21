@@ -691,6 +691,41 @@ fn json_text<T: Serialize>(v: &[T]) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Row-counts of the core credential tables, taken from a live store to stamp a backup manifest and
+/// then re-taken from the finished snapshot to prove it captured the same data (never a silent short
+/// backup). Only the tables an operator would notice missing: users, agents, tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RowCounts {
+    pub users: i64,
+    pub agents: i64,
+    pub tokens: i64,
+}
+
+/// `SELECT COUNT(*)` the three core tables over an arbitrary SQLite pool.
+async fn count_on_pool(pool: &sqlx::SqlitePool) -> io::Result<RowCounts> {
+    async fn one(pool: &sqlx::SqlitePool, table: &str) -> io::Result<i64> {
+        let row = sqlx::query(&format!("SELECT COUNT(*) AS n FROM {table}")).fetch_one(pool).await.map_err(err)?;
+        Ok(row.int("n"))
+    }
+    Ok(RowCounts {
+        users: one(pool, "users").await?,
+        agents: one(pool, "agents").await?,
+        tokens: one(pool, "tokens").await?,
+    })
+}
+
+/// Count the core tables in a standalone SQLite file (read-only, no migration) — used to verify a
+/// backup snapshot captured the live rows. The file is opened on its own short-lived pool that is
+/// closed before returning.
+pub async fn count_sqlite_rows(path: &Path) -> io::Result<RowCounts> {
+    use sqlx::sqlite::SqliteConnectOptions;
+    let opts = SqliteConnectOptions::new().filename(path).read_only(true);
+    let pool = sqlx::SqlitePool::connect_with(opts).await.map_err(err)?;
+    let counts = count_on_pool(&pool).await;
+    pool.close().await;
+    counts
+}
+
 fn row_user(r: &impl Cols) -> User {
     User {
         username: r.text("username"),
@@ -1264,6 +1299,16 @@ impl Store {
         match self {
             Store::Sqlite(s) => s.backup_to(dest).await,
             Store::Pg(_) => Err(io::Error::other("backup_sqlite_to is only valid for the SQLite backend")),
+        }
+    }
+
+    /// Live source row-counts (users, agents, tokens) read through the store's own pool — which sees
+    /// committed WAL frames — so a backup can record them and later prove the snapshot captured them.
+    /// Only meaningful on SQLite (the backup snapshot path); errs on Postgres.
+    pub async fn row_counts(&self) -> io::Result<RowCounts> {
+        match self {
+            Store::Sqlite(s) => count_on_pool(&s.pool).await,
+            Store::Pg(_) => Err(io::Error::other("row_counts is only valid for the SQLite backend")),
         }
     }
 
@@ -1850,6 +1895,15 @@ impl SqliteStore {
     /// then tightened to 0600 — it is a verbatim copy of the credential-digest store.
     async fn backup_to(&self, dest: &Path) -> io::Result<()> {
         let path = dest.to_str().ok_or_else(|| io::Error::other("backup destination path is not valid UTF-8"))?;
+        // Fold every committed WAL frame into the main db file BEFORE the snapshot. On a LIVE hub the
+        // main `hub.db` is frozen at the last checkpoint baseline while freshly committed data lives in
+        // the `-wal` held open by the running server; under concurrent writers `VACUUM INTO`
+        // intermittently reads ONLY that baseline and drops the committed WAL frames -> a near-empty
+        // backup that still succeeds. `wal_checkpoint(TRUNCATE)` forces all committed frames into the
+        // main db (and resets the WAL) so `VACUUM INTO` below cannot miss them. Best-effort on the
+        // return code (a concurrent reader can keep TRUNCATE from resetting the file), but the frame
+        // transfer that matters still happens; the caller's row-count verify is the hard backstop.
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&self.pool).await;
         // Escape single quotes for the inlined SQL string literal.
         let escaped = path.replace('\'', "''");
         sqlx::query(&format!("VACUUM INTO '{escaped}'")).execute(&self.pool).await.map_err(err)?;
@@ -2454,7 +2508,9 @@ impl SqliteStore {
             .fetch_optional(&mut *tx)
             .await
             .ok()??;
-        sqlx::query("DELETE FROM password_reset_tokens WHERE token = ?").bind(token).execute(&mut *tx).await.ok()?;
+        // Consuming a reset revokes ALL of that user's outstanding reset tokens, not just the presented
+        // one, so an older leaked reset link cannot be replayed after the user has already reset.
+        sqlx::query("DELETE FROM password_reset_tokens WHERE username = ?").bind(row.text("username")).execute(&mut *tx).await.ok()?;
         tx.commit().await.ok()?;
         if is_expired(&row.text("expires")) {
             return None;
@@ -3159,7 +3215,9 @@ impl PgStore {
             .fetch_optional(&mut *tx)
             .await
             .ok()??;
-        sqlx::query("DELETE FROM password_reset_tokens WHERE token = $1").bind(token).execute(&mut *tx).await.ok()?;
+        // Consuming a reset revokes ALL of that user's outstanding reset tokens, not just the presented
+        // one, so an older leaked reset link cannot be replayed after the user has already reset.
+        sqlx::query("DELETE FROM password_reset_tokens WHERE username = $1").bind(row.text("username")).execute(&mut *tx).await.ok()?;
         tx.commit().await.ok()?;
         if is_expired(&row.text("expires")) {
             return None;
@@ -4255,6 +4313,22 @@ mod tests {
         let expired = s.mint_password_reset_token("bob", Duration::from_secs(0)).await.unwrap();
         assert!(s.consume_password_reset_token(&expired).await.is_none(), "an expired reset token is never accepted");
         assert!(s.consume_password_reset_token(&expired).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn consuming_a_reset_revokes_all_the_users_outstanding_reset_tokens() {
+        // A completed reset must invalidate EVERY outstanding reset link for that user, not just the one
+        // used, so an older leaked reset link cannot be replayed after the user has already reset (#2).
+        let (_d, s) = tmp_store().await;
+        let t1 = s.mint_password_reset_token("alice", Duration::from_secs(3600)).await.unwrap();
+        let t2 = s.mint_password_reset_token("alice", Duration::from_secs(3600)).await.unwrap();
+        let bob = s.mint_password_reset_token("bob", Duration::from_secs(3600)).await.unwrap();
+        assert_eq!(s.password_reset_token_count().await, 3);
+        // Consuming alice's first token authorizes alice AND revokes her sibling t2.
+        assert_eq!(s.consume_password_reset_token(&t1).await.as_deref(), Some("alice"));
+        assert!(s.consume_password_reset_token(&t2).await.is_none(), "a sibling reset token is revoked once one is consumed");
+        // Another user's token is untouched: only the consuming user's reset tokens are revoked.
+        assert_eq!(s.consume_password_reset_token(&bob).await.as_deref(), Some("bob"), "another user's reset token is unaffected");
     }
 
     #[tokio::test]

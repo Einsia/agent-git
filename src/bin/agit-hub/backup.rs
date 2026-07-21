@@ -85,6 +85,12 @@ pub(crate) struct Manifest {
     pub external_blobs: bool,
     /// `filesystem` | `s3`.
     pub blob_backend: String,
+    /// The live source row-counts (users, agents, tokens) at backup time, for the SQLite backend. The
+    /// snapshot is verified against these at backup AND again at restore, so a short snapshot (dropped
+    /// WAL frames on a live hub) is caught loudly instead of restoring a near-empty DB. `None` on the
+    /// Postgres backend (its `pg_dump`/`psql` already fail loud) and on v1 backups predating this field.
+    #[serde(default)]
+    pub row_counts: Option<store::RowCounts>,
 }
 
 // ─────────────────────────── backup ───────────────────────────
@@ -132,11 +138,29 @@ pub(crate) async fn run_backup(root: &Path, out: &Path, now: &str, plan: &Plan) 
     std::fs::create_dir_all(&reserve).map_err(|e| format!("failed to create the reserve dir: {e}"))?;
 
     // 1. The metadata snapshot.
+    let mut row_counts = None;
     match &plan.pg_url {
         Some(url) => pg_dump(url, &reserve.join("metadata.sql"))?,
         None => {
             let s = Store::open_sqlite(root).await.map_err(|e| format!("failed to open the SQLite store at {}: {e}", root.display()))?;
-            s.backup_sqlite_to(&reserve.join("hub.db")).await.map_err(|e| format!("failed to snapshot hub.db: {e}"))?;
+            // The live source counts (through the store's own pool, which sees committed WAL frames):
+            // the baseline the snapshot must reproduce.
+            let source = s.row_counts().await.map_err(|e| format!("failed to read source row-counts: {e}"))?;
+            let snap = reserve.join("hub.db");
+            s.backup_sqlite_to(&snap).await.map_err(|e| format!("failed to snapshot hub.db: {e}"))?;
+            // Verify the snapshot actually captured the live rows. On a live hub, VACUUM INTO can
+            // intermittently snapshot only the pre-WAL baseline; the checkpoint in backup_to prevents
+            // it, and this count check is the hard backstop — a short snapshot fails LOUD (no tarball
+            // is written below), never a silent near-empty backup.
+            let got = store::count_sqlite_rows(&snap).await.map_err(|e| format!("failed to read snapshot row-counts: {e}"))?;
+            if got.users < source.users || got.agents < source.agents || got.tokens < source.tokens {
+                return Err(format!(
+                    "backup snapshot is SHORT of the live database (source users={} agents={} tokens={}, snapshot users={} agents={} tokens={}); \
+                     committed data would be lost — refusing to write a partial backup",
+                    source.users, source.agents, source.tokens, got.users, got.agents, got.tokens
+                ));
+            }
+            row_counts = Some(source);
         }
     }
 
@@ -156,6 +180,7 @@ pub(crate) async fn run_backup(root: &Path, out: &Path, now: &str, plan: &Plan) 
         created: now.to_string(),
         external_blobs: plan.s3_configured,
         blob_backend: if plan.s3_configured { "s3".to_string() } else { "filesystem".to_string() },
+        row_counts,
     };
     let mj = serde_json::to_vec_pretty(&manifest).map_err(|e| format!("failed to encode the manifest: {e}"))?;
     std::fs::write(reserve.join("manifest.json"), &mj).map_err(|e| format!("failed to write the manifest: {e}"))?;
@@ -308,6 +333,22 @@ pub(crate) async fn run_restore(root: &Path, archive: &Path, force: bool, target
             let src = reserve.join("hub.db");
             if !src.is_file() {
                 return Err(format!("the backup has no {RESERVE_DIR}/hub.db to place under the root"));
+            }
+            // Verify the snapshot carries at least the row-counts the manifest recorded at backup time.
+            // A snapshot short of its own manifest means WAL frames were dropped when it was taken (or
+            // the file was tampered/truncated): fail loud, non-zero, rather than silently restore a
+            // near-empty DB that still looks valid. `None` (v1 backup / postgres) skips the check.
+            if let Some(expected) = &manifest.row_counts {
+                let got = store::count_sqlite_rows(&src)
+                    .await
+                    .map_err(|e| format!("failed to read the snapshot's row-counts for verification: {e}"))?;
+                if got.users < expected.users || got.agents < expected.agents || got.tokens < expected.tokens {
+                    return Err(format!(
+                        "backup snapshot is SHORT of its manifest (manifest users={} agents={} tokens={}, snapshot users={} agents={} tokens={}); \
+                         this backup lost committed data and is being refused — restore an intact backup",
+                        expected.users, expected.agents, expected.tokens, got.users, got.agents, got.tokens
+                    ));
+                }
             }
             let dest = root.join("hub.db");
             // A stale live DB (under --force) must not linger next to the restored snapshot.
@@ -623,6 +664,7 @@ mod tests {
             created: "2020-02-02T02:02:02Z".into(),
             external_blobs: false,
             blob_backend: "filesystem".into(),
+            row_counts: None,
         };
         std::fs::write(reserve.join("manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
         // A stand-in for whichever payload that backend would carry.
@@ -725,6 +767,7 @@ mod tests {
             created: "2020-02-02T02:02:02Z".into(),
             external_blobs: false,
             blob_backend: "filesystem".into(),
+            row_counts: None,
         };
         std::fs::write(stage.join(RESERVE_DIR).join("manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
         write(&stage.join("hub.db"), "x");
@@ -738,5 +781,107 @@ mod tests {
         let err = run_restore(dst.path(), &archive, false, None).await.unwrap_err();
         assert!(err.contains("symlink member"), "{err}");
         assert!(!dst.path().join("hub.db").exists(), "a refused restore extracts nothing");
+    }
+
+    /// Add `n` extra users to a live store WITHOUT closing it, so the freshly-committed rows sit in the
+    /// `-wal` (no checkpoint) — the exact live-hub shape where `VACUUM INTO` used to snapshot only the
+    /// pre-WAL baseline and silently drop them.
+    async fn add_users(store: &Store, n: usize) {
+        for i in 0..n {
+            let salt = agit::hub::kdf::gen_salt().unwrap();
+            let kdf_id = agit::hub::kdf::current_kdf_id();
+            store
+                .add_user(store::User {
+                    username: format!("user{i:03}"),
+                    pw_hash: agit::hub::kdf::hash_password("password-123", &salt, &kdf_id).unwrap(),
+                    salt,
+                    kdf: kdf_id,
+                    is_admin: false,
+                    created: "2020-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_captures_rows_that_live_in_the_wal() {
+        // Regression: a backup of a LIVE hub whose committed data sits in the -wal must capture ALL of
+        // it. Keep a live store (and its pool) OPEN so the rows are never checkpointed by a drop, then
+        // back up through a second store — the checkpoint in backup_to must fold the WAL frames in.
+        let src = tempfile::tempdir().unwrap();
+        seed_root(src.path()).await; // 1 user (alice) + 1 agent + 1 token
+        let live = Store::open_sqlite(src.path()).await.unwrap();
+        add_users(&live, 27).await; // 28 users total, all committed but sitting in the WAL
+        let expected_users = live.users().await.len();
+        assert_eq!(expected_users, 28, "sanity: 28 users are committed on the live store");
+        assert!(src.path().join("hub.db-wal").exists(), "sanity: the writes are in the -wal, not checkpointed");
+
+        let outdir = tempfile::tempdir().unwrap();
+        let out = outdir.path().join("backup.tgz");
+        let (manifest, _w) =
+            run_backup(src.path(), &out, "2020-02-02T02:02:02Z", &sqlite_plan()).await.expect("backup succeeds");
+        // The manifest records the live source counts, and the backup passed its own snapshot verify.
+        let counts = manifest.row_counts.expect("sqlite backup records row-counts");
+        assert_eq!(counts.users, 28, "the manifest records the full live user count");
+        drop(live); // the live handle is no longer needed
+
+        // Restore and prove NONE of the WAL-resident rows were dropped.
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::remove_dir(dst.path()).unwrap();
+        run_restore(dst.path(), &out, false, None).await.expect("restore succeeds");
+        let restored = Store::open_sqlite(dst.path()).await.unwrap();
+        assert_eq!(restored.users().await.len(), 28, "every WAL-resident user is captured, none dropped");
+        assert_eq!(restored.tokens().await.len(), 1);
+        assert_eq!(restored.agents().await.len(), 1);
+    }
+
+    /// Build a backup tarball around a real (small) SQLite snapshot but with a manifest whose row-counts
+    /// are INFLATED past what the snapshot holds — i.e. a short/dropped-WAL backup masquerading as full.
+    async fn short_backup(claimed: store::RowCounts) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        // A real snapshot holding exactly one user (alice), via the same VACUUM-INTO path.
+        let seed = dir.path().join("seed");
+        seed_root(&seed).await;
+        let staging = dir.path().join("staging");
+        let reserve = staging.join(RESERVE_DIR);
+        std::fs::create_dir_all(&reserve).unwrap();
+        Store::open_sqlite(&seed).await.unwrap().backup_sqlite_to(&reserve.join("hub.db")).await.unwrap();
+        let manifest = Manifest {
+            format: FORMAT.into(),
+            backend: "sqlite".into(),
+            schema_version: store::schema_version(),
+            created: "2020-02-02T02:02:02Z".into(),
+            external_blobs: false,
+            blob_backend: "filesystem".into(),
+            row_counts: Some(claimed),
+        };
+        std::fs::write(reserve.join("manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        let fake_root = dir.path().join("root");
+        std::fs::create_dir_all(&fake_root).unwrap();
+        write(&fake_root.join("audit.log"), "{}\n");
+        let out = dir.path().join("short.tgz");
+        create_tarball(&fake_root, &staging, &out).unwrap();
+        (dir, out)
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_a_snapshot_short_of_its_manifest() {
+        // A snapshot with FEWER rows than its own manifest claims (a dropped-WAL backup) must be refused
+        // LOUD at restore — never a silent success that leaves a near-empty DB.
+        let (_d, archive) = short_backup(store::RowCounts { users: 28, agents: 1, tokens: 1 }).await;
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::remove_dir(dst.path()).unwrap();
+        let err = run_restore(dst.path(), &archive, false, None).await.unwrap_err();
+        assert!(err.contains("SHORT of its manifest"), "restore must reject a short snapshot loudly: {err}");
+        assert!(!dst.path().join("hub.db").exists(), "a rejected short restore places no hub.db");
+
+        // A manifest that matches the snapshot restores fine (the guard is not over-eager).
+        let (_d2, ok_archive) = short_backup(store::RowCounts { users: 1, agents: 1, tokens: 1 }).await;
+        let dst2 = tempfile::tempdir().unwrap();
+        std::fs::remove_dir(dst2.path()).unwrap();
+        run_restore(dst2.path(), &ok_archive, false, None).await.expect("an intact backup restores");
+        assert!(dst2.path().join("hub.db").is_file());
     }
 }
