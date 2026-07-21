@@ -316,21 +316,18 @@ fn decide_gate(findings: Vec<(String, scan::Finding)>, verb: &str) -> Gate {
         return Gate::Clean;
     }
 
-    errln!("agit: secret gate — suspected secrets in what you are about to {verb}:");
+    errln!("{}", ui::warn(&format!("agit: secret gate: suspected secrets before {verb}:")));
     for (name, f) in &findings {
         errln!("  {name}:{}  [{}]  {}", f.line, f.rule, f.excerpt);
     }
 
     if allow_override_enabled() {
         errln!(
-            "  {ALLOW_ENV} is set — gate BYPASSED for this {verb}. This override is explicit and auditable \
-             (unlike git --no-verify, which leaves no trace). You own the consequences: pushing publishes these to the team."
+            "  {ALLOW_ENV}=1: gate bypassed, {verb} proceeds with suspected secrets (logged)"
         );
         if verb == "push" {
             errln!(
-                "  note: the hub runs its own server-side secret gate that this flag does not bypass; if it \
-                 refuses, mark the line with an `{}` pragma (it travels with the commit) or ask the hub operator \
-                 to allowlist the finding.",
+                "  push: the hub runs its own secret gate this flag does not bypass; mark the line (`{}`) or ask the operator to allowlist",
                 scan::ALLOW_PRAGMA,
             );
         }
@@ -338,15 +335,15 @@ fn decide_gate(findings: Vec<(String, scan::Finding)>, verb: &str) -> Gate {
     } else {
         // State plainly that the action did NOT happen, so a blocked gate is never read as success.
         let not_done = match verb {
-            "commit" => "No commit was created.",
-            "push" => "Nothing was pushed.",
-            "snap" => "Nothing was committed.",
-            _ => "The action did not complete.",
+            "commit" => "No commit created",
+            "push" => "Nothing pushed",
+            "snap" => "Nothing committed",
+            _ => "Did not complete",
         };
+        let n = findings.len();
+        let plural = if n == 1 { "" } else { "s" };
         errln!(
-            "{not_done} {} suspected. Fix them, mark a false positive with a `{}` pragma or a `{}` entry, or — to override \
-             this gate wholesale — re-run with {ALLOW_ENV}=1 (disclosed and auditable, not a silent bypass).",
-            findings.len(),
+            "{not_done}: {n} suspected secret{plural}. Fix, allow-list (`{}` / `{}`), or {ALLOW_ENV}=1 to override",
             scan::ALLOW_PRAGMA,
             scan::ALLOW_FILE,
         );
@@ -357,13 +354,12 @@ fn decide_gate(findings: Vec<(String, scan::Finding)>, verb: &str) -> Gate {
 /// scan_root wrap-up: unifies the "found/not found" report and exit code.
 fn finish_scan(total: usize, staged: bool, scanned: usize) -> Result<i32> {
     if total > 0 {
-        errln!("\n{total} of them. Once the AgentState is pushed, a teammate who pulls carries them along.");
-        // scan has NO --no-verify — it is a report, not a git hook. The commit/push gates it mirrors have
+        errln!("\n{total} suspected. Once pushed, a teammate who pulls carries them along.");
+        // scan has NO --no-verify: it is a report, not a git hook. The commit/push gates it mirrors have
         // exactly one disclosed override, AGIT_ALLOW_SECRETS; point there, not at a flag that does not
         // exist and would walk the user toward silently committing the secret.
         errln!(
-            "Fix them, mark a false positive with a `{}` pragma or a `{}` entry. The gate that blocks commit/push \
-             has one disclosed override: {ALLOW_ENV}=1 (auditable — there is no --no-verify).",
+            "Fix, allow-list (`{}` / `{}`), or {ALLOW_ENV}=1 to override the commit/push gate (logged).",
             scan::ALLOW_PRAGMA,
             scan::ALLOW_FILE,
         );
@@ -724,7 +720,7 @@ pub fn convert_pass(agent: &Path, env: &Path, seen: &mut std::collections::HashS
                         // Unsigned here: the converted copy's captured content differs from this source,
                         // so its authoritative signature is written at capture, into the sidecar.
                         if let Err(err) = record_launch(&new_id, &o.aid, &o.name, env, to, None) {
-                            errln!("  ⚠ {from}→{to} launch record not written ({err:#}) — capture will attribute this copy by repo default.");
+                            errln!("  ⚠ {from}→{to} launch record not written ({err:#}); capture will attribute this copy by repo default.");
                         }
                     }
                     outln!("  ● {from}→{to}  {}", h.resume_cmd);
@@ -788,7 +784,7 @@ pub fn resume_cmd(
                 .map_err(|_| anyhow::anyhow!("no such environment path: {e}"))?;
             let (rc, _) = crate::scope::git_in_status(&p, &["rev-parse", "--is-inside-work-tree"]);
             if rc != 0 {
-                anyhow::bail!("{} is not a git repository — an Environment is a code repo", p.display());
+                anyhow::bail!("{} is not a git repository; an Environment is a code repo", p.display());
             }
             (Some(p.to_string_lossy().into_owned()), Some(p))
         }
@@ -886,8 +882,7 @@ impl Attribution {
         match self {
             Attribution::Launched(_) => None,
             Attribution::RepoDefault { name, .. } => Some(format!(
-                "not started by agit, so it has no launch record — filing it under this repo's default agent `{name}`. \
-                 Start it with `agit start --agent <name>` to attribute it exactly."
+                "no launch record, filed under default agent `{name}` (agit start --agent <name> to attribute)"
             )),
         }
     }
@@ -1398,7 +1393,7 @@ fn identity_register(args: &[String]) -> Result<i32> {
     outln!("{}", serde_json::to_string(&block)?);
     outln!("");
     outln!("paste this into the hub: Account -> Signing keys -> Add a signing key");
-    outln!("  (signed for {username:?} on device {device_label:?}; contains only public keys — no secret leaves this machine)");
+    outln!("  (signed for {username:?} on device {device_label:?}; contains only public keys; no secret leaves this machine)");
     Ok(0)
 }
 
@@ -1429,12 +1424,12 @@ fn identity_keys() -> Result<i32> {
     let ep = crate::hubapi::HubEndpoint::resolve()?;
     let username = ep.me()?;
     let Some(set) = ep.get_identity(&username)? else {
-        outln!("no device keys enrolled for {username} yet — run `agit identity register {username}` and paste the block into the hub.");
+        outln!("no device keys enrolled for {username} yet; run `agit identity register {username}` and paste the block into the hub.");
         return Ok(0);
     };
     let keys = set.get("keys").and_then(|k| k.as_array()).cloned().unwrap_or_default();
     if keys.is_empty() {
-        outln!("no device keys enrolled for {username} yet — run `agit identity register {username}` and paste the block into the hub.");
+        outln!("no device keys enrolled for {username} yet; run `agit identity register {username}` and paste the block into the hub.");
         return Ok(0);
     }
     outln!("device keys for {username}");
@@ -1475,7 +1470,7 @@ fn identity_revoke(args: &[String]) -> Result<i32> {
         }
         [only] => field(only, "key_fpr").to_string(),
         many => {
-            errln!("{sel:?} matches {} device keys — use a full fingerprint from `agit identity keys`.", many.len());
+            errln!("{sel:?} matches {} device keys; use a full fingerprint from `agit identity keys`.", many.len());
             return Ok(1);
         }
     };
@@ -1515,7 +1510,7 @@ fn identity_show(user: Option<&str>) -> Result<i32> {
             // Enrollment status is a courtesy: never fail `show` just because no hub is reachable.
             match hub_enrollment_status(&ed_pub) {
                 Ok(Some(line)) => outln!("  {line}"),
-                Ok(None) => outln!("  not enrolled on the hub yet — run `agit identity register <you>` and paste the block into the hub web UI."),
+                Ok(None) => outln!("  not enrolled on the hub yet; run `agit identity register <you>` and paste the block into the hub web UI."),
                 Err(_) => outln!("  (no hub configured; showing local identity only)"),
             }
             Ok(0)
@@ -1525,7 +1520,7 @@ fn identity_show(user: Option<&str>) -> Result<i32> {
             match ep.get_identity(u)? {
                 Some(v) => {
                     let keys = v.get("keys").and_then(|k| k.as_array()).cloned().unwrap_or_default();
-                    outln!("{u} — {} device key(s)", keys.len());
+                    outln!("{u}; {} device key(s)", keys.len());
                     for k in &keys {
                         outln!("  {}  {}", field(k, "key_fpr"), {
                             let l = field(k, "label");
@@ -1566,7 +1561,7 @@ fn hub_enrollment_status(local_ed_pub: &str) -> Result<Option<String>> {
             Ok(Some(format!("enrolled as {username} at epoch {epoch} ({count} device key(s); this machine is one)")))
         }
         None if count > 0 => Ok(Some(format!(
-            "enrolled as {username} with {count} device key(s), but NOT this machine — run `agit identity register {username}` and paste the block into the hub"
+            "enrolled as {username} with {count} device key(s), but NOT this machine; run `agit identity register {username}` and paste the block into the hub"
         ))),
         None => Ok(None),
     }
@@ -1658,7 +1653,7 @@ fn provenance_verify_agent(agent: &agent::Agent, repin: bool) -> Result<i32> {
     let mut sessions = store_sessions(&agent.store);
     if sessions.is_empty() {
         anyhow::bail!(
-            "agent `{}` has no sessions yet — nothing to verify (run one, or `agit a log` to list)",
+            "agent `{}` has no sessions yet; nothing to verify (run one, or `agit a log` to list)",
             agent.name
         );
     }
@@ -1778,11 +1773,11 @@ fn classify_session_selector(sel: Option<&str>) -> Result<SessionTarget> {
     // Nothing matched — say what was tried.
     match &active {
         Some(a) => anyhow::bail!(
-            "no session or agent `{sel}` — not a transcript path, not a session id in the active agent `{}`'s store, and not a known agent name.\n  run a session, or `agit a log` to list what this agent has.",
+            "no session or agent `{sel}`; not a transcript path, not a session id in the active agent `{}`'s store, and not a known agent name.\n  run a session, or `agit a log` to list what this agent has.",
             a.name
         ),
         None => anyhow::bail!(
-            "no session or agent `{sel}` — not a transcript path and not a known agent name (and no active agent to look up a session id in).\n  `agit a list` shows this machine's agents."
+            "no session or agent `{sel}`; not a transcript path and not a known agent name (and no active agent to look up a session id in).\n  `agit a list` shows this machine's agents."
         ),
     }
 }
@@ -1790,7 +1785,7 @@ fn classify_session_selector(sel: Option<&str>) -> Result<SessionTarget> {
 /// The latest session in an agent's store, or a clear error when it has none yet.
 fn agent_latest_transcript(agent: &agent::Agent) -> Result<PathBuf> {
     latest_session(&agent.store).map(|s| s.path).with_context(|| {
-        format!("agent `{}` has no sessions yet — run one, or `agit a log` to list", agent.name)
+        format!("agent `{}` has no sessions yet; run one, or `agit a log` to list", agent.name)
     })
 }
 
@@ -1960,7 +1955,7 @@ pub fn report_incoming(store: &Path) {
     }
     let new: Vec<&str> = out.lines().filter(|l| l.ends_with(".jsonl")).collect();
     if new.is_empty() {
-        outln!("  up to date — no new sessions on the remote.");
+        outln!("  up to date; no new sessions on the remote.");
         return;
     }
     // Break the count down per runtime by asking the registry which runtimes exist, not by naming any
@@ -1982,12 +1977,12 @@ pub fn report_incoming(store: &Path) {
 /// A one-line summary of the active store's position against its upstream, for `agit a status`.
 fn upstream_line(store: &Path) -> String {
     match ahead_behind(store) {
-        None => "no upstream yet — agit a push to publish".to_string(),
+        None => "no upstream yet; agit a push to publish".to_string(),
         Some((0, 0)) => "up to date with the remote".to_string(),
-        Some((ahead, 0)) => format!("{ahead} unpushed — agit a push to publish"),
-        Some((0, behind)) => format!("{behind} behind — agit a pull to integrate"),
+        Some((ahead, 0)) => format!("{ahead} unpushed; agit a push to publish"),
+        Some((0, behind)) => format!("{behind} behind; agit a pull to integrate"),
         Some((ahead, behind)) => {
-            format!("{ahead} ahead, {behind} behind — diverged; agit a merge to reconcile")
+            format!("{ahead} ahead, {behind} behind (diverged); agit a merge to reconcile")
         }
     }
 }
@@ -2019,7 +2014,7 @@ pub fn agent_status() -> Result<i32> {
         _ => match &resolved {
             Some(a) => vec![(a.name.clone(), a.aid.clone())],
             None => {
-                outln!("no agents bound to this repo — agit a init <name> mints one.");
+                outln!("no agents bound to this repo; agit a init <name> mints one.");
                 return Ok(0);
             }
         },
@@ -2041,10 +2036,10 @@ pub fn agent_status() -> Result<i32> {
                         .map(|s| s.recency())
                         .max()
                         .map(ui::ago)
-                        .unwrap_or_else(|| "—".into());
+                        .unwrap_or_else(|| "-".into());
                     (status, sessions.len().to_string(), last)
                 }
-                None => (ui::dim("not cloned").to_string(), "—".into(), "—".into()),
+                None => (ui::dim("not cloned").to_string(), "-".into(), "-".into()),
             };
             let here = if Some(aid) == active_aid.as_ref() { "  (active)" } else { "" };
             vec![name.clone(), status, sessions, format!("{last}{here}")]
@@ -2137,7 +2132,7 @@ fn start_carrying(ag: &agent::Agent, env: &Path, s: StoredSession, as_rt: Option
     // The record must exist before the runtime does. Its absence is not fatal — a session that captures
     // to the default agent beats no session — but it is never silent.
     if let Err(e) = record_launch(&id, &ag.aid, &ag.name, env, &rt, sign_over) {
-        errln!("  ⚠ launch record not written ({e:#}) — capture will attribute this session by repo default.");
+        errln!("  ⚠ launch record not written ({e:#}); capture will attribute this session by repo default.");
     }
     exec(&h.resume_cmd)
 }
@@ -2145,15 +2140,15 @@ fn start_carrying(ag: &agent::Agent, env: &Path, s: StoredSession, as_rt: Option
 /// No sessions yet: start FRESH but bound to the agent, and say so.
 fn start_fresh(ag: &agent::Agent, env: &Path, as_rt: Option<&str>) -> Result<i32> {
     let rt = crate::session::resolve_runtime(as_rt, &[], "start").map_err(|e| {
-        anyhow::anyhow!("{e}\n  `{}` has no sessions yet, so there is no runtime to continue in — name one: agit start --as claude-code|codex", ag.name)
+        anyhow::anyhow!("{e}\n  `{}` has no sessions yet, so there is no runtime to continue in; name one: agit start --as claude-code|codex", ag.name)
     })?;
     let cli = if rt == "codex" { "codex" } else { "claude" };
     outln!("┌ {} · {} · {rt}", ui::bold(&ag.name), ui::accent(&ui::tilde(env)));
-    outln!("└ no sessions yet — starting FRESH, bound to this agent.");
+    outln!("└ no sessions yet; starting FRESH, bound to this agent.");
     // The runtime mints the id, so there is nothing to write a launch record against yet: this session
     // will be attributed to the repo's default agent when captured. Said, never assumed.
     errln!(
-        "  note: a fresh session gets its id from {cli}, so it has no launch record — capture files it \
+        "  note: a fresh session gets its id from {cli}, so it has no launch record; capture files it \
          under this repo's default agent. Once it is snapped, `agit start --agent {}` carries it exactly.",
         ag.name
     );
@@ -2355,7 +2350,7 @@ fn crypt_enable_zero_config(home: &Path, yes: bool) -> Result<i32> {
         // when the org has no Team KEK yet, so a zero-config encrypt never silently falls back.
         DefaultTarget::Team(org) => crypt_enable_keybox_team(home, Some(&org), &[], false, yes),
         DefaultTarget::RequireExplicit(o) => bail!(
-            "`{o}` is a personal account, not a team — there is no team reader set to default to.\n\
+            "`{o}` is a personal account, not a team; there is no team reader set to default to.\n\
              \x20      Name who can read this session explicitly:\n\
              \x20        agit a encrypt --readers <a,b>   wrap the content key to specific people\n\
              \x20        agit a encrypt --public          readable to anyone who has the repo\n\
@@ -2367,15 +2362,15 @@ fn crypt_enable_zero_config(home: &Path, yes: bool) -> Result<i32> {
 
 /// Print the two mandatory, non-negotiable warnings (req.5) before encryption does anything.
 fn crypt_print_warnings() {
-    errln!("agit encrypt — read both before continuing:");
+    errln!("agit encrypt; read both before continuing:");
     errln!(
-        "  (1) The hub cannot render or server-side-scan an encrypted store — it never holds the key.\n\
+        "  (1) The hub cannot render or server-side-scan an encrypted store; it never holds the key.\n\
          \x20     Encryption is only coherent for a no-hub, public-remote setup; you are trading hub\n\
          \x20     features for at-rest confidentiality."
     );
     errln!(
         "  (2) Your local secret gate now scans ENCRYPTED content, so it no longer sees plaintext\n\
-         \x20     secrets in these sessions — the content is protected by encryption instead of by the\n\
+         \x20     secrets in these sessions; the content is protected by encryption instead of by the\n\
          \x20     scanner."
     );
 }
@@ -2386,7 +2381,7 @@ fn crypt_confirm(prompt: &str, yes: bool) -> Result<()> {
         return Ok(());
     }
     if !ui::interactive() {
-        bail!("{prompt}\n  refusing without confirmation — re-run with --yes to proceed non-interactively");
+        bail!("{prompt}\n  refusing without confirmation; re-run with --yes to proceed non-interactively");
     }
     out!("{prompt} [y/N] ");
     use std::io::Write;
@@ -2396,7 +2391,7 @@ fn crypt_confirm(prompt: &str, yes: bool) -> Result<()> {
         .read_line(&mut line)
         .context("reading confirmation")?;
     if !matches!(line.trim(), "y" | "Y" | "yes" | "Yes") {
-        bail!("aborted — encryption not enabled");
+        bail!("aborted; encryption not enabled");
     }
     Ok(())
 }
@@ -2542,7 +2537,7 @@ fn crypt_export(home: &Path, file: Option<&str>) -> Result<i32> {
     let master = crate::crypt::load_or_create_master(home)?;
     let hex_key = hex::encode(master);
     errln!(
-        "agit-crypt master key — this IS the secret that decrypts every encrypted store.\n\
+        "agit-crypt master key; this IS the secret that decrypts every encrypted store.\n\
          \x20 Distribute it out of band (password manager / Signal). NEVER commit or push it."
     );
     match file {
@@ -2595,12 +2590,12 @@ fn crypt_import(home: &Path, keyfile: &Path, force: bool, yes: bool) -> Result<i
                 if code == 0 {
                     outln!("  re-checked-out sessions/** (now decrypted)");
                 } else {
-                    errln!("  ⚠ could not re-checkout sessions/** — run `git checkout -- .` in the store yourself");
+                    errln!("  ⚠ could not re-checkout sessions/**; run `git checkout -- .` in the store yourself");
                 }
             }
         }
         Err(_) => {
-            outln!("  (no agent resolves here yet — after `agit a clone <name>`, run `agit a encrypt` to wire the filter)");
+            outln!("  (no agent resolves here yet; after `agit a clone <name>`, run `agit a encrypt` to wire the filter)");
         }
     }
     Ok(0)
@@ -2699,7 +2694,7 @@ fn crypt_enable_keybox(home: &Path, readers: &[String], public: bool, yes: bool)
         match me {
             Some(me) if readers.iter().any(|r| r == &me) => {} // already an explicit reader
             Some(me) if crate::keybox::resolve_recipient(home, &me, None, false).is_ok() => {
-                outln!("  including you ({me}) as a reader — you can unlock a fresh clone");
+                outln!("  including you ({me}) as a reader; you can unlock a fresh clone");
                 readers.push(me);
             }
             _ => outln!(
@@ -2806,7 +2801,7 @@ fn owner_and_name_of(store: &Path) -> Result<(String, String)> {
         None => remotes.into_iter().next().map(|(_, u)| u),
     }
     .context(
-        "this session has no hub remote — `agit hub doctor` reconciles a pushed session's ACL against\n\
+        "this session has no hub remote; `agit hub doctor` reconciles a pushed session's ACL against\n\
          \x20      its keybox. Push it first (`agit a push`).",
     )?;
     owner_and_name_from_url(&url)
@@ -2822,7 +2817,7 @@ fn obtain_tk(home: &Path, org: &str, gen: i64) -> Result<[u8; 32]> {
     let ep = crate::hubapi::HubEndpoint::resolve()?;
     let env = ep.get_kek_envelope(org, gen)?.with_context(|| {
         format!(
-            "no team-KEK envelope for you at org `{org}` generation {gen} — you are not a member, or this\n\
+            "no team-KEK envelope for you at org `{org}` generation {gen}; you are not a member, or this\n\
              \x20      generation was not sealed to you. Ask an admin to run `agit hub team sync {org}`."
         )
     })?;
@@ -2849,7 +2844,7 @@ fn seal_tk_to_members(
 ) -> Result<(Vec<serde_json::Value>, Vec<String>)> {
     let org_json = ep
         .get_org(org)?
-        .with_context(|| format!("cannot read org `{org}` — are you a member/admin of it?"))?;
+        .with_context(|| format!("cannot read org `{org}`; are you a member/admin of it?"))?;
     let members = org_json.get("members").and_then(|m| m.as_array()).cloned().unwrap_or_default();
     if members.is_empty() {
         bail!("org `{org}` has no members to seal a team KEK to");
@@ -3089,7 +3084,7 @@ fn hub_team_rekey(org: &str, rekey_all: bool) -> Result<i32> {
         let failed = rekey_local_team_sessions(&home, org, next, &tk)?;
         if failed > 0 {
             errln!(
-                "  ⚠ {failed} local session(s) could NOT be rekeyed (each left UNCHANGED on its old key —\n\
+                "  ⚠ {failed} local session(s) could NOT be rekeyed (each left UNCHANGED on its old key -\n\
                  \x20     no corruption). Their new content is not yet under the rotated team key. Fix the\n\
                  \x20     cause (often a TOFU mismatch: `agit identity pin <user> --repin`) and re-run\n\
                  \x20     `agit hub team rekey {org} --rekey-all`."
@@ -3136,7 +3131,7 @@ fn rekey_local_team_sessions(home: &Path, org: &str, new_gen: i64, tk: &[u8; 32]
         }
     }
     outln!(
-        "  ⚠ sessions NOT present on this machine were NOT rekeyed — they rotate on their next local\n\
+        "  ⚠ sessions NOT present on this machine were NOT rekeyed; they rotate on their next local\n\
          \x20     `agit a rekey` (or a later `--rekey-all` run on the machine that has them)."
     );
     Ok(failed)
@@ -3210,11 +3205,11 @@ fn hub_team_sync(org: &str) -> Result<i32> {
         .and_then(|c| c.as_i64())
         .unwrap_or(0);
     if current < 1 {
-        bail!("org `{org}` has no team KEK yet — run `agit hub team rekey {org}` first.");
+        bail!("org `{org}` has no team KEK yet; run `agit hub team rekey {org}` first.");
     }
     // The caller must hold a current-gen envelope to obtain TK (fail-closed if they do not).
     let tk = obtain_tk(&home, org, current).with_context(|| {
-        format!("you need a gen-{current} envelope to sync `{org}` — ask an admin to run `agit hub team rekey {org}`")
+        format!("you need a gen-{current} envelope to sync `{org}`; ask an admin to run `agit hub team rekey {org}`")
     })?;
     let (envelopes, skipped) = seal_tk_to_members(&home, &ep, org, &tk)?;
     if envelopes.is_empty() {
@@ -3353,7 +3348,7 @@ fn doctor_one(home: &Path, ep: &crate::hubapi::HubEndpoint, a: &agent::Agent, fi
     let stanzas = crate::keybox::read_keybox(store)?;
     outln!("── hub doctor: {} ({}) ──", a.name, a.aid);
     if stanzas.is_empty() {
-        outln!("  not keybox-encrypted — no confidentiality axis to reconcile.");
+        outln!("  not keybox-encrypted; no confidentiality axis to reconcile.");
         return Ok(false);
     }
     let (owner, name) = owner_and_name_of(store)?;
@@ -3403,7 +3398,7 @@ fn doctor_one(home: &Path, ep: &crate::hubapi::HubEndpoint, a: &agent::Agent, fi
     let drift = reconcile(&authorized, &user_readers, &team_covered, public);
 
     let readers_line = if user_readers.is_empty() {
-        "—".to_string()
+        "-".to_string()
     } else {
         user_readers.iter().cloned().collect::<Vec<_>>().join(", ")
     };
@@ -3424,7 +3419,7 @@ fn doctor_one(home: &Path, ep: &crate::hubapi::HubEndpoint, a: &agent::Agent, fi
             let cur = v.get("current").and_then(|c| c.as_i64()).unwrap_or(0);
             if *g != cur {
                 outln!(
-                    "  ⚠ STALE-GEN: team stanza for {o} is gen {g}, org current is {cur} — run\n\
+                    "  ⚠ STALE-GEN: team stanza for {o} is gen {g}, org current is {cur}; run\n\
                      \x20     `agit hub team rekey {o} --rekey-all` (or `agit a rekey`) to seal under the current gen."
                 );
             }
@@ -3432,7 +3427,7 @@ fn doctor_one(home: &Path, ep: &crate::hubapi::HubEndpoint, a: &agent::Agent, fi
         match ep.get_kek_envelope(o, *g) {
             Ok(Some(_)) => {}
             Ok(None) => outln!(
-                "  ⚠ you hold NO gen-{g} team-KEK envelope for {o} — you cannot open this team stanza\n\
+                "  ⚠ you hold NO gen-{g} team-KEK envelope for {o}; you cannot open this team stanza\n\
                  \x20     (ask an admin to `agit hub team sync {o}`)."
             ),
             Err(_) => {}
@@ -3597,15 +3592,15 @@ fn readers_add(home: &Path, args: &[String]) -> Result<i32> {
             .iter()
             .any(|s| matches!(s, crate::keybox::Stanza::Team(t) if t.kid == kid && t.org == org && t.gen == gen))
         {
-            outln!("already team-wrapped at kid {kid} (org {org} gen {gen}) — nothing to do.");
+            outln!("already team-wrapped at kid {kid} (org {org} gen {gen}); nothing to do.");
             return Ok(0);
         }
         let tk = obtain_tk(home, &org, gen)?;
         crate::keybox::append_stanza(&store, &crate::keybox::team_stanza(&ck, kid, &org, gen, &tk)?)?;
-        outln!("  wrapped the current content key (kid {kid}) to team {org} (gen {gen}) — no content re-encrypted");
+        outln!("  wrapped the current content key (kid {kid}) to team {org} (gen {gen}); no content re-encrypted");
     } else if public {
         if crate::keybox::is_public_at(&crate::keybox::read_keybox(&store)?, kid) {
-            outln!("already public at kid {kid} — nothing to do.");
+            outln!("already public at kid {kid}; nothing to do.");
             return Ok(0);
         }
         crate::keybox::append_stanza(&store, &crate::keybox::public_stanza(&ck, kid))?;
@@ -3616,7 +3611,7 @@ fn readers_add(home: &Path, args: &[String]) -> Result<i32> {
         };
         let key = crate::keybox::resolve_recipient(home, &user, key_override.as_deref(), repin)?;
         crate::keybox::append_stanza(&store, &crate::keybox::user_stanza(&ck, kid, &user, 0, &key)?)?;
-        outln!("  wrapped the current content key (kid {kid}) to {user} — no content re-encrypted");
+        outln!("  wrapped the current content key (kid {kid}) to {user}; no content re-encrypted");
     }
 
     // Commit ONLY the keybox line.
@@ -3704,7 +3699,7 @@ fn readers_ls() -> Result<i32> {
     let store = a.store.clone();
     let stanzas = crate::keybox::read_keybox(&store)?;
     if stanzas.is_empty() {
-        outln!("no keybox — {} ({}) is not per-session encrypted.", a.name, a.aid);
+        outln!("no keybox; {} ({}) is not per-session encrypted.", a.name, a.aid);
         return Ok(0);
     }
     let cur = crate::crypt::repo_keyring_path_from(&store)
@@ -3721,7 +3716,7 @@ fn readers_ls() -> Result<i32> {
         for (org, gen) in &teams {
             parts.push(format!("team:{org}@{gen}"));
         }
-        let who = if parts.is_empty() { "—".to_string() } else { parts.join(", ") };
+        let who = if parts.is_empty() { "-".to_string() } else { parts.join(", ") };
         outln!("  kid {kid}{marker}: {who}{}", if public { " [public]" } else { "" });
     }
     Ok(0)
@@ -3776,7 +3771,7 @@ fn purge_confirm(prompt: &str, yes: bool) -> Result<bool> {
         return Ok(true);
     }
     if !ui::interactive() {
-        bail!("{prompt}\n  refusing without confirmation — re-run with --yes to proceed non-interactively");
+        bail!("{prompt}\n  refusing without confirmation; re-run with --yes to proceed non-interactively");
     }
     out!("{prompt} [y/N] ");
     use std::io::Write;
@@ -3915,7 +3910,7 @@ pub fn purge_history_cmd(args: &[String]) -> Result<i32> {
     }
     if !status.trim().is_empty() {
         bail!(
-            "the store working tree is dirty — a history rewrite needs a clean tree.\n\
+            "the store working tree is dirty; a history rewrite needs a clean tree.\n\
              \x20      Commit or discard changes in {} first, then re-run. Outstanding:\n{}",
             store.display(),
             status
@@ -3923,18 +3918,18 @@ pub fn purge_history_cmd(args: &[String]) -> Result<i32> {
     }
 
     // ── LOUD WARNINGS + CONFIRMATION (honoured by --yes; refuses rather than hangs when it cannot ask). ──
-    errln!("agit a purge-history — DESTRUCTIVE, IRREVERSIBLE rewrite of this store's ENTIRE git history.");
+    errln!("agit a purge-history; DESTRUCTIVE, IRREVERSIBLE rewrite of this store's ENTIRE git history.");
     errln!(
         "  It re-runs every commit's sessions/** through the encryption clean filter so pre-encryption\n\
          \x20     plaintext (and blobs under retired keys) no longer exist in ANY commit. Consequences:\n\
-         \x20       • EVERY commit SHA in this store changes — this is a full history rewrite;\n\
+         \x20       • EVERY commit SHA in this store changes; this is a full history rewrite;\n\
          \x20       • you MUST force-push afterwards, and every existing clone must RE-CLONE (not pull);\n\
          \x20       • provenance signatures / verdicts recorded against the OLD commit SHAs may need\n\
          \x20         re-verification;\n\
          \x20       • it cannot be undone except from a backup. BACK UP THE STORE FIRST."
     );
     if !purge_confirm("Rewrite history and purge sessions/** plaintext now?", yes)? {
-        errln!("aborted — history not rewritten.");
+        errln!("aborted; history not rewritten.");
         return Ok(1);
     }
 
@@ -3967,13 +3962,13 @@ pub fn purge_history_cmd(args: &[String]) -> Result<i32> {
     outln!(
         "history rewritten via {backend}: every sessions/** revision re-encrypted under the current keyring."
     );
-    outln!("  the working tree is still decryptable — checkout runs the smudge filter as before.");
+    outln!("  the working tree is still decryptable; checkout runs the smudge filter as before.");
 
     // ── DO NOT auto-push. Print the exact force-push command(s) for the user to run after reviewing. ──
     outln!("  NOT pushed. Review the rewrite, then force-push yourself:");
     if remotes.is_empty() {
         outln!(
-            "    (no remote configured — add one, then) git -C {} push --force <remote> {branch}",
+            "    (no remote configured; add one, then) git -C {} push --force <remote> {branch}",
             store.display()
         );
     } else {
@@ -3982,7 +3977,7 @@ pub fn purge_history_cmd(args: &[String]) -> Result<i32> {
         }
     }
     errln!(
-        "  ⚠ every teammate must RE-CLONE — a pull cannot reconcile a rewritten history — and any\n\
+        "  ⚠ every teammate must RE-CLONE; a pull cannot reconcile a rewritten history; and any\n\
          \x20     provenance signatures / verdicts recorded against the old commit SHAs may need\n\
          \x20     re-verification."
     );
@@ -4028,7 +4023,7 @@ fn run_filter_branch_purge(store: &Path, exe: &Path) -> Result<()> {
     let status = status?;
     if !status.success() {
         bail!(
-            "git filter-branch exited {} — history was NOT rewritten.",
+            "git filter-branch exited {}; history was NOT rewritten.",
             status.code().unwrap_or(-1)
         );
     }
@@ -4070,7 +4065,7 @@ fn run_filter_repo_purge(store: &Path, exe: &Path) -> Result<()> {
         .context("running git filter-repo")?;
     if !status.success() {
         bail!(
-            "git filter-repo exited {} — history was NOT rewritten.",
+            "git filter-repo exited {}; history was NOT rewritten.",
             status.code().unwrap_or(-1)
         );
     }
@@ -4128,7 +4123,7 @@ fn escrow_enable() -> Result<i32> {
     if mode != "hub-assist" {
         bail!(
             "hub-assist escrow is not enabled for org `{owner}` (mode = {mode}).\n\
-             \x20      An org owner must run `agit hub org escrow {owner} --mode hub-assist` first — this\n\
+             \x20      An org owner must run `agit hub org escrow {owner} --mode hub-assist` first; this\n\
              \x20      RE-TRUSTS the hub, so it is a deliberate per-org decision."
         );
     }
@@ -4147,7 +4142,7 @@ fn escrow_enable() -> Result<i32> {
     outln!("hub-assist escrow enabled for {} ({}): escrowed {escrowed} content-key generation(s).", a.name, a.aid);
     outln!("  ⚠ this RE-TRUSTS the hub: it can now RELEASE these keys to any caller the ACL lets read this");
     outln!("    session (they unlock via `agit crypt unlock`). Remove that reader from the ACL and the hub");
-    outln!("    refuses future release — the one path with retroactive-for-unfetched revocation.");
+    outln!("    refuses future release; the one path with retroactive-for-unfetched revocation.");
     Ok(0)
 }
 
@@ -4194,7 +4189,7 @@ fn crypt_unlock() -> Result<i32> {
     let stanzas = crate::keybox::read_keybox(&store)?;
     if stanzas.is_empty() {
         outln!(
-            "no keybox at {} — nothing to unlock (this session is not per-session encrypted).",
+            "no keybox at {}; nothing to unlock (this session is not per-session encrypted).",
             crate::keybox::keybox_path(&store).display()
         );
         return Ok(0);
@@ -4212,12 +4207,12 @@ fn crypt_unlock() -> Result<i32> {
         // the original fail-closed error and write NO keyring.
         None => match try_hub_assist_release(&store)? {
             Some(r) => {
-                outln!("  no keybox stanza opened with this machine — unlocked via hub-assist escrow release");
+                outln!("  no keybox stanza opened with this machine; unlocked via hub-assist escrow release");
                 outln!("  (the hub RE-TRUSTS path: the hub released the content key under the ACL Read gate).");
                 r
             }
             None => bail!(
-                "you are not a reader of this encrypted session — none of the {} keybox stanza(s) open with\n\
+                "you are not a reader of this encrypted session; none of the {} keybox stanza(s) open with\n\
                  \x20      this machine's identity (nor a team KEK you can obtain, nor a hub-assist escrow\n\
                  \x20      release). The keyring was NOT written; the session stays locked. Publish your key\n\
                  \x20      (agit identity register <you>, pasted into the hub) and ask a reader to `agit a readers add <you>`, or join the\n\
@@ -4234,7 +4229,7 @@ fn crypt_unlock() -> Result<i32> {
     // Re-checkout sessions so any ciphertext in the working tree becomes plaintext under the recovered keys.
     let (code, _) = scope::git_in_status(&store, &["checkout", "--", "sessions"]);
     if code != 0 {
-        errln!("  ⚠ wrote the keyring but could not re-checkout sessions/** — run `git checkout -- .` in the store");
+        errln!("  ⚠ wrote the keyring but could not re-checkout sessions/**; run `git checkout -- .` in the store");
     }
     outln!("unlocked {} ({}): recovered {recovered} content key(s), current kid {current}.", a.name, a.aid);
     Ok(0)
@@ -4669,14 +4664,14 @@ mod start_tests {
         let gap = a.duration_since(b).or_else(|_| b.duration_since(a)).unwrap_or_default();
         assert!(
             gap < std::time::Duration::from_secs(60),
-            "a clone must erase the content-age gap (these are 6 years apart by content), got {gap:?} — \
+            "a clone must erase the content-age gap (these are 6 years apart by content), got {gap:?}; \
              otherwise this test proves nothing"
         );
 
         let latest = latest_session(&clone).expect("a cloned store still has sessions");
         assert!(
             latest.path.ends_with("new.jsonl"),
-            "picked {:?} — ordering fell back to the filesystem, which a clone has erased",
+            "picked {:?}; ordering fell back to the filesystem, which a clone has erased",
             latest.path
         );
     }
@@ -4884,7 +4879,7 @@ mod wave4_tests {
         assert_eq!(
             default_target(Some("alice"), false),
             DefaultTarget::RequireExplicit("alice".into()),
-            "a personal owner has no team to default to — the user must name readers"
+            "a personal owner has no team to default to; the user must name readers"
         );
     }
 
@@ -5087,7 +5082,7 @@ mod secretux_gate_tests {
     fn blocked_commit_says_no_commit_was_created() {
         let (gate, err) = gate_under_override(false, "commit");
         assert!(matches!(gate, Gate::Blocked(1)));
-        assert!(err.contains("No commit was created."), "got: {err:?}");
+        assert!(err.contains("No commit created"), "got: {err:?}");
     }
 
     /// The push override must warn that the hub runs its own server-side gate this flag cannot reach.
@@ -5095,7 +5090,7 @@ mod secretux_gate_tests {
     fn push_override_carries_the_server_gate_note() {
         let (gate, err) = gate_under_override(true, "push");
         assert!(matches!(gate, Gate::Overridden));
-        assert!(err.contains("server-side secret gate"), "got: {err:?}");
+        assert!(err.contains("the hub runs its own secret gate"), "got: {err:?}");
     }
 
     /// A commit override is accurate for the local gate — it must NOT carry the hub/server-gate note.
@@ -5103,6 +5098,6 @@ mod secretux_gate_tests {
     fn commit_override_omits_the_server_gate_note() {
         let (gate, err) = gate_under_override(true, "commit");
         assert!(matches!(gate, Gate::Overridden));
-        assert!(!err.contains("server-side secret gate"), "commit override must not mention the hub gate: {err:?}");
+        assert!(!err.contains("the hub runs its own secret gate"), "commit override must not mention the hub gate: {err:?}");
     }
 }

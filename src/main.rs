@@ -70,7 +70,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
         "list" => {
             let agents = agent::list()?;
             if agents.is_empty() {
-                println!("no agents yet — agit a init <name> mints one.");
+                println!("no agents yet: agit a init <name> mints one.");
                 return Ok(0);
             }
             let env = scope::env_root().ok();
@@ -95,7 +95,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
                         .map(|s| s.recency())
                         .max()
                         .map(ui::ago)
-                        .unwrap_or_else(|| "—".into());
+                        .unwrap_or_else(|| "-".into());
                     let here = if Some(&a.aid) == active.as_ref() { "  (here)" } else { "" };
                     vec![a.name.clone(), status, sessions.len().to_string(), format!("{last}{here}")]
                 })
@@ -114,14 +114,14 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             println!("name   {}", a.name);
             println!("aid    {}", a.aid);
             println!("store  {}", a.store.display());
-            println!("remote {}", a.remote.as_deref().unwrap_or("— (local only; agit a push records one)"));
+            println!("remote {}", a.remote.as_deref().unwrap_or("(local only; agit a push records one)"));
             Ok(0)
         }
         // `switch` is the git-native name for "select this worktree's active agent" — the smart
         // version of `git switch` on the store.
         "switch" => {
             let a = agent::switch_agent(&need("name|aid")?)?;
-            println!("● {} ({})  — this worktree's agent", a.name, a.aid);
+            println!("{} {} ({}): this worktree's agent", ui::accent("●"), a.name, a.aid);
             Ok(0)
         }
         "rename" => {
@@ -131,7 +131,7 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
                 None => anyhow::bail!("agit agent rename: missing <new-name>\n  usage: agit a rename <old> <new>"),
             };
             let a = agent::rename(&old, &new)?;
-            println!("renamed {old} → {} ({} — unchanged)", a.name, a.aid);
+            println!("renamed {old} → {} ({}, unchanged)", a.name, a.aid);
             Ok(0)
         }
         // Override the integrity check (`--remote <url>`), or give a forked store its own identity
@@ -141,13 +141,13 @@ fn agent_mgmt(verb: &str, args: &[String]) -> anyhow::Result<i32> {
             let name = args.first().filter(|a| !a.starts_with("--")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             let a = agent::rebind(name.as_deref(), remote.as_deref(), flag("--new-id"))?;
             println!("rebound {} ({})", a.name, a.aid);
-            println!("  remote {}", a.remote.as_deref().unwrap_or("—"));
+            println!("  remote {}", a.remote.as_deref().unwrap_or("-"));
             Ok(0)
         }
         // Unreachable: every verb in AGENT_MGMT_VERBS has an arm above. Kept as a defensive default so
         // adding a name to the closed set without an arm fails loudly here rather than falling to git.
         v => {
-            eprintln!("agit agent {v}: no handler — this is a bug (a closed-set verb with no arm).");
+            eprintln!("agit agent {v}: no handler (bug: closed-set verb with no arm).");
             eprintln!("  available: list · status · switch · info · rename · rebind");
             Ok(2)
         }
@@ -454,7 +454,7 @@ const SNAP_USAGE: &str = "usage: agit a snap [<runtime>] [--from <runtime>] [--w
 const CONVERT_USAGE: &str = "usage: agit convert [<session|agent>] --to claude-code|codex [--from RT] [--cwd PATH] [--write]\n  (no session -> the active agent's latest; an agent name -> that agent's latest; --watch [--interval N] to auto-convert both ways)";
 const RESUME_USAGE: &str = "usage: agit resume [<session|agent>] [--as claude-code|codex] [--env PATH] [--relocate] [--cwd PATH] [--exec]\n  (no session -> the active agent's latest; an agent name -> that agent's latest)";
 const INIT_USAGE: &str = "usage: agit init [--agent <name>]   (prepare this repo: clone or select its agent, install the secret hooks)";
-const MERGE_USAGE: &str = "usage: agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice] [--dry-run]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref — --agent X / --ref X disambiguate; --quick shortens the dialogue; --splice skips the model and just combines both sessions' context; --dry-run/--preview shows what the merge would do without running the model)";
+const MERGE_USAGE: &str = "usage: agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice] [--dry-run]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref (--agent X / --ref X disambiguate); --quick shortens the dialogue; --splice skips the model and just combines both sessions' context; --dry-run/--preview shows what the merge would do without running the model)";
 
 /// start arguments: `--agent <name|aid>` (this invocation only — it does NOT flip the default, or two
 /// agents in one repo would fight over one pointer) and `--as <runtime>`.
@@ -761,7 +761,7 @@ fn harness_cmd(sub: &str, rt: Option<&str>, force: bool, from_env: Option<&str>)
 fn agent_init(args: &[String]) -> anyhow::Result<i32> {
     use agit::agent;
     let Some(name) = args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-        anyhow::bail!("agit a init: name the agent — agit a init <name>");
+        anyhow::bail!("agit a init: name the agent (agit a init <name>)");
     };
     let a = agent::init_agent(name)?;
     println!("minted {} ({})", a.name, a.aid);
@@ -884,7 +884,7 @@ fn agent_clone(args: &[String]) -> anyhow::Result<i32> {
         .map(|s| s.trim())
         .find(|s| !s.is_empty() && !s.starts_with("--"))
     else {
-        anyhow::bail!("agit a clone: name an agent or a store URL — agit a clone [--init] <name|url>");
+        anyhow::bail!("agit a clone: name an agent or store URL (agit a clone [--init] <name|url>)");
     };
     let init = args.iter().any(|x| x == "--init");
     let a = agent::clone_agent(target, !args.iter().any(|x| x == "--no-switch"), init)?;
@@ -1189,7 +1189,7 @@ fn push_fanout(a: &agit::agent::Agent, flags: &[String]) -> i32 {
             println!("  pushed {name}");
         } else {
             // A non-owner's push to a personal hub returns non-zero from the ACL 403 — shown, not fatal.
-            eprintln!("  push to {name} rejected (exit {code}) — reported, not fatal");
+            eprintln!("  push to {name} rejected (exit {code}); reported, not fatal");
             hub_auth_hint_url(url);
         }
         if primary.as_deref() == Some(name.as_str()) {
@@ -1203,7 +1203,7 @@ fn push_fanout(a: &agit::agent::Agent, flags: &[String]) -> i32 {
 /// credential-stripping can't remove (e.g. a `?private_token=` query), and this note prints on every
 /// push, so it must never echo the raw URL or it leaks the secret to the terminal and CI logs.
 fn skipped_note(name: &str, bf: &str) -> String {
-    format!("  note: remote {name} is not a transport agit will record in {bf} — left unchanged.")
+    format!("  note: remote {name} is not a transport agit records in {bf}; left unchanged.")
 }
 
 /// Print what `sync_remotes_to_binding` recorded/skipped. Recorded lines only appear on a change (an
@@ -1212,14 +1212,14 @@ fn print_sync_summary(agent_name: &str, s: &agit::agent::RemoteSyncSummary) {
     let bf = agit::agent::BINDING_FILE;
     if s.changed {
         for r in &s.recorded {
-            let tag = if r.primary { "  (primary — clone/pull anchor)" } else { "" };
+            let tag = if r.primary { "  (primary; clone/pull anchor)" } else { "" };
             println!("  bound  {agent_name} → {}{tag}", r.locator);
         }
         if !s.recorded.is_empty() {
             println!("         (commit {bf}: teammates clone the agent from here)");
         }
         if s.recorded.iter().any(|r| r.stripped) {
-            eprintln!("  note: credentials stripped from a recorded remote — {bf} is committed.");
+            eprintln!("  note: credentials stripped from a recorded remote; {bf} is committed.");
             eprintln!("        The store keeps the full URL locally; your teammates' git supplies their own.");
         }
     }
@@ -1249,7 +1249,7 @@ fn confirm_or_yes(prompt: &str, yes: bool) -> anyhow::Result<bool> {
     }
     if !ui::interactive() {
         anyhow::bail!(
-            "{prompt}\n  refusing without confirmation — re-run with --yes to proceed non-interactively"
+            "{prompt}\n  refusing without confirmation (re-run with --yes to proceed non-interactively)"
         );
     }
     print!("{prompt} [y/N] ");
@@ -1281,20 +1281,20 @@ fn agent_encrypt_rotate(args: &[String]) -> anyhow::Result<i32> {
     // Rotation only makes sense once encryption is enabled — there is otherwise no key to rotate.
     if crypt::read_master(&home)?.is_none() {
         anyhow::bail!(
-            "agit-crypt is not enabled on this machine — run `agit a encrypt` first, then --rotate"
+            "agit-crypt is not enabled on this machine: run `agit a encrypt` first, then --rotate"
         );
     }
     let a = agent::resolve(None)?;
     let store = a.store.clone();
 
-    eprintln!("agit encrypt --rotate — mint a new key and re-encrypt this store's working tree.");
+    eprintln!("agit encrypt --rotate: mint a new key and re-encrypt this store's working tree.");
     eprintln!(
         "  Retired keys are kept LOCALLY so history / not-yet-renormalized blobs still decrypt; only\n\
          \x20     new writes use the new key. Afterwards you must `agit a push` and re-share the key\n\
          \x20     (`agit a encrypt --export <file>`) so teammates can decrypt going-forward blobs."
     );
     if !confirm_or_yes("Rotate the crypt key and re-encrypt this store now?", yes)? {
-        eprintln!("aborted — key not rotated");
+        eprintln!("aborted: key not rotated");
         return Ok(1);
     }
 
@@ -1351,14 +1351,13 @@ fn agent_pull(args: &[String]) -> anyhow::Result<i32> {
     // failure (no upstream, network) is git's own and already printed above.
     if commands::diverged(&a.store) {
         eprintln!();
-        eprintln!("your sessions and the remote's have diverged — a textual git merge would corrupt the");
-        eprintln!("transcripts. Reconcile them by dialogue instead:");
+        eprintln!("diverged: local and remote both added sessions (a text merge corrupts transcripts)");
         // Suggest the diverged UPSTREAM ref (e.g. `origin/main`), never the agent's own name: `agit a
         // merge <self-name>` resolves back to this agent and dead-ends with "no local session to
         // represent it". `@{u}` is the generic fallback when the tracking ref can't be named — still a
         // ref, still not the agent name.
         let target = commands::upstream_ref(&a.store).unwrap_or_else(|| "@{u}".to_string());
-        eprintln!("  agit a merge {target}");
+        eprintln!("  agit a merge {target}   reconcile by dialogue");
     }
     Ok(code)
 }
@@ -1483,7 +1482,7 @@ fn parse_scan(args: &[String]) -> Result<(bool, Vec<PathBuf>), ParseCtl> {
 }
 
 const USAGE: &str = "\
-agit — version an agent's raw session so teams can collaborate on Agent Context
+agit: version an agent's raw session so teams can collaborate on Agent Context
 
 Works with claude-code and codex. Commands that read sessions use the one you name with --from, else
 the only one present, else they ask.
@@ -1492,7 +1491,7 @@ the only one present, else they ask.
   agit a snap [--watch]    Mirror this project's session dump + harness (MCP/skills/config, secrets redacted) into the Agent Store; captures every runtime with sessions here unless --from names one (--watch = auto-snap; --no-harness = sessions only)
   agit a push / pull       Push your sessions to, and pull the team's back from, the shared store (the Agent Store is just a git repo)
   agit start               Launch a session HERE already carrying this agent's latest context, from whatever repo it was last in (--agent <name> picks the agent for this invocation only; --as <rt> switches runtime)
-  agit a merge <target>    Merge this agent's memory with <target>'s by dialogue (alias: sync); <target> is an agent name or a ref — never a code branch. Same agent → the histories merge too; a different agent → dialogue only, both stay intact (--agent X / --ref X disambiguate)
+  agit a merge <target>    Merge this agent's memory with <target>'s by dialogue (alias: sync); <target> is an agent name or a ref (never a code branch). Same agent → the histories merge too; a different agent → dialogue only, both stay intact (--agent X / --ref X disambiguate)
   agit a clone <url>       Clone an agent published on a hub (its memory, by identity); --init mints a fresh agent into an EMPTY store and pushes it
   agit a scan [--staged]   Scan session dumps for secrets
   agit workspace [log]     Show the Agent↔Environment pairing
@@ -1508,10 +1507,10 @@ the only one present, else they ask.
 
   agit <git-args>          Run git transparently on the code repository (Environment). `agit clone <target>` also adopts an agit agent store (a positively-identified hub URL, or a known agent name) as an agent; --git forces the raw git clone
   agit clone --git <url>   Force a raw git clone (never adopt it as an agent)
-  agit agent <git-args>    Run isomorphic git on the Agent Store — `agit a` is the alias (agit a log · agit a add -A · agit a commit · agit a push)
+  agit agent <git-args>    Run isomorphic git on the Agent Store; `agit a` is the alias (agit a log · agit a add -A · agit a commit · agit a push)
 
   agit a status            Overview of this repo: its agents, which is active, each one's sessions + last activity + live-watcher, and the active store's unpushed/ahead-behind
-  agit a log / diff        The SESSION view of the store (a timeline of sessions; the prompts + edits added between two refs) — pass --raw for the byte-level git log/diff
+  agit a log / diff        The SESSION view of the store (a timeline of sessions; the prompts + edits added between two refs); pass --raw for the byte-level git log/diff
 
   agit agent <verb>        Agent management, a closed set: init, clone, switch, list, status, info, rename, rebind, merge (push/pull/fetch too).
                            Anything else after `a` is git, so `agit a add -A` is git-add and `agit a show` is git-show.

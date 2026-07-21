@@ -186,7 +186,7 @@ fn init_will_not_name_an_agent_after_the_directory() {
     let (code, out, err) = r.agit(&["init"]);
     let said = format!("{out}{err}");
     assert_ne!(code, 0, "init must not mint an agent nobody named: {said}");
-    assert!(said.contains("will not name one for you"), "{said}");
+    assert!(said.contains("no agent name"), "{said}");
     assert!(said.contains("agit init --agent <name>"), "must name the fix: {said}");
     assert!(said.contains("agit a clone"), "and the other real answer: {said}");
     // Nothing may be left behind by the refusal.
@@ -690,7 +690,7 @@ fn blocked_commit_states_no_commit_was_created() {
     r.agit(&["-a", "add", "-A"]);
     let (code, _out, err) = r.agit(&["-a", "commit", "-m", "leak"]);
     assert_ne!(code, 0, "a staged secret must block: {err}");
-    assert!(err.contains("No commit was created."), "the block must state nothing was committed: {err}");
+    assert!(err.contains("No commit created"), "the block must state nothing was committed: {err}");
 }
 
 /// The push gate: `agit a push` scans the store tree before touching the remote, so a committed secret
@@ -2217,7 +2217,14 @@ fn diverged_pull_suggests_the_upstream_ref_not_the_agent_name() {
         .find(|l| l.contains("agit a merge"))
         .map(|l| l.trim().to_string())
         .unwrap_or_else(|| panic!("pull must print a merge suggestion:\n{err}"));
-    let target = sugg.trim_start_matches("agit a merge").trim().to_string();
+    // The suggestion line carries an inline hint after the ref ("… reconcile by dialogue"), so take the
+    // first token after the command as the ref.
+    let target = sugg
+        .trim_start_matches("agit a merge")
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
 
     // It is a REF (contains `/` or `@`), never the bare agent name.
     assert!(
@@ -2229,4 +2236,153 @@ fn diverged_pull_suggests_the_upstream_ref_not_the_agent_name() {
     // And the suggested ref is the WORKING path: a dry-run merge against it resolves and exits 0.
     let (mc, mo, me) = r.agit(&["a", "merge", &target, "--dry-run"]);
     assert_eq!(mc, 0, "merging the suggested ref must work (--dry-run): {mo}{me}");
+}
+
+// ─────────────────── message hygiene: no em dash in a user-facing string ───────────────────
+
+/// Guard for this wave's message rule: every user-facing CLI string is `<state>: <fact> (<why>)`,
+/// punctuated with `:` / `(...)` / `;` and NEVER an em dash. This scans the touched source files for a
+/// `—` sitting inside a string literal (normal or raw); comments and doc-comments keep their prose and
+/// are exempt. Keeping the check in the test suite means a regression fails CI, not review.
+#[test]
+fn no_user_facing_string_carries_an_em_dash() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let files = ["init.rs", "session.rs", "sync.rs", "commands.rs", "main.rs", "view.rs", "agent.rs"];
+    let mut offenders: Vec<String> = Vec::new();
+    for f in files {
+        let path = format!("{root}/src/{f}");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        for line in string_literal_em_dash_lines(&src) {
+            offenders.push(format!("  {f}:{line}"));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "em dash inside a message string (use `:` / `(...)` / `;` instead):\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// Return the 1-based line of every `—` that sits inside a Rust string literal. A minimal lexer that
+/// tracks line/block comments, char literals and lifetimes, so only real string bytes are inspected.
+fn string_literal_em_dash_lines(src: &str) -> Vec<usize> {
+    let c: Vec<char> = src.chars().collect();
+    let n = c.len();
+    let (mut i, mut line) = (0usize, 1usize);
+    let mut hits: Vec<usize> = Vec::new();
+    while i < n {
+        let ch = c[i];
+        if ch == '\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        // line comment (covers `//`, `///` and `//!`)
+        if ch == '/' && i + 1 < n && c[i + 1] == '/' {
+            while i < n && c[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // block comment (nesting-aware, like rustc)
+        if ch == '/' && i + 1 < n && c[i + 1] == '*' {
+            i += 2;
+            let mut depth = 1;
+            while i < n && depth > 0 {
+                if c[i] == '\n' {
+                    line += 1;
+                    i += 1;
+                } else if c[i] == '/' && i + 1 < n && c[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if c[i] == '*' && i + 1 < n && c[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // raw string: r"…", r#"…"#, br"…" — no escapes inside; the terminator is `"` + N `#`
+        if ch == 'r' || (ch == 'b' && i + 1 < n && c[i + 1] == 'r') {
+            let mut k = i;
+            if c[k] == 'b' {
+                k += 1;
+            }
+            k += 1; // past the `r`
+            let mut hashes = 0;
+            while k < n && c[k] == '#' {
+                hashes += 1;
+                k += 1;
+            }
+            if k < n && c[k] == '"' {
+                let mut j = k + 1;
+                loop {
+                    if j >= n {
+                        break;
+                    }
+                    if c[j] == '"' && (1..=hashes).all(|h| j + h < n && c[j + h] == '#') {
+                        j += 1 + hashes;
+                        break;
+                    }
+                    if c[j] == '\n' {
+                        line += 1;
+                    }
+                    if c[j] == '—' {
+                        hits.push(line);
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            // not a raw string after all — fall through and advance one char
+        }
+        // normal string
+        if ch == '"' {
+            let mut j = i + 1;
+            while j < n {
+                if c[j] == '\\' {
+                    if j + 1 < n && c[j + 1] == '\n' {
+                        line += 1;
+                    }
+                    j += 2;
+                    continue;
+                }
+                if c[j] == '"' {
+                    break;
+                }
+                if c[j] == '\n' {
+                    line += 1;
+                }
+                if c[j] == '—' {
+                    hits.push(line);
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        // char literal vs lifetime
+        if ch == '\'' {
+            if i + 1 < n && c[i + 1] == '\\' {
+                // escaped char literal: skip the escape indicator, then scan to the closing `'`
+                let mut j = i + 3;
+                while j < n && c[j] != '\'' {
+                    j += 1;
+                }
+                i = j + 1;
+                continue;
+            } else if i + 2 < n && c[i + 2] == '\'' {
+                i += 3; // simple char literal like 'x' or '"'
+                continue;
+            } else {
+                i += 1; // a lifetime tick
+                continue;
+            }
+        }
+        i += 1;
+    }
+    hits
 }

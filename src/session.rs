@@ -12,6 +12,7 @@
 use crate::adapter::claude_code;
 use crate::commands::Attribution;
 use crate::scope::{self, Scope};
+use crate::ui;
 use crate::{errln, outln};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -109,7 +110,7 @@ pub fn resolve_runtime(explicit: Option<&str>, present: &[&'static str], what: &
         many => {
             let names = many.join(", ");
             if !stdin().is_terminal() {
-                bail!("{names} all have sessions — say which with --from <runtime>.");
+                bail!("multiple runtimes have sessions ({names}): say which with --from <runtime>.");
             }
             outln!("Sessions exist for {names}. Which runtime should agit {what}?");
             for (i, rt) in many.iter().enumerate() {
@@ -189,7 +190,7 @@ fn store_for(by: Option<&Attribution>, id: &str) -> Result<Option<(PathBuf, Opti
         Ok(ag) => Ok(Some((ag.store, Some(ag.name)))),
         Err(e) => {
             errln!(
-                "  ⚠ {id} was launched by {} ({}), which this machine no longer has — not captured: {e:#}",
+                "  ⚠ {id} not captured: launched by {} ({}), absent from this machine ({e:#})",
                 by.name(),
                 by.aid()
             );
@@ -295,7 +296,7 @@ fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
     outln!("Mirrored the session dump for {}:", rt);
     outln!("  source : {source_desc}");
     if routed.is_empty() {
-        outln!("  (no sessions this project owns — nothing to mirror)");
+        outln!("  (nothing to mirror: no sessions this project owns)");
         return Ok(0);
     }
 
@@ -415,7 +416,7 @@ pub fn lock_store(store: &Path) -> Result<StoreLock> {
             };
             bail!(
                 "{} is locked by {who} and did not release it within {}s.\n\
-                 \x20      Another agit is writing this agent — one store is shared by every repo that tracks it.\n\
+                 \x20      Another agit is writing this agent; one store is shared by every repo that tracks it.\n\
                  \x20      If that process is gone, clear the lock: rm {}",
                 store.display(),
                 LOCK_WAIT.as_secs(),
@@ -661,15 +662,17 @@ fn commit_snap(agent: &Path, rt: &str, count: &mut u64) -> bool {
         Ok(g) if g.allowed() => {}
         Ok(_) => {
             errln!(
-                "  ⚠ auto-snap not committed (suspected secrets) — mirrored to disk, held out of history. \
-                 `agit -a scan` to see; set {}=1 to override.",
-                crate::commands::ALLOW_ENV
+                "{}",
+                ui::warn(&format!(
+                    "  ⚠ not committed: suspected secrets (mirrored, kept out of history). agit a scan to see; {}=1 to override",
+                    crate::commands::ALLOW_ENV
+                ))
             );
             let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
             return true;
         }
         Err(e) => {
-            errln!("  ⚠ auto-snap not committed — secret gate failed to run ({e:#}). `agit -a scan` to see.");
+            errln!("{}", ui::warn(&format!("  ⚠ not committed: secret gate failed to run ({e:#}). agit a scan to see")));
             let _ = scope::git_in_status(agent, &["reset", "-q"]);
             return true;
         }
@@ -684,10 +687,10 @@ fn commit_snap(agent: &Path, rt: &str, count: &mut u64) -> bool {
     );
     if rc == 0 {
         *count += 1;
-        outln!("  ● snapped {ts}  (#{count})");
+        outln!("  {} snapped {ts}  (#{count})", ui::accent("●"));
         false
     } else {
-        errln!("  ⚠ auto-snap not committed — `git commit` refused it. `agit -a scan` to see.");
+        errln!("{}", ui::warn("  ⚠ not committed: git commit refused it. agit a scan to see"));
         let _ = scope::git_in_status(agent, &["reset", "-q"]); // unstage so we don't spin on it
         true
     }
@@ -947,7 +950,7 @@ fn announce_watching(stores: &[PathBuf], env: &Path, announced: &mut std::collec
             started: now_iso(),
         };
         if let Err(e) = scope::agit_home().and_then(|h| record_watcher_at(&h, &w)) {
-            errln!("  ⚠ watcher not announced ({e:#}) — `agit a list` will not show this agent as watched.");
+            errln!("{}", ui::warn(&format!("  ⚠ watcher not announced ({e:#}): agit a list will not show it as watched")));
         }
     }
 }
@@ -1236,7 +1239,7 @@ mod routing_tests {
 
             assert_eq!(count, 1, "one settled capture must record one commit");
             let after = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
-            assert_ne!(before, after, "capture_pass must commit — the store's HEAD must advance");
+            assert_ne!(before, after, "capture_pass must commit; the store's HEAD must advance");
             let subject = scope::git_in(&fe.store, &["log", "-1", "--format=%s"]).unwrap();
             assert!(subject.starts_with("auto-snap claude-code"), "the commit must be the auto-snap: {subject}");
         });

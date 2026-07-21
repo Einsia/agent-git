@@ -71,11 +71,11 @@ pub struct StoreIdentity {
 pub fn read_identity(store: &Path) -> Result<StoreIdentity> {
     let p = store.join("agent.toml");
     let text = std::fs::read_to_string(&p)
-        .with_context(|| format!("{} has no agent.toml — it is not an agent store", store.display()))?;
+        .with_context(|| format!("{} has no agent.toml: it is not an agent store", store.display()))?;
     let aid = match parse_agent_toml(&text) {
         Identity::Aid(a) => a,
         Identity::Unidentified => bail!(
-            "{} has no `agt_…` id in agent.toml — it is not an identified agent store.",
+            "{} has no `agt_…` id in agent.toml: it is not an identified agent store.",
             p.display()
         ),
     };
@@ -92,7 +92,7 @@ fn write_agent_toml(store: &Path, id: &StoreIdentity) -> Result<()> {
     std::fs::write(
         store.join("agent.toml"),
         format!(
-            "# Agent identity — committed, so the aid travels with the store's history.\n\
+            "# Agent identity (committed, so the aid travels with the store's history).\n\
              # The id is minted once and never changes; the name is a label and may be renamed.\n\
              [agent]\n\
              id      = \"{}\"\n\
@@ -495,7 +495,7 @@ impl Binding {
             }
         }
         if b.version > BINDING_VERSION {
-            bail!("{BINDING_FILE} is version {} — this agit understands {BINDING_VERSION}. Upgrade agit.", b.version);
+            bail!("{BINDING_FILE} is version {}: this agit understands {BINDING_VERSION}. Upgrade agit.", b.version);
         }
         // Normalize each agent's remotes so downstream code can assume the invariants — even for a
         // hand-edited file: drop empty-url entries, dedupe by name (last wins), and guarantee exactly
@@ -541,7 +541,7 @@ impl Binding {
 
     pub fn to_toml(&self) -> String {
         let mut s = String::from(
-            "# agit binding — COMMITTED. Which agents this repo works with.\n\
+            "# agit binding (COMMITTED). Which agents this repo works with.\n\
              # The id is the identity (a remote is only a locator); the name is a label.\n",
         );
         s.push_str(&format!("version = {}\n", self.version));
@@ -737,7 +737,7 @@ fn resolve_in(
 }
 
 fn no_agent_error(home: &Path, binding: Option<&Binding>) -> String {
-    let mut s = String::from("no agent selected — agit will not guess which memory you meant.\n");
+    let mut s = String::from("no agent selected: agit will not guess which memory you meant.\n");
     let known: Vec<String> = list_in(home)
         .unwrap_or_default()
         .into_iter()
@@ -848,7 +848,7 @@ fn new_agent_in(home: &Path, name: &str) -> Result<Agent> {
     let id = StoreIdentity { aid: mint_aid(), name: name.to_string(), created: now() };
     let store = agents_dir_in(home).join(&id.aid);
     if store.exists() {
-        bail!("{} already exists — refusing to overwrite a store", store.display());
+        bail!("{} already exists: refusing to overwrite a store", store.display());
     }
     std::fs::create_dir_all(&store)
         .with_context(|| format!("failed to create the agent store at {}", store.display()))?;
@@ -901,7 +901,7 @@ pub fn clone_agent(target: &str, activate: bool, init: bool) -> Result<Agent> {
         // Already on disk: `track` is idempotent, and re-cloning would be a second copy of one memory.
         // `--init` on a target this machine already has is contradictory — there is nothing empty to mint.
         Ok(_) if !looks_like_url(target) && init => bail!(
-            "`{target}` already has an agent on this machine — drop --init to use it (agit a clone {target})."
+            "`{target}` already has an agent on this machine: drop --init to use it (agit a clone {target})."
         ),
         Ok(a) if !looks_like_url(target) => a,
         _ => {
@@ -981,13 +981,13 @@ fn check_remote(url: &str) -> Result<()> {
     // exist yet, so clone dies before `--upload-pack` runs) — but that is an accident of argument order,
     // not a control, and it would silently become one again if the order ever changed.
     if u.starts_with('-') {
-        bail!("refusing a remote that starts with `-` — git would read `{u}` as a flag, not a URL");
+        bail!("refusing a remote that starts with `-`: git would read `{u}` as a flag, not a URL");
     }
     // Remote-helper syntax `<transport>::<address>`, which is what makes ext:: run commands. Checked
     // before the scheme allowlist: `https://` contains no `::`, so nothing legitimate is caught here.
     if let Some(h) = u.split("::").next().filter(|h| *h != u && !h.contains('/')) {
         bail!(
-            "refusing the `{h}::` transport — git remote helpers run commands, and `{h}::…` would \
+            "refusing the `{h}::` transport: git remote helpers run commands, and `{h}::…` would \
              execute this machine's shell on a URL that came from {BINDING_FILE}.\n\
              \x20      Allowed: {}, git@host:path, or a local path.",
             SAFE_SCHEMES.join(", ")
@@ -1060,7 +1060,7 @@ fn clone_in(home: &Path, url: &str, init: bool) -> Result<Agent> {
     if init {
         let _ = std::fs::remove_dir_all(&tmp);
         let shown = crate::hubapi::redact_url(url);
-        bail!("{shown} already has an agent — drop --init to adopt it (agit a clone {shown}).");
+        bail!("{shown} already has an agent: drop --init to adopt it (agit a clone {shown}).");
     }
     // A store IS just a git repo, and a self-hosted bare hub (`git init --bare` with
     // `init.defaultBranch` unset) has HEAD → `refs/heads/master` while agit's stores are on `main`. The
@@ -1514,9 +1514,9 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
         // fall back to the active pointer.
         let agent = match sel {
             Some(s) => find_in(&home, s)
-                .with_context(|| format!("no agent `{s}` on this machine to re-mint — agit a clone <url> first"))?,
+                .with_context(|| format!("no agent `{s}` on this machine to re-mint: agit a clone <url> first"))?,
             None => {
-                let aid = read_active(&env)?.context("no agent selected to re-mint — agit a switch <name> first")?;
+                let aid = read_active(&env)?.context("no agent selected to re-mint: agit a switch <name> first")?;
                 find_in(&home, &aid)?
             }
         };
@@ -1524,7 +1524,7 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
         // the daemon onto the old inode — the same silent-capture-loss import refuses, so refuse here too.
         if let Some(pid) = live_watcher(&env, &agent.store) {
             bail!(
-                "a watcher is running (pid {pid}) — refusing to re-mint the store out from under it.\n\
+                "a watcher is running (pid {pid}): refusing to re-mint the store out from under it.\n\
                  \x20      Stop it, re-mint, then start it again:\n\
                  \x20        agit watch --stop\n\
                  \x20        agit a rebind --new-id\n\
@@ -1534,7 +1534,7 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
         let fresh = mint_aid();
         let dest = agents_dir_in(&home).join(&fresh);
         if dest.exists() {
-            bail!("{} already exists — refusing to overwrite a store", dest.display());
+            bail!("{} already exists: refusing to overwrite a store", dest.display());
         }
         // Re-minting changes the IDENTITY, and the store is shared across repos by design: any other
         // repo or worktree still bound to the old aid will stop resolving until it re-tracks the fork.
@@ -1566,7 +1566,7 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
     // binding must be corrected to. find_in bypasses the integrity check on purpose: overriding it is
     // the whole point of this verb.
     let agent = find_in(&home, sel)
-        .with_context(|| format!("no agent `{sel}` on this machine to rebind — agit a clone <url> first"))?;
+        .with_context(|| format!("no agent `{sel}` on this machine to rebind: agit a clone <url> first"))?;
     let mut b = Binding::load(&env)?.unwrap_or_default();
     // Every remote written to the COMMITTED binding goes through committed_locator — the new one if
     // `--remote` is given, else the store's EXISTING origin. The `--remote`-omitted fallback used to
@@ -1627,7 +1627,7 @@ pub fn load_or_create_signing_key(home: &Path) -> Result<SigningKey> {
     let path = signing_key_path(home);
     if let Ok(text) = std::fs::read_to_string(&path) {
         let raw = hex::decode(text.trim())
-            .with_context(|| format!("{} is not valid hex — the machine identity is corrupt", path.display()))?;
+            .with_context(|| format!("{} is not valid hex: the machine identity is corrupt", path.display()))?;
         let bytes: [u8; 32] = raw
             .as_slice()
             .try_into()
@@ -2077,7 +2077,7 @@ agent = "frontend"        # what a FRESH clone activates
         let before = new_agent_in(h.path(), "web").unwrap();
         let after = rename_in(h.path(), "web", "frontend").unwrap();
         assert_eq!(after.aid, before.aid, "identity survives the label");
-        assert_eq!(after.store, before.store, "no directory moves — a running watcher is never orphaned");
+        assert_eq!(after.store, before.store, "no directory moves; a running watcher is never orphaned");
         assert_eq!(read_identity(&after.store).unwrap().name, "frontend");
         assert!(find_in(h.path(), "web").is_err());
         assert_eq!(find_in(h.path(), "frontend").unwrap().aid, before.aid);
@@ -2561,7 +2561,7 @@ primary = true
         for hook in ["pre-commit", "pre-push"] {
             assert!(
                 minted.store.join(".git/hooks").join(hook).exists(),
-                "agit a init must install {hook} — a store minted without it scans nothing, silently"
+                "agit a init must install {hook}; a store minted without it scans nothing, silently"
             );
         }
     }

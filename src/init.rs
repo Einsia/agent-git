@@ -13,6 +13,7 @@
 
 use crate::agent::{self, Binding};
 use crate::scope;
+use crate::ui;
 use crate::{errln, outln};
 use anyhow::{bail, Context, Result};
 use std::io::{IsTerminal, Write};
@@ -55,16 +56,16 @@ pub fn run_named(name: Option<String>) -> Result<i32> {
     agent::bind_here(&agent, &env, false)?;
     agent::write_active(&env, &agent.aid)?;
 
-    outln!("agit is ready.");
+    outln!("{}", ui::accent("agit is ready."));
     outln!("  Environment : {}", env.display());
     outln!("  Agent       : {} ({})", agent.name, agent.aid);
     outln!("  Store       : {}", agent.store.display());
-    outln!("  Binding     : {}   (commit it — your team gets this agent on clone)", agent::BINDING_FILE);
+    outln!("  Binding     : {}   {}", agent::BINDING_FILE, ui::dim("(commit it; teammates get this agent on clone)"));
     outln!();
-    outln!("  agit start              launch a session already carrying this agent's latest context");
-    outln!("  agit snap               capture this project's sessions into the store");
-    outln!("  agit a push / pull      sync the memory with your team");
-    outln!("  agit a merge <agent>    reconcile this agent's memory with another agent's, by dialogue");
+    outln!("  agit start              {}", ui::dim("launch a session carrying this agent's latest context"));
+    outln!("  agit snap               {}", ui::dim("capture this project's sessions into the store"));
+    outln!("  agit a push / pull      {}", ui::dim("sync the memory with your team"));
+    outln!("  agit a merge <agent>    {}", ui::dim("reconcile this agent's memory with another's, by dialogue"));
     Ok(0)
 }
 
@@ -92,7 +93,7 @@ fn track_declared(env: &Path) -> Result<Option<agent::Agent>> {
             continue;
         }
         if entry.primary_url().is_none() {
-            errln!("  · {} is declared but has no remote to clone — skipping (its owner has not published it)", entry.name);
+            errln!("  · {}: declared but no remote to clone, skipping (owner has not published it)", entry.name);
             continue;
         }
         match agent::clone_agent(&entry.name, false, false) {
@@ -130,12 +131,9 @@ fn pick_name(env: &Path, given: Option<&str>) -> Result<String> {
     }
     if !std::io::stdin().is_terminal() {
         bail!(
-            "no agent here yet, and agit will not name one for you.\n\
-             \x20      An agent is a memory, named for what it knows — `frontend`, `payments-api` — and it outlives\n\
-             \x20      this repo, so `{}` would be the wrong label even when it is a legal one.\n\
-             \x20        agit init --agent <name>   mint one here\n\
-             \x20        agit a clone <name|url>    use one you (or your team) already have",
-            env.file_name().and_then(|s| s.to_str()).unwrap_or("this directory")
+            "fatal: no agent name (agents outlive their repo)\n\
+             \x20 agit init --agent <name>   mint one\n\
+             \x20 agit a clone <name|url>    use an existing one"
         );
     }
     // Interactive: the directory is offered as a *suggestion* a human can see and reject — which is
@@ -144,13 +142,13 @@ fn pick_name(env: &Path, given: Option<&str>) -> Result<String> {
     let suggest = crate::agent::is_usable_name(&dir).then_some(dir);
     loop {
         match &suggest {
-            Some(d) => print!("Agent name — what will this agent know? [{d}]: "),
-            None => print!("Agent name — what will this agent know?: "),
+            Some(d) => print!("Agent name (what this agent knows) [{d}]: "),
+            None => print!("Agent name (what this agent knows): "),
         }
         std::io::stdout().flush()?;
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line)? == 0 {
-            bail!("no agent name given (stdin closed) — agit init --agent <name>");
+            bail!("no agent name (stdin closed): agit init --agent <name>");
         }
         match (line.trim(), &suggest) {
             ("", Some(d)) => return Ok(d.clone()),

@@ -97,13 +97,13 @@ pub fn agent_log(_args: &[String]) -> Result<i32> {
     sessions.sort_by_key(|s| std::cmp::Reverse(s.recency()));
 
     if sessions.is_empty() {
-        println!("{} has no sessions yet — agit start, then agit a snap.", ui::bold(&agent.name));
+        println!("{} has no sessions yet: agit start, then agit a snap.", ui::bold(&agent.name));
         return Ok(0);
     }
 
     let count = sessions.len();
     println!(
-        "{} — {count} session{}",
+        "{} · {count} session{}",
         ui::bold(&agent.name),
         if count == 1 { "" } else { "s" }
     );
@@ -177,11 +177,11 @@ pub fn agent_diff(args: &[String]) -> Result<i32> {
     );
     if code != 0 {
         anyhow::bail!(
-            "could not diff {from}..{to} on the store — check the refs (or use `agit a diff --raw` for the git diff)."
+            "could not diff {from}..{to} on the store: check the refs (or use `agit a diff --raw` for the git diff)."
         );
     }
 
-    println!("{} — {}", ui::bold(&agent.name), ui::dim(&format!("{from}..{to}")));
+    println!("{} · {}", ui::bold(&agent.name), ui::dim(&format!("{from}..{to}")));
 
     let changed: Vec<(char, String)> = out
         .lines()

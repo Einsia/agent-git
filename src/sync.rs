@@ -124,13 +124,13 @@ fn resolve_target(store: &Path, name: &str, prefer: Option<Prefer>) -> Result<Ta
         (None, is_ref, Some(Prefer::Agent)) => bail!(
             "--agent says `{name}` is an agent, but no agent by that name is tracked here.{}\n  \
              known agents: {}",
-            if is_ref { format!("\n  There IS a ref `{name}` — did you mean `--ref {name}`?") } else { String::new() },
+            if is_ref { format!("\n  There IS a ref `{name}`; did you mean `--ref {name}`?") } else { String::new() },
             known_names()
         ),
         (_, true, Some(Prefer::Ref)) => Ok(Target::Ref(name.to_string())),
         (is_agent, false, Some(Prefer::Ref)) => bail!(
             "--ref says `{name}` is a ref, but the Agent Store has no such ref.{}",
-            if is_agent.is_some() { format!("\n  There IS an agent `{name}` — did you mean `--agent {name}`?") } else { String::new() }
+            if is_agent.is_some() { format!("\n  There IS an agent `{name}`; did you mean `--agent {name}`?") } else { String::new() }
         ),
 
         (Some(a), false, None) => Ok(Target::Peer(a)),
@@ -139,7 +139,7 @@ fn resolve_target(store: &Path, name: &str, prefer: Option<Prefer>) -> Result<Ta
         (None, false, None) => bail!(
             "`{name}` is neither an agent nor a ref in this Agent Store.\n  \
              known agents: {}\n  \
-             a teammate's copy of this agent arrives as a ref — fetch it first: agit a fetch <remote>",
+             a teammate's copy of this agent arrives as a ref; fetch it first: agit a fetch <remote>",
             known_names()
         ),
     }
@@ -278,11 +278,11 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
         // An empty tail means two very different things, and conflating them IS the bug this fixes.
         // Grounded in a shared ancestor, empty is the truth: nothing diverged, we are up to date.
         if grounded {
-            outln!("{} added no {rt} sessions since the common ancestor — nothing to reconcile by dialogue.", target.label());
+            outln!("{}: nothing to reconcile (no new {rt} sessions)", target.label());
             // A dry run reports what WOULD happen and mutates nothing — not even the git fuse.
             if dry_run {
                 if mode == Mode::Fuse {
-                    outln!("(dry run) would fuse the git histories (same agent) — nothing else to do.");
+                    outln!("(dry run) would fuse histories (same agent); nothing else to do");
                 }
                 return Ok(0);
             }
@@ -291,8 +291,7 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
         }
         // Ungrounded and empty is NOT evidence of agreement — it is a failed read. Never exit 0 on it.
         bail!(
-            "{} has no {rt} sessions to reconcile with, and shares no history with this store, so \
-             there is nothing to compare against. (`--from <runtime>` picks the other runtime.)",
+            "{}: no {rt} sessions and no shared history, nothing to compare (--from <runtime> picks the other runtime)",
             target.label()
         );
     }
@@ -354,7 +353,7 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
             branch_b.as_deref().unwrap_or("?")
         );
     } else {
-        errln!("! Both code branches aren't in this repo (or share a name) — falling back to a single tree: the agents only see the current checkout, not each other's code.");
+        errln!("{}", crate::ui::warn("warning: single tree (both code branches not present); agents see only this checkout"));
     }
 
     // 5. Revive the voice session per side, bound to its own tree (never touching the user's real sessions).
@@ -371,12 +370,12 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
         let transcript = run_dialogue(&rt, &a, &b, quick)?;
         let (resolved, open) = synthesize(&transcript)?;
         let archive = save_transcript(&agent, &rt, &a.id, &b.id, &transcript)?;
-        outln!("── sync result ──");
+        outln!("── merge result ──");
         if !resolved.is_empty() {
             outln!("Agreed:\n{resolved}");
         }
         outln!("\nTranscript archived → {}", archive.display());
-        outln!("Merged state (both contexts + the reconciliation) — resume it to continue:");
+        outln!("Merged state (both contexts + the reconciliation); resume it to continue:");
         outln!("  {}", resume_cmd(&rt, &env, &a.id));
         if both {
             if let Err(e) = emit_both(&rt, &b, &env) {
@@ -401,11 +400,11 @@ pub fn run(reference: &str, runtime: &str, both: bool, quick: bool, splice: bool
 /// State the mode. The user must never have to infer whether their agents just got fused.
 fn announce(target: &Target, theirs: Option<&str>, mode: Mode) {
     let label = target.label();
-    let aid = theirs.map(short_aid).unwrap_or_else(|| "no aid recorded".into());
     match mode {
-        Mode::Fuse => outln!("{label} is this agent ({aid}) — reconciling, then merging the histories."),
+        Mode::Fuse => outln!("{label}: same agent, fusing histories"),
         Mode::DialogueOnly => {
-            outln!("{label} is a different agent ({aid}) — reconciling by dialogue; histories stay separate.")
+            let aid = theirs.map(short_aid).unwrap_or_else(|| "no aid".into());
+            outln!("{label}: different agent ({aid}), dialogue only")
         }
     }
 }
@@ -435,9 +434,9 @@ fn dry_run_report(target: &str, mode: Mode, a: &SidePreview, b: &SidePreview) ->
     let mut s = String::from("── dry run (no model spent; nothing installed, fused, or left behind) ──\n");
     s.push_str(&format!("Target: {target}\n"));
     s.push_str(match mode {
-        Mode::Fuse => "Mode: same agent — would reconcile by dialogue, THEN fuse the git histories.\n",
+        Mode::Fuse => "Mode: same agent; would reconcile by dialogue, THEN fuse the git histories.\n",
         Mode::DialogueOnly => {
-            "Mode: different agent — would reconcile by dialogue only; the git histories stay separate.\n"
+            "Mode: different agent; would reconcile by dialogue only; the git histories stay separate.\n"
         }
     });
     s.push_str(&format!("A @ {}: {} session(s), voice = {}\n", a.branch.unwrap_or("?"), a.sessions.len(), a.voice_name()));
@@ -463,8 +462,10 @@ fn fuse(store: &Path, target: &Target) -> Result<i32> {
     let rc = scope::git_in_inherit(store, &["merge", &spec]);
     if rc != 0 {
         errln!(
-            "  ⚠ git merge left conflicts in the Agent Store. The reconciliation above is already \
-             recorded; resolve the files and `agit a commit`."
+            "{}",
+            crate::ui::warn(
+                "  ⚠ git merge left conflicts in the Agent Store (reconciliation already recorded); resolve the files and agit a commit"
+            )
         );
         return Ok(1);
     }
@@ -489,7 +490,7 @@ fn peer_sessions(store: &Path, target: &Target, rt: &str) -> Result<(Vec<(String
             let related = scope::git_in_status(store, &["merge-base", "HEAD", r]).0 == 0;
             let range = if related { format!("HEAD...{r}") } else { format!("HEAD..{r}") };
             if !related {
-                errln!("No common ancestor with {r} — enumerating its sessions directly (two-dot).");
+                errln!("No common ancestor with {r}: enumerating its sessions directly (two-dot).");
             }
             let (rc, out) = scope::git_in_status(
                 store,
@@ -607,7 +608,7 @@ fn resolve_inline(rt: &str, a: &Side, open: &str, agent: &Path, b_id: &str) -> R
     // A merge in CI must never block on a prompt nobody can answer: print what needed deciding, with
     // every option, and leave non-zero for the pipeline to act on.
     if !crate::ui::interactive() {
-        outln!("\nNeeds your decision — rerun at a terminal to answer, or decide these by hand:");
+        outln!("\nNeeds your decision (rerun at a terminal to answer, or decide by hand):");
         for (i, c) in items.iter().enumerate() {
             outln!("\n[{}/{}] {}", i + 1, items.len(), c.what);
             for (n, o) in c.options.iter().enumerate() {
@@ -760,7 +761,7 @@ fn run_dialogue(rt: &str, a: &Side, b: &Side, quick: bool) -> Result<Vec<(char, 
 /// transcript, and it is cleared before the reply prints (and on drop, so an error lands on a clean
 /// line).
 fn turn_aloud(who: char, rt: &str, cwd: &Path, id: &str, prompt: &str, tools: bool) -> Result<String> {
-    let spinner = crate::ui::Spinner::start(&format!("{who} is thinking"));
+    let spinner = crate::ui::Spinner::start(&format!("{who} ({rt})"));
     let reply = turn_with(rt, cwd, id, prompt, tools);
     let took = spinner.stop();
     let msg = reply?;
@@ -792,7 +793,7 @@ fn emit_both(rt: &str, b: &Side, env: &Path) -> Result<()> {
     let content = std::fs::read_to_string(&path)?;
     let b_merged = convo::fresh_id("sync-b-merged");
     install_copy(rt, &content, &b_merged, env)?;
-    outln!("B's merged state — resume it on B's branch:");
+    outln!("B's merged state; resume it on B's branch:");
     outln!("  (cd {} && claude --resume {b_merged})", env.display());
     Ok(())
 }
@@ -932,7 +933,7 @@ fn turn_codex(cwd: &Path, session_id: &str, prompt: &str) -> Result<String> {
 
 const RULES: &str = "Rules: at most 4 sentences per turn; put any real conflict (something that can't both be \
 true, or that would break at merge) on its own line starting with 'CONFLICT:'; you have READ-ONLY access to \
-your branch's tree (Read/Grep/Glob) — check the code instead of guessing; end your message with 'DONE' when \
+your branch's tree (Read/Grep/Glob); check the code instead of guessing; end your message with 'DONE' when \
 you have nothing left to raise or resolve.";
 
 // ── The handoff prompt ──
@@ -968,7 +969,7 @@ fn no_tools_preamble(rt: &str) -> String {
 
 - Do NOT use {}, or ANY other tool.
 - You already have all the context you need in the conversation above.
-- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
+- Tool calls will be REJECTED and will waste your only turn; you will fail the task.
 - Your entire response must be plain text: an <analysis> block followed by a <summary> block.
 
 ",
@@ -979,7 +980,7 @@ fn no_tools_preamble(rt: &str) -> String {
 /// Layer 3 of the clamp (claude's `jvu`, appended last).
 const NO_TOOLS_REMINDER: &str = "
 
-REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> \
+REMINDER: Do NOT call any tools. Respond with plain text only; an <analysis> block followed by a <summary> \
 block. Tool calls will be rejected and you will fail the task.";
 
 /// The forced scratchpad pre-pass. Stripped from the reply before anything sees it (see `strip_analysis`);
@@ -1001,14 +1002,14 @@ verbatim in the summary so they continue to apply after the handoff.
 /// The handoff's fixed section schema, in order. Claude's `Bkg` sections 1–7 with its prefix-summarizer
 /// tail (8. Work Completed / 9. Context for Continuing Work), reworded for a branch-to-branch handoff.
 const HANDOFF_SECTIONS: [(&str, &str); 9] = [
-    ("Primary Request and Intent", "What you were asked to do on this branch, in detail — the goal, not just the diff."),
+    ("Primary Request and Intent", "What you were asked to do on this branch, in detail; the goal, not just the diff."),
     ("Key Technical Concepts", "The technologies, patterns, and invariants this work relies on."),
     ("Files and Code Sections", "Files you examined, changed, or created. Include the code that matters and why each file matters."),
     ("Errors and fixes", "Errors you hit and how you fixed them, in one line each."),
     ("Problem Solving", "Problems solved, and any troubleshooting still in flight."),
     (
         "All user messages",
-        "Every instruction your human gave you on this branch that is not a tool result — these carry \
+        "Every instruction your human gave you on this branch that is not a tool result; these carry \
          feedback and changing intent. Preserve security-relevant instructions and constraints VERBATIM so \
          they still bind after the handoff. The reconciliation turns of this merge (this prompt, and \
          anything relayed from the other agent) are not your human's instructions: do not list them.",
@@ -1023,10 +1024,10 @@ const HANDOFF_SECTIONS: [(&str, &str); 9] = [
 ];
 
 /// What must NOT cross. Codex omits this half; it can afford to, we cannot (see the module comment).
-const HANDOFF_DROP: &str = "Leave OUT — it costs the other agent context and misleads:
+const HANDOFF_DROP: &str = "Leave OUT; it costs the other agent context and misleads:
 - Approaches you superseded, unless the other agent might plausibly retry one; then say it was rejected and why.
 - Errors you already fixed, beyond the one-line record in section 4.
-- Verbose tool output, file dumps, and command logs already reflected on disk — the diff below is ground truth for those.
+- Verbose tool output, file dumps, and command logs already reflected on disk; the diff below is ground truth for those.
 - Anything you cannot support from the conversation or your diff. Do not speculate to fill a section; write 'none'.";
 
 fn section_schema() -> String {
@@ -1044,7 +1045,7 @@ fn receiver_frame(peer: &str) -> String {
         "Agent {peer} produced a summary of its thinking process. Use this to build on the work that has \
          already been done and avoid duplicating work. Note that you do NOT have access to the state of the \
          tools {peer} used: {peer} worked in its own tree, and your Read/Grep/Glob see only YOUR branch's \
-         tree — so {peer}'s summary and the diffs you are given are your only evidence about {peer}'s side. \
+         tree; so {peer}'s summary and the diffs you are given are your only evidence about {peer}'s side. \
          Never assume a file you can read is {peer}'s version of it. Here is the summary produced by \
          {peer}, use the information in this summary to assist with your own analysis:"
     )
@@ -1064,7 +1065,7 @@ fn handoff_prompt(rt: &str, role: &str, peer: &str, incoming: Option<&str>, diff
          {peer}'s context and the turns that reconcile the two branches follow after it (you do not see \
          them here). Summarize thoroughly so that {peer}, reading only your summary, can understand what \
          you did and why, and reconcile it against their own work. Your diff is ground truth for WHAT \
-         changed — the reasoning is the part {peer} cannot see.\n\n\
+         changed; the reasoning is the part {peer} cannot see.\n\n\
          {HANDOFF_ANALYSIS}\n\n\
          Your summary must contain these sections, in this order:\n\n{}\n\n\
          {HANDOFF_DROP}\n\n\
@@ -1120,7 +1121,7 @@ fn diff_block(diff: &str) -> String {
     if diff.trim().is_empty() {
         String::new()
     } else {
-        format!("\n\nYour branch's diff since the common ancestor (ground truth — trust this over your memory):\n```diff\n{diff}\n```")
+        format!("\n\nYour branch's diff since the common ancestor (ground truth; trust this over your memory):\n```diff\n{diff}\n```")
     }
 }
 
@@ -1201,7 +1202,7 @@ fn synthesize(transcript: &[(char, String)]) -> Result<(String, String)> {
          [RESOLVED] decisions they agreed on (one per line; write 'none' if empty).\n\
          [OPEN] conflicts still needing a human decision (one per line; write 'none' if empty).\n\
          Write each [OPEN] line as: <the conflict, naming both sides> || <one way out> | <the other way out>\n\
-         Each way out must be a concrete action a human can pick, naming who changes what — e.g.\n\
+         Each way out must be a concrete action a human can pick, naming who changes what; e.g.\n\
          field name: user_id (frontend) vs uid (api) || keep uid, frontend updates its caller | keep user_id, api reverts the rename\n\
          Omit the `||` and the options only if the dialogue never named a way out.\n\
          Be terse; don't replay the dialogue.\n\n{convo_text}"
@@ -1282,7 +1283,7 @@ fn pick_side(rt: &str, sessions: &[(String, String)], branch: Option<&str>) -> (
 
     let mut brief = String::new();
     if !others.is_empty() {
-        brief.push_str("Your earlier sessions on this branch (context — you are resuming the latest one):\n");
+        brief.push_str("Your earlier sessions on this branch (context; you are resuming the latest one):\n");
         for (name, content) in others.iter().map(|s| (&s.0, &s.1)) {
             let first = side_first_prompt(rt, content).unwrap_or_else(|| "(no prompt)".into());
             brief.push_str(&format!("- {}: {}\n", &name[..name.len().min(8)], convo::truncate(&first, 120)));
