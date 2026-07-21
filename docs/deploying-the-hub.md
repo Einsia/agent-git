@@ -25,13 +25,21 @@ Everything below uses the **real** CLI. The full subcommand surface is:
 agit-hub serve [--host 127.0.0.1] [--port 8177] [--root ~/.agit-hub]
                [--tls] [--insecure] [--trusted-proxy IP,IP]      start the Hub
 agit-hub user add <name> [--admin]                   add a user (asks for the password)
+agit-hub user verify-email <name>                    force-mark a user's email verified (admin vouch)
+agit-hub user verify-link <name>                     print a verification link to forward to the user
 agit-hub user list                                   list users
-agit-hub add <name> [--owner <user>] [--public]      new Agent Store (private by default)
+agit-hub add <name> [--owner <user>] [--public] [--initialize]   new Agent Store (private by default)
 agit-hub list                                        list hosted agents
-agit-hub token add <name> [--user <owner>] [--agent <name>]
+agit-hub token add <name> [--user <owner>] [--agent <owner>/<name>]
                    [--read|--write] [--ttl-days N]   issue an access token
 agit-hub token list                                  list tokens (metadata only)
 agit-hub token rm <id>                               revoke a token
+agit-hub org invite <org> <user> [--role R]          invite a user into an org (pending)
+agit-hub org invitations <org>                       list an org's pending invitations
+agit-hub org transfer <org> <new_owner>              hand org ownership to a member
+agit-hub org rm <org>                                delete an empty org
+agit-hub backup [--out <file.tgz>]                   one tar.gz: data root + a consistent metadata snapshot (0600, sensitive)
+agit-hub restore <file.tgz> [--force]                inverse; refuses a non-empty root or a cross-backend restore
 ```
 
 `agit-hub --help` prints exactly this. Two further switches are set at serve time
@@ -39,7 +47,8 @@ and do not appear in that summary: `--open-registration` (covered under
 [Registration](#enabling-self-service-registration)), and the database and blob
 backends, which are selected by environment variables (`AGIT_HUB_DB`,
 `AGIT_HUB_S3_ENDPOINT`; see [The database and blob backends](#the-database-and-blob-backends)).
-Organizations are managed through the API and web UI, not the CLI.
+Organizations are created through the API and web UI; the `org` subcommands above
+manage an existing org's invitations, ownership transfer, and deletion.
 
 ---
 
