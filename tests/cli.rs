@@ -1962,6 +1962,114 @@ fn a_diff_shows_session_level_changes_and_raw_falls_back_to_git() {
     assert!(raw.contains("sessionId"), "`a diff --raw` is the byte-level git diff: {raw}");
 }
 
+/// Write a full transcript this project owns into `<home>/.claude/projects/<slug>/<id>.jsonl`, verbatim.
+fn seed_claude_raw(r: &Repo, home: &Path, id: &str, body: &str) -> PathBuf {
+    let top = r.sh("git rev-parse --show-toplevel").trim().to_string();
+    let slug: String = top.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    let sdir = home.join(".claude/projects").join(&slug);
+    std::fs::create_dir_all(&sdir).unwrap();
+    let p = sdir.join(format!("{id}.jsonl"));
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+/// End to end (features A, B, D): `agit a snap` records the divergence DAG into each session's sidecar,
+/// and `agit a log` renders it as a tree - a `/branch` child indented under the parent it shares a
+/// prefix with (with the branch-point), a subagent host annotated `+N subagents`, and a lone session flat.
+#[test]
+fn a_log_renders_the_divergence_dag() {
+    let r = Repo::new();
+    let home = r.path().join("cchome");
+    let top = r.sh("git rev-parse --show-toplevel").trim().to_string();
+
+    // A shared opening prefix: u1 (a real user prompt) + u2 (assistant). Only the session id differs
+    // between parent and child - exactly what a runtime `/branch` leaves behind.
+    let prefix = |sid: &str| {
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{sid}\",\"uuid\":\"u1\",\"parentUuid\":null,\"timestamp\":\"2026-07-20T09:00:00.000Z\",\"cwd\":\"{top}\",\"message\":{{\"role\":\"user\",\"content\":\"build a parser\"}}}}\n\
+             {{\"type\":\"assistant\",\"sessionId\":\"{sid}\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"timestamp\":\"2026-07-20T09:00:01.000Z\",\"cwd\":\"{top}\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"starting\"}}]}}}}\n"
+        )
+    };
+    // PARENT diverges at u3a (earlier); CHILD carries the same prefix then diverges at u3b (later).
+    seed_claude_raw(
+        &r,
+        &home,
+        "PARENT",
+        &format!(
+            "{}{{\"type\":\"user\",\"sessionId\":\"PARENT\",\"uuid\":\"u3a\",\"parentUuid\":\"u2\",\"timestamp\":\"2026-07-20T09:05:00.000Z\",\"cwd\":\"{top}\",\"message\":{{\"role\":\"user\",\"content\":\"use recursive descent\"}}}}\n",
+            prefix("PARENT"),
+        ),
+    );
+    seed_claude_raw(
+        &r,
+        &home,
+        "CHILD",
+        &format!(
+            "{}{{\"type\":\"user\",\"sessionId\":\"CHILD\",\"uuid\":\"u3b\",\"parentUuid\":\"u2\",\"timestamp\":\"2026-07-20T11:00:00.000Z\",\"cwd\":\"{top}\",\"message\":{{\"role\":\"user\",\"content\":\"use a PEG grammar instead\"}}}}\n",
+            prefix("CHILD"),
+        ),
+    );
+    // A subagent host: an assistant Task turn on the main thread, plus a sub-thread under HOST/subagents/.
+    seed_claude_raw(
+        &r,
+        &home,
+        "HOST",
+        &format!(
+            "{{\"type\":\"user\",\"sessionId\":\"HOST\",\"uuid\":\"h1\",\"parentUuid\":null,\"timestamp\":\"2026-07-20T08:00:00.000Z\",\"cwd\":\"{top}\",\"message\":{{\"role\":\"user\",\"content\":\"delegate a subtask\"}}}}\n\
+             {{\"type\":\"assistant\",\"sessionId\":\"HOST\",\"uuid\":\"hspawn\",\"parentUuid\":\"h1\",\"timestamp\":\"2026-07-20T08:00:01.000Z\",\"cwd\":\"{top}\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_H\",\"name\":\"Task\",\"input\":{{\"description\":\"work\"}}}}]}}}}\n"
+        ),
+    );
+    let slug: String = top.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    let sub = home.join(".claude/projects").join(&slug).join("HOST").join("subagents");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(
+        sub.join("agent-h.jsonl"),
+        "{\"type\":\"user\",\"uuid\":\"sub-1\",\"parentUuid\":null,\"isSidechain\":true,\"sessionId\":\"HOST\",\"message\":{\"content\":\"go\"}}\n\
+         {\"type\":\"assistant\",\"uuid\":\"hleaf\",\"parentUuid\":\"sub-1\",\"isSidechain\":true,\"sessionId\":\"HOST\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sub.join("agent-h.meta.json"),
+        "{\"agentType\":\"general-purpose\",\"toolUseId\":\"toolu_H\",\"name\":\"h\"}",
+    )
+    .unwrap();
+
+    let (code, _out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
+    assert_eq!(code, 0, "snap must succeed: {err}");
+
+    // The CHILD sidecar records the branch back to PARENT (feature B), and the HOST sidecar records the
+    // subagent branch-point (feature A) - asserting the committed metadata, not just the rendering.
+    let child_side = captured_transcript(&r, "claude-code", "CHILD.jsonl").with_extension("agit.json");
+    let cs = std::fs::read_to_string(&child_side).expect("CHILD sidecar exists");
+    assert!(cs.contains("\"parent\": \"PARENT\""), "CHILD's lineage names PARENT: {cs}");
+    assert!(cs.contains("\"detected_by\": \"prefix\""), "CHILD was detected by shared prefix: {cs}");
+    assert!(cs.contains("\"branch_point\": \"u2\""), "the branch point is the last shared uuid: {cs}");
+    let host_side = captured_transcript(&r, "claude-code", "HOST.jsonl").with_extension("agit.json");
+    let hs = std::fs::read_to_string(&host_side).expect("HOST sidecar exists");
+    assert!(hs.contains("\"spawn\": \"hspawn\""), "HOST records the spawning Task turn: {hs}");
+    assert!(hs.contains("\"leaf\": \"hleaf\""), "HOST records the sub-thread leaf: {hs}");
+    // PARENT stays a root (feature D): null parent, empty subagents.
+    let par_side = captured_transcript(&r, "claude-code", "PARENT.jsonl").with_extension("agit.json");
+    let ps = std::fs::read_to_string(&par_side).expect("PARENT sidecar exists");
+    assert!(ps.contains("\"parent\": null"), "PARENT is a root: {ps}");
+
+    // `a log` renders the DAG.
+    let (code, out, err) = r.agit(&["a", "log"]);
+    assert_eq!(code, 0, "a log must succeed: {err}");
+    // Parent and child share the opening prompt (the log's gist is the first prompt), so it appears
+    // twice - once for the root, once for the indented child.
+    assert_eq!(out.matches("build a parser").count(), 2, "parent and child both show the shared opening: {out}");
+    assert!(out.contains("delegate a subtask"), "the subagent host's prompt shows: {out}");
+    assert!(out.contains("branched at u2 (prefix)"), "the child is annotated with its branch-point: {out}");
+    assert!(out.contains("+1 subagent"), "the subagent host is annotated: {out}");
+    // The child is indented UNDER its parent: an indented bullet, appearing after the parent's root
+    // bullet and carrying the branch-point line. HOST stays flat (a root bullet at column 0).
+    assert!(out.contains("  ● "), "a /branch child is indented beneath its parent: {out:?}");
+    let par_pos = out.find("● claude-code").unwrap(); // first (root) bullet is the parent
+    let branch_pos = out.find("branched at u2").unwrap();
+    assert!(par_pos < branch_pos, "the child block renders under its parent: {out}");
+}
+
 /// git-parity: Rust ignores SIGPIPE, so `agit a log | head` USED to panic on the first write into the
 /// closed pipe ("failed printing to stdout: Broken pipe", exit 101). With SIGPIPE reset to the default,
 /// piping long native output into a reader that closes early terminates cleanly (killed by SIGPIPE, no

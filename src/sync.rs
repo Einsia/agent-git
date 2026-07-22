@@ -871,6 +871,27 @@ fn splice_sessions(rt: &str, a_text: &str, b_text: &str, new_id: &str, cwd: &Pat
     convo::write_conversation(rt, &ir, &opts)
 }
 
+/// The count of leading records two conversations share - the SAME common-ancestor machinery
+/// `splice_sessions` uses (parse each with `read_conversation`, then count equal leading `raw` lines),
+/// exposed for lineage's `/branch` detection.
+///
+/// One adaptation: `splice_sessions` runs *after* an install has already put both sides under agreeing
+/// ids, so it compares `raw` verbatim. Lineage compares two INDEPENDENTLY captured sessions whose every
+/// record still carries its own `sessionId` (`"sessionId":"<a>"` vs `"<b>"`), so a verbatim compare would
+/// see zero overlap. We normalize each side's own session id to one placeholder before comparing, which
+/// is exactly what a runtime `/branch` leaves behind: the parent's prefix records, re-stamped with the
+/// child's session id. Record uuids in a shared prefix are preserved by `/branch`, so they still match.
+pub(crate) fn shared_prefix_len(a: &convo::ConversationIR, b: &convo::ConversationIR) -> usize {
+    const PH: &str = "\u{1}agit-sid\u{1}";
+    a.events
+        .iter()
+        .zip(b.events.iter())
+        .take_while(|(x, y)| {
+            convo::swap_quoted(&x.raw, &a.session_id, PH) == convo::swap_quoted(&y.raw, &b.session_id, PH)
+        })
+        .count()
+}
+
 /// Copy a claude session into a fresh-id session bound to `cwd` (same-vendor replay rewrites id/cwd),
 /// returning the installed transcript's path so a caller can read the revived (and later dialogue-mutated)
 /// session back — that path is where the merged state lands.

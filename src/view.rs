@@ -210,50 +210,126 @@ pub fn agent_log(args: &[String]) -> Result<i32> {
         if count == 1 { "" } else { "s" }
     );
 
-    for s in &sessions {
-        let when = ui::ago(s.recency());
-        // One parse yields both the origin and the distilled facts — the same parse the rest of agit
-        // reads sessions with.
-        let text = std::fs::read_to_string(&s.path).unwrap_or_default();
-        let ir = convo::read_conversation(s.runtime, &text).ok();
-        let distilled = ir.as_ref().map(distill);
-        // Where it ran: the cwd the transcript recorded (`~`-collapsed), else the store's partition slug.
-        let origin = ir
-            .as_ref()
-            .and_then(|ir| ir.cwd.clone())
-            .map(|c| ui::tilde(Path::new(&c)))
-            .or_else(|| s.env_slug.clone());
-
-        println!();
-        let loc = match origin {
-            Some(o) => format!("{} · {when} · {}", s.runtime, ui::accent(&o)),
-            None => format!("{} · {when}", s.runtime),
-        };
-        println!("● {loc}");
-
-        match &distilled {
-            Some(d) => {
-                if let Some(gist) = d.prompts.first() {
-                    println!("    {}", ui::dim(&format!("\"{}\"", ui::one_line(gist, 72))));
-                }
-                let mut tail = String::new();
-                if d.tool_calls > 0 {
-                    tail.push_str(&format!("{} tool call{}", d.tool_calls, if d.tool_calls == 1 { "" } else { "s" }));
-                }
-                if !d.edits.is_empty() {
-                    if !tail.is_empty() {
-                        tail.push_str(" · ");
-                    }
-                    tail.push_str(&format!("edited {}", edit_summary(&d.edits)));
-                }
-                if !tail.is_empty() {
-                    println!("    {}", ui::dim(&tail));
-                }
+    // The sessions form a DAG through their recorded lineage (design §"A log DAG"): runtime `/branch`
+    // siblings hang under the parent they share a prefix with, and a session that spawned subagents is
+    // annotated. Build the parent→children map over the sessions we are about to show (the id is the
+    // transcript's file stem, which is what `lineage.parent` records), then walk roots-first.
+    let node_ids: Vec<String> = sessions.iter().map(|s| full_id(&s.path)).collect();
+    let lineages: Vec<crate::session::Lineage> = sessions.iter().map(|s| crate::session::read_lineage(&s.path)).collect();
+    let id_to_idx: std::collections::HashMap<&str, usize> =
+        node_ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); sessions.len()];
+    let mut is_child = vec![false; sessions.len()];
+    // `sessions` is already recency-sorted, so children accumulate newest-first, matching the roots.
+    for (i, l) in lineages.iter().enumerate() {
+        if let Some(p) = &l.parent {
+            if let Some(&pi) = id_to_idx.get(p.as_str()).filter(|&&pi| pi != i) {
+                children[pi].push(i);
+                is_child[i] = true;
             }
-            None => println!("    {}", ui::dim("(unreadable transcript)")),
+        }
+    }
+
+    let mut visited = vec![false; sessions.len()];
+    // Roots (no parent among the shown sessions) first, in recency order; each subtree follows inline.
+    for root in (0..sessions.len()).filter(|&i| !is_child[i]) {
+        print_node(root, 0, &sessions, &lineages, &children, &mut visited);
+    }
+    // Safety net: a session whose parent is shown but whose subtree a cycle kept us out of still prints.
+    for i in 0..sessions.len() {
+        if !visited[i] {
+            print_node(i, 0, &sessions, &lineages, &children, &mut visited);
         }
     }
     Ok(0)
+}
+
+/// A session's stable id: the transcript's file stem (a UUID), which is what a child's `lineage.parent`
+/// names. Unlike `short_id`, this is the full id so the parent lookup is exact.
+fn full_id(path: &Path) -> String {
+    path.file_stem().and_then(|s| s.to_str()).unwrap_or("session").to_string()
+}
+
+/// Render one session and, indented beneath it, its `/branch` children - the DAG as a terminal tree.
+fn print_node(
+    idx: usize,
+    depth: usize,
+    sessions: &[commands::StoredSession],
+    lineages: &[crate::session::Lineage],
+    children: &[Vec<usize>],
+    visited: &mut [bool],
+) {
+    if visited[idx] {
+        return;
+    }
+    visited[idx] = true;
+
+    let s = &sessions[idx];
+    let lin = &lineages[idx];
+    let when = ui::ago(s.recency());
+    let pad = "  ".repeat(depth);
+    // One parse yields both the origin and the distilled facts - the same parse the rest of agit reads with.
+    let text = std::fs::read_to_string(&s.path).unwrap_or_default();
+    let ir = convo::read_conversation(s.runtime, &text).ok();
+    let distilled = ir.as_ref().map(distill);
+    let origin = ir
+        .as_ref()
+        .and_then(|ir| ir.cwd.clone())
+        .map(|c| ui::tilde(Path::new(&c)))
+        .or_else(|| s.env_slug.clone());
+
+    println!();
+    let mut loc = match origin {
+        Some(o) => format!("{} · {when} · {}", s.runtime, ui::accent(&o)),
+        None => format!("{} · {when}", s.runtime),
+    };
+    // A child shows where it forked from its parent (the shared branch-point), and how that was detected.
+    if depth > 0 {
+        if let Some(bp) = &lin.branch_point {
+            let how = lin.detected_by.as_deref().unwrap_or("prefix");
+            loc.push_str(&ui::dim(&format!(" · branched at {} ({how})", short_uuid(bp))));
+        }
+    }
+    println!("{pad}● {loc}");
+
+    match &distilled {
+        Some(d) => {
+            if let Some(gist) = d.prompts.first() {
+                println!("{pad}    {}", ui::dim(&format!("\"{}\"", ui::one_line(gist, 72))));
+            }
+            let mut tail = String::new();
+            if d.tool_calls > 0 {
+                tail.push_str(&format!("{} tool call{}", d.tool_calls, if d.tool_calls == 1 { "" } else { "s" }));
+            }
+            if !d.edits.is_empty() {
+                if !tail.is_empty() {
+                    tail.push_str(" · ");
+                }
+                tail.push_str(&format!("edited {}", edit_summary(&d.edits)));
+            }
+            // A session that spawned subagents is annotated (e.g. "+2 subagents").
+            if !lin.subagents.is_empty() {
+                if !tail.is_empty() {
+                    tail.push_str(" · ");
+                }
+                let n = lin.subagents.len();
+                tail.push_str(&format!("+{n} subagent{}", if n == 1 { "" } else { "s" }));
+            }
+            if !tail.is_empty() {
+                println!("{pad}    {}", ui::dim(&tail));
+            }
+        }
+        None => println!("{pad}    {}", ui::dim("(unreadable transcript)")),
+    }
+
+    for &child in &children[idx] {
+        print_node(child, depth + 1, sessions, lineages, children, visited);
+    }
+}
+
+/// A branch-point uuid clipped for display (the first 8 chars).
+fn short_uuid(uuid: &str) -> String {
+    uuid.chars().take(8).collect()
 }
 
 /// `agit a diff [<from>] [<to>]` — the SESSION-level change between two refs of the store: the sessions

@@ -451,7 +451,12 @@ fn mirror_owned(rt: &str, env: &Path, r: &Routed) -> Result<(Stats, usize, PathB
         // The sidecar is a pure function of the transcript, so rewriting it unchanged would turn every
         // watch tick into a commit. Building it re-reads the transcript, so do it only when one moved.
         if copied || !crate::commands::sidecar_path(&dp).exists() {
-            write_sidecar(&dp, o, env, rt, &r.store)?;
+            // The comparison set for `/branch` detection is the other sessions this pass routes to the
+            // SAME store (one store == one agent), which is the "same agent+env" cohort the model wants.
+            let siblings: Vec<(PathBuf, String)> =
+                r.sessions.iter().filter(|s| s.id != o.id).map(|s| (s.src.clone(), s.id.clone())).collect();
+            let lineage = detect_lineage(rt, &o.src, &o.id, &siblings);
+            write_sidecar(&dp, o, env, rt, &r.store, &lineage)?;
         }
         // a session's sidecars (subagents/, tool-results/) live under a dir named for its id
         if let Some(side) = o.src.parent().map(|d| d.join(&o.id)).filter(|d| d.is_dir()) {
@@ -490,7 +495,7 @@ fn mirror_owned(rt: &str, env: &Path, r: &Routed) -> Result<(Stats, usize, PathB
 /// This is also where provenance is written (§ provenance): the sidecar is COMMITTED beside the session,
 /// so the signature travels with the transcript to a teammate, unlike the machine-local launch record.
 /// The signature binds `(sha256(transcript) ‖ aid ‖ committer email ‖ started)` to this machine's key.
-fn write_sidecar(dp: &Path, o: &Owned, env: &Path, rt: &str, store: &Path) -> Result<()> {
+fn write_sidecar(dp: &Path, o: &Owned, env: &Path, rt: &str, store: &Path, lineage: &Lineage) -> Result<()> {
     let mut v = serde_json::json!({
         "env": env.display().to_string(),
         "runtime": rt,
@@ -501,6 +506,10 @@ fn write_sidecar(dp: &Path, o: &Owned, env: &Path, rt: &str, store: &Path) -> Re
         // floor (never `now`, which would churn a fresh commit on every watch tick and still differ per
         // machine). Either value travels with the store, so everyone orders the same way.
         "last_activity": last_activity(&o.src).unwrap_or_else(|| NO_ACTIVITY_FLOOR.to_string()),
+        // The divergence DAG, recorded as content-derived metadata (§ storage: lineage, not git branches).
+        // A root/absent session serializes with a null parent and an empty subagents list, and an old
+        // sidecar that predates this field renders as a root - there is no migration (we have no users).
+        "lineage": lineage.to_json(),
     });
     if let Some(a) = &o.by {
         v["aid"] = a.aid().into();
@@ -566,6 +575,324 @@ pub(crate) fn last_activity(path: &Path) -> Option<String> {
         }
     }
     last
+}
+
+// ─────────────────────── lineage: the divergence DAG as sidecar metadata ───────────────────────
+//
+// Subagents, runtime `/branch` siblings, and forks are one operation - agent memory diverges, then
+// rejoins - seen at three scopes (design: "A coherent model for subagents, branches, and forks"). This
+// wave RECORDS that structure as metadata on each session's committed sidecar; it never moves a
+// transcript and never creates a git branch in the store. Two kinds are detected, both grounded in real
+// transcript fields confirmed against dumps under ~/.claude/projects:
+//
+//   * SUBAGENT - Claude Code marks a spawned sub-thread's records `"isSidechain":true`. Each lives under
+//     `<id>/subagents/<agent>.jsonl` with a companion `<agent>.meta.json` carrying `toolUseId`, the id of
+//     the main-thread `Task` tool_use that spawned it. We record `{ spawn, leaf }`: the main-thread turn
+//     that issued that Task, and the sub-thread's last record. (Older inline sidechains are handled too.)
+//     Codex has no structural sub-thread marker (its records are session_meta/response_item/event_msg/…),
+//     so nothing is fabricated for it.
+//   * /branch SIBLING - a session that shares an opening prefix with another session of the same
+//     agent+env and then diverges. Detected `leaf` (a record's `leafUuid` resolving into another captured
+//     session) when that exact link is present, else by shared prefix (reusing `sync::shared_prefix_len`).
+
+/// One recorded subagent branch-point: the main-thread turn that spawned it, and the sub-thread's leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subagent {
+    pub spawn: String,
+    pub leaf: String,
+}
+
+/// A session's place in the divergence DAG. A root has `parent: None` and no subagents.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lineage {
+    /// The session this one branched from (a sibling of the same agent+env), or `None` for a root.
+    pub parent: Option<String>,
+    /// The uuid both sessions shared last - the point the branch forked at.
+    pub branch_point: Option<String>,
+    /// How the parent link was found: `"leaf"` (exact leafUuid link) or `"prefix"` (shared prefix).
+    pub detected_by: Option<String>,
+    /// Subagent branch-points this session spawned (empty when it spawned none).
+    pub subagents: Vec<Subagent>,
+}
+
+impl Lineage {
+    /// The committed sidecar shape. Nulls and an empty list are written explicitly so a reader never has
+    /// to distinguish "root" from "field absent" - both render as a root.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "parent": self.parent,
+            "branch_point": self.branch_point,
+            "detected_by": self.detected_by,
+            "subagents": self
+                .subagents
+                .iter()
+                .map(|s| serde_json::json!({ "spawn": s.spawn, "leaf": s.leaf }))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Read a captured session's committed lineage from its sidecar. A missing sidecar, missing `lineage`
+/// object, or a pre-lineage sidecar all read as a clean root - no migration, by design.
+pub fn read_lineage(transcript: &Path) -> Lineage {
+    let Ok(text) = std::fs::read_to_string(crate::commands::sidecar_path(transcript)) else {
+        return Lineage::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Lineage::default();
+    };
+    let Some(l) = v.get("lineage") else { return Lineage::default() };
+    let str_field = |k: &str| l.get(k).and_then(|x| x.as_str()).map(String::from);
+    let subagents = l
+        .get("subagents")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    Some(Subagent {
+                        spawn: s.get("spawn")?.as_str()?.to_string(),
+                        leaf: s.get("leaf")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Lineage { parent: str_field("parent"), branch_point: str_field("branch_point"), detected_by: str_field("detected_by"), subagents }
+}
+
+/// Detect a captured session's lineage: its subagent branch-points, and whether it branched from a
+/// sibling. `siblings` are the other sessions of the same agent+env (transcript path + id).
+pub fn detect_lineage(rt: &str, src: &Path, id: &str, siblings: &[(PathBuf, String)]) -> Lineage {
+    let text = std::fs::read_to_string(src).unwrap_or_default();
+    let subagents = detect_subagents(&text, src, id);
+    let (parent, branch_point, detected_by) = match detect_branch(rt, &text, id, siblings) {
+        Some((p, b, d)) => (Some(p), Some(b), Some(d)),
+        None => (None, None, None),
+    };
+    Lineage { parent, branch_point, detected_by, subagents }
+}
+
+/// The uuid of the last record in a transcript file (the sub-thread's leaf), or `None`.
+fn last_record_uuid(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).ok()?;
+    let mut last = None;
+    for line in std::io::BufReader::new(f).lines() {
+        let Ok(line) = line else { break };
+        if let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(u) = rec.get("uuid").and_then(|v| v.as_str()) {
+                last = Some(u.to_string());
+            }
+        }
+    }
+    last
+}
+
+/// Find this session's subagent branch-points. Two storage layouts, both real:
+///   * sidechains stored under `<id>/subagents/<agent>.jsonl` (+ `<agent>.meta.json{toolUseId}`) - the
+///     current Claude Code shape; the meta's `toolUseId` names the spawning main-thread `Task`.
+///   * sidechains inline in the transcript (`isSidechain:true` runs) - older shape; the spawn is the
+///     nearest preceding main-thread `Task` turn.
+fn detect_subagents(text: &str, src: &Path, id: &str) -> Vec<Subagent> {
+    // Map each main-thread Task tool_use id → the uuid of the assistant turn that issued it, and track
+    // the most recent such turn so an inline sidechain run can be attributed to the Task before it.
+    let mut task_spawn: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut last_task_turn: Option<String> = None;
+    let mut out: Vec<Subagent> = Vec::new();
+    // Open inline sidechain run, if any: (spawn turn at the point it opened, running leaf uuid).
+    let mut open_spawn: Option<String> = None;
+    let mut open_leaf: Option<String> = None;
+
+    let close_inline = |out: &mut Vec<Subagent>, spawn: &mut Option<String>, leaf: &mut Option<String>| {
+        if let (Some(sp), Some(lf)) = (spawn.take(), leaf.take()) {
+            out.push(Subagent { spawn: sp, leaf: lf });
+        } else {
+            *spawn = None;
+            *leaf = None;
+        }
+    };
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let uuid = rec.get("uuid").and_then(|v| v.as_str()).map(String::from);
+        if rec.get("isSidechain").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if open_leaf.is_none() && open_spawn.is_none() {
+                open_spawn = last_task_turn.clone();
+            }
+            if let Some(u) = uuid {
+                open_leaf = Some(u);
+            }
+            continue;
+        }
+        // A main-thread record closes any open inline sidechain run.
+        close_inline(&mut out, &mut open_spawn, &mut open_leaf);
+        if rec.get("type").and_then(|v| v.as_str()) == Some("assistant") {
+            if let Some(blocks) = rec.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                for b in blocks {
+                    if b.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                        && b.get("name").and_then(|v| v.as_str()) == Some("Task")
+                    {
+                        if let (Some(tid), Some(u)) = (b.get("id").and_then(|v| v.as_str()), &uuid) {
+                            task_spawn.insert(tid.to_string(), u.clone());
+                            last_task_turn = Some(u.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    close_inline(&mut out, &mut open_spawn, &mut open_leaf);
+
+    // Sub-thread files stored alongside the transcript, each with a `.meta.json` naming its spawning Task.
+    if let Some(dir) = src.parent().map(|d| d.join(id).join("subagents")).filter(|d| d.is_dir()) {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut files: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false))
+                .collect();
+            files.sort();
+            for f in files {
+                let Some(leaf) = last_record_uuid(&f) else { continue };
+                let tool_use_id = std::fs::read_to_string(f.with_extension("meta.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .and_then(|v| v.get("toolUseId").and_then(|x| x.as_str()).map(String::from));
+                // Resolve the Task tool_use id to the main-thread turn that issued it; when the transcript
+                // no longer holds that turn, the tool_use id itself still names the spawn point.
+                let spawn = tool_use_id.as_ref().and_then(|t| task_spawn.get(t).cloned()).or(tool_use_id);
+                if let Some(spawn) = spawn {
+                    out.push(Subagent { spawn, leaf });
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| (a.spawn.as_str(), a.leaf.as_str()).cmp(&(b.spawn.as_str(), b.leaf.as_str())));
+    out.dedup();
+    out
+}
+
+/// Detect whether this session branched from a sibling: the exact `leafUuid` link first, then the
+/// shared-prefix fallback. Returns `(parent_id, branch_point_uuid, detected_by)`.
+fn detect_branch(rt: &str, text: &str, id: &str, siblings: &[(PathBuf, String)]) -> Option<(String, String, String)> {
+    detect_branch_leaf(text, siblings).or_else(|| detect_branch_prefix(rt, text, id, siblings))
+}
+
+/// EXACT: a record in this session carries a `leafUuid` that resolves to a uuid living in ANOTHER
+/// captured session (and not in this one) - that other session is the parent, the branch-point is that
+/// uuid. Confirmed field name in real dumps (`leafUuid`), though real dumps only ever carry it as a
+/// same-session bookmark, which this correctly ignores.
+fn detect_branch_leaf(text: &str, siblings: &[(PathBuf, String)]) -> Option<(String, String, String)> {
+    let mut own: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut leaves: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
+        if let Some(u) = rec.get("uuid").and_then(|v| v.as_str()) {
+            own.insert(u.to_string());
+        }
+        if let Some(l) = rec.get("leafUuid").and_then(|v| v.as_str()) {
+            leaves.push(l.to_string());
+        }
+    }
+    for leaf in leaves {
+        if own.contains(&leaf) {
+            continue; // a same-session bookmark, not a branch link
+        }
+        for (sp, sid) in siblings {
+            if session_contains_uuid(sp, &leaf) {
+                return Some((sid.clone(), leaf, "leaf".to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Whether a transcript file contains a record with this uuid.
+fn session_contains_uuid(path: &Path, uuid: &str) -> bool {
+    use std::io::BufRead;
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    for line in std::io::BufReader::new(f).lines() {
+        let Ok(line) = line else { break };
+        if let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) {
+            if rec.get("uuid").and_then(|v| v.as_str()) == Some(uuid) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// FALLBACK: shared-prefix. Reusing `sync::shared_prefix_len`, find the sibling whose opening record
+/// chain matches this session's longest before diverging - that sibling is the parent and the last
+/// shared uuid is the branch-point. Guards against false positives: the overlap must contain a real user
+/// prompt (unrelated sessions differ at their first prompt, so a boilerplate-only overlap is not a
+/// branch), and the two must actually diverge. The parent is the EARLIER session (by start timestamp,
+/// then id) so the edge is asymmetric and the DAG cannot cycle.
+fn detect_branch_prefix(rt: &str, text: &str, id: &str, siblings: &[(PathBuf, String)]) -> Option<(String, String, String)> {
+    let this_ir = crate::convo::read_conversation(rt, text).ok()?;
+    let this_end = last_timestamp(&this_ir);
+    let mut best: Option<(usize, String, String)> = None;
+    for (sp, sid) in siblings {
+        let stext = std::fs::read_to_string(sp).unwrap_or_default();
+        let Ok(sib_ir) = crate::convo::read_conversation(rt, &stext) else { continue };
+        let n = crate::sync::shared_prefix_len(&this_ir, &sib_ir);
+        if n == 0 {
+            continue;
+        }
+        // Must actually diverge: a full match on both sides is a copy, not a branch we can point at.
+        if n >= this_ir.events.len() && n >= sib_ir.events.len() {
+            continue;
+        }
+        if !prefix_has_prompt(&this_ir, n) {
+            continue; // boilerplate-only overlap (mode/permission records) - not a branch
+        }
+        // The parent is the earlier session; if the sibling is the later one, it branched from us. "Later"
+        // is judged by most-recent activity (the recency the store already orders sessions by), since a
+        // branch and its parent share their opening record and therefore its start timestamp.
+        if !sibling_is_parent(&last_timestamp(&sib_ir), &this_end, sid, id) {
+            continue;
+        }
+        let bp = this_ir
+            .events
+            .get(n - 1)
+            .and_then(|e| e.id.clone())
+            .or_else(|| sib_ir.events.get(n - 1).and_then(|e| e.id.clone()))?;
+        if best.as_ref().map(|(bn, _, _)| n > *bn).unwrap_or(true) {
+            best = Some((n, sid.clone(), bp));
+        }
+    }
+    best.map(|(_, p, b)| (p, b, "prefix".to_string()))
+}
+
+/// The last record timestamp in a conversation (its most recent activity), if any.
+fn last_timestamp(ir: &crate::convo::ConversationIR) -> Option<String> {
+    ir.events.iter().rev().find_map(|e| e.timestamp.clone())
+}
+
+/// Whether the sibling is the parent (the earlier session): earlier last-activity wins; a tie or
+/// missing timestamps fall back to the smaller id, so exactly one of any pair is the parent.
+fn sibling_is_parent(sib_end: &Option<String>, this_end: &Option<String>, sib_id: &str, this_id: &str) -> bool {
+    match (parse_rfc3339(sib_end), parse_rfc3339(this_end)) {
+        (Some(a), Some(b)) if a != b => a < b,
+        _ => sib_id < this_id,
+    }
+}
+
+fn parse_rfc3339(s: &Option<String>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(s.as_deref()?.trim()).ok()
+}
+
+/// Whether the first `n` records of a conversation contain any real user prompt.
+fn prefix_has_prompt(ir: &crate::convo::ConversationIR, n: usize) -> bool {
+    ir.events
+        .iter()
+        .take(n)
+        .any(|e| e.kinds.iter().any(|k| matches!(k, crate::convo::EventKind::UserPrompt(_))))
 }
 
 /// The store the convert worker acts on when capture has not routed anything yet: the agent this repo
@@ -2024,5 +2351,247 @@ mod resolve_runtime_tests {
         // claude default could never satisfy this test.
         assert_eq!(resolve_runtime(None, &["codex"], "snap").unwrap(), "codex");
         assert_eq!(resolve_runtime(None, &["claude-code"], "snap").unwrap(), "claude-code");
+    }
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+
+    fn write(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// A record with a real user prompt, wired into the parentUuid chain.
+    fn user(sid: &str, uuid: &str, parent: Option<&str>, ts: &str, content: &str) -> String {
+        let parent = parent.map(|p| format!("\"{p}\"")).unwrap_or_else(|| "null".into());
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{sid}\",\"uuid\":\"{uuid}\",\"parentUuid\":{parent},\"timestamp\":\"{ts}\",\"cwd\":\"/proj\",\"message\":{{\"role\":\"user\",\"content\":\"{content}\"}}}}"
+        )
+    }
+
+    fn assistant(sid: &str, uuid: &str, parent: &str, ts: &str, text: &str) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"sessionId\":\"{sid}\",\"uuid\":\"{uuid}\",\"parentUuid\":\"{parent}\",\"timestamp\":\"{ts}\",\"cwd\":\"/proj\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}"
+        )
+    }
+
+    // ── A. SUBAGENT ─────────────────────────────────────────────────────────────────────────────
+    // A captured session whose sub-thread lives under <id>/subagents/*.jsonl (the real Claude Code
+    // shape: isSidechain records + a .meta.json naming the spawning Task) records a { spawn, leaf }
+    // branch-point; the spawn resolves to the main-thread turn that issued that Task.
+
+    #[test]
+    fn subagent_from_subdir_records_spawn_turn_and_leaf() {
+        let d = tempfile::tempdir().unwrap();
+        let id = "S1";
+        let src = d.path().join(format!("{id}.jsonl"));
+        // Main thread: a user turn, then an assistant turn that issues a Task tool_use with a known id.
+        let spawn_turn = "spawn-uuid-1";
+        let task_id = "toolu_TASK123";
+        let main = format!(
+            "{}\n{{\"type\":\"assistant\",\"sessionId\":\"{id}\",\"uuid\":\"{spawn_turn}\",\"parentUuid\":\"u1\",\"timestamp\":\"2026-07-20T10:00:01.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"{task_id}\",\"name\":\"Task\",\"input\":{{\"description\":\"do work\"}}}}]}}}}\n",
+            user(id, "u1", None, "2026-07-20T10:00:00.000Z", "please do the thing"),
+        );
+        write(&src, &main);
+        // The sub-thread transcript + its meta, under <id>/subagents/.
+        let sub = d.path().join(id).join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_leaf = "sub-leaf-9";
+        let sub_body = format!(
+            "{{\"type\":\"user\",\"uuid\":\"sub-1\",\"parentUuid\":null,\"isSidechain\":true,\"sessionId\":\"{id}\",\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"assistant\",\"uuid\":\"{sub_leaf}\",\"parentUuid\":\"sub-1\",\"isSidechain\":true,\"sessionId\":\"{id}\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}\n"
+        );
+        write(&sub.join("agent-x.jsonl"), &sub_body);
+        write(
+            &sub.join("agent-x.meta.json"),
+            &format!("{{\"agentType\":\"general-purpose\",\"toolUseId\":\"{task_id}\",\"name\":\"x\"}}"),
+        );
+
+        let lin = detect_lineage("claude-code", &src, id, &[]);
+        assert_eq!(lin.subagents.len(), 1, "one sub-thread must be recorded: {lin:?}");
+        let sa = &lin.subagents[0];
+        assert_eq!(sa.spawn, spawn_turn, "spawn resolves to the main-thread Task turn");
+        assert_eq!(sa.leaf, sub_leaf, "leaf is the sub-thread's last record");
+        assert!(lin.parent.is_none(), "a subagent host is still a root unless it also branched");
+    }
+
+    #[test]
+    fn subagent_inline_sidechain_run_is_detected() {
+        // Older shape: sidechain records inline in the transcript. The run is attributed to the Task turn
+        // that precedes it, and its leaf is the run's last record.
+        let d = tempfile::tempdir().unwrap();
+        let id = "S1";
+        let src = d.path().join(format!("{id}.jsonl"));
+        let body = format!(
+            "{}\n\
+             {{\"type\":\"assistant\",\"sessionId\":\"{id}\",\"uuid\":\"spawn-2\",\"parentUuid\":\"u1\",\"timestamp\":\"2026-07-20T10:00:01.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_T\",\"name\":\"Task\",\"input\":{{}}}}]}}}}\n\
+             {{\"type\":\"user\",\"uuid\":\"sc-1\",\"parentUuid\":null,\"isSidechain\":true,\"sessionId\":\"{id}\",\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"assistant\",\"uuid\":\"sc-leaf\",\"parentUuid\":\"sc-1\",\"isSidechain\":true,\"sessionId\":\"{id}\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}\n\
+             {{\"type\":\"user\",\"sessionId\":\"{id}\",\"uuid\":\"u3\",\"parentUuid\":\"spawn-2\",\"timestamp\":\"2026-07-20T10:00:05.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"thanks\"}}}}\n",
+            user(id, "u1", None, "2026-07-20T10:00:00.000Z", "do it"),
+        );
+        write(&src, &body);
+        let lin = detect_lineage("claude-code", &src, id, &[]);
+        assert_eq!(lin.subagents.len(), 1, "{lin:?}");
+        assert_eq!(lin.subagents[0].spawn, "spawn-2");
+        assert_eq!(lin.subagents[0].leaf, "sc-leaf");
+    }
+
+    #[test]
+    fn no_sidechain_records_no_subagents() {
+        let d = tempfile::tempdir().unwrap();
+        let id = "S1";
+        let src = d.path().join(format!("{id}.jsonl"));
+        write(
+            &src,
+            &format!(
+                "{}\n{}\n",
+                user(id, "u1", None, "2026-07-20T10:00:00.000Z", "hello"),
+                assistant(id, "u2", "u1", "2026-07-20T10:00:01.000Z", "hi"),
+            ),
+        );
+        let lin = detect_lineage("claude-code", &src, id, &[]);
+        assert!(lin.subagents.is_empty(), "a session with no sidechains records none: {lin:?}");
+    }
+
+    // ── B. /branch PREFIX ───────────────────────────────────────────────────────────────────────
+    // Two sessions sharing an identical opening prefix (same record uuids, re-stamped session id - what
+    // a runtime /branch leaves) that then diverge: the later one records { parent, branch_point,
+    // detected_by:"prefix" }, and the earlier one stays a root.
+
+    #[test]
+    fn branch_prefix_links_the_later_session_to_its_parent() {
+        let d = tempfile::tempdir().unwrap();
+        // Shared opening prefix: u1 (user prompt) + u2 (assistant). Parent PAR diverges at u3a; child
+        // CHILD carries the same prefix (session id re-stamped to CHILD) and diverges at u3b later.
+        let shared_user = |sid: &str| user(sid, "u1", None, "2026-07-20T09:00:00.000Z", "build a parser");
+        let shared_asst = |sid: &str| assistant(sid, "u2", "u1", "2026-07-20T09:00:01.000Z", "starting");
+
+        let par_src = d.path().join("PAR.jsonl");
+        write(
+            &par_src,
+            &format!(
+                "{}\n{}\n{}\n",
+                shared_user("PAR"),
+                shared_asst("PAR"),
+                user("PAR", "u3a", Some("u2"), "2026-07-20T09:00:02.000Z", "use recursive descent"),
+            ),
+        );
+        let child_src = d.path().join("CHILD.jsonl");
+        write(
+            &child_src,
+            &format!(
+                "{}\n{}\n{}\n",
+                shared_user("CHILD"),
+                shared_asst("CHILD"),
+                user("CHILD", "u3b", Some("u2"), "2026-07-20T10:00:00.000Z", "use a PEG grammar instead"),
+            ),
+        );
+
+        // The later session (CHILD) sees PAR as a sibling and records the branch.
+        let lin = detect_lineage("claude-code", &child_src, "CHILD", &[(par_src.clone(), "PAR".into())]);
+        assert_eq!(lin.parent.as_deref(), Some("PAR"), "child links to the earlier parent: {lin:?}");
+        assert_eq!(lin.detected_by.as_deref(), Some("prefix"));
+        assert_eq!(lin.branch_point.as_deref(), Some("u2"), "branch point is the last shared uuid");
+
+        // The earlier session (PAR) does NOT record CHILD as its parent - the edge is asymmetric.
+        let lin_par = detect_lineage("claude-code", &par_src, "PAR", &[(child_src, "CHILD".into())]);
+        assert!(lin_par.parent.is_none(), "the earlier session stays a root: {lin_par:?}");
+    }
+
+    #[test]
+    fn unrelated_sessions_with_different_openings_are_not_a_branch() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("A.jsonl");
+        let b = d.path().join("B.jsonl");
+        write(&a, &format!("{}\n", user("A", "u1", None, "2026-07-20T09:00:00.000Z", "fix the login bug")));
+        write(&b, &format!("{}\n", user("B", "u1", None, "2026-07-20T10:00:00.000Z", "write release notes")));
+        let lin = detect_lineage("claude-code", &b, "B", &[(a, "A".into())]);
+        assert!(lin.parent.is_none(), "different opening prompts are not a branch: {lin:?}");
+    }
+
+    // ── C. /branch LEAF ─────────────────────────────────────────────────────────────────────────
+    // SKIPPED as a real-data test: no `type:summary` record exists in any dump under ~/.claude/projects,
+    // and every `leafUuid` (carried by `last-prompt` records) resolves within its OWN session - never
+    // cross-session. The exact cross-session leaf link could not be confirmed, so per the task it is not
+    // faked. The resolver below is still exercised to prove it fires ONLY on a genuine cross-session link
+    // and correctly ignores the same-session bookmark that real dumps actually contain.
+
+    #[test]
+    fn leaf_link_fires_only_across_sessions_never_on_a_same_session_bookmark() {
+        let d = tempfile::tempdir().unwrap();
+        let parent = d.path().join("PAR.jsonl");
+        write(
+            &parent,
+            &format!("{}\n", user("PAR", "shared-leaf", None, "2026-07-20T09:00:00.000Z", "start here")),
+        );
+        // A same-session bookmark: leafUuid points at this session's OWN uuid → not a branch.
+        let self_bookmark = d.path().join("SELF.jsonl");
+        write(
+            &self_bookmark,
+            &format!(
+                "{}\n{{\"type\":\"last-prompt\",\"sessionId\":\"SELF\",\"leafUuid\":\"own-1\"}}\n",
+                user("SELF", "own-1", None, "2026-07-20T09:30:00.000Z", "keep going"),
+            ),
+        );
+        let lin_self = detect_lineage("claude-code", &self_bookmark, "SELF", &[(parent.clone(), "PAR".into())]);
+        assert!(lin_self.parent.is_none(), "a same-session bookmark is not a branch: {lin_self:?}");
+
+        // A genuine cross-session link: leafUuid resolves into PAR's uuid → detected_by:"leaf".
+        let branched = d.path().join("BR.jsonl");
+        write(
+            &branched,
+            &format!(
+                "{{\"type\":\"summary\",\"leafUuid\":\"shared-leaf\"}}\n{}\n",
+                user("BR", "b1", None, "2026-07-20T10:00:00.000Z", "diverge now"),
+            ),
+        );
+        let lin = detect_lineage("claude-code", &branched, "BR", &[(parent, "PAR".into())]);
+        assert_eq!(lin.parent.as_deref(), Some("PAR"), "cross-session leaf link resolves to the parent: {lin:?}");
+        assert_eq!(lin.detected_by.as_deref(), Some("leaf"));
+        assert_eq!(lin.branch_point.as_deref(), Some("shared-leaf"));
+    }
+
+    // ── D. ROOT ─────────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_lone_session_is_a_root_with_null_parent_and_no_subagents() {
+        let d = tempfile::tempdir().unwrap();
+        let id = "ONLY";
+        let src = d.path().join(format!("{id}.jsonl"));
+        write(
+            &src,
+            &format!(
+                "{}\n{}\n",
+                user(id, "u1", None, "2026-07-20T10:00:00.000Z", "hello"),
+                assistant(id, "u2", "u1", "2026-07-20T10:00:01.000Z", "hi"),
+            ),
+        );
+        let lin = detect_lineage("claude-code", &src, id, &[]);
+        assert_eq!(lin, Lineage::default(), "a lone session is a pure root: {lin:?}");
+        // And the committed shape carries explicit nulls + an empty list (round-trips through the reader).
+        let j = lin.to_json();
+        assert!(j.get("parent").unwrap().is_null());
+        assert!(j.get("subagents").unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_lineage_round_trips_and_missing_sidecar_is_a_root() {
+        let d = tempfile::tempdir().unwrap();
+        let transcript = d.path().join("X.jsonl");
+        write(&transcript, "{}\n");
+        // No sidecar yet → root.
+        assert_eq!(read_lineage(&transcript), Lineage::default());
+        // Write a sidecar carrying a full lineage and read it back.
+        let lin = Lineage {
+            parent: Some("PAR".into()),
+            branch_point: Some("bp-1".into()),
+            detected_by: Some("prefix".into()),
+            subagents: vec![Subagent { spawn: "sp".into(), leaf: "lf".into() }],
+        };
+        let side = crate::commands::sidecar_path(&transcript);
+        write(&side, &format!("{{\"lineage\":{}}}", lin.to_json()));
+        assert_eq!(read_lineage(&transcript), lin, "lineage survives a write/read round-trip");
     }
 }
