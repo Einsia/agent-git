@@ -48,4 +48,4 @@ LLM 后端只做一件事：在 `agit a merge` 结束时综合出冲突清单（
 
 您推送或 rebind 所针对的 URL 中的凭据，会在进入 `.agit.toml` 之前被剥除。含令牌的完整 URL 只保留在存储库本地的 git 配置里。
 
-文件内的 `agit:allow-secret` 编译指示把单独一行标记为误报，是 `.agit-allow-secrets` 白名单在行级别上的对应物。两者都在[不让密钥进入共享历史](secrets.html)中一并说明。
+文件内的 `agit:allow-secret` 行内指令把单独一行标记为误报，是 `.agit-allow-secrets` 白名单在行级别上的对应物。两者都在[不让密钥进入共享历史](secrets.html)中一并说明。
