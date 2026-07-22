@@ -172,3 +172,118 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ── Rendered markdown (the session conversation turns). Typography for a transcript turn: readable
+   prose with fenced code in an inset readout well. All wide content (code, tables) scrolls inside its
+   own box so the page body never scrolls sideways. Attacker-authored content — no raw HTML is ever
+   emitted by the renderer, so this only has to style the safe element set react-markdown produces. */
+.md {
+  font-size: 0.92rem;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.md > :first-child {
+  margin-top: 0;
+}
+.md > :last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0.5rem 0;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  margin: 1rem 0 0.5rem;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.md h1 {
+  font-size: 1.25rem;
+}
+.md h2 {
+  font-size: 1.12rem;
+}
+.md h3 {
+  font-size: 1rem;
+}
+.md ul,
+.md ol {
+  margin: 0.5rem 0;
+  padding-left: 1.4rem;
+}
+.md ul {
+  list-style: disc;
+}
+.md ol {
+  list-style: decimal;
+}
+.md li {
+  margin: 0.2rem 0;
+}
+.md li > input[type="checkbox"] {
+  margin-right: 0.4rem;
+}
+.md a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.md blockquote {
+  margin: 0.6rem 0;
+  border-left: 2px solid var(--border);
+  padding-left: 0.8rem;
+  color: var(--muted-foreground);
+}
+.md hr {
+  margin: 1rem 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+/* Inline code: a subtle mono chip. */
+.md :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.84em;
+  background: var(--muted);
+  color: var(--card-foreground);
+  padding: 0.1rem 0.32rem;
+  border-radius: 0.25rem;
+}
+/* Fenced code block: an inset readout well that scrolls horizontally on its own. */
+.md pre {
+  margin: 0.6rem 0;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--muted);
+  overflow-x: auto;
+}
+.md pre code {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.55;
+  white-space: pre;
+}
+/* GFM tables: wrapped in .md-scroll by the renderer so a wide table scrolls, not the page. */
+.md-scroll {
+  overflow-x: auto;
+  margin: 0.6rem 0;
+}
+.md table {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.md th,
+.md td {
+  border: 1px solid var(--border);
+  padding: 0.3rem 0.55rem;
+  text-align: left;
+}
+.md th {
+  background: var(--muted);
+  font-weight: 600;
+}
+.md img {
+  max-width: 100%;
+}

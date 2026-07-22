@@ -40,6 +40,15 @@ pub(crate) fn api_session(repo: &Path, id: &str, query: &str) -> Resp {
     };
     let d = digest(&r.runtime, &r.id, &jsonl);
     let p = provenance(repo, &r.path, &jsonl);
+    // The ordered conversation — the readable back-and-forth the SPA renders as markdown. Built from the
+    // same ordered event walk the spine/digest use, so the interleaving (user, assistant, user, …) is
+    // preserved instead of being flattened into two separate lists.
+    let t = extract_turns(&r.runtime, &jsonl);
+    let turns: Vec<serde_json::Value> = t
+        .turns
+        .iter()
+        .map(|turn| serde_json::json!({ "role": turn.role, "text": turn.text, "tools": turn.tools }))
+        .collect();
     let revisions: Vec<serde_json::Value> = session_revisions(repo, &r.path)
         .into_iter()
         .map(|(sha, when, subject)| serde_json::json!({ "sha": sha, "when": when, "subject": subject }))
@@ -57,6 +66,8 @@ pub(crate) fn api_session(repo: &Path, id: &str, query: &str) -> Resp {
         "commit": p.commit,
         "prompts": d.prompts.iter().map(|s| first_line(s)).collect::<Vec<_>>(),
         "texts": d.texts.iter().rev().take(8).rev().map(|t| clip(t, 700)).collect::<Vec<_>>(),
+        "turns": turns,
+        "turns_capped": t.capped,
         "files": d.files,
         "spine": spine_string(&r.runtime, &jsonl),
         "revisions": revisions,
