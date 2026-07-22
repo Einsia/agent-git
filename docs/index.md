@@ -3,6 +3,8 @@ title: Home
 nav_order: 1
 ---
 
+English | [中文](zh/index.html)
+
 # agit
 
 agit saves each coding session your AI agent produces (what the agent read, ran, and changed) into a
