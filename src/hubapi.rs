@@ -441,6 +441,77 @@ pub fn hub_web_base(url: &str) -> Option<String> {
     parse_http_url(url).ok().map(|(base, _)| base)
 }
 
+/// The `host[:port]` authority of a hub URL — the key `agit a push` scopes git's credential helper to
+/// (`credential.https://<host>.helper=...`). `None` for a non-http(s) URL (ssh / local path / bare name),
+/// which has no hub host. Credential-free by construction.
+pub fn hub_host(url: &str) -> Option<String> {
+    let (base, _) = parse_http_url(url).ok()?;
+    // base is `scheme://host[:port]`; the authority is everything after the scheme separator.
+    base.split_once("://").map(|(_, host)| host.to_string())
+}
+
+/// Mint a short-lived bearer token from THIS machine's ENROLLED ed25519 key via the hub's key-auth
+/// handshake: `GET {base}/api/auth/challenge` for a nonce, sign the canonical assertion
+/// ([`crate::agent::identity_auth_message`]) with the machine signing key, then `POST {base}/api/auth/key`
+/// and read back the minted token. `base` is `scheme://host[:port]` (no path).
+///
+/// Every failure — the key is not enrolled, the hub 401s, the hub is unreachable, the CSPRNG/clock is
+/// unavailable — is a plain `None`, so the credential helper prints nothing and git falls back to its
+/// normal Basic prompt. A push must NEVER hard-fail because of this path.
+///
+/// Returns `(token, expires_at)` where `expires_at` is the hub's unix-seconds expiry for the minted
+/// token (0 if the hub omitted it), so the caller can cache it until shortly before it lapses.
+pub fn mint_key_token(base: &str, username: &str) -> Option<(String, i64)> {
+    let base = base.trim_end_matches('/');
+    let sk = crate::agent::machine_signing_key().ok()?;
+    let ed_pub = hex::encode(sk.verifying_key().to_bytes());
+
+    // 1. Challenge: fetch a single-use nonce.
+    let challenge_url = format!("{base}/api/auth/challenge");
+    let mut resp = http_agent().get(&challenge_url).call().ok()?;
+    if resp.status().as_u16() != 200 {
+        return None;
+    }
+    let text = resp.body_mut().read_to_string().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let nonce = v.get("nonce")?.as_str()?.to_string();
+
+    // 2. Sign: bind the assertion to THIS hub (audience == base) with a near-future expiry (clock skew
+    // slack, well within the hub's accepted window). Unix seconds from the system clock.
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64
+        + 60;
+    let msg = crate::agent::identity_auth_message(base, username, &ed_pub, &nonce, expiry);
+    let sig = crate::agent::sign_hex(&sk, &msg);
+
+    // 3. Exchange: POST the signed assertion, read back the minted token.
+    let key_url = format!("{base}/api/auth/key");
+    let payload = serde_json::json!({
+        "username": username,
+        "ed25519_pub": ed_pub,
+        "nonce": nonce,
+        "audience": base,
+        "expiry": expiry,
+        "sig": sig,
+    });
+    let body = serde_json::to_string(&payload).ok()?;
+    let mut resp = http_agent()
+        .post(&key_url)
+        .header("Content-Type", "application/json")
+        .send(&body)
+        .ok()?;
+    if resp.status().as_u16() != 200 {
+        return None;
+    }
+    let text = resp.body_mut().read_to_string().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let token = v.get("token").and_then(|t| t.as_str())?.to_string();
+    let expires_at = v.get("expires_at").and_then(|e| e.as_i64()).unwrap_or(0);
+    Some((token, expires_at))
+}
+
 fn parse_http_url(url: &str) -> Result<(String, Option<Auth>)> {
     let url = url.trim();
     let (scheme, rest) = url

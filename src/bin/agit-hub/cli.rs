@@ -674,11 +674,19 @@ async fn token_cmd_async(root: &Path, args: &[String]) -> i32 {
 /// Issue a token: generate a 32-byte CSPRNG plaintext and store only its sha256 digest. Returns the
 /// plaintext (this once, and never again).
 pub(crate) async fn issue_token(store: &Store, name: &str, owner: &str, agent: Option<&str>, scope: Scope, ttl_days: Option<i64>) -> Result<String, String> {
+    // Day-granular is the CLI's contract; delegate to the Duration-granular mint so the two never drift.
+    issue_token_ttl(store, name, owner, agent, scope, ttl_days.map(chrono::Duration::days)).await
+}
+
+/// [`issue_token`] with an arbitrary-granularity TTL. Factored out so the key-auth handler can mint a
+/// MINUTES-lived token (`chrono::Duration::minutes(...)`) through the same tokens-table INSERT the CLI
+/// uses for day-lived ones — no schema change, no second code path. `ttl: None` means never expires.
+pub(crate) async fn issue_token_ttl(store: &Store, name: &str, owner: &str, agent: Option<&str>, scope: Scope, ttl: Option<chrono::Duration>) -> Result<String, String> {
     // If the CSPRNG is unavailable, **error out** — never fall back to predictable time values to
     // mint credentials.
     let secret = kdf::gen_secret().map_err(|e| format!("refusing to issue a token: {e}"))?;
     let id = store::new_token_id().map_err(|e| format!("refusing to issue a token: {e}"))?;
-    let expires = ttl_days.map(|d| (chrono::Utc::now() + chrono::Duration::days(d)).format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    let expires = ttl.map(|d| (chrono::Utc::now() + d).format("%Y-%m-%dT%H:%M:%SZ").to_string());
     let rec = TokenRec {
         id,
         name: name.to_string(),

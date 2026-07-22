@@ -31,6 +31,13 @@ pub(crate) struct Cfg {
     /// user creation), and opening account creation to anyone who can reach the port must be a
     /// deliberate opt-in. Enabled via `AGIT_HUB_REGISTRATION` or `--open-registration`.
     pub(crate) registration: bool,
+    /// This hub's own canonical base URL (`scheme://host[:port]`, no path), when the operator has
+    /// configured one via `AGIT_HUB_PUBLIC_URL`. It is the AUTHORITATIVE audience the key-auth handler
+    /// (`POST /api/auth/key`) checks a signed assertion against: a configured value is server-controlled
+    /// and CANNOT be spoofed by a request header, so a signature captured for this hub can never be
+    /// replayed to a different hub. When unset the handler falls back to the request `Host` (see
+    /// `keyauth::canonical_audience`), which is best-effort only — pin this on any multi-hub deployment.
+    pub(crate) public_url: Option<String>,
 }
 
 /// All the shared state one request needs. Wrapped in a single Arc so [`Ctx`] is cheap to clone into
@@ -67,6 +74,11 @@ pub(crate) struct CtxInner {
     /// a hub with hub-assist escrow ENABLED for an org has, by design, chosen to trust the hub with the
     /// ability to release those sessions' keys under the ACL gate.
     pub(crate) escrow: EscrowKeypair,
+    /// The in-memory, single-use challenge nonces for KEY-BASED auth (`GET /api/auth/challenge` +
+    /// `POST /api/auth/key`). Deliberately NOT a table/column: nonces live ~60s and must never touch the
+    /// schema-migration path (the known live-Postgres crash-loop risk). Behind an `Arc` so every handler
+    /// shares one store; pruned lazily on access.
+    pub(crate) auth_nonces: Arc<crate::keyauth::AuthNonces>,
 }
 
 /// The hub's escrow keypair. `secret` is a raw 32-byte X25519 scalar (clamped on use via `mul_clamped`);
@@ -164,6 +176,12 @@ pub(crate) fn serve_cmd(root: &Path, args: &[String]) -> i32 {
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "open" | "yes"))
         .unwrap_or(false)
         || has_flag(args, "--open-registration");
+    // The hub's own canonical base URL, if the operator pins one. It anchors the key-auth audience check
+    // (see `Cfg::public_url`). A trailing slash is trimmed so it compares equal to a client's path-free base.
+    let public_url = flag(args, "--public-url")
+        .or_else(|| std::env::var("AGIT_HUB_PUBLIC_URL").ok())
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
     if let Err(e) = bind_guard(host, tls, insecure) {
         eprintln!("{e}");
         return 2;
@@ -172,7 +190,7 @@ pub(crate) fn serve_cmd(root: &Path, args: &[String]) -> i32 {
         println!("note: --private is no longer needed — visibility is now a **per-agent** property, and new agents are private by default.");
         println!("      To publish one agent: `agit-hub add <name> --public`, or change it in the UI.");
     }
-    serve(root, Cfg { host, port, tls, insecure, trusted_proxies, registration })
+    serve(root, Cfg { host, port, tls, insecure, trusted_proxies, registration, public_url })
 }
 
 /// The safety gate before bind (pure function, easy to test).
@@ -344,6 +362,7 @@ pub(crate) fn serve(root: &Path, cfg: Cfg) -> i32 {
             register_rl: Arc::new(TokenBuckets::with_rate(REGISTER_RATE_PER_SEC, REGISTER_BURST)),
             metrics: Arc::new(Metrics::new()),
             escrow,
+            auth_nonces: Arc::new(crate::keyauth::AuthNonces::new()),
         }));
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,

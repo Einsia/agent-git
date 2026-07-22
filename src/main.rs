@@ -17,7 +17,7 @@
 #![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 // Core logic lives in the lib (crate `agit`), shared with agit-hub, so the two bins don't each write their own parsing and drift apart.
 use agit::scope::{self, Scope};
-use agit::{commands, debug, harness, init, passthrough, session, sync, ui, view};
+use agit::{commands, credential, debug, harness, init, passthrough, session, sync, ui, view};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -357,6 +357,12 @@ fn dispatch(argv: Vec<String>) -> i32 {
         //    (encryption-recipients Wave 1). `enroll [--rotate]` derives the ed25519 + X25519 halves,
         //    self-signs, and upserts the caller's own row; `show [<user>]` prints fingerprints. ──
         "identity" => commands::identity_cmd(args),
+
+        // ── credential: git's credential-helper protocol for HUB hosts. git invokes this (never a
+        //    human) as `agit credential <get|store|erase>`, wired by `agit a push` scoped to the hub
+        //    host. `get` mints a short-lived token from the enrolled key; non-hub hosts print nothing so
+        //    git falls through to its normal helpers. Scope-independent (git runs it, from anywhere). ──
+        "credential" => credential::credential_cmd(args),
 
         // ── hub: hub-side operations beyond per-agent git. `hub team rekey <org>` rotates the org's
         //    Team KEK (gen++, re-seals to members); `hub team sync <org>` seals the current TK to members
@@ -1194,6 +1200,13 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
         return Ok(1);
     }
 
+    // Key-based hub auth: teach git to run `agit credential` for THIS machine's hub host(s), so a push
+    // authenticates with the enrolled ed25519 key (auto-minting a short-lived token) instead of a
+    // copy-pasted one. Scoped to `credential.https://<hubhost>.helper` per host, so github/gitlab/other
+    // remotes are UNTOUCHED — git only consults the helper for a matching host. Built ONCE here and
+    // prepended to every push exec below (the one place the push git is actually run).
+    let cred_args = credential_helper_args(&credential::hub_hosts());
+
     // Inherited stdio throughout: a push is where credential helpers prompt, and capturing would both
     // swallow git's errors and block the prompt. `--no-verify` skips git's now-redundant pre-push hook
     // (we just gated the tree); the hook stays installed for a raw `git push`.
@@ -1201,7 +1214,8 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
         // (a) Targeted single push — the command's identity anchor. Any positional refspec the user
         // typed (`--to hub main`, `--to hub HEAD:review`) rides along AFTER the remote name, so a
         // targeted push is not silently narrowed to a bare `git push <remote>`.
-        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        let mut pa: Vec<&str> = cred_args.iter().map(String::as_str).collect();
+        pa.extend(["push", "--no-verify"]);
         pa.extend(flags.iter().map(String::as_str));
         pa.push(&name);
         pa.extend(positionals.iter().map(String::as_str));
@@ -1218,7 +1232,8 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
         // `origin HEAD:x`) is passed through verbatim — untouched.
         let default_refspec: Option<String> =
             (positionals.len() == 1).then(|| current_branch(&a.store));
-        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        let mut pa: Vec<&str> = cred_args.iter().map(String::as_str).collect();
+        pa.extend(["push", "--no-verify"]);
         pa.extend(flags.iter().map(String::as_str));
         pa.extend(positionals.iter().map(String::as_str));
         if let Some(spec) = default_refspec.as_deref() {
@@ -1232,7 +1247,7 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
     } else {
         // (c) Bare push — fan out to every configured remote. A per-remote rejection is reported but
         // never fatal; the exit reflects the PRIMARY remote's push (always recorded after the loop).
-        (push_fanout(&a, &flags), true)
+        (push_fanout(&a, &flags, &cred_args), true)
     };
 
     // Reconcile ALL of the store's remotes into the binding, only inside an environment — a bare store
@@ -1293,17 +1308,39 @@ fn hub_auth_hint_url(url: &str) {
     }
 }
 
+/// The `-c credential.https://<host>.helper=<exe> credential` git options that make git run THIS binary
+/// as its credential helper for each hub `host`. Uses the current executable's absolute path (via
+/// `std::env::current_exe`) so it resolves even when `agit` is not on `PATH`. Empty when the exe can't be
+/// found or there are no hub hosts, in which case the push runs exactly as before. Scoped per host, so a
+/// non-hub remote (github/gitlab) never triggers the helper — git only consults it for a matching host.
+fn credential_helper_args(hosts: &[String]) -> Vec<String> {
+    let Ok(exe) = std::env::current_exe() else {
+        return vec![];
+    };
+    let exe = exe.display().to_string();
+    let mut out = Vec::new();
+    for host in hosts {
+        out.push("-c".to_string());
+        // git parses the helper value as a command line, so the exe path plus the `credential` subcommand
+        // is invoked as `<exe> credential <get|store|erase>`.
+        out.push(format!("credential.https://{host}.helper={exe} credential"));
+    }
+    out
+}
+
 /// Fan a bare `agit a push` out to every git remote the store has: an explicit `<name> <branch>`
 /// refspec per remote (a freshly `remote add`-ed hub has no upstream, so a bare `git push <name>` under
 /// `push.default=simple` would error). Each remote's TARGET is announced (credentials redacted) before
 /// the push and its success/failure printed after; a per-remote failure is non-fatal. The returned exit
 /// is the PRIMARY remote's push code — the command's identity anchor.
-fn push_fanout(a: &agit::agent::Agent, flags: &[String]) -> i32 {
+fn push_fanout(a: &agit::agent::Agent, flags: &[String], cred_args: &[String]) -> i32 {
     use agit::agent;
+    let cred: Vec<&str> = cred_args.iter().map(String::as_str).collect();
     let remotes = agent::store_remotes(&a.store);
     // No remotes: fall back to today's plain push (whatever upstream the store has, or git's own error).
     if remotes.is_empty() {
-        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        let mut pa: Vec<&str> = cred.clone();
+        pa.extend(["push", "--no-verify"]);
         pa.extend(flags.iter().map(String::as_str));
         return scope::git_in_inherit(&a.store, &pa);
     }
@@ -1311,7 +1348,8 @@ fn push_fanout(a: &agit::agent::Agent, flags: &[String]) -> i32 {
     let branch = branch.trim().to_string();
     // A detached HEAD (or a failed rev-parse) has no branch to fan out; fall back to a plain push.
     if bcode != 0 || branch.is_empty() || branch == "HEAD" {
-        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        let mut pa: Vec<&str> = cred.clone();
+        pa.extend(["push", "--no-verify"]);
         pa.extend(flags.iter().map(String::as_str));
         return scope::git_in_inherit(&a.store, &pa);
     }
@@ -1321,7 +1359,8 @@ fn push_fanout(a: &agit::agent::Agent, flags: &[String]) -> i32 {
         // Announce the target BEFORE the push so the multi-remote fan-out is never a surprise; the URL
         // is redacted so a credential in it never reaches the terminal or CI logs.
         println!("→ pushing to {name} ({})", agit::hubapi::redact_url(url));
-        let mut pa: Vec<&str> = vec!["push", "--no-verify"];
+        let mut pa: Vec<&str> = cred.clone();
+        pa.extend(["push", "--no-verify"]);
         pa.extend(flags.iter().map(String::as_str));
         pa.push(name.as_str());
         pa.push(&branch);

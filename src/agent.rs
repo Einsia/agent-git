@@ -1611,7 +1611,7 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
 // Cross-team pubkey→person trust is the hub's job (out of scope here). What lives here is client-side:
 // mint the key, sign a session's digest, and self-verify a recorded signature against its own pubkey.
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 /// `$AGIT_HOME/identity/` — where the machine keypair lives, spanning every repo like `launches.jsonl`.
 fn identity_dir(home: &Path) -> PathBuf {
@@ -1701,7 +1701,11 @@ pub fn verify_hex(pubkey_hex: &str, message: &[u8], sig_hex: &str) -> bool {
     let Ok(sig_raw) = hex::decode(sig_hex.trim()) else { return false };
     let Ok(sig_bytes) = <[u8; 64]>::try_from(sig_raw.as_slice()) else { return false };
     let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    vk.verify(message, &sig).is_ok()
+    // verify_strict, not verify: reject non-canonical S and small-order/torsion public keys, so a
+    // captured signature cannot be malleated into a second "valid" one over the same message. Every
+    // signature agit itself produces (deterministic ed25519 via sign_hex) is canonical and still
+    // verifies, so this is strictly a hardening for both the auth handshake and provenance.
+    vk.verify_strict(message, &sig).is_ok()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1764,6 +1768,28 @@ pub fn machine_x25519_pubkey_hex() -> Result<String> {
 /// a valid one for a key it does not hold.
 pub fn identity_enroll_message(username: &str, epoch: i64, ed25519_pub: &str, x25519_pub: &str) -> Vec<u8> {
     format!("agit-identity-enroll-v1\n{username}\n{epoch}\n{ed25519_pub}\n{x25519_pub}").into_bytes()
+}
+
+/// The exact bytes signed by a KEY-AUTH assertion: the client proves it holds the private ed25519 key
+/// for `ed25519_pub` by signing a fresh server nonce, and the hub re-computes and verifies these same
+/// bytes to mint a short-lived bearer token (see the hub's `POST /api/auth/key`). This is the HTTPS
+/// analog of pushing with an SSH key: possession of the enrolled key, not a copy-pasted token.
+///
+/// The `agit-hub-auth-v1` prefix DOMAIN-SEPARATES it from [`identity_enroll_message`]
+/// (`agit-identity-enroll-v1`) and every other agit signature: an enroll signature can never verify as
+/// an auth signature and vice-versa, because the first framed line differs. The fields are joined by
+/// newlines, unambiguous because a username has no newline (see `valid_username`), the pubkey and nonce
+/// are hex, the audience is a URL (no newline), and the expiry is decimal. Field order is FIXED:
+/// `audience`, `username`, `ed25519_pub`, `nonce`, `expiry`.
+///
+/// - `audience` binds the assertion to ONE hub (its canonical base URL), so a captured signature cannot
+///   be replayed to a different hub.
+/// - `nonce` is the hub's single-use challenge, so a captured signature cannot be replayed to the SAME
+///   hub after the nonce is consumed or expires.
+/// - `expiry` (client-set unix seconds) bounds how long the assertion is valid even before the nonce
+///   times out.
+pub fn identity_auth_message(audience: &str, username: &str, ed25519_pub: &str, nonce: &str, expiry: i64) -> Vec<u8> {
+    format!("agit-hub-auth-v1\n{audience}\n{username}\n{ed25519_pub}\n{nonce}\n{expiry}").into_bytes()
 }
 
 #[cfg(test)]
@@ -1843,6 +1869,34 @@ mod tests {
         let h2 = tmp();
         let sk2 = load_or_create_signing_key(h2.path()).unwrap();
         assert_ne!(pub_from_scalar, x25519_public_from_secret(&derive_x25519_secret(&sk2)), "distinct identities differ");
+    }
+
+    /// The key-auth assertion is DOMAIN-SEPARATED from the enroll message: the two share no prefix, so
+    /// an enroll signature can never be replayed as an auth signature (and vice-versa). A cross-verify
+    /// must fail even when every field the two messages have in common is identical.
+    #[test]
+    fn auth_message_is_domain_separated_from_enroll() {
+        let h = tmp();
+        let sk = load_or_create_signing_key(h.path()).unwrap();
+        let pk = hex::encode(sk.verifying_key().to_bytes());
+        let x_pub = hex::encode(x25519_public_from_secret(&derive_x25519_secret(&sk)));
+
+        // The two messages start with DISTINCT fixed prefixes — the whole point of the separation.
+        let auth = identity_auth_message("https://hub.example", "alice", &pk, "deadbeef", 42);
+        let enroll = identity_enroll_message("alice", 42, &pk, &x_pub);
+        assert!(auth.starts_with(b"agit-hub-auth-v1\n"), "auth carries its own version prefix");
+        assert!(enroll.starts_with(b"agit-identity-enroll-v1\n"), "enroll carries its own version prefix");
+        assert_ne!(auth, enroll, "the two canonical messages must never coincide");
+
+        // A signature over the ENROLL bytes must NOT verify as an AUTH signature.
+        let enroll_sig = sign_hex(&sk, &enroll);
+        assert!(verify_hex(&pk, &enroll, &enroll_sig), "the enroll sig verifies over enroll bytes");
+        assert!(!verify_hex(&pk, &auth, &enroll_sig), "an enroll sig must NOT verify as an auth sig");
+
+        // ...and the reverse: an AUTH signature must NOT verify as an ENROLL signature.
+        let auth_sig = sign_hex(&sk, &auth);
+        assert!(verify_hex(&pk, &auth, &auth_sig), "the auth sig verifies over auth bytes");
+        assert!(!verify_hex(&pk, &enroll, &auth_sig), "an auth sig must NOT verify as an enroll sig");
     }
 
     #[test]

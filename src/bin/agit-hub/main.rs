@@ -11,6 +11,7 @@ mod doctor;
 mod emailverify;
 mod gitplumb;
 mod http;
+mod keyauth;
 mod limits;
 mod prov;
 mod resetpw;
@@ -560,6 +561,7 @@ mod h4_tests {
             insecure: false,
             trusted_proxies: vec![],
             registration,
+            public_url: None,
         };
         let ctx = Ctx(Arc::new(CtxInner {
             store,
@@ -576,6 +578,7 @@ mod h4_tests {
                 secret: [7u8; 32],
                 public: agit::agent::x25519_public_from_secret(&[7u8; 32]),
             },
+            auth_nonces: Arc::new(crate::keyauth::AuthNonces::new()),
         }));
         (dir, ctx)
     }
@@ -1024,6 +1027,7 @@ mod h3_tests {
             insecure: false,
             trusted_proxies: vec![],
             registration: false,
+            public_url: None,
         };
         let ctx = Ctx(Arc::new(CtxInner {
             store,
@@ -1039,6 +1043,7 @@ mod h3_tests {
                 secret: [7u8; 32],
                 public: agit::agent::x25519_public_from_secret(&[7u8; 32]),
             },
+            auth_nonces: Arc::new(crate::keyauth::AuthNonces::new()),
         }));
         (dir, ctx)
     }
@@ -1396,6 +1401,7 @@ mod obs_tests {
             insecure: false,
             trusted_proxies: vec![],
             registration: false,
+            public_url: None,
         };
         let ctx = Ctx(Arc::new(CtxInner {
             store,
@@ -1411,6 +1417,7 @@ mod obs_tests {
                 secret: [7u8; 32],
                 public: agit::agent::x25519_public_from_secret(&[7u8; 32]),
             },
+            auth_nonces: Arc::new(crate::keyauth::AuthNonces::new()),
         }));
         (dir, ctx)
     }
