@@ -17,7 +17,7 @@
 #![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 // Core logic lives in the lib (crate `agit`), shared with agit-hub, so the two bins don't each write their own parsing and drift apart.
 use agit::scope::{self, Scope};
-use agit::{commands, harness, init, passthrough, session, sync, ui, view};
+use agit::{commands, debug, harness, init, passthrough, session, sync, ui, view};
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -210,6 +210,21 @@ fn dispatch(argv: Vec<String>) -> i32 {
             println!("agit {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
+
+        // ── doctor: a fast, human-readable health check + environment summary — the thing a user pastes
+        //    into a bug report. Scope-independent; takes no args but `--help`. ──
+        "doctor" => match parse_doctor(args) {
+            Ok(()) => debug::doctor(),
+            Err(ctl) => Ok(ctl.emit(DOCTOR_USAGE)),
+        },
+
+        // ── debug: the full, redacted diagnostic bundle (sectioned text + debug.json). `--out <dir>`
+        //    names the output directory; `--rerun "<subcmd>"` re-runs a failing agit command under
+        //    trace and captures it. Scope-independent. ──
+        "debug" => match parse_debug(args) {
+            Ok((out, rerun)) => debug::debug_cmd(out.as_deref(), rerun.as_deref()),
+            Err(ctl) => Ok(ctl.emit(DEBUG_USAGE)),
+        },
 
         // ── start: the headline path — launch a real session here, already carrying the agent's
         //    context, with no ids and no file paths typed. ──
@@ -467,6 +482,8 @@ impl ParseCtl {
 }
 
 const SCAN_USAGE: &str = "usage: agit a scan [--staged] [<file>…]   (scan session dumps for secrets)";
+const DOCTOR_USAGE: &str = "usage: agit doctor   (fast health check + environment summary to paste into a bug report)";
+const DEBUG_USAGE: &str = "usage: agit debug [--out <dir>] [--rerun \"<subcmd>\"]\n  (write a full, redacted diagnostic bundle; --rerun re-runs an agit subcommand under trace and captures it)";
 const SNAP_USAGE: &str = "usage: agit a snap [<runtime>] [--from <runtime>] [--watch] [--interval <n>] [--no-harness]   (mirror this project's session dump into the Agent Store)";
 const CONVERT_USAGE: &str = "usage: agit convert [<session|agent>] --to claude-code|codex [--from RT] [--cwd PATH] [--write]\n  (no session -> the active agent's latest; an agent name -> that agent's latest; --watch [--interval N] to auto-convert both ways)";
 const RESUME_USAGE: &str = "usage: agit resume [<session|agent>] [--as claude-code|codex] [--env PATH] [--relocate] [--cwd PATH] [--exec]\n  (no session -> the active agent's latest; an agent name -> that agent's latest)";
@@ -514,6 +531,42 @@ fn parse_init(args: &[String]) -> Result<Option<String>, ParseCtl> {
         }
     }
     Ok(agent)
+}
+
+/// doctor arguments: none but `--help`/`-h`. An unknown dash flag is rejected (git-parity), and a stray
+/// positional is rejected too — `doctor` is a pure report with nothing to name.
+fn parse_doctor(args: &[String]) -> Result<(), ParseCtl> {
+    match args.first().map(|s| s.as_str()) {
+        None => Ok(()),
+        Some("--help" | "-h") => Err(ParseCtl::Help),
+        Some(other) if other.starts_with('-') => Err(ParseCtl::Unknown(other.to_string())),
+        Some(_) => Err(ParseCtl::Usage),
+    }
+}
+
+/// debug arguments: `--out <dir>` names the output directory, `--rerun "<subcmd>"` the command to
+/// re-run under trace. `--help`/`-h` prints usage; an unknown dash flag is rejected, not swallowed.
+/// Returns (out, rerun).
+fn parse_debug(args: &[String]) -> Result<(Option<String>, Option<String>), ParseCtl> {
+    let mut out = None;
+    let mut rerun = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" if i + 1 < args.len() => {
+                out = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--rerun" if i + 1 < args.len() => {
+                rerun = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--help" | "-h" => return Err(ParseCtl::Help),
+            other if other.starts_with('-') => return Err(ParseCtl::Unknown(other.to_string())),
+            _ => i += 1,
+        }
+    }
+    Ok((out, rerun))
 }
 
 /// snap arguments: `--from <rt>` (or a bare positional) names the runtime, else snap captures every
@@ -1561,6 +1614,8 @@ the only one present, else they ask.
   agit convert [<session|agent>] --to <rt>  Convert a session into one another runtime can resume (default: the active agent's latest; an agent name picks that agent's latest; --write to persist; --watch auto-converts both ways in the background)
   agit resume [<session|agent>]  Load a session into a runtime and continue (default: the active agent's latest; an agent name picks that agent's latest; --as <rt> to switch runtime; --env <path> to run this agent against a different repo; --relocate if it's the same project moved; --exec to launch). `agit start` launches a fresh runtime here carrying that latest context instead
   agit provenance verify [<session|agent>]  Check a captured session's signature against its recorded key (default: the active agent's latest; an agent name verifies ALL its sessions; unsigned → unverified, never blocks); `agit provenance key` shows this machine's public key
+  agit doctor              Fast health check + environment summary to paste into a bug report (runtimes on PATH, git identity, store vs remote, watch daemon)
+  agit debug [--out <dir>] Full, redacted diagnostic bundle (sectioned text + debug.json); --rerun '<subcmd>' re-runs a failing command under trace and captures it. Nothing is uploaded
 
   agit <git-args>          Run git transparently on the code repository (Environment). `agit clone <target>` also adopts an agit agent store (a positively-identified hub URL, or a known agent name) as an agent; --git forces the raw git clone
   agit clone --git <url>   Force a raw git clone (never adopt it as an agent)

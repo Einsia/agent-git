@@ -3011,3 +3011,155 @@ fn string_literal_em_dash_lines(src: &str) -> Vec<usize> {
     }
     hits
 }
+
+// ─────────────────────────── agit doctor / agit debug (Wave A diagnostics) ───────────────────────────
+
+/// Every regular file under `dir`, concatenated — for asserting a planted secret appears NOWHERE in the
+/// produced bundle (across SUMMARY.txt, the section .txt files, and debug.json alike).
+fn read_bundle_files(dir: &Path) -> String {
+    fn walk(dir: &Path, out: &mut String) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push_str(&std::fs::read_to_string(&p).unwrap_or_default());
+                out.push('\n');
+            }
+        }
+    }
+    let mut s = String::new();
+    walk(dir, &mut s);
+    s
+}
+
+/// REDACTION — the critical safety property. A fake secret is planted in THREE channels at once (an
+/// `AGIT_TOKEN` env var, a credentialed store-remote URL, and a token-shaped string in a config file);
+/// the produced bundle must contain none of the raw values. This fails loudly if any channel leaks.
+#[test]
+fn debug_bundle_redacts_every_planted_secret() {
+    let r = Repo::new();
+    let store = r.agent();
+    // (b) a credentialed remote URL in the store's git config — creds must be stripped, host kept.
+    r.git_at(
+        &store,
+        &["remote", "add", "origin", "https://user:PLAINTEXTPW9f3z@hub.example/x.git"],
+    );
+    // (c) a token-shaped string planted in a config file (not a URL credential) — only the FINAL
+    //     scanner pass can catch this, which is exactly what it exists for.
+    let toml = r.path().join(".agit.toml");
+    let mut content = std::fs::read_to_string(&toml).unwrap_or_default();
+    content.push_str("\n# stray key AKIAIOSFODNN7EXAMPLE left in config\n");
+    std::fs::write(&toml, content).unwrap();
+
+    let out = r.path().join("bundle");
+    // (a) the secret env var is set only for this invocation.
+    let (code, _o, err) = r.agit_env(
+        &[("AGIT_TOKEN", "sk-SECRET123")],
+        &["debug", "--out", out.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "debug should succeed: {err}");
+
+    let all = read_bundle_files(&out);
+    for planted in ["sk-SECRET123", "PLAINTEXTPW9f3z", "AKIAIOSFODNN7EXAMPLE"] {
+        assert!(
+            !all.contains(planted),
+            "planted secret {planted:?} LEAKED into the debug bundle"
+        );
+    }
+    // The host survives credential stripping — the URL is redacted, not simply dropped (which would
+    // hide that a remote exists at all).
+    assert!(all.contains("hub.example"), "the remote host should survive credential stripping");
+    // debug.json must stay valid even after the scanner masked the planted token line.
+    let json = std::fs::read_to_string(out.join("debug.json")).unwrap();
+    serde_json::from_str::<serde_json::Value>(&json).expect("debug.json must remain valid JSON");
+}
+
+/// `agit doctor` reports the git-identity check as WARN when no committer identity is set (snap refuses
+/// without one) and OK once it is. Uses an ISOLATED global gitconfig + neutralized system config so the
+/// developer's real identity never bleeds in (honors "no global git config in tests").
+#[test]
+fn doctor_flips_git_identity_check_on_committer_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let empty_cfg = tmp.path().join("empty-gitconfig");
+    std::fs::write(&empty_cfg, "").unwrap();
+
+    let run_git = |args: &[&str]| {
+        Command::new("git")
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", &empty_cfg)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args)
+            .output()
+            .unwrap();
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+
+    let run_doctor = || -> String {
+        let o = Command::new(BIN)
+            .current_dir(&repo)
+            .env("HOME", tmp.path())
+            .env("AGIT_HOME", tmp.path().join("agit-home"))
+            .env("GIT_CONFIG_GLOBAL", &empty_cfg)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["doctor"])
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(0), "doctor always exits 0");
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+
+    // No identity anywhere -> WARN.
+    let warn = run_doctor();
+    assert!(
+        warn.contains("[WARN] git identity"),
+        "expected a WARN git-identity line with no committer set:\n{warn}"
+    );
+
+    // Set a (local) committer identity -> OK.
+    run_git(&["config", "user.email", "dev@example.com"]);
+    run_git(&["config", "user.name", "Dev"]);
+    let ok = run_doctor();
+    assert!(
+        ok.contains("[OK  ] git identity"),
+        "expected an OK git-identity line once a committer is set:\n{ok}"
+    );
+}
+
+/// The full bundle carries the expected sections, `debug.json` parses, and a store that actually holds
+/// a session reports a non-zero session count.
+#[test]
+fn debug_bundle_is_complete_and_counts_store_sessions() {
+    let r = Repo::new();
+    // A store with a session: written under the runtime dir exactly as snap would land it.
+    r.write_agent(
+        "sessions/claude-code/sess-debugtest.jsonl",
+        "{\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n",
+    );
+    let out = r.path().join("bundle");
+    let (code, _o, err) = r.agit(&["debug", "--out", out.to_str().unwrap()]);
+    assert_eq!(code, 0, "debug should succeed: {err}");
+
+    for f in [
+        "SUMMARY.txt",
+        "platform.txt",
+        "git.txt",
+        "agit.txt",
+        "store.txt",
+        "runtimes.txt",
+        "connectivity.txt",
+        "debug.json",
+    ] {
+        assert!(out.join(f).exists(), "the bundle is missing {f}");
+    }
+
+    let json = std::fs::read_to_string(out.join("debug.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).expect("debug.json must parse");
+    for section in ["platform", "git", "agit_env", "store"] {
+        assert!(v.get(section).is_some(), "debug.json is missing the {section} section");
+    }
+    let count = v["store"]["session_count"].as_u64().unwrap_or(0);
+    assert!(count >= 1, "a store with a planted session must report a non-zero count, got {count}");
+}
