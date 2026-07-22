@@ -15,7 +15,7 @@
 //! and fork/resume embeds the parent session of **another project** into the same rollout. So project ownership must
 //! scan **all** session_meta — if any foreign-project cwd appears, skip the whole file (see id_if_owned, the privacy backstop).
 
-use super::{Adapter, SessionIR};
+use super::{Adapter, SessionIR, StrandedSession};
 use anyhow::{bail, Context, Result};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -118,6 +118,53 @@ pub fn project_rollouts(cwd: &Path) -> Vec<(PathBuf, String)> {
     out
 }
 
+/// The first `session_meta` in a rollout, as (id, cwd) — the directory the session actually ran in.
+fn primary_meta(path: &Path) -> Option<(String, String)> {
+    let f = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(f).lines() {
+        let Ok(line) = line else { break };
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if rec.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+            continue;
+        }
+        let p = rec.get("payload")?;
+        let cwd = p.get("cwd").and_then(|c| c.as_str())?.to_string();
+        let id = p
+            .get("id")
+            .and_then(|i| i.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| file_id(path));
+        return Some((id, cwd));
+    }
+    None
+}
+
+/// Codex rollouts recorded under a DIFFERENT cwd than `env` but plausibly meant for it (a parent dir, or
+/// the same repo at another path). A rollout that this project fully owns is excluded (that's captured);
+/// a rollout for a genuinely unrelated project is not plausibly-here (a correct, silent drop). The
+/// recorded cwd is the primary `session_meta.cwd`. Ownership stays exact — this only powers the
+/// drop-warning and `agit relocate`.
+pub fn stranded_sessions(env: &Path) -> Vec<StrandedSession> {
+    let Ok(root) = sessions_root() else {
+        return vec![];
+    };
+    let want = env.to_string_lossy();
+    let mut out = vec![];
+    for f in all_rollouts(&root) {
+        if id_if_owned(&f, &want).is_some() {
+            continue; // owned by this project → captured, not stranded
+        }
+        let Some((id, cwd)) = primary_meta(&f) else { continue };
+        if cwd == *want || !crate::scope::plausibly_here(Path::new(&cwd), env) {
+            continue;
+        }
+        out.push(StrandedSession { path: f, id, runtime: "codex", recorded_cwd: cwd });
+    }
+    out
+}
+
 impl Adapter for Codex {
     fn name(&self) -> &'static str {
         "codex"
@@ -125,6 +172,10 @@ impl Adapter for Codex {
 
     fn project_sessions(&self, env: &Path) -> Vec<(PathBuf, String)> {
         project_rollouts(env)
+    }
+
+    fn stranded_sessions(&self, env: &Path) -> Vec<StrandedSession> {
+        stranded_sessions(env)
     }
 
     fn source_desc(&self, env: &Path) -> String {

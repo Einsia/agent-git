@@ -871,6 +871,144 @@ pub fn resume_cmd(
     Ok(0)
 }
 
+// ─────────────────────── relocate: bring sessions started in the wrong dir here ───────────────────────
+
+/// `agit relocate [<selector>] [--to <path>] [--yes]` — the escape hatch for a session started in the
+/// WRONG directory (the runtime ran in a parent/monorepo dir, or the same repo at another path, so
+/// capture dropped it as not-this-repo and stranded the work).
+///
+/// BARE `agit relocate` is the common case: it auto-detects every stranded session that belongs HERE
+/// (the same `plausibly_here` test the drop-warning uses), lists them, asks once, then rewrites each
+/// transcript's cwd to this repo and captures it into the active agent's store — no id or path typed. A
+/// `<selector>` narrows it to one session; `--to` overrides the destination (default: this repo's root).
+pub fn relocate_cmd(selector: Option<&str>, to: Option<String>, yes: bool) -> Result<i32> {
+    // Destination defaults to this repo's root; `--to` overrides but MUST be a git work tree (a session
+    // installs under a slug derived from a real checkout, mirroring `resume --env`'s check).
+    let env = match to {
+        Some(p) => {
+            let cp = std::fs::canonicalize(&p).map_err(|_| anyhow::anyhow!("no such path: {p}"))?;
+            let (rc, _) = scope::git_in_status(&cp, &["rev-parse", "--is-inside-work-tree"]);
+            if rc != 0 {
+                anyhow::bail!("{} is not a git work tree; a relocate destination is a code repo", cp.display());
+            }
+            scope::git_toplevel(&cp).unwrap_or(cp)
+        }
+        None => scope::env_root()?,
+    };
+
+    let mut stranded = crate::session::stranded_here(&env);
+    // A selector targets ONE session (uncommon path): match its id, its transcript path, or a substring
+    // of the directory it ran in (the recorded-cwd slug the user would have seen).
+    if let Some(sel) = selector {
+        stranded.retain(|s| relocate_selector_matches(s, sel));
+        if stranded.is_empty() {
+            anyhow::bail!(
+                "no stranded session here matches `{sel}`.\n  run `agit relocate` with no arguments to list what would move."
+            );
+        }
+    }
+
+    if stranded.is_empty() {
+        // Not an error: running it in the right place with nothing stranded is a valid, complete outcome.
+        outln!("nothing to relocate: no sessions here were started in another directory.");
+        return Ok(0);
+    }
+
+    outln!("Sessions that ran elsewhere but belong in {}:", env.display());
+    for s in &stranded {
+        let gist = relocate_gist(&s.path, s.runtime);
+        let when = recorded_activity(&s.path)
+            .map(|t| ui::ago(std::time::SystemTime::from(t)))
+            .unwrap_or_else(|| "unknown".into());
+        outln!("  {} · {} · {when}", s.runtime, s.recorded_cwd);
+        if let Some(g) = gist {
+            outln!("      {}", ui::dim(&format!("\"{g}\"")));
+        }
+    }
+
+    // One confirmation, unless --yes. A non-interactive shell with no --yes is treated as "no": relocate
+    // moves history into the store, so it never proceeds unattended without an explicit go-ahead.
+    if !yes {
+        if !ui::interactive() {
+            errln!(
+                "  refusing to relocate {} session(s) without confirmation; re-run with --yes (no terminal to prompt on).",
+                stranded.len()
+            );
+            return Ok(1);
+        }
+        use std::io::{stdin, stdout, BufRead, Write};
+        print!("bring these {} session(s) into {}? [Y/n] ", stranded.len(), env.display());
+        let _ = stdout().flush();
+        let mut line = String::new();
+        stdin().lock().read_line(&mut line).ok();
+        let ans = line.trim().to_ascii_lowercase();
+        if !(ans.is_empty() || ans == "y" || ans == "yes") {
+            outln!("aborted; nothing moved.");
+            return Ok(0);
+        }
+    }
+
+    let ag = agent::resolve(None)?;
+    let mut moved = 0usize;
+    let mut touched: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    for s in &stranded {
+        match relocate_one(s, &env, &ag) {
+            Ok(()) => {
+                moved += 1;
+                touched.insert(s.runtime);
+            }
+            Err(e) => errln!("  ⚠ could not relocate {} (ran in {}): {e:#}", s.id, s.recorded_cwd),
+        }
+    }
+    // Now capture the freshly-installed, now-owned sessions into the active agent's store.
+    for rt in &touched {
+        if let Err(e) = crate::session::capture_relocated(&env, rt) {
+            errln!("  ⚠ {rt} capture after relocate failed: {e:#}");
+        }
+    }
+
+    if moved == 0 {
+        anyhow::bail!("relocate found sessions but moved none; see the warnings above.");
+    }
+    outln!("relocated {moved} session(s) into {}; `agit a log` to see them.", env.display());
+    Ok(0)
+}
+
+/// One stranded session → installed under `env`'s slug (its transcript cwd rewritten to `env`, reusing
+/// `convert_for_install`'s same-runtime cwd rewrite), with a launch record attributing it to `ag` so the
+/// following capture routes it into `ag`'s store rather than the repo default.
+fn relocate_one(s: &crate::adapter::StrandedSession, env: &Path, ag: &agent::Agent) -> Result<()> {
+    let text = std::fs::read_to_string(&s.path)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", s.path.display()))?;
+    // Same-runtime (no cross-vendor convert): byte replay with the recorded cwd swapped to env.
+    let (new_id, out, _ir, cwd) =
+        convert_for_install(&text, &s.path, s.runtime, s.runtime, Some(env.display().to_string()))?;
+    crate::register::install(s.runtime, &new_id, &cwd, &out)?;
+    // Unsigned, best-effort: attribution just needs the store, and capture writes the authoritative
+    // content-bound provenance into the sidecar (mirrors convert_pass).
+    record_launch(&new_id, &ag.aid, &ag.name, env, s.runtime, None)?;
+    Ok(())
+}
+
+/// A `<selector>` matches a stranded session by its id, its transcript path, or a substring of the
+/// directory it ran in.
+fn relocate_selector_matches(s: &crate::adapter::StrandedSession, sel: &str) -> bool {
+    s.id == sel
+        || s.path.to_string_lossy() == sel
+        || s.path.file_stem().map(|st| st.to_string_lossy() == sel).unwrap_or(false)
+        || s.recorded_cwd.contains(sel)
+}
+
+/// A one-line opening gist for the relocate listing, read cheaply from the transcript's first prompt.
+fn relocate_gist(path: &Path, runtime: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let ir = match runtime {
+        "codex" => crate::adapter::codex::parse_rollout(&content, "x"),
+        _ => crate::adapter::claude_code::parse_jsonl(&content, "x"),
+    };
+    ir.prompts.into_iter().map(|p| ui::one_line(&p, 72)).find(|p| !p.is_empty())
+}
+
 
 // ─────────────────────── The launch record (§6): whose session is this? ───────────────────────
 
@@ -2169,6 +2307,9 @@ fn origin_and_gist(s: &StoredSession) -> (Option<String>, Option<String>) {
 /// carrying the agent's context, with no file paths and no ids typed (§5.1).
 pub fn start_cmd(agent_sel: Option<&str>, as_rt: Option<&str>) -> Result<i32> {
     let env = scope::env_root()?;
+    // Disclose sessions dropped for running in the wrong directory (a parent dir, or the same repo at
+    // another path) before launching — otherwise stranded work is invisible here. Points at `agit relocate`.
+    crate::session::warn_stranded(&env);
     let ag = agent::resolve(agent_sel)?;
     match latest_session(&ag.store) {
         Some(s) => start_carrying(&ag, &env, s, as_rt),

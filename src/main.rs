@@ -403,6 +403,12 @@ fn dispatch(argv: Vec<String>) -> i32 {
             Err(ctl) => Ok(ctl.emit(RESUME_USAGE)),
         },
 
+        // ── relocate: bring sessions started in the WRONG directory into this repo ──
+        "relocate" => match parse_relocate(args) {
+            Ok((sel, to, yes)) => commands::relocate_cmd(sel.as_deref(), to, yes),
+            Err(ctl) => Ok(ctl.emit(RELOCATE_USAGE)),
+        },
+
         // ── Agent-store management verbs, checked before passthrough so they never reach git ──
         v if scope == Scope::Agent && AGENT_MGMT_VERBS.contains(&v) => agent_mgmt(v, args),
 
@@ -470,6 +476,7 @@ const SCAN_USAGE: &str = "usage: agit a scan [--staged] [<file>…]   (scan sess
 const SNAP_USAGE: &str = "usage: agit a snap [<runtime>] [--from <runtime>] [--watch] [--interval <n>] [--no-harness]   (mirror this project's session dump into the Agent Store)";
 const CONVERT_USAGE: &str = "usage: agit convert [<session|agent>] --to claude-code|codex [--from RT] [--cwd PATH] [--write]\n  (no session -> the active agent's latest; an agent name -> that agent's latest; --watch [--interval N] to auto-convert both ways)";
 const RESUME_USAGE: &str = "usage: agit resume [<session|agent>] [--as claude-code|codex] [--env PATH] [--relocate] [--cwd PATH] [--exec]\n  (no session -> the active agent's latest; an agent name -> that agent's latest)";
+const RELOCATE_USAGE: &str = "usage: agit relocate [<session>] [--to PATH] [--yes]\n  (bare: bring EVERY session started in the wrong directory into this repo; <session> targets one; --to overrides the destination repo; --yes skips the confirmation)";
 const INIT_USAGE: &str = "usage: agit init [--agent <name>]   (prepare this repo: clone or select its agent, install the secret hooks)";
 const WATCH_USAGE: &str = "usage: agit watch [--interval <n>] [--no-convert] [--no-harness] [--daemon|--background] [--stop] [--status]\n  (hands-off: watch both runtimes' dumps, auto-snap + auto-convert both ways; --daemon runs it in the background, --stop/--status manage it)";
 const MERGE_USAGE: &str = "usage: agit a merge <target> [--from <runtime>] [--both] [--quick] [--splice] [--dry-run]   (reconcile this agent's memory with <target>'s by dialogue; <target> is an agent name or a ref (--agent X / --ref X disambiguate); --quick shortens the dialogue; --splice skips the model and just combines both sessions' context; --dry-run/--preview shows what the merge would do without running the model)";
@@ -752,6 +759,38 @@ fn parse_resume(args: &[String]) -> Result<ResumeArgs, ParseCtl> {
         }
     }
     Ok((sel, as_rt, cwd, env, exec, relocate))
+}
+
+/// relocate arguments: OPTIONAL positional selector + `--to <path>` + `--yes`/`-y`. The bare form (no
+/// selector) is the common case — relocate every stranded session here. An unknown dash flag is rejected,
+/// never swallowed, so `--yse` cannot silently skip the confirmation.
+type RelocateArgs = (Option<String>, Option<String>, bool);
+fn parse_relocate(args: &[String]) -> Result<RelocateArgs, ParseCtl> {
+    let mut sel = None;
+    let mut to = None;
+    let mut yes = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--to" if i + 1 < args.len() => {
+                to = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--yes" | "-y" => {
+                yes = true;
+                i += 1;
+            }
+            "--help" | "-h" => return Err(ParseCtl::Help),
+            other if other.starts_with('-') => return Err(ParseCtl::Unknown(other.to_string())),
+            other => {
+                if sel.is_none() {
+                    sel = Some(other.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    Ok((sel, to, yes))
 }
 
 /// `agit harness [show|apply] [--from <rt>]` — which runtime's harness is resolved against what was
@@ -1560,6 +1599,7 @@ the only one present, else they ask.
   agit shadow [install]    Route `git` through `agit` in your shell so every git command versions agent context (uninstall / status to manage)
   agit convert [<session|agent>] --to <rt>  Convert a session into one another runtime can resume (default: the active agent's latest; an agent name picks that agent's latest; --write to persist; --watch auto-converts both ways in the background)
   agit resume [<session|agent>]  Load a session into a runtime and continue (default: the active agent's latest; an agent name picks that agent's latest; --as <rt> to switch runtime; --env <path> to run this agent against a different repo; --relocate if it's the same project moved; --exec to launch). `agit start` launches a fresh runtime here carrying that latest context instead
+  agit relocate            Bring sessions started in the WRONG directory (a parent/monorepo dir, or the same repo elsewhere) into this repo, so capture stops stranding them (bare form moves all; --to overrides the destination; --yes skips the prompt)
   agit provenance verify [<session|agent>]  Check a captured session's signature against its recorded key (default: the active agent's latest; an agent name verifies ALL its sessions; unsigned → unverified, never blocks); `agit provenance key` shows this machine's public key
 
   agit <git-args>          Run git transparently on the code repository (Environment). `agit clone <target>` also adopts an agit agent store (a positively-identified hub URL, or a known agent name) as an agent; --git forces the raw git clone

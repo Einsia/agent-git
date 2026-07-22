@@ -12,6 +12,18 @@ pub mod codex;
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
+/// A session in a runtime's dump whose recorded cwd is NOT `env`, but which is PLAUSIBLY meant for it
+/// (started in a parent dir, or the same repo at another path). Ownership stays exact — these are NEVER
+/// captured by it; they are surfaced only so capture can WARN and `agit relocate` can bring them in.
+#[derive(Debug, Clone)]
+pub struct StrandedSession {
+    pub path: PathBuf,
+    pub id: String,
+    pub runtime: &'static str,
+    /// The cwd the runtime recorded for the session — the directory it actually ran in.
+    pub recorded_cwd: String,
+}
+
 /// A single Read call (a file fragment the agent actually looked at).
 #[derive(Debug, Clone)]
 pub struct FileRead {
@@ -70,6 +82,15 @@ pub trait Adapter {
 
     /// Parse this runtime's raw transcript text into the IR (the hub renders session digests from it).
     fn parse(&self, text: &str, fallback_id: &str) -> SessionIR;
+
+    /// Sessions this runtime recorded elsewhere but that are PLAUSIBLY meant for `env` — a parent
+    /// directory, or the same repo at another path (see `scope::plausibly_here`). Never captured by
+    /// ownership (that stays exact); surfaced only for the drop-warning and `agit relocate`. Reads the
+    /// dump's recorded cwds, not full transcripts. The default is empty for runtimes with no dump concept.
+    fn stranded_sessions(&self, env: &Path) -> Vec<StrandedSession> {
+        let _ = env;
+        vec![]
+    }
 }
 
 /// One registered runtime. This is the single place a runtime is named: its canonical name, a

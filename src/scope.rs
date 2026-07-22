@@ -150,6 +150,92 @@ pub fn git_in_inherit(root: &Path, args: &[&str]) -> i32 {
         .unwrap_or(-1)
 }
 
+// ─────────────── plausibly-here detection (stranded sessions started in the wrong dir) ───────────────
+
+/// The git work-tree root of `dir`, or `None` when `dir` is not inside a git repository (or does not
+/// exist locally — a recorded cwd from another machine simply answers `None`).
+pub fn git_toplevel(dir: &Path) -> Option<PathBuf> {
+    let (rc, out) = git_in_status(dir, &["rev-parse", "--show-toplevel"]);
+    (rc == 0 && !out.trim().is_empty()).then(|| PathBuf::from(out.trim()))
+}
+
+fn origin_url(dir: &Path) -> Option<String> {
+    let (rc, out) = git_in_status(dir, &["remote", "get-url", "origin"]);
+    (rc == 0 && !out.trim().is_empty()).then(|| out.trim().to_string())
+}
+
+/// The repo's root commit(s). A repo with several roots (grafted histories) lists several; the LAST line
+/// is used so two checkouts of the same history compare equal regardless of ordering quirks.
+fn root_commit(dir: &Path) -> Option<String> {
+    let (rc, out) = git_in_status(dir, &["rev-list", "--max-parents=0", "HEAD"]);
+    if rc != 0 {
+        return None;
+    }
+    out.lines().last().map(|l| l.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Do two working directories belong to the SAME repository? True when they share a work-tree root, an
+/// origin url, or a root commit. Cross-machine paths that don't resolve locally answer `false` (git
+/// can't identify them), which is the safe default — an unverifiable match must not warn.
+pub fn same_repo(a: &Path, b: &Path) -> bool {
+    let (ta, tb) = match (git_toplevel(a), git_toplevel(b)) {
+        (Some(ta), Some(tb)) => (ta, tb),
+        _ => return false,
+    };
+    if ta == tb {
+        return true; // same repo, different subpath
+    }
+    if let (Some(ua), Some(ub)) = (origin_url(a), origin_url(b)) {
+        if ua == ub {
+            return true; // sibling clone: shared origin
+        }
+    }
+    match (root_commit(a), root_commit(b)) {
+        (Some(ra), Some(rb)) => ra == rb, // sibling clone: shared history root
+        _ => false,
+    }
+}
+
+/// Is a session recorded under `recorded` PLAUSIBLY meant for the repo rooted at `env`?
+///   (a) `recorded` is a strict PARENT directory of `env` (ran in the monorepo/outer dir, meant a subdir), OR
+///   (b)/(c) `recorded` resolves into the SAME repository as `env` (same work-tree, origin, or root commit).
+///
+/// `recorded == env` is NOT stranded — that session is OWNED, so it returns `false`. A genuinely
+/// unrelated project (a different repo that is neither a parent nor a same-repo checkout) also returns
+/// `false`: it was a correct, legitimate drop and must never warn.
+pub fn plausibly_here(recorded: &Path, env: &Path) -> bool {
+    if recorded == env {
+        return false;
+    }
+    // (a) strict parent: component-wise prefix (equality already excluded above), so `/p/app` is a child
+    // of `/p` but NOT of the unrelated `/pp`.
+    if env.starts_with(recorded) {
+        return true;
+    }
+    same_repo(recorded, env)
+}
+
+#[cfg(test)]
+mod plausibly_here_tests {
+    use super::plausibly_here;
+    use std::path::Path;
+
+    #[test]
+    fn parent_is_plausible_equal_and_unrelated_are_not() {
+        // (a) a strict parent of env is plausibly-meant-for-env (the wrong-directory case).
+        assert!(plausibly_here(Path::new("/p"), Path::new("/p/app")));
+        assert!(plausibly_here(Path::new("/home/you/proj"), Path::new("/home/you/proj/app")));
+        // env itself is OWNED, not stranded.
+        assert!(!plausibly_here(Path::new("/p/app"), Path::new("/p/app")));
+        // a string-prefix that is not a path-component parent must NOT count (no false positive).
+        assert!(!plausibly_here(Path::new("/pp"), Path::new("/p/app")));
+        // an unrelated sibling that does not exist on disk (no git identity) must NOT warn.
+        assert!(!plausibly_here(Path::new("/some/other/proj"), Path::new("/p/app")));
+        // a CHILD of env is not a parent; without git it can't be proven same-repo, so it's not plausible here.
+        assert!(!plausibly_here(Path::new("/p/app/sub"), Path::new("/p/app")));
+    }
+}
+
 #[cfg(test)]
 mod agit_home_tests {
     use super::agit_home_from;

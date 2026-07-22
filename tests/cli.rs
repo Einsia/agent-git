@@ -2860,6 +2860,200 @@ fn diverged_pull_suggests_the_upstream_ref_not_the_agent_name() {
     assert_eq!(mc, 0, "merging the suggested ref must work (--dry-run): {mo}{me}");
 }
 
+// ─────────────── relocate: sessions started in the WRONG directory (parent/monorepo dir) ───────────────
+//
+// These build a nested layout by hand (a parent git repo with a CHILD git repo inside it), which the
+// single-repo `Repo` helper cannot express, so they carry their own isolated HOME/AGIT_HOME/gitconfig
+// runner. The parent is the outer/monorepo dir a user runs the runtime in by mistake; the child is the
+// repo they meant to work in.
+
+/// Claude Code's project slug for a path: every non-ASCII-alphanumeric char collapses to '-' (matches
+/// `claude_code::slug_for`).
+fn cc_slug(p: &Path) -> String {
+    p.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// A git identity file, written once per base, so every repo here resolves the same committer and no
+/// global config is touched (honors "no global git config in tests").
+fn nested_gitconfig(base: &Path) -> PathBuf {
+    let gc = base.join("gitconfig");
+    if !gc.exists() {
+        std::fs::write(&gc, "[user]\n\tname = tester\n\temail = tester@agit.test\n[commit]\n\tgpgsign = false\n").unwrap();
+    }
+    gc
+}
+
+fn nested_git(base: &Path, cwd: &Path, args: &[&str]) {
+    let gc = nested_gitconfig(base);
+    let mut c = Command::new("git");
+    c.current_dir(cwd)
+        .env("HOME", base.join("home"))
+        .env("GIT_CONFIG_GLOBAL", &gc)
+        .args(args);
+    let o = c.output().unwrap();
+    assert!(o.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+fn nested_agit(base: &Path, cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    let gc = nested_gitconfig(base);
+    let mut c = Command::new(BIN);
+    c.current_dir(cwd)
+        .env("HOME", base.join("home"))
+        .env("AGIT_HOME", base.join("agit-home"))
+        .env("GIT_CONFIG_GLOBAL", &gc)
+        .args(args);
+    let o = c.output().unwrap();
+    (
+        o.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&o.stdout).to_string(),
+        String::from_utf8_lossy(&o.stderr).to_string(),
+    )
+}
+
+/// Seed a claude transcript under `<home>/.claude/projects/<slug(cwd)>/<id>.jsonl` recording `cwd`.
+fn nested_seed_claude(home: &Path, cwd: &Path, id: &str, msg: &str) {
+    let sd = home.join(".claude/projects").join(cc_slug(cwd));
+    std::fs::create_dir_all(&sd).unwrap();
+    std::fs::write(
+        sd.join(format!("{id}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"uuid\":\"u1\",\"parentUuid\":null,\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"{msg}\"}}}}\n",
+            cwd.display()
+        ),
+    )
+    .unwrap();
+}
+
+fn init_repo(base: &Path, dir: &Path, seed_file: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    nested_git(base, dir, &["init", "-q", "-b", "main", "."]);
+    std::fs::write(dir.join(seed_file), "seed\n").unwrap();
+    nested_git(base, dir, &["add", "-A"]);
+    nested_git(base, dir, &["commit", "-qm", "seed"]);
+}
+
+/// Concatenate every session byte in a store, wherever it sits (either layout).
+fn store_all_text(store: &Path) -> String {
+    fn walk(dir: &Path, out: &mut String) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().map(|x| x == "jsonl").unwrap_or(false) {
+                out.push_str(&std::fs::read_to_string(&p).unwrap_or_default());
+            }
+        }
+    }
+    let mut s = String::new();
+    walk(&store.join("sessions"), &mut s);
+    s
+}
+
+/// A: a claude session recorded in the PARENT dir is still DROPPED from the child's capture, but capture
+/// now WARNS, naming both paths and pointing at `agit relocate`. A genuinely unrelated project's session
+/// is a correct, silent drop (no false positive). The child's own session captures normally.
+#[test]
+fn capture_warns_about_a_parent_dir_session_but_not_an_unrelated_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    std::fs::create_dir_all(base.join("home")).unwrap();
+    let parent = base.join("work"); // the outer/monorepo dir, a git repo
+    let child = parent.join("app"); // the repo the user meant to work in
+    let other = base.join("other"); // an unrelated repo
+    init_repo(base, &parent, "root.md");
+    init_repo(base, &child, "app.ts");
+    init_repo(base, &other, "o.txt");
+    assert_eq!(nested_agit(base, &child, &["init", "--agent", "childmem"]).0, 0, "agit init in child");
+
+    let home = base.join("home");
+    nested_seed_claude(&home, &parent, "parentsess", "work in the monorepo root by mistake");
+    nested_seed_claude(&home, &child, "childsess", "the real child work");
+    nested_seed_claude(&home, &other, "othersess", "a totally different project");
+
+    let (code, out, err) = nested_agit(base, &child, &["a", "snap"]);
+    assert_eq!(code, 0, "capture of the matching session still succeeds: {err}{out}");
+
+    // The parent-dir session is disclosed, naming the dir it ran in and the fix.
+    assert!(
+        err.contains(&format!("ran in {}", parent.display())),
+        "warning must name the parent dir the session ran in: {err}"
+    );
+    assert!(err.contains("agit relocate"), "warning must point at `agit relocate`: {err}");
+
+    // The unrelated project is a correct, silent drop: no false positive.
+    assert!(!err.contains(&other.display().to_string()), "unrelated repo path must not appear: {err}");
+    assert!(!err.contains("othersess"), "unrelated session must stay silent: {err}");
+
+    // The child's OWN session was captured (ownership unchanged); the parent one was NOT (still dropped).
+    let store = nested_agit(base, &child, &["a", "rev-parse", "--show-toplevel"]).1.trim().to_string();
+    let all = store_all_text(Path::new(&store));
+    assert!(all.contains("the real child work"), "child session must be captured: {all:.400}");
+    assert!(
+        !all.contains("work in the monorepo root by mistake"),
+        "the parent-dir session must remain dropped, not leaked into capture"
+    );
+}
+
+/// B: a session recorded with cwd == env captures normally, with NO stranded warning.
+#[test]
+fn a_normal_capture_emits_no_stranded_warning() {
+    let r = Repo::new();
+    let home = r.path().join("cchome");
+    seed_claude_session(&r, &home, "normal1", "ordinary owned work");
+
+    let (code, out, err) = r.agit_env(&[("HOME", home.to_str().unwrap())], &["a", "snap"]);
+    assert_eq!(code, 0, "a normal snap succeeds: {err}{out}");
+    assert!(r.captured("claude-code", "normal1.jsonl"), "the owned session is captured");
+    assert!(
+        !err.contains("wrong directory") && !err.contains("agit relocate"),
+        "an in-place session must not trigger a stranded warning: {err}"
+    );
+}
+
+/// C (the common case): a session stranded under a PARENT slug is brought in by BARE `agit relocate
+/// --yes` run in the child, with no selector and no --to. It is auto-detected, its transcript cwd
+/// rewritten to the child, and captured under the child's slug in the active agent's store.
+#[test]
+fn bare_relocate_brings_a_parent_dir_session_into_this_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    std::fs::create_dir_all(base.join("home")).unwrap();
+    let parent = base.join("work");
+    let child = parent.join("app");
+    init_repo(base, &parent, "root.md");
+    init_repo(base, &child, "app.ts");
+    assert_eq!(nested_agit(base, &child, &["init", "--agent", "childmem"]).0, 0, "agit init in child");
+
+    let home = base.join("home");
+    nested_seed_claude(&home, &parent, "strandedsess", "stranded work meant for the child");
+
+    let (code, out, err) = nested_agit(base, &child, &["relocate", "--yes"]);
+    assert_eq!(code, 0, "bare relocate should succeed: {err}{out}");
+    assert!(out.contains("relocated 1 session"), "reports what it moved: {out}");
+
+    // The active agent's store now holds it, with its cwd rewritten to the child (not the parent).
+    let store = nested_agit(base, &child, &["a", "rev-parse", "--show-toplevel"]).1.trim().to_string();
+    let all = store_all_text(Path::new(&store));
+    assert!(all.contains("stranded work meant for the child"), "the relocated session is captured: {all:.400}");
+    assert!(
+        all.contains(&format!("\"cwd\":\"{}\"", child.display())),
+        "the stored transcript's cwd is rewritten to the child: {all:.400}"
+    );
+    assert!(
+        !all.contains(&format!("\"cwd\":\"{}\"", parent.display())),
+        "the parent cwd must be gone from the captured copy"
+    );
+}
+
+/// C (the empty case): with nothing stranded, bare `agit relocate` exits 0 with a plain message, not an error.
+#[test]
+fn bare_relocate_with_nothing_stranded_says_so_and_exits_zero() {
+    let r = Repo::new();
+    let (code, out, err) = r.agit(&["relocate"]);
+    assert_eq!(code, 0, "nothing to relocate is a success, not an error: {err}{out}");
+    assert!(out.contains("nothing to relocate"), "says so plainly: {out}");
+}
+
 // ─────────────────── message hygiene: no em dash in a user-facing string ───────────────────
 
 /// Guard for this wave's message rule: every user-facing CLI string is `<state>: <fact> (<why>)`,
