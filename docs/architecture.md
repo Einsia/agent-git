@@ -1,9 +1,12 @@
 ---
-title: Architecture
-nav_order: 11
+title: Architecture (contributors)
+nav_order: 99
 ---
 
 # agit architecture (session model)
+
+> For contributors. This page describes agit's internals, not how to use it. If you want to use agit,
+> start at [Home](index.html) and the guides. This page is not part of the user documentation.
 
 > The current architecture. The earlier "two repos + hand-authored facts + deterministic evidence merge" design (architecture-v2) has been retired.
 

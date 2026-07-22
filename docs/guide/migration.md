@@ -1,20 +1,20 @@
 ---
-title: Migration
-nav_order: 6
+title: Rebind an agent's identity
+nav_order: 15
 ---
 
-# Migration
+# Rebind an agent's identity
 
-An agent is keyed by its aid, and agit refuses to connect a binding to a store whose aid doesn't match
-what `.agit.toml` records (see [How it works](concepts.html)). That integrity check is what stops a
-recreated remote from silently swapping in a different agent under the same name. When you actually mean
-to change the mapping, `agit a rebind` overrides it. There are two forms.
+An agent is keyed by its aid, and agit refuses to connect a binding to a store whose aid does not match
+what `.agit.toml` records (see [Concepts](concepts.html)). That check stops a recreated remote from
+silently swapping in a different agent under the same name. When you actually mean to change the mapping,
+`agit a rebind` overrides it. There are two forms.
 
 ## Point a binding at a recreated remote
 
-Use `--remote` when the store a name resolves to holds a different aid than the binding records — a
-remote recreated with a fresh identity, or DNS pointing the name somewhere new. Resolution refuses that
-by default; rebind is the explicit acceptance of it:
+Use `--remote` when the store a name resolves to holds a different aid than the binding records, such as a
+remote recreated with a fresh identity, or DNS pointing the name somewhere new. Resolution refuses that by
+default; rebind is how you accept it:
 
 ```
 agit a rebind frontend --remote https://hub.example.com/frontend.git
@@ -25,8 +25,8 @@ URL. As with `agit a push`, any credential in the URL is kept out of the committ
 
 ## Give a fork its own identity
 
-A clone of a fork carries the source's aid, so it reads as the same agent — a second claimant on one
-identity. `--new-id` mints a fresh aid, making the fork an independent agent:
+A clone of a fork carries the source's aid, so it reads as the same agent (a second claimant on one
+identity). `--new-id` mints a fresh aid, making the fork an independent agent:
 
 ```
 agit a rebind --new-id
@@ -34,7 +34,7 @@ agit a rebind --new-id
 
 Re-minting moves the store, because the store is keyed by aid. Two consequences follow:
 
-- It's refused while a watcher is running against the agent. Stop the watcher first with
+- It is refused while a watcher is running against the agent. Stop the watcher first with
   `agit watch --stop`.
-- Other repositories bound to the old aid don't follow the fork. Each must `agit a clone` the fork again
-  to pick it up.
+- Other repositories bound to the old aid do not follow the fork. Each must run `agit a clone` on the fork
+  again to pick it up.

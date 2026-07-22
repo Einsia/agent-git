@@ -5,31 +5,35 @@ nav_order: 1
 
 # agit
 
-agit is version control for the sessions an AI coding agent produces (Claude Code and Codex). Your
-code is already shared through Git; the session — what the agent read, ran, concluded, and intended —
-is not. agit stores that session in a git repository, syncs it with push and pull, and reconciles
-divergent sessions by having the agents compare their own work against the code.
+agit saves each coding session your AI agent produces (what the agent read, ran, and changed) into a
+git repository, so the session is versioned, shared, and reconciled the same way your code is. It works
+with Claude Code and Codex.
 
-## The two scopes
+`agit <git command>` runs git against your code repository, unchanged. Put `a` after `agit` and the same
+command runs against the agent's store, a separate git repository of session transcripts. So `agit log`
+shows your code history and `agit a log` shows the agent's sessions.
 
-agit adds a layer on top of git rather than replacing it. `agit <git command>` runs git against your
-code repository, transparently — everything you already type keeps working, `agit commit` and
-`agit push` included. Put `a` after `agit` and the same command runs against the agent's store instead,
-a normal git repository of session transcripts kept under `~/.agit`:
+## What do you want to do?
 
-| You type | Runs git against |
+| Goal | Guide |
 |---|---|
-| `agit <git command>` | your code repo — ordinary git |
-| `agit a <git command>` | the agent's store — plain git, plus a few agent-aware verbs |
+| Install agit and record your first session | [Get started](guide/quickstart.html) |
+| Record sessions automatically as you work | [Capture agent sessions](guide/capture.html) |
+| Continue a session with its context loaded | [Resume a session](guide/resume.html) |
+| Move a session between Claude Code and Codex | [Move a session between runtimes](guide/runtimes.html) |
+| Give a teammate an agent and its history | [Share an agent with your team](guide/sharing.html) |
+| Combine two people's diverged sessions | [Reconcile diverged sessions](guide/merging.html) |
+| Stop a secret from reaching shared history | [Keep secrets out of shared history](guide/secrets.html) |
+| Confirm which person produced a session | [Verify who produced a session](guide/provenance.html) |
+| Browse agents and sessions in a web UI | [Browse agents on the hub](hub.html) |
+| Run a hub for your team | [Self-host the hub](deploying-the-hub.html) |
+| Point an agent at a recreated remote or fork | [Rebind an agent's identity](guide/migration.html) |
 
-Most `agit a` commands are plain git on the store. The ones that do more are git verbs that mean
-something specific for an agent: `agit a clone <name>` clones by identity (resolving the URL from
-`.agit.toml`), `agit a push` records the store's remote into `.agit.toml`, and `agit a merge <agent>`
-reconciles two sessions by dialogue rather than textually (see [Merging](guide/merging.html)).
+## Reference
 
-One committed file, `.agit.toml`, declares which agents a repo uses and where to clone them, so a
-teammate's fresh clone can pull the same agents. One agent can work across many repos, and one repo
-can host many.
+- [Command reference](guide/command-reference.html): every command, one line each.
+- [Configuration](guide/configuration.html): environment variables and files.
+- [Concepts](guide/concepts.html): the vocabulary (agent, aid, store, environment).
 
 ## Install
 
@@ -37,34 +41,4 @@ can host many.
 npm install -g @einsia/agentgit
 ```
 
-This installs the `agit` client. Optionally route `git` through `agit`, so ordinary git commands also
-version your agent's sessions:
-
-```
-agit shadow install     # bash, zsh, fish, or PowerShell; undo with agit shadow uninstall
-```
-
-The `agit-hub` server is distributed separately — teams host it with Docker or build it from source
-(see [Deploying the hub](deploying-the-hub.html)).
-
-## The daemon
-
-Run `agit watch --daemon` once and leave it: it snapshots new sessions into the agent's store as you
-work, and converts them between Claude Code and Codex so a session recorded in one is resumable in the
-other.
-
-## Guide
-
-1. [Quickstart](guide/quickstart.html) — create, capture, share, and merge an agent.
-2. [How it works](guide/concepts.html) — the ideas behind the tool.
-3. [Merging](guide/merging.html) — reconciling divergent sessions.
-4. [Runtimes](guide/runtimes.html) — Claude Code and Codex, and session conversion.
-5. [Migration](guide/migration.html) — rebinding an agent's identity for recreated remotes and forks.
-6. [Configuration](guide/configuration.html) — environment variables and files.
-7. [Security](guide/security.html): the secret gate and session provenance.
-8. [Command reference](guide/command-reference.html) — every command.
-
-## Hosting
-
-- [The hub](hub.html) — what `agit-hub` is, and how its database, permissions, and API work.
-- [Deploying the hub](deploying-the-hub.html) — running one for your team.
+See [Get started](guide/quickstart.html) for the first run.

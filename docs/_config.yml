@@ -17,6 +17,7 @@ aux_links_new_tab: true
 exclude:
   - plans/
   - architecture.md
+  - demo-walkthrough.md
   - 使用介绍.md
   - 使用说明.md
   - 风险分析.md
