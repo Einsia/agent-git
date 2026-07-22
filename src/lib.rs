@@ -20,6 +20,7 @@ pub mod adapter;
 pub mod agent;
 pub mod commands;
 pub mod convo;
+pub mod debug;
 pub mod crypt;
 pub mod environment;
 pub mod harness;

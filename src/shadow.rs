@@ -220,17 +220,27 @@ pub fn uninstall(shell: Option<Shell>) -> Result<i32> {
     Ok(0)
 }
 
-/// `agit shadow status` — where the shadow is installed, if anywhere.
-pub fn status() -> Result<i32> {
-    let mut any = false;
+/// The shells whose profile currently carries the shadow block: `(label, profile path)`. The read-only
+/// core `status()` prints from, exposed so the debug bundle can report shadow state without spawning a
+/// second process or duplicating the profile-scan.
+pub fn status_lines() -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
     for s in ALL {
         let Ok(path) = profile_path(s) else { continue };
         if std::fs::read_to_string(&path).map(|c| c.contains(BEGIN)).unwrap_or(false) {
-            println!("● installed ({}): {}", s.label(), path.display());
-            any = true;
+            out.push((s.label(), path.display().to_string()));
         }
     }
-    if !any {
+    out
+}
+
+/// `agit shadow status` — where the shadow is installed, if anywhere.
+pub fn status() -> Result<i32> {
+    let installed = status_lines();
+    for (label, path) in &installed {
+        println!("● installed ({label}): {path}");
+    }
+    if installed.is_empty() {
         println!("git shadow not installed. Enable it with: agit shadow install");
     }
     Ok(0)
