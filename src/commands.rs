@@ -1601,6 +1601,12 @@ fn identity_register(args: &[String]) -> Result<i32> {
     outln!("");
     outln!("paste this into the hub: Account -> Signing keys -> Add a signing key");
     outln!("  (signed for {username:?} on device {device_label:?}; contains only public keys; no secret leaves this machine)");
+    // Persist the hub account so the git credential helper (`agit credential get`) knows which account to
+    // authenticate as — zero-config after this one-time enroll. Best-effort: a write failure never fails
+    // the register (the helper can still be pointed via the AGIT_HUB_USER override).
+    if let Err(e) = crate::credential::persist_hub_account(&username) {
+        errln!("note: could not remember the hub account for key-auth ({e}); set AGIT_HUB_USER to use `agit a push` without a token.");
+    }
     Ok(0)
 }
 

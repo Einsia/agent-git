@@ -87,6 +87,11 @@ pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, clien
         ("GET", "version") => return api_version(),
         ("POST", "login") => return api_login(ctx, req, body).await,
         ("POST", "register") => return api_register(ctx, client_ip, body).await,
+        // Key-based auth (anonymous, like login/register): a challenge nonce, then a signed-assertion
+        // exchange that mints a short-lived bearer token from the caller's ENROLLED ed25519 key — the
+        // git-credential-helper path that replaces a copy-pasted token. See `keyauth`.
+        ("GET", "auth/challenge") => return crate::keyauth::api_auth_challenge(ctx),
+        ("POST", "auth/key") => return crate::keyauth::api_auth_key(ctx, req, body).await,
         ("POST", "logout") => return api_logout(ctx, req, caller).await,
         ("GET", "me") => return api_me(ctx, caller).await,
         ("GET", "me/invitations") => return api_me_invitations(ctx, caller).await,
@@ -1320,15 +1325,15 @@ pub(crate) async fn api_admin_set_disabled(ctx: &Ctx, caller: &Caller, username:
 
 /// The largest hex field the registry accepts, and the exact lengths for each fixed-width value. An
 /// ed25519/X25519 public key is 32 bytes (64 hex chars); an ed25519 signature is 64 bytes (128 hex).
-const ED25519_PUB_HEX: usize = 64;
+pub(crate) const ED25519_PUB_HEX: usize = 64;
 const X25519_PUB_HEX: usize = 64;
-const ENROLL_SIG_HEX: usize = 128;
+pub(crate) const ENROLL_SIG_HEX: usize = 128;
 /// The most usernames one batch lookup will resolve — bounds the work a single request can trigger.
 const IDENTITY_BATCH_MAX: usize = 256;
 
 /// Whether `s` is exactly `n` lowercase/uppercase hex characters. Rejects both an oversized field and a
 /// non-hex one, so the registry only ever stores well-formed, fixed-width public material.
-fn is_hex_len(s: &str, n: usize) -> bool {
+pub(crate) fn is_hex_len(s: &str, n: usize) -> bool {
     s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -4757,7 +4762,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_sqlite(dir.path()).await.unwrap();
         let blobs = Blobs::open(dir.path()).await.unwrap();
-        let cfg = Cfg { host: IpAddr::from([127, 0, 0, 1]), port: 8177, tls: false, insecure: false, trusted_proxies: vec![], registration: false };
+        let cfg = Cfg { host: IpAddr::from([127, 0, 0, 1]), port: 8177, tls: false, insecure: false, trusted_proxies: vec![], registration: false, public_url: None };
         let ctx = Ctx(Arc::new(CtxInner {
             store,
             blobs,
@@ -4775,6 +4780,7 @@ mod tests {
                 let public = agit::agent::x25519_public_from_secret(&secret);
                 crate::server::EscrowKeypair { secret, public }
             },
+            auth_nonces: Arc::new(crate::keyauth::AuthNonces::new()),
         }));
         (dir, ctx)
     }
