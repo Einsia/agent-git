@@ -283,18 +283,22 @@ fn print_node(
         Some(o) => format!("{} · {when} · {}", s.runtime, ui::accent(&o)),
         None => format!("{} · {when}", s.runtime),
     };
-    // A child shows where it forked from its parent (the shared branch-point), and how that was detected.
+    // A child shows where it forked from its parent (the shared branch-point).
     if depth > 0 {
         if let Some(bp) = &lin.branch_point {
-            let how = lin.detected_by.as_deref().unwrap_or("prefix");
-            loc.push_str(&ui::dim(&format!(" · branched at {} ({how})", short_uuid(bp))));
+            loc.push_str(&ui::dim(&format!(" · branched at {}", short_uuid(bp))));
         }
     }
-    println!("{pad}● {loc}");
+    // A short session id on every node, so branches that share an opening are still told apart.
+    let sid = s.path.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+    println!("{pad}● {} {loc}", ui::dim(&short_uuid(&sid)));
 
     match &distilled {
         Some(d) => {
-            if let Some(gist) = d.prompts.first() {
+            // A root shows its opening prompt; a branch child shows its DIVERGENT tip (its latest prompt),
+            // since its opening is shared with the parent and would otherwise read identically.
+            let gist = if depth > 0 { d.prompts.last() } else { d.prompts.first() };
+            if let Some(gist) = gist {
                 println!("{pad}    {}", ui::dim(&format!("\"{}\"", ui::one_line(gist, 72))));
             }
             let mut tail = String::new();

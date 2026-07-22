@@ -595,10 +595,12 @@ pub(crate) fn last_activity(path: &Path) -> Option<String> {
 //     agent+env and then diverges. Detected `leaf` (a record's `leafUuid` resolving into another captured
 //     session) when that exact link is present, else by shared prefix (reusing `sync::shared_prefix_len`).
 
-/// One recorded subagent branch-point: the main-thread turn that spawned it, and the sub-thread's leaf.
+/// One recorded subagent branch-point: the main-thread turn that spawned it (when known), and the
+/// sub-thread's leaf. `spawn` is `None` for an in-process teammate whose meta carries no `toolUseId`:
+/// the subagent still exists and is counted, its exact spawn turn is just not recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subagent {
-    pub spawn: String,
+    pub spawn: Option<String>,
     pub leaf: String,
 }
 
@@ -650,7 +652,7 @@ pub fn read_lineage(transcript: &Path) -> Lineage {
             arr.iter()
                 .filter_map(|s| {
                     Some(Subagent {
-                        spawn: s.get("spawn")?.as_str()?.to_string(),
+                        spawn: s.get("spawn").and_then(|x| x.as_str()).map(String::from),
                         leaf: s.get("leaf")?.as_str()?.to_string(),
                     })
                 })
@@ -705,7 +707,7 @@ fn detect_subagents(text: &str, src: &Path, id: &str) -> Vec<Subagent> {
 
     let close_inline = |out: &mut Vec<Subagent>, spawn: &mut Option<String>, leaf: &mut Option<String>| {
         if let (Some(sp), Some(lf)) = (spawn.take(), leaf.take()) {
-            out.push(Subagent { spawn: sp, leaf: lf });
+            out.push(Subagent { spawn: Some(sp), leaf: lf });
         } else {
             *spawn = None;
             *leaf = None;
@@ -763,16 +765,16 @@ fn detect_subagents(text: &str, src: &Path, id: &str) -> Vec<Subagent> {
                     .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
                     .and_then(|v| v.get("toolUseId").and_then(|x| x.as_str()).map(String::from));
                 // Resolve the Task tool_use id to the main-thread turn that issued it; when the transcript
-                // no longer holds that turn, the tool_use id itself still names the spawn point.
+                // no longer holds that turn, the tool_use id itself still names the spawn point. An
+                // in-process teammate carries no `toolUseId`, so `spawn` stays None: the subagent is still
+                // recorded and counted (leaf is known), its exact spawn turn is simply unknown.
                 let spawn = tool_use_id.as_ref().and_then(|t| task_spawn.get(t).cloned()).or(tool_use_id);
-                if let Some(spawn) = spawn {
-                    out.push(Subagent { spawn, leaf });
-                }
+                out.push(Subagent { spawn, leaf });
             }
         }
     }
 
-    out.sort_by(|a, b| (a.spawn.as_str(), a.leaf.as_str()).cmp(&(b.spawn.as_str(), b.leaf.as_str())));
+    out.sort_by(|a, b| (a.spawn.as_deref(), a.leaf.as_str()).cmp(&(b.spawn.as_deref(), b.leaf.as_str())));
     out.dedup();
     out
 }
@@ -862,7 +864,13 @@ fn detect_branch_prefix(rt: &str, text: &str, id: &str, siblings: &[(PathBuf, St
             .get(n - 1)
             .and_then(|e| e.id.clone())
             .or_else(|| sib_ir.events.get(n - 1).and_then(|e| e.id.clone()))?;
-        if best.as_ref().map(|(bn, _, _)| n > *bn).unwrap_or(true) {
+        // Longest shared prefix wins; a tie is broken by the smaller sibling id, so the parent a session
+        // resolves to is deterministic and does not depend on sibling walk order.
+        let better = match best.as_ref() {
+            None => true,
+            Some((bn, best_id, _)) => n > *bn || (n == *bn && sid < best_id),
+        };
+        if better {
             best = Some((n, sid.clone(), bp));
         }
     }
@@ -2411,9 +2419,35 @@ mod lineage_tests {
         let lin = detect_lineage("claude-code", &src, id, &[]);
         assert_eq!(lin.subagents.len(), 1, "one sub-thread must be recorded: {lin:?}");
         let sa = &lin.subagents[0];
-        assert_eq!(sa.spawn, spawn_turn, "spawn resolves to the main-thread Task turn");
+        assert_eq!(sa.spawn.as_deref(), Some(spawn_turn), "spawn resolves to the main-thread Task turn");
         assert_eq!(sa.leaf, sub_leaf, "leaf is the sub-thread's last record");
         assert!(lin.parent.is_none(), "a subagent host is still a root unless it also branched");
+    }
+
+    // An in-process teammate's sub-thread carries a meta with NO `toolUseId` (real dumps: most subagent
+    // metas are these). The subagent must still be RECORDED and counted (its leaf is known) with a null
+    // spawn, not silently dropped, so `agit a log`'s "+N subagents" reflects reality.
+    #[test]
+    fn subagent_without_tooluseid_is_still_recorded_with_null_spawn() {
+        let d = tempfile::tempdir().unwrap();
+        let id = "S1";
+        let src = d.path().join(format!("{id}.jsonl"));
+        write(&src, &format!("{}\n", user(id, "u1", None, "2026-07-20T10:00:00.000Z", "go")));
+        let sub = d.path().join(id).join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        write(
+            &sub.join("agent-tm.jsonl"),
+            &format!(
+                "{{\"type\":\"assistant\",\"uuid\":\"tm-leaf\",\"parentUuid\":null,\"isSidechain\":true,\"sessionId\":\"{id}\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}\n"
+            ),
+        );
+        // Meta WITHOUT a toolUseId, as an in-process teammate writes it.
+        write(&sub.join("agent-tm.meta.json"), "{\"agentType\":\"in_process_teammate\",\"spawnDepth\":1}");
+
+        let lin = detect_lineage("claude-code", &src, id, &[]);
+        assert_eq!(lin.subagents.len(), 1, "a teammate sub-thread must still be recorded: {lin:?}");
+        assert!(lin.subagents[0].spawn.is_none(), "no toolUseId means a null spawn, not a dropped subagent");
+        assert_eq!(lin.subagents[0].leaf, "tm-leaf", "the leaf is still the sub-thread's last record");
     }
 
     #[test]
@@ -2434,7 +2468,7 @@ mod lineage_tests {
         write(&src, &body);
         let lin = detect_lineage("claude-code", &src, id, &[]);
         assert_eq!(lin.subagents.len(), 1, "{lin:?}");
-        assert_eq!(lin.subagents[0].spawn, "spawn-2");
+        assert_eq!(lin.subagents[0].spawn.as_deref(), Some("spawn-2"));
         assert_eq!(lin.subagents[0].leaf, "sc-leaf");
     }
 
@@ -2588,7 +2622,7 @@ mod lineage_tests {
             parent: Some("PAR".into()),
             branch_point: Some("bp-1".into()),
             detected_by: Some("prefix".into()),
-            subagents: vec![Subagent { spawn: "sp".into(), leaf: "lf".into() }],
+            subagents: vec![Subagent { spawn: Some("sp".into()), leaf: "lf".into() }],
         };
         let side = crate::commands::sidecar_path(&transcript);
         write(&side, &format!("{{\"lineage\":{}}}", lin.to_json()));

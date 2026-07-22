@@ -2056,16 +2056,18 @@ fn a_log_renders_the_divergence_dag() {
     // `a log` renders the DAG.
     let (code, out, err) = r.agit(&["a", "log"]);
     assert_eq!(code, 0, "a log must succeed: {err}");
-    // Parent and child share the opening prompt (the log's gist is the first prompt), so it appears
-    // twice - once for the root, once for the indented child.
-    assert_eq!(out.matches("build a parser").count(), 2, "parent and child both show the shared opening: {out}");
+    // The parent shows its opening prompt once; the child shows its DIVERGENT tip (its latest prompt),
+    // not the shared opening, so two branches that share an opening are still told apart.
+    assert_eq!(out.matches("build a parser").count(), 1, "only the parent shows the shared opening: {out}");
+    assert!(out.contains("use a PEG grammar instead"), "the child shows its divergent tip, not the shared opening: {out}");
     assert!(out.contains("delegate a subtask"), "the subagent host's prompt shows: {out}");
-    assert!(out.contains("branched at u2 (prefix)"), "the child is annotated with its branch-point: {out}");
+    assert!(out.contains("branched at u2"), "the child is annotated with its branch-point: {out}");
+    assert!(!out.contains("(prefix)"), "the internal detection-method jargon is not shown to the user: {out}");
     assert!(out.contains("+1 subagent"), "the subagent host is annotated: {out}");
     // The child is indented UNDER its parent: an indented bullet, appearing after the parent's root
     // bullet and carrying the branch-point line. HOST stays flat (a root bullet at column 0).
     assert!(out.contains("  ● "), "a /branch child is indented beneath its parent: {out:?}");
-    let par_pos = out.find("● claude-code").unwrap(); // first (root) bullet is the parent
+    let par_pos = out.find("● PARENT").unwrap(); // the root bullet now carries a short session id
     let branch_pos = out.find("branched at u2").unwrap();
     assert!(par_pos < branch_pos, "the child block renders under its parent: {out}");
 }
