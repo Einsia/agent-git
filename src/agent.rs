@@ -1611,7 +1611,7 @@ pub fn rebind(sel: Option<&str>, remote: Option<&str>, new_id: bool) -> Result<A
 // Cross-team pubkey→person trust is the hub's job (out of scope here). What lives here is client-side:
 // mint the key, sign a session's digest, and self-verify a recorded signature against its own pubkey.
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 /// `$AGIT_HOME/identity/` — where the machine keypair lives, spanning every repo like `launches.jsonl`.
 fn identity_dir(home: &Path) -> PathBuf {
@@ -1701,7 +1701,11 @@ pub fn verify_hex(pubkey_hex: &str, message: &[u8], sig_hex: &str) -> bool {
     let Ok(sig_raw) = hex::decode(sig_hex.trim()) else { return false };
     let Ok(sig_bytes) = <[u8; 64]>::try_from(sig_raw.as_slice()) else { return false };
     let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    vk.verify(message, &sig).is_ok()
+    // verify_strict, not verify: reject non-canonical S and small-order/torsion public keys, so a
+    // captured signature cannot be malleated into a second "valid" one over the same message. Every
+    // signature agit itself produces (deterministic ed25519 via sign_hex) is canonical and still
+    // verifies, so this is strictly a hardening for both the auth handshake and provenance.
+    vk.verify_strict(message, &sig).is_ok()
 }
 
 // ---------------------------------------------------------------------------------------------

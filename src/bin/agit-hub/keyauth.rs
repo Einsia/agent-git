@@ -121,6 +121,17 @@ fn canonical_audience(ctx: &Ctx, req: &Req) -> String {
     if let Some(u) = ctx.cfg.public_url.as_deref() {
         return u.trim_end_matches('/').to_string();
     }
+    // Unpinned: the audience is reconstructed from the request Host, which a caller can set. Safe for a
+    // single-hub deployment (there is no other hub to be confused with), but on a multi-hub setup a
+    // signature for hub A could be replayed to an unpinned hub B. Warn ONCE so this cannot ship silently;
+    // the operator closes the gap by setting AGIT_HUB_PUBLIC_URL.
+    static WARN_UNPINNED: std::sync::Once = std::sync::Once::new();
+    WARN_UNPINNED.call_once(|| {
+        tracing::warn!(
+            "key-auth audience is unpinned (AGIT_HUB_PUBLIC_URL unset); falling back to the request Host. \
+             Set AGIT_HUB_PUBLIC_URL to this hub's canonical URL to bind the audience against cross-hub replay."
+        );
+    });
     let scheme = if ctx.cfg.tls { "https" } else { "http" };
     format!("{scheme}://{}", req.host()).trim_end_matches('/').to_string()
 }
