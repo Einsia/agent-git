@@ -361,7 +361,7 @@ easily if it trusted `X-Forwarded-For` blindly. So:
   a trusted proxy (the real client). A malformed or fully-trusted chain falls back
   to the peer.
 
-So the rule is simple: set `--trusted-proxy` to the address(es) of the proxy that
+Set `--trusted-proxy` to the address(es) of the proxy that
 connects to the hub (Caddy's fixed `172.28.0.2` in Option A, `127.0.0.1` in
 Option B) and nothing else.
 

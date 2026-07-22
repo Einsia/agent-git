@@ -23,10 +23,10 @@ push cannot be waved through with `git --no-verify`: they scan in the wrapper fi
 `--no-verify` to the git call they make, so the wrapper's scan always runs even though git's own hook is
 skipped.
 
-Run the scan by hand any time:
+Scan the agent's sessions by hand any time:
 
 ```
-agit scan
+agit a scan
 ```
 
 ## When the scan finds something

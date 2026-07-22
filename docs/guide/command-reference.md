@@ -21,7 +21,7 @@ Anything not listed here is passed through to git: `agit <git-args>` runs on the
 | `agit adapter` | List the runtimes agit knows. |
 | `agit harness [apply]` | Show, or apply, an agent's captured MCP servers, skills, and config. |
 | `agit shadow install\|uninstall\|status` | Route `git` through `agit` in your shell (bash/zsh/fish/PowerShell). |
-| `agit scan` | Run the secret scan by hand. |
+| `agit a scan` | Scan the agent's sessions for secrets by hand. |
 | `agit provenance key` | Show this machine's signing identity (an ed25519 key, minted on first use). |
 | `agit provenance verify <session>` | Self-verify a captured session's signature. See [Verify who produced a session](provenance.html). |
 | `agit identity register <you>` | Print a paste-able block to enroll this machine's key under your hub account. |

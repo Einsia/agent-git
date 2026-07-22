@@ -108,7 +108,7 @@ agit a merge peer --splice
 full transcript, appends B's tail from the point the two forked, normalizes the session id and working
 directory onto one, and installs the result as a single new session. Nothing is reconciled and no
 conflicts are computed. You resume the combined session, and the agent reads both sides' context in one
-window and takes it from there.
+window and continues from there.
 
 Because it runs no model and revives nothing, `--splice` needs neither `AGIT_LLM` nor the runtime CLI,
 and it is deterministic: the same two sessions always splice to the same bytes. A same-aid target still

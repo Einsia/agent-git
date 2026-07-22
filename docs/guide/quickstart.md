@@ -38,7 +38,7 @@ Run this inside your code repository:
 agit init --agent frontend
 ```
 
-This creates an agent named `frontend`, writes a committed `.agit.toml` binding it to the repository,
+This creates an agent named `frontend`, writes a `.agit.toml` binding it to the repository (commit it so teammates get the agent),
 and installs a secret-scanning hook on the agent's store. Name the agent for what it works on
 (`frontend`, `payments-api`), not for you or the folder.
 
