@@ -12,15 +12,13 @@ aux_links:
   Repository: https://github.com/Einsia/agent-git
 aux_links_new_tab: true
 
-# Kept in the repo, but not part of the published wiki: the design history, the
-# contributor architecture doc, and the Chinese translation.
+# Kept in the repo, but not part of the published wiki: the design history and the
+# contributor architecture doc. The Chinese translation lives under docs/zh/ and is
+# published alongside the English wiki.
 exclude:
   - plans/
   - architecture.md
   - demo-walkthrough.md
-  - 使用介绍.md
-  - 使用说明.md
-  - 风险分析.md
   - Gemfile
   - Gemfile.lock
 
