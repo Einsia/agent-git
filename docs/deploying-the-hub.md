@@ -1,22 +1,21 @@
 ---
-title: Deploying the hub
+title: Self-host the hub
 nav_order: 11
 ---
 
-# Deploying agit-hub
+# Self-host the hub
 
-`agit-hub` is AgentGitHub: one self-contained HTTP service that hosts your team's
-Agent Stores (bare git repos of AI-session transcripts), readable by people
-through an embedded React SPA and pullable by agents over git smart-http. It
-carries auth (cookie sessions for people, scoped tokens for git/scripts), a
-per-agent ACL, an audit log, and a server-side secret scan on every push. Its
-metadata lives in a database (SQLite by default, Postgres for production), and
-large objects go in a content-addressed blob store (local filesystem by default,
-S3/Garage when configured).
+`agit-hub` is one self-contained HTTP service that hosts your team's agent stores
+(bare git repos of session transcripts). People browse them through an embedded web
+UI, and agents push and pull them over git smart-http. It carries authentication
+(cookie sessions for people, scoped tokens for git and scripts), a per-agent access
+check, an audit log, and a server-side secret scan on every push. Its metadata lives
+in a database (SQLite by default, Postgres for production), and large objects go in a
+content-addressed blob store (local filesystem by default, S3/Garage when configured).
 
-This guide covers the two supported ways to run it — a container behind a reverse
-proxy, and a systemd service behind a reverse proxy — plus the operational parts:
-TLS (why it is mandatory), the trusted-proxy story, the database and blob backends,
+This guide covers the two supported ways to run it (a container behind a reverse
+proxy, and a systemd service behind a reverse proxy) and the operational parts: TLS
+(why it is mandatory), the trusted-proxy setup, the database and blob backends,
 registration, backups, and upgrades.
 
 Everything below uses the **real** CLI. The full subcommand surface is:
@@ -68,15 +67,15 @@ them:
    ```
    $ agit-hub serve --host 0.0.0.0
    refusing to listen on 0.0.0.0 in plaintext.
-   Other people on this address's network can reach it — and without TLS, login
+   Other people on this address's network can reach it, and without TLS, login
    passwords and tokens cross the wire in plaintext ...
    ```
 
-   `--tls` does **not** make the hub speak TLS — the hub never terminates TLS
-   itself. It is a promise that *TLS is terminated in front of it* (by a reverse
-   proxy). It relaxes the bind guard and marks the session cookie `Secure`.
-   `--insecure` is the "plaintext on purpose, I know the price" escape hatch for a
-   trusted LAN or a throwaway demo.
+   `--tls` does **not** make the hub speak TLS (the hub never terminates TLS
+   itself). It is a promise that TLS is terminated in front of it by a reverse
+   proxy. It relaxes the bind guard and marks the session cookie `Secure`.
+   `--insecure` is the deliberate-plaintext escape hatch for a trusted LAN or a
+   throwaway demo.
 
 3. **Secrets on disk are locked down.** The data root is created `0700`. On the
    default SQLite backend the metadata database (`hub.db` and its write-ahead-log
@@ -100,7 +99,7 @@ history. That is why the hub refuses a public plaintext bind unless you force it
 
 ---
 
-## Option A — Docker behind Caddy (recommended)
+## Option A: Docker behind Caddy (recommended)
 
 Files: [`Dockerfile`](../Dockerfile), [`.dockerignore`](../.dockerignore),
 [`deploy/docker-compose.yml`](../deploy/docker-compose.yml),
@@ -113,7 +112,7 @@ client ──HTTPS──▶ caddy (:443) ──HTTP──▶ hub (:8177)
 Caddy terminates HTTPS and reverse-proxies to the hub over the internal Docker
 network, forwarding `X-Forwarded-For`. Inside the container the hub binds
 `0.0.0.0:8177` with `--tls` (TLS terminated in front) and trusts Caddy's fixed
-address. Nothing but Caddy can reach the hub — it publishes no host ports.
+address. Nothing but Caddy can reach the hub, which publishes no host ports.
 
 The compose file bundles four services: **caddy** (TLS in front), **hub**,
 **postgres** (the production metadata backend), and **garage** (S3-compatible blob
@@ -134,9 +133,9 @@ The `Dockerfile` is multi-stage:
   `/data`; because `HOME=/data`, the hub's default `--root` resolves to
   `/data/.agit-hub` for `serve` and for every admin command alike.
 
-The default `CMD` is `serve --host 0.0.0.0 --port 8177 --tls` — the container
-model from the bind guard's own guidance. `docker-compose.yml` overrides it only
-to add `--trusted-proxy`.
+The default `CMD` is `serve --host 0.0.0.0 --port 8177 --tls`, the container model
+from the bind guard's own guidance. `docker-compose.yml` overrides it only to add
+`--trusted-proxy`.
 
 ### Bring it up
 
@@ -236,9 +235,9 @@ docker compose -f deploy/docker-compose.yml exec hub agit-hub user list
 docker compose -f deploy/docker-compose.yml exec hub agit-hub list
 
 # from a machine with the agit client and the token from step 3:
-agit -a remote add origin https://hub.example.com/payments.git
-agit -a push -u origin main
-#   git prompts for a username/password — put the TOKEN in the password field
+agit a remote add origin https://hub.example.com/payments.git
+agit a push -u origin main
+#   git prompts for a username/password: put the TOKEN in the password field
 #   (the username can be anything).
 ```
 
@@ -248,7 +247,7 @@ Read-only credentials for pulling agents are the same command without `--write`
 
 ---
 
-## Option B — systemd behind a local reverse proxy
+## Option B: systemd behind a local reverse proxy
 
 File: [`deploy/agit-hub.service`](../deploy/agit-hub.service).
 
@@ -282,7 +281,7 @@ family, an empty `CapabilityBoundingSet`, `SystemCallFilter=@system-service`,
 Verify it before deploying with `systemd-analyze verify
 /etc/systemd/system/agit-hub.service`.
 
-### Admin commands — mind the `--root`
+### Admin commands: mind the `--root`
 
 The service data root is `/var/lib/agit-hub`. Manual admin commands must point at
 the **same** root and run as the service user, or they will read/create a
@@ -358,13 +357,13 @@ easily if it trusted `X-Forwarded-For` blindly. So:
 - With **no** `--trusted-proxy`, it ignores `X-Forwarded-For` entirely and keys on
   the raw peer IP.
 - With `--trusted-proxy` set, and only when the peer is one of those addresses, it
-  walks `X-Forwarded-For` right-to-left and takes the first address that is *not*
-  a trusted proxy — the real client. A malformed or fully-trusted chain falls back
+  walks `X-Forwarded-For` right-to-left and takes the first address that is not
+  a trusted proxy (the real client). A malformed or fully-trusted chain falls back
   to the peer.
 
 So the rule is simple: set `--trusted-proxy` to the address(es) of the proxy that
-connects to the hub — Caddy's fixed `172.28.0.2` in Option A, `127.0.0.1` in
-Option B — and nothing else.
+connects to the hub (Caddy's fixed `172.28.0.2` in Option A, `127.0.0.1` in
+Option B) and nothing else.
 
 ---
 
