@@ -248,6 +248,61 @@ fn live_sessions(rt: &str, env: &Path) -> Result<(Vec<(PathBuf, String)>, String
     Ok((adapter.project_sessions(env), adapter.source_desc(env)))
 }
 
+// ─────────────── stranded sessions: started in the wrong dir, warn + relocate ───────────────
+
+/// Sessions across every runtime that were DROPPED from capture because their recorded cwd != `env`, yet
+/// are plausibly meant for THIS repo (a parent dir, or the same repo at another path). This does NOT
+/// loosen ownership — capture still drops them; this collects the same drops so we can warn and so
+/// `agit relocate` can bring them in. A genuinely-unrelated project is not stranded_here and never appears.
+pub fn stranded_here(env: &Path) -> Vec<crate::adapter::StrandedSession> {
+    let mut out = vec![];
+    for rt in runtimes() {
+        if let Ok(a) = crate::adapter::get(rt) {
+            out.extend(a.stranded_sessions(env));
+        }
+    }
+    out
+}
+
+/// Print ONE informational note per wrong directory when capture drops sessions that look meant for THIS
+/// repo, pointing at `agit relocate`. Never fatal — capture of the real, matching sessions still
+/// succeeds. Silent when nothing is stranded-and-plausible (an unrelated drop is correct, not warned).
+pub fn warn_stranded(env: &Path) {
+    let stranded = stranded_here(env);
+    if stranded.is_empty() {
+        return;
+    }
+    // Group by the directory they actually ran in; BTreeMap keeps the note order stable across runs.
+    let mut by_cwd: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for s in &stranded {
+        *by_cwd.entry(s.recorded_cwd.clone()).or_default() += 1;
+    }
+    for (cwd, n) in by_cwd {
+        errln!(
+            "note: {n} session(s) ran in {cwd}, not this repo ({}). started in the wrong directory? run `agit relocate` to bring them here.",
+            env.display()
+        );
+    }
+}
+
+/// Capture into the store the sessions THIS repo now owns for `rt` — used by `agit relocate` after it
+/// installs a relocated session under `env`'s slug and records its launch. Quiet: it reuses the same
+/// route → mirror → gated-commit path as snap, without snap's per-store banner, and returns how many
+/// files it wrote. Errors from a single store are surfaced but never abort the whole relocate.
+pub fn capture_relocated(env: &Path, rt: &str) -> Result<usize> {
+    let rt = normalize(rt);
+    let (routed, _) = route(&rt, env)?;
+    let mut written = 0usize;
+    for r in &routed {
+        let _lock = lock_store(&r.store)?;
+        let (stats, _hits, _dst) = mirror_owned(&rt, env, r)?;
+        let mut count = 0u64;
+        commit_snap(&r.store, &rt, &mut count);
+        written += stats.added + stats.updated;
+    }
+    Ok(written)
+}
+
 /// `agit a snap [--from <runtime>]` — mirror session dumps into the Agent Store, once.
 ///
 /// With no `--from` there is nothing to default to: claude-code and codex are peers, so snap captures
@@ -265,6 +320,10 @@ pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
         return sync(&r, capture_harness);
     }
     let env = scope::env_root()?;
+    // Before deciding there is nothing to capture, disclose any sessions dropped for running in the wrong
+    // directory — otherwise an all-stranded project (everything ran in the parent) looks empty and the
+    // user's work is silently stranded. Informational; the real capture below is unaffected.
+    warn_stranded(&env);
     let live = live_runtimes(&env);
     if live.is_empty() {
         bail!(
@@ -286,6 +345,7 @@ pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
 /// `capture_harness` also captures the project's MCP/skills/config (redacting secrets); `--no-harness` skips it.
 pub fn sync(runtime: &str, capture_harness: bool) -> Result<i32> {
     let env = scope::env_root()?;
+    warn_stranded(&env);
     snap_one(&normalize(runtime), &env, capture_harness)
 }
 
@@ -925,6 +985,7 @@ pub fn snap_watch_checked(runtime: &str, interval_secs: u64, capture_harness: bo
 
 pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> Result<i32> {
     let env = scope::env_root()?;
+    warn_stranded(&env);
     let rt = normalize(runtime);
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
     let watch = source_path(&rt, &env);
@@ -1256,6 +1317,7 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
     let env = scope::env_root()?;
+    warn_stranded(&env);
     let interval = Duration::from_secs(interval_secs.max(1));
     let runtimes = runtimes();
     let mut last: HashMap<&str, String> = HashMap::new();

@@ -5,7 +5,7 @@
 //!   type=assistant message.content is a block list: tool_use / thinking / text
 //!   tool_use: {name, input}  -- Read{file_path,offset,limit} / Bash{command} / Write|Edit{file_path}
 
-use super::{Adapter, FileRead, SessionIR};
+use super::{Adapter, FileRead, SessionIR, StrandedSession};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -86,6 +86,47 @@ pub fn project_sessions(env: &Path) -> Vec<(PathBuf, String)> {
     out
 }
 
+/// Claude sessions recorded under a DIFFERENT cwd than `env` but plausibly meant for it (a parent dir,
+/// or the same repo at another path). Claude splits by project slug, and a parent path slugifies to a
+/// DIFFERENT directory (`/p` → `-p`, `/p/app` → `-p-app`), so these live under OTHER slug dirs, never
+/// `env`'s own — the scan therefore walks all of `~/.claude/projects/*`. Ownership is untouched: this
+/// only powers the drop-warning and `agit relocate`. Reads each transcript's launch cwd (one line), not
+/// the whole file. A session whose recorded cwd == env is owned (excluded); an unrelated project's is
+/// not plausibly-here (excluded), so it stays a silent, correct drop.
+pub fn stranded_sessions(env: &Path) -> Vec<StrandedSession> {
+    let Ok(root) = projects_dir() else {
+        return vec![];
+    };
+    let Ok(dirs) = std::fs::read_dir(&root) else {
+        return vec![];
+    };
+    let want = env.to_string_lossy();
+    let mut out = vec![];
+    for slug_dir in dirs.filter_map(|e| e.ok()) {
+        let sd = slug_dir.path();
+        if !sd.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&sd) else {
+            continue;
+        };
+        for e in files.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if !p.is_file() || p.extension().map(|x| x != "jsonl").unwrap_or(true) {
+                continue;
+            }
+            let Some(cwd) = launch_cwd(&p) else { continue };
+            if cwd == *want || !crate::scope::plausibly_here(Path::new(&cwd), env) {
+                continue;
+            }
+            if let Some(id) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) {
+                out.push(StrandedSession { path: p, id, runtime: "claude-code", recorded_cwd: cwd });
+            }
+        }
+    }
+    out
+}
+
 /// Does this project have the slug directory to itself? Used to decide whether slug-level content that
 /// belongs to no session (`memory/`) can be attributed to us at all.
 pub fn slug_dir_is_exclusive(env: &Path) -> bool {
@@ -152,6 +193,10 @@ impl Adapter for ClaudeCode {
 
     fn project_sessions(&self, env: &Path) -> Vec<(PathBuf, String)> {
         project_sessions(env)
+    }
+
+    fn stranded_sessions(&self, env: &Path) -> Vec<StrandedSession> {
+        stranded_sessions(env)
     }
 
     fn source_desc(&self, env: &Path) -> String {
