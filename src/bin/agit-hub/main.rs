@@ -7,6 +7,7 @@ mod api;
 mod backup;
 mod cli;
 mod content;
+mod doctor;
 mod emailverify;
 mod gitplumb;
 mod http;
@@ -44,6 +45,7 @@ pub(crate) fn run() -> i32 {
         "org" => org_cmd(&root, &args),
         "backup" => crate::backup::backup_cmd(&root, &args),
         "restore" => crate::backup::restore_cmd(&root, &args),
+        "doctor" => crate::doctor::doctor_cmd(&root, &args),
         "pre-receive" => pre_receive_cmd(&root, &args),
         "-h" | "--help" => {
             print_help();
@@ -79,7 +81,8 @@ pub(crate) fn print_help() {
          agit-hub org transfer <org> <new_owner>              hand org ownership to a member\n\
          agit-hub org rm <org>                                delete an empty org\n\
          agit-hub backup [--out <file.tgz>]                   one tar.gz of the data root + a consistent metadata snapshot (0600, sensitive)\n\
-         agit-hub restore <file.tgz> [--force]                inverse; refuses a non-empty root without --force, refuses a cross-backend restore\n\n\
+         agit-hub restore <file.tgz> [--force]                inverse; refuses a non-empty root without --force, refuses a cross-backend restore\n\
+         agit-hub doctor                                      operator diagnostic: version, backend, schema, row counts, storage, health (credentials redacted)\n\n\
          First step: agit-hub user add <you> --admin\n\
          Hosted repos are bare git. Publish with: agit -a push http://HOST:PORT/<owner>/<name>.git (with a write token)\n\n\
          Listens on 127.0.0.1 only by default. Serving the network needs --host 0.0.0.0, and without TLS also --insecure."
@@ -1453,6 +1456,58 @@ mod obs_tests {
         assert!(text.contains("# TYPE git_push_total counter"));
         assert!(text.contains("secret_scan_rejects_total"));
         assert!(text.contains("agit_hub_build_info"));
+    }
+
+    /// Every response — a 200 AND an error path — carries an `X-Request-Id`, two requests get DIFFERENT
+    /// ids, and a JSON error body folds in a `request_id` that MATCHES its header.
+    #[tokio::test]
+    async fn every_response_carries_a_unique_request_id_and_errors_echo_it_in_the_body() {
+        let (_d, ctx) = ctx_with_admin().await;
+        let app = build(ctx.clone());
+
+        // A 200 (public /api/version) carries the header.
+        let ok = app.clone().oneshot(Request::builder().uri("/api/version").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(ok.status(), 200);
+        let rid_ok = ok.headers().get("x-request-id").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        assert!(rid_ok.as_deref().map(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())).unwrap_or(false), "200 must carry a 16-hex X-Request-Id, got {rid_ok:?}");
+
+        // An error path (unknown /api route → 404 JSON) ALSO carries the header, and its body echoes it.
+        let err = app.clone().oneshot(Request::builder().uri("/api/no-such-route").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(err.status(), 404);
+        let rid_err = err.headers().get("x-request-id").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        assert!(rid_err.is_some(), "the 404 error path must carry an X-Request-Id header");
+        let body: serde_json::Value = serde_json::from_str(&body_string(err).await).unwrap();
+        assert_eq!(
+            body["request_id"].as_str().map(|s| s.to_string()),
+            rid_err,
+            "the error JSON body's request_id must MATCH the X-Request-Id header"
+        );
+
+        // Two requests get DIFFERENT ids (per-request, not a process constant).
+        assert_ne!(rid_ok, rid_err, "two requests must get distinct correlation ids");
+
+        // A 401 error path (admin-only /api/audit, anonymous) carries a header too.
+        let unauth = app.clone().oneshot(Request::builder().uri("/api/audit").body(Body::empty()).unwrap()).await.unwrap();
+        assert!(unauth.status() == 401 || unauth.status() == 403, "anonymous audit is denied, got {}", unauth.status());
+        assert!(unauth.headers().get("x-request-id").is_some(), "even a denied request carries an X-Request-Id");
+    }
+
+    /// `GET /api/version` is PUBLIC: an anonymous caller (no token, no cookie) gets 200 with the version
+    /// and schema_version, and it is never gated behind auth.
+    #[tokio::test]
+    async fn version_is_public_and_reports_version_and_schema() {
+        let (_d, ctx) = ctx_with_admin().await;
+        let app = build(ctx.clone());
+        let resp = app.clone().oneshot(Request::builder().uri("/api/version").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), 200, "anonymous /api/version must not require a token");
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["version"].as_str(), Some(env!("CARGO_PKG_VERSION")), "reports the crate version");
+        assert_eq!(
+            v["schema_version"].as_i64(),
+            Some(agit::hub::store::schema_version()),
+            "reports the live schema version"
+        );
+        assert!(v.get("build_sha").is_some(), "the build_sha field is present (null when not compiled in)");
     }
 
     #[tokio::test]

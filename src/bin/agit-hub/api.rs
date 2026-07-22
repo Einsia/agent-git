@@ -82,6 +82,9 @@ pub(crate) const SEARCH_SCAN_CAP: usize = 400;
 pub(crate) async fn api(ctx: &Ctx, req: &Req, rest: &str, caller: &Caller, client_ip: Option<IpAddr>, body: &[u8]) -> Resp {
     let m = req.method.as_str();
     match (m, rest) {
+        // Public, no auth: the version/schema the web report + client record to pin the hub version.
+        // Registered at the anonymous tier (no `caller` gate) exactly like the open `repos` index.
+        ("GET", "version") => return api_version(),
         ("POST", "login") => return api_login(ctx, req, body).await,
         ("POST", "register") => return api_register(ctx, client_ip, body).await,
         ("POST", "logout") => return api_logout(ctx, req, caller).await,
@@ -473,6 +476,17 @@ async fn classify_read_status(
         ed25519_keys: keys.iter().map(|k| k.ed25519_pub.clone()).collect(),
     });
     agit::commands::attribute_with_registry(self_status, registered, None)
+}
+
+/// `GET /api/version` — public (no auth). The version + schema the web report and the client read to
+/// pin the hub version they talked to. `build_sha` is the git sha compiled in via `AGIT_BUILD_SHA` (a
+/// release build sets it); when it was not set at compile time it is `null`, never a fabricated value.
+pub(crate) fn api_version() -> Resp {
+    Resp::json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_sha": option_env!("AGIT_BUILD_SHA"),
+        "schema_version": store::schema_version(),
+    }))
 }
 
 // ── Authentication ──
