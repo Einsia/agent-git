@@ -8,9 +8,10 @@ nav_order: 10
 `agit-hub` is a separate, self-contained server a team hosts to share agents. It holds each agent as a
 bare git repo of session transcripts and adds what a shared store needs: a database for its metadata,
 access control (with organizations), self-service registration, sync over git smart-http, server-side
-secret scanning on every push, content-addressed blob storage, an audit log, and a web UI for browsing
-sessions. Run it with Docker or build it from source — [Deploying the hub](deploying-the-hub.html)
-covers both.
+secret scanning on every push, content-addressed blob storage, a registry of members' device signing
+keys (so a captured session can be verified as a person, not just a machine), an audit log, and a web UI
+for browsing sessions. Run it with Docker or build it from source;
+[Deploying the hub](deploying-the-hub.html) covers both.
 
 The hub does not run agents and does not merge. Merging reads two sessions and reasons about them
 against your code, which is a model's job that happens locally, on the machine that has both the code
@@ -105,8 +106,11 @@ agent's effective permission at decision time: the single `acl::decide` check st
 never learns that orgs exist, so an org just contributes members to the agents it owns. The routes live
 under `/api/orgs`: `GET`/`POST /api/orgs` list and create orgs (the creator becomes the first org
 admin), `GET /api/orgs/<name>` shows one, and `/api/orgs/<name>/members[/<username>]` manages the
-roster. Org detail and membership follow the same existence-non-disclosure as agents: you only see orgs
-you belong to, so org names cannot be enumerated.
+roster. `GET /api/orgs/<name>/overview` backs the org page below: it returns the members plus every
+agent the org owns and every personal agent its members own that you may read, each with its session
+count and the code repos it has worked in. Org detail and membership follow the same
+existence-non-disclosure as agents: you only see orgs you belong to, so org names cannot be enumerated,
+and the overview lists only the agents you are allowed to read.
 
 ## Registration
 
@@ -164,6 +168,15 @@ Beyond that view, the API serves a **semantic** diff between two revisions — t
 and conclusions added and removed, not raw jsonl line noise — and search across the sessions of every
 agent the caller may read. Session transcripts are attacker-authored input, so raw blob and
 cross-revision compare views serve their content with a content type the browser will not execute.
+
+Two index pages cross the per-agent grain. **`/orgs/<name>`** is an organization overview: its members,
+and the agents each can reach (the org's own plus members' personal ones you may read), with each
+agent's session count and the code repos it has worked in. **`/repos`** inverts that: every code repo
+the hub's agents have worked in, grouped by environment, with the agents attached to each. One repo is
+often touched by several agents, and it is listed once with its per-agent session counts. Both are
+built by fanning out over the agents you are allowed to read (backed by `/api/orgs/<name>/overview` and
+`/api/repos`), so neither reveals an agent you cannot already see. `/repos` serves any caller the public
+slice; `/orgs/<name>` is limited to members and site admins.
 
 ## Limits
 

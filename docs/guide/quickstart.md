@@ -48,6 +48,17 @@ Without the daemon you capture by hand with `agit snap`: it copies the runtime's
 into the store and commits them, running the secret gate first exactly as the daemon does. It is the
 same capture, just triggered by hand instead of on a timer.
 
+A captured session is attributed to your git identity, so set it once like any git repo:
+
+```
+git config --global user.email you@example.com
+git config --global user.name  "Your Name"
+```
+
+agit does not invent an identity for you and refuses to snap a session under an unset one rather than
+attribute it to nobody. Creating agents needs no identity; only a snap does. See
+[Security](security.html) for how this becomes a "verified as you" signature.
+
 ## Work
 
 ```

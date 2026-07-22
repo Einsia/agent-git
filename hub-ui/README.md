@@ -1,7 +1,8 @@
 # hub-ui
 
 The AgentGitHub web frontend — a React SPA that renders the agent roster, session
-traces (with the signature **session spine**), provenance, permalinks, and revision diffs.
+traces (with the signature **session spine**), provenance, permalinks, revision diffs,
+an organization overview (`/orgs/<name>`), and a code-repo index (`/repos`).
 It consumes the JSON API served by the `agit-hub` binary at the same origin.
 
 Stack: Vite + React + TypeScript + Tailwind CSS v4 + shadcn/ui (new-york) + react-router.

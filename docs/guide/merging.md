@@ -40,6 +40,11 @@ claude --resume <id>
 codex exec resume <id>
 ```
 
+A successful merge captures that session into the store as the agent's latest, so a bare `agit start`
+or `agit resume` (no id) picks it up like any freshly snapped session. You do not snap it by hand; if a
+secret slips into the merged transcript the same gate holds it out of history and the merge exits
+non-zero, exactly as a snap would.
+
 ## The conflict ledger
 
 When merge surfaces conflicts, you decide each one: accept a way out the dialogue named, type your own
