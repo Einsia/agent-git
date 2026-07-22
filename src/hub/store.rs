@@ -701,6 +701,23 @@ pub struct RowCounts {
     pub tokens: i64,
 }
 
+/// The tables `agit-hub doctor` reports row counts for. A FIXED allowlist — never interpolated from
+/// caller input — so the `COUNT(*)` below can name the table directly (no bound-parameter slot exists
+/// for an identifier) without opening an injection surface. Ordered how an operator reads them.
+pub const DOCTOR_TABLES: &[&str] = &[
+    "users",
+    "agents",
+    "orgs",
+    "tokens",
+    "mrs",
+    "invitations",
+    "identity_keys",
+    "email_verify_tokens",
+    "password_reset_tokens",
+    "team_keks",
+    "escrow_keys",
+];
+
 /// `SELECT COUNT(*)` the three core tables over an arbitrary SQLite pool.
 async fn count_on_pool(pool: &sqlx::SqlitePool) -> io::Result<RowCounts> {
     async fn one(pool: &sqlx::SqlitePool, table: &str) -> io::Result<i64> {
@@ -1310,6 +1327,24 @@ impl Store {
             Store::Sqlite(s) => count_on_pool(&s.pool).await,
             Store::Pg(_) => Err(io::Error::other("row_counts is only valid for the SQLite backend")),
         }
+    }
+
+    /// Per-table row counts for the operator diagnostic (`agit-hub doctor`), on whichever backend is
+    /// live. Returns one `(table, Option<count>)` per [`DOCTOR_TABLES`] entry in order: a table that
+    /// errors (absent on an older schema, say) yields `None` for its count rather than failing the whole
+    /// report, so the diagnostic is best-effort and never aborts on one missing table.
+    pub async fn table_counts(&self) -> Vec<(&'static str, Option<i64>)> {
+        let mut out = Vec::with_capacity(DOCTOR_TABLES.len());
+        for &table in DOCTOR_TABLES {
+            // The table name is a compile-time constant from DOCTOR_TABLES, never caller input.
+            let sql = format!("SELECT COUNT(*) AS n FROM {table}");
+            let count = match self {
+                Store::Sqlite(s) => sqlx::query(&sql).fetch_one(&s.pool).await.ok().map(|r| r.int("n")),
+                Store::Pg(s) => sqlx::query(&sql).fetch_one(&s.pool).await.ok().map(|r| r.int("n")),
+            };
+            out.push((table, count));
+        }
+        out
     }
 
     // ── users ──

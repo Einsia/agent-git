@@ -5,7 +5,10 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
+use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
@@ -30,6 +33,66 @@ use crate::smarthttp::git_http;
 /// re-deriving it. A newtype so it can't collide with any other `IpAddr` in extensions.
 #[derive(Clone, Copy)]
 pub(crate) struct ClientIp(pub(crate) IpAddr);
+
+/// The per-request correlation id (`X-Request-Id`), minted once by [`observe`] and stashed in request
+/// extensions so any inner handler can log it alongside its own events. A newtype so it can't collide
+/// with any other `String` in extensions.
+#[derive(Clone)]
+pub(crate) struct RequestId(pub(crate) String);
+
+/// Mint a fresh 16-hex-char (8-byte) correlation id from OS randomness. Per-request and random — never a
+/// clock/pid alone — so two requests in the same microsecond, or across a fork, still get distinct ids.
+/// A caller-supplied `X-Request-Id` is deliberately NOT honored: minting server-side keeps an attacker
+/// from forging or colliding ids in the logs (log injection), and a fresh id is all correlation needs.
+pub(crate) fn new_request_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 8];
+    // OsRng is infallible here in practice; on the vanishingly unlikely gather failure fall back to a
+    // still-unique-per-process nanosecond stamp so a request is never left without an id.
+    if rand::rngs::OsRng.try_fill_bytes(&mut b).is_err() {
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        b.copy_from_slice(&(n as u64).to_be_bytes());
+    }
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Set the `X-Request-Id` header on a response, and — for a JSON error body (`>= 400`) — fold the id
+/// into the JSON object as a `request_id` field so the client and web UI can surface it. Only small JSON
+/// error bodies are buffered/rewritten; success responses (git packs, blob downloads) are never touched.
+/// No request body is ever read or logged here — correlation is method/route/status/id only.
+async fn stamp_request_id(mut resp: Response, rid: &str) -> Response {
+    if let Ok(hv) = HeaderValue::from_str(rid) {
+        resp.headers_mut().insert(HeaderName::from_static("x-request-id"), hv);
+    }
+    if resp.status().as_u16() < 400 {
+        return resp;
+    }
+    let is_json = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.starts_with("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    // Error bodies are tiny; cap the buffering so a mislabeled large body can't blow up here.
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return Response::from_parts(parts, Body::empty()),
+    };
+    let new_body = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(serde_json::Value::Object(mut m)) => {
+            m.insert("request_id".to_string(), serde_json::Value::String(rid.to_string()));
+            serde_json::to_vec(&serde_json::Value::Object(m)).unwrap_or_else(|_| bytes.to_vec())
+        }
+        _ => bytes.to_vec(),
+    };
+    // The body length changed; drop the stale Content-Length so the server recomputes it.
+    parts.headers.remove(CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(new_body))
+}
 
 // ── Frontend embedded at compile time (hub-ui/dist) ──
 pub(crate) const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/index.html"));
@@ -148,20 +211,26 @@ fn route_label(path: &str) -> &'static str {
 /// closed set, status folded to its class inside `Metrics`); the request path is **not** used as a
 /// metric label — only as a coarse `route` field on the log line — so no request can grow the metric
 /// families. No secrets/PII are logged: method, coarse route, status, and latency only.
-async fn observe(State(ctx): State<Ctx>, req: Request, next: Next) -> Response {
+async fn observe(State(ctx): State<Ctx>, mut req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_string();
     let route = route_label(req.uri().path());
+    // One correlation id per request: stashed in extensions (so inner handlers can log it) and stamped
+    // onto every response below — a maintainer greps this single id to find the request end-to-end.
+    let rid = new_request_id();
+    req.extensions_mut().insert(RequestId(rid.clone()));
     let start = Instant::now();
-    tracing::debug!(%method, route, "request start");
+    tracing::debug!(%method, route, request_id = %rid, "request start");
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
+    // Attach X-Request-Id to EVERY response (2xx and error alike), and fold it into JSON error bodies.
+    let resp = stamp_request_id(resp, &rid).await;
     let secs = start.elapsed().as_secs_f64();
     ctx.metrics.record_request(&method, status, secs);
     let latency_ms = secs * 1_000.0;
     if status >= 500 {
-        tracing::error!(%method, route, status, latency_ms, "request end");
+        tracing::error!(%method, route, status, request_id = %rid, latency_ms, "request end");
     } else {
-        tracing::info!(%method, route, status, latency_ms, "request end");
+        tracing::info!(%method, route, status, request_id = %rid, latency_ms, "request end");
     }
     resp
 }
@@ -198,6 +267,9 @@ async fn favicon() -> Response {
 async fn gate_conn_and_auth(State(ctx): State<Ctx>, req: Request, next: Next) -> Response {
     let (mut parts, body) = req.into_parts();
     let reqo = req_from_parts(parts.method.as_str(), &parts.uri, &parts.headers);
+    // The correlation id `observe` minted (it runs outside this layer), so the auth log lines below
+    // carry the SAME id as the request-end span — one grep ties an auth event to its request.
+    let rid = parts.extensions.get::<RequestId>().map(|r| r.0.clone()).unwrap_or_default();
 
     // (a) Blanket path-traversal gate: any `..` segment → 400, covering git + api + spa uniformly.
     if parts.uri.path().split('/').any(|seg| seg == "..") {
@@ -228,7 +300,7 @@ async fn gate_conn_and_auth(State(ctx): State<Ctx>, req: Request, next: Next) ->
         // A token that matched a real, usable grant. `id` is the token's *identifier* (e.g. `tok_1`),
         // never the plaintext secret, so it is safe to log.
         ctx.metrics.record_auth(AuthResult::TokenOk);
-        tracing::info!(token_id = %id, "token accepted");
+        tracing::info!(token_id = %id, request_id = %rid, "token accepted");
         auth::touch_token(&ctx.store, &id).await;
         if !ctx.token_rl.allow(&id) {
             return Resp::text(
@@ -243,7 +315,7 @@ async fn gate_conn_and_auth(State(ctx): State<Ctx>, req: Request, next: Next) ->
         // unusable/expired/unknown token (a live session would have won and set `caller.user`). Count
         // and log the denial — without the header contents, which may carry the secret.
         ctx.metrics.record_auth(AuthResult::TokenDenied);
-        tracing::warn!("token denied");
+        tracing::warn!(request_id = %rid, "token denied");
     }
 
     // (e) Hand the Caller to the handlers via extensions, then run the inner service with the IpGuard
