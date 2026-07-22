@@ -265,6 +265,15 @@ export interface Revision {
   subject: string
 }
 
+/// One ordered turn of the conversation, as `api_session` (src/bin/agit-hub/content.rs) serializes it.
+/// `text` is the turn's ORIGINAL markdown (code fences, lists, headings preserved), clipped server-side.
+/// `tools` counts the tool calls folded into an assistant turn; 0 for a user turn.
+export interface Turn {
+  role: "user" | "assistant"
+  text: string
+  tools: number
+}
+
 export interface SessionDetail {
   id: string
   runtime: string
@@ -276,6 +285,10 @@ export interface SessionDetail {
   cwd: string
   prompts: string[]
   texts: string[]
+  /// The ordered back-and-forth — the readable conversation the session view renders as markdown.
+  turns: Turn[]
+  /// True when the conversation was longer than the server's turn cap and was truncated.
+  turns_capped: boolean
   files: string[]
   spine: string
   revisions: Revision[]

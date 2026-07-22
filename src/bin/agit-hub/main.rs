@@ -1523,3 +1523,110 @@ mod obs_tests {
         assert!(dump.contains("http_request_duration_seconds_count 1"));
     }
 }
+
+#[cfg(test)]
+mod session_turns_tests {
+    use crate::content::api_session;
+    use crate::gitplumb::{extract_turns, TURN_CAP, TURN_CLIP};
+
+    // ── Session view: the ordered conversation (turns) ──
+
+    /// A four-round claude transcript: user, assistant (with two tool calls + a code fence), user,
+    /// assistant. The tool_result user records between them are NOT turns.
+    const MULTI_ROUND: &str = concat!(
+        "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"cwd\":\"/p\",\"gitBranch\":\"main\",\"message\":{\"role\":\"user\",\"content\":\"first question\"}}\n",
+        "{\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"first reply\\n```rust\\nfn x() {}\\n```\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Read\",\"input\":{\"file_path\":\"/a\"}}]}}\n",
+        "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u3\",\"parentUuid\":\"u2\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"a\\nb\"}]}}\n",
+        "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u4\",\"parentUuid\":\"u3\",\"message\":{\"role\":\"user\",\"content\":\"second question\"}}\n",
+        "{\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u5\",\"parentUuid\":\"u4\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"second reply\"}]}}\n",
+    );
+
+    #[test]
+    fn extract_turns_interleaves_in_order_with_tool_counts() {
+        let t = extract_turns("claude-code", MULTI_ROUND);
+        assert!(!t.capped);
+        // The conversation interleaves — NOT two flat lists. Roles alternate user/assistant/user/assistant.
+        let roles: Vec<&str> = t.turns.iter().map(|x| x.role).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"], "turns must interleave in order");
+        assert_eq!(t.turns[0].text, "first question");
+        // Markdown is preserved verbatim: the fenced code block survives, not stripped to a first line.
+        assert!(t.turns[1].text.contains("```rust"), "code fence preserved: {}", t.turns[1].text);
+        assert!(t.turns[1].text.contains("fn x() {}"), "{}", t.turns[1].text);
+        // The two tool_use blocks fold into the assistant turn that issued them.
+        assert_eq!(t.turns[1].tools, 2, "assistant turn counts its tool calls");
+        assert_eq!(t.turns[0].tools, 0, "a user turn has no tools");
+        assert_eq!(t.turns[2].text, "second question");
+        assert_eq!(t.turns[3].text, "second reply");
+        assert_eq!(t.turns[3].tools, 0, "the last assistant reply issued no tools");
+    }
+
+    #[test]
+    fn extract_turns_clips_a_very_long_turn() {
+        let long = "x".repeat(TURN_CLIP + 500);
+        let jsonl = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"message\":{{\"role\":\"user\",\"content\":\"{long}\"}}}}\n"
+        );
+        let t = extract_turns("claude-code", &jsonl);
+        assert_eq!(t.turns.len(), 1);
+        // Clipped to the bound + a trailing marker, so it never returns megabytes.
+        assert!(t.turns[0].text.ends_with("..."), "clipped turns are marked");
+        assert_eq!(t.turns[0].text.chars().count(), TURN_CLIP + 3, "clipped to TURN_CLIP chars + \"...\"");
+    }
+
+    #[test]
+    fn extract_turns_caps_a_huge_conversation() {
+        let mut jsonl = String::new();
+        for i in 0..(TURN_CAP + 50) {
+            jsonl.push_str(&format!(
+                "{{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u{i}\",\"parentUuid\":null,\"message\":{{\"role\":\"user\",\"content\":\"q{i}\"}}}}\n"
+            ));
+        }
+        let t = extract_turns("claude-code", &jsonl);
+        assert!(t.capped, "an over-long conversation is capped");
+        assert_eq!(t.turns.len(), TURN_CAP);
+    }
+
+    /// Build a real repo with the multi-round session committed at `sessions/claude-code/S1.jsonl`,
+    /// then drive `api_session` end-to-end and assert the JSON carries the ordered `turns`.
+    #[test]
+    fn api_session_serves_ordered_turns() {
+        fn run_git(dir: &std::path::Path, args: &[&str]) {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init", "-q"]);
+        let sdir = root.join("sessions/claude-code");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(sdir.join("S1.jsonl"), MULTI_ROUND).unwrap();
+        run_git(root, &["add", "."]);
+        // Per-invocation identity so a throwaway repo never clobbers the user's real commit identity.
+        run_git(
+            root,
+            &["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "session"],
+        );
+
+        let resp = api_session(root, "S1", "");
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let turns = v["turns"].as_array().expect("turns is an array");
+        let shape: Vec<(&str, i64)> = turns
+            .iter()
+            .map(|t| (t["role"].as_str().unwrap(), t["tools"].as_i64().unwrap()))
+            .collect();
+        // Interleaved order + the assistant's tool count survives serialization.
+        assert_eq!(shape, vec![("user", 0), ("assistant", 2), ("user", 0), ("assistant", 0)]);
+        assert!(turns[1]["text"].as_str().unwrap().contains("```rust"), "markdown preserved in JSON");
+        assert_eq!(v["turns_capped"].as_bool(), Some(false));
+        // The old fields stay for compatibility.
+        assert!(v.get("prompts").is_some() && v.get("texts").is_some() && v.get("spine").is_some());
+    }
+}

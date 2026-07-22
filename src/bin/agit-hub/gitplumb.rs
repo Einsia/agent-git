@@ -338,6 +338,83 @@ pub(crate) fn digest(runtime: &str, id: &str, jsonl: &str) -> SessionDigest {
     }
 }
 
+/// One readable turn in the conversation view: a single user prompt, or a single assistant reply.
+/// `text` keeps the original markdown (code fences, lists, headings) verbatim, clipped to a bound.
+/// `tools` counts the tool calls attributed to an assistant turn (consecutive tool calls/results are
+/// not turns of their own; they fold into the assistant turn that issued them). 0 for a user turn.
+pub(crate) struct Turn {
+    pub(crate) role: &'static str,
+    pub(crate) text: String,
+    pub(crate) tools: usize,
+}
+
+/// The ordered conversation plus whether it was capped (a huge session must not return megabytes).
+pub(crate) struct Turns {
+    pub(crate) turns: Vec<Turn>,
+    pub(crate) capped: bool,
+}
+
+/// Max turns returned by the session view; a longer conversation is truncated (`capped`).
+pub(crate) const TURN_CAP: usize = 200;
+/// Per-turn char bound; a longer turn is clipped with a trailing marker.
+pub(crate) const TURN_CLIP: usize = 6000;
+
+/// Reconstruct the ordered back-and-forth from a transcript, IN ORDER, so the session view can render
+/// a real conversation instead of two flattened lists. Walks the same ordered ConversationIR events the
+/// spine does: each `UserPrompt` / `AssistantText` becomes a turn (markdown preserved, clipped), and
+/// each `ToolCall` folds into the count of the assistant turn that most recently spoke. Empty/whitespace
+/// turns are skipped; the whole thing is capped at [`TURN_CAP`] turns.
+///
+/// Runtime-agnostic (claude-code / codex) via [`agit::convo::read_conversation`]; an unparsable
+/// transcript yields an empty, uncapped result rather than an error — the view degrades to its other
+/// sections.
+pub(crate) fn extract_turns(runtime: &str, jsonl: &str) -> Turns {
+    use agit::convo::EventKind;
+    let Ok(ir) = agit::convo::read_conversation(runtime, jsonl) else {
+        return Turns { turns: Vec::new(), capped: false };
+    };
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut capped = false;
+    // Index of the assistant turn that most recently spoke — tool calls fold into it. Reset by a user
+    // prompt (a tool call with no preceding assistant turn has nowhere to attribute and is dropped).
+    let mut cur_assist: Option<usize> = None;
+    'walk: for e in &ir.events {
+        for k in &e.kinds {
+            match k {
+                EventKind::UserPrompt(s) => {
+                    if s.trim().is_empty() {
+                        continue;
+                    }
+                    if turns.len() >= TURN_CAP {
+                        capped = true;
+                        break 'walk;
+                    }
+                    turns.push(Turn { role: "user", text: clip_marked(s, TURN_CLIP), tools: 0 });
+                    cur_assist = None;
+                }
+                EventKind::AssistantText(s) => {
+                    if s.trim().is_empty() {
+                        continue;
+                    }
+                    if turns.len() >= TURN_CAP {
+                        capped = true;
+                        break 'walk;
+                    }
+                    turns.push(Turn { role: "assistant", text: clip_marked(s, TURN_CLIP), tools: 0 });
+                    cur_assist = Some(turns.len() - 1);
+                }
+                EventKind::ToolCall { .. } => {
+                    if let Some(i) = cur_assist {
+                        turns[i].tools += 1;
+                    }
+                }
+                EventKind::ToolResult { .. } | EventKind::FileEdit { .. } => {}
+            }
+        }
+    }
+    Turns { turns, capped }
+}
+
 pub(crate) struct Provenance {
     pub(crate) author: String,
     pub(crate) when: String,
@@ -420,4 +497,16 @@ pub(crate) fn first_line(s: &str) -> String {
 
 pub(crate) fn clip(s: &str, n: usize) -> String {
     s.trim().chars().take(n).collect()
+}
+
+/// Clip to `n` chars, char-safe (never mid-byte), appending a trailing "..." when the text was cut.
+/// Unlike [`clip`], the caller can tell a clipped turn from one that just happened to end there.
+pub(crate) fn clip_marked(s: &str, n: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= n {
+        t.to_string()
+    } else {
+        let head: String = t.chars().take(n).collect();
+        format!("{head}...")
+    }
 }
