@@ -276,7 +276,7 @@ function AboutCard({
           </span>
         </Fact>
         <Fact label="Owner">
-          <span className="truncate font-mono">{owner || "—"}</span>
+          <span className="truncate font-mono">{owner || "-"}</span>
         </Fact>
       </dl>
 
@@ -289,7 +289,7 @@ function AboutCard({
           end-to-end
         </Badge>
         <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-          Sessions can be encrypted per-session before they reach the hub — it stores only ciphertext
+          Sessions can be encrypted per-session before they reach the hub, which stores only ciphertext
           and never holds the keys, so it can't report who the readers are.
         </p>
         <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
@@ -298,7 +298,7 @@ function AboutCard({
         </p>
         {org && (
           <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-            Owned by <span className="font-mono text-foreground/80">{org}</span> — hub-assist escrow and
+            Owned by <span className="font-mono text-foreground/80">{org}</span>. Hub-assist escrow and
             offline recovery are set on the{" "}
             <Link to="/orgs" className="text-primary hover:underline">
               org page
