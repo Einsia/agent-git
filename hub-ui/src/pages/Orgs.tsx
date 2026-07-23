@@ -8,7 +8,7 @@ import { useSession } from "@/lib/session"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { Eyebrow, LoadError } from "@/components/States"
+import { LoadError } from "@/components/States"
 
 // Mirrors valid_username() in src/hub/store.rs — orgs share the username rules: 2-32 chars,
 // lowercase [a-z0-9._-], no leading dot. Advisory only; the server is the gate, and it lowercases
@@ -30,9 +30,8 @@ export function Orgs() {
   return (
     <div className="flex flex-col gap-8">
       <header>
-        <span className="eyebrow">organizations</span>
-        <h1 className="mt-1 text-2xl font-bold tracking-tight">Organizations</h1>
-        <p className="mt-1 max-w-[62ch] text-sm text-muted-foreground">
+        <h1 className="text-2xl font-bold tracking-tight">Organizations</h1>
+        <p className="mt-2 max-w-[62ch] text-sm text-muted-foreground">
           A team that can own agents together. Every member gets write on the org's agents; an
           admin also manages the roster. Open one to see its agents, members and settings.
         </p>
@@ -41,7 +40,12 @@ export function Orgs() {
       <CreateOrg reload={reload} />
 
       <section>
-        <Eyebrow className="mb-3">your orgs</Eyebrow>
+        <h2 className="mb-4 flex items-baseline gap-2 text-lg font-semibold tracking-tight">
+          Your organizations
+          {data && (
+            <span className="font-mono text-base tabular-nums text-muted-foreground">{data.length}</span>
+          )}
+        </h2>
         {loading && <p className="py-6 text-muted-foreground">Loading…</p>}
         {error && status !== 401 && <LoadError message={error} />}
         {data && data.length === 0 && (
@@ -88,12 +92,12 @@ function CreateOrg({ reload }: { reload: () => void }) {
   }
 
   return (
-    <section>
-      <Eyebrow className="mb-3">new org</Eyebrow>
-      <form onSubmit={submit} className="flex flex-col gap-3 rounded-lg border bg-card p-4">
+    <section className="rounded-lg border bg-card p-4">
+      <h2 className="text-sm font-semibold">Create an organization</h2>
+      <form onSubmit={submit} className="mt-4 flex flex-col gap-3">
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1.5">
-            <span className="eyebrow">name</span>
+            <span className="text-sm font-medium">Name</span>
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -108,10 +112,10 @@ function CreateOrg({ reload }: { reload: () => void }) {
             {busy ? "Creating…" : "Create org"}
           </Button>
         </div>
-        <p className="text-[0.75rem] text-muted-foreground">
+        <p className="text-sm text-muted-foreground">
           You become its first admin. Names are lowercase [a-z0-9._-], 2-32 characters.
         </p>
-        {nameError && <p className="text-[0.78rem] text-destructive">{nameError}</p>}
+        {nameError && <p className="text-sm text-destructive">{nameError}</p>}
         {error && (
           <p role="alert" className="text-sm text-destructive">
             {error}
@@ -129,16 +133,16 @@ function OrgRow({ org, me }: { org: Org; me: string | null }) {
   return (
     <Link
       to={`/orgs/${encodeURIComponent(org.name)}`}
-      className="flex flex-wrap items-center gap-2.5 rounded-lg border bg-card p-4 transition-colors hover:border-primary/50 hover:bg-accent/40"
+      className="flex flex-wrap items-center gap-3 rounded-lg border bg-card p-4 transition-colors hover:border-primary/50 hover:bg-accent/40"
     >
-      <Building2 className="size-4 text-muted-foreground" />
+      <Building2 className="size-5 text-muted-foreground" />
       <span className="font-mono text-lg font-semibold">{org.name}</span>
       {mine && (
-        <Badge variant="muted" className="font-mono text-[0.6rem]">
+        <Badge variant="muted" className="font-mono">
           {mine.role}
         </Badge>
       )}
-      <Badge variant="muted" className="ml-auto text-[0.6rem]">
+      <Badge variant="muted" className="ml-auto">
         {org.members.length} {org.members.length === 1 ? "member" : "members"}
       </Badge>
     </Link>

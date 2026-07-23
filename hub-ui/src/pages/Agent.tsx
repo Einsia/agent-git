@@ -171,11 +171,12 @@ export function Agent() {
 }
 
 // A copyable, read-only command block — GitHub's grey terminal box. The copy button floats in the
-// top-right so a long command still scrolls under it without collision.
+// top-right; the command wraps (preserving its own newlines) so a long clone URL stays fully readable
+// inside the card instead of overflowing or truncating under the button.
 function CommandBlock({ code }: { code: string }) {
   return (
     <div className="relative">
-      <pre className="overflow-x-auto rounded-md border bg-muted p-3 pr-12 font-mono text-[0.8rem] leading-relaxed">
+      <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted p-3 pr-12 font-mono text-[0.8rem] leading-relaxed">
         {code}
       </pre>
       <CopyButton value={code} size="icon" variant="ghost" className="absolute right-2 top-2" label="Copy command" />

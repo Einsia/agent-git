@@ -1,5 +1,5 @@
 import { Link, useParams, useSearchParams } from "react-router-dom"
-import { ArrowUpRight, Lock } from "lucide-react"
+import { ArrowUpRight, Building2, Lock } from "lucide-react"
 
 import { api, type OrgOverview, type OrgOverviewAgent } from "@/lib/api"
 import { useGuarded } from "@/lib/useGuarded"
@@ -7,7 +7,7 @@ import { useSession } from "@/lib/session"
 import { cn } from "@/lib/utils"
 import { Badge } from "@/components/ui/badge"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Eyebrow, Forbidden, LoadError } from "@/components/States"
+import { Forbidden, LoadError } from "@/components/States"
 import { MemberCreateControl, MembersPanel, OrgCrypto } from "@/pages/orgs-management"
 
 // The agent-page route segment is the owner_ns, not the full owner string: an org-owned agent's owner
@@ -20,9 +20,9 @@ const TABS = ["agents", "members", "settings"] as const
 type TabKey = (typeof TABS)[number]
 
 const TAB_LABELS: Record<TabKey, string> = {
-  agents: "agents",
-  members: "members",
-  settings: "settings",
+  agents: "Agents",
+  members: "Members",
+  settings: "Settings",
 }
 
 export function OrgDetail() {
@@ -58,9 +58,11 @@ export function OrgDetail() {
   return (
     <div className="flex flex-col gap-8">
       <header>
-        <span className="eyebrow">organization</span>
-        <h1 className="mt-1 font-mono text-2xl font-bold tracking-tight">{name}</h1>
-        <p className="mt-1 max-w-[62ch] text-sm text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <Building2 className="size-6 text-muted-foreground" />
+          <h1 className="font-mono text-2xl font-bold tracking-tight">{name}</h1>
+        </div>
+        <p className="mt-2 max-w-[62ch] text-sm text-muted-foreground">
           Everyone in this org and the agents they can reach: the org's own agents plus each member's
           personal ones you have access to.
         </p>
@@ -84,7 +86,7 @@ export function OrgDetail() {
                 aria-controls={`org-panel-${t}`}
                 onClick={() => selectTab(t)}
                 className={cn(
-                  "eyebrow -mb-px border-b-2 border-transparent px-2.5 py-2 transition-colors hover:text-foreground",
+                  "-mb-px border-b-2 border-transparent px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground",
                   tab === t && "border-primary text-foreground"
                 )}
               >
@@ -109,10 +111,10 @@ export function OrgDetail() {
 function AgentsTab({ data }: { data: OrgOverview }) {
   return (
     <section>
-      <div className="mb-3 flex items-baseline gap-2">
-        <Eyebrow>agents</Eyebrow>
-        <span className="font-mono text-sm tabular-nums text-muted-foreground">{data.agents.length}</span>
-      </div>
+      <h2 className="mb-4 flex items-baseline gap-2 text-lg font-semibold tracking-tight">
+        Agents
+        <span className="font-mono text-base tabular-nums text-muted-foreground">{data.agents.length}</span>
+      </h2>
       {data.agents.length === 0 ? (
         <p className="rounded-lg border bg-card px-4 py-8 text-muted-foreground">
           No agents you can reach here yet. The org's own agents and its members' personal agents
@@ -123,10 +125,10 @@ function AgentsTab({ data }: { data: OrgOverview }) {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>agent</TableHead>
-                <TableHead>visibility</TableHead>
-                <TableHead className="text-right">sessions</TableHead>
-                <TableHead>environments</TableHead>
+                <TableHead>Agent</TableHead>
+                <TableHead>Visibility</TableHead>
+                <TableHead className="text-right">Sessions</TableHead>
+                <TableHead>Environments</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -145,7 +147,7 @@ function SettingsTab({ org, canManage }: { org: string; canManage: boolean }) {
   if (!canManage) {
     return (
       <section>
-        <Eyebrow className="mb-3">settings</Eyebrow>
+        <h2 className="mb-4 text-lg font-semibold tracking-tight">Settings</h2>
         <p className="rounded-lg border bg-card px-4 py-8 text-muted-foreground">
           Only an org admin can change these settings.
         </p>
@@ -175,7 +177,7 @@ function AgentRow({ a }: { a: OrgOverviewAgent }) {
             <ArrowUpRight className="size-3.5 shrink-0 text-muted-foreground" />
           </Link>
           {a.personal && (
-            <Badge variant="muted" className="text-[0.6rem]">
+            <Badge variant="muted">
               personal
             </Badge>
           )}
@@ -204,7 +206,7 @@ function AgentRow({ a }: { a: OrgOverviewAgent }) {
                 key={env}
                 to="/repos"
                 title="View this repo in the code-repo index"
-                className="rounded-full border bg-muted px-2 py-0.5 font-mono text-[0.68rem] text-muted-foreground transition-colors hover:text-foreground"
+                className="rounded-full border bg-muted px-2.5 py-0.5 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
               >
                 {env}
               </Link>
