@@ -562,12 +562,23 @@ fn extract_claude_kinds(rec: &serde_json::Value) -> Vec<EventKind> {
                                 }
                             }
                         }
+                        // The assistant's plaintext extended-reasoning block. Captured IN ORDER (before/
+                        // after the text as authored) for the read-only transcript view; the `signature`
+                        // field (the encrypted CoT proof) is deliberately ignored. Empty thinking is noise
+                        // and skipped, like empty text. DROPPED on cross-vendor convert (see the writers).
+                        Some("thinking") => {
+                            if let Some(t) = b.get("thinking").and_then(|v| v.as_str()) {
+                                if !t.trim().is_empty() {
+                                    out.push(EventKind::Thinking(t.to_string()));
+                                }
+                            }
+                        }
                         Some("tool_use") => out.push(EventKind::ToolCall {
                             call_id: b.get("id").and_then(|v| v.as_str()).map(String::from),
                             name: b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             input: b.get("input").cloned().unwrap_or(serde_json::Value::Null),
                         }),
-                        _ => {} // thinking: encrypted, dropped across vendors (kept by raw within the same vendor)
+                        _ => {} // other block types (e.g. encrypted-only) live in raw, dropped across vendors
                     }
                 }
             }
@@ -661,12 +672,19 @@ fn cross_to_claude(ir: &ConversationIR, opts: &ConvertOpts) -> String {
     }
     for e in &ir.events {
         for k in &e.kinds {
+            // Thinking is dropped cross-vendor: it is not needed for resumability, and the target model
+            // never replays another runtime's reasoning. Skipping it here keeps the converted transcript
+            // byte-for-byte free of the reasoning (no extra record, no chain reorder).
+            if let EventKind::Thinking(_) = k {
+                continue;
+            }
             let (user, text) = match k {
                 EventKind::UserPrompt(s) => (true, s.clone()),
                 EventKind::AssistantText(s) => (false, s.clone()),
                 EventKind::ToolCall { name, input, .. } => (false, narrate_call(name, input)),
                 EventKind::ToolResult { output, .. } => (false, format!("[output] {}", truncate(output, 2000))),
                 EventKind::FileEdit { paths } => (false, format!("[edited: {}]", paths.join(", "))),
+                EventKind::Thinking(_) => unreachable!("skipped above"),
             };
             if text.trim().is_empty() {
                 continue;
@@ -742,6 +760,44 @@ mod tests {
         let kinds: Vec<&EventKind> = ir.events.iter().flat_map(|e| e.kinds.iter()).collect();
         assert!(matches!(kinds[0], EventKind::UserPrompt(p) if p == "hi there"));
         assert!(kinds.iter().any(|k| matches!(k, EventKind::AssistantText(t) if t == "hello")));
+    }
+
+    #[test]
+    fn thinking_block_parsed_in_order_and_dropped_on_convert() {
+        // An assistant message authored as [thinking, text, tool_use]: the thinking block must surface as
+        // a Thinking kind IN ORDER (before the text and tool call), alongside the visible content.
+        let src = "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"cwd\":\"/p\",\"gitBranch\":\"main\",\"message\":{\"role\":\"user\",\"content\":\"do it\"}}\n\
+                   {\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"LET_ME_REASON\",\"signature\":\"SECRETSIG\"},{\"type\":\"text\",\"text\":\"VISIBLE_REPLY\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"ls\"}}]}}\n";
+        let ir = read_conversation(src);
+        let kinds: Vec<&EventKind> = ir.events.iter().flat_map(|e| e.kinds.iter()).collect();
+        // Order: UserPrompt, Thinking, AssistantText, ToolCall — the thinking sits where it was authored.
+        assert!(matches!(kinds[0], EventKind::UserPrompt(p) if p == "do it"), "{kinds:?}");
+        assert!(matches!(kinds[1], EventKind::Thinking(t) if t == "LET_ME_REASON"), "thinking in order: {kinds:?}");
+        assert!(matches!(kinds[2], EventKind::AssistantText(t) if t == "VISIBLE_REPLY"), "{kinds:?}");
+        assert!(matches!(kinds[3], EventKind::ToolCall { .. }), "{kinds:?}");
+
+        // A convert round-trip that INCLUDES thinking still produces a valid converted transcript: the
+        // thinking (and its encrypted signature) is DROPPED, while the other events carry through intact.
+        let opts = ConvertOpts { cwd: None, new_id: "NEWID".into() };
+        let out = crate::convo::write_conversation("codex", &ir, &opts).unwrap();
+        assert!(!out.contains("LET_ME_REASON"), "thinking must be dropped on convert: {out}");
+        assert!(!out.contains("SECRETSIG"), "the encrypted signature must never carry over: {out}");
+        assert!(out.contains("do it"), "the prompt survives: {out}");
+        assert!(out.contains("VISIBLE_REPLY"), "the visible reply survives: {out}");
+        assert!(out.contains("ls"), "the tool call is narrated: {out}");
+        // The converted rollout re-reads cleanly, with the visible turns intact and no thinking kind.
+        let ir2 = crate::convo::read_conversation("codex", &out).unwrap();
+        assert!(
+            ir2.events.iter().flat_map(|e| &e.kinds).all(|k| !matches!(k, EventKind::Thinking(_))),
+            "no thinking survives into the converted transcript"
+        );
+        assert!(
+            ir2.events
+                .iter()
+                .flat_map(|e| &e.kinds)
+                .any(|k| matches!(k, EventKind::UserPrompt(p) if p == "do it")),
+            "the prompt is recoverable from the converted transcript"
+        );
     }
 
     #[test]

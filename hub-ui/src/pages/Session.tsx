@@ -1,6 +1,6 @@
-import type { ReactNode } from "react"
+import { useState, type ReactNode } from "react"
 import { Link, useParams, useSearchParams } from "react-router-dom"
-import { GitCompare } from "lucide-react"
+import { GitCompare, Loader2, Maximize2, Minimize2 } from "lucide-react"
 
 import { api } from "@/lib/api"
 import { useGuarded } from "@/lib/useGuarded"
@@ -16,9 +16,14 @@ export function Session() {
   const { owner = "", name = "", id = "" } = useParams()
   const [params] = useSearchParams()
   const at = params.get("at") ?? undefined
+  // The default view is the light, clipped/capped transcript. Toggling `full` refetches with ?full=1 to
+  // pull the UNCLIPPED transcript, rendered through the SAME virtualized list so even a huge one stays
+  // performant. useAsync preserves the previous data across a refetch, so the old view stays on screen
+  // (with a subtle loading state) instead of blanking while the full payload loads.
+  const [full, setFull] = useState(false)
   const { data, loading, error, status, forbidden } = useGuarded(
-    () => api.session(owner, name, id, at),
-    [owner, name, id, at]
+    () => api.session(owner, name, id, at, full),
+    [owner, name, id, at, full]
   )
   // The live, registry-classified provenance verdict, fetched alongside the session (its own read so a
   // slow registry lookup never holds up the transcript). Best-effort: a failure just hides the badge —
@@ -30,7 +35,9 @@ export function Session() {
   return (
     <div>
       <Crumb owner={owner} name={name} session={id} />
-      {loading && <p className="py-6 text-muted-foreground">Loading…</p>}
+      {/* Only the FIRST load blanks to "Loading…"; a full/clipped switch keeps the old view up (data is
+          preserved across the refetch) and shows a subtle inline indicator by the toggle instead. */}
+      {loading && !data && <p className="py-6 text-muted-foreground">Loading…</p>}
       {/* 401 is already redirecting to the login form; don't flash an error behind it. */}
       {error && status !== 401 && <LoadError message={error} />}
 
@@ -64,7 +71,29 @@ export function Session() {
 
           <div className="mt-7 grid grid-cols-1 gap-8 md:grid-cols-[1fr_260px]">
             <div>
-              <Section title={`conversation · ${data.turns.length} turns`}>
+              <Section
+                title={`conversation · ${data.turns.length} turns`}
+                action={
+                  <div className="flex items-center gap-2">
+                    {loading && (
+                      <span className="inline-flex items-center gap-1 text-[0.72rem] text-muted-foreground">
+                        <Loader2 className="size-3 animate-spin" />
+                        loading
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setFull((v) => !v)}
+                      disabled={loading}
+                      aria-pressed={full}
+                      className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[0.75rem] text-muted-foreground transition-colors hover:bg-muted disabled:opacity-60"
+                    >
+                      {full ? <Minimize2 className="size-3" /> : <Maximize2 className="size-3" />}
+                      {full ? "Clipped view" : "View full transcript"}
+                    </button>
+                  </div>
+                }
+              >
                 {data.turns.length === 0 ? (
                   <p className="text-sm text-muted-foreground">No readable turns in this session.</p>
                 ) : (
@@ -72,8 +101,9 @@ export function Session() {
                     <Transcript turns={data.turns} />
                     {data.turns_capped && (
                       <p className="mt-3 rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
-                        This conversation is long; the view is truncated. Pull the session for the full
-                        transcript.
+                        {full
+                          ? "This conversation is very long; even the full view is capped. Pull the session for everything."
+                          : "This conversation is long; the view is truncated. Switch to the full transcript, or pull the session."}
                       </p>
                     )}
                   </>
@@ -140,10 +170,13 @@ agit -a merge origin/main`}
   )
 }
 
-function Section({ title, children }: { title: string; children: ReactNode }) {
+function Section({ title, children, action }: { title: string; children: ReactNode; action?: ReactNode }) {
   return (
     <section className="mb-6">
-      <h3 className="eyebrow mb-2">{title}</h3>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <h3 className="eyebrow">{title}</h3>
+        {action}
+      </div>
       {children}
     </section>
   )

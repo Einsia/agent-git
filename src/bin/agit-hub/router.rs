@@ -95,10 +95,31 @@ async fn stamp_request_id(mut resp: Response, rid: &str) -> Response {
 }
 
 // ── Frontend embedded at compile time (hub-ui/dist) ──
+//
+// The SPA is CODE-SPLIT (see hub-ui/vite.config.ts): the entry is `app.js`, plus a small set of
+// deterministically-named chunks. The heavy, lazily-used chunks (Session/Diff/MrDetail and the
+// markdown/virtualizer vendors) are fetched on demand by the browser at their `/assets/<name>.js` URL,
+// so every emitted chunk must be embedded and served here. Names are hash-free and pinned by the vite
+// config, so this table stays stable across rebuilds; adding a new lazy chunk means adding a row here.
 pub(crate) const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/index.html"));
-pub(crate) const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/app.js"));
 pub(crate) const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/app.css"));
 pub(crate) const FAVICON: &str = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>◆</text></svg>";
+
+/// One embedded static asset: (basename under /assets/, content-type, body). The whole code-split bundle
+/// lives here so the single `/assets/{file}` route can serve any chunk the SPA lazily imports.
+type Asset = (&'static str, &'static str, &'static str);
+const JS: &str = "application/javascript; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+pub(crate) const ASSETS: &[Asset] = &[
+    ("app.js", JS, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/app.js"))),
+    ("app.css", CSS, APP_CSS),
+    ("react-vendor.js", JS, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/react-vendor.js"))),
+    ("markdown-vendor.js", JS, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/markdown-vendor.js"))),
+    ("virtual-vendor.js", JS, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/virtual-vendor.js"))),
+    ("Session.js", JS, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/Session.js"))),
+    ("Diff.js", JS, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/Diff.js"))),
+    ("MrDetail.js", JS, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/hub-ui/dist/assets/MrDetail.js"))),
+];
 
 /// Record a denial. A denied anonymous read = "not logged in yet", which is noise; a denied
 /// authenticated caller, or a denied write/manage action, is signal.
@@ -172,8 +193,7 @@ pub(crate) fn deny_resp(caller: &Caller, acl: &AgentAcl, owner: &str, name: &str
 pub(crate) fn build(ctx: Ctx) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
-        .route("/assets/app.js", get(asset_js))
-        .route("/assets/app.css", get(asset_css))
+        .route("/assets/{file}", get(asset))
         .route("/favicon.ico", get(favicon))
         .route("/api/{*rest}", any(api_entry))
         .fallback(git_or_spa)
@@ -251,11 +271,14 @@ async fn metrics_handler(State(ctx): State<Ctx>, req: Request) -> Response {
     Resp::new(200, "text/plain; version=0.0.4; charset=utf-8", ctx.metrics.render().into_bytes()).into_response()
 }
 
-async fn asset_js() -> Response {
-    Resp::new(200, "application/javascript; charset=utf-8", APP_JS.as_bytes().to_vec()).into_response()
-}
-async fn asset_css() -> Response {
-    Resp::new(200, "text/css; charset=utf-8", APP_CSS.as_bytes().to_vec()).into_response()
+/// Serve one compiled-in SPA asset by basename from the [`ASSETS`] table. An unknown name is a 404 (it
+/// never falls through to the SPA's index.html — a `.js` request answered with HTML would break the
+/// module load). The set is closed and hash-free, so this cannot serve anything but the built bundle.
+async fn asset(axum::extract::Path(file): axum::extract::Path<String>) -> Response {
+    match ASSETS.iter().find(|(name, ..)| *name == file) {
+        Some((_, ctype, body)) => Resp::new(200, ctype, body.as_bytes().to_vec()).into_response(),
+        None => Resp::err(404, "not found").into_response(),
+    }
 }
 async fn favicon() -> Response {
     Resp::new(200, "image/svg+xml", FAVICON.as_bytes().to_vec()).into_response()

@@ -630,6 +630,13 @@ fn cross_to_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
 
     for e in &ir.events {
         for k in &e.kinds {
+            // Thinking is dropped cross-vendor (claude → codex): reasoning is not needed to resume and is
+            // never replayed into the target. Skip before synthesizing any record so the rollout carries
+            // no reasoning and no reordering. (Codex's own reasoning is encrypted and already produces no
+            // Thinking kind, so this only affects a claude source.)
+            if let EventKind::Thinking(_) = k {
+                continue;
+            }
             let (role, ctype, sub, text) = match k {
                 EventKind::UserPrompt(s) => ("user", "input_text", "user_message", s.clone()),
                 EventKind::AssistantText(s) => ("assistant", "output_text", "agent_message", s.clone()),
@@ -642,6 +649,7 @@ fn cross_to_codex(ir: &ConversationIR, opts: &ConvertOpts) -> String {
                 EventKind::FileEdit { paths } => {
                     ("assistant", "output_text", "agent_message", format!("[edited: {}]", paths.join(", ")))
                 }
+                EventKind::Thinking(_) => unreachable!("skipped above"),
             };
             if text.trim().is_empty() {
                 continue;

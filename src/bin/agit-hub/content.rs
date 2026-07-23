@@ -40,10 +40,18 @@ pub(crate) fn api_session(repo: &Path, id: &str, query: &str) -> Resp {
     };
     let d = digest(&r.runtime, &r.id, &jsonl);
     let p = provenance(repo, &r.path, &jsonl);
+    // `?full=1` returns the UNCLIPPED transcript (high, still-bounded clip + turn cap); the DEFAULT (no
+    // flag) stays exactly as before — clipped and capped — so the normal page stays light. Both modes are
+    // bounded so this endpoint can never return unbounded bytes.
+    let full = param(query, "full").as_deref() == Some("1");
     // The ordered conversation — the readable back-and-forth the SPA renders as markdown. Built from the
     // same ordered event walk the spine/digest use, so the interleaving (user, assistant, user, …) is
     // preserved instead of being flattened into two separate lists.
-    let t = extract_turns(&r.runtime, &jsonl);
+    let t = if full {
+        extract_turns_with(&r.runtime, &jsonl, &FULL_LIMITS)
+    } else {
+        extract_turns(&r.runtime, &jsonl)
+    };
     let turns: Vec<serde_json::Value> = t
         .turns
         .iter()
@@ -68,6 +76,9 @@ pub(crate) fn api_session(repo: &Path, id: &str, query: &str) -> Resp {
         "texts": d.texts.iter().rev().take(8).rev().map(|t| clip(t, 700)).collect::<Vec<_>>(),
         "turns": turns,
         "turns_capped": t.capped,
+        // Which view this payload is: false = the default clipped/capped page, true = the full (?full=1)
+        // high-bound transcript. `turns_capped` still reports whether even the full view hit its cap.
+        "full": full,
         "files": d.files,
         "spine": spine_string(&r.runtime, &jsonl),
         "revisions": revisions,

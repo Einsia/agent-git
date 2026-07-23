@@ -270,11 +270,14 @@ export interface Revision {
 /// Every payload is server-clipped and marked (see `Turn.truncated`); tool input/output are
 /// ATTACKER-AUTHORED, so the renderer shows them as PLAIN TEXT in mono boxes, never as markdown/HTML.
 ///   - text        — a markdown segment (code fences, lists, headings preserved), clipped.
+///   - thinking    — the assistant's plaintext reasoning, clipped. ATTACKER-AUTHORED like the rest, shown
+///                   in a distinct, quiet, collapsed-by-default block (never an HTML/script sink).
 ///   - tool_use    — a tool call: its name and a compact one-line preview of the JSON input.
 ///   - tool_result — a tool's output text, clipped.
 ///   - file_edit   — the files a turn edited; `paths` is capped, `more` is the overflow count.
 export type Block =
   | { kind: "text"; text: string }
+  | { kind: "thinking"; text: string }
   | { kind: "tool_use"; name: string; input: string }
   | { kind: "tool_result"; output: string }
   | { kind: "file_edit"; paths: string[]; more?: number }
@@ -305,8 +308,12 @@ export interface SessionDetail {
   texts: string[]
   /// The ordered back-and-forth — the readable conversation the session view renders as markdown.
   turns: Turn[]
-  /// True when the conversation was longer than the server's turn cap and was truncated.
+  /// True when the conversation was longer than the server's turn cap and was truncated. Reported for
+  /// both views: in full mode it means even the high (?full=1) cap was hit.
   turns_capped: boolean
+  /// Which view produced this payload: false = the default clipped/capped page, true = the full
+  /// (?full=1) high-bound transcript.
+  full: boolean
   files: string[]
   spine: string
   revisions: Revision[]
@@ -771,10 +778,17 @@ export const api = {
     ),
 
   // ── sessions ──
-  session: (owner: string, name: string, id: string, at?: string) =>
-    get<SessionDetail>(
-      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/session/${encodeURIComponent(id)}${at ? `?at=${at}` : ""}`
-    ),
+  // `full` requests the UNCLIPPED transcript (?full=1) — a high, still-bounded clip + turn cap. The
+  // default (full=false) is the light clipped/capped page. `at` pins a revision.
+  session: (owner: string, name: string, id: string, at?: string, full = false) => {
+    const q = new URLSearchParams()
+    if (at) q.set("at", at)
+    if (full) q.set("full", "1")
+    const qs = q.toString()
+    return get<SessionDetail>(
+      `/api/agent/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/session/${encodeURIComponent(id)}${qs ? `?${qs}` : ""}`
+    )
+  },
   // The live, registry-classified provenance verdict — "verified as <person>" / "key mismatch" / etc.
   // Distinct from the self-verify field embedded in `session(...)`: this one resolves the committer email
   // against the hub identity registry server-side (route: GET .../session/<id>/provenance in api.rs).
