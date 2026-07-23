@@ -25,6 +25,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "proces
 # only — the `macros` feature is deliberately omitted so the build is hermetic (no live DB at compile).
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
 tower = { version = "0.5", features = ["limit", "util"] }
+# Structured per-request tracing spans for agit-hub (method/path/status/latency), correlated with the
+# X-Request-Id `observe` mints. tower-http is ALREADY compiled transitively (axum pulls it); this pins it
+# directly ONLY to switch on the `trace` feature (TraceLayer) — no new crate enters the tree, just that
+# feature on the existing 0.6 build. `tracing`/`tracing-subscriber` (below) already carry the subscriber.
+tower-http = { version = "0.6", features = ["trace"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 futures-util = "0.3"

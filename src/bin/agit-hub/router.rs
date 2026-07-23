@@ -3,7 +3,7 @@
 //! git smart-http ahead of the SPA. This band replaces the hand-rolled route()/api() dispatch band.
 #![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
@@ -13,6 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
+use tower_http::trace::TraceLayer;
 
 use agit::hub::acl::{self, Action, AgentAcl, Caller, Decision, Deny};
 use agit::hub::metrics::AuthResult;
@@ -181,6 +182,24 @@ pub(crate) fn build(ctx: Ctx) -> Router {
         .layer(middleware::from_fn_with_state(ctx.clone(), gate_conn_and_auth))
         // ...the global concurrency cap wraps it (replaces the accept-time Semaphore)...
         .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONN))
+        // ...structured request tracing sits JUST INSIDE `observe`: because `observe` runs first (it is
+        // outermost) it has already minted the X-Request-Id into the request extensions, so the span this
+        // layer opens reads that SAME id — every event under the span greps to the exact id the response
+        // carries. It records method/path/route on open and status/latency on response (see `on_response`).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(make_request_span)
+                .on_response(|resp: &Response, latency: Duration, span: &tracing::Span| {
+                    let status = resp.status().as_u16();
+                    let latency_ms = latency.as_secs_f64() * 1_000.0;
+                    // Fill the fields left `Empty` at span open, then emit one INFO event *inside* the span
+                    // so it inherits `request_id`/`method`/`path` — this is the line that actually prints
+                    // under the default `info` filter (a span alone emits nothing without span events).
+                    span.record("status", status);
+                    span.record("latency_ms", latency_ms);
+                    tracing::info!(parent: span, status, latency_ms, "http response");
+                }),
+        )
         // ...and the observability layer is outermost, so it times and counts every request that
         // arrives (including any rejected by the layers within) and always runs.
         .layer(middleware::from_fn_with_state(ctx.clone(), observe))
@@ -204,6 +223,45 @@ fn route_label(path: &str) -> &'static str {
     } else {
         "git-or-spa"
     }
+}
+
+/// The fields lifted off a request to seed its tracing span, pulled EXACTLY as [`make_request_span`]
+/// does — factored out so a unit test can assert the span is seeded from the same `RequestId`
+/// [`observe`] minted (the one the response carries) WITHOUT reaching into global subscriber state.
+pub(crate) struct SpanFields {
+    pub(crate) request_id: String,
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) route: &'static str,
+}
+
+/// Read the span fields off a request. `request_id` is the id `observe` stashed in extensions upstream
+/// (empty only if this layer were ever wired OUTSIDE `observe`); `route` is the bounded label, never the
+/// unbounded path, matching `observe`'s cardinality discipline (the raw `path` is a span field, not a
+/// metric label, so it carries no flood risk).
+pub(crate) fn span_fields(req: &Request) -> SpanFields {
+    SpanFields {
+        request_id: req.extensions().get::<RequestId>().map(|r| r.0.clone()).unwrap_or_default(),
+        method: req.method().as_str().to_string(),
+        path: req.uri().path().to_string(),
+        route: route_label(req.uri().path()),
+    }
+}
+
+/// Build the structured span for one request: method, path, route, and the correlated `request_id`,
+/// with `status`/`latency_ms` left `Empty` for `on_response` to fill. Named (not an inline closure) so
+/// it is unit-testable via [`span_fields`].
+fn make_request_span(req: &Request) -> tracing::Span {
+    let f = span_fields(req);
+    tracing::info_span!(
+        "http_request",
+        method = %f.method,
+        path = %f.path,
+        route = f.route,
+        request_id = %f.request_id,
+        status = tracing::field::Empty,
+        latency_ms = tracing::field::Empty,
+    )
 }
 
 /// Per-request observability: time the request, record `http_requests_total{method,status}` + the
@@ -444,4 +502,37 @@ async fn git_or_spa(State(ctx): State<Ctx>, req: Request) -> Response {
         return Resp::new(200, "text/html; charset=utf-8", INDEX_HTML.as_bytes().to_vec()).into_response();
     }
     Resp::text(405, "method not allowed").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_span_reuses_the_request_id_observe_minted() {
+        // The TraceLayer span must be seeded from the SAME RequestId `observe` stashes in the request
+        // extensions, so any log line under the span greps to the exact X-Request-Id the response carries.
+        // Asserting the builder wiring here proves the correlation deterministically, without reading
+        // global subscriber state.
+        let mut req = Request::builder().method("POST").uri("/api/agents/x").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(RequestId("deadbeefcafe0123".into()));
+        let f = span_fields(&req);
+        assert_eq!(f.request_id, "deadbeefcafe0123", "the span must reuse observe's request id");
+        assert_eq!(f.method, "POST");
+        assert_eq!(f.path, "/api/agents/x");
+        assert_eq!(f.route, "/api", "the unbounded path folds to a bounded route label");
+        // The named builder actually constructs a span (not a disabled one) from those fields.
+        let span = make_request_span(&req);
+        assert!(!span.is_disabled(), "make_request_span must produce a live span");
+    }
+
+    #[test]
+    fn request_span_degrades_without_a_request_id() {
+        // If this layer were ever wired OUTSIDE `observe` (no RequestId in extensions), the builder must
+        // degrade to an empty id rather than panic — the span still forms, just uncorrelated.
+        let bare = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let f = span_fields(&bare);
+        assert_eq!(f.request_id, "", "no minted id yet → empty, never a panic");
+        assert_eq!(f.route, "/");
+    }
 }
