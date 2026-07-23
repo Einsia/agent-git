@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState } from "react"
 import { useWindowVirtualizer } from "@tanstack/react-virtual"
-import { ChevronRight, FilePen, Wrench } from "lucide-react"
+import { Brain, ChevronRight, FilePen, Wrench } from "lucide-react"
 
 import type { Block, Turn } from "@/lib/api"
 import { Markdown } from "@/components/Markdown"
@@ -112,6 +112,8 @@ function BlockView({ block }: { block: Block }) {
           <Markdown text={block.text} />
         </BlockErrorBoundary>
       )
+    case "thinking":
+      return <ThinkingRow text={block.text} />
     case "tool_use":
       return <ToolUseRow name={block.name} input={block.input} />
     case "tool_result":
@@ -119,6 +121,46 @@ function BlockView({ block }: { block: Block }) {
     case "file_edit":
       return <FileEditRow paths={block.paths} more={block.more} />
   }
+}
+
+// The assistant's reasoning: a DISTINCT, QUIET, COLLAPSED-by-default block — a dim "thinking" chip that
+// expands to the text. Visually separate from normal assistant prose (dashed, muted, no card accent) so
+// it reads as a side channel, not the reply. Thinking is ATTACKER-AUTHORED too, so the expanded text goes
+// through the SAME sanitized Markdown renderer (no rehype-raw / dangerouslySetInnerHTML) inside a
+// per-block error boundary — never an HTML/script sink.
+function ThinkingRow({ text }: { text: string }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="rounded-md border border-dashed border-muted-foreground/25 bg-muted/20">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left"
+        aria-expanded={open}
+      >
+        <Brain className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="eyebrow text-muted-foreground">thinking</span>
+        {!open && (
+          <span className="min-w-0 flex-1 truncate text-[0.72rem] italic text-muted-foreground/80">
+            {text}
+          </span>
+        )}
+        <ChevronRight
+          className={cn(
+            "ml-auto size-3.5 shrink-0 text-muted-foreground transition-transform",
+            open && "rotate-90"
+          )}
+        />
+      </button>
+      {open && (
+        <div className="border-t border-dashed border-muted-foreground/20 px-2.5 py-2 text-muted-foreground">
+          <BlockErrorBoundary fallbackText={text}>
+            <Markdown text={text} />
+          </BlockErrorBoundary>
+        </div>
+      )}
+    </div>
+  )
 }
 
 // A compact, collapsible tool call: an icon + the monospace tool name, expanding to show the input

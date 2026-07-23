@@ -343,6 +343,7 @@ pub(crate) fn digest(runtime: &str, id: &str, jsonl: &str) -> SessionDigest {
 /// events, so the SPA can render a Claude-Code/Codex-style transcript (text, tool call, tool result,
 /// file edit) instead of one flat markdown blob. Each block is a tagged JSON value:
 ///   - `{"kind":"text","text": <markdown, clipped to [`TURN_CLIP`]>}`
+///   - `{"kind":"thinking","text": <the assistant's plaintext reasoning, clipped to [`TURN_CLIP`]>}`
 ///   - `{"kind":"tool_use","name": <str>, "input": <compact one-line preview, clipped to [`TOOL_INPUT_CLIP`]>}`
 ///   - `{"kind":"tool_result","output": <clipped to [`TOOL_RESULT_CLIP`]>}`
 ///   - `{"kind":"file_edit","paths": [<str>...], "more": <n>}` (paths capped at [`FILE_EDIT_CAP`]; `more` = the overflow count, present only when > 0)
@@ -376,6 +377,39 @@ pub(crate) const TOOL_RESULT_CLIP: usize = 1000;
 /// Max file-edit paths listed on one block; the overflow is reported as a `more` count.
 pub(crate) const FILE_EDIT_CAP: usize = 20;
 
+/// FULL (`?full=1`) mode bounds: still bounded so the endpoint can never return unbounded bytes, but
+/// generous enough to show the whole conversation. A turn beyond [`FULL_TURN_CAP`] still caps; a block
+/// beyond [`FULL_BLOCK_CLIP`] chars still clips and marks the turn truncated.
+pub(crate) const FULL_TURN_CAP: usize = 2000;
+pub(crate) const FULL_BLOCK_CLIP: usize = 200_000;
+
+/// The per-view clip/cap bounds. The DEFAULT view keeps the page light (short clips, a low turn cap);
+/// the FULL view raises every bound so the whole transcript renders, while staying bounded.
+#[derive(Clone, Copy)]
+pub(crate) struct TurnLimits {
+    pub(crate) turn_cap: usize,
+    pub(crate) text_clip: usize,
+    pub(crate) tool_input_clip: usize,
+    pub(crate) tool_result_clip: usize,
+}
+
+/// The clipped, capped default — exactly the bounds the view used before full mode existed.
+pub(crate) const DEFAULT_LIMITS: TurnLimits = TurnLimits {
+    turn_cap: TURN_CAP,
+    text_clip: TURN_CLIP,
+    tool_input_clip: TOOL_INPUT_CLIP,
+    tool_result_clip: TOOL_RESULT_CLIP,
+};
+
+/// The full, high-bound view: every text/tool bound raised to [`FULL_BLOCK_CLIP`], the turn cap to
+/// [`FULL_TURN_CAP`]. Bounded, never unlimited.
+pub(crate) const FULL_LIMITS: TurnLimits = TurnLimits {
+    turn_cap: FULL_TURN_CAP,
+    text_clip: FULL_BLOCK_CLIP,
+    tool_input_clip: FULL_BLOCK_CLIP,
+    tool_result_clip: FULL_BLOCK_CLIP,
+};
+
 /// Clip to `n` chars, char-safe, returning `(clipped, was_clipped)`. Unlike [`clip_marked`] the caller
 /// learns whether the text was actually cut (a text that already ends in "..." is not a false positive).
 fn clip_flag(s: &str, n: usize) -> (String, bool) {
@@ -404,6 +438,13 @@ fn clip_flag(s: &str, n: usize) -> (String, bool) {
 /// transcript yields an empty, uncapped result rather than an error — the view degrades to its other
 /// sections.
 pub(crate) fn extract_turns(runtime: &str, jsonl: &str) -> Turns {
+    extract_turns_with(runtime, jsonl, &DEFAULT_LIMITS)
+}
+
+/// [`extract_turns`] with explicit clip/cap bounds. The DEFAULT view passes [`DEFAULT_LIMITS`] (the
+/// light, clipped page); the `?full=1` view passes [`FULL_LIMITS`] to render the whole transcript while
+/// staying bounded.
+pub(crate) fn extract_turns_with(runtime: &str, jsonl: &str, limits: &TurnLimits) -> Turns {
     use agit::convo::EventKind;
     let Ok(ir) = agit::convo::read_conversation(runtime, jsonl) else {
         return Turns { turns: Vec::new(), capped: false };
@@ -420,11 +461,11 @@ pub(crate) fn extract_turns(runtime: &str, jsonl: &str) -> Turns {
                     if s.trim().is_empty() {
                         continue;
                     }
-                    if turns.len() >= TURN_CAP {
+                    if turns.len() >= limits.turn_cap {
                         capped = true;
                         break 'walk;
                     }
-                    let (t, clipped) = clip_flag(s, TURN_CLIP);
+                    let (t, clipped) = clip_flag(s, limits.text_clip);
                     turns.push(Turn {
                         role: "user",
                         text: t.clone(),
@@ -438,7 +479,7 @@ pub(crate) fn extract_turns(runtime: &str, jsonl: &str) -> Turns {
                     if s.trim().is_empty() {
                         continue;
                     }
-                    let (t, clipped) = clip_flag(s, TURN_CLIP);
+                    let (t, clipped) = clip_flag(s, limits.text_clip);
                     match cur_assist {
                         Some(i) => {
                             if !turns[i].text.is_empty() {
@@ -449,7 +490,7 @@ pub(crate) fn extract_turns(runtime: &str, jsonl: &str) -> Turns {
                             turns[i].truncated |= clipped;
                         }
                         None => {
-                            if turns.len() >= TURN_CAP {
+                            if turns.len() >= limits.turn_cap {
                                 capped = true;
                                 break 'walk;
                             }
@@ -464,13 +505,45 @@ pub(crate) fn extract_turns(runtime: &str, jsonl: &str) -> Turns {
                         }
                     }
                 }
+                // The assistant's plaintext reasoning: a DISTINCT `thinking` block, emitted IN ORDER within
+                // the assistant turn (opening one if the reply leads with reasoning). Clipped like text and
+                // counted toward `truncated`. The flat `text` concat deliberately excludes it — thinking is
+                // quiet and separate, not part of the reply prose. Attacker-authored; the SPA renders it as
+                // plain text / the same sanitized markdown, never an HTML sink.
+                EventKind::Thinking(s) => {
+                    if s.trim().is_empty() {
+                        continue;
+                    }
+                    let (t, clipped) = clip_flag(s, limits.text_clip);
+                    let block = serde_json::json!({ "kind": "thinking", "text": t });
+                    match cur_assist {
+                        Some(i) => {
+                            turns[i].blocks.push(block);
+                            turns[i].truncated |= clipped;
+                        }
+                        None => {
+                            if turns.len() >= limits.turn_cap {
+                                capped = true;
+                                break 'walk;
+                            }
+                            turns.push(Turn {
+                                role: "assistant",
+                                text: String::new(),
+                                tools: 0,
+                                blocks: vec![block],
+                                truncated: clipped,
+                            });
+                            cur_assist = Some(turns.len() - 1);
+                        }
+                    }
+                }
                 EventKind::ToolCall { name, input, .. } => {
                     // A reply may lead with a tool call (assistant message with no text); open a turn so
                     // the tool is never dropped.
                     let i = match cur_assist {
                         Some(i) => i,
                         None => {
-                            if turns.len() >= TURN_CAP {
+                            if turns.len() >= limits.turn_cap {
                                 capped = true;
                                 break 'walk;
                             }
@@ -489,14 +562,14 @@ pub(crate) fn extract_turns(runtime: &str, jsonl: &str) -> Turns {
                     // A compact one-line render of the input (attacker-authored — the SPA shows it as
                     // plain text in a mono box, never as a markdown/HTML sink).
                     let compact = serde_json::to_string(input).unwrap_or_default();
-                    let (preview, clipped) = clip_flag(&compact, TOOL_INPUT_CLIP);
+                    let (preview, clipped) = clip_flag(&compact, limits.tool_input_clip);
                     turns[i].blocks.push(serde_json::json!({ "kind": "tool_use", "name": name, "input": preview }));
                     turns[i].tools += 1;
                     turns[i].truncated |= clipped;
                 }
                 EventKind::ToolResult { output, .. } => {
                     if let Some(i) = cur_assist {
-                        let (out, clipped) = clip_flag(output, TOOL_RESULT_CLIP);
+                        let (out, clipped) = clip_flag(output, limits.tool_result_clip);
                         turns[i].blocks.push(serde_json::json!({ "kind": "tool_result", "output": out }));
                         turns[i].truncated |= clipped;
                     }
@@ -581,12 +654,16 @@ pub(crate) fn spine_string(runtime: &str, jsonl: &str) -> String {
     let mut out = String::new();
     for e in &ir.events {
         for k in &e.kinds {
-            out.push(match k {
+            let c = match k {
                 EventKind::UserPrompt(_) => 'p',
                 EventKind::AssistantText(_) => 'a',
                 EventKind::ToolCall { .. } | EventKind::ToolResult { .. } => 't',
                 EventKind::FileEdit { .. } => 'e',
-            });
+                // Thinking is quiet reasoning, not a waveform beat — skip it so the spine reads exactly as
+                // it did before thinking was captured.
+                EventKind::Thinking(_) => continue,
+            };
+            out.push(c);
             if out.len() >= 600 {
                 return out;
             }

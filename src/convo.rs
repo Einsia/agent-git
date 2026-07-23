@@ -48,6 +48,10 @@ pub struct Event {
 pub enum EventKind {
     UserPrompt(String),
     AssistantText(String),
+    /// The assistant's plaintext "thinking" (extended reasoning) content. Captured for the read-only
+    /// transcript VIEW only; it is DROPPED on cross-vendor convert (not needed for resumability, and the
+    /// target runtime never replays foreign reasoning). Same-vendor convert replays it via `raw`.
+    Thinking(String),
     ToolCall { call_id: Option<String>, name: String, input: Value },
     ToolResult { call_id: Option<String>, output: String },
     FileEdit { paths: Vec<String> },

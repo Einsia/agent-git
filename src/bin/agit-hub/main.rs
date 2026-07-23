@@ -1465,6 +1465,34 @@ mod obs_tests {
         assert!(text.contains("agit_hub_build_info"));
     }
 
+    /// The CODE-SPLIT bundle is served: the entry app.js AND a lazily-imported chunk (Session.js) both
+    /// resolve as JavaScript; an unknown asset name is a 404 (never the SPA's HTML, which would break a
+    /// module fetch).
+    #[tokio::test]
+    async fn code_split_chunks_are_served_as_javascript() {
+        let (_d, ctx) = ctx_with_admin().await;
+        let app = build(ctx.clone());
+
+        for name in ["app.js", "Session.js", "markdown-vendor.js", "react-vendor.js"] {
+            let r = app
+                .clone()
+                .oneshot(Request::builder().uri(format!("/assets/{name}")).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "/assets/{name} must be served");
+            let ct = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+            assert!(ct.contains("javascript"), "/assets/{name} content-type was {ct}");
+        }
+
+        // An unknown chunk name is a 404 — it must NOT fall through to index.html.
+        let miss = app
+            .clone()
+            .oneshot(Request::builder().uri("/assets/does-not-exist.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), 404, "an unknown asset must 404, not serve HTML");
+    }
+
     /// Every response — a 200 AND an error path — carries an `X-Request-Id`, two requests get DIFFERENT
     /// ids, and a JSON error body folds in a `request_id` that MATCHES its header.
     #[tokio::test]
@@ -1535,6 +1563,32 @@ mod obs_tests {
 mod session_turns_tests {
     use crate::content::api_session;
     use crate::gitplumb::{extract_turns, TURN_CAP, TURN_CLIP};
+
+    /// Commit `jsonl` at `sessions/claude-code/<id>.jsonl` in a fresh throwaway repo and return its temp
+    /// dir (kept alive by the caller) + root path, ready to drive `api_session` end-to-end.
+    fn repo_with_session(id: &str, jsonl: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        fn run_git(dir: &std::path::Path, args: &[&str]) {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        run_git(&root, &["init", "-q"]);
+        let sdir = root.join("sessions/claude-code");
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(sdir.join(format!("{id}.jsonl")), jsonl).unwrap();
+        run_git(&root, &["add", "."]);
+        // Per-invocation identity so a throwaway repo never clobbers the user's real commit identity.
+        run_git(&root, &["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "session"]);
+        (dir, root)
+    }
 
     #[test]
     fn extract_turns_emits_ordered_interleaved_blocks() {
@@ -1684,5 +1738,56 @@ mod session_turns_tests {
         assert_eq!(v["turns_capped"].as_bool(), Some(false));
         // The old fields stay for compatibility.
         assert!(v.get("prompts").is_some() && v.get("texts").is_some() && v.get("spine").is_some());
+    }
+
+    /// A claude transcript whose assistant message is [thinking, text]: extract_turns must emit a DISTINCT
+    /// `thinking` block IN ORDER (before the text), inside the assistant turn.
+    #[test]
+    fn extract_turns_emits_thinking_block_in_order() {
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"message\":{\"role\":\"user\",\"content\":\"ship it\"}}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"first I weigh the options\"},{\"type\":\"text\",\"text\":\"here is the plan\"}]}}\n",
+        );
+        let t = extract_turns("claude-code", jsonl);
+        assert_eq!(t.turns.len(), 2);
+        // The assistant turn's blocks are ordered: the thinking block leads, then the visible text.
+        let b = &t.turns[1].blocks;
+        let kinds: Vec<&str> = b.iter().map(|x| x["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["thinking", "text"], "thinking block emitted in order, before text");
+        assert_eq!(b[0]["text"], "first I weigh the options");
+        assert_eq!(b[1]["text"], "here is the plan");
+        // The flat `text` concat is the visible reply only — thinking stays out of it (quiet + separate).
+        assert_eq!(t.turns[1].text, "here is the plan", "thinking is not folded into the flat text");
+    }
+
+    /// `?full=1` returns UNCLIPPED turn text; the default (no flag) clips at TURN_CLIP. Same session, so a
+    /// turn longer than the default bound is longer in full mode than in the default.
+    #[test]
+    fn api_session_full_flag_returns_unclipped_text() {
+        // An assistant reply longer than the default clip but well under the full bound.
+        let long = "z".repeat(TURN_CLIP + 4000);
+        let jsonl = format!(
+            "{{\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{long}\"}}]}}}}\n"
+        );
+        let (_d, root) = repo_with_session("S1", &jsonl);
+
+        let default_resp = api_session(&root, "S1", "");
+        let full_resp = api_session(&root, "S1", "full=1");
+        assert_eq!(default_resp.status, 200);
+        assert_eq!(full_resp.status, 200);
+        let dv: serde_json::Value = serde_json::from_slice(&default_resp.body).unwrap();
+        let fv: serde_json::Value = serde_json::from_slice(&full_resp.body).unwrap();
+
+        let default_len = dv["turns"][0]["text"].as_str().unwrap().chars().count();
+        let full_len = fv["turns"][0]["text"].as_str().unwrap().chars().count();
+        // The default is clipped to the bound (+ the "..." marker); the full view carries the whole reply.
+        assert_eq!(default_len, TURN_CLIP + 3, "default view clips to TURN_CLIP + \"...\"");
+        assert_eq!(full_len, long.chars().count(), "full view is unclipped");
+        assert!(full_len > default_len, "full text ({full_len}) must be longer than default ({default_len})");
+        // The mode echo + the default staying light.
+        assert_eq!(dv["full"].as_bool(), Some(false));
+        assert_eq!(fv["full"].as_bool(), Some(true));
+        assert!(dv["turns"][0]["truncated"].as_bool().unwrap(), "the clipped default turn is marked truncated");
+        assert!(!fv["turns"][0]["truncated"].as_bool().unwrap(), "the full turn is not truncated");
     }
 }
