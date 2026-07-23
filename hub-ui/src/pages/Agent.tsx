@@ -45,7 +45,7 @@ export function Agent() {
 
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.per_page)) : 1
   // The server builds the clone url (it knows the scheme — http vs https behind TLS).
-  const cloneUrl = data?.clone_url || `http://HOST:PORT/${owner}/${name}.git`
+  const cloneUrl = data?.clone_url || `${location.origin}/${owner}/${name}.git`
 
   if (forbidden) return <Forbidden what={`${owner}/${name}`} />
 

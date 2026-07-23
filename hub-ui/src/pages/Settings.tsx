@@ -154,7 +154,7 @@ function Bind({ data, owner, name }: { data: AgentPage; owner: string; name: str
   const snippet = `[agent]
 id = "${data.aid || "agt_…"}"
 name = "${name}"
-remote = "${data.clone_url || "http://HOST:PORT/" + owner + "/" + name + ".git"}"`
+remote = "${data.clone_url || location.origin + "/" + owner + "/" + name + ".git"}"`
 
   return (
     <Section

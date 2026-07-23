@@ -128,7 +128,7 @@ export function Session() {
               <h3 className="eyebrow mb-2 mt-6">pull &amp; resume</h3>
               <pre className="overflow-auto rounded-md border bg-muted p-3 font-mono text-[0.72rem] leading-relaxed">
 {`agit clone \\
-  http://${location.host}/${owner}/${name}.git
+  ${location.origin}/${owner}/${name}.git
 agit -a merge origin/main`}
               </pre>
               <p className="mt-3 font-mono text-[0.72rem] text-muted-foreground">{data.commit.slice(0, 12)}</p>

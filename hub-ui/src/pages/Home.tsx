@@ -114,7 +114,7 @@ export function Home() {
             Push a local agit repo to this hub to add it to the index:
           </p>
           <pre className="mt-3 overflow-x-auto rounded-md border bg-muted p-3 font-mono text-sm leading-relaxed">
-            agit -a push http://{data.host}/&lt;name&gt;.git
+            agit a push {location.origin}/&lt;name&gt;.git
           </pre>
           <div className="mt-4 border-t pt-3">
             <Link className="text-sm text-primary hover:underline" to="/api/agents" reloadDocument>
