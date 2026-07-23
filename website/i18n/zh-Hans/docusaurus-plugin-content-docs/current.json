@@ -1,0 +1,26 @@
+{
+  "version.label": {
+    "message": "当前",
+    "description": "The label for version current"
+  },
+  "sidebar.docs.category.Get started": {
+    "message": "开始使用",
+    "description": "The label for category 'Get started' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Using the CLI": {
+    "message": "使用 CLI",
+    "description": "The label for category 'Using the CLI' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Using the Hub": {
+    "message": "使用 Hub",
+    "description": "The label for category 'Using the Hub' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Connecting CLI + Hub": {
+    "message": "连接 CLI 与 Hub",
+    "description": "The label for category 'Connecting CLI + Hub' in sidebar 'docs'"
+  },
+  "sidebar.docs.category.Self-hosting the hub": {
+    "message": "自托管 Hub",
+    "description": "The label for category 'Self-hosting the hub' in sidebar 'docs'"
+  }
+}

@@ -1,0 +1,37 @@
+/**
+ * agit docs theme. Infima variables, a restrained accent, and readable code blocks.
+ * Two surfaces (CLI + Hub) share one palette; the accent marks links and active nav.
+ */
+
+:root {
+  --ifm-color-primary: #2e7d6b;
+  --ifm-color-primary-dark: #29715f;
+  --ifm-color-primary-darker: #266a5a;
+  --ifm-color-primary-darkest: #1f574a;
+  --ifm-color-primary-light: #338877;
+  --ifm-color-primary-lighter: #368f7d;
+  --ifm-color-primary-lightest: #3ea18d;
+  --ifm-code-font-size: 92%;
+  --ifm-font-family-monospace: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #4fbfa6;
+  --ifm-color-primary-dark: #43b199;
+  --ifm-color-primary-darker: #3fa791;
+  --ifm-color-primary-darkest: #348a78;
+  --ifm-color-primary-light: #62c8b1;
+  --ifm-color-primary-lighter: #6ccbb6;
+  --ifm-color-primary-lightest: #8ad5c4;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+.markdown table {
+  display: table;
+  width: 100%;
+}
+
+.theme-doc-markdown code {
+  word-break: break-word;
+}

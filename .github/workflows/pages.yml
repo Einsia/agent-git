@@ -1,19 +1,17 @@
 name: Deploy docs to Pages
 
-# Builds the just-the-docs site under `docs/` and deploys it to GitHub Pages.
+# Builds the Docusaurus site under `website/` (all locales) and deploys it to GitHub Pages.
 #
-# One-time repository setup (Settings → Pages): set "Build and deployment → Source" to
-# "GitHub Actions". No branch selection is needed — this workflow is the source.
+# One-time repository setup (Settings -> Pages): set "Build and deployment -> Source" to
+# "GitHub Actions". No branch selection is needed; this workflow is the source.
 #
-# The site uses `remote_theme: just-the-docs/just-the-docs`, which the `actions/jekyll-build-pages`
-# action supports because it bundles the `github-pages` gem (and with it `jekyll-remote-theme`). The
-# site's `url`/`baseurl` are pinned in `docs/_config.yml` to `einsia.github.io` / `/agent-git`.
+# The site's url/baseUrl are pinned in website/docusaurus.config.js to einsia.github.io / /agent-git/.
 
 on:
   push:
     branches: [main]
     paths:
-      - 'docs/**'
+      - 'website/**'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -23,7 +21,7 @@ permissions:
   pages: write
   id-token: write
 
-# One live deployment at a time. Don't cancel an in-flight deploy — let it finish.
+# One live deployment at a time. Don't cancel an in-flight deploy; let it finish.
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -32,17 +30,26 @@ jobs:
   build:
     name: build site
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: website
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-      - name: Build with Jekyll
-        uses: actions/jekyll-build-pages@v1
+      - uses: actions/setup-node@v4
         with:
-          source: ./docs
-          destination: ./_site
+          node-version: 20
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Build (all locales)
+        run: npm run build
+      - uses: actions/configure-pages@v5
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/build
 
   deploy:
     name: deploy to Pages
