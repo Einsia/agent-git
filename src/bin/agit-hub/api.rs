@@ -1755,7 +1755,16 @@ pub(crate) async fn api_create_agent(ctx: &Ctx, req: &Req, caller: &Caller, body
 }
 
 pub(crate) fn clone_url(ctx: &Ctx, req: &Req, owner_ns: &str, name: &str) -> String {
-    format!("{}://{}/{owner_ns}/{name}.git", if ctx.cfg.tls { "https" } else { "http" }, req.host())
+    // Prefer the operator-pinned public URL: it is the authoritative scheme + host. When TLS is terminated
+    // by a proxy in front, `cfg.tls` is false, so building from it alone emits an `http://` clone command
+    // that does not work against the https hub. Fall back to the request, honoring `X-Forwarded-Proto` so a
+    // TLS-terminating proxy still yields https.
+    if let Some(base) = ctx.cfg.public_url.as_deref() {
+        return format!("{}/{owner_ns}/{name}.git", base.trim_end_matches('/'));
+    }
+    let https = ctx.cfg.tls
+        || req.header("x-forwarded-proto").map(|p| p.eq_ignore_ascii_case("https")).unwrap_or(false);
+    format!("{}://{}/{owner_ns}/{name}.git", if https { "https" } else { "http" }, req.host())
 }
 
 /// Everything the agent-detail response reads out of the repo (git + fs). Collected inside one
@@ -4759,10 +4768,14 @@ mod tests {
 
     /// An in-process Ctx over a fresh SQLite store + fs blobs, enough to drive the handlers directly.
     async fn harness() -> (tempfile::TempDir, Ctx) {
+        harness_pub(None).await
+    }
+
+    async fn harness_pub(public_url: Option<&str>) -> (tempfile::TempDir, Ctx) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_sqlite(dir.path()).await.unwrap();
         let blobs = Blobs::open(dir.path()).await.unwrap();
-        let cfg = Cfg { host: IpAddr::from([127, 0, 0, 1]), port: 8177, tls: false, insecure: false, trusted_proxies: vec![], registration: false, public_url: None };
+        let cfg = Cfg { host: IpAddr::from([127, 0, 0, 1]), port: 8177, tls: false, insecure: false, trusted_proxies: vec![], registration: false, public_url: public_url.map(str::to_string) };
         let ctx = Ctx(Arc::new(CtxInner {
             store,
             blobs,
@@ -4821,6 +4834,23 @@ mod tests {
 
     fn body(v: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&v).unwrap()
+    }
+
+    // clone_url must produce a working https URL behind a TLS-terminating proxy (cfg.tls is false there).
+    #[tokio::test]
+    async fn clone_url_prefers_public_url_then_forwarded_proto() {
+        // A pinned public URL is authoritative: https even though cfg.tls is false.
+        let (_d, ctx) = harness_pub(Some("https://agit.example/")).await;
+        assert_eq!(clone_url(&ctx, &req("GET", None), "alice", "frontend"), "https://agit.example/alice/frontend.git");
+
+        // No public URL: X-Forwarded-Proto from a TLS-terminating proxy still yields https.
+        let (_d2, ctx2) = harness().await;
+        let mut fwd = req("GET", None);
+        fwd.headers.push(("x-forwarded-proto".into(), "https".into()));
+        assert_eq!(clone_url(&ctx2, &fwd, "alice", "frontend"), "https://localhost:8177/alice/frontend.git");
+
+        // No public URL and no forwarded proto: plain http (a bare local hub).
+        assert_eq!(clone_url(&ctx2, &req("GET", None), "alice", "frontend"), "http://localhost:8177/alice/frontend.git");
     }
 
     // ── self-service password change ──
