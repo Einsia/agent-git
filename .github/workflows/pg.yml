@@ -1,0 +1,88 @@
+name: Postgres integration
+
+# Runs the ENV-GATED Postgres store integration test (src/hub/store.rs ::
+# pg_store_roundtrip_and_legacy_reshape) against a REAL postgres:16 and an S3-compatible MinIO service.
+#
+# This is ADDED ALONGSIDE ci.yml — it does not touch or weaken the existing build-test/fmt/clippy gate.
+# ci.yml's `cargo test --workspace` runs the SAME test but with no AGIT_HUB_TEST_DB set, so there it
+# SKIPS cleanly; only this job supplies the env that makes it exercise the live Postgres path.
+#
+# The gated test opens the store through the SAME constructor AGIT_HUB_DB drives in production
+# (Store::open selecting Postgres), round-trips add_user/create-agent/mint-token, and reproduces the
+# legacy identity_keys single-key shape to prove the multi-key migration reshapes it without the
+# crash-loop it once caused live.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: pg-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  pg-integration:
+    name: pg store integration (gated test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      # Postgres runs as a health-checked service container; the runner publishes it on localhost:5432.
+      # Credentials are EPHEMERAL and CI-ONLY (a throwaway user/password/db). No real secrets.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agithub
+          POSTGRES_PASSWORD: agithub
+          POSTGRES_DB: agithub_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agithub -d agithub_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      # S3-compatible object store. bitnami/minio auto-starts the server (the stock minio/minio image
+      # needs a `server /data` command that service containers cannot supply) and pre-creates the bucket
+      # from MINIO_DEFAULT_BUCKETS. Exported for production parity; the current gated test round-trips the
+      # Postgres store only and does not touch blobs, so its readiness never blocks the test.
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+          MINIO_DEFAULT_BUCKETS: agit-blobs
+        ports:
+          - 9000:9000
+    env:
+      # The gate: the test reads AGIT_HUB_TEST_DB, then sets AGIT_HUB_DB to it and calls Store::open so
+      # the SAME production selector (is_pg_url -> PgStore) runs.
+      AGIT_HUB_TEST_DB: postgres://agithub:agithub@127.0.0.1:5432/agithub_test
+      # S3 env exported for parity with production so the gated test can grow to exercise the blob store
+      # without a workflow change.
+      AGIT_HUB_S3_ENDPOINT: http://127.0.0.1:9000
+      AGIT_HUB_S3_BUCKET: agit-blobs
+      AGIT_HUB_S3_REGION: us-east-1
+      AGIT_HUB_S3_ACCESS_KEY: minioadmin
+      AGIT_HUB_S3_SECRET_KEY: minioadmin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pg-integration
+      - name: Run the env-gated Postgres integration test
+        # Filter names the one gated test. It builds only the lib test binary (fast). `--nocapture` so the
+        # migration/round-trip output is visible; the `1 passed` guard fails the job if the filter matched
+        # nothing (a rename would otherwise let it pass with 0 tests run).
+        run: |
+          set -o pipefail
+          cargo test -p agit --lib pg_store_roundtrip_and_legacy_reshape -- --nocapture 2>&1 | tee test.out
+          grep -q "1 passed" test.out || { echo "gated pg test did not run (expected exactly 1)"; exit 1; }
