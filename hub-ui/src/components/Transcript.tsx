@@ -19,13 +19,20 @@ export function Transcript({ turns }: { turns: Turn[] }) {
   // its coordinate space up with page scroll. Measured after layout (and on resize).
   const [scrollMargin, setScrollMargin] = useState(0)
   useLayoutEffect(() => {
-    const measure = () => {
-      const el = listRef.current
-      if (el) setScrollMargin(el.getBoundingClientRect().top + window.scrollY)
-    }
+    const el = listRef.current
+    if (!el) return
+    const measure = () => setScrollMargin(el.getBoundingClientRect().top + window.scrollY)
     measure()
     window.addEventListener("resize", measure)
-    return () => window.removeEventListener("resize", measure)
+    // Layout ABOVE the transcript can change after mount (an async provenance badge loading, a wrapping
+    // header) and shift the list's document offset without firing a window resize. A ResizeObserver on the
+    // body re-measures so the virtualizer's coordinate space stays aligned and turns are not offset.
+    const ro = new ResizeObserver(measure)
+    ro.observe(document.body)
+    return () => {
+      window.removeEventListener("resize", measure)
+      ro.disconnect()
+    }
   }, [])
 
   const virtualizer = useWindowVirtualizer({
