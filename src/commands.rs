@@ -948,24 +948,10 @@ pub fn relocate_cmd(selector: Option<&str>, to: Option<String>, yes: bool) -> Re
         }
     }
 
-    let ag = agent::resolve(None)?;
-    let mut moved = 0usize;
-    let mut touched: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
-    for s in &stranded {
-        match relocate_one(s, &env, &ag) {
-            Ok(()) => {
-                moved += 1;
-                touched.insert(s.runtime);
-            }
-            Err(e) => errln!("  ⚠ could not relocate {} (ran in {}): {e:#}", s.id, s.recorded_cwd),
-        }
-    }
-    // Now capture the freshly-installed, now-owned sessions into the active agent's store.
-    for rt in &touched {
-        if let Err(e) = crate::session::capture_relocated(&env, rt) {
-            errln!("  ⚠ {rt} capture after relocate failed: {e:#}");
-        }
-    }
+    // Install each session under env's slug and capture it through snap's gated path (secret gate +
+    // provenance). `agit relocate` ignores the blocked flag here — a held-back secret is warned by the
+    // gate and left mirrored, and relocate's own exit stays 0 as it always has.
+    let (moved, _blocked) = adopt_stranded(&stranded, &env)?;
 
     if moved == 0 {
         anyhow::bail!("relocate found sessions but moved none; see the warnings above.");
@@ -988,6 +974,41 @@ fn relocate_one(s: &crate::adapter::StrandedSession, env: &Path, ag: &agent::Age
     // content-bound provenance into the sidecar (mirrors convert_pass).
     record_launch(&new_id, &ag.aid, &ag.name, env, s.runtime, None)?;
     Ok(())
+}
+
+/// Install a set of off-cwd sessions under `env`'s slug (attributed to the resolved agent) and capture
+/// them through the SAME gated commit path as snap — the secret gate and provenance run on every one, no
+/// bypass. Returns `(sessions installed, whether the gate blocked a commit)`.
+///
+/// The one place both `agit relocate` (explicit/batch move) and snap/watch's off-cwd auto-capture reach:
+/// classification decides WHICH sessions are handed here (relocate: all plausibly-here; snap: only the
+/// Owned tier), and this does the identical install + gated capture for whatever it is given.
+pub fn adopt_stranded(stranded: &[crate::adapter::StrandedSession], env: &Path) -> Result<(usize, bool)> {
+    if stranded.is_empty() {
+        return Ok((0, false));
+    }
+    let ag = agent::resolve(None)?;
+    let mut moved = 0usize;
+    let mut touched: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    for s in stranded {
+        match relocate_one(s, env, &ag) {
+            Ok(()) => {
+                moved += 1;
+                touched.insert(s.runtime);
+            }
+            Err(e) => errln!("  ⚠ could not capture {} (ran in {}): {e:#}", s.id, s.recorded_cwd),
+        }
+    }
+    // Capture the freshly-installed, now-owned sessions into the active agent's store. A blocked secret
+    // gate in any runtime propagates, so a scripted `snap && push` stops on an auto-captured secret.
+    let mut blocked = false;
+    for rt in &touched {
+        match crate::session::capture_relocated(env, rt) {
+            Ok((_written, b)) => blocked |= b,
+            Err(e) => errln!("  ⚠ {rt} capture after relocate failed: {e:#}"),
+        }
+    }
+    Ok((moved, blocked))
 }
 
 /// A `<selector>` matches a stranded session by its id, its transcript path, or a substring of the

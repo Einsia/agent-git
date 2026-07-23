@@ -285,22 +285,167 @@ pub fn warn_stranded(env: &Path) {
     }
 }
 
+// ─────────────── off-cwd attribution: adopt subdir/parent sessions, surface the rest ───────────────
+
+/// What `handle_offcwd` did, so the caller can reflect it in snap's exit code.
+#[derive(Default)]
+struct OffCwd {
+    /// Owned (tier 1/2) sessions auto-captured, plus any candidate the user accepted interactively.
+    adopted: usize,
+    /// Tier-3 candidates left for `agit relocate` (a non-interactive run, or an interactive decline).
+    surfaced: usize,
+    /// A secret gate blocked an auto-captured session's commit — the caller turns it into a non-zero exit.
+    blocked: bool,
+}
+
+/// After the exact-cwd capture, attribute the sessions that ran in a SUBDIR or a PARENT of `env`.
+///
+/// Walks the same stranded set `agit relocate` lists, classifies each with `scope::session_tier`, and:
+///   * AUTO-CAPTURES the Owned tier (tier 1: ran inside `env`; tier 2: ran above but edited a file here)
+///     through the gated relocate-install path (`commands::adopt_stranded`), so the secret gate and
+///     provenance run on every one with no bypass, then REPORTS them.
+///   * SURFACES the Candidate tier (tier 3: ran above `env` and only read here): an interactive
+///     snap/watch asks one targeted question per directory and captures on "yes"; a non-interactive run
+///     prints the stranded note pointing at `agit relocate` and claims nothing.
+///
+/// `only` restricts the pass to one runtime (a `--from <rt>` snap); `None` handles every runtime.
+fn handle_offcwd(env: &Path, only: Option<&str>) -> Result<OffCwd> {
+    let mut out = OffCwd::default();
+    let want = only.map(normalize);
+    let stranded: Vec<crate::adapter::StrandedSession> = stranded_here(env)
+        .into_iter()
+        .filter(|s| want.as_deref().map(|w| w == s.runtime).unwrap_or(true))
+        .collect();
+    if stranded.is_empty() {
+        return Ok(out);
+    }
+
+    let mut owned: Vec<crate::adapter::StrandedSession> = Vec::new();
+    let mut candidates: Vec<crate::adapter::StrandedSession> = Vec::new();
+    for s in stranded {
+        let (edited, read) = crate::convo::session_touched(s.runtime, &s.path);
+        match scope::session_tier(Path::new(&s.recorded_cwd), &edited, &read, env) {
+            scope::Tier::Owned => owned.push(s),
+            scope::Tier::Candidate => candidates.push(s),
+            // Unrelated is a correct drop. `stranded_here` already excludes genuinely-unrelated sessions,
+            // so this only fires for a same-repo checkout at another path that touched nothing under env —
+            // left for `agit relocate`, never surfaced by snap.
+            scope::Tier::Unrelated => {}
+        }
+    }
+
+    if !owned.is_empty() {
+        match crate::commands::adopt_stranded(&owned, env) {
+            Ok((moved, blocked)) => {
+                out.adopted += moved;
+                out.blocked |= blocked;
+                if moved > 0 {
+                    report_captured(&owned, env);
+                }
+            }
+            // Auto-capture failing (no resolvable agent, a store error) must not abort the snap the way
+            // the tier-3 note never did: fall back to surfacing the owned sessions for `agit relocate`.
+            Err(e) => {
+                errln!("  ⚠ could not auto-capture off-cwd sessions: {e:#}");
+                stranded_note(&owned, env);
+                out.surfaced += owned.len();
+            }
+        }
+    }
+
+    if !candidates.is_empty() {
+        surface_candidates(&candidates, env, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Report the Owned off-cwd sessions just captured, one line per directory they ran in.
+fn report_captured(owned: &[crate::adapter::StrandedSession], env: &Path) {
+    let mut by_cwd: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for s in owned {
+        *by_cwd.entry(s.recorded_cwd.clone()).or_default() += 1;
+    }
+    for (cwd, n) in by_cwd {
+        outln!("  captured {n} session(s) that ran in {cwd} (work here), now owned by {}", env.display());
+    }
+}
+
+/// The non-interactive tier-3 note, byte-identical to `warn_stranded`'s: one line per directory, pointing
+/// at `agit relocate`. Never claims anything.
+fn stranded_note(sessions: &[crate::adapter::StrandedSession], env: &Path) {
+    let mut by_cwd: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for s in sessions {
+        *by_cwd.entry(s.recorded_cwd.clone()).or_default() += 1;
+    }
+    for (cwd, n) in by_cwd {
+        errln!(
+            "note: {n} session(s) ran in {cwd}, not this repo ({}). started in the wrong directory? run `agit relocate` to bring them here.",
+            env.display()
+        );
+    }
+}
+
+/// Surface tier-3 candidates. Non-interactive: print the stranded note, claim nothing. Interactive: ask
+/// once per directory and capture on "yes" (through the same gated path), leaving a decline for relocate.
+fn surface_candidates(candidates: &[crate::adapter::StrandedSession], env: &Path, out: &mut OffCwd) -> Result<()> {
+    use std::io::{stdin, stdout, BufRead, Write};
+    if !ui::interactive() {
+        stranded_note(candidates, env);
+        out.surfaced += candidates.len();
+        return Ok(());
+    }
+    let mut by_cwd: std::collections::BTreeMap<String, Vec<crate::adapter::StrandedSession>> =
+        std::collections::BTreeMap::new();
+    for s in candidates {
+        by_cwd.entry(s.recorded_cwd.clone()).or_default().push(s.clone());
+    }
+    for (cwd, group) in by_cwd {
+        let n = group.len();
+        print!("{n} session(s) ran in {cwd} and read files here but edited none. Capture for this repo? [y/N] ");
+        let _ = stdout().flush();
+        let mut line = String::new();
+        stdin().lock().read_line(&mut line).ok();
+        if matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            match crate::commands::adopt_stranded(&group, env) {
+                Ok((moved, blocked)) => {
+                    out.adopted += moved;
+                    out.blocked |= blocked;
+                    if moved > 0 {
+                        report_captured(&group, env);
+                    }
+                }
+                Err(e) => {
+                    errln!("  ⚠ could not capture: {e:#}");
+                    out.surfaced += n;
+                }
+            }
+        } else {
+            out.surfaced += n;
+        }
+    }
+    Ok(())
+}
+
 /// Capture into the store the sessions THIS repo now owns for `rt` — used by `agit relocate` after it
 /// installs a relocated session under `env`'s slug and records its launch. Quiet: it reuses the same
-/// route → mirror → gated-commit path as snap, without snap's per-store banner, and returns how many
-/// files it wrote. Errors from a single store are surfaced but never abort the whole relocate.
-pub fn capture_relocated(env: &Path, rt: &str) -> Result<usize> {
+/// route → mirror → gated-commit path as snap, without snap's per-store banner, and returns
+/// `(files written, whether the secret gate blocked a commit)`. Errors from a single store are surfaced
+/// but never abort the whole relocate.
+pub fn capture_relocated(env: &Path, rt: &str) -> Result<(usize, bool)> {
     let rt = normalize(rt);
     let (routed, _) = route(&rt, env)?;
     let mut written = 0usize;
+    // A blocked secret gate on ANY routed store propagates, so an auto-captured off-cwd session carrying
+    // a secret fails the caller's exit exactly like a same-cwd snap does. The mirror still lands on disk.
+    let mut blocked = false;
     for r in &routed {
         let _lock = lock_store(&r.store)?;
         let (stats, _hits, _dst) = mirror_owned(&rt, env, r)?;
         let mut count = 0u64;
-        commit_snap(&r.store, &rt, &mut count);
+        blocked |= commit_snap(&r.store, &rt, &mut count);
         written += stats.added + stats.updated;
     }
-    Ok(written)
+    Ok((written, blocked))
 }
 
 /// `agit a snap [--from <runtime>]` — mirror session dumps into the Agent Store, once.
@@ -320,23 +465,27 @@ pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
         return sync(&r, capture_harness);
     }
     let env = scope::env_root()?;
-    // Before deciding there is nothing to capture, disclose any sessions dropped for running in the wrong
-    // directory — otherwise an all-stranded project (everything ran in the parent) looks empty and the
-    // user's work is silently stranded. Informational; the real capture below is unaffected.
-    warn_stranded(&env);
     let live = live_runtimes(&env);
-    if live.is_empty() {
-        bail!(
-            "No {} sessions found for this project.\n\
-             (has it been run in either yet? `agit adapter` lists the runtimes; `--from <runtime>` forces one.)",
-            runtime_list()
-        );
-    }
     // A blocked snap in ANY runtime propagates as a non-zero exit (see snap_one), so capturing several
     // runtimes at once never masks a held-back secret behind a peer's clean capture.
     let mut code = 0;
     for rt in &live {
         code = code.max(snap_one(rt, &env, capture_harness)?);
+    }
+    // After the exact-cwd capture: attribute sessions that ran in a SUBDIR or a PARENT of this repo —
+    // auto-capturing the Owned tiers and surfacing the read-only candidates (§ off-cwd attribution).
+    let off = handle_offcwd(&env, None)?;
+    if off.blocked {
+        code = code.max(2);
+    }
+    // Only now is "nothing here" a real error: an all-off-cwd project (everything ran in the parent) is
+    // no longer empty once its Owned sessions are adopted, so the bail moved below the attribution pass.
+    if live.is_empty() && off.adopted == 0 {
+        bail!(
+            "No {} sessions found for this project.\n\
+             (has it been run in either yet? `agit adapter` lists the runtimes; `--from <runtime>` forces one.)",
+            runtime_list()
+        );
     }
     Ok(code)
 }
@@ -345,8 +494,15 @@ pub fn snap(runtime: Option<&str>, capture_harness: bool) -> Result<i32> {
 /// `capture_harness` also captures the project's MCP/skills/config (redacting secrets); `--no-harness` skips it.
 pub fn sync(runtime: &str, capture_harness: bool) -> Result<i32> {
     let env = scope::env_root()?;
-    warn_stranded(&env);
-    snap_one(&normalize(runtime), &env, capture_harness)
+    let rt = normalize(runtime);
+    let mut code = snap_one(&rt, &env, capture_harness)?;
+    // Off-cwd attribution for THIS runtime only (the user named it with --from): adopt Owned subdir/parent
+    // sessions and surface the read-only candidates, exactly as the both-runtimes snap does.
+    let off = handle_offcwd(&env, Some(&rt))?;
+    if off.blocked {
+        code = code.max(2);
+    }
+    Ok(code)
 }
 
 fn snap_one(rt: &str, env: &Path, capture_harness: bool) -> Result<i32> {
@@ -985,8 +1141,12 @@ pub fn snap_watch_checked(runtime: &str, interval_secs: u64, capture_harness: bo
 
 pub fn snap_watch(runtime: &str, interval_secs: u64, capture_harness: bool) -> Result<i32> {
     let env = scope::env_root()?;
-    warn_stranded(&env);
     let rt = normalize(runtime);
+    // Attribute any subdir/parent sessions present at startup (adopt Owned, surface candidates) before the
+    // loop begins, the same one-time pass the manual snap runs; the loop below watches the exact-cwd dump.
+    if let Err(e) = handle_offcwd(&env, Some(&rt)) {
+        errln!("  ⚠ off-cwd attribution skipped: {e:#}");
+    }
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
     let watch = source_path(&rt, &env);
 
@@ -1317,7 +1477,11 @@ pub fn watch(interval_secs: u64, do_convert: bool, capture_harness: bool) -> Res
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
     let env = scope::env_root()?;
-    warn_stranded(&env);
+    // Attribute subdir/parent sessions present at startup (adopt Owned, surface candidates) before the
+    // loop, the same one-time pass the manual snap runs; the loop below watches each exact-cwd dump.
+    if let Err(e) = handle_offcwd(&env, None) {
+        errln!("  ⚠ off-cwd attribution skipped: {e:#}");
+    }
     let interval = Duration::from_secs(interval_secs.max(1));
     let runtimes = runtimes();
     let mut last: HashMap<&str, String> = HashMap::new();
@@ -1570,9 +1734,13 @@ pub(crate) mod testenv {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = [var("HOME"), var("AGIT_HOME")];
+        let old = [var("HOME"), var("AGIT_HOME"), var("AGIT_AGENT")];
         std::env::set_var("HOME", home);
         std::env::set_var("AGIT_HOME", agit_home);
+        // Start each test with NO ambient agent selection, so a leak from a prior test cannot silently
+        // pick the wrong store; a test that needs one sets `AGIT_AGENT` inside its own closure. Restored
+        // on exit so the selection never escapes to the next test.
+        std::env::remove_var("AGIT_AGENT");
         // Give this test's ISOLATED HOME a resolvable git identity, so a store scaffolded under it
         // inherits a committer email the way a real user's machine does (the snap gate now refuses an
         // unset identity). This is the test's own throwaway `$HOME/.gitconfig`, never the developer's
@@ -1582,6 +1750,7 @@ pub(crate) mod testenv {
         f();
         restore("HOME", &old[0]);
         restore("AGIT_HOME", &old[1]);
+        restore("AGIT_AGENT", &old[2]);
     }
 
     /// Write an isolated `[user]` identity into `$HOME/.gitconfig`. Global git config in this test's own
@@ -2689,5 +2858,218 @@ mod lineage_tests {
         let side = crate::commands::sidecar_path(&transcript);
         write(&side, &format!("{{\"lineage\":{}}}", lin.to_json()));
         assert_eq!(read_lineage(&transcript), lin, "lineage survives a write/read round-trip");
+    }
+}
+
+#[cfg(test)]
+mod offcwd_tests {
+    use super::*;
+
+    /// A minimal claude transcript recorded in `cwd`, with one tool_use touching `file_path`.
+    fn one_tool(cwd: &Path, tool: &str, file_path: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"{c}\",\"timestamp\":\"2026-07-20T10:00:00.000Z\",\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"assistant\",\"cwd\":\"{c}\",\"timestamp\":\"2026-07-20T10:00:01.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"{tool}\",\"input\":{{\"file_path\":\"{file_path}\"}}}}]}}}}\n",
+            c = cwd.display(),
+        )
+    }
+
+    /// A transcript recorded in `cwd` that EDITS several files (each an `Edit` tool_use).
+    fn edits(cwd: &Path, paths: &[String]) -> String {
+        let blocks: Vec<String> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                format!("{{\"type\":\"tool_use\",\"id\":\"t{i}\",\"name\":\"Edit\",\"input\":{{\"file_path\":\"{p}\"}}}}")
+            })
+            .collect();
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"{c}\",\"timestamp\":\"2026-07-20T10:00:00.000Z\",\"message\":{{\"content\":\"go\"}}}}\n\
+             {{\"type\":\"assistant\",\"cwd\":\"{c}\",\"timestamp\":\"2026-07-20T10:00:01.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{blocks}]}}}}\n",
+            c = cwd.display(),
+            blocks = blocks.join(","),
+        )
+    }
+
+    /// Drop a claude session into the runtime dump under the slug of the dir it ran in.
+    fn place(home: &Path, recorded_cwd: &Path, id: &str, body: &str) {
+        let slug = home.join(".claude/projects").join(claude_code::slug_for(recorded_cwd));
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::write(slug.join(format!("{id}.jsonl")), body).unwrap();
+    }
+
+    fn git_init(dir: &Path) {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(["init", "-q"]).output().unwrap();
+        assert!(out.status.success(), "git init failed in {}", dir.display());
+    }
+
+    fn abs(p: &Path) -> String {
+        p.display().to_string()
+    }
+
+    /// Tier 1: a READ-ONLY session recorded in a SUBDIR of env is auto-captured (being inside the repo is
+    /// the claim, like git walking up to `.git`), and it lands in the store.
+    #[test]
+    fn tier1_readonly_subdir_session_is_auto_captured() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let envd = tempfile::tempdir().unwrap();
+        let env = envd.path().to_path_buf();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            std::env::set_var("AGIT_AGENT", "frontend");
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            // env must be a real work-tree so the subdir resolves same-repo (git walk-up).
+            git_init(&env);
+            let sub = env.join("frontend");
+            std::fs::create_dir_all(&sub).unwrap();
+            place(home.path(), &sub, "s-sub", &one_tool(&sub, "Read", &abs(&sub.join("app.ts"))));
+
+            let out = handle_offcwd(&env, None).unwrap();
+            assert_eq!(out.adopted, 1, "a read-only subdir session must be auto-captured (tier 1)");
+            assert!(!out.blocked);
+            assert_eq!(out.surfaced, 0, "a tier-1 session is owned, never merely surfaced");
+            assert_eq!(crate::commands::store_sessions(&fe.store).len(), 1, "the captured session must be in the store");
+        });
+    }
+
+    /// Tier 2: a session whose cwd is a PARENT of env and that EDITED a file under env is auto-captured;
+    /// a peer session in the same parent that edited only a SIBLING repo is NOT captured for env (it is a
+    /// candidate, surfaced). One dump, one pass: the two are told apart by what they touched, not their cwd.
+    #[test]
+    fn tier2_parent_edit_under_env_is_captured_sibling_edit_is_not() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let env = ws.path().join("app");
+        let parent = ws.path().to_path_buf();
+        std::fs::create_dir_all(&env).unwrap();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            std::env::set_var("AGIT_AGENT", "frontend");
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            // ran in the parent, edited a file UNDER env → tier 2, owned.
+            place(home.path(), &parent, "s-here", &one_tool(&parent, "Edit", &abs(&env.join("src/main.rs"))));
+            // ran in the parent, edited only a SIBLING repo → not owned for env.
+            place(home.path(), &parent, "s-sib", &one_tool(&parent, "Edit", &abs(&ws.path().join("other/x.rs"))));
+
+            let out = handle_offcwd(&env, None).unwrap();
+            assert_eq!(out.adopted, 1, "only the session that edited under env is captured");
+            assert_eq!(out.surfaced, 1, "the sibling-only session is surfaced, not claimed");
+            assert!(!out.blocked);
+            assert_eq!(crate::commands::store_sessions(&fe.store).len(), 1, "exactly the env-editing session lands in the store");
+        });
+    }
+
+    /// Tier 3: a PARENT-cwd session that only READ files under env is NOT auto-captured — it is a
+    /// candidate, and in a non-interactive run (no TTY under `cargo test`) it is surfaced, never claimed.
+    #[test]
+    fn tier3_parent_readonly_is_surfaced_not_claimed_non_interactive() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let env = ws.path().join("app");
+        let parent = ws.path().to_path_buf();
+        std::fs::create_dir_all(&env).unwrap();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            std::env::set_var("AGIT_AGENT", "frontend");
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            place(home.path(), &parent, "s-ro", &one_tool(&parent, "Read", &abs(&env.join("config.toml"))));
+
+            let out = handle_offcwd(&env, None).unwrap();
+            assert_eq!(out.adopted, 0, "a parent read-only session must NOT be auto-captured");
+            assert_eq!(out.surfaced, 1, "it is surfaced as a candidate for `agit relocate`");
+            assert_eq!(crate::commands::store_sessions(&fe.store).len(), 0, "nothing may be silently claimed");
+        });
+    }
+
+    /// A session that edited files under TWO repos is owned by EACH: snapping in either repo captures it
+    /// there. The same parent-launched dump is classified Owned against both `app` and `api`.
+    #[test]
+    fn a_session_editing_two_repos_is_captured_into_each() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let app = ws.path().join("app");
+        let api = ws.path().join("api");
+        let parent = ws.path().to_path_buf();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&api).unwrap();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            std::env::set_var("AGIT_AGENT", "frontend");
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            place(
+                home.path(),
+                &parent,
+                "s-two",
+                &edits(&parent, &[abs(&app.join("x.rs")), abs(&api.join("y.rs"))]),
+            );
+
+            let a = handle_offcwd(&app, None).unwrap();
+            assert_eq!(a.adopted, 1, "the two-repo session is owned by app");
+            let b = handle_offcwd(&api, None).unwrap();
+            assert_eq!(b.adopted, 1, "…and owned by api");
+
+            // One session captured into each repo's partition of the shared store.
+            assert_eq!(
+                crate::commands::store_sessions(&fe.store).len(),
+                2,
+                "the session is captured once per repo it worked on"
+            );
+        });
+    }
+
+    /// `session_touched` resolves a RELATIVE edited path against the recorded cwd before any under-env
+    /// test — an `Edit` of `src/main.rs` in a session launched at `<cwd>` is `<cwd>/src/main.rs`.
+    #[test]
+    fn session_touched_resolves_relative_edit_against_recorded_cwd() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = d.path().join("app");
+        let t = d.path().join("s.jsonl");
+        std::fs::write(&t, one_tool(&cwd, "Edit", "src/main.rs")).unwrap();
+
+        let (edited, read) = crate::convo::session_touched("claude-code", &t);
+        assert!(
+            edited.contains(&cwd.join("src/main.rs")),
+            "a relative edit must resolve against the recorded cwd: {edited:?}"
+        );
+        assert!(read.is_empty());
+    }
+
+    /// The secret gate still runs on an AUTO-CAPTURED off-cwd session: a planted AWS key is mirrored but
+    /// held OUT of history, the store's HEAD does not advance, and the block is reported (non-zero) so a
+    /// scripted `snap && push` stops — no bypass on the auto-capture path.
+    #[test]
+    fn a_planted_secret_in_an_auto_captured_session_is_gated() {
+        let home = tempfile::tempdir().unwrap();
+        let agit_home = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let env = ws.path().join("app");
+        let parent = ws.path().to_path_buf();
+        std::fs::create_dir_all(&env).unwrap();
+
+        testenv::with(home.path(), agit_home.path(), || {
+            std::env::set_var("AGIT_AGENT", "frontend");
+            let fe = crate::agent::init_agent("frontend").unwrap();
+            // Tier 2 (edited under env), but the transcript carries a real AWS key.
+            let body = format!(
+                "{{\"type\":\"user\",\"cwd\":\"{c}\",\"timestamp\":\"2026-07-20T10:00:00.000Z\",\"message\":{{\"content\":\"key AKIAIOSFODNN7EXAMPLE leaked\"}}}}\n\
+                 {{\"type\":\"assistant\",\"cwd\":\"{c}\",\"timestamp\":\"2026-07-20T10:00:01.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Edit\",\"input\":{{\"file_path\":\"{f}\"}}}}]}}}}\n",
+                c = parent.display(),
+                f = abs(&env.join("x.rs")),
+            );
+            place(home.path(), &parent, "s-secret", &body);
+
+            let before = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+            let out = handle_offcwd(&env, None).unwrap();
+            assert!(out.blocked, "a planted secret in an auto-captured session must block the commit");
+
+            let after = scope::git_in(&fe.store, &["rev-parse", "HEAD"]).unwrap();
+            assert_eq!(before, after, "the store HEAD must not advance for a gated auto-capture");
+            let tracked = scope::git_in(&fe.store, &["ls-files", "--", "sessions"]).unwrap();
+            assert!(!tracked.contains("s-secret") && !tracked.contains(".jsonl"), "the secret session must not be committed: {tracked}");
+        });
     }
 }

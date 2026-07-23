@@ -165,6 +165,45 @@ pub fn stranded_sessions(env: &Path) -> Vec<StrandedSession> {
     out
 }
 
+/// The file paths this codex rollout EDITED, as raw strings, plus the recorded cwd so the caller can
+/// resolve relatives against it. Codex records edits in `patch_apply_end` (structured `changes` keys, or
+/// `A/M/D <path>` stdout lines) and has no structured read tool, so the read set is always empty.
+/// Powers the off-cwd ownership tiers (`scope::session_tier`), symmetric with `claude_code::touched`.
+pub fn touched(text: &str) -> (Vec<String>, Vec<String>, Option<String>) {
+    let mut edited = vec![];
+    let read = vec![];
+    let mut cwd: Option<String> = None;
+    for line in text.lines() {
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let ty = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let p = rec.get("payload");
+        match ty {
+            "session_meta" => {
+                if cwd.is_none() {
+                    if let Some(c) = p.and_then(|p| p.get("cwd")).and_then(|v| v.as_str()) {
+                        if !c.is_empty() {
+                            cwd = Some(c.to_string());
+                        }
+                    }
+                }
+            }
+            "event_msg" if p.and_then(|p| p.get("type")).and_then(|v| v.as_str()) == Some("patch_apply_end") => {
+                if let Some(ch) = p.and_then(|p| p.get("changes")).and_then(|c| c.as_object()) {
+                    for k in ch.keys() {
+                        edited.push(k.clone());
+                    }
+                } else if let Some(so) = p.and_then(|p| p.get("stdout")).and_then(|v| v.as_str()) {
+                    patch_stdout_files(so, &mut edited);
+                }
+            }
+            _ => {}
+        }
+    }
+    (edited, read, cwd)
+}
+
 impl Adapter for Codex {
     fn name(&self) -> &'static str {
         "codex"
