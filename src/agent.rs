@@ -1024,13 +1024,27 @@ fn clone_in(home: &Path, url: &str, init: bool) -> Result<Agent> {
     check_remote(url)?;
     let tmp = home.join("tmp").join(format!("clone-{}", convo::fresh_id(url)));
     std::fs::create_dir_all(tmp.parent().unwrap_or(home))?;
+    // Key-based hub auth for a clone: inject `agit credential` as git's helper ONLY when the clone url's
+    // host is ALREADY a declared hub for this machine (AGIT_HUB_URL or a bound-store remote, via
+    // `hub_hosts()`). A clone url is untrusted input, so it must not self-certify as a hub: an arbitrary
+    // https store must never trigger a signed challenge (that would leak the account username + public key
+    // to whoever the url points at). Because the host is already declared, the user's AGIT_HUB_URL is
+    // inherited by the helper git spawns, so no environment is forged here. A non-matching or non-http url
+    // yields `None`, leaving the clone byte-identical to before (no `-c`, no env). No enrolled key -> the
+    // helper stays silent -> git falls back to its prompt; a clone must never hard-fail because of this.
+    let cred_args = crate::credential::clone_cred_plan(url, &crate::credential::hub_hosts())
+        .map(|host| crate::credential::credential_helper_args(std::slice::from_ref(&host)))
+        .unwrap_or_default();
+
     // Inherited stdio: capturing would swallow git's errors and block credential prompts.
     // Defence in depth behind `check_remote`: `-c` denies the command-running transports outright (a
     // victim with `protocol.ext.allow=always` in their own gitconfig is otherwise one step from RCE),
     // and `--` stops any future `-`-prefixed URL from being read as a flag. Neither is sufficient alone
     // — `--` does not stop `ext::`, and the config does not stop flag smuggling.
-    let ok = Command::new("git")
-        .args(["-c", "protocol.ext.allow=never", "-c", "protocol.fd.allow=never"])
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "protocol.ext.allow=never", "-c", "protocol.fd.allow=never"]);
+    cmd.args(&cred_args);
+    let ok = cmd
         .args(["clone", "--quiet", "--", url])
         .arg(&tmp)
         .stdin(Stdio::inherit())

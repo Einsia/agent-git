@@ -1205,7 +1205,7 @@ fn agent_push(args: &[String]) -> anyhow::Result<i32> {
     // copy-pasted one. Scoped to `credential.https://<hubhost>.helper` per host, so github/gitlab/other
     // remotes are UNTOUCHED — git only consults the helper for a matching host. Built ONCE here and
     // prepended to every push exec below (the one place the push git is actually run).
-    let cred_args = credential_helper_args(&credential::hub_hosts());
+    let cred_args = credential::credential_helper_args(&credential::hub_hosts());
 
     // Inherited stdio throughout: a push is where credential helpers prompt, and capturing would both
     // swallow git's errors and block the prompt. `--no-verify` skips git's now-redundant pre-push hook
@@ -1308,25 +1308,6 @@ fn hub_auth_hint_url(url: &str) {
     }
 }
 
-/// The `-c credential.https://<host>.helper=<exe> credential` git options that make git run THIS binary
-/// as its credential helper for each hub `host`. Uses the current executable's absolute path (via
-/// `std::env::current_exe`) so it resolves even when `agit` is not on `PATH`. Empty when the exe can't be
-/// found or there are no hub hosts, in which case the push runs exactly as before. Scoped per host, so a
-/// non-hub remote (github/gitlab) never triggers the helper — git only consults it for a matching host.
-fn credential_helper_args(hosts: &[String]) -> Vec<String> {
-    let Ok(exe) = std::env::current_exe() else {
-        return vec![];
-    };
-    let exe = exe.display().to_string();
-    let mut out = Vec::new();
-    for host in hosts {
-        out.push("-c".to_string());
-        // git parses the helper value as a command line, so the exe path plus the `credential` subcommand
-        // is invoked as `<exe> credential <get|store|erase>`.
-        out.push(format!("credential.https://{host}.helper={exe} credential"));
-    }
-    out
-}
 
 /// Fan a bare `agit a push` out to every git remote the store has: an explicit `<name> <branch>`
 /// refspec per remote (a freshly `remote add`-ed hub has no upstream, so a bare `git push <name>` under
@@ -1525,9 +1506,16 @@ fn agent_pull(args: &[String]) -> anyhow::Result<i32> {
     use agit::agent;
     let a = agent::resolve(None)?;
 
+    // Key-based hub auth: same wiring as push. Scoped `-c credential.https://<hubhost>.helper=<exe>`
+    // options prepended BEFORE the `pull` subcommand, so fetching a PRIVATE hub store auto-mints a token
+    // from the enrolled key instead of prompting. Per-host scoped, so github/gitlab remotes are untouched;
+    // no hub hosts -> empty -> the pull runs exactly as before.
+    let cred_args = credential::credential_helper_args(&credential::hub_hosts());
+
     // `--ff-only`: git integrates by fast-forward or not at all — never a textual merge. The caller's
     // args (an explicit remote/branch) ride along. Inherited stdio so credential helpers can prompt.
-    let mut pull_args: Vec<&str> = vec!["pull", "--ff-only"];
+    let mut pull_args: Vec<&str> = cred_args.iter().map(String::as_str).collect();
+    pull_args.extend(["pull", "--ff-only"]);
     pull_args.extend(args.iter().map(String::as_str));
     let code = scope::git_in_inherit(&a.store, &pull_args);
     if code == 0 {
@@ -1558,7 +1546,13 @@ fn agent_fetch(args: &[String]) -> anyhow::Result<i32> {
     use agit::agent;
     let a = agent::resolve(None)?;
 
-    let mut fetch_args: Vec<&str> = vec!["fetch"];
+    // Key-based hub auth: same wiring as push/pull. Scoped `-c credential.https://<hubhost>.helper=<exe>`
+    // options prepended BEFORE the `fetch` subcommand, so fetching a PRIVATE hub store auto-mints a token
+    // from the enrolled key. Per-host scoped (github/gitlab untouched); no hub hosts -> runs as before.
+    let cred_args = credential::credential_helper_args(&credential::hub_hosts());
+
+    let mut fetch_args: Vec<&str> = cred_args.iter().map(String::as_str).collect();
+    fetch_args.push("fetch");
     fetch_args.extend(args.iter().map(String::as_str));
     let code = scope::git_in_inherit(&a.store, &fetch_args);
     if code != 0 {
