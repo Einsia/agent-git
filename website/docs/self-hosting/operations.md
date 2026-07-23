@@ -43,7 +43,7 @@ Public, no auth. Returns the version, the build sha (or `null` when it was not s
 compile time, never a fabricated value), and the schema version:
 
 ```sh
-curl -s https://hub.example.com/api/version
+curl -s https://agit.anggita.org/api/version
 ```
 
 ```json
@@ -61,7 +61,7 @@ would, so `/metrics` is not even discoverable without an admin credential. Scrap
 an admin token in the password field:
 
 ```sh
-curl -s -u x:$ADMIN_TOKEN https://hub.example.com/metrics
+curl -s -u x:$ADMIN_TOKEN https://agit.anggita.org/metrics
 ```
 
 The series it exposes:

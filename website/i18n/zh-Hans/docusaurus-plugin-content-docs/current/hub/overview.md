@@ -5,6 +5,10 @@ title: 中枢概览
 
 # 中枢概览
 
+:::tip 试用托管中枢
+[agit.anggita.org](https://agit.anggita.org) 上运行着一个中枢。登录即可浏览智能体，或[自行运行一个](../self-hosting/deploying.md)。
+:::
+
 中枢（Hub）是团队自行运行的一台服务器，用于共享智能体（agent）并在浏览器中阅读它们。它承担三项职责：
 
 - **托管。** 每个智能体都是一个存放会话记录（transcript）的裸 git 仓库。你通过 git smart-http 向它推送（push）、从它拉取（pull），与任何其他 git 远端并无二致。

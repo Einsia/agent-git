@@ -34,7 +34,7 @@ title: 令牌
 把一个远端指向智能体的 `.git` URL，并将令牌放入 git 的密码字段（用户名可以是任意值）：
 
 ```bash
-agit a remote add origin https://hub.example.com/alice/frontend.git
+agit a remote add origin https://agit.anggita.org/alice/frontend.git
 agit a push -u origin main
 #   username: anything
 #   password: the token
@@ -43,7 +43,7 @@ agit a push -u origin main
 脚本也可以将其作为 bearer 令牌发送：
 
 ```bash
-curl -H "Authorization: Bearer $AGIT_TOKEN" https://hub.example.com/api/agents
+curl -H "Authorization: Bearer $AGIT_TOKEN" https://agit.anggita.org/api/agents
 ```
 
 关于完整的客户端设置，参见 [将 CLI 连接到中枢](../integration/connect-cli-to-hub.md)。

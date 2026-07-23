@@ -50,7 +50,7 @@ title: 将 CLI 连接到中枢
 程的主机。一旦你将某个智能体 push 到中枢，其绑定的远程就会使该主机变为已知。在首次 push 之前，请设置 `AGIT_HUB_URL`：
 
 ```bash
-export AGIT_HUB_URL=https://hub.example.com
+export AGIT_HUB_URL=https://agit.anggita.org
 ```
 
 对某个中枢存储库执行 `git clone` 时，只有当该 URL 的主机已被本机声明为中枢，才会自动签发令牌。任意 URL 绝不会触发
@@ -69,7 +69,7 @@ export AGIT_HUB_URL=https://hub.example.com
    - 导出为环境变量：
 
      ```bash
-     export AGIT_HUB_URL=https://hub.example.com
+     export AGIT_HUB_URL=https://agit.anggita.org
      export AGIT_HUB_TOKEN=<token>
      export AGIT_HUB_USER=you
      ```

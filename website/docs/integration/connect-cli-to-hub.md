@@ -53,7 +53,7 @@ store remote the active agent is bound to. Once you have pushed an agent to the 
 makes the host known. Before the first push, set `AGIT_HUB_URL`:
 
 ```bash
-export AGIT_HUB_URL=https://hub.example.com
+export AGIT_HUB_URL=https://agit.anggita.org
 ```
 
 A `git clone` of a hub store auto-mints a token only when the URL's host is already a declared hub for
@@ -74,7 +74,7 @@ Use a token where no key is enrolled, or from a script that should not carry a p
    - Export it:
 
      ```bash
-     export AGIT_HUB_URL=https://hub.example.com
+     export AGIT_HUB_URL=https://agit.anggita.org
      export AGIT_HUB_TOKEN=<token>
      export AGIT_HUB_USER=you
      ```

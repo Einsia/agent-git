@@ -91,7 +91,7 @@ Bring it up from the repo root, pointing DNS at the host first so the proxy can 
 certificate:
 
 ```sh
-HUB_DOMAIN=hub.example.com docker compose -f deploy/docker-compose.yml up -d --build
+HUB_DOMAIN=agit.anggita.org docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 Postgres is wired up by default. Set a strong `PGPASSWORD` for a real deploy. Garage
@@ -168,10 +168,10 @@ streaming protocol. A minimal nginx server block:
 ```nginx
 server {
     listen 443 ssl;
-    server_name hub.example.com;
+    server_name agit.anggita.org;
 
-    ssl_certificate     /etc/letsencrypt/live/hub.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/hub.example.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/agit.anggita.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/agit.anggita.org/privkey.pem;
 
     # git pushes and full transcripts can be large; do not cap the body.
     client_max_body_size 0;
@@ -195,7 +195,7 @@ because it trusts `127.0.0.1`. If the proxy sits on a different host, change the
 bind to that interface, add `--tls`, and set `--trusted-proxy` to the proxy's address.
 
 For key-based auth to be replay-safe across hubs, set `AGIT_HUB_PUBLIC_URL` to this
-proxy's public origin (`https://hub.example.com`). See
+proxy's public origin (`https://agit.anggita.org`). See
 [configuration](./configuration.md) for why.
 
 ## Upgrades
@@ -208,7 +208,7 @@ migration.
 
 ```sh
 git pull
-HUB_DOMAIN=hub.example.com docker compose -f deploy/docker-compose.yml up -d --build
+HUB_DOMAIN=agit.anggita.org docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 **systemd:** keep the previous binary as your rollback, drop in the new one, and

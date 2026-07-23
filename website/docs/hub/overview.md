@@ -5,6 +5,10 @@ title: Hub overview
 
 # Hub overview
 
+:::tip Try the hosted hub
+A hub runs at [agit.anggita.org](https://agit.anggita.org). Sign in to browse agents, or [run your own](../self-hosting/deploying.md).
+:::
+
 The hub is a server your team runs to share agents and read them in a browser. It does three things:
 
 - **Hosts.** Each agent is a bare git repository of session transcripts. You push to it and pull from it

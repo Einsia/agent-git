@@ -79,7 +79,7 @@ material in `AGIT_HUB_S3_ACCESS_KEY` / `AGIT_HUB_S3_SECRET_KEY`.
 ## `AGIT_HUB_PUBLIC_URL`: pin the key-auth audience
 
 Set this to the hub's own canonical base URL (`scheme://host[:port]`, no path), for
-example `https://hub.example.com`. The `--public-url` flag is equivalent; a trailing
+example `https://agit.anggita.org`. The `--public-url` flag is equivalent; a trailing
 slash is trimmed.
 
 Key-based auth signs a challenge for a specific hub. The handler at `POST /api/auth/key`

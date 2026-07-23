@@ -17,7 +17,7 @@ title: 发布与获取智能体
 绑定一个远程，然后 push：
 
 ```bash
-agit a remote add origin https://hub.example.com/frontend.git
+agit a remote add origin https://agit.anggita.org/frontend.git
 agit a push -u origin HEAD
 git add .agit.toml && git commit -m "declare the frontend agent"
 ```

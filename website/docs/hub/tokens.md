@@ -46,7 +46,7 @@ Point a remote at the agent's `.git` URL and put the token in git's password fie
 anything):
 
 ```bash
-agit a remote add origin https://hub.example.com/alice/frontend.git
+agit a remote add origin https://agit.anggita.org/alice/frontend.git
 agit a push -u origin main
 #   username: anything
 #   password: the token
@@ -55,7 +55,7 @@ agit a push -u origin main
 A script can send it as a bearer token instead:
 
 ```bash
-curl -H "Authorization: Bearer $AGIT_TOKEN" https://hub.example.com/api/agents
+curl -H "Authorization: Bearer $AGIT_TOKEN" https://agit.anggita.org/api/agents
 ```
 
 For the full client setup, see [Connect the CLI to a hub](../integration/connect-cli-to-hub.md).

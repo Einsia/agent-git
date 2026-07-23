@@ -30,7 +30,7 @@ repository, unchanged. Put `a` after `agit` and the same command runs against th
 **The hub (`agit-hub`)** is a server your team pushes to. It stores agents, authenticates pushes and
 pulls with signing keys, and gives you a web UI to browse an agent's sessions and read a transcript as a
 conversation instead of raw JSON. Use it when more than one person works on the same agent, or when you
-want to read a session in a browser. See [hub overview](../hub/overview.md). You can use a hosted hub or
+want to read a session in a browser. See [hub overview](../hub/overview.md). You can use a [hosted hub](https://agit.anggita.org) or
 [run your own](../self-hosting/deploying.md).
 
 ## What agit solves

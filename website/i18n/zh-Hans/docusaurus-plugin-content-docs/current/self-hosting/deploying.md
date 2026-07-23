@@ -80,7 +80,7 @@ client ──HTTPS──▶ proxy (:443) ──HTTP──▶ hub (:8177)
 从仓库根目录启动，并先将 DNS 指向该主机，以便代理能够获取证书：
 
 ```sh
-HUB_DOMAIN=hub.example.com docker compose -f deploy/docker-compose.yml up -d --build
+HUB_DOMAIN=agit.anggita.org docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 Postgres 默认已接好线路。真实部署时请设置一个强 `PGPASSWORD`。Garage 会保持空闲，
@@ -155,10 +155,10 @@ nginx server 块：
 ```nginx
 server {
     listen 443 ssl;
-    server_name hub.example.com;
+    server_name agit.anggita.org;
 
-    ssl_certificate     /etc/letsencrypt/live/hub.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/hub.example.com/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/agit.anggita.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/agit.anggita.org/privkey.pem;
 
     # git 推送与完整转录记录可能很大；不要对请求体设上限。
     client_max_body_size 0;
@@ -182,7 +182,7 @@ server {
 `--trusted-proxy` 设为代理的地址。
 
 为使基于密钥的认证在跨中枢时具备防重放能力，请将 `AGIT_HUB_PUBLIC_URL` 设为该代理的
-公开源（`https://hub.example.com`）。原因参见[配置](./configuration.md)。
+公开源（`https://agit.anggita.org`）。原因参见[配置](./configuration.md)。
 
 ## 升级
 
@@ -193,7 +193,7 @@ server {
 
 ```sh
 git pull
-HUB_DOMAIN=hub.example.com docker compose -f deploy/docker-compose.yml up -d --build
+HUB_DOMAIN=agit.anggita.org docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 **systemd：** 保留上一个可执行文件作为回滚点，放入新的可执行文件，然后重启。

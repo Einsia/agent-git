@@ -17,7 +17,7 @@ enrolled. See [authentication](./authentication.md).
 Bind a remote, then push:
 
 ```bash
-agit a remote add origin https://hub.example.com/frontend.git
+agit a remote add origin https://agit.anggita.org/frontend.git
 agit a push -u origin HEAD
 git add .agit.toml && git commit -m "declare the frontend agent"
 ```

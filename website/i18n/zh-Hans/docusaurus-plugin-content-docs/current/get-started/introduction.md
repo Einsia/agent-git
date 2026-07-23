@@ -27,7 +27,7 @@ Claude Code 与 Codex 之间迁移会话，并向远端推送（push）和从远
 **中枢（`agit-hub`）** 是一台你的团队向其推送的服务器。它存储各个智能体，用签名密钥（signing key）对推送与拉取
 进行认证，并提供一个 Web 界面，让你浏览某个智能体的各次会话，并把转录记录以对话形式（而非原始 JSON）阅读。当有
 一人以上在同一个智能体上工作时，或当你想在浏览器中阅读某次会话时，就使用它。参见
-[中枢概览](../hub/overview.md)。你可以使用托管的中枢，也可以
+[中枢概览](../hub/overview.md)。你可以使用[托管的中枢](https://agit.anggita.org)，也可以
 [自行运行一个](../self-hosting/deploying.md)。
 
 ## agit 解决什么问题
