@@ -188,12 +188,17 @@ pub fn credential_helper_args(hosts: &[String]) -> Vec<String> {
 /// (`scheme://host[:port]`) is set as `AGIT_HUB_URL` in the git child's env so the spawned helper's
 /// `is_hub_host()` recognises the host and mints. Returns `None` for a github/gitlab/ssh/local url, for
 /// which the clone must stay byte-identical to before (no `-c`, no env change).
-pub fn clone_cred_plan(url: &str) -> Option<(String, String)> {
+pub fn clone_cred_plan(url: &str, trusted_hosts: &[String]) -> Option<String> {
+    // A clone URL is UNTRUSTED input, so it must never self-certify as a hub. We inject the credential
+    // helper ONLY when the URL's host is ALREADY a declared hub for this machine (in `trusted_hosts`,
+    // which come from AGIT_HUB_URL and any bound-store remotes). Otherwise an arbitrary https store
+    // (github.com, or an attacker's URL implementing /api/auth/challenge) would make the machine sign a
+    // challenge and POST the account username + ed25519 public key to whoever the URL points at. Requiring
+    // a pre-declared hub is the trust anchor; a non-matching or non-http URL yields None and the clone
+    // falls back to git's own credential prompt. The already-set AGIT_HUB_URL is inherited by the helper
+    // git spawns, so no environment needs to be forged here.
     let host = hubapi::hub_host(url)?;
-    // `hub_web_base` gives the canonical credential-free `scheme://host[:port]`; fall back to https on the
-    // bare host if it somehow can't parse (hub_host already succeeded, so this is belt-and-suspenders).
-    let base = hubapi::hub_web_base(url).unwrap_or_else(|| format!("https://{host}"));
-    Some((host, base))
+    trusted_hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)).then_some(host)
 }
 
 /// The hosts that count as "a hub" for this machine: `AGIT_HUB_URL` (if set) plus every http(s) remote of
@@ -397,25 +402,44 @@ mod tests {
         assert!(credential_helper_args(&[]).is_empty());
     }
 
-    /// A hub clone url yields a plan — the host to scope the `-c` helper to, and the canonical base to set
-    /// as `AGIT_HUB_URL` in the git child's env so the spawned helper recognises the host.
+    /// A clone url whose host is ALREADY a declared hub yields that host to scope the `-c` helper to. The
+    /// user's AGIT_HUB_URL (why the host is trusted) is inherited by the spawned helper, so no env is forged.
     #[test]
-    fn clone_cred_plan_wires_a_hub_url() {
-        let plan = clone_cred_plan("https://hub.example.com/alice/frontend.git");
-        assert_eq!(plan, Some(("hub.example.com".to_string(), "https://hub.example.com".to_string())));
-        // A port rides along in both the host (helper scope) and the base (env), kept together.
-        let ported = clone_cred_plan("http://localhost:8080/alice/x.git");
-        assert_eq!(ported, Some(("localhost:8080".to_string(), "http://localhost:8080".to_string())));
+    fn clone_cred_plan_injects_only_for_a_declared_hub() {
+        let trusted = vec!["hub.example.com".to_string()];
+        assert_eq!(
+            clone_cred_plan("https://hub.example.com/alice/frontend.git", &trusted),
+            Some("hub.example.com".to_string())
+        );
+        // A port is part of the authority, so the trusted host must match it too.
+        let ported = vec!["localhost:8080".to_string()];
+        assert_eq!(
+            clone_cred_plan("http://localhost:8080/alice/x.git", &ported),
+            Some("localhost:8080".to_string())
+        );
     }
 
-    /// An ssh (github/gitlab `git@host:path`) or local url yields NO plan: those carry no http(s) host to
-    /// mint against, so the clone stays byte-identical to before — no `-c` helper, no `AGIT_HUB_URL` env.
-    /// (Key-auth is https-only; the mint handshake is an http API.)
+    /// The security boundary: an arbitrary https url whose host is NOT a declared hub yields None, so an
+    /// attacker's (or github/gitlab's) https store can never trigger a signed challenge and leak the
+    /// account username + public key. This is hub-vs-non-hub, not merely http-vs-non-http.
+    #[test]
+    fn clone_cred_plan_refuses_an_undeclared_https_host() {
+        let trusted = vec!["hub.example.com".to_string()];
+        assert_eq!(clone_cred_plan("https://github.com/alice/frontend.git", &trusted), None);
+        assert_eq!(clone_cred_plan("https://gitlab.com/alice/frontend.git", &trusted), None);
+        assert_eq!(clone_cred_plan("https://evil.example.net/alice/store.git", &trusted), None);
+        // Empty trusted set (no declared hub, e.g. AGIT_HUB_URL unset at clone time) -> never inject.
+        assert_eq!(clone_cred_plan("https://hub.example.com/alice/x.git", &[]), None);
+    }
+
+    /// An ssh (`git@host:path`) or local url yields None even when the host string is a declared hub: the
+    /// mint handshake is an http API, so key-auth is https-only. The clone stays byte-identical to before.
     #[test]
     fn clone_cred_plan_leaves_non_http_urls_alone() {
-        assert_eq!(clone_cred_plan("git@github.com:alice/frontend.git"), None);
-        assert_eq!(clone_cred_plan("git@gitlab.com:alice/frontend.git"), None);
-        assert_eq!(clone_cred_plan("ssh://git@hub.example.com/alice/x.git"), None);
-        assert_eq!(clone_cred_plan("/srv/local/store.git"), None);
+        let trusted = vec!["hub.example.com".to_string()];
+        assert_eq!(clone_cred_plan("git@github.com:alice/frontend.git", &trusted), None);
+        assert_eq!(clone_cred_plan("git@gitlab.com:alice/frontend.git", &trusted), None);
+        assert_eq!(clone_cred_plan("ssh://git@hub.example.com/alice/x.git", &trusted), None);
+        assert_eq!(clone_cred_plan("/srv/local/store.git", &trusted), None);
     }
 }
