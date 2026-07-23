@@ -43,6 +43,7 @@ dependencies = [
  "tokio-util",
  "totp-rs",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "ureq",
@@ -2661,6 +2662,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
  "url",
 ]
 

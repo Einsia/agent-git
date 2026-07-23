@@ -4514,6 +4514,124 @@ mod tests {
         assert_eq!(s.list_identity_keys("frank").await.len(), 2, "the reshaped table is truly multi-key");
     }
 
+    /// ENV-GATED live-Postgres integration test. Skips (returns early) unless `AGIT_HUB_TEST_DB` holds a
+    /// `postgres://` URL, so a normal `cargo test` is completely unaffected. CI (`.github/workflows/pg.yml`)
+    /// stands up a `postgres:16` + MinIO service, exports the env, and runs THIS test by name.
+    ///
+    /// It closes the "Postgres path is untested live" gap two ways:
+    ///   1. Opens the store through the SAME constructor `AGIT_HUB_DB` drives in production (`Store::open`
+    ///      selecting Postgres via `is_pg_url`), runs the full migration set, and round-trips add_user →
+    ///      create-agent → mint-token → read-them-back.
+    ///   2. Reproduces the specific incident that once crash-looped the live Postgres: it seeds the LEGACY
+    ///      single-key `identity_keys` shape, then re-runs `migrate()` and asserts the multi-key reshape
+    ///      completes without error and preserves the row — the exact regression this guards.
+    #[tokio::test]
+    async fn pg_store_roundtrip_and_legacy_reshape() {
+        let url = match std::env::var("AGIT_HUB_TEST_DB") {
+            Ok(u) if is_pg_url(&u) => u,
+            Ok(_) => panic!("AGIT_HUB_TEST_DB must be a postgres:// URL"),
+            // The gate: unset → skip cleanly so `cargo test --workspace` is unaffected.
+            Err(_) => {
+                eprintln!("skip pg_store_roundtrip_and_legacy_reshape: AGIT_HUB_TEST_DB not set");
+                return;
+            }
+        };
+
+        // Fresh slate: wipe the throwaway/CI database so the run is deterministic regardless of any prior
+        // state left by an earlier run. Safe because AGIT_HUB_TEST_DB is a dedicated test database.
+        let pool = sqlx::PgPool::connect(&url).await.expect("connect to AGIT_HUB_TEST_DB");
+        sqlx::query("DROP SCHEMA public CASCADE").execute(&pool).await.ok();
+        sqlx::query("CREATE SCHEMA public").execute(&pool).await.expect("recreate public schema");
+        pool.close().await;
+
+        // Open via the SAME path AGIT_HUB_DB drives in production: set the env, call Store::open — which
+        // selects Postgres (is_pg_url), connects, and runs the full migration set on a fresh schema.
+        std::env::set_var("AGIT_HUB_DB", &url);
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).await.expect("Store::open must migrate a fresh Postgres");
+        assert_eq!(store.backend(), "postgres", "the postgres:// URL must select the Pg backend");
+
+        // ── round-trip: add_user, create an agent, mint a token, read them all back ──
+        store.add_user(User { username: "alice".into(), created: now_iso(), ..Default::default() }).await.unwrap();
+        assert!(store.user("alice").await.is_some(), "the user must read back after add_user");
+
+        store
+            .update_agents(|a| a.push(AgentMeta::new("frontend", Some("alice"), Visibility::Private)))
+            .await
+            .unwrap();
+        let meta = store.agent_scoped("alice", "frontend").await.expect("the agent must read back");
+        assert_eq!(meta.owner.as_deref(), Some("alice"));
+        assert_eq!(meta.visibility, "private");
+
+        let tid = new_token_id().unwrap();
+        store
+            .update_tokens(|t| {
+                t.push(TokenRec {
+                    id: tid.clone(),
+                    name: "ci".into(),
+                    owner: Some("alice".into()),
+                    agent: Some("frontend".into()),
+                    scope: "write".into(),
+                    hash: "deadbeefcafe0123".into(),
+                    created: now_iso(),
+                    expires: None,
+                    last_used: None,
+                })
+            })
+            .await
+            .unwrap();
+        let toks = store.tokens().await;
+        assert!(
+            toks.iter().any(|t| t.id == tid && t.owner.as_deref() == Some("alice") && t.scope == "write"),
+            "the minted token must read back with its owner and scope"
+        );
+
+        // ── legacy reshape regression: plant the historical single-key identity_keys shape, re-migrate ──
+        let Store::Pg(inner) = &store else { unreachable!("backend asserted postgres above") };
+        sqlx::query("DROP INDEX IF EXISTS identity_keys_email").execute(&inner.pool).await.unwrap();
+        sqlx::query("DROP TABLE identity_keys").execute(&inner.pool).await.unwrap();
+        // The OLD single-key shape: PRIMARY KEY(username), no key_fpr / no label.
+        sqlx::query(
+            "CREATE TABLE identity_keys (\
+               username TEXT PRIMARY KEY, ed25519_pub TEXT NOT NULL, x25519_pub TEXT NOT NULL, \
+               epoch BIGINT NOT NULL DEFAULT 0, enroll_sig TEXT NOT NULL, created TEXT NOT NULL DEFAULT '', \
+               revoked TEXT, email TEXT NOT NULL DEFAULT '')",
+        )
+        .execute(&inner.pool)
+        .await
+        .unwrap();
+        let ed = "f".repeat(64);
+        sqlx::query(
+            "INSERT INTO identity_keys (username, ed25519_pub, x25519_pub, epoch, enroll_sig, created, email) \
+             VALUES ('alice', $1, $2, 2, 'sig', '2026-01-01T00:00:00Z', 'alice@corp.com')",
+        )
+        .bind(&ed)
+        .bind("b".repeat(64))
+        .execute(&inner.pool)
+        .await
+        .unwrap();
+        store.set_email_verified("alice", true).await.unwrap();
+
+        // Re-run migration: it must reshape the legacy single-key table into the composite multi-key shape
+        // WITHOUT erroring (the exact live-Postgres crash-loop this test guards) and keep the row.
+        store.migrate().await.expect("migrate must reshape a legacy single-key identity_keys on Postgres");
+
+        let keys = store.list_identity_keys("alice").await;
+        assert_eq!(keys.len(), 1, "the legacy row survives as exactly one device key");
+        assert_eq!(keys[0].ed25519_pub, ed);
+        assert_eq!(keys[0].key_fpr, ed25519_fingerprint(&ed), "key_fpr is back-filled from the row's ed25519_pub");
+        assert_eq!(keys[0].label, "default", "a back-filled legacy row is labelled 'default'");
+        assert_eq!(keys[0].epoch, 2, "the rotation epoch is preserved");
+        let hits = store.get_identity_keys_by_email("alice@corp.com").await;
+        assert_eq!(hits.len(), 1, "the reshaped row still resolves by verified email");
+        assert_eq!(hits[0].username, "alice");
+
+        // Migration is idempotent: a second pass over the now-reshaped schema is a clean no-op.
+        store.migrate().await.expect("re-running migrate on the reshaped Postgres must be a no-op");
+
+        std::env::remove_var("AGIT_HUB_DB");
+    }
+
     #[test]
     fn org_owner_parse() {
         let org_owned = AgentMeta { owner: Some("org:acme".into()), ..AgentMeta::new("x", None, Visibility::Private) };

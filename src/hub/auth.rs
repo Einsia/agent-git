@@ -310,12 +310,12 @@ mod tests {
         let secret = issue(&f.store, "tok_1", Some("alice"), Some("proj"), "write", None).await;
 
         // While enabled: the token authorizes alice.
-        let a = authenticate(&f.store, &f.sessions, None, &[secret.clone()]).await;
+        let a = authenticate(&f.store, &f.sessions, None, std::slice::from_ref(&secret)).await;
         assert_eq!(a.caller.user.as_deref(), Some("alice"), "an active owner's token authorizes");
 
         // Disable alice: the SAME token now authenticates nobody.
         assert!(f.store.set_user_disabled("alice", true).await.unwrap());
-        let a = authenticate(&f.store, &f.sessions, None, &[secret.clone()]).await;
+        let a = authenticate(&f.store, &f.sessions, None, std::slice::from_ref(&secret)).await;
         assert!(a.caller.user.is_none(), "a disabled owner's token must not authenticate");
         assert!(a.caller.token.is_none());
         assert!(a.token_id.is_none());
