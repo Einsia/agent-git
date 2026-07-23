@@ -266,6 +266,11 @@ pub fn path_under(p: &Path, base: &Path) -> bool {
 ///   tier 2  cwd a parent of / outside env, but it EDITED a file under env                 -> Owned
 ///   tier 3  cwd a parent of / outside env, and it only READ under env (or a strict parent) -> Candidate
 ///   else                                                                                   -> Unrelated
+///
+/// Tier 1 is a purely LEXICAL path prefix, not a git check, so the caller must only pass candidates whose
+/// cwd is already confirmed to be the SAME work-tree as `env` (a nested but DIFFERENT git repo under `env`
+/// would otherwise read as Owned). `handle_offcwd` does this: it classifies only `stranded_here`, which
+/// `plausibly_here` -> `same_repo` has already filtered to this repo.
 pub fn session_tier(recorded_cwd: &Path, edited: &HashSet<PathBuf>, read: &HashSet<PathBuf>, env: &Path) -> Tier {
     // Tier 1: launched at or inside env's work-tree. Owned regardless of read vs edit — being inside the
     // repo is the claim, exactly as git identifies a repo by walking up from the cwd.
