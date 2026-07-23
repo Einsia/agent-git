@@ -159,6 +159,43 @@ pub fn hub_hosts() -> Vec<String> {
     hosts
 }
 
+/// The `-c credential.https://<host>.helper=<exe> credential` git options that make git run THIS binary
+/// as its credential helper for each hub `host`. Uses the current executable's absolute path (via
+/// `std::env::current_exe`) so it resolves even when `agit` is not on `PATH`. Empty when the exe can't be
+/// found or there are no hub hosts, in which case the command runs exactly as before. Scoped per host, so
+/// a non-hub remote (github/gitlab) never triggers the helper — git only consults it for a matching host.
+///
+/// Shared by every agit command that shells out to git against a hub (`push`, `pull`, `fetch`, `clone`),
+/// so key-auth is wired identically everywhere.
+pub fn credential_helper_args(hosts: &[String]) -> Vec<String> {
+    let Ok(exe) = std::env::current_exe() else {
+        return vec![];
+    };
+    let exe = exe.display().to_string();
+    let mut out = Vec::new();
+    for host in hosts {
+        out.push("-c".to_string());
+        // git parses the helper value as a command line, so the exe path plus the `credential` subcommand
+        // is invoked as `<exe> credential <get|store|erase>`.
+        out.push(format!("credential.https://{host}.helper={exe} credential"));
+    }
+    out
+}
+
+/// Decide whether a `git clone <url>` should wire key-auth, and how. A clone runs with NO bound agent, so
+/// [`hub_hosts`] cannot resolve the clone host; instead we classify the url directly. Returns
+/// `Some((host, base))` when `url` is a hub URL — `host` scopes the credential helper `-c` option, `base`
+/// (`scheme://host[:port]`) is set as `AGIT_HUB_URL` in the git child's env so the spawned helper's
+/// `is_hub_host()` recognises the host and mints. Returns `None` for a github/gitlab/ssh/local url, for
+/// which the clone must stay byte-identical to before (no `-c`, no env change).
+pub fn clone_cred_plan(url: &str) -> Option<(String, String)> {
+    let host = hubapi::hub_host(url)?;
+    // `hub_web_base` gives the canonical credential-free `scheme://host[:port]`; fall back to https on the
+    // bare host if it somehow can't parse (hub_host already succeeded, so this is belt-and-suspenders).
+    let base = hubapi::hub_web_base(url).unwrap_or_else(|| format!("https://{host}"));
+    Some((host, base))
+}
+
 /// The hosts that count as "a hub" for this machine: `AGIT_HUB_URL` (if set) plus every http(s) remote of
 /// the active agent's store. Resolution failures are simply skipped — an empty list means "no hub known",
 /// so the helper stays silent (safe).
@@ -333,5 +370,52 @@ mod tests {
         assert!(enroll.starts_with(b"agit-identity-enroll-v1\n"), "enroll carries the enroll-v1 domain prefix");
         assert!(!auth.starts_with(b"agit-identity-enroll-v1"), "the auth prefix is NOT the enroll prefix");
         assert_ne!(auth, enroll);
+    }
+
+    /// One `-c credential.https://<host>.helper=<exe> credential` pair per host: two entries per host (the
+    /// `-c` flag and its value), the value carrying the current exe path and the ` credential` subcommand.
+    #[test]
+    fn credential_helper_args_emits_one_scoped_pair_per_host() {
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let args = credential_helper_args(&["h1".to_string(), "h2".to_string()]);
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                format!("credential.https://h1.helper={exe} credential"),
+                "-c".to_string(),
+                format!("credential.https://h2.helper={exe} credential"),
+            ]
+        );
+        // Each value is scoped to ONE host and names the exe + subcommand git will spawn.
+        assert!(args[1].contains(&exe) && args[1].ends_with(" credential"));
+    }
+
+    /// No hosts -> no options at all: the git command runs exactly as it would without key-auth.
+    #[test]
+    fn credential_helper_args_is_empty_for_no_hosts() {
+        assert!(credential_helper_args(&[]).is_empty());
+    }
+
+    /// A hub clone url yields a plan — the host to scope the `-c` helper to, and the canonical base to set
+    /// as `AGIT_HUB_URL` in the git child's env so the spawned helper recognises the host.
+    #[test]
+    fn clone_cred_plan_wires_a_hub_url() {
+        let plan = clone_cred_plan("https://hub.example.com/alice/frontend.git");
+        assert_eq!(plan, Some(("hub.example.com".to_string(), "https://hub.example.com".to_string())));
+        // A port rides along in both the host (helper scope) and the base (env), kept together.
+        let ported = clone_cred_plan("http://localhost:8080/alice/x.git");
+        assert_eq!(ported, Some(("localhost:8080".to_string(), "http://localhost:8080".to_string())));
+    }
+
+    /// An ssh (github/gitlab `git@host:path`) or local url yields NO plan: those carry no http(s) host to
+    /// mint against, so the clone stays byte-identical to before — no `-c` helper, no `AGIT_HUB_URL` env.
+    /// (Key-auth is https-only; the mint handshake is an http API.)
+    #[test]
+    fn clone_cred_plan_leaves_non_http_urls_alone() {
+        assert_eq!(clone_cred_plan("git@github.com:alice/frontend.git"), None);
+        assert_eq!(clone_cred_plan("git@gitlab.com:alice/frontend.git"), None);
+        assert_eq!(clone_cred_plan("ssh://git@hub.example.com/alice/x.git"), None);
+        assert_eq!(clone_cred_plan("/srv/local/store.git"), None);
     }
 }
