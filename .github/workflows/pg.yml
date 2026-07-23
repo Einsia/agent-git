@@ -48,29 +48,12 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-      # S3-compatible object store. bitnami/minio auto-starts the server (the stock minio/minio image
-      # needs a `server /data` command that service containers cannot supply) and pre-creates the bucket
-      # from MINIO_DEFAULT_BUCKETS. Exported for production parity; the current gated test round-trips the
-      # Postgres store only and does not touch blobs, so its readiness never blocks the test.
-      minio:
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-          MINIO_DEFAULT_BUCKETS: agit-blobs
-        ports:
-          - 9000:9000
     env:
-      # The gate: the test reads AGIT_HUB_TEST_DB, then sets AGIT_HUB_DB to it and calls Store::open so
-      # the SAME production selector (is_pg_url -> PgStore) runs.
+      # The gate: the test reads AGIT_HUB_TEST_DB, then sets AGIT_HUB_DB to it and calls Store::open so the
+      # SAME production selector (is_pg_url -> PgStore) runs. The gated test round-trips the Postgres store
+      # only (migrations + add_user/create-agent/mint-token + the legacy identity_keys reshape) and never
+      # touches blobs, so no S3/MinIO service is needed. Add one back if a blob-path test is ever gated here.
       AGIT_HUB_TEST_DB: postgres://agithub:agithub@127.0.0.1:5432/agithub_test
-      # S3 env exported for parity with production so the gated test can grow to exercise the blob store
-      # without a workflow change.
-      AGIT_HUB_S3_ENDPOINT: http://127.0.0.1:9000
-      AGIT_HUB_S3_BUCKET: agit-blobs
-      AGIT_HUB_S3_REGION: us-east-1
-      AGIT_HUB_S3_ACCESS_KEY: minioadmin
-      AGIT_HUB_S3_SECRET_KEY: minioadmin
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust components
