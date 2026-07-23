@@ -47,7 +47,7 @@ pub(crate) fn api_session(repo: &Path, id: &str, query: &str) -> Resp {
     let turns: Vec<serde_json::Value> = t
         .turns
         .iter()
-        .map(|turn| serde_json::json!({ "role": turn.role, "text": turn.text, "tools": turn.tools }))
+        .map(|turn| serde_json::json!({ "role": turn.role, "text": turn.text, "tools": turn.tools, "blocks": turn.blocks, "truncated": turn.truncated }))
         .collect();
     let revisions: Vec<serde_json::Value> = session_revisions(repo, &r.path)
         .into_iter()
