@@ -182,12 +182,13 @@ pub fn credential_helper_args(hosts: &[String]) -> Vec<String> {
     out
 }
 
-/// Decide whether a `git clone <url>` should wire key-auth, and how. A clone runs with NO bound agent, so
-/// [`hub_hosts`] cannot resolve the clone host; instead we classify the url directly. Returns
-/// `Some((host, base))` when `url` is a hub URL — `host` scopes the credential helper `-c` option, `base`
-/// (`scheme://host[:port]`) is set as `AGIT_HUB_URL` in the git child's env so the spawned helper's
-/// `is_hub_host()` recognises the host and mints. Returns `None` for a github/gitlab/ssh/local url, for
-/// which the clone must stay byte-identical to before (no `-c`, no env change).
+/// Decide whether a `git clone <url>` should wire key-auth. Returns `Some(host)` ONLY when the clone url's
+/// host is already a declared hub for this machine (`trusted_hosts`, from [`hub_hosts`] = AGIT_HUB_URL +
+/// bound-store remotes); that host scopes the credential helper `-c` option. Returns `None` for an
+/// undeclared host (an arbitrary/attacker https url, github, gitlab) or a non-http url, leaving the clone
+/// byte-identical to before (no `-c`, no env). A clone url is untrusted input, so it must never
+/// self-certify as a hub; the trust anchor is prior membership in `trusted_hosts`, and the machine's real
+/// AGIT_HUB_URL is inherited by the helper git spawns, so no environment is forged.
 pub fn clone_cred_plan(url: &str, trusted_hosts: &[String]) -> Option<String> {
     // A clone URL is UNTRUSTED input, so it must never self-certify as a hub. We inject the credential
     // helper ONLY when the URL's host is ALREADY a declared hub for this machine (in `trusted_hosts`,
@@ -411,11 +412,12 @@ mod tests {
             clone_cred_plan("https://hub.example.com/alice/frontend.git", &trusted),
             Some("hub.example.com".to_string())
         );
-        // A port is part of the authority, so the trusted host must match it too.
-        let ported = vec!["localhost:8080".to_string()];
+        // A port is part of the authority, so the trusted host must match it too. https, because the helper
+        // is scoped to `credential.https://<host>` and would never fire for an http url.
+        let ported = vec!["hub.example.com:8443".to_string()];
         assert_eq!(
-            clone_cred_plan("http://localhost:8080/alice/x.git", &ported),
-            Some("localhost:8080".to_string())
+            clone_cred_plan("https://hub.example.com:8443/alice/x.git", &ported),
+            Some("hub.example.com:8443".to_string())
         );
     }
 
