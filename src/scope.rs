@@ -12,7 +12,8 @@
 //! by walking to a path relative to the code repo.
 
 use anyhow::{bail, Context, Result};
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +214,143 @@ pub fn plausibly_here(recorded: &Path, env: &Path) -> bool {
         return true;
     }
     same_repo(recorded, env)
+}
+
+// ─────────────── off-cwd ownership tiers (attribute a session launched outside env) ───────────────
+
+/// Where a candidate session sits relative to the repo at `env`, deciding what capture may do with it.
+///
+///   * `Owned`     — capture it automatically (tier 1: launched at/inside `env`; tier 2: launched
+///                   above/outside but it EDITED a file under `env`, demonstrating work here).
+///   * `Candidate` — surface it, never auto-claim (tier 3: launched above `env` and only READ under it,
+///                   or launched from a strict parent and touched nothing detectable here).
+///   * `Unrelated` — a correct, silent drop: it neither sits under `env`, nor touched anything under it,
+///                   nor was launched from an ancestor of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Owned,
+    Candidate,
+    Unrelated,
+}
+
+/// Lexically normalize a path — resolve `.`/`..` without touching disk — so a prefix test compares
+/// component by component. No canonicalization: the recorded cwd and the touched paths may name files
+/// that do not exist on this machine (a transcript from elsewhere), and `env` is already a real root.
+fn normalize_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Is `p` at or under `base`, component-wise? `/p/app` is under `/p` and under `/p/app`, but NOT under
+/// `/p/ap` — the same boundary rule `Path::starts_with` gives, applied after lexical normalization so a
+/// `..` or a `.` in either path cannot spoof the prefix.
+pub fn path_under(p: &Path, base: &Path) -> bool {
+    normalize_path(p).starts_with(normalize_path(base))
+}
+
+/// Classify a candidate session for the repo rooted at `env`, from the directory it ran in and the
+/// absolute file paths it edited and read (already resolved against its cwd — see
+/// `convo::session_touched`). This is the whole off-cwd ownership table in one function, and it is pure:
+/// no disk, no git, so it is unit-testable directly.
+///
+///   tier 1  cwd == env, or cwd UNDER env (same work-tree, like git walking up to `.git`)  -> Owned
+///   tier 2  cwd a parent of / outside env, but it EDITED a file under env                 -> Owned
+///   tier 3  cwd a parent of / outside env, and it only READ under env (or a strict parent) -> Candidate
+///   else                                                                                   -> Unrelated
+pub fn session_tier(recorded_cwd: &Path, edited: &HashSet<PathBuf>, read: &HashSet<PathBuf>, env: &Path) -> Tier {
+    // Tier 1: launched at or inside env's work-tree. Owned regardless of read vs edit — being inside the
+    // repo is the claim, exactly as git identifies a repo by walking up from the cwd.
+    if path_under(recorded_cwd, env) {
+        return Tier::Owned;
+    }
+    // Tier 2: launched above/outside env, but it edited a file under env — demonstrated work here.
+    if edited.iter().any(|p| path_under(p, env)) {
+        return Tier::Owned;
+    }
+    // Tier 3: it only read under env, or it was launched from a strict parent/ancestor of env (so it is
+    // plausibly meant for this repo but showed no edit here). Surfaced, never auto-claimed.
+    if read.iter().any(|p| path_under(p, env)) || path_under(env, recorded_cwd) {
+        return Tier::Candidate;
+    }
+    Tier::Unrelated
+}
+
+#[cfg(test)]
+mod session_tier_tests {
+    use super::{session_tier, Tier};
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    fn set(paths: &[&str]) -> HashSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn tier1_env_and_subdir_are_owned_even_read_only() {
+        let env = Path::new("/p/app");
+        // launched AT env, read-only -> Owned
+        assert_eq!(session_tier(Path::new("/p/app"), &set(&[]), &set(&["/p/app/README.md"]), env), Tier::Owned);
+        // launched in a SUBDIR, read-only -> Owned (git walk-up)
+        assert_eq!(
+            session_tier(Path::new("/p/app/frontend"), &set(&[]), &set(&["/p/app/frontend/x.ts"]), env),
+            Tier::Owned
+        );
+        // a sibling that merely shares a name prefix is NOT under env
+        assert_eq!(session_tier(Path::new("/p/app-other"), &set(&[]), &set(&[]), env), Tier::Unrelated);
+    }
+
+    #[test]
+    fn tier2_parent_that_edited_under_env_is_owned() {
+        let env = Path::new("/p/app");
+        // launched in the parent, edited a file under env -> Owned
+        assert_eq!(
+            session_tier(Path::new("/p"), &set(&["/p/app/src/main.rs"]), &set(&[]), env),
+            Tier::Owned
+        );
+        // launched in the parent, edited only a SIBLING repo -> NOT owned for env (it is a candidate,
+        // because a parent-launched session is still plausibly meant for this repo)
+        assert_eq!(
+            session_tier(Path::new("/p"), &set(&["/p/other/src/main.rs"]), &set(&[]), env),
+            Tier::Candidate
+        );
+    }
+
+    #[test]
+    fn tier3_parent_read_only_under_env_is_a_candidate() {
+        let env = Path::new("/p/app");
+        assert_eq!(
+            session_tier(Path::new("/p"), &set(&[]), &set(&["/p/app/config.toml"]), env),
+            Tier::Candidate
+        );
+    }
+
+    #[test]
+    fn a_session_that_edited_two_repos_is_owned_by_each() {
+        let a = Path::new("/p/app");
+        let b = Path::new("/p/api");
+        let edited = set(&["/p/app/x.rs", "/p/api/y.rs"]);
+        assert_eq!(session_tier(Path::new("/p"), &edited, &set(&[]), a), Tier::Owned);
+        assert_eq!(session_tier(Path::new("/p"), &edited, &set(&[]), b), Tier::Owned);
+    }
+
+    #[test]
+    fn an_unrelated_session_is_dropped_not_surfaced() {
+        let env = Path::new("/p/app");
+        // cwd is neither under env, nor an ancestor of env, and nothing touched under env
+        assert_eq!(
+            session_tier(Path::new("/other"), &set(&["/other/z.rs"]), &set(&["/other/q.rs"]), env),
+            Tier::Unrelated
+        );
+    }
 }
 
 #[cfg(test)]

@@ -127,6 +127,66 @@ pub fn stranded_sessions(env: &Path) -> Vec<StrandedSession> {
     out
 }
 
+/// The file paths this claude transcript EDITED and READ, as raw strings, plus the recorded launch cwd
+/// so the caller can resolve any relative path against it. Edited = `Edit`/`Write`/`MultiEdit`
+/// (`file_path`) and `NotebookEdit` (`notebook_path`); read = `Read` (`file_path`) and `Grep`/`Glob`
+/// (`path`, the directory searched). Powers the off-cwd ownership tiers (`scope::session_tier`); the
+/// resolution + set-building lives once in `convo::session_touched`, shared with codex.
+pub fn touched(text: &str) -> (Vec<String>, Vec<String>, Option<String>) {
+    let mut edited = vec![];
+    let mut read = vec![];
+    let mut cwd: Option<String> = None;
+    for line in text.lines() {
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if cwd.is_none() {
+            if let Some(c) = rec.get("cwd").and_then(|v| v.as_str()) {
+                if !c.is_empty() {
+                    cwd = Some(c.to_string());
+                }
+            }
+        }
+        if rec.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = rec.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for b in blocks {
+            if b.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let input = b.get("input");
+            let field = |k: &str| input.and_then(|i| i.get(k)).and_then(|v| v.as_str()).map(String::from);
+            match b.get("name").and_then(|v| v.as_str()).unwrap_or("") {
+                "Edit" | "Write" | "MultiEdit" => {
+                    if let Some(p) = field("file_path") {
+                        edited.push(p);
+                    }
+                }
+                "NotebookEdit" => {
+                    if let Some(p) = field("notebook_path").or_else(|| field("file_path")) {
+                        edited.push(p);
+                    }
+                }
+                "Read" => {
+                    if let Some(p) = field("file_path") {
+                        read.push(p);
+                    }
+                }
+                "Grep" | "Glob" => {
+                    if let Some(p) = field("path") {
+                        read.push(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (edited, read, cwd)
+}
+
 /// Does this project have the slug directory to itself? Used to decide whether slug-level content that
 /// belongs to no session (`memory/`) can be attributed to us at all.
 pub fn slug_dir_is_exclusive(env: &Path) -> bool {

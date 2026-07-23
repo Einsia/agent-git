@@ -15,7 +15,8 @@
 use crate::adapter::{claude_code, codex};
 use anyhow::{bail, Result};
 use serde_json::Value;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 /// Lossless conversation representation.
 #[derive(Debug, Default, Clone)]
@@ -120,6 +121,33 @@ pub fn convert(
 /// Whether this is cross-vendor (source and target runtime differ).
 pub fn is_cross_vendor(src: &str, target: &str) -> bool {
     normalize_runtime(src) != normalize_runtime(target)
+}
+
+/// The absolute file paths a session EDITED and READ, for the off-cwd ownership classifier
+/// (`scope::session_tier`). Reads the transcript once, delegates the runtime-specific block parsing to
+/// the adapter (`touched`), then resolves every RELATIVE path against the session's own recorded cwd —
+/// so an `Edit` of `src/main.rs` in a session launched at `<env>` resolves to `<env>/src/main.rs` before
+/// the under-env test runs. An unreadable transcript, or one whose runtime is unknown, yields empty sets.
+pub fn session_touched(runtime: &str, transcript: &Path) -> (HashSet<PathBuf>, HashSet<PathBuf>) {
+    let text = std::fs::read_to_string(transcript).unwrap_or_default();
+    let (edited, read, cwd) = match normalize_runtime(runtime) {
+        "claude-code" => claude_code::touched(&text),
+        "codex" => codex::touched(&text),
+        _ => (vec![], vec![], None),
+    };
+    let base = cwd.map(PathBuf::from);
+    let resolve = |raw: Vec<String>| -> HashSet<PathBuf> {
+        raw.into_iter()
+            .map(|p| {
+                let pb = PathBuf::from(&p);
+                match &base {
+                    Some(b) if pb.is_relative() => b.join(pb),
+                    _ => pb,
+                }
+            })
+            .collect()
+    };
+    (resolve(edited), resolve(read))
 }
 
 /// Replace id / cwd during same-vendor replay: swap the **JSON-quote-wrapped** `"old"` in the raw line for `"new"`.
