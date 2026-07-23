@@ -1,6 +1,6 @@
 [package]
 name = "agit"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Git for agent context: version raw agent session dumps, sync with your team, LLM-merge on pull."
 license = "MIT"
