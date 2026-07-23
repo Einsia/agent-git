@@ -338,14 +338,24 @@ pub(crate) fn digest(runtime: &str, id: &str, jsonl: &str) -> SessionDigest {
     }
 }
 
-/// One readable turn in the conversation view: a single user prompt, or a single assistant reply.
-/// `text` keeps the original markdown (code fences, lists, headings) verbatim, clipped to a bound.
-/// `tools` counts the tool calls attributed to an assistant turn (consecutive tool calls/results are
-/// not turns of their own; they fold into the assistant turn that issued them). 0 for a user turn.
+/// One readable turn in the conversation view: a user prompt, or an assistant reply and the tool
+/// activity it drove. A turn now carries an ordered `blocks` list reconstructed from the same ordered
+/// events, so the SPA can render a Claude-Code/Codex-style transcript (text, tool call, tool result,
+/// file edit) instead of one flat markdown blob. Each block is a tagged JSON value:
+///   - `{"kind":"text","text": <markdown, clipped to [`TURN_CLIP`]>}`
+///   - `{"kind":"tool_use","name": <str>, "input": <compact one-line preview, clipped to [`TOOL_INPUT_CLIP`]>}`
+///   - `{"kind":"tool_result","output": <clipped to [`TOOL_RESULT_CLIP`]>}`
+///   - `{"kind":"file_edit","paths": [<str>...], "more": <n>}` (paths capped at [`FILE_EDIT_CAP`]; `more` = the overflow count, present only when > 0)
+///
+/// `text` keeps a flat concat of the turn's text blocks (clipped) for back-compat/search; `tools`
+/// counts the tool calls folded into an assistant turn (0 for a user turn); `truncated` is true when
+/// any block or the flat text was clipped, so the SPA can surface a "truncated" note.
 pub(crate) struct Turn {
     pub(crate) role: &'static str,
     pub(crate) text: String,
     pub(crate) tools: usize,
+    pub(crate) blocks: Vec<serde_json::Value>,
+    pub(crate) truncated: bool,
 }
 
 /// The ordered conversation plus whether it was capped (a huge session must not return megabytes).
@@ -354,16 +364,41 @@ pub(crate) struct Turns {
     pub(crate) capped: bool,
 }
 
-/// Max turns returned by the session view; a longer conversation is truncated (`capped`).
-pub(crate) const TURN_CAP: usize = 200;
-/// Per-turn char bound; a longer turn is clipped with a trailing marker.
-pub(crate) const TURN_CLIP: usize = 6000;
+/// Max turns returned by the session view; a longer conversation is truncated (`capped`). Generous,
+/// because virtualization is client-side — but the payload still has to stay bounded.
+pub(crate) const TURN_CAP: usize = 500;
+/// Per-text-block (and flat `text`) char bound; a longer text is clipped with a trailing marker.
+pub(crate) const TURN_CLIP: usize = 3000;
+/// Char bound for a tool call's input preview (a compact one-line render of the JSON input).
+pub(crate) const TOOL_INPUT_CLIP: usize = 600;
+/// Char bound for a tool result's output text.
+pub(crate) const TOOL_RESULT_CLIP: usize = 1000;
+/// Max file-edit paths listed on one block; the overflow is reported as a `more` count.
+pub(crate) const FILE_EDIT_CAP: usize = 20;
 
-/// Reconstruct the ordered back-and-forth from a transcript, IN ORDER, so the session view can render
-/// a real conversation instead of two flattened lists. Walks the same ordered ConversationIR events the
-/// spine does: each `UserPrompt` / `AssistantText` becomes a turn (markdown preserved, clipped), and
-/// each `ToolCall` folds into the count of the assistant turn that most recently spoke. Empty/whitespace
-/// turns are skipped; the whole thing is capped at [`TURN_CAP`] turns.
+/// Clip to `n` chars, char-safe, returning `(clipped, was_clipped)`. Unlike [`clip_marked`] the caller
+/// learns whether the text was actually cut (a text that already ends in "..." is not a false positive).
+fn clip_flag(s: &str, n: usize) -> (String, bool) {
+    let t = s.trim();
+    if t.chars().count() <= n {
+        (t.to_string(), false)
+    } else {
+        let head: String = t.chars().take(n).collect();
+        (format!("{head}..."), true)
+    }
+}
+
+/// Reconstruct the ordered back-and-forth from a transcript, IN ORDER, as turns of ordered blocks, so
+/// the session view can render a real Claude-Code/Codex-style conversation instead of two flattened
+/// lists. Walks the same ordered ConversationIR events the spine does:
+///   - each real `UserPrompt` starts a user turn (one text block);
+///   - `AssistantText` opens (or extends) the current assistant turn with a text block;
+///   - `ToolCall` appends a `tool_use` block to the current assistant turn (opening one if a tool call
+///     leads the reply) and bumps its `tools` count;
+///   - `ToolResult` / `FileEdit` append their blocks to the current assistant turn.
+/// A user prompt closes the open assistant turn. Empty/whitespace text is skipped; every payload is
+/// clipped to a bound so hundreds of turns stay a sane JSON size, and the whole thing is capped at
+/// [`TURN_CAP`] turns (`capped`).
 ///
 /// Runtime-agnostic (claude-code / codex) via [`agit::convo::read_conversation`]; an unparsable
 /// transcript yields an empty, uncapped result rather than an error — the view degrades to its other
@@ -375,8 +410,8 @@ pub(crate) fn extract_turns(runtime: &str, jsonl: &str) -> Turns {
     };
     let mut turns: Vec<Turn> = Vec::new();
     let mut capped = false;
-    // Index of the assistant turn that most recently spoke — tool calls fold into it. Reset by a user
-    // prompt (a tool call with no preceding assistant turn has nowhere to attribute and is dropped).
+    // Index of the open assistant turn — tool activity and further assistant text fold into it. Reset to
+    // None by a user prompt, so the next assistant utterance starts a fresh turn.
     let mut cur_assist: Option<usize> = None;
     'walk: for e in &ir.events {
         for k in &e.kinds {
@@ -389,26 +424,95 @@ pub(crate) fn extract_turns(runtime: &str, jsonl: &str) -> Turns {
                         capped = true;
                         break 'walk;
                     }
-                    turns.push(Turn { role: "user", text: clip_marked(s, TURN_CLIP), tools: 0 });
+                    let (t, clipped) = clip_flag(s, TURN_CLIP);
+                    turns.push(Turn {
+                        role: "user",
+                        text: t.clone(),
+                        tools: 0,
+                        blocks: vec![serde_json::json!({ "kind": "text", "text": t })],
+                        truncated: clipped,
+                    });
                     cur_assist = None;
                 }
                 EventKind::AssistantText(s) => {
                     if s.trim().is_empty() {
                         continue;
                     }
-                    if turns.len() >= TURN_CAP {
-                        capped = true;
-                        break 'walk;
+                    let (t, clipped) = clip_flag(s, TURN_CLIP);
+                    match cur_assist {
+                        Some(i) => {
+                            if !turns[i].text.is_empty() {
+                                turns[i].text.push_str("\n\n");
+                            }
+                            turns[i].text.push_str(&t);
+                            turns[i].blocks.push(serde_json::json!({ "kind": "text", "text": t }));
+                            turns[i].truncated |= clipped;
+                        }
+                        None => {
+                            if turns.len() >= TURN_CAP {
+                                capped = true;
+                                break 'walk;
+                            }
+                            turns.push(Turn {
+                                role: "assistant",
+                                text: t.clone(),
+                                tools: 0,
+                                blocks: vec![serde_json::json!({ "kind": "text", "text": t })],
+                                truncated: clipped,
+                            });
+                            cur_assist = Some(turns.len() - 1);
+                        }
                     }
-                    turns.push(Turn { role: "assistant", text: clip_marked(s, TURN_CLIP), tools: 0 });
-                    cur_assist = Some(turns.len() - 1);
                 }
-                EventKind::ToolCall { .. } => {
+                EventKind::ToolCall { name, input, .. } => {
+                    // A reply may lead with a tool call (assistant message with no text); open a turn so
+                    // the tool is never dropped.
+                    let i = match cur_assist {
+                        Some(i) => i,
+                        None => {
+                            if turns.len() >= TURN_CAP {
+                                capped = true;
+                                break 'walk;
+                            }
+                            turns.push(Turn {
+                                role: "assistant",
+                                text: String::new(),
+                                tools: 0,
+                                blocks: Vec::new(),
+                                truncated: false,
+                            });
+                            let idx = turns.len() - 1;
+                            cur_assist = Some(idx);
+                            idx
+                        }
+                    };
+                    // A compact one-line render of the input (attacker-authored — the SPA shows it as
+                    // plain text in a mono box, never as a markdown/HTML sink).
+                    let compact = serde_json::to_string(input).unwrap_or_default();
+                    let (preview, clipped) = clip_flag(&compact, TOOL_INPUT_CLIP);
+                    turns[i].blocks.push(serde_json::json!({ "kind": "tool_use", "name": name, "input": preview }));
+                    turns[i].tools += 1;
+                    turns[i].truncated |= clipped;
+                }
+                EventKind::ToolResult { output, .. } => {
                     if let Some(i) = cur_assist {
-                        turns[i].tools += 1;
+                        let (out, clipped) = clip_flag(output, TOOL_RESULT_CLIP);
+                        turns[i].blocks.push(serde_json::json!({ "kind": "tool_result", "output": out }));
+                        turns[i].truncated |= clipped;
                     }
                 }
-                EventKind::ToolResult { .. } | EventKind::FileEdit { .. } => {}
+                EventKind::FileEdit { paths } => {
+                    if let Some(i) = cur_assist {
+                        let shown: Vec<&String> = paths.iter().take(FILE_EDIT_CAP).collect();
+                        let more = paths.len().saturating_sub(FILE_EDIT_CAP);
+                        let mut block = serde_json::json!({ "kind": "file_edit", "paths": shown });
+                        if more > 0 {
+                            block["more"] = serde_json::json!(more);
+                            turns[i].truncated = true;
+                        }
+                        turns[i].blocks.push(block);
+                    }
+                }
             }
         }
     }
@@ -497,16 +601,4 @@ pub(crate) fn first_line(s: &str) -> String {
 
 pub(crate) fn clip(s: &str, n: usize) -> String {
     s.trim().chars().take(n).collect()
-}
-
-/// Clip to `n` chars, char-safe (never mid-byte), appending a trailing "..." when the text was cut.
-/// Unlike [`clip`], the caller can tell a clipped turn from one that just happened to end there.
-pub(crate) fn clip_marked(s: &str, n: usize) -> String {
-    let t = s.trim();
-    if t.chars().count() <= n {
-        t.to_string()
-    } else {
-        let head: String = t.chars().take(n).collect();
-        format!("{head}...")
-    }
 }

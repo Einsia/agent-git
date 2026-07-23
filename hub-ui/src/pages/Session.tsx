@@ -10,8 +10,7 @@ import { SpineReadout } from "@/components/Spine"
 import { ProvChips } from "@/components/ProvChips"
 import { ProvenanceBadge } from "@/components/ProvenanceBadge"
 import { Forbidden, LoadError } from "@/components/States"
-import { Markdown } from "@/components/Markdown"
-import type { Turn } from "@/lib/api"
+import { Transcript } from "@/components/Transcript"
 
 export function Session() {
   const { owner = "", name = "", id = "" } = useParams()
@@ -69,17 +68,15 @@ export function Session() {
                 {data.turns.length === 0 ? (
                   <p className="text-sm text-muted-foreground">No readable turns in this session.</p>
                 ) : (
-                  <div className="space-y-3">
-                    {data.turns.map((t, i) => (
-                      <TurnBlock key={i} turn={t} />
-                    ))}
+                  <>
+                    <Transcript turns={data.turns} />
                     {data.turns_capped && (
-                      <p className="rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
+                      <p className="mt-3 rounded-md border bg-muted px-3 py-2 text-sm text-muted-foreground">
                         This conversation is long; the view is truncated. Pull the session for the full
                         transcript.
                       </p>
                     )}
-                  </div>
+                  </>
                 )}
               </Section>
 
@@ -149,24 +146,5 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
       <h3 className="eyebrow mb-2">{title}</h3>
       {children}
     </section>
-  )
-}
-
-/// One turn of the conversation: a labeled, visually distinct block (user vs assistant, keyed off the
-/// existing kind-prompt / kind-assist tokens), its text rendered as sanitized markdown. An assistant
-/// turn shows its tool activity compactly.
-function TurnBlock({ turn }: { turn: Turn }) {
-  const isUser = turn.role === "user"
-  const accent = isUser ? "border-kind-prompt" : "border-kind-assist"
-  return (
-    <div className={`rounded-r-md border-l-2 ${accent} bg-card px-3.5 py-2.5`}>
-      <div className="eyebrow mb-1.5">{isUser ? "user" : "assistant"}</div>
-      <Markdown text={turn.text} />
-      {turn.tools > 0 && (
-        <div className="mt-2 font-mono text-[0.72rem] text-muted-foreground">
-          → {turn.tools} tool {turn.tools === 1 ? "call" : "calls"}
-        </div>
-      )}
-    </div>
   )
 }

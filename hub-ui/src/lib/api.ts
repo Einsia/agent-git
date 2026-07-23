@@ -265,13 +265,31 @@ export interface Revision {
   subject: string
 }
 
+/// One ordered block inside a turn, as `extract_turns` (src/bin/agit-hub/gitplumb.rs) serializes it.
+/// A turn's blocks are the real content, rendered in order like a Claude-Code/Codex transcript.
+/// Every payload is server-clipped and marked (see `Turn.truncated`); tool input/output are
+/// ATTACKER-AUTHORED, so the renderer shows them as PLAIN TEXT in mono boxes, never as markdown/HTML.
+///   - text        — a markdown segment (code fences, lists, headings preserved), clipped.
+///   - tool_use    — a tool call: its name and a compact one-line preview of the JSON input.
+///   - tool_result — a tool's output text, clipped.
+///   - file_edit   — the files a turn edited; `paths` is capped, `more` is the overflow count.
+export type Block =
+  | { kind: "text"; text: string }
+  | { kind: "tool_use"; name: string; input: string }
+  | { kind: "tool_result"; output: string }
+  | { kind: "file_edit"; paths: string[]; more?: number }
+
 /// One ordered turn of the conversation, as `api_session` (src/bin/agit-hub/content.rs) serializes it.
-/// `text` is the turn's ORIGINAL markdown (code fences, lists, headings preserved), clipped server-side.
-/// `tools` counts the tool calls folded into an assistant turn; 0 for a user turn.
+/// `blocks` is the ordered, interleaved content (text / tool_use / tool_result / file_edit) the SPA
+/// renders. `text` is a flat concat of the turn's text blocks (clipped) kept for back-compat/search;
+/// `tools` counts the tool calls folded into an assistant turn (0 for a user turn); `truncated` is true
+/// when any block or the flat text was clipped server-side.
 export interface Turn {
   role: "user" | "assistant"
   text: string
   tools: number
+  blocks: Block[]
+  truncated: boolean
 }
 
 export interface SessionDetail {

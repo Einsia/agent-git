@@ -1536,6 +1536,55 @@ mod session_turns_tests {
     use crate::content::api_session;
     use crate::gitplumb::{extract_turns, TURN_CAP, TURN_CLIP};
 
+    #[test]
+    fn extract_turns_emits_ordered_interleaved_blocks() {
+        let t = extract_turns("claude-code", MULTI_ROUND);
+        assert!(!t.capped);
+        assert_eq!(t.turns.len(), 4);
+
+        // Turn 0 (user): one text block, verbatim prompt.
+        let b0 = &t.turns[0].blocks;
+        assert_eq!(b0.len(), 1);
+        assert_eq!(b0[0]["kind"], "text");
+        assert_eq!(b0[0]["text"], "first question");
+
+        // Turn 1 (assistant): blocks are ORDERED and INTERLEAVED — text, tool_use, tool_use, tool_result.
+        let b1 = &t.turns[1].blocks;
+        let kinds: Vec<&str> = b1.iter().map(|b| b["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["text", "tool_use", "tool_use", "tool_result"], "blocks interleave in order");
+        // The code fence survives inside the text block (markdown preserved, not stripped to a line).
+        let text = b1[0]["text"].as_str().unwrap();
+        assert!(text.contains("```rust"), "code fence preserved: {text}");
+        assert!(text.contains("fn x() {}"), "{text}");
+        // The tool NAME survives on each tool_use block, in call order.
+        assert_eq!(b1[1]["name"], "Bash");
+        assert_eq!(b1[2]["name"], "Read");
+        // The input preview is a compact one-line render of the JSON input.
+        assert!(b1[1]["input"].as_str().unwrap().contains("ls"), "{}", b1[1]["input"]);
+        // The tool_result output carries through.
+        assert!(b1[3]["output"].as_str().unwrap().contains('a'), "{}", b1[3]["output"]);
+        assert!(!t.turns[1].truncated);
+
+        // Turn 2 (user) then turn 3 (assistant) — the conversation continues after the tool round.
+        assert_eq!(t.turns[2].blocks[0]["text"], "second question");
+        assert_eq!(t.turns[3].blocks[0]["text"], "second reply");
+    }
+
+    #[test]
+    fn extract_turns_marks_a_clipped_text_block_truncated() {
+        let long = "y".repeat(TURN_CLIP + 500);
+        let jsonl = format!(
+            "{{\"type\":\"assistant\",\"sessionId\":\"S1\",\"uuid\":\"u1\",\"parentUuid\":null,\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{long}\"}}]}}}}\n"
+        );
+        let t = extract_turns("claude-code", &jsonl);
+        assert_eq!(t.turns.len(), 1);
+        // A clipped block marks its turn truncated so the SPA can surface the "truncated" note.
+        assert!(t.turns[0].truncated, "a clipped turn is marked truncated");
+        let block_text = t.turns[0].blocks[0]["text"].as_str().unwrap();
+        assert!(block_text.ends_with("..."), "the clipped text block is marked");
+        assert_eq!(block_text.chars().count(), TURN_CLIP + 3, "clipped to TURN_CLIP chars + \"...\"");
+    }
+
     // ── Session view: the ordered conversation (turns) ──
 
     /// A four-round claude transcript: user, assistant (with two tool calls + a code fence), user,
