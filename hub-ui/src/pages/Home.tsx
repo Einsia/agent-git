@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom"
-import { ArrowUpRight, Lock, Plus } from "lucide-react"
+import { ArrowUpRight, Layers, Lock, Plus } from "lucide-react"
 
 import { api, type AgentSummary, type EffectiveRole } from "@/lib/api"
 import { useAsync } from "@/lib/useAsync"
@@ -23,8 +23,8 @@ export function Home() {
   const empty = data?.agents.length === 0
 
   return (
-    <div>
-      {/* Status readout: the instrument's main gauge — registry state at a glance, no prose. */}
+    <div className="flex flex-col gap-8">
+      {/* Status readout: the instrument's main gauge — registry state at a glance. */}
       <section className="readout rounded-lg border p-5">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div className="flex gap-8">
@@ -32,8 +32,8 @@ export function Home() {
             <Stat value={data ? totalSessions : "—"} label="sessions" />
           </div>
           {data?.host && (
-            <span className="font-mono text-[0.7rem] text-muted-foreground">
-              host <span className="text-foreground/80">{data.host}</span>
+            <span className="text-sm text-muted-foreground">
+              host <span className="font-mono text-foreground/80">{data.host}</span>
             </span>
           )}
         </div>
@@ -42,17 +42,21 @@ export function Home() {
         </div>
       </section>
 
-      <div className="mt-7">
-        <div className="mb-2 flex items-center justify-between gap-4 px-4">
-          <div className="grid flex-1 grid-cols-[1fr_2fr_auto] gap-4">
-            <span className="eyebrow">agent</span>
-            <span className="eyebrow">latest</span>
-            <span className="eyebrow text-right">sessions</span>
-          </div>
+      {/* The agent index: its own titled section with a labeled create action, GitHub-style. */}
+      <section>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="flex items-baseline gap-2 text-lg font-semibold tracking-tight">
+            Agents
+            {data && (
+              <span className="font-mono text-base tabular-nums text-muted-foreground">
+                {data.agents.length}
+              </span>
+            )}
+          </h2>
           {me && (
-            <Link to="/new" className={cn(buttonVariants({ variant: "outline", size: "sm" }), "shrink-0")}>
+            <Link to="/new" className={cn(buttonVariants({ variant: "outline", size: "sm" }))}>
               <Plus />
-              new agent
+              New agent
             </Link>
           )}
         </div>
@@ -92,7 +96,7 @@ export function Home() {
         )}
 
         {data && !empty && signedOut && (
-          <p className="mt-3 px-4 text-[0.8rem] text-muted-foreground">
+          <p className="mt-3 text-sm text-muted-foreground">
             Showing public agents.{" "}
             <Link to="/login" className="text-primary hover:underline">
               Sign in
@@ -100,21 +104,25 @@ export function Home() {
             to see private ones.
           </p>
         )}
+      </section>
 
-        {data && (
-          <footer className="mt-8 flex flex-wrap gap-x-8 gap-y-3 border-t pt-4 text-sm text-muted-foreground">
-            <span>
-              <span className="eyebrow mr-2">publish</span>
-              <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
-                agit -a push http://{data.host}/&lt;name&gt;.git
-              </code>
-            </span>
-            <Link className="font-mono text-xs text-primary hover:underline" to="/api/agents" reloadDocument>
-              /api/agents
+      {/* Publish + API pointers, kept apart from the list rather than crammed into one strip. */}
+      {data && (
+        <section className="rounded-lg border bg-card p-4">
+          <h2 className="text-sm font-semibold">Publish an agent</h2>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Push a local agit repo to this hub to add it to the index:
+          </p>
+          <pre className="mt-3 overflow-x-auto rounded-md border bg-muted p-3 font-mono text-sm leading-relaxed">
+            agit -a push http://{data.host}/&lt;name&gt;.git
+          </pre>
+          <div className="mt-4 border-t pt-3">
+            <Link className="text-sm text-primary hover:underline" to="/api/agents" reloadDocument>
+              Browse the raw index at /api/agents
             </Link>
-          </footer>
-        )}
-      </div>
+          </div>
+        </section>
+      )}
     </div>
   )
 }
@@ -123,26 +131,31 @@ function Row({ a }: { a: AgentSummary }) {
   return (
     <Link
       to={`/agent/${a.full_name}`}
-      className="grid grid-cols-[1fr_2fr_auto] items-center gap-4 border-t px-4 py-3.5 first:border-t-0 transition-colors hover:bg-accent/40"
+      className="flex items-start justify-between gap-4 border-t px-4 py-4 first:border-t-0 transition-colors hover:bg-accent/40"
     >
-      <span className="flex min-w-0 items-center gap-1.5 font-mono font-semibold">
-        {/* Private is the default, so the lock marks the norm, not the exception — it stays
-            quiet. What it buys is that a public agent is visibly missing one. */}
-        {a.visibility === "private" && (
-          <Lock className="size-3 shrink-0 text-muted-foreground" aria-label="private" />
-        )}
-        {/* The display identity is the scoped owner/name — a name is unique only within an owner. */}
-        <span className="truncate">{a.full_name}</span>
-        <ArrowUpRight className="size-3.5 shrink-0 text-muted-foreground" />
-      </span>
-      <span className="min-w-0 truncate text-sm text-muted-foreground">
-        <span className="mr-2 font-mono text-[0.78rem] text-muted-foreground/70">{a.when || "—"}</span>
-        {a.subject || "No sessions yet"}
-      </span>
-      <span className="flex items-center justify-end gap-2">
+      <div className="min-w-0">
+        <span className="flex items-center gap-1.5 font-mono text-base font-semibold">
+          {/* Private is the default, so the lock marks the norm, not the exception — it stays
+              quiet. What it buys is that a public agent is visibly missing one. */}
+          {a.visibility === "private" && (
+            <Lock className="size-3.5 shrink-0 text-muted-foreground" aria-label="private" />
+          )}
+          {/* The display identity is the scoped owner/name — a name is unique only within an owner. */}
+          <span className="truncate">{a.full_name}</span>
+          <ArrowUpRight className="size-4 shrink-0 text-muted-foreground" />
+        </span>
+        <p className="mt-1 truncate text-sm text-muted-foreground">
+          {a.subject || "No sessions yet"}
+        </p>
+        {a.when && <p className="mt-1 text-xs text-muted-foreground">Updated {a.when}</p>}
+      </div>
+      <div className="flex shrink-0 items-center gap-3">
         <RoleBadge role={a.role} />
-        <span className="w-8 text-right font-mono font-semibold tabular-nums">{a.sessions}</span>
-      </span>
+        <span className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+          <Layers className="size-4" />
+          <span className="font-mono font-semibold tabular-nums text-foreground">{a.sessions}</span>
+        </span>
+      </div>
     </Link>
   )
 }
@@ -151,7 +164,7 @@ function Row({ a }: { a: AgentSummary }) {
 function RoleBadge({ role }: { role: EffectiveRole | null }) {
   if (!role) return null
   return (
-    <Badge variant={role === "owner" ? "default" : "muted"} className="font-mono text-[0.6rem]">
+    <Badge variant={role === "owner" ? "default" : "muted"} className="font-mono">
       {role}
     </Badge>
   )
@@ -185,9 +198,11 @@ function Skeleton({ rows }: { rows: number }) {
   return (
     <div className="overflow-hidden rounded-lg border bg-card">
       {Array.from({ length: rows }).map((_, i) => (
-        <div key={i} className="grid grid-cols-[1fr_2fr_auto] gap-4 border-t px-4 py-4 first:border-t-0">
-          <div className="h-4 w-24 animate-pulse rounded bg-muted" />
-          <div className="h-4 w-full animate-pulse rounded bg-muted" />
+        <div key={i} className="flex items-center justify-between gap-4 border-t px-4 py-5 first:border-t-0">
+          <div className="flex-1 space-y-2">
+            <div className="h-4 w-40 animate-pulse rounded bg-muted" />
+            <div className="h-3 w-full max-w-md animate-pulse rounded bg-muted" />
+          </div>
           <div className="h-4 w-10 animate-pulse rounded bg-muted" />
         </div>
       ))}

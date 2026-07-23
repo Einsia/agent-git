@@ -4,7 +4,7 @@ import { ArrowUpRight, FolderGit2 } from "lucide-react"
 import { api, type Repo } from "@/lib/api"
 import { useGuarded } from "@/lib/useGuarded"
 import { Badge } from "@/components/ui/badge"
-import { Eyebrow, LoadError } from "@/components/States"
+import { LoadError } from "@/components/States"
 
 // The agent-page route segment is the owner_ns, not the full owner string: an org-owned agent's owner
 // is "org:<name>" but its URL segment is the bare "<name>". A personal agent's owner already IS the ns.
@@ -22,16 +22,22 @@ export function Repos() {
   return (
     <div className="flex flex-col gap-8">
       <header>
-        <span className="eyebrow">code repos</span>
-        <h1 className="mt-1 text-2xl font-bold tracking-tight">Code repos</h1>
-        <p className="mt-1 max-w-[62ch] text-sm text-muted-foreground">
+        <h1 className="text-2xl font-bold tracking-tight">Code repos</h1>
+        <p className="mt-2 max-w-[62ch] text-sm text-muted-foreground">
           Every code repo the hub's agents have worked in, grouped by environment. One repo can be
           touched by several agents; each is listed here. Only agents you can read contribute.
         </p>
       </header>
 
       <section>
-        <Eyebrow className="mb-3">repos</Eyebrow>
+        <h2 className="mb-4 flex items-baseline gap-2 text-lg font-semibold tracking-tight">
+          Repos
+          {data && (
+            <span className="font-mono text-base tabular-nums text-muted-foreground">
+              {data.repos.length}
+            </span>
+          )}
+        </h2>
 
         {loading && <p className="py-6 text-muted-foreground">Loading…</p>}
         {/* 401 is already on its way to the sign-in form; don't flash an error behind it. */}
@@ -58,7 +64,7 @@ export function Repos() {
           </p>
         )}
         {data && data.has_more && !data.capped && (
-          <p className="mt-4 text-[0.78rem] text-muted-foreground">
+          <p className="mt-4 text-sm text-muted-foreground">
             Showing the most recently active repos; older ones are not listed.
           </p>
         )}
@@ -73,34 +79,34 @@ function RepoCard({ repo }: { repo: Repo }) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <FolderGit2 className="size-4 shrink-0 text-muted-foreground" />
-            <h2 className="truncate font-mono text-sm font-semibold">{repo.cwd ?? repo.env}</h2>
+            <FolderGit2 className="size-5 shrink-0 text-muted-foreground" />
+            <h2 className="truncate font-mono text-base font-semibold">{repo.cwd ?? repo.env}</h2>
           </div>
           {repo.cwd && (
-            <p className="mt-1 truncate font-mono text-[0.72rem] text-muted-foreground">{repo.env}</p>
+            <p className="mt-1 truncate font-mono text-sm text-muted-foreground">{repo.env}</p>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-2 text-sm">
-          <Badge variant="muted" className="font-mono text-[0.6rem]">
+        <div className="flex shrink-0 items-center gap-2.5">
+          <Badge variant="muted" className="font-mono">
             {repo.total_sessions} {repo.total_sessions === 1 ? "session" : "sessions"}
           </Badge>
-          {repo.last && <span className="font-mono text-[0.72rem] text-muted-foreground">{repo.last}</span>}
+          {repo.last && <span className="text-sm text-muted-foreground">{repo.last}</span>}
         </div>
       </div>
 
-      <div className="mt-3 border-t pt-3">
-        <Eyebrow className="mb-2">agents</Eyebrow>
+      <div className="mt-4 border-t pt-3">
+        <h3 className="mb-2 text-sm font-semibold">Agents</h3>
         <div className="flex flex-wrap gap-2">
           {repo.agents.map((ag) => (
             <Link
               key={`${ag.owner}/${ag.name}`}
               to={`/agent/${encodeURIComponent(ownerNs(ag.owner))}/${encodeURIComponent(ag.name)}`}
-              className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 font-mono text-xs transition-colors hover:bg-accent/40"
+              className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 font-mono text-sm transition-colors hover:bg-accent/40"
             >
               <span className="text-muted-foreground">{ag.owner}/</span>
               <span className="font-semibold">{ag.name}</span>
               <span className="tabular-nums text-muted-foreground">{ag.sessions}</span>
-              <ArrowUpRight className="size-3 text-muted-foreground" />
+              <ArrowUpRight className="size-3.5 text-muted-foreground" />
             </Link>
           ))}
         </div>
