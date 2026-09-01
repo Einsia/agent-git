@@ -1,0 +1,41 @@
+# OpenCode part.data.type histogram over the whole database (139 sessions / 3419 messages / 14883 parts)
+
+## part type
+tool|3838
+step-start|3011
+step-finish|2962
+reasoning|2460
+text|1922
+patch|599
+file|86
+compaction|5
+
+## tool state machine distribution (state.status)
+completed|3798
+error|37
+running|3
+
+## step-finish reason
+length|2
+stop|297
+tool-calls|2663
+
+## text part by host message role × synthetic flag
+assistant||1426
+user||391
+user|1|105
+
+## assistant message mode distribution
+Sisyphus - ultraworker|2040
+build|735
+multimodal-looker|61
+librarian|57
+plan|42
+Sisyphus-Junior|36
+explore|34
+oracle|6
+compaction|5
+
+## file part url prefixes
+data:applicatio|41
+data:image/png;|45

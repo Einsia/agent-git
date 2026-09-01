@@ -1,0 +1,15 @@
+# opencode export / import behavior, measured (v1.18.13, Linux, isolated scratch HOME/XDG)
+
+## export
+- Two exports of the same session at rest are byte-identical (cmp passes, 185575 bytes).
+- Top-level shape: {info, messages:[{info, parts:[..]}]}; JSON indented by 2 spaces, on stdout.
+- info key order: id, slug, projectID, directory, path, parentID, title, agent, model, version, summary, cost, tokens, permission, time{created,updated}
+- With no sessionID it picks a session interactively (ordered by updated); --sanitize replaces every body / path / URL with [redacted:<kind>:<id>].
+
+## import (import.ts: Session.Info validation + onConflictDoUpdate{project_id,directory,path}; message/part are onConflictDoNothing)
+- The original session id is reused, no new id is minted; stdout prints 'Imported session: ses_...' (exit 0).
+- directory/path are rewritten to the cwd at import time and its path relative to the worktree; project ownership follows the cwd.
+- Re-importing the same id: the session row does not overwrite title (measured: a title edit is discarded); a message/part row conflict is skipped (measured: an edited part body never reaches the database).
+- A full id remint (random, non-time-ordered ids included) imports and shows up in session list; info.parentID must not be null (the key has to be deleted).
+- time_created on message/part always takes the moment of import (the original value is not kept); a partial export (2 of the 8 messages) lands complete in a fresh database.
+- A session carrying parent_id does not appear in 'opencode session list' (that command lists root sessions only).

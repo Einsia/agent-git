@@ -1,0 +1,80 @@
+{
+ "user_message_row": {
+  "id": "msg_fc7dbb083001lXtvpuUMudSOVK",
+  "data": {
+   "role": "user",
+   "time": {
+    "created": 1785764491395
+   },
+   "agent": "build",
+   "model": {
+    "providerID": "einsia",
+    "modelID": "glm-5.2"
+   },
+   "summary": {
+    "diffs": []
+   }
+  },
+  "text_part_example": "{\"type\":\"text\",\"text\":\"\\\"reply with exactly the word: PONG\\\"\"}"
+ },
+ "assistant_message_row": {
+  "id": "msg_fc7dbb1ed001lx0ecSwLvaz3eS",
+  "data": {
+   "parentID": "msg_fc7dbb083001lXtvpuUMudSOVK",
+   "role": "assistant",
+   "mode": "build",
+   "agent": "build",
+   "path": {
+    "cwd": "/cluster/home/nana/projects/AgentGit",
+    "root": "/"
+   },
+   "cost": 0,
+   "tokens": {
+    "total": 7058,
+    "input": 7054,
+    "output": 4,
+    "reasoning": 0,
+    "cache": {
+     "write": 0,
+     "read": 0
+    }
+   },
+   "modelID": "glm-5.2",
+   "providerID": "einsia",
+   "time": {
+    "created": 1785764491757,
+    "completed": 1785764492839
+   },
+   "finish": "stop"
+  }
+ },
+ "tool_part_row_completed": {
+  "id": "prt_fc7dd7cd10018iWGZyO34kJ3ne",
+  "data": {
+   "type": "tool",
+   "tool": "bash",
+   "callID": "bash:0",
+   "state": {
+    "status": "completed",
+    "input": {
+     "command": "ls ~/.codex/"
+    },
+    "output": "app-server-control\nconfig.toml\ngoals_1.sqlite\ninstallation_id\nlogs_2.sqlite\nlogs_2.sqlite-shm\nlogs_2.sqlite-wal\nmemories_1.sqlite\nplugins\nsession_index.jsonl\nsessions\nshell_snapshots\nskills\nstate_5.sq…(truncated)",
+    "metadata": {
+     "output": "app-server-control\nconfig.toml\ngoals_1.sqlite\ninstallation_id\nlogs_2.sqlite\nlogs_2.sqlite-shm\nlogs_2.sqlite-wal\nmemories_1.sqlite\nplugins\nsession_index.jsonl\nsessions\nshell_snapshots\nskills\nstate_5.sq…(truncated)",
+     "exit": 0,
+     "truncated": false
+    },
+    "title": "ls ~/.codex/",
+    "time": {
+     "start": 1785764609310,
+     "end": 1785764609317
+    }
+   }
+  }
+ },
+ "reasoning_part_example": {
+  "id": "prt_fc7dbcdc9001ftv3z0UTrP8zP0",
+  "data": "{\"type\":\"reasoning\",\"text\":\"We need answer exactly word PONG. Need final only PONG. Ensure no extra. Same language? User English. Final exactly PONG.\",\"time\":{\"start\":1785764498889,\"end\":1785764499290}}"
+ }
+}

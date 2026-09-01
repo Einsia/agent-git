@@ -1,0 +1,28 @@
+# Cursor turn-boundary signal turn_ended — measured on this machine (105 transcripts)
+
+## Record shape (top level, no role / message field)
+{"type":"turn_ended","status":"success"}
+{"type":"turn_ended","status":"error","error":"User aborted request"}
+{"type":"turn_ended","status":"aborted","error":"User aborted/interrupted manually."}
+
+## Full counts (104 snapshot files)
+   48  status=success
+    8  status=error    error="User aborted request"
+    2  status=aborted  error="User aborted/interrupted manually."
+A second machine (Linux) has the same three kinds, counted 23 / 2 / 1 — the shape matches exactly, no version difference.
+
+## It arrived on 2026-07-30, so it must be treated as an optional field
+files with turn_ended: 31, mtime 2026-07-30 15:59 ... 2026-08-01 00:41
+files without turn_ended: 74, mtime 2026-04-09 19:15 ... 2026-08-01 00:15
+files after the earliest turn_ended (2026-07-30 15:59) that still have none: only 3
+=> conclusion: the dividing line falls around 2026-07-30 (Cursor 3.13.x). Old transcripts carry none at all.
+
+## Correspondence with the human turn count (main sessions, only files that have turn_ended)
+  user=13  turn_ended=11   web-app/0bc2ed42…
+  user=14  turn_ended=10   AgentGit/7bf0e7c5…
+  user=14  turn_ended= 4   AgentGit/5077c9e5…
+  user=16  turn_ended= 4   empty-window/7bf0e7c5…
+  user= 3  turn_ended= 3   research-notes/46a21569…
+  user= 6  turn_ended= 2   AgentGit/1bbe1065…
+=> roughly 1:1 but not exact (it can undercount, and two occasionally appear back to back). Reliability is
+   on par with Codex's task_complete: not a basis for counting, only an existence signal that "this turn ended".

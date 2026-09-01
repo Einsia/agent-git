@@ -1,0 +1,39 @@
+# Cursor agent-transcripts record-shape histogram (this machine, macOS, Cursor IDE)
+# Sample: 104 .jsonl files (60 main sessions + 44 subagent), 11162 content blocks / top-level records in total
+
+    3429  role=assistant  type=text       name/status=None
+    2050  role=assistant  type=tool_use   name/status=Read
+    1484  role=assistant  type=tool_use   name/status=Shell
+     844  role=assistant  type=tool_use   name/status=Grep
+     709  role=assistant  type=tool_use   name/status=StrReplace
+     533  role=assistant  type=tool_use   name/status=ReadFile
+     475  role=user       type=text       name/status=None
+     338  role=assistant  type=tool_use   name/status=Write
+     297  role=assistant  type=tool_use   name/status=Glob
+     179  role=assistant  type=tool_use   name/status=ApplyPatch
+     177  role=assistant  type=tool_use   name/status=rg
+     162  role=assistant  type=tool_use   name/status=TodoWrite
+      95  role=assistant  type=tool_use   name/status=ReadLints
+      65  role=assistant  type=tool_use   name/status=Task
+      56  role=assistant  type=tool_use   name/status=UpdateCurrentStep
+      48  role=<no role>  type=turn_ended name/status=success
+      40  role=assistant  type=tool_use   name/status=WebFetch
+      28  role=assistant  type=tool_use   name/status=cursor-ide-browser-browser_cdp
+      26  role=assistant  type=tool_use   name/status=Delete
+      25  role=assistant  type=tool_use   name/status=AskQuestion
+      18  role=assistant  type=tool_use   name/status=WebSearch
+      15  role=assistant  type=tool_use   name/status=Subagent
+      14  role=assistant  type=tool_use   name/status=AwaitShell
+       9  role=assistant  type=tool_use   name/status=cursor-ide-browser-browser_click
+       8  role=<no role>  type=turn_ended name/status=error
+       7  role=assistant  type=tool_use   name/status=Await
+       6  role=assistant  type=tool_use   name/status=SemanticSearch
+       6  role=assistant  type=tool_use   name/status=CreatePlan
+       6  role=assistant  type=tool_use   name/status=cursor-ide-browser-browser_snapshot
+       5  role=assistant  type=tool_use   name/status=SwitchMode
+       2  role=<no role>  type=turn_ended name/status=aborted
+       2  role=assistant  type=tool_use   name/status=cursor-ide-browser-browser_navigate
+       1  role=assistant  type=tool_use   name/status=cursor-ide-browser-browser_fill
+       1  role=assistant  type=tool_use   name/status=cursor-ide-browser-browser_press_key
+       1  role=assistant  type=tool_use   name/status=cursor-ide-browser-browser_scroll
+       1  role=assistant  type=tool_use   name/status=cursor-ide-browser-browser_mouse_click_xy

@@ -1,0 +1,2 @@
+{"version":"v1","kind":"Prompt","data":{"message_id":"1a75dbae-b393-483b-951e-a0d3ddddbcaa","content":[{"kind":"text","data":"Hi"}],"meta":{"timestamp":1784898358}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"286735f2-f3a5-40b8-b03c-f8e61c41d544","content":[{"kind":"text","data":"Hi! What can I help you with today?"}]}}

@@ -1,0 +1,254 @@
+[package]
+name = "agit"
+# This number is at once the version of the npm package @einsia/agent-git, the
+# release tag, and the version segment in artifact filenames. Changing it here
+# means changing package.json in the same commit; scripts/check-version.js holds
+# CI closed until both agree.
+#
+# @einsia/agent-git and @einsia/agentgit are independent package lines. This
+# version follows this CLI's own lifecycle rather than trying to outrank the
+# other package; that the two are incompatible is said by the package name.
+version = "0.0.9"
+edition = "2024"
+# The observed floor, not a guess: on 1.85.1 cargo rejects `cargo check --locked`
+# outright, because the locked darling 0.23 and instability 0.3.12 (a ratatui
+# dependency) both declare rust-version = 1.88; 1.88 compiles.
+#
+# So edition 2024's 1.85 is not the real constraint, the lockfile is. Declaring it
+# here makes cargo hold that line itself: an older toolchain gets "requires rustc
+# 1.88" instead of an edition error nobody can read.
+rust-version = "1.88"
+description = "AgentGit CLI: lossless version control for every agent session, publishable and ready to pick up"
+license = "MIT"
+repository = "https://github.com/Einsia/agent-git"
+
+[[bin]]
+name = "agit"
+path = "src/main.rs"
+# The binary needs `cli`: without it there is no clap and no `commands` module.
+# The default features include `cli`, so `cargo build` / `cargo test` are
+# unaffected by this gate.
+required-features = ["cli"]
+
+[lib]
+name = "agit"
+path = "src/lib.rs"
+
+[features]
+default = ["cli"]
+
+# The terminal half.
+#
+# # Why this switch exists
+#
+# The hub's backend reuses this crate's IR (`adapter`) and turn chain
+# (`domain::turn`) — the web transcript and `agit show` must come from the same
+# source word for word, or the two parsing implementations drift apart silently.
+# But the backend must not link a TUI in to get that: with
+# `default-features = false` it gets `adapter` + `domain` + `infra`, no ratatui,
+# no clap, no HTTP client.
+#
+# The dividing line is "whether anyone is sitting at a terminal": `commands`
+# (argument parsing and interaction), `ui` (rendering and prompts) and `hub` (the
+# CLI's own HTTP client and its authenticated git subprocesses) all sit inside
+# `cli`. `domain` and `adapter` are needed on both sides, so neither ever goes in.
+cli = [
+    "rc",
+    "secret-vault",
+    "dep:clap",
+    "dep:clap_complete",
+    "dep:ratatui",
+    "dep:crossterm",
+    "dep:comfy-table",
+    "dep:indicatif",
+    "dep:owo-colors",
+    "dep:dialoguer",
+    "dep:ureq",
+]
+
+# `agit rc` — the resident daemon (agitd) that supervises harness processes and
+# streams their events to the hub over WebSocket. This is the crate's first async
+# code; it is gated so that the backend's `default-features = false` import stays
+# free of tokio and TLS. `cli` implies `rc` because `agit rc start` is a subcommand.
+# The protocol *types* (`crate::protocol`) are deliberately NOT gated — the hub
+# compiles against them.
+rc = [
+    "secret-vault",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "dep:portable-pty",
+    "dep:base64",
+    "dep:windows-sys",
+]
+
+# The device-local vault for low-entropy secrets. A backend reusing domain with
+# default-features=false must not link the OS keyring / AEAD in; only the CLI and
+# agitd need this layer.
+secret-vault = [
+    "dep:aes-gcm",
+    "dep:base64",
+    "dep:keyring",
+    "dep:zeroize",
+]
+
+[dependencies]
+# ── CLI ─────────────────────────────────────────────────────────────────
+clap = { version = "4", features = ["derive", "env"], optional = true }
+clap_complete = { version = "4", optional = true }
+
+# ── TUI / terminal rendering ────────────────────────────────────────────
+# `agit show` renders a session as a conversation, `agit log` renders the
+# timeline. `unstable-rendered-line-info` turns on `Paragraph::line_count`: the
+# scroll limit has to be computed from **the line count the renderer itself
+# arrives at**. Dividing out the columns by hand diverges from its wrapping
+# rules, and the symptom of that divergence is "the last few lines cannot be
+# scrolled to" — nobody reports a bug like that. The cost of an unstable API is
+# one site to follow when ratatui is upgraded, cheaper than maintaining a
+# parallel wrapping implementation forever.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"], optional = true }
+crossterm = { version = "0.29", optional = true }
+# Computes "how many columns this text occupies". ratatui measures with it too
+# (`Span::width`), and the width budget of a list row has to use the same ruler:
+# count characters instead and a row of CJK takes twice the columns, so the
+# renderer quietly truncates the time and the tag at the end of the line — exactly
+# what must not be dropped.
+#
+# Not optional: `comfy-table` needs it to measure colored table widths too, so it
+# does not sit behind the `cli` gate.
+unicode-width = "0.2"
+# The CLI passes pre-colored status text to table cells.  `custom_styling`
+# makes comfy-table measure ANSI-colored strings by their visible width;
+# without it, escape sequences inflate the column width and shift the right
+# border on otherwise valid tables.
+comfy-table = { version = "7", features = ["custom_styling"], optional = true }
+indicatif = { version = "0.18", optional = true }
+owo-colors = { version = "4", features = ["supports-colors"], optional = true }
+dialoguer = { version = "0.11", default-features = false, features = ["fuzzy-select", "password"], optional = true }
+
+# ── Index store ─────────────────────────────────────────────────────────
+# Codex keeps session metadata in the `threads` table of
+# ~/.codex/state_<N>.sqlite. Querying that is orders of magnitude faster than
+# scanning the whole rollout directory, observed rather than assumed.
+#
+# `bundled` compiles the sqlite sources in instead of linking the system library:
+# nothing guarantees the target machine has sqlite, or even the `sqlite3` command.
+# The cost is one more C build.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# ── Serialization ───────────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+# Never enable `preserve_order` / `arbitrary_precision`: a feature applies
+# uniformly across the whole workspace, the backend included. The envelope hash in
+# domain::transcript depends on the default shape (BTreeMap key order + f64
+# numbers) being the canonical serialization; tripwire tests in that module fire
+# on the day that is violated.
+serde_json = "1"
+# Used only to read and write Claude Code's settings.json (installing the hook)
+# and Codex's config.toml.
+toml = "0.9"
+
+# ── Error handling ──────────────────────────────────────────────────────
+anyhow = "1"
+thiserror = "2"
+
+# ── Time ────────────────────────────────────────────────────────────────
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+
+# ── Filesystem ──────────────────────────────────────────────────────────
+walkdir = "2"
+tempfile = "3"
+# File locks: hooks can fire concurrently (two sessions opened at once), so writes
+# to the store must be serialized.
+fs2 = "0.4"
+
+# ── Cryptography ────────────────────────────────────────────────────────
+sha2 = "0.10"
+hex = "0.4"
+# provenance: one ed25519 key per machine, a session carries a signature, and the
+# server verifies who it belongs to.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+# End-to-end encryption for `agit share`. AES-GCM because browsers support it
+# natively through WebCrypto: the viewer decrypts with zero dependencies.
+aes-gcm = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+# native store: macOS Keychain / Windows Credential Manager / Unix Secret Service.
+# `v1` is this crate's narrow cross-platform API; the `cli` feature stays off,
+# since it links every alternative store in.
+keyring = { version = "4.1", default-features = false, features = ["v1"], optional = true }
+zeroize = { version = "1", optional = true }
+
+# ── HTTP ────────────────────────────────────────────────────────────────
+# Blocking is enough: the CLI has no concurrent-request path. rustls keeps the
+# build free of system dependencies.
+ureq = { version = "3", default-features = false, features = ["rustls", "json"], optional = true }
+
+# ── Miscellaneous ───────────────────────────────────────────────────────
+regex = "1"
+# The keyword prefilter for secret scanning. Not "an optimization added in
+# passing": running the whole gitleaks rule set over a megabyte-scale transcript
+# costs seconds, and behind the prefilter it costs milliseconds. A per-rule
+# `contains()` is O(number of rules times text length), which lands back in
+# seconds — so it has to be one automaton walking the text once.
+#
+# Not a new dependency: regex already depends on it; this only promotes it to a
+# direct dependency so the domain layer can use it too.
+aho-corasick = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+# git-parity: restores the default SIGPIPE disposition, so `agit log | head`
+# exits cleanly.
+libc = "0.2"
+
+# ── rc (agitd) ───────────────────────────────────────────────────────────
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net", "fs", "signal"], optional = true }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+# The terminal needs a real PTY: without one `vim`, `top` and anything that checks
+# isatty do not work, and the whole point of that bottom-right pane is "run real
+# interactive commands". The session path deliberately does **not** use a PTY (see
+# rc/harness/mod.rs); the two want opposite things.
+portable-pty = { version = "0.9", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Harness and settlement subprocesses must be born suspended, attached to a
+# kill-on-close Job Object, and only then resumed. Killing only the direct child
+# leaves tool or git-helper grandchildren able to write after authority ends.
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# `test-util` makes `#[tokio::test(start_paused = true)]` usable: the tests for
+# timeout semantics wait on the session timeout, and waiting on it in real time
+# leaves the whole suite unrunnable.
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread", "time"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+
+# Optimize the regex engine under the dev profile.
+#
+# Not for a benchmark: secret scanning compiles the whole gitleaks rule set and
+# then runs a lazy DFA over megabyte-scale transcripts, and **both happen entirely
+# inside dependency crates**. Unoptimized, compiling the rules costs seconds and
+# one transcript scan is slow enough to be felt on every run; at opt-level=3 both
+# cost a small fraction of that. The price is a slower first build of these few
+# crates, and it buys `cargo test` and `cargo run` no longer waiting on the gate.
+[profile.dev.package.regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3

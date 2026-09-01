@@ -1,0 +1,66 @@
+# Cursor model / reasoning tier attribution — measured (this machine, macOS)
+# Source: ~/Library/Application Support/Cursor/User/globalStorage/state.vscdb
+
+## A. Whole-database histogram of each bubble's modelInfo.modelName
+##    SQL: select json_extract(value,'$.modelInfo.modelName'), count(*) from cursorDiskKV
+##         where key like 'bubbleId:%' and json_valid(value) group by 1 order by 2 desc
+137393  <absent>
+1921  claude-4.5-sonnet-thinking
+392  claude-4.6-opus-high-thinking
+197  gpt-5-codex
+160  gpt-5
+143  claude-4.5-opus-high-thinking
+92  claude-opus-4-7-thinking-xhigh
+89  claude-4.5-opus
+51  claude-opus-5
+39  claude-4-sonnet
+36  default
+30  gpt-5.4-medium
+18  claude-4-sonnet-thinking
+15  claude-opus-4-8-thinking-max
+13  gpt-5.5-extra-high-fast
+12  claude-4.6-sonnet-medium-thinking
+9  claude-opus-4-8-thinking-high
+7  gemini-3-pro-preview
+6  gpt-5.3-codex
+6  claude-4.5-sonnet
+5  composer-1
+4  gpt-5.5-medium
+3  grok-4.5
+3  gpt-5.6-sol
+2  gpt-5.4-xhigh
+1  claude-opus-4-8-medium
+
+## B. modelInfo fill rate (by bubble type: 1=user, 2=assistant)
+1  4970  1979
+2  135668  1275
+<null>  9  0
+
+## C. Model switched mid-session: one composer carries several modelName values
+ab1b4513-093e-4740-8f9e-a578ea1891da  3  claude-4.6-opus-high-thinking,gpt-5.3-codex,claude-4-sonnet
+a55ec80b-fa91-4dd5-b047-502be6992b2a  3  gpt-5.4-medium,gpt-5.4-xhigh,claude-opus-4-7-thinking-xhigh
+84db0005-ecc4-4b24-847c-9791cbdad5b9  3  default,gpt-5,claude-4.5-sonnet-thinking
+0a4075ad-3da9-47ce-a9d0-7347b16e56d1  3  claude-4.5-opus-high-thinking,claude-4.5-sonnet-thinking,gemini-3-pro-preview
+f8b7a433-056e-4a11-9488-e4c27c8e6cf0  2  claude-4.5-sonnet-thinking,gpt-5-codex
+f55f4c31-5da4-4ca2-9c62-b25b96629c12  2  claude-opus-4-8-thinking-max,claude-opus-4-8-thinking-high
+edb4ad9a-fd05-41d8-9491-3d580670adaf  2  gpt-5,claude-4.5-sonnet-thinking
+d7b74505-175c-4765-9afa-c4e0c2abb743  2  claude-opus-4-8-thinking-high,claude-opus-4-8-medium
+d6e9673e-f182-4b32-af17-7884b2cba36e  2  claude-4.5-opus-high-thinking,claude-4.5-opus
+bca2e52e-8363-49b7-b679-6d1eb284aee3  2  gpt-5-codex,claude-4.5-sonnet-thinking
+ab5e620d-af54-4292-8cdc-7d2f750659bd  2  default,composer-1
+9d392cd2-dfa2-4749-b66c-f71a9e6531e5  2  gpt-5,default
+9a143ceb-ce32-4c26-8130-5b70b627506a  2  claude-4.5-sonnet-thinking,claude-4.5-opus-high-thinking
+9862d4d3-b8fa-46f0-ba6b-0d77ba6d2808  2  claude-4.5-sonnet-thinking,claude-4.5-opus-high-thinking
+827d16ba-92e4-4063-852f-9f2a3436f06c  2  claude-4.5-sonnet-thinking,default
+
+## D. thinking persistence (per bubble)
+28373  28169  8091  0  140649
+
+## E. One composerData:<id>.modelConfig (the session-level current selection, effort included)
+{"modelName":"claude-opus-5","maxMode":true,"selectedModels":[{"modelId":"claude-opus-5","parameters":[{"id":"thinking","value":"true"},{"id":"context","value":"1m"},{"id":"effort","value":"high"},{"id":"fast","value":"false"}]}]}
+
+## F. composerHeaders index table schema (usable as a reverse-lookup index)
+CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, value TEXT);
+CREATE INDEX idx_composerHeaders_0 ON composerHeaders (workspaceId, isSubagent, isArchived, recency);
+CREATE INDEX idx_composerHeaders_1 ON composerHeaders (recency, composerId);
+562  122  5

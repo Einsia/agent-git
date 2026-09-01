@@ -1,0 +1,33 @@
+{
+  "name": "create-agit",
+  "version": "0.0.9",
+  "description": "One-line installer for agit (npx create-agit) \u2014 thin wrapper around @einsia/agent-git that lands the CLI at ~/.local/bin and wires skills/hooks/MCP.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "create-agit": "./bin.mjs"
+  },
+  "dependencies": {
+    "@einsia/agent-git": "0.0.9"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "homepage": "https://agent-git.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Einsia/agent-git",
+    "directory": "npm/create-agit"
+  },
+  "keywords": [
+    "agent",
+    "session",
+    "version-control",
+    "claude-code",
+    "codex",
+    "opencode",
+    "cursor",
+    "mcp",
+    "cli"
+  ]
+}

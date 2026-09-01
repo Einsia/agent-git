@@ -1,0 +1,42 @@
+# Cursor's second model-attribution source: ~/.cursor/ai-tracking/ai-code-tracking.db (6 MB)
+# Its slug granularity differs from what state.vscdb's bubble.modelInfo records (see A).
+
+## A. ai_code_hashes.model x source histogram
+9490  claude-opus-5  composer
+3209  claude-opus-5-thinking-high  composer
+1549  claude-opus-5-thinking-xhigh  composer
+243  <null>  human
+210  gpt-5.6-sol  composer
+185  grok-4.5  composer
+
+## B. Coverage (a rolling window recording only hashes of AI-produced code, so coverage is partial)
+14886  17  2026-07-01 11:15:21  2026-07-31 16:39:12
+
+## C. schema
+CREATE TABLE ai_code_hashes (
+        hash TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        fileExtension TEXT,
+        fileName TEXT,
+        requestId TEXT,
+        conversationId TEXT,
+        timestamp INTEGER,
+        model TEXT,
+        createdAt INTEGER NOT NULL
+      );
+CREATE INDEX idx_ai_code_hashes_createdAt
+      ON ai_code_hashes(createdAt)
+    ;
+CREATE TABLE conversation_summaries (
+        conversationId TEXT PRIMARY KEY,
+        title TEXT,
+        tldr TEXT,
+        overview TEXT,
+        summaryBullets TEXT,
+        model TEXT,
+        mode TEXT,
+        updatedAt INTEGER NOT NULL
+      );
+CREATE INDEX idx_conversation_summaries_updatedAt
+      ON conversation_summaries(updatedAt)
+    ;

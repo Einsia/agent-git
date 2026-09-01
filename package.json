@@ -1,0 +1,56 @@
+{
+  "name": "@einsia/agent-git",
+  "version": "0.0.9",
+  "description": "Version control for agent sessions \u2014 the agit CLI plus skills/hooks/MCP wiring for Claude Code, Codex, OpenCode and Cursor. The AgentGit hub deploys separately.",
+  "keywords": [
+    "agit",
+    "agent",
+    "git",
+    "llm",
+    "claude",
+    "claude-code",
+    "codex",
+    "opencode",
+    "cursor",
+    "session",
+    "mcp",
+    "cli"
+  ],
+  "license": "MIT",
+  "homepage": "https://agent-git.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Einsia/agent-git.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Einsia/agent-git/issues"
+  },
+  "bin": {
+    "agit": "npm/shim.js"
+  },
+  "files": [
+    "npm/shim.js",
+    "npm/postinstall.js",
+    "npm/lib/",
+    "npm/README.md",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node npm/postinstall.js",
+    "check-version": "node scripts/check-version.js",
+    "bump-version": "node scripts/bump-version.mjs",
+    "prepack": "node scripts/check-version.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {
+    "@einsia/agent-git-linux-x64": "0.0.9",
+    "@einsia/agent-git-linux-arm64": "0.0.9",
+    "@einsia/agent-git-darwin-x64": "0.0.9",
+    "@einsia/agent-git-darwin-arm64": "0.0.9"
+  }
+}

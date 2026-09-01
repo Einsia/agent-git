@@ -1,0 +1,2 @@
+{"version":"v1","kind":"Prompt","data":{"message_id":"f3dacb75-5842-43a5-b5d8-a72d1766c55f","content":[{"kind":"text","data":"hi"}],"meta":{"timestamp":1785003130}}}
+{"version":"v1","kind":"AssistantMessage","data":{"message_id":"fa147fee-013e-4008-9b70-db7da881e3c3","content":[{"kind":"text","data":"Hi! What can I help you with?\n\nI'm running in `/mnt/data/shared/homes/nana-data` — happy to dig into code, run commands, work with AWS, or just talk through a problem."}]}}

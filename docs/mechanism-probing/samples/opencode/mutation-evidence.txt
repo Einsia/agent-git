@@ -1,0 +1,33 @@
+# OpenCode row-level mutability, measured (the decisive experiment)
+
+Method: run one opencode session normally on this machine (ses_032345905ffefk87XdLu8d1wjW, this
+session itself); take a db+wal+shm copy at 01:22 and at 01:45 (the session stayed live and appended
+27 messages / 142 parts in between); compare row by row every row already present in copy1.
+
+## Result
+
+message table (copy1 has 3 rows):
+- 1 row completely unchanged
+- 1 row (user) changed in time_updated only (data bytes unchanged)
+- 1 row (assistant, the one in flight) changed in data + time_updated:
+    finish: null → "tool-calls"; tokens filled from zeros to measured values; time gains completed
+part table (copy1 has 14 rows):
+- 12 rows completely unchanged
+- 2 rows (parts of the assistant message in flight) changed in data + time_updated:
+    text part accumulates body; tool part state.status running → completed (gains output/metadata)
+
+Zero deletions, zero reordering. The event table (message.part.updated.1 ×33905 / message.updated.1
+×12561 / session.updated.1 ×3970) shows "an in-flight row's data is UPDATEd in place" is the normal path.
+
+## What this means for the canonical stream
+
+Using the format "meta line + message/part lines sorted by (time_created, kind, id), time_updated excluded":
+- a session at rest reads byte-identical twice (ses_0347…, 39 lines, cmp passes)
+- of the 18 lines in copy1 of a live session, the first 12 appear unchanged at the same prefix
+  position in copy2; the first divergence is exactly the assistant message in flight (and its parts)
+
+→ The continuity invariant: "a line in the committed prefix that belongs to a finished message"
+never changes afterwards; the trailing message being written (with its parts) can be rewritten in place.
+The safe practice: snapshot/commit draws the line only where "the last assistant message has
+reached a terminal state (finish non-empty, its parts' state.status ∈ {completed,error})";
+otherwise that tail is left for next time.

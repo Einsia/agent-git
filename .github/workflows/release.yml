@@ -1,0 +1,344 @@
+name: Release
+
+# Pushing an `agit-v*` tag cross-compiles agit for every platform and attaches the
+# results to a GitHub Release.
+#
+# ────────────────────────────────────────────────────────────────────────────
+#  Artifact naming contract (the npm publish chain depends on it — changing it
+#  means changing .github/RELEASE_ARTIFACTS.md, npm/publish.mjs and
+#  npm/lib/platform.js, all of them together)
+#
+#  tag `agit-vX.Y.Z` → VERSION = `X.Y.Z`. One archive per target:
+#
+#     agit-<VERSION>-x86_64-unknown-linux-musl.tar.gz
+#     agit-<VERSION>-aarch64-unknown-linux-musl.tar.gz
+#     agit-<VERSION>-x86_64-apple-darwin.tar.gz
+#     agit-<VERSION>-aarch64-apple-darwin.tar.gz
+#     SHA256SUMS
+#
+#  The archive root holds one executable `agit`, with no enclosing directory.
+#  SHA256SUMS lists every archive by bare filename, in `sha256sum` format.
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Publishing to npm is a separate workflow (.github/workflows/npm-publish.yml):
+# once this one finishes successfully, that one takes over automatically through
+# workflow_run and publishes the whole family; the manual entry point is for a
+# re-publish or a retry. This one covers binaries only.
+
+on:
+  push:
+    # Not `v*`: v0.1.0 ... v0.5.0 are tags of the pre-rewrite project and already
+    # exist on the remote. Reusing `v` makes `git push origin v0.1.0` fail outright,
+    # and makes the source fallback `cargo install --git --tag v0.1.0` silently
+    # install that project's code instead.
+    tags: ['agit-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'An existing, reviewed production tag (for example, agit-v0.1.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Windows (x86_64-pc-windows-msvc) is deliberately not built: the rustls
+          # chain compiles aws-lc-sys C code, which is unreliable on windows
+          # runners, and agit's claude-code / codex users are almost all on mac and
+          # linux. Windows installs from source (with no platform package to install,
+          # the npm package prints the source-install instructions, see
+          # npm/lib/run.js). Adding it back means changing this list and KEYS/TRIPLES
+          # in npm/lib/platform.js together.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Validate production tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            agit-v*) ;;
+            *) echo "::error::production release requires an agit-v* tag"; exit 1 ;;
+          esac
+          test "$(git tag --points-at HEAD | grep -Fx "$RELEASE_TAG")" = "$RELEASE_TAG"
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # linux links musl statically, not gnu. A gnu artifact binds the build
+      # machine's glibc version: one built on ubuntu-latest (24.04) demands
+      # GLIBC_2.39 and starts on none of debian:12, ubuntu:22.04, debian:11,
+      # amazonlinux:2. musl is static-pie, has no glibc floor, and the same artifact
+      # runs in all of those plus alpine.
+      #
+      # cargo-zigbuild rather than apt's musl-tools: bundled sqlite is real C, so
+      # cross-compiling needs a complete musl cross C toolchain, and musl-tools ships
+      # only the x86_64 one. zig carries musl headers and libc for every
+      # architecture, so one recipe covers both targets.
+      - uses: actions/setup-python@v5
+        if: contains(matrix.target, 'linux-musl')
+        with:
+          python-version: '3.x'
+      - name: Install zig + cargo-zigbuild (linux musl)
+        if: contains(matrix.target, 'linux-musl')
+        # zig comes from pip: cargo-zigbuild takes `python -m ziglang`, so no
+        # separate zig binary is needed. setup-python is there for a pip that the
+        # distro's PEP 668 restriction does not reach.
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build agit (release)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            *linux-musl) cargo zigbuild --locked --release --target "$TARGET" --bin agit ;;
+            *)           cargo build    --locked --release --target "$TARGET" --bin agit ;;
+          esac
+
+      # The binary must be the architecture it claims, and the two linux ones must
+      # actually be static. The easiest cross-compilation mistake is "silently built
+      # for the host architecture"; a fallback to dynamic linking smuggles the glibc
+      # floor back in — both errors surface only once a user installs.
+      - name: Verify artifact architecture and linkage
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN="target/$TARGET/release/agit"
+          # `file` **exits 0 on a path that does not exist** as well, and echoes the
+          # path verbatim — and the path carries the target triple. So "the artifact
+          # was never built at all" still passes `file "$BIN" | grep -q 'x86_64'`:
+          # the x86_64-apple-darwin branch has only this one assertion, and the miss
+          # goes through cleanly.
+          #
+          # Two guards: confirm the file is really there, then take only the
+          # description with `file -b`, without the filename, so the greps below
+          # match properties of the artifact itself.
+          test -f "$BIN" || { echo "::error::$BIN does not exist; the build before this step produced nothing"; exit 1; }
+          DESC="$(file -b "$BIN")"
+          echo "$DESC"
+          case "$TARGET" in
+            x86_64-unknown-linux-musl)
+              echo "$DESC" | grep -q 'x86-64'
+              echo "$DESC" | grep -qE 'static-pie linked|statically linked'
+              ! (objdump -T "$BIN" 2>/dev/null | grep -q GLIBC_) || { echo "::error::GLIBC symbols in the musl artifact"; exit 1; }
+              ;;
+            aarch64-unknown-linux-musl)
+              echo "$DESC" | grep -q 'aarch64'
+              echo "$DESC" | grep -qE 'static-pie linked|statically linked'
+              ;;
+            x86_64-apple-darwin)  echo "$DESC" | grep -q 'x86_64' ;;
+            aarch64-apple-darwin) echo "$DESC" | grep -q 'arm64' ;;
+          esac
+
+      # Run the freshly built artifact inside genuinely old distros. A gnu artifact
+      # installed from npm fails on a user's linux with GLIBC_2.38 not found;
+      # "statically linked, therefore it runs anywhere" is a claim to verify on every
+      # build, not a premise to assume.
+      - name: Set up QEMU (run the aarch64 artifact)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Smoke-test the artifact on old distros
+        if: contains(matrix.target, 'linux-musl')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/$TARGET/release/agit"
+          case "$TARGET" in
+            aarch64-*) PLAT=linux/arm64 ;;
+            *)         PLAT=linux/amd64 ;;
+          esac
+          for img in alpine:3 amazonlinux:2 debian:11 ubuntu:24.04; do
+            echo "── $img ($PLAT)"
+            docker run --rm --platform "$PLAT" -v "$BIN:/agit:ro" "$img" /agit --version
+          done
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#agit-v}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE="agit-$VERSION-$TARGET.tar.gz"
+          # -C into the directory before packing: the archive holds a bare `agit`,
+          # with no path prefix.
+          tar -C "target/$TARGET/release" -czf "$ARCHIVE" agit
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          ls -l "$ARCHIVE"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the Release, upload its assets
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # A tag that disagrees with Cargo.toml/package.json sends npm to a version
+      # directory that does not exist. Failing before the Release is created is
+      # cleaner than deleting the tag afterwards.
+      - name: Tag matches the repository version
+        run: |
+          set -euo pipefail
+          node scripts/check-version.js
+          PKG_VER="$(node -p "require('./package.json').version")"
+          TAG_VER="${RELEASE_TAG#agit-v}"
+          if [ "$PKG_VER" != "$TAG_VER" ]; then
+            echo "::error::tag $RELEASE_TAG does not match repository version $PKG_VER" && exit 1
+          fi
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+
+      # Whether this is a pre-release depends on the **version**, not on the whole
+      # tag name.
+      #
+      # Matching the whole tag name with `contains(github.ref_name, '-')` picks out a
+      # suffix like `v0.2.0-rc.1` only while tags are named `v0.1.0`. Under the
+      # `agit-v` prefix every tag name carries a hyphen, so that test would mark
+      # **every stable release** as a pre-release — and a Release with
+      # prerelease=true leaves the repository home page's "Latest release" on the
+      # pre-rewrite project's v0.5.0, so what a new user sees first is the old
+      # project. Strip the prefix first, then test the version.
+      - name: Decide whether this is a pre-release
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#agit-v}"
+          case "$VERSION" in
+            *-*) VALUE=true ;; # 0.2.0-rc.1
+            *)   VALUE=false ;;
+          esac
+          echo "prerelease=$VALUE" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          # Checksum the archives only, by bare filename — npm/install.js looks them
+          # up by bare filename.
+          sha256sum agit-*.tar.gz > SHA256SUMS
+          echo "── SHA256SUMS ──"
+          cat SHA256SUMS
+          # Every target must be there; a missing one makes npm users on that
+          # platform install a 404.
+          test "$(wc -l < SHA256SUMS)" -eq 4
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            dist/agit-*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          # A pre-release version (agit-v0.2.0-rc.1 and the like) is marked
+          # pre-release on GitHub, and "Latest release" keeps pointing at the last
+          # stable release. The decision is made in the step above.
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+
+      # prerelease / Latest is decided by this step, not inferred by the action
+      # above.
+      #
+      # The `prerelease:` input above is unreliable once a Release for this tag
+      # already exists: softprops takes `input !== undefined ? input :
+      # existingRelease.prerelease`, so an empty input **keeps the old value and
+      # raises no error**. Once a Release carries prerelease=true, re-pushing the tag
+      # leaves it true.
+      #
+      # The consequence of that flag is that the repository home page's "Latest
+      # release" does not point at this version — what a new user sees first is the
+      # pre-rewrite project's v0.5.0. Nobody goes looking for it and every new user
+      # hits it, so set it explicitly, then read it back and check.
+      - name: Set the prerelease flag and Latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          API="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases"
+          AUTH="Authorization: Bearer $GH_TOKEN"
+          JSON='Accept: application/vnd.github+json'
+
+          # An empty value is exactly the shape of that trap (empty = keep the old
+          # value), so reject it up front.
+          [ -n "$WANT" ] || { echo "::error::the pre-release decision arrived empty"; exit 1; }
+          # A pre-release must not take Latest; a stable release must get it.
+          if [ "$WANT" = true ]; then LATEST=false; else LATEST=true; fi
+
+          curl -fsS -H "$AUTH" -H "$JSON" "$API/tags/$RELEASE_TAG" -o rel.json
+          ID="$(node -p 'JSON.parse(require("fs").readFileSync("rel.json","utf8")).id')"
+          WAS="$(node -p 'JSON.parse(require("fs").readFileSync("rel.json","utf8")).prerelease')"
+
+          curl -fsS -X PATCH -H "$AUTH" -H "$JSON" "$API/$ID" \
+               -d "{\"prerelease\":$WANT,\"make_latest\":\"$LATEST\"}" -o patched.json
+          NOW="$(node -p 'JSON.parse(require("fs").readFileSync("patched.json","utf8")).prerelease')"
+          echo "::notice::prerelease decided=$WANT, before=$WAS, after=$NOW"
+          [ "$NOW" = "$WANT" ] || { echo "::error::prerelease is still $NOW, want $WANT"; exit 1; }
+
+          # This is what users actually see: "Latest release" on the repository
+          # home page.
+          if [ "$WANT" = false ]; then
+            curl -fsS -H "$AUTH" -H "$JSON" "$API/latest" -o latest.json
+            TAG="$(node -p 'JSON.parse(require("fs").readFileSync("latest.json","utf8")).tag_name')"
+            [ "$TAG" = "$RELEASE_TAG" ] || {
+              echo "::error::Latest release is $TAG, not $RELEASE_TAG"; exit 1; }
+            echo "::notice::Latest release = $TAG"
+          fi

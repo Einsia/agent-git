@@ -1,0 +1,28 @@
+Session ses_038237e2effe7AdW65L1cOX8DH (321 messages), compaction happens at index 176. Three-stage structure:
+
+── ① Boundary marker: a user message whose only part type is compaction ──
+{"type":"compaction","auto":true,"overflow":false,"tail_start_id":"msg_fc7efb4c1001T0YGJJ2MnDyq1K"}
+
+   host message data:
+{"role":"user","model":{"providerID":"einsia","modelID":"kimi-k3"},"agent":"build","time":{"created":1785765906687},"summary":{"diffs":[]}}
+
+── ② Summary body: an assistant message, mode=compaction / agent=compaction / summary=true ──
+{"role":"assistant","parentID":"msg_fc7f148ff001VIcQycLHuhBxY6","mode":"compaction","agent":"compaction","summary":true,"path":{"cwd":"/cluster/home/nana/projects/AgentGit","root":"/"},"cost":0,"tokens":{"total":136125,"input":134210,"output":1894,"reasoning":21,"cache":{"write":0,"read":0}},"modelID":"kimi-k3","providerID":"einsia","time":{"created":1785765906812,"completed":1785765933334},"finis…
+
+   start of its text part (= the lossy summary itself, quoted verbatim):
+## Objective
+- 接手 Codex session `019fc7cc-<REDACTED>`（线程"这个项目是做什么的"，被用户 abort）半途的系统重构，把 AgentGit 项目的三项设计改造收尾到代码与文档全绿。
+
+## Important Details
+- 三项已定案改造：**①快照 id = git commit SHA**（`agit-<sha>` tag，废弃 `hash(parent‖cwd‖转录)` 自定义方案）；**②彻底删除 ed25519 签名/公钥登记体系**（commit 作者改用 git `user.name`/
+
+── ③ Continuation injection: a user message, text synthetic=1 + metadata.compaction_continue ──
+{"type":"text","metadata":{"compaction_continue":true},"synthetic":true,"text":"Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.","time":{"start":1785765933340,"end":1785765933340}}
+
+Whole-database counts for the three stages: 5 compaction parts; mode=compaction message count:
+5
+metadata.compaction_continue text part count:
+6
+
+time_compacting column: NULL for all 139 sessions (a transient flag, set only while compacting, cleared as soon as it finishes).
+0

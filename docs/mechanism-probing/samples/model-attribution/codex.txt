@@ -1,0 +1,50 @@
+# Codex model / reasoning effort attribution — measured
+
+## This machine (macOS, cli_version 0.146.0-alpha.3.1)
+## turn_context.payload: model x effort x summary (one per turn)
+ 268 gpt-5.6-sol  effort=high  summary=auto  cm.reasoning_effort=high
+  88 gpt-5.5  effort=high  summary=auto  cm.reasoning_effort=high
+  41 codex-auto-review  effort=low  summary=auto  cm.reasoning_effort=low
+  29 gpt-5.6-sol  effort=ultra  summary=auto  cm.reasoning_effort=ultra
+  10 gpt-5.5  effort=xhigh  summary=auto  cm.reasoning_effort=xhigh
+   4 gpt-5.6-luna  effort=low  summary=auto  cm.reasoning_effort=low
+   3 gpt-5.6-sol  effort=medium  summary=auto  cm.reasoning_effort=medium
+
+## This machine ~/.codex/state_5.sqlite  threads table: model x reasoning_effort
+39  gpt-5.6-sol  high
+26  <null>  <null>
+22  gpt-5.5  high
+9  codex-auto-review  low
+8  gpt-5.6-sol  ultra
+7  gpt-5.1-codex-max  medium
+5  gpt-5.1-codex-max  <null>
+4  gpt-5.1-codex-max  xhigh
+2  gpt-5.6-luna  low
+1  gpt-5.5  xhigh
+1  gpt-5.6-sol  medium
+
+## All threads columns (0.144→0.146 already carry model / reasoning_effort / agent_path / thread_source)
+id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, tokens_used, has_user_event, archived, archived_at, git_sha, git_branch, git_origin_url, cli_version, first_user_message, agent_nickname, agent_role, memory_mode, model, reasoning_effort, agent_path, created_at_ms, updated_at_ms, thread_source, preview, recency_at, recency_at_ms, history_mode, name
+
+## Fill rate
+124  98  93  124
+
+## remote-host (Linux, cli_version 0.144.5): turn_context model x effort
+    249 gpt-5.6-sol  effort=medium
+    105 gpt-5.6-sol  effort=high
+     21 gpt-5.6-sol  effort=ultra
+      7 gpt-5.6-terra  effort=high
+
+## the remote host top-level record type histogram (with an extra inter_agent_communication_metadata)
+  31407 response_item
+  20621 event_msg
+    382 turn_context
+    149 world_state
+    114 session_meta
+     39 compacted
+      2 inter_agent_communication_metadata
+
+## session_meta.payload key sets (this machine) — no model, only model_provider
+  20 base_instructions,cli_version,context_window,cwd,dynamic_tools,git,history_mode,id,memory_mode,model_provider,originator,session_id,source,thread_source,timestamp
+   4 base_instructions,cli_version,context_window,cwd,dynamic_tools,git,history_mode,id,model_provider,originator,session_id,source,thread_source,timestamp
+   7 base_instructions,cli_version,context_window,cwd,dynamic_tools,history_mode,id,model_provider,originator,session_id,source,thread_source,timestamp

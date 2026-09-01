@@ -1,0 +1,29 @@
+# OpenCode injected (synthetic) user text: the inventory and the test
+
+The test is simple: the text part carries "synthetic":true (which reads out of SQLite JSON as 1).
+Of the 496 user text parts in the whole database, 105 are synthetic and 391 are human.
+
+## Prefix histogram of the 105 synthetic user texts (the same prefix merged at 60 characters)
+
+ 56 | Called the Read tool with the following input: {"filePath":"…      (the paths all differ)
+  7 | <system-reminder>Note: The user opened the file "/cluster/home/nana/projects/data/demo-dataset/deliverable_v0.1/openco…
+  4 | Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.
+  2 | <system-reminder>Note: The user opened the file "/cluster/home/nana/.claude/settings.json"…
+  1 | <system-reminder>Note: The user selected #7 from "/cluster/home/nana/.config/opencode/opencode.json"…
+  1 | <system-reminder>Note: The user selected #7-8 from "/cluster/home/nana/.claude/settings.json"…
+ 34 | Called the Read tool … (the rest, one occurrence each, elided)
+
+## Shape summary (merged by hand)
+
+- `Called the <Tool> tool with the following input: {…}` (86, counted exactly by `LIKE 'Called the % tool with the following input%'`) — the synthetic user
+  message generated when a tool call is rewritten as plain text for a channel that does not support tool-use.
+- `<system-reminder>Note: The user opened the file "…" / selected #N …` (11) — IDE context reminder.
+- `Continue if you have next steps, …` (4) — the continuation injected after a compaction or an
+  interruption; the part also carries `metadata.compaction_continue` (see compaction-anatomy.txt).
+- `[SYSTEM DIRECTIVE: OH-MY-OPENCODE - TODO CONTINUATION] …` — the omo plugin's todo continuation injection.
+- `The previous request exceeded the provider's size limit due to large media attachments. …` (1)
+  — notice of a retry after media went over the size limit and was compressed.
+
+Text parts on the assistant side never carry synthetic (all 1426 are empty).
+Another 6 text parts carry `metadata.compaction_continue` (the first 4 are the Continue injections
+above, all synthetic=1; one has host agent "Sisyphus - ultraworker" and a SYSTEM DIRECTIVE body).

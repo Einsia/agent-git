@@ -1,0 +1,29 @@
+# Kiro event log type LogEntryV1 — extracted from kiro-cli-chat binary symbols / literals
+# Binary: ~/.local/bin/kiro-cli-chat (695 MB, ELF, not stripped, with debug_info)
+# Command: LC_ALL=C grep -a -o '<pattern>' kiro-cli-chat | sort -u
+
+## 1) Modules and types (debug symbols)
+agent..agent..event_log..EventLog
+agent..agent..event_log..LogEntry
+agent..agent..event_log..LogEntryV1
+agent..agent..event_log..ToolResult
+agent..agent..event_log.._
+agent::agent::event_logcrates
+
+## 2) serde variant names (error message literals)
+struct variant LogEntryV1::AssistantMessagethere
+struct variant LogEntryV1::ResetTostruct
+struct variant LogEntryV1::ToolResultsstruct
+
+## 3) Literal concatenation of the serde VARIANTS array (variant names run together)
+LogEntryV1CancelledPromptClearToolResultresultassertion
+LogEntryV1PromptToolResultsCompactionResetToCancelledPromptClearstruct
+
+## 4) Literals tied to reasoning / compaction
+      1 AssistantMessagePayload
+     29 CompactStrategy
+      1 SayReasoning
+      1 ToolResultPayload
+      1 effectiveFromMessageId
+      1 operationType
+      1 reasoningSignature

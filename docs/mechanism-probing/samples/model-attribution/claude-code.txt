@@ -1,0 +1,41 @@
+# Claude Code model / effort attribution — measured
+
+## This machine (macOS, ~/.claude/projects, versions 2.1.197 / 2.1.219)
+## message.model x top-level effort
+1737 claude-opus-4-8  effort=null
+ 845 claude-opus-5-thinking  effort=high
+  94 claude-opus-5-thinking  effort=null
+  51 claude-sonnet-5  effort=high
+   8 <synthetic>  effort=null
+   6 claude-haiku-4-5-20251001-thinking  effort=null
+
+## remote-host (Linux, versions 2.1.219 / 2.1.220)
+## message.model x effort x version
+  31564 claude-opus-5  effort=high  v=2.1.220
+  28079 claude-opus-5  effort=xhigh  v=2.1.220
+    726 claude-sonnet-5  effort=high  v=2.1.220
+    248 claude-sonnet-5  effort=xhigh  v=2.1.220
+    144 <synthetic>  effort=null  v=2.1.220
+     31 claude-opus-5  effort=medium  v=2.1.220
+      6 claude-opus-5-thinking  effort=high  v=2.1.219
+
+## the remote host: subagent attribution field attributionAgent x model x effort x isSidechain
+  25599 general-purpose  claude-opus-5  effort=high  sidechain=true
+  21081 general-purpose  claude-opus-5  effort=xhigh  sidechain=true
+    710 general-purpose  claude-sonnet-5  effort=high  sidechain=true
+    220 general-purpose  claude-sonnet-5  effort=xhigh  sidechain=true
+
+## Version differences: the top-level key set on assistant records
+### This machine
+ 828 cwd,effort,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,timestamp,type,userType,uuid,version
+ 100 cwd,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,timestamp,type,userType,uuid,version
+  60 cwd,effort,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,slug,timestamp,type,userType,uuid,version
+   8 attributionMcpServer,attributionMcpTool,cwd,effort,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,timestamp,type,userType,uuid,version
+   3 cwd,entrypoint,gitBranch,isApiErrorMessage,isSidechain,message,parentUuid,sessionId,timestamp,type,userType,uuid,version
+### the remote host
+  31846 agentId,attributionAgent,cwd,effort,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,timestamp,type,userType,uuid,version
+  14827 agentId,attributionAgent,cwd,effort,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,slug,timestamp,type,userType,uuid,version
+   8217 cwd,effort,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,session_id,timestamp,type,userType,uuid,version
+   2815 cwd,effort,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,session_id,slug,timestamp,type,userType,uuid,version
+   2004 cwd,effort,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,sessionKind,session_id,timestamp,type,userType,uuid,version
+    937 agentId,attributionAgent,cwd,effort,entrypoint,gitBranch,isSidechain,message,parentUuid,sessionId,sessionKind,timestamp,type,userType,uuid,version

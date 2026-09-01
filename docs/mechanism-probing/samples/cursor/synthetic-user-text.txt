@@ -1,0 +1,64 @@
+# Cursor: which user records the runtime injects (synthetic) and which a person typed
+# Sample: 104 .jsonl files, 475 role=user text blocks in total
+# Of those, blocks not wrapped in <user_query>: 1
+# Human-typed example lines below are paraphrased for publication; counts and shapes are as measured.
+
+## Top-level tags appearing in user text (counted by line-start match)
+   474  <user_query>
+   328  <timestamp>
+    48  <image_files>
+     3  <external_links>
+     2  <module>
+
+## First line inside <user_query> — those occurring >=2 times
+    12  Perform any necessary follow-up actions in response to the subagent completion
+    10  Analyze the benchmark repo at /Users/nana/Projects/research/bench-suite and su
+     9  Briefly inform the user about the task result and perform any follow-up action
+     7  @petal/backend/core/memory/structural/tables/context_builder.py 这个文件里的逻辑帮我理一下
+     7  Audit exactly one delivered benchmark task at /tmp/bench-review.XXXXXX and rep
+     6  @experiments/specs/20260610_run_a/20260610_config_variant_e 这份 spec 有什么问题
+     5  Start multitasking
+     4  了解一下这个项目是做什么的
+     4  ssh host-b 帮我把 backend 部署到这个机器上 可以在 /mnt/data 下面建个目录放代码和依赖
+     3  ~/Projects/AgentGit/agent-git~/Projects/AgentGit/agent-git 这下面写个 setup.sh 可以一键
+     3  能跟我详细地讲下现在这个 store 里 随着你 commit push use 别人的 或者 fork  有什么变化吗；然后你再试着研究一下 codex 
+     3  然后我们来给后端部分加点功能。一个是用户界面。一个是 agent 展示界面。要像 github 一样。
+     3  然后是 agent session 展示页面。在我访问 https://backend/@user/agent_name?{ref=...} 的时候 我希望
+     3  我其实希望你跟我讨论一个更合理的方案
+     3  就是现在 每个 表 更新的字段 能不能直接和 context 里的某个请求 ID 直接关联起来，方便我直接去看这个请求输入和输出是啥。现在还是有一些 混项目
+     3  用中文回答我 这次都改了哪些文件的哪些内容 带我简单review一下代码 和关键的配置里需要修改的参数
+     2  Build the first version of a web frontend for the **AgentGit** project. Scope 
+     2  You are the forked subagent; continue executing your task.
+     2  然后是用户页面，我希望搞个类似这个的用户页面 在我访问 https://backend/@user 的时候
+     2  Reverse-engineer a reference web app that visualizes AI agent sessions, and tu
+     2  @petal-backend
+     2  continue
+     2  可以的，你想想方案后可以开始实现了
+     2  /Users/nana/Projects/petal/backend/core/memory/structural 这个目录的分层帮我讲一下
+     2  @petal/backend/core/memory/structural/service.py:28 apply_ops( 这个函数的调用方有哪些
+     2  @petal/backend/core/memory/structural/updating/__init__.py:57-58 不对，跟
+     2  改一下吧
+     2  你再重新调研一下现在的 memory 有的问题，用中文给我写下你认为的解决方案
+     2  帮我稍微修改下这页面。左边列表的部分可以宽度高度都小一点了，没那么多信息要展示，右边留空大一点。同时，做到右边每个字段给一下最后更新的版本号，
+     2  这个字段的生成逻辑，改下 Prompt，让他要多想想 不要局限于纸面的文字，结合上下文推断
+     2  你上一问的表结构答案是"不要"账号区分字段——也就是 usage_for 一条条自己写清楚就行
+     2  (A) 把 Project / App / Artifact 也接到 Debug Panel  那肯定的，能有个下拉框选当前表
+     2  确定一下，现在不要做外键关联。直接写名字就行。把奇怪的这种关联去掉
+     2  current_user_time user_weekday 这俩留着 user_date 这个干掉
+     2  开始修吧 都修了
+     2  @/Users/nana/.cursor/projects/Users-nana-Projects-petal/terminals/ 这里的输出帮我看下
+     2  2: A. Continue to fix
+     2  In the petal codebase (workspace root: /Users/nana/Projects/petal) find where t
+     2  42	
+     2  /Users/nana/Projects/research/experiments/specs 用今天的日期新建一个子文件夹 把spec 放
+     2  假设真的是配置的问题，我 spec 里给了很多 @experiments/specs/20260615_run_b 这样的例子
+     2  我其实这个脚本只想做一个事情，就是分数据源限制我想 sample 的行数。
+     2  https://github.com/anthropics/skills/tree/main/skills/pptx 
+     2  set -x
+     2  P0 已经 apply了 你继续看这个锯齿状的曲线 分析为什么会上升。都在同一个生成处理段里
+     2  帮我讲一下这个项目架构 我想快速了解这个项目的代码 我该关注哪些
+     2  好了 不要再问问题了 你好好考虑 reason step by step 然后就可以开始干了
+     2  @shared/agent-executor.ts:332-343 这一部分你有什么更好的处理意见吗 现在也是经常超时 这里我希望他不要换session .
+
+## First line of blocks without <user_query> (all)
+     1  Your previous response was interrupted. Continue from where 

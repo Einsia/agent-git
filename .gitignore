@@ -1,0 +1,17 @@
+/target
+/dist
+
+# npm pack output. Releases go through CI; a tarball built locally is only for ad-hoc
+# verification.
+*.tgz
+/npm/platforms/*/bin/agit
+
+# macOS metadata
+.DS_Store
+
+# A binding file legacy agit wrote into the code repo. **The current implementation does not
+# read it** (see the opening of `src/hub/mod.rs`: bindings are looked up through the hub, and
+# nothing is written into a user's repo), so it is only a leftover still sitting in the
+# workspace. Ignore it so the next `git add -A` does not commit a dead machine/repo binding
+# asset into the source tree again — which has already happened once.
+.agit.toml

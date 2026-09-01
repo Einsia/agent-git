@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cli-output-v1.json",
+  "title": "agit CLI machine-readable output",
+  "description": "Stable envelope emitted by agit when --json is requested.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "command",
+    "ok",
+    "exit_code",
+    "result",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cli-output"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "command": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Canonical top-level command name, for example status or cherry-pick."
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "Whether the command completed with exit code zero."
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "The same process exit code that non-JSON mode would return."
+    },
+    "result": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/json_result"
+        },
+        {
+          "$ref": "#/$defs/json_lines_result"
+        },
+        {
+          "$ref": "#/$defs/text_result"
+        },
+        {
+          "$ref": "#/$defs/empty_result"
+        }
+      ]
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/diagnostics"
+    }
+  },
+  "$defs": {
+    "json_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "kind", "value"],
+      "properties": {
+        "format": {
+          "const": "json"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable semantic result kind; initially the command name."
+        },
+        "value": {
+          "description": "The command's structured JSON value, preserved without string encoding."
+        }
+      }
+    },
+    "json_lines_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "kind", "values"],
+      "properties": {
+        "format": {
+          "const": "json_lines"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable semantic result kind; initially the command name."
+        },
+        "values": {
+          "type": "array",
+          "description": "One decoded JSON value for each non-empty output line, in order."
+        }
+      }
+    },
+    "text_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "kind", "lines"],
+      "properties": {
+        "format": {
+          "const": "text"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable semantic result kind; initially the command name."
+        },
+        "lines": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Stdout split into non-empty logical lines, without newline characters; blank presentation lines are omitted."
+        }
+      }
+    },
+    "empty_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "kind"],
+      "properties": {
+        "format": {
+          "const": "empty"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable semantic result kind; initially the command name."
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stderr"],
+      "properties": {
+        "stderr": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["level", "message"],
+            "properties": {
+              "level": {
+                "type": "string",
+                "enum": ["error", "warning", "hint", "info"]
+              },
+              "message": {"type": "string"}
+            }
+          },
+          "description": "Captured stderr classified by the standard CLI diagnostic prefixes."
+        }
+      }
+    }
+  }
+}

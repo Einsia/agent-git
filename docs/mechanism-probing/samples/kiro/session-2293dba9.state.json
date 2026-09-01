@@ -1,0 +1,195 @@
+{
+    "session_id": "2293dba9-b634-4af1-83d2-2d9e1624fe09",
+    "cwd": "/mnt/data/shared/homes/nana-data",
+    "created_at": "2026-07-25T18:11:31.434763716Z",
+    "updated_at": "2026-07-25T18:12:13.425986171Z",
+    "title": "hi",
+    "session_created_reason": "subagent",
+    "session_state": {
+        "version": "v1",
+        "conversation_metadata": {
+            "user_turn_metadatas": [
+                {
+                    "loop_id": {
+                        "agent_id": {
+                            "name": "kiro_default",
+                            "parent_id": null,
+                            "rand": null
+                        },
+                        "rand": 3841010478
+                    },
+                    "result": {
+                        "Ok": {
+                            "id": "0e346ac6-c415-43cd-92e9-4b383d87e0c7",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "kind": "text",
+                                    "data": "Hi! What can I help you with?\n\nI'm running in `/mnt/data/shared/homes/nana-data` \u2014 happy to dig into code, run commands, work with AWS, or just talk through a problem."
+                                }
+                            ],
+                            "meta": {
+                                "timestamp": 1785003133
+                            }
+                        }
+                    },
+                    "message_ids": [
+                        "f3dacb75-5842-43a5-b5d8-a72d1766c55f",
+                        "fa147fee-013e-4008-9b70-db7da881e3c3"
+                    ],
+                    "total_request_count": 1,
+                    "number_of_cycles": 0,
+                    "builtin_tool_uses": 0,
+                    "turn_duration": {
+                        "secs": 2,
+                        "nanos": 762278439
+                    },
+                    "end_reason": "UserTurnEnd",
+                    "end_timestamp": "2026-07-25T18:12:13.424416722Z",
+                    "input_token_count": 0,
+                    "output_token_count": 0,
+                    "context_usage_percentage": 1.7728001,
+                    "metering_usage": [
+                        {
+                            "value": 0.14178060895522387,
+                            "unit": "credit",
+                            "unitPlural": "credits"
+                        }
+                    ],
+                    "user_prompt_length": 2
+                }
+            ],
+            "user_turn_start_request": null,
+            "last_request": null
+        },
+        "rts_model_state": {
+            "conversation_id": "2293dba9-b634-4af1-83d2-2d9e1624fe09",
+            "model_info": {
+                "model_name": "claude-opus-5",
+                "description": "Experimental preview of Claude Opus 5 model with 1M context window",
+                "model_id": "claude-opus-5",
+                "context_window_tokens": 1000000,
+                "rate_multiplier": 2.2,
+                "rate_unit": "Credit",
+                "additional_fields": {
+                    "schema": {
+                        "additionalProperties": false,
+                        "properties": {
+                            "thinking": {
+                                "properties": {
+                                    "display": {
+                                        "enum": [
+                                            "summarized",
+                                            "omitted"
+                                        ],
+                                        "type": "string"
+                                    },
+                                    "type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "adaptive",
+                                            "disabled"
+                                        ]
+                                    }
+                                },
+                                "required": [
+                                    "type"
+                                ],
+                                "type": "object"
+                            },
+                            "max_tokens": {
+                                "maximum": 128000,
+                                "type": "integer",
+                                "minimum": 1024
+                            },
+                            "output_config": {
+                                "type": "object",
+                                "properties": {
+                                    "effort": {
+                                        "enum": [
+                                            "low",
+                                            "medium",
+                                            "high",
+                                            "xhigh",
+                                            "max"
+                                        ],
+                                        "type": "string",
+                                        "default": "high"
+                                    }
+                                }
+                            }
+                        },
+                        "type": "object"
+                    }
+                }
+            },
+            "context_usage_percentage": 1.7728001,
+            "additional_fields": {
+                "schema": {
+                    "additionalProperties": false,
+                    "properties": {
+                        "thinking": {
+                            "properties": {
+                                "display": {
+                                    "enum": [
+                                        "summarized",
+                                        "omitted"
+                                    ],
+                                    "type": "string"
+                                },
+                                "type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "adaptive",
+                                        "disabled"
+                                    ]
+                                }
+                            },
+                            "required": [
+                                "type"
+                            ],
+                            "type": "object"
+                        },
+                        "max_tokens": {
+                            "maximum": 128000,
+                            "type": "integer",
+                            "minimum": 1024
+                        },
+                        "output_config": {
+                            "type": "object",
+                            "properties": {
+                                "effort": {
+                                    "enum": [
+                                        "low",
+                                        "medium",
+                                        "high",
+                                        "xhigh",
+                                        "max"
+                                    ],
+                                    "type": "string",
+                                    "default": "high"
+                                }
+                            }
+                        }
+                    },
+                    "type": "object"
+                }
+            }
+        },
+        "permissions": {
+            "filesystem": {
+                "allowed_read_paths": [
+                    "/mnt/data/shared/homes/nana-data"
+                ],
+                "allowed_write_paths": [],
+                "denied_read_paths": [],
+                "denied_write_paths": []
+            },
+            "trusted_tools": [],
+            "denied_tools": [],
+            "allowed_commands": []
+        },
+        "agent_name": "kiro_default",
+        "goal": null
+    }
+}

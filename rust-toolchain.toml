@@ -1,0 +1,25 @@
+# The only toolchain declaration in the repo.
+#
+# This **pins one concrete version** rather than `stable`. The argument for `stable` — that
+# pinning only forces contributors to download a second toolchain — does not survive the
+# `-D warnings` clippy gate:
+#
+# * clippy's rule set moves with the version. Under `-D warnings`, "zero existing warnings" holds
+#   on one concrete version only; the moment stable moves, a batch of new lints unrelated to
+#   anyone's change turns every branch red at once.
+# * The more direct problem is that it contradicts CI: `.gitlab/ci/internal-cli.yml` pins the
+#   image by digest, but what the image installs is that version of the toolchain, not something
+#   named `stable`, so rustup **downloads a current stable of its own on account of this file**.
+#   However tightly the image digest is pinned, it buys nothing, and the gate runs on a version
+#   that moves.
+#
+# Changing the version means changing both places: here and the image in
+# `.gitlab/ci/internal-cli.yml` — and clear the new version's lints before committing, or the
+# gate blows up on someone else's branch.
+#
+# This does not change the crate's MSRV promise: the floor is still `rust-version = 1.88` in
+# Cargo.toml, enforced by cargo itself. But CI builds only on the pinned version and **does not
+# verify that 1.88 still compiles** — keeping that promise takes a separate MSRV job.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

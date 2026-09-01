@@ -1,0 +1,149 @@
+{
+  "info": {
+    "id": "ses_0347ccf14ffeUUP6oCmzF06wDN",
+    "slug": "crisp-cactus",
+    "projectID": "4b80d4c6690b027301a330457612e32104c7020d",
+    "directory": "[redacted:session-directory:ses_0347ccf14ffeUUP6oCmzF06wDN]",
+    "path": "",
+    "parentID": "ses_034823986ffevsfWWAxZOFnK1c",
+    "title": "[redacted:session-title:ses_0347ccf14ffeUUP6oCmzF06wDN]",
+    "agent": "plan",
+    "model": {
+      "id": "kimi-k3",
+      "providerID": "einsia",
+      "variant": "default"
+    },
+    "version": "1.18.12",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 182803,
+      "output": 8770,
+      "reasoning": 11649,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "permission": [
+      {
+        "permission": "task",
+        "action": "allow",
+        "pattern": "*"
+      },
+      {
+        "permission": "call_omo_agent",
+        "action": "allow",
+        "pattern": "*"
+      },
+      {
+        "permission": "question",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_create",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_delete",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_shutdown_request",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_approve_shutdown",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_reject_shutdown",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_send_message",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_task_create",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_task_list",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_task_update",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_task_get",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_status",
+        "action": "deny",
+        "pattern": "*"
+      },
+      {
+        "permission": "team_list",
+        "action": "deny",
+        "pattern": "*"
+      }
+    ],
+    "time": {
+      "created": 1785825800427,
+      "updated": 1785827465889
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1785825800440
+        },
+        "tools": {
+          "task": true,
+          "call_omo_agent": true,
+          "question": false,
+          "team_create": false,
+          "team_delete": false,
+          "team_shutdown_request": false,
+          "team_approve_shutdown": false,
+          "team_reject_shutdown": false,
+          "team_send_message": false,
+          "team_task_create": false,
+          "team_task_list": false,
+          "team_task_update": false,
+          "team_task_get": false,
+          "team_status": false,
+          "team_list": false
+        },
+        "agent": "plan",
+        "model": {
+          "providerID": "einsia",
+          "modelID": "kimi-k3"
+        },
+        "system": "[redacted:system:msg_fcb8330f8001zFHx51gyKs3g1R]",
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_fcb8330f8001zFHx51gyKs3g1R",
+        "sessionID": "ses_0347ccf14ffeUUP6oCmzF06wDN"
+      }…(truncated; the full export is 185575 bytes, re-exported with --sanitize, same structure as export1.json)

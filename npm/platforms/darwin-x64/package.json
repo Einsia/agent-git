@@ -1,0 +1,26 @@
+{
+  "name": "@einsia/agent-git-darwin-x64",
+  "version": "0.0.9",
+  "description": "Prebuilt agit CLI binary (darwin x64) — platform package for @einsia/agent-git.",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "bin": {
+    "agit": "bin/agit"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Einsia/agent-git",
+    "directory": "npm/platforms/darwin-x64"
+  }
+}

@@ -1,0 +1,7 @@
+# Where the postinstall download / cargo install --root lands. Not committed, not published
+# (package.json's "files" does not list it).
+/bin/
+
+# cargo install --root leaves an install ledger here.
+/.crates.toml
+/.crates2.json

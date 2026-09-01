@@ -1,0 +1,227 @@
+name: npm publish
+
+# npm publishing picks up automatically once the Release workflow concludes
+# successfully; the manual entry point stays (retries, publishing next, running a
+# dry run only).
+#
+# An npm version number is occupied forever once published (unpublish has a
+# 72-hour window and leaves a tombstone), so the safety of the automatic chain
+# rides entirely on the guardrails before publish — do not take them apart:
+#
+#   - the assertion that the tag, Cargo.toml and every package.json agree on the version;
+#   - the assertion that the Release artifacts are complete (four targets + SHA256SUMS);
+#   - once the platform packages are out, the main package tarball is installed for
+#     real before the rest goes out — the path the user will take works first, and
+#     only then does publishing the main package and the wrapper mean anything;
+#   - the E403 npm returns for an already-published version is read as idempotent
+#     success, so the whole workflow can be re-run end to end.
+#
+# What goes out is the whole family, and the order is the dependency direction:
+#
+#   @einsia/agent-git-{linux-x64,linux-arm64,darwin-x64,darwin-arm64}
+#   @einsia/agent-git      (optionalDependencies pins the platform packages at exact versions)
+#   create-agit            (the npx create-agit one-shot install wrapper, depends on the main package)
+#
+# There is deliberately no unscoped alias package: `agit` is squatted by an
+# unrelated project, and npm's typosquat rule blocks `agent-git` for being one
+# punctuation mark away from a third party's `agentgit`.
+#
+# The platform packages must be on the registry before the main package: when
+# optionalDependencies points at a version that does not exist, npm skips it
+# silently and what the user installs is "no prebuilt binary for this platform".
+# The install wrapper likewise must come after the main package. npm/publish.mjs
+# implements the order; this workflow calls it in two steps (--only platforms /
+# --only entry), with the preflight above in between.
+#
+# workflow_run picks up only a Release run whose event is push, whose conclusion
+# is success, and whose head_branch is an agit-v* tag name. The event type has to
+# be checked: Release has a manual dispatch entry point too, and on the name
+# prefix alone any ref whose name looks like a tag could impersonate a tag push
+# and get a real publish out of it. A Release from a manual retry never picks up
+# automatically; publish it from the manual entry point here.
+#
+# The package name is @einsia/agent-git (with a hyphen), matching the GitHub
+# repository. @einsia/agentgit, from before the rewrite, is a different package
+# and stays on npm untouched; there is no upgrade path between the two — so the
+# dist-tag here defaults to latest.
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The git tag to publish (example: agit-v0.1.0)'
+        required: true
+        type: string
+      dist_tag:
+        description: 'npm dist-tag. Choose next to try it on a narrow audience first.'
+        required: true
+        default: 'latest'
+        type: choice
+        options: [latest, next]
+      dry_run:
+        description: 'Run the preflight only, without publishing'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish ${{ inputs.tag || github.event.workflow_run.head_branch }} → ${{ inputs.dist_tag || 'latest' }}
+    # A manual run carries no condition; the automatic pickup accepts only a
+    # Release run triggered by a tag push, concluded successfully, and carrying an
+    # agit-v* tag name — all three are required (see the note at the top).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'agit-v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # trusted publishing: npm trades this short-lived OIDC token for publish
+      # rights, so the repository holds no long-lived NPM_TOKEN and no 2FA is
+      # involved, and provenance comes along with it.
+      #
+      # npmjs.com needs a one-time setup for every package name: the package page
+      # → Settings → Trusted Publisher → GitHub Actions, pointed at
+      # Einsia/agent-git's `npm-publish.yml`. Every package in the list above
+      # needs it; a package that is missing it is rejected by the registry at the
+      # publish step.
+      #
+      # A package name that has never been published has no page on npm and a
+      # trusted publisher cannot be configured: run `npm publish` locally once for
+      # the first release, then hand it back here.
+      id-token: write
+      contents: read
+    env:
+      TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+      DIST_TAG: ${{ inputs.dist_tag || 'latest' }}
+      # The automatic pickup always publishes for real; dry run belongs to the
+      # manual entry point alone.
+      DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      # Trusted publishing on its own does not guarantee a provenance
+      # attestation on the published version; ask for one explicitly. With this
+      # set, a publish whose OIDC context or repository fields cannot back the
+      # attestation fails loudly instead of shipping without it. Local publishes
+      # through npm/publish.mjs are unaffected — the variable lives only here.
+      NPM_CONFIG_PROVENANCE: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The automatic pickup pins to the immutable SHA of the run that
+          # triggered it — when the tag is moved or recreated after the Release
+          # concludes, the tree that packs the npm manifest here must still share
+          # its origin with the tree that run built the binaries from; otherwise
+          # the two halves of the artifact do not match while every version
+          # assertion passes. The manual entry point resolves the tag it was given.
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || env.TAG }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # trusted publishing needs npm >= 11.5.1; the npm bundled with Node is not
+      # that new.
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Versions agree (Cargo.toml / every package.json / tag)
+        run: |
+          set -euo pipefail
+          node scripts/check-version.js
+          PKG_VER="$(node -p "require('./package.json').version")"
+          TAG_VER="${TAG#agit-v}"
+          if [ "$PKG_VER" != "$TAG_VER" ]; then
+            echo "::error::tag $TAG does not match package.json $PKG_VER" && exit 1
+          fi
+          echo "VERSION=$PKG_VER" >> "$GITHUB_ENV"
+
+      # The Release artifacts must be complete. With one target missing, that
+      # platform's package cannot be published and what the user installs is "no
+      # prebuilt binary".
+      - name: Release artifacts complete
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          echo "$assets"
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+                   x86_64-apple-darwin aarch64-apple-darwin; do
+            echo "$assets" | grep -qx "agit-$VERSION-$t.tar.gz" \
+              || { echo "::error::Release is missing agit-$VERSION-$t.tar.gz"; exit 1; }
+          done
+          echo "$assets" | grep -qx 'SHA256SUMS' \
+            || { echo "::error::Release is missing SHA256SUMS"; exit 1; }
+
+      - name: Download the Release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -p 'agit-*.tar.gz' -D dist
+          ls -l dist
+
+      # publish.mjs unpacks and verifies every binary (version, architecture
+      # magic), then publishes one package at a time.
+      - name: Publish the platform packages
+        run: |
+          set -euo pipefail
+          FLAGS=(--only platforms --dist-tag "$DIST_TAG")
+          if [ "$DRY" = "true" ]; then FLAGS+=(--dry-run); fi
+          node npm/publish.mjs dist "${FLAGS[@]}"
+
+      # A real install: the tarball packed here is the main package to be
+      # published, and installing it globally makes npm resolve the just-published
+      # platform package from the registry by os/cpu, then run the real postinstall
+      # self-check. A just-published version replicates onto the packument with a
+      # delay, so poll until all four platform packages are visible before
+      # installing. A dry run publishes no platform packages: while that version is
+      # not on the registry, a global install must fail, and the preflight degrades
+      # to the pack itself.
+      - name: Preflight — install the main package tarball to be published
+        run: |
+          set -euo pipefail
+          TARBALL="$(npm pack --silent)"
+          echo "packed: $TARBALL"
+          visible() {
+            for k in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+              npm view "@einsia/agent-git-$k@$VERSION" version >/dev/null 2>&1 || return 1
+            done
+          }
+          for _ in $(seq 20); do
+            visible && break
+            sleep 15
+          done
+          if ! visible; then
+            if [ "$DRY" = "true" ]; then
+              echo "::notice::the platform packages @$VERSION are not on the registry (a dry run publishes nothing) — skipping the global-install preflight"
+              exit 0
+            fi
+            echo "::error::the platform packages @$VERSION are not visible on the registry"
+            exit 1
+          fi
+          npm install -g "./$TARBALL"
+          test "$(agit --version)" = "agit $VERSION"
+          rm -f "$TARBALL"
+
+      # No NODE_AUTH_TOKEN: npm authenticates over OIDC itself and attaches
+      # provenance.
+      - name: Publish the main package and the install wrapper
+        run: |
+          set -euo pipefail
+          FLAGS=(--only entry --dist-tag "$DIST_TAG")
+          if [ "$DRY" = "true" ]; then FLAGS+=(--dry-run); fi
+          node npm/publish.mjs dist "${FLAGS[@]}"
+
+      - name: dry run, publish skipped
+        if: ${{ env.DRY == 'true' }}
+        run: echo "Preflight passed. Uncheck dry_run and run again to publish for real."

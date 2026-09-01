@@ -1,0 +1,100 @@
+# Kiro CLI session store — observed (remote Linux host, kiro-cli 2.14.1)
+
+## Directory layout
+total 40
+drwxrwsr-x 2 nana-data nana-data 4096 Jul 25 18:12 .
+drwxrwsr-x 3 nana-data nana-data 4096 Jul 24 13:05 ..
+-rw-rw-r-- 1 nana-data nana-data   27 Jul 25 18:12 2293dba9-b634-4af1-83d2-2d9e1624fe09.history
+-rw-rw-r-- 1 nana-data nana-data 5638 Jul 25 18:12 2293dba9-b634-4af1-83d2-2d9e1624fe09.json
+-rw-rw-r-- 1 nana-data nana-data  499 Jul 25 18:12 2293dba9-b634-4af1-83d2-2d9e1624fe09.jsonl
+-rw-rw-r-- 1 nana-data nana-data   10 Jul 24 13:05 c8e2f183-6853-4fb7-b5a9-251b7e3cd486.history
+-rw-rw-r-- 1 nana-data nana-data 5464 Jul 24 13:05 c8e2f183-6853-4fb7-b5a9-251b7e3cd486.json
+-rw-rw-r-- 1 nana-data nana-data  343 Jul 24 13:05 c8e2f183-6853-4fb7-b5a9-251b7e3cd486.jsonl
+
+~/.kiro
+~/.kiro/sessions
+~/.kiro/sessions/cli
+~/.kiro/sessions/cli/2293dba9-b634-4af1-83d2-2d9e1624fe09.jsonl
+~/.kiro/sessions/cli/2293dba9-b634-4af1-83d2-2d9e1624fe09.json
+~/.kiro/sessions/cli/c8e2f183-6853-4fb7-b5a9-251b7e3cd486.jsonl
+~/.kiro/sessions/cli/c8e2f183-6853-4fb7-b5a9-251b7e3cd486.json
+~/.kiro/sessions/cli/2293dba9-b634-4af1-83d2-2d9e1624fe09.history
+~/.kiro/sessions/cli/c8e2f183-6853-4fb7-b5a9-251b7e3cd486.history
+~/.kiro/agents
+~/.kiro/logs
+~/.kiro/logs/20260731T163218598
+~/.kiro/logs/20260731T163218598/powers.log
+~/.kiro/logs/20260731T163218598/mcp.log
+~/.kiro/logs/20260731T163218598/kiro.log
+~/.kiro/settings
+~/.kiro/settings/cli.json
+~/.kiro/settings/feed_state.json
+~/.kiro/settings/survey_state.json
+
+## Record kind histogram (two sessions, all 4 records)
+   2 v1  |  AssistantMessage  |  content+message_id
+   2 v1  |  Prompt  |  content+message_id+meta
+
+## kiro-cli chat --list-sessions -f json (the CLI's own index, keyed by cwd)
+[
+    {
+        "cwd": "/mnt/data/shared/homes/nana-data",
+        "sessions": [
+            {
+                "sessionId": "2293dba9-b634-4af1-83d2-2d9e1624fe09",
+                "source": "v2",
+                "title": "hi",
+                "updatedAt": "2026-07-25T18:12:13.425Z",
+                "messageCount": 2
+            },
+            {
+                "sessionId": "c8e2f183-6853-4fb7-b5a9-251b7e3cd486",
+                "source": "v2",
+                "title": "Hi",
+                "updatedAt": "2026-07-24T13:05:59.593Z",
+                "messageCount": 2
+            }
+        ]
+    }
+]
+
+## kiro-cli chat --list-models -f json (the full set of model slugs, default_model=auto)
+  auto                   ctx=  1000000 rate=1.0
+  claude-opus-5          ctx=  1000000 rate=2.2
+  claude-sonnet-5        ctx=  1000000 rate=1.3
+  claude-opus-4.8        ctx=  1000000 rate=2.2
+  gpt-5.6-sol            ctx=   272000 rate=2.4
+  gpt-5.6-terra          ctx=   272000 rate=1.2
+  gpt-5.6-luna           ctx=   272000 rate=0.6
+  claude-opus-4.7        ctx=  1000000 rate=2.2
+  claude-opus-4.6        ctx=  1000000 rate=2.2
+  claude-sonnet-4.6      ctx=  1000000 rate=1.3
+  claude-opus-4.5        ctx=   200000 rate=2.2
+  claude-sonnet-4.5      ctx=   200000 rate=1.3
+  claude-sonnet-4        ctx=   200000 rate=1.3
+  claude-haiku-4.5       ctx=   200000 rate=0.4
+  deepseek-3.2           ctx=   164000 rate=0.25
+  minimax-m2.5           ctx=   196000 rate=0.25
+  minimax-m2.1           ctx=   196000 rate=0.15
+  glm-5                  ctx=   200000 rate=0.5
+  qwen3-coder-next       ctx=   256000 rate=0.05
+  default_model = auto
+
+## data.sqlite3 schema (conversations / conversations_v2 both have 0 rows → not the index source)
+CREATE TABLE conversations (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE conversations_v2 (
+    key TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at INTEGER NOT NULL,  -- Unix timestamp in milliseconds
+    updated_at INTEGER NOT NULL,  -- Unix timestamp in milliseconds
+    PRIMARY KEY (key, conversation_id)
+
+conversations: 0
+conversations_v2: 0
+history: 0
+state: 11
+auth_kv: 2

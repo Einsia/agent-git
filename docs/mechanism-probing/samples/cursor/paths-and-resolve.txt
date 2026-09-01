@@ -1,0 +1,38 @@
+# Cursor transcript paths and resolve cost — measured on this machine (105 transcript files / 77 project slugs)
+
+## Path templates
+main session:  ~/.cursor/projects/<project-slug>/agent-transcripts/<session-uuid>/<session-uuid>.jsonl
+subagent:      ~/.cursor/projects/<project-slug>/agent-transcripts/<parent-uuid>/subagents/<sub-uuid>.jsonl
+
+## project-slug rule (measured across 10+ samples)
+slug = every non-ASCII-alphanumeric character in cwd becomes '-', then the leading '-' is stripped
+  /Users/nana/Projects/AgentGit                     -> Users-nana-Projects-AgentGit
+  /mnt/data/shared/homes/...                       -> mnt-data-shared-homes-...
+  demo-app.orig                                    -> ...-demo-app-orig
+i.e. domain::store::slug_for(cwd).trim_start_matches('-')
+   (Claude Code uses the variant that keeps the leading '-')
+
+## Slugs that are not paths (must be tolerated; the cwd cannot be derived back)
+1785313507111
+empty-window
+var-folders-wc-p8c9k32n1b12slb70qkssgs40000gn-T-1398c00e-ad25-4c86-91a9-f9871ac8bec0
+var-folders-wc-p8c9k32n1b12slb70qkssgs40000gn-T-774336cc-82fa-4b1a-bfd6-ccaa64d9ff2d
+var-folders-wc-p8c9k32n1b12slb70qkssgs40000gn-T-caec562d-373e-464c-b3e3-1c51d0f6cdf2
+var-folders-wc-p8c9k32n1b12slb70qkssgs40000gn-T-cf4c225a-5637-4818-997b-246e7dede5a1
+var-folders-wc-p8c9k32n1b12slb70qkssgs40000gn-T-d3f3cab0-9fb1-4cbf-b702-af6a49216a43
+var-folders-wc-p8c9k32n1b12slb70qkssgs40000gn-T-d77f7947-0eb9-4ad2-872b-08f4bbef7202
+var-folders-wc-p8c9k32n1b12slb70qkssgs40000gn-T-f7ee807d-5759-4e3d-8432-d50d1b625d50
+
+## One session id appears under two slugs with diverged content (observed)
+-rw-r--r--@ 1 nana  staff  137932 Aug  1 00:29 /Users/nana/.cursor/projects/Users-nana-Projects-AgentGit/agent-transcripts/7bf0e7c5-6a0d-4890-9a2e-a73dfea7473c/7bf0e7c5-6a0d-4890-9a2e-a73dfea7473c.jsonl
+-rw-r--r--@ 1 nana  staff  141380 Aug  1 00:17 /Users/nana/.cursor/projects/empty-window/agent-transcripts/7bf0e7c5-6a0d-4890-9a2e-a73dfea7473c/7bf0e7c5-6a0d-4890-9a2e-a73dfea7473c.jsonl
+line-count difference:
+        75 lines  /Users/nana/.cursor/projects/Users-nana-Projects-AgentGit/agent-transcripts/7bf0e7c5-6a0d-4890-9a2e-a73dfea7473c/7bf0e7c5-6a0d-4890-9a2e-a73dfea7473c.jsonl
+        56 lines  /Users/nana/.cursor/projects/empty-window/agent-transcripts/7bf0e7c5-6a0d-4890-9a2e-a73dfea7473c/7bf0e7c5-6a0d-4890-9a2e-a73dfea7473c.jsonl
+
+## Reverse-lookup cost (Python, warm cache)
+  direct stat <slug>/agent-transcripts/<id>/<id>.jsonl          0.009 ms
+  one-level glob projects/*/agent-transcripts/<id>/<id>.jsonl   0.554 ms   (2 matches!)
+  subagent glob projects/*/agent-transcripts/*/subagents/       3.448 ms
+  list every transcript (two globs, 105 files)                  5.018 ms
+Conclusion: Cursor splits into per-project directories natively, like Claude Code — **no SQLite index is needed**.
