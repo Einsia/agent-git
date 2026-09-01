@@ -8,7 +8,7 @@ name = "agit"
 # @einsia/agent-git and @einsia/agentgit are independent package lines. This
 # version follows this CLI's own lifecycle rather than trying to outrank the
 # other package; that the two are incompatible is said by the package name.
-version = "0.0.9"
+version = "0.1.0"
 edition = "2024"
 # The observed floor, not a guess: on 1.85.1 cargo rejects `cargo check --locked`
 # outright, because the locked darling 0.23 and instability 0.3.12 (a ratatui
