@@ -7,7 +7,7 @@ description: Manage AgentGit global configuration.
 
 ## Purpose
 
-Read, set, or remove global settings such as `hub.url`, `runtime.default`, `push.visibility`, and `commit.auto`. `push.visibility` is the default for a first publish when neither a push flag nor a repo preference (`agit init --private`) says otherwise.
+Read, set, or remove global settings such as `hub.url`, `runtime.default`, `push.visibility`, `commit.auto`, and `secrets.keystore`. `push.visibility` is the default for a first publish when neither a push flag nor a repo preference (`agit init --private`) says otherwise. `secrets.keystore` (`os | file`) says where the secret-filter key lives: the system credential store, or a private file under `AGIT_HOME/keystore/` for a machine with no desktop session (an SSH login, a CI runner; Unix only, and a backup of `AGIT_HOME` then carries the key); `AGIT_SECRETS_KEYSTORE` overrides it.
 
 ## Synopsis
 
@@ -38,6 +38,7 @@ agit config --unset <key>
 agit config hub.url
 agit config runtime.default codex
 agit config commit.auto false
+agit config secrets.keystore file   # on a machine with no desktop session
 agit config --list
 agit config --unset runtime.default
 ```

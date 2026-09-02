@@ -27,16 +27,24 @@ or read access to `agitd` process memory. The matcher has to hold the patterns a
 Aho–Corasick automaton is not a raw string array, but it can still be analyzed and the
 patterns recovered, so it is protected at the same level as plaintext.
 
-What this design protects against:
+What this design protects against, with the OS credential store as the keystore (`os`, the
+default; §3.2):
 
 - a leak of the vault file, an ordinary backup or an offline disk on its own;
 - the user copying or archiving `$AGIT_HOME` along with everything else by mistake;
 - ordinary scan logs, CI output and the RC wire leaking matched content a second time.
 
+With the file keystore (`file`) the first two do not hold. The key then sits under
+`$AGIT_HOME` beside the vault, so a full backup of the home directory, an archive of it or an
+offline disk holds both and decrypts the vault, unless the disk or the backup is itself
+encrypted. The file keystore keeps the vault from other users of the same machine and from a
+copy of the vault directory alone, and nothing more; the third item holds under either store.
+
 What it does not promise:
 
 - that secrets stay unreachable once the Secret Guard process is taken over;
-- that malicious code holding the right to unlock the OS keyring cannot decrypt;
+- that malicious code holding the right to read the keystore — to unlock the OS keyring, or
+  with the file keystore to read the user's files — cannot decrypt;
 - that an authorized process with unlimited calls to the scan interface cannot guess online;
 - that content another component wrote to a log or sent to the network before the filter was
   in the path can be recalled.
@@ -63,7 +71,7 @@ master key exposes every registered value immediately.
 Keys come in two layers:
 
 ```text
-KEK  256-bit, handed to the operating system credential store
+KEK  256-bit, handed to the configured keystore (§3.2)
   └─ AEAD wrapping
 DEK  256-bit, randomly generated, kept in the vault's wrapped_dek
   └─ AES-256-GCM encryption
@@ -76,10 +84,28 @@ The vault lives at:
 $AGIT_HOME/secret-filter/vault.json
 ```
 
-The KEK never enters that file. Where it lands on the operating system side is decided by
-`keyring`'s native store: macOS Keychain, Windows Credential Manager, Unix Secret Service. In
-a headless environment with no usable keyring, initialization and unlocking fail explicitly
-rather than degrade to a plaintext key file in the same directory.
+The KEK never enters that file. Where it lands is the `secrets.keystore` setting
+(`AGIT_SECRETS_KEYSTORE` overrides it):
+
+- `os` (the default): `keyring`'s native store — macOS Keychain, Windows Credential Manager,
+  the Secret Service on other Unix systems;
+- `file`: one `<vault-id>.key` per vault under `$AGIT_HOME/keystore/`, a 0600 file in a 0700
+  directory. This is for a machine with no desktop session — an SSH login, a CI runner — where
+  no Secret Service answers. Its protection is the file mode, the trust an SSH private key
+  rests on, which sets its boundary (§2) and makes it Unix only: on a platform without an
+  owner-only file mode the credential store is the keystore. A key file the store cannot vouch
+  for — a symbolic link, a file readable beyond its owner, one another user owns — is refused
+  on read, never resolved; an existing key file is never overwritten; and a key is durable on
+  disk, its bytes, its mode and its directory entry, before the vault that references it is
+  written, so a power cut cannot leave a vault whose key never reached the disk. The directory
+  is a sibling of `secret-filter/`, never inside it, so a copy of the vault directory alone
+  does not carry the key.
+
+The choice is explicit and per machine. Nothing falls through from one store to the other: a
+key created under the environment of one login and looked up under another would be missing
+on every other day. With the OS store selected and no usable keyring, initialization and
+unlocking fail explicitly rather than degrade to a plaintext key file in the same directory;
+the error names the setting, and `agit doctor` reports the keystore's state.
 
 Every AES-GCM encryption uses a fresh 96-bit CSPRNG nonce. The AAD binds the application
 domain, the vault id, the record id and the format version. An authentication failure makes
@@ -117,7 +143,7 @@ there is none.
 At `agitd` startup:
 
 1. if the vault does not exist, load an empty matcher;
-2. take the KEK from the OS keyring;
+2. take the KEK from the keystore `secrets.keystore` selects (§3.2);
 3. unwrap the DEK, then authenticate and decrypt the records one by one;
 4. build an immutable matcher;
 5. explicitly zero the temporary DEK and the record plaintext bytes;
@@ -223,7 +249,8 @@ The first release does not claim that an allocator drop amounts to reliable zero
 
 - vault missing: empty matcher, ordinary operation;
 - malformed vault JSON: fail closed;
-- OS keyring entry missing: fail closed, reporting the vault as unrecoverable;
+- keystore entry missing (OS keyring entry or key file): fail closed, reporting the vault as
+  unrecoverable;
 - the wrapped DEK fails authentication: fail closed;
 - any record fails authentication: the whole matcher reload fails;
 - the Aho–Corasick build fails: keep the old matcher, never publish half a rule set;
@@ -242,7 +269,7 @@ release opens no CLI rotation command, but the file format reserves `key_version
 `vault_version`.
 
 There is no cross-device recovery by default: a database copied to another machine has no
-matching OS keyring entry, so every value is registered again. Adding an export later takes a
+matching keystore entry, so every value is registered again. Adding an export later takes a
 separate RFC, covering user presence, a separate recovery passphrase, a slow KDF, auditing and
 explicit risk confirmation; the KEK is never quietly slipped into an ordinary backup.
 
@@ -263,7 +290,7 @@ Cryptography and storage:
 - encrypting the same record twice yields different ciphertext;
 - modifying the nonce, the ciphertext or the AAD fails authentication;
 - the database holds no plaintext, no exact length and neither KEK nor DEK;
-- a missing keyring and a corrupt record both fail closed;
+- a missing keystore entry and a corrupt record both fail closed;
 - a failed atomic write leaves the old vault intact.
 
 Performance and resources:

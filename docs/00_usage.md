@@ -740,13 +740,15 @@ rely on it indiscriminately in scripts.
 ~/.agit/workspaces/              directory ↔ agent bindings, the branch switch pinned
 ~/.agit/credentials/<hub>.json   credentials, one file per hub (0600)
 ~/.agit/config.json              global config
+~/.agit/secret-filter/           the encrypted vault of registered secrets (its key is elsewhere)
+~/.agit/keystore/                the vault key, only with `secrets.keystore = file` (0600)
 ```
 
 `AGIT_HOME` moves the whole thing elsewhere (default `~/.agit`). `AGIT_HUB_URL` switches hub, and
 **switching hub is switching identity**: credentials are stored per host, so switching back and
 forth needs no new sign-in.
 
-Config has five keys, and the same command reads and writes:
+Config has six keys, and the same command reads and writes:
 
 ```sh
 agit config --list
@@ -755,7 +757,13 @@ agit config runtime.default           # read
 ```
 
 `hub.url` · `runtime.default` · `push.visibility` · `commit.auto` · `memory.track` (`session | off`,
-whether the runtime's project memory is collected into the session branch, see 3.7).
+whether the runtime's project memory is collected into the session branch, see 3.7) ·
+`secrets.keystore` (`os | file`, where the secret-filter key lives: the system credential store,
+or a private file under `~/.agit/keystore/` for a machine with no desktop session such as an SSH
+login or a CI runner — Unix only, and a backup of `~/.agit` then carries the key along with the
+global vault, while a repository's dictionary in its `.git` takes both backups to decrypt;
+`AGIT_SECRETS_KEYSTORE` overrides it, and `agit doctor` reports whether the chosen store
+answers).
 `push.visibility` governs the first publish only: push's `--private`/`--public` overrides it, and so
 does the preference `agit init --private` records in the repo; set to `ask` (the default) it asks
 once at the first publish, and a non-interactive environment gets private.

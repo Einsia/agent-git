@@ -1059,8 +1059,8 @@ pub fn view_text_for_install(repo_root: &Path) -> crate::Result<String> {
             meta::VIEW_FILE
         ));
     }
-    let hydrated =
-        crate::domain::secret_filter::RepositoryDictionary::open(repo_root).hydrate_jsonl(&text)?;
+    let hydrated = crate::domain::secret_filter::RepositoryDictionary::open(repo_root)?
+        .hydrate_jsonl(&text)?;
     if hydrated.unresolved > 0 {
         ui::warning(&format!(
             "{} repository secret placeholder(s) have no local dictionary entry and were left unchanged.",

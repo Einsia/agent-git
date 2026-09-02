@@ -1,8 +1,9 @@
 //! `agit config` — reading and writing the small set of global config keys.
 //!
 //! Only these keys exist (PRD, the `agit config` section): `hub.url`, `runtime.default`,
-//! `push.visibility`, `commit.auto`, `memory.track`. **There is no repo-level config file** — the
-//! smaller the configuration surface, the easier "why does it behave this way" is to answer.
+//! `push.visibility`, `commit.auto`, `memory.track`, `secrets.keystore`. **There is no repo-level
+//! config file** — the smaller the configuration surface, the easier "why does it behave this
+//! way" is to answer.
 //!
 //! `ask` for `push.visibility` counts as `private` in a non-interactive environment (publishing
 //! memory always errs conservative); that rule lives where the value is read (push), not in the
@@ -15,7 +16,7 @@ use clap::Args as ClapArgs;
 
 /// The full set of valid keys. Adding a key means editing here; an unknown key is always rejected
 /// and this table printed.
-pub const KEYS: [(&str, &str); 5] = [
+pub const KEYS: [(&str, &str); 6] = [
     (
         "hub.url",
         "default hub address (AGIT_HUB_URL takes priority)",
@@ -32,6 +33,10 @@ pub const KEYS: [(&str, &str); 5] = [
     (
         "memory.track",
         "collect the runtime’s project memory onto session branches: session | off",
+    ),
+    (
+        config::SecretKeystore::KEY,
+        "where the secret-filter key lives: os (system credential store) | file (private file under AGIT_HOME/keystore; AGIT_SECRETS_KEYSTORE takes priority)",
     ),
 ];
 
@@ -66,6 +71,7 @@ pub fn run(args: Args) -> CmdResult {
                 "push.visibility" => Some("ask".to_string()),
                 "commit.auto" => Some("false".to_string()),
                 "memory.track" => Some("session".to_string()),
+                "secrets.keystore" => Some(config::SecretKeystore::Os.as_str().to_string()),
                 _ => None,
             });
             let mark = if stored.contains_key(key) {
@@ -138,6 +144,7 @@ fn validate(key: &str, v: &str) -> crate::Result<()> {
         "memory.track" => matches!(v, "session" | "off"),
         "runtime.default" => crate::adapter::normalize(v).is_ok(),
         "hub.url" => v.starts_with("http://") || v.starts_with("https://"),
+        "secrets.keystore" => config::SecretKeystore::parse(v).is_some(),
         _ => false,
     };
     if !ok {
@@ -162,5 +169,8 @@ mod tests {
         assert!(validate("memory.track", "maybe").is_err());
         assert!(validate("hub.url", "https://h.example").is_ok());
         assert!(validate("hub.url", "h.example").is_err());
+        assert!(validate("secrets.keystore", "os").is_ok());
+        assert!(validate("secrets.keystore", "file").is_ok());
+        assert!(validate("secrets.keystore", "keychain").is_err());
     }
 }

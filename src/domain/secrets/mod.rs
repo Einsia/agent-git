@@ -2682,7 +2682,7 @@ pub fn scan_agent_repo(
     let registered = load_registered_matcher()?;
     #[cfg(feature = "secret-vault")]
     let registered = registered.merged(
-        &crate::domain::secret_filter::RepositoryDictionary::open(repo.root()).active_matcher()?,
+        &crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?.active_matcher()?,
     )?;
     // The working tree and the history objects have to use one provenance view. Source events
     // imported by a merge appear both in the current events/** and in a history blob; supplying

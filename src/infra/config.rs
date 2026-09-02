@@ -121,22 +121,93 @@ pub fn secret_filter_dir() -> Result<PathBuf> {
     Ok(agit_home()?.join("secret-filter"))
 }
 
-/// The encrypted vault. The KEK is not here; the operating system keyring holds it.
+/// The encrypted vault. The KEK is not here; the configured keystore holds it.
 pub fn secret_filter_vault_path() -> Result<PathBuf> {
     Ok(secret_filter_dir()?.join("vault.json"))
 }
 
+/// The directory of the opt-in file keystore: one `<vault-id>.key` per vault, 0600 files in a
+/// 0700 directory.
+///
+/// A sibling of `secret-filter/`, never inside it: the vault directory is what a backup or a
+/// copy of the filter carries along, and the key must not travel with it by default.
+pub fn keystore_dir() -> Result<PathBuf> {
+    Ok(agit_home()?.join("keystore"))
+}
+
+/// Where the secret-filter KEK lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretKeystore {
+    /// The operating-system credential store: macOS Keychain, Windows Credential Manager, the
+    /// Secret Service on other Unix systems.
+    Os,
+    /// A private file under [`keystore_dir`]. Chosen explicitly, for a machine with no desktop
+    /// session (SSH, CI) where no Secret Service answers; its protection is the file mode.
+    File,
+}
+
+impl SecretKeystore {
+    pub const KEY: &str = "secrets.keystore";
+    pub const ENV: &str = "AGIT_SECRETS_KEYSTORE";
+
+    pub fn parse(v: &str) -> Option<Self> {
+        match v.trim() {
+            "os" => Some(Self::Os),
+            "file" => Some(Self::File),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Os => "os",
+            Self::File => "file",
+        }
+    }
+}
+
+/// The configured keystore: `$AGIT_SECRETS_KEYSTORE` > `secrets.keystore` > `os`.
+///
+/// A value outside the domain is an error, not the default: a misspelt setting that silently
+/// selected the OS store would create the key there, and every later run under the intended
+/// setting would find its vault without a key.
+pub fn secret_keystore() -> Result<SecretKeystore> {
+    match get_global(SecretKeystore::KEY)? {
+        None => Ok(SecretKeystore::Os),
+        Some(v) => SecretKeystore::parse(&v).with_context(|| {
+            format!(
+                "`{}` takes `os` or `file`, not `{v}` (from ${} or `agit config {}`)",
+                SecretKeystore::KEY,
+                SecretKeystore::ENV,
+                SecretKeystore::KEY
+            )
+        }),
+    }
+}
+
+/// The config keys an environment variable overrides, and the variable.
+const ENV_OVERRIDES: [(&str, &str); 2] = [
+    ("hub.url", "AGIT_HUB_URL"),
+    (SecretKeystore::KEY, SecretKeystore::ENV),
+];
+
 /// Read one global config key.
 ///
-/// Order: **the environment variable** (`hub.url` ← `AGIT_HUB_URL`) > the config file > None
-/// (the caller supplies the default).
+/// Order: **the environment variable** (`hub.url` ← `AGIT_HUB_URL`, `secrets.keystore` ←
+/// `AGIT_SECRETS_KEYSTORE`) > the config file > None (the caller supplies the default).
 pub fn get_global(key: &str) -> Result<Option<String>> {
-    if key == "hub.url"
-        && let Ok(v) = std::env::var("AGIT_HUB_URL")
+    if let Some((_, var)) = ENV_OVERRIDES.iter().find(|(k, _)| *k == key)
+        && let Ok(v) = std::env::var(var)
     {
-        let v = v.trim().trim_end_matches('/').to_string();
+        let v = v.trim();
+        // A hub address is an origin; a trailing slash is not part of the identity.
+        let v = if key == "hub.url" {
+            v.trim_end_matches('/')
+        } else {
+            v
+        };
         if !v.is_empty() {
-            return Ok(Some(v));
+            return Ok(Some(v.to_string()));
         }
     }
     let path = global_config_path()?;
@@ -405,6 +476,17 @@ mod tests {
         // The path stays out of the key: it is not part of the identity.
         assert_eq!(hub_host_key("https://hub.corp.com/api/"), "hub.corp.com");
         assert_eq!(hub_host_key(""), "unknown");
+    }
+
+    #[test]
+    fn secret_keystore_values_are_exact() {
+        assert_eq!(SecretKeystore::parse("os"), Some(SecretKeystore::Os));
+        assert_eq!(SecretKeystore::parse(" file\n"), Some(SecretKeystore::File));
+        // Anything else is refused rather than read as the default: a typo that silently
+        // selected the OS store would put the key where the intended setting never looks.
+        for bad in ["", "File", "keychain", "file/", "auto"] {
+            assert_eq!(SecretKeystore::parse(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

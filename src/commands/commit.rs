@@ -1398,7 +1398,7 @@ fn settle_bytes(
     } else {
         crate::domain::secret_filter::VaultStore::open_default()?.matcher()?
     };
-    let secret_dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root());
+    let secret_dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
     let protected_full = if file_line {
         crate::domain::secret_filter::ProtectionReport {
             text: text.clone(),
@@ -1409,18 +1409,20 @@ fn settle_bytes(
         }
     } else {
         // The dictionary is created lazily, by the first finding. On a machine
-        // with no OS credential store that first finding is also the first time
-        // a commit can fail for a reason that has nothing to do with the commit
-        // — say which decision needed the keyring, since the underlying error
-        // only knows that a KEK could not be stored. Degrading to a key file
-        // beside the vault is not on the table (docs/05, §3.2).
+        // whose keystore cannot hold a key that first finding is also the first
+        // time a commit can fail for a reason that has nothing to do with the
+        // commit — say which decision needed the keystore, since the underlying
+        // error only knows that a KEK could not be stored. Quietly degrading to
+        // a key file beside the vault is not on the table (docs/05, §3.2); the
+        // file keystore is a setting the user makes.
         secret_dictionary
             .protect_jsonl(&text, &global_secrets)
             .map_err(|error| {
                 anyhow::anyhow!(
                     "cannot protect this session's secrets before committing: {error:#}\n\
-                     the repository dictionary keeps its key in the OS credential store, and \
-                     settlement will not fall back to an unprotected one"
+                     the repository dictionary keeps its key in the configured keystore \
+                     (`agit config secrets.keystore`), and settlement will not fall back to \
+                     an unprotected one"
                 )
             })?
     };
