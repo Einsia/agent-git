@@ -6,8 +6,8 @@
 
 use super::{
     CURRENT_PROJECTION_VERSION, CURRENT_SCHEMA_VERSION, DecryptedRecord, KeyStore,
-    MAX_REPOSITORY_SECRET_BYTES, Matcher, OsKeyStore, PlainRecord, RECORD_VERSION, RecordOrigin,
-    SealedRecord, Unlocked, VaultStore, encode_padded, record_aad, seal, validate_name,
+    MAX_REPOSITORY_SECRET_BYTES, Matcher, PlainRecord, RECORD_VERSION, RecordOrigin, SealedRecord,
+    SelectedKeyStore, Unlocked, VaultStore, encode_padded, record_aad, seal, validate_name,
     validate_secret, write_vault,
 };
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -60,18 +60,19 @@ pub struct RepositoryRecordSummary {
 
 /// One encrypted dictionary per checkout. The path is beneath `.git`, so no
 /// normal add/push/export path can accidentally publish it.
-pub struct RepositoryDictionary<K: KeyStore = OsKeyStore> {
+pub struct RepositoryDictionary<K: KeyStore = SelectedKeyStore> {
     store: VaultStore<K>,
 }
 
-impl RepositoryDictionary<OsKeyStore> {
-    pub fn open(repo_root: &Path) -> Self {
+impl RepositoryDictionary<SelectedKeyStore> {
+    /// Fails only on a keystore setting outside its domain; the key itself is touched lazily.
+    pub fn open(repo_root: &Path) -> crate::Result<Self> {
         // One dictionary per repository: session-branch worktrees and the main checkout share it.
-        Self::new(
+        Ok(Self::new(
             crate::domain::repo::common_git_dir(repo_root)
                 .join(Path::new(DICTIONARY_RELATIVE_PATH)),
-            OsKeyStore,
-        )
+            SelectedKeyStore::from_config()?,
+        ))
     }
 }
 

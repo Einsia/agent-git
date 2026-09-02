@@ -59,7 +59,7 @@ keeps its full, fail-closed repo-wide scan as the last backstop for:
 - plaintext history that predates the feature;
 - content the user writes or commits directly, bypassing `agit commit`;
 - shared files and commit/tag headers outside the session's automatic protection surface;
-- a corrupt dictionary, a missing keyring, or a conversion that did not finish.
+- a corrupt dictionary, a missing keystore entry, or a conversion that did not finish.
 
 This delivers what the user observes — what goes up is the key, what comes back hydrates on
 this device — without faking Git's identity model.
@@ -69,7 +69,8 @@ this device — without faking Git's identity model.
 Both chains live in the one `domain::secret_filter` domain module because they share four
 security primitives:
 
-- the KEK in the OS keyring;
+- the KEK in the configured keystore (05, §3.2): the OS credential store, or the opt-in file
+  keystore on a machine that has none;
 - AES-256-GCM envelope encryption that fails closed on an authentication failure;
 - linear Aho–Corasick matching over arbitrary UTF-8 literals;
 - semantic traversal over JSON string values: serialized bytes carrying `\"`, `\\` or `\n`
@@ -96,9 +97,9 @@ Each repository's dictionary lives at:
 
 It sits inside Git metadata, so `git add`, push, an ordinary workspace scan and shared-file
 export never carry it away. The file reuses the global vault's envelope encryption; the KEK
-lives only in the system credential store, and the vault file holds only the wrapped DEK and
-per-record AEAD ciphertext. Copying the repository directory without the matching keyring
-entry must fail explicitly; an absent keyring entry is never read as an empty dictionary.
+lives only in the configured keystore, and the vault file holds only the wrapped DEK and
+per-record AEAD ciphertext. Copying the repository directory without the matching keystore
+entry must fail explicitly; an absent keystore entry is never read as an empty dictionary.
 
 A random record id is generated the first time a secret is met in that repository; the same
 secret in the same repository reuses one record, and another repository generates a different
@@ -177,7 +178,15 @@ unresolved count is reported.
 
 This design protects against a leak of the remote, the logs, an ordinary backup or the vault
 file on its own; it does not defend against an attacker who already controls the local
-process, the system credential store or the runtime files. A decrypted secret lives briefly in
+process, the keystore (the system credential store — or, with the file keystore, the user's
+files) or the runtime files.
+
+With the file keystore (05, §3.2) the dictionary and its key live in two places: the
+dictionary under the checkout's `.git` (§4), the key under `$AGIT_HOME/keystore/`. A backup of
+the repository alone carries the dictionary and not the key; a backup of `$AGIT_HOME` alone
+carries the key and not the dictionary — unlike the global vault, which sits under
+`$AGIT_HOME` beside its key (05, §2). Only a backup or an offline disk that holds both
+decrypts the dictionary; whoever plans backup isolation plans it around that pair. A decrypted secret lives briefly in
 process memory during materialization, and once it reaches the runtime it falls under the
 runtime's own plaintext-transcript security boundary.
 
@@ -192,8 +201,8 @@ hard to guess" is not a replay defense.
 
 - no dictionary: this repository has no mapping; the write path may create one on the first
   hit, the read path keeps the unknown token;
-- a dictionary with a missing keyring, corrupt JSON or a failed AEAD authentication: read and
-  write both fail closed;
+- a dictionary with a missing keystore entry, corrupt JSON or a failed AEAD authentication:
+  read and write both fail closed;
 - the atomic write fails: no Git commit referencing the new placeholder is formed;
 - a new global explicit rule hits an already settled plaintext prefix: the continuity check
   refuses and asks for an explicit migration; a new heuristic record may complete its forward
@@ -220,7 +229,7 @@ hard to guess" is not a replay defense.
 - settling again after a commit still passes continuity;
 - resume hydrates when the dictionary is present, and keeps the token with a warning when it
   is not;
-- a missing keyring and an authentication failure on any record both fail closed;
+- a missing keystore entry and an authentication failure on any record both fail closed;
 - push still refuses a secret in old history or outside the protection surface;
 - a retry after the heuristic dictionary has persisted still allows forward projection, while
   an explicit/global rule hitting an old prefix is still refused;

@@ -252,7 +252,7 @@ fn repository_dictionary(repo: Option<PathBuf>) -> crate::Result<RepositoryDicti
             path.display()
         );
     };
-    Ok(RepositoryDictionary::open(repo.root()))
+    RepositoryDictionary::open(repo.root())
 }
 
 fn print_repository_record(record: &RepositoryRecordSummary) {

@@ -149,6 +149,12 @@ pub fn run(args: Args) -> CmdResult {
         },
     ));
 
+    // ── Secret keystore ──
+    // Probed the way a commit uses it. A store that opens but refuses writes, or a vault whose
+    // key the configured store does not hold, fails the first commit that finds a secret — on
+    // a machine with no desktop session, that is the first sign anything is wrong.
+    checks.push(("secret keystore".into(), keystore_row()));
+
     // ── Backend ──
     if args.check_backend {
         let client = crate::hub::Client::from_env();
@@ -447,6 +453,32 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         ExitCode::Ok
     })
+}
+
+/// One keystore row: which store, whether it answers, and what stops working when it does not.
+fn keystore_row() -> Check {
+    use crate::domain::secret_filter::KeystoreHealth;
+    use crate::infra::config::SecretKeystore;
+    let label = |keystore: Option<SecretKeystore>, dir: Option<&Path>| match (keystore, dir) {
+        (Some(SecretKeystore::File), Some(dir)) => format!("file keystore {}", ui::tilde(dir)),
+        (Some(SecretKeystore::File), None) => "file keystore".to_string(),
+        (Some(SecretKeystore::Os), _) => "OS credential store".to_string(),
+        (None, _) => format!("`{}`", SecretKeystore::KEY),
+    };
+    match crate::domain::secret_filter::keystore_health() {
+        KeystoreHealth::Ok {
+            keystore,
+            dir,
+            vault,
+        } => Check::Ok(format!(
+            "{} — {vault}",
+            label(Some(keystore), dir.as_deref())
+        )),
+        KeystoreHealth::Problem { keystore, dir, why } => Check::Warn(format!(
+            "{}: {why} — `agit secrets add` and any commit that finds a secret fail",
+            label(keystore, dir.as_deref())
+        )),
+    }
 }
 
 /// One runtime diagnostic row: capability tier + format family + next step.

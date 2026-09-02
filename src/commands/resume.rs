@@ -551,7 +551,7 @@ pub fn resume_branch_with_prompt(
         // prefix of live, and nobody touched the VIEW after that commit (continuity covers this
         // test — objects brought in by a merge stop committed from being the prefix of live).
         if let Ok(live) = lk.read() {
-            let projected = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
+            let projected = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
                 .protect_existing_jsonl(&live)?;
             if matches!(
                 transcript::continuity(&committed_log, &projected.text),
@@ -863,7 +863,7 @@ fn materialize_and_resume(
         ui::hint("a fresh session goes through `agit new`");
         anyhow::bail!("empty VIEW");
     }
-    let hydrated = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
+    let hydrated = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
         .hydrate_jsonl(&text)?;
     if hydrated.unresolved > 0 {
         ui::warning(&format!(

@@ -4,10 +4,12 @@
 //! contain, verbatim, a value the user already registered". The two cannot be merged into one
 //! heuristic: a passphrase a human can remember may well be an ordinary sentence.
 //!
-//! Disk holds AES-256-GCM ciphertext only; the KEK goes to the operating-system keyring, and the
-//! random DEK sits in the vault wrapped by the KEK. Unlocking builds one Aho–Corasick; a scan
-//! does not walk the input once per rule.
+//! Disk holds AES-256-GCM ciphertext only; the KEK goes to the keystore the user configured —
+//! the operating-system credential store, or a private file on a machine that has none — and
+//! the random DEK sits in the vault wrapped by the KEK. Unlocking builds one Aho–Corasick; a
+//! scan does not walk the input once per rule.
 
+use crate::infra::config::SecretKeystore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng, Payload, rand_core::RngCore};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -31,6 +33,11 @@ const VAULT_VERSION: u32 = 1;
 const RECORD_VERSION: u32 = 1;
 const KEY_VERSION: u32 = 1;
 const KEYRING_SERVICE: &str = "com.einsia.agent-git.secret-filter";
+/// The prefix of the entries `keystore_health` writes and deletes. Each probe carries its own
+/// random suffix, so two diagnostics running at once never read or delete each other's entry;
+/// a vault id is a UUID and collides with neither.
+const KEYSTORE_PROBE_PREFIX: &str = "doctor-probe-";
+const FILE_KEYSTORE_UNIX_ONLY: &str = "the file keystore is available on Unix only: its protection is a file mode the platform enforces for the owner alone, and here the credential store is the keystore (secrets.keystore = os)";
 const MIN_SECRET_BYTES: usize = 4;
 const DEFAULT_MIN_SECRET_BYTES: usize = 8;
 const MAX_SECRET_BYTES: usize = 512;
@@ -150,8 +157,8 @@ pub struct FilterReport {
     pub ids: Vec<String>,
 }
 
-/// The KEK backend. Tests use an in-memory implementation, production the OS keyring; the vault
-/// logic is not written twice.
+/// The KEK backend. Tests use an in-memory implementation, production the store the user
+/// configured; the vault logic is not written twice.
 pub trait KeyStore: Send + Sync {
     fn get(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>>;
     fn set(&self, vault_id: &str, key: &[u8]) -> crate::Result<()>;
@@ -163,8 +170,16 @@ pub struct OsKeyStore;
 
 impl OsKeyStore {
     fn entry(vault_id: &str) -> crate::Result<keyring::Entry> {
-        keyring::Entry::new(KEYRING_SERVICE, vault_id)
-            .context("cannot open the operating-system credential store")
+        // The store fails to open on a machine with no desktop session (an SSH login, a CI
+        // runner): there is no Secret Service to answer. That machine has a supported setting,
+        // and the error names it, or the user meets a dead end at the first commit that finds
+        // a secret.
+        keyring::Entry::new(KEYRING_SERVICE, vault_id).with_context(|| {
+            format!(
+                "cannot open the operating-system credential store (with no desktop session, keep the key in a private file instead: `agit config {} file`)",
+                SecretKeystore::KEY
+            )
+        })
     }
 }
 
@@ -172,7 +187,8 @@ impl KeyStore for OsKeyStore {
     fn get(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
         let key = Self::entry(vault_id)?.get_secret().with_context(|| {
             format!(
-                "the secret-filter vault exists, but its OS keyring key `{vault_id}` is unavailable"
+                "the secret-filter vault exists, but its key `{vault_id}` is not in the operating-system credential store ({} = os)",
+                SecretKeystore::KEY
             )
         })?;
         validate_key(&key, "KEK")?;
@@ -193,18 +209,408 @@ impl KeyStore for OsKeyStore {
     }
 }
 
+/// The opt-in file keystore: one `<vault-id>.key` per vault, 0600 files in a 0700 directory.
+///
+/// It exists for machines where no credential store answers — an SSH login, a CI runner — and
+/// serves only when the user selects it (`secrets.keystore = file`). Its protection is the file
+/// mode alone: whoever reads the user's files reads the key, the trust an SSH private key rests
+/// on, so it is Unix only, and a key file it cannot vouch for — a symbolic link, a file another
+/// user owns or one readable beyond its owner — is refused rather than read. The directory is a
+/// sibling of the vault directory, never the vault directory itself; a copy of the vault
+/// directory alone does not carry the key, while a backup of the whole home does (docs/05,
+/// §2 and §3.2).
+#[derive(Debug, Clone)]
+pub struct FileKeyStore {
+    dir: PathBuf,
+}
+
+impl FileKeyStore {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The key file of one vault. The id becomes a path component, so any character a generated
+    /// id never contains is refused before it can name a file outside the directory.
+    #[cfg(unix)]
+    fn key_path(&self, vault_id: &str) -> crate::Result<PathBuf> {
+        let well_formed = !vault_id.is_empty()
+            && vault_id.len() <= 64
+            && vault_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if !well_formed {
+            bail!("the secret-filter vault id `{vault_id}` cannot name a key file");
+        }
+        Ok(self.dir.join(format!("{vault_id}.key")))
+    }
+}
+
+#[cfg(unix)]
+impl KeyStore for FileKeyStore {
+    fn get(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
+        use std::io::Read as _;
+        let path = self.key_path(vault_id)?;
+        let mut file = open_owner_only(&path).with_context(|| {
+            format!(
+                "the secret-filter vault exists, but its key `{vault_id}` is not usable from the file keystore {} ({} = file)",
+                self.dir.display(),
+                SecretKeystore::KEY
+            )
+        })?;
+        let mut text = Zeroizing::new(String::new());
+        file.read_to_string(&mut text)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let key = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(text.trim())
+                .with_context(|| {
+                    format!("the secret-filter key file {} is malformed", path.display())
+                })?,
+        );
+        validate_key(&key, "KEK")?;
+        Ok(key)
+    }
+
+    fn set(&self, vault_id: &str, key: &[u8]) -> crate::Result<()> {
+        validate_key(key, "KEK")?;
+        let path = self.key_path(vault_id)?;
+        let created = !self.dir.exists();
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("cannot create {}", self.dir.display()))?;
+        set_private_dir(&self.dir)?;
+        if created {
+            fsync_dir(
+                self.dir
+                    .parent()
+                    .context("the keystore directory has no parent directory")?,
+            )?;
+        }
+        let mut temp = tempfile::NamedTempFile::new_in(&self.dir).with_context(|| {
+            format!(
+                "cannot create a temporary key file in {}",
+                self.dir.display()
+            )
+        })?;
+        let encoded = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(key));
+        temp.write_all(encoded.as_bytes())?;
+        temp.write_all(b"\n")?;
+        temp.flush()?;
+        temp.as_file().sync_all()?;
+        set_private_file(temp.path())?;
+        // A key file is written once per vault id. Replacing one strands the vault whose DEK it
+        // wraps, so an existing file is an error, never overwritten.
+        temp.persist_noclobber(&path)
+            .map_err(|e| e.error)
+            .with_context(|| {
+                format!(
+                    "cannot create the secret-filter key file {}",
+                    path.display()
+                )
+            })?;
+        // The vault written next references this key by id. The key is durable — its bytes,
+        // its mode and the directory entry the rename made — before this returns, so a power
+        // cut never leaves a vault on disk whose key never reached it. Opening the persisted
+        // file the way a read does also vouches for what was just written.
+        open_owner_only(&path)?
+            .sync_all()
+            .with_context(|| format!("cannot sync {}", path.display()))?;
+        fsync_dir(&self.dir)?;
+        Ok(())
+    }
+
+    fn delete(&self, vault_id: &str) -> crate::Result<()> {
+        let path = self.key_path(vault_id)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| {
+                format!(
+                    "cannot delete the secret-filter key file {}",
+                    path.display()
+                )
+            }),
+        }
+    }
+}
+
+/// Off Unix the file keystore touches nothing: no directory, no temporary file, no key. The
+/// refusal comes before any filesystem operation, so a caller that reaches the store directly
+/// gets an error and leaves no plaintext key behind.
+#[cfg(not(unix))]
+impl KeyStore for FileKeyStore {
+    fn get(&self, _vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
+        bail!("{FILE_KEYSTORE_UNIX_ONLY}")
+    }
+
+    fn set(&self, _vault_id: &str, _key: &[u8]) -> crate::Result<()> {
+        bail!("{FILE_KEYSTORE_UNIX_ONLY}")
+    }
+
+    fn delete(&self, _vault_id: &str) -> crate::Result<()> {
+        bail!("{FILE_KEYSTORE_UNIX_ONLY}")
+    }
+}
+
+/// The keystore the configuration selects: one choice per machine, made explicitly. Nothing
+/// falls through from one store to the other; a key created under the environment of one
+/// login and looked for under another would be missing on every other day.
+#[derive(Debug, Clone)]
+pub enum SelectedKeyStore {
+    Os(OsKeyStore),
+    File(FileKeyStore),
+}
+
+impl SelectedKeyStore {
+    pub fn from_config() -> crate::Result<Self> {
+        Ok(match crate::infra::config::secret_keystore()? {
+            SecretKeystore::Os => Self::Os(OsKeyStore),
+            SecretKeystore::File => {
+                if !cfg!(unix) {
+                    bail!("{FILE_KEYSTORE_UNIX_ONLY}");
+                }
+                Self::File(FileKeyStore::new(crate::infra::config::keystore_dir()?))
+            }
+        })
+    }
+}
+
+impl KeyStore for SelectedKeyStore {
+    fn get(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
+        match self {
+            Self::Os(store) => store.get(vault_id),
+            Self::File(store) => store.get(vault_id),
+        }
+    }
+
+    fn set(&self, vault_id: &str, key: &[u8]) -> crate::Result<()> {
+        match self {
+            Self::Os(store) => store.set(vault_id, key),
+            Self::File(store) => store.set(vault_id, key),
+        }
+    }
+
+    fn delete(&self, vault_id: &str) -> crate::Result<()> {
+        match self {
+            Self::Os(store) => store.delete(vault_id),
+            Self::File(store) => store.delete(vault_id),
+        }
+    }
+}
+
+/// What `agit doctor` learns about the configured keystore.
+#[derive(Debug)]
+pub enum KeystoreHealth {
+    /// The store answered a write and a read, and the global vault, if one exists, unlocked.
+    Ok {
+        keystore: SecretKeystore,
+        /// The file keystore directory; None for the OS store.
+        dir: Option<PathBuf>,
+        vault: String,
+    },
+    /// The store, or the vault under it, cannot serve a commit; `why` says which.
+    Problem {
+        /// None when the setting itself is outside its domain.
+        keystore: Option<SecretKeystore>,
+        dir: Option<PathBuf>,
+        why: String,
+    },
+}
+
+/// Probe the configured keystore the way a commit uses it, without touching any vault's key.
+///
+/// Either store gets a throwaway key written, read back and deleted through the production
+/// path: opening a store proves nothing about writes, and a store that opens but cannot hold a
+/// key fails the first commit that finds a secret. Then the global vault, if one exists, is
+/// unlocked and every record authenticated.
+pub fn keystore_health() -> KeystoreHealth {
+    let selected = match SelectedKeyStore::from_config() {
+        Ok(selected) => selected,
+        Err(e) => {
+            return KeystoreHealth::Problem {
+                keystore: None,
+                dir: None,
+                why: format!("{e:#}"),
+            };
+        }
+    };
+    let (keystore, dir, probe) = match &selected {
+        SelectedKeyStore::Os(_) => (SecretKeystore::Os, None, probe_os_store()),
+        SelectedKeyStore::File(store) => (
+            SecretKeystore::File,
+            Some(store.dir().to_path_buf()),
+            probe_file_store(store),
+        ),
+    };
+    if let Err(e) = probe {
+        return KeystoreHealth::Problem {
+            keystore: Some(keystore),
+            dir,
+            why: format!("{e:#}"),
+        };
+    }
+    let vault = crate::infra::config::secret_filter_vault_path()
+        .map(|path| VaultStore::new(path, selected))
+        .and_then(|store| store.status());
+    match vault {
+        Ok(status) if status.initialized => KeystoreHealth::Ok {
+            keystore,
+            dir,
+            vault: format!("vault unlocked, {} rules", status.rules),
+        },
+        Ok(_) => KeystoreHealth::Ok {
+            keystore,
+            dir,
+            vault: "no vault yet".into(),
+        },
+        Err(e) => KeystoreHealth::Problem {
+            keystore: Some(keystore),
+            dir,
+            why: format!("{e:#}"),
+        },
+    }
+}
+
+fn probe_id() -> String {
+    format!("{KEYSTORE_PROBE_PREFIX}{}", uuid::Uuid::new_v4().simple())
+}
+
+fn probe_key() -> Zeroizing<Vec<u8>> {
+    let mut probe = Zeroizing::new(vec![0u8; 32]);
+    OsRng.fill_bytes(&mut probe);
+    probe
+}
+
+fn probe_os_store() -> crate::Result<()> {
+    let entry = OsKeyStore::entry(&probe_id())?;
+    let probe = probe_key();
+    entry
+        .set_secret(&probe)
+        .context("the operating-system credential store refused a write")?;
+    let back = entry
+        .get_secret()
+        .map(Zeroizing::new)
+        .context("the operating-system credential store cannot read back what it stored");
+    // The probe entry is not left behind whatever the read said; a store that cannot delete
+    // is reported too.
+    let removed = entry
+        .delete_credential()
+        .context("the operating-system credential store cannot delete what it stored");
+    if *back? != *probe {
+        bail!("the operating-system credential store returned different bytes than it stored");
+    }
+    removed
+}
+
+/// A round trip through the production file store. A missing directory is created the way the
+/// first commit creates it, so a home the user cannot write to fails here rather than there.
+/// The directory stays: it is the production directory, and a probe that removed it would pull
+/// the floor from under a second diagnostic writing its own probe key at the same moment. One
+/// that already existed is checked for its mode and left as found — the probe reports, it does
+/// not repair.
+fn probe_file_store(store: &FileKeyStore) -> crate::Result<()> {
+    let dir = store.dir();
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
+        Ok(md) if !md.is_dir() => bail!("{} is not a directory", dir.display()),
+        Ok(md) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = md.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    bail!(
+                        "{} is mode {mode:04o}; a keystore is readable by its owner alone (chmod 0700)",
+                        dir.display()
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = md;
+        }
+    }
+    let id = probe_id();
+    let probe = probe_key();
+    store.set(&id, &probe)?;
+    let back = store.get(&id);
+    let removed = store
+        .delete(&id)
+        .context("the file keystore cannot delete what it stored");
+    if *back? != *probe {
+        bail!("the file keystore returned different bytes than it stored");
+    }
+    removed
+}
+
+/// Open a key file for reading, refusing what a private file must not be: a symbolic link, a
+/// non-regular file, a file readable beyond its owner, or one another user owns. The checks
+/// run on the opened handle, so what is checked is what is read.
+#[cfg(unix)]
+fn open_owner_only(path: &Path) -> crate::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => bail!(
+            "{} is a symbolic link; a key file is a regular file",
+            path.display()
+        ),
+        Err(e) => return Err(e).with_context(|| format!("cannot open {}", path.display())),
+    };
+    let md = file
+        .metadata()
+        .with_context(|| format!("cannot stat {}", path.display()))?;
+    if !md.file_type().is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mode = md.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "{} is mode {mode:04o}; a key file is readable by its owner alone (chmod 0600)",
+            path.display()
+        );
+    }
+    // SAFETY: geteuid takes no arguments, cannot fail and touches no memory.
+    let me = unsafe { libc::geteuid() };
+    if md.uid() != me {
+        bail!(
+            "{} belongs to uid {}, not to this user",
+            path.display(),
+            md.uid()
+        );
+    }
+    Ok(file)
+}
+
+/// Make a directory's entries durable: a rename or a creation inside it is on disk only once
+/// the directory itself is synced.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> crate::Result<()> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("cannot sync {}", dir.display()))
+}
+
 /// The vault entry point. Every read and write happens under the same lock file, so two CLIs
 /// cannot overwrite each other's records.
-pub struct VaultStore<K: KeyStore = OsKeyStore> {
+pub struct VaultStore<K: KeyStore = SelectedKeyStore> {
     path: PathBuf,
     keys: K,
 }
 
-impl VaultStore<OsKeyStore> {
+impl VaultStore<SelectedKeyStore> {
+    /// Fails only on a keystore setting outside its domain; the key itself is touched lazily.
     pub fn open_default() -> crate::Result<Self> {
         Ok(Self::new(
             crate::infra::config::secret_filter_vault_path()?,
-            OsKeyStore,
+            SelectedKeyStore::from_config()?,
         ))
     }
 }
@@ -1252,6 +1658,187 @@ mod tests {
         let report = redactor.scrub("blue horse battery");
         assert_eq!(report.text, PLACEHOLDER);
         assert_eq!(report.registered_ids, vec!["sec_new"]);
+    }
+
+    /// The file keystore keeps one private file per vault id and never replaces one: a
+    /// replaced file strands the vault whose DEK the old key wraps, and a group- or
+    /// world-readable one is no keystore at all.
+    #[cfg(unix)]
+    #[test]
+    fn file_keystore_roundtrips_privately_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = FileKeyStore::new(dir.path().join("keystore"));
+        let vault_id = uuid::Uuid::new_v4().to_string();
+        let key = [7u8; 32];
+        keys.set(&vault_id, &key).unwrap();
+        assert_eq!(&*keys.get(&vault_id).unwrap(), &key[..]);
+        let path = keys.key_path(&vault_id).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(keys.dir()), 0o700);
+        }
+        assert!(keys.set(&vault_id, &[9u8; 32]).is_err());
+        assert_eq!(&*keys.get(&vault_id).unwrap(), &key[..]);
+        // A key of the wrong length is rejected before anything reaches disk.
+        assert!(keys.set("other", &[1u8; 16]).is_err());
+        assert!(!keys.dir().join("other.key").exists());
+        keys.delete(&vault_id).unwrap();
+        assert!(!path.exists());
+        assert!(keys.get(&vault_id).is_err());
+        // Deleting what is already gone is the same end state, not a failure.
+        keys.delete(&vault_id).unwrap();
+    }
+
+    /// A vault id is a UUID; anything that could leave the directory when joined to a path
+    /// must be refused rather than resolved.
+    #[cfg(unix)]
+    #[test]
+    fn file_keystore_refuses_path_like_vault_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = FileKeyStore::new(dir.path().join("keystore"));
+        for bad in [
+            "",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "x".repeat(65).as_str(),
+        ] {
+            assert!(keys.set(bad, &[1u8; 32]).is_err(), "{bad:?}");
+            assert!(keys.get(bad).is_err(), "{bad:?}");
+            assert!(keys.delete(bad).is_err(), "{bad:?}");
+        }
+        assert!(!dir.path().join("escape.key").exists());
+    }
+
+    /// The file keystore trusts the file mode alone, so a key it cannot vouch for is refused
+    /// on read — a group- or world-readable file, a symbolic link — and the same key reads
+    /// again once the file is private.
+    #[cfg(unix)]
+    #[test]
+    fn file_keystore_refuses_a_wide_mode_and_a_symlink_on_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = FileKeyStore::new(dir.path().join("keystore"));
+        keys.set("vault", &[5u8; 32]).unwrap();
+        let path = keys.key_path("vault").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = keys.get("vault").unwrap_err();
+        assert!(format!("{err:#}").contains("0644"), "{err:#}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(&*keys.get("vault").unwrap(), &[5u8; 32][..]);
+        // A link to a private copy elsewhere is refused too: the keystore vouches for what it
+        // holds, not for what a link points at.
+        let elsewhere = dir.path().join("elsewhere.key");
+        std::fs::copy(&path, &elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        let err = keys.get("vault").unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+    }
+
+    /// The doctor probe goes through the production store: a home that cannot hold a key
+    /// fails here, the directory the probe created stays (private and empty, as the first
+    /// commit would leave it), and a wide mode on an existing one is reported, not repaired.
+    #[cfg(unix)]
+    #[test]
+    fn file_store_probe_round_trips_and_leaves_only_the_directory_behind() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let store = FileKeyStore::new(home.join("keystore"));
+        probe_file_store(&store).unwrap();
+        let mode = std::fs::metadata(store.dir()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_eq!(std::fs::read_dir(store.dir()).unwrap().count(), 0);
+
+        std::fs::set_permissions(store.dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = probe_file_store(&store).unwrap_err();
+        assert!(format!("{err:#}").contains("0755"), "{err:#}");
+        let mode = std::fs::metadata(store.dir()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        std::fs::set_permissions(store.dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        probe_file_store(&store).unwrap();
+        assert!(store.dir().exists());
+        assert_eq!(std::fs::read_dir(store.dir()).unwrap().count(), 0);
+
+        // A home the user cannot write to is the failure a commit would meet. Root writes
+        // anywhere, so for it the case has no meaning.
+        // SAFETY: geteuid takes no arguments, cannot fail and touches no memory.
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::remove_dir(store.dir()).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+            assert!(probe_file_store(&store).is_err());
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    /// Off Unix the store refuses before touching the filesystem: a failed call leaves no
+    /// directory and no plaintext key behind.
+    #[cfg(not(unix))]
+    #[test]
+    fn file_keystore_is_refused_off_unix_without_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = FileKeyStore::new(dir.path().join("keystore"));
+        assert!(keys.set("vault", &[1u8; 32]).is_err());
+        assert!(keys.get("vault").is_err());
+        assert!(keys.delete("vault").is_err());
+        assert!(!keys.dir().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_malformed_key_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = FileKeyStore::new(dir.path().join("keystore"));
+        keys.set("vault", &[3u8; 32]).unwrap();
+        let path = keys.key_path("vault").unwrap();
+        std::fs::write(&path, "not base64!\n").unwrap();
+        assert!(keys.get("vault").is_err());
+        // Valid base64 of the wrong length is not a key either.
+        std::fs::write(&path, "AAAA\n").unwrap();
+        assert!(keys.get("vault").is_err());
+    }
+
+    /// The whole vault on the file keystore: the store selected on a machine with no
+    /// credential store must give the same fail-closed vault as the OS store does.
+    #[cfg(unix)]
+    #[test]
+    fn vault_on_the_file_keystore_roundtrips_and_fails_closed_without_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VaultStore::new(
+            dir.path().join("secret-filter").join("vault.json"),
+            FileKeyStore::new(dir.path().join("keystore")),
+        );
+        store
+            .add(
+                "memorable",
+                Zeroizing::new("correct horse battery".into()),
+                false,
+            )
+            .unwrap();
+        let matcher = store.matcher().unwrap();
+        assert_eq!(matcher.find("say correct horse battery now").len(), 1);
+        let disk = std::fs::read_to_string(dir.path().join("secret-filter/vault.json")).unwrap();
+        assert!(!disk.contains("correct horse battery"));
+        // The key lives beside the vault directory, not inside it.
+        assert!(
+            std::fs::read_dir(dir.path().join("keystore"))
+                .unwrap()
+                .count()
+                == 1
+        );
+        assert!(!dir.path().join("secret-filter").join("keystore").exists());
+        let file = read_vault(&dir.path().join("secret-filter/vault.json")).unwrap();
+        store.keys.delete(&file.vault_id).unwrap();
+        assert!(store.status().is_err());
+        assert!(store.matcher().is_err());
     }
 
     #[test]
