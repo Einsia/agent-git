@@ -103,12 +103,12 @@ is gone the moment it exits, and that stretch turns blank.
 screen": the name is this session's identity in version control, and it and its
 result both leave a trace.
 
-## 3. Four screens
+## 3. The screens
 
 ### 3.1 Bare `agit` / `agit resume` — which one to continue
 
 ```text
-┌ agit ── nana @ agent-git.com ── ⚠ 2 unnamed ──────────────────────────┐
+┌ agit ── nana @ agent-git.com ── rc: online ── ⚠ 2 unnamed ───────────┐
 │  sessions                          │  refund-fix                      │
 │ ─────────────────────────────────  │ ──────────────────────────────── │
 │ ▸ ● here    payments/refund-fix    │  repo     nana/payments          │
@@ -126,10 +126,47 @@ Three sources:
 | `same-repo` | a branch in the same code repo |
 | `unnamed` | a session that exists in the runtime but is not managed yet |
 
-**`unnamed` sorts to the top**, because those rows need an action from the user
-while the rest merely can be continued. A to-do buried twenty rows down is no
-to-do at all. Naming is itself an explicit action: the interface does not decide
-for the user, it only hands over an `agit import` command that pastes as is.
+All three sources share one recency axis; on an exact tie an adopted session
+comes first. The status bar keeps the number of `unnamed` sessions visible
+without letting the badge split the list into a second ordering rule.
+
+Every screen also carries one bounded snapshot of `agit rc status`. The probe
+runs before the alternate screen is entered and is refreshed after a runtime
+handoff, so a slow control socket cannot freeze an already captured terminal.
+The bar says `rc: online` only when the daemon reports a live hub connection;
+every other outcome is the conservative `rc: offline`.
+
+Naming is itself an explicit action: the interface does not decide the repo or
+branch. When unnamed sessions exist, the naming inbox opens before this list,
+both on initial entry and after a runtime hands the terminal back. Enter on an
+unnamed row opens the same inbox again.
+
+```text
+┌ agit name ── nana @ agent-git.com ── ⚠ 2 unnamed ────────────────────┐
+│  sessions to name                  │  runtime  claude-code           │
+│ ─────────────────────────────────  │  session  a3f9c1…               │
+│ ▸ claude-code  a3f9c1…             │                                │
+│     fix the flaky retry            │  repo     nana/payments         │
+│   codex  7b21ee…                    │  branch   flaky-test_           │
+└───────────────────────────────────────────────────────────────────────┘
+ ↑↓ session   tab repo   enter name   s skip   x ignore   q quit
+```
+
+`Tab` changes the destination repo; branch editing has its own mode so command
+keys remain typeable as branch-name characters. Enter adopts through the same
+`agit import <id> --from <runtime> --into <owner/repo>@<branch>` path as the
+CLI, with its output on the normal screen. `s` skips only this visit and leaves
+the session in the inbox for next time. `x` records a persistent dismissal, for
+sessions that should never enter version control. The runtime is part of every
+identity, so equal ids from two runtime indexes are never conflated.
+
+SessionStart hooks also make the state visible while the runtime owns the
+terminal. Claude titles managed sessions `agit <owner/repo>@<branch>` and
+unmanaged sessions `agit: unnamed`; both Claude and Codex give the agent the
+explicit `agit import` form for an unmanaged session if the user asks to save
+the conversation. Codex exposes no SessionStart title field, so its managed
+sessions need no response. Compacting an existing conversation does not reapply
+the Claude title, because that would replace a later name chosen by the user.
 
 `●` / `○` is "the transcript file has grown within the last 90 seconds". A live
 session must not be taken over by a second writer — once two streams of appends
@@ -213,15 +250,59 @@ list on the left, the conversation on the right.
 * text no runtime recognizes is handed over unchanged. Blank reads as "this turn
   has no content" when the fact is that it was not understood.
 
+### 3.5 `agit import` — adopt an existing conversation
+
+With no arguments, import lists the unmanaged runtime sessions under the current
+directory. The selected row shows its opening prompt, destination repo and the
+new session branch; `Tab` changes repo and `l` switches to `--link-only`, which
+needs neither a sign-in nor a destination. A session that still looks active is
+left for its own terminal to finish first.
+
+The screen creates nothing. It leaves the alternate screen and fills in the
+ordinary `agit import <id> --from <runtime> --into <repo>@<branch>` arguments, or
+the equivalent `--link-only` form. Permission checks, branch creation, linking
+and the opening settlement all stay on the command path.
+
+### 3.6 `agit init` — create the file line
+
+With no arguments, init opens a wizard for the repository name, directory
+binding and optional project assets. The directory name is shown as a
+suggestion but is never copied into the field: typing the name is the action
+that chooses it. The owner is the signed-in account, or `local` while offline.
+
+Seed selection is a separate checklist and begins empty. `AGENTS.md`,
+`CLAUDE.md` and discovered skills may contain private memory, so each item must
+be selected explicitly. The wizard then leaves the alternate screen and the
+ordinary init path performs conflict checks, creates `main`, copies exactly the
+selected assets and binds the directory.
+
+### 3.7 `agit config` — effective and stored values
+
+With no arguments, config opens all supported global keys in one editor. Each
+row names the source of its effective value: environment, stored, default or
+unset. The detail pane keeps the effective and stored values on separate lines.
+For `hub.url`, it also shows the current `AGIT_HUB_URL` value and explains when
+that environment variable masks the file.
+
+`Enter` edits the stored value through the command's existing value-domain
+checks, and `u` removes it. An environment override remains effective after
+either operation, so the screen never implies that changing `config.json` can
+change the current process environment. Explicit key/value and `--list` forms
+keep their command-line behavior.
+
 ## 4. Two disciplines
 
 ### 4.1 The list does not parse transcripts
 
 The cost of opening a screen must not grow linearly with the number of sessions,
-branches or repos. So every screen's data layer is a **pure function**: it
-receives metadata that has already been fetched, and has no filesystem. "The
-first frame parses no transcript" is therefore not a rule enforced by
-remembering, but something the types make impossible.
+branches or repos. List data therefore comes from metadata gathered without
+parsing transcripts, and filtering never refetches it.
+
+Import has one bounded exception: Claude has no indexed opening prompt, and a
+column of ids does not identify conversations to a person. It parses only the
+selected candidate on demand and caches the result; moving the cursor may parse
+one more. Codex supplies that preview from its index without opening the
+transcript. Candidates that were never inspected cost no transcript reads.
 
 The fetching layer stands on its own and **asks git in batches**: the cost of a
 per-item `git show` is almost entirely process startup — on this machine 12
@@ -275,9 +356,29 @@ it into "on", the worst kind of counter-intuitive.
 
 Here: session selection (bare `agit` / `agit resume`), repo selection
 (`agit new`), the timeline (`agit log`), transcript reading (`agit show --tui`
-and enter from the timeline), and the terminal handoff running through all of
-them.
+and enter from the timeline), session adoption (`agit import`), and the terminal
+handoff running through all of them.
 
-Not here: an interface form for `agit config`, `agit init` or `agit import`.
-With no arguments they still take the existing inline prompts, and function is
-unaffected.
+All zero-argument interface forms in this document now use the shared shell.
+
+## 8. Runtime validation
+
+The Codex hook contract has an executable end-to-end probe at
+[`../scripts/codex-hook-probe.py`](../scripts/codex-hook-probe.py). It creates
+an isolated home, installs the hooks through `agit setup`, starts one real
+managed Codex turn, captures the `SessionStart` and `Stop` payloads, and checks
+that the Stop hook advances the selected AgentGit branch. It also runs Codex
+with a non-default `CODEX_HOME`, which keeps session discovery, hook
+installation, and transcript settlement on the same configured root.
+
+Run it after building the debug binary:
+
+```bash
+cargo build
+scripts/codex-hook-probe.py
+```
+
+The probe requires an installed Codex CLI with hooks enabled and an existing
+Codex login. It copies only `auth.json` into a temporary directory and removes
+that directory on exit. AgentGit uses a temporary local-only author identity;
+the probe neither copies AgentGit credentials nor contacts an AgentGit Hub.

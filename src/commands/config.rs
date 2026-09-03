@@ -54,6 +54,27 @@ pub struct Args {
     pub list: bool,
 }
 
+/// Where the effective value shown by the editor comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Environment,
+    Stored,
+    Default,
+    Unset,
+}
+
+/// One config row, keeping the effective and persisted values separate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub key: &'static str,
+    pub description: &'static str,
+    pub effective: Option<String>,
+    pub stored: Option<String>,
+    pub source: Source,
+    pub environment_name: Option<&'static str>,
+    pub environment: Option<String>,
+}
+
 /// The entry point other commands read config through; that `AGIT_HUB_URL` takes priority is a
 /// rule of the `config` module.
 pub fn get(key: &str) -> Option<String> {
@@ -61,6 +82,18 @@ pub fn get(key: &str) -> Option<String> {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    if wants_tui(&args) {
+        match crate::tui::should_enter() {
+            crate::tui::Verdict::Enter => {
+                crate::tui::screens::configuration::edit()?;
+                return Ok(ExitCode::Ok);
+            }
+            crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
+            crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
+            crate::tui::Verdict::Skip => {}
+        }
+    }
+
     if args.list {
         let stored = config::list_global()?;
         for (key, desc) in KEYS {
@@ -136,8 +169,79 @@ pub fn run(args: Args) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
+/// Read every row once for the editor without conflating an environment override with a stored
+/// value.
+pub(crate) fn collect() -> crate::Result<Vec<Entry>> {
+    let stored = config::list_global()?;
+    Ok(KEYS
+        .into_iter()
+        .map(|(key, description)| {
+            entry_for(
+                key,
+                description,
+                stored.get(key).cloned(),
+                config::global_env_name(key),
+                config::global_env_override(key).map(|(_, value)| value),
+            )
+        })
+        .collect())
+}
+
+fn entry_for(
+    key: &'static str,
+    description: &'static str,
+    persisted: Option<String>,
+    environment_name: Option<&'static str>,
+    environment: Option<String>,
+) -> Entry {
+    let (effective, source) = if let Some(value) = &environment {
+        (Some(value.clone()), Source::Environment)
+    } else if let Some(value) = &persisted {
+        (Some(value.clone()), Source::Stored)
+    } else if let Some(value) = default_value(key) {
+        (Some(value.to_string()), Source::Default)
+    } else {
+        (None, Source::Unset)
+    };
+    Entry {
+        key,
+        description,
+        effective,
+        stored: persisted,
+        source,
+        environment_name,
+        environment,
+    }
+}
+
+/// Apply one editor action through the same validation and storage path as the CLI.
+pub(crate) fn apply(key: &str, value: Option<&str>) -> crate::Result<()> {
+    if !KEYS.iter().any(|(known, _)| *known == key) {
+        anyhow::bail!("unknown config key `{key}`");
+    }
+    if let Some(value) = value {
+        validate(key, value)?;
+    }
+    config::set_global(key, value)
+}
+
+fn default_value(key: &str) -> Option<&'static str> {
+    match key {
+        "hub.url" => Some(config::DEFAULT_HUB_URL),
+        "push.visibility" => Some("ask"),
+        "commit.auto" => Some("false"),
+        "memory.track" => Some("session"),
+        config::SecretKeystore::KEY => Some(config::SecretKeystore::Os.as_str()),
+        _ => None,
+    }
+}
+
+fn wants_tui(args: &Args) -> bool {
+    args.key.is_none() && args.value.is_none() && !args.unset && !args.list
+}
+
 /// Value-domain check. Failing it is a usage error, not a runtime failure.
-fn validate(key: &str, v: &str) -> crate::Result<()> {
+pub(crate) fn validate(key: &str, v: &str) -> crate::Result<()> {
     let ok = match key {
         "push.visibility" => matches!(v, "ask" | "private" | "public"),
         "commit.auto" => matches!(v, "true" | "false"),
@@ -156,6 +260,26 @@ fn validate(key: &str, v: &str) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct W {
+        #[command(flatten)]
+        args: super::Args,
+    }
+
+    #[test]
+    fn only_the_zero_argument_form_enters_the_config_editor() {
+        assert!(wants_tui(&W::try_parse_from(["x"]).unwrap().args));
+        for argv in [
+            vec!["x", "hub.url"],
+            vec!["x", "hub.url", "https://example.test"],
+            vec!["x", "--list"],
+            vec!["x", "--unset", "hub.url"],
+        ] {
+            assert!(!wants_tui(&W::try_parse_from(argv).unwrap().args));
+        }
+    }
 
     #[test]
     fn validate_known_keys() {
@@ -172,5 +296,50 @@ mod tests {
         assert!(validate("secrets.keystore", "os").is_ok());
         assert!(validate("secrets.keystore", "file").is_ok());
         assert!(validate("secrets.keystore", "keychain").is_err());
+    }
+
+    #[test]
+    fn secret_keystore_projects_environment_stored_and_default_sources() {
+        let description = KEYS
+            .iter()
+            .find(|(key, _)| *key == config::SecretKeystore::KEY)
+            .unwrap()
+            .1;
+        let environment = entry_for(
+            config::SecretKeystore::KEY,
+            description,
+            Some("os".into()),
+            Some(config::SecretKeystore::ENV),
+            Some("file".into()),
+        );
+        assert_eq!(environment.effective.as_deref(), Some("file"));
+        assert_eq!(environment.stored.as_deref(), Some("os"));
+        assert_eq!(environment.source, Source::Environment);
+        assert_eq!(
+            environment.environment_name,
+            Some(config::SecretKeystore::ENV)
+        );
+
+        let stored = entry_for(
+            config::SecretKeystore::KEY,
+            description,
+            Some("file".into()),
+            Some(config::SecretKeystore::ENV),
+            None,
+        );
+        assert_eq!(stored.effective.as_deref(), Some("file"));
+        assert_eq!(stored.source, Source::Stored);
+        assert_eq!(stored.environment_name, Some(config::SecretKeystore::ENV));
+
+        let default = entry_for(
+            config::SecretKeystore::KEY,
+            description,
+            None,
+            Some(config::SecretKeystore::ENV),
+            None,
+        );
+        assert_eq!(default.effective.as_deref(), Some("os"));
+        assert_eq!(default.source, Source::Default);
+        assert_eq!(default.environment_name, Some(config::SecretKeystore::ENV));
     }
 }

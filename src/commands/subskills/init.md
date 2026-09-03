@@ -15,6 +15,10 @@ Create a new local Agent repo:
 
 Initialize the `main` file line and the `AGENTS.md`, `memory/`, and `skills/` scaffold. The current directory is bound to the repo by default. `init` does not create a session or import the current conversation.
 
+On a TTY, the zero-argument form opens a full-screen wizard for the explicit name, binding, and
+item-by-item seed choices. It leaves the alternate screen before the ordinary init path writes or
+prints anything. Explicit options and non-interactive calls retain the command-line path.
+
 ## Synopsis
 
 ```bash
@@ -35,6 +39,7 @@ agit init [<name>] [--seed] [--private] [--no-bind | --rebind]
 | `-q, --quiet` | Reduce output |
 | `-C, --directory <dir>` | Run in the given directory |
 | `--no-color` | Disable color |
+| `--tui` / `--no-tui` | Force or forbid the full-screen interface; machine-output flags still forbid it |
 | `-h, --help`, `-V, --version` | Show help or version |
 
 ## Examples

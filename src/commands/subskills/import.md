@@ -9,6 +9,11 @@ description: Adopt an existing runtime transcript into an Agent repo session bra
 
 Import an existing Codex, Claude Code, or other runtime session into AgentGit. Import creates or binds a real `refs/heads/<branch>` and stores the transcript as context; a workspace binding does not select the correct repo automatically.
 
+On a TTY, the zero-argument form opens the naming inbox for unmanaged sessions.
+Select a session, choose its destination repo, and enter a branch name; the
+screen then leaves the alternate buffer before the ordinary import path runs.
+Explicit arguments and non-interactive calls retain the command-line path.
+
 ## Synopsis
 
 ```bash
@@ -28,6 +33,7 @@ agit import [session] --repo <owner/name> -b <branch> [options]
 | `--onto <ref>` | Attach imported content to an existing ref |
 | `--privacy` | Adopt a privacy-redacted transcript copy (currently Claude Code only) |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
+| `--tui` / `--no-tui` | Force or forbid the full-screen interface; machine-output flags still forbid it |
 
 ## Scenarios and examples
 

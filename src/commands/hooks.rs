@@ -6,7 +6,9 @@
 //!   answer** to "which session is running now", see below.
 //! * **`settle` (Stop)**: a turn ended, so settle it.
 //!
-//! Always silent, always exit 0: a hook failure must not disturb the session.
+//! Always exit 0: a hook failure must not disturb the session. `settle` stays silent; `ingest`
+//! may return one valid SessionStart JSON response so the runtime can expose the session state.
+//! Failures and sessions that are none of agit's business produce no output.
 //!
 //! # Why SessionStart is authoritative and `AGIT_SESSION` is not
 //!
@@ -117,10 +119,8 @@ struct Event {
     source: Source,
 }
 
-fn read_event() -> Option<Event> {
-    let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&buf).ok()?;
+fn parse_event(buf: &str) -> Option<Event> {
+    let v: serde_json::Value = serde_json::from_str(buf).ok()?;
     let sid = v.get("session_id")?.as_str()?.to_string();
     if sid.is_empty() {
         return None;
@@ -137,6 +137,12 @@ fn read_event() -> Option<Event> {
         transcript_path: get("transcript_path"),
         source: Source::parse(v.get("source").and_then(|s| s.as_str())),
     })
+}
+
+fn read_event() -> Option<Event> {
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf).ok()?;
+    parse_event(&buf)
 }
 
 /// Which runtime is calling us.
@@ -235,13 +241,15 @@ pub fn concerns_us(bound: bool, env_session: bool) -> bool {
 }
 
 fn ingest(runtime: Option<&str>) -> CmdResult {
-    // Any failure exits 0 silently. Nobody reads stderr in a hook, and an error disturbs the
-    // session.
-    let _ = ingest_inner(runtime);
+    // Any failure exits 0 silently. The only stdout allowed here is one complete response the
+    // hook harness understands; diagnostics would corrupt that protocol.
+    if let Some(response) = ingest_inner(runtime) {
+        println!("{response}");
+    }
     Ok(ExitCode::Ok)
 }
 
-fn ingest_inner(runtime: Option<&str>) -> Option<()> {
+fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     let ev = read_event()?;
     let env_session = super::context::from_session_env();
 
@@ -302,7 +310,58 @@ fn ingest_inner(runtime: Option<&str>) -> Option<()> {
     // session environment. With no binding, write `unset` — an empty value sends agit down the
     // full context resolution chain; a stale wrong value makes it confidently do the wrong thing.
     write_session_env(&ev.session_id, env_value.as_deref());
-    Some(())
+    session_annotation(rt, ev.source, &ev.session_id, env_value.as_deref())
+}
+
+/// The SessionStart response the runtime may show or add to the conversation.
+///
+/// `compact` is deliberately excluded: it happens after the session has already started, when the
+/// user may have renamed it. Reapplying our title there would overwrite that explicit choice.
+/// Unknown sources are excluded for the same reason — output is safe only when the event is known
+/// to represent entering a session. Codex accepts the same response envelope but has no
+/// `sessionTitle` field, so a managed Codex session needs no response and an unmanaged one receives
+/// only the adoption context.
+fn session_annotation(
+    runtime: &str,
+    source: Source,
+    session_id: &str,
+    binding: Option<&str>,
+) -> Option<serde_json::Value> {
+    if !matches!(source, Source::Startup | Source::Resume | Source::Clear) {
+        return None;
+    }
+
+    let additional_context = binding.is_none().then(|| {
+        format!(
+            "This session is not under agit version control yet. If the user asks to save, name, or publish it, ask for the target if needed, then run `agit import {} --from {runtime} --into <owner/repo>@<branch>`.",
+            sh_quote(session_id)
+        )
+    });
+    if runtime == "codex" && additional_context.is_none() {
+        return None;
+    }
+    if !matches!(runtime, "claude-code" | "codex") {
+        return None;
+    }
+
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "hookEventName".into(),
+        serde_json::Value::String("SessionStart".into()),
+    );
+    if runtime == "claude-code" {
+        let title = binding
+            .map(|binding| format!("agit {binding}"))
+            .unwrap_or_else(|| "agit: unnamed".to_string());
+        output.insert("sessionTitle".into(), serde_json::Value::String(title));
+    }
+    if let Some(context) = additional_context {
+        output.insert(
+            "additionalContext".into(),
+            serde_json::Value::String(context),
+        );
+    }
+    Some(serde_json::json!({ "hookSpecificOutput": output }))
 }
 
 /// Write the binding into the harness's "session environment" file.
@@ -458,6 +517,50 @@ mod tests {
         assert_eq!(Source::parse(None), Source::Other);
     }
 
+    /// The parser accepts the fields emitted by Codex hooks and ignores event-specific additions.
+    /// SessionStart and Stop carry different optional fields, so requiring their full objects to
+    /// match would make settlement disappear when Codex adds metadata.
+    #[test]
+    fn live_codex_payload_shapes_parse_to_the_same_session() {
+        let start = super::parse_event(
+            r#"{
+                "session_id":"01a062f9-e70d-78b1-b14e-c48fa1cea69b",
+                "transcript_path":"/tmp/codex/sessions/rollout.jsonl",
+                "cwd":"/tmp/work",
+                "hook_event_name":"SessionStart",
+                "model":"gpt-5.6-sol",
+                "permission_mode":"bypassPermissions",
+                "source":"startup"
+            }"#,
+        )
+        .expect("SessionStart payload must parse");
+        let stop = super::parse_event(
+            r#"{
+                "session_id":"01a062f9-e70d-78b1-b14e-c48fa1cea69b",
+                "transcript_path":"/tmp/codex/sessions/rollout.jsonl",
+                "cwd":"/tmp/work",
+                "hook_event_name":"Stop",
+                "last_assistant_message":"CODEX_HOOK_PROBE_OK",
+                "model":"gpt-5.6-sol",
+                "permission_mode":"bypassPermissions",
+                "stop_hook_active":false,
+                "turn_id":"01a062f9-e760-7362-b0c0-de319632e620"
+            }"#,
+        )
+        .expect("Stop payload must parse");
+
+        assert_eq!(start.session_id, stop.session_id);
+        assert_eq!(start.cwd.as_deref(), Some("/tmp/work"));
+        assert_eq!(stop.cwd.as_deref(), Some("/tmp/work"));
+        assert_eq!(
+            start.transcript_path.as_deref(),
+            Some("/tmp/codex/sessions/rollout.jsonl")
+        );
+        assert_eq!(start.transcript_path, stop.transcript_path);
+        assert_eq!(start.source, Source::Startup);
+        assert_eq!(stop.source, Source::Other);
+    }
+
     /// Claiming happens only on startup.
     ///
     /// On `/resume`, `AGIT_SESSION` names the session current **at launch**, while the id in the
@@ -534,6 +637,84 @@ mod tests {
         // With nothing to go on, fall back to the runtime that installs this hook into
         // settings.json.
         assert_eq!(super::runtime_of(None, None), "claude-code");
+    }
+
+    /// A managed session exposes its exact destination without adding instructions that could
+    /// make an agent attempt to adopt it again.
+    #[test]
+    fn a_managed_session_is_labeled_with_its_binding() {
+        assert_eq!(
+            super::session_annotation(
+                "claude-code",
+                Source::Resume,
+                "SID-A",
+                Some("einsia/payments@flaky-test"),
+            ),
+            Some(serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "sessionTitle": "agit einsia/payments@flaky-test",
+                }
+            }))
+        );
+    }
+
+    /// An unmanaged session gets both the visible state and a command containing its real runtime
+    /// identity. Quoting the id keeps the suggested shell command one argument even if a future
+    /// runtime widens its id alphabet.
+    #[test]
+    fn an_unmanaged_session_gets_actionable_adoption_context() {
+        let response =
+            super::session_annotation("claude-code", Source::Clear, "sid with ' quote", None)
+                .unwrap();
+        let output = &response["hookSpecificOutput"];
+        assert_eq!(output["hookEventName"], "SessionStart");
+        assert_eq!(output["sessionTitle"], "agit: unnamed");
+        let context = output["additionalContext"].as_str().unwrap();
+        assert!(
+            context.contains(
+                "agit import 'sid with '\\'' quote' --from claude-code --into <owner/repo>@<branch>"
+            ),
+            "{context}"
+        );
+    }
+
+    /// Codex accepts the same hook envelope and adoption context, but its SessionStart schema has
+    /// no title field. Adding Claude's field makes the whole response invalid instead of merely
+    /// ignoring the field, so the two payloads must differ exactly here.
+    #[test]
+    fn an_unmanaged_codex_session_gets_context_without_a_title() {
+        assert_eq!(
+            super::session_annotation("codex", Source::Startup, "SID-C", None),
+            Some(serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "This session is not under agit version control yet. If the user asks to save, name, or publish it, ask for the target if needed, then run `agit import 'SID-C' --from codex --into <owner/repo>@<branch>`.",
+                }
+            }))
+        );
+    }
+
+    /// Reapplying a title after the user can rename the session loses their explicit choice.
+    /// Unknown runtimes also stay silent rather than receiving another runtime's JSON schema.
+    #[test]
+    fn annotation_is_limited_to_verified_session_entry_events() {
+        for source in [Source::Compact, Source::Other] {
+            assert!(
+                super::session_annotation("claude-code", source, "SID-A", None).is_none(),
+                "{source:?}"
+            );
+        }
+        assert!(
+            super::session_annotation(
+                "codex",
+                Source::Startup,
+                "SID-A",
+                Some("einsia/payments@work"),
+            )
+            .is_none()
+        );
+        assert!(super::session_annotation("cursor", Source::Startup, "SID-A", None).is_none());
     }
 
     /// A value written out must parse back: a recorded namespace is used as recorded, an

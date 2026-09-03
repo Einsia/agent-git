@@ -38,6 +38,23 @@ pub struct Args {
 
 pub fn run(args: Args) -> CmdResult {
     let cwd = std::env::current_dir()?;
+    // `show` has its own `--tui` flag because, unlike the other entry points, it never opens the
+    // interface implicitly. Once it is requested, the common arbitration still owns every other
+    // rule: an explicit off switch wins, an agent-session guard is overridden, and a missing
+    // terminal is an error instead of a silent fallback.
+    let use_tui = match tui_verdict(args.tui, crate::tui::Signals::from_process()) {
+        None | Some(crate::tui::Verdict::Skip) => false,
+        Some(crate::tui::Verdict::Enter) => true,
+        Some(crate::tui::Verdict::Explain(note)) => {
+            crate::tui::warn_skipped(&note);
+            false
+        }
+        Some(crate::tui::Verdict::NoTerminal) => {
+            ui::error("--tui needs an interactive terminal.");
+            ui::hint("in pipes or CI, use the default line output");
+            return Ok(ExitCode::Interactive);
+        }
+    };
     // Reference-syntax fast path: `ref#n` / `ref#n.k` / `ref:path` / a repo qualifier with `@`.
     // Everything that enters this path resolves by the PRD reference syntax (see domain::refs).
     if let Some(t) = &args.target
@@ -56,7 +73,7 @@ pub fn run(args: Args) -> CmdResult {
     // the store (whose target is a session id).
     if let Some(t) = &args.target
         && args.agent.is_none()
-        && !args.tui
+        && !use_tui
     {
         match names_local_ref(t) {
             Ok(true) => return Ok(show_ref(t, &args).unwrap_or(ExitCode::Ref)),
@@ -97,16 +114,7 @@ pub fn run(args: Args) -> CmdResult {
     // Scoped to the `--agent` arm instead, `agit show --tui` without `--agent` silently degrades
     // to line output: an explicitly given flag does nothing, and in a pipe it does not even
     // return `Interactive` — a script concludes the interface was opened.
-    if args.tui {
-        if !ui::is_tty() {
-            ui::error("--tui needs an interactive terminal.");
-            ui::hint("in pipes or CI, use the default line output");
-            // `Interactive`, not `Usage`: `--tui` in a pipe is not a misused argument, it is a
-            // request that cannot be satisfied. The other entry points (bare `agit`, `log`,
-            // `new`, `resume`) all return this code for the same thing; if this one alone
-            // returned `Usage`, no single check in a script covers them all.
-            return Ok(ExitCode::Interactive);
-        }
+    if use_tui {
         let sessions = match &repo {
             Some(r) => session::list(r),
             // With no target the agit repo bound to the current working directory is already
@@ -244,6 +252,19 @@ pub fn run(args: Args) -> CmdResult {
         println!("\n{}", ui::dim(&format!("web: {url}")));
     }
     Ok(ExitCode::Ok)
+}
+
+/// Decide whether `show` enters its explicitly requested interface.
+///
+/// `Signals::forced` covers the global flag before the subcommand and an exported `AGIT_TUI=1`;
+/// `explicit` covers `show --tui`, whose subcommand-local flag does not write that environment
+/// variable. Both requests have the same precedence once combined.
+fn tui_verdict(explicit: bool, mut signals: crate::tui::Signals) -> Option<crate::tui::Verdict> {
+    if !explicit && !signals.forced {
+        return None;
+    }
+    signals.forced = true;
+    Some(crate::tui::verdict(&signals))
 }
 
 /// Normalize a prefix into the full session identity in the list, then return its position.
@@ -675,6 +696,56 @@ mod tests {
     use crate::domain::repo::Repo;
     use crate::domain::session;
     use crate::domain::transcript;
+
+    fn tui_signals() -> crate::tui::Signals {
+        crate::tui::Signals {
+            interactive: true,
+            forced: false,
+            off: None,
+            agent_session: None,
+        }
+    }
+
+    #[test]
+    fn an_explicit_show_request_keeps_the_common_tui_precedence() {
+        assert_eq!(super::tui_verdict(false, tui_signals()), None);
+        assert_eq!(
+            super::tui_verdict(true, tui_signals()),
+            Some(crate::tui::Verdict::Enter)
+        );
+
+        let mut inside_agent = tui_signals();
+        inside_agent.agent_session = Some(("AGIT_SESSION", "nana/payments@work".into()));
+        assert_eq!(
+            super::tui_verdict(true, inside_agent),
+            Some(crate::tui::Verdict::Enter),
+            "the explicit request overrides only the agent-session guard"
+        );
+
+        let mut off = tui_signals();
+        off.off = Some("--no-tui");
+        assert_eq!(
+            super::tui_verdict(true, off),
+            Some(crate::tui::Verdict::Skip),
+            "an explicit off switch still wins"
+        );
+
+        let mut pipe = tui_signals();
+        pipe.interactive = false;
+        assert_eq!(
+            super::tui_verdict(true, pipe),
+            Some(crate::tui::Verdict::NoTerminal),
+            "a requested interface cannot silently degrade in a pipe"
+        );
+
+        let mut global = tui_signals();
+        global.forced = true;
+        assert_eq!(
+            super::tui_verdict(false, global),
+            Some(crate::tui::Verdict::Enter),
+            "the global flag before `show` is a request too"
+        );
+    }
 
     #[test]
     fn max_chars_bounded_by_default() {

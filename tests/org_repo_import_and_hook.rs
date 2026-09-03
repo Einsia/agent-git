@@ -504,6 +504,18 @@ fn an_org_import_lands_in_the_org_repo_and_the_next_stop_hook_follows_it() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let response: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("SessionStart must return one hook response: {e}"));
+    assert_eq!(
+        response["hookSpecificOutput"]["sessionTitle"],
+        "agit einsia/qa@work"
+    );
+    assert!(
+        response["hookSpecificOutput"]
+            .get("additionalContext")
+            .is_none(),
+        "a managed session must not be told to import itself again: {response}"
+    );
     let written = fs::read_to_string(&env_file).unwrap();
     assert!(
         written.contains("einsia/qa@work"),

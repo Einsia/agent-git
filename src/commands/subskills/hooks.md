@@ -22,7 +22,7 @@ agit hooks settle < hook.json    # Stop
 
 | Subcommand | Event | Meaning |
 |---|---|---|
-| `ingest` | SessionStart | Register the current session according to the payload's `source`: `startup` with `AGIT_SESSION` in the environment claims that branch; `resume` and `clear` only register the session as a candidate for adoption; `compact` leaves the binding alone. It also writes the session's real binding back into the runtime's session environment. |
+| `ingest` | SessionStart | Register the current session according to the payload's `source`: `startup` with `AGIT_SESSION` in the environment claims that branch; `resume` and `clear` only register the session as a candidate for adoption; `compact` leaves the binding alone. It also writes the session's real binding back into the runtime's session environment. Claude sessions receive managed or unnamed titles; unnamed Claude and Codex sessions receive adoption guidance. |
 | `settle` | Stop | Settle the turn that just ended. The target branch is resolved from the payload's `session_id` through the store link — **never from the environment**. A session that was never adopted is not settled. |
 
 ## Options
@@ -34,6 +34,6 @@ agit hooks settle < hook.json    # Stop
 
 ## Notes
 
-Both actions are **always silent and always exit 0** — a failing hook must not disturb the session. `agit config set commit.auto false` turns automatic settlement off.
+Both actions **always exit 0** — a failing hook must not disturb the session. `settle` is silent. A successful Claude SessionStart may return one structured hook response with a session title and, only for an unnamed session, adoption guidance. Codex uses the same response envelope but exposes no title field, so only an unnamed Codex session receives a response, containing adoption guidance. Every other path is silent. `agit config set commit.auto false` turns automatic settlement off.
 
 The input schema is produced by the runtime hook; do not hand-forge it to claim another person's session.

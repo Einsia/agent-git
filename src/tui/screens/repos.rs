@@ -308,6 +308,7 @@ pub fn pick(from: &str) -> crate::Result<Option<Picked>> {
         );
         return Ok(None);
     }
+    widgets::refresh_rc_status();
     let picked = {
         let mut guard = crate::tui::term::Guard::enter()?;
         let out = run_loop(&rows);
@@ -492,6 +493,7 @@ fn draw(
             counters: widgets::Counters::default(),
         },
     );
+    let list_area = widgets::list_area_with_notice(f, panes, notice);
 
     let items: Vec<ListItem> = view.iter().map(|r| ListItem::new(row_lines(r))).collect();
     let title = match filter.hint() {
@@ -503,7 +505,7 @@ fn draw(
             .block(widgets::pane(&title))
             .highlight_style(theme::selected())
             .highlight_symbol("▸ "),
-        panes.list,
+        list_area,
         state,
     );
 

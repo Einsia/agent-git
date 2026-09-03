@@ -3,8 +3,10 @@
 //! # On-disk format
 //!
 //! ```text
-//! ~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl
+//! $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl
 //! ```
+//!
+//! `$CODEX_HOME` defaults to `~/.codex` when it is unset.
 //!
 //! One directory per date, **with no project information in the path**. Direct consequence:
 //! finding "the sessions that belong to a repo" means opening each file and reading
@@ -35,6 +37,7 @@ use super::{
 };
 use crate::Result;
 use anyhow::Context;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 pub struct Codex;
@@ -48,17 +51,31 @@ pub struct Codex;
 pub const CROSS_RUNTIME_OUTPUT_PLACEHOLDER: &str =
     "[agit] this tool call was replayed from another runtime; its output was not carried over.";
 
+fn codex_home_from(configured: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    configured
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(PathBuf::from).map(|path| path.join(".codex")))
+}
+
+pub(super) fn codex_home() -> Result<PathBuf> {
+    codex_home_from(
+        std::env::var_os("CODEX_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .context("neither $CODEX_HOME nor $HOME is set")
+}
+
 fn sessions_root() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("$HOME is not set")?;
-    Ok(PathBuf::from(home).join(".codex").join("sessions"))
+    Ok(codex_home()?.join("sessions"))
 }
 
 /// Read only the leading bytes of a file.
 ///
 /// **This function is performance-critical.** `session_meta` is always on the first line, while a
 /// transcript can run to tens of MB. Reading the whole file degrades "list the sessions that
-/// belong to this repo" to minutes on a machine with many sessions (especially with `~/.codex` on
-/// a network filesystem).
+/// belong to this repo" to minutes on a machine with many sessions (especially with
+/// `$CODEX_HOME` on a network filesystem).
 fn read_head(path: &Path, bytes: usize) -> Option<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
@@ -990,6 +1007,22 @@ fn extract_output_text(output: Option<&serde_json::Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_codex_home_controls_sessions_and_index_location() {
+        assert_eq!(
+            codex_home_from(
+                Some(OsStr::new("/runtime/codex")),
+                Some(OsStr::new("/home/me")),
+            ),
+            Some(PathBuf::from("/runtime/codex"))
+        );
+        assert_eq!(
+            codex_home_from(Some(OsStr::new("")), Some(OsStr::new("/home/me"))),
+            Some(PathBuf::from("/home/me/.codex"))
+        );
+        assert_eq!(codex_home_from(None, None), None);
+    }
 
     #[test]
     fn id_extracted_from_filename() {

@@ -30,6 +30,7 @@ agit config --unset <key>
 | `-q, --quiet` | Reduce output |
 | `-C, --directory <dir>` | Use the given directory |
 | `--no-color` | Disable color |
+| `--tui` / `--no-tui` | Force or forbid the full-screen interface; machine-output flags still forbid it |
 | `-h, --help`, `-V, --version` | Show help or version |
 
 ## Examples
@@ -44,3 +45,7 @@ agit config --unset runtime.default
 ```
 
 Configuration is not session metadata; changing it does not change an existing branch or runtime link.
+
+On a TTY, the zero-argument form opens a full-screen editor. It labels each effective value as
+coming from the environment, stored config, a built-in default, or no source, while showing the
+stored value separately. Explicit arguments and non-interactive calls retain the command-line path.

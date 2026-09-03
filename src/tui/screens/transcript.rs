@@ -296,6 +296,7 @@ fn run(entries: Vec<Entry>, start: usize, title: &str) -> crate::CmdResultAlias 
         println!("nothing to read here.");
         return Ok(crate::ExitCode::Ok);
     }
+    widgets::refresh_rc_status();
     let guard = crate::tui::term::Guard::enter()?;
     let out = event_loop(&entries, start, title);
     // Give the terminal back before letting the result propagate: those words belong on the
