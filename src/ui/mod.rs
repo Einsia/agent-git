@@ -64,6 +64,8 @@ colorize!(ok, green);
 colorize!(warn_text, yellow);
 colorize!(err_text, red);
 
+colorize!(transient, bright_magenta);
+
 /// Errors go to stderr — there they stay visible while `agit log > out.txt` redirects stdout.
 pub fn error(msg: &str) {
     eprintln!("{} {msg}", err_text("error"));
@@ -73,9 +75,10 @@ pub fn warning(msg: &str) {
     eprintln!("{} {msg}", warn_text("note"));
 }
 
-/// The next-step hint.
+/// The next-step hint. Cargo's transient/help style is applied to the complete line so the
+/// message remains legible even when a command is not wrapped in backticks.
 pub fn hint(msg: &str) {
-    eprintln!("{}", dim(&format!("  → {msg}")));
+    eprintln!("{}", transient(&format!("  → {msg}")));
 }
 
 pub fn success(msg: &str) {
