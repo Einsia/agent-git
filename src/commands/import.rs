@@ -106,6 +106,31 @@ enum Pick {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    let mut args = args;
+    // A bare import is a request to choose, not a request to guess. The TUI fills in the same
+    // explicit session and destination arguments the command accepts, then leaves the alternate
+    // screen before this function reaches any precondition or write below. Every non-TTY and
+    // explicitly parameterized call keeps the existing path byte for byte.
+    if wants_tui(&args) {
+        match crate::tui::should_enter() {
+            crate::tui::Verdict::Enter => {
+                let cwd = std::env::current_dir()?;
+                let Some(picked) = crate::tui::screens::adopt::pick(&cwd)? else {
+                    return Ok(ExitCode::Ok);
+                };
+                args.session = Some(picked.session_id);
+                args.from = Some(picked.runtime);
+                args.link_only = picked.link_only;
+                if let Some((slug, branch)) = picked.destination {
+                    args.repo = Some(format!("{slug}@{branch}"));
+                }
+            }
+            crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
+            crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
+            crate::tui::Verdict::Skip => {}
+        }
+    }
+
     // ── 1. Ask the preconditions first, then touch the disk ──
     //
     // Recording a version needs an account name, and import records one by default. Finding out
@@ -310,6 +335,19 @@ pub fn run(args: Args) -> CmdResult {
         landing.rollback();
     }
     outcome
+}
+
+/// Only the actual zero-argument form opens the picker. A flag changes the operation and must not
+/// disappear into a screen that cannot represent it.
+fn wants_tui(args: &Args) -> bool {
+    args.session.is_none()
+        && args.name.is_none()
+        && args.from.is_none()
+        && !args.link_only
+        && args.repo.is_none()
+        && args.branch.is_none()
+        && args.onto.is_none()
+        && !args.privacy
 }
 
 /// Where this import lands, and how to put it back on failure.
@@ -1025,6 +1063,10 @@ fn attach(store: &Store, found: &Found, existing: Option<Link>) -> crate::Result
     if lk.cwd.is_none() {
         lk.cwd = found.cwd.clone();
     }
+    // An explicit import is the user's answer to the naming prompt, including `--link-only`.
+    // Leaving the dismissal set would make the same session disappear again if its claim is
+    // temporarily incomplete.
+    lk.naming_ignored = false;
     link::write(store, &lk)?;
 
     if was_tracked {
@@ -1107,7 +1149,7 @@ fn cwd_of(runtime: &str, session_id: &str, path: &Path) -> Option<String> {
 ///
 /// Codex takes it from the index; Claude Code can only read the file (the only exception, see the
 /// comment at the call site).
-fn gist_for(runtime: &str, session_id: &str, path: &Path) -> String {
+pub(crate) fn gist_for(runtime: &str, session_id: &str, path: &Path) -> String {
     if runtime == "codex"
         && let Some(m) =
             adapter::codex_index::thread_by_id(session_id).and_then(|t| t.first_user_message)
@@ -1132,6 +1174,23 @@ mod tests {
     struct W {
         #[command(flatten)]
         a: super::Args,
+    }
+
+    /// The interface represents the bare command exactly. An option-bearing invocation stays on
+    /// the command path so no requested operation is hidden or dropped by the picker.
+    #[test]
+    fn only_the_zero_argument_form_enters_the_import_picker() {
+        assert!(wants_tui(&W::try_parse_from(["x"]).unwrap().a));
+        for argv in [
+            vec!["x", "SESSION"],
+            vec!["x", "--from", "codex"],
+            vec!["x", "--link-only"],
+            vec!["x", "--privacy"],
+            vec!["x", "--into", "nana/payments@work"],
+        ] {
+            let args = W::try_parse_from(argv).unwrap().a;
+            assert!(!wants_tui(&args));
+        }
     }
 
     /// `main` (the file line) plus someone else's session branch, HEAD parked on the latter —
@@ -1337,6 +1396,24 @@ mod tests {
             claimed_elsewhere(&lk, "notes", "work").as_deref(),
             Some("photo@work")
         );
+    }
+
+    #[test]
+    fn explicit_import_clears_a_naming_dismissal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("store"));
+        let mut existing = Link::new("codex", "AB", Some(Path::new("/repo/one")));
+        existing.naming_ignored = true;
+        let found = Found {
+            runtime: "codex",
+            session_id: "AB".into(),
+            cwd: Some("/repo/one".into()),
+        };
+
+        let attached = attach(&store, &found, Some(existing)).unwrap();
+
+        assert!(!attached.naming_ignored);
+        assert!(!link::get(&store, "codex", "AB").unwrap().naming_ignored);
     }
 
     #[test]

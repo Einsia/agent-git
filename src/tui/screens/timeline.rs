@@ -294,6 +294,7 @@ pub fn run(repo: &Repo, slug: &str, branch: &str, head: &str) -> crate::CmdResul
         branches: None,
         view: View::Turns,
     };
+    widgets::refresh_rc_status();
     let guard = crate::tui::term::Guard::enter()?;
     let out = event_loop(repo, &mut screen);
     // Give the terminal back before letting the result (an error above all) propagate: those

@@ -27,11 +27,17 @@ agit setup [options]
 
 ```bash
 agit setup --runtime codex --skill --mcp --agents-md
+agit setup --runtime codex --hooks
 agit setup --runtime claude-code --hooks
 agit setup --completions zsh
 ```
 
 Run `agit doctor` after installation. Hooks may commit at Stop/turn boundaries, but ordinary CLI use still needs an explicit `push`.
+
+Claude hooks are merged into `~/.claude/settings.json`. Codex hooks are merged into
+`$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) only when `codex features list` reports the
+hooks capability. Codex may ask the user to trust the installed commands before running them; agit
+does not grant that trust on the user's behalf.
 
 The native Skill targets are:
 

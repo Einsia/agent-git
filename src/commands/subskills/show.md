@@ -19,9 +19,8 @@ agit show [session] [options]
 |---|---|
 | `[session]` | Session ID, prefix, or ref; when omitted, show the latest settled session in the AgentGit repo bound to the current directory. If no repo is bound, refuse instead of falling back to the global newest session |
 | `--agent <owner/agent>` | Restrict output to one local agent's sessions |
-| `--tui` | Interactive terminal UI |
 | `--max-chars <count>` | Maximum characters per segment; default 2000 |
-| `--tui` / `--no-tui` | Force or forbid the full-screen interface. `--tui` overrides the agent-session check but not `--json` / `-q` / `-y` |
+| `--tui` / `--no-tui` | Open or forbid the full-screen interface. `--tui` overrides the agent-session check but not `--json`, `-q`, `-y`, or `AGIT_TUI=0` |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
 ## Examples

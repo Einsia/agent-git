@@ -14,6 +14,7 @@
 use crate::ui::theme;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Below this width there are no two panes.
 ///
@@ -110,9 +111,39 @@ pub struct Status {
     pub title: String,
     /// `account @ hub`. `None` when not signed in.
     pub identity: Option<String>,
-    /// Whether `agit rc` is connected. `None` when the screen does not care.
+    /// Whether `agit rc` is connected. `None` uses the shared snapshot when one was collected.
     pub rc_online: Option<bool>,
     pub counters: Counters,
+}
+
+const RC_UNKNOWN: u8 = 0;
+const RC_OFFLINE: u8 = 1;
+const RC_ONLINE: u8 = 2;
+static RC_STATUS: AtomicU8 = AtomicU8::new(RC_UNKNOWN);
+
+/// Refresh the shared daemon snapshot before taking over the terminal.
+///
+/// The probe happens on the ordinary screen so an unresponsive control socket cannot leave a
+/// full-screen interface looking frozen. Every screen then reads the same atomic snapshot.
+pub fn refresh_rc_status() {
+    let value = if crate::commands::rc::tui_online() {
+        RC_ONLINE
+    } else {
+        RC_OFFLINE
+    };
+    RC_STATUS.store(value, Ordering::Relaxed);
+}
+
+fn shared_rc_status() -> Option<bool> {
+    match RC_STATUS.load(Ordering::Relaxed) {
+        RC_ONLINE => Some(true),
+        RC_OFFLINE => Some(false),
+        _ => None,
+    }
+}
+
+fn resolve_rc_status(explicit: Option<bool>, shared: Option<bool>) -> Option<bool> {
+    explicit.or(shared)
 }
 
 impl Status {
@@ -152,6 +183,8 @@ impl Status {
 
 /// Draw the status bar.
 pub fn render_status(f: &mut Frame, area: Rect, status: &Status) {
+    let mut status = status.clone();
+    status.rc_online = resolve_rc_status(status.rc_online, shared_rc_status());
     f.render_widget(Paragraph::new(status.line()), area);
 }
 
@@ -164,6 +197,31 @@ pub fn render_footer(f: &mut Frame, area: Rect, keys: &str) {
         ))),
         area,
     );
+}
+
+/// Render operation feedback above a single-pane list and return the remaining list area.
+///
+/// A detail pane may disappear as the terminal narrows, but validation and persistence failures
+/// must remain visible because they are the only explanation for an action that did not complete.
+pub fn list_area_with_notice(f: &mut Frame, panes: Panes, notice: Option<&str>) -> Rect {
+    let Some(notice) = notice else {
+        return panes.list;
+    };
+    if panes.detail.is_some() || panes.list.height == 0 {
+        return panes.list;
+    }
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(panes.list);
+    f.render_widget(
+        Paragraph::new(clamp_line(
+            Line::from(Span::styled(
+                format!(" {notice}"),
+                Style::default().fg(theme::WARN),
+            )),
+            rows[0].width as usize,
+        )),
+        rows[0],
+    );
+    rows[1]
 }
 
 /// How many columns this text occupies in the terminal.
@@ -403,6 +461,13 @@ mod tests {
             ..quiet
         };
         assert!(busy.line().to_string().contains("2 unnamed"));
+    }
+
+    #[test]
+    fn the_shared_rc_snapshot_fills_only_an_unspecified_status() {
+        assert_eq!(resolve_rc_status(None, Some(true)), Some(true));
+        assert_eq!(resolve_rc_status(Some(false), Some(true)), Some(false));
+        assert_eq!(resolve_rc_status(None, None), None);
     }
 
     /// Being signed out must be said on the status bar — recording a version needs an account

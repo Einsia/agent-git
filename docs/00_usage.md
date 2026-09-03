@@ -78,8 +78,8 @@ note below):
 
 | What        | Where                                              | Effect                                                       |
 | ----------- | -------------------------------------------------- | ------------------------------------------------------------ |
-| hooks       | `~/.claude/settings.json` (**claude-code only**)   | SessionStart registers the session, Stop settles a turn automatically |
-| skill       | `~/.claude/skills/agit/`, `~/.codex/AGENTS.md`, and so on | teaches the agent the `agit commit --milestone` discipline |
+| hooks       | `~/.claude/settings.json`, `$CODEX_HOME/hooks.json` | SessionStart registers the session, Stop settles a turn automatically |
+| skill       | `~/.claude/skills/agit/`, `$CODEX_HOME/skills/agit/`, and so on | teaches the agent the `agit commit --milestone` discipline |
 | MCP         | each runtime's MCP config                          | the agent can `search` / `show` other people's sessions directly |
 | AGENTS.md   | the current project                                | the project-level rules block                                |
 
@@ -87,15 +87,19 @@ Name the one runtime you use, so no config is written for tools you do not have:
 
 ```sh
 agit setup --runtime claude-code
+agit setup --runtime codex --hooks
 cd ~/Projects/payments && agit setup --agents-md     # install just the project-level block
 ```
 
-With hooks installed, Claude Code **settles once every time a turn completes**, and day to day you
-never type `agit commit`. Manual settlement stays useful — see the milestones in 3.2.
+With hooks installed, Claude Code and a hook-capable Codex **settle once every time a turn
+completes**, and day to day you never type `agit commit`. Manual settlement stays useful — see the
+milestones in 3.2.
 
-Hooks are a Claude Code mechanism. codex / opencode / cursor have no equivalent "turn finished"
-callback; the skill above injects the settlement discipline into the agent, and the agent types
-`agit commit` itself at the right moment.
+Codex hook installation is capability-gated by `codex features list`; unsupported installations
+are left untouched. Codex treats user hooks as untrusted until they are reviewed, so it may ask for
+approval before first use or after the installed command changes. OpenCode and Cursor have no
+equivalent "turn finished" callback; the skill above injects the settlement discipline into the
+agent, and the agent types `agit commit` itself at the right moment.
 
 > Running `agit setup --agents-md` repeatedly appends another `<!-- agit:end -->` marker to
 > AGENTS.md every time. When you see a run of extra end markers, delete by hand until one pair is
@@ -107,6 +111,11 @@ callback; the skill above injects the settlement discipline into the agent, and 
 cd ~/Projects/payments
 agit init payments
 ```
+
+At a terminal, bare `agit init` opens the same operation as a full-screen wizard: type the repo
+name, choose whether to bind this directory, and optionally review seed assets. Seed choices start
+empty and the screen closes before the existing init path writes anything. Explicit arguments,
+pipes, CI and agent sessions keep the command-line behavior.
 
 ```
 ✓ repo created: alice/payments (main is the file line; scaffolding in ~/.agit/repos/alice/payments)
@@ -136,6 +145,11 @@ conversation to have a history.
 cd ~/Projects/payments
 agit import                       # no argument: lists the unadopted sessions in this directory
 ```
+
+At a terminal, the zero-argument form opens a full-screen candidate list. Pick a session, choose
+the destination repo with `Tab`, type a new branch, or press `l` for the offline `--link-only`
+path. The screen closes before the ordinary import command writes anything or prints its result.
+Pipes, CI and agent sessions keep the existing inline behavior.
 
 Once you have picked one (or given the id prefix directly):
 
@@ -755,6 +769,10 @@ agit config --list
 agit config runtime.default codex     # write
 agit config runtime.default           # read
 ```
+
+At a terminal, bare `agit config` opens a full-screen editor for every supported key. It shows
+effective and stored values separately, including an active `AGIT_HUB_URL` override. Explicit
+keys, values, `--unset`, `--list`, pipes, CI and agent sessions retain the command-line path.
 
 `hub.url` · `runtime.default` · `push.visibility` · `commit.auto` · `memory.track` (`session | off`,
 whether the runtime's project memory is collected into the session branch, see 3.7) ·

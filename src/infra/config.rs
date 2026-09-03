@@ -196,19 +196,8 @@ const ENV_OVERRIDES: [(&str, &str); 2] = [
 /// Order: **the environment variable** (`hub.url` ← `AGIT_HUB_URL`, `secrets.keystore` ←
 /// `AGIT_SECRETS_KEYSTORE`) > the config file > None (the caller supplies the default).
 pub fn get_global(key: &str) -> Result<Option<String>> {
-    if let Some((_, var)) = ENV_OVERRIDES.iter().find(|(k, _)| *k == key)
-        && let Ok(v) = std::env::var(var)
-    {
-        let v = v.trim();
-        // A hub address is an origin; a trailing slash is not part of the identity.
-        let v = if key == "hub.url" {
-            v.trim_end_matches('/')
-        } else {
-            v
-        };
-        if !v.is_empty() {
-            return Ok(Some(v.to_string()));
-        }
+    if let Some((_, value)) = global_env_override(key) {
+        return Ok(Some(value));
     }
     let path = global_config_path()?;
     let text = match std::fs::read_to_string(&path) {
@@ -218,6 +207,31 @@ pub fn get_global(key: &str) -> Result<Option<String>> {
     let map: std::collections::BTreeMap<String, String> =
         serde_json::from_str(&text).with_context(|| format!("{} is malformed", path.display()))?;
     Ok(map.get(key).cloned())
+}
+
+/// The active environment override for a global key, including the variable that supplied it.
+///
+/// Configuration surfaces use this alongside the file value so an override does not masquerade
+/// as persisted state.
+pub(crate) fn global_env_override(key: &str) -> Option<(&'static str, String)> {
+    let var = global_env_name(key)?;
+    let value = std::env::var(var).ok()?;
+    let value = value.trim();
+    // A hub address is an origin; a trailing slash is not part of the identity.
+    let value = if key == "hub.url" {
+        value.trim_end_matches('/')
+    } else {
+        value
+    };
+    (!value.is_empty()).then(|| (var, value.to_string()))
+}
+
+/// The environment variable that can override a global key, whether or not it is currently set.
+pub(crate) fn global_env_name(key: &str) -> Option<&'static str> {
+    ENV_OVERRIDES
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, var)| *var)
 }
 
 /// Write or delete one global config key (a `value` of None deletes).
@@ -307,17 +321,21 @@ pub fn repo_origin() -> Option<String> {
 /// have to set it anyway, and requiring every ordinary user to export an environment variable
 /// before anything works puts the cost on the wrong people.
 pub fn hub_url() -> String {
-    if let Some(v) = std::env::var("AGIT_HUB_URL")
-        .ok()
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(v) = hub_url_env_override() {
         return v;
     }
     if let Ok(Some(v)) = get_global_file("hub.url") {
         return v;
     }
     DEFAULT_HUB_URL.to_string()
+}
+
+/// The non-empty, normalized `AGIT_HUB_URL` override, when one is active.
+///
+/// Configuration UIs need the source as well as the effective value: a stored value hidden by
+/// the environment must not look as though editing the file will change the running process.
+pub(crate) fn hub_url_env_override() -> Option<String> {
+    global_env_override("hub.url").map(|(_, value)| value)
 }
 
 /// Reads the config file only (no environment lookup), for hub_url to use (avoids recursion).

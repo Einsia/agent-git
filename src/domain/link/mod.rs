@@ -17,7 +17,7 @@
 //! ```json
 //! ```
 //!
-//! # Three fields; the runtime and the id are in the path
+//! # Body fields; the runtime and the id are in the path
 //!
 //! Recording one thing in two places becomes inconsistent one day, and the path is the copy you
 //! hold first when looking a session up — so the body does not repeat `runtime` and
@@ -88,10 +88,17 @@ pub struct Link {
     /// SHA-256 of the baseline region: doctor verifies that "the live transcript has had no
     /// non-append write inside the baseline".
     pub baseline_hash: Option<String>,
+    /// The user dismissed this unclaimed session from the naming inbox. This is presentation
+    /// state, not ownership evidence; an ignored link is still unmanaged until it is claimed.
+    pub naming_ignored: bool,
 }
 
-/// The on-disk form: three fields only, and an empty one omits the key entirely (rather than
-/// writing `null`).
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The on-disk form: optional values are omitted rather than written as `null`, and default
+/// boolean state is omitted so a missing key and an explicit false value have one representation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Body {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,6 +113,8 @@ struct Body {
     baseline_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     baseline_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    naming_ignored: bool,
 }
 
 impl Link {
@@ -119,6 +128,7 @@ impl Link {
             branch: None,
             baseline_bytes: None,
             baseline_hash: None,
+            naming_ignored: false,
         }
     }
 
@@ -130,6 +140,7 @@ impl Link {
             branch: self.branch.clone(),
             baseline_bytes: self.baseline_bytes,
             baseline_hash: self.baseline_hash.clone(),
+            naming_ignored: self.naming_ignored,
         }
     }
 
@@ -237,6 +248,7 @@ pub fn read(path: &Path) -> Option<Link> {
         branch: body.branch,
         baseline_bytes: body.baseline_bytes,
         baseline_hash: body.baseline_hash,
+        naming_ignored: body.naming_ignored,
     })
 }
 
@@ -303,6 +315,31 @@ pub fn latest(store: &Store) -> Option<Link> {
 /// making a new one. This is the one that cannot be filled in after the fact.
 pub fn get(store: &Store, source: &str, session_id: &str) -> Option<Link> {
     read(&link_path(store, source, session_id))
+}
+
+/// Keep an unclaimed session out of the naming inbox.
+///
+/// The read-modify-write is locked because a stale screen action can race with a runtime hook or
+/// an import. A session that became managed while the screen was open wins that race and is left
+/// unchanged; ownership must never acquire presentation state from an obsolete row.
+pub fn dismiss_naming(
+    store: &Store,
+    source: &str,
+    session_id: &str,
+    cwd: Option<&Path>,
+) -> Result<Link> {
+    let _guard = lock(store, source, session_id)?;
+    let mut link =
+        get(store, source, session_id).unwrap_or_else(|| Link::new(source, session_id, cwd));
+    if is_managed(&link) {
+        return Ok(link);
+    }
+    if link.cwd.is_none() {
+        link.cwd = cwd.map(|p| p.to_string_lossy().to_string());
+    }
+    link.naming_ignored = true;
+    write(store, &link)?;
+    Ok(link)
 }
 
 /// Whether there is enough ownership evidence to treat the session as managed by AgentGit.
@@ -426,12 +463,10 @@ mod tests {
         (d, s)
     }
 
-    /// The on-disk form is exactly three fields, no more.
-    ///
-    /// `runtime` / `session_id` are in the path; writing them down again adds one more place that
+    /// `runtime` / `session_id` stay in the path; writing them down again adds one more place that
     /// can disagree.
     #[test]
-    fn body_is_exactly_three_fields() {
+    fn body_omits_path_identity_fields() {
         let (_d, s) = store();
         let mut l = Link::new("codex", "AB", Some(Path::new("/repo/one")));
         l.agent = Some("photo".into());
@@ -461,13 +496,51 @@ mod tests {
     }
 
     #[test]
+    fn naming_dismissal_is_backward_compatible_and_persistent() {
+        let (_d, s) = store();
+        let path = link_path(&s, "codex", "AB");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let old = read(&path).unwrap();
+        assert!(!old.naming_ignored, "an absent field means not dismissed");
+
+        let dismissed = dismiss_naming(&s, "codex", "AB", Some(Path::new("/repo"))).unwrap();
+        assert!(dismissed.naming_ignored);
+        assert_eq!(dismissed.cwd.as_deref(), Some("/repo"));
+        let saved = read(&path).unwrap();
+        assert!(saved.naming_ignored);
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("\"naming_ignored\": true")
+        );
+    }
+
+    #[test]
     fn only_a_claimed_link_is_managed() {
-        let link = Link::new("codex", "s", None);
+        let mut link = Link::new("codex", "s", None);
         assert!(!is_managed(&link));
+        link.naming_ignored = true;
+        assert!(!is_managed(&link), "a dismissal is not an adoption");
 
         let mut claimed = link;
         claimed.agent = Some("paper".into());
         assert!(is_managed(&claimed));
+    }
+
+    #[test]
+    fn a_stale_dismissal_does_not_mark_a_managed_session() {
+        let (_d, s) = store();
+        let mut claimed = Link::new("codex", "AB", Some(Path::new("/repo")));
+        claimed.agent = Some("photo".into());
+        claimed.branch = Some("work".into());
+        write(&s, &claimed).unwrap();
+
+        let result = dismiss_naming(&s, "codex", "AB", Some(Path::new("/other"))).unwrap();
+        assert!(!result.naming_ignored);
+        assert_eq!(result.cwd.as_deref(), Some("/repo"));
+        assert!(!get(&s, "codex", "AB").unwrap().naming_ignored);
     }
 
     #[test]

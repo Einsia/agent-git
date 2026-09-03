@@ -197,7 +197,12 @@ fn qualify(owner: Option<&str>, agent: &str) -> String {
 /// Assemble the three sources into one sorted list. **A pure function, with no filesystem.**
 pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
-    let seen_by_id = |id: &str| input.seen.iter().find(|s| s.id == id);
+    let seen_by_identity = |runtime: &str, id: &str| {
+        input
+            .seen
+            .iter()
+            .find(|s| s.runtime == runtime && s.id == id)
+    };
 
     // ① here: a link whose cwd matches this directory and that is already managed.
     for a in &input.links {
@@ -208,7 +213,7 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
         let (Some(agent), Some(branch)) = (&l.agent, &l.branch) else {
             continue;
         };
-        let s = seen_by_id(&l.session_id);
+        let s = seen_by_identity(&l.source, &l.session_id);
         rows.push(Row {
             badge: Badge::Here,
             // The owner recorded on the link wins: for a session in an org repo (einsia/...)
@@ -237,15 +242,23 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
     // "Unmanaged" covers both no link at all and a link-only record that merely registers
     // existence (the kind `agit hooks ingest` writes) — to the user those are one and the same
     // thing: not named yet.
-    let adopted: std::collections::HashSet<&str> = input
+    let adopted: std::collections::HashSet<(&str, &str)> = input
         .links
         .iter()
         .map(|a| &a.link)
         .filter(|l| l.agent.is_some() && l.branch.is_some())
-        .map(|l| l.session_id.as_str())
+        .map(|l| (l.source.as_str(), l.session_id.as_str()))
+        .collect();
+    let ignored: std::collections::HashSet<(&str, &str)> = input
+        .links
+        .iter()
+        .map(|a| &a.link)
+        .filter(|l| l.naming_ignored)
+        .map(|l| (l.source.as_str(), l.session_id.as_str()))
         .collect();
     for s in &input.seen {
-        if adopted.contains(s.id.as_str()) || !s.worth_naming {
+        let identity = (s.runtime.as_str(), s.id.as_str());
+        if adopted.contains(&identity) || ignored.contains(&identity) || !s.worth_naming {
             continue;
         }
         rows.push(Row {
@@ -378,11 +391,17 @@ fn gather(cwd: &Path, now: SystemTime) -> Input {
         .unwrap_or_default();
 
     // A managed session needs no naming probe — it never enters the naming queue anyway.
-    let adopted: std::collections::HashSet<String> = links
+    let adopted: std::collections::HashSet<(&str, &str)> = links
         .iter()
         .map(|a| &a.link)
         .filter(|l| l.agent.is_some() && l.branch.is_some())
-        .map(|l| l.session_id.clone())
+        .map(|l| (l.source.as_str(), l.session_id.as_str()))
+        .collect();
+    let ignored: std::collections::HashSet<(&str, &str)> = links
+        .iter()
+        .map(|a| &a.link)
+        .filter(|l| l.naming_ignored)
+        .map(|l| (l.source.as_str(), l.session_id.as_str()))
         .collect();
 
     let mut refs: Vec<crate::adapter::SessionRef> = Vec::new();
@@ -400,9 +419,10 @@ fn gather(cwd: &Path, now: SystemTime) -> Input {
     let seen = refs
         .iter()
         .map(|sr| {
-            let needs_probe = !adopted.contains(&sr.id);
+            let identity = (sr.runtime, sr.id.as_str());
+            let needs_probe = !adopted.contains(&identity) && !ignored.contains(&identity);
             let worth = if !needs_probe {
-                false // adopted: not in the naming queue, so this I/O is not spent
+                false // adopted or ignored: not in the naming queue, so this I/O is not spent
             } else if budget == 0 {
                 true // budget spent, so no verdict — keep it rather than hide it
             } else {
@@ -552,9 +572,7 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 pub enum Outcome {
     /// Continue this session line.
     Resume { slug: String, branch: String },
-    /// The selection is a session that has no name yet. The TUI does not decide for the user; it
-    /// only hands over a pasteable adoption command — naming is an explicit action
-    /// (`docs/07_tui.md` §3.1).
+    /// Open the naming inbox on this session. The destination remains an explicit user choice.
     Adopt { runtime: String, session_id: String },
     /// No candidate at all. **Do not enter an empty TUI**: making the user press q to leave an
     /// empty list wastes an interaction (§4.1).
@@ -579,6 +597,7 @@ pub fn run(cwd: &Path) -> crate::CmdResultAlias {
         );
         return Ok(crate::ExitCode::Ok);
     }
+    widgets::refresh_rc_status();
     let mut guard = crate::tui::term::Guard::enter()?;
     let out = resident(&mut guard, cwd, rows);
     // Give the terminal back before letting the result (an error above all) propagate: those
@@ -594,22 +613,40 @@ fn resident(
     cwd: &Path,
     mut rows: Vec<Row>,
 ) -> crate::CmdResultAlias {
+    let mut deferred = std::collections::HashSet::new();
+    let mut naming_focus: Option<super::naming::Identity> = None;
     loop {
+        // The inbox is the first stop whenever a new unclaimed session appears, including after
+        // the runtime hands the terminal back. A skip lives in `deferred` only for this resident
+        // visit; selecting that unnamed row from the Sessions screen removes it and opens the
+        // inbox again.
+        if super::naming::has_pending(&rows, &deferred) {
+            match super::naming::run(&rows, cwd, &mut deferred, naming_focus.as_ref())? {
+                super::naming::Outcome::Quit => return Ok(crate::ExitCode::Ok),
+                super::naming::Outcome::Done => naming_focus = None,
+                super::naming::Outcome::Adopt(choice) => {
+                    naming_focus = None;
+                    let _ = super::naming::execute_import(guard, &choice)?;
+                    rows = collect(cwd);
+                    if rows.is_empty() {
+                        return Ok(crate::ExitCode::Ok);
+                    }
+                    continue;
+                }
+            }
+        }
         match run_loop(&rows)? {
             Outcome::Quit | Outcome::Nothing => return Ok(crate::ExitCode::Ok),
             Outcome::Adopt {
                 runtime,
                 session_id,
             } => {
-                // Naming is an explicit action: do not decide for the user, hand over a
-                // command that pastes as is. It prints on the normal screen, so give the
-                // terminal up first.
-                guard.suspend()?;
-                crate::ui::error("that session isn’t under version control yet.");
-                crate::ui::hint(&format!(
-                    "adopt it first: `agit import {session_id} -n <repo> -b <branch>` ({runtime})"
-                ));
-                return Ok(crate::ExitCode::Precondition);
+                let identity = super::naming::Identity {
+                    runtime,
+                    session_id,
+                };
+                deferred.remove(&identity);
+                naming_focus = Some(identity);
             }
             Outcome::Resume { slug, branch } => {
                 rows = handoff(guard, cwd, &slug, &branch)?;
@@ -654,6 +691,7 @@ fn handoff(
     // Rescan on the way back: new sessions and changes in management are seen at this step.
     // All of it comes from the runtime index and the store; no transcript is opened (§6.3).
     let rows = collect(cwd);
+    widgets::refresh_rc_status();
     guard.resume()?;
     Ok(rows)
 }
@@ -775,6 +813,7 @@ fn draw(
             counters: widgets::Counters { unnamed },
         },
     );
+    let list_area = widgets::list_area_with_notice(f, panes, notice);
 
     let items: Vec<ListItem> = view.iter().map(|r| ListItem::new(row_line(r))).collect();
     let title = match filter.hint() {
@@ -786,7 +825,7 @@ fn draw(
             .block(widgets::pane(&title))
             .highlight_style(theme::selected())
             .highlight_symbol("▸ "),
-        panes.list,
+        list_area,
         state,
     );
 
@@ -980,6 +1019,66 @@ mod tests {
         let rows = assemble(&input, t(20));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].badge, Badge::Here);
+    }
+
+    /// A dismissed session stays out of the naming queue without becoming managed. Runtime is
+    /// part of the identity, so dismissing a Codex id must not hide a Claude session whose id
+    /// happens to match it.
+    #[test]
+    fn a_dismissed_session_is_hidden_only_in_its_runtime() {
+        let mut dismissed = link("A", "/w", None, None);
+        dismissed.link.source = "codex".into();
+        dismissed.link.naming_ignored = true;
+        let input = Input {
+            cwd: "/w".into(),
+            links: vec![dismissed],
+            seen: vec![
+                Seen {
+                    runtime: "codex".into(),
+                    ..seen("A", 20)
+                },
+                seen("A", 10),
+            ],
+            ..Default::default()
+        };
+
+        let rows = assemble(&input, t(100));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].runtime, "claude-code");
+        assert_eq!(rows[0].badge, Badge::Unnamed);
+    }
+
+    /// An adopted row takes activity and summary data from the runtime recorded on its link.
+    /// Session identifiers are runtime-local, so matching only the identifier can borrow another
+    /// runtime's liveness and incorrectly block or permit takeover.
+    #[test]
+    fn an_adopted_session_matches_runtime_and_id() {
+        let mut adopted = link("A", "/w", Some("payments"), Some("refund-fix"));
+        adopted.link.source = "codex".into();
+        let input = Input {
+            cwd: "/w".into(),
+            links: vec![adopted],
+            seen: vec![
+                Seen {
+                    gist: Some("claude summary".into()),
+                    worth_naming: false,
+                    ..seen("A", 95)
+                },
+                Seen {
+                    runtime: "codex".into(),
+                    gist: Some("codex summary".into()),
+                    ..seen("A", 10)
+                },
+            ],
+            ..Default::default()
+        };
+
+        let rows = assemble(&input, t(100));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].runtime, "codex");
+        assert_eq!(rows[0].gist.as_deref(), Some("codex summary"));
+        assert_eq!(rows[0].last_active, t(10));
+        assert!(!rows[0].live);
     }
 
     /// same-repo does not duplicate a branch `here` already lists.

@@ -3,12 +3,9 @@
 //!
 //! * `--hooks`: settle automatically at the end of a turn (silent; a failure never blocks) +
 //!   `AGIT_SESSION` injection + registering a newly opened unadopted session inside a bound
-//!   workspace as pending adoption. Discovery answers only "which ones exist".
-//!
-//!   It never guesses "whose it is" and never creates a branch. hooks are a mechanism only Claude
-//!   Code has (codex / opencode / cursor have no equivalent "end of turn callback"), so their
-//!   discipline rides on instruction injection: the rule in the global instruction file teaches
-//!   the agent to call `agit commit` itself.
+//!   workspace as pending adoption. Discovery answers only "which ones exist". Claude Code and
+//!   hook-capable Codex installations receive the integration; other runtimes keep using the
+//!   instruction-injected `agit commit` discipline.
 //! * `--skill`: install one entrypoint plus command references read on demand into each runtime's
 //!   native Skill directory:
 //!   - claude-code → `~/.claude/skills/agit/`
@@ -183,51 +180,160 @@ const RETIRED_HOOKS: &[(&str, &str)] = &[("Stop", "commit --from-hook")];
 /// The command string of one hook. The exe path can contain spaces, but Claude Code hands
 /// `command` to a shell, so this stays a bare join. Quoting is a separate concern — adding it
 /// here changes the semantics.
-fn hook_command(exe: &str, argv: &[&str]) -> String {
-    format!("{exe} {}", argv.join(" "))
+fn hook_command(exe: &str, argv: &[&str], runtime: Option<&str>) -> String {
+    let mut command = format!("{exe} {}", argv.join(" "));
+    if let Some(runtime) = runtime {
+        command.push_str(&format!(" --runtime {runtime}"));
+    }
+    command
 }
 
-/// Claude Code hooks (~/.claude/settings.json). Idempotent: the same command is never written
-/// twice.
+/// Runtime hook configuration. Each runtime-owned file is merged idempotently, so the same
+/// command is never written twice.
 fn install_hooks(runtime: Option<&str>) -> SetupReport {
-    if !wants(runtime, "claude-code") {
-        return SetupReport::default();
-    }
-    let Some(settings) = home().map(|h| h.join(".claude/settings.json")) else {
-        ui::warning("cannot install Claude Code hooks: HOME is not set");
-        return SetupReport::failure();
-    };
+    let mut report = SetupReport::default();
     let exe = exe_str();
 
-    let mut doc: serde_json::Value = std::fs::read_to_string(&settings)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let hooks = doc
-        .as_object_mut()
-        .expect("settings.json must be an object")
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
+    if wants(runtime, "claude-code") {
+        match home().map(|h| h.join(".claude/settings.json")) {
+            Some(path) => report.merge(install_hook_file(&path, "Claude Code", &exe, None)),
+            None => {
+                ui::warning("cannot install Claude Code hooks: HOME is not set");
+                report.merge(SetupReport::failure());
+            }
+        }
+    }
+
+    if wants(runtime, "codex") {
+        let explicit = matches!(runtime, Some("codex" | "all"));
+        match codex_hooks_capability() {
+            Some(capability) => match codex_home_path().map(|h| h.join("hooks.json")) {
+                Some(path) => {
+                    let installed = install_hook_file(&path, "Codex", &exe, Some("codex"));
+                    report.merge(installed);
+                    if installed.succeeded() {
+                        if capability.enabled {
+                            println!(
+                                "  {} Codex may ask you to trust these hooks when their command changes",
+                                ui::dim("·")
+                            );
+                        } else {
+                            ui::warning(
+                                "Codex hooks are configured but its `hooks` feature is disabled",
+                            );
+                        }
+                    }
+                }
+                None => {
+                    ui::warning("cannot install Codex hooks: HOME and CODEX_HOME are not set");
+                    report.merge(SetupReport::failure());
+                }
+            },
+            None if explicit => {
+                ui::warning("cannot install Codex hooks: this Codex does not report hook support");
+                report.merge(SetupReport::failure());
+            }
+            None => println!("  {} Codex hooks unavailable; skipping", ui::dim("·")),
+        }
+    }
+
+    report
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodexHooksCapability {
+    enabled: bool,
+}
+
+/// Ask the installed Codex whether it knows the hooks feature. Presence is the compatibility
+/// boundary; the version string is not, because downstream builds may add or remove capabilities
+/// without sharing the release numbering of the public binary.
+fn codex_hooks_capability() -> Option<CodexHooksCapability> {
+    let exe = crate::adapter::which("codex")?;
+    let output = std::process::Command::new(exe)
+        .args(["features", "list"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_codex_hooks_capability(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_codex_hooks_capability(output: &str) -> Option<CodexHooksCapability> {
+    output.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "hooks" {
+            return None;
+        }
+        let enabled = fields.last()?.parse().ok()?;
+        Some(CodexHooksCapability { enabled })
+    })
+}
+
+/// Add agit's hooks to one runtime-owned JSON file without replacing malformed or non-object
+/// user configuration. `runtime_flag` makes the payload parser independent of transcript paths.
+fn install_hook_file(
+    path: &Path,
+    label: &str,
+    exe: &str,
+    runtime_flag: Option<&str>,
+) -> SetupReport {
+    let mut doc = match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(doc) => doc,
+            Err(_) => {
+                ui::warning(&format!(
+                    "cannot install {label} hooks: {} is not valid JSON",
+                    path.display()
+                ));
+                return SetupReport::failure();
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(_) => {
+            ui::warning(&format!(
+                "cannot install {label} hooks: failed to read {}",
+                path.display()
+            ));
+            return SetupReport::failure();
+        }
+    };
+    let Some(root) = doc.as_object_mut() else {
+        ui::warning(&format!(
+            "cannot install {label} hooks: {} must contain a JSON object",
+            path.display()
+        ));
+        return SetupReport::failure();
+    };
+    let hooks = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        ui::warning(&format!(
+            "cannot install {label} hooks: `hooks` in {} must be an object",
+            path.display()
+        ));
+        return SetupReport::failure();
+    }
 
     let mut added = 0;
     for (event, argv) in RETIRED_HOOKS {
         added += retire_hook(hooks, event, argv);
     }
     for (event, argv) in HOOKS {
-        added += upsert_hook(hooks, event, &hook_command(&exe, argv));
+        added += upsert_hook(hooks, event, &hook_command(exe, argv, runtime_flag));
     }
     if added > 0 {
-        if write_json(&settings, &doc).is_err() {
-            ui::warning(&format!("failed to write {}", settings.display()));
+        if write_json(path, &doc).is_err() {
+            ui::warning(&format!("failed to write {}", path.display()));
             return SetupReport::failure();
         }
         println!(
-            "  {} hooks → {}",
+            "  {} {label} hooks → {}",
             ui::ok(ui::theme::symbols().check),
-            ui::tilde(&settings)
+            ui::tilde(path)
         );
     } else {
-        println!("  {} hooks already in place", ui::dim("·"));
+        println!("  {} {label} hooks already in place", ui::dim("·"));
     }
     SetupReport::item()
 }
@@ -987,6 +1093,59 @@ mod tests {
         assert!(!wants(Some("codex"), "all")); // a runtime name is no synonym for "all"
     }
 
+    /// Capability presence, not a release number, decides whether writing Codex hooks is safe.
+    #[test]
+    fn codex_hook_capability_comes_from_the_feature_table() {
+        assert_eq!(
+            parse_codex_hooks_capability(
+                "goals stable true\nhooks stable true\nplugins stable true\n"
+            ),
+            Some(CodexHooksCapability { enabled: true })
+        );
+        assert_eq!(
+            parse_codex_hooks_capability("hooks under-development false\n"),
+            Some(CodexHooksCapability { enabled: false })
+        );
+        assert_eq!(parse_codex_hooks_capability("plugins stable true\n"), None);
+    }
+
+    /// Installing into Codex keeps unrelated hooks, names the runtime explicitly, and is
+    /// idempotent. A malformed file is preserved byte for byte instead of being replaced with an
+    /// empty object, because configuration owned by another program is not repairable by guessing.
+    #[test]
+    fn codex_hook_file_is_merged_without_repairing_user_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [{"hooks": [{
+                        "type": "command",
+                        "command": "/usr/bin/user-hook"
+                    }]}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex")).succeeded());
+        let once = std::fs::read_to_string(&path).unwrap();
+        assert!(once.contains("/usr/bin/user-hook"), "{once}");
+        assert!(once.contains("agit hooks ingest --runtime codex"), "{once}");
+        assert!(once.contains("agit hooks settle --runtime codex"), "{once}");
+        assert!(install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex")).succeeded());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
+
+        std::fs::write(&path, "not json\n").unwrap();
+        assert_eq!(
+            install_hook_file(&path, "Codex", "/usr/bin/agit", Some("codex")).failures,
+            1
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json\n");
+    }
+
     /// **The command written out must parse as an agit invocation.**
     ///
     /// This is the root-cause guard for B1: a hook whose subcommand takes no positional argument
@@ -1009,8 +1168,12 @@ mod tests {
         // The command string itself must round-trip to the same argv (the join swallows no
         // argument).
         assert_eq!(
-            hook_command("/usr/bin/agit", HOOKS[0].1),
+            hook_command("/usr/bin/agit", HOOKS[0].1, None),
             "/usr/bin/agit hooks ingest"
+        );
+        assert_eq!(
+            hook_command("/usr/bin/agit", HOOKS[0].1, Some("codex")),
+            "/usr/bin/agit hooks ingest --runtime codex"
         );
     }
 
@@ -1021,7 +1184,7 @@ mod tests {
         let mut hooks = serde_json::json!({});
         for (event, argv) in HOOKS {
             assert_eq!(
-                upsert_hook(&mut hooks, event, &hook_command("agit", argv)),
+                upsert_hook(&mut hooks, event, &hook_command("agit", argv, None)),
                 1
             );
         }
@@ -1031,7 +1194,7 @@ mod tests {
         // Idempotent: the same command is never written twice.
         for (event, argv) in HOOKS {
             assert_eq!(
-                upsert_hook(&mut hooks, event, &hook_command("agit", argv)),
+                upsert_hook(&mut hooks, event, &hook_command("agit", argv, None)),
                 0
             );
         }
@@ -1059,7 +1222,7 @@ mod tests {
             );
         }
         for (event, argv) in HOOKS {
-            upsert_hook(&mut hooks, event, &hook_command("agit", argv));
+            upsert_hook(&mut hooks, event, &hook_command("agit", argv, None));
         }
         let text = hooks.to_string();
         assert!(

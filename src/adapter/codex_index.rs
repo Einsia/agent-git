@@ -6,7 +6,7 @@
 //! "list the sessions belonging to a given repo" otherwise means opening every file to read
 //! `session_meta.cwd`. On this machine that is **18745** rollout files — minutes on NFS.
 //!
-//! The `threads` table in `~/.codex/state_<N>.sqlite` already has that metadata indexed:
+//! The `threads` table in `$CODEX_HOME/state_<N>.sqlite` already has that metadata indexed:
 //!
 //! ```text
 //! threads: 18779 rows
@@ -57,8 +57,7 @@ pub struct Thread {
 /// The name carries a version number (`state_5.sqlite`); take the highest number. None if there
 /// is none.
 pub fn index_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(home).join(".codex");
+    let dir = super::codex::codex_home().ok()?;
     let mut best: Option<(u32, PathBuf)> = None;
     for e in std::fs::read_dir(&dir).ok()? {
         let Ok(e) = e else { continue };
@@ -186,7 +185,7 @@ pub fn thread_by_id(id: &str) -> Option<Thread> {
 mod tests {
     use super::*;
 
-    /// A temporary database for the query logic, with no dependency on a real `~/.codex`.
+    /// A temporary database for the query logic, with no dependency on a real Codex home.
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("state_1.sqlite");
@@ -209,7 +208,7 @@ mod tests {
         (d, p)
     }
 
-    /// Runs the query on a connection directly, bypassing index_path()'s dependency on $HOME.
+    /// Runs the query on a connection directly, bypassing index_path()'s environment dependency.
     /// The SQL stays identical to `threads_for_cwd`.
     fn q_cwd(p: &Path, cwd: &str) -> Vec<Thread> {
         let con = open(p).unwrap();
@@ -283,7 +282,7 @@ mod tests {
     #[test]
     fn picks_highest_numbered_state_db() {
         // The database name carries a version number and the newest one must win. Tested as a
-        // pure function, leaving $HOME alone.
+        // pure function, leaving the process environment alone.
         fn pick(names: &[&str]) -> Option<String> {
             let mut best: Option<(u32, String)> = None;
             for n in names {

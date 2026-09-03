@@ -37,10 +37,33 @@ pub struct Args {
     /// Bind this directory even if it is already bound to another repo.
     #[arg(long, conflicts_with = "no_bind")]
     pub rebind: bool,
+
+    /// Asset choices made by the TUI. `None` means use the ordinary `--seed` policy; `Some`
+    /// carries the exact item-by-item confirmation and must not ask a second time.
+    #[arg(skip)]
+    pub(crate) seed_assets: Option<Vec<(PathBuf, PathBuf)>>,
 }
 
 pub fn run(args: Args) -> CmdResult {
+    let mut args = args;
     let cwd = std::env::current_dir()?;
+
+    if wants_tui(&args) {
+        match crate::tui::should_enter() {
+            crate::tui::Verdict::Enter => {
+                let Some(picked) = crate::tui::screens::initialize::pick(&cwd)? else {
+                    return Ok(ExitCode::Ok);
+                };
+                args.name = Some(picked.name);
+                args.no_bind = !picked.bind;
+                args.seed = picked.seed_assets.is_some();
+                args.seed_assets = picked.seed_assets;
+            }
+            crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
+            crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
+            crate::tui::Verdict::Skip => {}
+        }
+    }
 
     // Name: an explicit argument > under a tty, the directory name as a suggestion that is
     // retyped to confirm > an error without a tty.
@@ -126,7 +149,9 @@ pub fn run(args: Args) -> CmdResult {
     };
     scaffold(repo.root())?;
 
-    let seeded = if args.seed {
+    let seeded = if let Some(picked) = args.seed_assets.as_deref() {
+        copy_seed_assets(repo.root(), picked)?
+    } else if args.seed {
         seed_into(repo.root(), &cwd)?
     } else {
         0
@@ -164,6 +189,17 @@ pub fn run(args: Args) -> CmdResult {
         ));
     }
     Ok(ExitCode::Ok)
+}
+
+/// The wizard represents only the zero-argument command. Flags keep their existing command-line
+/// meaning and never disappear into a form that does not expose them.
+fn wants_tui(args: &Args) -> bool {
+    args.name.is_none()
+        && !args.seed
+        && !args.private
+        && !args.no_bind
+        && !args.rebind
+        && args.seed_assets.is_none()
 }
 
 /// What an existing checkout is, as far as `init` is concerned.
@@ -221,7 +257,11 @@ pub(super) fn seed_into(repo_root: &Path, project: &Path) -> crate::Result<usize
         return Ok(0);
     }
     let picked = pick_assets(&found);
-    for (dst, src) in &picked {
+    copy_seed_assets(repo_root, &picked)
+}
+
+fn copy_seed_assets(repo_root: &Path, picked: &[(PathBuf, PathBuf)]) -> crate::Result<usize> {
+    for (dst, src) in picked {
         let target = repo_root.join(dst);
         if let Some(p) = target.parent() {
             std::fs::create_dir_all(p)?;
@@ -258,7 +298,7 @@ pub(super) fn scaffold(root: &Path) -> Result<(), std::io::Error> {
 }
 
 /// Known asset locations → target paths.
-fn find_seed_assets(cwd: &Path) -> Vec<(PathBuf, PathBuf)> {
+pub(crate) fn find_seed_assets(cwd: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
     for (rel, dst) in [("AGENTS.md", "AGENTS.md"), ("CLAUDE.md", "CLAUDE.md")] {
         let src = cwd.join(rel);
@@ -351,6 +391,29 @@ fn pick_assets(found: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct W {
+        #[command(flatten)]
+        args: super::Args,
+    }
+
+    /// Only the bare form is represented by the wizard; every flag stays on the established CLI
+    /// path so its semantics cannot be lost behind a checkbox that does not exist.
+    #[test]
+    fn only_the_zero_argument_form_enters_the_init_wizard() {
+        assert!(wants_tui(&W::try_parse_from(["x"]).unwrap().args));
+        for argv in [
+            vec!["x", "repo"],
+            vec!["x", "--seed"],
+            vec!["x", "--private"],
+            vec!["x", "--no-bind"],
+            vec!["x", "--rebind"],
+        ] {
+            assert!(!wants_tui(&W::try_parse_from(argv).unwrap().args));
+        }
+    }
 
     /// "Personal memory can carry private content and is never collected silently" — a
     /// non-interactive `--seed` takes nothing.

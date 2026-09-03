@@ -458,7 +458,7 @@ impl CodexDriver {
         self.thread_id.as_deref()
     }
 
-    /// codex writes `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl`.
+    /// codex writes `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl`.
     /// The date path is not knowable up front, so resolve through the adapter's
     /// sqlite index (0.4 ms) once the thread id is known.
     pub fn transcript_path(&self) -> Option<PathBuf> {

@@ -213,14 +213,23 @@ pub fn clear_pidfile() {
 
 /// Send one request and read one reply. Used by the CLI side.
 pub fn ask(req: &Request) -> crate::Result<Reply> {
+    ask_with_timeout(req, CONNECT_TIMEOUT)
+}
+
+/// Send one request with a caller-selected bound for connection and I/O.
+pub(crate) fn ask_with_timeout(
+    req: &Request,
+    timeout: std::time::Duration,
+) -> crate::Result<Reply> {
     let path = socket_path()?;
     // Connect through the **bounded** path, for the same reason the probe does: against a full
     // backlog a blocking connect waits indefinitely on Linux (observed), and this is the path
     // `agit rc status` / `agit rc stop` send their requests on — bounding the probe but not this
     // leaves the commands wedged on the same kernel-level wait.
-    let stream = connect_within(&path, CONNECT_TIMEOUT)
+    let stream = connect_within(&path, timeout)
         .map_err(|e| anyhow::anyhow!("no daemon listening at {}: {e}", path.display()))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let mut w = stream.try_clone()?;
     let mut line = serde_json::to_string(req)?;
     line.push('\n');

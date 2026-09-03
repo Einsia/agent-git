@@ -524,6 +524,19 @@ fn status() -> CmdResult {
     }
 }
 
+/// The daemon connection bit used by the TUI status bar.
+///
+/// A status bar is advisory and must not inherit the command's full wait budget. A missing,
+/// offline, busy or unreadable daemon is conservatively shown as offline; `agit rc status` keeps
+/// the detailed three-way diagnosis.
+pub(crate) fn tui_online() -> bool {
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+    matches!(
+        control::ask_with_timeout(&control::Request::Status, BUDGET),
+        Ok(control::Reply::Status(control::Status { online: true, .. }))
+    )
+}
+
 /// What to say when the daemon cannot be asked.
 ///
 /// # Why "definitely absent" and "cannot tell" stay apart here
