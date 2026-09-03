@@ -19,6 +19,10 @@ agit clone <owner>/<agent>         fetch (with git history) and pick up right aw
 agit upgrade                       upgrade the CLI itself to the latest release the hub announces
 ```
 
+On user-facing startup, `agit` checks for a newer release at most once a day and prints a
+reminder to stderr; it never upgrades automatically. JSON/quiet/CI and internal hook/MCP paths
+skip this reminder.
+
 Adopting and recording the first version are one command — the in-between
 state ("linked, but unversioned") means nothing to anyone. To mark a session
 without versioning it (e.g. offline), pass `--link-only`.

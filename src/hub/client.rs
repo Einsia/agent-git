@@ -113,10 +113,18 @@ fn refresh_gate() -> &'static std::sync::Mutex<()> {
 impl Client {
     /// Build from the environment and the credentials file. The single construction entry point.
     pub fn from_env() -> Client {
+        Self::from_env_with_timeout(Duration::from_secs(30))
+    }
+
+    /// Build a client with an explicit request timeout.
+    ///
+    /// Normal commands get a generous timeout, while incidental work such as the startup
+    /// version nudge must fail fast and never make the user's command feel hung.
+    pub fn from_env_with_timeout(timeout: Duration) -> Client {
         let cfg = ureq::Agent::config_builder()
             // A timeout is mandatory: hanging on an unresponsive hub buys nothing, and the
             // user reads it as agit being dead.
-            .timeout_global(Some(Duration::from_secs(30)))
+            .timeout_global(Some(timeout))
             // 4xx/5xx are not transport errors: by default ureq turns a status code into
             // `Error::StatusCode`, and that variant **drops the response body** — the refusal
             // the server wrote into the body disappears with it. With it off, status codes go

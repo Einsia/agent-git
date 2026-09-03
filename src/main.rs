@@ -92,6 +92,7 @@ fn main() {
         // nothing.
         match agit::tui::should_enter() {
             agit::tui::Verdict::Enter => {
+                commands::upgrade::maybe_startup_nudge("resume", cli.json);
                 if let Some(code) = enter_and_migrate(cli.directory.as_deref()) {
                     exit(code);
                 }
@@ -105,8 +106,12 @@ fn main() {
     // warnings are part of this output too, and left outside the envelope they become bare text
     // ahead of the JSON that the consumer cannot parse.
     let json = commands::json_requested(cli.json, &command);
+    let command_name = commands::command_name(&command);
+    // A best-effort, once-a-day update hint belongs to the process startup path so it also
+    // appears for ordinary commands, not only after a successful push. The helper skips the JSON
+    // path because stdout there is a strict machine-readable envelope.
+    commands::upgrade::maybe_startup_nudge(command_name, json);
     if json {
-        let command_name = commands::command_name(&command);
         if let Some(reason) = commands::json::incompatible(&command) {
             exit(commands::json::emit_rejection(
                 command_name,
