@@ -186,8 +186,9 @@ pub fn fork_branch(
         return Ok(None);
     }
 
-    // Identity recast: replace the session in meta and nothing else (the shape and the rest of
-    // the tree are inherited byte for byte).
+    // Identity recast: replace the session in meta. The source tree is otherwise inherited, but
+    // the branch-local seal must not cross the fork boundary: forking is the sanctioned way to
+    // continue from a sealed line.
     let log = storage::materialize_at(repo.root(), base_sha, meta::LOG_FILE)?;
     let view = storage::materialize_at(repo.root(), base_sha, meta::VIEW_FILE)?;
     let log = if base_snap.layout == meta::LayoutVersion::V0 {
@@ -209,6 +210,7 @@ pub fn fork_branch(
     // must be upgraded to the current layout while keeping the source VIEW's full context and the
     // original session annotation carried by each envelope.
     let tree = super::plumbing::session_snapshot_tree(repo, base_sha, &log, &view, &snap_text)?;
+    let tree = super::plumbing::tree_apply(repo, &tree, &[(super::branch::SEAL_FILE, None)])?;
     let commit = super::plumbing::commit_tree(
         repo,
         &tree,
@@ -302,6 +304,11 @@ mod tests {
             format!("{line}{view_only}"),
         )
         .unwrap();
+        std::fs::write(
+            repo.root().join(super::super::branch::SEAL_FILE),
+            "sealed\n",
+        )
+        .unwrap();
         repo.add_all().unwrap();
         repo.commit("v0 turn").unwrap();
         let old_head = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
@@ -320,6 +327,16 @@ mod tests {
 
         let fork = fork_branch(&base, "main", "forked").unwrap().unwrap();
         let fork_meta = meta::read_at_ref(&base.repo, &fork).unwrap();
+        assert!(
+            base.repo
+                .show_raw(&base.resolved.sha, super::super::branch::SEAL_FILE)
+                .is_some()
+        );
+        assert!(
+            base.repo
+                .show_raw(&fork, super::super::branch::SEAL_FILE)
+                .is_none()
+        );
         assert_eq!(fork_meta.layout, meta::LayoutVersion::V1);
         assert_eq!(fork_meta.kind, meta::Kind::File);
         assert!(base.repo.show_raw(&fork, meta::LEGACY_LOG_FILE).is_none());
