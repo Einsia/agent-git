@@ -491,7 +491,6 @@ pub fn run(args: Args) -> CmdResult {
         "{}",
         ui::dim(&format!("  teammates: agit clone {owner}/{name}"))
     );
-    super::upgrade::maybe_nudge();
     Ok(ExitCode::Ok)
 }
 

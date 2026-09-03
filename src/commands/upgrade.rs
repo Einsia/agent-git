@@ -19,11 +19,12 @@
 //!
 //! ## The passing nudge (the passive path)
 //!
-//! `push` calls `maybe_nudge` once it succeeds: the local cache is consulted once a day, only an
-//! expired one sends a request, and a newer version prints one unobtrusive line. It **never
-//! blocks the main command** — a slow network, an old hub, GitHub down are all just "no nudge
-//! today", not an error. It hangs only off commands that already go to the network: an offline
-//! command like `status` must not touch the network or write a cache for the sake of a nudge.
+//! User-facing command startup calls the nudge path: the local cache is consulted once a day,
+//! only an expired one sends a short-timeout request, and a newer version
+//! prints one unobtrusive line. A slow network, an old hub, or GitHub being down are all just "no
+//! nudge today", not an error. JSON, quiet, CI, and internal hook/MCP paths never get extra
+//! output or a network request. Startup notices go to stderr so a piped command's stdout remains
+//! usable by a caller that is not expecting a notice.
 
 use super::CmdResult;
 use crate::hub::client::Client;
@@ -44,6 +45,9 @@ pub struct Args {
 /// Nudge cache: one check per day. A failed write is not an error — at worst it asks again
 /// tomorrow.
 const NUDGE_INTERVAL_SECS: u64 = 24 * 3600;
+/// Incidental checks must fail quickly. The explicit `agit upgrade` command keeps the normal
+/// 30-second hub timeout; a startup hint is best-effort and must not make a command feel stuck.
+const NUDGE_TIMEOUT_SECS: u64 = 2;
 
 pub fn run(args: Args) -> CmdResult {
     if !crate::infra::config::is_production_release() {
@@ -411,8 +415,24 @@ fn save_cache(latest: &str) {
     let _ = std::fs::write(p, serde_json::to_string(&body).unwrap());
 }
 
-/// One version check after a hub command succeeds. Failures are swallowed: a nudge, not work.
-pub fn maybe_nudge() {
+/// Check for an update at a user-facing CLI startup.
+///
+/// Machine-readable output, quiet mode, CI, and the internal hook/MCP commands must skip both
+/// the network request and the notice. Eligible user-facing invocations share the daily cache.
+pub fn maybe_startup_nudge(command: &str, json: bool) {
+    let quiet = std::env::var_os("AGIT_QUIET").is_some();
+    let ci = std::env::var_os("CI").is_some();
+    if !startup_nudge_allowed(command, json, quiet, ci) {
+        return;
+    }
+    maybe_nudge_with_timeout(std::time::Duration::from_secs(NUDGE_TIMEOUT_SECS));
+}
+
+fn startup_nudge_allowed(command: &str, json: bool, quiet: bool, ci: bool) -> bool {
+    !json && !quiet && !ci && !matches!(command, "upgrade" | "hooks" | "mcp")
+}
+
+fn maybe_nudge_with_timeout(timeout: std::time::Duration) {
     if !crate::infra::config::is_production_release() {
         return;
     }
@@ -427,10 +447,10 @@ pub fn maybe_nudge() {
     {
         return nudge_with(&c.latest);
     }
-    // A failed ask (old hub, upstream down) still stamps the time: otherwise every push sends
-    // another request, and "one failure costs a day" must not become "one failure costs every
-    // time".
-    let Ok(latest) = Client::from_env().cli_version() else {
+    // A failed ask (old hub, upstream down) still stamps the time: otherwise every eligible
+    // startup sends another request, and "one failure costs a day" must not become "one failure
+    // costs every invocation".
+    let Ok(latest) = Client::from_env_with_timeout(timeout).cli_version() else {
         save_cache("");
         return;
     };
@@ -440,10 +460,8 @@ pub fn maybe_nudge() {
 
 fn nudge_with(latest: &str) {
     if !latest.is_empty() && compare(env!("CARGO_PKG_VERSION"), latest) == Ordering::Less {
-        println!(
-            "{}",
-            ui::dim(&format!("agit {latest} is available — `agit upgrade`"))
-        );
+        let message = ui::dim(&format!("agit {latest} is available — use `agit upgrade`"));
+        eprintln!("{message}");
     }
 }
 
@@ -472,5 +490,18 @@ mod tests {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         assert_eq!(n.unwrap(), "agit-0.1.0-x86_64-unknown-linux-musl.tar.gz");
         let _ = n;
+    }
+
+    #[test]
+    fn startup_nudge_is_only_for_interactive_user_commands() {
+        assert!(startup_nudge_allowed("run", false, false, false));
+        assert!(startup_nudge_allowed("resume", false, false, false));
+        assert!(startup_nudge_allowed("push", false, false, false));
+        for command in ["upgrade", "hooks", "mcp"] {
+            assert!(!startup_nudge_allowed(command, false, false, false));
+        }
+        assert!(!startup_nudge_allowed("run", true, false, false));
+        assert!(!startup_nudge_allowed("run", false, true, false));
+        assert!(!startup_nudge_allowed("run", false, false, true));
     }
 }

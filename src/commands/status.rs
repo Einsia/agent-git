@@ -191,9 +191,8 @@ pub fn run(args: Args) -> CmdResult {
         ui::hint("--check-missing lists this repo’s unadopted sessions");
     }
 
-    // `status` neither goes to the network nor writes a cache: it is the local answer to "who
-    // am I, how far am I synced", and it answers the same offline. The new-version nudge rides
-    // `push`, which goes to the network anyway (`upgrade::maybe_nudge`).
+    // The status computation itself is local. The main startup path may have performed the
+    // separate, best-effort once-a-day version check before dispatching this command.
     Ok(ExitCode::Ok)
 }
 

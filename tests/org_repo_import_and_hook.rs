@@ -11,9 +11,14 @@
 use agit::domain::repo::Repo;
 use std::io::{Read as _, Write as _};
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::{fs, net::TcpListener};
 
 const SID: &str = "cccccccc-0000-4000-8000-000000000003";
+const QA_AGENT_ID: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 
 /// A fake hub that answers the way the hub does: `einsia/qa` exists and is writable (once the
 /// `gate_closed` file appears the write gate answers 404 instead — simulating a revoked grant;
@@ -22,7 +27,12 @@ const SID: &str = "cccccccc-0000-4000-8000-000000000003";
 /// both "exists but not writable" and "does not exist"); `einsia/fresh` does not exist and I am
 /// the owner of `einsia`; `acme/ghost` does not exist and I am only a plain member of `acme`.
 /// Serves until the process ends.
-fn fake_hub(gate_closed: std::path::PathBuf) -> String {
+fn fake_hub(
+    gate_closed: std::path::PathBuf,
+    clone_url: std::path::PathBuf,
+    latest_version: std::path::PathBuf,
+    version_requests: Arc<AtomicUsize>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     std::thread::spawn(move || {
@@ -52,10 +62,12 @@ fn fake_hub(gate_closed: std::path::PathBuf) -> String {
                 r#"{"error":"agent not found","kind":"not_found"}"#.to_string(),
             );
             let agent = |owner: &str, name: &str| {
+                let clone_url = fs::read_to_string(&clone_url).unwrap_or_else(|_| "x".into());
                 (
                     "200 OK",
                     format!(
-                        r#"{{"agent_id":"id-{name}","owner":"{owner}","name":"{name}","clone_url":"x","visibility":"public"}}"#
+                        r#"{{"agent_id":"{QA_AGENT_ID}","owner":"{owner}","name":"{name}","clone_url":{},"visibility":"public"}}"#,
+                        serde_json::to_string(clone_url.trim()).unwrap()
                     ),
                 )
             };
@@ -63,6 +75,18 @@ fn fake_hub(gate_closed: std::path::PathBuf) -> String {
                 (
                     "401 Unauthorized",
                     r#"{"error":"auth","kind":"unauthorized"}"#.to_string(),
+                )
+            } else if path == "/api/cli/version" {
+                version_requests.fetch_add(1, Ordering::SeqCst);
+                let version = fs::read_to_string(&latest_version)
+                    .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into());
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "version": version.trim(),
+                        "tag": format!("agit-v{}", version.trim()),
+                    })
+                    .to_string(),
                 )
             } else if path == "/api/agents/einsia/qa" {
                 agent("einsia", "qa")
@@ -90,7 +114,7 @@ fn fake_hub(gate_closed: std::path::PathBuf) -> String {
                         .then(|| v.trim().to_string())
                 });
                 match expected.as_deref() {
-                    Some("id-qa") => ("200 OK", "0000".to_string()),
+                    Some(QA_AGENT_ID) => ("200 OK", "0000".to_string()),
                     Some(_) => (
                         "412 Precondition Failed",
                         r#"{"error":"this repository name now refers to a different Agent identity","kind":"identity_precondition_failed"}"#.to_string(),
@@ -118,6 +142,9 @@ struct Lab {
     hub: String,
     /// Creating this file stops the fake hub from allowing writes to `einsia/qa`.
     gate_closed: std::path::PathBuf,
+    clone_url: std::path::PathBuf,
+    latest_version: std::path::PathBuf,
+    version_requests: Arc<AtomicUsize>,
     home: std::path::PathBuf,
     agit_home: std::path::PathBuf,
     work: std::path::PathBuf,
@@ -136,7 +163,17 @@ impl Lab {
         // to match.
         let work = work.canonicalize().unwrap();
         let gate_closed = tmp.path().join("gate-closed");
-        let hub = fake_hub(gate_closed.clone());
+        let clone_url = tmp.path().join("clone-url");
+        let latest_version = tmp.path().join("latest-version");
+        let version_requests = Arc::new(AtomicUsize::new(0));
+        fs::write(&clone_url, "x").unwrap();
+        fs::write(&latest_version, env!("CARGO_PKG_VERSION")).unwrap();
+        let hub = fake_hub(
+            gate_closed.clone(),
+            clone_url.clone(),
+            latest_version.clone(),
+            Arc::clone(&version_requests),
+        );
         let cred = agit::infra::credentials::HubCredential {
             username: "me".into(),
             email: None,
@@ -156,6 +193,9 @@ impl Lab {
             _tmp: tmp,
             hub,
             gate_closed,
+            clone_url,
+            latest_version,
+            version_requests,
             home,
             agit_home,
             work,
@@ -262,6 +302,114 @@ fn commits_on(dir: &std::path::Path, branch: &str) -> usize {
         .trim()
         .parse()
         .unwrap()
+}
+
+fn push_with_fresh_update_cache(
+    lab: &Lab,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (std::process::Output, usize) {
+    let _ = fs::remove_file(lab.agit_home.join("cli-update.json"));
+    let before = lab.version_requests.load(Ordering::SeqCst);
+    let mut cmd = lab.agit(args);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().unwrap();
+    let requests = lab.version_requests.load(Ordering::SeqCst) - before;
+    (output, requests)
+}
+
+fn update_notice_count(output: &std::process::Output) -> usize {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .matches("agit 999.0.0 is available")
+    .count()
+}
+
+/// The update check has one owner: binary startup. This deliberately drives a successful push
+/// all the way through Git so a second call reintroduced at the tail would print the cached
+/// notice twice. Suppressed modes start without a cache, making any bypass visible as a request.
+#[test]
+fn push_dispatches_one_startup_update_check_and_suppressed_modes_dispatch_none() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "publish this turn", "done");
+    let imported = lab
+        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(
+        imported.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&imported.stdout),
+        String::from_utf8_lossy(&imported.stderr)
+    );
+
+    let bare = lab._tmp.path().join("remote.git");
+    let initialized = Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(&bare)
+        .status()
+        .unwrap();
+    assert!(
+        initialized.success(),
+        "temporary push remote must initialize"
+    );
+    fs::write(&lab.clone_url, bare.to_string_lossy().as_bytes()).unwrap();
+    fs::write(&lab.latest_version, "999.0.0").unwrap();
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    repo.set_remote(bare.to_str().unwrap()).unwrap();
+    let identity = agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap();
+    agit::hub::identity::pin(&repo, &identity).unwrap();
+
+    let push = ["push", "einsia/qa", "-b", "work"];
+    let (ordinary, requests) = push_with_fresh_update_cache(&lab, &push, &[]);
+    assert!(
+        ordinary.status.success(),
+        "ordinary push must reach its successful tail:\n{}{}",
+        String::from_utf8_lossy(&ordinary.stdout),
+        String::from_utf8_lossy(&ordinary.stderr)
+    );
+    assert_eq!(
+        requests, 1,
+        "ordinary push asks for the latest version once"
+    );
+    assert_eq!(
+        update_notice_count(&ordinary),
+        1,
+        "ordinary push prints exactly one startup notice"
+    );
+
+    for (label, args, env) in [
+        (
+            "JSON",
+            vec!["--json", "push", "einsia/qa", "-b", "work"],
+            vec![],
+        ),
+        (
+            "quiet",
+            vec!["-q", "push", "einsia/qa", "-b", "work"],
+            vec![],
+        ),
+        ("CI", push.to_vec(), vec![("CI", "1")]),
+    ] {
+        let (output, requests) = push_with_fresh_update_cache(&lab, &args, &env);
+        assert!(
+            output.status.success(),
+            "{label} push must succeed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(requests, 0, "{label} push must not check for an update");
+        assert_eq!(
+            update_notice_count(&output),
+            0,
+            "{label} push must not print an update notice"
+        );
+    }
 }
 
 #[test]
