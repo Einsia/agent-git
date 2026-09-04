@@ -1,6 +1,6 @@
 {
   "name": "@einsia/agent-git-linux-x64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Prebuilt agit CLI binary (linux x64) — platform package for @einsia/agent-git.",
   "license": "MIT",
   "os": [
