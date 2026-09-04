@@ -33,6 +33,7 @@ const VAULT_VERSION: u32 = 1;
 const RECORD_VERSION: u32 = 1;
 const KEY_VERSION: u32 = 1;
 const KEYRING_SERVICE: &str = "com.einsia.agent-git.secret-filter";
+const OS_KEYSTORE_UNAVAILABLE_GUIDANCE: &str = "the selected OS credential store is unavailable; either install and configure an OS credential store (for example, Secret Service/keyring on Linux), or explicitly select the file keystore with `agit config secrets.keystore file`";
 /// The prefix of the entries `keystore_health` writes and deletes. Each probe carries its own
 /// random suffix, so two diagnostics running at once never read or delete each other's entry;
 /// a vault id is a UUID and collides with neither.
@@ -169,27 +170,56 @@ pub trait KeyStore: Send + Sync {
 pub struct OsKeyStore;
 
 impl OsKeyStore {
+    /// Whether an error means the store itself cannot serve this machine, as opposed to a
+    /// problem with one entry or one call. Only the first kind is helped by installing a
+    /// credential store or selecting the file keystore; for the second, that advice would
+    /// leave the existing vault behind with its key in the store it was created in.
+    fn is_unavailable(error: &keyring::Error) -> bool {
+        matches!(
+            error,
+            keyring::Error::NoDefaultStore
+                | keyring::Error::PlatformFailure(_)
+                | keyring::Error::NoStorageAccess(_)
+                | keyring::Error::NotSupportedByStore(_)
+        )
+    }
+
+    /// The error of one store operation, with the remedy guidance appended only when the
+    /// store is unavailable; any other failure keeps its own meaning.
+    fn failure(operation: &str, error: keyring::Error) -> anyhow::Error {
+        if Self::is_unavailable(&error) {
+            anyhow::Error::new(error)
+                .context(format!("{operation}; {OS_KEYSTORE_UNAVAILABLE_GUIDANCE}"))
+        } else {
+            anyhow::Error::new(error).context(operation.to_string())
+        }
+    }
+
     fn entry(vault_id: &str) -> crate::Result<keyring::Entry> {
         // The store fails to open on a machine with no desktop session (an SSH login, a CI
-        // runner): there is no Secret Service to answer. That machine has a supported setting,
-        // and the error names it, or the user meets a dead end at the first commit that finds
-        // a secret.
-        keyring::Entry::new(KEYRING_SERVICE, vault_id).with_context(|| {
-            format!(
-                "cannot open the operating-system credential store (with no desktop session, keep the key in a private file instead: `agit config {} file`)",
-                SecretKeystore::KEY
-            )
+        // runner): there is no Secret Service to answer. Name both explicit remedies and say
+        // that agit did not silently change the user's storage boundary.
+        keyring::Entry::new(KEYRING_SERVICE, vault_id).map_err(|error| {
+            Self::failure("cannot open the operating-system credential store", error)
         })
     }
 }
 
 impl KeyStore for OsKeyStore {
     fn get(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
-        let key = Self::entry(vault_id)?.get_secret().with_context(|| {
-            format!(
-                "the secret-filter vault exists, but its key `{vault_id}` is not in the operating-system credential store ({} = os)",
-                SecretKeystore::KEY
-            )
+        let key = Self::entry(vault_id)?.get_secret().map_err(|error| match error {
+            // A reachable store with no matching key is a recovery problem, not an unavailable
+            // backend. Suggesting a different backend here would strand the existing vault too.
+            keyring::Error::NoEntry => anyhow::Error::new(keyring::Error::NoEntry).context(
+                format!(
+                    "the secret-filter vault exists, but its key `{vault_id}` is not in the operating-system credential store ({} = os)",
+                    SecretKeystore::KEY
+                ),
+            ),
+            error => Self::failure(
+                "cannot read the secret-filter KEK from the operating-system credential store",
+                error,
+            ),
         })?;
         validate_key(&key, "KEK")?;
         Ok(Zeroizing::new(key))
@@ -197,15 +227,21 @@ impl KeyStore for OsKeyStore {
 
     fn set(&self, vault_id: &str, key: &[u8]) -> crate::Result<()> {
         validate_key(key, "KEK")?;
-        Self::entry(vault_id)?
-            .set_secret(key)
-            .context("cannot save the secret-filter KEK in the operating-system credential store")
+        Self::entry(vault_id)?.set_secret(key).map_err(|error| {
+            Self::failure(
+                "cannot save the secret-filter KEK in the operating-system credential store",
+                error,
+            )
+        })
     }
 
     fn delete(&self, vault_id: &str) -> crate::Result<()> {
-        Self::entry(vault_id)?.delete_credential().context(
-            "cannot delete the secret-filter KEK from the operating-system credential store",
-        )
+        Self::entry(vault_id)?.delete_credential().map_err(|error| {
+            Self::failure(
+                "cannot delete the secret-filter KEK from the operating-system credential store",
+                error,
+            )
+        })
     }
 }
 
@@ -487,18 +523,26 @@ fn probe_key() -> Zeroizing<Vec<u8>> {
 fn probe_os_store() -> crate::Result<()> {
     let entry = OsKeyStore::entry(&probe_id())?;
     let probe = probe_key();
-    entry
-        .set_secret(&probe)
-        .context("the operating-system credential store refused a write")?;
-    let back = entry
-        .get_secret()
-        .map(Zeroizing::new)
-        .context("the operating-system credential store cannot read back what it stored");
+    entry.set_secret(&probe).map_err(|error| {
+        OsKeyStore::failure(
+            "the operating-system credential store refused a write",
+            error,
+        )
+    })?;
+    let back = entry.get_secret().map(Zeroizing::new).map_err(|error| {
+        OsKeyStore::failure(
+            "the operating-system credential store cannot read back what it stored",
+            error,
+        )
+    });
     // The probe entry is not left behind whatever the read said; a store that cannot delete
     // is reported too.
-    let removed = entry
-        .delete_credential()
-        .context("the operating-system credential store cannot delete what it stored");
+    let removed = entry.delete_credential().map_err(|error| {
+        OsKeyStore::failure(
+            "the operating-system credential store cannot delete what it stored",
+            error,
+        )
+    });
     if *back? != *probe {
         bail!("the operating-system credential store returned different bytes than it stored");
     }
@@ -1414,6 +1458,45 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    /// Only a store that cannot serve this machine gets the remedy guidance: a missing
+    /// default store names both remedies, while a corrupt store or an ambiguous entry keeps
+    /// its own meaning — switching backends would not repair either and would leave the
+    /// existing vault behind.
+    #[test]
+    fn only_an_unavailable_os_keystore_gets_the_remedy_guidance() {
+        let operation =
+            "cannot save the secret-filter KEK in the operating-system credential store";
+        let unavailable = format!(
+            "{:#}",
+            OsKeyStore::failure(operation, keyring::Error::NoDefaultStore)
+        );
+        assert!(unavailable.contains(operation));
+        assert!(unavailable.contains("the selected OS credential store is unavailable"));
+        assert!(unavailable.contains("install and configure an OS credential store"));
+        assert!(unavailable.contains("Secret Service/keyring on Linux"));
+        assert!(unavailable.contains("agit config secrets.keystore file"));
+        assert!(unavailable.contains("No default store"));
+
+        for error in [
+            keyring::Error::BadStoreFormat("truncated index".into()),
+            keyring::Error::Ambiguous(vec![]),
+            keyring::Error::Invalid("target".into(), "empty".into()),
+        ] {
+            let own_meaning = error.to_string();
+            let rendered = format!("{:#}", OsKeyStore::failure(operation, error));
+            assert!(rendered.contains(operation), "{rendered}");
+            assert!(rendered.contains(&own_meaning), "{rendered}");
+            assert!(
+                !rendered.contains("agit config secrets.keystore file"),
+                "{rendered}"
+            );
+            assert!(
+                !rendered.contains("credential store is unavailable"),
+                "{rendered}"
+            );
+        }
+    }
 
     #[derive(Default)]
     struct MemoryKeys(Mutex<HashMap<String, Vec<u8>>>);
