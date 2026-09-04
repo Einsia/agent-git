@@ -49,3 +49,8 @@ agit merge --continue
 ```
 
 If the intents cannot be reconciled, use `agit merge --abort`; do not rebase or force-push.
+
+In a non-interactive environment (CI, pipes, or an agent harness), a normal merge refuses before
+settling the target, materializing a merge session, or taking the branch lock. Use `--manual` to
+open the transaction and follow the printed `pick`/`summary`/`--continue` protocol, or run the
+command from a terminal.

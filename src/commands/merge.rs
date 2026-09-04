@@ -35,6 +35,7 @@ use crate::domain::transcript::Envelope;
 use crate::{ExitCode, ui};
 use anyhow::Context;
 use clap::Args as ClapArgs;
+use std::io::IsTerminal;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -236,6 +237,21 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
+    // Starting the merge agent is the only part of this command that needs an interactive
+    // runtime.  Check that requirement before settling the target, checking out its worktree,
+    // or taking the transaction lock.  Otherwise a CI/agent-harness invocation reaches
+    // `resume_branch_with_prompt`, which materializes the merge session and only then fails with
+    // "stdin is not a terminal", leaving the transaction open for somebody to recover by hand.
+    // `--manual` is intentionally exempt: it opens the same transaction for explicit plumbing
+    // commands and is designed to work without a terminal.
+    if should_refuse_noninteractive_merge(args.manual, args.dry_run, !merge_agent_can_launch()) {
+        ui::error("starting the merge agent requires an interactive terminal.");
+        ui::hint(
+            "run `agit merge ... --manual` to drive the transaction without launching a runtime",
+        );
+        return Ok(ExitCode::Interactive);
+    }
+
     // Preflight: settle the target branch's unsettled turns (settling is idempotent; with no
     // session link it silently skips).
     let exe = std::env::current_exe()?;
@@ -334,6 +350,22 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
             Ok(ExitCode::Precondition)
         }
     }
+}
+
+/// Whether the child runtime can receive interactive input from this process.
+///
+/// Keep this separate from [`ui::is_tty`]: that helper intentionally checks stdout only for
+/// rendering decisions, while a launched runtime needs both sides of the conversation.
+fn merge_agent_can_launch() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Whether starting this merge would be unsafe in a non-interactive process.
+///
+/// `manual` and `dry_run` are preparation-only paths and therefore do not need a TTY.  Keeping
+/// the policy as a pure function makes the side-effect ordering contract easy to pin in tests.
+fn should_refuse_noninteractive_merge(manual: bool, dry_run: bool, noninteractive: bool) -> bool {
+    !manual && !dry_run && noninteractive
 }
 
 fn manual_commands(slug: &str, target: &str, src_ref: &str) -> String {
@@ -1080,6 +1112,14 @@ pub fn turn_lines(repo: &Repo, head: &str, n: u32) -> crate::Result<Vec<usize>> 
 mod tests {
     use super::*;
     use crate::domain::meta::Meta;
+
+    #[test]
+    fn merge_agent_tty_gate_only_blocks_the_launching_path() {
+        assert!(should_refuse_noninteractive_merge(false, false, true));
+        assert!(!should_refuse_noninteractive_merge(true, false, true));
+        assert!(!should_refuse_noninteractive_merge(false, true, true));
+        assert!(!should_refuse_noninteractive_merge(false, false, false));
+    }
 
     #[test]
     fn markers_are_envelopes_too() {
