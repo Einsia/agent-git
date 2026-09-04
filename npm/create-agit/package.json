@@ -1,14 +1,14 @@
 {
   "name": "create-agit",
-  "version": "0.1.0",
-  "description": "One-line installer for agit (npx create-agit) \u2014 thin wrapper around @einsia/agent-git that lands the CLI at ~/.local/bin and wires skills/hooks/MCP.",
+  "version": "0.1.1",
+  "description": "One-line installer for agit (npx create-agit) — thin wrapper around @einsia/agent-git that lands the CLI at ~/.local/bin and wires skills/hooks/MCP.",
   "license": "MIT",
   "type": "module",
   "bin": {
     "create-agit": "./bin.mjs"
   },
   "dependencies": {
-    "@einsia/agent-git": "0.1.0"
+    "@einsia/agent-git": "0.1.1"
   },
   "engines": {
     "node": ">=20"
