@@ -252,11 +252,46 @@ list on the left, the conversation on the right.
 
 ### 3.5 `agit import` — adopt an existing conversation
 
-With no arguments, import lists the unmanaged runtime sessions under the current
-directory. The selected row shows its opening prompt, destination repo and the
-new session branch; `Tab` changes repo and `l` switches to `--link-only`, which
-needs neither a sign-in nor a destination. A session that still looks active is
-left for its own terminal to finish first.
+With no arguments, import makes all three adoption stages explicit: the AgentGit
+repo receiving the new line, the unmanaged runtime session under the current
+directory, and the destination that names the branch and confirms the operation.
+`Tab` and Enter advance one stage; `Shift-Tab` and Esc retreat one stage. Esc
+quits only from the first stage. Arrows and `/` affect only the focused selection
+pane, while the destination stage owns branch-name input. A user can always walk
+back to either choice without losing it.
+
+```text
+┌ agit import ── nana @ agent-git.com ── ● 1 active ───────────────────┐
+│ 1 repos          │ 2 sessions                 │ 3 destination       │
+│ ▸ nana/payments  │ • codex a3f9c1…    6m ago │ repo   nana/payments│
+│   12 sessions    │   fix the retry path       │ branch retry-fix_   │
+│   einsia/infra   │   claude 7b21ee…   28s ago │ session codex a3f9… │
+│   read-only      │   investigate import       │ active  6m ago       │
+└─────────────────────────────────────────────────────────────────────┘
+ tab/enter next   shift-tab/esc back   ↑↓ move   / filter   q quit
+```
+
+At 120 columns and above, all three stages are side-by-side. Between 80 and 119
+columns, repo and session remain side-by-side and destination moves below them.
+Below 80 columns, one stage occupies the body at a time under an explicit stage
+indicator. Resizing changes only presentation, never focus or selection. With
+exactly one eligible repo, it is selected up front and the first focus is the
+session stage; the user may still retreat to inspect it. With none, the repo
+stage states that versioned adoption requires `agit init` and leaves
+`link-only` available.
+
+Each session row shows runtime, short id, opening prompt and relative last
+activity, and the rows are ordered newest first. "Last activity" is the runtime
+index's update time when it provides one, otherwise the transcript's modified
+time; it is not a separately recorded "last resumed" event. The `●` live marker
+uses the same timestamp and conservative live window. A session that still
+looks active is left for its own terminal to finish first.
+
+`l` switches to `--link-only`, which needs neither sign-in nor a repo or branch;
+the first stage is visibly skipped until versioned import is restored. The
+session still advances to destination so the complete link operation is visible
+before Enter confirms it. `/` filters the focused selection pane, so repo and
+session queries never erase each other.
 
 The screen creates nothing. It leaves the alternate screen and fills in the
 ordinary `agit import <id> --from <runtime> --into <repo>@<branch>` arguments, or
@@ -298,11 +333,14 @@ The cost of opening a screen must not grow linearly with the number of sessions,
 branches or repos. List data therefore comes from metadata gathered without
 parsing transcripts, and filtering never refetches it.
 
-Import has one bounded exception: Claude has no indexed opening prompt, and a
-column of ids does not identify conversations to a person. It parses only the
-selected candidate on demand and caches the result; moving the cursor may parse
-one more. Codex supplies that preview from its index without opening the
-transcript. Candidates that were never inspected cost no transcript reads.
+Import has two bounded exceptions. First, the shared naming collector checks the
+most recent unindexed candidates within a fixed budget so abandoned empty
+startup sessions do not fill the list; candidates beyond that budget stay
+visible without being read. Second, Claude has no indexed opening prompt, and a
+column of ids does not identify conversations to a person. The selected
+candidate is parsed on demand and cached; moving the cursor may parse one more.
+Codex supplies that preview from its index without opening the transcript, and
+filtering never refetches either source.
 
 The fetching layer stands on its own and **asks git in batches**: the cost of a
 per-item `git show` is almost entirely process startup — on this machine 12

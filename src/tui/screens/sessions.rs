@@ -55,6 +55,12 @@ const NAMING_PROBE_BYTES: u64 = 32 * 1024;
 /// opening prompt once, only for the candidates it is about to show.
 const NAMING_PROBE_LIMIT: usize = 20;
 
+/// One runtime-index row after the shared naming probe policy has been applied.
+pub(super) struct ProbedSession {
+    pub session: SessionRef,
+    pub worth_naming: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Badge {
     Here,
@@ -390,47 +396,10 @@ fn gather(cwd: &Path, now: SystemTime) -> Input {
         })
         .unwrap_or_default();
 
-    // A managed session needs no naming probe — it never enters the naming queue anyway.
-    let adopted: std::collections::HashSet<(&str, &str)> = links
+    let link_refs = links.iter().map(|item| &item.link).collect::<Vec<_>>();
+    let seen = probe_sessions_for_naming(cwd, &link_refs)
         .iter()
-        .map(|a| &a.link)
-        .filter(|l| l.agent.is_some() && l.branch.is_some())
-        .map(|l| (l.source.as_str(), l.session_id.as_str()))
-        .collect();
-    let ignored: std::collections::HashSet<(&str, &str)> = links
-        .iter()
-        .map(|a| &a.link)
-        .filter(|l| l.naming_ignored)
-        .map(|l| (l.source.as_str(), l.session_id.as_str()))
-        .collect();
-
-    let mut refs: Vec<crate::adapter::SessionRef> = Vec::new();
-    for rt in crate::adapter::RUNTIMES {
-        let Ok(ad) = crate::adapter::get(rt) else {
-            continue;
-        };
-        refs.extend(ad.sessions_for(cwd).unwrap_or_default());
-    }
-    // The probe budget is spent in order of recent activity: the rows the user is most likely
-    // to see are judged first.
-    refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
-
-    let mut budget = NAMING_PROBE_LIMIT;
-    let seen = refs
-        .iter()
-        .map(|sr| {
-            let identity = (sr.runtime, sr.id.as_str());
-            let needs_probe = !adopted.contains(&identity) && !ignored.contains(&identity);
-            let worth = if !needs_probe {
-                false // adopted or ignored: not in the naming queue, so this I/O is not spent
-            } else if budget == 0 {
-                true // budget spent, so no verdict — keep it rather than hide it
-            } else {
-                budget -= 1;
-                worth_naming(sr.runtime, &sr.path, sr.gist.as_deref())
-            };
-            Seen::from_ref(sr, worth)
-        })
+        .map(|item| Seen::from_ref(&item.session, item.worth_naming))
         .collect();
 
     let same_repo = same_repo_branches(&links, now);
@@ -441,6 +410,66 @@ fn gather(cwd: &Path, now: SystemTime) -> Input {
         seen,
         same_repo,
     }
+}
+
+/// Gather runtime-index rows and apply the naming probe budget on one recency axis.
+///
+/// Every TUI that offers unmanaged sessions uses this path so opening a screen cannot multiply
+/// transcript reads by the number of candidates in the directory.
+pub(super) fn probe_sessions_for_naming(cwd: &Path, links: &[&Link]) -> Vec<ProbedSession> {
+    let mut refs: Vec<SessionRef> = Vec::new();
+    for rt in crate::adapter::RUNTIMES {
+        let Ok(ad) = crate::adapter::get(rt) else {
+            continue;
+        };
+        refs.extend(ad.sessions_for(cwd).unwrap_or_default());
+    }
+    apply_naming_probe(refs, links, |session| {
+        worth_naming(session.runtime, &session.path, session.gist.as_deref())
+    })
+}
+
+fn apply_naming_probe(
+    mut refs: Vec<SessionRef>,
+    links: &[&Link],
+    mut probe: impl FnMut(&SessionRef) -> bool,
+) -> Vec<ProbedSession> {
+    // A managed or ignored session never enters the naming queue, so it spends no probe budget.
+    let adopted: std::collections::HashSet<(&str, &str)> = links
+        .iter()
+        .filter(|link| link.agent.is_some() && link.branch.is_some())
+        .map(|link| (link.source.as_str(), link.session_id.as_str()))
+        .collect();
+    let ignored: std::collections::HashSet<(&str, &str)> = links
+        .iter()
+        .filter(|link| link.naming_ignored)
+        .map(|link| (link.source.as_str(), link.session_id.as_str()))
+        .collect();
+
+    // The probe budget is spent in order of recent activity: the rows the user is most likely
+    // to see are judged first.
+    refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
+
+    let mut budget = NAMING_PROBE_LIMIT;
+    refs.into_iter()
+        .map(|session| {
+            let sr = &session;
+            let identity = (sr.runtime, sr.id.as_str());
+            let needs_probe = !adopted.contains(&identity) && !ignored.contains(&identity);
+            let worth = if !needs_probe {
+                false // adopted or ignored: not in the naming queue, so this I/O is not spent
+            } else if budget == 0 {
+                true // budget spent, so no verdict — keep it rather than hide it
+            } else {
+                budget -= 1;
+                probe(sr)
+            };
+            ProbedSession {
+                session,
+                worth_naming: worth,
+            }
+        })
+        .collect()
 }
 
 /// When this branch's native session was last written to.
@@ -815,7 +844,11 @@ fn draw(
     );
     let list_area = widgets::list_area_with_notice(f, panes, notice);
 
-    let items: Vec<ListItem> = view.iter().map(|r| ListItem::new(row_line(r))).collect();
+    let width = list_area.width.saturating_sub(4) as usize;
+    let items: Vec<ListItem> = view
+        .iter()
+        .map(|r| ListItem::new(row_line(r, width)))
+        .collect();
     let title = match filter.hint() {
         Some(q) => format!("sessions  {q}"),
         None => format!("sessions ({})", view.len()),
@@ -851,7 +884,7 @@ fn draw(
     );
 }
 
-fn row_line(r: &Row) -> Line<'static> {
+fn row_line(r: &Row, width: usize) -> Line<'static> {
     let s = theme::symbols();
     let mark = if r.live { s.active } else { s.idle };
     let (badge_color, name) = match r.badge {
@@ -871,14 +904,21 @@ fn row_line(r: &Row) -> Line<'static> {
             ),
         ),
     };
-    Line::from(vec![
-        Span::raw(format!("{mark} ")),
-        Span::styled(
-            format!("{:<9} ", r.badge.label()),
-            Style::default().fg(badge_color),
-        ),
-        Span::raw(name),
-    ])
+    let active = crate::ui::ago(r.last_active);
+    let name_width = width.saturating_sub(14 + widgets::cols(&active));
+    let name = widgets::truncate_cols(&name, name_width);
+    widgets::clamp_line(
+        Line::from(vec![
+            Span::raw(format!("{mark} ")),
+            Span::styled(
+                format!("{:<9} ", r.badge.label()),
+                Style::default().fg(badge_color),
+            ),
+            Span::raw(name),
+            Span::styled(format!("  {active}"), theme::muted()),
+        ]),
+        width,
+    )
 }
 
 fn detail_text(r: Option<&Row>, notice: Option<&str>) -> String {
@@ -928,6 +968,16 @@ mod tests {
             mtime: t(at),
             gist: None,
             worth_naming: true,
+        }
+    }
+    fn session_ref(id: &str, at: u64) -> SessionRef {
+        SessionRef {
+            id: id.into(),
+            path: Path::new("/nonexistent").join(id),
+            runtime: "claude-code",
+            cwd: Some("/w".into()),
+            mtime: t(at),
+            gist: None,
         }
     }
     fn link(id: &str, cwd: &str, agent: Option<&str>, branch: Option<&str>) -> Adopted {
@@ -1264,6 +1314,51 @@ mod tests {
         ));
         // a missing file is kept too; one failed read does not hide a session.
         assert!(worth_naming("claude-code", Path::new("/nonexistent"), None));
+    }
+
+    /// Naming screens spend their shared probe budget on the most recent eligible sessions.
+    /// Managed and ignored rows spend none, and eligible rows beyond the budget remain visible.
+    #[test]
+    fn the_naming_probe_budget_is_shared_and_fails_open() {
+        let mut managed = Link::new("claude-code", "managed", Some(Path::new("/w")));
+        managed.agent = Some("payments".into());
+        managed.branch = Some("work".into());
+        let mut ignored = Link::new("claude-code", "ignored", Some(Path::new("/w")));
+        ignored.naming_ignored = true;
+        let links = [&managed, &ignored];
+
+        let eligible = NAMING_PROBE_LIMIT + 2;
+        let mut refs = (0..eligible)
+            .map(|index| session_ref(&format!("candidate-{index}"), index as u64))
+            .collect::<Vec<_>>();
+        refs.push(session_ref("managed", 10_000));
+        refs.push(session_ref("ignored", 9_999));
+
+        let mut probed = Vec::new();
+        let rows = apply_naming_probe(refs, &links, |session| {
+            probed.push(session.id.clone());
+            false
+        });
+        assert_eq!(probed.len(), NAMING_PROBE_LIMIT);
+        assert_eq!(probed[0], format!("candidate-{}", eligible - 1));
+        assert!(!probed.iter().any(|id| id == "managed" || id == "ignored"));
+
+        let eligible_rows = rows
+            .iter()
+            .filter(|row| row.session.id.starts_with("candidate-"))
+            .collect::<Vec<_>>();
+        assert!(
+            eligible_rows
+                .iter()
+                .take(NAMING_PROBE_LIMIT)
+                .all(|row| !row.worth_naming)
+        );
+        assert!(
+            eligible_rows
+                .iter()
+                .skip(NAMING_PROBE_LIMIT)
+                .all(|row| row.worth_naming)
+        );
     }
 
     #[test]

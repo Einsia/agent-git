@@ -343,7 +343,14 @@ fn draw_form(
                 form.name.trim()
             }
         ));
-        detail.push_str(&format!("bind   {}\n", crate::ui::tilde(cwd)));
+        detail.push_str(&format!(
+            "bind   {}\n",
+            if form.bind {
+                crate::ui::tilde(cwd)
+            } else {
+                "do not bind this directory".to_string()
+            }
+        ));
         detail.push_str(&format!(
             "seed   {}\n\n",
             if form.seed {
@@ -482,5 +489,33 @@ mod tests {
                 "missing `{expected}` from frame: {text}"
             );
         }
+    }
+
+    #[test]
+    fn the_summary_says_when_the_directory_will_not_be_bound() {
+        use ratatui::backend::TestBackend;
+        let cwd = Path::new("/Projects/agent-git");
+        let form = Form {
+            name: "work-memory".into(),
+            bind: false,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(110, 14)).unwrap();
+        terminal
+            .draw(|frame| draw_form(frame, &form, "agent-git", "nana", cwd, 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("bind   do not bind this directory"),
+            "the summary must match the no-bind execution path: {text}"
+        );
     }
 }

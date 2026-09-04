@@ -484,6 +484,9 @@ fn draw(f: &mut Frame, pane: &Pane<'_>, view: &[&Entry], state: &mut ListState) 
     let items: Vec<ListItem> = view
         .iter()
         .map(|e| {
+            let active = crate::ui::ago(e.when);
+            let width = panes.list.width.saturating_sub(4) as usize;
+            let note_width = width.saturating_sub(widgets::cols(&active) + 3);
             ListItem::new(vec![
                 Line::from(Span::styled(
                     e.label.clone(),
@@ -491,11 +494,8 @@ fn draw(f: &mut Frame, pane: &Pane<'_>, view: &[&Entry], state: &mut ListState) 
                 )),
                 Line::from(Span::styled(
                     format!(
-                        "  {}",
-                        widgets::truncate_cols(
-                            &e.note,
-                            panes.list.width.saturating_sub(4) as usize
-                        )
+                        "  {} · {active}",
+                        widgets::truncate_cols(&e.note, note_width)
                     ),
                     theme::muted(),
                 )),
@@ -822,6 +822,11 @@ mod tests {
         assert!(rows[1].contains("turns (2)"), "{:?}", rows[1]);
         assert!(rows[1].contains("conversation"), "{:?}", rows[1]);
         assert!(rows[2].contains("#14 3f2a1bc"), "{:?}", rows[2]);
+        assert!(
+            rows[3].contains(&crate::ui::ago(entries[0].when)),
+            "the session row must expose last activity: {:?}",
+            rows[3]
+        );
         // The assertion is only that the right pane draws the selected row; it does not count
         // how wide characters land in the buffer's cells.
         assert!(

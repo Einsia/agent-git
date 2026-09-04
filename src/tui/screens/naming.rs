@@ -345,10 +345,11 @@ fn draw(
         },
     );
     let list_area = widgets::list_area_with_notice(frame, panes, notice);
+    let width = list_area.width.saturating_sub(4) as usize;
 
     let items: Vec<ListItem> = view
         .iter()
-        .map(|row| ListItem::new(row_lines(row)))
+        .map(|row| ListItem::new(row_lines(row, width)))
         .collect();
     frame.render_stateful_widget(
         List::new(items)
@@ -379,18 +380,25 @@ fn draw(
     );
 }
 
-fn row_lines(row: &sessions::Row) -> Vec<Line<'static>> {
+fn row_lines(row: &sessions::Row, width: usize) -> Vec<Line<'static>> {
     let id = row
         .session_id
         .as_deref()
         .map(crate::domain::link::short)
         .unwrap_or_default();
-    let mut lines = vec![Line::from(format!("{}  {id}", row.runtime))];
+    let active = crate::ui::ago(row.last_active);
+    let identity = format!("{}  {id}", row.runtime);
+    let identity =
+        widgets::truncate_cols(&identity, width.saturating_sub(widgets::cols(&active) + 2));
+    let mut lines = vec![widgets::clamp_line(
+        Line::from(format!("{identity}  {active}")),
+        width,
+    )];
     if let Some(gist) = &row.gist {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", crate::ui::truncate(gist, 52)),
-            Style::default().fg(theme::MUTED),
-        )));
+        lines.push(widgets::clamp_line(
+            Line::from(Span::styled(format!("  {gist}"), theme::muted())),
+            width,
+        ));
     }
     lines
 }
@@ -564,5 +572,9 @@ mod tests {
                 "missing `{expected}` from frame: {text}"
             );
         }
+        assert!(
+            text.contains(&crate::ui::ago(rows[0].last_active)),
+            "the session row must expose last activity: {text}"
+        );
     }
 }
