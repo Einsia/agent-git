@@ -32,6 +32,19 @@ if (!version || !/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) {
   process.exit(1)
 }
 
+// The release notes come before the version. A bump with no section to ship stops here, with
+// every file as it was, rather than part-way through the manifests with the gate below red.
+{
+  const notes = spawnSync(process.execPath, [join(root, 'scripts', 'release-notes.mjs'), version], {
+    encoding: 'utf8',
+  })
+  if (notes.status !== 0) {
+    process.stderr.write(notes.stderr || '')
+    console.error(`write the "## [${version}]" section of CHANGELOG.md first; nothing was changed.`)
+    process.exit(1)
+  }
+}
+
 // Only the version line that comes first in the [package] section changes; the
 // section-boundary test is the same one check-version.js uses: every dependency
 // version = "..." sits in a later section, out of reach.
@@ -98,7 +111,7 @@ const check = spawnSync('node', [join(root, 'scripts', 'check-version.js')], { c
 if (check.status !== 0) process.exit(check.status ?? 1)
 
 console.log(`
-version ${version} staged. Next:
+version ${version} staged (the CHANGELOG.md section for it is the Release body). Next:
   git add -A && git commit
   git tag agit-v${version} && git push origin agit-v${version}
   # release.yml builds the binaries; on success the "npm publish" workflow takes over and publishes the npm family.`)

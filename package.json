@@ -1,7 +1,7 @@
 {
   "name": "@einsia/agent-git",
   "version": "0.1.1",
-  "description": "Version control for agent sessions — the agit CLI plus skills/hooks/MCP wiring for Claude Code, Codex, OpenCode and Cursor. The AgentGit hub deploys separately.",
+  "description": "Version control for agent sessions \u2014 the agit CLI plus skills/hooks/MCP wiring for Claude Code, Codex, OpenCode and Cursor. The AgentGit hub deploys separately.",
   "keywords": [
     "agit",
     "agent",
@@ -33,7 +33,8 @@
     "npm/postinstall.js",
     "npm/lib/",
     "npm/README.md",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "postinstall": "node npm/postinstall.js",

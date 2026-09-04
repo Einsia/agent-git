@@ -118,6 +118,7 @@ unreleased versions".
 | Probed storage formats of each runtime  | [`docs/mechanism-probing/`](docs/mechanism-probing/)          |
 | npm package behavior and env vars       | [`npm/README.md`](npm/README.md)                              |
 | Release artifact naming contract        | [`.github/RELEASE_ARTIFACTS.md`](.github/RELEASE_ARTIFACTS.md) |
+| What changed in each release            | [`CHANGELOG.md`](CHANGELOG.md)                                |
 
 The server (**AgentGit**) is a separate repository, deployed on its own.
 
@@ -130,6 +131,13 @@ agree with it (`node scripts/check-version.js` — run in CI and before
 ```sh
 node scripts/bump-version.mjs 0.1.0    # Cargo.toml + Cargo.lock + all npm manifests
 ```
+
+Release notes live in [`CHANGELOG.md`](CHANGELOG.md), and they come first: write the
+version's `## [x.y.z]` section, then bump. `bump-version.mjs` refuses to touch a file for
+a version that has no section, and `check-version.js` refuses one in CI and before `npm pack`.
+The section becomes the GitHub Release body (`scripts/release-notes.mjs` extracts it in
+`release.yml`, with repository-relative links pinned to the release tag) and ships inside
+the `@einsia/agent-git` package.
 
 Pushing the tag runs the whole chain — binaries first, npm right after:
 

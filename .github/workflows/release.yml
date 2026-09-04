@@ -280,10 +280,20 @@ jobs:
           # platform install a 404.
           test "$(wc -l < SHA256SUMS)" -eq 4
 
+      # The Release body is this version's section of CHANGELOG.md. A release without
+      # notes must not go out, so a missing section stops the job here, before anything
+      # is published. The auto-generated "Full Changelog" link is appended below it.
+      - name: Release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          node scripts/release-notes.mjs "${RELEASE_TAG#agit-v}" > "$RUNNER_TEMP/RELEASE_NOTES.md"
+          cat "$RUNNER_TEMP/RELEASE_NOTES.md"
+
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          body_path: ${{ runner.temp }}/RELEASE_NOTES.md
           files: |
             dist/agit-*.tar.gz
             dist/SHA256SUMS

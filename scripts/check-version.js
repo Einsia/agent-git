@@ -15,6 +15,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
 const cargoPath = path.join(root, 'Cargo.toml');
@@ -88,6 +89,19 @@ for (const rel of sibPkgs) {
     console.error(`[check-version] ${rel} pins @einsia/agent-git@${pin}, the main version is ${cargo}.`);
     process.exit(1);
   }
+}
+
+// A version without release notes is not releasable: the Release body is that version's section
+// of CHANGELOG.md, and a section found missing at tag time costs deleting the tag. The section
+// is required here, where CI and `npm pack` already run. The extractor prints the notes on
+// stdout, which prepack must not see (below), so its output stays captured.
+const notes = spawnSync(process.execPath, [path.join(__dirname, 'release-notes.mjs'), cargo], {
+  encoding: 'utf8',
+});
+if (notes.status !== 0) {
+  process.stderr.write(notes.stderr || '');
+  console.error(`[check-version] CHANGELOG.md needs a "## [${cargo}]" section before ${cargo} can ship.`);
+  process.exit(1);
 }
 
 // stderr, like every branch above. This script hangs off prepack, and prepack's stdout is the
