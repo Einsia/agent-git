@@ -26,6 +26,7 @@ agit commit [branch|@] [options] [-- <path>...]
 | `--code` | Also commit the code repo and cross-link both commits; outside Git, warn and settle the session turn without the code side commit |
 | `-m, --message <message>` | Message for a file-only commit; new turns usually derive their message from the transcript |
 | `-n, --name <agent>` | Agent repo name when repo context is unavailable |
+| `-b, --branch <branch>` | Legacy session-ID compatibility: choose the session branch; `main` is refused for turn settlement |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
 ## Examples
@@ -35,6 +36,7 @@ agit commit                                             # settle the pending tur
 agit commit @ --milestone "Phase one passed tests" --tag ms-auth
 agit commit --code -- src/auth.rs                       # also commit the code repo, scoped to one path
 agit commit <owner/repo>@main -m "docs: add README" -- README.md
+agit commit <session-id> -n photo -b fix-auth           # legacy compatibility form
 ```
 
 Supervisors/hooks may settle each user turn, but the CLI does not promise an automatic push. Use `agit push` when the history must be shared.

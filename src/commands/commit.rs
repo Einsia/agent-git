@@ -127,6 +127,10 @@ pub struct Args {
     /// Compat: settle under a different repo (default: this session’s own home).
     #[arg(short = 'n', long = "name", value_name = "owner/name or name")]
     pub name: Option<String>,
+
+    /// Compat: settle a legacy session onto this session branch (never `main`).
+    #[arg(short = 'b', long = "branch", value_name = "branch")]
+    pub branch: Option<String>,
 }
 
 /// What a settlement targets.
@@ -139,9 +143,13 @@ enum Target {
         link: Link,
         via: &'static str,
     },
-    /// The legacy form: a link resolved from an agent name / session id (its branch is the
-    /// registered value, or the current branch).
-    Legacy { link: Link, agent: String },
+    /// The legacy form: a link resolved from an agent name / session id (the explicit branch,
+    /// registered value, or current branch is selected in that order).
+    Legacy {
+        link: Link,
+        agent: String,
+        branch: Option<String>,
+    },
     /// A `-m` pure file commit on the file line. There is no session link, and there must not be
     /// one: the file line never claims a session, so "no link" is its normal state, not a defect.
     FileLine {
@@ -252,7 +260,11 @@ fn run_inner(args: Args) -> CmdResult {
             }
             settle(&store, &repo_dir, &slug, &branch, link, &owner, opts)
         }
-        Target::Legacy { link, agent } => {
+        Target::Legacy {
+            link,
+            agent,
+            branch: requested_branch,
+        } => {
             if std::env::var_os(crate::hub::identity::EXPECTED_AGENT_ID_ENV).is_some() {
                 anyhow::bail!(
                     "an identity-fenced RC settlement did not resolve to its exact branch checkout"
@@ -274,14 +286,31 @@ fn run_inner(args: Args) -> CmdResult {
             } else {
                 super::clone::checkout_for_recording(&namespace, &agent)?
             };
-            let repo = Repo::open_or_init(&repo_dir)?;
-            let branch = link
-                .branch
-                .clone()
-                .or_else(|| repo.current_branch())
+            let branch = requested_branch
+                .or(link.branch.clone())
+                .or_else(|| Repo::open(&repo_dir).and_then(|repo| repo.current_branch()))
                 .unwrap_or_else(|| "main".into());
             let slug = format!("{namespace}/{agent}");
-            settle(&store, &repo_dir, &slug, &branch, link, &owner, opts)
+            let mut link = link;
+            let landing = match super::import::place_legacy_commit_branch(
+                &mut link, &store, &agent, &namespace, &owner, &repo_dir, branch,
+            )? {
+                super::import::Placed::Ready(landing) => *landing,
+                super::import::Placed::Refused(code) => return Ok(code),
+            };
+            let outcome = settle(
+                &store,
+                landing.repo_dir(),
+                &slug,
+                landing.branch(),
+                link,
+                &owner,
+                opts,
+            );
+            if !matches!(outcome, Ok(ExitCode::Ok)) {
+                landing.rollback();
+            }
+            outcome
         }
         Target::FileLine {
             repo_dir,
@@ -716,14 +745,18 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
                         if !quiet {
                             ui::error("this session has no home yet — it needs a name.");
                             ui::hint(&format!(
-                                "agit commit {} -n <name>",
+                                "agit commit {} -n <name> -b <branch>",
                                 link::short(&l.session_id)
                             ));
                         }
                         return Ok(None);
                     }
                 };
-                return Ok(Some(Target::Legacy { link: l, agent }));
+                return Ok(Some(Target::Legacy {
+                    link: l,
+                    agent,
+                    branch: args.branch.clone(),
+                }));
             }
             Located::Explained(code) => {
                 let _ = code;
@@ -1076,6 +1109,17 @@ fn settle(
     opts: SettleOpts,
 ) -> CmdResult {
     let quiet = opts.quiet;
+    if branch == "main" {
+        if !quiet {
+            ui::error(&format!(
+                "cannot settle session turns onto `{branch}` — it is the shared file line"
+            ));
+            ui::hint(
+                "choose a session branch with `-b <branch>`; sessions must never land on main",
+            );
+        }
+        return Ok(ExitCode::Precondition);
+    }
     let fresh = !repo_dir.join(".git").exists();
     let primary = Repo::open_or_init(repo_dir)?;
     let repo = match checkout_for_settlement(&primary, slug, branch)? {
@@ -3114,11 +3158,10 @@ pub fn record(store: &Store, lk: Link, agent: &str, owner: &str, author: &str) -
     } else {
         super::clone::checkout_for_recording(owner, agent)?
     };
-    let repo = Repo::open_or_init(&repo_dir)?;
     let branch = lk
         .branch
         .clone()
-        .or_else(|| repo.current_branch())
+        .or_else(|| Repo::open(&repo_dir).and_then(|repo| repo.current_branch()))
         .unwrap_or_else(|| "main".into());
     let slug = format!("{owner}/{agent}");
     settle(
@@ -3227,6 +3270,28 @@ mod tests {
         l.agent = Some("photo".into());
         l.branch = Some("main".into());
         l
+    }
+
+    #[test]
+    fn session_settlement_refuses_main_before_initializing_repo() {
+        let (_d, s) = store();
+        let repo_root = tempfile::tempdir().unwrap();
+        let repo_dir = repo_root.path().join("agents/alice/photo");
+        let code = settle(
+            &s,
+            &repo_dir,
+            "alice/photo",
+            "main",
+            link(),
+            "alice",
+            opts(),
+        )
+        .unwrap();
+        assert_eq!(code, ExitCode::Precondition);
+        assert!(
+            !repo_dir.exists(),
+            "a refused session must not initialize a repo"
+        );
     }
 
     fn run_code_git(cwd: &Path, args: &[&str]) -> String {

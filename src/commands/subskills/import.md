@@ -39,6 +39,9 @@ agit import [session] --repo <owner/name> -b <branch> [options]
 
 Use `--repo` and `--branch` to import an external runtime into an existing repo. If the session ID is unknown, start with `agit status` or filter with `--from`. Use `--link-only` when adoption should be recorded but content should wait.
 
+The `--link-only` follow-up command uses the legacy compatibility path and must name a session
+branch with `-b <branch>`; session turns cannot be settled onto `main`.
+
 ```bash
 agit import 132bf69f-22a --from claude-code --repo szh/p1 -b fix-auth
 agit import /tmp/transcript.jsonl --repo szh/p1 -b imported --onto main

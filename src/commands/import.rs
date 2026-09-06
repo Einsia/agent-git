@@ -39,7 +39,9 @@
 //! Recording a version needs an account name (the `<owner>/` of the repo path and the commit's
 //! user.name/email all come from the credentials), so the default path requires being signed in.
 //! `--link-only` keeps the purely offline route: write the link only, and `agit commit` later to
-//! record a version. Marking a session down on a plane must not need the network.
+//! record a version. The legacy follow-up must name a session branch with `-b`; `main` is the
+//! shared file line and cannot receive session turns. Marking a session down on a plane must not
+//! need the network.
 
 use super::CmdResult;
 use crate::domain::link::{self, Link};
@@ -297,7 +299,7 @@ pub fn run(args: Args) -> CmdResult {
         println!(
             "\n{}",
             ui::dim(&format!(
-                "  `agit commit {} -n <name>` records the first version",
+                "  `agit commit {} -n <name> -b <branch>` records the first version",
                 link::short(&lk.session_id)
             ))
         );
@@ -351,7 +353,7 @@ fn wants_tui(args: &Args) -> bool {
 }
 
 /// Where this import lands, and how to put it back on failure.
-struct Landing {
+pub(super) struct Landing {
     repo_dir: PathBuf,
     branch: String,
     /// This import created the branch (a failure deletes it).
@@ -377,6 +379,14 @@ struct Landing {
 }
 
 impl Landing {
+    pub(super) fn repo_dir(&self) -> &Path {
+        &self.repo_dir
+    }
+
+    pub(super) fn branch(&self) -> &str {
+        &self.branch
+    }
+
     /// Put the ref and the checkout back the way they were before the import.
     ///
     /// Without this, an import refused by "already claimed" leaves a branch ref pointing at
@@ -384,7 +394,7 @@ impl Landing {
     /// follows (which only knows `current_branch`) then publishes that ghost branch to the hub.
     /// So "did not succeed" must mean "nothing happened" — switch back first, then delete the
     /// ref; in the other order git refuses to delete the current branch.
-    fn rollback(&self) {
+    pub(super) fn rollback(&self) {
         let Some(repo) = Repo::open(&self.repo_dir) else {
             return;
         };
@@ -456,7 +466,7 @@ impl Landing {
 }
 
 /// The result of [`place_on_branch`].
-enum Placed {
+pub(super) enum Placed {
     Ready(Box<Landing>),
     /// The reason is already printed; exit with this code.
     Refused(ExitCode),
@@ -540,6 +550,64 @@ fn place_on_branch(
         }
     };
 
+    place_resolved_branch(
+        lk,
+        store,
+        agent,
+        owner,
+        author,
+        repo_dir,
+        repo,
+        branch,
+        onto_commit,
+    )
+}
+
+/// Prepare the branch selected by the legacy `commit <session-id> -n <name> -b <branch>` form.
+///
+/// The repo path is already resolved by `commit`, preserving its legacy checkout-selection and
+/// namespace rules. Branch creation and link claiming then use the same path as normal import.
+pub(super) fn place_legacy_commit_branch(
+    lk: &mut Link,
+    store: &Store,
+    agent: &str,
+    owner: &str,
+    author: &str,
+    repo_dir: &Path,
+    branch: String,
+) -> crate::Result<Placed> {
+    if branch == "main" {
+        ui::error("cannot settle session turns onto `main` — it is the shared file line");
+        ui::hint("choose a session branch with `-b <branch>`; sessions must never land on main");
+        return Ok(Placed::Refused(ExitCode::Precondition));
+    }
+    let repo = Repo::open_or_init(repo_dir)?;
+    place_resolved_branch(
+        lk,
+        store,
+        agent,
+        owner,
+        author,
+        repo_dir.to_path_buf(),
+        repo,
+        branch,
+        None,
+    )
+}
+
+/// Validate, claim, and create a selected session branch.
+#[allow(clippy::too_many_arguments)]
+fn place_resolved_branch(
+    lk: &mut Link,
+    store: &Store,
+    agent: &str,
+    owner: &str,
+    author: &str,
+    repo_dir: PathBuf,
+    repo: Repo,
+    branch: String,
+    onto_commit: Option<String>,
+) -> crate::Result<Placed> {
     // Only the name of a branch about to be **created** goes through the prefix check: an
     // existing branch is a fact on the ground, and stopping it only leaves a line that already
     // exists unable to settle from then on.
@@ -576,9 +644,35 @@ fn place_on_branch(
         }
     }
 
-    // Only once the name is decided does the disk get touched: a repo created here gets its
-    // `main` file line first.
-    //
+    birth_session_branch(
+        lk,
+        store,
+        agent,
+        owner,
+        author,
+        repo_dir,
+        repo,
+        branch,
+        onto_commit,
+    )
+}
+
+/// Create and claim a session branch after the destination and reroute checks have passed.
+///
+/// Every entry point uses this path so a fresh repository always gets its `main` file line before
+/// the session branch is born from it.
+#[allow(clippy::too_many_arguments)]
+fn birth_session_branch(
+    lk: &mut Link,
+    store: &Store,
+    agent: &str,
+    owner: &str,
+    author: &str,
+    repo_dir: PathBuf,
+    repo: Repo,
+    branch: String,
+    onto_commit: Option<String>,
+) -> crate::Result<Placed> {
     // A repo with no `main` collapses the whole chain, at every link: a server-side bare repo's
     // HEAD dangles at a non-existent `refs/heads/main` → `clone` checks out no local branch and
     // warns that the remote HEAD points at a ref that does not exist → `resume` reports no branch
@@ -1450,6 +1544,44 @@ mod tests {
             "the default records a version"
         );
         assert!(W::parse_from(["x", "AB", "--link-only"]).a.link_only);
+    }
+
+    /// The offline adoption link has no repository or branch claim. Its legacy commit follow-up
+    /// must create the shared file line first, then grow the named session branch from that line.
+    #[test]
+    fn link_only_followup_births_main_before_the_session_branch() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::at(d.path().join("store"));
+        let repo_dir = d.path().join("agents/alice/photo");
+        let mut lk = Link::new("codex", "AB", None);
+        link::write(&store, &lk).unwrap();
+
+        let placed = place_legacy_commit_branch(
+            &mut lk,
+            &store,
+            "photo",
+            "alice",
+            "alice",
+            &repo_dir,
+            "fix-auth".into(),
+        )
+        .unwrap();
+        assert!(matches!(placed, Placed::Ready(_)));
+
+        let repo = Repo::open(&repo_dir).unwrap();
+        assert!(meta::is_file_line_at(&repo, "refs/heads/main"));
+        assert!(
+            meta::read_at_ref(&repo, "refs/heads/fix-auth")
+                .is_some_and(|snapshot| snapshot.is_session_line())
+        );
+        repo.git(&["merge-base", "--is-ancestor", "main", "fix-auth"])
+            .unwrap();
+        assert!(repo.show("refs/heads/fix-auth", "AGENTS.md").is_some());
+
+        let saved = link::get(&store, "codex", "AB").unwrap();
+        assert_eq!(saved.owner.as_deref(), Some("alice"));
+        assert_eq!(saved.agent.as_deref(), Some("photo"));
+        assert_eq!(saved.branch.as_deref(), Some("fix-auth"));
     }
 
     #[test]
