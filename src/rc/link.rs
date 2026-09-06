@@ -540,12 +540,23 @@ where
 ///
 /// A daemon is not a browser, so the plain `Authorization` header works and we
 /// do not need the `Sec-WebSocket-Protocol` smuggling that browsers force.
+///
+/// The handshake also names the daemon. A WebSocket client library sends no
+/// `User-Agent` on its own, and the hub's edge firewall treats a request
+/// without one as a scanner: it answers 403 before the application can read
+/// the token, which looks like a revoked pairing from the daemon's side.
 fn build_request(
     url: &str,
     token: &str,
 ) -> crate::Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = url.into_client_request()?;
+    req.headers_mut().insert(
+        "user-agent",
+        concat!("agit/", env!("CARGO_PKG_VERSION"))
+            .parse()
+            .expect("a crate version is a valid header value"),
+    );
     req.headers_mut().insert(
         "authorization",
         format!("Bearer {token}")
@@ -832,6 +843,28 @@ mod tests {
         assert!(
             REGISTER_DEADLINE > std::time::Duration::from_secs(crate::protocol::HEARTBEAT_SECS),
             "one heartbeat period at minimum, so a normally slow registration is not kicked"
+        );
+    }
+
+    /// The handshake must name the daemon as well as carry the token. An
+    /// implementation that only sets `Authorization` still pairs and still
+    /// passes every local test, and is turned away at the hub's edge with a
+    /// 403 that no code on this side can distinguish from a revoked token.
+    #[test]
+    fn the_handshake_names_the_daemon_and_carries_the_token() {
+        let req = build_request("wss://hub.example.com/rc/ws", "agit_rc_secret").unwrap();
+        let headers = req.headers();
+        assert_eq!(
+            headers.get("user-agent").unwrap(),
+            concat!("agit/", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer agit_rc_secret"
+        );
+        assert_eq!(
+            headers.get("x-agit-protocol").unwrap(),
+            VERSION.to_string().as_str()
         );
     }
 
