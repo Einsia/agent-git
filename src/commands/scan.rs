@@ -300,7 +300,7 @@ fn collect(repo: &Repo, agent: &str) -> crate::Result<Found> {
     // which is the one `agit push` publishes to from here. Without it, when `origin` points at
     // another agent under the same account, that agent's history is subtracted wholesale from
     // the scan surface.
-    let plan = secrets::ScanPlan::to(super::publish_destination(repo, agent));
+    let plan = secrets::ScanPlan::to(super::publish_destination(repo, agent, false).scan);
     let wide = secrets::scan_agent_repo(repo, &plan)?;
     let hits = wide
         .hits
@@ -463,7 +463,8 @@ mod tests {
         // The scan path.
         let scanned = collect(&repo, AGENT).expect("the repo is well-formed");
         // The push path: the same destination, the same plan.
-        let plan = secrets::ScanPlan::to(crate::commands::publish_destination(&repo, AGENT));
+        let plan =
+            secrets::ScanPlan::to(crate::commands::publish_destination(&repo, AGENT, true).scan);
         let pushed = secrets::scan_agent_repo(&repo, &plan).expect("the repo is well-formed");
 
         assert!(

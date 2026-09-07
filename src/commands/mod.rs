@@ -472,26 +472,43 @@ fn mib(bytes: u64) -> String {
 /// the checkout it selected (`checkout.name`, the same name `ensure_remote` creates or fetches),
 /// `agit scan` from the slug it resolved. It is the third segment of the destination identity —
 /// it **must not** be derived here from `origin`, which is handing the suspect URL its own alibi.
-pub fn publish_destination(repo: &crate::domain::repo::Repo, agent: &str) -> secrets::Destination {
+pub fn publish_destination(
+    repo: &crate::domain::repo::Repo,
+    agent: &str,
+    include_tags: bool,
+) -> PublishDestination {
+    let unknown = || PublishDestination {
+        scan: secrets::Destination::Unknown,
+        tags: Default::default(),
+    };
     let Some(url) = repo.remote_url() else {
-        return secrets::Destination::Unknown; // No origin yet: this push sends everything.
+        return unknown();
     };
     let base = crate::infra::config::hub_url();
     let me = crate::infra::credentials::current_user();
     if !lands_on(&url, &base, me.as_deref(), agent) {
-        return secrets::Destination::Unknown; // origin does not describe this destination.
+        return unknown();
     }
     let Some(owner) = me.as_deref() else {
-        return secrets::Destination::Unknown;
+        return unknown();
     };
     let client = crate::hub::Client::from_env();
     if crate::hub::identity::verify_slug(repo, &client, owner, agent).is_err() {
-        return secrets::Destination::Unknown; // slug reused, legacy checkout, or no answer now.
+        return unknown();
     }
-    let Some(tips) = crate::hub::git::ls_remote_heads(repo.root(), &url) else {
-        return secrets::Destination::Unknown; // Unanswerable (offline, no access, agent gone).
+    let Some(refs) = crate::hub::git::ls_remote_refs(repo.root(), &url, include_tags) else {
+        return unknown();
     };
-    secrets::Destination::advertised(repo, tips).unwrap_or(secrets::Destination::Unknown)
+    PublishDestination {
+        scan: secrets::Destination::advertised(repo, refs.heads)
+            .unwrap_or(secrets::Destination::Unknown),
+        tags: refs.tags,
+    }
+}
+
+pub struct PublishDestination {
+    pub scan: secrets::Destination,
+    pub tags: std::collections::BTreeMap<String, String>,
 }
 
 /// Whether this push really lands on `remote_url`.

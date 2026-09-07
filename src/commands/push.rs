@@ -301,7 +301,10 @@ pub fn run(args: Args) -> CmdResult {
     // read-only promotion swaps only the owner, see `target` in `promote_if_read_only`), so what
     // is asked here and what is done there are the same destination.
     let asked_url = repo.remote_url();
-    let dest = super::publish_destination(&repo, &checkout.name);
+    let super::PublishDestination {
+        scan: dest,
+        tags: mut advertised_tags,
+    } = super::publish_destination(&repo, &checkout.name, true);
     // Whether the destination narrowed the scan surface. Only a narrowed pass has to be redone
     // after the destination changes.
     let narrowed = dest.narrows();
@@ -395,7 +398,11 @@ pub fn run(args: Args) -> CmdResult {
     // about "the origin as it was then"; this step closes that gap. `narrowed` is the necessary
     // guard: when step 3 scanned in full anyway, a changed destination misses nothing and
     // rescanning only burns time.
-    if narrowed && (created || asked_url.as_deref() != Some(push_url.as_str())) {
+    let destination_changed = created || asked_url.as_deref() != Some(push_url.as_str());
+    if destination_changed {
+        advertised_tags.clear();
+    }
+    if narrowed && destination_changed {
         ui::warning(&format!(
             "the destination changed while preparing this push ({}) — re-checking the full history.",
             if created {
@@ -439,7 +446,8 @@ pub fn run(args: Args) -> CmdResult {
     // the content, so "same name, different value" cannot happen and re-pushing is a safe
     // idempotent operation.
     let tags = tags_to_push(&repo, &refs);
-    if let Err(out) = push_tags(&repo, &tags) {
+    let missing_tags = tags_missing_from_remote(&repo, &tags, &advertised_tags);
+    if let Err(out) = push_tags(&repo, &missing_tags) {
         ui::warning("branches pushed, but version tags didn’t go up.");
         for line in diagnose(&out, &owner, &name) {
             ui::hint(&line);
@@ -1225,6 +1233,36 @@ fn tags_to_push(repo: &Repo, branches: &[String]) -> Vec<String> {
     out
 }
 
+/// Only exact tag objects on the verified destination can be omitted. Peeling an annotated
+/// tag would hide a changed message, while an unavailable local ref must still reach Git.
+fn tags_missing_from_remote(
+    repo: &Repo,
+    tags: &[String],
+    advertised: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let Some(local) = repo.git_opt(&[
+        "for-each-ref",
+        "--format=%(refname)%09%(objectname)",
+        "refs/tags",
+    ]) else {
+        return tags.to_vec();
+    };
+    let local: std::collections::BTreeMap<_, _> = local
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect();
+    tags.iter()
+        .filter(|tag| {
+            let name = format!("refs/tags/{tag}");
+            match (local.get(name.as_str()), advertised.get(&name)) {
+                (Some(local), Some(remote)) => *local != remote,
+                _ => true,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 /// Push tags. Batched because an agent gets a version ID every turn, and a command line has a
 /// length limit.
 fn push_tags(repo: &Repo, tags: &[String]) -> std::result::Result<(), crate::hub::git::Outcome> {
@@ -1682,6 +1720,49 @@ mod tests {
         assert!(got.contains(&"agit-ghost-three".to_string()), "{got:?}");
         assert!(!got.contains(&"agit-refund-two".to_string()), "{got:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_identical_advertised_tag_objects_are_skipped() {
+        let (dir, repo) = fixture("advertised-tags");
+        repo.git(&["tag", "-a", "release", "-m", "published message", "main"])
+            .unwrap();
+        let tag_oid = repo.git_opt(&["rev-parse", "refs/tags/release"]).unwrap();
+        let lightweight_oid = repo
+            .git_opt(&["rev-parse", "refs/tags/agit-main-one"])
+            .unwrap();
+        let advertised = std::collections::BTreeMap::from([
+            ("refs/tags/release".to_string(), tag_oid),
+            ("refs/tags/agit-main-one".to_string(), lightweight_oid),
+        ]);
+        let tags = tags_to_push(&repo, &["refund-fix".to_string()]);
+        assert_eq!(
+            tags_missing_from_remote(&repo, &tags, &advertised),
+            ["agit-refund-two"]
+        );
+        assert_eq!(
+            tags_missing_from_remote(&repo, &tags, &Default::default()),
+            tags
+        );
+        repo.git(&[
+            "tag",
+            "-f",
+            "-a",
+            "release",
+            "-m",
+            "changed message",
+            "main",
+        ])
+        .unwrap();
+        let mut missing = tags_missing_from_remote(&repo, &tags, &advertised);
+        missing.sort();
+        assert_eq!(missing, ["agit-refund-two", "release"]);
+        assert!(!missing.contains(&"agit-ghost-three".to_string()));
+        assert_eq!(
+            tags_missing_from_remote(&repo, &["gone".to_string()], &advertised),
+            ["gone"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

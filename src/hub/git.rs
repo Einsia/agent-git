@@ -185,43 +185,58 @@ fn run_for_identity(
     Ok(Outcome { code, stderr })
 }
 
-/// Ask a remote: **which branch tips do you have right now**.
-///
-/// `None` means "no answer" (offline, no permission, unreachable address, remote does not
-/// exist) — the caller must take it as "unknown", not as "nothing there". The direction is the
-/// same either way (both force a full scan), but reading one failure as "the far side already
-/// has it" leaves content unscanned, and that is the failure this gate must not have.
-///
-/// # Why this is needed
-///
-/// The local `refs/remotes/origin/*` describes **the remote of the last fetch/push**, not the
-/// destination of this push. Switching hubs, or a remote deleted and recreated, leaves it
-/// unchanged. So "what this push will send" can only be asked of the destination itself. This
-/// one round trip is read-only and changes no state, and what comes back is exactly the
-/// advertisement `git push` negotiates against.
-///
-/// `--heads` only: what is wanted here is "how far the far side's history has come", and the
-/// commit a tag points at is already reachable from a branch. It also avoids a real shape — an
-/// agent makes one tag per version, so a repo of a thousand turns has a thousand tag refs, and
-/// fetching them all only moves a list that takes no part in the verdict across the network.
-pub fn ls_remote_heads(dir: &Path, url: &str) -> Option<Vec<String>> {
+/// Advertised branches and unpeeled tags from an identity-fenced remote probe.
+#[derive(Default)]
+pub struct RemoteRefs {
+    pub heads: Vec<String>,
+    pub tags: std::collections::BTreeMap<String, String>,
+}
+
+/// An unavailable or malformed advertisement is unknown and cannot justify skipping content.
+/// Branch tips narrow the secret scan; exact tag objects identify already published tags.
+pub fn ls_remote_refs(dir: &Path, url: &str, include_tags: bool) -> Option<RemoteRefs> {
     let repo = Repo::at(dir);
     let identity =
         super::identity::require_current_expected(&repo, &crate::infra::config::hub_url()).ok()?;
     let out = capture(
         dir,
-        &["ls-remote", "--heads", url],
+        &remote_ref_args(url, include_tags),
         Some(&identity.agent_id),
     )?;
-    Some(head_oids(&out))
+    parse_remote_refs(&out)
 }
 
-fn head_oids(out: &str) -> Vec<String> {
-    out.lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|oid| !oid.is_empty())
-        .map(str::to_string)
-        .collect()
+fn remote_ref_args(url: &str, include_tags: bool) -> Vec<&str> {
+    let mut args = vec!["ls-remote", "--refs", "--heads"];
+    if include_tags {
+        args.push("--tags");
+    }
+    args.push(url);
+    args
+}
+
+fn parse_remote_refs(out: &str) -> Option<RemoteRefs> {
+    let mut refs = RemoteRefs::default();
+    for line in out.lines() {
+        let (oid, name) = line.split_once('\t')?;
+        if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        if name.starts_with("refs/heads/") {
+            refs.heads.push(oid.to_string());
+        } else if name.starts_with("refs/tags/") && !name.ends_with("^{}") {
+            if refs
+                .tags
+                .insert(name.to_string(), oid.to_string())
+                .is_some()
+            {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(refs)
 }
 
 /// How long one read-only probe waits at most.
@@ -253,7 +268,7 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// forever and the timeout is what finally cuts it down.
 ///
 /// This is not rare. The output of `ls-remote --heads` grows linearly with the branch count, and
-/// in this product every session line is one `refs/heads/*` ([`ls_remote_heads`]'s own doc is
+/// in this product every session line is one `refs/heads/*` ([`ls_remote_refs`]'s own doc is
 /// discussing "a repo of a thousand turns has a thousand refs") — observed: 1201 branches →
 /// 106 950 bytes → every probe stalls out [`PROBE_TIMEOUT`].
 ///
@@ -515,6 +530,65 @@ mod tests {
     }
 
     #[test]
+    fn scan_probe_omits_tags_without_changing_advertised_branch_tips() {
+        let work = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(work.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.test")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.test")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "local Git fixture must succeed");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "--allow-empty", "--no-gpg-sign", "-m", "base"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&[
+            "-c",
+            "tag.gpgSign=false",
+            "tag",
+            "-a",
+            "release",
+            "-m",
+            "release",
+        ]);
+        let tag = git(&["rev-parse", "refs/tags/release"]);
+        let url = work.path().to_str().unwrap();
+        let scan = parse_remote_refs(&git(&remote_ref_args(url, false))).unwrap();
+        let push = parse_remote_refs(&git(&remote_ref_args(url, true))).unwrap();
+        assert_eq!(scan.heads, [head]);
+        assert_eq!(scan.heads, push.heads);
+        assert!(scan.tags.is_empty());
+        assert_eq!(push.tags.get("refs/tags/release"), Some(&tag));
+    }
+
+    #[test]
+    fn advertised_tags_keep_their_exact_objects_separate_from_branch_tips() {
+        let commit = "a".repeat(40);
+        let tag = "b".repeat(40);
+        let refs = parse_remote_refs(&format!(
+            "{commit}\trefs/heads/main\n{tag}\trefs/tags/release\n"
+        ))
+        .unwrap();
+        assert_eq!(refs.heads, [commit]);
+        assert_eq!(refs.tags.get("refs/tags/release"), Some(&tag));
+        assert!(parse_remote_refs("").unwrap().tags.is_empty());
+        for malformed in [
+            "bad\trefs/tags/release\n".to_string(),
+            format!("{tag}\trefs/tags/release^{{}}\n"),
+            format!("{tag}\trefs/tags/release\n{tag}\trefs/tags/release\n"),
+        ] {
+            assert!(parse_remote_refs(&malformed).is_none());
+        }
+    }
+
+    #[test]
     fn token_never_appears_in_a_url_or_argv() {
         // The whole reason this module exists: the token lives only in an environment variable.
         let e = transport_env_after(0, Some("s3cret"), "00000000-0000-0000-0000-000000000001");
@@ -612,6 +686,14 @@ mod tests {
 mod probe_timeout_tests {
     use super::*;
 
+    fn head_oids(out: &str) -> Vec<String> {
+        out.lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|oid| !oid.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     /// A read-only probe must be bounded.
     ///
     /// `GIT_TERMINAL_PROMPT=0` blocks an interactive hang, not a network one: when an address is
@@ -656,7 +738,7 @@ mod probe_timeout_tests {
     /// # This is not an extreme shape
     ///
     /// Every session line is one `refs/heads/*`, so "a repo of a thousand turns has a thousand
-    /// refs" is the normal case for this product ([`ls_remote_heads`]'s own doc discusses it).
+    /// refs" is the normal case for this product ([`ls_remote_refs`]'s own doc discusses it).
     /// The advertisement for 1200 branches is about 107 KB while a pipe holds on the order of
     /// 64 KiB — **enough of them and it fills every time**.
     ///
