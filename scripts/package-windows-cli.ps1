@@ -18,6 +18,8 @@ if (-not (Test-Path $rustup)) {
 foreach ($tool in @('cargo', 'node', 'git', 'tar')) {
     Get-Command $tool -ErrorAction Stop | Out-Null
 }
+& node scripts/verify-windows-powershell.mjs
+if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell host verification failed' }
 if ($env:AGIT_RELEASE_CHANNEL -notin @('dev', 'staging')) { throw 'Internal packages require dev or staging' }
 if (-not $env:AGIT_DEFAULT_HUB_URL) { throw 'AGIT_DEFAULT_HUB_URL is required' }
 if (-not $env:AGIT_BUILD_SHA) { throw 'AGIT_BUILD_SHA is required' }
@@ -34,8 +36,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows CLI build failed' }
 $binary = "target/$target/release/agit.exe"
 & cargo check --locked --release --no-default-features --target $target --lib
 if ($LASTEXITCODE -ne 0) { throw 'Windows library without RC failed to compile' }
-& cargo test --locked --release --target $target --test windows_rc -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows native RC integration tests failed' }
+& cargo test --locked --release --target $target --test windows_rc --test import_noninteractive_selection -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows native CLI integration tests failed' }
 & node scripts/verify-windows-cli.mjs $binary
 if ($LASTEXITCODE -ne 0) { throw 'Windows executable verification failed' }
 $actualVersion = & $binary --version

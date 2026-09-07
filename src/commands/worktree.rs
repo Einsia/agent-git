@@ -46,7 +46,36 @@ pub fn home_for(primary: &Repo) -> crate::Result<PathBuf> {
 }
 
 fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::path::{Component, Prefix};
+
+        // Git's worktree commands require ordinary drive or UNC paths rather than the
+        // verbatim prefixes returned by Windows canonicalization.
+        let mut components = canonical.components();
+        let prefix = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => {
+                    Some(OsString::from(format!("{}:", char::from(drive))))
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut prefix = OsString::from(r"\\");
+                    prefix.push(server);
+                    prefix.push(r"\");
+                    prefix.push(share);
+                    Some(prefix)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(prefix) = prefix {
+            return PathBuf::from(prefix).join(components.as_path());
+        }
+    }
+    canonical
 }
 
 /// Where a branch's worktree belongs, whether or not it exists.

@@ -49,6 +49,7 @@ use crate::domain::store::Store;
 use crate::infra::config;
 use crate::{ExitCode, adapter, ui};
 use clap::Args as ClapArgs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
@@ -170,7 +171,7 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Usage);
         }
         Some(sel) => by_selector(sel, args.from.as_deref())?,
-        None => pick_here(&store)?,
+        None => pick_here(&store, &args)?,
     };
     let found = match picked {
         Pick::One(f) => f,
@@ -963,7 +964,7 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
             for f in found.iter().take(8) {
                 println!("  {:12} {}", f.runtime, link::short(&f.session_id));
             }
-            ui::hint("give a longer prefix");
+            ui::hint("give a longer prefix or select its runtime with `--from <runtime>`");
             Ok(Pick::Explained(ExitCode::Usage))
         }
     }
@@ -1060,24 +1061,29 @@ fn scrub_copy(found: &Found) -> crate::Result<Option<Found>> {
 ///
 /// Candidates come from the runtime index (Codex queries the `threads` table, Claude Code reads
 /// the directory), with **no transcript opened**.
-fn pick_here(store: &Store) -> crate::Result<Pick> {
+fn pick_here(store: &Store, args: &Args) -> crate::Result<Pick> {
     let Some(repo) = config::repo_root().or_else(|| std::env::current_dir().ok()) else {
         ui::error("can’t determine the current directory.");
         ui::hint("be explicit: agit import <session-id> -n <name>");
         return Ok(Pick::Explained(ExitCode::Usage));
     };
 
-    let known: std::collections::HashSet<String> = link::list(store)
-        .into_iter()
-        .map(|l| l.session_id)
+    let links = link::list(store);
+    let known: std::collections::HashSet<_> = links
+        .iter()
+        .map(|link| (link.source.as_str(), link.session_id.as_str()))
         .collect();
 
     let sp = ui::spinner("looking for sessions under this directory…");
     let mut cands: Vec<(&'static str, std::path::PathBuf, String)> = vec![];
+    let selected_runtime = args.from.as_deref().map(adapter::normalize).transpose()?;
     for rt in adapter::RUNTIMES {
+        if selected_runtime.is_some_and(|selected| selected != *rt) {
+            continue;
+        }
         let Ok(ad) = adapter::get(rt) else { continue };
         for sr in ad.sessions_for(&repo).unwrap_or_default() {
-            if !known.contains(&sr.id) {
+            if !known.contains(&(ad.id(), sr.id.as_str())) {
                 cands.push((ad.id(), sr.path, sr.id));
             }
         }
@@ -1107,13 +1113,29 @@ fn pick_here(store: &Store) -> crate::Result<Pick> {
     // exception to "listing must not parse transcripts", because without the prompt a column of
     // uuids means nothing to the user in an interactive list. Two bounds hold it down: only the
     // unadopted candidates under the current directory, and only when the list is shown.
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let labels: Vec<String> = cands
         .iter()
         .map(|(rt, p, id)| {
             let gist = gist_for(rt, id, p);
-            format!("{rt:12} {}  \"{gist}\"", link::short(id))
+            let identity = if interactive {
+                link::short(id)
+            } else {
+                id.clone()
+            };
+            format!("{rt:12} {identity}  \"{gist}\"")
         })
         .collect();
+
+    if !interactive {
+        ui::error("a session must be selected explicitly; no interactive terminal is available.");
+        for label in &labels {
+            eprintln!("  {label}");
+        }
+        ui::hint(&format!("be explicit: {}", selection_command(args)));
+        return Ok(Pick::Explained(ExitCode::Interactive));
+    }
+
     let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
 
     match ui::prompt::select("which session to adopt?", &refs)? {
@@ -1138,6 +1160,79 @@ fn pick_here(store: &Store) -> crate::Result<Pick> {
             Ok(Pick::Explained(ExitCode::Usage))
         }
     }
+}
+
+fn selection_command(args: &Args) -> String {
+    let mut command = String::from("agit import <session-id>");
+    for (flag, value) in [
+        ("--into", args.repo.as_deref()),
+        ("-n", args.name.as_deref()),
+        ("-b", args.branch.as_deref()),
+        ("--from", args.from.as_deref()),
+        ("--onto", args.onto.as_deref()),
+    ] {
+        if let Some(value) = value {
+            command.push_str(&format!(" {flag} {}", selection_arg(value)));
+        }
+    }
+    if args.from.is_none() {
+        command.push_str(" --from <runtime>");
+    }
+    if args.link_only {
+        command.push_str(" --link-only");
+    } else if args.repo.is_none() && args.name.is_none() {
+        command.push_str(if args.branch.is_some() {
+            " --into <owner/repo>"
+        } else {
+            " --into <owner/repo>@<branch>"
+        });
+    } else if args.branch.is_none() && args.repo.as_deref().is_none_or(|repo| !repo.contains('@')) {
+        command.push_str(" -b <branch>");
+    }
+    if args.privacy {
+        command.push_str(" --privacy");
+    }
+    command
+}
+
+fn selection_arg(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        powershell_selection_arg(value)
+    }
+    #[cfg(not(windows))]
+    {
+        if value.is_empty() || (value.starts_with('<') && value.ends_with('>')) {
+            format!("'{}'", value.replace('\'', "'\\''"))
+        } else {
+            ui::session::shell_arg(value)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn powershell_selection_arg(value: &str) -> String {
+    if !value.is_empty()
+        && !value.starts_with('@')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '@' | '-' | '_' | '.'))
+    {
+        return value.to_owned();
+    }
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        // PowerShell recognizes typographic quotes as string delimiters too.
+        if matches!(
+            character,
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'
+        ) {
+            quoted.push(character);
+        }
+        quoted.push(character);
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Adopt a session: write the link, nothing else.
@@ -1290,6 +1385,30 @@ mod tests {
             let args = W::try_parse_from(argv).unwrap().a;
             assert!(!wants_tui(&args));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selection_arguments_round_trip_literal_values_through_the_shell() {
+        let values = [
+            "",
+            "<work>",
+            "<work'literal>",
+            "@branch",
+            "work;literal'branch",
+        ];
+        let arguments = values.map(selection_arg).join(" ");
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("printf '%s\\0' {arguments}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let expected: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.bytes().chain(std::iter::once(0)))
+            .collect();
+        assert_eq!(output.stdout, expected);
+        assert!(output.stderr.is_empty(), "{output:?}");
     }
 
     /// `main` (the file line) plus someone else's session branch, HEAD parked on the latter —

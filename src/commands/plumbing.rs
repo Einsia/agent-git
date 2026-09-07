@@ -253,16 +253,26 @@ pub fn tree_apply_owned(
         anyhow::bail!("git rev-parse returned an invalid tree object id");
     }
 
-    let git_dir = repo.git(&["rev-parse", "--git-dir"])?;
-    let git_dir = std::path::PathBuf::from(git_dir.trim());
-    let git_dir = if git_dir.is_absolute() {
-        git_dir
-    } else {
-        repo.root().join(git_dir)
+    #[cfg(windows)]
+    let git_dir = {
+        // Git supplies an absolute path usable by its own subprocesses; Rust's Windows
+        // canonical paths use a verbatim prefix that Git cannot use for its index lock.
+        let path = repo.git(&["rev-parse", "--absolute-git-dir"])?;
+        std::path::PathBuf::from(path.trim())
     };
-    // hash-object runs inside the scratch directory; GIT_DIR must be absolute, or a relative
-    // `.git` points at scratch itself once current_dir has changed.
-    let git_dir = std::fs::canonicalize(&git_dir)?;
+    #[cfg(not(windows))]
+    let git_dir = {
+        let path = repo.git(&["rev-parse", "--git-dir"])?;
+        let path = std::path::PathBuf::from(path.trim());
+        let path = if path.is_absolute() {
+            path
+        } else {
+            repo.root().join(path)
+        };
+        // An absolute GIT_DIR remains valid when hash-object moves into the scratch directory.
+        // Resolving the native path preserves a repository root that is not UTF-8.
+        std::fs::canonicalize(path)?
+    };
     let scratch = tempfile::Builder::new()
         .prefix("agit-tree-")
         .tempdir_in(&git_dir)?;
@@ -4025,6 +4035,33 @@ mod tests {
 
         import_commit_graph(&target, &source, &head).unwrap();
         verify_commit_connectivity(&target, &head).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_tree_apply_preserves_non_utf8_repository_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"repo-\xff".to_vec()));
+        let repo = Repo::init(&root).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(repo.root().join("base.txt"), b"base\n").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("init").unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let bytes = b"owned content\0\xff".to_vec();
+        let tree = tree_apply_owned(
+            &repo,
+            &head,
+            vec![("owned.bin".into(), Some(bytes.clone()))],
+        )
+        .unwrap();
+        assert_eq!(cat_blob(&repo, &tree, "owned.bin"), bytes);
+        assert!(!repo.root().join("owned.bin").exists());
+        assert!(scratch_dirs(&repo).is_empty());
     }
 
     #[test]
