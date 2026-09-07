@@ -238,6 +238,74 @@ fn a_stop_hook_settles_the_stdin_session_and_nothing_else() {
     );
 }
 
+#[test]
+fn imported_history_cannot_claim_the_code_state_observed_by_a_later_hook() {
+    use agit::domain::meta::{self, Completeness, WorktreeStatus};
+
+    let lab = Lab::new();
+    let code = Repo::init(&lab.work).unwrap();
+    code.git(&[
+        "remote",
+        "add",
+        "origin",
+        "git@example.invalid:team/project.git",
+    ])
+    .unwrap();
+    code.git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "code root",
+    ])
+    .unwrap();
+    lab.append(
+        A,
+        &lab.turn(A, 1, "historical request", "historical answer"),
+    );
+    lab.append(
+        A,
+        &lab.turn(A, 2, "later historical request", "later historical answer"),
+    );
+    lab.run(&["init", "qa"]);
+    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+
+    let repo = Repo::open(lab.agit_home.join("repos/me/qa")).unwrap();
+    let head = repo.git(&["rev-parse", "refs/heads/s1"]).unwrap();
+    for reference in [head.trim().to_string(), format!("{}~1", head.trim())] {
+        let historical = meta::read_at_ref(&repo, &reference).unwrap();
+        assert!(historical.code.is_some());
+        assert_eq!(historical.completeness, Some(Completeness::Unknown));
+        assert!(historical.cwd_state.is_none());
+    }
+
+    lab.append(A, &lab.turn(A, 3, "live request", "live answer"));
+    lab.hook(&["hooks", "settle"], A, Some("me/qa@s1"));
+    let live = meta::read_at_ref(&repo, "refs/heads/s1").unwrap();
+    assert_eq!(live.completeness, Some(Completeness::Exact));
+    let state = live.cwd_state.unwrap();
+    assert_eq!(
+        state.origin.as_deref(),
+        Some("git@example.invalid:team/project.git")
+    );
+    assert_eq!(state.worktree, WorktreeStatus::Clean);
+
+    fs::write(lab.work.join("untracked.txt"), "uncommitted code\n").unwrap();
+    lab.append(
+        A,
+        &lab.turn(A, 4, "dirty live request", "dirty live answer"),
+    );
+    lab.hook(&["hooks", "settle"], A, Some("me/qa@s1"));
+    let dirty = meta::read_at_ref(&repo, "refs/heads/s1").unwrap();
+    assert_eq!(dirty.completeness, Some(Completeness::Partial));
+    assert_eq!(dirty.cwd_state.unwrap().worktree, WorktreeStatus::Dirty);
+}
+
 /// Inside a process tree launched by the supervisor, the Stop command touches no local state:
 /// branches, links and the memory directory are identical before and after — a branch moves only
 /// inside the supervisor's lease. The same command outside the gate settles as usual, which pins

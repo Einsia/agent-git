@@ -227,6 +227,7 @@ fn run_inner(args: Args) -> CmdResult {
         milestone: args.milestone,
         tag: args.tag,
         code: args.code,
+        historical: false,
         message: args.message,
         paths: args.paths,
         quiet,
@@ -424,6 +425,7 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
             milestone: None,
             tag: None,
             code: false,
+            historical: false,
             message: None,
             paths: Vec::new(),
             quiet: true,
@@ -780,6 +782,7 @@ struct SettleOpts {
     milestone: Option<String>,
     tag: Option<String>,
     code: bool,
+    historical: bool,
     message: Option<String>,
     paths: Vec<String>,
     quiet: bool,
@@ -1863,7 +1866,11 @@ fn settle_bytes(
     if opts.code {
         code_anchor = code_commit(&cwd, &format!("{slug}@{branch}"))?;
     }
-    let cwd_state = meta::cwd_state_of(Path::new(&cwd));
+    let cwd_state = if opts.historical {
+        None
+    } else {
+        meta::cwd_state_of(Path::new(&cwd))
+    };
     let unborn_base_tree = if old_head.is_none() {
         Some(unborn_worktree_tree(repo)?)
     } else {
@@ -1909,11 +1916,9 @@ fn settle_bytes(
         if last {
             snap.cwd_state = cwd_state.clone();
         }
-        // Only the last turn's anchor is the workspace as of this settlement. Earlier turns in
-        // the same settlement happened while the code stood somewhere else, and today's sha is
-        // merely "nearby" for them — mark those Unknown rather than dressing an uncheckable
-        // claim up as Exact or Partial.
-        snap.completeness = if !last {
+        // Historical imports cannot prove the workspace state at any captured turn. During
+        // live settlement, only the last turn can use the workspace state observed now.
+        snap.completeness = if opts.historical || !last {
             snap.code.as_ref().map(|_| Completeness::Unknown)
         } else {
             code_anchor.as_ref().map(|(_, k)| *k).or_else(|| {
@@ -3175,6 +3180,7 @@ pub fn record(store: &Store, lk: Link, agent: &str, owner: &str, author: &str) -
             milestone: None,
             tag: None,
             code: false,
+            historical: true,
             message: None,
             paths: vec![],
             quiet: false,
@@ -3214,6 +3220,7 @@ mod tests {
             milestone: None,
             tag: None,
             code: false,
+            historical: false,
             message: None,
             paths: vec![],
             quiet: false,
