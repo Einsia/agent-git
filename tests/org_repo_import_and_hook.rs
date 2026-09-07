@@ -32,6 +32,7 @@ fn fake_hub(
     clone_url: std::path::PathBuf,
     latest_version: std::path::PathBuf,
     version_requests: Arc<AtomicUsize>,
+    hub_requests: Arc<AtomicUsize>,
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -50,6 +51,7 @@ fn fake_hub(
                     break;
                 }
             }
+            hub_requests.fetch_add(1, Ordering::SeqCst);
             let req = String::from_utf8_lossy(&buf).into_owned();
             let line = req.lines().next().unwrap_or_default().to_string();
             let authed = req.to_ascii_lowercase().contains("authorization: bearer ");
@@ -105,6 +107,15 @@ fn fake_hub(
                 agent("einsia", "qa")
             } else if path == "/api/agents/einsia/locked" {
                 agent("einsia", "locked")
+            } else if path == "/api/agents/acme/forbidden" {
+                (
+                    "403 Forbidden",
+                    r#"{"error":"access denied","kind":"forbidden"}"#.to_string(),
+                )
+            } else if path.starts_with("/denied.git/") {
+                ("401 Unauthorized", String::new())
+            } else if path.starts_with("/forbidden.git/") {
+                ("403 Forbidden", String::new())
             } else if path == "/api/orgs/einsia" {
                 (
                     "200 OK",
@@ -158,6 +169,7 @@ struct Lab {
     clone_url: std::path::PathBuf,
     latest_version: std::path::PathBuf,
     version_requests: Arc<AtomicUsize>,
+    hub_requests: Arc<AtomicUsize>,
     home: std::path::PathBuf,
     agit_home: std::path::PathBuf,
     work: std::path::PathBuf,
@@ -179,6 +191,7 @@ impl Lab {
         let clone_url = tmp.path().join("clone-url");
         let latest_version = tmp.path().join("latest-version");
         let version_requests = Arc::new(AtomicUsize::new(0));
+        let hub_requests = Arc::new(AtomicUsize::new(0));
         fs::write(&clone_url, "x").unwrap();
         fs::write(&latest_version, env!("CARGO_PKG_VERSION")).unwrap();
         let hub = fake_hub(
@@ -186,6 +199,7 @@ impl Lab {
             clone_url.clone(),
             latest_version.clone(),
             Arc::clone(&version_requests),
+            Arc::clone(&hub_requests),
         );
         let cred = agit::infra::credentials::HubCredential {
             username: "me".into(),
@@ -209,6 +223,7 @@ impl Lab {
             clone_url,
             latest_version,
             version_requests,
+            hub_requests,
             home,
             agit_home,
             work,
@@ -2064,6 +2079,366 @@ fn a_web_id_behind_the_local_head_continues_on_the_local_line() {
         tip,
         "the local head must not be moved back"
     );
+}
+
+fn new_session_remote(lab: &Lab) -> std::path::PathBuf {
+    let remote = lab._tmp.path().join("new-remote");
+    let repo = Repo::init(&remote).unwrap();
+    agit::domain::meta::write(repo.root(), &agit::domain::meta::Meta::new_file_line()).unwrap();
+    fs::write(
+        repo.root().join("AGENTS.md"),
+        "Inherited project instructions\n",
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("shared file line").unwrap();
+    fs::write(&lab.clone_url, remote.to_string_lossy().as_bytes()).unwrap();
+    remote
+}
+
+#[test]
+fn new_clones_an_explicit_missing_repository_without_binding_cwd() {
+    let lab = Lab::new();
+    let remote = new_session_remote(&lab);
+    let output = lab
+        .agit(&["new", "einsia/qa", "-b", "fresh", "--no-launch"])
+        .env("CI", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repo = Repo::open(lab.repo("einsia", "qa")).expect("explicit repository is cloned");
+    let identity = agit::hub::identity::read(&repo).unwrap().unwrap();
+    assert_eq!(identity.agent_id, QA_AGENT_ID);
+    assert_eq!(
+        repo.git(&["remote", "get-url", "origin"]).unwrap().trim(),
+        remote.to_string_lossy()
+    );
+    assert!(repo.has_ref("refs/heads/fresh"));
+    assert_eq!(
+        agit::domain::meta::line_at_ref(&repo, "fresh"),
+        Some(agit::domain::meta::Line::Session)
+    );
+    assert_eq!(
+        agit::domain::storage::materialize_at(repo.root(), "fresh", agit::domain::meta::LOG_FILE)
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        agit::domain::storage::materialize_at(repo.root(), "fresh", agit::domain::meta::VIEW_FILE)
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        fs::read_to_string(lab.work.join("AGENTS.md"))
+            .unwrap()
+            .trim(),
+        "Inherited project instructions"
+    );
+    assert!(
+        !lab.agit_home.join("workspaces").exists(),
+        "internal clone must not bind cwd"
+    );
+    assert!(
+        !lab.repo("me", "qa").exists(),
+        "read-only pickup must not promote ownership"
+    );
+}
+
+#[test]
+fn new_refuses_unmanaged_runtime_before_cloning_unless_fresh() {
+    let lab = Lab::new();
+    new_session_remote(&lab);
+    lab.append_turn(SID, 1, "Existing conversation", "Keep this evidence");
+    let original = fs::read(lab.transcript(SID)).unwrap();
+    let args = ["new", "einsia/qa", "-b", "fresh", "--no-launch"];
+    let refused = lab
+        .agit(&args)
+        .env("CI", "1")
+        .env("CLAUDE_CODE_SESSION_ID", SID)
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(agit::ExitCode::Precondition.as_i32())
+    );
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("agit import"));
+    assert_eq!(lab.hub_requests.load(Ordering::SeqCst), 0);
+    assert!(!lab.repo("einsia", "qa").exists());
+    assert_eq!(fs::read(lab.transcript(SID)).unwrap(), original);
+    let allowed = lab
+        .agit(&args)
+        .arg("--fresh")
+        .env("CI", "1")
+        .env("CLAUDE_CODE_SESSION_ID", SID)
+        .output()
+        .unwrap();
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert!(
+        Repo::open(lab.repo("einsia", "qa"))
+            .unwrap()
+            .has_ref("refs/heads/fresh")
+    );
+    assert_eq!(fs::read(lab.transcript(SID)).unwrap(), original);
+}
+
+#[test]
+fn new_keeps_existing_and_implicit_repository_resolution_offline() {
+    let lab = Lab::new();
+    let remote = new_session_remote(&lab);
+    for args in [
+        vec!["new", "qa", "-b", "fresh", "--no-launch"],
+        vec!["new", "-b", "fresh", "--no-launch"],
+    ] {
+        let output = lab.agit(&args).env("CI", "1").output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(lab.hub_requests.load(Ordering::SeqCst), 0);
+    }
+    fs::create_dir_all(lab.repo("einsia", "qa").parent().unwrap()).unwrap();
+    fs::rename(remote, lab.repo("einsia", "qa")).unwrap();
+    let output = lab
+        .agit(&["new", "einsia/qa", "-b", "fresh", "--no-launch"])
+        .env("CI", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(lab.hub_requests.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn new_remote_pickup_failures_preserve_auth_and_network_exit_codes() {
+    for scenario in ["unauthorized", "forbidden", "missing", "connection"] {
+        for json in [false, true] {
+            let lab = Lab::new();
+            if scenario == "unauthorized" {
+                fs::remove_dir_all(lab.agit_home.join("credentials")).unwrap();
+            }
+            let target = match scenario {
+                "forbidden" => "acme/forbidden",
+                "missing" => "acme/ghost",
+                _ => "einsia/qa",
+            };
+            let mut args = vec!["new", target, "-b", "fresh", "--no-launch"];
+            if json {
+                args.push("--json");
+            }
+            let mut command = lab.agit(&args);
+            command.env("CI", "1");
+            if scenario == "connection" {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let unavailable = format!("http://{}", listener.local_addr().unwrap());
+                drop(listener);
+                command.env("AGIT_HUB_URL", unavailable);
+            }
+            let output = command.output().unwrap();
+            let expected = if matches!(scenario, "unauthorized" | "forbidden") {
+                agit::ExitCode::Auth.as_i32()
+            } else {
+                agit::ExitCode::Network.as_i32()
+            };
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "scenario={scenario} json={json}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if json {
+                let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(document["exit_code"], expected);
+                assert_eq!(document["ok"], false);
+                assert_eq!(document["command"], "new");
+            }
+            assert!(!lab.work.join("AGENTS.md").exists());
+            assert!(!lab.agit_home.join("workspaces").exists());
+            assert!(!lab.repo("einsia", "qa").exists());
+        }
+    }
+}
+
+#[test]
+fn new_git_clone_auth_failures_preserve_auth_exit_codes() {
+    for path in ["denied.git", "forbidden.git"] {
+        for json in [false, true] {
+            let lab = Lab::new();
+            fs::write(&lab.clone_url, format!("{}/{path}", lab.hub)).unwrap();
+            let mut args = vec!["new", "einsia/qa", "-b", "fresh", "--no-launch"];
+            if json {
+                args.push("--json");
+            }
+            let output = lab.agit(&args).env("CI", "1").output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(agit::ExitCode::Auth.as_i32()),
+                "path={path} json={json}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if json {
+                let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(document["exit_code"], agit::ExitCode::Auth.as_i32());
+                assert_eq!(document["ok"], false);
+            }
+            assert!(lab.hub_requests.load(Ordering::SeqCst) > 1);
+            assert!(!lab.work.join("AGENTS.md").exists());
+            assert!(!lab.agit_home.join("workspaces").exists());
+            assert!(Repo::open(lab.repo("einsia", "qa")).is_none());
+        }
+    }
+}
+
+#[test]
+fn new_git_auth_with_a_credential_helper_is_independent_of_locale() {
+    for json in [false, true] {
+        let lab = Lab::new();
+        fs::write(&lab.clone_url, format!("{}/denied.git", lab.hub)).unwrap();
+        let mut args = vec!["new", "einsia/qa", "-b", "fresh", "--no-launch"];
+        if json {
+            args.push("--json");
+        }
+        let output = lab
+            .agit(&args)
+            .env("CI", "1")
+            .env("LANG", "zh_CN.UTF-8")
+            .env("LC_ALL", "zh_CN.UTF-8")
+            .env("LANGUAGE", "zh_CN")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "credential.helper")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                "!f() { printf 'username=fixture\\npassword=fixture\\n'; }; f",
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(agit::ExitCode::Auth.as_i32()),
+            "json={json}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if json {
+            let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(document["exit_code"], agit::ExitCode::Auth.as_i32());
+            assert_eq!(document["ok"], false);
+        }
+        assert!(!lab.work.join("AGENTS.md").exists());
+        assert!(!lab.agit_home.join("workspaces").exists());
+        assert!(Repo::open(lab.repo("einsia", "qa")).is_none());
+    }
+}
+
+#[test]
+fn new_preserves_local_state_when_remote_pickup_fails() {
+    for scenario in ["missing", "unauthorized", "occupied", "inheritance"] {
+        let lab = Lab::new();
+        new_session_remote(&lab);
+        if scenario == "unauthorized" {
+            fs::remove_dir_all(lab.agit_home.join("credentials")).unwrap();
+        }
+        if scenario == "occupied" {
+            fs::create_dir_all(lab.repo("einsia", "qa")).unwrap();
+            fs::write(
+                lab.repo("einsia", "qa").join("user-file"),
+                "Preserve unrelated content",
+            )
+            .unwrap();
+        }
+        let target = match scenario {
+            "missing" => "acme/ghost",
+            "inheritance" => "einsia/qa@missing-file-line",
+            _ => "einsia/qa",
+        };
+        let output = lab
+            .agit(&["new", target, "-b", "fresh", "--no-launch"])
+            .env("CI", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{scenario}");
+        assert!(!lab.work.join("AGENTS.md").exists(), "{scenario}");
+        assert!(!lab.agit_home.join("workspaces").exists(), "{scenario}");
+        if let Some(repo) = Repo::open(lab.repo("einsia", "qa")) {
+            assert!(!repo.has_ref("refs/heads/fresh"), "{scenario}");
+        }
+        if scenario == "occupied" {
+            assert_eq!(
+                fs::read_to_string(lab.repo("einsia", "qa").join("user-file")).unwrap(),
+                "Preserve unrelated content"
+            );
+        }
+    }
+}
+
+#[test]
+fn new_clones_the_explicit_file_line_and_finishes_legacy_recovery() {
+    use agit::domain::meta::{self, LayoutVersion};
+    for legacy in [false, true] {
+        let lab = Lab::new();
+        let remote = new_session_remote(&lab);
+        let source = Repo::at(&remote);
+        let target = if legacy {
+            let mut snapshot = meta::Meta::new_file_line();
+            snapshot.layout = LayoutVersion::V0;
+            meta::write(source.root(), &snapshot).unwrap();
+            source.add_all().unwrap();
+            source.commit("legacy shared file line").unwrap();
+            "einsia/qa"
+        } else {
+            source.git(&["checkout", "-b", "shared/topic"]).unwrap();
+            fs::write(
+                source.root().join("AGENTS.md"),
+                "Selected shared instructions\n",
+            )
+            .unwrap();
+            source.add_all().unwrap();
+            source.commit("specific shared file line").unwrap();
+            source.git(&["checkout", "main"]).unwrap();
+            "einsia/qa@shared/topic"
+        };
+        let output = lab
+            .agit(&["new", target, "-b", "fresh", "--no-launch"])
+            .env("CI", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "legacy={legacy}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+        assert_eq!(
+            meta::read_at_ref(&repo, "fresh").unwrap().layout,
+            LayoutVersion::V1
+        );
+        if legacy {
+            assert_eq!(
+                meta::read_at_ref(&repo, "main").unwrap().layout,
+                LayoutVersion::V1
+            );
+        } else {
+            assert_eq!(
+                fs::read_to_string(lab.work.join("AGENTS.md"))
+                    .unwrap()
+                    .trim(),
+                "Selected shared instructions"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(lab.agit_home.join("layout-v1-recovery"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
 }
 
 /// Namespace publication and directory movement exclude branch claim preparation.

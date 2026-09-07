@@ -29,6 +29,7 @@ pub const DEFAULT_FROM: &str = "main";
 #[derive(ClapArgs)]
 pub struct Args {
     /// Target owner/repo@from-ref (or repo plus --from); omitted repos require AGIT_SESSION.
+    /// Missing explicitly named repositories are cloned read-only without binding this directory.
     #[arg(value_name = "owner/repo@from-ref")]
     pub repo: Option<String>,
     /// New branch name.
@@ -112,20 +113,20 @@ pub fn run(args: Args) -> CmdResult {
         .unwrap_or_else(|| args.from.clone());
 
     // ── repo resolution ──
-    let slug = match &args.repo {
+    let (slug, explicitly_named) = match &args.repo {
         Some(r) => {
             let repo_name = unified
                 .as_ref()
                 .and_then(|t| t.repo.clone())
                 .unwrap_or_else(|| r.to_string());
             match super::parse_slug(&repo_name) {
-                Ok((o, n)) => format!("{o}/{n}"),
+                Ok((o, n)) => (format!("{o}/{n}"), true),
                 Err(_) => {
                     // A bare name: the one local repo carrying it.
                     let me =
                         crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
                     match super::clone::checkouts_named(&me, r)?.as_slice() {
-                        [only] => only.slug(),
+                        [only] => (only.slug(), false),
                         _ => {
                             ui::error(&format!(
                                 "`{r}` is ambiguous or missing — write owner/repo."
@@ -138,7 +139,7 @@ pub fn run(args: Args) -> CmdResult {
         }
         // An explicit environment can supply the destination repo; directory state cannot.
         None => match super::context::repo_for(&cwd_now) {
-            Ok(r) => super::context::qualify(&r),
+            Ok(r) => (super::context::qualify(&r), false),
             Err(e) => {
                 // Inside an unadopted runtime session, the difference between `new` and
                 // `import` is explained first even with no explicit target; otherwise the user
@@ -160,12 +161,38 @@ pub fn run(args: Args) -> CmdResult {
             }
         },
     };
+    // `new` is an empty session; running it inside a runtime session that has not been adopted
+    // leaves the current conversation in the runtime while taking the user onto another line
+    // with no context. Blocked by default; only an explicit `--fresh` allows dropping the
+    // current session. This check precedes remote pickup and the branch-name prompt, so refusing
+    // an unmanaged session cannot download a repository or ask an unusable question.
+    if !args.fresh
+        && let Some(current) = crate::infra::runtime_session::unmanaged()
+    {
+        ui::session::warn_new(
+            &current,
+            &slug,
+            args.branch.as_deref().unwrap_or("<branch>"),
+        );
+        return Ok(ExitCode::Precondition);
+    }
+
     let (owner, name) = super::parse_slug(&slug)?;
     let dir = config::repo_dir(&owner, &name)?;
-    let Some(repo) = Repo::open(&dir) else {
-        ui::error(&format!("{slug} doesn’t exist locally."));
-        ui::hint(&format!("fetch it first: `agit clone {slug}` (read-only)"));
-        return Ok(ExitCode::Precondition);
+    let repo = match Repo::open(&dir) {
+        Some(repo) => repo,
+        None if explicitly_named => match super::clone::readonly_clone(&owner, &name) {
+            Ok(repo) => repo,
+            Err(error) => {
+                ui::error(&format!("fetch failed: {error:#}"));
+                return Ok(super::clone::readonly_clone_error_code(&error));
+            }
+        },
+        None => {
+            ui::error(&format!("{slug} doesn’t exist locally."));
+            ui::hint(&format!("fetch it first: `agit clone {slug}` (read-only)"));
+            return Ok(ExitCode::Precondition);
+        }
     };
 
     // ── --from: main by default, must be a file line (memory only, no context) ──
@@ -202,22 +229,6 @@ pub fn run(args: Args) -> CmdResult {
             );
             return Ok(ExitCode::Precondition);
         }
-    }
-
-    // `new` is an empty session; running it inside a runtime session that has not been adopted
-    // leaves the current conversation in the runtime while taking the user onto another line
-    // with no context. Blocked by default; only an explicit `--fresh` allows dropping the
-    // current session. This check sits ahead of the branch-name prompt, so the user never
-    // answers an interactive question that will not be used.
-    if !args.fresh
-        && let Some(current) = crate::infra::runtime_session::unmanaged()
-    {
-        ui::session::warn_new(
-            &current,
-            &slug,
-            args.branch.as_deref().unwrap_or("<branch>"),
-        );
-        return Ok(ExitCode::Precondition);
     }
 
     // ── new branch name ──

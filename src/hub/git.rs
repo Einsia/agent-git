@@ -71,8 +71,16 @@ const AUTH_MARKERS: &[&str] = &[
     "terminal prompts disabled",
 ];
 
-fn looks_like_auth_failure(stderr: &str) -> bool {
+pub(crate) fn looks_like_auth_failure(stderr: &str) -> bool {
     AUTH_MARKERS.iter().any(|m| stderr.contains(m))
+}
+
+/// Authentication classification reads Git's diagnostics, so transport subprocesses use a
+/// stable diagnostic language without changing the caller's environment.
+fn transport_command() -> Command {
+    let mut command = Command::new("git");
+    command.env("LC_ALL", "C").env("LANGUAGE", "C");
+    command
 }
 
 /// Environment variables that inject the authentication header.
@@ -293,7 +301,7 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// is left — the helper is git's child, not ours).
 fn capture(dir: &Path, args: &[&str], expected_agent_id: Option<&str>) -> Option<String> {
     let once = |token: Option<String>| -> Option<(bool, String, String)> {
-        let mut cmd = Command::new("git");
+        let mut cmd = transport_command();
         cmd.arg("-C").arg(dir);
         cmd.args(args);
         cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -411,7 +419,7 @@ fn with_progress<'a>(args: &[&'a str], tty: bool) -> Vec<&'a str> {
 }
 
 fn spawn(dir: Option<&Path>, args: &[&str], expected_agent_id: &str) -> Result<(i32, String)> {
-    let mut cmd = Command::new("git");
+    let mut cmd = transport_command();
     if let Some(d) = dir {
         cmd.arg("-C").arg(d);
     }

@@ -76,14 +76,9 @@ pub fn run(args: Args) -> CmdResult {
                 (slug, true)
             } else {
                 // Automatic read-only clone: **does not bind the current directory**.
-                if let Err(e) = readonly_clone(o, n) {
+                if let Err(e) = super::clone::readonly_clone(o, n) {
                     ui::error(&format!("fetch failed: {e:#}"));
-                    let s = if is_authish(&e) {
-                        ExitCode::Auth
-                    } else {
-                        ExitCode::Network
-                    };
-                    return Ok(s);
+                    return Ok(super::clone::readonly_clone_error_code(&e));
                 }
                 (slug, true)
             }
@@ -437,24 +432,6 @@ fn ensure_mine(slug: &str) -> crate::Result<()> {
     Ok(())
 }
 
-/// Read-only clone (does not bind the current directory).
-fn readonly_clone(owner: &str, name: &str) -> crate::Result<()> {
-    let client = crate::hub::Client::from_env();
-    let a = client.get_agent(owner, name)?;
-    let identity = crate::hub::identity::RemoteIdentity::new(client.base(), &a.agent_id)?;
-    let dest = config::repo_dir(owner, name)?;
-    let history_update =
-        super::migration::begin_startup_recovery_for_path(&dest, "run-clone-history")?;
-    let out = crate::hub::git::clone(&a.clone_url, &dest, &identity)?;
-    if !out.ok() {
-        anyhow::bail!("{}", out.stderr.trim());
-    }
-    let repo = Repo::at(&dest);
-    repo.set_remote(&a.clone_url)?;
-    super::migration::finish_external_history_update(&repo, history_update)?;
-    Ok(())
-}
-
 fn fetch_quiet(owner: &str, name: &str) -> bool {
     let Ok(dir) = config::repo_dir(owner, name) else {
         return false;
@@ -470,17 +447,4 @@ fn fetch_quiet(owner: &str, name: &str) -> bool {
         Ok(o) => o.ok(),
         Err(_) => false,
     }
-}
-
-fn is_authish(e: &anyhow::Error) -> bool {
-    let s = format!("{e:#}");
-    s.contains("401")
-        || s.contains("authentication")
-        || s.contains("log in")
-        // AGENTS.md exception (ii): character data matching another script — Chinese-locale
-        // git/hub wording for the same two conditions.
-        || s.contains("认证")
-        || s.contains("登录")
-        || s.contains("credentials")
-        || s.contains("unauthorized")
 }

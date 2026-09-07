@@ -146,6 +146,39 @@ pub struct Args {
     pub no_launch: bool,
 }
 
+/// Read-only clone (does not bind the current directory).
+pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<Repo> {
+    let client = crate::hub::Client::from_env();
+    let a = client.get_agent(owner, name)?;
+    let identity = crate::hub::identity::RemoteIdentity::new(client.base(), &a.agent_id)?;
+    let dest = config::repo_dir(owner, name)?;
+    let history_update =
+        super::migration::begin_startup_recovery_for_path(&dest, "readonly-clone-history")?;
+    let out = crate::hub::git::clone(&a.clone_url, &dest, &identity)?;
+    if !out.ok() {
+        anyhow::bail!("{}", out.stderr.trim());
+    }
+    let repo = Repo::at(&dest);
+    repo.set_remote(&a.clone_url)?;
+    super::migration::finish_external_history_update(&repo, history_update)?;
+    Ok(repo)
+}
+
+pub(super) fn readonly_clone_error_code(error: &anyhow::Error) -> ExitCode {
+    if let Some(api) = error.downcast_ref::<crate::hub::client::ApiError>() {
+        return if matches!(api.status, 401 | 403) {
+            ExitCode::Auth
+        } else {
+            ExitCode::Network
+        };
+    }
+    if crate::hub::git::looks_like_auth_failure(&format!("{error:#}")) {
+        ExitCode::Auth
+    } else {
+        ExitCode::Network
+    }
+}
+
 /// Split the version/branch part out of `owner/agent@ref`.
 ///
 /// `@` is the design's uniform ref separator (`owner/repo@<ref>`, see [`crate::domain::refs`]).
@@ -1230,6 +1263,19 @@ fn choose_for_recording(name: &str, found: &[Checkout]) -> crate::Result<Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pickup_network_diagnostics_do_not_infer_auth_from_paths_or_ports() {
+        for detail in [
+            "failed to connect to http://localhost:40101/repo.git",
+            "cannot create /tmp/credentials/repo: permission denied",
+        ] {
+            assert_eq!(
+                super::readonly_clone_error_code(&anyhow::anyhow!(detail)),
+                crate::ExitCode::Network
+            );
+        }
+    }
+
     use super::{
         Args, Checkout, Mode, Plan, Ref, checkout_target, choose_for_recording, mode_of, split_ref,
         validate_copy_response,
