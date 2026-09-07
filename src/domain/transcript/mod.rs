@@ -38,6 +38,8 @@
 //! window on the raw live lines first and wraps the slice afterwards** — never index the wrapped
 //! envelope sequence with an IR line number.
 
+pub mod display;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

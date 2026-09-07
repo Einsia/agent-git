@@ -31,6 +31,14 @@ pub struct Args {
     #[arg(long)]
     pub tui: bool,
 
+    /// Render the complete LOG instead of the saved VIEW.
+    #[arg(long)]
+    pub log_only: bool,
+
+    /// Emit native JSONL from the selected evidence without headers or truncation.
+    #[arg(long, conflicts_with = "max_chars")]
+    pub raw: bool,
+
     /// Max chars per message
     #[arg(long, default_value = "2000", value_name = "chars")]
     pub max_chars: usize,
@@ -55,12 +63,16 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Interactive);
         }
     };
+    if args.raw && use_tui {
+        ui::error("--raw cannot be combined with an active --tui request.");
+        return Ok(ExitCode::Usage);
+    }
     // Reference-syntax fast path: `ref#n` / `ref#n.k` / `ref:path` / a repo qualifier with `@`.
     // Everything that enters this path resolves by the PRD reference syntax (see domain::refs).
     if let Some(t) = &args.target
         && (t.contains('#') || t.contains(':') || t.contains('@'))
     {
-        return Ok(show_ref(t, &args).unwrap_or_else(|| {
+        return Ok(show_ref(t, &args, use_tui).unwrap_or_else(|| {
             ui::error(&format!(
                 "could not resolve `{t}` as a local repository reference."
             ));
@@ -73,10 +85,9 @@ pub fn run(args: Args) -> CmdResult {
     // the store (whose target is a session id).
     if let Some(t) = &args.target
         && args.agent.is_none()
-        && !use_tui
     {
         match names_local_ref(t) {
-            Ok(true) => return Ok(show_ref(t, &args).unwrap_or(ExitCode::Ref)),
+            Ok(true) => return Ok(show_ref(t, &args, use_tui).unwrap_or(ExitCode::Ref)),
             Ok(false) => {}
             Err(e) => {
                 ui::error(&format!("{e:#}"));
@@ -156,9 +167,18 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Ok);
         }
         // The two sources' transcripts have **different forms**: the one in the repo is an
-        // envelope, materialized and then unwrapped; a store link points at the runtime's native
+        // envelope that retains its source identity; a store link points at the runtime's native
         // transcript, read directly. Pick the wrong side and every line renders as unreadable.
         return match &repo {
+            Some(r) if args.log_only => {
+                let selected = &sessions[start];
+                let content = read_session(Some(r), selected, true, false)?;
+                crate::tui::screens::transcript::browse_snapshot(
+                    selected.branch.as_deref().unwrap_or(&selected.id),
+                    content.text,
+                    repository_source(true),
+                )
+            }
             Some(r) => crate::tui::screens::transcript::browse_repo(r, &sessions, start),
             None => crate::tui::screens::transcript::browse_native(&sessions, start),
         };
@@ -177,6 +197,11 @@ pub fn run(args: Args) -> CmdResult {
         },
         None => {
             let Some(store) = Store::open()? else {
+                if args.raw {
+                    ui::error("the requested native session has no adopted local link.");
+                    ui::hint("adopt it first with `agit import <session-id> --link-only`");
+                    return Ok(ExitCode::Ref);
+                }
                 println!("no sessions adopted yet.");
                 ui::hint("`agit import <session-id> -n <agent-name>`");
                 return Ok(ExitCode::Ok);
@@ -205,24 +230,37 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
 
-    // `session/log.jsonl` in the repo is an envelope (see [`crate::domain::transcript`]) —
-    // unwrap it back to raw lines before the parse/render pipeline. Unwrapping is lossy: reading
-    // history tolerates faults line by line, and one corrupt line must not sink the whole read.
-    let text = session_text(repo.as_ref(), &target)?;
-    let rt = adapter::infer_runtime(&text).unwrap_or(target.runtime.as_str());
-    let parsed = adapter::get(rt)?.parse(&text)?;
+    let content = read_session(repo.as_ref(), &target, args.log_only, args.raw)?;
+    if args.raw {
+        print!("{}", content.text);
+        return Ok(ExitCode::Ok);
+    }
+    let parsed = if content.from_repo {
+        transcript::display::parse(&content.text)?
+    } else {
+        let rt = adapter::infer_runtime(&content.text).unwrap_or(target.runtime.as_str());
+        adapter::get(rt)?.parse(&content.text)?
+    };
 
     // ─── Header ───
     let mut kv: Vec<(&str, String)> = vec![
         ("session", ui::bold(&target.id)),
         ("runtime", target.runtime.clone()),
         ("recorded", ui::ago(target.mtime)),
+        (
+            "source",
+            if content.from_repo {
+                repository_source(args.log_only)
+            } else {
+                "live transcript"
+            }
+            .into(),
+        ),
     ];
     // When the content comes from a repo the session metadata sits in that branch tip's
     // `session/meta.json`; a store link (a live transcript in the runtime's directory) has no
     // meta — that one has not been fixed by a commit.
-    let header = repo.as_ref().and_then(|r| header_meta(r, &target));
-    match (&header, &link_info) {
+    match (&content.header, &link_info) {
         (Some((s, version)), _) => {
             kv.push(("code repo", ui::tilde(std::path::Path::new(&s.cwd))));
             if let Some(c) = &s.code {
@@ -245,11 +283,10 @@ pub fn run(args: Args) -> CmdResult {
     }
     kv.push((
         "file",
-        match &target.branch {
-            // A branch's content is read by ref; with a worktree the file is right there.
-            Some(_) if target.path.is_file() => ui::tilde(&target.path),
-            Some(branch) => format!("{branch}:{}", meta::LOG_FILE),
-            None => ui::tilde(&target.path),
+        match (&target.branch, repo.as_ref().filter(|_| content.from_repo)) {
+            (Some(branch), Some(_)) => format!("{branch}:{}", sequence_file(args.log_only)),
+            (None, Some(repo)) => ui::tilde(&repo.root().join(sequence_file(args.log_only))),
+            (_, None) => ui::tilde(&target.path),
         },
     ));
     print!("{}", ui::table::key_values(&kv));
@@ -298,6 +335,12 @@ fn session_index(sessions: &[session::Stored], selector: &str) -> crate::Result<
     if selector.is_empty() {
         anyhow::bail!("session selector must not be empty");
     }
+    if let Some(index) = sessions
+        .iter()
+        .position(|session| session.branch.as_deref() == Some(selector))
+    {
+        return Ok(index);
+    }
     let matches: Vec<&str> = sessions
         .iter()
         .filter(|session| session.id.starts_with(selector))
@@ -317,34 +360,53 @@ fn session_index(sessions: &[session::Stored], selector: &str) -> crate::Result<
         .ok_or_else(|| anyhow::anyhow!("selected session disappeared from the list"))
 }
 
-/// Read one session's content, returning raw line text.
-///
-/// A session from a repo really is the `session/log.jsonl` envelope file — unwrap it back to raw
-/// lines, skipping bad ones ([`transcript::unwrap_lossy`]). A store link points at a live
-/// transcript in the runtime's directory, and a selector given directly names some file the user
-/// holds — both are read verbatim; the envelope discipline governs only files inside the repo.
-fn session_text(repo: Option<&Repo>, target: &session::Stored) -> crate::Result<String> {
+#[derive(Debug)]
+struct SessionRead {
+    text: String,
+    header: Option<(meta::Meta, Option<String>)>,
+    from_repo: bool,
+}
+
+/// Repository sessions expose the explicitly selected sequence; native selectors expose the live file.
+/// A branch's content and header share a frozen commit even if its tip advances during the read.
+fn read_session(
+    repo: Option<&Repo>,
+    target: &session::Stored,
+    log_only: bool,
+    raw_output: bool,
+) -> crate::Result<SessionRead> {
     let from_repo = repo.is_some_and(|r| {
         target.branch.is_some()
             || target.path == r.root().join(meta::LOG_FILE)
             || target.path == r.root().join(meta::LEGACY_LOG_FILE)
     });
-    let raw = match (repo.filter(|_| from_repo), &target.branch) {
-        // A branch's content is read by its own ref — not by whichever branch is checked out.
-        (Some(repo), Some(branch)) => crate::domain::storage::materialize_at(
-            repo.root(),
-            &format!("refs/heads/{branch}"),
-            meta::LOG_FILE,
-        )?,
-        (Some(repo), None) => {
-            crate::domain::storage::materialize_worktree(repo.root(), meta::LOG_FILE)?
+    let (raw, header) = match (repo.filter(|_| from_repo), &target.branch) {
+        (Some(repo), Some(branch)) => {
+            let point = repo.git(&[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{branch}^{{commit}}"),
+            ])?;
+            let view = point_content(repo, &point, log_only)?;
+            let header = meta::read_at_ref_result(repo, &point)?
+                .map(|snapshot| (snapshot, Some(meta::id_from_sha(&point))));
+            (view, header)
         }
-        (None, _) => std::fs::read_to_string(&target.path)?,
+        (Some(repo), None) => {
+            let view =
+                crate::domain::storage::materialize_worktree(repo.root(), sequence_file(log_only))?;
+            (view, Some((meta::resolve(repo.root())?, None)))
+        }
+        (None, _) => (std::fs::read_to_string(&target.path)?, None),
     };
-    Ok(if from_repo {
-        transcript::unwrap_lossy(&raw).0
-    } else {
-        raw
+    Ok(SessionRead {
+        text: if from_repo && raw_output {
+            transcript::unwrap_strict(&raw)?
+        } else {
+            raw
+        },
+        header,
+        from_repo,
     })
 }
 
@@ -446,34 +508,11 @@ fn names_local_ref(t: &str) -> crate::Result<bool> {
     }
 }
 
-/// The metadata and version ID the header wants: the header reads the tip of whichever branch
-/// the body was read from — the main checkout sits on main, and its `session/meta.json` speaks
-/// for the file line, not for this session.
-fn header_meta(repo: &Repo, target: &session::Stored) -> Option<(meta::Meta, Option<String>)> {
-    match &target.branch {
-        Some(branch) => {
-            let refname = format!("refs/heads/{branch}");
-            let snap = meta::read_at_ref(repo, &refname)?;
-            let version = repo
-                .git_opt(&["rev-parse", &refname])
-                .map(|sha| meta::id_from_sha(sha.trim()));
-            Some((snap, version))
-        }
-        None => {
-            let snap = meta::resolve(repo.root()).ok()?;
-            let version = repo
-                .git_opt(&["rev-parse", "HEAD"])
-                .map(|sha| meta::id_from_sha(sha.trim()));
-            Some((snap, version))
-        }
-    }
-}
-
 /// Render by reference syntax: a branch or history point, `#n` (one turn), `#n.k` (one event),
 /// `:path`.
 /// `Some(exit code)` = handled (an already printed error included), `None` = fall back to the
 /// legacy path.
-fn show_ref(t: &str, args: &Args) -> Option<ExitCode> {
+fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
     let spec = match super::context::substitute_at(refs::parse(t).ok()?) {
         Ok(spec) => spec,
         Err(e) => {
@@ -481,6 +520,16 @@ fn show_ref(t: &str, args: &Args) -> Option<ExitCode> {
             return Some(ExitCode::Ref);
         }
     };
+    if matches!(spec.tail, refs::Tail::Range { .. }) {
+        ui::error("show does not support turn ranges; select a complete turn with <ref>#<turn>.");
+        return Some(ExitCode::Usage);
+    }
+    if args.log_only && matches!(spec.tail, refs::Tail::Event { .. } | refs::Tail::Path(_)) {
+        ui::error(
+            "--log-only selects conversation history; it cannot select an event or file path.",
+        );
+        return Some(ExitCode::Usage);
+    }
     let repo = match open_ref_repo(&spec) {
         Ok(repo) => repo,
         Err(e) => {
@@ -488,6 +537,12 @@ fn show_ref(t: &str, args: &Args) -> Option<ExitCode> {
             return Some(ExitCode::Ref);
         }
     };
+    if use_tui && matches!(spec.tail, refs::Tail::Event { .. } | refs::Tail::Path(_)) {
+        ui::error(
+            "--tui supports a session point or a complete turn; use line output for events or files.",
+        );
+        return Some(ExitCode::Usage);
+    }
     // Turn-level references (`#n` / `#n.k`) are handled first: they do **not** go through refs'
     // resolution by position, see [`turn_events`].
     match &spec.tail {
@@ -502,9 +557,15 @@ fn show_ref(t: &str, args: &Args) -> Option<ExitCode> {
                     return Some(ExitCode::Precondition);
                 }
             };
+            if args.raw {
+                return Some(print_native(&events.concat()));
+            }
+            let text = events.concat();
+            if use_tui {
+                return Some(browse_ref_text(t, text, "turn LOG"));
+            }
             println!("{}", ui::dim(&format!("  turn {turn}")));
-            render_text(&turn_text(&events), args.max_chars);
-            return Some(ExitCode::Ok);
+            return Some(render_envelopes(&text, args.max_chars));
         }
         refs::Tail::Event { turn: n, index } => {
             let (turn, events) = match turn_events(&repo, &spec, *n) {
@@ -567,6 +628,14 @@ fn show_ref(t: &str, args: &Args) -> Option<ExitCode> {
     }
 
     if meta::read_at_ref(&repo, &resolved.sha).is_some_and(|snapshot| snapshot.is_file_line()) {
+        if args.log_only || args.raw {
+            ui::error("this is a file line; --log-only and --raw require a session line.");
+            return Some(ExitCode::Usage);
+        }
+        if use_tui {
+            ui::error("this is a file line; use line output to read its tree and history.");
+            return Some(ExitCode::Usage);
+        }
         return Some(match show_file_line(&repo, &resolved.sha, t) {
             Ok(()) => ExitCode::Ok,
             Err(error) => {
@@ -576,28 +645,52 @@ fn show_ref(t: &str, args: &Args) -> Option<ExitCode> {
         });
     }
 
-    // The point as a whole: rendered as its VIEW (the world `resume` sees).
-    // VIEW is a deliberate visibility boundary.  Missing objects, bad hashes, limits,
-    // malformed sequences, or events unreachable from LOG must fail closed rather than
-    // widening the display to the complete LOG.
-    let env = match point_view(&repo, &resolved.sha) {
+    // The selected sequence is a visibility boundary. Unreadable VIEW content must not
+    // widen to LOG; complete history is available only through an explicit request.
+    let env = match point_content(&repo, &resolved.sha, args.log_only) {
         Ok(view) => view,
         Err(error) => {
-            // A session line fresh out of `import` / `new` with no turn settled yet: having no
-            // VIEW is its normal state, not corruption.
-            if meta::read_at_ref(&repo, &resolved.sha)
-                .is_some_and(|m| !m.is_file_line() && m.turn.is_none())
-            {
-                println!("{}", ui::dim(&format!("  {t}: no turns settled yet")));
-                return Some(ExitCode::Ok);
-            }
-            ui::error(&format!("cannot read this point's VIEW: {error:#}"));
+            ui::error(&format!(
+                "cannot read this point's {}: {error:#}",
+                sequence_file(args.log_only)
+            ));
             return Some(ExitCode::Precondition);
         }
     };
-    let (text, _) = transcript::unwrap_lossy(&env);
-    render_text(&text, args.max_chars);
-    Some(ExitCode::Ok)
+    if args.raw {
+        return Some(print_native(&env));
+    }
+    if use_tui {
+        return Some(browse_ref_text(t, env, repository_source(args.log_only)));
+    }
+    if args.log_only {
+        println!("{}", repository_source(true));
+    }
+    Some(render_envelopes(&env, args.max_chars))
+}
+
+/// Raw output retains every selected native value in order, without rendering or wrapper fields.
+fn print_native(envelopes: &str) -> ExitCode {
+    match transcript::unwrap_strict(envelopes) {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::Ok
+        }
+        Err(error) => {
+            ui::error(&format!("cannot read native JSONL: {error:#}"));
+            ExitCode::Precondition
+        }
+    }
+}
+
+fn browse_ref_text(target: &str, text: String, source: &str) -> ExitCode {
+    match crate::tui::screens::transcript::browse_snapshot(target, text, source) {
+        Ok(code) => code,
+        Err(error) => {
+            ui::error(&format!("cannot open this transcript: {error:#}"));
+            ExitCode::Failure
+        }
+    }
 }
 
 /// A file line has no conversation VIEW; its selected tree and history describe the point.
@@ -676,30 +769,39 @@ pub(crate) fn turn_envelopes(repo: &Repo, head: &str, turn: u32) -> crate::Resul
         .collect()
 }
 
-/// Unwrap a turn's envelope lines back to raw transcript lines — the render pipeline recognizes
-/// the runtime's own line format, and envelope JSON infers no runtime, so feeding it in directly
-/// prints a blank stretch.
-fn turn_text(events: &[String]) -> String {
-    let (text, _) = transcript::unwrap_lossy(&events.concat());
-    text
+fn sequence_file(log_only: bool) -> &'static str {
+    if log_only {
+        meta::LOG_FILE
+    } else {
+        meta::VIEW_FILE
+    }
 }
 
-fn point_view(repo: &Repo, sha: &str) -> crate::Result<String> {
-    repo.show_result(sha, meta::VIEW_FILE)?
-        .ok_or_else(|| anyhow::anyhow!("this point has no VIEW"))
+fn repository_source(log_only: bool) -> &'static str {
+    if log_only {
+        "repository LOG"
+    } else {
+        "repository VIEW"
+    }
 }
 
-/// Line rendering (pipeable): raw transcript lines through the parse/render pipeline.
-fn render_text(text: &str, max_chars: usize) {
-    print!("{}", rendered(text, max_chars));
+fn point_content(repo: &Repo, sha: &str, log_only: bool) -> crate::Result<String> {
+    let file = sequence_file(log_only);
+    repo.show_result(sha, file)?
+        .ok_or_else(|| anyhow::anyhow!("this point has no {file}"))
 }
 
-/// Text that cannot be parsed comes back unchanged — better that than printing nothing.
-fn rendered(text: &str, max_chars: usize) -> String {
-    let rt = adapter::infer_runtime(text).unwrap_or("codex");
-    match adapter::get(rt).and_then(|a| a.parse(text)) {
-        Ok(parsed) => ui::transcript::render_transcript(&parsed, max_chars),
-        Err(_) => text.to_string(),
+/// Saved evidence retains its native source identity until parsing is complete.
+fn render_envelopes(envelopes: &str, max_chars: usize) -> ExitCode {
+    match transcript::display::parse(envelopes) {
+        Ok(parsed) => {
+            print!("{}", ui::transcript::render_transcript(&parsed, max_chars));
+            ExitCode::Ok
+        }
+        Err(error) => {
+            ui::error(&format!("cannot render saved transcript: {error:#}"));
+            ExitCode::Precondition
+        }
     }
 }
 
@@ -722,12 +824,16 @@ mod tests {
         let mut snap = Meta::new_session_line("codex".into(), "/the/project".into());
         snap.session = format!("{}{}", meta::ID_PREFIX, "d".repeat(meta::ID_HEX_LEN));
         meta::write(r.root(), &snap).unwrap();
+        crate::domain::storage::write_snapshot(r.root(), "", "").unwrap();
         r.add_all().unwrap();
         r.commit("session").unwrap();
         r.git(&["checkout", "--quiet", "main"]).unwrap();
 
         let target = crate::domain::session::find(&r, "s1").unwrap();
-        let (header, version) = super::header_meta(&r, &target).unwrap();
+        let (header, version) = super::read_session(Some(&r), &target, false, false)
+            .unwrap()
+            .header
+            .unwrap();
         assert!(header.is_session_line());
         assert_eq!(header.cwd, "/the/project");
         let tip = r.git(&["rev-parse", "refs/heads/s1"]).unwrap();
@@ -737,7 +843,6 @@ mod tests {
         );
     }
 
-    use crate::adapter;
     use crate::domain::meta::{self, Meta};
     use crate::domain::repo::Repo;
     use crate::domain::session;
@@ -822,7 +927,9 @@ mod tests {
 
     #[test]
     fn tui_session_selector_requires_one_match() {
-        let sessions = [stored("abc-one"), stored("abc-two")];
+        let mut sessions = [stored("abc-one"), stored("abc-two")];
+        sessions[1].branch = Some("work".into());
+        assert_eq!(super::session_index(&sessions, "work").unwrap(), 1);
         assert!(super::session_index(&sessions, "missing").is_err());
         assert!(super::session_index(&sessions, "abc").is_err());
         assert_eq!(super::session_index(&sessions, "abc-t").unwrap(), 1);
@@ -846,21 +953,21 @@ mod tests {
         (d, r)
     }
 
-    /// An enveloped transcript in the repo still renders as that conversation: unwrapped back to
-    /// raw lines, then through the parse/render pipeline, with not one envelope key leaking into
-    /// the conversation stream.
+    /// Repository evidence retains source identity while rendering hides envelope fields.
     #[test]
     fn an_enveloped_repo_transcript_renders_the_conversation() {
         let (_d, r) = checkout_with_enveloped_transcript();
         let target = session::latest(&r).unwrap();
-        let text = super::session_text(Some(&r), &target).unwrap();
+        let text = super::read_session(Some(&r), &target, false, false)
+            .unwrap()
+            .text;
         assert_eq!(text.lines().count(), 2);
         assert!(
-            !text.contains("_object_hash"),
-            "unwrapping leaves no envelope key: {text}"
+            text.contains("_object_hash"),
+            "saved evidence retains its envelope before parsing: {text}"
         );
 
-        let parsed = adapter::get("claude-code").unwrap().parse(&text).unwrap();
+        let parsed = transcript::display::parse(&text).unwrap();
         let out = crate::ui::transcript::render_transcript(&parsed, 2000);
         assert!(
             out.contains("PROMPT-TEXT"),
@@ -883,7 +990,7 @@ mod tests {
         let event = r.root().join(meta::event_path(&id).unwrap());
         std::fs::write(event, b"{\"corrupt\":true}\n").unwrap();
         let target = session::latest(&r).unwrap();
-        let error = super::session_text(Some(&r), &target)
+        let error = super::read_session(Some(&r), &target, false, false)
             .unwrap_err()
             .to_string();
         assert!(error.contains(&id) || error.contains("event"), "{error}");
@@ -909,7 +1016,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        let error = super::point_view(&r, head.trim()).unwrap_err();
+        let error = super::point_content(&r, head.trim(), false).unwrap_err();
         assert!(error.to_string().contains("not reachable"));
     }
 
@@ -1002,10 +1109,9 @@ mod tests {
                 "one turn is two events: {}",
                 events.concat()
             );
-            // What is asserted is what `agit show <ref>#n` actually prints: envelope unwrapped,
-            // then through the render pipeline. Rendering envelope JSON directly infers no
-            // runtime and prints a blank stretch.
-            let out = super::rendered(&super::turn_text(&events), 2000);
+            // Turn rendering parses only the selected envelopes, preserving their native sources.
+            let parsed = transcript::display::parse(&events.concat()).unwrap();
+            let out = crate::ui::transcript::render_transcript(&parsed, 2000);
             assert!(out.contains(&format!("PROMPT-{turn}")), "{out}");
             assert!(out.contains(&format!("REPLY-{turn}")), "{out}");
             assert!(
@@ -1042,7 +1148,9 @@ mod tests {
             mtime: std::time::SystemTime::now(),
             branch: None,
         };
-        let text = super::session_text(None, &target).unwrap();
+        let text = super::read_session(None, &target, false, false)
+            .unwrap()
+            .text;
         assert_eq!(
             text,
             format!("{USER}\n"),

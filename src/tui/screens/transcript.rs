@@ -62,17 +62,12 @@ pub struct Entry {
 
 #[derive(Debug, Clone)]
 enum Source {
-    /// A session inside a repo: the transcript is an **envelope** sitting in some worktree, so
-    /// it is materialized first and the envelope unwrapped after.
-    Worktree { root: PathBuf, runtime: String },
-    /// The transcript of one session branch in a repo: materialized at that branch's own ref,
-    /// never depending on which branch happens to be checked out — the main checkout stays on
-    /// `main`, so reading through the checkout always yields `main`'s LOG.
-    Branch {
-        repo: PathBuf,
-        branch: String,
-        runtime: String,
-    },
+    /// A legacy repository session exposes its materialized VIEW as envelope content.
+    Worktree { root: PathBuf },
+    /// A repository session exposes its VIEW at its own local branch, frozen during loading.
+    Branch { repo: PathBuf, branch: String },
+    /// Already selected and validated repository evidence, frozen before the screen opens.
+    Snapshot { text: String },
     /// The **runtime-native** transcript a store link points at: one file, read directly.
     ///
     /// Kept apart from [`Source::Worktree`] for a reason, not out of tidiness: that path goes
@@ -106,33 +101,26 @@ impl Entry {
 /// module comment).
 fn text_of(entry: &Entry) -> String {
     match &entry.source {
-        Source::Worktree { root, runtime } => {
-            let Ok(envelopes) = crate::domain::storage::materialize_worktree(root, meta::LOG_FILE)
+        Source::Worktree { root } => {
+            let Ok(envelopes) = crate::domain::storage::materialize_worktree(root, meta::VIEW_FILE)
             else {
-                return "(can’t read this session’s LOG)".into();
+                return "(can’t read this session’s VIEW)".into();
             };
-            render(
-                &crate::domain::transcript::unwrap_lossy(&envelopes).0,
-                runtime,
-            )
+            render_envelopes(&envelopes)
+                .unwrap_or_else(|error| format!("(cannot render this VIEW: {error:#})"))
         }
-        Source::Branch {
-            repo,
-            branch,
-            runtime,
-        } => {
+        Source::Branch { repo, branch } => {
             let Ok(envelopes) = crate::domain::storage::materialize_at(
                 repo,
                 &format!("refs/heads/{branch}"),
-                meta::LOG_FILE,
+                meta::VIEW_FILE,
             ) else {
-                return "(can’t read this session’s LOG)".into();
+                return "(can’t read this session’s VIEW)".into();
             };
-            render(
-                &crate::domain::transcript::unwrap_lossy(&envelopes).0,
-                runtime,
-            )
+            render_envelopes(&envelopes)
+                .unwrap_or_else(|error| format!("(cannot render this VIEW: {error:#})"))
         }
+        Source::Snapshot { text } => text.clone(),
         Source::Native { path, runtime } => match std::fs::read_to_string(path) {
             Ok(text) => render(&text, runtime),
             Err(e) => format!("(can’t read {}: {e})", path.display()),
@@ -145,10 +133,8 @@ fn text_of(entry: &Entry) -> String {
                 return "(this commit did not settle a turn — nothing to read)".into();
             };
             match crate::commands::show::turn_envelopes(&repo, sha, turn) {
-                Ok(events) => {
-                    let (text, _) = crate::domain::transcript::unwrap_lossy(&events.concat());
-                    render(&text, "")
-                }
+                Ok(events) => render_envelopes(&events.concat())
+                    .unwrap_or_else(|error| format!("(cannot render this turn: {error:#})")),
                 // An unreadable turn says so. A birth commit, a merge, a commit on the file
                 // line can all carry no turn events; that is not an error, and it must not be
                 // dressed up as an empty turn either.
@@ -156,6 +142,17 @@ fn text_of(entry: &Entry) -> String {
             }
         }
     }
+}
+
+/// Repository snapshots dispatch each native source before conversation rendering.
+fn render_envelopes(envelopes: &str) -> crate::Result<String> {
+    let parsed = crate::domain::transcript::display::parse(envelopes)?;
+    let text = crate::ui::transcript::render_transcript(&parsed, MESSAGE_CHARS);
+    Ok(if text.trim().is_empty() {
+        "(nothing recorded at this point)".into()
+    } else {
+        text
+    })
 }
 
 /// Raw text → parse → conversation. An unrecognized runtime is guessed from the content; when
@@ -204,7 +201,7 @@ pub fn browse_repo(
     sessions: &[crate::domain::session::Stored],
     start: usize,
 ) -> crate::CmdResultAlias {
-    browse_with(sessions, start, |s| repo_source(repo, s))
+    browse_with(sessions, start, "repository VIEW", |s| repo_source(repo, s))
 }
 
 /// Where one session in a repo listing is read from: with a branch, through that branch's ref;
@@ -218,11 +215,9 @@ fn repo_source(repo: &Repo, s: &crate::domain::session::Stored) -> Source {
         Some(branch) => Source::Branch {
             repo: repo.root().to_path_buf(),
             branch: branch.clone(),
-            runtime: s.runtime.clone(),
         },
         None => Source::Worktree {
             root: worktree_root(&s.path),
-            runtime: s.runtime.clone(),
         },
     }
 }
@@ -232,7 +227,7 @@ pub fn browse_native(
     sessions: &[crate::domain::session::Stored],
     start: usize,
 ) -> crate::CmdResultAlias {
-    browse_with(sessions, start, |s| Source::Native {
+    browse_with(sessions, start, "live transcript", |s| Source::Native {
         path: s.path.clone(),
         runtime: s.runtime.clone(),
     })
@@ -241,18 +236,34 @@ pub fn browse_native(
 fn browse_with(
     sessions: &[crate::domain::session::Stored],
     start: usize,
+    kind: &str,
     source: impl Fn(&crate::domain::session::Stored) -> Source,
 ) -> crate::CmdResultAlias {
     let entries: Vec<Entry> = sessions
         .iter()
         .map(|s| Entry {
             label: s.id.chars().take(8).collect(),
-            note: s.runtime.clone(),
+            note: format!("{} · {kind}", s.runtime),
             when: s.mtime,
             source: source(s),
         })
         .collect();
     run(entries, start, "sessions")
+}
+
+/// Open the explicitly selected repository evidence without enumerating other sessions.
+pub fn browse_snapshot(label: &str, envelopes: String, source: &str) -> crate::CmdResultAlias {
+    let text = render_envelopes(&envelopes)?;
+    run(
+        vec![Entry {
+            label: label.to_owned(),
+            note: source.to_owned(),
+            when: SystemTime::UNIX_EPOCH,
+            source: Source::Snapshot { text },
+        }],
+        0,
+        source,
+    )
 }
 
 /// Enter in the Timeline: lists that branch turn by turn, with the selected turn's
@@ -484,7 +495,11 @@ fn draw(f: &mut Frame, pane: &Pane<'_>, view: &[&Entry], state: &mut ListState) 
     let items: Vec<ListItem> = view
         .iter()
         .map(|e| {
-            let active = crate::ui::ago(e.when);
+            let active = if matches!(e.source, Source::Snapshot { .. }) {
+                String::new()
+            } else {
+                crate::ui::ago(e.when)
+            };
             let width = panes.list.width.saturating_sub(4) as usize;
             let note_width = width.saturating_sub(widgets::cols(&active) + 3);
             ListItem::new(vec![
@@ -621,6 +636,69 @@ mod tests {
         assert!(render("", "").contains("nothing recorded"));
     }
 
+    #[test]
+    fn timeline_turn_preserves_each_native_source_without_reading_later_turns() {
+        use crate::domain::{storage, transcript};
+
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&temp.path().join("repo")).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        let claim = format!("{}{}", meta::ID_PREFIX, "a".repeat(meta::ID_HEX_LEN));
+        let claude = |text: &str| {
+            transcript::wrap_lines(
+                &format!(
+                    "{}\n",
+                    serde_json::json!({"type":"user", "message":{"role":"user", "content":text}})
+                ),
+                "claude-code",
+                &claim,
+            )
+        };
+        let codex = transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"CODEX-TURN-CONTENT"}]}})
+            ),
+            "codex",
+            &claim,
+        );
+        let first = format!("{}{codex}", claude("CLAUDE-TURN-CONTENT"));
+        let mut metadata = meta::Meta::new(claim.clone(), "codex".into(), "/fixture".into());
+        metadata.turn = Some(1);
+        meta::ensure_session_dir(repo.root()).unwrap();
+        meta::write(repo.root(), &metadata).unwrap();
+        storage::write_snapshot(repo.root(), &first, &first).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("selected mixed turn").unwrap();
+        let selected = repo.git(&["rev-parse", "HEAD"]).unwrap();
+
+        let later = format!("{first}{}", claude("LATER-TURN-CONTENT"));
+        metadata.turn = Some(2);
+        meta::write(repo.root(), &metadata).unwrap();
+        storage::write_snapshot(repo.root(), &later, &later).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("later turn").unwrap();
+
+        let text = text_of(&Entry {
+            label: "selected turn".into(),
+            note: String::new(),
+            when: SystemTime::UNIX_EPOCH,
+            source: Source::Turn {
+                repo: repo.root().to_path_buf(),
+                sha: selected,
+                turn: Some(1),
+            },
+        });
+        let claude = text
+            .find("CLAUDE-TURN-CONTENT")
+            .unwrap_or_else(|| panic!("{text}"));
+        let codex = text
+            .find("CODEX-TURN-CONTENT")
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(claude < codex, "{text}");
+        assert!(!text.contains("LATER-TURN-CONTENT"), "{text}");
+    }
+
     /// This pins the cache key to **the row's own identity**, not to its index.
     ///
     /// With an index key, one `/` filter changes the view and the same index points at another
@@ -662,7 +740,12 @@ mod tests {
             );
             let env = transcript::wrap_lines(&line, "claude-code", &claim);
             meta::ensure_session_dir(r.root()).unwrap();
-            storage::write_snapshot(r.root(), &env, &env).unwrap();
+            let hidden = transcript::wrap_lines(
+                &line.replace(prompt, "HIDDEN-LOG-ONLY"),
+                "claude-code",
+                &claim,
+            );
+            storage::write_snapshot(r.root(), &format!("{env}{hidden}"), &env).unwrap();
             meta::write(
                 r.root(),
                 &Meta::new(claim, "claude-code".into(), "/r".into()),
@@ -688,6 +771,7 @@ mod tests {
                 source: repo_source(&r, s),
             });
             assert!(text.contains(own), "{own}: {text}");
+            assert!(!text.contains("HIDDEN-LOG-ONLY"), "{text}");
             assert!(!text.contains(other), "{own} must not show {other}: {text}");
         }
     }
