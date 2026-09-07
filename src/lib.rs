@@ -90,6 +90,7 @@ pub mod ui;
 /// The test: a function only one domain uses stays inside that domain. The rule keeps another
 /// catch-all `core/` from growing.
 pub mod domain {
+    pub mod comparison;
     /// Install a session into a runtime (the native format is rewritten byte by byte;
     /// cross-runtime goes through the IR).
     pub mod install;

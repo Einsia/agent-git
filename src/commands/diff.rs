@@ -1,9 +1,8 @@
 //! `agit diff` — between two points.
 //!
 //! * `--turns` (default): the fork point plus the turns each side added, the reconnaissance view
-//!   before a merge. Within one repo that is the merge-base; across repos it is the common prefix
-//!   of the turn hash chain (the hash covers no timestamp, machine or account — the same turn
-//!   hashes the same across people, which is what makes a fork point findable across repos).
+//!   before a merge. A fork point is a verified Git merge-base, including shared history stored
+//!   in separate local repositories. Equal transcript content alone does not prove ancestry.
 //! * `--view`: insertions and deletions between the two VIEW sequences — what a merge or a
 //!   distill actually swapped into the agent's context.
 //! * `--files`: an ordinary text diff of the shared files.
@@ -11,6 +10,7 @@
 //! Zero arguments shows working-state changes to shared files plus a summary of unsettled turns.
 
 use super::CmdResult;
+use crate::domain::comparison::Comparison;
 use crate::domain::meta;
 use crate::domain::refs;
 use crate::domain::repo::Repo;
@@ -36,58 +36,77 @@ pub struct Args {
 
 pub fn run(args: Args) -> CmdResult {
     let cwd = std::env::current_dir()?;
-    let range = args.range.as_deref().map(|raw| {
-        let left = raw
-            .split_once("...")
-            .or_else(|| raw.split_once(".."))
-            .map(|(a, _)| a)
-            .unwrap_or(raw);
-        crate::commands::target::parse(left).map(|target| (raw.to_string(), target))
-    });
-    let (range, left_target) = match range {
-        Some(Ok((range, target))) => (Some(range), Some(target)),
-        Some(Err(e)) => {
-            ui::error(&format!("{e:#}"));
+    let endpoints = match args.range.as_deref().map(parse_endpoints).transpose() {
+        Ok(endpoints) => endpoints,
+        Err(error) => {
+            ui::error(&format!("{error:#}"));
             return Ok(ExitCode::Usage);
         }
-        None => (None, None),
     };
-    let explicit_repo = left_target.as_ref().and_then(|target| target.repo.clone());
-    let repo = if let Some(slug) = explicit_repo {
-        let (o, n) = super::parse_slug(&slug)?;
-        let Some(repo) = Repo::open(crate::infra::config::repo_dir(&o, &n)?) else {
-            ui::error(&format!("{slug} does not exist locally."));
-            return Ok(ExitCode::Precondition);
-        };
-        repo
-    } else {
-        let ctx = match super::context::resolve(&cwd) {
-            Ok(c) => c,
-            Err(e) => {
-                ui::error(&format!("{e:#}"));
+    let at_context = if endpoints.as_ref().is_some_and(|(left, right, _)| {
+        left.base == refs::Base::At
+            || right
+                .as_ref()
+                .is_some_and(|spec| spec.base == refs::Base::At)
+    }) {
+        match super::context::at_context() {
+            Ok(context) => Some(context),
+            Err(error) => {
+                ui::error(&format!("{error:#}"));
                 return Ok(ExitCode::Ref);
             }
-        };
-        let (o, n) = super::parse_slug(&ctx.repo)?;
-        let Some(repo) = Repo::open(crate::infra::config::repo_dir(&o, &n)?) else {
-            ui::error(&format!("{} does not exist locally.", ctx.repo));
-            return Ok(ExitCode::Precondition);
-        };
-        repo
+        }
+    } else {
+        None
     };
-
-    if range.is_none() {
+    let explicit_repo = match endpoints.as_ref().map(|(left, _, _)| left) {
+        Some(refs::RefSpec {
+            repo: refs::RepoSel::Slug(owner, name),
+            ..
+        }) => Some(format!("{owner}/{name}")),
+        Some(refs::RefSpec {
+            repo: refs::RepoSel::Context,
+            base: refs::Base::At,
+            ..
+        }) => at_context.as_ref().map(|context| context.repo.clone()),
+        Some(refs::RefSpec {
+            repo: refs::RepoSel::Local(_),
+            ..
+        }) => {
+            ui::error("name the repository as owner/repo@ref");
+            return Ok(ExitCode::Usage);
+        }
+        _ => None,
+    };
+    let slug = match explicit_repo {
+        Some(slug) => slug,
+        None => match super::context::resolve(&cwd) {
+            Ok(context) => context.repo,
+            Err(error) => {
+                ui::error(&format!("{error:#}"));
+                return Ok(ExitCode::Ref);
+            }
+        },
+    };
+    let (owner, name) = super::parse_slug(&slug)?;
+    let Some(repo) = Repo::open(crate::infra::config::repo_dir(&owner, &name)?) else {
+        ui::error(&format!("{slug} does not exist locally."));
+        return Ok(ExitCode::Precondition);
+    };
+    let Some((left_spec, right_spec, three_dot)) = endpoints else {
         return workdir_diff(&repo);
-    }
-    let range = range.unwrap();
-    let (a, b, three_dot) = split_range(&range);
-    if let Some(right) = &b
-        && let Err(e) = crate::commands::target::parse_local(right)
-    {
-        ui::error(&format!("{e:#}"));
-        return Ok(ExitCode::Usage);
-    }
-    let Some(a_sha) = (match resolve_in(&repo, &a) {
+    };
+    let right_repo = match right_spec.as_ref() {
+        Some(spec) => match right_repository(&repo, spec, at_context.as_ref()) {
+            Ok(repo) => repo,
+            Err(error) => {
+                ui::error(&format!("{error:#}"));
+                return Ok(ExitCode::Precondition);
+            }
+        },
+        None => repo.clone(),
+    };
+    let Some(a_sha) = (match resolve_spec(&repo, &left_spec, at_context.as_ref()) {
         Ok(sha) => sha,
         Err(e) => {
             ui::error(&format!("{e:#}"));
@@ -96,8 +115,8 @@ pub fn run(args: Args) -> CmdResult {
     }) else {
         return Ok(ExitCode::Ref);
     };
-    let b_sha = match b {
-        Some(b) => match resolve_local_in(&repo, &b) {
+    let b_sha = match right_spec {
+        Some(spec) => match resolve_spec(&right_repo, &spec, at_context.as_ref()) {
             Err(e) => {
                 ui::error(&format!("{e:#}"));
                 return Ok(ExitCode::Usage);
@@ -116,33 +135,22 @@ pub fn run(args: Args) -> CmdResult {
         },
     };
 
-    // The range operator **means one thing on all three paths**, so the left end is computed
-    // once here and every path below uses it.
-    //
-    // A left end that ignores the operator is wrong in both directions at once: a left end
-    // hardwired to the merge-base reads `..` as `...`, and one hardwired to `a_sha` reads `...`
-    // as `..`. Either way the same `a..b` is a fork-point view under `--turns` and a two-point
-    // view under `--files`, and the user has no way to ask for the other one.
-    //
-    // git's own definition governs: the left end of `..` is `a`, the left end of `...` is the
-    // fork point. All three paths share that left end — and share **whether it really is a fork
-    // point**.
-    //
-    // Three-dot semantics want the merge-base. A cross-repo comparison or an orphan branch has
-    // no common ancestor at all and `merge-base` fails. Falling back to `a` is right there (it
-    // is an honest answer), but **the label must stop saying fork point** — that value is not a
-    // computed fork point, and a fake fork point in the report reads as though the two lines
-    // really did split there.
-    //
-    // So "did it compute" comes out alongside the value, and the label below follows the fact
-    // rather than the operator the user typed.
+    let comparison = Comparison::new(&repo, &right_repo)?;
+    let graph = comparison.repository();
+
+    // Every output mode uses the same selected endpoints. Only a verified common ancestor
+    // earns the fork-point label; unrelated histories retain their explicit left endpoint.
     let (base, real_fork) = if three_dot {
-        match repo
-            .git_opt(&["merge-base", &a_sha, &b_sha])
-            .map(|s| s.trim().to_string())
-        {
-            Some(b) => (b, true),
-            None => (a_sha.clone(), false),
+        match comparison.merge_base(&a_sha, &b_sha) {
+            Ok(Some(base)) => (base, true),
+            Ok(None) => {
+                ui::warning("no common Git ancestor; comparing the explicit endpoints");
+                (a_sha.clone(), false)
+            }
+            Err(error) => {
+                ui::error(&format!("{error:#}"));
+                return Ok(ExitCode::Precondition);
+            }
         }
     } else {
         (a_sha.clone(), false)
@@ -152,8 +160,10 @@ pub fn run(args: Args) -> CmdResult {
         // Shared files = everything but the session itself. Excluding the whole `session/`
         // rather than each file name by name drops one way to fail silently: "the layout
         // changed and the exclude list did not follow".
-        let out = repo.git(&[
+        let out = graph.git(&[
             "diff",
+            "--no-ext-diff",
+            "--no-textconv",
             &base,
             &b_sha,
             "--",
@@ -168,15 +178,72 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     if args.view {
-        let va = view_at(&repo, &base)?;
-        let vb = view_at(&repo, &b_sha)?;
+        let va = view_at(graph, &base)?;
+        let vb = view_at(graph, &b_sha)?;
         view_diff(&va, &vb);
         return Ok(ExitCode::Ok);
     }
 
     // Default: the --turns reconnaissance.
-    turns_report(&repo, &base, &a_sha, &b_sha, real_fork);
+    turns_report(graph, &base, &a_sha, &b_sha, real_fork)?;
     Ok(ExitCode::Ok)
+}
+
+fn parse_endpoints(raw: &str) -> crate::Result<(refs::RefSpec, Option<refs::RefSpec>, bool)> {
+    let (left, right, three_dot) = split_range(raw);
+    let left = refs::parse(&left)?;
+    let right = right.as_deref().map(parse_right).transpose()?;
+    whole_point(&left)?;
+    if let Some(right) = &right {
+        whole_point(right)?;
+    }
+    Ok((left, right, three_dot))
+}
+
+fn parse_right(raw: &str) -> crate::Result<refs::RefSpec> {
+    if raw
+        .split_once('@')
+        .is_some_and(|(repo, _)| repo.contains('/'))
+    {
+        refs::parse(raw)
+    } else {
+        crate::commands::target::parse_local(raw)
+    }
+}
+
+fn whole_point(spec: &refs::RefSpec) -> crate::Result<()> {
+    match spec.tail {
+        refs::Tail::None | refs::Tail::Tilde(_) | refs::Tail::Turn(_) => Ok(()),
+        _ => anyhow::bail!(
+            "diff endpoints must name whole commits; event, turn-range, and path selectors are not supported"
+        ),
+    }
+}
+
+fn right_repository(
+    left: &Repo,
+    spec: &refs::RefSpec,
+    at_context: Option<&super::context::Context>,
+) -> crate::Result<Repo> {
+    let slug = match &spec.repo {
+        refs::RepoSel::Slug(owner, name) => Some(format!("{owner}/{name}")),
+        refs::RepoSel::Context if spec.base == refs::Base::At => Some(
+            at_context
+                .ok_or_else(|| anyhow::anyhow!("missing current-session identity"))?
+                .repo
+                .clone(),
+        ),
+        refs::RepoSel::Context => None,
+        refs::RepoSel::Local(_) => anyhow::bail!("name the repository as owner/repo@ref"),
+    };
+    match slug {
+        None => Ok(left.clone()),
+        Some(slug) => {
+            let (owner, name) = super::parse_slug(&slug)?;
+            Repo::open(crate::infra::config::repo_dir(&owner, &name)?)
+                .ok_or_else(|| anyhow::anyhow!("{slug} does not exist locally."))
+        }
+    }
 }
 
 /// The VIEW at one endpoint. **No VIEW does not mean broken.**
@@ -210,24 +277,31 @@ fn split_range(r: &str) -> (String, Option<String>, bool) {
     }
 }
 
-fn resolve_in(repo: &Repo, name: &str) -> crate::Result<Option<String>> {
-    let spec = refs::parse(name)?;
-    resolve_spec(repo, &spec)
-}
-
+#[cfg(test)]
 fn resolve_local_in(repo: &Repo, name: &str) -> crate::Result<Option<String>> {
     let spec = crate::commands::target::parse_local(name)?;
-    resolve_spec(repo, &spec)
+    resolve_spec(repo, &spec, None)
 }
 
-fn resolve_spec(repo: &Repo, spec: &refs::RefSpec) -> crate::Result<Option<String>> {
-    let spec = match crate::commands::context::substitute_at(spec.clone()) {
-        Ok(spec) => spec,
-        Err(e) => {
-            ui::error(&format!("{e:#}"));
-            return Ok(None);
+fn resolve_spec(
+    repo: &Repo,
+    spec: &refs::RefSpec,
+    at_context: Option<&super::context::Context>,
+) -> crate::Result<Option<String>> {
+    let mut spec = spec.clone();
+    if spec.base == refs::Base::At {
+        let context =
+            at_context.ok_or_else(|| anyhow::anyhow!("missing current-session identity"))?;
+        let (owner, name) = super::parse_slug(&context.repo)?;
+        let current = Repo::at(crate::infra::config::repo_dir(&owner, &name)?);
+        if current.common_dir()?.canonicalize()? != repo.common_dir()?.canonicalize()? {
+            anyhow::bail!(
+                "`@` belongs to {}; name an explicit branch in the selected repository",
+                context.repo
+            );
         }
-    };
+        spec.base = refs::Base::SessionBranch(context.branch.clone());
+    }
     match refs::resolve(repo, &spec) {
         Ok(r) => Ok(Some(r.sha)),
         Err(e) => {
@@ -237,7 +311,7 @@ fn resolve_spec(repo: &Repo, spec: &refs::RefSpec) -> crate::Result<Option<Strin
     }
 }
 
-fn turns_report(repo: &Repo, base: &str, a: &str, b: &str, three_dot: bool) {
+fn turns_report(repo: &Repo, base: &str, a: &str, b: &str, three_dot: bool) -> crate::Result<()> {
     // The label follows the semantics: only the left end of `...` is the fork point, the left
     // end of `..` is `a` itself. Printing `fork point` in the two-point view is a lie — that
     // value is not a computed fork point, and the A side then counts zero new turns, which
@@ -247,19 +321,34 @@ fn turns_report(repo: &Repo, base: &str, a: &str, b: &str, three_dot: bool) {
     } else {
         "base      "
     };
-    println!("{label}  {}", &base[..9.min(base.len())]);
+    let prior: std::collections::HashSet<String> = repo
+        .git(&["rev-list", base])?
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let mut sides = Vec::new();
     for (label, head) in [("A", a), ("B", b)] {
-        let n = repo
-            .git_opt(&["rev-list", "--count", &format!("{base}..{head}")])
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(0);
-        println!("{label} side    +{n} turns");
-        if let Ok(log) = repo.git(&["log", "--format=%h %s", &format!("{base}..{head}")]) {
-            for l in log.lines().take(10) {
-                println!("  {l}");
-            }
+        let chain = refs::Chain::read(repo, head)?;
+        let additions: Vec<String> = chain
+            .turns()
+            .into_iter()
+            .filter(|(_, sha)| !prior.contains(*sha))
+            .map(|(_, sha)| sha.to_owned())
+            .collect();
+        let mut previews = Vec::new();
+        for sha in additions.iter().rev().take(10) {
+            previews.push(repo.git(&["show", "-s", "--format=%h %s", sha])?);
+        }
+        sides.push((label, additions.len(), previews));
+    }
+    println!("{label}  {}", &base[..9.min(base.len())]);
+    for (label, count, previews) in sides {
+        println!("{label} side    +{count} turns");
+        for preview in previews {
+            println!("  {preview}");
         }
     }
+    Ok(())
 }
 
 /// VIEW sequence delta: identity is the full envelope event id, and insertions and deletions are
