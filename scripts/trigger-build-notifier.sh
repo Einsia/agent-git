@@ -11,8 +11,8 @@ set -euo pipefail
 : "${AGIT_NOTIFIER_TRIGGER_TOKEN:?missing AGIT_NOTIFIER_TRIGGER_TOKEN}"
 
 case "$AGIT_NOTIFY_CHANNEL:$AGIT_NOTIFY_JOBS" in
-  dev:dev:linux,dev:macos-arm64 | \
-  staging:staging:linux,staging:macos-arm64) ;;
+  dev:dev:linux,dev:macos-arm64,dev:windows-x64 | \
+  staging:staging:linux,staging:macos-arm64,staging:windows-x64) ;;
   *) echo "unsupported AgentGit notification target" >&2; exit 2 ;;
 esac
 
