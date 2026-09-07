@@ -7,7 +7,8 @@ description: Sign in to the AgentGit Hub.
 
 ## Purpose
 
-Create Hub credentials for commands such as `clone`, `import`, `push`, `repo`, and `rc`.
+Create Hub credentials for recording, publishing, and account operations.
+Public read-only cloning does not require login; `clone --mine` does.
 
 ## Synopsis
 

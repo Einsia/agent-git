@@ -1,84 +1,85 @@
-# `agit login` / `agit logout`
+# `agit login` / `agit logout` / `agit whoami`
 
-One path only: a username and password buy a pair of tokens. Accounts
-self-register at `/signup` in the web interface (email optional); on an instance
-with self-registration turned off an administrator creates them with
-`agentgit-admin user-add [--email <email>]`.
+The CLI signs in through browser authorization, device code, or a personal
+access token (PAT) read from stdin. Account authentication happens on the Hub
+website; the CLI does not ask for a username or password.
 
-Sign in with **either the username or the email** — an input containing `@` is
-looked up as an email, anything else as a username.
+## Choose a sign-in flow
 
-## Mechanism
+| Command | Behavior |
+| --- | --- |
+| `agit login` | Open an interactive menu. Press Enter for browser authorization, or select device code. |
+| `agit login --device` | Skip the menu and print a verification URL and code to approve in a browser on any device. |
+| `agit login --with-token < token.txt` | Read a PAT from stdin and exchange it for a Hub session. |
 
+Browser authorization opens the approval URL when possible and also prints it.
+Device code works when the CLI machine cannot open a browser, including SSH
+sessions and containers. Both flows wait for approval and can expire; device
+code still requires a person to approve it on the website. Use PAT input for
+unattended CI and agent jobs.
+
+The default interactive menu requires a terminal. Without one, it exits with
+code `8` and prints the PAT command. The explicit `--device` option bypasses
+that menu and can print its approval instructions without a terminal.
+
+Use `--hub <url>` to choose the Hub for a login. Otherwise the order is
+`AGIT_HUB_URL`, `config hub.url`, then the built-in public Hub. A successful
+login with `--hub` also saves that address as the configured default.
+
+```bash
+agit login --hub https://dev.agent-git.com
+agit login --hub https://dev.agent-git.com --device
+agit login --hub https://dev.agent-git.com --with-token < token.txt
 ```
-agit login                    username (or email) and password (tty required)
-  → POST /api/auth/login      → {username, email, access_token, refresh_token, both expiries}
-  → stores $AGIT_HOME/credentials.json (0600)
 
-later requests                carry Authorization: Bearer <access_token>
-  → on a 401 the client refreshes once and retries
-     POST /api/auth/refresh   {refresh_token} → a new pair
+## Authorization and credential storage
 
-agit logout
-  → POST /api/auth/logout     the server deletes the session row
-  → deletes the local credentials
-```
+Browser authorization creates a request with `POST /api/auth/cli/session` and
+polls `POST /api/auth/cli/poll`. Device code creates a request with
+`POST /api/auth/device/code` and polls `POST /api/auth/device/token`. The CLI
+saves credentials only after the Hub returns a session.
 
-The two tokens divide the work: **access lasts one hour** and rides on every
-request; **refresh lasts 30 days** and only buys a new access. A leaked access
-token is exposed for only one hour, while one sign-in lasts a user a month.
+Credentials live in `$AGIT_HOME/credentials/<hub-host-key>.json`, with
+`~/.agit` as the default home. Each file contains the access and refresh tokens,
+their expiry timestamps, the Hub address, username, and optional email. The
+host key includes the port when present; it is not a separate identity for
+each URL scheme or path. Unix credential files have mode `0600`; Windows
+writes use the current user's private access control list.
 
-## Sign-in also stores the username and email
+Requests carry the access token. On an authentication failure the Hub client
+can refresh and retry. Refresh tokens rotate, so processes sharing a credential
+file can adopt a newer pair saved by another process for the same account.
+Credentials for a different account are not substituted during that recovery.
 
-The credentials carry two more things: `username` and `email`. `agit commit`
-uses them to set `user.name` / `user.email` on the Agent repo's git — who
-recorded a commit is recorded through exactly this, the same as GitHub; there is
-no separate signing mechanism. A missing email falls back to
-`<username>@agit.local`.
+Recording a session uses the saved username and email for the Agent repo's Git
+author identity; a missing email falls back to `<username>@agit.local`. Login
+does not create an Agent repo or bind a workspace. Public read-only cloning
+does not require login; cloning into your namespace with `--mine` and publishing
+do. Offline adoption without recording a version uses `agit import --link-only`.
 
-## Three properties worth knowing
+## Session authorship and integrity
 
-**A refresh token is single-use.** A refresh deletes the whole row server-side
-and inserts a new one, so a second use of an old refresh fails. When one is
-stolen, the real user's next refresh fails — a detectable signal. When several
-clients / processes hold the same credentials in memory at once, whichever
-refreshes first persists the new pair, and a client that arrives later reads the
-disk on its 401: a newer pair for the same account is adopted directly, and a
-client whose own refresh fails waits, bounded, for a sibling process to persist
-and then adopts. Credentials for another account are never taken over.
+The current protocol has no AgentGit signing-key store, public-key enrollment,
+or signature verification badges. Hub sessions and repository grants authorize
+access. Git author fields record attribution, and Git object hashes identify
+content; neither is proof of a signing identity.
 
-**Only digests are stored.** The server's `sessions` table stores
-`sha256(plaintext)` for both tokens. A leaked database yields no directly
-reusable token. The plaintext appears once, at issue time.
+## Inspect or revoke a session
 
-**A failed sign-in does not distinguish the reason.** A wrong password and a
-nonexistent account both return "wrong username or password", and for a
-nonexistent account the server still runs one password hash verification — so
-the response time does not leak whether the account exists either.
+`agit whoami` displays the selected Hub, saved identity, and credential expiry
+without checking the server. `agit whoami --check` verifies authentication
+through the Hub's account endpoint; it does not treat a public health response
+as evidence that the token is valid. Missing credentials return code `5`.
 
-## Details
-
-* Credentials are stored per hub address; switching `AGIT_HUB_URL` switches
-  identity with no new sign-in
-* `login` requires a tty. A non-interactive environment is refused explicitly
-  instead of hanging or guessing
-* A malformed expiry timestamp: the client treats it as not expired (the
-  server's 401 arbitrates); the server treats it as expired (fail closed). The
-  asymmetry is deliberate
-* `logout` notifies the server before deleting locally. An unreachable server
-  only warns and does not block — the local credentials must be cleared
-* Signing in is a hard precondition for `push` and `clone` — both write
-  something to the server (`clone` creates an agent under your name)
-* Recording a version (`commit`, and `import`, which records a first version by
-  default) also needs a sign-in, for a different reason: it is a purely local
-  action and all it wants is the **username and email** in the credentials —
-  they go into git's `user.name` / `user.email`, and the Agent repo path is
-  `agents/<owner>/<name>/`; neither can be filled in afterwards. To adopt
-  offline without recording a version, use `agit import --link-only`; `log` /
-  `show` / `status` / `doctor` never need it
+`agit logout` attempts to revoke the current Hub session before deleting the
+local credentials. `agit logout --all` does this for every saved Hub. If the
+server is unreachable, the command warns and still clears local credentials;
+it cannot guarantee that the server session was revoked. An unreadable legacy
+credential or one without a recoverable Hub address has the same limitation.
+Captured sessions and local Agent repositories remain available after logout.
 
 ## Code locations
 
-`src/commands/{login,logout}.rs` · `src/infra/credentials.rs` ·
-`src/hub/client.rs::with_retry` (refresh-on-401) ·
-backend `features/auth/{account,session,routes}.rs`
+`src/commands/{login,logout,whoami}.rs`, `src/infra/{config,credentials}.rs`, and
+`src/hub/client.rs` implement the CLI behavior. The backend routes live in
+`src/router.rs` and `src/features/auth/` in the backend repository.

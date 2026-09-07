@@ -74,11 +74,10 @@
 //! The promotion itself is [`super::clone::promote`], the same code `agit clone --mine` uses —
 //! the repo state the two paths produce must be identical.
 //!
-//! # The push gate does not verify signatures
+//! # Publication identity
 //!
-//! A signature is a display feature, not a push gate — write access is enough to push, the same
-//! as GitHub. The server checks only content integrity (session/meta.json exists) and the
-//! secret scan. Signature verification lives on the read path, as the "Verified" badge.
+//! Hub sessions and repository grants authorize publication. Git object hashes establish
+//! content integrity; they do not prove a signing identity.
 
 use super::{CmdResult, require_login};
 use crate::domain::meta;
@@ -700,22 +699,14 @@ fn ask_visibility(agent: &str) -> crate::Result<Option<bool>> {
     )
 }
 
-/// Give **one next step that can be followed** when the push fails.
-///
-/// git reports every server-side rejection as exit code 128, and the response body is out of
-/// reach (`remote-curl` sets `CURLOPT_FAILONERROR`). So triage runs off the status code git
-/// printed, and a 422 takes one more question to the backend before it can say which gate
-/// stopped it.
-///
-/// Unconditional "the remote moved ahead" plus "authentication problem" advice points the wrong
-/// way when the real cause is an unregistered public key, and a next step aimed the wrong way is
-/// the most expensive thing to hand someone during a first end-to-end run.
+/// Keep remediation aligned with the server rejection category.
+/// Git transport can hide the response body; a content or provenance rejection must not be
+/// presented as missing authentication or remote branch movement.
 fn diagnose(out: &crate::hub::git::Outcome, owner: &str, name: &str) -> Vec<String> {
     let err = &out.stderr;
 
     match out.http_status() {
-        // 422 = the server-side gate refused the content (secret scan, provenance check, a
-        // branch swapping sessions). Signature verification is not a gate.
+        // Content rejection includes secret scanning, provenance, and branch identity changes.
         Some(422) => vec![
             "the server rejected the content (HTTP 422: secret scan or provenance check)".into(),
             "the server-side gate has no bypass — what it stopped would be irreversible inside shared history".into(),
