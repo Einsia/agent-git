@@ -164,6 +164,14 @@ pub fn run(args: Args) -> CmdResult {
         }
         None => base_name,
     };
+    let aligns_published_history = folded_oid.as_ref().is_some_and(|oid| {
+        repo.git_opt(&["cat-file", "-e", &format!("{oid}^{{commit}}")])
+            .is_some()
+    });
+    let history_update = aligns_published_history
+        .then(|| super::migration::begin_startup_recovery(&repo, "run-history"))
+        .transpose()?
+        .flatten();
     // After the fold, the local branch is aligned to the OID the id names: the web interface's
     // "continue" means **the head of this line right now** — absent locally it is created there,
     // behind and fast-forwardable it is fast-forwarded. A session-declaration id carries no OID
@@ -171,9 +179,7 @@ pub fn run(args: Args) -> CmdResult {
     // forked away is never overwritten — two lines that have each settled have no lossless
     // answer, and saying so beats picking a side for the user.
     if let Some(oid) = &folded_oid
-        && repo
-            .git_opt(&["cat-file", "-e", &format!("{oid}^{{commit}}")])
-            .is_some()
+        && aligns_published_history
     {
         let head_ref = format!("refs/heads/{base_name}");
         let cur = repo
@@ -230,6 +236,8 @@ pub fn run(args: Args) -> CmdResult {
             _ => {}
         }
     }
+
+    super::migration::finish_external_history_update(&repo, history_update)?;
 
     // ── 3. Arbitration: continue or fork ──
     let branch_exists = repo.has_ref(&format!("refs/heads/{base_name}"));
@@ -435,11 +443,15 @@ fn readonly_clone(owner: &str, name: &str) -> crate::Result<()> {
     let a = client.get_agent(owner, name)?;
     let identity = crate::hub::identity::RemoteIdentity::new(client.base(), &a.agent_id)?;
     let dest = config::repo_dir(owner, name)?;
+    let history_update =
+        super::migration::begin_startup_recovery_for_path(&dest, "run-clone-history")?;
     let out = crate::hub::git::clone(&a.clone_url, &dest, &identity)?;
     if !out.ok() {
         anyhow::bail!("{}", out.stderr.trim());
     }
-    Repo::at(&dest).set_remote(&a.clone_url)?;
+    let repo = Repo::at(&dest);
+    repo.set_remote(&a.clone_url)?;
+    super::migration::finish_external_history_update(&repo, history_update)?;
     Ok(())
 }
 

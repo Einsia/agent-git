@@ -690,10 +690,11 @@ fn birth_session_branch(
     let mut created_oid: Option<String> = None;
     if !repo.has_ref(&head_ref) {
         let frozen = |base: &str| -> crate::Result<String> {
-            Ok(repo
+            let oid = repo
                 .git(&["rev-parse", "--verify", &format!("{base}^{{commit}}")])?
                 .trim()
-                .to_string())
+                .to_string();
+            super::migration::migrate_frozen_tip(&repo, &oid)
         };
         match &onto_commit {
             Some(base) => {
@@ -1544,6 +1545,64 @@ mod tests {
             "the default records a version"
         );
         assert!(W::parse_from(["x", "AB", "--link-only"]).a.link_only);
+    }
+
+    #[test]
+    fn importing_onto_legacy_history_publishes_a_migrated_tip_with_exact_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("store"));
+        let repo_dir = directory.path().join("repos/alice/history");
+        let repo = Repo::init(&repo_dir).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        super::super::init::scaffold(repo.root()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("main file line").unwrap();
+        let main = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let mut legacy = Meta::new(
+            "agit-1111111111111111111111111111111111111111".into(),
+            "codex".into(),
+            "/project".into(),
+        );
+        legacy.layout = meta::LayoutVersion::V0;
+        meta::write(repo.root(), &legacy).unwrap();
+        std::fs::write(repo.root().join(meta::LEGACY_LOG_FILE), []).unwrap();
+        std::fs::write(repo.root().join(meta::LEGACY_VIEW_FILE), []).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("legacy session").unwrap();
+        let frozen = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        repo.git(&["reset", "--hard", &main]).unwrap();
+        let mut lk = Link::new("codex", "inflight", None);
+        link::write(&store, &lk).unwrap();
+        let placed = birth_session_branch(
+            &mut lk,
+            &store,
+            "history",
+            "alice",
+            "alice",
+            repo_dir.clone(),
+            repo,
+            "replay".into(),
+            Some(frozen.clone()),
+        )
+        .unwrap();
+        let Placed::Ready(landing) = placed else {
+            panic!("the unclaimed legacy lineage must be importable");
+        };
+        let repo = Repo::open(&repo_dir).unwrap();
+        let published = repo.git(&["rev-parse", "refs/heads/replay"]).unwrap();
+        assert_eq!(landing.created_oid.as_deref(), Some(published.as_str()));
+        assert_eq!(
+            meta::read_at_ref(&repo, &published).unwrap().layout,
+            meta::LayoutVersion::V1
+        );
+        assert_eq!(repo.git(&["rev-parse", "replay^1"]).unwrap(), frozen);
+        assert_eq!(
+            meta::read_at_ref(&repo, &frozen).unwrap().layout,
+            meta::LayoutVersion::V0
+        );
+        landing.rollback();
+        assert!(!repo.has_ref("refs/heads/replay"));
+        assert_eq!(repo.git(&["rev-parse", "main"]).unwrap(), main);
     }
 
     /// The offline adoption link has no repository or branch claim. Its legacy commit follow-up

@@ -19,6 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
@@ -56,6 +57,12 @@ struct MigrationMetrics {
 const MIGRATION_SPOOL_PREFIX: &str = "agit-layout-v1-spool-";
 const MIGRATION_SPOOL_LOCK: &str = "agit-layout-v1-spool.lock";
 const MIGRATION_STDERR_BYTES: usize = 64 * 1024;
+const STARTUP_MIGRATION_COMPLETE: &str = "layout-v1.complete";
+const STARTUP_RECOVERY_DIR: &str = "layout-v1-recovery";
+const STARTUP_RECOVERY_PREFIX: &str = "pending-";
+const STARTUP_MIGRATION_VERSION: &[u8] = b"1\n";
+
+static STARTUP_RECOVERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 struct DiscoveryLimits {
@@ -294,19 +301,247 @@ fn probe_repo_migration_with_failure_kind(
     })
 }
 
-/// Every CLI startup first scans `$AGIT_HOME/repos/<owner>/<name>`.
-///
-/// The scan itself is cheap; the global file lock serializes only the real ref transactions. A v0
-/// branch arriving from a fresh clone/fetch is therefore migrated before the next command, and no
-/// "done once" marker can let it slip through.
-pub fn migrate_startup() -> Result<Report> {
-    let home = crate::infra::config::agit_home()?;
-    let repos = crate::infra::config::repos_dir()?;
-    migrate_startup_at(&home, &repos)
+/// A live operation holds a shared startup lock and leaves this file behind if the process stops.
+/// Startup takes the exclusive side only when evidence exists, so clean commands do not contend
+/// on a global lock.
+pub(super) struct StartupRecoveryEvidence {
+    path: PathBuf,
+    directory: PathBuf,
+    _startup_lock: File,
 }
 
-fn migrate_startup_at(home: &Path, repos: &Path) -> Result<Report> {
+impl StartupRecoveryEvidence {
+    pub(super) fn clear(self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => sync_directory(&self.directory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "cannot clear startup recovery evidence {}",
+                    self.path.display()
+                )
+            }),
+        }
+    }
+}
+
+/// Publish recovery evidence before an operation can leave durable partial state.
+///
+/// Repositories outside the configured AgentGit store have no startup route and therefore keep
+/// using their repository-local recovery metadata alone.
+pub(super) fn begin_startup_recovery(
+    repo: &Repo,
+    operation: &str,
+) -> Result<Option<StartupRecoveryEvidence>> {
+    begin_startup_recovery_for_path(repo.root(), operation)
+}
+
+pub(super) fn begin_startup_recovery_for_path(
+    repo_root: &Path,
+    operation: &str,
+) -> Result<Option<StartupRecoveryEvidence>> {
+    let home = crate::infra::config::agit_home()?;
+    let repos = crate::infra::config::repos_dir()?;
+    begin_startup_recovery_at(&home, &repos, repo_root, operation)
+}
+
+fn begin_startup_recovery_at(
+    home: &Path,
+    repos: &Path,
+    repo_root: &Path,
+    operation: &str,
+) -> Result<Option<StartupRecoveryEvidence>> {
+    anyhow::ensure!(
+        !operation.is_empty()
+            && operation
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "invalid startup recovery operation {operation:?}"
+    );
+    let relative = match repo_root.strip_prefix(repos) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => {
+            let (Ok(canonical_repos), Ok(canonical_root)) =
+                (repos.canonicalize(), repo_root.canonicalize())
+            else {
+                return Ok(None);
+            };
+            let Ok(relative) = canonical_root.strip_prefix(canonical_repos) else {
+                return Ok(None);
+            };
+            relative.to_path_buf()
+        }
+    };
+    let components = relative.components().collect::<Vec<_>>();
+    if components.len() != 2
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Ok(None);
+    }
+
     std::fs::create_dir_all(home)?;
+    let lock_path = home.join("layout-v1.lock");
+    let startup_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("cannot open migration lock {}", lock_path.display()))?;
+    fs2::FileExt::lock_shared(&startup_lock)
+        .with_context(|| format!("cannot share migration lock {}", lock_path.display()))?;
+
+    let directory = home.join(STARTUP_RECOVERY_DIR);
+    std::fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "cannot create startup recovery directory {}",
+            directory.display()
+        )
+    })?;
+    // Evidence is durable only if the recovery directory has a durable parent entry.
+    sync_directory(home)?;
+    let (path, mut evidence) = loop {
+        let sequence = STARTUP_RECOVERY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            "{STARTUP_RECOVERY_PREFIX}{operation}-{}-{sequence}",
+            std::process::id()
+        ));
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(evidence) => break (path, evidence),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot create startup recovery evidence {}", path.display())
+                });
+            }
+        }
+    };
+    writeln!(evidence, "{}", relative.display())
+        .with_context(|| format!("cannot write startup recovery evidence {}", path.display()))?;
+    evidence
+        .sync_all()
+        .with_context(|| format!("cannot sync startup recovery evidence {}", path.display()))?;
+    sync_directory(&directory)?;
+    Ok(Some(StartupRecoveryEvidence {
+        path,
+        directory,
+        _startup_lock: startup_lock,
+    }))
+}
+
+/// Finish a local ref landing while its outer recovery evidence is still live.
+pub(super) fn finish_external_history_update(
+    repo: &Repo,
+    recovery: Option<StartupRecoveryEvidence>,
+) -> Result<usize> {
+    maybe_crash_after_external_history_update();
+    let migrated = migrate_repo(repo)?;
+    if let Some(recovery) = recovery {
+        recovery.clear()?;
+    }
+    Ok(migrated)
+}
+
+#[cfg(test)]
+fn maybe_crash_after_external_history_update() {
+    if std::env::var("AGIT_TEST_CRASH_AFTER_EXTERNAL_HISTORY_UPDATE").as_deref() == Ok("1") {
+        std::process::exit(88);
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_crash_after_external_history_update() {}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .with_context(|| format!("cannot open directory {} for sync", path.display()))?
+            .sync_all()
+            .with_context(|| format!("cannot sync directory {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn startup_migration_complete(home: &Path) -> Result<bool> {
+    let path = home.join(STARTUP_MIGRATION_COMPLETE);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect migration marker {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "refusing non-regular or symlinked migration marker {}",
+        path.display()
+    );
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("cannot read migration marker {}", path.display()))?;
+    Ok(bytes == STARTUP_MIGRATION_VERSION)
+}
+
+fn startup_recovery_evidence(home: &Path) -> Result<Vec<PathBuf>> {
+    let directory = home.join(STARTUP_RECOVERY_DIR);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot scan startup recovery directory {}",
+                    directory.display()
+                )
+            });
+        }
+    };
+    collect_startup_recovery_evidence(entries)
+}
+
+fn collect_startup_recovery_evidence(
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+) -> Result<Vec<PathBuf>> {
+    let mut evidence = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STARTUP_RECOVERY_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot inspect startup recovery evidence {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+        anyhow::ensure!(
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+            "refusing unrecognized startup recovery evidence {}",
+            path.display()
+        );
+        evidence.push(path);
+    }
+    evidence.sort();
+    Ok(evidence)
+}
+
+fn synchronized_recovery_snapshot(home: &Path) -> Result<Vec<PathBuf>> {
     let lock_path = home.join("layout-v1.lock");
     let lock = OpenOptions::new()
         .create(true)
@@ -317,17 +552,114 @@ fn migrate_startup_at(home: &Path, repos: &Path) -> Result<Report> {
         .with_context(|| format!("cannot open migration lock {}", lock_path.display()))?;
     lock.lock_exclusive()
         .with_context(|| format!("cannot lock {}", lock_path.display()))?;
+    let evidence = startup_recovery_evidence(home)?;
+    fs2::FileExt::unlock(&lock)?;
+    Ok(evidence)
+}
+
+fn write_startup_migration_complete(home: &Path) -> Result<()> {
+    let path = home.join(STARTUP_MIGRATION_COMPLETE);
+    let mut temporary = tempfile::NamedTempFile::new_in(home)
+        .with_context(|| format!("cannot create migration marker in {}", home.display()))?;
+    temporary
+        .write_all(STARTUP_MIGRATION_VERSION)
+        .context("cannot write migration marker")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .context("cannot sync migration marker")?;
+    temporary
+        .persist(&path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("cannot publish migration marker {}", path.display()))?;
+    sync_directory(home)
+}
+
+fn clear_recovery_snapshot(home: &Path, evidence: &[PathBuf]) -> Result<()> {
+    if evidence.is_empty() {
+        return Ok(());
+    }
+    for path in evidence {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot clear startup recovery evidence {}", path.display())
+                });
+            }
+        }
+    }
+    sync_directory(&home.join(STARTUP_RECOVERY_DIR))
+}
+
+/// A CLI startup scans `$AGIT_HOME/repos/<owner>/<name>` until the current migration completes.
+///
+/// Later clean starts read one completion marker. Operations publish recovery evidence before
+/// durable partial state, and that evidence sends startup back through the scan and repository
+/// locks until recovery finishes.
+pub fn migrate_startup() -> Result<Report> {
+    let home = crate::infra::config::agit_home()?;
+    let repos = crate::infra::config::repos_dir()?;
+    migrate_startup_at(&home, &repos)
+}
+
+pub(super) fn migrate_startup_at(home: &Path, repos: &Path) -> Result<Report> {
+    std::fs::create_dir_all(home)?;
+    let mut recovery_snapshot = startup_recovery_evidence(home)?;
+    if recovery_snapshot.is_empty() && startup_migration_complete(home)? {
+        return Ok(Report::default());
+    }
+    if !recovery_snapshot.is_empty() {
+        recovery_snapshot = synchronized_recovery_snapshot(home)?;
+        if recovery_snapshot.is_empty() && startup_migration_complete(home)? {
+            return Ok(Report::default());
+        }
+    }
 
     let discovery = local_repo_paths(repos)?;
     let mut report = Report {
         skipped: discovery.skipped,
         ..Report::default()
     };
+    let mut pending = Vec::new();
     for repo_path in discovery.paths {
         let Some(repo) = Repo::open(&repo_path) else {
             continue;
         };
-        let branches = match migrate_repo_classified(&repo) {
+        let probe = match probe_repo_at_startup(&repo) {
+            Ok(probe) => probe,
+            Err(RepoMigrationFailure::Skippable(error)) => {
+                report.skipped += 1;
+                crate::ui::warning(&format!(
+                    "skipped storage migration for {}: {error:#}",
+                    repo_path.display()
+                ));
+                continue;
+            }
+            Err(RepoMigrationFailure::Recovery(error)) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot safely recover interrupted checkout in {}",
+                        repo_path.display()
+                    )
+                });
+            }
+        };
+        if probe.needs_lock() {
+            pending.push((repo_path, repo, probe));
+        }
+    }
+    if pending.is_empty() {
+        if report.skipped == 0 {
+            clear_recovery_snapshot(home, &recovery_snapshot)?;
+            write_startup_migration_complete(home)?;
+        }
+        return Ok(report);
+    }
+
+    for (repo_path, repo, probe) in pending {
+        let branches = match migrate_repo_after_probe(&repo, probe) {
             Ok(branches) => branches,
             Err(RepoMigrationFailure::Skippable(error)) => {
                 report.skipped += 1;
@@ -351,7 +683,10 @@ fn migrate_startup_at(home: &Path, repos: &Path) -> Result<Report> {
             report.branches += branches;
         }
     }
-    fs2::FileExt::unlock(&lock)?;
+    if report.skipped == 0 {
+        clear_recovery_snapshot(home, &recovery_snapshot)?;
+        write_startup_migration_complete(home)?;
+    }
     Ok(report)
 }
 
@@ -512,10 +847,20 @@ fn local_repo_paths_with_limits(
 
 /// Migrate one local non-bare agent repo. Returns how many branches advanced.
 pub fn migrate_repo(repo: &Repo) -> Result<usize> {
-    migrate_repo_classified(repo).map_err(RepoMigrationFailure::into_error)
+    let probe = probe_repo_at_startup(repo).map_err(RepoMigrationFailure::into_error)?;
+    if !probe.needs_lock() {
+        return Ok(0);
+    }
+    let recovery = begin_startup_recovery(repo, "migration")?;
+    let migrated =
+        migrate_repo_after_probe(repo, probe).map_err(RepoMigrationFailure::into_error)?;
+    if let Some(recovery) = recovery {
+        recovery.clear()?;
+    }
+    Ok(migrated)
 }
 
-fn migrate_repo_classified(repo: &Repo) -> RepoMigrationResult<usize> {
+fn probe_repo_at_startup(repo: &Repo) -> RepoMigrationResult<MigrationProbe> {
     // Synchronize with a checkout transaction that was already inside its pre-journal window.
     // This opens only an existing mutex: a clean read-only v1 repository stays write-free. It is
     // a startup barrier, not command-lifetime exclusion; a later transaction can still begin in
@@ -530,13 +875,12 @@ fn migrate_repo_classified(repo: &Repo) -> RepoMigrationResult<usize> {
         }
     };
     if checkout_barrier == super::plumbing::ExistingCheckoutBarrierOutcome::RecoveryPending {
-        // Recovery metadata authorizes creating the checkout mutex. Once locked recovery returns,
-        // the checkout has converged and later ordinary migration failures become skippable again.
-        MigrationFailureKind::Recovery
-            .result(super::plumbing::recover_interrupted_checkout(repo))?;
+        return Ok(MigrationProbe {
+            checkout_recovery: true,
+            ..MigrationProbe::default()
+        });
     }
-    let probe = probe_repo_migration_with_failure_kind(repo, MigrationFailureKind::Skippable)?;
-    migrate_repo_after_probe(repo, probe)
+    probe_repo_migration_with_failure_kind(repo, MigrationFailureKind::Skippable)
 }
 
 fn migrate_repo_after_probe(repo: &Repo, probe: MigrationProbe) -> RepoMigrationResult<usize> {
@@ -856,6 +1200,21 @@ fn branch_heads(repo: &Repo) -> Result<Vec<(String, String)>> {
         heads.push((name.to_string(), sha.to_string()));
     }
     Ok(heads)
+}
+
+/// A branch born from frozen history must publish a current-layout tip even when no turn settles.
+pub(super) fn migrate_frozen_tip(repo: &Repo, old: &str) -> Result<String> {
+    if !read_meta_at(repo, old)?.is_some_and(|snapshot| snapshot.layout == LayoutVersion::V0) {
+        return Ok(old.to_string());
+    }
+    let recovery = begin_startup_recovery(repo, "frozen-history")?;
+    let (spool_lock, git_dir) = lock_repo_migration(repo)?;
+    cleanup_stale_spools(&git_dir, &spool_lock)?;
+    let migrated = migrate_tip(repo, old)?;
+    if let Some(recovery) = recovery {
+        recovery.clear()?;
+    }
+    Ok(migrated)
 }
 
 fn migrate_tip(repo: &Repo, old: &str) -> Result<String> {
@@ -1634,6 +1993,12 @@ mod tests {
         assert!(total_error.to_string().contains("repository discovery cap"));
     }
 
+    #[test]
+    fn directory_sync_is_supported_on_every_target() {
+        let directory = tempfile::tempdir().unwrap();
+        sync_directory(directory.path()).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn clean_v1_startup_probe_needs_no_writable_repo_locks() {
@@ -1650,6 +2015,10 @@ mod tests {
 
         std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(startup.unwrap(), Report::default());
+        assert!(
+            !home.path().join("layout-v1.lock").exists(),
+            "a clean startup must not create the global migration lock"
+        );
         assert!(!git_dir.join(MIGRATION_SPOOL_LOCK).exists());
         assert!(!git_dir.join("agit-checkout-transaction.lock").exists());
         assert!(other.git(&["status", "--porcelain"]).unwrap().is_empty());
@@ -1682,6 +2051,160 @@ mod tests {
                 .join(MIGRATION_SPOOL_LOCK)
                 .is_file()
         );
+    }
+
+    #[test]
+    fn startup_accepts_recovery_evidence_cleared_after_directory_read() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = home.path().join("repos");
+        let repo = local_repo_with_layout(&repos, "owner", "clean", LayoutVersion::V1);
+        let evidence = begin_startup_recovery_at(home.path(), &repos, repo.root(), "checkout")
+            .unwrap()
+            .unwrap();
+        let entries = std::fs::read_dir(home.path().join(STARTUP_RECOVERY_DIR))
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+
+        evidence.clear().unwrap();
+
+        assert!(
+            collect_startup_recovery_evidence(entries)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report::default()
+        );
+    }
+
+    #[test]
+    fn startup_preserves_unrelated_recovery_directory_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = home.path().join("repos");
+        let repo = local_repo_with_layout(&repos, "owner", "clean", LayoutVersion::V1);
+        let evidence = begin_startup_recovery_at(home.path(), &repos, repo.root(), "checkout")
+            .unwrap()
+            .unwrap();
+        let directory = home.path().join(STARTUP_RECOVERY_DIR);
+        let metadata = directory.join(".DS_Store");
+        std::fs::write(&metadata, b"desktop metadata").unwrap();
+        let unrelated = directory.join("notes");
+        std::fs::create_dir(&unrelated).unwrap();
+        drop(evidence);
+
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report::default()
+        );
+        assert!(startup_recovery_evidence(home.path()).unwrap().is_empty());
+        assert_eq!(std::fs::read(metadata).unwrap(), b"desktop metadata");
+        assert!(unrelated.is_dir());
+    }
+
+    #[test]
+    fn startup_recovery_refuses_a_directory_using_an_evidence_name() {
+        let home = tempfile::tempdir().unwrap();
+        let unexpected = home
+            .path()
+            .join(STARTUP_RECOVERY_DIR)
+            .join("pending-invalid");
+        std::fs::create_dir_all(&unexpected).unwrap();
+
+        assert!(startup_recovery_evidence(home.path()).is_err());
+        assert!(unexpected.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_repo_paths_keep_startup_recovery_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let repos = home.join("repos");
+        let repo = local_repo_with_layout(&repos, "owner", "clean", LayoutVersion::V1);
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let canonical_root = repo.root().canonicalize().unwrap();
+
+        let evidence =
+            begin_startup_recovery_at(&alias, &alias.join("repos"), &canonical_root, "checkout")
+                .unwrap()
+                .expect("a canonicalized store path must retain its recovery route");
+
+        assert_eq!(startup_recovery_evidence(&home).unwrap().len(), 1);
+        evidence.clear().unwrap();
+        assert!(startup_recovery_evidence(&home).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_work_is_migrated_before_the_completion_marker_is_written() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = home.path().join("repos");
+        let repo = local_repo_with_layout(&repos, "owner", "legacy", LayoutVersion::V0);
+
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report {
+                repos: 1,
+                branches: 1,
+                skipped: 0,
+            }
+        );
+
+        assert_eq!(
+            std::fs::read(home.path().join(STARTUP_MIGRATION_COMPLETE)).unwrap(),
+            STARTUP_MIGRATION_VERSION
+        );
+        assert_eq!(meta::read(repo.root()).unwrap().layout, LayoutVersion::V1);
+    }
+
+    #[test]
+    fn completed_startup_does_not_revisit_the_repository_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = home.path().join("repos");
+        local_repo_with_layout(&repos, "owner", "clean", LayoutVersion::V1);
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report::default()
+        );
+
+        let parked = home.path().join("parked-repos");
+        std::fs::rename(&repos, &parked).unwrap();
+        std::fs::write(&repos, b"the fast path must not inspect this path\n").unwrap();
+
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report::default()
+        );
+    }
+
+    #[test]
+    fn recovery_evidence_reopens_a_completed_startup_scan() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = home.path().join("repos");
+        local_repo_with_layout(&repos, "owner", "clean", LayoutVersion::V1);
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report::default()
+        );
+
+        let legacy = local_repo_with_layout(&repos, "owner", "legacy", LayoutVersion::V0);
+        let evidence = begin_startup_recovery_at(home.path(), &repos, legacy.root(), "migration")
+            .unwrap()
+            .unwrap();
+        drop(evidence);
+
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report {
+                repos: 1,
+                branches: 1,
+                skipped: 0,
+            }
+        );
+        assert_eq!(meta::read(legacy.root()).unwrap().layout, LayoutVersion::V1);
+        assert!(startup_recovery_evidence(home.path()).unwrap().is_empty());
     }
 
     #[test]
@@ -2015,6 +2538,22 @@ mod tests {
         panic!("migration spool failpoint did not terminate the process: {result:?}");
     }
 
+    /// Normally a no-op. The parent re-execs this test to stop after a fetched legacy ref becomes
+    /// local but before its migration begins.
+    #[test]
+    fn external_history_update_crash_child() {
+        let Some(root) = std::env::var_os("AGIT_TEST_EXTERNAL_HISTORY_REPO") else {
+            return;
+        };
+        let legacy = std::env::var("AGIT_TEST_EXTERNAL_HISTORY_COMMIT").unwrap();
+        let repo = Repo::open(PathBuf::from(root)).unwrap();
+        let recovery = begin_startup_recovery(&repo, "test-external-history").unwrap();
+        crate::commands::plumbing::update_ref_cas(&repo, "refs/heads/imported", &legacy, None)
+            .unwrap();
+        let result = finish_external_history_update(&repo, recovery);
+        panic!("external history failpoint did not terminate the process: {result:?}");
+    }
+
     #[test]
     fn restart_removes_hard_exit_spool_before_retrying_migration() {
         let d = tempfile::tempdir().unwrap();
@@ -2062,6 +2601,118 @@ mod tests {
         assert_eq!(migrate_repo(&repo).unwrap(), 1);
         assert_no_migration_spool(&repo);
         assert_eq!(meta::read(repo.root()).unwrap().layout, LayoutVersion::V1);
+    }
+
+    #[test]
+    fn startup_evidence_recovers_a_migration_that_exits_after_spooling() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = home.path().join("repos");
+        local_repo_with_layout(&repos, "owner", "clean", LayoutVersion::V1);
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report::default()
+        );
+
+        let repo = Repo::init(&repos.join("owner/legacy")).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        let session = format!("agit-{}", "f".repeat(40));
+        let event = envelope(serde_json::json!({"type":"event","n":1}), &session);
+        let old = legacy_session_tip(&repo, &session, &event, &event);
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::migration::tests::migration_spool_crash_child",
+                "--nocapture",
+            ])
+            .env("AGIT_HOME", home.path())
+            .env("AGIT_TEST_MIGRATION_REPO", repo.root())
+            .env("AGIT_TEST_MIGRATION_CRASH_AFTER_SPOOL", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(87),
+            "child did not hard-exit: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), old);
+        assert!(!startup_recovery_evidence(home.path()).unwrap().is_empty());
+
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report {
+                repos: 1,
+                branches: 1,
+                skipped: 0,
+            }
+        );
+        assert_no_migration_spool(&repo);
+        assert_eq!(meta::read(repo.root()).unwrap().layout, LayoutVersion::V1);
+        assert!(startup_recovery_evidence(home.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_history_is_evidenced_before_its_local_ref_lands() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = home.path().join("repos");
+        let repo = local_repo_with_layout(&repos, "owner", "history", LayoutVersion::V1);
+        let v1 = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let mut legacy_meta = Meta::new_file_line();
+        legacy_meta.layout = LayoutVersion::V0;
+        meta::write(repo.root(), &legacy_meta).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("legacy remote tip").unwrap();
+        let legacy = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        repo.git(&["reset", "--hard", &v1]).unwrap();
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report::default()
+        );
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::migration::tests::external_history_update_crash_child",
+                "--nocapture",
+            ])
+            .env("AGIT_HOME", home.path())
+            .env("AGIT_TEST_EXTERNAL_HISTORY_REPO", repo.root())
+            .env("AGIT_TEST_EXTERNAL_HISTORY_COMMIT", &legacy)
+            .env("AGIT_TEST_CRASH_AFTER_EXTERNAL_HISTORY_UPDATE", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(88),
+            "child did not hard-exit: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            meta::read_at_ref(&repo, "refs/heads/imported")
+                .unwrap()
+                .layout,
+            LayoutVersion::V0
+        );
+        assert!(!startup_recovery_evidence(home.path()).unwrap().is_empty());
+
+        assert_eq!(
+            migrate_startup_at(home.path(), &repos).unwrap(),
+            Report {
+                repos: 1,
+                branches: 1,
+                skipped: 0,
+            }
+        );
+        assert_eq!(
+            meta::read_at_ref(&repo, "refs/heads/imported")
+                .unwrap()
+                .layout,
+            LayoutVersion::V1
+        );
+        assert!(startup_recovery_evidence(home.path()).unwrap().is_empty());
     }
 
     #[cfg(unix)]

@@ -30,6 +30,11 @@ path = "src/main.rs"
 # unaffected by this gate.
 required-features = ["cli"]
 
+[[bench]]
+name = "startup_migration"
+harness = false
+required-features = ["cli"]
+
 [lib]
 name = "agit"
 path = "src/lib.rs"

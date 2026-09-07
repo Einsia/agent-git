@@ -250,6 +250,10 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
 
+    // The evidence precedes git clone, branch tracking and checkout: any of them may publish a
+    // legacy local ref that the completed startup scan would otherwise never revisit.
+    let history_update = super::migration::begin_startup_recovery_for_path(&dest, "clone-history")?;
+
     if existed {
         println!("updating {}…", ui::bold(&slug));
         let store = Repo::at(&dest);
@@ -363,6 +367,8 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
     }
+
+    super::migration::finish_external_history_update(&store, history_update)?;
 
     let heads = local_branches(&store);
     println!(

@@ -550,6 +550,7 @@ pub(super) struct CheckoutTransaction {
     attributes_layers: Option<AttributesLayers>,
     path: std::path::PathBuf,
     sidecar_path: Option<std::path::PathBuf>,
+    recovery_evidence: Option<super::migration::StartupRecoveryEvidence>,
     _lock: std::fs::File,
 }
 
@@ -870,6 +871,7 @@ fn persist_checkout_transaction(
     mut journal: CheckoutJournal,
     attributes_layers: Option<AttributesLayers>,
 ) -> Result<CheckoutTransaction> {
+    let recovery_evidence = super::migration::begin_startup_recovery(repo, "checkout")?;
     let sidecar_path = attributes_layers
         .as_ref()
         .map(|layers| write_attributes_sidecar(repo, layers))
@@ -922,14 +924,18 @@ fn persist_checkout_transaction(
         attributes_layers,
         path,
         sidecar_path,
+        recovery_evidence,
         _lock: lock,
     })
 }
 
-pub(super) fn finish_checkout_transaction(transaction: CheckoutTransaction) -> Result<()> {
+pub(super) fn finish_checkout_transaction(mut transaction: CheckoutTransaction) -> Result<()> {
     remove_checkout_journal(&transaction.path)?;
     if let Some(path) = transaction.sidecar_path.as_deref() {
         remove_checkout_sidecar(path)?;
+    }
+    if let Some(recovery_evidence) = transaction.recovery_evidence.take() {
+        recovery_evidence.clear()?;
     }
     Ok(())
 }
@@ -4733,6 +4739,70 @@ mod tests {
             );
             assert!(!recover_interrupted_checkout(&repo).unwrap());
         }
+    }
+
+    #[test]
+    fn startup_evidence_recovers_a_checkout_after_the_completion_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = home.path().join("repos");
+        let (repo, old, new) = checkout_crash_fixture(&repos.join("owner/session"));
+        assert_eq!(
+            crate::commands::migration::migrate_startup_at(home.path(), &repos).unwrap(),
+            crate::commands::migration::Report::default()
+        );
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::plumbing::tests::checkout_transaction_crash_child",
+                "--nocapture",
+            ])
+            .env("AGIT_HOME", home.path())
+            .env("AGIT_TEST_CHECKOUT_REPO", repo.root())
+            .env("AGIT_TEST_CHECKOUT_OLD", &old)
+            .env("AGIT_TEST_CHECKOUT_NEW", &new)
+            .env("AGIT_TEST_CHECKOUT_CRASH_AT", "during_apply")
+            .env("AGIT_TEST_CHECKOUT_FULL_INDEX", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "child did not hard-exit: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            std::fs::read_dir(home.path().join("layout-v1-recovery"))
+                .unwrap()
+                .next()
+                .is_some()
+        );
+
+        assert_eq!(
+            crate::commands::migration::migrate_startup_at(home.path(), &repos).unwrap(),
+            crate::commands::migration::Report::default()
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), new);
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("a.txt")).unwrap(),
+            "new a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("b.txt")).unwrap(),
+            "new b\n"
+        );
+        assert!(
+            !checkout_git_path(&repo, CHECKOUT_JOURNAL_NAME)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            std::fs::read_dir(home.path().join("layout-v1-recovery"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]

@@ -97,6 +97,7 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         repo.branches()
     };
+    let history_update = super::migration::begin_startup_recovery(&repo, "pull-history")?;
 
     let mut diverged = false;
     for b in &want {
@@ -155,6 +156,8 @@ pub fn run(args: Args) -> CmdResult {
             None => ui::warning(&format!("{b} and origin/{b} can’t be compared")),
         }
     }
+
+    super::migration::finish_external_history_update(&repo, history_update)?;
 
     if diverged {
         return Ok(ExitCode::Precondition);

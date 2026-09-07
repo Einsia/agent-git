@@ -287,6 +287,9 @@ fn land(args: LandArgs) -> CmdResult {
         );
     }
 
+    let history_update =
+        super::migration::begin_startup_recovery_for_path(&dest, "rc-land-history")?;
+
     // Fetch the hub's copy when we don't have one — a rebind of a folder that
     // already has history elsewhere must build on that history, not fork it.
     // Any failure is fatal for this attempt. Falling back to a fresh repo would
@@ -319,7 +322,9 @@ fn land(args: LandArgs) -> CmdResult {
     if repo.commit_count() == 0 {
         super::import::create_main_file_line(&repo, owner, &lk)?;
     }
-    if materialize_branch(&repo, &args.branch)? {
+    let created = materialize_branch(&repo, &args.branch)?;
+    super::migration::finish_external_history_update(&repo, history_update)?;
+    if created {
         super::import::declare_session_line(&repo, &args.branch, &lk)?;
     }
 
