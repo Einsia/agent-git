@@ -54,3 +54,10 @@ In a non-interactive environment (CI, pipes, or an agent harness), a normal merg
 settling the target, materializing a merge session, or taking the branch lock. Use `--manual` to
 open the transaction and follow the printed `pick`/`summary`/`--continue` protocol, or run the
 command from a terminal.
+
+The preview finds the common Git ancestor across the selected local repositories and counts
+settled turns after it. File and branch-identity commits do not add turns. Unrelated histories
+show an unavailable fork point and unknown added-turn counts; equal content does not prove
+shared ancestry. Shallow, unreadable, or ambiguous ancestry refuses before a transaction is
+opened. Cross-repository reconnaissance borrows the local object stores. Git may fetch missing
+objects from a configured promisor remote while reading a repository.

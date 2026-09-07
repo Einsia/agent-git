@@ -50,8 +50,8 @@ pub struct Tx {
     /// re-resolve free of the cwd.
     #[serde(default)]
     pub source_branch: Option<String>,
-    /// The fork-point commit (a same-repo merge-base, or the last commit of the common prefix
-    /// of the cross-repo hash chain).
+    /// The unique common Git ancestor, or an empty string when the histories are unrelated.
+    /// An absent ancestor does not establish a turn-count baseline.
     pub base: String,
     /// The target branch head when the transaction started (what the CAS compares against).
     pub target_head: String,

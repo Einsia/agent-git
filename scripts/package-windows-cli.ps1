@@ -36,7 +36,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows CLI build failed' }
 $binary = "target/$target/release/agit.exe"
 & cargo check --locked --release --no-default-features --target $target --lib
 if ($LASTEXITCODE -ne 0) { throw 'Windows library without RC failed to compile' }
-& cargo test --locked --release --target $target --test windows_rc --test import_noninteractive_selection -- --nocapture
+& cargo test --locked --release --target $target --test windows_rc --test import_noninteractive_selection --test merge_recon -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows native CLI integration tests failed' }
 & node scripts/verify-windows-cli.mjs $binary
 if ($LASTEXITCODE -ne 0) { throw 'Windows executable verification failed' }

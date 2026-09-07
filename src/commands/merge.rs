@@ -4,9 +4,8 @@
 //!
 //! 1. **Start**: `--into` defaults to `@`; outside a session context and with no `--into` this is
 //!    a usage error (reconciliation is asymmetric — the direction must be explicit). The
-//!    preflight settles the target branch's unsettled turns, finds the fork point (merge-base
-//!    within one repo, the turn hash chain as the cross-repo fallback), and locks the target
-//!    branch.
+//!    preflight compares the selected Git histories, settles the target branch's unsettled
+//!    turns, and locks the target branch. Content similarity cannot establish a fork point.
 //! 2. **resume merge agent**: resume a merge session from the target head **and send the
 //!    instruction in as its opening message** (only the directions and B's branch ref; no
 //!    transcript is quoted) — without it the agent comes up not knowing it is the merge agent
@@ -206,28 +205,28 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     let target_head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
     let target_head = target_head.trim().to_string();
 
-    // Fork point: merge-base within one repo; across repos (the source lives in another one)
-    // the hash chain's common prefix is the fallback — a cross-repo common prefix means nothing
-    // on the commit graph and is reported only.
-    let same_repo = base.repo.root() == repo.root();
-    let fork_point = if same_repo {
-        repo.git_opt(&["merge-base", &target_head, &base.resolved.sha])
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| target_head.clone())
-    } else {
-        target_head.clone() // cross-repo: the report starts from the target head
-    };
+    for selected in [&repo, &base.repo] {
+        anyhow::ensure!(
+            selected.git(&["rev-parse", "--is-shallow-repository"])? == "false",
+            "merge ancestry is incomplete in a shallow repository; fetch its complete history before retrying"
+        );
+    }
+    let comparison = crate::domain::comparison::Comparison::new(&repo, &base.repo)?;
+    let fork_point = comparison.merge_base(&target_head, &base.resolved.sha)?;
 
     // Recon report: the turns each side added — counted off the turn table, not off commits (a
     // fork's identity commit and file commits take no turn ordinal).
-    let new_on_target = turns_since(&repo, &target_head, &fork_point);
-    let new_on_source = if same_repo {
-        turns_since(&base.repo, &base.resolved.sha, &fork_point)
+    if let Some(fork_point) = &fork_point {
+        let graph = comparison.repository();
+        let new_on_target = turns_since(graph, &target_head, fork_point)?;
+        let new_on_source = turns_since(graph, &base.resolved.sha, fork_point)?;
+        println!("fork point  {}", &fork_point[..9.min(fork_point.len())]);
+        println!("this side  +{new_on_target} turns    source side  +{new_on_source} turns");
     } else {
-        0
-    };
-    println!("fork point  {}", &fork_point[..9.min(fork_point.len())]);
-    println!("this side  +{new_on_target} turns    source side  +{new_on_source} turns");
+        println!("fork point  unavailable (no common Git ancestor)");
+        println!("this side  unknown    source side  unknown");
+    }
+    drop(comparison);
 
     if args.dry_run {
         println!(
@@ -273,7 +272,7 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
             source: src_ref.to_string(),
             source_repo: Some(base.slug.clone()),
             source_branch: source_branch_for_tx(src_ref, &base)?,
-            base: fork_point,
+            base: fork_point.unwrap_or_default(),
             target_head: target_head.clone(),
             source_head: base.resolved.sha.clone(),
             picked: vec![],
@@ -463,7 +462,14 @@ fn status(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
         return Ok(ExitCode::Precondition);
     };
     println!("merge transaction  {} → {}", tx.source, tx.target);
-    println!("  fork point    {}", &tx.base[..9.min(tx.base.len())]);
+    println!(
+        "  fork point    {}",
+        if tx.base.is_empty() {
+            "unavailable"
+        } else {
+            &tx.base[..9.min(tx.base.len())]
+        }
+    );
     println!("  picked        {} items", tx.picked_count());
     println!(
         "  summary   {}",
@@ -1059,21 +1065,17 @@ fn expand_picked(source_repo: &Repo, tx: &Tx) -> crate::Result<Vec<usize>> {
 
 /// How many turns this side has settled since the fork point.
 ///
-/// Counts only the turn commits outside `fork_point`'s first-parent chain: an `agit merge` recon
-/// report says "+N turns", and N must be turns that are visible in `agit log`.
-fn turns_since(repo: &Repo, head: &str, fork_point: &str) -> u32 {
-    let Ok(chain) = refs::Chain::read(repo, head) else {
-        return 0;
-    };
-    let base: std::collections::HashSet<String> = refs::first_parent_chain(repo, fork_point)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    chain
+/// Visible turn commits already reachable from the fork point are shared history, including
+/// those brought into that ancestor through a merge parent.
+fn turns_since(repo: &Repo, head: &str, fork_point: &str) -> crate::Result<usize> {
+    let chain = refs::Chain::read(repo, head)?;
+    let ancestors = repo.git(&["rev-list", fork_point])?;
+    let base: std::collections::HashSet<&str> = ancestors.lines().collect();
+    Ok(chain
         .turns()
         .iter()
         .filter(|(_, sha)| !base.contains(*sha))
-        .count() as u32
+        .count())
 }
 
 /// The line numbers turn n contributes to the source transcript (the lines its commit adds

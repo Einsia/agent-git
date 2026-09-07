@@ -75,9 +75,7 @@ fn graph_base(repo: &Repo, left: &str, right: &str) -> crate::Result<Option<Stri
         Some(0) => match output.lines().collect::<Vec<_>>().as_slice() {
             [base] => Ok(Some((*base).to_owned())),
             [] => anyhow::bail!("Git returned no merge-base result"),
-            _ => anyhow::bail!(
-                "multiple common Git ancestors; choose an explicit base and use a two-dot comparison"
-            ),
+            _ => anyhow::bail!("multiple common Git ancestors; ancestry is ambiguous"),
         },
         _ => anyhow::bail!("cannot determine Git ancestry: {error}"),
     }
