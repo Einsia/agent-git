@@ -857,26 +857,7 @@ fn check_view_root(root: &SessionRoot) -> crate::Result<Option<ViewNote>> {
         .filter_map(|line| crate::domain::storage::event_id(line).ok())
         .collect();
     let mut unreachable = 0usize;
-    let mut depth = 0i64;
-    let mut markers = 0i64;
     for line in v.split_inclusive('\n') {
-        let Ok(env) = serde_json::from_str::<transcript::Envelope>(line) else {
-            continue;
-        };
-        let sub = env
-            .content
-            .get("subtype")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-        let is_marker = sub.starts_with("agit:");
-        if is_marker {
-            markers += 1;
-            match sub {
-                "agit:__merge_start__" | "agit:__cherry_pick_start__" => depth += 1,
-                "agit:__merge_end__" | "agit:__cherry_pick_end__" => depth -= 1,
-                _ => {}
-            }
-        }
         let Ok(id) = crate::domain::storage::event_id(line) else {
             unreachable += 1;
             continue;
@@ -888,12 +869,10 @@ fn check_view_root(root: &SessionRoot) -> crate::Result<Option<ViewNote>> {
     if unreachable > 0 {
         return Ok(Some(ViewNote::Unreachable { count: unreachable }));
     }
-    if depth != 0 {
-        return Ok(Some(ViewNote::UnbalancedMarkers {
-            count: depth.unsigned_abs() as usize,
-        }));
+    let unbalanced = crate::domain::storage::unbalanced_view_markers(&v)?;
+    if unbalanced != 0 {
+        return Ok(Some(ViewNote::UnbalancedMarkers { count: unbalanced }));
     }
-    let _ = markers;
     Ok(Some(ViewNote::Ok))
 }
 

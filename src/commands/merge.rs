@@ -584,12 +584,6 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
         super::plumbing::ensure_v1_namespace_available_at(&base.repo, src_head)?;
     }
 
-    // Cross-repo source commits live in a different object database.  Import their complete graph
-    // before either `merge-tree` or `commit-tree -p` needs to resolve the source parent.  This only
-    // installs Git objects: it creates no ref and leaves FETCH_HEAD, the index, and both worktrees
-    // untouched.  Same-repo merges are a no-op here.
-    super::plumbing::import_commit_graph(&repo, &base.repo, src_head)?;
-
     // The reconciliation of shared files lives in **the target branch's worktree**: reconciling
     // memory/ · skills/ · AGENTS.md is the merge agent's job, and it edits them directly under
     // `agit repo path <repo>@<target>`, with no add and no commit. Without collecting from there
@@ -737,9 +731,8 @@ fn storage_exclusions(layout: meta::LayoutVersion) -> &'static [&'static str] {
 /// The merge commit's **tree and message** at landing time: what the merge result looks like is
 /// decided entirely here.
 ///
-/// Split off from the rest of [`continue_tx`] (CAS, unlocking, worktree alignment) because this
-/// half is purely functional — given two heads, one selection, and a set of shared files, it
-/// produces a determined tree. Tests feed [`Tx`] directly, with no forged session context.
+/// A session candidate must pass VIEW validation before source objects or shared-file edits
+/// are written into the target repository.
 ///
 /// `Ok(None)` = a refusal whose reason is already printed.
 fn merge_tree(
@@ -751,11 +744,14 @@ fn merge_tree(
     target_is_file_line: bool,
 ) -> crate::Result<Option<(String, String)>> {
     if !target_is_file_line {
-        // Session line: merge the log and operate on the VIEW, over a base tree that already
-        // carries the shared files.
+        let Some(prepared) = prepare_session_merge(repo, source_repo, tx, src_head)? else {
+            return Ok(None);
+        };
+        super::plumbing::import_commit_graph(repo, source_repo, src_head)?;
         let base_tree = super::plumbing::tree_overlay_worktree(repo, &tx.target_head, shared)?;
-        return merge_session_view(repo, source_repo, tx, src_head, &base_tree);
+        return land_session_merge(repo, tx, prepared, &base_tree).map(Some);
     }
+    super::plumbing::import_commit_graph(repo, source_repo, src_head)?;
     // File reconciliation: `merge-tree` does the mechanical three-way merge, and the session's
     // own storage files are stripped out.
     let tree = match repo.git(&["merge-tree", "--write-tree", &tx.target_head, src_head]) {
@@ -811,13 +807,17 @@ fn merge_tree(
 ///   envelopes (objects folded in) + `merge_summary` + `__merge_end__`.
 /// * VIEW: A's view + the marker + the **selected** B-side events (original envelopes, the
 ///   `_session_id` is the origin marking) + the summary + the end marker.
-fn merge_session_view(
+struct PreparedSessionMerge {
+    metadata: meta::Meta,
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+fn prepare_session_merge(
     target_repo: &Repo,
     source_repo: &Repo,
     tx: &Tx,
     src_head: &str,
-    base_tree: &str,
-) -> crate::Result<Option<(String, String)>> {
+) -> crate::Result<Option<PreparedSessionMerge>> {
     let snap = meta::read_at_ref(target_repo, &tx.target_head)
         .ok_or_else(|| anyhow::anyhow!("the target head is missing {}", meta::FILE))?;
     let a_log = storage::materialize_at(target_repo.root(), &tx.target_head, meta::LOG_FILE)?;
@@ -910,15 +910,29 @@ fn merge_session_view(
     s.kind = meta::Kind::Merge;
     s.milestone = Some(format!("merge {}", tx.source));
     s.layout = meta::LayoutVersion::CURRENT;
-    let snap_text = meta::to_text(&s)?;
+    if storage::unbalanced_view_markers(&new_view)? != 0 {
+        ui::error("the merged VIEW has misplaced or mismatched merge/cherry-pick markers.");
+        ui::hint("adjust the selected events with `agit merge drop/pick`, then retry `--continue`");
+        return Ok(None);
+    }
+    let files = storage::snapshot_files(&new_log, &new_view)?;
+    Ok(Some(PreparedSessionMerge { metadata: s, files }))
+}
 
+fn land_session_merge(
+    target_repo: &Repo,
+    tx: &Tx,
+    prepared: PreparedSessionMerge,
+    base_tree: &str,
+) -> crate::Result<(String, String)> {
+    let snap_text = meta::to_text(&prepared.metadata)?;
     let existing_attributes =
         super::plumbing::regular_blob_text_at(target_repo, base_tree, meta::ATTRS_FILE)?;
-    let mut edits: std::collections::BTreeMap<String, Option<Vec<u8>>> =
-        storage::snapshot_files(&new_log, &new_view)?
-            .into_iter()
-            .map(|(path, bytes)| (path, Some(bytes)))
-            .collect();
+    let mut edits: std::collections::BTreeMap<String, Option<Vec<u8>>> = prepared
+        .files
+        .into_iter()
+        .map(|(path, bytes)| (path, Some(bytes)))
+        .collect();
     // A migrated v1 tip should already have no v0 files. Keeping these explicit makes the
     // merge operation safe when invoked directly against an old local checkout.
     edits.insert(meta::LEGACY_LOG_FILE.to_string(), None);
@@ -938,7 +952,7 @@ fn merge_session_view(
         tx.target,
         tx.summary_text()
     );
-    Ok(Some((tree, msg)))
+    Ok((tree, msg))
 }
 
 /// Markers and summaries both land as envelope lines (the envelope discipline has no exception:

@@ -332,6 +332,42 @@ pub fn ensure_gitattributes(root: &Path) -> Result<PathBuf> {
     ensure_attributes(root)
 }
 
+/// VIEW markers must close in nesting order with their original kind and source identity.
+pub fn unbalanced_view_markers(view: &str) -> Result<usize> {
+    let mut open = Vec::new();
+    let mut unmatched = 0;
+    validate_envelope_input_bounds("VIEW", view)?;
+    for (index, line) in view.split_inclusive('\n').enumerate() {
+        let envelope = parse_envelope_line(line)
+            .with_context(|| format!("invalid VIEW envelope at line {}", index + 1))?;
+        let subtype = envelope
+            .content
+            .get("subtype")
+            .and_then(serde_json::Value::as_str);
+        let (kind, opening) = match subtype {
+            Some("agit:__merge_start__") => ("merge", true),
+            Some("agit:__merge_end__") => ("merge", false),
+            Some("agit:__cherry_pick_start__") => ("cherry-pick", true),
+            Some("agit:__cherry_pick_end__") => ("cherry-pick", false),
+            _ => continue,
+        };
+        let identity = (
+            kind,
+            envelope.source,
+            envelope.session_id,
+            envelope.content.get("source").cloned(),
+        );
+        if opening {
+            open.push(identity);
+        } else if open.last() == Some(&identity) {
+            open.pop();
+        } else {
+            unmatched += 1;
+        }
+    }
+    Ok(unmatched + open.len())
+}
+
 /// Pure-function v1 snapshot encoding.
 ///
 /// Returns the LOG / VIEW sequence blobs and the deduplicated event files; meta and
