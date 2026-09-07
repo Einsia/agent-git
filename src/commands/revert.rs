@@ -133,7 +133,7 @@ pub fn run(args: Args) -> CmdResult {
         let spec = refs::parse(r)?;
         let src_head = match &spec.base {
             refs::Base::At => head.clone(),
-            refs::Base::Name(b) => repo
+            refs::Base::Name(b) | refs::Base::SessionBranch(b) => repo
                 .git(&["rev-parse", &format!("refs/heads/{b}")])
                 .map(|s| s.trim().to_string())?,
             refs::Base::Default => {

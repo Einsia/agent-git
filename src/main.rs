@@ -231,7 +231,6 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
 
         Commands::Import(a) => commands::import::run(a),
         Commands::Status(a) => commands::status::run(a),
-        Commands::Switch(a) => commands::switch::run(a),
         Commands::Memory(a) => commands::memory::run(a),
         Commands::Distill(a) => commands::memory::run_distill(a),
         Commands::Branch(a) => commands::branch::run(a),

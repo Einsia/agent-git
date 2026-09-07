@@ -222,13 +222,13 @@ open a new branch.
 
 ## 5. What branch operations look like today
 
-There is no `agit branch` / `agit switch` yet — the "wait for `agit branch`" line in the
-continuity check's rejection text says exactly that. Today's branch operations are git's own:
+`agit branch` lists, renames, removes or seals existing branches. Select the repository
+explicitly or through `AGIT_SESSION`. Create a new session line with `new`, `import` or `fork`:
 
 ```bash
-git -C ~/.agit/agents/alice/photo switch -c exif   # fork one off the current snapshot
-git -C ~/.agit/agents/alice/photo switch main      # switch back
-agit clone alice/photo:exif                        # pick up a remote branch (checkout origin/exif)
+agit branch --repo alice/photo
+agit fork alice/photo@exif -b exif-retry
+agit resume alice/photo@exif-retry
 ```
 
 Every session branch has its own worktree: settlement, merge and

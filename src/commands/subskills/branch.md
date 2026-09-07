@@ -7,12 +7,12 @@ description: List, rename, remove, or seal Agent repo session branches.
 
 ## Purpose
 
-Operate on the branches of one Agent repo. The repo comes from the session environment or this directory’s binding, so a freshly `init`-ed directory with no session yet can already list and manage branches.
+Operate on the branches of one Agent repo. Name the repo with `--repo <owner/repo>` or supply `AGIT_SESSION`. Directory bindings do not select the target.
 
 ## Synopsis
 
 ```bash
-agit branch [--all] [-v]
+agit branch --repo <owner/repo> [--all] [-v]
 agit branch rename <OLD> <NEW>
 agit branch rm [--force] <NAME>
 agit branch seal <NAME>
@@ -22,6 +22,7 @@ agit branch seal <NAME>
 
 | Option | Meaning |
 |---|---|
+| `--repo <owner/repo>` | Explicit Agent repo; overrides `AGIT_SESSION` and is accepted with every subcommand |
 | `-v, --verbose` | Show more branch details |
 | `--all` | Include remote-tracking branches |
 | `rename <OLD> <NEW>` | Rename a branch alias without changing history |
@@ -33,10 +34,10 @@ agit branch seal <NAME>
 ## Examples
 
 ```bash
-agit branch --all -v
-agit branch rename experiment experiment-v2
-agit branch seal handoff
-agit branch rm --force scratch
+agit branch --repo alice/payments --all -v
+agit branch --repo alice/payments rename experiment experiment-v2
+agit branch --repo alice/payments seal handoff
+agit branch --repo alice/payments rm --force scratch
 ```
 
 Before removing or sealing a branch, save any needed ref with `agit log`/`agit show`. After sealing, `agit run` takes the fork path instead of treating it as writable.

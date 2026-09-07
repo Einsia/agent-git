@@ -21,7 +21,7 @@ With no target at a terminal, this opens a session picker; choosing one hands th
 
 | Option | Meaning |
 |---|---|
-| `[branch|@]` | Branch name; `@` means the current session branch |
+| `[branch|@]` | Explicit owner/repo@branch, or a branch in the repo supplied through `AGIT_SESSION`; `@` requires `AGIT_SESSION`. Omitted targets open an interactive picker |
 | `--as <runtime>` | Runtime to use |
 | `--cwd <dir>` | Runtime working directory |
 | `--no-launch` | Resolve/materialize without starting |

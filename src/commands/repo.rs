@@ -714,7 +714,7 @@ fn delete(repo: &str, local_only: bool) -> CmdResult {
 fn path(repo: Option<String>) -> CmdResult {
     let Some(raw) = repo else {
         ui::error("can’t resolve the repo.");
-        ui::hint("use `agit repo path <owner/repo>`, or pin one with `agit switch` first");
+        ui::hint("use `agit repo path <owner/repo>`, or set AGIT_SESSION");
         return Ok(ExitCode::Ref);
     };
     // `<owner/repo>@<branch>` names that session branch's worktree; a bare `@` is the current

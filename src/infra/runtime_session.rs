@@ -25,9 +25,8 @@ pub struct Current {
 /// in lookup order.
 ///
 /// Claude Code exports `CLAUDE_CODE_SESSION_ID`; `CLAUDE_SESSION_ID` is agit's own name for it,
-/// carried only by child processes agit starts itself. Recognizing only the latter leaves `@`,
-/// `import @` and the `new` guard with nothing to resolve inside Claude Code. Both are recognized,
-/// the real one first.
+/// carried only by child processes agit starts itself. Both support unmanaged-session safety
+/// checks and stale AGIT_SESSION rejection; neither selects an ordinary command target.
 pub const ENV_SESSIONS: &[(&str, &str)] = &[
     ("CLAUDE_CODE_SESSION_ID", "claude-code"),
     ("CLAUDE_SESSION_ID", "claude-code"),

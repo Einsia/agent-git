@@ -24,7 +24,7 @@ agit import [session] --repo <owner/name> -b <branch> [options]
 
 | Option | Meaning |
 |---|---|
-| `[session]` | Runtime session ID, ID prefix, or transcript path; discovery from the current environment when omitted |
+| `[session]` | Explicit runtime session ID, ID prefix, or transcript path; omitted targets require a choice in the interactive picker. `@` does not infer the current runtime session |
 | `-n, --name <agent>` | Repo name only when a new Agent repo must be created |
 | `--from <runtime>` | Source runtime, such as `codex` or `claude-code` |
 | `--link-only` | Write the adoption link without importing/settling content |
@@ -39,13 +39,15 @@ agit import [session] --repo <owner/name> -b <branch> [options]
 
 Use `--repo` and `--branch` to import an external runtime into an existing repo. If the session ID is unknown, start with `agit status` or filter with `--from`. Use `--link-only` when adoption should be recorded but content should wait.
 
-The `--link-only` follow-up command uses the legacy compatibility path and must name a session
-branch with `-b <branch>`; session turns cannot be settled onto `main`.
+After `--link-only`, sign in and run `agit import <session-id> --into <owner/repo>@<branch>`
+to record the opening version. The offline link has no repository owner or branch claim;
+`agit commit` cannot choose them. Session turns cannot be settled onto `main`.
 
 ```bash
 agit import 132bf69f-22a --from claude-code --repo szh/p1 -b fix-auth
 agit import /tmp/transcript.jsonl --repo szh/p1 -b imported --onto main
-agit import --link-only 132bf69f-22a --repo szh/p1 -b pending
+agit import 132bf69f-22a --link-only
+agit import 132bf69f-22a --into szh/p1@pending
 ```
 
 After import, verify the real repository rather than trusting the summary:

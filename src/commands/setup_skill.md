@@ -18,7 +18,7 @@ session branch       = a branch in an Agent repo reserved by one session
 main file line       = AGENTS.md / memory/ / skills/ shared across sessions
 ```
 
-Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also touches the project code repository; ordinary `agit commit` records the AgentGit conversation repository. Each directory has at most one persisted `bound repo`. Multiple session links may share the same cwd and belong to different repos, but they are not multiple workspace bindings; when there is more than one, select explicitly with a ref or `AGIT_SESSION`. `pinned` only identifies the branch currently preferred by that directory.
+Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also touches the project code repository; ordinary `agit commit` records the AgentGit conversation repository. Each directory has at most one persisted `bound repo`. Multiple session links may share the same cwd and belong to different repos. Every existing-session operation selects its target through explicit arguments or `AGIT_SESSION`; directory state and native runtime IDs never select a session.
 
 ## Choose an Agent repo before starting a session
 
@@ -30,8 +30,8 @@ agit status
 
 Follow these rules in order. Never guess from a directory name, the first repo in a list, or the repo used last time:
 
-1. If and only if there is exactly one `bound repo`, default to creating the new session branch in that repo. Do not run `agit init` merely because this is a new session.
-2. If there is no `bound repo` but exactly one adopted session link for this cwd, it may identify the reusable repo. If there are multiple session links, stop and ask the user to choose, or require `AGIT_SESSION`/an explicit `<owner/repo>@<branch>`; never take the first automatically.
+1. A persisted `bound repo` records the workspace’s intended repo for session creation. Name that repo explicitly in `new` or `import`; the binding never selects an existing session branch. Do not run `agit init` merely because this is a new session.
+2. Adopted session links are discovery results, not default targets. If no destination repo has been selected, ask the user to choose or use an interactive picker; never infer it from the sole link or a native runtime ID.
 3. If there is no reusable Agent repo or uniquely selected session, run `agit init` first, then create the session branch.
 4. If the user has named an existing Agent repo, always reuse it; this takes precedence over directory state and session-link ambiguity. If it is not local, run `agit clone <owner/repo>` first, not `agit init`.
 5. Organization repos (`<org>/<name>`) accept `import`, `commit` and `push` from whoever the Hub lets push to that repo (the org owner, and team members granted on it); an org owner may also import into a repo that does not exist yet — the first push creates it under the org. The CLI asks the Hub before importing or pushing, so a refusal names the real reason. The checkout lives under `~/.agit/repos/<org>/<name>`, versions are authored by the signed-in account, and org repos are always public on the Hub. Write owner names in lowercase. Do not `clone --mine` a copy just because the owner is not the user.
@@ -53,7 +53,7 @@ If `AGIT_SESSION` is absent, do not assume the current transcript is already man
 agit status --check-missing
 ```
 
-This reports the resolved identity, if any, and scans the runtime directories for sessions that no Agent repo has adopted yet; the transcript you are running in is one of them. When the user asks to upload, save, or adopt the current session, select its ID (or pass `@`, which means the current runtime session) and adopt it into the repo chosen by the rules above:
+This reports the resolved identity, if any, and scans the runtime directories for sessions that no Agent repo has adopted yet; the transcript you are running in is one of them. When the user asks to upload, save, or adopt the current session, identify and explicitly pass its native session ID (or choose it in the interactive import picker) and adopt it into the repo chosen by the rules above:
 
 ```bash
 agit import <session-id> --repo <owner/repo> -b <branch>
@@ -120,7 +120,6 @@ agit push <owner/repo> -b main                         # publish the file line
 |---|---|
 | `import` | Adopt an existing runtime transcript into a repo/branch |
 | `status` | Show identity, adopted sessions, bindings, and sync state |
-| `switch` | Pin or unpin the workspace's default branch; it does not create a branch |
 | `branch` | List, rename, remove, or seal existing branches; it does not create them |
 
 ### Recording and inspection
@@ -132,7 +131,7 @@ agit push <owner/repo> -b main                         # publish the file line
 | `distill` | Promote selected memory files from a session branch into the shared `main` file line |
 | `tag` | Name a ref with a version tag |
 | `log` | Show turn/merge/view/file history |
-| `show` | Render a VIEW; no argument uses the AgentGit repo bound to the current directory, while `@` means current runtime context |
+| `show` | Render a VIEW; an omitted target or `@` requires `AGIT_SESSION` and selects that exact branch |
 | `diff` | Compare turns, VIEWs, or shared-file content |
 | `view` | Print the structured VIEW used by merge agents and tools |
 
@@ -179,26 +178,23 @@ These two commands are normally not used interactively.
 
 ## Context resolution order
 
-When a command must determine both repo and branch, use this order:
+Ordinary commands select an existing session from explicit arguments or `AGIT_SESSION`:
 
 ```text
 1. Explicit command arguments
-2. AGIT_SESSION
-3. Runtime session link (~/.agit/store/<runtime>/<id>.json)
-4. Workspace pin (agit switch)
-5. The only adopted session in the current directory
-6. If there is no unique answer, stop and require an explicit ref
+2. AGIT_SESSION=<owner>/<repo>@<branch>
+3. Otherwise refuse and request an explicit target
 ```
 
-Steps 2 and 3 arbitrate. `AGIT_SESSION` is injected once, when the runtime is launched, and it does not follow a session switch made inside the runtime's own interface (`/resume`, `/clear`). When the harness reports a session id whose link names a different branch, agit follows the link and prints a note saying which one it used. Treat step 2 as where the answer usually comes from, not as something that stays true after switching sessions.
+`@` refers only to `AGIT_SESSION`. A registered native runtime claim may reveal that this environment value is stale after a runtime session switch; agit then refuses it and asks for an explicit target or a corrected environment value. It never chooses the runtime’s branch automatically. Hook payloads name their session explicitly and do not let an inherited environment value override that identity. A legacy link without a recorded owner cannot settle through hooks; run `agit import <session-id> --into <owner>/<repo>@<branch>` to record the complete claim.
 
-The workspace lookup returns one persisted repo at most. A cwd can still have multiple adopted session links; those links are separate session metadata and require an explicit `<owner/repo>@<branch>` or `AGIT_SESSION` when they are ambiguous.
+Workspace bindings remain descriptive repo routes for creation and status. Native session links, cwd matches, the current checkout and the newest transcript cannot fill in a missing session target. Interactive import and resume pickers collect an explicit user choice.
 
-`new` and `import` create/adopt identity and should name the target repo explicitly. `commit`, `resume`, and `push` continue an existing identity and may use context resolution.
+`new` and `import` create/adopt identity and should name the destination repo explicitly. `branch --repo <owner/repo>` manages a repo without selecting a current session.
 
 ## Session rules
 
-- `AGIT_SESSION=<owner/repo@branch>` is process identity and takes precedence over cwd — but not over the session that is actually running. Switching sessions inside the runtime leaves it stale; agit then follows the runtime's current session and says so. `@` means the current session branch: `agit log`, `agit show @#3`, `agit commit @`.
+- `AGIT_SESSION=<owner/repo@branch>` explicitly selects the process’s session identity. A known conflicting native claim makes it stale and is refused. `@` uses this supplied identity: `agit log @`, `agit show @#3`, `agit commit @`.
 - One user turn normally becomes one AgentGit commit. When a phase genuinely completes (working feature and passing tests), settle it:
 
   ```bash

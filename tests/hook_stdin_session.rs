@@ -344,9 +344,7 @@ fn a_supervised_stop_hook_leaves_local_state_alone() {
     assert_eq!(turn_subjects(&log), vec!["A turn 1", "A turn 2"], "{log}");
 }
 
-/// Someone else's repo checked out locally: the link carries only the bare agent name `qa`, and
-/// the owner is not the current user. The hook recovers `alice` from the injected session
-/// identity or the directory binding; it must not go looking for `me/qa`.
+/// A recorded namespace wins over stale process and workspace identity during hook settlement.
 #[test]
 fn a_stop_hook_keeps_the_owner_of_someone_elses_repo() {
     someone_elses_checkout_settles_under_its_owner(&["commit", "--from-hook"]);
@@ -362,41 +360,28 @@ fn someone_elses_checkout_settles_under_its_owner(stop: &[&str]) {
     let lab = Lab::new();
     lab.append(A, &lab.turn(A, 1, "A turn 1", "A answer 1"));
 
-    // Build a local checkout of alice/qa holding a claimed session line s1 and a link that
-    // records only the bare name: create it under the current user, then move it and rewrite
-    // the binding — the shape `agit clone alice/qa` produces, where the link carries only
-    // `agent = "qa"`.
+    // The checkout and link name Alice while the workspace remains bound to the current user.
     lab.run(&["init", "qa"]);
     lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
     let repos = lab.agit_home.join("repos");
     fs::create_dir_all(repos.join("alice")).unwrap();
     fs::rename(repos.join("me/qa"), repos.join("alice/qa")).unwrap();
-    // A link pulled down by `agit clone alice/qa` carries only the bare agent name, with no
-    // namespace; this link was written by import under the current user and records `me` —
-    // stripping that is what makes this the scenario. A link that records the namespace binds
-    // to that one directory, which is a different contract (see org_repo_import_and_hook).
     let link_path = lab
         .agit_home
         .join("store/claude-code")
         .join(format!("{A}.json"));
     let mut lk: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&link_path).unwrap()).unwrap();
-    lk.as_object_mut().unwrap().remove("owner");
+    lk["owner"] = serde_json::Value::String("alice".into());
     fs::write(&link_path, lk.to_string()).unwrap();
-    let ws = lab.agit_home.join("workspaces");
-    let binding = fs::read_dir(&ws).unwrap().next().unwrap().unwrap().path();
-    let mut v: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&binding).unwrap()).unwrap();
-    v["repo"] = serde_json::Value::String("alice/qa".into());
-    fs::write(&binding, v.to_string()).unwrap();
 
-    // The process tree carries the identity injected at launch: the owner comes from it.
+    // The recorded owner remains authoritative when the injected identity names another repo.
     lab.append(A, &lab.turn(A, 2, "A turn 2", "A answer 2"));
-    lab.hook(stop, A, Some("alice/qa@s1"));
+    lab.hook(stop, A, Some("me/qa@other"));
     let log = lab.run(&["log", "alice/qa@s1", "--oneline"]);
     assert_eq!(turn_subjects(&log), vec!["A turn 1", "A turn 2"], "{log}");
 
-    // No injected identity (an ordinary session): the owner comes from the directory binding.
+    // The same claim remains complete when no environment identity is supplied.
     lab.append(A, &lab.turn(A, 3, "A turn 3", "A answer 3"));
     lab.hook(stop, A, None);
     let log = lab.run(&["log", "alice/qa@s1", "--oneline"]);
@@ -409,4 +394,203 @@ fn someone_elses_checkout_settles_under_its_owner(stop: &[&str]) {
         !repos.join("me/qa").exists(),
         "a repo must not be created under the current user out of nowhere"
     );
+}
+
+#[test]
+fn ownerless_hook_claims_require_explicit_readoption() {
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "registered turn", "done"));
+    lab.run(&["init", "qa"]);
+    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    let link_path = lab
+        .agit_home
+        .join("store/claude-code")
+        .join(format!("{A}.json"));
+    let mut claim: serde_json::Value =
+        serde_json::from_slice(&fs::read(&link_path).unwrap()).unwrap();
+    claim.as_object_mut().unwrap().remove("owner");
+    fs::write(&link_path, serde_json::to_vec(&claim).unwrap()).unwrap();
+    let environment_file = lab
+        .home
+        .join(".claude/session-env")
+        .join(A)
+        .join("sessionstart-hook.sh");
+    fs::create_dir_all(environment_file.parent().unwrap()).unwrap();
+    lab.hook_env(
+        &["hooks", "ingest"],
+        A,
+        None,
+        &[("CLAUDE_ENV_FILE", environment_file.to_str().unwrap())],
+    );
+    assert_eq!(
+        fs::read_to_string(environment_file).unwrap(),
+        "unset AGIT_SESSION\n"
+    );
+    let repo = Repo::open(lab.agit_home.join("repos/me/qa")).unwrap();
+    let before = repo.git(&["rev-parse", "refs/heads/s1"]).unwrap();
+    lab.append(A, &lab.turn(A, 2, "pending turn", "done"));
+    for command in [["commit", "--from-hook"], ["hooks", "settle"]] {
+        for env in [None, Some("me/qa@different-branch")] {
+            lab.hook(&command, A, env);
+            assert_eq!(
+                repo.git(&["rev-parse", "refs/heads/s1"]).unwrap(),
+                before,
+                "a hook must not infer a missing namespace from its environment or directory"
+            );
+        }
+    }
+    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    let claim: serde_json::Value = serde_json::from_slice(&fs::read(&link_path).unwrap()).unwrap();
+    assert_eq!(claim["owner"], "me");
+    let settled = repo.git(&["rev-parse", "refs/heads/s1"]).unwrap();
+    lab.append(A, &lab.turn(A, 3, "claimed turn", "done"));
+    lab.hook(&["hooks", "settle"], A, Some("other/qa@different-branch"));
+    assert_ne!(repo.git(&["rev-parse", "refs/heads/s1"]).unwrap(), settled);
+}
+
+/// A native transcript ID cannot supply a missing repository namespace after an account switch.
+#[test]
+fn native_id_commit_requires_the_recorded_repository_owner() {
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "saved under Alice", "done"));
+    lab.run(&["init", "qa"]);
+    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    let repos = lab.agit_home.join("repos");
+    fs::create_dir_all(repos.join("alice")).unwrap();
+    fs::rename(repos.join("me/qa"), repos.join("alice/qa")).unwrap();
+    let link_path = lab
+        .agit_home
+        .join("store/claude-code")
+        .join(format!("{A}.json"));
+    let mut claim: serde_json::Value =
+        serde_json::from_slice(&fs::read(&link_path).unwrap()).unwrap();
+    claim.as_object_mut().unwrap().remove("owner");
+    fs::write(&link_path, serde_json::to_vec(&claim).unwrap()).unwrap();
+    let before_link = fs::read(&link_path).unwrap();
+    let repo = Repo::open(repos.join("alice/qa")).unwrap();
+    let before_head = repo.git(&["rev-parse", "refs/heads/s1"]).unwrap();
+    lab.append(A, &lab.turn(A, 2, "new local work", "done"));
+    let output = lab.agit(&["commit", A]).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "ownerless native ID unexpectedly settled: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("recorded repository owner"));
+    assert_eq!(
+        repo.git(&["rev-parse", "refs/heads/s1"]).unwrap(),
+        before_head
+    );
+    assert_eq!(fs::read(&link_path).unwrap(), before_link);
+    assert!(!repos.join("me/qa").exists());
+    claim["owner"] = serde_json::Value::String("alice".into());
+    fs::write(&link_path, serde_json::to_vec(&claim).unwrap()).unwrap();
+    lab.run(&["commit", A]);
+    assert_ne!(
+        repo.git(&["rev-parse", "refs/heads/s1"]).unwrap(),
+        before_head
+    );
+    assert!(!repos.join("me/qa").exists());
+}
+
+/// An unmanaged-session refusal prints an executable adoption command for its detected native ID.
+#[test]
+fn new_guard_adoption_hint_preserves_the_detected_conversation() {
+    let lab = Lab::new();
+    lab.run(&["init", "qa"]);
+    lab.append(
+        A,
+        &lab.turn(A, 1, "preserve this unmanaged conversation", "done"),
+    );
+    let output = lab
+        .agit(&["new", "me/qa", "-b", "saved", "--no-launch"])
+        .env("CLAUDE_CODE_SESSION_ID", A)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let hint = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("agit import "))
+        .expect("adoption hint");
+    let arguments: Vec<_> = hint.split_whitespace().collect();
+    assert_eq!(arguments[2], A, "{hint}");
+    lab.run(&arguments[1..]);
+    let repo = Repo::open(lab.agit_home.join("repos/me/qa")).unwrap();
+    assert!(repo.has_ref("refs/heads/saved"));
+    let log = lab.run(&["log", "me/qa@saved", "--oneline"]);
+    assert_eq!(
+        turn_subjects(&log),
+        vec!["preserve this unmanaged conversation"]
+    );
+}
+
+/// Offline adoption leaves identity unclaimed until its printed command selects a repository.
+#[test]
+fn offline_import_hint_records_the_selected_first_version() {
+    assert_offline_adoption_hint(false);
+}
+
+/// Committing an unclaimed offline link directs the caller to an executable explicit import.
+#[test]
+fn unclaimed_commit_hint_records_the_selected_first_version() {
+    assert_offline_adoption_hint(true);
+}
+
+fn assert_offline_adoption_hint(from_commit: bool) {
+    let lab = Lab::new();
+    let credential_path = lab
+        .agit_home
+        .join("credentials")
+        .join(format!("{}.json", agit::infra::config::hub_host_key(HUB)));
+    let credentials = fs::read(&credential_path).unwrap();
+    fs::remove_file(&credential_path).unwrap();
+    lab.append(A, &lab.turn(A, 1, "preserve offline work", "done"));
+    let output = lab.run(&["import", A, "--link-only"]);
+    let link_path = lab
+        .agit_home
+        .join("store/claude-code")
+        .join(format!("{A}.json"));
+    let claim: serde_json::Value = serde_json::from_slice(&fs::read(&link_path).unwrap()).unwrap();
+    assert!(claim.get("owner").is_none());
+    assert!(!lab.agit_home.join("repos/me/qa").exists());
+    fs::write(&credential_path, credentials).unwrap();
+    let output = if from_commit {
+        let before = fs::read(&link_path).unwrap();
+        let result = lab.agit(&["commit", A]).output().unwrap();
+        assert!(!result.status.success());
+        assert_eq!(fs::read(&link_path).unwrap(), before);
+        assert!(!lab.agit_home.join("repos/me/qa").exists());
+        String::from_utf8_lossy(&result.stderr).into_owned()
+    } else {
+        output
+    };
+    let hint = if from_commit {
+        output
+            .lines()
+            .find_map(|line| line.find("agit ").map(|start| &line[start..]))
+    } else {
+        output
+            .lines()
+            .find(|line| line.contains("records the first version"))
+            .and_then(|line| line.split('`').nth(1))
+    }
+    .expect("offline adoption follow-up");
+    let command = hint
+        .replace("<owner/repo>", "me/qa")
+        .replace("<branch>", "saved");
+    let arguments: Vec<_> = command.split_whitespace().collect();
+    assert_eq!(arguments[1], "import", "{hint}");
+    assert_eq!(arguments[2], A, "{hint}");
+    lab.run(&arguments[1..]);
+    let repo = Repo::open(lab.agit_home.join("repos/me/qa")).unwrap();
+    assert!(repo.has_ref("refs/heads/saved"));
+    let claim: serde_json::Value = serde_json::from_slice(&fs::read(&link_path).unwrap()).unwrap();
+    assert_eq!(claim["owner"], "me");
+    assert_eq!(claim["agent"], "qa");
+    assert_eq!(claim["branch"], "saved");
+    let log = lab.run(&["log", "me/qa@saved", "--oneline"]);
+    assert_eq!(turn_subjects(&log), vec!["preserve offline work"]);
 }

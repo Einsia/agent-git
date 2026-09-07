@@ -113,8 +113,7 @@ fn maybe_interleave_publication(_repo: &Repo, _branch: &str) {}
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Target `owner/repo@branch` (or legacy branch / `@`; default: context resolution).
-    /// Legacy forms accepted: agent name / session id prefix.
+    /// Target owner/repo@branch or explicit session id; omitted targets require AGIT_SESSION.
     #[arg(value_name = "owner/repo@branch | branch | @")]
     pub target: Option<String>,
 
@@ -295,26 +294,24 @@ fn run_inner(args: Args) -> CmdResult {
                     "an identity-fenced RC settlement did not resolve to its exact branch checkout"
                 );
             }
-            // A link that records a namespace resolves the repo under it, and a missing one is
-            // an error — never fall back to the signed-in account and guess a different repo of
-            // the same name. A link that records none (a legacy link) is under the user's own.
-            let namespace = link.owner.clone().unwrap_or_else(|| owner.clone());
-            let repo_dir = if link.owner.is_some() {
-                let dir = crate::infra::config::repo_dir(&namespace, &agent)?;
-                if Repo::open(&dir).is_none() {
-                    anyhow::bail!(
-                        "this session is claimed on {namespace}/{agent}, but that checkout is missing ({}); clone it back with `agit clone {namespace}/{agent}`",
-                        dir.display()
-                    );
-                }
-                dir
-            } else {
-                super::clone::checkout_for_recording(&namespace, &agent)?
-            };
-            let branch = requested_branch
-                .or(link.branch.clone())
-                .or_else(|| Repo::open(&repo_dir).and_then(|repo| repo.current_branch()))
-                .unwrap_or_else(|| "main".into());
+            let branch = requested_branch.or(link.branch.clone()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this session has no claimed branch; provide -b <branch> explicitly"
+                )
+            })?;
+            let namespace = link.owner.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this session has no recorded repository owner; re-adopt it explicitly with `agit import {} --into <owner>/<repo>@<branch>` before committing",
+                    ui::session::shell_arg(&link.session_id)
+                )
+            })?;
+            let repo_dir = crate::infra::config::repo_dir(&namespace, &agent)?;
+            if Repo::open(&repo_dir).is_none() {
+                anyhow::bail!(
+                    "this session is claimed on {namespace}/{agent}, but that checkout is missing ({}); clone it back with `agit clone {namespace}/{agent}`",
+                    repo_dir.display()
+                );
+            }
             let slug = format!("{namespace}/{agent}");
             let mut link = link;
             let landing = match super::import::place_legacy_commit_branch(
@@ -429,7 +426,9 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
     let (Some(agent), Some(branch)) = (lk.agent.clone(), lk.branch.clone()) else {
         return Ok(ExitCode::Ok);
     };
-    let slug = link_slug(&lk, &agent, None);
+    let Some(slug) = link_slug(&lk, &agent) else {
+        return Ok(ExitCode::Ok);
+    };
     let (o, n) = super::parse_slug(&slug)?;
     let dir = crate::infra::config::repo_dir(&o, &n)?;
     // Settle only into a local repo that already exists: exit quietly when it is missing, and
@@ -510,12 +509,12 @@ impl HookInput {
 /// link is the only place that records a claim by session id: settle a claimed one, and treat a
 /// `hooks ingest` pre-registration, or no registration at all, as a conversation nobody has
 /// adopted yet — exit quietly and let `agit import` decide where it goes.
-fn hook_target(store: &Store, session_id: &str, hook_cwd: Option<&Path>) -> Option<Target> {
+fn hook_target(store: &Store, session_id: &str, _hook_cwd: Option<&Path>) -> Option<Target> {
     let lk = link::list(store)
         .into_iter()
         .find(|l| l.session_id == session_id)?;
     let (agent, branch) = hook_claim(&lk)?;
-    let slug = link_slug(&lk, &agent, hook_cwd);
+    let slug = link_slug(&lk, &agent)?;
     let (owner, name) = super::parse_slug(&slug).ok()?;
     let repo_dir = crate::infra::config::repo_dir(&owner, &name).ok()?;
     Repo::open(&repo_dir)?;
@@ -534,61 +533,18 @@ fn hook_claim(lk: &Link) -> Option<(String, String)> {
     Some((lk.agent.clone()?, lk.branch.clone()?))
 }
 
-/// The full `owner/name` of a link.
-///
-/// When the link records a namespace itself (written the moment the claim recorded a version),
-/// use it; for a legacy link that records only a bare agent name, the owner is recovered in turn
-/// from the injected session identity, the workspace binding of the payload's or the link's
-/// working directory, and the current user. Every hook settlement path takes its slug from here,
-/// so a checkout under someone else's name is never reinterpreted, on any path, as the current
-/// user's repo of the same name.
-fn link_slug(lk: &Link, agent: &str, hook_cwd: Option<&Path>) -> String {
-    let injected = std::env::var("AGIT_SESSION")
-        .ok()
-        .and_then(|v| super::context::decode_session_env(&v))
-        .map(|(repo, _)| repo);
-    let cwd = hook_cwd
-        .map(Path::to_path_buf)
-        .or_else(|| lk.cwd.as_deref().map(std::path::PathBuf::from))
-        .or_else(|| std::env::current_dir().ok());
-    let bound = cwd
-        .and_then(|d| crate::domain::workspace::read(&d))
-        .map(|w| w.repo);
-    hook_slug(
-        agent,
-        lk.owner.as_deref(),
-        injected.as_deref(),
-        bound.as_deref(),
-    )
-}
-
-/// The link records only a bare agent name, so the owner has to be recovered from elsewhere.
-///
-/// Filling it in as "signed-in user/agent" is right inside one's own repo and wrong inside
-/// someone else's read-only checkout: the link for `alice/qa` also writes only `agent = "qa"`,
-/// looking up `me/qa` under the current user finds nothing, and the hook stalls silently. Both
-/// the `AGIT_SESSION` injected when the runtime starts and the directory binding record a full
-/// `owner/name` — as long as the agent name matches, the owner they name is this link's owner.
-///
-/// When the link records a namespace itself (written the moment the claim recorded a version),
-/// use it and keep the environment out of it: a missing checkout is simply missing and the hook
-/// does not settle (the caller exits on the absent directory), rather than falling back to the
-/// signed-in account to find a different repo of the same name.
-fn hook_slug(
-    agent: &str,
-    claimed: Option<&str>,
-    injected: Option<&str>,
-    bound: Option<&str>,
-) -> String {
-    if let Some(owner) = claimed {
-        return format!("{owner}/{agent}");
-    }
-    let names = |slug: &str| slug.rsplit('/').next().unwrap_or(slug) == agent;
-    injected
-        .filter(|s| names(s))
-        .or_else(|| bound.filter(|s| names(s)))
-        .map(str::to_string)
-        .unwrap_or_else(|| super::context::qualify(agent))
+/// A hook's namespace belongs to its registered claim; inherited environment and cwd are not
+/// evidence of ownership. An incomplete legacy claim must be explicitly adopted again.
+fn link_slug(lk: &Link, agent: &str) -> Option<String> {
+    let Some(owner) = lk.owner.as_deref().filter(|owner| !owner.is_empty()) else {
+        ui::warning("this session link has no owner; its hook cannot select a repository");
+        ui::hint(&format!(
+            "adopt it explicitly: `agit import {} --into <owner>/<repo>@<branch>`",
+            ui::session::shell_arg(&lk.session_id)
+        ));
+        return None;
+    };
+    Some(format!("{owner}/{agent}"))
 }
 
 /// Resolve `commit`'s target: branch semantics first, the legacy form (agent name / session id)
@@ -596,26 +552,18 @@ fn hook_slug(
 fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Option<Target>> {
     let cwd = std::env::current_dir()?;
 
-    // A process that belongs to a superseded runtime must never fall through from its stable
-    // `AGIT_SESSION` branch identity to that branch's newer active link. The harness id identifies
-    // the transcript in front of the caller; carrying that exact stale link into `settle` produces
-    // the recovery refusal instead of reading another runtime's bytes. An explicit branch target
-    // still wins, because it is a deliberate instruction to settle the branch's active writer.
+    // A superseded runtime is a veto even when its repository identity is incomplete or gone.
+    // Reconstructing a target before refusing can lose that veto and select a replacement writer.
+    // An explicit branch target remains a deliberate instruction to settle its active writer.
     if matches!(args.target.as_deref(), None | Some("@"))
-        && let Some(lk) = superseded_harness_link(store)
-        && let (Some(slug), Some(branch)) = (super::context::slug_of_link(&lk), lk.branch.clone())
+        && let Some(lk) = superseded_harness_link(store)?
     {
-        let (owner, name) = super::parse_slug(&slug)?;
-        let repo_dir = crate::infra::config::repo_dir(&owner, &name)?;
-        if Repo::open(&repo_dir).is_some() {
-            return Ok(Some(Target::Branch {
-                repo_dir,
-                slug,
-                branch,
-                link: lk,
-                via: "superseded harness session env",
-            }));
-        }
+        anyhow::bail!(
+            "session {} was superseded by {} and cannot settle implicitly. Preserve later work with `agit import {} --into <owner>/<repo>@<new-branch>`, or name an explicit owner/repo@branch target to select its active writer.",
+            link::short(&lk.session_id),
+            lk.superseded_by.as_deref().unwrap_or("another runtime"),
+            ui::session::shell_arg(&lk.session_id),
+        );
     }
 
     // Unified form: `owner/repo@branch`.  It is resolved independently of the
@@ -720,11 +668,7 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
                         l.is_active()
                             && l.agent.as_deref() == Some(name.as_str())
                             && l.owner.as_deref().is_none_or(|o| o == owner)
-                            && (l.branch.as_deref() == Some(branch.as_str())
-                                // A legacy link has no branch field: it serves the branch
-                                // the repo currently has checked out.
-                                || (l.branch.is_none()
-                                    && repo.current_branch().as_deref() == Some(branch.as_str())))
+                            && l.branch.as_deref() == Some(branch.as_str())
                     })
                     .collect();
                 return match hits.len() {
@@ -772,9 +716,9 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
         }
     }
 
-    // The legacy form: agent name / session id prefix.
-    if let Some(t) = args.target.as_deref() {
-        match locate(store, Some(t))? {
+    // A native session id explicitly selects its registered claim.
+    if let Some(t) = args.target.as_deref().filter(|target| *target != "@") {
+        match locate(store, t)? {
             Located::Found(l) => {
                 let l = *l;
                 let agent = match (&args.name, &l.agent) {
@@ -785,10 +729,10 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
                     (None, Some(a)) => a.clone(),
                     (None, None) => {
                         if !quiet {
-                            ui::error("this session has no home yet — it needs a name.");
+                            ui::error("this session has no claimed repository or branch.");
                             ui::hint(&format!(
-                                "agit commit {} -n <name> -b <branch>",
-                                link::short(&l.session_id)
+                                "agit import {} --into <owner/repo>@<branch>",
+                                ui::session::shell_arg(&l.session_id)
                             ));
                         }
                         return Ok(None);
@@ -808,10 +752,8 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
     }
 
     if !quiet {
-        ui::error(
-            "no settlement target: not inside an agent session, no pinned branch, no argument given.",
-        );
-        ui::hint("try `agit commit <branch>`, or `agit import` / `agit switch` first");
+        ui::error("no explicit settlement target; provide owner/repo@branch or set AGIT_SESSION.");
+        ui::hint("use `agit commit <owner>/<repo>@<branch>`, or an adopted native session id");
     }
     Ok(None)
 }
@@ -820,7 +762,7 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
 ///
 /// Session ids are scoped by runtime in the store, so an exact `(runtime, id)` lookup neither
 /// guesses by prefix nor collides when two runtimes happen to use the same id.
-fn superseded_harness_link(store: &Store) -> Option<Link> {
+fn superseded_harness_link(store: &Store) -> crate::Result<Option<Link>> {
     let line = std::env::var("AGIT_SESSION")
         .ok()
         .and_then(|value| super::context::decode_session_env(&value));
@@ -857,11 +799,14 @@ fn superseded_harness_link(store: &Store) -> Option<Link> {
     // An active exact identity wins over a stale one on the same line, matching ordinary
     // harness-context resolution. If several stale identities remain, refuse to guess.
     if candidates.iter().any(Link::is_active) {
-        return None;
+        return Ok(None);
     }
     match candidates.as_slice() {
-        [link] => Some(link.clone()),
-        _ => None,
+        [] => Ok(None),
+        [link] => Ok(Some(link.clone())),
+        _ => anyhow::bail!(
+            "this process carries multiple superseded runtime identities; implicit settlement cannot select the active replacement. Resume the session before committing, or provide an explicit owner/repo@branch target."
+        ),
     }
 }
 
@@ -3355,54 +3300,25 @@ enum Located {
     Explained(ExitCode),
 }
 
-fn locate(store: &Store, target: Option<&str>) -> crate::Result<Located> {
+fn locate(store: &Store, sel: &str) -> crate::Result<Located> {
     let all = link::list(store);
     if all.is_empty() {
         ui::error("no sessions adopted yet.");
         ui::hint("adopt one with `agit import` and record the first version");
         return Ok(Located::Explained(ExitCode::Precondition));
     }
-    let active: Vec<Link> = all
-        .iter()
-        .filter(|link| link.is_active())
-        .cloned()
-        .collect();
-    let Some(sel) = target else {
-        if let [only] = active.as_slice() {
-            return Ok(Located::Found(Box::new(only.clone())));
-        }
-        ui::error(&format!(
-            "{} active sessions adopted — say which one to settle:",
-            active.len()
-        ));
-        return Ok(Located::Explained(ExitCode::Interactive));
-    };
-    let by_agent: Vec<Link> = active
-        .iter()
-        .filter(|l| l.agent.as_deref() == Some(sel))
-        .cloned()
-        .collect();
     let by_session: Vec<Link> = all
         .iter()
         .filter(|l| l.session_id.starts_with(sel))
         .cloned()
         .collect();
-    if !by_agent.is_empty() && !by_session.is_empty() {
-        ui::error(&format!(
-            "`{sel}` is both an agent name and a session id prefix — ambiguous."
-        ));
-        return Ok(Located::Explained(ExitCode::Ref));
-    }
-    if let [only] = by_agent.as_slice() {
-        return Ok(Located::Found(Box::new(only.clone())));
-    }
     match by_session.len() {
         1 => Ok(Located::Found(Box::new(
             by_session.into_iter().next().unwrap(),
         ))),
         0 => {
             ui::error(&format!(
-                "no agent named `{sel}`, and no session id starts with it."
+                "no native session id starts with `{sel}`; name owner/repo@branch or an adopted session id explicitly."
             ));
             Ok(Located::Explained(ExitCode::Ref))
         }
@@ -3419,16 +3335,15 @@ fn locate(store: &Store, target: Option<&str>) -> crate::Result<Located> {
 /// the latter's name. When the link records a namespace, that is the directory — no guessing by
 /// name.
 pub fn record(store: &Store, lk: Link, agent: &str, owner: &str, author: &str) -> CmdResult {
+    let branch = lk
+        .branch
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("the imported session has no explicit branch claim"))?;
     let repo_dir = if lk.owner.is_some() {
         crate::infra::config::repo_dir(owner, agent)?
     } else {
         super::clone::checkout_for_recording(owner, agent)?
     };
-    let branch = lk
-        .branch
-        .clone()
-        .or_else(|| Repo::open(&repo_dir).and_then(|repo| repo.current_branch()))
-        .unwrap_or_else(|| "main".into());
     let slug = format!("{owner}/{agent}");
     settle(
         store,
@@ -3460,6 +3375,24 @@ mod tests {
         let root = d.path().join("store");
         std::fs::create_dir_all(&root).unwrap();
         (d, Store::at(root))
+    }
+
+    #[test]
+    fn a_repo_name_cannot_select_its_only_adopted_session() {
+        let (_dir, store) = store();
+        let mut selected = Link::new("codex", "explicit-native-session", None);
+        selected.agent = Some("qa".into());
+        selected.owner = Some("me".into());
+        selected.branch = Some("work".into());
+        link::write(&store, &selected).unwrap();
+        assert!(matches!(
+            locate(&store, "qa").unwrap(),
+            Located::Explained(_)
+        ));
+        assert!(matches!(
+            locate(&store, "explicit-native-session").unwrap(),
+            Located::Found(_)
+        ));
     }
 
     const META: &str = r#"{"type":"session_meta","payload":{"id":"AB","cwd":"/repo/one"}}"#;
@@ -5370,26 +5303,12 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
         assert_eq!(hook_claim(&claimed), Some(("photo".into(), "s1".into())));
     }
 
-    /// The link records only a bare agent name; the owner is recovered from the injected session
-    /// identity or the directory binding, and counts only when the agent name matches — inside
-    /// someone else's read-only checkout the owner is not the current user.
     #[test]
-    fn a_hook_recovers_the_owner_from_the_session_identity_or_the_binding() {
-        assert_eq!(
-            hook_slug("qa", None, Some("alice/qa"), Some("me/qa")),
-            "alice/qa",
-            "the injected identity wins"
-        );
-        assert_eq!(
-            hook_slug("qa", None, Some("alice/other"), Some("bob/qa")),
-            "bob/qa",
-            "when the injected identity names another agent, the directory binding decides"
-        );
-        assert_eq!(
-            hook_slug("qa", None, Some("alice/other"), Some("bob/other")),
-            super::super::context::qualify("qa"),
-            "only when neither matches does it fall back to the current user"
-        );
+    fn a_hook_requires_the_links_recorded_owner() {
+        let mut claim = Link::new("claude-code", "native-session", None);
+        assert!(link_slug(&claim, "qa").is_none());
+        claim.owner = Some("alice".into());
+        assert_eq!(link_slug(&claim, "qa"), Some("alice/qa".into()));
     }
 
     /// Unchanged content: print the no-op and exit 0.

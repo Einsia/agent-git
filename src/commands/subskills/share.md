@@ -17,7 +17,7 @@ agit share rm <slug>
 
 | Option | Meaning |
 |---|---|
-| `[session]` | Adopted session ID or prefix; when omitted, use the latest settled session in the AgentGit repo bound to the current directory. If no repo is bound, refuse instead of falling back to the global newest session |
+| `[session]` | Adopted session ID or prefix; omitted targets require `AGIT_SESSION` and share its exact branch |
 | `--public` | Create an unencrypted link that can be fetched directly |
 | `--expire <24h\|7d\|30d\|never>` | Expiration; default `7d` |
 | `--views <count>` | Maximum views |

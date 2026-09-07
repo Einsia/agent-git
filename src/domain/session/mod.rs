@@ -188,6 +188,15 @@ pub fn latest(repo: &crate::domain::repo::Repo) -> Option<Stored> {
     list(repo).into_iter().next()
 }
 
+/// Read the settled session claimed by an exact branch name.
+/// A missing branch cannot fall through to a transcript path, identity prefix, or another branch.
+pub fn on_branch(repo: &crate::domain::repo::Repo, branch: &str) -> crate::Result<Stored> {
+    list(repo)
+        .into_iter()
+        .find(|session| session.branch.as_deref() == Some(branch))
+        .ok_or_else(|| anyhow::anyhow!("branch `{branch}` has no settled session"))
+}
+
 /// Find one by session identity or prefix.
 ///
 /// An ambiguous prefix **must error** rather than take the first — the wrong session resumes the

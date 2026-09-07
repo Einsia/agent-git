@@ -90,8 +90,13 @@ pub fn run(args: Args) -> CmdResult {
     };
     let spec = match parsed_target {
         Some(target) => crate::commands::target::to_spec(target),
-        None => refs::parse(default_ref.as_deref().expect("context has a branch"))
-            .expect("branch names are always valid refs"),
+        None => refs::RefSpec {
+            repo: refs::RepoSel::Context,
+            base: refs::Base::SessionBranch(
+                default_ref.as_ref().expect("context has a branch").clone(),
+            ),
+            tail: refs::Tail::None,
+        },
     };
     let spec = match super::context::substitute_at(spec) {
         Ok(spec) => spec,

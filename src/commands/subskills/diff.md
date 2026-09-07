@@ -15,7 +15,7 @@ agit diff [RANGE] [options]
 
 | Option | Meaning |
 |---|---|
-| `[RANGE]` | Agent ref/turn range; omitted compares the current AgentGit working state |
+| `[RANGE]` | Agent ref/turn range; omitted compares the branch supplied through `AGIT_SESSION` |
 | `--turns` | Compare turn/event changes; default mode |
 | `--view` | Compare the VIEW sequence of two refs |
 | `--files` | Compare shared-file text; it is not a file-name-only listing |

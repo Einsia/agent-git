@@ -123,7 +123,7 @@ fn resolve_branch(args: &Args, cwd: &Path) -> crate::Result<Resolved> {
         let (slug, base_name) = match &spec.repo {
             refs::RepoSel::Slug(o, n) => {
                 let name = match &spec.base {
-                    refs::Base::Name(b) => b.clone(),
+                    refs::Base::Name(b) | refs::Base::SessionBranch(b) => b.clone(),
                     refs::Base::At => {
                         ui::error("`@` takes no repo qualifier (it only ever means you).");
                         return Ok(Resolved::Refused(ExitCode::Ref));
@@ -137,12 +137,9 @@ fn resolve_branch(args: &Args, cwd: &Path) -> crate::Result<Resolved> {
                 (format!("{o}/{n}"), name)
             }
             _ => {
-                // With the branch name given explicitly only the repo has to resolve: the
-                // directory binding is enough. Full `resolve` also demands that this directory
-                // resolve a branch, so a freshly cloned directory (with no adopted session yet)
-                // fails — and "clone, then resume a branch" is the main path of design W3.
+                // A bare branch still needs the repository supplied by AGIT_SESSION.
                 match &spec.base {
-                    refs::Base::Name(b) => {
+                    refs::Base::Name(b) | refs::Base::SessionBranch(b) => {
                         let repo = match super::context::repo_for(cwd) {
                             Ok(r) => r,
                             Err(e) => {
@@ -165,7 +162,7 @@ fn resolve_branch(args: &Args, cwd: &Path) -> crate::Result<Resolved> {
                         if matches!(spec.base, refs::Base::Default) {
                             ui::error("no branch given.");
                             ui::hint(
-                                "use `agit resume <branch>`, or `agit switch <branch>` then `agit resume`",
+                                "use `agit resume <owner>/<repo>@<branch>`, or `agit resume @` with AGIT_SESSION",
                             );
                             return Ok(Resolved::Refused(ExitCode::Ref));
                         }
@@ -222,7 +219,7 @@ fn resolve_branch(args: &Args, cwd: &Path) -> crate::Result<Resolved> {
             for c in &cands {
                 eprintln!("  {}  {} @ {}", c.badge, c.slug, c.branch);
             }
-            ui::hint("be explicit: `agit resume <branch>`");
+            ui::hint("be explicit: `agit resume <owner>/<repo>@<branch>`");
             Ok(Resolved::Refused(super::context::NEED_INTERACTIVE))
         }
     }

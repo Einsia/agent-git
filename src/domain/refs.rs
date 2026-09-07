@@ -21,8 +21,7 @@
 //!
 //! This module only **parses** (string → struct) and **resolves** (struct + repo → commit /
 //! turn / event coordinates). It does not decide "who an omitted target applies to" — that is
-//! `context` in the commands layer (explicit argument → AGIT_SESSION → workspace pin → cwd
-//! match).
+//! `context` in the commands layer (explicit argument → AGIT_SESSION).
 
 use crate::Result;
 
@@ -40,9 +39,11 @@ pub enum RepoSel {
 /// The base of a reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Base {
-    /// `@`: the current session's branch. Resolved only from AGIT_SESSION / the harness
-    /// environment variables.
+    /// `@`: the current session's branch, supplied through AGIT_SESSION.
     At,
+    /// A captured session identity, restricted to its local branch namespace.
+    /// The parser never constructs this variant from an ordinary named reference.
+    SessionBranch(String),
     /// A branch name / tag name / sha prefix (≥ 4). All three matching at once is an error.
     Name(String),
     /// A repo with no ref: `owner/repo`.
@@ -302,26 +303,33 @@ pub struct Resolved {
 
 /// Resolve a reference to a concrete commit inside one repo.
 ///
-/// `repo` is the local repo already resolved. Ambiguity (a branch, tag and sha matching at
-/// once; a sha prefix matching several objects) always errors and lists every hit — nothing is
-/// ranked and picked for the user (PRD: better an error than a guess).
+/// Named refs reject namespace ambiguity. A captured session identity resolves only its local
+/// branch, retaining that identity at the tip and applying historic selectors to the frozen commit.
 pub fn resolve(repo: &crate::domain::repo::Repo, spec: &RefSpec) -> Result<Resolved> {
-    let base_ref = match &spec.base {
+    let (sha, branch) = match &spec.base {
         Base::At => anyhow::bail!(
             "`@` must be substituted with the session branch before resolving \
              (commands::context::substitute_at); the resolver never reads the environment"
         ),
-        Base::Default => repo
-            .current_branch()
-            .ok_or_else(|| anyhow::anyhow!("HEAD is detached and no ref was given"))?,
-        Base::Name(name) => name.clone(),
+        Base::SessionBranch(branch) => {
+            let full_ref = format!("refs/heads/{branch}");
+            if !ref_exists(repo, &full_ref)? {
+                anyhow::bail!("session branch `{branch}` does not exist locally");
+            }
+            (peel_to_commit(repo, &full_ref)?, Some(branch.clone()))
+        }
+        Base::Default | Base::Name(_) => {
+            let name = match &spec.base {
+                Base::Name(name) => name.clone(),
+                _ => repo
+                    .current_branch()
+                    .ok_or_else(|| anyhow::anyhow!("HEAD is detached and no ref was given"))?,
+            };
+            let sha = resolve_base(repo, &name)?;
+            let branch = repo.has_ref(&format!("refs/heads/{name}")).then_some(name);
+            (sha, branch)
+        }
     };
-
-    // Check for a branch / tag / sha-prefix collision.
-    let sha = resolve_base(repo, &base_ref)?;
-    let branch = repo
-        .has_ref(&format!("refs/heads/{base_ref}"))
-        .then_some(base_ref);
 
     let mut resolved = Resolved {
         branch,
@@ -914,6 +922,57 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Captured branch identity bypasses unrelated names and tails stay on its frozen history.
+    #[test]
+    fn session_branch_resolution_preserves_identity_and_historic_coordinates() {
+        let (_tmp, repo) = fixtures::forked_history();
+        let tip = repo.git(&["rev-parse", "refs/heads/f1"]).unwrap();
+        let tip = tip.trim();
+        let turn = fixtures::turn_sha(&repo, 3);
+        repo.git(&["tag", "f1", "refs/heads/main"]).unwrap();
+        repo.git(&["branch", tip, "refs/heads/main"]).unwrap();
+        let spec = RefSpec {
+            repo: RepoSel::Context,
+            base: Base::SessionBranch("f1".into()),
+            tail: Tail::None,
+        };
+        let resolved = resolve(&repo, &spec).unwrap();
+        assert_eq!(resolved.branch.as_deref(), Some("f1"));
+        assert_eq!(resolved.sha, tip);
+        assert!(resolve(&repo, &parse("f1").unwrap()).is_err());
+        for tail in [
+            Tail::Tilde(1),
+            Tail::Turn(3),
+            Tail::Event { turn: 3, index: 1 },
+            Tail::Range { a: 2, b: 3 },
+            Tail::Path("AGENTS.md".into()),
+        ] {
+            let actual = resolve(
+                &repo,
+                &RefSpec {
+                    tail: tail.clone(),
+                    ..spec.clone()
+                },
+            )
+            .unwrap();
+            match tail {
+                Tail::Tilde(_) => assert_eq!(
+                    actual.sha,
+                    repo.git(&["rev-parse", "refs/heads/f1~1"]).unwrap().trim()
+                ),
+                Tail::Turn(_) | Tail::Event { .. } | Tail::Range { .. } => {
+                    assert_eq!(actual.sha, turn)
+                }
+                Tail::Path(_) => {
+                    assert_eq!(actual.sha, tip);
+                    assert_eq!(actual.branch.as_deref(), Some("f1"));
+                    assert_eq!(actual.path.as_deref(), Some("AGENTS.md"));
+                }
+                Tail::None => unreachable!(),
+            }
+        }
+    }
 
     #[test]
     fn parses_plain_branch() {

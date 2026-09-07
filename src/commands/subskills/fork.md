@@ -19,7 +19,7 @@ agit fork <source> -b <branch> [--resume] [options]
 
 | Option | Meaning |
 |---|---|
-| `<source>` | Branch, tag, commit, `<repo>@<ref>`, or turn ref; `@` means the branch of the session hosting this process (`AGIT_SESSION` or a harness session id) and never falls back to the workspace pin or this directory |
+| `<source>` | Branch, tag, commit, `<repo>@<ref>`, or turn ref; `@` requires the exact branch supplied through `AGIT_SESSION` |
 | `-b, --branch <branch>` | New branch name (required) |
 | `--resume` | Start a runtime after forking; does not start by default |
 | `--as <runtime>` | Runtime used with `--resume` |

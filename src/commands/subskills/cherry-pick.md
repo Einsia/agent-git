@@ -16,7 +16,7 @@ agit cherry-pick [PICKS]... [options]
 | Option | Meaning |
 |---|---|
 | `[PICKS]...` | `<ref>#n`, `<ref>#a..#b`, or `<ref>#n.k`; repeatable |
-| `--into <branch>` | Target branch; defaults to the context branch. `@` in the source ref means the session hosting this process and never falls back to the workspace pin or this directory |
+| `--into <branch>` | Target branch; defaults to the branch explicitly supplied through `AGIT_SESSION`. `@` in the source ref also requires `AGIT_SESSION` |
 | `-m, --message <message>` | Message for the operation commit |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 

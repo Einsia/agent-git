@@ -507,11 +507,10 @@ fn an_org_import_lands_in_the_org_repo_and_the_next_stop_hook_follows_it() {
         "a hook that fell back to the account namespace would have created me/qa"
     );
 
-    // Ordinary context resolution reaches the org one too: with no AGIT_SESSION and no directory
-    // binding, resolving through "the only adopted session in this directory" and through the
-    // harness's session id environment variable must both land on einsia/qa.
+    // Explicit environment identity preserves the org namespace with or without runtime evidence.
     for env in [vec![], vec![("CLAUDE_SESSION_ID", SID)]] {
         let mut cmd = lab.agit(&["log", "--oneline"]);
+        cmd.env("AGIT_SESSION", "einsia/qa@work");
         for (k, v) in &env {
             cmd.env(k, v);
         }
@@ -519,7 +518,7 @@ fn an_org_import_lands_in_the_org_repo_and_the_next_stop_hook_follows_it() {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success() && stdout.contains("start the org line"),
-            "context resolution ({env:?}) must reach the org repo:\n{stdout}{}",
+            "explicit context ({env:?}) must reach the org repo:\n{stdout}{}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
@@ -961,6 +960,16 @@ fn repeated_no_launch_reuses_a_claude_desktop_session() {
 /// recovery metadata.
 #[test]
 fn an_advanced_branch_supersedes_an_untouched_materialization() {
+    check_superseded_harness_refusal(false);
+}
+
+/// An incomplete historical claim remains a veto and cannot lend settlement to a replacement.
+#[test]
+fn an_ownerless_superseded_harness_cannot_settle_its_replacement() {
+    check_superseded_harness_refusal(true);
+}
+
+fn check_superseded_harness_refusal(ownerless: bool) {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     assert!(
@@ -970,6 +979,16 @@ fn an_advanced_branch_supersedes_an_untouched_materialization() {
             .status
             .success()
     );
+    if ownerless {
+        let path = lab
+            .agit_home
+            .join("store/claude-code")
+            .join(format!("{SID}.json"));
+        let mut claim: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        claim.as_object_mut().unwrap().remove("owner");
+        fs::write(path, serde_json::to_vec(&claim).unwrap()).unwrap();
+    }
     assert!(
         lab.agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
             .output()
@@ -1045,6 +1064,66 @@ fn an_advanced_branch_supersedes_an_untouched_materialization() {
         "{from_old_runtime_text}"
     );
 
+    let active_path = walk(&lab.home.join(".codex/sessions"))
+        .into_iter()
+        .find(|path| path.to_string_lossy().contains(&active[0].session_id))
+        .unwrap();
+    let mut active_file = fs::OpenOptions::new()
+        .append(true)
+        .open(&active_path)
+        .unwrap();
+    for (role, kind, text) in [
+        ("user", "input_text", "active replacement continuation"),
+        ("assistant", "output_text", "active replacement answer"),
+    ] {
+        writeln!(
+            active_file,
+            "{}",
+            serde_json::json!({"type": "response_item", "payload": {
+                "type": "message", "role": role,
+                "content": [{"type": kind, "text": text}]
+            }})
+        )
+        .unwrap();
+    }
+    drop(active_file);
+    let head_before = repo.git(&["rev-parse", "refs/heads/work"]).unwrap();
+    let link_path = lab
+        .agit_home
+        .join("store/codex")
+        .join(format!("{}.json", active[0].session_id));
+    let link_before = fs::read(&link_path).unwrap();
+    let live_before = fs::read(&active_path).unwrap();
+    for (args, codex_id) in [
+        (vec!["commit"], Some(old.session_id.as_str())),
+        (vec!["commit", "@"], Some(old.session_id.as_str())),
+        (vec!["commit"], None),
+        (vec!["commit", "@"], None),
+    ] {
+        let mut command = lab.agit(&args);
+        command
+            .env("AGIT_SESSION", "einsia/qa@work")
+            .env("CLAUDE_CODE_SESSION_ID", SID)
+            .env("CLAUDE_SESSION_ID", SID);
+        if let Some(codex_id) = codex_id {
+            command.env("CODEX_SESSION_ID", codex_id);
+        }
+        let refused = command.output().unwrap();
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&refused.stdout),
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(!refused.status.success(), "{args:?}: {output}");
+        assert!(output.contains("superseded"), "{output}");
+        assert_eq!(
+            repo.git(&["rev-parse", "refs/heads/work"]).unwrap(),
+            head_before
+        );
+        assert_eq!(fs::read(&link_path).unwrap(), link_before);
+        assert_eq!(fs::read(&active_path).unwrap(), live_before);
+    }
+
     // A nested runtime can inherit the original Claude id while exposing the current Codex id.
     // The current active identity wins; the inherited superseded variable must not block it.
     let from_active_runtime = lab
@@ -1066,6 +1145,10 @@ fn an_advanced_branch_supersedes_an_untouched_materialization() {
     assert!(
         !from_active_runtime_text.contains("was superseded by"),
         "{from_active_runtime_text}"
+    );
+    assert_ne!(
+        repo.git(&["rev-parse", "refs/heads/work"]).unwrap(),
+        head_before
     );
 }
 

@@ -153,9 +153,7 @@ pub fn run(args: Args) -> CmdResult {
 
     // ── 1. Decide which agent to push ──
     //
-    // The candidates include read-only checkouts (they sit under the source author's name), so
-    // `agit push` has something to say inside such a repo, instead of reporting "no <you>/photo
-    // on this machine" and sending the reader the wrong way.
+    // A missing or rejected process identity cannot be replaced by local repository discovery.
     let (want_owner, agent, target_branch) = match &args.agent {
         Some(a) => match split_publish_target(a) {
             Ok(v) => v,
@@ -167,24 +165,13 @@ pub fn run(args: Args) -> CmdResult {
         None => match ctx.as_ref().and_then(|c| c.owner_name().ok()) {
             // When the context speaks, follow it — the same source `agit commit` uses.
             Some((o, n)) => (Some(o), n, None),
-            None => match local(&me)?.as_slice() {
-                [only] => (Some(only.owner.clone()), only.name.clone(), None),
-                [] => {
-                    ui::error("no agents on this machine yet.");
-                    ui::hint("adopt one first: `agit import <session-id> -n <name>`");
-                    return Ok(ExitCode::Usage);
-                }
-                all => {
-                    // Never guess between several — the wrong one publishes a session under
-                    // another agent's name.
-                    ui::error("several agents locally — name the one to push:");
-                    for c in all {
-                        println!("  {}", c.slug());
-                    }
-                    ui::hint("agit push <owner>/<agent>");
-                    return Ok(ExitCode::Usage);
-                }
-            },
+            None => {
+                ui::error(
+                    "no explicit publish repository; provide owner/repo or set AGIT_SESSION.",
+                );
+                ui::hint("agit push <owner>/<repo>@<branch>");
+                return Ok(ExitCode::Usage);
+            }
         },
     };
 
@@ -771,24 +758,6 @@ fn diagnose(out: &crate::hub::git::Outcome, owner: &str, name: &str) -> Vec<Stri
     }
 }
 
-/// Every agent checkout on this machine, yours first.
-///
-/// Read-only checkouts are included (they sit under the source author's name): with the agent
-/// name omitted and one read-only checkout on this machine, `agit push` speaks about that one
-/// instead of reporting "no agents on this machine yet".
-fn local(owner: &str) -> crate::Result<Vec<super::clone::Checkout>> {
-    let mut out: Vec<super::clone::Checkout> = super::clone::list_local()?
-        .into_iter()
-        .map(|(o, n, path)| super::clone::Checkout {
-            owner: o,
-            name: n,
-            path,
-        })
-        .collect();
-    out.sort_by_key(|c| (c.owner != owner, c.slug()));
-    Ok(out)
-}
-
 /// Pick the checkout by name. `None` means the reason has already been said.
 ///
 /// `want_owner` is the owner spelled out in the positional argument
@@ -1117,10 +1086,8 @@ fn has_settled_turns(repo: &Repo, branch: &str) -> bool {
 
 /// Decide which branches to push.
 ///
-/// The order is the priority: explicit `-b` → `--all` → the context branch → the only branch in
-/// the repo. Past that last rung it **does not guess**: with no resolvable context and several
-/// branches, any way of picking can publish an experiment line (or a ghost branch left behind by
-/// a rejected import) to the hub.
+/// Explicit branch arguments and `--all` precede the supplied process identity. Repository
+/// cardinality cannot choose a branch because an unselected line may contain private work.
 fn plan_branches(
     explicit: &[String],
     all: bool,
@@ -1182,15 +1149,11 @@ fn plan_branches(
             hints: vec!["record a first version: `agit commit`".into()],
             code: ExitCode::Precondition,
         }),
-        [only] => Ok(vec![only.clone()]),
-        many => Err(Refusal {
-            msg: format!(
-                "no session context here and this repo has {} branches — I won’t guess which one to publish:",
-                many.len()
-            ),
+        _ => Err(Refusal {
+            msg: "no explicit publish branch; name a branch or set AGIT_SESSION.".into(),
             hints: vec![
-                format!("pick one: agit push -b {}", many[0]),
-                "or publish everything with new turns: agit push --all".into(),
+                "agit push <owner>/<repo> -b <branch>".into(),
+                "or publish all updated branches: agit push <owner>/<repo> --all".into(),
             ],
             code: ExitCode::Ref,
         }),
@@ -1640,7 +1603,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With no resolvable context and several branches, this errors instead of picking one.
+    /// Repository cardinality cannot substitute for explicit branch selection.
     #[test]
     fn several_branches_without_a_context_are_refused_not_guessed() {
         let (dir, repo) = fixture("ambig");
@@ -1652,12 +1615,8 @@ mod tests {
             "{:?}",
             err.hints
         );
-        // With only one there is nothing to ask.
         let one = ["solo".to_string()];
-        assert_eq!(
-            plan_branches(&[], false, None, &repo, &one).unwrap(),
-            ["solo"]
-        );
+        assert!(plan_branches(&[], false, None, &repo, &one).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

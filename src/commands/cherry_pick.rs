@@ -192,12 +192,12 @@ fn expand_one(target_repo: &Repo, p: &str) -> crate::Result<Option<Vec<String>>>
         }
         _ => {
             let head = match &spec.base {
-                refs::Base::Name(b) => target_repo
+                refs::Base::Name(b) | refs::Base::SessionBranch(b) => target_repo
                     .git(&["rev-parse", &format!("refs/heads/{b}")])
                     .map(|s| s.trim().to_string())?,
                 refs::Base::At => match super::context::substitute_at(spec.clone()) {
                     Ok(refs::RefSpec {
-                        base: refs::Base::Name(b),
+                        base: refs::Base::SessionBranch(b),
                         ..
                     }) => target_repo
                         .git(&["rev-parse", &format!("refs/heads/{b}")])

@@ -17,7 +17,7 @@ agit tag --delete <NAME>
 | Option | Meaning |
 |---|---|
 | `[NAME]` | Tag name; omitted lists tags according to CLI behavior |
-| `[REF]` | Branch/commit/turn ref for the tag; current context when omitted |
+| `[REF]` | Branch/commit/turn ref for the tag; the branch supplied through `AGIT_SESSION` when omitted |
 | `-m, --message <message>` | Tag message |
 | `-f, --force` | Move an existing tag |
 | `-d, --delete` | Delete a tag |

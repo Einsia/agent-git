@@ -15,6 +15,9 @@ use clap::Args as ClapArgs;
 
 #[derive(ClapArgs)]
 pub struct Args {
+    /// Agent repo; omitted values require AGIT_SESSION.
+    #[arg(long, global = true, value_name = "owner/repo")]
+    pub repo: Option<String>,
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
     /// Show extra columns.
@@ -48,18 +51,20 @@ pub fn is_sealed(repo: &Repo, branch: &str) -> bool {
         .is_some()
 }
 
-/// Resolve the context → open the local repo. On failure it prints the reason and returns None.
-///
-/// Branch operations need only "which repo", which the directory binding answers on its own; they
-/// do not require this directory to resolve a current branch as well — a directory fresh from
-/// `agit init`, with no session yet, must still be able to list branches.
-fn ctx_repo() -> Option<(Repo, String)> {
-    let cwd = std::env::current_dir().ok()?;
-    let slug = match super::context::repo_for(&cwd) {
-        Ok(r) => super::context::qualify(&r),
-        Err(e) => {
-            ui::error(&format!("{e:#}"));
-            return None;
+/// Explicit repo arguments take precedence over the session environment for branch governance.
+fn ctx_repo(explicit: Option<&str>) -> Option<(Repo, String)> {
+    let slug = match explicit {
+        Some(repo) => super::context::qualify(repo),
+        None => {
+            let cwd = std::env::current_dir().ok()?;
+            match super::context::repo_for(&cwd) {
+                Ok(repo) => repo,
+                Err(error) => {
+                    ui::error(&format!("{error:#}"));
+                    ui::hint("use `agit branch --repo <owner>/<repo>` or set AGIT_SESSION");
+                    return None;
+                }
+            }
         }
     };
     let (owner, name) = super::parse_slug(&slug).ok()?;
@@ -77,7 +82,7 @@ fn ctx_repo() -> Option<(Repo, String)> {
 pub fn run(args: Args) -> CmdResult {
     match args.cmd {
         Some(Cmd::Rename { old, new }) => {
-            let Some((repo, slug)) = ctx_repo() else {
+            let Some((repo, slug)) = ctx_repo(args.repo.as_deref()) else {
                 return Ok(ExitCode::Precondition);
             };
             if !repo.has_ref(&format!("refs/heads/{old}")) {
@@ -100,7 +105,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Some(Cmd::Rm { name, force }) => {
-            let Some((repo, slug)) = ctx_repo() else {
+            let Some((repo, slug)) = ctx_repo(args.repo.as_deref()) else {
                 return Ok(ExitCode::Precondition);
             };
             if !repo.has_ref(&format!("refs/heads/{name}")) {
@@ -147,7 +152,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Some(Cmd::Seal { name }) => {
-            let Some((repo, slug)) = ctx_repo() else {
+            let Some((repo, slug)) = ctx_repo(args.repo.as_deref()) else {
                 return Ok(ExitCode::Precondition);
             };
             if !repo.has_ref(&format!("refs/heads/{name}")) {
@@ -191,7 +196,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         None => {
-            let Some((repo, slug)) = ctx_repo() else {
+            let Some((repo, slug)) = ctx_repo(args.repo.as_deref()) else {
                 return Ok(ExitCode::Precondition);
             };
             list(&repo, &slug, args.verbose, args.all)

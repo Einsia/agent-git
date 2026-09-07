@@ -28,8 +28,8 @@
 //! Partition slugs collide; cwd does not.
 //!
 //! `agent` is "which agent this session belongs to". `agit import -n <agent>` writes it in as it
-//! records the session's initial version. It is also the **reverse index**: `agit commit <agent>` uses it to
-//! get from an agent name back to the session, so no session id is needed afterwards.
+//! records the session's initial version. The recorded namespace and branch complete the claim;
+//! ordinary commands still require an explicit target or AGIT_SESSION.
 //!
 //! The only steps that write a link are the ones that bind content to a runtime:
 //!
@@ -74,10 +74,8 @@ pub struct Link {
     pub cwd: Option<String>,
     /// The agent name it belongs to. Absent before the first commit.
     pub agent: Option<String>,
-    /// The namespace the agent sits in (your own name, or an organization). When absent it is
-    /// filled in from the signed-in account — legacy links and repos under your own name are both
-    /// this form; an organization repo must be recorded, or the next settlement goes looking for
-    /// `<me>/<agent>`.
+    /// The namespace the agent sits in (your own name, or an organization). An absent namespace
+    /// is an incomplete legacy claim and cannot authorize hook settlement or environment propagation.
     pub owner: Option<String>,
     /// The branch this session holds. Absent before the first commit.
     ///

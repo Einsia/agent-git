@@ -28,7 +28,7 @@ pub const DEFAULT_FROM: &str = "main";
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Target `owner/repo@from-ref` (or legacy repo plus `--from`; default: context).
+    /// Target owner/repo@from-ref (or repo plus --from); omitted repos require AGIT_SESSION.
     #[arg(value_name = "owner/repo@from-ref")]
     pub repo: Option<String>,
     /// New branch name.
@@ -136,9 +136,7 @@ pub fn run(args: Args) -> CmdResult {
                 }
             }
         }
-        // The branch name comes from `-b`; only "which repo" is missing, so the directory
-        // binding is enough. A full `resolve` demands that a branch resolve as well, which
-        // leaves a directory fresh out of `agit init` unable to open its first session.
+        // An explicit environment can supply the destination repo; directory state cannot.
         None => match super::context::repo_for(&cwd_now) {
             Ok(r) => super::context::qualify(&r),
             Err(e) => {

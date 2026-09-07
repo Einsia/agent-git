@@ -137,7 +137,7 @@ pub fn run(args: Args) -> CmdResult {
 
     // ── 2. Locate ──
     let base_name = match &spec.base {
-        refs::Base::Name(b) => b.clone(),
+        refs::Base::Name(b) | refs::Base::SessionBranch(b) => b.clone(),
         refs::Base::Default => {
             ui::error("run needs a ref to aim at (branch / tag / commit / #n).");
             ui::hint(&format!(

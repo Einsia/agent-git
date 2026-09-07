@@ -37,19 +37,12 @@ pub fn run(args: Args) -> CmdResult {
         Err(_) => {
             println!(
                 "  {}",
-                ui::dim("not inside an agent session, and this directory isn’t pinned to a branch")
+                ui::dim("no session target supplied through AGIT_SESSION")
             );
         }
     }
     if let Some(ws) = crate::domain::workspace::read(&cwd) {
-        println!(
-            "  {}",
-            ui::dim(&format!(
-                "bound repo: {} · pinned: {}",
-                ws.repo,
-                ws.pinned.as_deref().unwrap_or("(none)")
-            ))
-        );
+        println!("  {}", ui::dim(&format!("bound repo: {}", ws.repo)));
     }
 
     // ── Local store ──

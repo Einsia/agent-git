@@ -24,7 +24,7 @@ use clap::{Args as ClapArgs, Subcommand};
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Session id / prefix / transcript path (default: the current directory's repo)
+    /// Session id, prefix or path; omitted targets use the branch in AGIT_SESSION.
     #[arg(value_name = "session")]
     pub target: Option<String>,
 
@@ -90,9 +90,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(source) => source,
             Err(error) => {
                 ui::error(&format!("{error:#}"));
-                ui::hint(
-                    "name a session explicitly, or bind this directory with `agit init` / `agit clone`",
-                );
+                ui::hint("name a session explicitly or set AGIT_SESSION=<owner>/<repo>@<branch>");
                 return Ok(ExitCode::Precondition);
             }
         },
@@ -286,18 +284,14 @@ struct ShareSource {
     label: String,
 }
 
-/// Read the settled session belonging to the AgentGit repo bound to the current directory.
-///
-/// A zero-argument share must never fall back to the machine-wide newest link: that can publish
-/// another project's transcript. The repo's LOG is the canonical snapshot, so it is materialized
-/// before the same secret scan and rendering path used by explicit targets.
+/// Read the LOG belonging to the explicitly supplied session environment.
 fn current_repo_source(cwd: &std::path::Path) -> crate::Result<ShareSource> {
-    let slug = super::context::qualify(&super::context::repo_for(cwd)?);
+    let context = super::context::resolve(cwd)?;
+    let slug = super::context::qualify(&context.repo);
     let (owner, name) = super::parse_slug(&slug)?;
     let repo = super::clone::local_store(&owner, &name)?
-        .ok_or_else(|| anyhow::anyhow!("{slug} is bound here but has no local AgentGit repo"))?;
-    let stored = session::latest(&repo)
-        .ok_or_else(|| anyhow::anyhow!("{slug} has no settled session to share"))?;
+        .ok_or_else(|| anyhow::anyhow!("{slug} has no local AgentGit repo"))?;
+    let stored = session::on_branch(&repo, &context.branch)?;
     repo_session_source(&repo, &stored, &slug)
 }
 

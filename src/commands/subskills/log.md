@@ -17,7 +17,7 @@ With no arguments at a terminal, this opens a full-screen browser instead of pri
 
 | Option | Meaning |
 |---|---|
-| `[ref|owner/repo]` | Branch, tag, commit, `@`, or repo; current context when omitted |
+| `[ref|owner/repo]` | Branch, tag, commit, `@`, or repo; the branch supplied through `AGIT_SESSION` when omitted |
 | `-n, --limit <count>` | Maximum entries; default 20 |
 | `--graph` | Show the branch graph |
 | `--branches` | Group/show by branch |

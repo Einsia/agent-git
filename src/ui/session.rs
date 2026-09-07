@@ -20,6 +20,7 @@ pub fn warn_new(current: &Current, target: &str, branch: &str) {
         .map(|n| format!("with {n} completed turns"))
         .unwrap_or_else(|| "with an active transcript".to_string());
     let destination = shell_arg(&format!("{target}@{branch}"));
+    let session_arg = shell_arg(&current.session_id);
     let target_arg = shell_arg(target);
     let branch_arg = shell_arg(branch);
     crate::ui::warning(&format!(
@@ -29,7 +30,7 @@ pub fn warn_new(current: &Current, target: &str, branch: &str) {
     ));
     eprintln!("\n`agit new` starts an empty session and will not include this conversation.\n");
     eprintln!("To adopt the current conversation:");
-    eprintln!("  agit import @ --into {destination}\n");
+    eprintln!("  agit import {session_arg} --into {destination}\n");
     eprintln!("To intentionally start fresh:");
     eprintln!("  agit new {target_arg} -b {branch_arg} --fresh");
 }

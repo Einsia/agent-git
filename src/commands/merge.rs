@@ -658,8 +658,7 @@ fn source_branch_for_tx(
 ) -> crate::Result<Option<String>> {
     let spec = super::context::substitute_at(refs::parse(source)?)?;
     Ok(match spec.base {
-        refs::Base::Name(branch) => Some(branch),
-        // `substitute_at` has already replaced `@` with the branch name.
+        refs::Base::Name(branch) | refs::Base::SessionBranch(branch) => Some(branch),
         refs::Base::At => unreachable!("`@` is substituted before it reaches here"),
         refs::Base::Default => base.resolved.branch.clone(),
     })
@@ -678,7 +677,7 @@ fn transaction_source_spec(tx: &Tx) -> crate::Result<refs::RefSpec> {
             .source_branch
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("merge transaction has no source branch identity"))?;
-        spec.base = refs::Base::Name(branch.to_string());
+        spec.base = refs::Base::SessionBranch(branch.to_string());
     }
     Ok(spec)
 }
@@ -1183,11 +1182,14 @@ mod tests {
 
     #[test]
     fn transaction_source_spec_rebinds_at_to_the_persisted_source_identity() {
+        let (_tmp, repo) = refs::fixtures::forked_history();
+        let turn = refs::fixtures::turn_sha(&repo, 3);
+        repo.git(&["tag", "f1", "refs/heads/main"]).unwrap();
         let tx = Tx {
             target: "main".into(),
-            source: "@#1".into(),
+            source: "@#3".into(),
             source_repo: Some("bob/notes".into()),
-            source_branch: Some("main".into()),
+            source_branch: Some("f1".into()),
             base: "base".into(),
             target_head: "target".into(),
             source_head: "source".into(),
@@ -1196,8 +1198,11 @@ mod tests {
         };
         let spec = transaction_source_spec(&tx).unwrap();
         assert_eq!(spec.repo, refs::RepoSel::Slug("bob".into(), "notes".into()));
-        assert_eq!(spec.base, refs::Base::Name("main".into()));
-        assert_eq!(spec.tail, refs::Tail::Turn(1));
+        assert_eq!(spec.base, refs::Base::SessionBranch("f1".into()));
+        assert_eq!(spec.tail, refs::Tail::Turn(3));
+        assert_eq!(refs::resolve(&repo, &spec).unwrap().sha, turn);
+        repo.git(&["update-ref", "-d", "refs/heads/f1"]).unwrap();
+        assert!(refs::resolve(&repo, &spec).is_err());
     }
 
     /// Design red line: the instruction holds only directions and the branch ref, **quoting no

@@ -24,7 +24,8 @@ need the account name, and neither can be filled in afterwards.
 `agit import` records the first version by default, so it needs a sign-in too.
 To mark a session down where there is no network, use
 `agit import <session> --link-only`: that path writes only the link, stays
-usable offline, and `agit commit` adds the version afterwards. `log` / `show` /
+usable offline. After sign-in, `agit import <session> --into <owner/repo>@<branch>`
+records the opening version with explicit ownership. `log` / `show` /
 `status` / `doctor` stay offline as always.
 
 There is no other installation step. agit writes nothing into

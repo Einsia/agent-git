@@ -19,14 +19,14 @@ agit commit [branch|@] [options] [-- <path>...]
 
 | Option | Meaning |
 |---|---|
-| `[branch|@]` | Target branch; context resolution when omitted, `@` means the current branch |
+| `[branch|@]` | Explicit owner/repo@branch or adopted native session ID; omitted targets and `@` require `AGIT_SESSION` |
 | `[-- <path>...]` | Include only these paths in the code commit |
 | `--milestone <summary>` | Mark a completed phase with a short summary |
 | `--tag <name>` | Tag the commit |
 | `--code` | Also commit the code repo and cross-link both commits; outside Git, warn and settle the session turn without the code side commit |
 | `-m, --message <message>` | Message for a file-only commit; new turns usually derive their message from the transcript |
-| `-n, --name <agent>` | Agent repo name when repo context is unavailable |
-| `-b, --branch <branch>` | Legacy session-ID compatibility: choose the session branch; `main` is refused for turn settlement |
+| `-n, --name <agent>` | Legacy native-ID compatibility: choose the repo name within the link's recorded owner; an ownerless link must be explicitly imported first |
+| `-b, --branch <branch>` | Legacy native-ID compatibility with a recorded owner: choose the session branch; `main` is refused for turn settlement |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
 ## Examples
@@ -36,8 +36,12 @@ agit commit                                             # settle the pending tur
 agit commit @ --milestone "Phase one passed tests" --tag ms-auth
 agit commit --code -- src/auth.rs                       # also commit the code repo, scoped to one path
 agit commit <owner/repo>@main -m "docs: add README" -- README.md
-agit commit <session-id> -n photo -b fix-auth           # legacy compatibility form
+agit commit <session-id> -n photo -b fix-auth           # requires a recorded repository owner
 ```
+
+An offline `agit import <session-id> --link-only` record has no repository owner or branch claim.
+After sign-in, use `agit import <session-id> --into <owner/repo>@<branch>` to establish that identity
+and record its opening version. Neither `-n` nor the signed-in account supplies a missing owner.
 
 Supervisors/hooks may settle each user turn, but the CLI does not promise an automatic push. Use `agit push` when the history must be shared.
 

@@ -239,20 +239,10 @@ pub fn run(args: Args) -> CmdResult {
     ));
 
     if !args.resume {
-        // The hint must be pasteable unchanged. A fork can happen in a repo this directory is
-        // not bound to (the kind `run` read-only clones on its own), where a bare branch name
-        // resolves against the bound repo and reports "no such branch". `switch` only knows
-        // branches in the bound repo, so it goes unmentioned when that repo is not this one.
+        // A fully qualified hint remains valid independently of the caller's environment.
         let full = format!("{}@{}", base.slug, args.branch);
-        let bound_here = crate::domain::workspace::read(&cwd).is_some_and(|w| w.repo == base.slug);
         println!("{}", ui::dim("  next:"));
         println!("    agit resume {full:<40} bring this session up");
-        if bound_here {
-            println!(
-                "    agit switch {:<40} pin this directory to it (optional)",
-                args.branch
-            );
-        }
         return Ok(ExitCode::Ok);
     }
 

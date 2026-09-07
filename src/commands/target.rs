@@ -58,10 +58,8 @@ pub fn parse_spec_for_repo(repo: &crate::domain::repo::Repo, input: &str) -> Res
     parse_spec_with_local(Some(repo), input)
 }
 
-/// The context repository, silently: the caller may not need a context at all
-/// (an explicit `owner/repo@ref` target), so a missing binding prints nothing.
-/// Only the repository binding is consulted — a workspace that is bound but
-/// has no pinned branch still owns its local branch names.
+/// An explicit qualified target needs no environment; missing AGIT_SESSION stays silent here.
+/// A supplied environment repo disambiguates its own slash-containing branch names.
 fn context_repo_quiet(cwd: &std::path::Path) -> Option<crate::domain::repo::Repo> {
     let slug = crate::commands::context::repo_for(cwd).ok()?;
     let slug = crate::commands::context::qualify(&slug);
@@ -91,6 +89,9 @@ pub fn from_spec(spec: RefSpec) -> Target {
     let base = match spec.base {
         Base::At => Some("@".to_string()),
         Base::Name(name) => Some(name),
+        Base::SessionBranch(_) => {
+            unreachable!("parsed targets cannot contain a captured session identity")
+        }
         Base::Default => None,
     };
     Target {

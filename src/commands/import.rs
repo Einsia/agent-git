@@ -38,10 +38,9 @@
 //!
 //! Recording a version needs an account name (the `<owner>/` of the repo path and the commit's
 //! user.name/email all come from the credentials), so the default path requires being signed in.
-//! `--link-only` keeps the purely offline route: write the link only, and `agit commit` later to
-//! record a version. The legacy follow-up must name a session branch with `-b`; `main` is the
-//! shared file line and cannot receive session turns. Marking a session down on a plane must not
-//! need the network.
+//! `--link-only` writes an unclaimed link offline. Recording its opening version requires another
+//! `agit import` with an explicit repository and session branch; an unclaimed link cannot borrow
+//! repository ownership from the current account. The shared file line cannot receive session turns.
 
 use super::CmdResult;
 use crate::domain::link::{self, Link};
@@ -54,7 +53,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Session id (or prefix); `@` means the current runtime session; omitted: lists this repo’s candidates to pick from
+    /// Session id or prefix; omitted: list candidates for an explicit interactive choice.
     #[arg(value_name = "session")]
     pub session: Option<String>,
 
@@ -66,7 +65,7 @@ pub struct Args {
     #[arg(long, value_name = "runtime")]
     pub from: Option<String>,
 
-    /// Link only, no version yet. Works offline; `agit commit` later
+    /// Link only, no version yet. Works offline; import again with an explicit target to record
     #[arg(long)]
     pub link_only: bool,
 
@@ -162,27 +161,13 @@ pub fn run(args: Args) -> CmdResult {
     // ── 2. Find that session ──
     let picked = match &args.session {
         Some(sel) if sel == "@" => {
-            let Some(current) = crate::infra::runtime_session::current() else {
-                ui::error("`@` requires an active runtime session in this process.");
-                ui::hint(
-                    "run this command from inside Codex/Claude Code/OpenCode, or give an explicit session id",
-                );
-                return Ok(ExitCode::Precondition);
-            };
-            if let Some(requested) = args.from.as_deref().map(adapter::normalize).transpose()?
-                && requested != current.runtime
-            {
-                ui::error(&format!(
-                    "`@` resolved to the current {} session, not `{requested}`.",
-                    crate::ui::session::runtime_label(current.runtime)
-                ));
-                return Ok(ExitCode::Usage);
-            }
-            Pick::One(Found {
-                runtime: current.runtime,
-                session_id: current.session_id,
-                cwd: current.cwd,
-            })
+            ui::error(
+                "import requires a native session id; `@` does not infer the current runtime session.",
+            );
+            ui::hint(
+                "use `agit import <session-id> --into <owner>/<repo>@<branch>`, or choose a session in the interactive import picker",
+            );
+            return Ok(ExitCode::Usage);
         }
         Some(sel) => by_selector(sel, args.from.as_deref())?,
         None => pick_here(&store)?,
@@ -299,8 +284,8 @@ pub fn run(args: Args) -> CmdResult {
         println!(
             "\n{}",
             ui::dim(&format!(
-                "  `agit commit {} -n <name> -b <branch>` records the first version",
-                link::short(&lk.session_id)
+                "  `agit import {} --into <owner/repo>@<branch>` records the first version after sign-in",
+                ui::session::shell_arg(&lk.session_id)
             ))
         );
         return Ok(ExitCode::Ok);
@@ -1101,17 +1086,6 @@ fn pick_here(store: &Store) -> crate::Result<Pick> {
 
     let here = repo.to_string_lossy().to_string();
 
-    // Exactly one candidate is not a question. Asking a question with a single answer wastes the
-    // user's time — and to make that one recognizable, the question would have to read a file
-    // (see the comment below).
-    if let [(rt, _, id)] = cands.as_slice() {
-        return Ok(Pick::One(Found {
-            runtime: rt,
-            session_id: id.clone(),
-            cwd: Some(here),
-        }));
-    }
-
     if cands.is_empty() {
         println!(
             "{}",
@@ -1132,8 +1106,7 @@ fn pick_here(store: &Store) -> crate::Result<Pick> {
     // file opened. Claude Code has no equivalent index, so the file has to be read — the **only**
     // exception to "listing must not parse transcripts", because without the prompt a column of
     // uuids means nothing to the user in an interactive list. Two bounds hold it down: only the
-    // unadopted candidates under the current directory, and only when the list is really shown
-    // (the single-candidate fast path above skips even this one).
+    // unadopted candidates under the current directory, and only when the list is shown.
     let labels: Vec<String> = cands
         .iter()
         .map(|(rt, p, id)| {
@@ -1155,7 +1128,9 @@ fn pick_here(store: &Store) -> crate::Result<Pick> {
         None => {
             // Nothing to ask with when non-interactive — list them and let the user be
             // explicit; never guess.
-            ui::error("multiple candidates, nothing interactive to ask with.");
+            ui::error(
+                "a session must be selected explicitly; no interactive terminal is available.",
+            );
             for l in labels.iter().take(12) {
                 println!("  {l}");
             }
@@ -1634,8 +1609,7 @@ mod tests {
         assert_eq!(repo.git(&["rev-parse", "main"]).unwrap(), main);
     }
 
-    /// The offline adoption link has no repository or branch claim. Its legacy commit follow-up
-    /// must create the shared file line first, then grow the named session branch from that line.
+    /// Explicit placement of an unclaimed link creates the shared file line before its session branch.
     #[test]
     fn link_only_followup_births_main_before_the_session_branch() {
         let d = tempfile::tempdir().unwrap();

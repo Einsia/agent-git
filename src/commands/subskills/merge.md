@@ -23,7 +23,7 @@ agit merge --continue | --abort
 
 | Option | Meaning |
 |---|---|
-| `[SOURCE]` | Source branch, tag, or `owner/repo@ref`; `@` means the session hosting this process and never falls back to the workspace pin or this directory |
+| `[SOURCE]` | Source branch, tag, or `owner/repo@ref`; `@` requires the session supplied through `AGIT_SESSION` |
 | `--into <branch>` | Landing branch; current `@` by default |
 | `--as <runtime>` | Runtime used to start the merge agent |
 | `-m, --message <instruction>` | Extra constraints for the merge agent |

@@ -20,7 +20,7 @@ and recent commits. Use `agit show owner/repo@main:README.md` to read a selected
 
 | Option | Meaning |
 |---|---|
-| `[session]` | Session ID, prefix, or ref; when omitted, show the latest settled session in the AgentGit repo bound to the current directory. If no repo is bound, refuse instead of falling back to the global newest session |
+| `[session]` | Session ID, prefix, or ref; omitted targets require `AGIT_SESSION` and show its exact branch |
 | `--agent <owner/agent>` | Restrict output to one local agent's sessions |
 | `--max-chars <count>` | Maximum characters per segment; default 2000 |
 | `--tui` / `--no-tui` | Open or forbid the full-screen interface. `--tui` overrides the agent-session check but not `--json`, `-q`, `-y`, or `AGIT_TUI=0` |
@@ -34,4 +34,4 @@ agit show 132bf69f-22a --agent szh/p1 --max-chars 4000
 agit show 132bf69f-22a --tui
 ```
 
-With no argument, agit uses the AgentGit repo bound to the current directory. If no repo is bound, name a session or ref explicitly. `@` still means the current runtime context.
+With no argument, agit uses the exact branch named by `AGIT_SESSION`. Without that variable, name a session or fully qualified ref explicitly. `@` also requires `AGIT_SESSION`.

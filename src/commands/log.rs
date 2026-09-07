@@ -119,8 +119,8 @@ pub fn run(args: Args) -> CmdResult {
             };
             (repo, slug, None)
         }
-        // The branch-level and graph views ask only which repo, and the directory binding
-        // answers that; they do not require this directory to also resolve a current branch.
+        // Aggregate views need the repository supplied by AGIT_SESSION, while ordinary history
+        // also uses its explicitly selected branch.
         None => match ctx_repo(&cwd, args.target.is_some() || args.branches || args.graph) {
             Some(v) => v,
             None => return Ok(ExitCode::Ref),
@@ -150,9 +150,7 @@ pub fn run(args: Args) -> CmdResult {
     {
         match crate::tui::should_enter() {
             crate::tui::Verdict::Enter => {
-                // A branch that exists only on the remote (never checked out) does not enter
-                // this screen: Timeline's starting point must be a commit `rev-parse` can
-                // produce. The path below falls back to HEAD on its own.
+                // Timeline starts only from the selected local branch, never another checkout's HEAD.
                 if let Some(head) = repo.git_opt(&["rev-parse", &format!("refs/heads/{b}")]) {
                     return crate::tui::screens::timeline::run(&repo, &slug, &b, head.trim());
                 }
@@ -185,25 +183,18 @@ pub fn run(args: Args) -> CmdResult {
             Some(h) => h,
             None => return Ok(ExitCode::Ref),
         },
-        None => match repo.git_opt(&[
-            "rev-parse",
-            &format!(
-                "refs/heads/{}",
-                branch.expect("targetless log has a context branch")
-            ),
-        ]) {
-            Some(h) => h.trim().to_string(),
-            None => {
-                // A context branch that is not local falls back to HEAD.
-                match repo.git_opt(&["rev-parse", "HEAD"]) {
-                    Some(h) => h.trim().to_string(),
-                    None => {
-                        println!("no commits yet.");
-                        return Ok(ExitCode::Ok);
-                    }
+        None => {
+            let branch = branch.expect("targetless log has a context branch");
+            match repo.git_opt(&["rev-parse", &format!("refs/heads/{branch}")]) {
+                Some(h) => h.trim().to_string(),
+                None => {
+                    ui::error(&format!(
+                        "selected session branch `{slug}@{branch}` does not exist locally."
+                    ));
+                    return Ok(ExitCode::Ref);
                 }
             }
-        },
+        }
     };
     let since_git = args.since.as_deref().map(parse_since_git);
 

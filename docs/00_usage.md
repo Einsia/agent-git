@@ -154,7 +154,7 @@ Pipes, CI and agent sessions keep the existing inline behavior.
 Once you have picked one (or given the id prefix directly):
 
 ```sh
-agit import 7f3a1c2e -n payments -b ratelimit
+agit import 7f3a1c2e --into alice/payments@ratelimit
 ```
 
 ```
@@ -167,6 +167,15 @@ link         ~/.agit/store/claude-code/7f3a1c2e-1111-4a4a-8b8b-000000000001.json
 
 ✓ settled 2 turns → alice/payments @ ratelimit
 ```
+
+Select that branch explicitly for subsequent commands in this terminal:
+
+```sh
+export AGIT_SESSION=alice/payments@ratelimit
+```
+
+`agit import` cannot change its parent shell's environment. Keep this selection while following
+the commands below, or supply `alice/payments@ratelimit` directly to each session command.
 
 Adopting and recording the first version are **one command** — the in-between state ("linked, but
 unversioned") means nothing to anyone.
@@ -186,11 +195,11 @@ the link keeps pointing at it.
 ```sh
 agit import 7f3a1c2e --link-only    # mark it only, record no version
 # back online: run import again — the link is still there, and this time the first version lands
-agit import 7f3a1c2e -n payments -b ratelimit
+agit import 7f3a1c2e --into alice/payments@ratelimit
 ```
 
-(`agit commit` has no `-b`; fill the version in with the import above rather than with commit —
-commit cannot say which branch to land on.)
+The offline link has no repository owner or branch claim. The explicit import target establishes
+that identity before recording; `agit commit` cannot infer it from the account you sign in to.
 
 **To show it to outsiders**, redact first: `--privacy` adopts a washed copy (secrets become
 `[redacted:<rule>]`; home directory, user name and host name become stable pseudonyms), and not
@@ -213,7 +222,7 @@ agit commit
 ```
 
 ```
-  target: alice/payments @ ratelimit (cwd match (this directory’s only adopted session))
+  target: alice/payments @ ratelimit (AGIT_SESSION)
 #3 6b2bb67d8 make the rate-limit threshold configurable
 
 ✓ settled 1 turns → alice/payments @ ratelimit
@@ -304,7 +313,7 @@ agit log -- memory/notes.md         # only commits that touched this shared file
 **Read the conversation itself**:
 
 ```sh
-agit show                                   # the most recently touched adopted session (not the context chain in 8.2)
+agit show                                   # the branch explicitly selected by AGIT_SESSION
 agit show 7f3a                              # by session id prefix — this one is exact
 agit show alice/payments@ratelimit          # the VIEW of one branch of one repo (the world resume sees)
 agit show 'ratelimit#5.1'                   # the 1st event the 5th commit added, raw JSON
@@ -374,13 +383,11 @@ rewritten — to get back to an old state, grow a new line instead of bending th
 Start a session from scratch (no old context, only the team memory):
 
 ```sh
-agit new -b onboarding                 # inherits AGENTS.md / memory/ / skills/ from main
+agit new alice/payments -b onboarding   # inherits AGENTS.md / memory/ / skills/ from main
 ```
 
-Omitting the repo name relies on "the adopted session in the current directory" or the branch
-`agit switch` pinned — **the directory binding does not count**. In a directory where you have
-just run `agit init` and imported no session yet, this prints `can’t resolve the target`; write
-the repo out in full: `agit new alice/payments -b onboarding`.
+Name the destination repo explicitly when starting a session. An omitted repo requires
+`AGIT_SESSION`; a workspace binding or adopted transcript does not supply a session target.
 
 ### 3.5 Off track: back to one turn and start over
 
@@ -707,28 +714,24 @@ Two easy traps:
 
 ### 8.2 "What is the current branch"
 
-A command with the target omitted looks for one in this order. To see which one matched, run
-`agit status` — it echoes the route (`via: ...`); `commit` / `fetch` / `merge` put the route in
-parentheses on the `target: ...` line; `log` / `show` and friends print nothing.
+Ordinary commands take their target from explicit arguments or `AGIT_SESSION`. `agit status`
+reports the supplied identity and discovered sessions; discovery never chooses a branch.
 
-```
-1. what you wrote explicitly (positional argument / --repo / -C)
-2. the AGIT_SESSION environment variable          ← injected when agit launches a session; the proper route for an agent calling agit inside its own session
-3. the session id environment variable the runtime exposes itself
-4. the branch agit switch pinned
-5. the only adopted session in this directory     ← with several, they are listed for you to pick; no guessing
-6. none of them: an error that tells you what to type next
+```text
+1. Explicit positional arguments or --repo
+2. AGIT_SESSION=<owner>/<repo>@<branch>
+3. Otherwise require an explicit target
 ```
 
-`@` uses steps 2 and 3 only. The cwd match and the pin do not apply to `@` — a merge agent and
-parallel sessions can share one directory, and a guess there names the wrong session.
-
-When several sessions run in one directory and commands start refusing to guess:
+`@` requires `AGIT_SESSION`. Native runtime IDs only help reject a stale supplied identity;
+workspace bindings, checkout state and the newest session cannot select the target. Interactive
+import and resume pickers accept an explicit user choice.
 
 ```sh
-agit status              # what the via line resolves through right now
-agit switch ratelimit    # pin it
-agit switch --unbind     # unpin
+agit log alice/payments@ratelimit
+export AGIT_SESSION=alice/payments@ratelimit
+agit log @
+agit branch --repo alice/payments
 ```
 
 ### 8.3 Command overview
@@ -756,7 +759,7 @@ rely on it indiscriminately in scripts.
 ```
 ~/.agit/repos/<owner>/<name>/    agent repos (real git repos)
 ~/.agit/store/                   session links (pointing at the original in the runtime directory, not a copy)
-~/.agit/workspaces/              directory ↔ agent bindings, the branch switch pinned
+~/.agit/workspaces/              directory ↔ Agent repo bindings
 ~/.agit/credentials/<hub>.json   credentials, one file per hub (0600)
 ~/.agit/config.json              global config
 ~/.agit/secret-filter/           the encrypted vault of registered secrets (its key is elsewhere)

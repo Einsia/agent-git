@@ -388,9 +388,8 @@ pub fn run(args: Args) -> CmdResult {
 
     // ── 6. Bind the current directory ──
     //
-    // clone and init are the only two commands that declare a directory binding (the "local
-    // layout" design): the point of a fetch is to carry on here, and zero-argument commands rely
-    // entirely on this binding to answer "which repo is this".
+    // The persisted binding records the workspace's repository for creation routing and status;
+    // it never selects an existing session for a later command.
     if !args.no_bind {
         let here = std::env::current_dir()?;
         workspace::bind(&here, &slug, args.rebind)?;

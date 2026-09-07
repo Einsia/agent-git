@@ -218,9 +218,8 @@ pub fn decide(source: Source, env_session: bool, known: bool, bound: bool) -> De
 /// # Why not "register everything"
 ///
 /// "Registering" sounds harmless — a JSON record of a few dozen bytes. But the store is not
-/// write-only: the resolution chain in [`crate::commands::context`] does a **full traversal** with
-/// `link::list()` in both `from_harness_env` and `from_cwd`, and that chain is on the path of every
-/// zero-argument agit command. Registering everything lets the store grow without bound with "the
+/// write-only: stale-environment checks in [`crate::commands::context`] traverse registered
+/// links. Registering everything lets the store grow without bound with "the
 /// total number of sessions ever started in any directory on this machine", so every command slows
 /// down with it and never comes back down.
 ///
@@ -316,9 +315,8 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
             .and_then(session_env_value),
     };
 
-    // Whichever branch ran above, the real binding of **this** session is written back to the
-    // session environment. With no binding, write `unset` — an empty value sends agit down the
-    // full context resolution chain; a stale wrong value makes it confidently do the wrong thing.
+    // Only this session's complete claim may propagate. An incomplete claim clears any
+    // inherited AGIT_SESSION instead of making the next command inherit another identity.
     write_session_env(&ev.session_id, env_value.as_deref());
     session_annotation(rt, ev.source, &ev.session_id, env_value.as_deref())
 }
@@ -377,7 +375,7 @@ fn session_annotation(
 /// Write the binding into the harness's "session environment" file.
 ///
 /// Only claude-code offers this mechanism (`CLAUDE_ENV_FILE`, one directory per session). codex has
-/// no equivalent and falls back to the freshness check in [`super::context`].
+/// no equivalent; [`super::context`] refuses a known stale supplied identity.
 fn write_session_env(session_id: &str, value: Option<&str>) {
     let Ok(path) = std::env::var("CLAUDE_ENV_FILE") else {
         return;
@@ -394,9 +392,8 @@ fn write_session_env(session_id: &str, value: Option<&str>) {
     // next finds it calling itself another branch. That is the data corruption this whole
     // mechanism exists to prevent, only running the other way.
     //
-    // On a mismatch, **do not write**. One skipped propagation merely sends agit back down the
-    // full context resolution chain (step 3 looks the session up by the harness's session id); one
-    // wrong write leaves a persistent false binding.
+    // A mismatch must not write another session's identity into this file. Ordinary commands
+    // reject a known stale AGIT_SESSION and require an explicit target to continue.
     if !env_file_belongs_to(&path, session_id) {
         return;
     }
@@ -420,18 +417,11 @@ fn env_file_belongs_to(path: &str, session_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The `AGIT_SESSION` value for one link; no binding, no value.
-///
-/// The namespace comes from the link ([`super::context::slug_of_link`]): a recorded one is used as
-/// recorded, an unrecorded one is filled in from the sign-in credentials, and with nobody signed in
-/// it is `local/<agent>` — exactly the owner `agit init` gives a repo when nobody is signed in, so
-/// the value written out is always complete, parsable, and points at the directory the repo really
-/// lives in. A half value (a bare name with no owner) is never written: such a value does not pass
-/// [`super::context::decode_session_env`], the next command drops it as malformed, and in between
-/// it keeps looking like a valid binding.
+/// Environment propagation requires a complete recorded claim. A missing namespace must not
+/// become an implicit account selection for commands launched after this hook.
 fn session_env_value(lk: &Link) -> Option<String> {
     let branch = lk.branch.as_deref()?;
-    let slug = super::context::slug_of_link(lk)?;
+    let slug = format!("{}/{}", lk.owner.as_deref()?, lk.agent.as_deref()?);
     let v = super::context::encode_session_env(&slug, branch);
     super::context::decode_session_env(&v).map(|_| v)
 }
@@ -727,35 +717,17 @@ mod tests {
         assert!(super::session_annotation("cursor", Source::Startup, "SID-A", None).is_none());
     }
 
-    /// A value written out must parse back: a recorded namespace is used as recorded, an
-    /// unrecorded one is filled in from the signed-in account, and with nobody signed in it is
-    /// `local` — all three give a complete `owner/agent@branch`. A half value
-    /// (`payments@refund-fix`) does not pass `decode_session_env`, so writing one would leave the
-    /// next command something that "looks like a binding but is dropped as malformed"; it never
-    /// appears.
     #[test]
     fn a_half_slug_is_never_written_to_the_session_env() {
         let mut lk = crate::domain::link::Link::new("claude-code", "S1", None);
         lk.branch = Some("refund-fix".into());
         lk.agent = Some("payments".into());
-        // No recorded namespace: the owner is filled in from the signed-in account, or `local`
-        // with nobody signed in — either way the value is complete and parsable, agent and branch
-        // unchanged, never a half value.
-        let v = super::session_env_value(&lk).expect("a claimed link always has a value");
-        let (repo, branch) = crate::commands::context::decode_session_env(&v)
-            .unwrap_or_else(|| panic!("a value written out must parse back: {v}"));
-        assert_eq!(branch, "refund-fix");
-        assert!(
-            repo.ends_with("/payments") && !repo.starts_with('/'),
-            "the owner half must be filled in, got {repo}"
-        );
-        // A recorded namespace is written as it stands, without asking the signed-in account.
+        assert!(super::session_env_value(&lk).is_none());
         lk.owner = Some("einsia".into());
         assert_eq!(
             super::session_env_value(&lk).as_deref(),
             Some("einsia/payments@refund-fix")
         );
-        // A link with no binding never has a value.
         let bare = crate::domain::link::Link::new("claude-code", "S2", None);
         assert!(super::session_env_value(&bare).is_none());
     }

@@ -26,7 +26,6 @@ agit status
 
 - `not inside an agent session`: no `AGIT_SESSION` and no uniquely resolvable session.
 - `bound repo`: the cwd's Agent repo route; it does not prove that a branch exists.
-- `pinned: <branch>`: the directory's default branch set by `agit switch`.
 - `never pushed`: the local Agent repo has commits/refs that have not reached the Hub.
 - `in sync`: local and known remote state agree.
 

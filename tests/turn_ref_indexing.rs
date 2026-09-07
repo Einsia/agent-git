@@ -10,7 +10,6 @@
 use agit::domain::meta::{self, Meta};
 use agit::domain::repo::Repo;
 use agit::domain::{storage, transcript};
-use sha2::{Digest, Sha256};
 use std::{fs, process::Command};
 
 fn claim() -> String {
@@ -104,7 +103,7 @@ fn log_show_and_fork_agree_on_turn_numbers() {
             .args(args)
             .current_dir(&work)
             .env("AGIT_HOME", &home)
-            .env_remove("AGIT_SESSION")
+            .env("AGIT_SESSION", "drh/qa@f1")
             .output()
             .unwrap();
         assert!(
@@ -168,17 +167,7 @@ fn log_show_and_fork_agree_on_turn_numbers() {
         );
     }
 
-    // ⑤ In a workspace bound to a directory with no pinned branch, a bare branch name renders the
-    // VIEW, not a session link in the store.
-    let canonical = work.canonicalize().unwrap();
-    let id = &hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()))[..16];
-    let workspace_dir = home.join("workspaces");
-    fs::create_dir_all(&workspace_dir).unwrap();
-    fs::write(
-        workspace_dir.join(format!("{id}.json")),
-        serde_json::to_vec(&serde_json::json!({ "dir": canonical, "repo": "drh/qa" })).unwrap(),
-    )
-    .unwrap();
+    // A supplied process identity scopes a bare branch name to its repository VIEW.
     let bare = run(&["show", "s1"]);
     for turn in 1..=4 {
         assert!(bare.contains(&format!("PROMPT-{turn}")), "{bare}");

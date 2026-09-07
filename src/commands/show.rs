@@ -19,7 +19,7 @@ use clap::Args as ClapArgs;
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Session id / prefix / transcript path (default: the current directory's repo)
+    /// Session id, prefix, path or ref; omitted targets use the branch in AGIT_SESSION.
     #[arg(value_name = "owner/repo@ref | session")]
     pub target: Option<String>,
 
@@ -84,6 +84,24 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
     }
+    let selected_context = if args.target.is_none() {
+        let ctx = match super::context::resolve(&cwd) {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                ui::error(&format!("{error:#}"));
+                return Ok(ExitCode::Ref);
+            }
+        };
+        if args.agent.as_deref().is_some_and(|agent| agent != ctx.repo) {
+            ui::error(
+                "--agent and AGIT_SESSION name different repositories; supply a session target explicitly.",
+            );
+            return Ok(ExitCode::Ref);
+        }
+        Some(ctx)
+    } else {
+        None
+    };
     // Two sources: a local repo (the content is inside it), or a link in the local store (which
     // resolves back to the original in the runtime's directory).
     let repo = match (&args.agent, args.target.is_none()) {
@@ -117,14 +135,21 @@ pub fn run(args: Args) -> CmdResult {
     if use_tui {
         let sessions = match &repo {
             Some(r) => session::list(r),
-            // With no target the agit repo bound to the current working directory is already
-            // locked in; only an explicit session id goes through the machine-wide store to
-            // reach a runtime transcript.
+            // Native transcript discovery requires an explicit session selector.
             None => adopted_sessions()?,
         };
         let start = match args.target.as_deref() {
             Some(selector) => session_index(&sessions, selector)?,
-            None => 0,
+            None => {
+                let branch = &selected_context
+                    .as_ref()
+                    .expect("omitted target has explicit context")
+                    .branch;
+                sessions
+                    .iter()
+                    .position(|session| session.branch.as_ref() == Some(branch))
+                    .ok_or_else(|| anyhow::anyhow!("branch `{branch}` has no settled session"))?
+            }
         };
         if sessions.is_empty() {
             println!("no sessions.");
@@ -142,13 +167,13 @@ pub fn run(args: Args) -> CmdResult {
     let target = match &repo {
         Some(r) => match &args.target {
             Some(t) => session::find(r, t)?,
-            None => match session::latest(r) {
-                Some(s) => s,
-                None => {
-                    println!("this agent has no sessions.");
-                    return Ok(ExitCode::Ok);
-                }
-            },
+            None => session::on_branch(
+                r,
+                &selected_context
+                    .as_ref()
+                    .expect("omitted target has explicit context")
+                    .branch,
+            )?,
         },
         None => {
             let Some(store) = Store::open()? else {
@@ -339,8 +364,7 @@ fn web_url(repo: &Repo, session_id: &str) -> Option<String> {
 /// Sessions adopted in the local store, ordered by most recent activity.
 ///
 /// Only for an explicit session selector together with `--tui`; a zero-argument `show` is already
-/// locked to the repo bound to the current working directory and never guesses a session out of
-/// the machine-wide store.
+/// locked to the branch supplied through AGIT_SESSION and never guesses from the machine-wide store.
 fn adopted_sessions() -> crate::Result<Vec<session::Stored>> {
     let Some(store) = Store::open()? else {
         return Ok(Vec::new());
@@ -363,18 +387,13 @@ fn adopted_sessions() -> crate::Result<Vec<session::Stored>> {
     Ok(out)
 }
 
-/// Resolve the local AgentGit repo bound to the current working directory.
-///
-/// A zero-argument `show` must stay inside the current workspace; falling back to the
-/// newest link in the machine-wide store can display an unrelated project's transcript.
+/// Open the repository selected by the supplied session environment.
 fn current_context_repo(cwd: &std::path::Path) -> crate::Result<Option<Repo>> {
     let slug = match super::context::repo_for(cwd) {
         Ok(repo) => super::context::qualify(&repo),
         Err(error) => {
             ui::error(&format!("{error:#}"));
-            ui::hint(
-                "name a session explicitly, or bind this directory with `agit init` / `agit clone`",
-            );
+            ui::hint("name a session explicitly or set AGIT_SESSION=<owner>/<repo>@<branch>");
             return Ok(None);
         }
     };
@@ -382,7 +401,7 @@ fn current_context_repo(cwd: &std::path::Path) -> crate::Result<Option<Repo>> {
     match super::clone::local_store(&owner, &name)? {
         Some(repo) => Ok(Some(repo)),
         None => {
-            ui::error(&format!("{slug} is bound here but has no local repo."));
+            ui::error(&format!("{slug} has no local repo."));
             ui::hint(&format!("fetch it first: `agit clone {slug}`"));
             Ok(None)
         }
@@ -391,9 +410,8 @@ fn current_context_repo(cwd: &std::path::Path) -> crate::Result<Option<Repo>> {
 
 /// The local repo a reference lives in: `owner/repo@` names it, otherwise it is the context repo.
 ///
-/// Context only has to resolve a **repo** ([`super::context::repo_for`]): the branch is already
-/// written in the reference, and a workspace bound to a directory with no pinned branch must
-/// still be able to `agit show <branch>`.
+/// An unqualified reference uses the repository supplied through AGIT_SESSION; directory state
+/// cannot choose which repository owns a branch name.
 fn open_ref_repo(spec: &refs::RefSpec) -> crate::Result<Repo> {
     let (o, n) = match &spec.repo {
         refs::RepoSel::Slug(o, n) => (o.clone(), n.clone()),

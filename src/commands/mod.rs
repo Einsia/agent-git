@@ -39,7 +39,6 @@ pub mod context;
 pub mod import;
 pub mod json;
 pub mod status;
-pub mod switch;
 pub mod target;
 pub mod upgrade;
 
@@ -1197,8 +1196,6 @@ pub enum Commands {
     Import(import::Args),
     /// Who am I, adopted sessions, sync state (instant, offline)
     Status(status::Args),
-    /// Pin the current directory to a branch (context only)
-    Switch(switch::Args),
     /// Branch listing and hygiene: rename / rm / seal (branches are born only via import/fork/new/run)
     Branch(branch::Args),
 
@@ -1293,7 +1290,6 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Repo(_) => "repo",
         Commands::Import(_) => "import",
         Commands::Status(_) => "status",
-        Commands::Switch(_) => "switch",
         Commands::Branch(_) => "branch",
         Commands::Commit(_) => "commit",
         Commands::Tag(_) => "tag",
