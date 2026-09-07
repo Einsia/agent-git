@@ -320,10 +320,13 @@ fn to_native(raw: &str, repo: &Repo, sha: &str, args: &Args) -> String {
     let src = adapter::get(&from);
     match (src, dst) {
         (Ok(s), Ok(d)) => match s.parse(raw) {
-            Ok(ir) => match d.render(&ir, "export", std::path::Path::new(".")) {
-                Ok(t) => t,
-                Err(_) => raw.to_string(),
-            },
+            Ok(ir) => {
+                let details = adapter::enrich::tool_details(s.format(), raw, &ir);
+                match d.render_with(&ir, "export", std::path::Path::new("."), &details) {
+                    Ok(t) => t,
+                    Err(_) => raw.to_string(),
+                }
+            }
             Err(_) => raw.to_string(),
         },
         _ => raw.to_string(),
