@@ -188,6 +188,66 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         })
     }
 
+    /// Comparison inputs share an immutable dictionary snapshot without learning records or
+    /// creating locks, vaults, or keys. An unreadable existing dictionary is not an empty one.
+    pub fn hydrate_pair_readonly(
+        &self,
+        committed: &str,
+        live: &str,
+    ) -> crate::Result<(HydrationReport, HydrationReport)> {
+        let (unlocked, records) = match std::fs::symlink_metadata(&self.store.path) {
+            Ok(_) => {
+                let unlocked = self.store.unlock_existing()?;
+                let records = super::decrypt_records(&unlocked.file, &unlocked.dek)?;
+                (Some(unlocked), records)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, vec![]),
+            Err(error) => return Err(error.into()),
+        };
+        let patterns: Vec<_> = unlocked
+            .as_ref()
+            .into_iter()
+            .flat_map(|vault| {
+                records
+                    .iter()
+                    .map(|record| token(&vault.file.vault_id, &record.id))
+            })
+            .collect();
+        let known_tokens: HashSet<_> = patterns.iter().map(String::as_str).collect();
+        let secrets: Vec<_> = records
+            .iter()
+            .map(|record| record.secret.as_str())
+            .collect();
+        let matcher = if patterns.is_empty() {
+            None
+        } else {
+            Some(
+                AhoCorasickBuilder::new()
+                    .match_kind(MatchKind::LeftmostLongest)
+                    .build(patterns.iter().map(String::as_bytes))
+                    .context("cannot build the repository secret hydrator")?,
+            )
+        };
+        let hydrate = |text: &str| -> crate::Result<HydrationReport> {
+            let mut unresolved = 0;
+            let (text, replacements) = transform_jsonl(text, |value| {
+                unresolved += token_segments(value)
+                    .filter(|(_, _, token)| !known_tokens.contains(*token))
+                    .count();
+                Ok(match &matcher {
+                    Some(matcher) => replace_known_tokens(value, matcher, &secrets),
+                    None => (value.to_owned(), 0),
+                })
+            })?;
+            Ok(HydrationReport {
+                text,
+                replacements,
+                unresolved,
+            })
+        };
+        Ok((hydrate(committed)?, hydrate(live)?))
+    }
+
     /// Project only records that came from explicit/global registration (plus
     /// legacy records). Commit continuity uses this view to distinguish a
     /// retry-safe heuristic forward projection from a true rewrite caused by a
@@ -1120,6 +1180,118 @@ mod tests {
             self.0.lock().unwrap().remove(vault_id);
             Ok(())
         }
+    }
+
+    #[test]
+    fn readonly_hydration_preserves_dictionary_keys_and_lock_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary/vault.json");
+        let dictionary = RepositoryDictionary::new(path.clone(), MemoryKeys::default());
+        let input = "{\"message\":\"stored-secret\"}\n";
+        let original = dictionary
+            .protect_jsonl(input, &Matcher::for_test(&[("global", "stored-secret")]))
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let keys = dictionary.store.keys.0.lock().unwrap().clone();
+        let lock = path.parent().unwrap().join("vault.lock");
+        std::fs::remove_file(&lock).unwrap();
+
+        let (committed, projected) = dictionary
+            .hydrate_pair_readonly(&original.text, input)
+            .unwrap();
+        assert_eq!(projected.text, input);
+        assert_eq!(committed.text, projected.text);
+        assert_eq!(committed.unresolved, 0);
+        assert_eq!(projected.unresolved, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(*dictionary.store.keys.0.lock().unwrap(), keys);
+        assert!(!lock.exists());
+
+        dictionary.store.keys.0.lock().unwrap().clear();
+        assert!(dictionary.hydrate_pair_readonly(input, input).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!lock.exists());
+        assert!(dictionary.store.keys.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn readonly_hydration_does_not_initialize_an_absent_dictionary() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("absent");
+        let dictionary =
+            RepositoryDictionary::new(parent.join("vault.json"), MemoryKeys::default());
+        let input = "{\"message\":\"unregistered-content\"}\n";
+        let result = dictionary.hydrate_pair_readonly(input, input).unwrap().0;
+        assert_eq!(result.text, input);
+        assert_eq!(result.replacements, 0);
+        assert!(!parent.exists());
+        assert!(dictionary.store.keys.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn readonly_hydration_counts_unknown_placeholders_without_creating_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent/vault.json");
+        let dictionary = RepositoryDictionary::new(path.clone(), MemoryKeys::default());
+        let unknown = token(
+            "00000000-0000-4000-8000-000000000001",
+            &format!("sec_{}", "a".repeat(32)),
+        );
+        let input = serde_json::json!({"content": unknown}).to_string();
+        let (committed, live) = dictionary
+            .hydrate_pair_readonly(&input, "{\"content\":\"literal\"}")
+            .unwrap();
+        assert_eq!(committed.unresolved, 1);
+        assert_eq!(live.unresolved, 0);
+        assert!(!path.parent().unwrap().exists());
+        assert!(dictionary.store.keys.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn readonly_comparison_survives_overlapping_mapping_additions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let dictionary = RepositoryDictionary::new(path.clone(), MemoryKeys::default());
+        let input = "{\"content\":\"stored-secret suffix\"}\n";
+        let original = dictionary
+            .protect_jsonl(input, &Matcher::for_test(&[("short", "stored-secret")]))
+            .unwrap();
+        dictionary
+            .protect_jsonl(
+                input,
+                &Matcher::for_test(&[("long", "stored-secret suffix")]),
+            )
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let (committed, live) = dictionary
+            .hydrate_pair_readonly(&original.text, input)
+            .unwrap();
+        assert_eq!(committed.text, live.text);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_hydration_rejects_a_dangling_dictionary_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let target = dir.path().join("missing-vault.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let dictionary = RepositoryDictionary::new(path.clone(), MemoryKeys::default());
+        assert!(
+            dictionary
+                .hydrate_pair_readonly("{\"message\":\"content\"}\n", "")
+                .is_err()
+        );
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        assert!(!target.exists());
+        assert!(!dir.path().join("vault.lock").exists());
+        assert!(dictionary.store.keys.0.lock().unwrap().is_empty());
     }
 
     #[test]

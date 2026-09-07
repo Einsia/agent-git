@@ -630,6 +630,114 @@ pub fn check_readonly_startup() -> Result<()> {
     Ok(())
 }
 
+/// A scoped inspection follows the selected repository's registered checkouts and aliases.
+/// Recovery evidence with unknown ownership cannot establish that the selected scope is settled.
+pub(super) fn check_readonly_repo_startup(repo: &Repo) -> Result<()> {
+    let home = crate::infra::config::agit_home()?;
+    let repos = crate::infra::config::repos_dir()?;
+    let selected_common_dir = repo.common_dir()?.canonicalize()?;
+    let mut roots = vec![repo.root().to_path_buf()];
+    roots.extend(repo.worktrees()?.into_iter().map(|worktree| worktree.path));
+    let mut canonical_roots = Vec::new();
+    for root in &roots {
+        canonical_roots.push(
+            root.canonicalize().with_context(|| {
+                format!("cannot identify registered checkout {}", root.display())
+            })?,
+        );
+    }
+    canonical_roots.sort();
+    canonical_roots.dedup();
+
+    for evidence in startup_recovery_evidence(&home)? {
+        let relative = recovery_evidence_repo(&evidence)?;
+        let recovered_root = repos.join(relative).canonicalize().with_context(|| {
+            format!(
+                "cannot establish repository ownership of recovery evidence {}",
+                evidence.display()
+            )
+        })?;
+        let recovered_repo = Repo::open(&recovered_root)
+            .context("recovery evidence does not identify an available local repository")?;
+        let recovered_common_dir = recovered_repo.common_dir()?.canonicalize()?;
+        anyhow::ensure!(
+            !canonical_roots.contains(&recovered_root)
+                && recovered_common_dir != selected_common_dir,
+            "the selected repository has pending recovery; complete recovery through the original AgentGit store before inspecting it"
+        );
+    }
+    for root in canonical_roots {
+        let checkout = Repo::at(&root);
+        let pending = super::plumbing::interrupted_checkout_metadata_present(&checkout)?
+            || probe_legacy_storage_checkout_recovery(&checkout, MigrationFailureKind::Skippable)
+                .map_err(RepoMigrationFailure::into_error)?;
+        anyhow::ensure!(
+            !pending,
+            "{} has pending recovery; complete recovery through the original AgentGit store before inspecting it",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+fn recovery_evidence_repo(path: &Path) -> Result<PathBuf> {
+    const MAX_RECOVERY_PATH_BYTES: u64 = 64 * 1024;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("cannot read recovery evidence {}", path.display()))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.is_symlink(),
+        "refusing non-regular recovery evidence {}",
+        path.display()
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        anyhow::ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "refusing reparse-point recovery evidence {}",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECOVERY_PATH_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_RECOVERY_PATH_BYTES,
+        "recovery evidence exceeds the path inspection budget"
+    );
+    let text = std::str::from_utf8(&bytes).context("recovery evidence path is not UTF-8")?;
+    let relative = text
+        .strip_suffix('\n')
+        .filter(|path| !path.contains(['\n', '\r', '\0']))
+        .context("recovery evidence does not identify a complete repository path")?;
+    let relative = Path::new(relative);
+    let components = relative.components().collect::<Vec<_>>();
+    anyhow::ensure!(
+        components.len() == 2
+            && components
+                .iter()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "recovery evidence does not identify a repository within the local store"
+    );
+    Ok(relative.to_path_buf())
+}
+
 pub(super) fn migrate_startup_at(home: &Path, repos: &Path) -> Result<Report> {
     std::fs::create_dir_all(home)?;
     let mut recovery_snapshot = startup_recovery_evidence(home)?;

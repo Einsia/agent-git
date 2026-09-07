@@ -23,8 +23,9 @@ use super::CmdResult;
 use super::skill_bundle;
 use crate::domain::link;
 use crate::domain::meta;
+use crate::domain::repo::{self, Repo};
 use crate::domain::store::Store;
-use crate::domain::transcript::{self, Continuity};
+use crate::domain::transcript;
 use crate::infra::config;
 use crate::infra::credentials;
 use crate::{ExitCode, adapter, ui};
@@ -34,9 +35,26 @@ use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
 pub struct Args {
+    /// Restrict repository and adopted-session checks to this local owner/repo
+    #[arg(long, value_name = "OWNER/REPO", value_parser = parse_repo)]
+    pub repo: Option<String>,
+
     /// Also check backend connectivity
     #[arg(long)]
     pub check_backend: bool,
+}
+
+fn parse_repo(value: &str) -> Result<String, String> {
+    let Some((owner, name)) = value.split_once('/') else {
+        return Err("expected a complete owner/repo, without a branch or selector".into());
+    };
+    for component in [owner, name] {
+        if component != component.trim() {
+            return Err("owner/repo must not contain whitespace".into());
+        }
+        repo::valid_name(component).map_err(|error| error.to_string())?;
+    }
+    Ok(value.to_owned())
 }
 
 enum Check {
@@ -46,6 +64,22 @@ enum Check {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    let selected = if let Some(slug) = args.repo.as_deref() {
+        parse_repo(slug).map_err(anyhow::Error::msg)?;
+        let (owner, name) = super::parse_slug(slug)?;
+        let path = config::repo_dir(&owner, &name)?;
+        let Some(repo) = Repo::open(&path) else {
+            ui::error(&format!("local repository {slug} is unavailable"));
+            return Ok(ExitCode::Ref);
+        };
+        if let Err(error) = super::migration::check_readonly_repo_startup(&repo) {
+            ui::error(&format!("local storage inspection failed: {error:#}"));
+            return Ok(ExitCode::Precondition);
+        }
+        Some((owner, name, path))
+    } else {
+        None
+    };
     let s = ui::theme::symbols();
     let mut checks: Vec<(String, Check)> = vec![];
     let mut fatal = false;
@@ -81,7 +115,18 @@ pub fn run(args: Args) -> CmdResult {
     // The counts come from the link files; no transcript is opened. The link list is hoisted to
     // the outer scope because the live-transcript comparison pairs against it too.
     let store = Store::open()?;
-    let links: Vec<link::Link> = store.as_ref().map(link::list).unwrap_or_default();
+    let links: Vec<link::Link> = store
+        .as_ref()
+        .map(link::list)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|claim| {
+            selected.as_ref().is_none_or(|(owner, name, _)| {
+                claim.owner.as_deref() == Some(owner.as_str())
+                    && claim.agent.as_deref() == Some(name.as_str())
+            })
+        })
+        .collect();
     match &store {
         Some(_) => {
             let committed = links.iter().filter(|l| l.agent.is_some()).count();
@@ -105,7 +150,10 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     // ── Local repos ──
-    let agents = super::clone::list_local()?;
+    let agents = match &selected {
+        Some(repo) => vec![repo.clone()],
+        None => super::clone::list_local()?,
+    };
     let unpushed: Vec<&String> = agents
         .iter()
         .filter(|(_, _, p)| {
@@ -174,6 +222,9 @@ pub fn run(args: Args) -> CmdResult {
 
     // ── Print ──
     println!("{}", ui::bold("agit doctor"));
+    if let Some((owner, name, _)) = &selected {
+        println!("Repository scope: {owner}/{name}");
+    }
     println!();
     for (label, c) in &checks {
         let (mark, text) = match c {
@@ -193,7 +244,7 @@ pub fn run(args: Args) -> CmdResult {
         );
     } else {
         let sp = ui::spinner(&format!(
-            "checking session metadata of {} repos against live transcripts…",
+            "checking session metadata of {} repos…",
             agents.len()
         ));
         // Old-layout repos collapse into one warning instead of scrolling by one at a time:
@@ -235,62 +286,6 @@ pub fn run(args: Args) -> CmdResult {
                     }
                 }
                 Err(e) => findings.push(format!("{slug} {}", first_line(&format!("{e:#}")))),
-            }
-        }
-
-        // ── Live-transcript comparison: committed envelopes prefix the live parseable lines ──
-        //
-        // Pairing goes through the `agent` field of the store link (name → local checkout); a
-        // session whose runtime file cannot be traced back, or cannot be read, does not take
-        // part — that is not "divergence", it is "nothing to compare against".
-        let mut checked = 0usize;
-        let mut with_new = 0usize;
-        let mut new_lines = 0usize;
-        let mut forks: Vec<String> = vec![];
-        for l in links.iter().filter(|l| l.is_active() && l.agent.is_some()) {
-            let Some(live_path) = l.resolve() else {
-                continue;
-            };
-            let Ok(live_bytes) = std::fs::read(&live_path) else {
-                continue;
-            };
-            let live = String::from_utf8_lossy(&live_bytes).into_owned();
-            let agent = l.agent.as_deref().unwrap_or_default();
-            for (o, n, p) in new_agents.iter().filter(|a| a.1 == agent) {
-                // A link that registers a branch is compared against that branch; a legacy
-                // link carries no branch and falls back to the checkout root.
-                let root = match l.branch.as_deref() {
-                    Some(branch) => match session_root(p, branch) {
-                        Some(root) => root,
-                        None => continue,
-                    },
-                    None => SessionRoot::Worktree(p.clone()),
-                };
-                let stored = match root.log() {
-                    Ok(Some(stored)) => stored,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        findings.push(format!(
-                            "{o}/{n}: committed LOG is unreadable: {}",
-                            first_line(&format!("{error:#}"))
-                        ));
-                        continue;
-                    }
-                };
-                checked += 1;
-                match check_continuity(&stored, &live) {
-                    ContinuityNote::Clean { appended } => {
-                        if appended > 0 {
-                            with_new += 1;
-                            new_lines += appended;
-                        }
-                    }
-                    ContinuityNote::Diverged => forks.push(format!(
-                        "{o}/{n} ({} {}): the local session diverged from its latest version — resolve before resume / clone",
-                        l.source,
-                        link::short(&l.session_id)
-                    )),
-                }
             }
         }
 
@@ -344,45 +339,6 @@ pub fn run(args: Args) -> CmdResult {
             ui::hint("the committed copy is still in the agent repo — nothing was lost");
         }
 
-        let growth = match with_new {
-            0 => String::new(),
-            n => format!(
-                " — of them, {n} grew {new_lines} lines since the last version; `agit commit` records the next one"
-            ),
-        };
-        if checked == 0 {
-            println!(
-                "  {}",
-                ui::dim(
-                    "no live transcript to compare (never versioned, or the runtime file can’t be traced back)"
-                )
-            );
-        } else if forks.is_empty() {
-            println!(
-                "  {} checked {checked} live transcripts: all continue committed content{growth}",
-                ui::ok(s.check)
-            );
-        } else {
-            println!(
-                "  {} checked {checked} live transcripts: {} forked from the latest version{growth}",
-                ui::warn_text(s.warn),
-                forks.len()
-            );
-            for f in forks.iter().take(8) {
-                println!("    {}", ui::warn_text(f));
-            }
-            if forks.len() > 8 {
-                println!(
-                    "    {}",
-                    ui::dim(&format!("… and {} more", forks.len() - 8))
-                );
-            }
-            ui::hint("the committed part is still in the agent repo — nothing is lost");
-            ui::hint(
-                "to keep the work after the fork, record it under another lineage: agit commit <session-id> -n <another-agent-name>",
-            );
-        }
-
         match view_errs.len() {
             0 if view_ok == 0 => println!(
                 "  {}",
@@ -428,6 +384,8 @@ pub fn run(args: Args) -> CmdResult {
             );
         }
     }
+
+    print_live_comparisons(&links);
 
     // ── Environment summary ──
     ui::section("environment");
@@ -652,28 +610,6 @@ impl SessionRoot {
             ),
         }
     }
-
-    /// The committed (or checked-out) LOG; None unless this is a session line with a claimed
-    /// identity.
-    fn log(&self) -> crate::Result<Option<String>> {
-        match self {
-            SessionRoot::Worktree(root) => stored_transcript(root),
-            SessionRoot::Ref { repo, branch } => {
-                let Some(snapshot) = self.meta()? else {
-                    return Ok(None);
-                };
-                if snapshot.is_file_line() || snapshot.session.is_empty() {
-                    return Ok(None);
-                }
-                crate::domain::storage::materialize_at(
-                    repo,
-                    &format!("refs/heads/{branch}"),
-                    meta::LOG_FILE,
-                )
-                .map(Some)
-            }
-        }
-    }
 }
 
 /// Where to read every session branch with a claimed identity in one repo; with none, this
@@ -727,63 +663,217 @@ fn session_roots(repo_root: &Path) -> Vec<(String, SessionRoot)> {
     session_roots_checked(repo_root).0
 }
 
-fn session_root(repo_root: &Path, branch: &str) -> Option<SessionRoot> {
-    session_roots(repo_root)
-        .into_iter()
-        .find(|(b, _)| b == branch)
-        .map(|(_, root)| root)
+/// A claim is compared only with its recorded owner, repository, and local branch.
+fn compare_claim(lk: &link::Link) -> crate::Result<(ContinuityNote, Option<String>)> {
+    let owner = lk.owner.as_deref().context("claim has no recorded owner")?;
+    let agent = lk
+        .agent
+        .as_deref()
+        .context("claim has no recorded repository")?;
+    let branch = lk
+        .branch
+        .as_deref()
+        .context("claim has no recorded branch")?;
+    let slug = format!("{owner}/{agent}");
+    parse_repo(&slug)
+        .map_err(anyhow::Error::msg)
+        .context("claim has invalid repository identity")?;
+    let repo = crate::domain::repo::Repo::open(config::repo_dir(owner, agent)?)
+        .context("claimed repository is not available locally")?;
+    if repo
+        .git_status(&["check-ref-format", &format!("refs/heads/{branch}")])?
+        .0
+        != Some(0)
+    {
+        anyhow::bail!("claim has an invalid local branch name");
+    }
+    let head = repo
+        .git(&[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ])
+        .context("claimed local branch cannot be read")?;
+    let snapshot = meta::read_at_ref_result(&repo, &head)?
+        .context("claimed branch has no committed session metadata")?;
+    if !snapshot.is_session_line() || snapshot.session.is_empty() {
+        anyhow::bail!("claimed branch is not a recorded session line");
+    }
+    let live = lk.read_bytes().context("live transcript cannot be read")?;
+    if lk.baseline_bytes.is_some() || lk.baseline_hash.is_some() || lk.materialized_from.is_some() {
+        let lineage = match lk.materialized_from.as_deref() {
+            Some(tip) if tip == head => None,
+            Some(_) => Some("materialized tip differs from the current branch tip".to_owned()),
+            None => Some("materialized branch-tip evidence is unavailable".to_owned()),
+        };
+        return Ok((check_materialized(lk, &live)?, lineage));
+    }
+    let live = std::str::from_utf8(&live).context("live transcript is not valid UTF-8")?;
+    let log = repo
+        .show_result(&head, meta::LOG_FILE)?
+        .context("claimed branch has no committed LOG")?;
+    let committed = committed_content(&log)?;
+    let (committed, live) = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
+        .hydrate_pair_readonly(&committed, live)
+        .context("repository secret reconstruction is unavailable")?;
+    if committed.unresolved != 0 || live.unresolved != 0 {
+        anyhow::bail!("repository secret mappings needed for comparison are unavailable");
+    }
+    Ok((check_continuity(&committed.text, &live.text)?, None))
 }
 
-fn stored_transcript(repo_root: &Path) -> crate::Result<Option<String>> {
-    if !meta::path_in(repo_root).exists() {
-        return Ok(None);
+fn committed_content(log: &str) -> crate::Result<String> {
+    let mut raw = String::new();
+    for line in log.split_inclusive('\n') {
+        let envelope = crate::domain::storage::parse_envelope_line(line)?;
+        raw.push_str(&serde_json::to_string(&envelope.content)?);
+        raw.push('\n');
     }
-    let snapshot = meta::resolve(repo_root)?;
-    if snapshot.is_file_line() || snapshot.session.is_empty() {
-        return Ok(None);
+    Ok(raw)
+}
+
+fn check_materialized(lk: &link::Link, live: &[u8]) -> crate::Result<ContinuityNote> {
+    use sha2::Digest as _;
+    let baseline = usize::try_from(
+        lk.baseline_bytes
+            .context("materialized byte baseline is missing")?,
+    )?;
+    let expected = lk
+        .baseline_hash
+        .as_deref()
+        .context("materialized baseline digest is missing")?;
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("materialized baseline digest is invalid");
     }
-    match crate::domain::storage::materialize_worktree(repo_root, meta::LOG_FILE) {
-        Ok(text) => return Ok(Some(text)),
-        Err(worktree_error) => {
-            let stored_path = match snapshot.layout {
-                meta::LayoutVersion::V0 => meta::LEGACY_LOG_FILE,
-                meta::LayoutVersion::V1 => meta::LOG_FILE,
-            };
-            match std::fs::symlink_metadata(repo_root.join(stored_path)) {
-                Ok(_) => {
-                    return Err(worktree_error)
-                        .with_context(|| format!("worktree {stored_path} is unreadable"));
+    if live.len() < baseline {
+        return Ok(ContinuityNote::Truncated);
+    }
+    let actual = hex::encode(sha2::Sha256::digest(&live[..baseline]));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Ok(ContinuityNote::Rewritten);
+    }
+    Ok(ContinuityNote::Clean {
+        appended: live.len() - baseline,
+    })
+}
+
+fn print_live_comparisons(links: &[link::Link]) {
+    ui::section("live transcript comparison");
+    let mut checked = 0;
+    let mut appended = 0;
+    let mut truncated = 0;
+    let mut rewritten = 0;
+    let mut unavailable = 0;
+    for lk in links.iter().filter(|lk| {
+        lk.is_active()
+            && (lk.agent.is_some()
+                || lk.owner.is_some()
+                || lk.branch.is_some()
+                || lk.baseline_bytes.is_some()
+                || lk.baseline_hash.is_some()
+                || lk.materialized_from.is_some())
+    }) {
+        let identity = format!(
+            "{}/{}@{} ({} {})",
+            lk.owner.as_deref().unwrap_or("<unknown-owner>"),
+            lk.agent.as_deref().unwrap_or("<unknown-repo>"),
+            lk.branch.as_deref().unwrap_or("<unknown-branch>"),
+            lk.source,
+            link::short(&lk.session_id)
+        );
+        match compare_claim(lk) {
+            Ok((note, lineage)) => {
+                checked += 1;
+                let (status, detail) = match note {
+                    ContinuityNote::Clean { appended: 0 } => {
+                        ("clean", "recorded content is unchanged")
+                    }
+                    ContinuityNote::Clean { .. } => {
+                        appended += 1;
+                        ("appended", "new content follows the recorded content")
+                    }
+                    ContinuityNote::Truncated => {
+                        truncated += 1;
+                        (
+                            "truncated",
+                            "live content is shorter than the recorded content",
+                        )
+                    }
+                    ContinuityNote::Rewritten => {
+                        rewritten += 1;
+                        (
+                            "rewritten",
+                            "live content differs inside the recorded content",
+                        )
+                    }
+                };
+                println!("  {identity}: {status} — {detail}");
+                if let Some(lineage) = lineage {
+                    println!("    {}", ui::warn_text(&lineage));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+            }
+            Err(error) => {
+                unavailable += 1;
+                println!(
+                    "  {identity}: unavailable — {}",
+                    first_line(&format!("{error:#}"))
+                );
             }
         }
     }
-    crate::domain::storage::materialize_at(repo_root, "HEAD", meta::LOG_FILE)
-        .context("worktree LOG is missing and the committed fallback is unreadable")
-        .map(Some)
+    if checked == 0 && unavailable == 0 {
+        println!("  {}", ui::dim("no active claimed transcripts to compare"));
+    } else {
+        println!(
+            "  checked {checked} live transcripts: {appended} appended, {truncated} truncated, {rewritten} rewritten; {unavailable} unavailable"
+        );
+    }
+    if truncated > 0 || rewritten > 0 {
+        ui::hint(
+            "inspect the explicit recorded branch and native transcript before choosing an import or fork; doctor changes neither",
+        );
+    }
 }
 
-/// The verdict of one live transcript compared against the committed envelope sequence.
+/// A malformed carrier is unavailable evidence, rather than an empty matching history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContinuityNote {
-    /// A continuation: Noop is `appended == 0`, Append carries the lines added since the
-    /// latest version.
     Clean { appended: usize },
-    /// Rewritten in the middle — the committed copy is no longer a prefix of the live
-    /// transcript.
-    Diverged,
+    Truncated,
+    Rewritten,
 }
 
-fn check_continuity(stored_env: &str, live: &str) -> ContinuityNote {
-    match transcript::continuity(stored_env, live) {
-        Continuity::Noop => ContinuityNote::Clean { appended: 0 },
-        Continuity::Append => ContinuityNote::Clean {
-            appended: transcript::live_hashes(live).len()
-                - transcript::envelope_hashes(stored_env).len(),
-        },
-        Continuity::Diverged => ContinuityNote::Diverged,
+fn raw_hashes(text: &str) -> crate::Result<Vec<String>> {
+    let mut current = Vec::new();
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|_| {
+            let kind = if line.ends_with('\n') {
+                "malformed"
+            } else {
+                "unfinished"
+            };
+            anyhow::anyhow!("live transcript has a {kind} record at line {}", index + 1)
+        })?;
+        current.push(transcript::object_hash(&value));
     }
+    Ok(current)
+}
+
+fn check_continuity(stored: &str, live: &str) -> crate::Result<ContinuityNote> {
+    let stored = raw_hashes(stored)?;
+    let current = raw_hashes(live)?;
+    if stored.iter().zip(&current).any(|(a, b)| a != b) {
+        return Ok(ContinuityNote::Rewritten);
+    }
+    if current.len() < stored.len() {
+        return Ok(ContinuityNote::Truncated);
+    }
+    Ok(ContinuityNote::Clean {
+        appended: current.len() - stored.len(),
+    })
 }
 
 /// The view-comparison verdict for one repo. No log = nothing to compare against (None).
@@ -920,7 +1010,7 @@ mod tests {
 
     use super::{
         Check, ContinuityNote, ViewNote, check_continuity, check_skill_dir, check_view,
-        is_old_layout, runtime_row, stored_transcript,
+        is_old_layout, runtime_row,
     };
     use crate::adapter::{self, Capability};
     use crate::domain::meta::{self, LayoutVersion, Meta};
@@ -1129,10 +1219,10 @@ mod tests {
     #[test]
     fn append_after_last_version_is_clean_with_a_line_count() {
         let v1 = "{\"a\":1}\n{\"b\":2}\n";
-        let stored = transcript::wrap_lines(v1, SRC, SID);
+        let stored = v1;
         let live = format!("{v1}{{\"c\":3}}\n");
         assert_eq!(
-            check_continuity(&stored, &live),
+            check_continuity(stored, &live).unwrap(),
             ContinuityNote::Clean { appended: 1 }
         );
     }
@@ -1141,9 +1231,9 @@ mod tests {
     #[test]
     fn an_untouched_session_is_clean_with_zero_new_lines() {
         let live = "{\"a\":1}\n{\"b\":2}\n";
-        let stored = transcript::wrap_lines(live, SRC, SID);
+        let stored = live;
         assert_eq!(
-            check_continuity(&stored, live),
+            check_continuity(stored, live).unwrap(),
             ContinuityNote::Clean { appended: 0 }
         );
     }
@@ -1153,9 +1243,12 @@ mod tests {
     /// harshly.
     #[test]
     fn a_rewritten_history_is_flagged_as_diverged() {
-        let stored = transcript::wrap_lines("{\"a\":1}\n{\"b\":2}\n", SRC, SID);
+        let stored = "{\"a\":1}\n{\"b\":2}\n";
         let live = "{\"a\":1}\n{\"b\":999}\n";
-        assert_eq!(check_continuity(&stored, live), ContinuityNote::Diverged);
+        assert_eq!(
+            check_continuity(stored, live).unwrap(),
+            ContinuityNote::Rewritten
+        );
     }
 
     // ── View comparison ──
@@ -1234,8 +1327,7 @@ mod tests {
         ]);
         let error = check_view(d.path()).unwrap_err();
         assert!(error.to_string().contains("LOG"), "{error:#}");
-        let error = stored_transcript(d.path()).unwrap_err();
-        assert!(error.to_string().contains("unreadable"), "{error:#}");
+        assert!(super::committed_content("{not-an-envelope}\n").is_err());
     }
 
     // ── Old-layout detection (what the aggregate warning rests on) ──
