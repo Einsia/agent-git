@@ -12,8 +12,9 @@
 use super::{CmdResult, require_login};
 use crate::domain::link;
 use crate::domain::meta;
+use crate::domain::refs;
+use crate::domain::repo::Repo;
 use crate::domain::secrets;
-use crate::domain::session;
 use crate::domain::storage;
 use crate::domain::store::Store;
 use crate::domain::transcript;
@@ -24,9 +25,13 @@ use clap::{Args as ClapArgs, Subcommand};
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Session id, prefix or path; omitted targets use the branch in AGIT_SESSION.
+    /// AgentGit ref or native session ID/prefix; omitted targets use AGIT_SESSION.
     #[arg(value_name = "session")]
     pub target: Option<String>,
+
+    /// Share the selected saved point's full LOG instead of its VIEW.
+    #[arg(long)]
+    pub full_log: bool,
 
     /// Unencrypted: mint a fetchable public link
     #[arg(long)]
@@ -72,28 +77,12 @@ pub fn run(args: Args) -> CmdResult {
         None => {}
     }
 
-    let source = match &args.target {
-        Some(target) => {
-            let Some(store) = Store::open()? else {
-                ui::error("no local store yet.");
-                return Ok(ExitCode::Usage);
-            };
-            // An explicit session target still reads the runtime transcript through the store link.
-            let lk = link::find(&store, target)?;
-            ShareSource {
-                raw: lk.read()?,
-                runtime: lk.source,
-                label: format!("session {}", link::short(&lk.session_id)),
-            }
+    let source = match selected_source(args.target.as_deref(), args.full_log) {
+        Ok(source) => source,
+        Err(error) => {
+            ui::error(&format!("{error:#}"));
+            return Ok(ExitCode::Precondition);
         }
-        None => match current_repo_source(&std::env::current_dir()?) {
-            Ok(source) => source,
-            Err(error) => {
-                ui::error(&format!("{error:#}"));
-                ui::hint("name a session explicitly or set AGIT_SESSION=<owner>/<repo>@<branch>");
-                return Ok(ExitCode::Precondition);
-            }
-        },
     };
 
     let raw = source.raw;
@@ -236,6 +225,7 @@ pub fn run(args: Args) -> CmdResult {
     print!(
         "{}",
         ui::table::key_values(&[
+            ("source", source.label.clone()),
             (
                 "encrypted",
                 if args.public {
@@ -284,43 +274,240 @@ struct ShareSource {
     label: String,
 }
 
-/// Read the LOG belonging to the explicitly supplied session environment.
-fn current_repo_source(cwd: &std::path::Path) -> crate::Result<ShareSource> {
-    let context = super::context::resolve(cwd)?;
-    let slug = super::context::qualify(&context.repo);
-    let (owner, name) = super::parse_slug(&slug)?;
-    let repo = super::clone::local_store(&owner, &name)?
-        .ok_or_else(|| anyhow::anyhow!("{slug} has no local AgentGit repo"))?;
-    let stored = session::on_branch(&repo, &context.branch)?;
-    repo_session_source(&repo, &stored, &slug)
+struct SharePoint {
+    repo: Repo,
+    sha: String,
+    slug: String,
 }
 
-/// Read a settled session from the ref that owns it.
-///
-/// Session branches can live in linked worktrees while the primary checkout stays on the file
-/// line. Reading the primary checkout would pair one session's identity with another ref's LOG.
-fn repo_session_source(
-    repo: &crate::domain::repo::Repo,
-    stored: &session::Stored,
-    slug: &str,
-) -> crate::Result<ShareSource> {
-    let envelope = match &stored.branch {
-        Some(branch) => {
-            storage::materialize_at(repo.root(), &format!("refs/heads/{branch}"), meta::LOG_FILE)?
-        }
-        None => storage::materialize_worktree(repo.root(), meta::LOG_FILE)?,
+fn selected_source(target: Option<&str>, full_log: bool) -> crate::Result<ShareSource> {
+    let Some(target) = target else {
+        let point = resolve_point(refs::parse("@")?, false)?
+            .ok_or_else(|| anyhow::anyhow!("the supplied session has no local repo"))?;
+        return point_source(point, full_log);
     };
+    let target = target.trim();
+    if target.is_empty() {
+        anyhow::bail!("a share target cannot be empty");
+    }
+    let explicit_ref = target.contains(['@', '~', '#', ':', '/']);
+    let native = if explicit_ref {
+        None
+    } else {
+        native_link(target)?
+    };
+    let spec = match parse_share_ref(target) {
+        Ok(spec) => spec,
+        Err(error) if native.is_none() => return Err(error),
+        Err(_) => return live_source(native.unwrap(), full_log),
+    };
+    let point = resolve_point(spec, native.is_some());
+    match (point, native) {
+        (Ok(Some(_)), Some(_)) => anyhow::bail!(
+            "`{target}` names both a saved ref and a native session; use owner/repo@ref to select the saved point"
+        ),
+        (Ok(Some(point)), None) => point_source(point, full_log),
+        (Ok(None), Some(native)) => live_source(native, full_log),
+        (Err(error), Some(native)) if refs::is_not_found(&error) => live_source(native, full_log),
+        (Err(error), _) => Err(error),
+        (Ok(None), None) => anyhow::bail!(
+            "`{target}` is not a native session ID; name owner/repo@ref or set AGIT_SESSION to select a saved ref"
+        ),
+    }
+}
+
+fn parse_share_ref(target: &str) -> crate::Result<refs::RefSpec> {
+    if let Some((name, _)) = target.split_once('@')
+        && !name.is_empty()
+        && !name.contains('/')
+    {
+        let mut spec = refs::parse(&format!("local/{target}"))?;
+        let refs::RepoSel::Slug(_, name) = spec.repo else {
+            anyhow::bail!("invalid local repository qualifier");
+        };
+        spec.repo = refs::RepoSel::Local(name);
+        return Ok(spec);
+    }
+    refs::parse(target)
+}
+
+fn native_link(target: &str) -> crate::Result<Option<link::Link>> {
+    let Some(store) = Store::open()? else {
+        return Ok(None);
+    };
+    let matches: Vec<_> = link::list(&store)
+        .into_iter()
+        .filter(|link| link.session_id.starts_with(target.trim()))
+        .take(2)
+        .collect();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => anyhow::bail!("`{target}` matches several native sessions; give a longer session ID"),
+    }
+}
+
+fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource> {
+    if full_log {
+        anyhow::bail!(
+            "--full-log needs an AgentGit ref such as owner/repo@branch; native session IDs select the live transcript"
+        );
+    }
+    Ok(ShareSource {
+        raw: native.read()?,
+        runtime: native.source.clone(),
+        label: format!(
+            "live runtime transcript {}:{}",
+            native.source,
+            link::short(&native.session_id)
+        ),
+    })
+}
+
+fn resolve_point(
+    mut spec: refs::RefSpec,
+    native_available: bool,
+) -> crate::Result<Option<SharePoint>> {
+    if !matches!(
+        spec.tail,
+        refs::Tail::None | refs::Tail::Tilde(_) | refs::Tail::Turn(_)
+    ) {
+        anyhow::bail!(
+            "share accepts a complete saved point; event, range and file selectors are not supported"
+        );
+    }
+    let context = if matches!(spec.base, refs::Base::At) {
+        let context = super::context::at_context()?;
+        spec.base = refs::Base::SessionBranch(context.branch.clone());
+        Some(context)
+    } else {
+        None
+    };
+    if matches!(spec.base, refs::Base::Default) {
+        anyhow::bail!("sharing a repository needs an explicit point: owner/repo@branch");
+    }
+    let slug = match &spec.repo {
+        refs::RepoSel::Slug(owner, name) => format!("{owner}/{name}"),
+        refs::RepoSel::Local(name) => {
+            let me = crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
+            let matches = super::clone::checkouts_named(&me, name)?;
+            match matches.as_slice() {
+                [only] => only.slug(),
+                _ => anyhow::bail!(
+                    "`{name}` does not identify a unique local repo; use owner/repo@ref"
+                ),
+            }
+        }
+        refs::RepoSel::Context => {
+            if std::env::var_os("AGIT_SESSION").is_none() {
+                return Ok(None);
+            }
+            match context.map(Ok).unwrap_or_else(super::context::at_context) {
+                Ok(context) => super::context::qualify(&context.repo),
+                Err(_) if native_available => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    let (owner, name) = super::parse_slug(&slug)?;
+    let repo = match Repo::open(config::repo_dir(&owner, &name)?) {
+        Some(repo) => repo,
+        None if native_available && matches!(spec.repo, refs::RepoSel::Context) => return Ok(None),
+        None => anyhow::bail!("{slug} has no local AgentGit repo; clone it before sharing"),
+    };
+    let sha = refs::resolve(&repo, &spec)?.sha;
+    Ok(Some(SharePoint { repo, sha, slug }))
+}
+
+/// Metadata, content and confirmation describe the same immutable saved point.
+fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource> {
+    let snapshot = meta::read_at_ref_result(&point.repo, &point.sha)?
+        .ok_or_else(|| anyhow::anyhow!("this point has no session metadata"))?;
+    if !snapshot.is_session_line() || snapshot.session.is_empty() {
+        anyhow::bail!(
+            "this point is not a settled session; select a session branch or recorded version"
+        );
+    }
+    let sequence = if full_log {
+        meta::LOG_FILE
+    } else {
+        meta::VIEW_FILE
+    };
+    let envelope = point
+        .repo
+        .show_result(&point.sha, sequence)?
+        .ok_or_else(|| anyhow::anyhow!("this point has no {sequence}; no share was created"))?;
+    if !full_log && snapshot.layout == meta::LayoutVersion::V0 {
+        let log = point
+            .repo
+            .show_result(&point.sha, meta::LOG_FILE)?
+            .ok_or_else(|| anyhow::anyhow!("this point has no LOG to validate its VIEW"))?;
+        let reachable: std::collections::HashSet<_> = log
+            .split_inclusive('\n')
+            .map(storage::event_id)
+            .collect::<crate::Result<_>>()?;
+        for line in envelope.split_inclusive('\n') {
+            if !reachable.contains(&storage::event_id(line)?)
+                && !legacy_synthetic(&storage::parse_envelope_line(line)?.content)
+            {
+                anyhow::bail!(
+                    "this point's VIEW contains an event outside its LOG; no share was created"
+                );
+            }
+        }
+    }
+    if !full_log && storage::unbalanced_view_markers(&envelope)? != 0 {
+        anyhow::bail!(
+            "this point's VIEW contains misplaced or mismatched markers; no share was created"
+        );
+    }
     let (raw, skipped) = transcript::unwrap_lossy(&envelope);
     if skipped > 0 {
-        ui::warning(&format!(
-            "skipped {skipped} malformed transcript line(s) while preparing the share"
-        ));
+        anyhow::bail!(
+            "this point's {sequence} contains unreadable transcript entries; no share was created"
+        );
     }
     Ok(ShareSource {
         raw,
-        runtime: stored.runtime.clone(),
-        label: format!("{slug} ({})", meta::short(&stored.id)),
+        runtime: snapshot.runtime,
+        label: format!(
+            "{sequence} of {}@{}",
+            point.slug,
+            &point.sha[..12.min(point.sha.len())]
+        ),
     })
+}
+
+/// Only writer-shaped synthetic content may be absent from a legacy VIEW's LOG.
+fn legacy_synthetic(content: &serde_json::Value) -> bool {
+    let Some(object) = content.as_object() else {
+        return false;
+    };
+    if object.len() != 3 {
+        return false;
+    }
+    if content["type"] == "system"
+        && content["source"].is_string()
+        && matches!(
+            content["subtype"].as_str(),
+            Some(
+                "agit:__merge_start__"
+                    | "agit:__merge_end__"
+                    | "agit:__cherry_pick_start__"
+                    | "agit:__cherry_pick_end__"
+                    | "agit:__revert__"
+            )
+        )
+    {
+        return true;
+    }
+    content["type"] == "user"
+        && content["agit"] == "merge_summary"
+        && content["message"]
+            .as_object()
+            .is_some_and(|message| message.len() == 2)
+        && content["message"]["role"] == "user"
+        && content["message"]["content"].is_string()
 }
 
 fn list(client: &crate::hub::Client) -> CmdResult {
@@ -410,6 +597,7 @@ fn encrypt(plaintext: &[u8]) -> crate::Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{session, storage};
 
     fn claim() -> String {
         format!("{}{}", meta::ID_PREFIX, "b".repeat(meta::ID_HEX_LEN))
@@ -509,11 +697,25 @@ mod tests {
 
         let stored = session::latest(&repo).unwrap();
         assert_eq!(stored.branch.as_deref(), Some("session-a"));
-        let source = repo_session_source(&repo, &stored, "me/paper").unwrap();
+        let point = SharePoint {
+            repo: Repo::open(repo.root()).unwrap(),
+            sha: repo.git(&["rev-parse", "refs/heads/session-a"]).unwrap(),
+            slug: "me/paper".into(),
+        };
+        let next = transcript::wrap_lines(
+            &raw.replace("BRANCH-TRANSCRIPT", "LATER-CONTENT"),
+            "claude-code",
+            &claim(),
+        );
+        storage::write_snapshot(worktree.root(), &(envelope + &next), &next).unwrap();
+        worktree.add_all().unwrap();
+        worktree.commit("advance selected branch").unwrap();
+        let source = point_source(point, false).unwrap();
+        assert!(!source.raw.contains("LATER-CONTENT"));
         assert!(source.raw.contains("BRANCH-TRANSCRIPT"), "{}", source.raw);
         assert_eq!(source.runtime, "claude-code");
         assert!(
-            source.label.starts_with("me/paper (agit-"),
+            source.label.starts_with("VIEW of me/paper@"),
             "{}",
             source.label
         );

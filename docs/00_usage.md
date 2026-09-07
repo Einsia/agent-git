@@ -519,8 +519,15 @@ the branch as usual.
 ### 4.1 Share with someone who does not have agit
 
 ```sh
+agit share owner/repo@branch --expire 24h --views 3
+agit share owner/repo@branch --full-log
 agit share 7f3a --expire 24h --views 3
 ```
+
+Saved refs share their VIEW; `--full-log` selects the saved LOG, including discarded history.
+An explicit native session ID shares its live transcript and is labelled accordingly. Omitting
+the target requires `AGIT_SESSION` and selects that exact branch's saved VIEW. Invalid or
+missing VIEW content is refused without widening the share.
 
 Mints a read-only sharing link; the other side needs no account. **End-to-end encrypted by
 default**, with the key in the URL's `#k=` fragment, printed once at that moment and never again —
