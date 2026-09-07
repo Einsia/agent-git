@@ -13,6 +13,9 @@ agit show [session] [options]
 
 `--tui` opens the transcript browser. It needs a terminal: in a pipe it exits with `Interactive` (8) rather than degrading silently.
 
+An explicit file-line ref such as `agit show owner/repo@main` prints that point's top-level tree
+and recent commits. Use `agit show owner/repo@main:README.md` to read a selected file verbatim.
+
 ## Options
 
 | Option | Meaning |

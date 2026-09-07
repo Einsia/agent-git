@@ -548,6 +548,16 @@ fn show_ref(t: &str, args: &Args) -> Option<ExitCode> {
         }
     }
 
+    if meta::read_at_ref(&repo, &resolved.sha).is_some_and(|snapshot| snapshot.is_file_line()) {
+        return Some(match show_file_line(&repo, &resolved.sha, t) {
+            Ok(()) => ExitCode::Ok,
+            Err(error) => {
+                ui::error(&format!("cannot read this file line: {error:#}"));
+                ExitCode::Precondition
+            }
+        });
+    }
+
     // The point as a whole: rendered as its VIEW (the world `resume` sees).
     // VIEW is a deliberate visibility boundary.  Missing objects, bad hashes, limits,
     // malformed sequences, or events unreachable from LOG must fail closed rather than
@@ -570,6 +580,24 @@ fn show_ref(t: &str, args: &Args) -> Option<ExitCode> {
     let (text, _) = transcript::unwrap_lossy(&env);
     render_text(&text, args.max_chars);
     Some(ExitCode::Ok)
+}
+
+/// A file line has no conversation VIEW; its selected tree and history describe the point.
+fn show_file_line(repo: &Repo, sha: &str, target: &str) -> crate::Result<()> {
+    let tree = repo.git(&["ls-tree", "--name-only", "--full-tree", sha])?;
+    let history = repo.git(&[
+        "log",
+        "--first-parent",
+        "--max-count=5",
+        "--format=%h %s",
+        sha,
+    ])?;
+    println!("file line {target} ({})", &sha[..9.min(sha.len())]);
+    ui::section("tree");
+    print!("{tree}");
+    ui::section("recent commits");
+    println!("{history}");
+    Ok(())
 }
 
 /// The turn ordinal for display: `#-1` is [`refs::LAST_TURN`] (`u32::MAX`) inside, which printed
