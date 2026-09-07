@@ -49,8 +49,12 @@ agit --version
 
 Both routes install a prebuilt binary — no Rust toolchain required. npm
 picks the platform sub-package matching your `os`/`cpu`; on platforms with no
-prebuilt binary (e.g. Windows) running `agit` prints the source-build recipe.
+prebuilt binary (e.g. FreeBSD) running `agit` prints the source-build recipe.
 Details and environment variables: [`npm/README.md`](npm/README.md).
+
+Windows x64 packages include the local RC daemon. Its control channel uses a local named
+pipe restricted to the current Windows user. RC state requires a private, user-owned
+directory; shared or redirected RC paths are rejected.
 
 pnpm (v10+) does not run dependency install scripts by default, so the
 automatic `agit setup` is skipped there — run `agit setup` once yourself

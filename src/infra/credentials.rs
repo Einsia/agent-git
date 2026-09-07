@@ -82,9 +82,15 @@ pub fn save_at(path: &Path, cred: &HubCredential) -> Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
-    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(cred)?))
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    set_private(path)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(cred)?);
+    #[cfg(windows)]
+    super::windows_security::write_private_file(path, body.as_bytes())
+        .with_context(|| format!("cannot write private credentials to {}", path.display()))?;
+    #[cfg(not(windows))]
+    {
+        std::fs::write(path, body).with_context(|| format!("cannot write {}", path.display()))?;
+        set_private(path)?;
+    }
     Ok(())
 }
 
@@ -183,7 +189,7 @@ fn set_private(p: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_private(_p: &Path) -> Result<()> {
     crate::warn(
         "this platform cannot set 0600; the credentials file may be readable by other users on this machine",

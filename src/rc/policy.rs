@@ -115,7 +115,7 @@ fn within(resolved: &Path, roots: &CanonicalRoots) -> bool {
 /// (the folder picker) which runs *before* any project is bound and is scoped
 /// by ownership rather than allowlist.
 pub fn is_under_home(target: &Path) -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::infra::config::user_home() else {
         return false;
     };
     is_within(target, &CanonicalRoots::from_untrusted([home]))
@@ -2633,7 +2633,7 @@ fn is_executable_file(c: &Path) -> bool {
 }
 
 pub fn require_dir_under_home(target: &Path) -> Result<PathBuf, PolicyError> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = crate::infra::config::user_home() else {
         return Err(PolicyError::OutsideHome(target.display().to_string()));
     };
     require_dir_under(target, &home)

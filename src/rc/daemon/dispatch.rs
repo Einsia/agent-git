@@ -39,9 +39,7 @@ impl Daemon {
             method::FS_READ_DIRECTORY => {
                 let p: FsReadDirectory = f.params_as()?;
                 let target = if p.path.trim().is_empty() {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .unwrap_or_default()
+                    crate::infra::config::user_home().unwrap_or_default()
                 } else {
                     PathBuf::from(&p.path)
                 };

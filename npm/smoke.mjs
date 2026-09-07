@@ -34,8 +34,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 // release / debug: whichever is newer wins — otherwise a stale release build makes smoke
 // assert against an outdated version
 const { statSync } = await import('node:fs')
-const bin = ['release', 'debug']
-  .map((p) => join(root, 'target', p, 'agit'))
+const bin = process.env.AGIT_NPM_SMOKE_BINARY || ['release', 'debug']
+  .map((p) => join(root, 'target', p, platform.binaryName()))
   .filter(existsSync)
   .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0]
 if (!bin) {
@@ -61,8 +61,8 @@ const check = (label, ok, detail = '') => {
 // Layout: node_modules/@einsia/agent-git (the installed form) + the host's platform package +
 // the install wrapper
 mkdirSync(join(nm, `agent-git-${key}`, 'bin'), { recursive: true })
-copyFileSync(bin, join(nm, `agent-git-${key}`, 'bin', 'agit'))
-chmodSync(join(nm, `agent-git-${key}`, 'bin', 'agit'), 0o755)
+copyFileSync(bin, join(nm, `agent-git-${key}`, 'bin', platform.binaryName()))
+chmodSync(join(nm, `agent-git-${key}`, 'bin', platform.binaryName()), 0o755)
 
 const mainPkg = join(nm, 'agent-git')
 mkdirSync(mainPkg, { recursive: true })
@@ -86,7 +86,7 @@ const mainShim = join(mainPkg, 'npm', 'shim.js')
 mkdirSync(join(work, 'node_modules', 'create-agit'), { recursive: true })
 cpSync(join(root, 'npm', 'create-agit'), join(work, 'node_modules', 'create-agit'), { recursive: true })
 
-const version = readFileSync(join(root, 'Cargo.toml'), 'utf8').match(/\[package\][\s\S]*?version\s*=\s*"([^"]+)"/)[1]
+const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'Cargo.toml'), 'utf8').match(/\[package\][\s\S]*?version\s*=\s*"([^"]+)"/)[1]
 
 // 1. main package shim forwarding
 {
@@ -101,12 +101,22 @@ const version = readFileSync(join(root, 'Cargo.toml'), 'utf8').match(/\[package\
 // 2. sandboxed install through the npx wrapper
 {
   mkdirSync(home, { recursive: true })
+  const env = { ...process.env, USERPROFILE: home }
+  if (process.platform === 'win32') {
+    for (const key of Object.keys(env)) {
+      if (['HOME', 'AGIT_HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME'].includes(key.toUpperCase())) delete env[key]
+    }
+  } else {
+    env.HOME = home
+    env.AGIT_HOME = join(home, '.agit')
+  }
   const r = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: home },
+    env,
+    cwd: home,
   })
-  const installed = join(home, '.local', 'bin', 'agit')
-  check('npx wrapper installs to $HOME/.local/bin/agit', r.status === 0 && existsSync(installed), `${r.status} ${r.stderr}`)
+  const installed = join(home, '.local', 'bin', platform.binaryName())
+  check(`npx wrapper installs ${platform.binaryName()} to the user bin directory`, r.status === 0 && existsSync(installed), `${r.status} ${r.stderr}`)
   if (existsSync(installed)) {
     const v = spawnSync(installed, ['--version'], { encoding: 'utf8' })
     check('installed binary runs', v.status === 0, `${v.status} ${v.stderr}`)

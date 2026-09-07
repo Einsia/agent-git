@@ -40,6 +40,7 @@ The hub (**AgentGit**) is not in this package; it deploys separately.
 | Linux | aarch64/arm64 | `@einsia/agent-git-linux-arm64`   |
 | macOS | x86_64        | `@einsia/agent-git-darwin-x64`    |
 | macOS | arm64         | `@einsia/agent-git-darwin-arm64`  |
+| Windows | x86_64      | `@einsia/agent-git-win32-x64`    |
 
 **Linux binaries are musl static-linked — no glibc floor.** Verified on Alpine,
 Amazon Linux 2 (glibc 2.26), Debian 11/12, Ubuntu 20.04–24.04, x86_64 and
@@ -48,7 +49,7 @@ arm64. No more `libc.so.6: version 'GLIBC_2.xx' not found`.
 On macOS, if Node runs under Rosetta (it reports itself as x64) the installer
 detects it and installs the arm64 build.
 
-Unsupported platforms (including Windows) get no prebuilt binary: running
+Unsupported operating system and architecture pairs get no prebuilt binary: running
 `agit` prints build-from-source instructions. On WSL, the Linux binary works.
 
 ## Failure behavior
@@ -73,3 +74,9 @@ Unsupported platforms (including Windows) get no prebuilt binary: running
 `agit upgrade` asks the hub for the latest CLI version and downloads the
 platform package tarball straight from the npm registry, verified against the
 registry's SRI (sha512) before anything is replaced.
+
+Windows packages contain `agit.exe`. The `create-agit` installer writes it to
+`%USERPROFILE%\.local\bin`; add that directory to your user PATH if the installer
+reports that it is missing. Windows source builds need Rust and the MSVC C/C++
+toolchain. The local RC daemon uses a current-user Windows named pipe and private
+RC state. It refuses shared or redirected RC paths instead of changing their permissions.

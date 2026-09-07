@@ -63,10 +63,9 @@ fn db_path() -> Option<PathBuf> {
     match base {
         Some(x) => Some(x.join("opencode").join("opencode.db")),
         None => {
-            let home = std::env::var("HOME").ok()?;
+            let home = crate::infra::config::user_home()?;
             Some(
-                PathBuf::from(home)
-                    .join(".local")
+                home.join(".local")
                     .join("share")
                     .join("opencode")
                     .join("opencode.db"),

@@ -69,6 +69,7 @@ cli = [
     "dep:owo-colors",
     "dep:dialoguer",
     "dep:ureq",
+    "dep:self-replace",
 ]
 
 # `agit rc` — the resident daemon (agitd) that supervises harness processes and
@@ -84,7 +85,6 @@ rc = [
     "dep:futures-util",
     "dep:portable-pty",
     "dep:base64",
-    "dep:windows-sys",
 ]
 
 # The device-local vault for low-entropy secrets. A backend reusing domain with
@@ -216,14 +216,19 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 portable-pty = { version = "0.9", optional = true }
 
 [target.'cfg(windows)'.dependencies]
+self-replace = { version = "1.5", optional = true }
 # Harness and settlement subprocesses must be born suspended, attached to a
 # kill-on-close Job Object, and only then resumed. Killing only the direct child
 # leaves tool or git-helper grandchildren able to write after authority ends.
-windows-sys = { version = "0.61", optional = true, features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 

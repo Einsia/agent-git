@@ -288,7 +288,6 @@ fn print_record(record: &RecordSummary) {
 
 /// A running daemon must switch to the new matcher before this command returns; one that is not
 /// running loads it on its next start.
-#[cfg(unix)]
 fn reload_daemon() -> crate::Result<()> {
     use crate::rc::control::{Presence, Reply, Request};
     match crate::rc::control::presence() {
@@ -306,11 +305,6 @@ fn reload_daemon() -> crate::Result<()> {
             "the vault was updated, but daemon state is unclear and reload was not confirmed: {why}"
         ),
     }
-}
-
-#[cfg(not(unix))]
-fn reload_daemon() -> crate::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

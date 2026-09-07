@@ -21,6 +21,7 @@ const VERSIONED = [
   'npm/platforms/linux-arm64/package.json',
   'npm/platforms/darwin-x64/package.json',
   'npm/platforms/darwin-arm64/package.json',
+  'npm/platforms/win32-x64/package.json',
 ]
 
 function snapshot(dir) {

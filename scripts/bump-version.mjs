@@ -5,7 +5,7 @@
  *   node scripts/bump-version.mjs 0.10.0
  *
  * The one source for the version is the [package] version in Cargo.toml; on the npm side the
- * main package, the installer wrapper and the four platform packages must carry the same
+ * main package, the installer wrapper and the platform packages must carry the same
  * value, and so must the pins on the main package and the platform packages in
  * optionalDependencies / dependencies — one digit apart and whoever installs gets a 404, or a
  * binary of a different version. `scripts/check-version.js` is the backstop in CI and in
@@ -82,6 +82,7 @@ const manifests = [
   'npm/platforms/linux-arm64/package.json',
   'npm/platforms/darwin-x64/package.json',
   'npm/platforms/darwin-arm64/package.json',
+  'npm/platforms/win32-x64/package.json',
 ]
 for (const rel of manifests) {
   const path = join(root, rel)

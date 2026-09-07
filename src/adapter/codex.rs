@@ -59,11 +59,12 @@ fn codex_home_from(configured: Option<&OsStr>, home: Option<&OsStr>) -> Option<P
 }
 
 pub(super) fn codex_home() -> Result<PathBuf> {
+    let home = crate::infra::config::user_home();
     codex_home_from(
         std::env::var_os("CODEX_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        home.as_deref().map(Path::as_os_str),
     )
-    .context("neither $CODEX_HOME nor $HOME is set")
+    .context("neither $CODEX_HOME nor the user home is set")
 }
 
 fn sessions_root() -> Result<PathBuf> {

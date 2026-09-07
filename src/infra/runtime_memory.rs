@@ -54,7 +54,7 @@ fn claude_config_dir() -> Option<PathBuf> {
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::infra::config::user_home()
 }
 
 /// Claude Code's memory directory: `autoMemoryDirectory` wins, otherwise the encoded project root.

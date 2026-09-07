@@ -9,7 +9,7 @@ name: npm publish
 # rides entirely on the guardrails before publish — do not take them apart:
 #
 #   - the assertion that the tag, Cargo.toml and every package.json agree on the version;
-#   - the assertion that the Release artifacts are complete (four targets + SHA256SUMS);
+#   - the assertion that the Release artifacts are complete (every target plus SHA256SUMS);
 #   - once the platform packages are out, the main package tarball is installed for
 #     real before the rest goes out — the path the user will take works first, and
 #     only then does publishing the main package and the wrapper mean anything;
@@ -18,7 +18,7 @@ name: npm publish
 #
 # What goes out is the whole family, and the order is the dependency direction:
 #
-#   @einsia/agent-git-{linux-x64,linux-arm64,darwin-x64,darwin-arm64}
+#   @einsia/agent-git-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,win32-x64}
 #   @einsia/agent-git      (optionalDependencies pins the platform packages at exact versions)
 #   create-agit            (the npx create-agit one-shot install wrapper, depends on the main package)
 #
@@ -155,7 +155,7 @@ jobs:
           assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
           echo "$assets"
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
-                   x86_64-apple-darwin aarch64-apple-darwin; do
+                   x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
             echo "$assets" | grep -qx "agit-$VERSION-$t.tar.gz" \
               || { echo "::error::Release is missing agit-$VERSION-$t.tar.gz"; exit 1; }
           done
@@ -183,7 +183,7 @@ jobs:
       # published, and installing it globally makes npm resolve the just-published
       # platform package from the registry by os/cpu, then run the real postinstall
       # self-check. A just-published version replicates onto the packument with a
-      # delay, so poll until all four platform packages are visible before
+      # delay, so poll until all platform packages are visible before
       # installing. A dry run publishes no platform packages: while that version is
       # not on the registry, a global install must fail, and the preflight degrades
       # to the pack itself.
@@ -193,7 +193,7 @@ jobs:
           TARBALL="$(npm pack --silent)"
           echo "packed: $TARBALL"
           visible() {
-            for k in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            for k in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
               npm view "@einsia/agent-git-$k@$VERSION" version >/dev/null 2>&1 || return 1
             done
           }

@@ -1034,9 +1034,10 @@ fn scrub_copy(found: &Found) -> crate::Result<Option<Found>> {
         .ok_or_else(|| {
             anyhow::anyhow!("can't determine a working directory for the scrubbed copy")
         })?;
-    let home = std::env::var("HOME")
-        .map_err(|_| anyhow::anyhow!("$HOME is not set — can't place the scrubbed copy"))?;
-    let dir = std::path::PathBuf::from(home)
+    let home = config::user_home().ok_or_else(|| {
+        anyhow::anyhow!("the user home is not set — can't place the scrubbed copy")
+    })?;
+    let dir = home
         .join(".claude")
         .join("projects")
         .join(crate::adapter::claude_code::slug_for(&cwd));

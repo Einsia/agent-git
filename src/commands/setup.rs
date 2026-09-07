@@ -924,7 +924,7 @@ fn project_agents_path_for(cwd: &Path) -> PathBuf {
 // ── shared primitives ─────────────────────────────────────────────────
 
 fn home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    crate::infra::config::user_home()
 }
 
 fn exe_str() -> String {

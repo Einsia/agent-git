@@ -14,9 +14,10 @@ name: Release
 #     agit-<VERSION>-aarch64-unknown-linux-musl.tar.gz
 #     agit-<VERSION>-x86_64-apple-darwin.tar.gz
 #     agit-<VERSION>-aarch64-apple-darwin.tar.gz
+#     agit-<VERSION>-x86_64-pc-windows-msvc.tar.gz
 #     SHA256SUMS
 #
-#  The archive root holds one executable `agit`, with no enclosing directory.
+#  The archive root holds `agit.exe` on Windows and `agit` elsewhere.
 #  SHA256SUMS lists every archive by bare filename, in `sha256sum` format.
 # ────────────────────────────────────────────────────────────────────────────
 #
@@ -55,6 +56,8 @@ jobs:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -Ctarget-feature=+crt-static
     strategy:
       fail-fast: false
       matrix:
@@ -67,13 +70,8 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-          # Windows (x86_64-pc-windows-msvc) is deliberately not built: the rustls
-          # chain compiles aws-lc-sys C code, which is unreliable on windows
-          # runners, and agit's claude-code / codex users are almost all on mac and
-          # linux. Windows installs from source (with no platform package to install,
-          # the npm package prints the source-install instructions, see
-          # npm/lib/run.js). Adding it back means changing this list and KEYS/TRIPLES
-          # in npm/lib/platform.js together.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -135,6 +133,7 @@ jobs:
       # for the host architecture"; a fallback to dynamic linking smuggles the glibc
       # floor back in — both errors surface only once a user installs.
       - name: Verify artifact architecture and linkage
+        if: runner.os != 'Windows'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -166,6 +165,17 @@ jobs:
             x86_64-apple-darwin)  echo "$DESC" | grep -q 'x86_64' ;;
             aarch64-apple-darwin) echo "$DESC" | grep -q 'arm64' ;;
           esac
+
+      - name: Verify Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo check --locked --release --no-default-features --target ${{ matrix.target }} --lib
+          if ($LASTEXITCODE -ne 0) { throw "Windows library without RC failed to compile" }
+          cargo test --locked --release --target ${{ matrix.target }} --test windows_rc -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "Windows native RC integration tests failed" }
+          node scripts/verify-windows-cli.mjs "target/${{ matrix.target }}/release/agit.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Windows executable verification failed" }
 
       # Run the freshly built artifact inside genuinely old distros. A gnu artifact
       # installed from npm fails on a user's linux with GLIBC_2.38 not found;
@@ -200,9 +210,10 @@ jobs:
           VERSION="${RELEASE_TAG#agit-v}"
           TARGET="${{ matrix.target }}"
           ARCHIVE="agit-$VERSION-$TARGET.tar.gz"
-          # -C into the directory before packing: the archive holds a bare `agit`,
-          # with no path prefix.
-          tar -C "target/$TARGET/release" -czf "$ARCHIVE" agit
+          # The archive root holds only the executable, with no path prefix.
+          BINARY=agit
+          if [[ "$TARGET" == *windows* ]]; then BINARY=agit.exe; fi
+          tar -C "target/$TARGET/release" -czf "$ARCHIVE" "$BINARY"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
           ls -l "$ARCHIVE"
 
@@ -278,7 +289,7 @@ jobs:
           cat SHA256SUMS
           # Every target must be there; a missing one makes npm users on that
           # platform install a 404.
-          test "$(wc -l < SHA256SUMS)" -eq 4
+          test "$(wc -l < SHA256SUMS)" -eq 5
 
       # The Release body is this version's section of CHANGELOG.md. A release without
       # notes must not go out, so a missing section stops the job here, before anything

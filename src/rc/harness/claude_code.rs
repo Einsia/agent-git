@@ -425,7 +425,7 @@ impl ClaudeCodeDriver {
     /// `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Known up front
     /// because we chose the session id — no waiting, no globbing.
     pub fn transcript_path(&self) -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let home = crate::infra::config::user_home()?;
         Some(
             home.join(".claude/projects")
                 .join(crate::adapter::claude_code::slug_for(&self.cwd))

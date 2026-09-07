@@ -31,13 +31,26 @@ pub struct Connection {
 }
 
 fn identity_path() -> crate::Result<PathBuf> {
-    Ok(super::rc_dir()?.join("identity.json"))
+    let path = super::rc_dir()?.join("identity.json");
+    #[cfg(windows)]
+    if path.try_exists()? {
+        super::windows_security::validate_path(&path, false, true)?;
+    }
+    Ok(path)
 }
 
 fn connection_path(hub: &str) -> crate::Result<PathBuf> {
     let d = super::rc_dir()?.join("connections");
+    #[cfg(windows)]
+    super::windows_security::private_directory(&d)?;
+    #[cfg(not(windows))]
     std::fs::create_dir_all(&d)?;
-    Ok(d.join(format!("{}.json", config::hub_host_key(hub))))
+    let path = d.join(format!("{}.json", config::hub_host_key(hub)));
+    #[cfg(windows)]
+    if path.try_exists()? {
+        super::windows_security::validate_path(&path, false, true)?;
+    }
+    Ok(path)
 }
 
 /// Load or create the machine identity.
@@ -86,6 +99,9 @@ pub fn remove_connection(hub: &str) -> crate::Result<bool> {
 
 /// Write then chmod 0600. Same discipline as `infra::credentials`.
 fn write_private(p: &std::path::Path, body: &str) -> crate::Result<()> {
+    #[cfg(windows)]
+    super::windows_security::write_private_file(p, body.as_bytes())?;
+    #[cfg(not(windows))]
     std::fs::write(p, body)?;
     #[cfg(unix)]
     {

@@ -44,6 +44,7 @@ One archive per target, attached to the GitHub Release of this tag:
 | `aarch64-unknown-linux-musl` | ubuntu-latest | `agit-<VERSION>-aarch64-unknown-linux-musl.tar.gz` |
 | `x86_64-apple-darwin`        | macos-latest  | `agit-<VERSION>-x86_64-apple-darwin.tar.gz`        |
 | `aarch64-apple-darwin`       | macos-latest  | `agit-<VERSION>-aarch64-apple-darwin.tar.gz`       |
+| `x86_64-pc-windows-msvc`     | windows-latest | `agit-<VERSION>-x86_64-pc-windows-msvc.tar.gz`     |
 
 ```
 agit-<VERSION>-<TARGET_TRIPLE>.tar.gz
@@ -66,16 +67,18 @@ needs a complete musl cross C toolchain, and apt's `musl-tools` carries only the
 x86_64 one; zig ships musl headers and libc for every architecture, so one recipe
 covers both architectures at once.
 
-**There is no Windows artifact.** The rustls dependency chain compiles the C code
-of aws-lc-sys, which is unstable on a windows runner. On Windows there is no
-matching platform package to install; the npm package prints the source-install
-instructions at runtime (`npm/lib/run.js`). Installing from source requires the
-MSVC C compiler on the machine.
+**Windows uses the native MSVC toolchain and NASM**, with the C runtime linked
+statically. GitLab validates the Windows artifact on a Windows x64 runner and
+packages both dev and staging channels. GitHub builds the production target on
+`windows-latest`; the artifact check verifies its PE machine type and runs the
+CLI with an isolated home before packaging.
+
+The Windows build prerequisites follow the [AWS LC Windows build requirements](https://aws.github.io/aws-lc-rs/requirements/windows.html).
 
 ## Archive contents
 
-The archive **root** holds one executable, `agit`, with no wrapping directory —
-unpack it and run `./agit` directly, with no path prefix to strip.
+The archive **root** holds `agit.exe` on Windows and `agit` on other platforms,
+with no wrapping directory. Run the executable directly after extraction.
 
 (The archive carries no `agit-hub`: the server side is a separate repository and
 does not ship with the client.)
@@ -122,7 +125,7 @@ https://github.com/<owner>/<repo>/releases/download/agit-v<VERSION>/SHA256SUMS
    attaches the artifacts and `SHA256SUMS`;
    → once that finishes successfully, the **npm publish** workflow takes over
    automatically through `workflow_run` and publishes the whole family in
-   dependency order: the four platform packages → `@einsia/agent-git` →
+   dependency order: the platform packages → `@einsia/agent-git` →
    `create-agit`, installing the main package's tarball globally for real
    along the way as the preflight.
 3. Verify afterwards: install with `npm i -g @einsia/agent-git` (or
@@ -147,3 +150,8 @@ commands for the local backstop are in the "Release" section of the README.
 - A package name whose first version has never been published has no page to
   configure: the maintainer publishes the first one locally with `npm publish`,
   then hands it back to the workflow.
+
+The Windows npm platform package is `@einsia/agent-git-win32-x64`. Its initial
+publication and Trusted Publisher setup follow the same bootstrap procedure as
+the other platform packages; configure it before publishing the first release
+that includes Windows.

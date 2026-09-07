@@ -65,7 +65,12 @@
 //! end-to-end hole-detection contract — a dropped frame at any hop is
 //! *detected*, not silently lost. The hub's only job is to reject holes.
 
+#[cfg(unix)]
 pub mod control;
+#[cfg(windows)]
+#[path = "control_windows.rs"]
+pub mod control;
+mod control_protocol;
 pub mod daemon;
 pub mod grants;
 pub mod harness;
@@ -83,6 +88,8 @@ pub mod terminal;
 pub mod ticket;
 #[cfg(windows)]
 mod windows_job;
+#[cfg(windows)]
+use crate::infra::windows_security;
 
 use std::path::PathBuf;
 
@@ -94,7 +101,12 @@ pub fn rc_dir() -> crate::Result<PathBuf> {
         .unwrap_or_else(crate::infra::config::agit_home)?;
     #[cfg(not(test))]
     let home = crate::infra::config::agit_home()?;
+    #[cfg(windows)]
+    windows_security::validate_path(&home, true, false)?;
     let d = home.join("rc");
+    #[cfg(windows)]
+    windows_security::private_directory(&d)?;
+    #[cfg(not(windows))]
     std::fs::create_dir_all(&d)?;
     Ok(d)
 }

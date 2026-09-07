@@ -2,8 +2,8 @@
 /**
  * agit's npm publisher, publishing the whole family:
  *
- *   @einsia/agent-git-{linux-x64,linux-arm64,darwin-x64,darwin-arm64}
- *   @einsia/agent-git          (optionalDependencies points at the four above)
+ *   @einsia/agent-git-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,win32-x64}
+ *   @einsia/agent-git          (optionalDependencies points at the platform packages)
  *   create-agit                (the one-shot `npx create-agit` install wrapper, depends on the main package)
  *
  * Usage:
@@ -15,7 +15,7 @@
  * optionalDependencies point at must exist on the registry first, or whoever installs gets a
  * 404; the install wrapper must likewise come after the main package):
  *
- *   1. Unpack the four platform binaries into platforms/<key>/bin/agit
+ *   1. Unpack platform binaries into platforms/<key>/bin
  *   2. Sync version and dependency pins across every package.json (checked against Cargo.toml)
  *   3. npm publish: platform packages → main package → create-agit
  *
@@ -30,12 +30,13 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import platform from './lib/platform.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const [artifacts, ...flags] = process.argv.slice(2)
 const dry = flags.includes('--dry-run')
 // For a rehearsal, or for publishing one platform first to verify the pipeline. A real release
-// must carry all four — a missing platform means its users install and land on the "no prebuilt
+// must carry every supported platform — a missing platform means its users install and land on the "no prebuilt
 // binary" error page.
 const partial = flags.includes('--allow-partial')
 
@@ -82,12 +83,8 @@ if (!cargo) {
 const version = cargo
 console.log(`version ${version}`)
 
-const TRIPLES = {
-  'linux-x64': 'x86_64-unknown-linux-musl',
-  'linux-arm64': 'aarch64-unknown-linux-musl',
-  'darwin-x64': 'x86_64-apple-darwin',
-  'darwin-arm64': 'aarch64-apple-darwin',
-}
+const { TRIPLES } = platform
+const binaryForKey = (key) => platform.binaryName(key.startsWith('win32-') ? 'win32' : 'linux')
 
 // "has this been published" deliberately does not pre-query the registry: the packument
 // replicates with a delay (`npm view` returns 404 for a while on a just-published package), so
@@ -107,7 +104,7 @@ function spawnSync3(cmd, args, opts) {
 
 for (const [key, triple] of Object.entries(TRIPLES)) {
   const dir = join(root, 'npm', 'platforms', key)
-  const stagedBin = join(dir, 'bin', 'agit')
+  const stagedBin = join(dir, 'bin', binaryForKey(key))
   const tarball = join(artifacts, `agit-${version}-${triple}.tar.gz`)
   if (!existsSync(tarball)) {
     // This artifacts directory carries no tar for this platform: any stale binary sitting in
@@ -122,7 +119,7 @@ for (const [key, triple] of Object.entries(TRIPLES)) {
     process.exit(1)
   }
   run('tar', ['-xzf', tarball, '-C', join(dir, 'bin')], {})
-  const bin = join(dir, 'bin', 'agit')
+  const bin = join(dir, 'bin', binaryForKey(key))
   // If it runs (native architecture), check the version; a cross-architecture artifact falls
   // back to the ELF magic check — release.yml's QEMU smoke test is the backstop for
   // cross-compilation correctness, so this does not pretend it can exec.
@@ -133,16 +130,21 @@ for (const [key, triple] of Object.entries(TRIPLES)) {
     // ELF is linux; Mach-O (darwin) is one of a handful of magics — cf fa ed fe / ca fe ba be
     // (fat). The platform key and the magic are checked against each other, so a cross artifact
     // staged into the wrong slot (a musl binary inside a darwin package) shows up here.
-    const head = readFileSync(bin).subarray(0, 4)
-    const hex = head.toString('hex')
+    const bytes = readFileSync(bin)
+    const hex = bytes.subarray(0, 4).toString('hex')
+    const pe = bytes.length >= 64 ? bytes.readUInt32LE(60) : bytes.length
+    const isWindowsX64 = bytes.subarray(0, 2).toString('ascii') === 'MZ' &&
+      pe <= bytes.length - 6 && bytes.readUInt32LE(pe) === 0x00004550 &&
+      bytes.readUInt16LE(pe + 4) === 0x8664
     const isELF = hex === '7f454c46'
     const isMachO = ['cffaedfe', 'cefaedfe', 'feedfacf', 'feedface', 'cafebabe'].includes(hex)
     const wantMachO = key.startsWith('darwin')
-    if ((wantMachO && !isMachO) || (!wantMachO && !isELF)) {
+    const wantWindows = key.startsWith('win32')
+    if (wantWindows ? !isWindowsX64 : wantMachO ? !isMachO : !isELF) {
       console.error(`${key} artifact neither runs nor has the right magic (got ${hex}) — corrupt staging`)
       process.exit(1)
     }
-    out = `(cross, ${wantMachO ? 'Mach-O' : 'ELF'} ok)`
+    out = `(cross, ${wantWindows ? 'PE x64' : wantMachO ? 'Mach-O' : 'ELF'} ok)`
   }
   if (!out.endsWith(` ${version}`) && !out.startsWith('(cross,')) {
     console.error(`${key} artifact reports "${out}", expected version ${version} — staging the wrong binary?`)
@@ -170,7 +172,7 @@ for (const rel of ['package.json', 'npm/create-agit/package.json']) {
 }
 
 const staged = Object.keys(TRIPLES).filter((k) =>
-  existsSync(join(root, 'npm', 'platforms', k, 'bin', 'agit')),
+  existsSync(join(root, 'npm', 'platforms', k, 'bin', binaryForKey(k))),
 )
 // optionalDependencies pointing at a platform version that is not published yet is safe: npm
 // skips an optional dep that returns 404, and users on that machine only get the "no prebuilt

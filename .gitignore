@@ -5,6 +5,7 @@
 # verification.
 *.tgz
 /npm/platforms/*/bin/agit
+/npm/platforms/*/bin/agit.exe
 
 # macOS metadata
 .DS_Store

@@ -1,0 +1,26 @@
+{
+  "name": "@einsia/agent-git-win32-x64",
+  "version": "0.1.1",
+  "description": "Prebuilt agit CLI binary (Windows x64) — platform package for @einsia/agent-git.",
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "bin": {
+    "agit": "bin/agit.exe"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Einsia/agent-git",
+    "directory": "npm/platforms/win32-x64"
+  }
+}

@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 pub struct ClaudeCode;
 
 fn projects_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("$HOME is not set")?;
-    Ok(PathBuf::from(home).join(".claude").join("projects"))
+    let home = crate::infra::config::user_home().context("the user home is not set")?;
+    Ok(home.join(".claude").join("projects"))
 }
 
 /// Map a cwd onto Claude Code's project directory name.

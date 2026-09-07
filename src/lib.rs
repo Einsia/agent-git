@@ -151,6 +151,8 @@ pub mod infra {
     pub mod runtime_memory;
     /// Discovery of the runtime session the current process belongs to (no CLI output here).
     pub mod runtime_session;
+    #[cfg(windows)]
+    pub(crate) mod windows_security;
 }
 
 pub type Result<T> = anyhow::Result<T>;

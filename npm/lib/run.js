@@ -21,7 +21,7 @@ function run() {
 
   if (!bin) {
     // npm skipped the optional dep for this os/cpu = this platform has no
-    // prebuilt artifact (win32, freebsd, ...). This block is often everything
+    // prebuilt artifact (freebsd, ...). This block is often everything
     // the user sees, so on its own it has to say why there is no binary and
     // which command fixes it.
     log.error(`no prebuilt agit binary for ${process.platform}/${process.arch}.`);

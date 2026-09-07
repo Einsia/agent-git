@@ -14,8 +14,9 @@
 //!    it against the matching line in the same release's `SHA256SUMS` — the checksum string
 //!    comes from the release too, so the trust anchor is the GitHub account's control over its
 //!    releases, and the hub only points the way.
-//! 4. Persisting is a temp file plus an atomic `rename`: lose power mid-upgrade and either the
-//!    old binary is there unchanged or the new one is fully in place, never half an executable.
+//!
+//! Replacement stages the executable before publishing it. Windows moves the running image
+//! aside and schedules cleanup after exit; other platforms replace it with an atomic rename.
 //!
 //! ## The passing nudge (the passive path)
 //!
@@ -175,7 +176,7 @@ fn compare(current: &str, latest: &str) -> Ordering {
 
 // ── Download and atomic replace ───────────────────────────────────────
 
-/// The targets release.yml builds (Windows is not in the matrix — install from source there).
+/// Download targets and package keys must match the release artifact contract.
 fn triple() -> Result<&'static str> {
     let t = std::env::consts::ARCH;
     let os = std::env::consts::OS;
@@ -184,6 +185,7 @@ fn triple() -> Result<&'static str> {
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         _ => bail!(
             "no prebuilt binary for {os}/{t} — build from source: git clone https://github.com/Einsia/agent-git && ./setup.sh"
         ),
@@ -269,10 +271,14 @@ fn download_and_replace(latest: &crate::hub::CliVersion) -> Result<()> {
         let _ = std::fs::remove_dir_all(&unpack);
         bail!("tar failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    let bytes = std::fs::read(unpack.join("agit"))
-        .context("the archive did not contain a bare `agit` binary")?;
+    let bytes = std::fs::read(unpack.join(executable_name()))
+        .context("the archive did not contain the platform executable")?;
     let _ = std::fs::remove_dir_all(&unpack);
     atomic_replace(&exe, &bytes)
+}
+
+fn executable_name() -> String {
+    format!("agit{}", std::env::consts::EXE_SUFFIX)
 }
 
 fn atomic_replace(exe: &Path, bytes: &[u8]) -> Result<()> {
@@ -284,12 +290,19 @@ fn atomic_replace(exe: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
-    // rename is atomic: processes reading the exe (this one included) keep the old inode; the
-    // next `agit` invocation gets the new one. A rename inside one directory stays on one
-    // filesystem.
-    std::fs::rename(&tmp, exe).inspect_err(|_| {
+    #[cfg(windows)]
+    {
+        let result = self_replace::self_replace(&tmp);
         let _ = std::fs::remove_file(&tmp);
-    })?;
+        result.context("cannot replace the running Windows executable")?;
+    }
+    #[cfg(not(windows))]
+    {
+        // A rename preserves the running inode while new invocations open the replacement.
+        std::fs::rename(&tmp, exe).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?;
+    }
     Ok(())
 }
 
@@ -303,6 +316,7 @@ fn npm_platform_key() -> Result<&'static str> {
         ("linux", "aarch64") => Ok("linux-arm64"),
         ("macos", "x86_64") => Ok("darwin-x64"),
         ("macos", "aarch64") => Ok("darwin-arm64"),
+        ("windows", "x86_64") => Ok("win32-x64"),
         (os, t) => bail!(
             "no prebuilt binary for {os}/{t} — build from source: git clone https://github.com/Einsia/agent-git && ./setup.sh"
         ),
@@ -372,8 +386,8 @@ fn download_from_npm(latest: &crate::hub::CliVersion) -> Result<()> {
         let _ = std::fs::remove_dir_all(&unpack);
         bail!("tar failed: {}", String::from_utf8_lossy(&out.stderr));
     }
-    let bytes = std::fs::read(unpack.join("package/bin/agit"))
-        .context("the platform package did not contain package/bin/agit")?;
+    let bytes = std::fs::read(unpack.join("package/bin").join(executable_name()))
+        .context("the platform package did not contain its executable")?;
     let _ = std::fs::remove_dir_all(&unpack);
     atomic_replace(&exe, &bytes)
 }

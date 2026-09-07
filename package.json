@@ -52,6 +52,7 @@
     "@einsia/agent-git-linux-x64": "0.1.1",
     "@einsia/agent-git-linux-arm64": "0.1.1",
     "@einsia/agent-git-darwin-x64": "0.1.1",
-    "@einsia/agent-git-darwin-arm64": "0.1.1"
+    "@einsia/agent-git-darwin-arm64": "0.1.1",
+    "@einsia/agent-git-win32-x64": "0.1.1"
   }
 }

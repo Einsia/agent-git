@@ -13,7 +13,31 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
-/// The agit home directory: `$AGIT_HOME` (non-empty) → `$HOME/.agit`.
+/// The explicit home wins; native Windows shells may provide only their user profile.
+pub fn user_home() -> Option<PathBuf> {
+    user_home_from(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+        cfg!(windows),
+    )
+}
+
+fn user_home_from(
+    home: Option<&std::ffi::OsStr>,
+    profile: Option<&std::ffi::OsStr>,
+    windows: bool,
+) -> Option<PathBuf> {
+    home.filter(|path| !path.is_empty())
+        .or_else(|| {
+            windows
+                .then_some(profile)
+                .flatten()
+                .filter(|path| !path.is_empty())
+        })
+        .map(PathBuf::from)
+}
+
+/// The agit home directory: an explicit `$AGIT_HOME` or `.agit` under the user home.
 ///
 /// An empty string is rejected: used as-is, `AGIT_HOME=""` resolves to the **relative** path
 /// `.agit`, and a hidden store grows under every working directory.
@@ -24,9 +48,9 @@ pub fn agit_home() -> Result<PathBuf> {
             return Ok(PathBuf::from(h));
         }
     }
-    let home = std::env::var("HOME")
-        .context("neither $HOME nor $AGIT_HOME is set — cannot locate the agit home")?;
-    Ok(PathBuf::from(home).join(".agit"))
+    let home =
+        user_home().context("no user home or $AGIT_HOME is set — cannot locate the agit home")?;
+    Ok(home.join(".agit"))
 }
 
 /// The local store: `$AGIT_HOME/store/`.
@@ -480,6 +504,27 @@ mod tests {
         // An empty string falls back; it must not become an empty address.
         assert_eq!(resolve(Some("   ")), DEFAULT_HUB_URL);
         assert_eq!(resolve(None), DEFAULT_HUB_URL);
+    }
+
+    #[test]
+    fn native_windows_home_falls_back_to_the_profile_without_changing_unix_resolution() {
+        use std::ffi::OsStr;
+        let explicit = OsStr::new("explicit-home");
+        let profile = OsStr::new("profile-home");
+        assert_eq!(
+            user_home_from(None, Some(profile), true),
+            Some(PathBuf::from(profile))
+        );
+        assert_eq!(
+            user_home_from(Some(OsStr::new("")), Some(profile), true),
+            Some(PathBuf::from(profile))
+        );
+        assert_eq!(
+            user_home_from(Some(explicit), Some(profile), true),
+            Some(PathBuf::from(explicit))
+        );
+        assert_eq!(user_home_from(None, Some(profile), false), None);
+        assert_eq!(user_home_from(None, Some(OsStr::new("")), true), None);
     }
 
     #[test]

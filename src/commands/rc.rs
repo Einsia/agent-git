@@ -6,7 +6,8 @@
 //! next step is a bug (see the CLI conventions in `commands/mod.rs`).
 
 use super::CmdResult;
-use crate::rc::{control, identity};
+use crate::rc::control;
+use crate::rc::identity;
 use crate::{ExitCode, infra::config, ui};
 use clap::{Args as ClapArgs, Subcommand};
 
@@ -438,12 +439,21 @@ fn start(args: StartArgs) -> CmdResult {
     if args.detach {
         // Re-exec ourselves without --detach, fully detached from this terminal.
         let exe = std::env::current_exe()?;
-        let child = std::process::Command::new(exe)
+        let mut command = std::process::Command::new(exe);
+        command
             .args(["rc", "start"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use windows_sys::Win32::System::Threading::{
+                CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+            };
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        }
+        let child = command.spawn()?;
         println!(
             "  {} daemon running in the background (pid {})",
             ui::ok("✓"),

@@ -13,9 +13,9 @@
  */
 
 import { createRequire } from 'node:module'
-import { chmodSync, copyFileSync, existsSync, mkdirSync } from 'node:fs'
-import { homedir, platform, arch, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { chmodSync, copyFileSync, mkdirSync } from 'node:fs'
+import { homedir, platform, arch } from 'node:os'
+import { join, delimiter } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const require = createRequire(import.meta.url)
@@ -25,23 +25,7 @@ function dim(m) { console.log(`\x1b[2m${m}\x1b[0m`) }
 function ok(m) { console.log(`\x1b[32m✓\x1b[0m ${m}`) }
 function fail(m) { console.error(`\x1b[31m✗ ${m}\x1b[0m`) }
 
-// node os/arch names → platform package suffix (one for one with the optionalDependencies of
-// @einsia/agent-git). Under Rosetta node reports x64, so probe the real hardware and install the
-// arm64 package instead.
-function packageKey() {
-  let a = arch()
-  if (platform() === 'darwin' && a === 'x64') {
-    const r = spawnSync('sysctl', ['-n', 'sysctl.proc_translated'], { encoding: 'utf8' })
-    if (!r.error && r.status === 0 && (r.stdout || '').trim() === '1') a = 'arm64'
-  }
-  const map = {
-    'linux/x64': 'linux-x64',
-    'linux/arm64': 'linux-arm64',
-    'darwin/x64': 'darwin-x64',
-    'darwin/arm64': 'darwin-arm64',
-  }
-  return map[`${platform()}/${a}`] || null
-}
+const { packageKey, binaryName } = require('@einsia/agent-git/npm/lib/platform.js')
 
 function main() {
   const t = packageKey()
@@ -54,7 +38,7 @@ function main() {
 
   let bin
   try {
-    bin = require.resolve(`@einsia/agent-git-${t}/bin/agit`)
+    bin = require.resolve(`@einsia/agent-git-${t}/bin/${binaryName()}`)
   } catch {
     fail(`platform package @einsia/agent-git-${t} is missing (npm skipped it as an optional dep?).`)
     say('If you are on an unsupported platform, build from source:')
@@ -66,7 +50,7 @@ function main() {
 
   const targetDir = join(homedir(), '.local', 'bin')
   mkdirSync(targetDir, { recursive: true })
-  const target = join(targetDir, 'agit')
+  const target = join(targetDir, binaryName())
   copyFileSync(bin, target)
   chmodSync(target, 0o755)
 
@@ -77,8 +61,8 @@ function main() {
   }
   ok(`installed ${check.stdout.trim()} → ${target}`)
 
-  if (!process.env.PATH?.split(':').includes(targetDir)) {
-    dim(`note: ${targetDir} is not on your PATH — add it (e.g. in ~/.profile)`)
+  if (!process.env.PATH?.split(delimiter).includes(targetDir)) {
+    dim(`note: ${targetDir} is not on your PATH — add it to your ${platform() === 'win32' ? 'user environment variables' : 'shell profile'}`)
   }
 
   // "installed by default at download time": hooks + skill + MCP + AGENTS.md in one pass. A

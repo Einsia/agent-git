@@ -58,8 +58,8 @@ pub struct Cursor;
 const TRANSCRIPTS: &str = "agent-transcripts";
 
 fn projects_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("$HOME is not set")?;
-    Ok(PathBuf::from(home).join(".cursor").join("projects"))
+    let home = crate::infra::config::user_home().context("the user home is not set")?;
+    Ok(home.join(".cursor").join("projects"))
 }
 
 /// Maps a cwd to Cursor's project directory name.
