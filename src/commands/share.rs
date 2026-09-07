@@ -208,8 +208,10 @@ pub fn run(args: Args) -> CmdResult {
                 return Ok(ExitCode::Ok);
             }
             None => {
-                ui::error("creating a share requires an interactive confirmation.");
-                ui::hint("run `agit share` from a terminal and confirm the target and visibility");
+                ui::error("creating a share requires confirmation.");
+                ui::hint(
+                    "rerun with -y (or --yes) to confirm the target and visibility, or confirm from a terminal",
+                );
                 return Ok(ExitCode::Interactive);
             }
         }
