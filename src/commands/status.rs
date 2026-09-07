@@ -18,7 +18,7 @@ use clap::Args as ClapArgs;
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Also scan runtime directories for unadopted sessions (slower)
+    /// Also inspect runtime indexes for unadopted sessions (slower; SQLite may maintain sidecars)
     #[arg(long)]
     pub check_missing: bool,
 }
@@ -193,8 +193,6 @@ pub fn run(args: Args) -> CmdResult {
         ui::hint("--check-missing lists this repo’s unadopted sessions");
     }
 
-    // The status computation itself is local. The main startup path may have performed the
-    // separate, best-effort once-a-day version check before dispatching this command.
     Ok(ExitCode::Ok)
 }
 

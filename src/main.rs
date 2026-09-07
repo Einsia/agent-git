@@ -93,7 +93,7 @@ fn main() {
         match agit::tui::should_enter() {
             agit::tui::Verdict::Enter => {
                 commands::upgrade::maybe_startup_nudge("resume", cli.json);
-                if let Some(code) = enter_and_migrate(cli.directory.as_deref()) {
+                if let Some(code) = prepare_startup(cli.directory.as_deref(), false) {
                     exit(code);
                 }
                 exit(dispatch(Commands::Resume(Default::default()), false));
@@ -107,6 +107,7 @@ fn main() {
     // ahead of the JSON that the consumer cannot parse.
     let json = commands::json_requested(cli.json, &command);
     let command_name = commands::command_name(&command);
+    let read_only = matches!(command, Commands::Status(_));
     // A best-effort, once-a-day update hint belongs to the process startup path so it also
     // appears for ordinary commands, not only after a successful push. The helper skips the JSON
     // path because stdout there is a strict machine-readable envelope.
@@ -121,7 +122,7 @@ fn main() {
         }
         let directory = cli.directory.clone();
         let code = commands::json::capture(command_name, || {
-            if let Some(code) = enter_and_migrate(directory.as_deref()) {
+            if let Some(code) = prepare_startup(directory.as_deref(), read_only) {
                 return code;
             }
             dispatch(command, true)
@@ -129,27 +130,28 @@ fn main() {
         exit(code);
     }
 
-    if let Some(code) = enter_and_migrate(cli.directory.as_deref()) {
+    if let Some(code) = prepare_startup(cli.directory.as_deref(), read_only) {
         exit(code);
     }
     exit(dispatch(command, false));
 }
 
-/// Enter the directory given by `-C` and run the startup migration. `Some(code)` = failure, exit
-/// with that code.
-///
-/// All three paths go through it (bare `agit`, the JSON envelope, ordinary dispatch), and the JSON
-/// one has to go through it **inside** the envelope — so it is one function, not the same code
-/// written out three times.
-fn enter_and_migrate(directory: Option<&std::path::Path>) -> Option<i32> {
+/// Apply the working directory before inspecting storage. Read-only inspection must refuse
+/// pending recovery without performing it; JSON callers keep failures inside their envelope.
+fn prepare_startup(directory: Option<&std::path::Path>, read_only: bool) -> Option<i32> {
     if let Some(d) = directory
         && let Err(e) = std::env::set_current_dir(d)
     {
         agit::ui::error(&format!("cannot enter {}: {e}", d.display()));
         return Some(agit::ExitCode::Usage.as_i32());
     }
-    if let Err(e) = commands::migration::migrate_startup() {
-        agit::ui::error(&format!("local storage migration failed: {e:#}"));
+    let prepared = if read_only {
+        commands::migration::check_readonly_startup()
+    } else {
+        commands::migration::migrate_startup().map(|_| ())
+    };
+    if let Err(e) = prepared {
+        agit::ui::error(&format!("local storage preparation failed: {e:#}"));
         return Some(agit::ExitCode::Precondition.as_i32());
     }
     None

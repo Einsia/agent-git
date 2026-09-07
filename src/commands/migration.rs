@@ -604,6 +604,32 @@ pub fn migrate_startup() -> Result<Report> {
     migrate_startup_at(&home, &repos)
 }
 
+/// Inspect recovery prerequisites without creating storage, acquiring locks, or migrating refs.
+/// Legacy history can be displayed, but interrupted publication cannot be reported as settled.
+pub fn check_readonly_startup() -> Result<()> {
+    let home = crate::infra::config::agit_home()?;
+    anyhow::ensure!(
+        startup_recovery_evidence(&home)?.is_empty(),
+        "local storage has pending recovery; complete recovery through the original AgentGit store before inspecting status"
+    );
+    for (_, _, path) in super::clone::list_local()? {
+        let repo = Repo::at(&path);
+        let checkout_recovery = super::plumbing::interrupted_checkout_metadata_present(&repo)?;
+        let legacy_recovery = if checkout_recovery {
+            false
+        } else {
+            probe_legacy_storage_checkout_recovery(&repo, MigrationFailureKind::Skippable)
+                .map_err(RepoMigrationFailure::into_error)?
+        };
+        anyhow::ensure!(
+            !checkout_recovery && !legacy_recovery,
+            "{} has pending recovery; complete recovery through the original AgentGit store before inspecting status",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn migrate_startup_at(home: &Path, repos: &Path) -> Result<Report> {
     std::fs::create_dir_all(home)?;
     let mut recovery_snapshot = startup_recovery_evidence(home)?;
