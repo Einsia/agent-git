@@ -49,7 +49,7 @@ pub struct Args {
     #[arg(long, value_name = "pat")]
     pub grep: Option<String>,
     /// Only recent ones (24h / 7d / 4w).
-    #[arg(long, value_name = "duration")]
+    #[arg(long, value_name = "duration", value_parser = parse_since_git)]
     pub since: Option<String>,
     /// One line per turn.
     #[arg(long)]
@@ -196,15 +196,13 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
     };
-    let since_git = args.since.as_deref().map(parse_since_git);
-
     let rows = match turns(
         &repo,
         &head,
         args.limit,
         args.kind.as_deref(),
         args.grep.as_deref(),
-        since_git.as_deref(),
+        args.since.as_deref(),
         &args.paths,
     ) {
         Ok(rows) => rows,
@@ -431,15 +429,17 @@ fn resolve_head(repo: &Repo, t: &str) -> Option<String> {
 }
 
 /// `24h`/`7d`/`4w` → the form `git --since` accepts.
-fn parse_since_git(s: &str) -> String {
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
-    let unit = match unit {
-        "h" => "hours",
-        "d" => "days",
-        "w" => "weeks",
-        _ => unit,
-    };
-    format!("{num} {unit} ago")
+fn parse_since_git(s: &str) -> Result<String, String> {
+    let invalid = || "expected a non-negative whole number followed by h, d, or w".to_owned();
+    let (num, unit) = [("h", "hours"), ("d", "days"), ("w", "weeks")]
+        .into_iter()
+        .find_map(|(suffix, unit)| s.strip_suffix(suffix).map(|num| (num, unit)))
+        .ok_or_else(invalid)?;
+    if num.is_empty() || !num.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let count = num.parse::<u32>().map_err(|_| invalid())?;
+    Ok(format!("{count} {unit} ago"))
 }
 
 /// The context repo (slug + branch).
@@ -838,9 +838,23 @@ mod tests {
 
     #[test]
     fn parses_since() {
-        assert_eq!(super::parse_since_git("24h"), "24 hours ago");
-        assert_eq!(super::parse_since_git("7d"), "7 days ago");
-        assert_eq!(super::parse_since_git("4w"), "4 weeks ago");
+        assert_eq!(super::parse_since_git("24h").unwrap(), "24 hours ago");
+        assert_eq!(super::parse_since_git("7d").unwrap(), "7 days ago");
+        assert_eq!(super::parse_since_git("4w").unwrap(), "4 weeks ago");
+        assert_eq!(super::parse_since_git("0d").unwrap(), "0 days ago");
+        for invalid in [
+            "",
+            "h",
+            "-1d",
+            "+1d",
+            "1.5d",
+            "24hours",
+            "4294967296d",
+            "\u{5929}",
+            "1\u{5929}",
+        ] {
+            assert!(super::parse_since_git(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

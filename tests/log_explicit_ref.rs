@@ -3,6 +3,37 @@ use sha2::{Digest, Sha256};
 use std::{fs, process::Command};
 
 #[test]
+fn invalid_since_is_a_usage_error_before_repository_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    for duration in [
+        "",
+        "h",
+        "1.5d",
+        "24hours",
+        "4294967296d",
+        "\u{5929}",
+        "1\u{5929}",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agit"))
+            .args(["log", "missing/repo@main", "--since", duration])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", tmp.path())
+            .env("AGIT_HOME", tmp.path().join("agit"))
+            .env("CI", "1")
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(agit::ExitCode::Usage.as_i32()));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("invalid value"), "{error}");
+        assert!(error.contains("--since"), "{error}");
+        assert!(!tmp.path().join("agit").exists());
+    }
+}
+
+#[test]
 fn slash_ref_uses_the_explicit_session_repository() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
