@@ -17,7 +17,7 @@
 //! ```json
 //! ```
 //!
-//! # Body fields; the runtime and the id are in the path
+//! # Runtime and id are in the path
 //!
 //! Recording one thing in two places becomes inconsistent one day, and the path is the copy you
 //! hold first when looking a session up — so the body does not repeat `runtime` and
@@ -39,6 +39,11 @@
 //!   materialize into the runtime — lineage not recorded at install time is lost forever.
 //! * `agit commit` fills in cwd, ownership and branch as it settles, so committing the same
 //!   session again and again needs no session id.
+//!
+//! A branch can retain historical runtime instances, but only links without `superseded_by` are
+//! active claims. Materialization records the exact branch tip in `materialized_from`; a repeated
+//! prepare can therefore reuse the same instance, while a newer tip can replace an instance only
+//! after its byte baseline proves that no runtime content was appended.
 //!
 //! `agit clone` does **not** write one: it only fetches, it does not run (see
 //! [`crate::commands::clone`]); materializing is `agit run`'s job.
@@ -88,17 +93,22 @@ pub struct Link {
     /// SHA-256 of the baseline region: doctor verifies that "the live transcript has had no
     /// non-append write inside the baseline".
     pub baseline_hash: Option<String>,
-    /// The user dismissed this unclaimed session from the naming inbox. This is presentation
-    /// state, not ownership evidence; an ignored link is still unmanaged until it is claimed.
+    /// The exact session-branch tip represented by this runtime instance's recorded baseline.
+    ///
+    /// A runtime-local id is not durable lineage. This commit id lets resume distinguish an
+    /// idempotent repeat from a branch that advanced and needs a fresh materialization. A
+    /// successful settlement advances this tip together with the byte baseline.
+    pub materialized_from: Option<String>,
+    /// The runtime instance that replaced this claim, in `<runtime>/<session-id>` form.
+    ///
+    /// The transcript remains in the runtime for recovery, but a superseded link is no longer a
+    /// candidate for implicit context or branch settlement.
+    pub superseded_by: Option<String>,
+    /// The user dismissed this unclaimed session from the naming inbox.
     pub naming_ignored: bool,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-/// The on-disk form: optional values are omitted rather than written as `null`, and default
-/// boolean state is omitted so a missing key and an explicit false value have one representation.
+/// The on-disk form. Empty optional fields are omitted rather than written as `null`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Body {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,8 +123,16 @@ struct Body {
     baseline_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     baseline_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    materialized_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     naming_ignored: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Link {
@@ -128,6 +146,8 @@ impl Link {
             branch: None,
             baseline_bytes: None,
             baseline_hash: None,
+            materialized_from: None,
+            superseded_by: None,
             naming_ignored: false,
         }
     }
@@ -140,8 +160,20 @@ impl Link {
             branch: self.branch.clone(),
             baseline_bytes: self.baseline_bytes,
             baseline_hash: self.baseline_hash.clone(),
+            materialized_from: self.materialized_from.clone(),
+            superseded_by: self.superseded_by.clone(),
             naming_ignored: self.naming_ignored,
         }
+    }
+
+    /// `<runtime>/<session-id>`, the machine-local identity used in supersession records.
+    pub fn instance(&self) -> String {
+        format!("{}/{}", self.source, self.session_id)
+    }
+
+    /// Only active links may resolve implicit context or advance their claimed branch.
+    pub fn is_active(&self) -> bool {
+        self.superseded_by.is_none()
     }
 
     /// The on-disk JSON. Shared by the tests and `write`, so what you see is what is written.
@@ -153,6 +185,21 @@ impl Link {
     pub fn resolve(&self) -> Option<PathBuf> {
         let ad = adapter::get(&self.source).ok()?;
         ad.resolve(&self.session_id, self.cwd.as_ref().map(Path::new))
+            // Claude Desktop deliberately has no listing/lookup surface of its own: the Code
+            // tab writes Claude Code jsonl and the Claude Code adapter owns the read side. Keep
+            // that de-duplication for session discovery, but let an already-claimed link read
+            // the file it actually points at. Without this fallback, an ExportOnly materialized
+            // link can never prove that its baseline is untouched and every repeated prepare
+            // becomes unverifiable.
+            .or_else(|| {
+                (self.source == "claude-desktop")
+                    .then(|| {
+                        adapter::get("claude-code")
+                            .ok()?
+                            .resolve(&self.session_id, self.cwd.as_ref().map(Path::new))
+                    })
+                    .flatten()
+            })
     }
 
     /// Read the transcript (raw bytes).
@@ -248,6 +295,8 @@ pub fn read(path: &Path) -> Option<Link> {
         branch: body.branch,
         baseline_bytes: body.baseline_bytes,
         baseline_hash: body.baseline_hash,
+        materialized_from: body.materialized_from,
+        superseded_by: body.superseded_by,
         naming_ignored: body.naming_ignored,
     })
 }
@@ -300,13 +349,160 @@ pub fn touched_at(store: &Store, link: &Link) -> std::time::SystemTime {
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
 }
 
+/// Cross-process exclusion for changing the active runtime claim of one session branch.
+///
+/// Per-session locks cannot protect a one-branch invariant: two materializations mint different
+/// ids and therefore take different locks. The stable digest gives every process claiming the
+/// same branch one shared lock without putting owner, repo, or branch names into a filesystem
+/// path.
+pub struct BranchLock {
+    _branch: std::fs::File,
+    _repository: std::fs::File,
+}
+
+pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock> {
+    use fs2::FileExt as _;
+    use sha2::Digest as _;
+
+    let repository = lock_repository(store, slug, false)?;
+    let mut digest = sha2::Sha256::new();
+    digest.update(slug.as_bytes());
+    digest.update([0]);
+    digest.update(branch.as_bytes());
+    let dir = store.root().join(".locks").join("branches");
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let path = dir.join(format!("{}.lock", hex::encode(digest.finalize())));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("cannot lock {}", path.display()))?;
+    Ok(BranchLock {
+        _branch: file,
+        _repository: repository,
+    })
+}
+
+/// Repository moves exclude every branch writer, including branches created during promotion.
+/// Shared repository guards let ordinary writes to independent branches proceed concurrently.
+fn lock_repository(store: &Store, slug: &str, exclusive: bool) -> Result<std::fs::File> {
+    use fs2::FileExt as _;
+    use sha2::Digest as _;
+
+    let dir = store.root().join(".locks").join("repositories");
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let path = dir.join(format!("{}.lock", hex::encode(sha2::Sha256::digest(slug))));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    if exclusive {
+        file.lock_exclusive()
+    } else {
+        fs2::FileExt::lock_shared(&file)
+    }
+    .with_context(|| format!("cannot lock {}", path.display()))?;
+    Ok(file)
+}
+
+/// Namespace guards precede link locks and use a stable order across overlapping promotions.
+pub fn lock_repositories_exclusive(store: &Store, slugs: &[&str]) -> Result<Vec<std::fs::File>> {
+    let mut slugs = slugs.to_vec();
+    slugs.sort_unstable();
+    slugs.dedup();
+    slugs
+        .into_iter()
+        .map(|slug| lock_repository(store, slug, true))
+        .collect()
+}
+
+/// Whether the runtime transcript still consists exactly of its recorded materialization.
+///
+/// Replacement is allowed only for `Untouched`. Missing hashes from legacy links and unreadable
+/// transcripts fail closed: inability to prove that no work exists must never discard a writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializationActivity {
+    Untouched,
+    Appended,
+    Rewritten,
+    Unverifiable,
+}
+
+pub fn materialization_activity(link: &Link) -> MaterializationActivity {
+    use sha2::Digest as _;
+
+    let (Some(baseline), Some(expected)) = (link.baseline_bytes, &link.baseline_hash) else {
+        return MaterializationActivity::Unverifiable;
+    };
+    let Ok(bytes) = link.read_bytes() else {
+        return MaterializationActivity::Unverifiable;
+    };
+    let Ok(baseline) = usize::try_from(baseline) else {
+        return MaterializationActivity::Unverifiable;
+    };
+    if bytes.len() < baseline {
+        return MaterializationActivity::Rewritten;
+    }
+    let actual = hex::encode(sha2::Sha256::digest(&bytes[..baseline]));
+    if actual != *expected {
+        return MaterializationActivity::Rewritten;
+    }
+    if bytes.len() == baseline {
+        MaterializationActivity::Untouched
+    } else {
+        MaterializationActivity::Appended
+    }
+}
+
+/// Whether a link still claims the exact branch destination named by a caller.
+///
+/// A legacy link without an owner belongs to the signed-in namespace, so it remains compatible
+/// with the historical representation. A recorded owner, however, is part of the destination and
+/// must match too; checking only the branch name can settle a rerouted runtime into another repo.
+pub fn claims_branch(link: &Link, owner: &str, agent: &str, branch: &str) -> bool {
+    link.is_active()
+        && link.agent.as_deref() == Some(agent)
+        && link.branch.as_deref() == Some(branch)
+        && link
+            .owner
+            .as_deref()
+            .is_none_or(|candidate| candidate == owner)
+}
+
+/// Active runtime claims for one session branch. A missing owner is the legacy personal-repo
+/// form and keeps the same compatibility rule as commit and resume.
+pub fn active_for_branch(store: &Store, owner: &str, agent: &str, branch: &str) -> Vec<Link> {
+    list(store)
+        .into_iter()
+        .filter(|link| {
+            link.is_active()
+                && link.agent.as_deref() == Some(agent)
+                && link.branch.as_deref() == Some(branch)
+                && link
+                    .owner
+                    .as_deref()
+                    .is_none_or(|candidate| candidate == owner)
+        })
+        .collect()
+}
+
 /// The link touched most recently.
 ///
 /// Used by the commands that still take the global-latest strategy. It must pick by time and not
 /// take the first of the list: the list is sorted by (runtime, id), so taking the first picks by
 /// lexicographic uuid order, which has nothing to do with "most recent".
 pub fn latest(store: &Store) -> Option<Link> {
-    list(store).into_iter().max_by_key(|l| touched_at(store, l))
+    list(store)
+        .into_iter()
+        .filter(Link::is_active)
+        .max_by_key(|l| touched_at(store, l))
 }
 
 /// Read one specific link from the store (None when it does not exist).
@@ -463,10 +659,12 @@ mod tests {
         (d, s)
     }
 
-    /// `runtime` / `session_id` stay in the path; writing them down again adds one more place that
+    /// Runtime and session identity belong to the path, not the JSON body.
+    ///
+    /// `runtime` / `session_id` are in the path; writing them down again adds one more place that
     /// can disagree.
     #[test]
-    fn body_omits_path_identity_fields() {
+    fn body_keeps_runtime_identity_in_the_path() {
         let (_d, s) = store();
         let mut l = Link::new("codex", "AB", Some(Path::new("/repo/one")));
         l.agent = Some("photo".into());
@@ -567,6 +765,32 @@ mod tests {
         write(&s, &Link::new("codex", "SAME", None)).unwrap();
         write(&s, &Link::new("claude-code", "SAME", None)).unwrap();
         assert_eq!(list(&s).len(), 4);
+    }
+
+    #[test]
+    fn superseded_links_are_not_active_branch_claims() {
+        let (_d, s) = store();
+        let mut old = Link::new("codex", "OLD", None);
+        old.owner = Some("alice".into());
+        old.agent = Some("photo".into());
+        old.branch = Some("work".into());
+        old.materialized_from = Some("a".repeat(40));
+        old.superseded_by = Some("codex/NEW".into());
+        write(&s, &old).unwrap();
+
+        let mut current = Link::new("codex", "NEW", None);
+        current.owner = Some("alice".into());
+        current.agent = Some("photo".into());
+        current.branch = Some("work".into());
+        current.materialized_from = Some("b".repeat(40));
+        write(&s, &current).unwrap();
+
+        let active = active_for_branch(&s, "alice", "photo", "work");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].session_id, "NEW");
+        let round_trip = get(&s, "codex", "OLD").unwrap();
+        assert_eq!(round_trip.materialized_from, Some("a".repeat(40)));
+        assert_eq!(round_trip.superseded_by.as_deref(), Some("codex/NEW"));
     }
 
     #[test]

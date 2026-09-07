@@ -21,8 +21,8 @@
 //! UUID form, so mint a new one (`mint_id()`).
 //!
 //! The cost is that the new session and the original one have **no inferable relationship** —
-//! this is exactly why the store link carries a `parent` field: lineage must be recorded
-//! explicitly at install time; it cannot be reconstructed afterward.
+//! this is why the store link records the branch claim and `materialized_from` tip explicitly at
+//! install time; lineage cannot be reconstructed afterward.
 
 use crate::Result;
 use crate::adapter::{self, Installed};

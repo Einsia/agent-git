@@ -317,7 +317,9 @@ fn land(args: LandArgs) -> CmdResult {
         );
     }
     let store = crate::domain::store::Store::open_or_init()?;
-    let lk = landed_link(&store, &args, name);
+    let _branch_guard = crate::domain::link::lock_branch(&store, &args.slug, &args.branch)?;
+    let _link_guard = crate::domain::link::lock(&store, &args.runtime, &args.session)?;
+    let lk = landed_link(&store, &args, name)?;
 
     if repo.commit_count() == 0 {
         super::import::create_main_file_line(&repo, owner, &lk)?;
@@ -365,47 +367,40 @@ fn materialize_branch(repo: &crate::domain::repo::Repo, branch: &str) -> crate::
     Ok(true)
 }
 
-/// What this session's store link must look like **after landing**: it adds to the **existing**
-/// one instead of creating a new one.
-///
-/// land is idempotent and runs on every session start/resume (and again before every turn's
-/// settlement), yet several fields on the link are not its output at all — `baseline_bytes` /
-/// `baseline_hash` are the **settlement baseline** recorded the moment `agit resume`'s slow path
-/// (and fork) materializes the VIEW into the runtime. `link::write` overwrites the whole file and
-/// does not merge, so writing back a brand-new `Link::new` here every time erases that baseline
-/// permanently.
-///
-/// Erasing it costs far more than one field: it alone decides `commit::settle_bytes`'s mode. With
-/// no baseline the path is "native continuation", comparing the committed LOG against the live
-/// transcript byte for byte for continuity — but materialized content ids are recast by
-/// `domain::install` and can never be a prefix of the LOG, so every turn is judged
-/// `already claimed by another session` and exits Policy. Not one line of the remotely driven
-/// conversation lands in the repo, and nothing goes red: settlement runs in the supervisor's
-/// subprocess, and a failure leaves one line in the log.
-///
-/// Reading the store **stays inside this function** and is not passed in by the caller: a caller
-/// can always pass an empty one, which is that same failure in its original shape — only now no
-/// test can see it. For the same reason the starting point is the whole old link rather than a
-/// field-by-field pick: whoever adds a field to `Link` later need not know this place exists.
-///
-/// The other way round, cwd / agent / branch always come from this landing: the first is the
-/// directory the daemon actually runs this session in right now, the other two are the agent repo
-/// and branch the hub just allocated. The old record in the store has no say over these three;
-/// copying it makes settlement advance the wrong branch.
+/// A repeated landing on the same destination retains its materialization baseline because
+/// runtime-local transcript identities differ from the committed evidence. A reroute cannot
+/// assume that another branch contains that prefix, so it must use native continuity checks.
+/// Superseded instances remain historical and require explicit import onto a recovery line.
 fn landed_link(
     store: &crate::domain::store::Store,
     args: &LandArgs,
     agent: &str,
-) -> crate::domain::link::Link {
+) -> crate::Result<crate::domain::link::Link> {
     let mut lk = crate::domain::link::get(store, &args.runtime, &args.session)
         .unwrap_or_else(|| crate::domain::link::Link::new(&args.runtime, &args.session, None));
+    anyhow::ensure!(
+        lk.is_active(),
+        "this runtime session was superseded; resume its active branch or import it onto a separate recovery line"
+    );
+    let owner = super::parse_slug(&args.slug)?.0;
+    let previous_owner = lk
+        .owner
+        .clone()
+        .or_else(crate::infra::credentials::current_user);
+    if previous_owner.as_deref() != Some(owner.as_str())
+        || !crate::domain::link::claims_branch(&lk, &owner, agent, &args.branch)
+    {
+        lk.baseline_bytes = None;
+        lk.baseline_hash = None;
+        lk.materialized_from = None;
+    }
     lk.cwd = Some(args.cwd.clone());
     lk.agent = Some(agent.to_string());
     if let Ok((owner, _)) = super::parse_slug(&args.slug) {
         lk.owner = Some(owner);
     }
     lk.branch = Some(args.branch.clone());
-    lk
+    Ok(lk)
 }
 
 fn start(args: StartArgs) -> CmdResult {
@@ -1032,78 +1027,48 @@ mod tests {
     }
 
     #[test]
-    fn landing_keeps_the_materialization_baseline_settlement_reads_from() {
+    fn landing_keeps_a_baseline_only_for_the_same_destination() {
         use crate::domain::link::{self, Link};
         use crate::domain::store::Store;
 
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path().join("store"));
-
-        // The link `agit resume`'s slow path registers right after materializing the VIEW.
-        let mut resumed = Link::new(
-            "claude-code",
-            "thread-1",
-            Some(std::path::Path::new("/home/alice/code/photo")),
-        );
+        let mut resumed = Link::new("claude-code", "thread", None);
+        resumed.owner = Some("alice".into());
         resumed.agent = Some("photo".into());
-        resumed.branch = Some("s-earlier".into());
+        resumed.branch = Some("work".into());
         resumed.baseline_bytes = Some(4096);
         resumed.baseline_hash = Some("f00d".into());
+        resumed.materialized_from = Some("a".repeat(40));
         link::write(&store, &resumed).unwrap();
-
-        // The daemon takes over the same session by thread id and lands this lineage. The argv
-        // comes from the real construction.
-        let full = super::land_argv(
-            "alice/photo",
-            AGENT_ID,
-            "s-202608220101-abcd",
-            "claude-code",
-            "thread-1",
-            "/home/alice/code/photo",
-        );
-        let mut argv = vec!["x".to_string()];
-        argv.extend(full.into_iter().skip(1));
-        let super::Action::Land(args) = Probe::try_parse_from(&argv).unwrap().cmd else {
-            panic!("parsed a different subcommand");
+        let mut args = super::LandArgs {
+            slug: "alice/photo".into(),
+            agent_id: AGENT_ID.into(),
+            branch: "work".into(),
+            runtime: "claude-code".into(),
+            session: "thread".into(),
+            cwd: "/home/alice/code/photo".into(),
         };
-        let landed = super::landed_link(&store, &args, "photo");
-        link::write(&store, &landed).unwrap();
+        let repeated = super::landed_link(&store, &args, "photo").unwrap();
+        assert_eq!(repeated.baseline_bytes, resumed.baseline_bytes);
+        assert_eq!(repeated.baseline_hash, resumed.baseline_hash);
+        assert_eq!(repeated.materialized_from, resumed.materialized_from);
+        assert_eq!(repeated.cwd.as_deref(), Some(args.cwd.as_str()));
 
-        let back = link::get(&store, "claude-code", "thread-1").expect("the link must still exist");
-        assert_eq!(
-            back.baseline_bytes,
-            Some(4096),
-            "landing must keep the materialization baseline; without it settlement switches to \
-             native continuation and judges every turn already claimed, so this remote session \
-             can never commit — land adds to the existing link instead of a fresh Link::new"
-        );
-        assert_eq!(
-            back.baseline_hash.as_deref(),
-            Some("f00d"),
-            "the baseline hash must survive too; doctor uses it to spot a non-append write to \
-             the live transcript below the baseline"
-        );
-        // The reverse: what the hub says now overrides the old record in the store; otherwise
-        // settlement advances the wrong branch.
-        assert_eq!(
-            back.branch.as_deref(),
-            Some("s-202608220101-abcd"),
-            "the hub allocates the branch, and landing must write the one for this turn"
-        );
-        assert_eq!(back.agent.as_deref(), Some("photo"));
-        assert_eq!(back.cwd.as_deref(), Some("/home/alice/code/photo"));
+        args.branch = "recovery".into();
+        let rerouted = super::landed_link(&store, &args, "photo").unwrap();
+        assert!(rerouted.baseline_bytes.is_none());
+        assert!(rerouted.baseline_hash.is_none());
+        assert!(rerouted.materialized_from.is_none());
+        assert_eq!(rerouted.branch.as_deref(), Some("recovery"));
 
-        // A first landing (no such link in the store yet) has no baseline to keep — that is a
-        // native session, and settlement runs the continuity check. A baseline invented out of
-        // nowhere would make it skip that check.
-        let empty = Store::at(dir.path().join("never-landed"));
-        let fresh = super::landed_link(&empty, &args, "photo");
-        assert_eq!(
-            fresh.baseline_bytes, None,
-            "a native session has no materialization baseline, and landing must not invent one; \
-             that would make settlement skip the continuity check"
-        );
-        assert_eq!(fresh.branch.as_deref(), Some("s-202608220101-abcd"));
-        assert_eq!(fresh.cwd.as_deref(), Some("/home/alice/code/photo"));
+        resumed.superseded_by = Some("claude-code/successor".into());
+        link::write(&store, &resumed).unwrap();
+        assert!(super::landed_link(&store, &args, "photo").is_err());
+        let empty = Store::at(dir.path().join("empty"));
+        let fresh = super::landed_link(&empty, &args, "photo").unwrap();
+        assert!(fresh.baseline_bytes.is_none());
+        assert!(fresh.baseline_hash.is_none());
+        assert!(fresh.materialized_from.is_none());
     }
 }

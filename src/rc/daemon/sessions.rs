@@ -53,6 +53,9 @@ impl Daemon {
                     let link = store
                         .as_ref()
                         .and_then(|s| crate::domain::link::get(s, r.runtime, &r.id));
+                    if link.as_ref().is_some_and(|link| !link.is_active()) {
+                        continue;
+                    }
                     out.push(LocalSession {
                         runtime_session_id: r.id.clone(),
                         runtime: r.runtime.to_string(),
@@ -185,6 +188,7 @@ impl Daemon {
                     "if its transcript exists it appears in the local sessions list; take it over from there",
                 ));
             }
+            require_active_runtime(&entry.runtime, &entry.thread_id)?;
             let roots = self.mirror.roots(&p.workspace_id);
             let cwd = policy::require_within(std::path::Path::new(&entry.cwd), &roots)
                 .map_err(|e| {
@@ -300,6 +304,7 @@ impl Daemon {
             project_id,
             likely_active: _,
         } = local;
+        require_active_runtime(&runtime, &p.session_id)?;
         let roots = self.mirror.roots(&p.workspace_id);
         let cwd = policy::require_within(&cwd, &roots).map_err(|e| {
             RpcError::new(ErrorCode::PathNotAllowed, e.to_string()).with_hint(
@@ -1027,5 +1032,41 @@ impl Daemon {
         // response carrying no seq against the event stream, or an `ended` from yesterday locks
         // the input box forever.
         Ok(self.stamped(info))
+    }
+}
+
+fn require_active_runtime(runtime: &str, session_id: &str) -> Result<(), RpcError> {
+    let store = crate::domain::store::Store::open()
+        .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))?;
+    let link = store
+        .as_ref()
+        .and_then(|store| crate::domain::link::get(store, runtime, session_id));
+    require_active_link(link.as_ref())
+}
+
+fn require_active_link(link: Option<&crate::domain::link::Link>) -> Result<(), RpcError> {
+    if link.is_some_and(|link| !link.is_active()) {
+        return Err(RpcError::new(
+            ErrorCode::SessionNotFound,
+            "this runtime session was superseded by a newer instance",
+        ).with_hint("resume the active branch, or import the historical transcript onto a separate recovery line"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod claim_tests {
+    #[test]
+    fn remote_resume_refuses_historical_claims_but_allows_unmanaged_sessions() {
+        let mut link = crate::domain::link::Link::new("codex", "old", None);
+        super::require_active_link(None).unwrap();
+        super::require_active_link(Some(&link)).unwrap();
+        link.superseded_by = Some("codex/current".into());
+        let error = super::require_active_link(Some(&link)).unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::protocol::ErrorCode::SessionNotFound as i32
+        );
+        assert!(error.message.contains("superseded"));
     }
 }

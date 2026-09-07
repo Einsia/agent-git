@@ -29,6 +29,8 @@ With no target at a terminal, this opens a session picker; choosing one hands th
 | `--tui` / `--no-tui` | Force or forbid the full-screen interface. `--tui` overrides the agent-session check but not `--json` / `-q` / `-y` |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
+Preparing the same branch tip, runtime, and directory again reuses the existing runtime session. A materialized instance whose branch advanced is superseded only when its recorded baseline proves that no new content exists; otherwise resume refuses before creating another writer.
+
 ## Examples
 
 ```bash

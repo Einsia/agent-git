@@ -62,7 +62,11 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     };
 
-    let links = link::list(&store);
+    let mut links = link::list(&store);
+    // Historical links remain visible for recovery, but they must not push the branch's current
+    // writer below the display limit. The stable sort keeps `link::list`'s deterministic order
+    // inside each group and avoids a filesystem metadata read in every comparator call.
+    links.sort_by_key(|link| !link.is_active());
     let committed = links.iter().filter(|l| l.agent.is_some()).count();
 
     print!(
@@ -88,12 +92,17 @@ pub fn run(args: Args) -> CmdResult {
                     l.agent
                         .clone()
                         .unwrap_or_else(|| ui::dim("unversioned").to_string()),
+                    if l.is_active() {
+                        "active".to_string()
+                    } else {
+                        ui::dim("superseded").to_string()
+                    },
                 ]
             })
             .collect();
         println!(
             "{}",
-            ui::table::render(&["session", "runtime", "AGENT"], &rows)
+            ui::table::render(&["session", "runtime", "AGENT", "state"], &rows)
         );
         if links.len() > 8 {
             println!("{}", ui::dim(&format!("… {} more", links.len() - 8)));

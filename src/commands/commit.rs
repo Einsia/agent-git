@@ -63,6 +63,8 @@ type SettlementInterleaveHook = Box<dyn FnOnce(&Repo, &str)>;
 thread_local! {
     static SETTLEMENT_INTERLEAVE_HOOK: std::cell::RefCell<Option<SettlementInterleaveHook>> =
         std::cell::RefCell::new(None);
+    static SETTLEMENT_PUBLICATION_HOOK: std::cell::RefCell<Option<SettlementInterleaveHook>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -86,6 +88,28 @@ fn maybe_interleave_settlement(repo: &Repo, branch: &str) {
 
 #[cfg(not(test))]
 fn maybe_interleave_settlement(_repo: &Repo, _branch: &str) {}
+
+#[cfg(test)]
+fn interleave_next_publication(hook: impl FnOnce(&Repo, &str) + 'static) {
+    SETTLEMENT_PUBLICATION_HOOK.with(|slot| {
+        let replaced = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            replaced.is_none(),
+            "a publication interleave hook is already installed"
+        );
+    });
+}
+
+#[cfg(test)]
+fn maybe_interleave_publication(repo: &Repo, branch: &str) {
+    let hook = SETTLEMENT_PUBLICATION_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(repo, branch);
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_interleave_publication(_repo: &Repo, _branch: &str) {}
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -572,6 +596,28 @@ fn hook_slug(
 fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Option<Target>> {
     let cwd = std::env::current_dir()?;
 
+    // A process that belongs to a superseded runtime must never fall through from its stable
+    // `AGIT_SESSION` branch identity to that branch's newer active link. The harness id identifies
+    // the transcript in front of the caller; carrying that exact stale link into `settle` produces
+    // the recovery refusal instead of reading another runtime's bytes. An explicit branch target
+    // still wins, because it is a deliberate instruction to settle the branch's active writer.
+    if matches!(args.target.as_deref(), None | Some("@"))
+        && let Some(lk) = superseded_harness_link(store)
+        && let (Some(slug), Some(branch)) = (super::context::slug_of_link(&lk), lk.branch.clone())
+    {
+        let (owner, name) = super::parse_slug(&slug)?;
+        let repo_dir = crate::infra::config::repo_dir(&owner, &name)?;
+        if Repo::open(&repo_dir).is_some() {
+            return Ok(Some(Target::Branch {
+                repo_dir,
+                slug,
+                branch,
+                link: lk,
+                via: "superseded harness session env",
+            }));
+        }
+    }
+
     // Unified form: `owner/repo@branch`.  It is resolved independently of the
     // current directory; the legacy bare branch / session-id forms below keep
     // their old context behavior for compatibility.
@@ -608,7 +654,8 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
         let mut hits: Vec<Link> = link::list(store)
             .into_iter()
             .filter(|l| {
-                l.agent.as_deref() == Some(name.as_str())
+                l.is_active()
+                    && l.agent.as_deref() == Some(name.as_str())
                     && l.branch.as_deref() == Some(branch.as_str())
                     // A link that records a namespace belongs to that namespace alone: when a
                     // personal and an org repo share a name, each finds its own.
@@ -643,9 +690,7 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
             }
             _ => {
                 if !quiet {
-                    ui::error(&format!(
-                        "{slug}@{branch} has multiple session links — can’t pick for you."
-                    ));
+                    report_multiple_links(&slug, &branch, &hits);
                 }
                 Ok(None)
             }
@@ -672,7 +717,8 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
                 let mut hits: Vec<Link> = links
                     .into_iter()
                     .filter(|l| {
-                        l.agent.as_deref() == Some(name.as_str())
+                        l.is_active()
+                            && l.agent.as_deref() == Some(name.as_str())
                             && l.owner.as_deref().is_none_or(|o| o == owner)
                             && (l.branch.as_deref() == Some(branch.as_str())
                                 // A legacy link has no branch field: it serves the branch
@@ -712,15 +758,8 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
                     }
                     many => {
                         if !quiet {
-                            ui::error(&format!(
-                                "branch {branch} has {many} session links — can’t pick for you:"
-                            ));
-                            for l in link::list(store).iter().take(8) {
-                                println!("  {:12} {}", l.source, link::short(&l.session_id));
-                            }
-                            ui::hint(
-                                "session identity conflicts shouldn’t happen; remove extra store links by hand (`agit status` lists them)",
-                            );
+                            debug_assert_eq!(many, hits.len());
+                            report_multiple_links(&format!("{owner}/{name}"), &branch, &hits);
                         }
                         Ok(None)
                     }
@@ -737,6 +776,7 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
     if let Some(t) = args.target.as_deref() {
         match locate(store, Some(t))? {
             Located::Found(l) => {
+                let l = *l;
                 let agent = match (&args.name, &l.agent) {
                     (Some(n), _) => {
                         repo::valid_name(n)?;
@@ -774,6 +814,71 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
         ui::hint("try `agit commit <branch>`, or `agit import` / `agit switch` first");
     }
     Ok(None)
+}
+
+/// The exact superseded link named by the runtime environment, if any.
+///
+/// Session ids are scoped by runtime in the store, so an exact `(runtime, id)` lookup neither
+/// guesses by prefix nor collides when two runtimes happen to use the same id.
+fn superseded_harness_link(store: &Store) -> Option<Link> {
+    let line = std::env::var("AGIT_SESSION")
+        .ok()
+        .and_then(|value| super::context::decode_session_env(&value));
+    let mut candidates = Vec::new();
+    for (variable, runtime) in crate::infra::runtime_session::ENV_SESSIONS {
+        let Ok(session_id) = std::env::var(variable) else {
+            continue;
+        };
+        if session_id.is_empty() {
+            continue;
+        }
+        if let Some(link) = link::get(store, runtime, &session_id) {
+            // When AGIT_SESSION is present it is the process's line identity. Ignore inherited
+            // outer-runtime links on another line; otherwise an active outer link can mask the
+            // superseded inner session that actually owns this process's transcript.
+            if let Some((repo, branch)) = &line {
+                let name = repo.rsplit('/').next().unwrap_or(repo);
+                let same_line = link.branch.as_deref() == Some(branch.as_str())
+                    && match link.owner.as_deref() {
+                        Some(_) => super::context::slug_of_link(&link).as_deref() == Some(repo),
+                        None => link.agent.as_deref() == Some(name),
+                    };
+                if !same_line {
+                    continue;
+                }
+            }
+            if !candidates.iter().any(|candidate: &Link| {
+                candidate.source == link.source && candidate.session_id == link.session_id
+            }) {
+                candidates.push(link);
+            }
+        }
+    }
+    // An active exact identity wins over a stale one on the same line, matching ordinary
+    // harness-context resolution. If several stale identities remain, refuse to guess.
+    if candidates.iter().any(Link::is_active) {
+        return None;
+    }
+    match candidates.as_slice() {
+        [link] => Some(link.clone()),
+        _ => None,
+    }
+}
+
+fn report_multiple_links(slug: &str, branch: &str, links: &[Link]) {
+    ui::error(&format!(
+        "{slug}@{branch} has {} active session links — can’t pick for you:",
+        links.len()
+    ));
+    for link in links.iter().take(8) {
+        println!(
+            "  {:12} {}  agit commit {}",
+            link.source,
+            link::short(&link.session_id),
+            link.session_id
+        );
+    }
+    ui::hint("choose one session id above; `agit status` lists every stored link");
 }
 
 // ───────────────────── Settlement engine ──────────────────────
@@ -1107,7 +1212,7 @@ fn settle(
     repo_dir: &Path,
     slug: &str,
     branch: &str,
-    lk: Link,
+    mut lk: Link,
     owner: &str,
     opts: SettleOpts,
 ) -> CmdResult {
@@ -1122,6 +1227,55 @@ fn settle(
             );
         }
         return Ok(ExitCode::Precondition);
+    }
+    let _branch_guard = link::lock_branch(store, slug, branch)?;
+    // Target resolution happens before the branch lock. Re-read this exact link after taking it:
+    // a concurrent prepare may have superseded or re-routed the claim while commit was waiting.
+    // Keep this per-link guard alive through settle_bytes: a reroute may use another branch lock,
+    // so releasing it after the check leaves a window in which the old transcript can still land
+    // on the old branch.
+    let _link_guard = link::lock(store, &lk.source, &lk.session_id)?;
+    if let Some(current) = link::get(store, &lk.source, &lk.session_id) {
+        lk = current;
+    }
+    let (target_owner, target_agent) = slug.split_once('/').unwrap_or(("", slug));
+    if !link::claims_branch(&lk, target_owner, target_agent, branch) {
+        if quiet {
+            return Ok(ExitCode::Ok);
+        }
+        if !lk.is_active() {
+            ui::error(&format!(
+                "session {} was superseded by {} and can no longer advance {slug}@{branch}.",
+                link::short(&lk.session_id),
+                lk.superseded_by
+                    .as_deref()
+                    .unwrap_or("a newer runtime session")
+            ));
+            ui::hint(&format!(
+                "preserve later work on a new line with `agit import {} --into {slug}@<new-branch>`",
+                lk.session_id
+            ));
+        } else {
+            let actual = match (
+                lk.owner.as_deref(),
+                lk.agent.as_deref(),
+                lk.branch.as_deref(),
+            ) {
+                (owner, Some(agent), Some(branch)) => format!(
+                    "{} / {} @ {}",
+                    owner.unwrap_or("the legacy namespace"),
+                    agent,
+                    branch
+                ),
+                _ => "another destination".to_string(),
+            };
+            ui::error(&format!(
+                "session {} no longer claims {slug}@{branch}; it now points at {actual}.",
+                link::short(&lk.session_id)
+            ));
+        }
+        ui::hint("resolve the current claim again with `agit status`");
+        return Ok(ExitCode::Policy);
     }
     let fresh = !repo_dir.join(".git").exists();
     let primary = Repo::open_or_init(repo_dir)?;
@@ -1207,7 +1361,78 @@ fn settle(
     if milestone && !quiet {
         super::memory::remind_pending(&primary, branch);
     }
+    if code == ExitCode::Ok && memory_link.baseline_bytes.is_some() {
+        let Some(mut current) = link::get(store, &memory_link.source, &memory_link.session_id)
+        else {
+            return Ok(code);
+        };
+        let (target_owner, target_agent) = slug.split_once('/').unwrap_or(("", slug));
+        if !link::claims_branch(&current, target_owner, target_agent, branch) {
+            if !quiet {
+                ui::warning(
+                    "the session link changed destination while memory was collected — leaving the new claim in place",
+                );
+            }
+            return Ok(code);
+        }
+        let candidate = primary.git(&["rev-parse", &format!("refs/heads/{branch}")])?;
+        if advance_materialized_file_tip(&primary, &mut current, candidate.trim())? {
+            link::write(store, &current)?;
+        }
+    }
     Ok(code)
+}
+
+/// File-only descendants may advance a runtime watermark while retaining its exact evidence.
+/// A concurrent history rewrite must remain visible to the next settlement's lineage check.
+fn advance_materialized_file_tip(
+    repo: &Repo,
+    link: &mut Link,
+    candidate: &str,
+) -> crate::Result<bool> {
+    let Some(source) = link.materialized_from.as_deref() else {
+        return Ok(false);
+    };
+    if source == candidate {
+        return Ok(false);
+    }
+    let (status, _, _) = repo.git_status(&["merge-base", "--is-ancestor", source, candidate])?;
+    if status != Some(0) {
+        return Ok(false);
+    }
+    let (Some(mut before), Some(mut after)) = (
+        meta::read_at_ref(repo, source),
+        meta::read_at_ref(repo, candidate),
+    ) else {
+        return Ok(false);
+    };
+    if after.kind != Kind::File {
+        return Ok(false);
+    }
+    before.kind = Kind::File;
+    before.milestone = None;
+    after.milestone = None;
+    if meta::to_text(&before)? != meta::to_text(&after)? {
+        return Ok(false);
+    }
+    let changed = repo.git(&[
+        "diff",
+        "--name-only",
+        "--no-renames",
+        source,
+        candidate,
+        "--",
+        meta::LOG_FILE,
+        meta::VIEW_FILE,
+        meta::LEGACY_LOG_FILE,
+        meta::LEGACY_VIEW_FILE,
+        meta::EVENTS_DIR,
+    ])?;
+    if !changed.trim().is_empty() {
+        return Ok(false);
+    }
+    link.materialized_from = Some(candidate.to_string());
+    Ok(true)
 }
 
 fn record_supervisor_result(commit_sha: &str) -> crate::Result<()> {
@@ -1399,15 +1624,19 @@ fn settle_bytes(
     fresh: bool,
     quiet: bool,
 ) -> CmdResult {
-    let text = String::from_utf8_lossy(bytes).into_owned();
     let materialized_mode = lk.baseline_bytes.is_some();
-    // The CAS expected value for writing the watermark back is rebuilt from `lk` itself
-    // (isomorphic to the bytes `link::write` persists): `lk` was read earlier in the call chain,
-    // and reading the disk now can hand back a new claim written by a reroute — exactly the thing
-    // that must not serve as `expected`. When the serialization does not match (a hand-edited
-    // link file included), skip the write-back; that direction is the safe one.
+    let text = if materialized_mode {
+        std::str::from_utf8(bytes)
+            .map_err(|error| {
+                anyhow::anyhow!("materialized runtime transcript is not valid UTF-8: {error}")
+            })?
+            .to_owned()
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    // Snapshot the persisted claim before parsing can fill its cwd/watermark fields. The caller
+    // holds the link lock for the entire settlement, so this remains the exact CAS value.
     let link_disk_at_entry = lk.to_json().ok().map(|j| format!("{j}\n").into_bytes());
-
     // Freeze the target branch exactly once before reading any committed state. Every metadata,
     // sequence, parent-tree and CAS decision below must refer to this immutable object id: if a
     // concurrent settlement advances the branch after these reads, our final expected-old CAS
@@ -1418,6 +1647,26 @@ fn settle_bytes(
     let branch_ref = format!("refs/heads/{branch}");
     let settlement_tip = optional_branch_commit(repo, &branch_ref)?;
     let has_head = settlement_tip.is_some();
+    if materialized_mode
+        && let Some(source_tip) = lk.materialized_from.as_deref()
+        && settlement_tip.as_deref() != Some(source_tip)
+    {
+        if !quiet {
+            let current_tip = settlement_tip.as_deref().unwrap_or("an unborn branch");
+            ui::error(&format!(
+                "session {} was materialized from {source_tip}, but {slug}@{branch} now points to {current_tip}.",
+                link::short(&lk.session_id)
+            ));
+            ui::hint(
+                "refusing to append this runtime's turns onto history that advanced independently",
+            );
+            ui::hint(&format!(
+                "preserve the runtime on its own line: `agit import {} --into {slug}@<new-branch> --onto {source_tip}`",
+                lk.session_id
+            ));
+        }
+        return Ok(ExitCode::Policy);
+    }
     let head_meta = if let Some(tip) = settlement_tip.as_deref() {
         // Once a branch has a commit, absence and corruption are different states:
         // malformed/non-UTF-8/invalid meta must stop every mutating path instead of being
@@ -1826,9 +2075,7 @@ fn settle_bytes(
         super::plumbing::ensure_v1_namespace_available_in_worktree(repo)?;
     }
 
-    // Test-only scheduling point for the exact historical race: another settlement may advance
-    // the branch after all baseline reads but before object construction. The frozen tip remains
-    // both our parent and expected-old value, so the final CAS must reject our stale proposal.
+    // Object construction must use the frozen baseline even if another writer advances the ref.
     maybe_interleave_settlement(repo, branch);
 
     // ── One commit per turn ──
@@ -1987,6 +2234,12 @@ fn settle_bytes(
         landed.push((turn_no, protected_subject, last_sha.clone()));
     }
 
+    // Publication must retain both the frozen parent and the active session claim while another
+    // writer attempts to advance the branch or reroute the runtime.
+    maybe_interleave_publication(repo, branch);
+
+    // Keep the route recheck, branch publication, and watermark write under one per-link lock.
+    // A reroute may use another branch lock, so the branch lock alone cannot protect this gap.
     match (old_head.as_deref(), pending_parent.as_deref()) {
         (Some(old), Some(new)) => {
             super::plumbing::update_branch_cas_and_refresh(repo, branch, new, old, false)?;
@@ -2009,19 +2262,20 @@ fn settle_bytes(
     // Settling advances the link's baseline.
     lk.agent = Some(slug.split('/').nth(1).unwrap_or(slug).to_string());
     lk.branch = Some(branch.to_string());
-    let new_baseline = (region_start + new_chunks.last().map(|c| c.end_byte).unwrap_or(0)) as u64;
+    let new_baseline = region_start + new_chunks.last().map(|c| c.end_byte).unwrap_or(0);
     if lk.baseline_bytes.is_some() {
-        // Materialized mode: the baseline advances to what has settled.
-        lk.baseline_bytes = Some(new_baseline);
-        lk.baseline_hash = None; // the region joins history, so doctor reads the commit chain
+        use sha2::Digest as _;
+        // Materialized mode: the baseline and its source tip advance together. Keeping the hash
+        // lets a later prepare prove that this runtime has stayed untouched before superseding it.
+        lk.baseline_bytes = Some(new_baseline as u64);
+        lk.baseline_hash = Some(hex::encode(sha2::Sha256::digest(&bytes[..new_baseline])));
+        lk.materialized_from = Some(last_sha.clone());
     }
-    let _ = new_baseline;
     // The same lock (`link::lock`) as import's claim/rollback critical section, plus a CAS:
     // write only while the disk still holds what it held when settlement started — a claim
     // rerouted mid-settlement must not be flattened by a whole-file write of the old watermark.
     // The turns themselves already landed on the branch under an expected-old CAS, so skipping
     // the watermark advance costs at most a rescan of the already-committed prefix next time.
-    let _guard = link::lock(store, &lk.source, &lk.session_id)?;
     let link_disk_now = std::fs::read(link::link_path(store, &lk.source, &lk.session_id)).ok();
     // No link on disk = no claim to flatten, so a first settlement persists as usual.
     if link_disk_now.is_none() || link_disk_now == link_disk_at_entry {
@@ -3097,7 +3351,7 @@ fn code_repo_dirty(cwd: &Path) -> bool {
 // ───────────────────── Legacy-form lookup (compat) ──────────────────────
 
 enum Located {
-    Found(Link),
+    Found(Box<Link>),
     Explained(ExitCode),
 }
 
@@ -3108,17 +3362,22 @@ fn locate(store: &Store, target: Option<&str>) -> crate::Result<Located> {
         ui::hint("adopt one with `agit import` and record the first version");
         return Ok(Located::Explained(ExitCode::Precondition));
     }
+    let active: Vec<Link> = all
+        .iter()
+        .filter(|link| link.is_active())
+        .cloned()
+        .collect();
     let Some(sel) = target else {
-        if let [only] = all.as_slice() {
-            return Ok(Located::Found(only.clone()));
+        if let [only] = active.as_slice() {
+            return Ok(Located::Found(Box::new(only.clone())));
         }
         ui::error(&format!(
-            "{} sessions adopted — say which one to settle:",
-            all.len()
+            "{} active sessions adopted — say which one to settle:",
+            active.len()
         ));
         return Ok(Located::Explained(ExitCode::Interactive));
     };
-    let by_agent: Vec<Link> = all
+    let by_agent: Vec<Link> = active
         .iter()
         .filter(|l| l.agent.as_deref() == Some(sel))
         .cloned()
@@ -3135,10 +3394,12 @@ fn locate(store: &Store, target: Option<&str>) -> crate::Result<Located> {
         return Ok(Located::Explained(ExitCode::Ref));
     }
     if let [only] = by_agent.as_slice() {
-        return Ok(Located::Found(only.clone()));
+        return Ok(Located::Found(Box::new(only.clone())));
     }
     match by_session.len() {
-        1 => Ok(Located::Found(by_session.into_iter().next().unwrap())),
+        1 => Ok(Located::Found(Box::new(
+            by_session.into_iter().next().unwrap(),
+        ))),
         0 => {
             ui::error(&format!(
                 "no agent named `{sel}`, and no session id starts with it."
@@ -3299,6 +3560,172 @@ mod tests {
             !repo_dir.exists(),
             "a refused session must not initialize a repo"
         );
+    }
+
+    /// A destination change waits until the claimed branch publishes its pending transcript.
+    /// The lock probe makes an early guard release fail even if the import thread is delayed.
+    #[test]
+    fn settlement_publishes_before_concurrent_import_reroutes_the_session() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const CHILD: &str = "AGIT_TEST_SETTLEMENT_REROUTE";
+        let Some(root) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let isolated = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::commit::tests::settlement_publishes_before_concurrent_import_reroutes_the_session",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env(CHILD, isolated.path())
+                .env("HOME", isolated.path().join("home"))
+                .env("AGIT_HOME", isolated.path().join("agit"))
+                .env("AGIT_SECRETS_KEYSTORE", "file")
+                .env("AGIT_HUB_URL", "http://127.0.0.1:1")
+                .env("AGIT_YES", "1")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated concurrency test failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+
+        let store = Store::open_or_init().unwrap();
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let runtime_id = "aaaaaaaa-0000-4000-8000-000000000083";
+        let transcript_dir = root
+            .join("home/.claude/projects")
+            .join(crate::adapter::claude_code::slug_for(&workspace));
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{runtime_id}.jsonl"));
+        let transcript = [
+            serde_json::json!({"type": "user", "uuid": "user", "sessionId": runtime_id,
+                "cwd": workspace, "message": {"role": "user", "content": "pending transcript"}}),
+            serde_json::json!({"type": "assistant", "uuid": "assistant", "parentUuid": "user",
+                "sessionId": runtime_id, "message": {"role": "assistant", "content": "settled answer"}}),
+        ]
+        .into_iter()
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+        std::fs::write(transcript_path, &transcript).unwrap();
+
+        let hub = "http://127.0.0.1:1";
+        credentials::save_at(
+            &root
+                .join("agit/credentials")
+                .join(format!("{}.json", crate::infra::config::hub_host_key(hub))),
+            &credentials::HubCredential {
+                username: "alice".into(),
+                email: None,
+                hub: Some(hub.into()),
+                access_token: "test-token".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_token: "test-refresh".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let repo_dir = crate::infra::config::repo_dir("alice", "photo").unwrap();
+        let mut lk = Link::new("claude-code", runtime_id, Some(&workspace));
+        let placed = super::super::import::place_legacy_commit_branch(
+            &mut lk,
+            &store,
+            "photo",
+            "alice",
+            "alice",
+            &repo_dir,
+            "work".into(),
+        )
+        .unwrap();
+        assert!(matches!(placed, super::super::import::Placed::Ready(_)));
+        let repo = Repo::open(&repo_dir).unwrap();
+        let before = repo.git(&["rev-parse", "refs/heads/work"]).unwrap();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (probe_tx, probe_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let importer_store = store.clone();
+        let importer_repo = repo_dir.clone();
+        let importer_before = before.clone();
+        let importer = std::thread::spawn(move || {
+            paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(
+                    link::link_path(&importer_store, "claude-code", runtime_id)
+                        .with_extension("json.lock"),
+                )
+                .unwrap();
+            let probe_result = fs2::FileExt::try_lock_exclusive(&probe);
+            let blocked = probe_result
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+            drop(probe);
+            probe_tx.send(blocked).unwrap();
+            let outcome = super::super::import::run(super::super::import::Args {
+                session: Some(runtime_id.into()),
+                name: Some("other".into()),
+                from: Some("claude-code".into()),
+                link_only: false,
+                repo: None,
+                branch: Some("work".into()),
+                onto: None,
+                privacy: false,
+            });
+            let repo = Repo::open(&importer_repo).unwrap();
+            assert_ne!(
+                repo.git(&["rev-parse", "refs/heads/work"]).unwrap(),
+                importer_before
+            );
+            assert!(
+                storage::materialize_at(repo.root(), "refs/heads/work", meta::LOG_FILE)
+                    .unwrap()
+                    .contains("pending transcript")
+            );
+            let _ = finished_tx.send(());
+            outcome
+        });
+        let frozen = before.clone();
+        interleave_next_publication(move |repo, branch| {
+            assert_eq!(
+                repo.git(&["rev-parse", &format!("refs/heads/{branch}")])
+                    .unwrap(),
+                frozen
+            );
+            paused_tx.send(()).unwrap();
+            assert!(
+                probe_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                "the session claim must stay locked until branch publication"
+            );
+            assert!(
+                matches!(finished_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "import must wait while the claimed branch is unpublished"
+            );
+        });
+        let outcome = settle(
+            &store,
+            &repo_dir,
+            "alice/photo",
+            "work",
+            lk,
+            "alice",
+            opts(),
+        );
+        assert_eq!(outcome.unwrap(), ExitCode::Ok);
+        assert_eq!(importer.join().unwrap().unwrap(), ExitCode::Ok);
+        let current = link::get(&store, "claude-code", runtime_id).unwrap();
+        assert!(link::claims_branch(&current, "alice", "other", "work"));
+        assert_ne!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), before);
     }
 
     fn run_code_git(cwd: &Path, args: &[&str]) -> String {
@@ -5000,6 +5427,142 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
         assert_eq!(repo.commit_count(), 1);
     }
 
+    #[test]
+    fn a_file_watermark_cannot_bless_concurrently_rewritten_context() {
+        let (_dir, store) = store();
+        let (_home, repo) = setup_repo();
+        let text = format!(
+            "{META}\n{}{}",
+            codex_user("original context"),
+            codex_asst("answer")
+        );
+        settle_bytes(
+            &store,
+            &repo,
+            "alice/photo",
+            "main",
+            link(),
+            text.as_bytes(),
+            "alice",
+            opts(),
+            true,
+            false,
+        )
+        .unwrap();
+        let base = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let file_child = |parent: &str| {
+            let mut snapshot = meta::read_at_ref(&repo, parent).unwrap();
+            snapshot.kind = Kind::File;
+            snapshot.milestone = None;
+            let metadata = meta::to_text(&snapshot).unwrap();
+            let tree = super::super::plumbing::tree_apply(
+                &repo,
+                parent,
+                &[
+                    (meta::FILE, Some(metadata.as_str())),
+                    ("memory/note.md", Some("local memory")),
+                ],
+            )
+            .unwrap();
+            super::super::plumbing::commit_tree(&repo, &tree, &[parent], "collect memory").unwrap()
+        };
+        let file_tip = file_child(&base);
+        let mut current = link();
+        current.materialized_from = Some(base.clone());
+        assert!(advance_materialized_file_tip(&repo, &mut current, &file_tip).unwrap());
+        assert_eq!(
+            current.materialized_from.as_deref(),
+            Some(file_tip.as_str())
+        );
+
+        let mut changed = meta::read_at_ref(&repo, &file_tip).unwrap();
+        changed.kind = Kind::View;
+        let metadata = meta::to_text(&changed).unwrap();
+        let tree = super::super::plumbing::tree_apply(
+            &repo,
+            &file_tip,
+            &[
+                (meta::FILE, Some(metadata.as_str())),
+                (meta::VIEW_FILE, Some("")),
+            ],
+        )
+        .unwrap();
+        let view_tip =
+            super::super::plumbing::commit_tree(&repo, &tree, &[&file_tip], "change context")
+                .unwrap();
+        let concurrent_tip = file_child(&view_tip);
+        assert!(!advance_materialized_file_tip(&repo, &mut current, &concurrent_tip).unwrap());
+        assert_eq!(
+            current.materialized_from.as_deref(),
+            Some(file_tip.as_str())
+        );
+
+        let orphan = super::super::plumbing::commit_tree(
+            &repo,
+            &repo
+                .git(&["rev-parse", &format!("{file_tip}^{{tree}}")])
+                .unwrap(),
+            &[],
+            "unrelated root",
+        )
+        .unwrap();
+        assert!(!advance_materialized_file_tip(&repo, &mut current, &orphan).unwrap());
+        let mut legacy = link();
+        assert!(!advance_materialized_file_tip(&repo, &mut legacy, &file_tip).unwrap());
+        assert!(legacy.materialized_from.is_none());
+    }
+
+    /// Materialized offsets address raw bytes, so decoding must not move the watermark.
+    #[test]
+    fn invalid_materialized_utf8_is_rejected_before_branch_publication() {
+        use sha2::Digest as _;
+
+        let (_d, s) = store();
+        let (_h, repo) = setup_repo();
+        let prefix = format!("{META}\n{}{}", codex_user("past work"), codex_asst("done"));
+        settle_bytes(
+            &s,
+            &repo,
+            "alice/photo",
+            "main",
+            link(),
+            prefix.as_bytes(),
+            "alice",
+            opts(),
+            true,
+            false,
+        )
+        .unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let mut lk = link();
+        lk.baseline_bytes = Some(prefix.len() as u64);
+        lk.baseline_hash = Some(hex::encode(sha2::Sha256::digest(prefix.as_bytes())));
+        lk.materialized_from = Some(head.clone());
+        let path = link::write(&s, &lk).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut bytes = prefix.into_bytes();
+        bytes.extend_from_slice(&[0xff, b'\n']);
+        bytes.extend_from_slice(
+            format!("{}{}", codex_user("new work"), codex_asst("done")).as_bytes(),
+        );
+        let error = settle_bytes(
+            &s,
+            &repo,
+            "alice/photo",
+            "main",
+            lk,
+            &bytes,
+            "alice",
+            opts(),
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("UTF-8"), "{error:#}");
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
     /// A baseline written non-append (materialized mode) → refused (Policy).
     #[test]
     fn tampered_baseline_is_refused() {
@@ -5080,7 +5643,14 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
         // copy that was passed in, so it is not the one to read).
         let back = crate::domain::link::get(&s, "codex", "AB").unwrap();
         assert_eq!(back.baseline_bytes, Some(grown.len() as u64));
-        assert!(back.baseline_hash.is_none());
+        assert_eq!(
+            back.baseline_hash.as_deref(),
+            Some(hex::encode(sha2::Sha256::digest(grown.as_bytes())).as_str())
+        );
+        assert_eq!(
+            back.materialized_from.as_deref(),
+            Some(repo.git(&["rev-parse", "HEAD"]).unwrap().trim())
+        );
     }
 
     /// A slow-path resume starts from a materialized VIEW, which can be only a small projection of

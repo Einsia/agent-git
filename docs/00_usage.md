@@ -351,6 +351,11 @@ agit resume ratelimit --as codex       # switch runtime (it shows you the lossy 
 agit resume ratelimit --cwd ../payments-2
 ```
 
+Preparing the same branch tip for the same runtime and directory is idempotent: agit prints the
+existing runtime session command again. If the branch advances, agit replaces a prepared instance
+only when its baseline proves that the runtime transcript is untouched. Unsettled content blocks
+replacement and must be committed or continued on a fork.
+
 The zero-copy path reuses the runtime's native transcript and bypasses the VIEW. So what
 `agit revert` (see 4.3) just took out of the VIEW is **still visible** in a session resumed
 zero-copy on this machine. For a revert to take effect in the resumed session, the materialized

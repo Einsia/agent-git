@@ -159,7 +159,7 @@ fn from_harness_env() -> Option<(Context, bool)> {
         }
         let hits: Vec<_> = all
             .iter()
-            .filter(|l| l.source == *runtime && l.session_id == sid)
+            .filter(|l| l.is_active() && l.source == *runtime && l.session_id == sid)
             .collect();
         if let [lk] = hits.as_slice()
             && let Some(repo) = slug_of_link(lk)
@@ -235,7 +235,7 @@ pub fn from_cwd(cwd: &std::path::Path) -> Vec<link::Link> {
     let cwd_s = cwd.to_string_lossy().to_string();
     link::list(&store)
         .into_iter()
-        .filter(|l| l.cwd.as_deref() == Some(cwd_s.as_str()))
+        .filter(|l| l.is_active() && l.cwd.as_deref() == Some(cwd_s.as_str()))
         .collect()
 }
 

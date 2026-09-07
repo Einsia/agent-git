@@ -242,7 +242,8 @@ fn gather_candidates(cwd: &Path) -> Vec<Candidate> {
     let cwd_s = cwd.to_string_lossy().to_string();
     if let Ok(store) = Store::open_or_init() {
         for l in link::list(&store) {
-            if l.cwd.as_deref() == Some(cwd_s.as_str())
+            if l.is_active()
+                && l.cwd.as_deref() == Some(cwd_s.as_str())
                 && let Some(branch) = &l.branch
                 && let Some(slug) = super::context::slug_of_link(&l)
             {
@@ -472,6 +473,7 @@ pub fn resume_branch_with_prompt(
         ));
         return Ok(None);
     }
+    let store = Store::open_or_init()?;
     let head = repo.git(&["rev-parse", &format!("refs/heads/{branch}")])?;
     let head = head.trim().to_string();
     // The form comes from `meta.line`, never a guess. A missing meta and "this is the file line"
@@ -517,34 +519,85 @@ pub fn resume_branch_with_prompt(
         CwdResumeDecision::Cancel => return Ok(None),
     };
 
+    // Prompts cannot hold the branch lock: a runtime waiting to settle must remain able to
+    // finish while the operator decides. The selected snapshot must still be current afterward.
+    let branch_guard = link::lock_branch(&store, slug, branch)?;
+    require_resume_head(repo, branch, &head)?;
+
     // ── Memory: the branch's memory merges into the target runtime's memory dir (both paths) ──
     let from = snap.runtime.as_str();
-    let to_runtime = args
+    let requested_runtime = args
         .as_runtime
         .as_deref()
-        .and_then(|r| adapter::normalize(r).ok())
+        .map(adapter::normalize)
+        .transpose()?;
+    let to_runtime = requested_runtime
+        .or_else(|| {
+            config::get_global("runtime.default")
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(|runtime| adapter::normalize(runtime).ok())
+        })
         .unwrap_or(from);
-    match super::memory::materialize(repo, branch, slug, to_runtime, &cwd) {
-        Ok(Some(report)) => super::memory::report_materialize(&report),
-        Ok(None) => {}
-        Err(error) => ui::warning(&format!("memory was not materialized: {error:#}")),
-    }
-
     // ── The fast-path test: continue the local native session ──
-    let switches_rt = args
-        .as_runtime
-        .as_deref()
-        .map(|r| adapter::normalize(r).map(|n| n != from).unwrap_or(true))
-        .unwrap_or(false);
+    let switches_rt = requested_runtime.is_some_and(|runtime| runtime != from);
     // VIEW is only a projection of the committed LOG. Validate the evidence carrier even when the
     // slow path will install only VIEW, so a missing/tampered event cannot be bypassed by changing
     // runtimes or by lacking a native-session link.
     let committed_log = committed_log(repo, &head, &snap)?;
+    let (owner, agent) = slug.split_once('/').unwrap_or(("", slug));
+    let active = link::active_for_branch(&store, owner, agent, branch);
+    if active.len() > 1 && !args.force {
+        report_multiple_active(slug, branch, &active);
+        return Ok(None);
+    }
+
+    // A repeated prepare of the same branch tip is idempotent. Appended content is safe to
+    // resume in place too: replacement is forbidden, but continuing the same writer loses
+    // nothing. A rewritten or unreadable baseline is not reused implicitly.
+    let reuse_prepared = |active: &[Link]| {
+        if !args.force
+            && let [existing] = active
+            && existing.materialized_from.as_deref() == Some(head.as_str())
+            && requested_runtime.is_none_or(|runtime| existing.source == runtime)
+            && existing.cwd.as_deref() == Some(cwd.to_string_lossy().as_ref())
+            && matches!(
+                link::materialization_activity(existing),
+                link::MaterializationActivity::Untouched | link::MaterializationActivity::Appended
+            )
+            && let Some(resumed) = prepared_resume(
+                &existing.source,
+                &existing.session_id,
+                &cwd,
+                slug,
+                branch,
+                prompt,
+                system_prompt.as_deref(),
+            )
+        {
+            materialize_memory(repo, branch, slug, &existing.source, &cwd);
+            println!(
+                "{}",
+                ui::dim(&format!(
+                    "  reusing the prepared runtime session: {} {}",
+                    existing.source,
+                    link::short(&existing.session_id)
+                ))
+            );
+            return Some(resumed);
+        }
+        None
+    };
+    if let Some(resumed) = reuse_prepared(&active) {
+        return Ok(Some(resumed));
+    }
+
     if !switches_rt
         && args.cwd.is_none()
         && !args.force
         && !history_rewrote_view(repo, &head)?
-        && let Some(lk) = lk_for(repo, slug, branch)
+        && let [lk] = active.as_slice()
         && lk.baseline_bytes.is_none()
     {
         // The branch head must have been settled out of this native session: committed is the
@@ -565,6 +618,7 @@ pub fn resume_branch_with_prompt(
                 prompt,
                 system_prompt.as_deref(),
             ) {
+                materialize_memory(repo, branch, slug, from, &cwd);
                 println!(
                     "{}",
                     ui::dim(&format!(
@@ -579,19 +633,135 @@ pub fn resume_branch_with_prompt(
         }
     }
 
+    let supersede = if active.is_empty() {
+        Vec::new()
+    } else if args.force {
+        ui::warning(&format!(
+            "replacing {} active runtime claim(s) because --force was given",
+            active.len()
+        ));
+        active
+    } else {
+        let existing = &active[0];
+        match claim_activity(repo, &committed_log, existing)? {
+            ClaimActivity::Untouched => active,
+            ClaimActivity::Appended => {
+                ui::error(&format!(
+                    "{slug}@{branch} already has unsettled content in {} {}.",
+                    existing.source,
+                    link::short(&existing.session_id)
+                ));
+                ui::hint(&format!(
+                    "settle it first: `agit commit {}`",
+                    existing.session_id
+                ));
+                ui::hint(&format!(
+                    "or preserve a separate line: `agit fork {slug}@{branch} -b <new-branch> --resume`"
+                ));
+                return Ok(None);
+            }
+            ClaimActivity::Rewritten => {
+                ui::error(&format!(
+                    "the active runtime session {} was rewritten inside its recorded baseline.",
+                    link::short(&existing.session_id)
+                ));
+                ui::hint(
+                    "inspect the runtime transcript and `agit status`; automatic replacement fails closed",
+                );
+                ui::hint(&format!(
+                    "to replace it deliberately: `agit resume {slug}@{branch} --force --no-launch`"
+                ));
+                return Ok(None);
+            }
+            ClaimActivity::Unverifiable => {
+                ui::error(&format!(
+                    "the active runtime session {} cannot be proven untouched.",
+                    link::short(&existing.session_id)
+                ));
+                ui::hint("inspect it with `agit status`; automatic replacement fails closed");
+                ui::hint(&format!(
+                    "to replace it deliberately: `agit resume {slug}@{branch} --force --no-launch`"
+                ));
+                return Ok(None);
+            }
+        }
+    };
+
+    drop(branch_guard);
+    confirm_conversion(from, to_runtime)?;
+    let _branch_guard = link::lock_branch(&store, slug, branch)?;
+    require_resume_head(repo, branch, &head)?;
+    let current = link::active_for_branch(&store, owner, agent, branch);
+    if current.iter().map(Link::instance).collect::<Vec<_>>()
+        != supersede.iter().map(Link::instance).collect::<Vec<_>>()
+    {
+        if let Some(resumed) = reuse_prepared(&current) {
+            return Ok(Some(resumed));
+        }
+        anyhow::bail!(
+            "the active runtime claim changed while preparing to resume; retry the command"
+        );
+    }
+    materialize_memory(repo, branch, slug, to_runtime, &cwd);
+
     // ── Slow path: materialize from the head VIEW, mint a new id ──
     materialize_and_resume(
         repo,
         slug,
         branch,
+        &head,
         &snap,
         from,
+        to_runtime,
         args,
         &cwd,
         prompt,
         system_prompt.as_deref(),
+        &committed_log,
+        &store,
+        supersede,
     )
     .map(Some)
+}
+
+fn require_resume_head(repo: &Repo, branch: &str, head: &str) -> crate::Result<()> {
+    anyhow::ensure!(
+        repo.git(&["rev-parse", &format!("refs/heads/{branch}")])?
+            .trim()
+            == head
+            && !super::branch::is_sealed(repo, branch),
+        "the branch changed while preparing to resume; retry the command"
+    );
+    Ok(())
+}
+
+fn confirm_conversion(from: &str, to: &str) -> crate::Result<()> {
+    if adapter::is_lossy_conversion(from, to) {
+        println!("  cross-runtime ({from} → {to}) via IR:");
+        println!(
+            "  kept: messages, tool calls; arguments and paired outputs when recoverable from the source transcript, thinking (best effort)"
+        );
+        println!("  lost: encrypted reasoning, vendor encodings, compact boundaries");
+        if ui::is_tty() && std::env::var("AGIT_YES").is_err() {
+            match ui::prompt::confirm("proceed?", false)? {
+                Some(true) => {}
+                _ => {
+                    println!("cancelled.");
+                    anyhow::bail!("cancelled by user");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn materialize_memory(repo: &Repo, branch: &str, slug: &str, runtime: &str, cwd: &Path) {
+    match super::memory::materialize(repo, branch, slug, runtime, cwd) {
+        Ok(Some(report)) => super::memory::report_materialize(&report),
+        Ok(None) => {}
+        Err(error) => ui::warning(&format!("memory was not materialized: {error:#}")),
+    }
 }
 
 /// Brings the runtime up from `owner/repo` + branch, down the same path as `agit resume <branch>`.
@@ -704,17 +874,63 @@ fn committed_log(repo: &Repo, head: &str, snap: &meta::Meta) -> crate::Result<St
 fn lk_for(_repo: &Repo, slug: &str, branch: &str) -> Option<Link> {
     let store = Store::open_or_init().ok()?;
     let (owner, name) = slug.split_once('/').unwrap_or(("", slug));
-    let mut hits: Vec<Link> = link::list(&store)
-        .into_iter()
-        .filter(|l| {
-            l.agent.as_deref() == Some(name)
-                && l.branch.as_deref() == Some(branch)
-                // A link that records a namespace belongs to that namespace only; one that
-                // records none is a legacy link, kept compatible by name.
-                && l.owner.as_deref().is_none_or(|o| o == owner)
-        })
-        .collect();
+    let mut hits = link::active_for_branch(&store, owner, name, branch);
     if hits.len() == 1 { hits.pop() } else { None }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimActivity {
+    Untouched,
+    Appended,
+    Rewritten,
+    Unverifiable,
+}
+
+/// Classify whether replacing one active branch claim can lose runtime content.
+///
+/// Materialized instances carry their own byte baseline. Native instances are compared against
+/// the committed LOG after applying the repository's existing secret projection, the same
+/// comparison used by the zero-copy path.
+fn claim_activity(repo: &Repo, committed_log: &str, link: &Link) -> crate::Result<ClaimActivity> {
+    if link.baseline_bytes.is_some() {
+        return Ok(match link::materialization_activity(link) {
+            link::MaterializationActivity::Untouched => ClaimActivity::Untouched,
+            link::MaterializationActivity::Appended => ClaimActivity::Appended,
+            link::MaterializationActivity::Rewritten => ClaimActivity::Rewritten,
+            link::MaterializationActivity::Unverifiable => ClaimActivity::Unverifiable,
+        });
+    }
+    let Ok(live) = link.read() else {
+        return Ok(ClaimActivity::Unverifiable);
+    };
+    let projected = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
+        .protect_existing_jsonl(&live)?;
+    Ok(
+        match transcript::continuity(committed_log, &projected.text) {
+            transcript::Continuity::Noop => ClaimActivity::Untouched,
+            transcript::Continuity::Append => ClaimActivity::Appended,
+            transcript::Continuity::Diverged => ClaimActivity::Rewritten,
+        },
+    )
+}
+
+fn report_multiple_active(slug: &str, branch: &str, links: &[Link]) {
+    ui::error(&format!(
+        "{slug}@{branch} has {} active session links — can’t pick for you:",
+        links.len()
+    ));
+    for link in links.iter().take(8) {
+        println!(
+            "  {:12} {}  agit commit {}",
+            link.source,
+            link::short(&link.session_id),
+            link.session_id
+        );
+    }
+    ui::hint("choose one session id above; `agit status` lists every stored link");
+    ui::hint(&format!(
+        "to replace all active claims deliberately: `agit resume {slug}@{branch} --force --no-launch`"
+    ));
 }
 
 /// The native resume command (each harness's own resume verb).
@@ -734,6 +950,9 @@ fn native_resume_cmd(
     let mut inner = match runtime {
         "claude-code" => format!("claude --resume {sid}"),
         "codex" => format!("codex resume {sid}"),
+        "opencode" if prompt.is_none() && system_prompt.is_none() => {
+            format!("opencode --session {sid}")
+        }
         _ => return None,
     };
     if let Some(system) = system_prompt {
@@ -757,6 +976,78 @@ fn native_resume_cmd(
     Some(wrap_launch(&inner, cwd, slug, branch))
 }
 
+/// Reconstruct the next step for an already materialized runtime instance.
+///
+/// CLI runtimes return a launch command. Claude Desktop's official handoff is intentionally only
+/// printed, just as it is after the initial materialization; the guaranteed CLI fallback still
+/// carries `AGIT_SESSION`.
+fn prepared_resume(
+    runtime: &str,
+    sid: &str,
+    cwd: &Path,
+    slug: &str,
+    branch: &str,
+    prompt: Option<&str>,
+    system_prompt: Option<&str>,
+) -> Option<Resumed> {
+    if let Some(cmd) = native_resume_cmd(runtime, sid, cwd, slug, branch, prompt, system_prompt) {
+        return Some(Resumed {
+            cmd: Some(cmd),
+            lossy: false,
+        });
+    }
+    if runtime == "opencode" {
+        if system_prompt.is_some() {
+            ui::warning(
+                "opencode cannot receive a system environment notice on resume; continuing without injection",
+            );
+        }
+        if let Some(prompt) = prompt {
+            ui::warning(
+                "opencode can’t take an opening prompt on resume — paste this in as the first message:",
+            );
+            println!("{prompt}");
+        }
+        return Some(Resumed {
+            cmd: Some(wrap_launch(
+                &format!("opencode --session {sid}"),
+                cwd,
+                slug,
+                branch,
+            )),
+            lossy: false,
+        });
+    }
+    if runtime != "claude-desktop" {
+        return None;
+    }
+    if system_prompt.is_some() {
+        ui::warning(
+            "the desktop handoff deep link cannot carry the environment notice; use the CLI fallback below to resume with it",
+        );
+    }
+    let trigger = format!("open 'claude://resume?session={sid}'");
+    let plain_fallback = wrap_launch(&format!("claude --resume {sid}"), cwd, slug, branch);
+    let fallback = handoff_fallback(
+        &plain_fallback,
+        sid,
+        cwd,
+        slug,
+        branch,
+        prompt,
+        system_prompt,
+    );
+    println!("  {}", ui::accent(&trigger));
+    println!(
+        "  {}",
+        ui::dim(&format!("the guaranteed way if handoff fails: {fallback}"))
+    );
+    Some(Resumed {
+        cmd: None,
+        lossy: false,
+    })
+}
+
 fn handoff_fallback(
     fallback: &str,
     sid: &str,
@@ -773,6 +1064,26 @@ fn handoff_fallback(
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+/// Hold the link lock only when this runtime still owns the branch claim being replaced.
+///
+/// The branch lock serializes operations on one branch, but importing this same runtime onto a
+/// different branch takes a different branch lock. Re-reading under the per-link lock prevents a
+/// supersession from writing an old routing snapshot over that newer destination.
+fn lock_active_branch_claim(
+    store: &Store,
+    expected: &Link,
+    slug: &str,
+    branch: &str,
+) -> crate::Result<Option<(std::fs::File, Link)>> {
+    let guard = link::lock(store, &expected.source, &expected.session_id)?;
+    let Some(current) = link::get(store, &expected.source, &expected.session_id) else {
+        return Ok(None);
+    };
+    let (owner, agent) = slug.split_once('/').unwrap_or(("", slug));
+    let still_claims_branch = link::claims_branch(&current, owner, agent, branch);
+    Ok(still_claims_branch.then_some((guard, current)))
+}
+
 /// Materializes the VIEW into the runtime and prepares the resume command.
 // The parameter list is long because loading needs exactly these facts; packing them into a
 // struct only adds a layer of indirection.
@@ -781,21 +1092,18 @@ fn materialize_and_resume(
     repo: &Repo,
     slug: &str,
     branch: &str,
+    head: &str,
     _snap: &meta::Meta,
     from: &str,
+    to: &str,
     args: &Args,
     cwd: &Path,
     prompt: Option<&str>,
     system_prompt: Option<&str>,
+    committed_log: &str,
+    store: &Store,
+    supersede: Vec<Link>,
 ) -> crate::Result<Resumed> {
-    let to = match &args.as_runtime {
-        Some(r) => adapter::normalize(r)?,
-        None => config::get_global("runtime.default")?
-            .as_deref()
-            .and_then(|r| adapter::normalize(r).ok())
-            .unwrap_or(from),
-    };
-
     // Cursor is import-only: refused before any work starts (PRD).
     let dst_ad = adapter::get(to)?;
     if !matches!(
@@ -820,11 +1128,7 @@ fn materialize_and_resume(
 
     // The materialized content = the original lines unwrapped from the branch head's VIEW (not
     // the full log).
-    let view_env = crate::domain::storage::materialize_at(
-        repo.root(),
-        &format!("refs/heads/{branch}"),
-        meta::VIEW_FILE,
-    )
+    let view_env = crate::domain::storage::materialize_at(repo.root(), head, meta::VIEW_FILE)
         .map_err(|_| {
             anyhow::anyhow!(
                 "{branch} has no {} yet — this session line hasn’t settled a turn (`agit commit` first), or the checkout is incomplete",
@@ -839,11 +1143,7 @@ fn materialize_and_resume(
     // whole LOG for one bootstrap line; the identity keys are rewritten uniformly by the load
     // afterwards.
     let text = if transcript::needs_bootstrap(&text, from) {
-        match crate::domain::storage::materialize_head_at(
-            repo.root(),
-            &format!("refs/heads/{branch}"),
-            meta::LOG_FILE,
-        ) {
+        match crate::domain::storage::materialize_head_at(repo.root(), head, meta::LOG_FILE) {
             Ok(Some(head)) => transcript::restore_bootstrap(&text, &head, from),
             _ => text,
         }
@@ -876,25 +1176,7 @@ fn materialize_and_resume(
     }
     let text = hydrated.text;
 
-    // The loss list: printed before any work starts, confirmed on a tty (PRD, "print the loss
-    // list before a cross-harness conversion").
     let lossy = adapter::is_lossy_conversion(from, to);
-    if lossy {
-        println!("  cross-runtime ({from} → {to}) via IR:");
-        println!(
-            "  kept: messages, tool calls; arguments and paired outputs when recoverable from the source transcript, thinking (best effort)"
-        );
-        println!("  lost: encrypted reasoning, vendor encodings, compact boundaries");
-        if ui::is_tty() && std::env::var("AGIT_YES").is_err() {
-            match ui::prompt::confirm("proceed?", false)? {
-                Some(true) => {}
-                _ => {
-                    println!("cancelled.");
-                    anyhow::bail!("cancelled by user");
-                }
-            }
-        }
-    }
 
     let (installed, _) = crate::domain::install::install(&text, from, to, cwd)?;
 
@@ -915,6 +1197,7 @@ fn materialize_and_resume(
         None => lk.agent = Some(slug.to_string()),
     }
     lk.branch = Some(branch.to_string());
+    lk.materialized_from = Some(head.to_string());
     // The baseline must be taken down **the same path that later reads the live transcript**
     // (`lk.read_bytes` → resolve), never by reading the file `install` dropped: for a file-backed
     // runtime the two are the same bytes, for a library-backed one they are not — OpenCode is
@@ -938,10 +1221,74 @@ fn materialize_and_resume(
     };
     lk.baseline_bytes = Some(materialized.len() as u64);
     lk.baseline_hash = Some(hex::encode(sha2::Sha256::digest(&materialized)));
-    if let Ok(store) = Store::open_or_init()
-        && let Err(e) = link::write(&store, &lk)
-    {
-        ui::warning(&format!("failed to record the link: {e:#}"));
+    let mut locked_supersede = Vec::with_capacity(supersede.len());
+    for previous in &supersede {
+        let Some((guard, current)) = lock_active_branch_claim(store, previous, slug, branch)?
+        else {
+            println!(
+                "{}",
+                ui::dim(&format!(
+                    "  left {} {} unchanged; it no longer claims {slug} @ {branch}",
+                    previous.source,
+                    link::short(&previous.session_id)
+                ))
+            );
+            continue;
+        };
+        if !args.force {
+            let activity = claim_activity(repo, committed_log, &current)?;
+            if activity != ClaimActivity::Untouched {
+                ui::warning(&format!(
+                    "the prepared {} session {} was left unclaimed; `agit status --check-missing` can find it",
+                    lk.source,
+                    link::short(&lk.session_id)
+                ));
+            }
+            match activity {
+                ClaimActivity::Untouched => {}
+                ClaimActivity::Appended => {
+                    ui::error(&format!(
+                        "the active runtime session {} gained content while its replacement was being prepared.",
+                        link::short(&previous.session_id)
+                    ));
+                    ui::hint(&format!(
+                        "its claim remains active; settle it with `agit commit {}` and retry",
+                        previous.session_id
+                    ));
+                    anyhow::bail!("active runtime changed during materialization");
+                }
+                ClaimActivity::Rewritten | ClaimActivity::Unverifiable => {
+                    ui::error(&format!(
+                        "the active runtime session {} can no longer be proven untouched.",
+                        link::short(&previous.session_id)
+                    ));
+                    ui::hint("its claim remains active; inspect the transcript and `agit status`");
+                    ui::hint(&format!(
+                        "to replace it deliberately: `agit resume {slug}@{branch} --force --no-launch`"
+                    ));
+                    anyhow::bail!("active runtime changed during materialization");
+                }
+            }
+        }
+        locked_supersede.push((guard, current));
+    }
+    let successor = lk.instance();
+    // Publish the successor first. A crash during the following historical-link updates can then
+    // leave an explicit multi-active refusal, but never zero active claims and an orphaned runtime
+    // session. The branch lock keeps other prepare mutations out; a commit that resolved the old
+    // link rechecks it under this same lock before writing.
+    link::write(store, &lk)?;
+    for (_guard, mut previous) in locked_supersede {
+        previous.superseded_by = Some(successor.clone());
+        link::write(store, &previous)?;
+        println!(
+            "{}",
+            ui::dim(&format!(
+                "  superseded {} {} on {slug} @ {branch}",
+                previous.source,
+                link::short(&previous.session_id)
+            ))
+        );
     }
 
     println!(
@@ -1061,8 +1408,10 @@ pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::link::{self, Link};
     use crate::domain::meta;
     use crate::domain::repo::Repo;
+    use crate::domain::store::Store;
     use crate::domain::transcript;
     use std::path::Path;
 
@@ -1120,6 +1469,53 @@ mod tests {
             ),
             "this is precisely the verdict the fast path needs"
         );
+    }
+
+    #[test]
+    fn resume_rejects_a_head_that_advanced_while_a_prompt_was_open() {
+        let (_dir, repo, head) = claimed_but_never_settled();
+        let branch = repo.git(&["branch", "--show-current"]).unwrap();
+        let branch = branch.trim();
+        super::require_resume_head(&repo, branch, &head).unwrap();
+        stack(
+            &repo,
+            meta::Kind::Turn,
+            meta::Line::Session,
+            "concurrent settlement",
+        );
+        assert!(super::require_resume_head(&repo, branch, &head).is_err());
+    }
+
+    /// A per-link lock must validate the routing state read after acquisition. Otherwise a
+    /// materialization holding the old branch lock can overwrite an import that already moved the
+    /// same runtime claim to another branch.
+    #[test]
+    fn a_rerouted_link_is_not_locked_for_stale_supersession() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("store"));
+        let mut expected = Link::new("codex", "session-a", Some(Path::new("/repo")));
+        expected.owner = Some("alice".into());
+        expected.agent = Some("photo".into());
+        expected.branch = Some("work".into());
+        expected.baseline_bytes = Some(10);
+        expected.baseline_hash = Some("old-baseline".into());
+        link::write(&store, &expected).unwrap();
+
+        let mut rerouted = expected.clone();
+        rerouted.owner = Some("bob".into());
+        rerouted.branch = Some("recovery".into());
+        rerouted.baseline_bytes = None;
+        rerouted.baseline_hash = None;
+        link::write(&store, &rerouted).unwrap();
+
+        let locked =
+            super::lock_active_branch_claim(&store, &expected, "alice/photo", "work").unwrap();
+        assert!(locked.is_none());
+        let current = link::get(&store, "codex", "session-a").unwrap();
+        assert_eq!(current.owner.as_deref(), Some("bob"));
+        assert_eq!(current.branch.as_deref(), Some("recovery"));
+        assert_eq!(current.baseline_bytes, None);
+        assert!(current.superseded_by.is_none());
     }
 
     /// Lands one more commit on top of the current HEAD: changes the meta's kind (and line

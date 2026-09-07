@@ -247,7 +247,7 @@ pub fn run(args: Args) -> CmdResult {
         let mut with_new = 0usize;
         let mut new_lines = 0usize;
         let mut forks: Vec<String> = vec![];
-        for l in links.iter().filter(|l| l.agent.is_some()) {
+        for l in links.iter().filter(|l| l.is_active() && l.agent.is_some()) {
             let Some(live_path) = l.resolve() else {
                 continue;
             };

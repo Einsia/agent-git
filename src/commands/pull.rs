@@ -18,7 +18,9 @@
 //! and `agit fork <sha> -b <b>-remote` both resolve straight to the point `origin/<b>` is at.
 
 use super::CmdResult;
+use crate::domain::link;
 use crate::domain::repo::Repo;
+use crate::domain::store::Store;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
@@ -100,7 +102,12 @@ pub fn run(args: Args) -> CmdResult {
     let history_update = super::migration::begin_startup_recovery(&repo, "pull-history")?;
 
     let mut diverged = false;
+    let store = Store::open_or_init()?;
+    let slug = format!("{owner}/{name}");
     for b in &want {
+        // Fetch changes only remote-tracking refs. The local branch comparison and fast-forward
+        // share the materialization/settlement lock so a prepare cannot straddle two branch tips.
+        let _branch_guard = link::lock_branch(&store, &slug, b)?;
         if !repo.has_ref(&format!("refs/heads/{b}")) {
             ui::warning(&format!("no local branch `{b}` — skipped"));
             continue;

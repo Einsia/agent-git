@@ -673,6 +673,31 @@ fn birth_session_branch(
     branch: String,
     onto_commit: Option<String>,
 ) -> crate::Result<Placed> {
+    // Import and materialization both create active branch claims. Serialize their branch/ref and
+    // link updates under the same key so a concurrent `run --no-launch` cannot observe an empty
+    // destination and install a second writer while this claim is being placed.
+    let _branch_guard = link::lock_branch(store, &format!("{owner}/{agent}"), &branch)?;
+    let _claim_guard = link::lock(store, &lk.source, &lk.session_id)?;
+    let prev_link = link::get(store, &lk.source, &lk.session_id);
+    if let Some(current) = &prev_link {
+        // The link was first read before destination selection and a possible confirmation. Once
+        // the locks are held, the disk copy is authoritative for watermark and supersession state.
+        // A routing change invalidates the earlier confirmation; retrying is the only way to make
+        // that new destination part of the user's decision.
+        let routing_changed =
+            current.owner != lk.owner || current.agent != lk.agent || current.branch != lk.branch;
+        if routing_changed {
+            ui::error("the session claim changed while import was waiting for its branch lock");
+            ui::hint("inspect the current destination with `agit status`, then retry the import");
+            return Ok(Placed::Refused(ExitCode::Policy));
+        }
+        let discovered_cwd = lk.cwd.clone();
+        *lk = current.clone();
+        if lk.cwd.is_none() {
+            lk.cwd = discovered_cwd;
+        }
+    }
+
     // A repo with no `main` collapses the whole chain, at every link: a server-side bare repo's
     // HEAD dangles at a non-existent `refs/heads/main` → `clone` checks out no local branch and
     // warns that the remote HEAD points at a ref that does not exist → `resume` reports no branch
@@ -730,9 +755,6 @@ fn birth_session_branch(
     // destination for good). Snapshot, claim, and read-back of the expected bytes all happen
     // under one link lock (see `link::lock`): a watermark advance from the Stop hook cannot slip
     // in between, so the bytes read back are necessarily the ones this claim wrote.
-    let _claim_guard = link::lock(store, &lk.source, &lk.session_id)?;
-    let prev_link = link::get(store, &lk.source, &lk.session_id);
-
     // The materialization baseline asserts "this prefix is already history **on the line it was
     // materialized onto**". Only two cases keep it: a re-run onto the same destination (with the
     // first turn unsettled, settlement is legitimately a no-op, and clearing it falls back to the
@@ -758,6 +780,12 @@ fn birth_session_branch(
     if rerouted && !(created && onto_commit.is_some()) {
         lk.baseline_bytes = None;
         lk.baseline_hash = None;
+        lk.materialized_from = None;
+    }
+    if rerouted {
+        // A superseded transcript can be recovered only onto another line. The new claim is
+        // active there; retaining its old successor would make the recovery impossible to settle.
+        lk.superseded_by = None;
     }
     persist_branch_claim(store, lk, owner, agent, &branch)?;
     let claimed_path = link::link_path(store, &lk.source, &lk.session_id);

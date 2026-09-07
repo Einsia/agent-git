@@ -851,9 +851,8 @@ fn validate_copy_response(
 /// a checkout of, and after the promotion that agent is yours, so the path following along is what
 /// is true — leaving it where it was is a lie.
 ///
-/// The links in the store are renamed with it — their `agent` field is the reverse index for
-/// `agit commit <agent>`, and if `--name` changes the name while the links do not follow, the next
-/// commit finds nothing (or worse, finds another agent of the same name).
+/// Store claims follow the promoted owner and name. Matching only a bare repository name would
+/// move unrelated claims belonging to other namespaces.
 pub fn promote(
     client: &crate::hub::Client,
     checkout: &Path,
@@ -882,6 +881,13 @@ pub fn promote(
     )?;
     let copy_identity = validate_copy_response(client.base(), &resp, &source_identity)?;
 
+    let store = Store::open_or_init()?;
+    let source_slug = source.slug();
+    let destination_slug = format!("{}/{}", resp.owner, resp.name);
+    let _repository_guards = crate::domain::link::lock_repositories_exclusive(
+        &store,
+        &[&source_slug, &destination_slug],
+    )?;
     let dest = config::repo_dir(&resp.owner, &resp.name)?;
     if dest != checkout && dest.join(".git").exists() {
         anyhow::bail!(
@@ -892,6 +898,17 @@ pub fn promote(
             resp.name,
             ui::tilde(&dest),
             source.slug()
+        );
+    }
+    if source_slug != destination_slug
+        && crate::domain::link::list(&store).iter().any(|claim| {
+            claim.is_active()
+                && claim.owner.as_deref() == Some(resp.owner.as_str())
+                && claim.agent.as_deref() == Some(resp.name.as_str())
+        })
+    {
+        anyhow::bail!(
+            "{destination_slug} already has an active runtime claim; inspect it before promoting this checkout"
         );
     }
 
@@ -906,7 +923,7 @@ pub fn promote(
         std::fs::rename(checkout, &dest)
             .with_context(|| format!("can’t move {} to {}", checkout.display(), dest.display()))?;
     }
-    rename_links(&source.name, &resp.name)?;
+    rename_links(&source.owner, &source.name, &resp.owner, &resp.name)?;
 
     println!(
         "{} {} is now yours: {}",
@@ -934,18 +951,30 @@ pub fn promote(
     })
 }
 
-/// After the copy is renamed, move the store links that point at the old name over to it.
-fn rename_links(from: &str, to: &str) -> crate::Result<()> {
-    if from == to {
+/// Only claims whose recorded namespace matches the promoted source can move to its copy.
+/// An ownerless legacy claim cannot prove which same-named repository it belongs to.
+fn rename_links(from_owner: &str, from: &str, to_owner: &str, to: &str) -> crate::Result<()> {
+    if from_owner == to_owner && from == to {
         return Ok(());
     }
     let Some(store) = Store::open()? else {
         return Ok(());
     };
-    for mut lk in crate::domain::link::list(&store) {
-        if lk.agent.as_deref() == Some(from) {
-            lk.agent = Some(to.to_string());
-            crate::domain::link::write(&store, &lk)?;
+    let belongs = |claim: &crate::domain::link::Link| {
+        claim.agent.as_deref() == Some(from) && claim.owner.as_deref() == Some(from_owner)
+    };
+    for observed in crate::domain::link::list(&store) {
+        if !belongs(&observed) {
+            continue;
+        }
+        let _guard = crate::domain::link::lock(&store, &observed.source, &observed.session_id)?;
+        if let Some(mut current) =
+            crate::domain::link::get(&store, &observed.source, &observed.session_id)
+            && belongs(&current)
+        {
+            current.agent = Some(to.to_string());
+            current.owner = Some(to_owner.to_string());
+            crate::domain::link::write(&store, &current)?;
         }
     }
     Ok(())

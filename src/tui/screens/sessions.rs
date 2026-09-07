@@ -213,7 +213,7 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
     // ① here: a link whose cwd matches this directory and that is already managed.
     for a in &input.links {
         let l = &a.link;
-        if l.cwd.as_deref() != Some(input.cwd.as_str()) {
+        if !l.is_active() || l.cwd.as_deref() != Some(input.cwd.as_str()) {
             continue;
         }
         let (Some(agent), Some(branch)) = (&l.agent, &l.branch) else {
@@ -497,7 +497,9 @@ fn branch_last_seen(
     // this source carries a full slug by construction.
     let mut latest: Option<SystemTime> = None;
     for link in links.iter().map(|a| &a.link).filter(|l| {
-        l.branch.as_deref() == Some(branch) && l.agent.as_deref().map(bare) == Some(bare(slug))
+        l.is_active()
+            && l.branch.as_deref() == Some(branch)
+            && l.agent.as_deref().map(bare) == Some(bare(slug))
     }) {
         // An unreadable file is treated as being written right now: calling it "live" wrongly
         // only blocks one takeover, calling it "dead" wrongly interleaves two streams of appends
@@ -1017,6 +1019,32 @@ mod tests {
         );
         assert_eq!(rows[1].slug.as_deref(), Some("nana/payments"));
         assert_eq!(rows[1].branch.as_deref(), Some("refund-fix"));
+    }
+
+    #[test]
+    fn superseded_transcripts_do_not_duplicate_the_active_branch_or_reenter_naming() {
+        let mut historical = link("old", "/w", Some("photo"), Some("work"));
+        historical.link.superseded_by = Some("claude-code/current".into());
+        let input = Input {
+            cwd: "/w".into(),
+            owner: Some("alice".into()),
+            links: vec![
+                historical,
+                link("current", "/w", Some("photo"), Some("work")),
+            ],
+            seen: vec![seen("old", 1000), seen("current", 0)],
+            same_repo: vec![SameRepo {
+                slug: "alice/photo".into(),
+                branch: "work".into(),
+                last_active: t(0),
+                last_seen: None,
+            }],
+        };
+        let rows = assemble(&input, t(1000));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id.as_deref(), Some("current"));
+        assert_eq!(rows[0].badge, Badge::Here);
+        assert!(!rows[0].live);
     }
 
     /// On a tie the adopted session comes before the unnamed one; the owner recorded on the

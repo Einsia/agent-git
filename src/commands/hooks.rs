@@ -261,6 +261,16 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
 
     let rt = runtime_of(runtime, ev.transcript_path.as_deref());
     let store = Store::open_or_init().ok()?;
+    let _branch_guard = if ev.source == Source::Startup {
+        env_session
+            .as_ref()
+            .map(|(slug, branch)| link::lock_branch(&store, slug, branch))
+            .transpose()
+            .ok()?
+    } else {
+        None
+    };
+    let _link_guard = link::lock(&store, rt, &ev.session_id).ok()?;
     let existing = link::get(&store, rt, &ev.session_id);
     let has_binding = existing
         .as_ref()

@@ -42,3 +42,5 @@ agit run alice/notes@v2 --mine -b my-v2 --as codex
 ```
 
 Use `resume` when you know the session should continue, and `fork` when you know an old point should start a new line.
+
+`--no-launch` performs the preparation; it is not a dry run. Repeating the same preparation reuses its runtime session. If the branch advances, an untouched prepared session is retained as superseded history and replaced; a session with unsettled content must be committed or forked before another materialization can take its claim.

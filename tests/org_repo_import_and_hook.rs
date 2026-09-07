@@ -35,6 +35,7 @@ fn fake_hub(
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let server_base = base.clone();
     std::thread::spawn(move || {
         for sock in listener.incoming() {
             let Ok(mut sock) = sock else { continue };
@@ -85,6 +86,18 @@ fn fake_hub(
                     serde_json::json!({
                         "version": version.trim(),
                         "tag": format!("agit-v{}", version.trim()),
+                    })
+                    .to_string(),
+                )
+            } else if line.starts_with("POST /api/agents/einsia/qa/clone ") {
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "agent_id": "bbbbbbbb-0000-4000-8000-000000000002",
+                        "forked_from": QA_AGENT_ID,
+                        "owner": "me", "name": "qa",
+                        "push_url": format!("{server_base}/me/qa.git"),
+                        "web_url": format!("{server_base}/me/qa"),
                     })
                     .to_string(),
                 )
@@ -302,6 +315,43 @@ fn commits_on(dir: &std::path::Path, branch: &str) -> usize {
         .trim()
         .parse()
         .unwrap()
+}
+
+fn active_links_on(
+    lab: &Lab,
+    owner: &str,
+    agent: &str,
+    branch: &str,
+) -> Vec<agit::domain::link::Link> {
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    agit::domain::link::active_for_branch(&store, owner, agent, branch)
+}
+
+fn advance_branch_without_changing_its_tree(repo: &Repo, branch: &str) -> String {
+    let old = repo
+        .git(&["rev-parse", &format!("refs/heads/{branch}")])
+        .unwrap();
+    let tree = repo
+        .git(&["rev-parse", &format!("refs/heads/{branch}^{{tree}}")])
+        .unwrap();
+    let new = repo
+        .git(&[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            old.trim(),
+            "-m",
+            "advance branch",
+        ])
+        .unwrap();
+    repo.git(&[
+        "update-ref",
+        &format!("refs/heads/{branch}"),
+        new.trim(),
+        old.trim(),
+    ])
+    .unwrap();
+    new.trim().to_string()
 }
 
 fn push_with_fresh_update_cache(
@@ -756,6 +806,762 @@ fn a_cross_runtime_resume_baselines_what_the_live_read_returns() {
     );
 }
 
+/// An existing runtime remains the resume target unless the caller explicitly requests another.
+#[test]
+fn runtime_default_does_not_replace_an_existing_native_session() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "keep the native runtime", "ok");
+    assert!(
+        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        lab.agit(&["config", "runtime.default", "codex"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let resumed = lab
+        .agit(&["resume", "einsia/qa@work", "--no-launch"])
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(resumed.status.success(), "{output}");
+    assert!(
+        output.contains("reusing the local native session"),
+        "{output}"
+    );
+    assert!(output.contains(SID), "{output}");
+    let active = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].session_id, SID);
+    assert_eq!(active[0].source, "claude-code");
+}
+
+/// Repeating the same prepare must return the existing runtime id instead of minting another
+/// active writer for the branch.
+#[test]
+fn repeated_no_launch_reuses_the_prepared_session() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    let imported = lab
+        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(imported.status.success());
+
+    let first = lab
+        .agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_active = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(first_active.len(), 1);
+    let prepared = first_active[0].session_id.clone();
+
+    assert!(
+        lab.agit(&["config", "runtime.default", "claude-code"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let second = lab
+        .agit(&["run", "einsia/qa@work", "--no-launch"])
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.status.success(), "{output}");
+    assert!(
+        output.contains("reusing the prepared runtime session"),
+        "{output}"
+    );
+    assert!(output.contains(&prepared), "{output}");
+    let second_active = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(second_active.len(), 1);
+    assert_eq!(second_active[0].session_id, prepared);
+    assert_eq!(walk(&lab.home.join(".codex").join("sessions")).len(), 1);
+}
+
+/// Claude Desktop writes the same Claude Code jsonl file but intentionally has no listing
+/// adapter. An already-materialized desktop link must still read that file for the idempotent
+/// prepare check, rather than becoming an unverifiable active claim on the second run.
+#[test]
+fn repeated_no_launch_reuses_a_claude_desktop_session() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    assert!(
+        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let first = lab
+        .agit(&[
+            "run",
+            "einsia/qa@work",
+            "--no-launch",
+            "--as",
+            "claude-desktop",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_active = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(first_active.len(), 1);
+    assert_eq!(first_active[0].source, "claude-desktop");
+    let prepared = first_active[0].session_id.clone();
+
+    let second = lab
+        .agit(&[
+            "run",
+            "einsia/qa@work",
+            "--no-launch",
+            "--as",
+            "claude-desktop",
+        ])
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.status.success(), "{output}");
+    assert!(
+        output.contains("reusing the prepared runtime session"),
+        "{output}"
+    );
+    assert!(output.contains(&prepared), "{output}");
+    let second_active = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(second_active.len(), 1);
+    assert_eq!(second_active[0].session_id, prepared);
+}
+
+/// A newer branch tip replaces an untouched materialization while preserving the old link as
+/// recovery metadata.
+#[test]
+fn an_advanced_branch_supersedes_an_untouched_materialization() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    assert!(
+        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        lab.agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let old = active_links_on(&lab, "einsia", "qa", "work").pop().unwrap();
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    let advanced = advance_branch_without_changing_its_tree(&repo, "work");
+
+    let resumed = lab
+        .agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(resumed.status.success(), "{output}");
+    assert!(output.contains("superseded codex"), "{output}");
+
+    let active = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(active.len(), 1);
+    assert_ne!(active[0].session_id, old.session_id);
+    assert_eq!(
+        active[0].materialized_from.as_deref(),
+        Some(advanced.as_str())
+    );
+    let successor = active[0].instance();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let old = agit::domain::link::get(&store, "codex", &old.session_id).unwrap();
+    assert_eq!(old.superseded_by.as_deref(), Some(successor.as_str()));
+
+    let by_branch = lab.agit(&["commit", "einsia/qa@work"]).output().unwrap();
+    let by_branch_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&by_branch.stdout),
+        String::from_utf8_lossy(&by_branch.stderr)
+    );
+    assert!(by_branch.status.success(), "{by_branch_text}");
+    assert!(!by_branch_text.contains("multiple session links"));
+
+    let stale = lab.agit(&["commit", &old.session_id]).output().unwrap();
+    let stale_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stale.stdout),
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert!(!stale.status.success(), "{stale_text}");
+    assert!(stale_text.contains("was superseded by"), "{stale_text}");
+
+    // The old runtime can still be open after its untouched link is superseded. Its stable branch
+    // environment must not make an implicit commit read the newer active runtime's transcript.
+    let from_old_runtime = lab
+        .agit(&["commit"])
+        .env("AGIT_SESSION", "einsia/qa@work")
+        .env("CODEX_SESSION_ID", &old.session_id)
+        .output()
+        .unwrap();
+    let from_old_runtime_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&from_old_runtime.stdout),
+        String::from_utf8_lossy(&from_old_runtime.stderr)
+    );
+    assert!(
+        !from_old_runtime.status.success(),
+        "{from_old_runtime_text}"
+    );
+    assert!(
+        from_old_runtime_text.contains("was superseded by"),
+        "{from_old_runtime_text}"
+    );
+
+    // A nested runtime can inherit the original Claude id while exposing the current Codex id.
+    // The current active identity wins; the inherited superseded variable must not block it.
+    let from_active_runtime = lab
+        .agit(&["commit"])
+        .env("AGIT_SESSION", "einsia/qa@work")
+        .env("CLAUDE_CODE_SESSION_ID", SID)
+        .env("CODEX_SESSION_ID", &active[0].session_id)
+        .output()
+        .unwrap();
+    let from_active_runtime_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&from_active_runtime.stdout),
+        String::from_utf8_lossy(&from_active_runtime.stderr)
+    );
+    assert!(
+        from_active_runtime.status.success(),
+        "{from_active_runtime_text}"
+    );
+    assert!(
+        !from_active_runtime_text.contains("was superseded by"),
+        "{from_active_runtime_text}"
+    );
+}
+
+/// If an outer Claude runtime is active on another line while an inner Codex runtime is the
+/// superseded process, the stale Codex identity must not be hidden by the unrelated active link.
+/// `AGIT_SESSION` supplies the line discriminator; without it, the resolver would fall through to
+/// the newer active claim and settle the wrong transcript.
+#[test]
+fn a_nested_runtime_on_another_line_does_not_mask_a_superseded_harness() {
+    const CLAUDE_ID: &str = "dddddddd-0000-4000-8000-000000000005";
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    assert!(
+        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        lab.agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let old = active_links_on(&lab, "einsia", "qa", "work").pop().unwrap();
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    advance_branch_without_changing_its_tree(&repo, "work");
+    assert!(
+        lab.agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let claude_dir = lab.agit_home.join("store").join("claude-code");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join(format!("{CLAUDE_ID}.json")),
+        serde_json::json!({
+            "cwd": lab.work.to_string_lossy(),
+            "agent": "qa",
+            "owner": "einsia",
+            "branch": "outer-line"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let refused = lab
+        .agit(&["commit"])
+        .env("AGIT_SESSION", "einsia/qa@work")
+        .env("CLAUDE_CODE_SESSION_ID", CLAUDE_ID)
+        .env("CODEX_SESSION_ID", &old.session_id)
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains("was superseded by"), "{output}");
+}
+
+#[test]
+fn rc_rerouting_a_materialization_checks_history_and_can_settle_a_fresh_line() {
+    check_rc_rerouted_settlement(false);
+}
+
+/// Legacy personal claims cannot lend their materialization baseline to an org's namesake line.
+#[test]
+fn rc_rerouting_a_legacy_personal_claim_checks_the_destination_namespace() {
+    check_rc_rerouted_settlement(true);
+}
+
+fn check_rc_rerouted_settlement(legacy_personal: bool) {
+    let lab = Lab::new();
+    let (source, source_owner, destination_branch) = if legacy_personal {
+        ("me/qa@work", "me", "work")
+    } else {
+        ("einsia/qa@work", "einsia", "unrelated")
+    };
+    lab.append_turn(SID, 1, "original context", "original answer");
+    let run = |args: &[&str]| {
+        let output = lab.agit(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&["import", SID, "--into", source]);
+    run(&["resume", source, "--force", "--no-launch"]);
+    let mut active = active_links_on(&lab, source_owner, "qa", "work")
+        .pop()
+        .unwrap();
+    assert!(active.baseline_bytes.is_some());
+    if legacy_personal {
+        active.owner = None;
+        active.materialized_from = None;
+        let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+        agit::domain::link::write(&store, &active).unwrap();
+    }
+    lab.append_turn(
+        &active.session_id,
+        2,
+        "new remote work",
+        "new remote answer",
+    );
+
+    let unrelated = "cccccccc-0000-4000-8000-000000000099";
+    lab.append_turn(unrelated, 1, "unrelated context", "unrelated answer");
+    run(&[
+        "import",
+        unrelated,
+        "--into",
+        &format!("einsia/qa@{destination_branch}"),
+    ]);
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    let identity = agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap();
+    agit::hub::identity::pin(&repo, &identity).unwrap();
+    let destination_ref = format!("refs/heads/{destination_branch}");
+    let before = repo.git(&["rev-parse", &destination_ref]).unwrap();
+    let land = |branch: &str| {
+        run(&[
+            "rc",
+            "land",
+            "--slug",
+            "einsia/qa",
+            "--agent-id",
+            QA_AGENT_ID,
+            "--branch",
+            branch,
+            "--runtime",
+            &active.source,
+            "--session",
+            &active.session_id,
+            "--cwd",
+            lab.work.to_str().unwrap(),
+        ]);
+    };
+    land(destination_branch);
+    let refused = lab.agit(&["commit", &active.session_id]).output().unwrap();
+    assert!(
+        !refused.status.success(),
+        "unrelated branch must reject the rerouted transcript: {}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(repo.git(&["rev-parse", &destination_ref]).unwrap(), before);
+
+    land("recovered");
+    run(&["commit", &active.session_id]);
+    let log = agit::domain::storage::materialize_at(
+        repo.root(),
+        "refs/heads/recovered",
+        agit::domain::meta::LOG_FILE,
+    )
+    .unwrap();
+    assert!(log.contains("original context"));
+    assert!(log.contains("new remote work"));
+    assert!(!log.contains("unrelated context"));
+}
+
+/// A materialized runtime is a continuation of one exact branch tip. If that tip moves before the
+/// runtime settles its appended turn, commit must preserve both histories instead of placing the
+/// runtime turn after the independently advanced branch.
+#[test]
+fn a_materialized_commit_refuses_after_its_source_tip_moves() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    let imported = lab
+        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(imported.status.success());
+
+    let prepared = lab
+        .agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        prepared.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&prepared.stdout),
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let active = active_links_on(&lab, "einsia", "qa", "work").pop().unwrap();
+    let source_tip = active.materialized_from.clone().unwrap();
+    let rollout_path = walk(&lab.home.join(".codex").join("sessions"))
+        .pop()
+        .unwrap();
+    let mut rollout = fs::OpenOptions::new()
+        .append(true)
+        .open(rollout_path)
+        .unwrap();
+    writeln!(
+        rollout,
+        "{}",
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "local continuation"}]
+            }
+        })
+    )
+    .unwrap();
+    writeln!(
+        rollout,
+        "{}",
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "local answer"}]
+            }
+        })
+    )
+    .unwrap();
+    drop(rollout);
+
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    let moved_tip = advance_branch_without_changing_its_tree(&repo, "work");
+    assert_ne!(source_tip, moved_tip);
+
+    let refused = lab.agit(&["commit", &active.session_id]).output().unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains("was materialized from"), "{output}");
+    assert!(output.contains("advanced independently"), "{output}");
+    assert_eq!(
+        repo.git(&["rev-parse", "refs/heads/work"]).unwrap().trim(),
+        moved_tip
+    );
+    let still_active = active_links_on(&lab, "einsia", "qa", "work").pop().unwrap();
+    assert_eq!(
+        still_active.materialized_from.as_deref(),
+        Some(source_tip.as_str())
+    );
+}
+
+/// Appended runtime bytes are unsettled work. A newer branch tip must not silently replace that
+/// writer, even though materializing the tip itself would succeed.
+#[test]
+fn an_advanced_branch_refuses_to_supersede_unsettled_content() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    assert!(
+        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        lab.agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let active = active_links_on(&lab, "einsia", "qa", "work").pop().unwrap();
+    let rollout = walk(&lab.home.join(".codex").join("sessions"))
+        .pop()
+        .unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(rollout)
+        .unwrap()
+        .write_all(b"{\"unsettled\":true}\n")
+        .unwrap();
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    advance_branch_without_changing_its_tree(&repo, "work");
+
+    let refused = lab
+        .agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains("already has unsettled content"), "{output}");
+    assert!(
+        output.contains(&format!("agit commit {}", active.session_id)),
+        "{output}"
+    );
+    let after = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].session_id, active.session_id);
+    assert_eq!(walk(&lab.home.join(".codex").join("sessions")).len(), 1);
+}
+
+/// Matching length alone does not prove an untouched materialization. Rewriting any byte inside
+/// the recorded baseline must preserve the old claim and stop before another session is created.
+#[test]
+fn an_advanced_branch_refuses_to_supersede_a_rewritten_baseline() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    assert!(
+        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        lab.agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let active = active_links_on(&lab, "einsia", "qa", "work").pop().unwrap();
+    let rollout = walk(&lab.home.join(".codex").join("sessions"))
+        .pop()
+        .unwrap();
+    let mut bytes = fs::read(&rollout).unwrap();
+    bytes[0] = if bytes[0] == b'{' { b'[' } else { b'{' };
+    fs::write(&rollout, bytes).unwrap();
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    advance_branch_without_changing_its_tree(&repo, "work");
+
+    let refused = lab
+        .agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{output}");
+    assert!(
+        output.contains("rewritten inside its recorded baseline"),
+        "{output}"
+    );
+    assert!(output.contains("--force --no-launch"), "{output}");
+    let after = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].session_id, active.session_id);
+    assert_eq!(walk(&lab.home.join(".codex").join("sessions")).len(), 1);
+}
+
+/// A legacy or damaged materialized link without a baseline hash fails closed. Byte length by
+/// itself must never authorize automatic replacement.
+#[test]
+fn an_advanced_branch_refuses_to_supersede_an_unverifiable_baseline() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    assert!(
+        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        lab.agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let active = active_links_on(&lab, "einsia", "qa", "work").pop().unwrap();
+    let link_path = lab
+        .agit_home
+        .join("store")
+        .join("codex")
+        .join(format!("{}.json", active.session_id));
+    let mut body: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&link_path).unwrap()).unwrap();
+    body.as_object_mut().unwrap().remove("baseline_hash");
+    fs::write(&link_path, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    advance_branch_without_changing_its_tree(&repo, "work");
+
+    let refused = lab
+        .agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"])
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains("cannot be proven untouched"), "{output}");
+    let after = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].session_id, active.session_id);
+    assert_eq!(walk(&lab.home.join(".codex").join("sessions")).len(), 1);
+}
+
+/// The branch lock covers the read-decide-write sequence. Concurrent prepares therefore converge
+/// on one runtime id instead of both observing an empty claim set and minting independently.
+#[test]
+fn concurrent_no_launch_prepares_leave_one_active_claim() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    assert!(
+        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let mut first = lab.agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"]);
+    let mut second = lab.agit(&["run", "einsia/qa@work", "--no-launch", "--as", "codex"]);
+    let one = std::thread::spawn(move || first.output().unwrap());
+    let two = std::thread::spawn(move || second.output().unwrap());
+    let one = one.join().unwrap();
+    let two = two.join().unwrap();
+    assert!(
+        one.status.success() && two.status.success(),
+        "first:\n{}{}\nsecond:\n{}{}",
+        String::from_utf8_lossy(&one.stdout),
+        String::from_utf8_lossy(&one.stderr),
+        String::from_utf8_lossy(&two.stdout),
+        String::from_utf8_lossy(&two.stderr)
+    );
+    assert_eq!(active_links_on(&lab, "einsia", "qa", "work").len(), 1);
+    assert_eq!(walk(&lab.home.join(".codex").join("sessions")).len(), 1);
+}
+
+/// Legacy stores can already contain several active links. The refusal must name commands that
+/// select either runtime session instead of asking the user to edit store files by hand.
+#[test]
+fn legacy_multiple_link_error_offers_session_id_disambiguation() {
+    const LEGACY_SID: &str = "cccccccc-0000-4000-8000-000000000005";
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start the org line", "ok");
+    assert!(
+        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let dir = lab.agit_home.join("store").join("claude-code");
+    let original = fs::read_to_string(dir.join(format!("{SID}.json"))).unwrap();
+    fs::write(dir.join(format!("{LEGACY_SID}.json")), original).unwrap();
+
+    let refused_run = lab
+        .agit(&["run", "einsia/qa@work", "--no-launch"])
+        .output()
+        .unwrap();
+    let run_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused_run.stdout),
+        String::from_utf8_lossy(&refused_run.stderr)
+    );
+    assert!(!refused_run.status.success(), "{run_output}");
+    assert!(
+        run_output.contains(&format!("agit commit {SID}")),
+        "{run_output}"
+    );
+    assert!(
+        run_output.contains(&format!("agit commit {LEGACY_SID}")),
+        "{run_output}"
+    );
+    assert!(run_output.contains("--force --no-launch"), "{run_output}");
+
+    let refused = lab.agit(&["commit", "einsia/qa@work"]).output().unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{output}");
+    assert!(output.contains("2 active session links"), "{output}");
+    assert!(output.contains(&format!("agit commit {SID}")), "{output}");
+    assert!(
+        output.contains(&format!("agit commit {LEGACY_SID}")),
+        "{output}"
+    );
+    assert!(
+        !output.contains("remove extra store links by hand"),
+        "{output}"
+    );
+}
+
 /// A rerouted claim must invalidate the materialization baseline: the baseline the earlier line
 /// left behind covers the whole transcript, and carried onto a new branch with no history the
 /// settlement region is the empty string — the entire history silently settles as zero turns.
@@ -1175,4 +1981,115 @@ fn a_web_id_behind_the_local_head_continues_on_the_local_line() {
         tip,
         "the local head must not be moved back"
     );
+}
+
+/// Namespace publication and directory movement exclude branch claim preparation.
+#[test]
+fn promotion_excludes_prepare_while_publishing_claim_ownership() {
+    let lab = promotion_lab();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let claim_guard = agit::domain::link::lock(&store, "claude-code", SID).unwrap();
+    let mut promote = lab.agit(&["clone", "einsia/qa", "--mine", "--no-bind"]);
+    let promote = std::thread::spawn(move || promote.output().unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !lab.repo("me", "qa").join(".git").exists() {
+        if promote.is_finished() {
+            let output = promote.join().unwrap();
+            panic!(
+                "promotion exited before publication: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "promotion must reach claim publication"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut prepare = lab.agit(&["resume", "me/qa@work", "--no-launch", "--as", "codex"]);
+    let (send, receive) = std::sync::mpsc::channel();
+    let prepare = std::thread::spawn(move || send.send(prepare.output().unwrap()).unwrap());
+    let premature = receive.recv_timeout(std::time::Duration::from_millis(500));
+    drop(claim_guard);
+    let promoted = promote.join().unwrap();
+    assert!(
+        promoted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&promoted.stderr)
+    );
+    let waited = premature.is_err();
+    let prepared = premature.unwrap_or_else(|_| {
+        receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+    });
+    prepare.join().unwrap();
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    assert!(
+        waited,
+        "prepare must wait until promotion publishes the source claim; active destination claims: {}",
+        active_links_on(&lab, "me", "qa", "work").len()
+    );
+    assert_eq!(active_links_on(&lab, "me", "qa", "work").len(), 1);
+    assert!(active_links_on(&lab, "einsia", "qa", "work").is_empty());
+}
+
+fn promotion_lab() -> Lab {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "preserve the promoted line", "ok");
+    let imported = lab
+        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let source = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    agit::hub::identity::pin(
+        &source,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    lab
+}
+
+/// A destination claim cannot be combined with the promoted source namespace.
+#[test]
+fn promotion_refuses_destination_claims_before_moving_the_checkout() {
+    let lab = promotion_lab();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let mut existing =
+        agit::domain::link::Link::new("codex", "destination-session", Some(&lab.work));
+    existing.owner = Some("me".into());
+    existing.agent = Some("qa".into());
+    existing.branch = Some("work".into());
+    agit::domain::link::write(&store, &existing).unwrap();
+    let output = lab
+        .agit(&["clone", "einsia/qa", "--mine", "--no-bind"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already has an active runtime claim")
+    );
+    assert!(lab.repo("einsia", "qa").join(".git").exists());
+    assert!(!lab.repo("me", "qa").exists());
+    let source = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    assert_eq!(
+        agit::hub::identity::read(&source)
+            .unwrap()
+            .unwrap()
+            .agent_id,
+        QA_AGENT_ID
+    );
+    assert_eq!(active_links_on(&lab, "einsia", "qa", "work").len(), 1);
+    assert_eq!(active_links_on(&lab, "me", "qa", "work").len(), 1);
 }
