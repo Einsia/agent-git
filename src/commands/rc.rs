@@ -685,7 +685,7 @@ fn list() -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e}"));
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&e, ExitCode::Network))
         }
     }
 }
@@ -709,7 +709,7 @@ fn revoke(args: RevokeArgs) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e}"));
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&e, ExitCode::Network))
         }
     }
 }

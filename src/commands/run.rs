@@ -64,7 +64,7 @@ pub fn run(args: Args) -> CmdResult {
                 if let Err(e) = ensure_mine(&slug) {
                     super::fix::register_terminal_api_error(&e);
                     ui::error(&format!("promotion into your namespace failed: {e:#}"));
-                    return Ok(ExitCode::Network);
+                    return Ok(super::terminal_error_code(&e, ExitCode::Network));
                 }
                 let me = crate::infra::credentials::current_user().unwrap_or_default();
                 (format!("{me}/{n}"), true)

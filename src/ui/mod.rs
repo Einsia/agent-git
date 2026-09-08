@@ -87,6 +87,54 @@ pub fn hint_with_fix(msg: &str, action: impl FnOnce() -> Option<crate::commands:
     crate::commands::fix::register(action);
 }
 
+/// A POSIX shell must receive the complete argument literally, including embedded apostrophes.
+pub(crate) fn quote_posix_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+pub(crate) fn quote_powershell_argument(value: &str) -> String {
+    if !value.is_empty()
+        && !value.starts_with('@')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '@' | '-' | '_' | '.'))
+    {
+        return value.to_owned();
+    }
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        // PowerShell recognizes typographic quotes as string delimiters too.
+        if matches!(
+            character,
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'
+        ) {
+            quoted.push(character);
+        }
+        quoted.push(character);
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// A copied login command retains the request's Hub after command-local routing expires.
+pub(crate) fn login_hint(hub: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "log in from PowerShell with `& {{ $agitLoginHubBefore = $env:AGIT_HUB_URL; try {{ $env:AGIT_HUB_URL = {}; agit login }} finally {{ $env:AGIT_HUB_URL = $agitLoginHubBefore }} }}`",
+            quote_powershell_argument(hub)
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "log in with `agit login --hub {}`",
+            quote_posix_argument(hub)
+        )
+    }
+}
+
 pub fn success(msg: &str) {
     println!("{} {msg}", ok(theme::symbols().check));
 }

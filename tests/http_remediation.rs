@@ -210,6 +210,7 @@ mod unix {
             let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
             command
                 .args(args)
+                .stdin(Stdio::null())
                 .env_clear()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("HOME", &self.home)
@@ -274,6 +275,7 @@ mod unix {
         fn git(&self, directory: &Path, args: &[&str]) -> Vec<u8> {
             let output = Command::new("git")
                 .args(args)
+                .stdin(Stdio::null())
                 .env_clear()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("HOME", &self.home)
@@ -304,7 +306,6 @@ mod unix {
 
     fn run_bounded(mut command: Command) -> Output {
         let mut child = command
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -345,6 +346,307 @@ mod unix {
     }
 
     #[test]
+    fn missing_credentials_keep_auth_category_and_selected_directory_in_all_formats() {
+        for args in [
+            vec!["search", "needle"],
+            vec!["share", "list"],
+            vec!["pr", "show", "1"],
+            vec!["repo", "create", "qa"],
+            vec!["repo", "list", "--remote"],
+        ] {
+            let lab = Lab::new();
+            let hub = Hub::new(|_| vec![]);
+            for version in [None, Some("1"), Some("2")] {
+                let mut argv = vec!["-C", lab.work.to_str().unwrap(), "--json"];
+                if let Some(version) = version {
+                    argv.extend(["--json-version", version]);
+                }
+                argv.extend(args.iter().copied());
+                let mut command = lab.command(&hub.base, &argv);
+                command.current_dir(&lab.home);
+                let output = run_bounded(command);
+                assert_eq!(output.status.code(), Some(5), "{output:?}");
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["exit_code"], 5);
+                assert_eq!(value["ok"], false);
+                if version == Some("1") {
+                    assert_eq!(value["schema_version"], 1);
+                    assert!(value.get("fix").is_none());
+                } else {
+                    lab.assert_login(&value, &hub.base);
+                }
+            }
+            let mut command = lab.command(&hub.base, &["-C", lab.work.to_str().unwrap()]);
+            command.args(&args).current_dir(&lab.home);
+            let output = run_bounded(command);
+            assert_eq!(output.status.code(), Some(5), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains(&hub.base));
+            assert!(!lab.credential_path(&hub.base).exists());
+            assert!(hub.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_credential_configuration_is_not_missing_authentication() {
+        for args in [vec!["search", "needle"], vec!["repo", "create", "qa"]] {
+            for malformed in [false, true] {
+                let lab = Lab::new();
+                let hub = Hub::new(|_| vec![]);
+                let path = lab.credential_path(&hub.base);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let bytes = if malformed {
+                    b"not credential JSON".to_vec()
+                } else {
+                    let mut value = credential(&hub.base, false);
+                    value.hub = Some("https://other.invalid".into());
+                    serde_json::to_vec(&value).unwrap()
+                };
+                fs::write(&path, &bytes).unwrap();
+                let mut argv = vec!["--json"];
+                argv.extend(args.iter().copied());
+                let value = lab.json(&hub.base, &argv, 2);
+                assert_eq!(value["fix"], json!([]));
+                assert!(value.to_string().contains("credentials do not belong"));
+                assert!(!value.to_string().contains("not logged in"));
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                assert!(hub.finish().is_empty());
+            }
+        }
+        let lab = Lab::new();
+        let value = lab.json(
+            "https://invalid.example/?route=other",
+            &["--json", "search", "needle"],
+            2,
+        );
+        assert_eq!(value["fix"], json!([]));
+        assert!(!value.to_string().contains("not logged in"));
+    }
+
+    #[test]
+    fn copied_login_hint_keeps_literal_hub_after_command_local_routing_expires() {
+        for authenticated in [false, true] {
+            let lab = Lab::new();
+            let path = "/team&qa;printf/it's/$HOME";
+            let hub = Hub::new(|_| {
+                if authenticated {
+                    vec![Step::error(
+                        "GET",
+                        &format!("{path}/api/shares"),
+                        authentication_error("synthetic rejection"),
+                    )]
+                } else {
+                    vec![]
+                }
+            });
+            let selected = format!("{}{path}", hub.base);
+            if authenticated {
+                lab.seed_credentials(&selected, false);
+            }
+            let output = run_bounded(lab.command(&selected, &["share", "list"]));
+            assert_eq!(output.status.code(), Some(5), "{output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let line = stderr
+                .lines()
+                .find(|line| line.contains("with `agit login --hub "))
+                .unwrap();
+            let copied = line
+                .split_once("with `")
+                .unwrap()
+                .1
+                .strip_suffix('`')
+                .unwrap();
+            let script = format!("agit() {{ printf '%s\\n' \"$@\"; }}; {copied}");
+            let replay = Command::new("sh")
+                .args(["-c", &script])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("AGIT_HUB_URL", "https://different.invalid")
+                .env("HOME", &lab.home)
+                .output()
+                .unwrap();
+            assert!(replay.status.success(), "{replay:?}");
+            assert!(replay.stderr.is_empty(), "{replay:?}");
+            assert_eq!(
+                String::from_utf8(replay.stdout).unwrap(),
+                format!("login\n--hub\n{selected}\n")
+            );
+            assert_eq!(hub.finish().len(), usize::from(authenticated));
+        }
+    }
+
+    #[test]
+    fn accepted_hub_spellings_keep_auth_errors_without_widening_the_fix_schema() {
+        for scheme in ["HTTP", "hTtP"] {
+            for authenticated in [false, true] {
+                let lab = Lab::new();
+                let hub = Hub::new(|_| {
+                    if authenticated {
+                        vec![Step::error(
+                            "GET",
+                            "/api/shares",
+                            authentication_error("synthetic rejection"),
+                        )]
+                    } else {
+                        vec![]
+                    }
+                });
+                let selected = hub.base.replacen("http", scheme, 1);
+                if authenticated {
+                    lab.seed_credentials(&selected, false);
+                }
+                let value = lab.json(&selected, &["--json", "share", "list"], 5);
+                assert_eq!(value["fix"], json!([]));
+                assert!(value.to_string().contains(&selected));
+                assert!(value.to_string().contains("agit login --hub"));
+                assert_eq!(hub.finish().len(), usize::from(authenticated));
+            }
+        }
+    }
+
+    #[test]
+    fn api_status_drives_auth_category_without_guessing_from_recipes_or_prose() {
+        for (args, target, fallback) in [
+            (
+                vec!["search", "needle"],
+                "/api/search/sessions?q=needle&per=10",
+                1,
+            ),
+            (vec!["share", "list"], "/api/shares", 2),
+            (vec!["rc", "list"], "/api/rc/connections", 6),
+        ] {
+            for status in [401, 403, 404, 500] {
+                let lab = Lab::new();
+                let hub = Hub::new(|_| {
+                    let mut step =
+                        Step::error("GET", target, authentication_error("HTTP 401: agit login"));
+                    step.status = status;
+                    vec![step]
+                });
+                lab.seed_credentials(&hub.base, false);
+                let before = fs::read(lab.credential_path(&hub.base)).unwrap();
+                let mut argv = vec!["--json"];
+                argv.extend(args.iter().copied());
+                let value = lab.json(&hub.base, &argv, if status == 401 { 5 } else { fallback });
+                if status == 401 {
+                    lab.assert_login(&value, &hub.base);
+                } else {
+                    assert_eq!(value["fix"], json!([]));
+                    assert!(!value.to_string().contains("log in with `agit login --hub"));
+                }
+                assert!(value.to_string().contains("HTTP 401: agit login"));
+                assert_eq!(fs::read(lab.credential_path(&hub.base)).unwrap(), before);
+                assert_eq!(hub.finish().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn hub_login_recipes_require_explicit_matching_context_in_every_json_version() {
+        for (status, kind, recipe, login) in [
+            (401, "unauthorized", Some(true), true),
+            (401, "unauthorized", None, false),
+            (401, "unauthorized", Some(false), false),
+            (401, "share_password", Some(true), false),
+            (401, "Unauthorized", Some(true), false),
+            (401, " unauthorized ", Some(true), false),
+            (401, "", Some(true), false),
+            (404, "not_found", Some(true), false),
+            (409, "conflict", Some(true), false),
+            (503, "repository_unavailable", Some(true), false),
+        ] {
+            let lab = Lab::new();
+            let hub = Hub::new(|_| {
+                [None, Some("1"), Some("2"), None]
+                    .into_iter()
+                    .map(|_| {
+                        let mut body = json!({"error":"synthetic credential refusal", "kind":kind});
+                        if let Some(recipe) = recipe {
+                            body["fix"] = if recipe {
+                                json!([{"kind":"authenticate"}])
+                            } else {
+                                json!([])
+                            };
+                        }
+                        let mut step =
+                            Step::error("GET", "/api/search/sessions?q=needle&per=10", body);
+                        step.status = status;
+                        step
+                    })
+                    .collect()
+            });
+            lab.seed_credentials(&hub.base, false);
+            let before = fs::read(lab.credential_path(&hub.base)).unwrap();
+            for version in [None, Some("1"), Some("2")] {
+                let mut args = vec!["--json"];
+                if let Some(version) = version {
+                    args.extend(["--json-version", version]);
+                }
+                args.extend(["search", "needle"]);
+                let value = lab.json(&hub.base, &args, if status == 401 { 5 } else { 1 });
+                assert!(value.to_string().contains("synthetic credential refusal"));
+                assert!(value.to_string().contains(&hub.base));
+                assert_eq!(
+                    value.to_string().contains("log in with `agit login --hub"),
+                    login
+                );
+                if version == Some("1") {
+                    assert!(value.get("fix").is_none());
+                } else if login {
+                    lab.assert_login(&value, &hub.base);
+                } else {
+                    assert_eq!(value["fix"], json!([]));
+                }
+                assert_eq!(fs::read(lab.credential_path(&hub.base)).unwrap(), before);
+            }
+            let output = run_bounded(lab.command(&hub.base, &["search", "needle"]));
+            assert_eq!(
+                output.status.code(),
+                Some(if status == 401 { 5 } else { 1 })
+            );
+            assert!(output.stdout.is_empty());
+            let text = String::from_utf8(output.stderr).unwrap();
+            assert!(text.contains("synthetic credential refusal"));
+            assert!(text.contains(&hub.base));
+            assert_eq!(text.contains("log in with `agit login --hub"), login);
+            assert_eq!(fs::read(lab.credential_path(&hub.base)).unwrap(), before);
+            assert_eq!(hub.finish().len(), 4);
+        }
+    }
+
+    #[test]
+    fn rejected_pat_keeps_auth_failure_instead_of_claiming_a_terminal_is_missing() {
+        let lab = Lab::new();
+        let hub = Hub::new(|_| {
+            let mut step = Step::error(
+                "POST",
+                "/api/auth/login",
+                authentication_error("synthetic rejected PAT"),
+            );
+            step.bearer = None;
+            vec![step]
+        });
+        let mut command = lab.command(&hub.base, &["--json", "login", "--with-token"]);
+        let input = lab.home.join("synthetic-pat.txt");
+        fs::write(&input, OLD_ACCESS).unwrap();
+        command.stdin(fs::File::open(input).unwrap());
+        let output = run_bounded(command);
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        lab.assert_login(&value, &hub.base);
+        assert!(!value.to_string().contains("needs an interactive terminal"));
+        assert!(!value.to_string().contains(OLD_ACCESS));
+        assert!(!lab.credential_path(&hub.base).exists());
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
+            json!({"token":OLD_ACCESS})
+        );
+    }
+
+    #[test]
     fn terminal_search_categories_and_counts_keep_server_recipes() {
         let lab = Lab::new();
         let kinds = ["sessions", "agents", "prs", "people"];
@@ -370,12 +672,12 @@ mod unix {
             let value = lab.json(
                 &hub.base,
                 &["--json", "search", "needle", "--type", kind],
-                1,
+                5,
             );
             lab.assert_login(&value, &hub.base);
             assert!(value.to_string().contains("synthetic terminal search"));
         }
-        let value = lab.json(&hub.base, &["--json", "search", "needle", "--counts"], 1);
+        let value = lab.json(&hub.base, &["--json", "search", "needle", "--counts"], 5);
         lab.assert_login(&value, &hub.base);
         assert!(value.to_string().contains("synthetic terminal counts"));
         assert_eq!(hub.finish().len(), kinds.len() + 1);
@@ -417,32 +719,135 @@ mod unix {
     }
 
     #[test]
+    fn whoami_does_not_replace_other_http_refusals_with_sign_in_advice() {
+        for (status, kind, recipe, login) in [
+            (401, "unauthorized", true, true),
+            (401, "unauthorized", false, false),
+            (401, "share_password", true, false),
+            (403, "forbidden", true, false),
+            (503, "repository_unavailable", true, false),
+        ] {
+            let lab = Lab::new();
+            let hub = Hub::new(|_| {
+                let mut steps = Vec::new();
+                for _ in [true, false] {
+                    let mut body =
+                        json!({"error":"synthetic identity refusal", "kind":kind, "fix":[]});
+                    if recipe {
+                        body["fix"] = json!([{"kind":"authenticate"}]);
+                    }
+                    let mut step = Step::error("GET", "/api/auth/me", body);
+                    step.status = status;
+                    steps.push(step);
+                    if status == 401 {
+                        let mut refresh = Step::error(
+                            "POST",
+                            "/api/auth/refresh",
+                            authentication_error("synthetic discarded refresh"),
+                        );
+                        refresh.bearer = None;
+                        steps.push(refresh);
+                    }
+                }
+                steps
+            });
+            lab.seed_credentials(&hub.base, true);
+            let before = fs::read(lab.credential_path(&hub.base)).unwrap();
+            let code = if matches!(status, 401 | 403) { 5 } else { 6 };
+            let value = lab.json(&hub.base, &["--json", "whoami", "--check"], code);
+            assert!(value.to_string().contains("synthetic identity refusal"));
+            assert!(!value.to_string().contains("synthetic discarded refresh"));
+            assert_eq!(value["result"]["value"]["check"]["server_reachable"], true);
+            assert_eq!(
+                value.to_string().contains("log in with `agit login --hub"),
+                login
+            );
+            if login {
+                lab.assert_login(&value, &hub.base);
+            } else {
+                assert_eq!(value["fix"], json!([]));
+                assert!(!value.to_string().contains("sign in again"));
+            }
+            let output = run_bounded(lab.command(&hub.base, &["whoami", "--check"]));
+            assert_eq!(output.status.code(), Some(code));
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("synthetic identity refusal"));
+            assert!(!stderr.contains("synthetic discarded refresh"));
+            assert_eq!(stderr.contains("log in with `agit login --hub"), login);
+            if !login {
+                assert!(!stderr.contains("sign in again"));
+            }
+            assert_eq!(fs::read(lab.credential_path(&hub.base)).unwrap(), before);
+            assert_eq!(hub.finish().len(), if status == 401 { 4 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn unavailable_pat_endpoint_does_not_invent_an_authentication_retry() {
+        for recipe in [false, true] {
+            let lab = Lab::new();
+            let hub = Hub::new(|_| {
+                let mut body = json!({"error":"synthetic repository unavailable", "kind":"repository_unavailable", "fix":[]});
+                if recipe {
+                    body["fix"] = json!([{"kind":"authenticate"}]);
+                }
+                let mut step = Step::error("POST", "/api/auth/login", body);
+                step.status = 503;
+                step.bearer = None;
+                vec![step]
+            });
+            lab.seed_credentials(&hub.base, false);
+            let before = fs::read(lab.credential_path(&hub.base)).unwrap();
+            let input = lab.home.join("synthetic-pat.txt");
+            fs::write(&input, OLD_ACCESS).unwrap();
+            let mut command = lab.command(&hub.base, &["--json", "login", "--with-token"]);
+            command.stdin(fs::File::open(input).unwrap());
+            let output = run_bounded(command);
+            assert_eq!(output.status.code(), Some(8), "{output:?}");
+            assert!(output.stderr.is_empty());
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["fix"], json!([]));
+            assert!(
+                value
+                    .to_string()
+                    .contains("synthetic repository unavailable")
+            );
+            assert!(!value.to_string().contains("agit login"));
+            assert!(!value.to_string().contains("mint a token"));
+            assert!(!value.to_string().contains("needs an interactive terminal"));
+            assert!(!value.to_string().contains(OLD_ACCESS));
+            assert_eq!(fs::read(lab.credential_path(&hub.base)).unwrap(), before);
+            assert_eq!(hub.finish().len(), 1);
+        }
+    }
+
+    #[test]
     fn propagated_and_converted_terminal_errors_both_supply_actions() {
         for (args, method, target, code) in [
-            (vec!["--json", "share", "list"], "GET", "/api/shares", 2),
+            (vec!["--json", "share", "list"], "GET", "/api/shares", 5),
             (
                 vec!["--json", "repo", "create", "qa"],
                 "POST",
                 "/api/agents",
-                6,
+                5,
             ),
             (
                 vec!["--json", "fetch", "me/qa"],
                 "GET",
                 "/api/agents/me/qa",
-                6,
+                5,
             ),
             (
                 vec!["--json", "rc", "list"],
                 "GET",
                 "/api/rc/connections",
-                6,
+                5,
             ),
             (
                 vec!["--json", "rc", "revoke", "synthetic"],
                 "POST",
                 "/api/rc/connections/synthetic/revoke",
-                6,
+                5,
             ),
             (
                 vec!["--json", "rc", "pair"],
@@ -505,9 +910,10 @@ mod unix {
         });
         lab.seed_credentials(&hub.base, false);
         for _ in &wire_values {
-            let value = lab.json(&hub.base, &["--json", "search", "needle"], 1);
+            let value = lab.json(&hub.base, &["--json", "search", "needle"], 5);
             assert_eq!(value["fix"], json!([]), "{value}");
             assert!(value.to_string().contains("synthetic retained diagnosis"));
+            assert!(!value.to_string().contains("log in with `agit login --hub"));
             assert!(!value.to_string().contains("unsafe-command"));
             assert!(!value.to_string().contains("foreign.invalid"));
         }
@@ -528,12 +934,12 @@ mod unix {
             ]
         });
         lab.seed_credentials(&hub.base, false);
-        let value = lab.json(&hub.base, &["--json", "search", "needle"], 1);
+        let value = lab.json(&hub.base, &["--json", "search", "needle"], 5);
         lab.assert_login(&value, &hub.base);
         let legacy = lab.json(
             &hub.base,
             &["--json", "--json-version", "1", "search", "needle"],
-            1,
+            5,
         );
         assert_eq!(legacy["schema_version"], 1);
         assert!(legacy.get("fix").is_none());
@@ -593,7 +999,7 @@ mod unix {
         assert!(value.to_string().contains("secret-like patterns found"));
         assert!(!value.to_string().contains(SECRET_PATTERN));
         assert!(!value.to_string().contains("synthetic scan probe"));
-        let terminal = lab.json(&hub.base, &["--json", "fetch", "me/qa"], 6);
+        let terminal = lab.json(&hub.base, &["--json", "fetch", "me/qa"], 5);
         lab.assert_login(&terminal, &hub.base);
         assert_eq!(lab.git(&repo, &["show-ref"]), refs_before);
         assert_eq!(fs::read(repo.join(".git/config")).unwrap(), config_before);
@@ -622,7 +1028,7 @@ mod unix {
         let repo = lab.initialize_repo(&hub.base);
         let refs_before = lab.git(&repo, &["show-ref"]);
         let config_before = fs::read(repo.join(".git/config")).unwrap();
-        let value = lab.json(&hub.base, &["--json", "push", "me/qa", "-b", "main"], 2);
+        let value = lab.json(&hub.base, &["--json", "push", "me/qa", "-b", "main"], 5);
         lab.assert_login(&value, &hub.base);
         assert!(value.to_string().contains("synthetic terminal pinned push"));
         assert!(

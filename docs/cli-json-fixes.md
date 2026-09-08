@@ -61,9 +61,13 @@ contribute recovery actions carry the current reporter explicitly and use its
 `run` method. Reporter handles close with their invocation, including on failure
 or unwinding, and cannot publish into a later invocation.
 
-Hub HTTP errors can include `fix: [{"kind":"authenticate"}]`. The client retains
-this recipe as passive error metadata and reports a login action only when that
-error determines the command's final failure. Failed refresh exchanges, discarded
+Hub HTTP errors can include `fix: [{"kind":"authenticate"}]`. The client accepts
+this recipe only with HTTP 401 and `kind: "unauthorized"`, retains it as passive
+error metadata, and reports a login action only when that error determines the
+command's final failure. A missing or rejected recipe also prevents the generic
+HTTP error renderer from generating a Hub-login command: other credential failures
+can use the same status and category. The server's diagnostic remains intact.
+Failed refresh exchanges, discarded
 probes, warnings and recovered requests do not register actions. The login action
 uses the failed request's Hub even when current global routing has changed.
 

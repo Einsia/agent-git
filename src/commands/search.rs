@@ -124,7 +124,7 @@ fn failed(e: anyhow::Error) -> CmdResult {
     super::fix::register_terminal_api_error(&e);
     ui::error(&format!("search failed: {e:#}"));
     ui::hint("if this hub is self-hosted, it may be older than this CLI");
-    Ok(ExitCode::Failure)
+    Ok(super::terminal_error_code(&e, ExitCode::Failure))
 }
 
 fn counts(client: &crate::hub::Client, args: &Args) -> CmdResult {

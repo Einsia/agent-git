@@ -103,14 +103,44 @@ pub type CmdResult = Result<ExitCode>;
 /// Several commands need this precondition, so the wording lives in one place.
 pub fn require_login() -> Result<crate::hub::Client> {
     let c = crate::hub::Client::from_env();
-    if !c.has_token() {
-        anyhow::bail!(
-            "not logged in to {} yet.\n  \
-             Run `agit login` first.",
-            c.base()
-        );
+    if c.checked_access_token()?.is_none() {
+        return Err(anyhow::Error::new(LoginRequired {
+            hub: c.base().to_owned(),
+        }));
     }
     Ok(c)
+}
+
+#[derive(Debug)]
+pub(crate) struct LoginRequired {
+    pub(crate) hub: String,
+}
+
+impl std::fmt::Display for LoginRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "not logged in to {} yet.\n  {}",
+            self.hub,
+            crate::ui::login_hint(&self.hub)
+        )
+    }
+}
+
+impl std::error::Error for LoginRequired {}
+
+/// Only typed authentication failures override a command's existing failure category.
+pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCode {
+    if error.chain().any(|cause| {
+        cause.is::<LoginRequired>()
+            || cause
+                .downcast_ref::<crate::hub::client::ApiError>()
+                .is_some_and(|api| api.status == 401)
+    }) {
+        ExitCode::Auth
+    } else {
+        fallback
+    }
 }
 
 /// Parse the `<owner>/<name>` form.

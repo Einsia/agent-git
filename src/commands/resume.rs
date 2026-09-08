@@ -34,6 +34,9 @@ use crate::domain::repo::Repo;
 use crate::domain::store::Store;
 use crate::domain::transcript;
 use crate::infra::config;
+use crate::ui::quote_posix_argument as shell_quote;
+#[cfg(windows)]
+use crate::ui::quote_powershell_argument as powershell_recovery_arg;
 use crate::{ExitCode, adapter, ui};
 use clap::Args as ClapArgs;
 use std::path::{Path, PathBuf};
@@ -957,31 +960,6 @@ fn recovery_arg(value: &str) -> String {
     }
 }
 
-#[cfg(windows)]
-fn powershell_recovery_arg(value: &str) -> String {
-    if !value.is_empty()
-        && !value.starts_with('@')
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '@' | '-' | '_' | '.'))
-    {
-        return value.to_owned();
-    }
-    let mut quoted = String::from("'");
-    for character in value.chars() {
-        // PowerShell recognizes typographic quotes as string delimiters too.
-        if matches!(
-            character,
-            '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'
-        ) {
-            quoted.push(character);
-        }
-        quoted.push(character);
-    }
-    quoted.push('\'');
-    quoted
-}
-
 fn require_resume_state(
     repo: &Repo,
     branch: &str,
@@ -1815,10 +1793,6 @@ fn wrap_launch(inner: &str, cwd: &Path, slug: &str, branch: &str) -> String {
         shell_quote(&cwd.to_string_lossy()),
         inner
     )
-}
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// The finish: print or launch.

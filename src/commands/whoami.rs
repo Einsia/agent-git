@@ -104,7 +104,12 @@ fn verify_online(hub: &str, client: &crate::hub::Client, human: bool) -> (Check,
             match e.downcast_ref::<crate::hub::client::ApiError>() {
                 Some(api) if api.status == 401 || api.status == 403 => {
                     ui::error(&format!("{hub} rejects the credentials: {}", api.detail));
-                    ui::hint("next: sign in again with `agit login`");
+                    if api
+                        .remedies()
+                        .contains(&crate::hub::client::Remediation::Authenticate {})
+                    {
+                        ui::hint(&ui::login_hint(api.base()));
+                    }
                     (
                         Check {
                             server_reachable: Some(true),

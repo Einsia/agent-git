@@ -78,7 +78,7 @@ pub fn run(args: Args) -> CmdResult {
                 return Ok(ExitCode::Network);
             }
             ui::error(&format!("couldn't ask the hub for the latest version: {e}"));
-            return Ok(ExitCode::Network);
+            return Ok(super::terminal_error_code(&e, ExitCode::Network));
         }
     };
 

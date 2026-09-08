@@ -105,7 +105,7 @@ fn fetch_slug(slug: &str) -> CmdResult {
                 ui::hint(&format!(
                     "want a working checkout instead? `agit clone {slug}`"
                 ));
-                return Ok(ExitCode::Network);
+                return Ok(super::terminal_error_code(&e, ExitCode::Network));
             }
         },
     };
@@ -135,7 +135,7 @@ fn fetch_slug(slug: &str) -> CmdResult {
                 // need it.
                 let _ = std::fs::remove_dir_all(&dir);
             }
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&e, ExitCode::Network))
         }
     }
 }
@@ -201,7 +201,7 @@ fn fetch_context() -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("fetch failed: {e:#}"));
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&e, ExitCode::Network))
         }
     }
 }

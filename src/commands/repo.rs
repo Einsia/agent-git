@@ -92,13 +92,7 @@ fn resolve_or_ctx(arg: Option<&str>) -> Option<String> {
 }
 
 fn create(name: &str, private: bool) -> CmdResult {
-    let client = match super::require_login() {
-        Ok(c) => c,
-        Err(e) => {
-            ui::error(&format!("{e:#}"));
-            return Ok(ExitCode::Auth);
-        }
-    };
+    let client = super::require_login()?;
     // The local check comes before the hub mutation: with a same-name repo
     // already on disk, failing after publish would occupy the remote name
     // and leave the user with both halves broken. The post-publish check in
@@ -158,7 +152,7 @@ fn create(name: &str, private: bool) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&e, ExitCode::Network))
         }
     }
 }
@@ -191,13 +185,7 @@ fn materialize_at(
 
 fn list(remote: bool) -> CmdResult {
     if remote {
-        let client = match super::require_login() {
-            Ok(c) => c,
-            Err(e) => {
-                ui::error(&format!("{e:#}"));
-                return Ok(ExitCode::Auth);
-            }
-        };
+        let client = super::require_login()?;
         match client.list_agents() {
             Ok(agents) => {
                 if agents.is_empty() {
@@ -217,7 +205,7 @@ fn list(remote: bool) -> CmdResult {
             Err(e) => {
                 super::fix::register_terminal_api_error(&e);
                 ui::error(&format!("{e:#}"));
-                return Ok(ExitCode::Network);
+                return Ok(super::terminal_error_code(&e, ExitCode::Network));
             }
         }
         return Ok(ExitCode::Ok);
@@ -341,13 +329,7 @@ fn set_visibility(repo: &str, v: &str) -> CmdResult {
             return Ok(ExitCode::Usage);
         }
     };
-    let client = match super::require_login() {
-        Ok(c) => c,
-        Err(e) => {
-            ui::error(&format!("{e:#}"));
-            return Ok(ExitCode::Auth);
-        }
-    };
+    let client = super::require_login()?;
     // The identity is taken **before** the split: in either direction, the object being opened
     // up or locked down is the one the local checkout points at, while `owner/name` can be
     // deleted and rebuilt under the same name. The public direction needs this more — a
@@ -395,7 +377,7 @@ fn set_visibility(repo: &str, v: &str) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&e, ExitCode::Network))
         }
     }
 }
@@ -416,7 +398,7 @@ fn set_public_visibility(
         Err(error) => {
             super::fix::register_terminal_api_error(&error);
             ui::error(&format!("{error:#}"));
-            return Ok(ExitCode::Network);
+            return Ok(super::terminal_error_code(&error, ExitCode::Network));
         }
     };
     if !prepared.findings.complete {
@@ -500,19 +482,13 @@ fn set_public_visibility(
         Err(error) => {
             super::fix::register_terminal_api_error(&error);
             ui::error(&format!("{error:#}"));
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&error, ExitCode::Network))
         }
     }
 }
 
 fn collab(action: CollabAction) -> CmdResult {
-    let client = match super::require_login() {
-        Ok(c) => c,
-        Err(e) => {
-            ui::error(&format!("{e:#}"));
-            return Ok(ExitCode::Auth);
-        }
-    };
+    let client = super::require_login()?;
     match action {
         CollabAction::Add { repo, user, role } => {
             let Some((o, n)) = super::parse_slug(&repo).ok() else {
@@ -537,7 +513,7 @@ fn collab(action: CollabAction) -> CmdResult {
                 Err(e) => {
                     super::fix::register_terminal_api_error(&e);
                     ui::error(&format!("{e:#}"));
-                    Ok(ExitCode::Network)
+                    Ok(super::terminal_error_code(&e, ExitCode::Network))
                 }
             }
         }
@@ -560,7 +536,7 @@ fn collab(action: CollabAction) -> CmdResult {
                 Err(e) => {
                     super::fix::register_terminal_api_error(&e);
                     ui::error(&format!("{e:#}"));
-                    Ok(ExitCode::Network)
+                    Ok(super::terminal_error_code(&e, ExitCode::Network))
                 }
             }
         }
@@ -581,7 +557,7 @@ fn collab(action: CollabAction) -> CmdResult {
                 Err(e) => {
                     super::fix::register_terminal_api_error(&e);
                     ui::error(&format!("{e:#}"));
-                    Ok(ExitCode::Network)
+                    Ok(super::terminal_error_code(&e, ExitCode::Network))
                 }
             }
         }
@@ -606,13 +582,7 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
         ));
         return Ok(ExitCode::Precondition);
     }
-    let client = match super::require_login() {
-        Ok(c) => c,
-        Err(e) => {
-            ui::error(&format!("{e:#}"));
-            return Ok(ExitCode::Auth);
-        }
-    };
+    let client = super::require_login()?;
     let identity = match mutation_identity(&client, &owner, &name) {
         Ok(identity) => identity,
         Err(e) => {
@@ -625,7 +595,7 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("remote rename failed: {e:#}"));
-            return Ok(ExitCode::Network);
+            return Ok(super::terminal_error_code(&e, ExitCode::Network));
         }
     }
     // The local directory follows.
@@ -684,13 +654,7 @@ fn delete(repo: &str, local_only: bool) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
-    let client = match super::require_login() {
-        Ok(c) => c,
-        Err(e) => {
-            ui::error(&format!("{e:#}"));
-            return Ok(ExitCode::Auth);
-        }
-    };
+    let client = super::require_login()?;
     let identity = match mutation_identity(&client, &owner, &name) {
         Ok(identity) => identity,
         Err(e) => {
@@ -716,7 +680,7 @@ fn delete(repo: &str, local_only: bool) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&e, ExitCode::Network))
         }
     }
 }

@@ -582,3 +582,71 @@ fn whoami_only_contacts_the_hub_for_explicit_identity_verification() {
         Some(format!("Bearer {TOKEN}").as_str())
     );
 }
+
+#[test]
+#[cfg(windows)]
+fn copied_auth_hint_preserves_native_shims_exit_and_environment() {
+    let lab = Lab::new();
+    let root = tempfile::tempdir().unwrap();
+    let recorder = root.path().join("record.ps1");
+    std::fs::write(
+        &recorder,
+        "$record = @{ hub=$env:AGIT_HUB_URL; arguments=@($args) }; [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'record.json'), ($record | ConvertTo-Json -Compress))",
+    ).unwrap();
+    std::fs::write(
+        root.path().join("agit.cmd"),
+        "@echo off\r\npowershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0record.ps1\" %*\r\nexit /b 17\r\n",
+    ).unwrap();
+    let restored = root.path().join("restored.json");
+    // PowerShell delimiter fixtures remain literal through native command resolution.
+    for hub in [
+        "https://example.invalid/team&qa;Write-Output/it's/$HOME",
+        "https://example.invalid/a\"b",
+        "https://example.invalid/‘’‚‛/$HOME",
+    ] {
+        let output = lab.run(hub, &["share", "list"]);
+        assert_eq!(output.status.code(), Some(5), "{output:?}");
+        let diagnostics = String::from_utf8(output.stderr).unwrap();
+        let hint = diagnostics
+            .lines()
+            .find(|line| line.contains("log in from PowerShell with `"))
+            .unwrap();
+        assert!(hint.contains("from PowerShell"));
+        let copied = hint
+            .split_once("with `")
+            .unwrap()
+            .1
+            .strip_suffix('`')
+            .unwrap();
+        for prior in ["$null", "''", "'https://prior.invalid'"] {
+            let script = format!(
+                "$env:AGIT_HUB_URL={prior}; $before=$env:AGIT_HUB_URL; {copied}; $record=@{{ before=$before; after=$env:AGIT_HUB_URL; exit_code=$LASTEXITCODE }}; [IO.File]::WriteAllText($env:AGIT_FIXTURE_RESTORED_PATH, ($record | ConvertTo-Json -Compress))",
+            );
+            let output = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .env("AGIT_FIXTURE_RESTORED_PATH", &restored)
+                .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+                .env(
+                    "PATH",
+                    format!(
+                        "{};{}",
+                        root.path().display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let actual: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.path().join("record.json")).unwrap())
+                    .unwrap();
+            assert_eq!(actual, serde_json::json!({"hub":hub,"arguments":["login"]}));
+            let actual: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&restored).unwrap()).unwrap();
+            assert_eq!(actual["before"], actual["after"]);
+            assert_eq!(actual["exit_code"], 17);
+            assert!(lab.credentials().is_empty());
+        }
+    }
+}

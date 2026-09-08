@@ -206,8 +206,18 @@ fn unicode_config_mutation_is_captured_and_survives_native_readback() {
 fn unauthenticated_search_captures_diagnostics_and_typed_login_without_running_it() {
     let lab = Lab::new();
     let (output, local) = lab.json(&["--json", "search", "SYNTHETIC-QUERY"]);
-    assert_eq!(output.status.code(), Some(2), "{local}");
-    assert_eq!(local["fix"], json!([]));
+    assert_eq!(output.status.code(), Some(5), "{local}");
+    assert_eq!(local["fix"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        local["fix"][0]["argv"],
+        json!(["agit", "login", "--hub", HUB])
+    );
+    assert_eq!(local["fix"][0]["cwd"], lab.work.to_str().unwrap());
+    assert_eq!(
+        local["fix"][0]["env"],
+        json!({"AGIT_HOME":lab.store, "AGIT_HUB_URL":HUB})
+    );
+    assert_eq!(local["fix"][0]["requires_interaction"], true);
     assert!(!lab.store.join("credentials").exists());
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -278,7 +288,7 @@ fn unauthenticated_search_captures_diagnostics_and_typed_login_without_running_i
         .output()
         .unwrap();
     let current = envelope(&output);
-    assert_eq!(output.status.code(), Some(1), "{current}");
+    assert_eq!(output.status.code(), Some(5), "{current}");
     assert_eq!(current["schema_version"], 2);
     assert_eq!(current["result"]["format"], "empty");
     assert!(
@@ -306,7 +316,7 @@ fn unauthenticated_search_captures_diagnostics_and_typed_login_without_running_i
         .output()
         .unwrap();
     let legacy = envelope(&output);
-    assert_eq!(output.status.code(), Some(1), "{legacy}");
+    assert_eq!(output.status.code(), Some(5), "{legacy}");
     assert_eq!(legacy["schema_version"], 1);
     assert!(legacy.get("fix").is_none());
     let mut same = current;

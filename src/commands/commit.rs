@@ -198,7 +198,7 @@ pub fn run(args: Args) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
-            Ok(ExitCode::Failure)
+            Ok(super::terminal_error_code(&e, ExitCode::Failure))
         }
     }
 }

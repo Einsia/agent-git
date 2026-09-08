@@ -64,7 +64,9 @@ impl std::fmt::Display for ApiError {
         // indistinguishable from "does not exist" to a user without access (otherwise agent
         // names can be enumerated), so the wording deliberately does not separate the two.
         let hint = match self.status {
-            401 => Some("log in again with `agit login`".to_string()),
+            401 if self.remedies.contains(&Remediation::Authenticate {}) => {
+                Some(crate::ui::login_hint(&self.base))
+            }
             404 => {
                 Some("it may not exist, or it may be a private agent you cannot access".to_string())
             }
@@ -101,7 +103,10 @@ struct ErrorBody {
 }
 
 impl ErrorBody {
-    fn remedies(&self) -> Vec<Remediation> {
+    fn remedies(&self, status: u16) -> Vec<Remediation> {
+        if status != 401 || self.kind != "unauthorized" {
+            return Vec::new();
+        }
         self.fix
             .as_array()
             .into_iter()
@@ -352,7 +357,7 @@ impl Client {
         // inventing an explanation.
         let (kind, detail, remedies) = match resp.body_mut().read_json::<ErrorBody>() {
             Ok(b) => {
-                let remedies = b.remedies();
+                let remedies = b.remedies(status);
                 (b.kind, b.error, remedies)
             }
             Err(_) => (
@@ -1698,6 +1703,28 @@ mod tests {
     }
 
     #[test]
+    fn terminal_authentication_category_survives_context_without_prose_inference() {
+        use crate::ExitCode;
+        use crate::commands::terminal_error_code;
+        for fallback in [
+            ExitCode::Usage,
+            ExitCode::Failure,
+            ExitCode::Network,
+            ExitCode::Precondition,
+        ] {
+            let typed = anyhow::Error::new(api_err(401, "opaque", "opaque failure"))
+                .context("outer command diagnosis");
+            assert_eq!(terminal_error_code(&typed, fallback), ExitCode::Auth);
+            let text = anyhow::anyhow!("HTTP 401; unauthorized; run agit login");
+            assert_eq!(terminal_error_code(&text, fallback), fallback);
+            for status in [403, 404, 409, 500] {
+                let other = anyhow::Error::new(api_err(status, "unauthorized", "HTTP 401"));
+                assert_eq!(terminal_error_code(&other, fallback), fallback);
+            }
+        }
+    }
+
+    #[test]
     fn optional_remedies_do_not_discard_human_errors_or_accept_server_commands() {
         for (wire, expected) in [
             (serde_json::Value::Null, vec![]),
@@ -1725,11 +1752,11 @@ mod tests {
             .unwrap();
             assert_eq!(body.error, "synthetic account error");
             assert_eq!(body.kind, "unauthorized");
-            assert_eq!(body.remedies(), expected);
+            assert_eq!(body.remedies(401), expected);
         }
         let old: ErrorBody =
             serde_json::from_str(r#"{"error":"legacy","kind":"unauthorized"}"#).unwrap();
-        assert!(old.remedies().is_empty());
+        assert!(old.remedies(401).is_empty());
     }
 
     #[test]

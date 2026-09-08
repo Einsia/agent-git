@@ -47,6 +47,8 @@ use crate::domain::link::{self, Link};
 use crate::domain::repo::{self, Repo};
 use crate::domain::store::Store;
 use crate::infra::config;
+#[cfg(windows)]
+use crate::ui::quote_powershell_argument as powershell_selection_arg;
 use crate::{ExitCode, adapter, ui};
 use clap::Args as ClapArgs;
 use std::io::IsTerminal;
@@ -1252,31 +1254,6 @@ fn selection_arg(value: &str) -> String {
             ui::session::shell_arg(value)
         }
     }
-}
-
-#[cfg(windows)]
-fn powershell_selection_arg(value: &str) -> String {
-    if !value.is_empty()
-        && !value.starts_with('@')
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '@' | '-' | '_' | '.'))
-    {
-        return value.to_owned();
-    }
-    let mut quoted = String::from("'");
-    for character in value.chars() {
-        // PowerShell recognizes typographic quotes as string delimiters too.
-        if matches!(
-            character,
-            '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'
-        ) {
-            quoted.push(character);
-        }
-        quoted.push(character);
-    }
-    quoted.push('\'');
-    quoted
 }
 
 /// Adopt a session: write the link, nothing else.

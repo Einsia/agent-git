@@ -54,13 +54,7 @@ pub enum Cmd {
 }
 
 pub fn run(args: Args) -> CmdResult {
-    let client = match super::require_login() {
-        Ok(c) => c,
-        Err(e) => {
-            ui::error(&format!("{e:#}"));
-            return Ok(ExitCode::Auth);
-        }
-    };
+    let client = super::require_login()?;
     match args.cmd {
         Cmd::Create {
             target,
@@ -266,7 +260,7 @@ fn list(client: &Client, repo: &str) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&e, ExitCode::Network))
         }
     }
 }
@@ -290,7 +284,7 @@ fn show(client: &Client, id: u64) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
-            Ok(ExitCode::Network)
+            Ok(super::terminal_error_code(&e, ExitCode::Network))
         }
     }
 }
@@ -301,7 +295,7 @@ fn fetch(client: &Client, id: u64) -> CmdResult {
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
-            return Ok(ExitCode::Network);
+            return Ok(super::terminal_error_code(&e, ExitCode::Network));
         }
     };
     // Fetch pr/<id> into the local target repo (the server publishes the PR head at
@@ -327,7 +321,7 @@ fn fetch(client: &Client, id: u64) -> CmdResult {
     if let Err(e) = crate::hub::identity::verify_slug(&repo, &identity_client, &o, &n) {
         super::fix::register_terminal_api_error(&e);
         ui::error(&format!("refusing to fetch pr/{id}: {e:#}"));
-        return Ok(ExitCode::Precondition);
+        return Ok(super::terminal_error_code(&e, ExitCode::Precondition));
     }
     let out = crate::hub::git::run(
         &repo,
@@ -358,7 +352,7 @@ fn merge(client: &Client, id: u64, adopt: Option<&str>) -> CmdResult {
             ui::hint(
                 "common rejection: the author’s branch moved while the PR was open (stale) → contributor pulls upstream, redoes the merge and reopens; or a real fork with no pre-run merge → read the fix guidance first",
             );
-            Ok(ExitCode::Precondition)
+            Ok(super::terminal_error_code(&e, ExitCode::Precondition))
         }
     }
 }

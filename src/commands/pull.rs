@@ -79,7 +79,7 @@ pub fn run(args: Args) -> CmdResult {
     if let Err(e) = crate::hub::identity::verify_slug(&repo, &client, &owner, &name) {
         super::fix::register_terminal_api_error(&e);
         ui::error(&format!("refusing to fetch: {e:#}"));
-        return Ok(ExitCode::Precondition);
+        return Ok(super::terminal_error_code(&e, ExitCode::Precondition));
     }
     let out = crate::hub::git::run(&repo, &["fetch", "origin", "--prune", "--tags"])?;
     if !out.ok() {
