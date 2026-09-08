@@ -30,6 +30,12 @@ path = "src/main.rs"
 # unaffected by this gate.
 required-features = ["cli"]
 
+[[test]]
+name = "codex_resume_provider"
+path = "tests/codex_resume_provider.rs"
+harness = false
+required-features = ["cli"]
+
 [[bench]]
 name = "startup_migration"
 harness = false

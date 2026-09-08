@@ -28,6 +28,8 @@ pub mod claude_code;
 pub mod claude_desktop;
 pub mod codex;
 pub mod codex_index;
+#[cfg(feature = "cli")]
+pub(crate) mod codex_provider;
 pub mod cursor;
 pub mod enrich;
 pub mod opencode;

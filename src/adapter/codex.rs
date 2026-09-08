@@ -42,6 +42,12 @@ use std::path::{Path, PathBuf};
 
 pub struct Codex;
 
+/// The selected workspace overrides the native session's persisted directory.
+pub(crate) fn resume_command(sid: &str, cwd: &Path) -> String {
+    let cwd = cwd.to_string_lossy().replace('\'', "'\\''");
+    format!("codex resume {sid} --cd '{cwd}'")
+}
+
 /// The output body paired to a tool call replayed from another runtime.
 ///
 /// The real output on the source side cannot be attributed to this call (the IR does not model
@@ -729,7 +735,12 @@ impl Adapter for Codex {
         uuid::Uuid::now_v7().to_string()
     }
 
-    fn install(&self, content: &str, new_id: &str, _cwd: &Path) -> Result<Installed> {
+    fn install(&self, content: &str, new_id: &str, cwd: &Path) -> Result<Installed> {
+        let cwd = std::path::absolute(cwd)?;
+        #[cfg(feature = "cli")]
+        let localized = super::codex_provider::localize(content, &cwd);
+        #[cfg(feature = "cli")]
+        let content = localized.as_deref().unwrap_or(content);
         // Write into today's date directory. The date itself does not matter — Codex scans
         // recursively and matches by id.
         let now = chrono::Utc::now();
@@ -746,7 +757,7 @@ impl Adapter for Codex {
         std::fs::write(&path, content)
             .with_context(|| format!("cannot write {}", path.display()))?;
         Ok(Installed {
-            next: Next::Resume(format!("codex resume {new_id}")),
+            next: Next::Resume(resume_command(new_id, &cwd)),
             path,
         })
     }

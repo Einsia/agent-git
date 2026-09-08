@@ -605,6 +605,7 @@ fn resume_branch_for(
                 .map(PathBuf::from)
         })
         .unwrap_or(std::env::current_dir()?);
+    let cwd = std::path::absolute(cwd)?;
 
     // `cwd_state` is an observation, not a checkout instruction. Compare it before either
     // native reuse or VIEW materialization so both resume paths make the same decision.
@@ -1321,12 +1322,19 @@ fn native_resume_cmd(
 ) -> Option<String> {
     let mut inner = match runtime {
         "claude-code" => format!("claude --resume {sid}"),
-        "codex" => format!("codex resume {sid}"),
+        "codex" => adapter::codex::resume_command(sid, cwd),
         "opencode" if prompt.is_none() && system_prompt.is_none() => {
             format!("opencode --session {sid}")
         }
         _ => return None,
     };
+    if runtime == "codex"
+        && let Some(provider) = adapter::codex_provider::resume_override(sid, cwd)
+    {
+        let value = serde_json::to_string(&provider).ok()?;
+        inner.push_str(" -c ");
+        inner.push_str(&shell_quote(&format!("model_provider={value}")));
+    }
     if let Some(system) = system_prompt {
         match runtime {
             "claude-code" => {
@@ -2277,12 +2285,12 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(cx.contains("codex resume ABC 'merge it'"), "{cx}");
-        // With no prompt not one word is added.
+        assert!(cx.contains("codex resume ABC --cd '/w' 'merge it'"), "{cx}");
+        // The workspace remains explicit when no opening prompt is supplied.
         let bare =
             super::native_resume_cmd("codex", "ABC", Path::new("/w"), "me/r", "b", None, None)
                 .unwrap();
-        assert!(bare.ends_with("codex resume ABC)"), "{bare}");
+        assert!(bare.ends_with("codex resume ABC --cd '/w')"), "{bare}");
     }
 
     /// A prompt always carries quotes (`agit merge summary -m "..."`) and newlines — this
