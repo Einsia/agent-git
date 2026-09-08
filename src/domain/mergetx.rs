@@ -38,6 +38,9 @@ pub const ENV: &str = "AGIT_MERGE_TX";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
+    /// A preparation belongs to this transaction instance even when another uses identical refs.
+    #[serde(default)]
+    pub generation: Option<String>,
     /// The target branch (the merge lands on it).
     pub target: String,
     /// The source ref (what the merge draws from).
@@ -67,6 +70,18 @@ pub struct Tx {
 }
 
 impl Tx {
+    /// Mutable progress belongs to the same creation and frozen source/target selection.
+    pub fn same_instance(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.target == other.target
+            && self.target_head == other.target_head
+            && self.source == other.source
+            && self.source_head == other.source_head
+            && self.source_repo == other.source_repo
+            && self.source_branch == other.source_branch
+            && self.base == other.base
+    }
+
     /// The pick list (the raw ref text, for example `B#3..#5`).
     pub fn picked_refs(&self) -> &[String] {
         &self.picked
@@ -166,20 +181,88 @@ pub fn read(repo_root: &Path) -> Result<Option<Tx>> {
     }
 }
 
+/// Serialize transaction publication, progress, cancellation, and launch admission.
+/// The handle is not inherited by spawned runtimes, so cancellation never waits for their lifetime.
+pub struct ControlGuard {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl ControlGuard {
+    pub fn acquire(repo_root: &Path) -> Result<Self> {
+        use anyhow::Context as _;
+
+        let path = lock_path(repo_root);
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(path.with_extension("control"))
+            .context("cannot open merge transaction control")?;
+        fs2::FileExt::lock_exclusive(&file).context("cannot lock merge transaction control")?;
+        Ok(Self { path, _file: file })
+    }
+
+    pub fn read(&self) -> Result<Option<Tx>> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn publish(&self, tx: &Tx, replace: bool) -> Result<()> {
+        use anyhow::Context as _;
+        use std::io::Write as _;
+
+        let mut pending = tempfile::NamedTempFile::new_in(
+            self.path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("the transaction has no parent directory"))?,
+        )?;
+        writeln!(pending, "{}", serde_json::to_string_pretty(tx)?)?;
+        pending.as_file().sync_all()?;
+        if replace {
+            pending
+                .persist(&self.path)
+                .map_err(|error| error.error)
+                .context("cannot update the merge transaction")?;
+        } else {
+            pending.persist_noclobber(&self.path).map_err(|error| error.error)
+                .context("cannot open the merge transaction without replacing existing state; inspect `agit merge --status`")?;
+        }
+        Ok(())
+    }
+
+    pub fn write(&self, tx: &Tx) -> Result<()> {
+        self.publish(tx, true)
+    }
+
+    pub fn remove(&self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// Publish a complete transaction only when no transaction already owns the repository.
+/// Admission must not use the update path, which intentionally replaces existing progress.
+pub fn create(repo_root: &Path, tx: &Tx) -> Result<()> {
+    ControlGuard::acquire(repo_root)?.publish(tx, false)
+}
+
 pub fn lock(repo_root: &Path, tx: &Tx) -> Result<()> {
-    std::fs::write(
-        lock_path(repo_root),
-        format!("{}\n", serde_json::to_string_pretty(tx)?),
-    )?;
-    Ok(())
+    ControlGuard::acquire(repo_root)?.write(tx)
 }
 
 pub fn unlock(repo_root: &Path) -> Result<()> {
-    match std::fs::remove_file(lock_path(repo_root)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    ControlGuard::acquire(repo_root)?.remove()
 }
 
 #[cfg(test)]
@@ -193,6 +276,7 @@ mod tests {
         std::fs::create_dir_all(&git).unwrap();
         assert!(!is_locked(d.path()));
         let tx = Tx {
+            generation: None,
             target: "a".into(),
             source: "b".into(),
             source_repo: None,
@@ -212,6 +296,7 @@ mod tests {
 
     fn tx_on(target: &str) -> Tx {
         Tx {
+            generation: None,
             target: target.into(),
             source: "b".into(),
             source_repo: None,
@@ -222,6 +307,85 @@ mod tests {
             picked: vec![],
             summary: None,
         }
+    }
+
+    #[test]
+    fn creation_preserves_existing_progress_and_unreadable_state() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".git")).unwrap();
+        let mut original = tx_on("target");
+        original.picked.push("source#1".into());
+        original.summary = Some("preserve the reconciliation".into());
+        create(directory.path(), &original).unwrap();
+        let path = lock_path(directory.path());
+        let before = std::fs::read(&path).unwrap();
+        assert!(create(directory.path(), &tx_on("other")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        original.picked.push("source#2".into());
+        lock(directory.path(), &original).unwrap();
+        assert_eq!(
+            read(directory.path()).unwrap().unwrap().picked,
+            original.picked
+        );
+        std::fs::write(&path, "unreadable transaction").unwrap();
+        assert!(create(directory.path(), &tx_on("other")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"unreadable transaction");
+    }
+
+    #[test]
+    fn concurrent_creators_publish_only_the_winning_transaction() {
+        use std::sync::{Arc, Barrier};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".git")).unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let winners = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|index| {
+                    let barrier = barrier.clone();
+                    let root = directory.path();
+                    scope.spawn(move || {
+                        let target = format!("target-{index}");
+                        let mut transaction = tx_on(&target);
+                        transaction.picked.push(format!("source-{index}#1"));
+                        transaction.summary = Some(format!("intent from {index}"));
+                        barrier.wait();
+                        create(root, &transaction).is_ok().then_some(transaction)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(winners.len(), 1);
+        let actual = read(directory.path()).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(&winners[0]).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_transactions_remain_readable_without_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".git")).unwrap();
+        let mut legacy = serde_json::to_value(tx_on("target")).unwrap();
+        legacy.as_object_mut().unwrap().remove("generation");
+        std::fs::write(
+            lock_path(directory.path()),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let control = ControlGuard::acquire(directory.path()).unwrap();
+        let mut transaction = control.read().unwrap().unwrap();
+        assert!(transaction.generation.is_none());
+        transaction.pick_more(&["source#1".into()]);
+        control.write(&transaction).unwrap();
+        assert_eq!(control.read().unwrap().unwrap().picked, transaction.picked);
+        control.remove().unwrap();
+        assert!(control.read().unwrap().is_none());
     }
 
     /// The lock blocks the target branch only: other branches of the same repo stay writable.

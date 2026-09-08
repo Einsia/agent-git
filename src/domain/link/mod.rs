@@ -434,12 +434,19 @@ pub enum MaterializationActivity {
 }
 
 pub fn materialization_activity(link: &Link) -> MaterializationActivity {
+    let Ok(bytes) = link.read_bytes() else {
+        return MaterializationActivity::Unverifiable;
+    };
+    materialization_activity_with_bytes(link, &bytes)
+}
+
+pub(crate) fn materialization_activity_with_bytes(
+    link: &Link,
+    bytes: &[u8],
+) -> MaterializationActivity {
     use sha2::Digest as _;
 
     let (Some(baseline), Some(expected)) = (link.baseline_bytes, &link.baseline_hash) else {
-        return MaterializationActivity::Unverifiable;
-    };
-    let Ok(bytes) = link.read_bytes() else {
         return MaterializationActivity::Unverifiable;
     };
     let Ok(baseline) = usize::try_from(baseline) else {

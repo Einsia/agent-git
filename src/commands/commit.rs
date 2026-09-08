@@ -894,6 +894,12 @@ fn in_flight_tail(ir: &Session, open: &[OpenCall]) -> Option<InFlight> {
         })
 }
 
+pub(super) fn has_in_flight_turn(runtime: &str, text: &str) -> crate::Result<bool> {
+    let adapter = crate::adapter::get(runtime)?;
+    let session = adapter.parse(text)?;
+    Ok(in_flight_tail(&session, &adapter.open_tool_calls(text)).is_some())
+}
+
 /// Tell the user why the trailing turn is not in this settlement and when it will be.
 ///
 /// Saying so is required: `agit status` reports `in sync` and `agit push` publishes without

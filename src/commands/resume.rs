@@ -67,6 +67,41 @@ pub struct Resumed {
     pub cmd: Option<String>,
     /// Whether the cross-runtime conversion was lossy.
     pub lossy: bool,
+    /// Merge publication and process spawning share admission with transaction cancellation.
+    pub(crate) merge_launch_guard: Option<crate::domain::mergetx::ControlGuard>,
+    launch_messages: Vec<LaunchMessage>,
+}
+
+enum LaunchMessage {
+    Line(String),
+    Warning(String),
+}
+
+impl Resumed {
+    pub(crate) fn emit_launch_messages(&mut self) {
+        for message in self.launch_messages.drain(..) {
+            match message {
+                LaunchMessage::Line(line) => println!("{line}"),
+                LaunchMessage::Warning(warning) => ui::warning(&warning),
+            }
+        }
+    }
+}
+
+fn launch_line(messages: &mut Vec<LaunchMessage>, defer: bool, line: String) {
+    if defer {
+        messages.push(LaunchMessage::Line(line));
+    } else {
+        println!("{line}");
+    }
+}
+
+fn launch_warning(messages: &mut Vec<LaunchMessage>, defer: bool, warning: &str) {
+    if defer {
+        messages.push(LaunchMessage::Warning(warning.to_owned()));
+    } else {
+        ui::warning(warning);
+    }
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -457,6 +492,58 @@ pub fn resume_branch_with_prompt(
     args: &Args,
     prompt: Option<&str>,
 ) -> crate::Result<Option<Resumed>> {
+    resume_branch_for(repo, slug, branch, args, prompt, ResumePurpose::Continue)
+}
+
+/// Prepare the agent for an open merge whose source and target identities are frozen.
+pub(crate) fn resume_merge_agent(
+    repo: &Repo,
+    slug: &str,
+    tx: &crate::domain::mergetx::Tx,
+    args: &Args,
+    prompt: &str,
+) -> crate::Result<Option<Resumed>> {
+    resume_branch_for(
+        repo,
+        slug,
+        &tx.target,
+        args,
+        Some(prompt),
+        ResumePurpose::Merge(tx),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ResumePurpose<'a> {
+    Continue,
+    Merge(&'a crate::domain::mergetx::Tx),
+}
+
+impl ResumePurpose<'_> {
+    fn require_transaction(self, repo: &Repo, branch: &str, head: &str) -> crate::Result<()> {
+        if let Self::Merge(expected) = self {
+            let active = crate::domain::mergetx::read(repo.root())?
+                .ok_or_else(|| anyhow::anyhow!("the merge transaction is no longer open"))?;
+            anyhow::ensure!(
+                expected.generation.is_some()
+                    && expected.target == branch
+                    && expected.target_head == head
+                    && active.same_instance(expected),
+                "the merge transaction changed while preparing its agent; inspect `agit merge --status`"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn resume_branch_for(
+    repo: &Repo,
+    slug: &str,
+    branch: &str,
+    args: &Args,
+    prompt: Option<&str>,
+    purpose: ResumePurpose<'_>,
+) -> crate::Result<Option<Resumed>> {
     // Preconditions: it exists, it is not the file line, it is unsealed, and it is a branch head
     // (`resolve_branch` already guarantees the last).
     if !repo.has_ref(&format!("refs/heads/{branch}")) {
@@ -494,6 +581,14 @@ pub fn resume_branch_with_prompt(
         return Ok(None);
     }
 
+    purpose.require_transaction(repo, branch, &head)?;
+    let tracking = ResumeTracking::read(repo, branch)?;
+    if matches!(purpose, ResumePurpose::Continue)
+        && !tracking.is_integrated(repo, slug, branch, &head)?
+    {
+        return Ok(None);
+    }
+
     // The fallback is the current directory — the same answer as launching the runtime directly.
     // Falling back to "the top level of the git repo containing the current directory" instead
     // installs a session resumed from ~/Code into ~ on a machine whose home directory is itself a
@@ -519,7 +614,11 @@ pub fn resume_branch_with_prompt(
     // Prompts cannot hold the branch lock: a runtime waiting to settle must remain able to
     // finish while the operator decides. The selected snapshot must still be current afterward.
     let branch_guard = link::lock_branch(&store, slug, branch)?;
-    require_resume_head(repo, branch, &head)?;
+    require_resume_state(repo, branch, &head, &tracking)?;
+    purpose.require_transaction(repo, branch, &head)?;
+    if matches!(purpose, ResumePurpose::Merge(_)) {
+        require_merge_claims(repo, &store, slug, branch, &head, false)?;
+    }
 
     // ── Memory: the branch's memory merges into the target runtime's memory dir (both paths) ──
     let from = snap.runtime.as_str();
@@ -554,7 +653,8 @@ pub fn resume_branch_with_prompt(
     // resume in place too: replacement is forbidden, but continuing the same writer loses
     // nothing. A rewritten or unreadable baseline is not reused implicitly.
     let reuse_prepared = |active: &[Link]| {
-        if !args.force
+        if matches!(purpose, ResumePurpose::Continue)
+            && !args.force
             && let [existing] = active
             && existing.materialized_from.as_deref() == Some(head.as_str())
             && requested_runtime.is_none_or(|runtime| existing.source == runtime)
@@ -590,7 +690,8 @@ pub fn resume_branch_with_prompt(
         return Ok(Some(resumed));
     }
 
-    if !switches_rt
+    if matches!(purpose, ResumePurpose::Continue)
+        && !switches_rt
         && args.cwd.is_none()
         && !args.force
         && !history_rewrote_view(repo, &head)?
@@ -625,6 +726,8 @@ pub fn resume_branch_with_prompt(
                 return Ok(Some(Resumed {
                     cmd: Some(cmd),
                     lossy: false,
+                    merge_launch_guard: None,
+                    launch_messages: vec![],
                 }));
             }
         }
@@ -687,7 +790,8 @@ pub fn resume_branch_with_prompt(
     drop(branch_guard);
     confirm_conversion(from, to_runtime)?;
     let _branch_guard = link::lock_branch(&store, slug, branch)?;
-    require_resume_head(repo, branch, &head)?;
+    require_resume_state(repo, branch, &head, &tracking)?;
+    purpose.require_transaction(repo, branch, &head)?;
     let current = link::active_for_branch(&store, owner, agent, branch);
     if current.iter().map(Link::instance).collect::<Vec<_>>()
         != supersede.iter().map(Link::instance).collect::<Vec<_>>()
@@ -698,6 +802,9 @@ pub fn resume_branch_with_prompt(
         anyhow::bail!(
             "the active runtime claim changed while preparing to resume; retry the command"
         );
+    }
+    if matches!(purpose, ResumePurpose::Merge(_)) {
+        require_merge_claims(repo, &store, slug, branch, &head, false)?;
     }
     materialize_memory(repo, branch, slug, to_runtime, &cwd);
 
@@ -717,8 +824,173 @@ pub fn resume_branch_with_prompt(
         &committed_log,
         &store,
         supersede,
+        purpose,
     )
     .map(Some)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResumeTracking {
+    reference: Option<String>,
+    oid: Option<String>,
+}
+
+impl ResumeTracking {
+    fn read(repo: &Repo, branch: &str) -> crate::Result<Self> {
+        let selected = format!("refs/heads/{branch}");
+        let (status, output, error) = repo.git_status_local(&[
+            "for-each-ref",
+            "--count=1",
+            "--sort=refname",
+            "--format=%(refname)%09%(upstream)%00",
+            &selected,
+        ])?;
+        anyhow::ensure!(
+            status == Some(0) && error.is_empty(),
+            "cannot inspect tracking for {selected}: {error}"
+        );
+        let output = output
+            .strip_suffix('\0')
+            .ok_or_else(|| anyhow::anyhow!("incomplete tracking record for {selected}"))?;
+        let (found, upstream) = output.split_once('\t').unwrap_or((output, ""));
+        anyhow::ensure!(
+            found == selected,
+            "the selected branch changed while reading tracking"
+        );
+        if upstream.is_empty() {
+            for field in ["remote", "merge"] {
+                let (status, _, error) = repo.git_status_local(&[
+                    "config",
+                    "--get",
+                    &format!("branch.{branch}.{field}"),
+                ])?;
+                anyhow::ensure!(
+                    status == Some(1) && error.is_empty(),
+                    "cannot resolve the configured tracking branch for {selected}; inspect its Git tracking configuration: {error}"
+                );
+            }
+            return Ok(Self {
+                reference: None,
+                oid: None,
+            });
+        }
+        let (status, output, error) = repo.git_status_local(&[
+            "for-each-ref",
+            "--count=1",
+            "--sort=refname",
+            "--format=%(refname)%09%(objectname)",
+            upstream,
+        ])?;
+        anyhow::ensure!(
+            status == Some(0) && error.is_empty(),
+            "cannot inspect known tracking ref {upstream}: {error}"
+        );
+        let oid = if let Some((found, oid)) = output.split_once('\t')
+            && found == upstream
+        {
+            let (status, kind, error) = repo.git_status_local(&["cat-file", "-t", oid])?;
+            anyhow::ensure!(
+                status == Some(0) && error.is_empty() && kind == "commit",
+                "known tracking ref {upstream} does not name a locally available commit: {error}"
+            );
+            Some(oid.to_owned())
+        } else {
+            let (status, _, error) =
+                repo.git_status_local(&["symbolic-ref", "--quiet", upstream])?;
+            anyhow::ensure!(
+                status == Some(1) && error.is_empty(),
+                "known tracking ref {upstream} cannot resolve to a commit: {error}"
+            );
+            None
+        };
+        Ok(Self {
+            reference: Some(upstream.to_owned()),
+            oid,
+        })
+    }
+
+    fn is_integrated(
+        &self,
+        repo: &Repo,
+        slug: &str,
+        branch: &str,
+        head: &str,
+    ) -> crate::Result<bool> {
+        let Some(oid) = &self.oid else {
+            return Ok(true);
+        };
+        let (status, _, error) =
+            repo.git_status_local(&["merge-base", "--is-ancestor", oid, head])?;
+        match status {
+            Some(0) => Ok(true),
+            Some(1) if error.is_empty() => {
+                ui::error(&format!(
+                    "{slug}@{branch} has known tracking commits that are not integrated."
+                ));
+                let source = recovery_arg(&format!("{slug}@{}", meta::id_from_sha(oid)));
+                let target = recovery_arg(&format!("{slug}@{branch}"));
+                let shell = if cfg!(windows) { " in PowerShell" } else { "" };
+                ui::hint(&format!(
+                    "reconcile the known tracking history{shell}: `agit merge {source} --into {target} --manual`"
+                ));
+                Ok(false)
+            }
+            _ => {
+                anyhow::bail!("cannot compare known tracking history for {slug}@{branch}: {error}")
+            }
+        }
+    }
+}
+
+fn recovery_arg(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        powershell_recovery_arg(value)
+    }
+    #[cfg(not(windows))]
+    {
+        ui::session::shell_arg(value)
+    }
+}
+
+#[cfg(windows)]
+fn powershell_recovery_arg(value: &str) -> String {
+    if !value.is_empty()
+        && !value.starts_with('@')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '@' | '-' | '_' | '.'))
+    {
+        return value.to_owned();
+    }
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        // PowerShell recognizes typographic quotes as string delimiters too.
+        if matches!(
+            character,
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'
+        ) {
+            quoted.push(character);
+        }
+        quoted.push(character);
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn require_resume_state(
+    repo: &Repo,
+    branch: &str,
+    head: &str,
+    tracking: &ResumeTracking,
+) -> crate::Result<()> {
+    require_resume_head(repo, branch, head)?;
+    // A prompt can outlive either the configured tracking identity or its locally known tip.
+    anyhow::ensure!(
+        ResumeTracking::read(repo, branch)? == *tracking,
+        "known tracking state changed while preparing to resume; retry the command"
+    );
+    Ok(())
 }
 
 fn require_resume_head(repo: &Repo, branch: &str, head: &str) -> crate::Result<()> {
@@ -883,6 +1155,106 @@ enum ClaimActivity {
     Unverifiable,
 }
 
+/// Merge replaces local writers only after their complete evidence is represented in history.
+/// Hook success alone is insufficient because hooks deliberately suppress settlement failures.
+pub(crate) fn require_merge_claims(
+    repo: &Repo,
+    store: &Store,
+    slug: &str,
+    branch: &str,
+    head: &str,
+    allow_settlement: bool,
+) -> crate::Result<()> {
+    let (owner, agent) = slug.split_once('/').unwrap_or(("", slug));
+    let active = link::active_for_branch(store, owner, agent, branch);
+    if active.is_empty() {
+        return Ok(());
+    }
+    let snapshot = meta::read_at_ref_result(repo, head)?
+        .ok_or_else(|| anyhow::anyhow!("the merge target has no session metadata"))?;
+    let committed = committed_log(repo, head, &snapshot)?;
+    for claim in active {
+        require_merge_claim(repo, &committed, &claim, slug, branch, allow_settlement)?;
+    }
+    Ok(())
+}
+
+fn require_merge_claim(
+    repo: &Repo,
+    committed: &str,
+    claim: &Link,
+    slug: &str,
+    branch: &str,
+    allow_settlement: bool,
+) -> crate::Result<()> {
+    let bytes = claim.read_bytes().map_err(|_| anyhow::anyhow!(
+        "cannot read the active runtime transcript; merge cannot prove {slug}@{branch} is settled"
+    ))?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| anyhow::anyhow!(
+        "the active runtime transcript contains invalid text; inspect it before merging {slug}@{branch}"
+    ))?;
+    anyhow::ensure!(
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
+        "the active runtime transcript contains an incomplete or malformed record; finish or recover it before merging {slug}@{branch}"
+    );
+    let activity = if claim.baseline_bytes.is_some() {
+        match link::materialization_activity_with_bytes(claim, &bytes) {
+            link::MaterializationActivity::Untouched => ClaimActivity::Untouched,
+            link::MaterializationActivity::Appended => ClaimActivity::Appended,
+            link::MaterializationActivity::Rewritten => ClaimActivity::Rewritten,
+            link::MaterializationActivity::Unverifiable => ClaimActivity::Unverifiable,
+        }
+    } else {
+        native_merge_claim_activity(repo, committed, text)?
+    };
+    if activity == ClaimActivity::Untouched {
+        return Ok(());
+    }
+    if activity == ClaimActivity::Appended && allow_settlement {
+        let region = match claim.baseline_bytes {
+            Some(baseline) => usize::try_from(baseline)
+                .ok()
+                .and_then(|offset| text.get(offset..)),
+            None => Some(text),
+        };
+        if let Some(region) = region
+            && !super::commit::has_in_flight_turn(&claim.source, region)?
+        {
+            return Ok(());
+        }
+    }
+    let target = recovery_arg(&format!("{slug}@{branch}"));
+    anyhow::bail!(
+        "the active {} session {} has unsettled or unverifiable content; finish the turn and run `agit commit {target}`, or preserve it on another branch before merging",
+        claim.source,
+        link::short(&claim.session_id)
+    )
+}
+
+fn native_merge_claim_activity(
+    repo: &Repo,
+    committed: &str,
+    live: &str,
+) -> crate::Result<ClaimActivity> {
+    if transcript::continuity(committed, live) == transcript::Continuity::Noop {
+        return Ok(ClaimActivity::Untouched);
+    }
+    let (committed, live) = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
+        .hydrate_pair_readonly(committed, live)?;
+    if committed.unresolved > 0 || live.unresolved > 0 {
+        return Ok(ClaimActivity::Unverifiable);
+    }
+    Ok(
+        match transcript::continuity_of_content(&committed.text, &live.text) {
+            transcript::Continuity::Noop => ClaimActivity::Untouched,
+            transcript::Continuity::Append => ClaimActivity::Appended,
+            transcript::Continuity::Diverged => ClaimActivity::Rewritten,
+        },
+    )
+}
+
 /// Classify whether replacing one active branch claim can lose runtime content.
 ///
 /// Materialized instances carry their own byte baseline. Native instances are compared against
@@ -991,6 +1363,8 @@ fn prepared_resume(
         return Some(Resumed {
             cmd: Some(cmd),
             lossy: false,
+            merge_launch_guard: None,
+            launch_messages: vec![],
         });
     }
     if runtime == "opencode" {
@@ -1013,6 +1387,8 @@ fn prepared_resume(
                 branch,
             )),
             lossy: false,
+            merge_launch_guard: None,
+            launch_messages: vec![],
         });
     }
     if runtime != "claude-desktop" {
@@ -1042,6 +1418,8 @@ fn prepared_resume(
     Some(Resumed {
         cmd: None,
         lossy: false,
+        merge_launch_guard: None,
+        launch_messages: vec![],
     })
 }
 
@@ -1100,6 +1478,7 @@ fn materialize_and_resume(
     committed_log: &str,
     store: &Store,
     supersede: Vec<Link>,
+    purpose: ResumePurpose<'_>,
 ) -> crate::Result<Resumed> {
     // Cursor is import-only: refused before any work starts (PRD).
     let dst_ad = adapter::get(to)?;
@@ -1175,6 +1554,15 @@ fn materialize_and_resume(
 
     let lossy = adapter::is_lossy_conversion(from, to);
 
+    let mut locked_supersede = Vec::with_capacity(supersede.len());
+    for previous in &supersede {
+        if let Some((guard, current)) = lock_active_branch_claim(store, previous, slug, branch)? {
+            if matches!(purpose, ResumePurpose::Merge(_)) {
+                require_merge_claim(repo, committed_log, &current, slug, branch, false)?;
+            }
+            locked_supersede.push((guard, current));
+        }
+    }
     let (installed, _) = crate::domain::install::install(&text, from, to, cwd)?;
 
     // Registration: the new instance's baseline = the byte count and hash of the materialized
@@ -1218,22 +1606,41 @@ fn materialize_and_resume(
     };
     lk.baseline_bytes = Some(materialized.len() as u64);
     lk.baseline_hash = Some(hex::encode(sha2::Sha256::digest(&materialized)));
-    let mut locked_supersede = Vec::with_capacity(supersede.len());
-    for previous in &supersede {
-        let Some((guard, current)) = lock_active_branch_claim(store, previous, slug, branch)?
-        else {
-            println!(
-                "{}",
-                ui::dim(&format!(
-                    "  left {} {} unchanged; it no longer claims {slug} @ {branch}",
-                    previous.source,
-                    link::short(&previous.session_id)
-                ))
-            );
-            continue;
-        };
-        if !args.force {
-            let activity = claim_activity(repo, committed_log, &current)?;
+    let defer = matches!(purpose, ResumePurpose::Merge(_));
+    let mut launch_messages = vec![];
+    let mut merge_launch_guard = if defer {
+        let control = crate::domain::mergetx::ControlGuard::acquire(repo.root())?;
+        if let Err(error) = purpose
+            .require_transaction(repo, branch, head)
+            .and_then(|()| require_resume_head(repo, branch, head))
+        {
+            drop(control);
+            ui::warning(&format!(
+                "the prepared {} session {} was left unclaimed; `agit status --check-missing` can find it",
+                lk.source,
+                link::short(&lk.session_id)
+            ));
+            return Err(error);
+        }
+        Some(control)
+    } else {
+        None
+    };
+    for (_, current) in &locked_supersede {
+        if matches!(purpose, ResumePurpose::Merge(_))
+            && let Err(error) =
+                require_merge_claim(repo, committed_log, current, slug, branch, false)
+        {
+            drop(merge_launch_guard.take());
+            ui::warning(&format!(
+                "the prepared {} session {} was left unclaimed; `agit status --check-missing` can find it",
+                lk.source,
+                link::short(&lk.session_id)
+            ));
+            return Err(error);
+        }
+        if !defer && !args.force {
+            let activity = claim_activity(repo, committed_log, current)?;
             if activity != ClaimActivity::Untouched {
                 ui::warning(&format!(
                     "the prepared {} session {} was left unclaimed; `agit status --check-missing` can find it",
@@ -1246,18 +1653,18 @@ fn materialize_and_resume(
                 ClaimActivity::Appended => {
                     ui::error(&format!(
                         "the active runtime session {} gained content while its replacement was being prepared.",
-                        link::short(&previous.session_id)
+                        link::short(&current.session_id)
                     ));
                     ui::hint(&format!(
                         "its claim remains active; settle it with `agit commit {}` and retry",
-                        previous.session_id
+                        current.session_id
                     ));
                     anyhow::bail!("active runtime changed during materialization");
                 }
                 ClaimActivity::Rewritten | ClaimActivity::Unverifiable => {
                     ui::error(&format!(
                         "the active runtime session {} can no longer be proven untouched.",
-                        link::short(&previous.session_id)
+                        link::short(&current.session_id)
                     ));
                     ui::hint("its claim remains active; inspect the transcript and `agit status`");
                     ui::hint(&format!(
@@ -1267,7 +1674,6 @@ fn materialize_and_resume(
                 }
             }
         }
-        locked_supersede.push((guard, current));
     }
     let successor = lk.instance();
     // Publish the successor first. A crash during the following historical-link updates can then
@@ -1278,25 +1684,30 @@ fn materialize_and_resume(
     for (_guard, mut previous) in locked_supersede {
         previous.superseded_by = Some(successor.clone());
         link::write(store, &previous)?;
-        println!(
-            "{}",
+        launch_line(
+            &mut launch_messages,
+            defer,
             ui::dim(&format!(
                 "  superseded {} {} on {slug} @ {branch}",
                 previous.source,
                 link::short(&previous.session_id)
             ))
+            .to_string(),
         );
     }
-
-    println!(
-        "  {} materialized VIEW → {} {}",
-        ui::ok(ui::theme::symbols().check),
-        ui::dim(&ui::tilde(&installed.path)),
-        if lossy {
-            ui::warn_text("(lossy)").to_string()
-        } else {
-            String::new()
-        }
+    launch_line(
+        &mut launch_messages,
+        defer,
+        format!(
+            "  {} materialized VIEW → {} {}",
+            ui::ok(ui::theme::symbols().check),
+            ui::dim(&ui::tilde(&installed.path)),
+            if lossy {
+                ui::warn_text("(lossy)").to_string()
+            } else {
+                String::new()
+            }
+        ),
     );
 
     let cmd = match &installed.next {
@@ -1309,9 +1720,13 @@ fn materialize_and_resume(
                 Some(c2) => Some(c2),
                 None => {
                     if system_prompt.is_some() {
-                        ui::warning(&format!(
-                            "{to} cannot receive a system environment notice on resume; continuing without injection"
-                        ));
+                        launch_warning(
+                            &mut launch_messages,
+                            defer,
+                            &format!(
+                                "{to} cannot receive a system environment notice on resume; continuing without injection"
+                            ),
+                        );
                     }
                     match prompt {
                         Some(p) => {
@@ -1319,10 +1734,14 @@ fn materialize_and_resume(
                             // instruction must not be dropped over that — print it for the
                             // person at the terminal to paste in, rather than leaving the agent
                             // idle once it starts.
-                            ui::warning(&format!(
-                                "{to} can’t take an opening prompt on resume — paste this in as the first message:"
-                            ));
-                            println!("{p}");
+                            launch_warning(
+                                &mut launch_messages,
+                                defer,
+                                &format!(
+                                    "{to} can’t take an opening prompt on resume — paste this in as the first message:"
+                                ),
+                            );
+                            launch_line(&mut launch_messages, defer, p.to_owned());
                             Some(inject_session_env(c, slug, branch))
                         }
                         None => Some(inject_session_env(c, slug, branch)),
@@ -1332,21 +1751,36 @@ fn materialize_and_resume(
         }
         adapter::Next::HandOff { trigger, fallback } => {
             if system_prompt.is_some() {
-                ui::warning(
+                launch_warning(
+                    &mut launch_messages,
+                    defer,
                     "the desktop handoff deep link cannot carry the environment notice; use the CLI fallback below to resume with it",
                 );
             }
             let fallback =
                 handoff_fallback(fallback, &sid, cwd, slug, branch, prompt, system_prompt);
-            println!("  {}", ui::accent(trigger));
-            println!(
-                "  {}",
-                ui::dim(&format!("the guaranteed way if handoff fails: {fallback}"))
+            launch_line(
+                &mut launch_messages,
+                defer,
+                format!("  {}", ui::accent(trigger)),
+            );
+            launch_line(
+                &mut launch_messages,
+                defer,
+                format!(
+                    "  {}",
+                    ui::dim(&format!("the guaranteed way if handoff fails: {fallback}"))
+                ),
             );
             None
         }
     };
-    Ok(Resumed { cmd, lossy })
+    Ok(Resumed {
+        cmd,
+        lossy,
+        merge_launch_guard,
+        launch_messages,
+    })
 }
 
 /// Injects `AGIT_SESSION` into the launch command.
@@ -1466,6 +1900,152 @@ mod tests {
             ),
             "this is precisely the verdict the fast path needs"
         );
+    }
+
+    #[test]
+    fn resume_rejects_tracking_changes_across_confirmation() {
+        for change in ["configured", "created", "advanced", "removed", "remapped"] {
+            let (_dir, repo, head) = claimed_but_never_settled();
+            let branch = repo.current_branch().unwrap();
+            repo.git(&[
+                "remote",
+                "add",
+                "mirror",
+                "https://example.invalid/fixture.git",
+            ])
+            .unwrap();
+            if change != "configured" {
+                repo.git(&["config", &format!("branch.{branch}.remote"), "mirror"])
+                    .unwrap();
+                repo.git(&[
+                    "config",
+                    &format!("branch.{branch}.merge"),
+                    "refs/heads/topic",
+                ])
+                .unwrap();
+            }
+            if !matches!(change, "configured" | "created") {
+                repo.git(&["update-ref", "refs/remotes/mirror/topic", &head])
+                    .unwrap();
+            }
+            let tracking = super::ResumeTracking::read(&repo, &branch).unwrap();
+            super::require_resume_state(&repo, &branch, &head, &tracking).unwrap();
+            match change {
+                "configured" => {
+                    repo.git(&["config", &format!("branch.{branch}.remote"), "mirror"])
+                        .unwrap();
+                    repo.git(&[
+                        "config",
+                        &format!("branch.{branch}.merge"),
+                        "refs/heads/topic",
+                    ])
+                    .unwrap();
+                }
+                "created" => {
+                    repo.git(&["update-ref", "refs/remotes/mirror/topic", &head])
+                        .unwrap();
+                }
+                "advanced" => {
+                    let tree = repo
+                        .git(&["rev-parse", &format!("{head}^{{tree}}")])
+                        .unwrap();
+                    let advanced = repo
+                        .git(&["commit-tree", &tree, "-p", &head, "-m", "tracking advance"])
+                        .unwrap();
+                    repo.git(&["update-ref", "refs/remotes/mirror/topic", &advanced])
+                        .unwrap();
+                }
+                "removed" => {
+                    repo.git(&["update-ref", "-d", "refs/remotes/mirror/topic"])
+                        .unwrap();
+                }
+                "remapped" => {
+                    repo.git(&["update-ref", "refs/remotes/mirror/other", &head])
+                        .unwrap();
+                    repo.git(&[
+                        "config",
+                        &format!("branch.{branch}.merge"),
+                        "refs/heads/other",
+                    ])
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                repo.git(&["rev-parse", &format!("refs/heads/{branch}")])
+                    .unwrap(),
+                head
+            );
+            assert!(
+                super::require_resume_state(&repo, &branch, &head, &tracking).is_err(),
+                "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_agent_preparation_requires_the_open_frozen_transaction() {
+        use crate::domain::mergetx::{self, Tx};
+
+        let (_dir, repo, head) = claimed_but_never_settled();
+        let branch = repo.current_branch().unwrap();
+        let expected = Tx {
+            generation: Some("synthetic-generation".into()),
+            target: branch.clone(),
+            source: "source".into(),
+            source_repo: Some("me/fixture".into()),
+            source_branch: Some("source".into()),
+            base: head.clone(),
+            target_head: head.clone(),
+            source_head: head.clone(),
+            picked: vec![],
+            summary: None,
+        };
+        let purpose = super::ResumePurpose::Merge(&expected);
+        assert!(purpose.require_transaction(&repo, &branch, &head).is_err());
+        mergetx::lock(repo.root(), &expected).unwrap();
+        purpose.require_transaction(&repo, &branch, &head).unwrap();
+        assert!(purpose.require_transaction(&repo, "other", &head).is_err());
+        assert!(
+            purpose
+                .require_transaction(&repo, &branch, "other")
+                .is_err()
+        );
+        for field in [
+            "generation",
+            "target",
+            "target_head",
+            "source",
+            "source_head",
+            "source_repo",
+            "source_branch",
+            "base",
+        ] {
+            let mut changed = expected.clone();
+            match field {
+                "generation" => changed.generation = Some("replacement-generation".into()),
+                "target" => changed.target = "other".into(),
+                "target_head" => changed.target_head = "other".into(),
+                "source" => changed.source = "other".into(),
+                "source_head" => changed.source_head = "other".into(),
+                "source_repo" => changed.source_repo = None,
+                "source_branch" => changed.source_branch = None,
+                "base" => changed.base = "other".into(),
+                _ => unreachable!(),
+            }
+            mergetx::lock(repo.root(), &changed).unwrap();
+            assert!(
+                purpose.require_transaction(&repo, &branch, &head).is_err(),
+                "{field}"
+            );
+        }
+        let mut progress = expected.clone();
+        progress.picked.push("source#1".into());
+        progress.summary = Some("reconciled intent".into());
+        mergetx::lock(repo.root(), &progress).unwrap();
+        purpose.require_transaction(&repo, &branch, &head).unwrap();
+        mergetx::unlock(repo.root()).unwrap();
+        assert!(purpose.require_transaction(&repo, &branch, &head).is_err());
     }
 
     #[test]

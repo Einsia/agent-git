@@ -203,30 +203,51 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     };
 
     let target_head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
-    let target_head = target_head.trim().to_string();
+    let mut target_head = target_head.trim().to_string();
+    let mut reconnaissance =
+        Reconnaissance::read(&repo, &base.repo, &target_head, &base.resolved.sha)?;
 
-    for selected in [&repo, &base.repo] {
-        anyhow::ensure!(
-            selected.git(&["rev-parse", "--is-shallow-repository"])? == "false",
-            "merge ancestry is incomplete in a shallow repository; fetch its complete history before retrying"
-        );
-    }
-    let comparison = crate::domain::comparison::Comparison::new(&repo, &base.repo)?;
-    let fork_point = comparison.merge_base(&target_head, &base.resolved.sha)?;
+    if !args.dry_run {
+        // Starting the merge agent is the only part of this command that needs an interactive
+        // runtime.  Check that requirement before settling the target, checking out its worktree,
+        // or taking the transaction lock.  Otherwise a CI/agent-harness invocation reaches
+        // `resume_merge_agent`, which materializes the merge session and only then fails with
+        // "stdin is not a terminal", leaving the transaction open for somebody to recover by hand.
+        // `--manual` is intentionally exempt: it opens the same transaction for explicit plumbing
+        // commands and is designed to work without a terminal.
+        if should_refuse_noninteractive_merge(args.manual, args.dry_run, !merge_agent_can_launch())
+        {
+            ui::error("starting the merge agent requires an interactive terminal.");
+            ui::hint(
+                "run `agit merge ... --manual` to drive the transaction without launching a runtime",
+            );
+            return Ok(ExitCode::Interactive);
+        }
 
-    // Recon report: the turns each side added — counted off the turn table, not off commits (a
-    // fork's identity commit and file commits take no turn ordinal).
-    if let Some(fork_point) = &fork_point {
-        let graph = comparison.repository();
-        let new_on_target = turns_since(graph, &target_head, fork_point)?;
-        let new_on_source = turns_since(graph, &base.resolved.sha, fork_point)?;
-        println!("fork point  {}", &fork_point[..9.min(fork_point.len())]);
-        println!("this side  +{new_on_target} turns    source side  +{new_on_source} turns");
-    } else {
-        println!("fork point  unavailable (no common Git ancestor)");
-        println!("this side  unknown    source side  unknown");
+        let store = crate::domain::store::Store::open_or_init()?;
+        {
+            let _guard = crate::domain::link::lock_branch(&store, &slug, &target)?;
+            super::resume::require_merge_claims(&repo, &store, &slug, &target, &target_head, true)?;
+        }
+
+        // A hook may settle complete content but cannot certify that its quiet exit saved it.
+        let exe = std::env::current_exe()?;
+        let _ = std::process::Command::new(exe)
+            .args(["commit", "--from-hook", &format!("{slug}@{target}")])
+            .current_dir(repo.root())
+            .output();
+
+        let _guard = crate::domain::link::lock_branch(&store, &slug, &target)?;
+        let settled_head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
+        super::resume::require_merge_claims(&repo, &store, &slug, &target, &settled_head, false)?;
+        if settled_head != target_head {
+            reconnaissance =
+                Reconnaissance::read(&repo, &base.repo, &settled_head, &base.resolved.sha)?;
+            target_head = settled_head;
+        }
     }
-    drop(comparison);
+
+    reconnaissance.print();
 
     if args.dry_run {
         println!(
@@ -236,28 +257,13 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
-    // Starting the merge agent is the only part of this command that needs an interactive
-    // runtime.  Check that requirement before settling the target, checking out its worktree,
-    // or taking the transaction lock.  Otherwise a CI/agent-harness invocation reaches
-    // `resume_branch_with_prompt`, which materializes the merge session and only then fails with
-    // "stdin is not a terminal", leaving the transaction open for somebody to recover by hand.
-    // `--manual` is intentionally exempt: it opens the same transaction for explicit plumbing
-    // commands and is designed to work without a terminal.
-    if should_refuse_noninteractive_merge(args.manual, args.dry_run, !merge_agent_can_launch()) {
-        ui::error("starting the merge agent requires an interactive terminal.");
-        ui::hint(
-            "run `agit merge ... --manual` to drive the transaction without launching a runtime",
-        );
-        return Ok(ExitCode::Interactive);
-    }
-
-    // Preflight: settle the target branch's unsettled turns (settling is idempotent; with no
-    // session link it silently skips).
-    let exe = std::env::current_exe()?;
-    let _ = std::process::Command::new(exe)
-        .args(["commit", "--from-hook", &target])
-        .current_dir(repo.root())
-        .output();
+    let store = crate::domain::store::Store::open_or_init()?;
+    let branch_guard = crate::domain::link::lock_branch(&store, &slug, &target)?;
+    anyhow::ensure!(
+        repo.git(&["rev-parse", &format!("refs/heads/{target}")])? == target_head,
+        "the merge target changed after settlement; retry the merge"
+    );
+    super::resume::require_merge_claims(&repo, &store, &slug, &target, &target_head, false)?;
 
     // The target branch's worktree comes first: the merge agent reconciles shared files there,
     // and `--continue` collects the edits from there. During the transaction its path comes from
@@ -265,20 +271,20 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     super::worktree::checkout(&repo, &target)?;
 
     // Take the lock.
-    mergetx::lock(
-        repo.root(),
-        &Tx {
-            target: target.clone(),
-            source: src_ref.to_string(),
-            source_repo: Some(base.slug.clone()),
-            source_branch: source_branch_for_tx(src_ref, &base)?,
-            base: fork_point.unwrap_or_default(),
-            target_head: target_head.clone(),
-            source_head: base.resolved.sha.clone(),
-            picked: vec![],
-            summary: None,
-        },
-    )?;
+    let tx = Tx {
+        generation: Some(uuid::Uuid::now_v7().to_string()),
+        target: target.clone(),
+        source: src_ref.to_string(),
+        source_repo: Some(base.slug.clone()),
+        source_branch: source_branch_for_tx(src_ref, &base)?,
+        base: reconnaissance.fork_point().unwrap_or_default().to_owned(),
+        target_head: target_head.clone(),
+        source_head: base.resolved.sha.clone(),
+        picked: vec![],
+        summary: None,
+    };
+    mergetx::create(repo.root(), &tx)?;
+    drop(branch_guard);
     ui::success(&format!(
         "merge transaction open: {src_ref} → {target} (branch locked)"
     ));
@@ -305,32 +311,28 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     // comes up with no idea that it is the merge agent — that is what leaves it sitting there
     // waiting after launch.
     let instruction = merge_instruction(&slug, &target, src_ref, args.message.as_deref());
-    match super::resume::resume_branch_with_prompt(
-        &repo,
-        &slug,
-        &target,
-        &rargs,
-        Some(&instruction),
-    )? {
-        Some(res) => {
+    match super::resume::resume_merge_agent(&repo, &slug, &tx, &rargs, &instruction)? {
+        Some(mut res) => {
+            let child = res.cmd.as_ref().map(|cmd| {
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .env(mergetx::ENV, format!("{slug}@{target}"))
+                    .spawn()
+            });
+            drop(res.merge_launch_guard.take());
+            let child = child.transpose()?;
+            res.emit_launch_messages();
             println!();
             println!(
                 "merge-agent protocol (sent as its opening message; the skill is on the scene too):"
             );
-            for l in instruction.lines() {
-                println!("  {}", ui::dim(l));
+            for line in instruction.lines() {
+                println!("  {}", ui::dim(line));
             }
-            match res.cmd {
-                Some(cmd) => {
-                    // AGIT_MERGE_TX goes to the child only: `Command::env` is enough, with no
-                    // `export` spliced into the command string (that would require the string to
-                    // have exactly the `(export ...` shape, which the codex resume command does
-                    // not, and the string surgery then drops the marker with no symptom).
-                    let status = std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(&cmd)
-                        .env(mergetx::ENV, format!("{slug}@{target}"))
-                        .status()?;
+            match child {
+                Some(mut child) => {
+                    let status = child.wait()?;
                     Ok(match status.code() {
                         Some(0) | None => ExitCode::Ok,
                         Some(_) => ExitCode::Precondition,
@@ -347,6 +349,60 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
             );
             ui::hint("agit merge pick … → agit merge summary -m … → agit merge --continue");
             Ok(ExitCode::Precondition)
+        }
+    }
+}
+
+enum Reconnaissance {
+    Related {
+        fork_point: String,
+        target_turns: usize,
+        source_turns: usize,
+    },
+    Unrelated,
+}
+
+impl Reconnaissance {
+    fn read(left: &Repo, right: &Repo, target: &str, source: &str) -> crate::Result<Self> {
+        for selected in [left, right] {
+            anyhow::ensure!(
+                selected.git(&["rev-parse", "--is-shallow-repository"])? == "false",
+                "merge ancestry is incomplete in a shallow repository; fetch its complete history before retrying"
+            );
+        }
+        let comparison = crate::domain::comparison::Comparison::new(left, right)?;
+        let Some(fork_point) = comparison.merge_base(target, source)? else {
+            return Ok(Self::Unrelated);
+        };
+        let graph = comparison.repository();
+        Ok(Self::Related {
+            target_turns: turns_since(graph, target, &fork_point)?,
+            source_turns: turns_since(graph, source, &fork_point)?,
+            fork_point,
+        })
+    }
+
+    fn fork_point(&self) -> Option<&str> {
+        match self {
+            Self::Related { fork_point, .. } => Some(fork_point),
+            Self::Unrelated => None,
+        }
+    }
+
+    fn print(&self) {
+        match self {
+            Self::Related {
+                fork_point,
+                target_turns,
+                source_turns,
+            } => {
+                println!("fork point  {}", &fork_point[..9.min(fork_point.len())]);
+                println!("this side  +{target_turns} turns    source side  +{source_turns} turns");
+            }
+            Self::Unrelated => {
+                println!("fork point  unavailable (no common Git ancestor)");
+                println!("this side  unknown    source side  unknown");
+            }
         }
     }
 }
@@ -411,8 +467,11 @@ fn merge_instruction(slug: &str, target: &str, src: &str, extra: Option<&str>) -
 
 // ─────────────────── Transaction state ──────────────────
 
-/// Find the merge transaction in progress and its repository.
-fn open_tx(cwd: &std::path::Path, into: Option<&str>) -> crate::Result<Option<(Repo, Tx)>> {
+/// Resolve the selected transaction repository without acquiring mutation authority.
+fn transaction_repo(
+    cwd: &std::path::Path,
+    into: Option<&str>,
+) -> crate::Result<Option<(Repo, Option<String>)>> {
     let (repo, selected_branch) = if let Some(into) = into {
         let Some((repo, _slug, branch, _via)) = target_of(cwd, Some(into))? else {
             return Ok(None);
@@ -433,6 +492,10 @@ fn open_tx(cwd: &std::path::Path, into: Option<&str>) -> crate::Result<Option<(R
         };
         (repo, Some(ctx.branch))
     };
+    Ok(Some((repo, selected_branch)))
+}
+
+fn read_selected_tx(repo: &Repo, selected_branch: Option<&str>) -> crate::Result<Option<Tx>> {
     match mergetx::read(repo.root())? {
         Some(tx) => {
             if let Some(branch) = selected_branch
@@ -448,13 +511,31 @@ fn open_tx(cwd: &std::path::Path, into: Option<&str>) -> crate::Result<Option<(R
                 ));
                 return Ok(None);
             }
-            Ok(Some((repo, tx)))
+            Ok(Some(tx))
         }
         None => {
             println!("no merge transaction is open.");
             Ok(None)
         }
     }
+}
+
+fn open_tx(cwd: &std::path::Path, into: Option<&str>) -> crate::Result<Option<(Repo, Tx)>> {
+    let Some((repo, branch)) = transaction_repo(cwd, into)? else {
+        return Ok(None);
+    };
+    Ok(read_selected_tx(&repo, branch.as_deref())?.map(|tx| (repo, tx)))
+}
+
+fn open_tx_locked(
+    cwd: &std::path::Path,
+    into: Option<&str>,
+) -> crate::Result<Option<(Repo, Tx, mergetx::ControlGuard)>> {
+    let Some((repo, branch)) = transaction_repo(cwd, into)? else {
+        return Ok(None);
+    };
+    let control = mergetx::ControlGuard::acquire(repo.root())?;
+    Ok(read_selected_tx(&repo, branch.as_deref())?.map(|tx| (repo, tx, control)))
 }
 
 fn status(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
@@ -483,10 +564,10 @@ fn status(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
 }
 
 fn abort(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
-    let Some((repo, tx)) = open_tx(cwd, into)? else {
+    let Some((_repo, tx, control)) = open_tx_locked(cwd, into)? else {
         return Ok(ExitCode::Precondition);
     };
-    mergetx::unlock(repo.root())?;
+    control.remove()?;
     ui::success(&format!(
         "dropped the {} → {} merge. The target ref never moved.",
         tx.source, tx.target
@@ -495,34 +576,53 @@ fn abort(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
 }
 
 fn pick_drop_summary(cwd: &std::path::Path, into: Option<&str>, cmd: PickCmd) -> CmdResult {
-    let Some((repo, mut tx)) = open_tx(cwd, into)? else {
+    let Some((repo, expected, control)) = open_tx_locked(cwd, into)? else {
         ui::error(
             "no merge transaction is open. Start one with `agit merge <source> --into <branch>`.",
         );
         return Ok(ExitCode::Precondition);
     };
-    match cmd {
-        PickCmd::Pick { refs: picks } => {
-            tx.pick_more(&picks);
-            mergetx::lock(repo.root(), &tx)?;
-            ui::success(&format!("picked {} items", picks.len()));
-        }
-        PickCmd::Drop { refs: drops } => {
-            let n = tx.drop(&drops);
-            mergetx::lock(repo.root(), &tx)?;
-            ui::success(&format!("removed {n} items"));
-        }
+    drop(control);
+    let cmd = match cmd {
         PickCmd::Summary { message, file } => {
             let text = match (message, file) {
-                (Some(m), _) => m,
-                (None, Some(f)) => std::fs::read_to_string(&f)?,
+                (Some(message), _) => message,
+                (None, Some(path)) => std::fs::read_to_string(path)?,
                 (None, None) => {
                     ui::error("summary needs -m <text> or -F <file>.");
                     return Ok(ExitCode::Usage);
                 }
             };
+            PickCmd::Summary {
+                message: Some(text),
+                file: None,
+            }
+        }
+        command => command,
+    };
+    let control = mergetx::ControlGuard::acquire(repo.root())?;
+    let mut tx = control
+        .read()?
+        .ok_or_else(|| anyhow::anyhow!("the selected merge transaction is no longer open"))?;
+    anyhow::ensure!(
+        tx.same_instance(&expected),
+        "the merge transaction changed while reading command input; inspect `agit merge --status` before retrying"
+    );
+    match cmd {
+        PickCmd::Pick { refs: picks } => {
+            tx.pick_more(&picks);
+            control.write(&tx)?;
+            ui::success(&format!("picked {} items", picks.len()));
+        }
+        PickCmd::Drop { refs: drops } => {
+            let n = tx.drop(&drops);
+            control.write(&tx)?;
+            ui::success(&format!("removed {n} items"));
+        }
+        PickCmd::Summary { message, .. } => {
+            let text = message.expect("summary text is read before transaction admission");
             tx.set_summary(text);
-            mergetx::lock(repo.root(), &tx)?;
+            control.write(&tx)?;
             ui::success("merge summary written");
         }
     }
@@ -530,7 +630,7 @@ fn pick_drop_summary(cwd: &std::path::Path, into: Option<&str>, cmd: PickCmd) ->
 }
 
 fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
-    let Some((repo, tx)) = open_tx(cwd, into)? else {
+    let Some((repo, tx, control)) = open_tx_locked(cwd, into)? else {
         return Ok(ExitCode::Precondition);
     };
 
@@ -641,7 +741,7 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
         &tx.target_head,
         on_target,
     )?;
-    mergetx::unlock(repo.root())?;
+    control.remove()?;
 
     ui::success(&format!(
         "merge commit landed: {} (parents: {}, {})",
@@ -1188,6 +1288,7 @@ mod tests {
         let turn = refs::fixtures::turn_sha(&repo, 3);
         repo.git(&["tag", "f1", "refs/heads/main"]).unwrap();
         let tx = Tx {
+            generation: None,
             target: "main".into(),
             source: "@#3".into(),
             source_repo: Some("bob/notes".into()),
@@ -1315,6 +1416,7 @@ mod tests {
         repo.git(&["checkout", "-q", "main"]).unwrap();
 
         let tx = Tx {
+            generation: None,
             target: "main".into(),
             source: "b".into(),
             source_repo: None,
@@ -1616,6 +1718,7 @@ mod tests {
         let status_before = target.git(&["status", "--porcelain=v1"]).unwrap();
 
         let tx = Tx {
+            generation: None,
             target: "main".into(),
             source: "elsewhere/source@main".into(),
             source_repo: Some("elsewhere/source".into()),

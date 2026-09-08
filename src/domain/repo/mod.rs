@@ -976,8 +976,26 @@ impl Repo {
     /// repository, the ref store cannot be read). [`Repo::git`] treats every non-zero as a failure,
     /// which on commands like these cannot tell "no" from "don't know".
     pub fn git_status(&self, args: &[&str]) -> Result<(Option<i32>, String, String)> {
-        let out = self
-            .cmd()
+        self.git_status_with_transport(args, true)
+    }
+
+    /// Probe local objects without allowing a transport to supply missing history.
+    pub(crate) fn git_status_local(&self, args: &[&str]) -> Result<(Option<i32>, String, String)> {
+        self.git_status_with_transport(args, false)
+    }
+
+    fn git_status_with_transport(
+        &self,
+        args: &[&str],
+        allow_transport: bool,
+    ) -> Result<(Option<i32>, String, String)> {
+        let mut command = self.cmd();
+        if !allow_transport {
+            command.env("GIT_NO_LAZY_FETCH", "1");
+            // The transport allowlist also blocks Git versions that ignore the lazy-fetch switch.
+            command.env("GIT_ALLOW_PROTOCOL", "");
+        }
+        let out = command
             .args(args)
             .output()
             .with_context(|| format!("failed to run git {}", args.join(" ")))?;

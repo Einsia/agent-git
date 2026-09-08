@@ -61,3 +61,9 @@ show an unavailable fork point and unknown added-turn counts; equal content does
 shared ancestry. Shallow, unreadable, or ambiguous ancestry refuses before a transaction is
 opened. Cross-repository reconnaissance borrows the local object stores. Git may fetch missing
 objects from a configured promisor remote while reading a repository.
+
+Merge preflight settles complete local content and then verifies every known active target claim. An unfinished turn, malformed record, missing transcript, or rewritten baseline stops the merge before opening its transaction. A quiet hook exit does not prove settlement. With no local claim, manual merging requires no login.
+
+If a runtime writes while its replacement is being installed, the original claim stays active and the merge transaction remains available for manual recovery. The prepared replacement remains unclaimed and can be found with `agit status --check-missing`; merge does not discard the original transcript or launch that replacement.
+
+Cancellation and merge-agent launch share a transaction control guard. If cancellation completes before final publication, the prepared session stays unclaimed and no agent is spawned. Once spawning wins admission, the guard is released immediately; a later abort clears the transaction without waiting for or terminating that runtime. Transaction progress and landing hold the same guard from their state read through their update, so an aborted transaction cannot be revived by a delayed command.

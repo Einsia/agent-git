@@ -2551,3 +2551,555 @@ fn promotion_refuses_destination_claims_before_moving_the_checkout() {
     assert_eq!(active_links_on(&lab, "einsia", "qa", "work").len(), 1);
     assert_eq!(active_links_on(&lab, "me", "qa", "work").len(), 1);
 }
+
+fn resume_tracking_fixture(shape: &str) -> (Lab, Repo, String) {
+    let lab = Lab::new();
+    lab.append_turn(
+        SID,
+        1,
+        "preserve selected tracking history",
+        "synthetic reply",
+    );
+    let imported = lab
+        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    let head = repo.git(&["rev-parse", "refs/heads/work"]).unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+    assert_eq!(repo.current_branch().as_deref(), Some("main"));
+    if shape != "absent" {
+        repo.git(&[
+            "remote",
+            "add",
+            "mirror",
+            &format!("{}/unreachable.git", lab.hub),
+        ])
+        .unwrap();
+        repo.git(&["config", "branch.work.remote", "mirror"])
+            .unwrap();
+        let topic = if shape == "diverged-unicode" {
+            "topic\u{2003}"
+        } else {
+            "topic"
+        };
+        repo.git(&[
+            "config",
+            "branch.work.merge",
+            &format!("refs/heads/{topic}"),
+        ])
+        .unwrap();
+        if shape != "missing" {
+            let ancestor = repo.git(&["rev-parse", &format!("{head}^")]).unwrap();
+            let tracking = match shape {
+                "equal" => head.clone(),
+                "local-ahead" => ancestor,
+                "remote-ahead" | "diverged" | "diverged-unicode" => {
+                    let tree = repo
+                        .git(&["rev-parse", &format!("{head}^{{tree}}")])
+                        .unwrap();
+                    let parent = if shape == "remote-ahead" {
+                        &head
+                    } else {
+                        &ancestor
+                    };
+                    repo.git(&[
+                        "commit-tree",
+                        &tree,
+                        "-p",
+                        parent,
+                        "-m",
+                        "synthetic tracking advance",
+                    ])
+                    .unwrap()
+                }
+                _ => panic!("unknown tracking fixture shape"),
+            };
+            repo.git(&[
+                "update-ref",
+                &format!("refs/remotes/mirror/{topic}"),
+                &tracking,
+            ])
+            .unwrap();
+        }
+    }
+    (lab, repo, head)
+}
+
+fn resume_json_snapshot(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && matches!(
+                    entry.path().extension().and_then(|ext| ext.to_str()),
+                    Some("json" | "jsonl")
+                )
+        })
+        .map(|entry| {
+            (
+                entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Known tracking advances exclude both native reuse and replacement of the selected branch.
+#[test]
+fn resume_refuses_known_tracking_advances_even_with_force() {
+    for shape in ["remote-ahead", "diverged", "diverged-unicode"] {
+        for force in [false, true] {
+            let (lab, repo, head) = resume_tracking_fixture(shape);
+            let native_before = resume_json_snapshot(&lab.home);
+            let links_before = resume_json_snapshot(&lab.agit_home.join("store"));
+            let refs_before = repo.git(&["show-ref"]).unwrap();
+            let requests_before = lab.hub_requests.load(Ordering::SeqCst);
+            let mut args = vec!["resume", "einsia/qa@work", "--no-launch"];
+            if force {
+                args.push("--force");
+            }
+            let output = lab.agit(&args).env("CI", "1").output().unwrap();
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(4),
+                "{shape} force={force}: {diagnostic}"
+            );
+            assert!(diagnostic.contains("tracking"), "{diagnostic}");
+            assert!(diagnostic.contains("einsia/qa@work"), "{diagnostic}");
+            assert_eq!(resume_json_snapshot(&lab.home), native_before);
+            assert_eq!(
+                resume_json_snapshot(&lab.agit_home.join("store")),
+                links_before
+            );
+            assert_eq!(repo.git(&["show-ref"]).unwrap(), refs_before);
+            assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), head);
+            assert_eq!(lab.hub_requests.load(Ordering::SeqCst), requests_before);
+        }
+    }
+}
+
+/// A reconciliation agent can prepare the frozen target while ordinary continuation stays blocked.
+#[cfg(all(unix, feature = "rc"))]
+#[test]
+fn interactive_merge_launches_for_diverged_tracking_after_settlement() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
+
+    let (lab, repo, initial_head) = resume_tracking_fixture("diverged");
+    let tracking = repo
+        .git(&["rev-parse", "refs/remotes/mirror/topic"])
+        .unwrap();
+    lab.append_turn(
+        SID,
+        2,
+        "settle before freezing the merge",
+        "preserve this reply",
+    );
+    let bin = lab._tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let runtime = bin.join("codex");
+    fs::write(
+        &runtime,
+        "#!/bin/sh\nprintf '%s\\0' \"$AGIT_SESSION\" \"$AGIT_MERGE_TX\" \"$@\" > \"$AGIT_TEST_MERGE_LAUNCH\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+    let capture = lab._tmp.path().join("merge-launch");
+    let source = format!("einsia/qa@{}", agit::domain::meta::id_from_sha(&tracking));
+    let template = lab.agit(&[]);
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+    command.args([
+        "merge",
+        &source,
+        "--into",
+        "einsia/qa@work",
+        "--as",
+        "codex",
+    ]);
+    command.cwd(&lab.work);
+    command.env_clear();
+    for (name, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    let mut path = vec![bin];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    command.env("PATH", std::env::join_paths(path).unwrap());
+    command.env("AGIT_YES", "1");
+    command.env("AGIT_TEST_MERGE_LAUNCH", &capture);
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize::default())
+        .unwrap();
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let output = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let mut child = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(pty.master);
+    let output = output.join().unwrap();
+    assert!(status.is_some_and(|status| status.success()), "{output}");
+    assert_eq!(output.matches("fork point  ").count(), 1, "{output}");
+    assert!(
+        output.contains("this side  +2 turns    source side  +1 turns"),
+        "{output}"
+    );
+    let captured = fs::read(&capture).unwrap_or_else(|error| panic!("{error}: {output}"));
+    let arguments: Vec<&str> = captured
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| std::str::from_utf8(part).unwrap())
+        .collect();
+    assert_eq!(
+        &arguments[..3],
+        &["einsia/qa@work", "einsia/qa@work", "resume"]
+    );
+    assert!(arguments.last().unwrap().contains("as the merge agent"));
+    assert!(arguments.last().unwrap().contains(&source));
+    let tx = agit::domain::mergetx::read(repo.root()).unwrap().unwrap();
+    assert_eq!(tx.target, "work");
+    assert_eq!(tx.source_head, tracking);
+    assert_ne!(tx.target_head, initial_head);
+    assert_eq!(
+        tx.target_head,
+        repo.git(&["rev-parse", "refs/heads/work"]).unwrap()
+    );
+    assert_eq!(
+        tx.base,
+        repo.git(&["merge-base", &tx.target_head, &tracking])
+            .unwrap()
+    );
+    let links = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].source, "codex");
+    assert_eq!(
+        links[0].materialized_from.as_deref(),
+        Some(tx.target_head.as_str())
+    );
+    assert_eq!(arguments[3], links[0].session_id);
+    let installed = resume_json_snapshot(&lab.home.join(".codex/sessions"));
+    let transcript = installed
+        .iter()
+        .find(|(path, _)| path.to_string_lossy().contains(&links[0].session_id))
+        .map(|(_, content)| String::from_utf8_lossy(content))
+        .unwrap();
+    assert!(transcript.contains("settle before freezing the merge"));
+    let native_before = resume_json_snapshot(&lab.home);
+    let links_before = resume_json_snapshot(&lab.agit_home.join("store"));
+    let resumed = lab
+        .agit(&["resume", "einsia/qa@work", "--force", "--no-launch"])
+        .env("AGIT_MERGE_TX", "einsia/qa@work")
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&resumed.stderr).contains("tracking"));
+    assert_eq!(resume_json_snapshot(&lab.home), native_before);
+    assert_eq!(
+        resume_json_snapshot(&lab.agit_home.join("store")),
+        links_before
+    );
+    let aborted = lab
+        .agit(&["merge", "--abort", "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(aborted.status.success());
+}
+
+/// Invalid graph preflight cannot settle the target's pending transcript before refusing.
+#[test]
+fn merge_preflight_refuses_before_settling_a_pending_target() {
+    let (lab, repo, head) = resume_tracking_fixture("diverged");
+    let tracking = repo
+        .git(&["rev-parse", "refs/remotes/mirror/topic"])
+        .unwrap();
+    let source = format!("einsia/qa@{}", agit::domain::meta::id_from_sha(&tracking));
+    lab.append_turn(
+        SID,
+        2,
+        "keep pending until preflight accepts",
+        "synthetic pending reply",
+    );
+    fs::write(
+        repo.common_dir().unwrap().join("shallow"),
+        format!("{head}\n"),
+    )
+    .unwrap();
+    let native_before = resume_json_snapshot(&lab.home);
+    let links_before = resume_json_snapshot(&lab.agit_home.join("store"));
+    let refs_before = repo.git(&["show-ref"]).unwrap();
+    let output = lab
+        .agit(&["merge", &source, "--into", "einsia/qa@work", "--manual"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("shallow repository"),
+        "{output:?}"
+    );
+    assert_eq!(repo.git(&["show-ref"]).unwrap(), refs_before);
+    assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), head);
+    assert_eq!(resume_json_snapshot(&lab.home), native_before);
+    assert_eq!(
+        resume_json_snapshot(&lab.agit_home.join("store")),
+        links_before
+    );
+    assert!(agit::domain::mergetx::read(repo.root()).unwrap().is_none());
+}
+
+/// Offline continuation does not depend on an existing published tracking ref.
+#[test]
+fn resume_allows_absent_equal_or_integrated_tracking_without_fetching() {
+    for shape in ["absent", "missing", "equal", "local-ahead"] {
+        let (lab, repo, head) = resume_tracking_fixture(shape);
+        let requests_before = lab.hub_requests.load(Ordering::SeqCst);
+        let output = lab
+            .agit(&["resume", "einsia/qa@work", "--no-launch"])
+            .env("CI", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{shape}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(SID));
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), head);
+        assert_eq!(repo.current_branch().as_deref(), Some("main"));
+        assert_eq!(lab.hub_requests.load(Ordering::SeqCst), requests_before);
+    }
+}
+
+/// A configured ref that cannot be inspected is not an absent tracking history.
+#[test]
+fn resume_refuses_unreadable_or_invalid_tracking_without_writes() {
+    for fault in ["broken-ref", "dangling-ref", "noncommit", "unknown-remote"] {
+        let (lab, repo, head) = resume_tracking_fixture("equal");
+        match fault {
+            "broken-ref" => {
+                let path = repo
+                    .git(&["rev-parse", "--git-path", "refs/remotes/mirror/topic"])
+                    .unwrap();
+                fs::write(repo.root().join(path), "invalid object identity\n").unwrap();
+            }
+            "dangling-ref" => {
+                repo.git(&[
+                    "symbolic-ref",
+                    "refs/remotes/mirror/topic",
+                    "refs/remotes/mirror/missing",
+                ])
+                .unwrap();
+            }
+            "noncommit" => {
+                let blob = repo
+                    .git(&["rev-parse", "refs/heads/work:session/meta.json"])
+                    .unwrap();
+                repo.git(&["update-ref", "refs/remotes/mirror/topic", &blob])
+                    .unwrap();
+            }
+            "unknown-remote" => {
+                repo.git(&["config", "branch.work.remote", "missing-remote"])
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let native_before = resume_json_snapshot(&lab.home);
+        let links_before = resume_json_snapshot(&lab.agit_home.join("store"));
+        let requests_before = lab.hub_requests.load(Ordering::SeqCst);
+        let output = lab
+            .agit(&["resume", "einsia/qa@work", "--force", "--no-launch"])
+            .env("CI", "1")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{fault} was treated as absent tracking"
+        );
+        assert_eq!(resume_json_snapshot(&lab.home), native_before);
+        assert_eq!(
+            resume_json_snapshot(&lab.agit_home.join("store")),
+            links_before
+        );
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), head);
+        assert_eq!(lab.hub_requests.load(Ordering::SeqCst), requests_before);
+    }
+}
+
+/// Missing promised history must refuse without fetching objects or changing runtime state.
+#[test]
+fn resume_tracking_does_not_lazy_fetch_missing_promised_objects() {
+    for missing in ["tip", "ancestor"] {
+        let (lab, repo, head) = resume_tracking_fixture("diverged");
+        let tracking = repo
+            .git(&["rev-parse", "refs/remotes/mirror/topic"])
+            .unwrap();
+        let absent = if missing == "tip" {
+            tracking
+        } else {
+            repo.git(&["rev-parse", &format!("{head}^")]).unwrap()
+        };
+        let remote = lab._tmp.path().join("promisor.git");
+        repo.git(&[
+            "clone",
+            "--bare",
+            "--no-hardlinks",
+            &repo.root().to_string_lossy(),
+            &remote.to_string_lossy(),
+        ])
+        .unwrap();
+        repo.git(&[
+            "--git-dir",
+            &remote.to_string_lossy(),
+            "config",
+            "uploadpack.allowAnySHA1InWant",
+            "true",
+        ])
+        .unwrap();
+        repo.git(&[
+            "--git-dir",
+            &remote.to_string_lossy(),
+            "config",
+            "uploadpack.allowFilter",
+            "true",
+        ])
+        .unwrap();
+        repo.git(&["remote", "set-url", "mirror", &remote.to_string_lossy()])
+            .unwrap();
+        repo.git(&["config", "remote.mirror.promisor", "true"])
+            .unwrap();
+        repo.git(&["config", "remote.mirror.partialclonefilter", "blob:none"])
+            .unwrap();
+        let objects = repo.root().join(".git/objects");
+        fs::remove_file(objects.join(&absent[..2]).join(&absent[2..])).unwrap();
+        let object_snapshot = || {
+            walkdir::WalkDir::new(&objects)
+                .into_iter()
+                .map(Result::unwrap)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| (entry.path().to_path_buf(), fs::read(entry.path()).unwrap()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let objects_before = object_snapshot();
+        let native_before = resume_json_snapshot(&lab.home);
+        let links_before = resume_json_snapshot(&lab.agit_home.join("store"));
+        let refs_before = repo
+            .git(&["for-each-ref", "--format=%(refname)%09%(objectname)"])
+            .unwrap();
+        let trace = lab._tmp.path().join("tracking-trace");
+        let output = lab
+            .agit(&["resume", "einsia/qa@work", "--force", "--no-launch"])
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .env("GIT_NO_LAZY_FETCH", "0")
+            .env("GIT_TRACE", &trace)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{missing}: {output:?}");
+        assert!(object_snapshot() == objects_before, "{missing}: {output:?}");
+        let trace = fs::read_to_string(trace).unwrap();
+        assert!(!trace.contains("upload-pack"), "{missing}: {trace}");
+        assert_eq!(resume_json_snapshot(&lab.home), native_before);
+        assert_eq!(
+            resume_json_snapshot(&lab.agit_home.join("store")),
+            links_before
+        );
+        assert_eq!(
+            repo.git(&["for-each-ref", "--format=%(refname)%09%(objectname)"])
+                .unwrap(),
+            refs_before
+        );
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), head);
+    }
+}
+
+/// The recovery command names the frozen tracking graph and survives shell argument parsing.
+#[cfg(unix)]
+#[test]
+fn resume_tracking_recovery_hint_resolves_the_frozen_graph() {
+    for branch in ["work", "work;literal'quoted‘’‚‛"] {
+        let (lab, repo, head) = resume_tracking_fixture("diverged");
+        if branch != "work" {
+            repo.git(&["branch", "-m", "work", branch]).unwrap();
+        }
+        let tracking = repo
+            .git(&["rev-parse", "refs/remotes/mirror/topic"])
+            .unwrap();
+        let base = repo.git(&["merge-base", &head, &tracking]).unwrap();
+        let target = format!("einsia/qa@{branch}");
+        let native_before = resume_json_snapshot(&lab.home);
+        let links_before = resume_json_snapshot(&lab.agit_home.join("store"));
+        let refs_before = repo.git(&["show-ref"]).unwrap();
+        let requests_before = lab.hub_requests.load(Ordering::SeqCst);
+        let output = lab
+            .agit(&["resume", &target, "--no-launch"])
+            .env("CI", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        let command = diagnostic.split('`').nth(1).unwrap();
+        let prefix = command.strip_suffix("--manual").unwrap_or_else(|| {
+            panic!("recovery must not require a launched runtime: {diagnostic}")
+        });
+        let template = lab.agit(&[]);
+        let mut shell = Command::new("sh");
+        shell
+            .args(["-c", &format!("{prefix}--dry-run")])
+            .current_dir(&lab.work)
+            .env_clear();
+        for (name, value) in template.get_envs() {
+            if let Some(value) = value {
+                shell.env(name, value);
+            }
+        }
+        let mut path = vec![
+            std::path::Path::new(env!("CARGO_BIN_EXE_agit"))
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        ];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let recovery = shell
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env("CI", "1")
+            .output()
+            .unwrap();
+        assert!(recovery.status.success(), "{command}: {recovery:?}");
+        let report = String::from_utf8_lossy(&recovery.stdout);
+        assert!(report.contains(&base[..9]), "{report}");
+        assert_eq!(resume_json_snapshot(&lab.home), native_before);
+        assert_eq!(
+            resume_json_snapshot(&lab.agit_home.join("store")),
+            links_before
+        );
+        assert_eq!(repo.git(&["show-ref"]).unwrap(), refs_before);
+        assert_eq!(lab.hub_requests.load(Ordering::SeqCst), requests_before);
+    }
+}

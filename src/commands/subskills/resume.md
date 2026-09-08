@@ -25,11 +25,15 @@ With no target at a terminal, this opens a session picker; choosing one hands th
 | `--as <runtime>` | Runtime to use |
 | `--cwd <dir>` | Runtime working directory |
 | `--no-launch` | Resolve/materialize without starting |
-| `--force` | Force recovery from an already-running or otherwise abnormal state (use carefully) |
+| `--force` | Replace an active runtime claim; known unintegrated tracking history still refuses |
 | `--tui` / `--no-tui` | Force or forbid the full-screen interface. `--tui` overrides the agent-session check but not `--json` / `-q` / `-y` |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
 Preparing the same branch tip, runtime, and directory again reuses the existing runtime session. A materialized instance whose branch advanced is superseded only when its recorded baseline proves that no new content exists; otherwise resume refuses before creating another writer.
+
+Resume checks the tracking ref configured for the explicitly selected branch, even when the primary checkout is on another branch. The tracking check uses only local objects and does not fetch updates; absent tracking refs are allowed. A known tracking tip must already be an ancestor of the local tip; remote advances and divergence refuse both native reuse and materialization, including `--force`. Tracking identity and tip changes across confirmation prompts also require a retry.
+
+The refusal prints a manual merge command for that exact known tracking version and selected branch. It does not assume the remote is `origin` or that its branch has the same name. Add `--dry-run` instead of `--manual` to inspect the graph without opening a merge transaction. On Windows, copy the printed command into PowerShell.
 
 ## Examples
 
