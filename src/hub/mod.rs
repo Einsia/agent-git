@@ -338,7 +338,7 @@ pub struct SearchPage<T> {
     pub per: usize,
     #[serde(default)]
     pub items: Vec<T>,
-    /// The server's scan budget ran out; some content went unread.
+    /// The server returned a partial result without identifying the cause.
     ///
     /// This must be passed on to the user, never swallowed: silently handing back a truncated
     /// number reads as "searched, nothing there" — and what this feature is for is deciding from

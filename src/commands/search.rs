@@ -42,9 +42,8 @@
 //! * `unknown`: the user writes `runtim:codex` (one letter off) and it is searched as an ordinary
 //!   word. Unreported, the results just look inexplicable, and the user does not suspect their own
 //!   syntax — they suspect search is broken.
-//! * `incomplete`: the hub's scan budget ran out. Quietly handing back a truncated number reads as
-//!   "it was searched, there is nothing" — and this command exists precisely to decide from that
-//!   whether a piece of work has to be done over.
+//! * `incomplete`: the hub returned a partial result without identifying the cause. The count is
+//!   a lower bound, so an empty result cannot establish that matching readable content is absent.
 
 use super::{CmdResult, require_login};
 use crate::hub::{AgentHit, PersonHit, PrHit, SearchHit, SearchPage};
@@ -164,7 +163,7 @@ fn counts(client: &crate::hub::Client, args: &Args) -> CmdResult {
     );
     println!("{}  {}", ui::bold(&c.people.to_string()), ui::dim("people"));
     if c.sessions_incomplete {
-        ui::hint("session count is a lower bound — the scan hit its budget");
+        ui::hint("session count is a lower bound — the search is incomplete");
     }
     Ok(ExitCode::Ok)
 }
@@ -197,8 +196,8 @@ fn header<T>(p: &SearchPage<T>, query: &str) {
 
 fn footer<T>(p: &SearchPage<T>) {
     if p.incomplete {
-        ui::warning("not everything was read — the scan hit its budget");
-        ui::hint("narrow with owner: or agent: to cover the rest");
+        ui::warning("search results are incomplete — some readable content may not be covered");
+        ui::hint("try narrowing with owner: or agent:, or retry later");
     }
     if p.per > 0 && p.total > p.page.max(1) * p.per {
         ui::hint(&format!(
@@ -489,7 +488,7 @@ fn nothing<T>(query: &str, p: &SearchPage<T>) -> CmdResult {
         ));
     }
     if p.incomplete {
-        ui::warning("the scan hit its budget, so this is not a definitive “no”");
+        ui::warning("the search is incomplete — matching readable content may still exist");
     }
     ui::hint("the corpus only covers what you can read");
     Ok(ExitCode::Ok)
