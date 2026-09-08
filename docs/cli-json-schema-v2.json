@@ -1,0 +1,257 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cli-output-v2.json",
+  "title": "agit CLI machine-readable output with typed fixes",
+  "description": "Version 2 CLI envelope. Fix commands are advisory native argument data and are never executed by reporting.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "command",
+    "ok",
+    "exit_code",
+    "result",
+    "diagnostics",
+    "fix"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cli-output"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "command": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Canonical top-level command name, for example status or cherry-pick."
+    },
+    "ok": {
+      "type": "boolean",
+      "description": "Whether the command completed with exit code zero."
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "The same process exit code that non-JSON mode would return."
+    },
+    "result": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/json_result"
+        },
+        {
+          "$ref": "#/$defs/json_lines_result"
+        },
+        {
+          "$ref": "#/$defs/text_result"
+        },
+        {
+          "$ref": "#/$defs/empty_result"
+        }
+      ]
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/diagnostics"
+    },
+    "fix": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fix_command"
+      },
+      "description": "Alternative complete next-step commands. Empty on success or when a complete, lossless command is unavailable; never automatically execute these actions."
+    }
+  },
+  "$defs": {
+    "json_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "kind",
+        "value"
+      ],
+      "properties": {
+        "format": {
+          "const": "json"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable semantic result kind; initially the command name."
+        },
+        "value": {
+          "description": "The command's structured JSON value, preserved without string encoding."
+        }
+      }
+    },
+    "json_lines_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "kind",
+        "values"
+      ],
+      "properties": {
+        "format": {
+          "const": "json_lines"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable semantic result kind; initially the command name."
+        },
+        "values": {
+          "type": "array",
+          "description": "One decoded JSON value for each non-empty output line, in order."
+        }
+      }
+    },
+    "text_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "kind",
+        "lines"
+      ],
+      "properties": {
+        "format": {
+          "const": "text"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable semantic result kind; initially the command name."
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Stdout split into non-empty logical lines, without newline characters; blank presentation lines are omitted."
+        }
+      }
+    },
+    "empty_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "kind"
+      ],
+      "properties": {
+        "format": {
+          "const": "empty"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable semantic result kind; initially the command name."
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stderr"
+      ],
+      "properties": {
+        "stderr": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "level",
+              "message"
+            ],
+            "properties": {
+              "level": {
+                "type": "string",
+                "enum": [
+                  "error",
+                  "warning",
+                  "hint",
+                  "info"
+                ]
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Captured stderr classified by the standard CLI diagnostic prefixes."
+        }
+      }
+    },
+    "fix_command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "argv",
+        "cwd",
+        "env",
+        "requires_interaction"
+      ],
+      "properties": {
+        "kind": {
+          "const": "agit_command"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "const": "agit"
+            },
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[^\u0000]*$"
+            }
+          ],
+          "items": {
+            "type": "string",
+            "pattern": "^[^\u0000]*$"
+          },
+          "description": "Exact native arguments, including the logical agit executable. Values are not shell code and must not be split, interpolated, trimmed, or normalized."
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\u0000]*$",
+          "description": "Absolute working directory for the action."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "AGIT_HOME",
+            "AGIT_HUB_URL"
+          ],
+          "properties": {
+            "AGIT_HOME": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[^\u0000]*$"
+            },
+            "AGIT_HUB_URL": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^https?://[^/@?#\\u0000]+(?:/[^?#\\u0000]*)?$"
+            }
+          },
+          "description": "Only non-secret routing values. Apply these to the original invocation environment; do not treat them as permission to bypass its controls."
+        },
+        "requires_interaction": {
+          "type": "boolean",
+          "description": "The command requires an interactive-capable caller when a confirmation cannot be ruled out; this does not grant permission to run it."
+        }
+      }
+    }
+  }
+}

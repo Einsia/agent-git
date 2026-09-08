@@ -32,6 +32,7 @@ fn main() {
 
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let json_hint = raw_args.iter().any(|arg| arg == "--json");
+    let json_version_hint = commands::json::Version::from_argv(&raw_args);
     let cli = match <Cli as clap::Parser>::try_parse_from(raw_args.clone()) {
         Ok(cli) => cli,
         Err(error) => {
@@ -42,8 +43,9 @@ fn main() {
                     ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
                 )
             {
-                exit(commands::json::emit_parse_error(
+                exit(commands::json::emit_parse_error_version(
                     commands::json::command_from_argv(&raw_args),
+                    json_version_hint,
                     error.exit_code(),
                     &error.to_string(),
                 ));
@@ -51,6 +53,18 @@ fn main() {
             error.exit();
         }
     };
+    let json_version = cli.json_version.unwrap_or_default();
+    let json = cli.command.as_ref().map_or(cli.json, |command| {
+        commands::json_requested(cli.json, command)
+    });
+    if cli.json_version.is_some() && !json {
+        <Cli as clap::CommandFactory>::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--json-version requires --json",
+            )
+            .exit();
+    }
     if cli.no_color {
         unsafe { std::env::set_var("NO_COLOR", "1") };
     }
@@ -98,14 +112,13 @@ fn main() {
                 }
                 exit(dispatch(Commands::Resume(Default::default()), false));
             }
-            verdict => exit(bare_help(verdict, cli.json)),
+            verdict => exit(bare_help(verdict, cli.json, json_version)),
         }
     };
 
     // The JSON path moves the cd and the startup migration inside the envelope: migration
     // warnings are part of this output too, and left outside the envelope they become bare text
     // ahead of the JSON that the consumer cannot parse.
-    let json = commands::json_requested(cli.json, &command);
     let command_name = commands::command_name(&command);
     let startup = match &command {
         Commands::Status(_) => Startup::Inspect,
@@ -120,14 +133,29 @@ fn main() {
     }
     if json {
         if let Some(reason) = commands::json::incompatible(&command) {
-            exit(commands::json::emit_rejection(
+            exit(commands::json::emit_rejection_version(
                 command_name,
+                json_version,
                 agit::ExitCode::Interactive.as_i32(),
                 reason,
+                if json_version == commands::json::Version::V2 {
+                    commands::json::incompatible_fixes(
+                        &command,
+                        cli.directory.as_deref(),
+                        &[
+                            ("--yes", cli.yes),
+                            ("--quiet", cli.quiet),
+                            ("--no-color", cli.no_color),
+                            ("--no-tui", cli.no_tui),
+                        ],
+                    )
+                } else {
+                    Vec::new()
+                },
             ));
         }
         let directory = cli.directory.clone();
-        let code = commands::json::capture(command_name, || {
+        let code = commands::json::capture_version(command_name, json_version, || {
             if let Some(code) = prepare_startup(directory.as_deref(), startup) {
                 return code;
             }
@@ -177,7 +205,7 @@ enum Startup {
 /// migration first, and this path must not touch the store. It prints the help, which is what
 /// `arg_required_else_help` does: in a pipe, in CI and in an agent session, `agit`'s output is
 /// unchanged down to the byte.
-fn bare_help(verdict: agit::tui::Verdict, json: bool) -> i32 {
+fn bare_help(verdict: agit::tui::Verdict, json: bool, version: commands::json::Version) -> i32 {
     match verdict {
         // `--tui` asks for the interface explicitly and there is no terminal: error out, do not
         // silently degrade into a help page. A silent degradation lets a script believe the flag
@@ -206,8 +234,9 @@ fn bare_help(verdict: agit::tui::Verdict, json: bool) -> i32 {
         let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
         let mut strict = agit::commands::cli_def().subcommand_required(true);
         let code = match strict.try_get_matches_from_mut(&argv) {
-            Err(e) => commands::json::emit_parse_error(
+            Err(e) => commands::json::emit_parse_error_version(
                 commands::json::command_from_argv(&argv),
+                version,
                 e.exit_code(),
                 &e.to_string(),
             ),
@@ -288,6 +317,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
     match result {
         Ok(code) => code.as_i32(),
         Err(e) => {
+            commands::fix::register_terminal_api_error(&e);
             // `{e:#}` prints the whole anyhow error chain, which is what diagnostics need.
             agit::ui::error(&format!("{e:#}"));
             agit::ExitCode::Usage.as_i32()

@@ -66,6 +66,7 @@ pub fn run(args: Args) -> CmdResult {
     let latest = match client.cli_version() {
         Ok(v) => v,
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             if let Some(api) = e.downcast_ref::<crate::hub::client::ApiError>()
                 && api.status == 404
             {

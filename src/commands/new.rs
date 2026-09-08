@@ -184,6 +184,7 @@ pub fn run(args: Args) -> CmdResult {
         None if explicitly_named => match super::clone::readonly_clone(&owner, &name) {
             Ok(repo) => repo,
             Err(error) => {
+                super::fix::register_terminal_api_error(&error);
                 ui::error(&format!("fetch failed: {error:#}"));
                 return Ok(super::clone::readonly_clone_error_code(&error));
             }

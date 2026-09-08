@@ -30,6 +30,24 @@ pub struct ApiError {
     /// The server's human-readable wording. Empty when the body cannot be read.
     pub detail: String,
     base: String,
+    remedies: Vec<Remediation>,
+}
+
+/// A server recipe names a local capability; it never supplies executable arguments or routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum Remediation {
+    Authenticate {},
+}
+
+impl ApiError {
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    pub(crate) fn remedies(&self) -> &[Remediation] {
+        &self.remedies
+    }
 }
 
 impl std::fmt::Display for ApiError {
@@ -78,6 +96,19 @@ struct ErrorBody {
     error: String,
     #[serde(default)]
     kind: String,
+    #[serde(default)]
+    fix: serde_json::Value,
+}
+
+impl ErrorBody {
+    fn remedies(&self) -> Vec<Remediation> {
+        self.fix
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+            .collect()
+    }
 }
 
 pub struct Client {
@@ -319,11 +350,15 @@ impl Client {
         // Left empty when the body cannot be read (not JSON, rewritten by a proxy). Display
         // then falls back to "the hub returned HTTP <code>" — imprecise, but more honest than
         // inventing an explanation.
-        let (kind, detail) = match resp.body_mut().read_json::<ErrorBody>() {
-            Ok(b) => (b.kind, b.error),
+        let (kind, detail, remedies) = match resp.body_mut().read_json::<ErrorBody>() {
+            Ok(b) => {
+                let remedies = b.remedies();
+                (b.kind, b.error, remedies)
+            }
             Err(_) => (
                 String::new(),
                 format!("the hub returned HTTP {status} ({path})"),
+                Vec::new(),
             ),
         };
         anyhow::Error::new(ApiError {
@@ -331,6 +366,7 @@ impl Client {
             kind,
             detail,
             base: self.base.clone(),
+            remedies,
         })
     }
 
@@ -1487,12 +1523,20 @@ mod tests {
                 if let Some(tx) = tx.lock().unwrap().take() {
                     let _ = tx.send(());
                 }
-                return (401, r#"{"error":"used","kind":"unauthorized"}"#.into());
+                return (
+                    401,
+                    r#"{"error":"used","kind":"unauthorized","fix":[{"kind":"authenticate"}]}"#
+                        .into(),
+                );
             }
             if req.contains("Bearer at-new") {
                 (200, "{}".into())
             } else {
-                (401, r#"{"error":"expired","kind":"unauthorized"}"#.into())
+                (
+                    401,
+                    r#"{"error":"expired","kind":"unauthorized","fix":[{"kind":"authenticate"}]}"#
+                        .into(),
+                )
             }
         });
 
@@ -1510,7 +1554,9 @@ mod tests {
             std::thread::sleep(REFRESH_SETTLE_STEP * 3);
             credentials::save(&sibling_base, &new_pair(&sibling_base, "alice")).unwrap();
         });
+        let scope = crate::commands::fix::Scope::enter();
         let result = Client::for_credential(&base, &cred).logout();
+        assert!(scope.finish(7).is_empty());
         sibling.join().unwrap();
         unsafe {
             match old_home {
@@ -1647,7 +1693,77 @@ mod tests {
             kind: kind.into(),
             detail: detail.into(),
             base: "http://h".into(),
+            remedies: Vec::new(),
         }
+    }
+
+    #[test]
+    fn optional_remedies_do_not_discard_human_errors_or_accept_server_commands() {
+        for (wire, expected) in [
+            (serde_json::Value::Null, vec![]),
+            (serde_json::json!("authenticate"), vec![]),
+            (serde_json::json!({"kind": "authenticate"}), vec![]),
+            (serde_json::json!([]), vec![]),
+            (
+                serde_json::json!([null, {}, "authenticate", {"kind": "future"}]),
+                vec![],
+            ),
+            (
+                serde_json::json!([{"kind": "authenticate", "argv": ["server-command"]}]),
+                vec![],
+            ),
+            (
+                serde_json::json!([{"kind": "authenticate"}]),
+                vec![Remediation::Authenticate {}],
+            ),
+        ] {
+            let body: ErrorBody = serde_json::from_value(serde_json::json!({
+                "error": "synthetic account error",
+                "kind": "unauthorized",
+                "fix": wire,
+            }))
+            .unwrap();
+            assert_eq!(body.error, "synthetic account error");
+            assert_eq!(body.kind, "unauthorized");
+            assert_eq!(body.remedies(), expected);
+        }
+        let old: ErrorBody =
+            serde_json::from_str(r#"{"error":"legacy","kind":"unauthorized"}"#).unwrap();
+        assert!(old.remedies().is_empty());
+    }
+
+    #[test]
+    fn terminal_remedies_are_explicit_deduplicated_and_bound_to_the_failed_request() {
+        let _home = CredentialTestHome::new();
+        let mut api = api_err(401, "unauthorized", "synthetic refused");
+        api.remedies = vec![Remediation::Authenticate {}, Remediation::Authenticate {}];
+        let error = anyhow::Error::new(api).context("operation refused");
+        let passive = crate::commands::fix::Scope::enter();
+        assert!(format!("{error:#}").contains("synthetic refused"));
+        assert!(format!("{error}").contains("operation refused"));
+        assert!(passive.finish(7).is_empty());
+
+        unsafe { std::env::set_var("AGIT_HUB_URL", "https://different.invalid") };
+        let scope = crate::commands::fix::Scope::enter();
+        crate::commands::fix::register_terminal_api_error(&error);
+        crate::commands::fix::register_terminal_api_error(&error);
+        let actions = serde_json::to_value(scope.finish(5)).unwrap();
+        assert_eq!(actions.as_array().unwrap().len(), 1);
+        assert_eq!(
+            actions[0]["argv"],
+            serde_json::json!(["agit", "login", "--hub", "http://h"])
+        );
+        assert_eq!(actions[0]["env"]["AGIT_HUB_URL"], "http://h");
+        assert_eq!(actions[0]["requires_interaction"], true);
+
+        let ordinary = crate::commands::fix::Scope::enter();
+        crate::commands::fix::register_terminal_api_error(&anyhow::Error::new(api_err(
+            401,
+            "unauthorized",
+            "sign in",
+        )));
+        crate::commands::fix::register_terminal_api_error(&anyhow::anyhow!("HTTP 401; agit login"));
+        assert!(ordinary.finish(5).is_empty());
     }
 
     #[test]

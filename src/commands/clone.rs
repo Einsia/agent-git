@@ -1027,6 +1027,7 @@ fn resolve_from_repo(client: &crate::hub::Client) -> crate::Result<Option<(Strin
     let candidates = match candidates {
         Ok(c) => c,
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("reverse lookup failed: {e:#}"));
             ui::hint("name it: agit clone <owner>/<agent>");
             return Ok(None);

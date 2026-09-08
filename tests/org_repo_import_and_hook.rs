@@ -2096,6 +2096,107 @@ fn new_session_remote(lab: &Lab) -> std::path::PathBuf {
     remote
 }
 
+#[cfg(unix)]
+#[test]
+fn missing_repository_recovery_preserves_workspace_binding_through_resume() {
+    let publisher = Lab::new();
+    publisher.append_turn(SID, 1, "restore this published session", "synthetic reply");
+    let imported = publisher
+        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .env("CI", "1")
+        .output()
+        .unwrap();
+    assert!(imported.status.success(), "{imported:?}");
+    let source = Repo::open(publisher.repo("einsia", "qa")).unwrap();
+    let source_head = source.git(&["rev-parse", "refs/heads/work"]).unwrap();
+    let remote = publisher._tmp.path().join("published.git");
+    let published = Command::new("git")
+        .args(["clone", "--bare", "--quiet"])
+        .arg(source.root())
+        .arg(&remote)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(published.status.success(), "{published:?}");
+
+    for already_bound in [true, false] {
+        let lab = Lab::new();
+        fs::write(&lab.clone_url, remote.to_string_lossy().as_bytes()).unwrap();
+        if already_bound {
+            let initialized = lab
+                .agit(&["init", "project"])
+                .env("CI", "1")
+                .output()
+                .unwrap();
+            assert!(initialized.status.success(), "{initialized:?}");
+        }
+        let bindings = lab.agit_home.join("workspaces");
+        let snapshot = || {
+            if bindings.try_exists().unwrap() {
+                resume_json_snapshot(&bindings)
+            } else {
+                Default::default()
+            }
+        };
+        let before = snapshot();
+        assert_eq!(before.is_empty(), !already_bound);
+        if already_bound {
+            assert!(before.values().any(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["repo"] == "me/project"
+            }));
+        }
+        let resume_args = ["--json", "resume", "einsia/qa@work", "--no-launch"];
+        let output = lab.agit(&resume_args).env("CI", "1").output().unwrap();
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let action = &document["fix"][0];
+        assert_eq!(action["requires_interaction"], false);
+        assert!(!lab.repo("einsia", "qa").exists());
+        assert_eq!(snapshot(), before);
+        let argv: Vec<_> = action["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        let mut retry = lab.agit(&argv);
+        retry
+            .current_dir(action["cwd"].as_str().unwrap())
+            .env("CI", "1");
+        for (key, value) in action["env"].as_object().unwrap() {
+            retry.env(key, value.as_str().unwrap());
+        }
+        let cloned = retry.output().unwrap();
+        assert!(cloned.status.success(), "{cloned:?}");
+        assert_eq!(snapshot(), before);
+        let received = Repo::open(lab.repo("einsia", "qa")).unwrap();
+        assert_eq!(
+            received.git(&["rev-parse", "refs/heads/work"]).unwrap(),
+            source_head
+        );
+        assert!(active_links_on(&lab, "einsia", "qa", "work").is_empty());
+        let prepared = lab.agit(&resume_args).env("CI", "1").output().unwrap();
+        assert!(prepared.status.success(), "{prepared:?}");
+        let document: serde_json::Value = serde_json::from_slice(&prepared.stdout).unwrap();
+        assert_eq!(document["fix"], serde_json::json!([]));
+        let claims = active_links_on(&lab, "einsia", "qa", "work");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(
+            claims[0].materialized_from.as_deref(),
+            Some(source_head.as_str())
+        );
+        assert_ne!(claims[0].session_id, SID);
+        assert_eq!(snapshot(), before);
+        assert_eq!(bindings.exists(), already_bound);
+        assert_eq!(
+            received.git(&["rev-parse", "refs/heads/work"]).unwrap(),
+            source_head
+        );
+    }
+}
+
 #[test]
 fn new_clones_an_explicit_missing_repository_without_binding_cwd() {
     let lab = Lab::new();

@@ -219,7 +219,10 @@ fn resolve_branch(args: &Args, cwd: &Path) -> crate::Result<Resolved> {
         let dir = config::repo_dir(&o, &n)?;
         let Some(repo) = Repo::open(&dir) else {
             ui::error(&format!("{slug} doesn’t exist locally."));
-            ui::hint(&format!("fetch it first: `agit clone {slug}`"));
+            ui::hint_with_fix(
+                &format!("fetch it first: `agit clone --no-bind {slug}`"),
+                || super::fix::FixCommand::current(&["clone", "--no-bind", "--", &slug], false),
+            );
             return Ok(Resolved::Refused(ExitCode::Ref));
         };
         return Ok(Resolved::Branch(repo, slug, base_name));

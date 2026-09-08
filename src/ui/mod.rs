@@ -81,6 +81,12 @@ pub fn hint(msg: &str) {
     eprintln!("{}", transient(&format!("  → {msg}")));
 }
 
+/// Keep the human hint while registering only an explicitly constructed recovery action.
+pub fn hint_with_fix(msg: &str, action: impl FnOnce() -> Option<crate::commands::fix::FixCommand>) {
+    hint(msg);
+    crate::commands::fix::register(action);
+}
+
 pub fn success(msg: &str) {
     println!("{} {msg}", ok(theme::symbols().check));
 }

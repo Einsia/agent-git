@@ -99,42 +99,45 @@ fn verify_online(hub: &str, client: &crate::hub::Client, human: bool) -> (Check,
                 ExitCode::Ok,
             )
         }
-        Err(e) => match e.downcast_ref::<crate::hub::client::ApiError>() {
-            Some(api) if api.status == 401 || api.status == 403 => {
-                ui::error(&format!("{hub} rejects the credentials: {}", api.detail));
-                ui::hint("next: sign in again with `agit login`");
-                (
-                    Check {
-                        server_reachable: Some(true),
-                        authenticated: Some(false),
-                    },
-                    ExitCode::Auth,
-                )
+        Err(e) => {
+            super::fix::register_terminal_api_error(&e);
+            match e.downcast_ref::<crate::hub::client::ApiError>() {
+                Some(api) if api.status == 401 || api.status == 403 => {
+                    ui::error(&format!("{hub} rejects the credentials: {}", api.detail));
+                    ui::hint("next: sign in again with `agit login`");
+                    (
+                        Check {
+                            server_reachable: Some(true),
+                            authenticated: Some(false),
+                        },
+                        ExitCode::Auth,
+                    )
+                }
+                Some(api) => {
+                    ui::error(&format!("{hub} answered with an error: {api}"));
+                    (
+                        Check {
+                            server_reachable: Some(true),
+                            authenticated: None,
+                        },
+                        ExitCode::Network,
+                    )
+                }
+                None => {
+                    ui::error(&format!("can’t reach {hub}: {e:#}"));
+                    ui::hint(
+                        "fix the network first — doctor being offline by default exists for exactly these moments",
+                    );
+                    (
+                        Check {
+                            server_reachable: Some(false),
+                            authenticated: None,
+                        },
+                        ExitCode::Network,
+                    )
+                }
             }
-            Some(api) => {
-                ui::error(&format!("{hub} answered with an error: {api}"));
-                (
-                    Check {
-                        server_reachable: Some(true),
-                        authenticated: None,
-                    },
-                    ExitCode::Network,
-                )
-            }
-            None => {
-                ui::error(&format!("can’t reach {hub}: {e:#}"));
-                ui::hint(
-                    "fix the network first — doctor being offline by default exists for exactly these moments",
-                );
-                (
-                    Check {
-                        server_reachable: Some(false),
-                        authenticated: None,
-                    },
-                    ExitCode::Network,
-                )
-            }
-        },
+        }
     }
 }
 

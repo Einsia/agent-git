@@ -36,6 +36,7 @@ pub mod run;
 // Adoption and status
 pub mod branch;
 pub mod context;
+pub mod fix;
 pub mod import;
 pub mod json;
 pub mod status;
@@ -1145,6 +1146,10 @@ pub struct Cli {
     /// Emit one machine-readable JSON document for the command.
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Select the JSON contract version (default: 2; 1 preserves the legacy envelope).
+    #[arg(long, global = true, value_enum)]
+    pub json_version: Option<json::Version>,
 
     /// Skip confirmations (equivalent to answering “yes” to every prompt).
     #[arg(short = 'y', long, global = true)]

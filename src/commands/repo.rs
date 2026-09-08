@@ -156,6 +156,7 @@ fn create(name: &str, private: bool) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
             Ok(ExitCode::Network)
         }
@@ -214,6 +215,7 @@ fn list(remote: bool) -> CmdResult {
                 }
             }
             Err(e) => {
+                super::fix::register_terminal_api_error(&e);
                 ui::error(&format!("{e:#}"));
                 return Ok(ExitCode::Network);
             }
@@ -391,6 +393,7 @@ fn set_visibility(repo: &str, v: &str) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
             Ok(ExitCode::Network)
         }
@@ -411,6 +414,7 @@ fn set_public_visibility(
     let prepared = match client.prepare_public_visibility(owner, name, expected_agent_id) {
         Ok(prepared) => prepared,
         Err(error) => {
+            super::fix::register_terminal_api_error(&error);
             ui::error(&format!("{error:#}"));
             return Ok(ExitCode::Network);
         }
@@ -494,6 +498,7 @@ fn set_public_visibility(
             Ok(ExitCode::Ok)
         }
         Err(error) => {
+            super::fix::register_terminal_api_error(&error);
             ui::error(&format!("{error:#}"));
             Ok(ExitCode::Network)
         }
@@ -530,6 +535,7 @@ fn collab(action: CollabAction) -> CmdResult {
                     Ok(ExitCode::Ok)
                 }
                 Err(e) => {
+                    super::fix::register_terminal_api_error(&e);
                     ui::error(&format!("{e:#}"));
                     Ok(ExitCode::Network)
                 }
@@ -552,6 +558,7 @@ fn collab(action: CollabAction) -> CmdResult {
                     Ok(ExitCode::Ok)
                 }
                 Err(e) => {
+                    super::fix::register_terminal_api_error(&e);
                     ui::error(&format!("{e:#}"));
                     Ok(ExitCode::Network)
                 }
@@ -572,6 +579,7 @@ fn collab(action: CollabAction) -> CmdResult {
                     Ok(ExitCode::Ok)
                 }
                 Err(e) => {
+                    super::fix::register_terminal_api_error(&e);
                     ui::error(&format!("{e:#}"));
                     Ok(ExitCode::Network)
                 }
@@ -615,6 +623,7 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
     match client.rename_agent(&owner, &name, new_name, &identity.agent_id) {
         Ok(()) => ui::success(&format!("remote renamed: {repo} → {owner}/{new_name}")),
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("remote rename failed: {e:#}"));
             return Ok(ExitCode::Network);
         }
@@ -705,6 +714,7 @@ fn delete(repo: &str, local_only: bool) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
             Ok(ExitCode::Network)
         }

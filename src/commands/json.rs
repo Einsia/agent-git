@@ -9,12 +9,13 @@
 //! ```json
 //! {
 //!   "schema": "cli-output",
-//!   "schema_version": 1,
+//!   "schema_version": 2,
 //!   "command": "status",
 //!   "ok": true,
 //!   "exit_code": 0,
 //!   "result": { "format": "text", "kind": "status", "lines": [] },
-//!   "diagnostics": { "stderr": [] }
+//!   "diagnostics": { "stderr": [] },
+//!   "fix": []
 //! }
 //! ```
 
@@ -23,7 +24,49 @@ use serde_json::Value;
 use std::io::{Read, Write};
 
 pub const SCHEMA_NAME: &str = "cli-output";
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Version {
+    #[value(name = "1")]
+    V1,
+    #[default]
+    #[value(name = "2")]
+    V2,
+}
+
+impl Version {
+    /// Preserve an explicit contract selection even when another argument fails to parse.
+    pub fn from_argv(args: &[std::ffi::OsString]) -> Self {
+        let mut args = args.iter().skip(1);
+        let mut selected = Self::default();
+        while let Some(arg) = args.next() {
+            if arg == "--" {
+                break;
+            }
+            let value = if arg == "--json-version" {
+                args.next().and_then(|value| value.to_str())
+            } else {
+                arg.to_str()
+                    .and_then(|value| value.strip_prefix("--json-version="))
+            };
+            match value {
+                Some("1") => selected = Self::V1,
+                Some("2") => selected = Self::V2,
+                _ => {}
+            }
+        }
+        selected
+    }
+}
+
+#[derive(Serialize)]
+struct V2Document {
+    #[serde(flatten)]
+    document: Document,
+    fix: Vec<super::fix::FixCommand>,
+}
 
 #[derive(Debug, Serialize)]
 struct Document {
@@ -74,17 +117,23 @@ struct Diagnostic {
 /// is rejected before the command runs; emitting an empty envelope after
 /// leaking human output would violate the single-document contract.
 pub fn capture(command: &str, f: impl FnOnce() -> i32) -> i32 {
+    capture_version(command, Version::default(), f)
+}
+
+pub fn capture_version(command: &str, version: Version, f: impl FnOnce() -> i32) -> i32 {
     #[cfg(unix)]
     {
-        capture_unix(command, f)
+        capture_unix(command, version, f)
     }
     #[cfg(not(unix))]
     {
         let _ = f;
-        emit_rejection(
+        emit_rejection_version(
             command,
+            version,
             crate::ExitCode::Precondition.as_i32(),
             "--json output is not supported on this platform yet; the command was not run",
+            Vec::new(),
         )
     }
 }
@@ -95,22 +144,36 @@ pub fn capture(command: &str, f: impl FnOnce() -> i32) -> i32 {
 /// single JSON document (for example, a long-running runtime attached to a
 /// terminal), and for platforms where stdout/stderr capture is unavailable.
 pub fn emit_rejection(command: &str, code: i32, message: &str) -> i32 {
-    emit(Document {
-        schema: SCHEMA_NAME,
-        schema_version: SCHEMA_VERSION,
-        command: command.to_string(),
-        ok: false,
-        exit_code: code,
-        result: ResultValue::Empty {
-            kind: "rejected".to_string(),
+    emit_rejection_version(command, Version::default(), code, message, Vec::new())
+}
+
+pub fn emit_rejection_version(
+    command: &str,
+    version: Version,
+    code: i32,
+    message: &str,
+    fixes: Vec<super::fix::FixCommand>,
+) -> i32 {
+    emit_version(
+        Document {
+            schema: SCHEMA_NAME,
+            schema_version: LEGACY_SCHEMA_VERSION,
+            command: command.to_string(),
+            ok: false,
+            exit_code: code,
+            result: ResultValue::Empty {
+                kind: "rejected".to_string(),
+            },
+            diagnostics: Diagnostics {
+                stderr: vec![Diagnostic {
+                    level: "error",
+                    message: message.to_owned(),
+                }],
+            },
         },
-        diagnostics: Diagnostics {
-            stderr: vec![Diagnostic {
-                level: "error",
-                message: message.to_owned(),
-            }],
-        },
-    });
+        version,
+        fixes,
+    );
     code
 }
 
@@ -166,23 +229,89 @@ pub fn incompatible(command: &super::Commands) -> Option<&'static str> {
     }
 }
 
+/// A preparation retry is complete only when its session branch is already named explicitly.
+pub fn incompatible_fixes(
+    command: &super::Commands,
+    directory: Option<&std::path::Path>,
+    global_flags: &[(&str, bool)],
+) -> Vec<super::fix::FixCommand> {
+    use std::ffi::OsString;
+    let super::Commands::Resume(args) = command else {
+        return Vec::new();
+    };
+    let Some(target) = args.target.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(spec) = crate::domain::refs::parse(target) else {
+        return Vec::new();
+    };
+    if !matches!(spec.repo, crate::domain::refs::RepoSel::Slug(_, _)) {
+        return Vec::new();
+    }
+    let Ok(parsed) = super::target::branch_only(target) else {
+        return Vec::new();
+    };
+    if parsed.repo.is_none() || parsed.base.is_none() {
+        return Vec::new();
+    }
+    let mut argv = vec![OsString::from("resume"), "--no-launch".into()];
+    argv.extend(
+        global_flags
+            .iter()
+            .filter(|(_, enabled)| *enabled)
+            .map(|(flag, _)| OsString::from(flag)),
+    );
+    if let Some(runtime) = &args.as_runtime {
+        argv.push(format!("--as={runtime}").into());
+    }
+    if let Some(cwd) = &args.cwd {
+        let mut value = OsString::from("--cwd=");
+        value.push(cwd);
+        argv.push(value);
+    }
+    if args.force {
+        argv.push("--force".into());
+    }
+    argv.extend(["--".into(), target.into()]);
+    let confirmed = global_flags
+        .iter()
+        .any(|(flag, enabled)| *flag == "--yes" && *enabled)
+        || std::env::var("AGIT_YES").is_ok();
+    super::fix::FixCommand::in_directory(argv, directory, !confirmed)
+        .into_iter()
+        .collect()
+}
+
 /// Emit a JSON envelope for a command-line parse error. Clap normally exits
 /// before `main` can enter [`capture`], but `--json` callers still need one
 /// machine-readable document rather than a usage blob on stderr.
 pub fn emit_parse_error(command: String, code: i32, message: &str) -> i32 {
-    emit(Document {
-        schema: SCHEMA_NAME,
-        schema_version: SCHEMA_VERSION,
-        command,
-        ok: false,
-        exit_code: code,
-        result: ResultValue::Empty {
-            kind: "parse_error".to_string(),
+    emit_parse_error_version(command, Version::default(), code, message)
+}
+
+pub fn emit_parse_error_version(
+    command: String,
+    version: Version,
+    code: i32,
+    message: &str,
+) -> i32 {
+    emit_version(
+        Document {
+            schema: SCHEMA_NAME,
+            schema_version: LEGACY_SCHEMA_VERSION,
+            command,
+            ok: false,
+            exit_code: code,
+            result: ResultValue::Empty {
+                kind: "parse_error".to_string(),
+            },
+            diagnostics: Diagnostics {
+                stderr: diagnostics(message),
+            },
         },
-        diagnostics: Diagnostics {
-            stderr: diagnostics(message),
-        },
-    });
+        version,
+        Vec::new(),
+    );
     code
 }
 
@@ -197,7 +326,7 @@ pub fn command_from_argv(args: &[std::ffi::OsString]) -> String {
             skip_value = false;
             continue;
         }
-        if arg == "-C" || arg == "--directory" {
+        if arg == "-C" || arg == "--directory" || arg == "--json-version" {
             skip_value = true;
             continue;
         }
@@ -210,7 +339,7 @@ pub fn command_from_argv(args: &[std::ffi::OsString]) -> String {
 }
 
 #[cfg(unix)]
-fn capture_unix(command: &str, f: impl FnOnce() -> i32) -> i32 {
+fn capture_unix(command: &str, version: Version, f: impl FnOnce() -> i32) -> i32 {
     use std::os::fd::RawFd;
     use std::thread;
 
@@ -245,7 +374,9 @@ fn capture_unix(command: &str, f: impl FnOnce() -> i32) -> i32 {
 
     let out_thread = thread::spawn(move || read_fd(out_read));
     let err_thread = thread::spawn(move || read_fd(err_read));
+    let scope = (version == Version::V2).then(super::fix::Scope::enter);
     let code = f();
+    let fixes = scope.map(|scope| scope.finish(code)).unwrap_or_default();
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     redirect(libc::STDOUT_FILENO, saved_out);
@@ -257,7 +388,7 @@ fn capture_unix(command: &str, f: impl FnOnce() -> i32) -> i32 {
 
     let stdout = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
-    emit(document(command, code, stdout, stderr));
+    emit_version(document(command, code, stdout, stderr), version, fixes);
     code
 }
 
@@ -289,7 +420,7 @@ fn document(command: &str, code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Docum
     };
     Document {
         schema: SCHEMA_NAME,
-        schema_version: SCHEMA_VERSION,
+        schema_version: LEGACY_SCHEMA_VERSION,
         command: command.to_string(),
         ok: code == 0,
         exit_code: code,
@@ -342,11 +473,26 @@ fn diagnostics(text: &str) -> Vec<Diagnostic> {
         .collect()
 }
 
-fn emit(document: Document) {
+fn emit_version(mut document: Document, version: Version, fixes: Vec<super::fix::FixCommand>) {
     let mut stdout = std::io::stdout().lock();
     // Serialization of these in-memory values cannot fail; if stdout itself
     // is closed, the normal process-level write error is the only useful one.
-    let _ = serde_json::to_writer_pretty(&mut stdout, &document);
+    match version {
+        Version::V1 => {
+            document.schema_version = LEGACY_SCHEMA_VERSION;
+            let _ = serde_json::to_writer_pretty(&mut stdout, &document);
+        }
+        Version::V2 => {
+            document.schema_version = SCHEMA_VERSION;
+            let _ = serde_json::to_writer_pretty(
+                &mut stdout,
+                &V2Document {
+                    document,
+                    fix: fixes,
+                },
+            );
+        }
+    }
     let _ = writeln!(stdout);
 }
 
@@ -425,6 +571,42 @@ mod tests {
         assert_eq!(d.diagnostics.stderr[2].level, "hint");
         assert_eq!(d.diagnostics.stderr[2].message, "agit login");
         assert_eq!(d.diagnostics.stderr[3].level, "info");
+    }
+
+    #[test]
+    fn ordinary_hints_do_not_register_executable_actions() {
+        let scope = super::super::fix::Scope::enter();
+        crate::ui::hint("agit login --hub https://example.invalid");
+        let _ = diagnostics("  → agit push --force\nerror synthetic failure\n");
+        assert!(scope.finish(4).is_empty());
+    }
+
+    #[test]
+    fn version_selection_does_not_read_arguments_after_the_terminator() {
+        let args = ["agit", "--json-version=1", "--", "--json-version=2"].map(Into::into);
+        assert_eq!(Version::from_argv(&args), Version::V1);
+    }
+
+    #[test]
+    fn legacy_schema_stays_exact_while_v2_declares_the_action_array() {
+        use sha2::Digest as _;
+        assert_eq!(
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(include_bytes!("../../docs/cli-json-schema.json"))
+            ),
+            "d64bb9c690a134af4f338a18a6cdb8573e6d053f691ab0a3eb5115cd525a46b4"
+        );
+        let v2: Value =
+            serde_json::from_str(include_str!("../../docs/cli-json-schema-v2.json")).unwrap();
+        assert_eq!(v2["properties"]["schema_version"]["const"], 2);
+        assert!(
+            v2["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from("fix"))
+        );
+        assert_eq!(v2["$defs"]["fix_command"]["additionalProperties"], false);
     }
 
     #[test]

@@ -194,6 +194,7 @@ pub fn run(args: Args) -> CmdResult {
         // swallowing every internal error into a wordless exit 0 shows whoever is diagnosing
         // "the command succeeded and nothing happened". Quiet belongs to hooks alone.
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
             Ok(ExitCode::Failure)
         }
@@ -387,7 +388,9 @@ pub fn owner_for_recording(quiet: bool) -> crate::Result<Option<String>> {
             ui::hint(
                 "a version names its author and repo paths need the account name — neither can be backfilled",
             );
-            ui::hint("`agit login`");
+            ui::hint_with_fix("`agit login`", || {
+                super::fix::FixCommand::at_hub(&["login", "--hub", c.base()], c.base(), true)
+            });
         }
         return Ok(None);
     }
@@ -396,7 +399,9 @@ pub fn owner_for_recording(quiet: bool) -> crate::Result<Option<String>> {
         None => {
             if !quiet {
                 ui::error("no account name in the stored credentials.");
-                ui::hint("re-run `agit login`");
+                ui::hint_with_fix("re-run `agit login`", || {
+                    super::fix::FixCommand::at_hub(&["login", "--hub", c.base()], c.base(), true)
+                });
             }
             Ok(None)
         }

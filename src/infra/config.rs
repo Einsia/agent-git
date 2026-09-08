@@ -367,10 +367,17 @@ pub fn repo_origin() -> Option<String> {
 /// have to set it anyway, and requiring every ordinary user to export an environment variable
 /// before anything works puts the cost on the wrong people.
 pub fn hub_url() -> String {
+    hub_url_at(agit_home().ok().as_deref())
+}
+
+/// Resolve routing for a known store without changing the process working directory.
+pub(crate) fn hub_url_at(home: Option<&std::path::Path>) -> String {
     if let Some(v) = hub_url_env_override() {
         return v;
     }
-    if let Ok(Some(v)) = get_global_file("hub.url") {
+    if let Some(home) = home
+        && let Ok(Some(v)) = get_global_file_at(&home.join("config.json"), "hub.url")
+    {
         return v;
     }
     DEFAULT_HUB_URL.to_string()
@@ -385,9 +392,8 @@ pub(crate) fn hub_url_env_override() -> Option<String> {
 }
 
 /// Reads the config file only (no environment lookup), for hub_url to use (avoids recursion).
-fn get_global_file(key: &str) -> Result<Option<String>> {
-    let path = global_config_path()?;
-    let text = match std::fs::read_to_string(&path) {
+fn get_global_file_at(path: &std::path::Path, key: &str) -> Result<Option<String>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(_) => return Ok(None),
     };

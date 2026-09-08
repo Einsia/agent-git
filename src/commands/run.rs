@@ -62,6 +62,7 @@ pub fn run(args: Args) -> CmdResult {
                 // `clone` is idempotent: an existing read-only checkout is promoted in place;
                 // one already under your name is only updated).
                 if let Err(e) = ensure_mine(&slug) {
+                    super::fix::register_terminal_api_error(&e);
                     ui::error(&format!("promotion into your namespace failed: {e:#}"));
                     return Ok(ExitCode::Network);
                 }
@@ -77,6 +78,7 @@ pub fn run(args: Args) -> CmdResult {
             } else {
                 // Automatic read-only clone: **does not bind the current directory**.
                 if let Err(e) = super::clone::readonly_clone(o, n) {
+                    super::fix::register_terminal_api_error(&e);
                     ui::error(&format!("fetch failed: {e:#}"));
                     return Ok(super::clone::readonly_clone_error_code(&e));
                 }

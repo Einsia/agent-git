@@ -77,6 +77,7 @@ pub fn run(args: Args) -> CmdResult {
     // 1. fetch.
     let client = crate::hub::Client::from_env();
     if let Err(e) = crate::hub::identity::verify_slug(&repo, &client, &owner, &name) {
+        super::fix::register_terminal_api_error(&e);
         ui::error(&format!("refusing to fetch: {e:#}"));
         return Ok(ExitCode::Precondition);
     }

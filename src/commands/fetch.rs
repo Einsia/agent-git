@@ -97,6 +97,7 @@ fn fetch_slug(slug: &str) -> CmdResult {
         None => match adopt_peer(&owner, &name, &dir) {
             Ok(r) => r,
             Err(e) => {
+                super::fix::register_terminal_api_error(&e);
                 ui::error(&format!("can’t fetch {slug}: {e:#}"));
                 ui::hint(
                     "a private agent needs the owner’s grant — check who you are with `agit whoami`",
@@ -126,6 +127,7 @@ fn fetch_slug(slug: &str) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("fetch failed: {e:#}"));
             if fresh {
                 // A fetch that never lands leaves nothing but an empty repo. Keeping it puts an
@@ -197,6 +199,7 @@ fn fetch_context() -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("fetch failed: {e:#}"));
             Ok(ExitCode::Network)
         }

@@ -123,6 +123,7 @@ fn create(client: &Client, target: &str, branch: &str, message: Option<&str>) ->
     let remote = match client.get_agent(&so, &sn) {
         Ok(remote) => remote,
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             let code = api_error_exit(&e);
             ui::error(&format!("cannot verify PR source {so}/{sn}: {e:#}"));
             return Ok(code);
@@ -159,6 +160,7 @@ fn create(client: &Client, target: &str, branch: &str, message: Option<&str>) ->
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             let code = api_error_exit(&e);
             ui::error(&format!("{e:#}"));
             if e.downcast_ref::<crate::hub::client::ApiError>()
@@ -262,6 +264,7 @@ fn list(client: &Client, repo: &str) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
             Ok(ExitCode::Network)
         }
@@ -285,6 +288,7 @@ fn show(client: &Client, id: u64) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
             Ok(ExitCode::Network)
         }
@@ -295,6 +299,7 @@ fn fetch(client: &Client, id: u64) -> CmdResult {
     let p = match client.pr_get(id) {
         Ok(p) => p,
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
             return Ok(ExitCode::Network);
         }
@@ -320,6 +325,7 @@ fn fetch(client: &Client, id: u64) -> CmdResult {
     };
     let identity_client = crate::hub::Client::from_env();
     if let Err(e) = crate::hub::identity::verify_slug(&repo, &identity_client, &o, &n) {
+        super::fix::register_terminal_api_error(&e);
         ui::error(&format!("refusing to fetch pr/{id}: {e:#}"));
         return Ok(ExitCode::Precondition);
     }
@@ -347,6 +353,7 @@ fn merge(client: &Client, id: u64, adopt: Option<&str>) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e:#}"));
             ui::hint(
                 "common rejection: the author’s branch moved while the PR was open (stale) → contributor pulls upstream, redoes the merge and reopens; or a real fork with no pre-run merge → read the fix guidance first",

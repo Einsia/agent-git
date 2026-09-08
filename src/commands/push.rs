@@ -912,10 +912,10 @@ fn ensure_remote(
         // and cannot rewrite the pin the other way.
         let pinned = identity::require_current_expected(repo, client.base())?;
         let remote = client.get_agent(owner, agent).map_err(|e| {
-            anyhow::anyhow!(
-                "the checkout is pinned to agent {}, but {owner}/{agent} is unavailable; refusing to create a replacement at the same name: {e:#}",
+            e.context(format!(
+                "the checkout is pinned to agent {}, but {owner}/{agent} is unavailable; refusing to create a replacement at the same name",
                 pinned.agent_id
-            )
+            ))
         })?;
         let observed = RemoteIdentity::new(client.base(), &remote.agent_id)?;
         if observed != pinned {

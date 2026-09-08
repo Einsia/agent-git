@@ -292,6 +292,7 @@ fn login_with_token(hub: &str) -> crate::Result<Option<(HubCredential, String)>>
             resp.username,
         ))),
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("the PAT wasn’t accepted: {e:#}"));
             ui::hint("mint a token by signing in on another machine, then paste it here");
             Ok(None)

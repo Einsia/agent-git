@@ -121,6 +121,7 @@ pub fn run(args: Args) -> CmdResult {
 /// lag the CLI, and what the user does then (upgrade the hub) has nothing to do with a mistyped
 /// query.
 fn failed(e: anyhow::Error) -> CmdResult {
+    super::fix::register_terminal_api_error(&e);
     ui::error(&format!("search failed: {e:#}"));
     ui::hint("if this hub is self-hosted, it may be older than this CLI");
     Ok(ExitCode::Failure)

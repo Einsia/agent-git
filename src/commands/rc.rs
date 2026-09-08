@@ -683,6 +683,7 @@ fn list() -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e}"));
             Ok(ExitCode::Network)
         }
@@ -706,6 +707,7 @@ fn revoke(args: RevokeArgs) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e}"));
             Ok(ExitCode::Network)
         }
@@ -747,6 +749,7 @@ fn pair_interactive(hub: &str) -> crate::Result<Option<identity::Connection>> {
     ) {
         Ok(r) => r,
         Err(e) => {
+            super::fix::register_terminal_api_error(&e);
             ui::error(&format!("{e}"));
             return Ok(None);
         }
