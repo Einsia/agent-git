@@ -17,6 +17,12 @@ agit resume [branch|@] [options]
 
 With no target at a terminal, this opens a session picker; choosing one hands the terminal to the runtime and takes it back when that exits. It stays text in pipes, in CI, and inside an agent session. Bare `agit` is the same thing.
 
+The picker groups branches with the same recorded code repository across forge SSH and HTTPS
+remote spellings. Repository paths remain case-sensitive, and custom service ports remain distinct.
+Home-relative SSH paths outside the `git` service account and explicitly named SSH homes retain
+their login and literal path identity.
+This grouping offers candidates; it does not select a session target.
+
 ## Options
 
 | Option | Meaning |

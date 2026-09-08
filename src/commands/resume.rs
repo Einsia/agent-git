@@ -325,21 +325,128 @@ fn gather_candidates(cwd: &Path) -> Vec<Candidate> {
     out
 }
 
-/// Whether this branch's code anchor points at the `origin` code repo.
-///
-/// **This is the only implementation**: the TUI's Sessions screen lists the same candidates
-/// (`tui::screens::sessions`), and two copies of "the same repo" will drift apart sooner or
-/// later — the symptom of that drift is rows appearing in or vanishing from the list out of
-/// nowhere, which nobody immediately connects to two criteria disagreeing.
+/// Candidate badges compare complete repository identities. Prefix matches would associate
+/// unrelated projects, and transport spelling must not hide the same remote repository.
 pub(crate) fn same_repo_as(code: &str, origin: &str) -> bool {
-    code.starts_with(&format!("{origin}@")) || code.starts_with(&normalize_origin(origin))
+    let Some((recorded, sha)) = code.rsplit_once('@') else {
+        return false;
+    };
+    if sha.len() < 4 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let origin = origin.trim();
+    if !origin.is_empty() && recorded == origin {
+        return true;
+    }
+    match (normalize_origin(recorded), normalize_origin(origin)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        _ => false,
+    }
 }
 
-/// The ssh and the https spelling are the same repo (PRD, the interactive picker section).
-fn normalize_origin(o: &str) -> String {
-    o.replace("git@", "https://")
-        .replace(':', "/")
-        .replace("https://", "")
+fn normalize_origin(origin: &str) -> Option<String> {
+    let origin = origin.trim();
+    if origin.is_empty() {
+        return None;
+    }
+    if origin.split_once("::").is_some_and(|(transport, _)| {
+        !transport.is_empty()
+            && transport
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"+._-".contains(&byte))
+    }) {
+        return Some(format!("literal:{origin}"));
+    }
+    let scp_host = match origin.split_once('@') {
+        Some((user, host)) if !user.contains([':', '/', '\\']) => host,
+        _ => origin,
+    };
+    let (authority, path, scheme, scp) = if let Some((scheme, rest)) = origin.split_once("://") {
+        if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+            return Some(format!("literal:{origin}"));
+        }
+        let (authority, path) = rest.split_once('/')?;
+        (authority, path, scheme, false)
+    } else if scp_host.starts_with('[') {
+        let end = origin.find("]:")?;
+        (&origin[..end + 1], &origin[end + 2..], "ssh", true)
+    } else if let Some((authority, path)) = origin.split_once(':') {
+        if authority.len() <= 1 || authority.contains(['/', '\\', '[']) {
+            return Some(format!("literal:{origin}"));
+        }
+        (authority, path, "ssh", true)
+    } else {
+        return Some(format!("literal:{origin}"));
+    };
+    let (user, authority) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(user, host)| (Some(user), host));
+    let authority = match authority.rsplit_once(':') {
+        Some((host, port))
+            if matches!(
+                (scheme, port),
+                ("https", "443") | ("http", "80") | ("ssh", "22") | ("git", "9418")
+            ) =>
+        {
+            host
+        }
+        _ => authority,
+    };
+    let (path, home_relative) = if scp {
+        path.strip_prefix('/')
+            .map_or((path, true), |path| (path, path.starts_with('~')))
+    } else {
+        (path, scheme == "ssh" && path.starts_with('~'))
+    };
+    let path = path.trim_end_matches('/');
+    let named_home = home_relative && path.starts_with('~') && !path.starts_with("~/");
+    let path = if home_relative {
+        path.strip_prefix("~/").unwrap_or(path)
+    } else {
+        path
+    };
+    if authority.is_empty() || path.is_empty() {
+        return None;
+    }
+    // Named SSH homes retain their literal paths. Only the git login's own namespace can
+    // match an HTTP forge path; other login homes must not collapse into each other.
+    if home_relative && (user != Some("git") || named_home) {
+        let namespace = if named_home {
+            "ssh-named-home"
+        } else {
+            "ssh-home"
+        };
+        return Some(format!(
+            "{namespace}:{user:?}@{}/{path}",
+            canonical_origin_authority(authority)
+        ));
+    }
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+    // Repository paths can be case-sensitive; custom ports can name different services.
+    Some(format!(
+        "remote:{}/{path}",
+        canonical_origin_authority(authority)
+    ))
+}
+
+fn canonical_origin_authority(authority: &str) -> String {
+    let zone_start = authority
+        .strip_prefix('[')
+        .and_then(|host| host.split_once(']'))
+        .and_then(|(address, _)| address.find('%'))
+        .map(|offset| offset + 1);
+    match zone_start {
+        // Zone identifiers name interfaces whose spelling can be case-sensitive.
+        Some(zone_start) => format!(
+            "{}{}",
+            authority[..zone_start].to_ascii_lowercase(),
+            &authority[zone_start..]
+        ),
+        None => authority.to_ascii_lowercase(),
+    }
 }
 
 enum CwdResumeDecision {
@@ -1830,6 +1937,315 @@ mod tests {
     use crate::domain::store::Store;
     use crate::domain::transcript;
     use std::path::Path;
+
+    #[test]
+    fn same_repo_matches_explicit_ssh_home_spellings() {
+        let login_home = [
+            "alice@example.invalid:repo.git",
+            "alice@example.invalid:~/repo.git",
+            "alice@example.invalid:/~/repo.git",
+            "ssh://alice@example.invalid/~/repo.git",
+        ];
+        for recorded in login_home {
+            for current in login_home {
+                assert!(super::same_repo_as(&format!("{recorded}@1839e61"), current));
+            }
+        }
+        for user in ["alice", "git"] {
+            let named_home = [
+                format!("{user}@example.invalid:~bob/repo.git"),
+                format!("{user}@example.invalid:/~bob/repo.git"),
+                format!("ssh://{user}@example.invalid/~bob/repo.git"),
+            ];
+            for recorded in &named_home {
+                for current in &named_home {
+                    assert!(super::same_repo_as(&format!("{recorded}@1839e61"), current));
+                }
+                for other in [
+                    "https://example.invalid/~bob/repo.git".to_owned(),
+                    format!("ssh://{user}@example.invalid/~bob/repo"),
+                    format!("ssh://{user}@example.invalid/~Bob/repo.git"),
+                    format!("ssh://{user}@example.invalid/~charlie/repo.git"),
+                    format!("ssh://{user}@example.invalid//~bob/repo.git"),
+                    format!("{user}@example.invalid://~bob/repo.git"),
+                ] {
+                    assert!(!super::same_repo_as(&format!("{recorded}@1839e61"), &other));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_repo_keeps_named_homes_separate_from_nested_login_paths() {
+        for user in ["alice", "git"] {
+            let home_root = [
+                format!("{user}@example.invalid:~"),
+                format!("{user}@example.invalid:~/"),
+                format!("{user}@example.invalid:/~"),
+                format!("{user}@example.invalid:/~/"),
+                format!("ssh://{user}@example.invalid/~"),
+                format!("ssh://{user}@example.invalid/~/"),
+            ];
+            for recorded in &home_root {
+                for current in &home_root {
+                    assert!(super::same_repo_as(&format!("{recorded}@1839e61"), current));
+                }
+            }
+            let nested_login_home = [
+                format!("{user}@example.invalid:~/~bob/repo.git"),
+                format!("{user}@example.invalid:/~/~bob/repo.git"),
+                format!("ssh://{user}@example.invalid/~/~bob/repo.git"),
+            ];
+            let named_home = [
+                format!("{user}@example.invalid:~bob/repo.git"),
+                format!("{user}@example.invalid:/~bob/repo.git"),
+                format!("ssh://{user}@example.invalid/~bob/repo.git"),
+            ];
+            for recorded in &nested_login_home {
+                for current in &nested_login_home {
+                    assert!(super::same_repo_as(&format!("{recorded}@1839e61"), current));
+                }
+                for named in &named_home {
+                    assert!(!super::same_repo_as(&format!("{recorded}@1839e61"), named));
+                    assert!(!super::same_repo_as(&format!("{named}@1839e61"), recorded));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_repo_matches_transport_spellings_in_both_directions() {
+        let spellings = [
+            "git@github.com:acme/app.git",
+            "https://github.com/acme/app",
+            "https://GitHub.com:443/acme/app.git/",
+            "ssh://git@github.com:22/acme/app.git",
+            "git://github.com:9418/acme/app.git",
+        ];
+        for recorded in spellings {
+            for current in spellings {
+                assert!(
+                    super::same_repo_as(&format!("{recorded}@1839e61"), current),
+                    "{recorded} and {current} name the same remote"
+                );
+            }
+        }
+        assert!(super::same_repo_as(
+            "git@github.com:acme/app@next.git@1839e61",
+            "https://github.com/acme/app@next.git"
+        ));
+        assert!(super::same_repo_as(
+            "ssh://git@[2001:db8::1]/acme/app.git@1839e61",
+            "https://[2001:db8::1]/acme/app"
+        ));
+        assert!(super::same_repo_as(
+            "git@[2001:db8::1]:acme/app.git@1839e61",
+            "ssh://git@[2001:db8::1]/acme/app.git"
+        ));
+        assert!(super::same_repo_as(
+            "git@example.com:/srv/app.git@1839e61",
+            "ssh://git@example.com/srv/app.git"
+        ));
+        assert!(super::same_repo_as(
+            "git@example.com:/srv/repo[copy]:part.git@1839e61",
+            "ssh://git@example.com/srv/repo[copy]:part.git"
+        ));
+        assert!(super::same_repo_as(
+            "git@example.com:/srv/repo::part.git@1839e61",
+            "ssh://git@example.com/srv/repo::part.git"
+        ));
+    }
+
+    #[test]
+    fn same_repo_preserves_exact_root_origins() {
+        for origin in [
+            "https://example.invalid",
+            "https://example.invalid/",
+            "http://example.invalid:8177",
+        ] {
+            assert!(super::same_repo_as(&format!("{origin}@1839e61"), origin));
+        }
+        for (code, origin) in [("@1839e61", ""), ("@1839e61", "  ")] {
+            assert!(!super::same_repo_as(code, origin));
+        }
+    }
+
+    #[test]
+    fn same_repo_preserves_scoped_address_zones() {
+        let spellings = [
+            "git@[fe80::ABCD%EnA]:acme/app.git",
+            "git@[FE80::abcd%EnA]:acme/app.git",
+            "ssh://git@[fe80::ABCD%EnA]/acme/app.git",
+            "ssh://git@[FE80::abcd%EnA]:22/acme/app.git",
+            "http://[fe80::ABCD%EnA]/acme/app.git",
+            "http://[FE80::abcd%EnA]:80/acme/app.git",
+            "https://[FE80::abcd%EnA]:443/acme/app.git",
+            "git://[FE80::abcd%EnA]:9418/acme/app.git",
+        ];
+        for recorded in spellings {
+            for current in spellings {
+                assert!(
+                    super::same_repo_as(&format!("{recorded}@1839e61"), current),
+                    "{recorded} and {current} name the same remote"
+                );
+                let other_zone = current.replace("%EnA", "%ena");
+                assert!(
+                    !super::same_repo_as(&format!("{recorded}@1839e61"), &other_zone),
+                    "{recorded} and {other_zone} use different interfaces"
+                );
+            }
+        }
+        for recorded in [
+            "ssh://git@[fe80::ABCD%EnA]:2222/acme/app.git",
+            "ssh://git@[FE80::abcd%EnA]:2222/acme/app.git",
+        ] {
+            assert!(super::same_repo_as(
+                &format!("{recorded}@1839e61"),
+                "ssh://git@[fe80::abcd%EnA]:2222/acme/app"
+            ));
+            for other in [
+                "ssh://git@[fe80::abcd%ena]:2222/acme/app.git",
+                "ssh://git@[fe80::abcd%EnA]:2223/acme/app.git",
+                "ssh://git@[fe80::abcd%EnA]:22/acme/app.git",
+                "ssh://git@[fe80::abcd%EnA]:2222/acme/App.git",
+                "ssh://git@[fe80::abcd%EnA]:2222/acme/app/child.git",
+                "ssh://git@[fe80::abcd%EnA]:2222//acme/app.git",
+            ] {
+                assert!(!super::same_repo_as(&format!("{recorded}@1839e61"), other));
+            }
+        }
+        assert!(super::same_repo_as(
+            "https://[fe80::ABCD%25EnA]/acme/app.git@1839e61",
+            "https://[FE80::abcd%25EnA]/acme/app.git"
+        ));
+        assert!(!super::same_repo_as(
+            "https://[fe80::abcd%25EnA]/acme/app.git@1839e61",
+            "https://[fe80::abcd%25ena]/acme/app.git"
+        ));
+    }
+
+    #[test]
+    fn same_repo_preserves_scoped_ssh_home_namespaces() {
+        for user in ["alice", "git"] {
+            for path in ["repo.git", "~bob/repo.git", "~/~bob/repo.git"] {
+                let recorded = format!("{user}@[fe80::ABCD%EnA]:{path}");
+                let url_path = if path.starts_with('~') {
+                    path.to_owned()
+                } else {
+                    format!("~/{path}")
+                };
+                for current in [
+                    format!("{user}@[FE80::abcd%EnA]:{path}"),
+                    format!("ssh://{user}@[fe80::ABCD%EnA]/{url_path}"),
+                    format!("ssh://{user}@[FE80::abcd%EnA]:22/{url_path}"),
+                ] {
+                    assert!(super::same_repo_as(
+                        &format!("{recorded}@1839e61"),
+                        &current
+                    ));
+                    let other_zone = current.replace("%EnA", "%ena");
+                    assert!(!super::same_repo_as(
+                        &format!("{recorded}@1839e61"),
+                        &other_zone
+                    ));
+                }
+            }
+        }
+        let recorded = "alice@[fe80::ABCD%EnA]:~bob/repo.git@1839e61";
+        for other in [
+            "git@[fe80::abcd%EnA]:~bob/repo.git",
+            "alice@[fe80::abcd%EnA]:~Bob/repo.git",
+            "alice@[fe80::abcd%EnA]:~/~bob/repo.git",
+            "alice@[fe80::abcd%EnA]:~bob/repo",
+            "https://[fe80::abcd%EnA]/~bob/repo.git",
+        ] {
+            assert!(!super::same_repo_as(recorded, other));
+        }
+    }
+
+    #[test]
+    fn same_repo_preserves_repository_and_service_boundaries() {
+        let recorded = "git@github.com:acme/app.git@1839e61";
+        for other in [
+            "https://github.com/acme/application",
+            "https://github.com/acme/app/child",
+            "https://github.com/Acme/app.git",
+            "https://github.com/acme/App.git",
+            "https://gitlab.com/acme/app.git",
+            "https://github.com:8443/acme/app.git",
+            "ssh://git@github.com:2222/acme/app.git",
+            "",
+        ] {
+            assert!(!super::same_repo_as(recorded, other), "{other}");
+        }
+        assert!(!super::same_repo_as(
+            "github.com/acme/application@1839e61",
+            "github.com/acme/app"
+        ));
+        assert!(super::same_repo_as(
+            "https://github.com:8443/acme/app.git@1839e61",
+            "https://github.com:8443/acme/app"
+        ));
+        for other in [
+            "bob@example.com:app.git",
+            "alice@example.com:app",
+            "https://example.com/app.git",
+            "ssh://alice@example.com/app.git",
+            "alice@example.com:/app.git",
+        ] {
+            assert!(!super::same_repo_as(
+                "alice@example.com:app.git@1839e61",
+                other
+            ));
+        }
+        assert!(super::same_repo_as(
+            "alice@example.com:app.git@1839e61",
+            "ssh://alice@example.com/~/app.git"
+        ));
+    }
+
+    #[test]
+    fn same_repo_does_not_reinterpret_local_paths_or_malformed_anchors() {
+        for origin in ["/tmp/project.git", "../project.git", "C:\\project.git"] {
+            assert!(super::same_repo_as(&format!("{origin}@1839e61"), origin));
+            assert!(!super::same_repo_as(
+                &format!("{origin}@1839e61"),
+                origin.strip_suffix(".git").unwrap()
+            ));
+        }
+        for code in [
+            "git@github.com:acme/app.git",
+            "https://github.com/acme/app.git@",
+            "https://github.com/acme/app.git@HEAD",
+            "https://github.com/acme/app.git@abc",
+            "@1839e61",
+        ] {
+            assert!(!super::same_repo_as(
+                code,
+                "https://github.com/acme/app.git"
+            ));
+        }
+        assert!(super::same_repo_as(
+            "helper::opaque.git@1839e61",
+            "helper::opaque.git"
+        ));
+        assert!(!super::same_repo_as(
+            "helper::opaque.git@1839e61",
+            "helper::opaque"
+        ));
+        for (code, other) in [
+            (
+                "helper::git@[::1]:/app.git@1839e61",
+                "helper::git@[::1]:/app",
+            ),
+            (
+                "helper::git@[ABCD::1]:/app.git@1839e61",
+                "helper::git@[abcd::1]:/app.git",
+            ),
+        ] {
+            assert!(!super::same_repo_as(code, other));
+        }
+    }
 
     /// A branch carrying only that one `agit: claim session line` commit: it declares itself a
     /// session line, has not claimed an identity, and holds no LOG / VIEW in its tree.
