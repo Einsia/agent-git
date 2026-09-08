@@ -197,13 +197,13 @@ pub fn register_terminal_api_error(error: &anyhow::Error) {
     });
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, all(windows, target_env = "msvc"), test))]
 pub(crate) struct Scope {
     reporter: Reporter,
     _binding: Binding,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, all(windows, target_env = "msvc"), test))]
 impl Scope {
     pub(crate) fn enter() -> Self {
         let reporter = Reporter(Arc::new(Mutex::new(State::default())));
@@ -226,7 +226,7 @@ impl Scope {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, all(windows, target_env = "msvc"), test))]
 impl Drop for Scope {
     fn drop(&mut self) {
         let mut state = self

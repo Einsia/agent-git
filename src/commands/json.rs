@@ -21,7 +21,12 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
+
+#[cfg(all(windows, target_env = "msvc"))]
+mod windows;
 
 pub const SCHEMA_NAME: &str = "cli-output";
 pub const SCHEMA_VERSION: u32 = 2;
@@ -111,9 +116,9 @@ struct Diagnostic {
 
 /// Capture a command's terminal output and emit one JSON document.
 ///
-/// Unix file descriptors are used instead of changing every `println!` call in
-/// the command tree.  Reader threads prevent a verbose command from blocking
-/// when the pipe buffer fills.  A platform without this capture implementation
+/// Standard streams are redirected instead of changing every `println!` call in
+/// the command tree. Reader threads drain verbose command output while it runs.
+/// A platform without this capture implementation
 /// is rejected before the command runs; emitting an empty envelope after
 /// leaking human output would violate the single-document contract.
 pub fn capture(command: &str, f: impl FnOnce() -> i32) -> i32 {
@@ -125,7 +130,11 @@ pub fn capture_version(command: &str, version: Version, f: impl FnOnce() -> i32)
     {
         capture_unix(command, version, f)
     }
-    #[cfg(not(unix))]
+    #[cfg(all(windows, target_env = "msvc"))]
+    {
+        windows::capture(command, version, f)
+    }
+    #[cfg(not(any(unix, all(windows, target_env = "msvc"))))]
     {
         let _ = f;
         emit_rejection_version(
@@ -473,27 +482,36 @@ fn diagnostics(text: &str) -> Vec<Diagnostic> {
         .collect()
 }
 
-fn emit_version(mut document: Document, version: Version, fixes: Vec<super::fix::FixCommand>) {
+fn emit_version(document: Document, version: Version, fixes: Vec<super::fix::FixCommand>) {
+    let _ = emit_version_checked(document, version, fixes);
+}
+
+fn emit_version_checked(
+    mut document: Document,
+    version: Version,
+    fixes: Vec<super::fix::FixCommand>,
+) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     // Serialization of these in-memory values cannot fail; if stdout itself
     // is closed, the normal process-level write error is the only useful one.
     match version {
         Version::V1 => {
             document.schema_version = LEGACY_SCHEMA_VERSION;
-            let _ = serde_json::to_writer_pretty(&mut stdout, &document);
+            serde_json::to_writer_pretty(&mut stdout, &document)?;
         }
         Version::V2 => {
             document.schema_version = SCHEMA_VERSION;
-            let _ = serde_json::to_writer_pretty(
+            serde_json::to_writer_pretty(
                 &mut stdout,
                 &V2Document {
                     document,
                     fix: fixes,
                 },
-            );
+            )?;
         }
     }
-    let _ = writeln!(stdout);
+    writeln!(stdout)?;
+    stdout.flush()
 }
 
 #[cfg(test)]

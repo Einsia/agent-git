@@ -73,7 +73,13 @@ An HTTP status or human hint alone does not produce an action. Server-provided
 commands, arguments, environments and destinations are never used. Explicit
 JSON version 1 continues to omit the action array.
 
-Native Windows retains its existing early rejection of global JSON capture.
-Version selection and pre-dispatch rejection envelopes do not claim to implement
-normal Windows command capture. HTTP recipes are translated into this CLI envelope;
-JSON-RPC error protocols remain separate.
+The native Windows MSVC build captures command output from both Rust and the C
+runtime, including inherited subprocess output. It supports the same version
+selection and typed recovery data. Capture setup must succeed before the command
+runs. Output exceeding 64 MiB on either stream, a capture failure, or a child still
+holding an output stream after the command returns produces an explicit incomplete
+capture error. If the final JSON destination is closed, a successful command exits
+with a nonzero code; the command's side effects may already have completed.
+
+HTTP recipes are translated into this CLI envelope; JSON-RPC error protocols
+remain separate.

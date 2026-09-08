@@ -21,8 +21,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows CLI build failed' }
 $binary = "target/$target/release/agit.exe"
 & cargo check --locked --release --no-default-features --target $target --lib
 if ($LASTEXITCODE -ne 0) { throw 'Windows library without RC failed to compile' }
-& cargo test --locked --release --target $target --test windows_rc --test import_noninteractive_selection --test merge_recon --test merge_settlement --test hub_credential_binding --test whoami_identity_snapshot --test codex_resume_provider -- --nocapture
+& cargo test --locked --release --target $target --test windows_rc --test import_noninteractive_selection --test merge_recon --test merge_settlement --test hub_credential_binding --test whoami_identity_snapshot --test codex_resume_provider --test windows_json_capture -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows native CLI integration tests failed' }
+& cargo test --locked --release --target $target --lib commands::json::windows::tests -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows native JSON capture lifecycle tests failed' }
 & node scripts/verify-windows-cli.mjs $binary
 if ($LASTEXITCODE -ne 0) { throw 'Windows executable verification failed' }
 $actualVersion = & $binary --version
