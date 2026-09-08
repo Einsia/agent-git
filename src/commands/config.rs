@@ -99,14 +99,8 @@ pub fn run(args: Args) -> CmdResult {
         for (key, desc) in KEYS {
             // The read goes through the full resolution chain (env var > file), so what the
             // user sees is the effective value.
-            let effective = config::get_global(key)?.or(match key {
-                "hub.url" => Some(config::DEFAULT_HUB_URL.to_string()),
-                "push.visibility" => Some("ask".to_string()),
-                "commit.auto" => Some("false".to_string()),
-                "memory.track" => Some("session".to_string()),
-                "secrets.keystore" => Some(config::SecretKeystore::Os.as_str().to_string()),
-                _ => None,
-            });
+            let effective =
+                config::get_global(key)?.or_else(|| default_value(key).map(str::to_owned));
             let mark = if stored.contains_key(key) {
                 ""
             } else {
@@ -229,7 +223,7 @@ fn default_value(key: &str) -> Option<&'static str> {
     match key {
         "hub.url" => Some(config::DEFAULT_HUB_URL),
         "push.visibility" => Some("ask"),
-        "commit.auto" => Some("false"),
+        "commit.auto" => Some("true"),
         "memory.track" => Some("session"),
         config::SecretKeystore::KEY => Some(config::SecretKeystore::Os.as_str()),
         _ => None,

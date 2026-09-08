@@ -800,10 +800,10 @@ answers).
 `push.visibility` governs the first publish only: push's `--private`/`--public` overrides it, and so
 does the preference `agit init --private` records in the repo; set to `ask` (the default) it asks
 once at the first publish, and a non-interactive environment gets private.
-Setting `commit.auto` to `false` turns off the hooks' automatic settlement and makes everything
-manual. When that key has never been set, `--list` shows `commit.auto = false (default)` while the
-real default behavior is that automatic settlement is **on** — only an explicit `false` turns it
-off, so do not read that default in `--list` backwards.
+Automatic settlement is enabled by default: `commit.auto = true`. Setting it to `false` disables
+hook and supervisor settlement; explicit `agit commit` remains available. Unsetting the key
+restores the enabled default. The config list and editor show this effective default separately
+from the stored value.
 
 Common exit codes: `0` Ok · `2` Usage · `3` Ref / context does not resolve · `4` Precondition ·
 `5` Auth (not signed in) · `6` Network · `7` Policy (a secret is blocked) · `8` Interactive.
