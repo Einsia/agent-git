@@ -112,6 +112,12 @@ fn captured_session_refs_read_and_fork_the_local_branch() {
 fn share_sends_only_the_selected_branch_to_the_requested_hub() {
     let tmp = tempfile::tempdir().unwrap();
     let home = fixture(tmp.path());
+    let payload = share_payload(&home, tmp.path());
+    assert!(payload.contains("SELECTED-CONTENT"), "{payload}");
+    assert!(!payload.contains("UNSELECTED-CONTENT"), "{payload}");
+}
+
+fn share_payload(home: &Path, work: &Path) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let hub = format!("http://{}", listener.local_addr().unwrap());
     let credential = agit::infra::credentials::HubCredential {
@@ -191,7 +197,7 @@ fn share_sends_only_the_selected_branch_to_the_requested_hub() {
             }
         }
     });
-    let out = agit(&home, tmp.path(), &["share", "--public", "-y"])
+    let out = agit(home, work, &["share", "--public", "-y"])
         .env("AGIT_HUB_URL", &hub)
         .output()
         .unwrap();
@@ -203,7 +209,92 @@ fn share_sends_only_the_selected_branch_to_the_requested_hub() {
     let body = receiver
         .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap();
-    let payload = body["payload"].as_str().unwrap();
-    assert!(payload.contains("SELECTED-CONTENT"), "{payload}");
-    assert!(!payload.contains("UNSELECTED-CONTENT"), "{payload}");
+    body["payload"].as_str().unwrap().to_owned()
+}
+
+/// Source adapters may need earlier selected records, but merging their output must preserve
+/// the envelope order rather than grouping all dialogue from the same runtime together.
+#[test]
+fn share_renders_both_runtime_orders_and_each_runtime_on_its_own() {
+    let claude = |text: &str| {
+        transcript::wrap_lines(
+            &serde_json::json!({"type":"user","message":{"role":"user","content":text}})
+                .to_string(),
+            "claude-code",
+            &format!("agit-{}", "c".repeat(40)),
+        )
+    };
+    let codex = |text: &str| {
+        transcript::wrap_lines(
+            &serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}}).to_string(),
+            "codex", &format!("agit-{}", "d".repeat(40)),
+        )
+    };
+    let c1 = claude("CLAUDE-FIRST");
+    let c2 = claude("CLAUDE-LAST");
+    let x1 = codex("CODEX-FIRST");
+    let x2 = codex("CODEX-LAST");
+    let summary = agit::commands::merge::summary_envelope(
+        "MERGED-CONCLUSION",
+        "codex",
+        &format!("agit-{}", "d".repeat(40)),
+    );
+    for (selected, runtime, expected) in [
+        (
+            format!("{c1}{x1}{summary}{c2}{x2}"),
+            "claude-code",
+            vec![
+                "CLAUDE-FIRST",
+                "CODEX-FIRST",
+                "MERGED-CONCLUSION",
+                "CLAUDE-LAST",
+                "CODEX-LAST",
+            ],
+        ),
+        (
+            format!("{x1}{c1}{summary}{x2}{c2}"),
+            "codex",
+            vec![
+                "CODEX-FIRST",
+                "CLAUDE-FIRST",
+                "MERGED-CONCLUSION",
+                "CODEX-LAST",
+                "CLAUDE-LAST",
+            ],
+        ),
+        (
+            format!("{c1}{c2}"),
+            "claude-code",
+            vec!["CLAUDE-FIRST", "CLAUDE-LAST"],
+        ),
+        (
+            format!("{x1}{x2}"),
+            "codex",
+            vec!["CODEX-FIRST", "CODEX-LAST"],
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = fixture(tmp.path());
+        let repo = Repo::open(home.join("repos").join(REPO)).unwrap();
+        repo.git(&["switch", "-q", "selected"]).unwrap();
+        storage::write_snapshot(repo.root(), &selected, &selected).unwrap();
+        let mut snapshot = meta::Meta::new(
+            format!("agit-{}", "a".repeat(40)),
+            runtime.into(),
+            "/work".into(),
+        );
+        snapshot.kind = meta::Kind::Merge;
+        meta::write(repo.root(), &snapshot).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("selected mixed history").unwrap();
+        let payload = share_payload(&home, tmp.path());
+        let mut offset = 0;
+        for text in expected {
+            let position = payload[offset..]
+                .find(text)
+                .unwrap_or_else(|| panic!("selected event {text} missing or reordered: {payload}"));
+            offset += position + text.len();
+        }
+        assert!(!payload.contains("UNSELECTED-CONTENT"), "{payload}");
+    }
 }

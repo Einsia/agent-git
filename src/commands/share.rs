@@ -141,8 +141,13 @@ pub fn run(args: Args) -> CmdResult {
 
     // Render a readable transcript before sharing — a share exists to be read by people, not
     // parsed by machines.
-    let rt = adapter::infer_runtime(&raw).unwrap_or(source.runtime.as_str());
-    let parsed = adapter::get(rt)?.parse(&raw)?;
+    let parsed = match source.envelope.as_deref() {
+        Some(envelope) => transcript::display::parse(envelope)?,
+        None => {
+            let rt = adapter::infer_runtime(&raw).unwrap_or(source.runtime.as_str());
+            adapter::get(rt)?.parse(&raw)?
+        }
+    };
     let readable = ui::transcript::render_transcript(&parsed, 20000);
 
     let expire_secs = parse_expire(&args.expire)?;
@@ -270,6 +275,7 @@ pub fn run(args: Args) -> CmdResult {
 
 struct ShareSource {
     raw: String,
+    envelope: Option<String>,
     runtime: String,
     label: String,
 }
@@ -355,6 +361,7 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
     }
     Ok(ShareSource {
         raw: native.read()?,
+        envelope: None,
         runtime: native.source.clone(),
         label: format!(
             "live runtime transcript {}:{}",
@@ -469,6 +476,7 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
     }
     Ok(ShareSource {
         raw,
+        envelope: Some(envelope),
         runtime: snapshot.runtime,
         label: format!(
             "{sequence} of {}@{}",
