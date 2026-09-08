@@ -60,6 +60,7 @@ default = ["cli"]
 cli = [
     "rc",
     "secret-vault",
+    "dep:gix",
     "dep:clap",
     "dep:clap_complete",
     "dep:ratatui",
@@ -98,6 +99,8 @@ secret-vault = [
 ]
 
 [dependencies]
+# Object construction is in-process; ref publication remains an expected-old transaction.
+gix = { version = "0.87.1", default-features = false, features = ["sha1", "sha256"], optional = true }
 # ── CLI ─────────────────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"], optional = true }
 clap_complete = { version = "4", optional = true }

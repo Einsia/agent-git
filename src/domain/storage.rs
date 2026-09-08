@@ -379,33 +379,67 @@ pub fn snapshot_files(
 ) -> Result<BTreeMap<String, Vec<u8>>> {
     validate_envelope_input_bounds("LOG", log_envelopes)?;
     validate_envelope_input_bounds("VIEW", view_envelopes)?;
-    let log = parse_envelopes(log_envelopes).context("invalid LOG envelope JSONL")?;
-    let view = parse_envelopes(view_envelopes).context("invalid VIEW envelope JSONL")?;
 
-    let mut files = BTreeMap::<String, Vec<u8>>::new();
-    let mut log_ids = Vec::with_capacity(log.len());
-    let mut unique_event_bytes = 0usize;
-    for envelope in &log {
-        let line = envelope_line(envelope);
-        if line.len() > MAX_EVENT_BYTES {
-            anyhow::bail!(
-                "event is {} bytes, above the {MAX_EVENT_BYTES}-byte limit",
-                line.len()
-            );
+    let mut log = SnapshotLog::default();
+    for (index, line) in log_envelopes.split_inclusive('\n').enumerate() {
+        log.push(line)
+            .with_context(|| format!("invalid LOG envelope at line {}", index + 1))?;
+    }
+    let (log_ids, mut files) = log.into_parts();
+    let log_sequence = sequence_text(&log_ids)?.into_bytes();
+    let view_sequence = if log_envelopes == view_envelopes {
+        log_sequence.clone()
+    } else {
+        let mut view_ids = Vec::new();
+        for (index, line) in view_envelopes.split_inclusive('\n').enumerate() {
+            let id = event_id(line)
+                .with_context(|| format!("invalid VIEW envelope at line {}", index + 1))?;
+            let path = meta::event_path(&id)?;
+            match files.get(&path) {
+                Some(log_line) if log_line.as_slice() == line.as_bytes() => {}
+                Some(_) => anyhow::bail!("event id collision for {id}"),
+                None => anyhow::bail!("VIEW references event {id} which is not reachable from LOG"),
+            }
+            view_ids.push(id);
         }
-        let id = event_id(&line)?;
+        sequence_text(&view_ids)?.into_bytes()
+    };
+    files.insert(meta::LOG_FILE.to_owned(), log_sequence);
+    files.insert(meta::VIEW_FILE.to_owned(), view_sequence);
+    Ok(files)
+}
+
+/// A bounded, strictly validated LOG whose event bytes are retained without parsed JSON trees.
+#[derive(Default)]
+pub(crate) struct SnapshotLog {
+    ids: Vec<String>,
+    files: BTreeMap<String, Vec<u8>>,
+    bytes: usize,
+}
+
+impl SnapshotLog {
+    pub(crate) fn push(&mut self, line: &str) -> Result<()> {
+        anyhow::ensure!(
+            line.len() <= MAX_EVENT_BYTES,
+            "LOG event exceeds the event byte limit"
+        );
+        let bytes = self
+            .bytes
+            .checked_add(line.len())
+            .context("LOG size overflow")?;
+        anyhow::ensure!(
+            bytes <= MAX_MATERIALIZED_BYTES,
+            "LOG exceeds the snapshot byte limit"
+        );
+        anyhow::ensure!(
+            self.ids.len() < MAX_SEQUENCE_EVENTS,
+            "LOG exceeds the snapshot event limit"
+        );
+        let id = event_id(line)?;
         let path = meta::event_path(&id)?;
-        match files.entry(path) {
+        match self.files.entry(path) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                unique_event_bytes = unique_event_bytes
-                    .checked_add(line.len())
-                    .context("unique event size overflow")?;
-                if unique_event_bytes > MAX_MATERIALIZED_BYTES {
-                    anyhow::bail!(
-                        "unique event bytes exceed the {MAX_MATERIALIZED_BYTES}-byte snapshot limit"
-                    );
-                }
-                entry.insert(line.into_bytes());
+                entry.insert(line.as_bytes().to_vec());
             }
             std::collections::btree_map::Entry::Occupied(entry)
                 if entry.get().as_slice() != line.as_bytes() =>
@@ -414,40 +448,14 @@ pub fn snapshot_files(
             }
             std::collections::btree_map::Entry::Occupied(_) => {}
         }
-        log_ids.push(id);
+        self.ids.push(id);
+        self.bytes = bytes;
+        Ok(())
     }
 
-    let reachable: HashSet<&str> = log_ids.iter().map(String::as_str).collect();
-    let mut view_ids = Vec::with_capacity(view.len());
-    for envelope in &view {
-        let line = envelope_line(envelope);
-        if line.len() > MAX_EVENT_BYTES {
-            anyhow::bail!(
-                "VIEW event is {} bytes, above the {MAX_EVENT_BYTES}-byte limit",
-                line.len()
-            );
-        }
-        let id = event_id(&line)?;
-        if !reachable.contains(id.as_str()) {
-            anyhow::bail!("VIEW references event {id} which is not reachable from LOG");
-        }
-        let path = meta::event_path(&id)?;
-        match files.get(&path) {
-            Some(log_line) if log_line == line.as_bytes() => {}
-            Some(_) => anyhow::bail!("event id collision for {id}"),
-            None => anyhow::bail!("VIEW references event {id} which has no LOG object"),
-        }
-        view_ids.push(id);
+    pub(crate) fn into_parts(self) -> (Vec<String>, BTreeMap<String, Vec<u8>>) {
+        (self.ids, self.files)
     }
-    files.insert(
-        meta::LOG_FILE.to_owned(),
-        sequence_text(&log_ids)?.into_bytes(),
-    );
-    files.insert(
-        meta::VIEW_FILE.to_owned(),
-        sequence_text(&view_ids)?.into_bytes(),
-    );
-    Ok(files)
 }
 
 fn validate_envelope_input_bounds(label: &str, text: &str) -> Result<()> {
@@ -2500,6 +2508,48 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn snapshot_log_rejects_invalid_or_over_budget_input_without_advancing() {
+        let valid = line(SID_A, 1);
+        let mut log = SnapshotLog {
+            bytes: MAX_MATERIALIZED_BYTES - valid.len(),
+            ..SnapshotLog::default()
+        };
+        assert!(log.push("invalid\n").is_err());
+        assert!(log.ids.is_empty());
+        assert!(log.files.is_empty());
+        log.push(&valid).unwrap();
+        assert_eq!(log.bytes, MAX_MATERIALIZED_BYTES);
+        assert!(log.push(&valid).is_err());
+        let (ids, files) = log.into_parts();
+        assert_eq!(ids, vec![event_id(&valid).unwrap()]);
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_streaming_preserves_strict_validation_for_shared_and_distinct_views() {
+        let valid = line(SID_A, 1);
+        let mut tampered: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        tampered["content"] = serde_json::json!({"changed": true});
+        let invalid = [
+            valid.trim_end().to_owned(),
+            format!(" {valid}"),
+            valid.replace('\n', "\r\n"),
+            format!("{tampered}\n"),
+            "\n".to_owned(),
+        ];
+        for bytes in invalid {
+            assert!(snapshot_files(&bytes, &bytes).is_err());
+            assert!(snapshot_files(&valid, &bytes).is_err());
+            assert!(snapshot_files(&bytes, "").is_err());
+        }
+        let repeated = format!("{valid}{valid}");
+        let files = snapshot_files(&repeated, &repeated).unwrap();
+        assert_eq!(files[meta::LOG_FILE], files[meta::VIEW_FILE]);
+        assert_eq!(files.len(), 3);
+        assert_eq!(snapshot_files("", "").unwrap().len(), 2);
     }
 
     #[test]

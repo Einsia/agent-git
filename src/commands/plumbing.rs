@@ -201,21 +201,11 @@ pub fn tree_apply(
     result
 }
 
-/// Add and delete files in bulk on an existing tree, storing content as raw bytes.
+/// Apply raw-byte edits directly to the object database of an immutable base tree.
 ///
-/// `Some(bytes)` adds or replaces a file, `None` deletes it. Next to [`tree_apply`], this entry
-/// point is for large, dynamically generated path sets (for example `events/a/b/c/d/<hash>`):
-///
-/// * all added blobs spawn `git hash-object --stdin-paths` only once;
-/// * all index changes spawn `git update-index --index-info -z` only once;
-/// * `--no-filters` keeps the incoming binary bytes from being rewritten by `.gitattributes`;
-/// * temporary files and the temporary index live in one RAII directory, cleaned up on success
-///   and on error alike;
-/// * the real index, the worktree and the checkout are not touched by a single byte.
-///
-/// Paths use the git tree `/`-separated form. NUL cannot be expressed by `--index-info -z`, and
-/// an empty path, an absolute path and a `.` / `..` component are not canonical in-repository
-/// paths either, so they are rejected before git starts.
+/// Blob and tree construction has no subprocess protocol, temporary index, or per-blob file.
+/// Only changed subtrees are written; filters, the checkout, index and refs are never touched.
+/// Paths are canonical Git paths and edits must not duplicate or overlap one another.
 pub fn tree_apply_owned(
     repo: &Repo,
     base_commitish: &str,
@@ -240,9 +230,7 @@ pub fn tree_apply_owned(
         }
     }
 
-    // Resolve to a tree oid first. Besides making read-tree's input unambiguous, its length
-    // gives deletion records the null oid of this repository's object format (40 for SHA-1,
-    // 64 for SHA-256).
+    // Resolve the immutable tree through the same no-replacement boundary as ref publication.
     let tree_expr = format!("{base_commitish}^{{tree}}");
     let base_tree = repo.git(&["rev-parse", "--verify", &tree_expr])?;
     let base_tree = base_tree.trim();
@@ -253,90 +241,25 @@ pub fn tree_apply_owned(
         anyhow::bail!("git rev-parse returned an invalid tree object id");
     }
 
-    #[cfg(windows)]
-    let git_dir = {
-        // Git supplies an absolute path usable by its own subprocesses; Rust's Windows
-        // canonical paths use a verbatim prefix that Git cannot use for its index lock.
-        let path = repo.git(&["rev-parse", "--absolute-git-dir"])?;
-        std::path::PathBuf::from(path.trim())
-    };
-    #[cfg(not(windows))]
-    let git_dir = {
-        let path = repo.git(&["rev-parse", "--git-dir"])?;
-        let path = std::path::PathBuf::from(path.trim());
-        let path = if path.is_absolute() {
-            path
-        } else {
-            repo.root().join(path)
-        };
-        // An absolute GIT_DIR remains valid when hash-object moves into the scratch directory.
-        // Resolving the native path preserves a repository root that is not UTF-8.
-        std::fs::canonicalize(path)?
-    };
-    let scratch = tempfile::Builder::new()
-        .prefix("agit-tree-")
-        .tempdir_in(&git_dir)?;
-    let index = scratch.path().join("index");
-
-    run_with_index(repo, &index, &["read-tree", base_tree], None)?;
-
-    // Feed --stdin-paths controlled ASCII temporary file names. A repository that itself sits
-    // under a non-UTF-8 path therefore never has that path pushed lossily into stdin;
-    // hash-object's cwd is the scratch directory.
-    let mut hash_input = Vec::new();
-    let mut additions = 0usize;
-    for (i, (_, content)) in edits.iter().enumerate() {
-        let Some(bytes) = content else { continue };
-        let name = format!("blob-{i}");
-        std::fs::write(scratch.path().join(&name), bytes)?;
-        hash_input.extend_from_slice(name.as_bytes());
-        hash_input.push(b'\n');
-        additions += 1;
-    }
-
-    let hashes = if additions == 0 {
-        Vec::new()
-    } else {
-        hash_owned_blobs(&git_dir, scratch.path(), &hash_input, additions)?
-    };
-    let mut hashes = hashes.into_iter();
-
-    // An --index-info -z record is still `mode SP oid TAB path NUL`; -z only swaps the path
-    // terminator from LF to NUL and turns off path quoting. A deletion uses mode 0 plus an
-    // all-zero oid of the current object format's length, so tabs and newlines inside a path
-    // survive byte for byte.
-    let null_oid = "0".repeat(base_tree.len());
-    let mut index_info = Vec::new();
-    for (path, content) in &edits {
+    let mut objects = gix::open_opts(
+        repo.root(),
+        gix::open::Options::default().config_overrides(["core.useReplaceRefs=false"]),
+    )?;
+    objects.objects.ignore_replacements = true;
+    let base_id = gix::ObjectId::from_hex(base_tree.as_bytes())?;
+    let mut editor = objects.edit_tree(base_id)?;
+    for (path, content) in edits {
         match content {
-            Some(_) => {
-                let oid = hashes.next().ok_or_else(|| {
-                    anyhow::anyhow!("git hash-object returned too few object ids")
-                })?;
-                index_info.extend_from_slice(b"100644 ");
-                index_info.extend_from_slice(oid.as_bytes());
+            Some(bytes) => {
+                let id = objects.write_blob(&bytes)?.detach();
+                editor.upsert(path.as_str(), gix::object::tree::EntryKind::Blob, id)?;
             }
             None => {
-                index_info.extend_from_slice(b"0 ");
-                index_info.extend_from_slice(null_oid.as_bytes());
+                editor.remove_leaf(path.as_str())?;
             }
         }
-        index_info.push(b'\t');
-        index_info.extend_from_slice(path.as_bytes());
-        index_info.push(0);
     }
-    if hashes.next().is_some() {
-        anyhow::bail!("git hash-object returned too many object ids");
-    }
-
-    run_with_index(
-        repo,
-        &index,
-        &["update-index", "-z", "--index-info"],
-        Some(&index_info),
-    )?;
-    let tree = run_with_index(repo, &index, &["write-tree"], None)?;
-    Ok(String::from_utf8(tree)?.trim().to_string())
+    Ok(editor.write()?.to_string())
 }
 
 /// Rebuild a complete v1 session snapshot on top of `base_commitish`.
@@ -351,6 +274,21 @@ pub fn session_snapshot_tree(
     view: &str,
     meta_text: &str,
 ) -> Result<String> {
+    session_snapshot_tree_files(
+        repo,
+        base_commitish,
+        storage::snapshot_files(log, view)?,
+        meta_text,
+    )
+}
+
+/// Install a validated snapshot, retaining the same namespace and upgrade preflights.
+pub(super) fn session_snapshot_tree_files(
+    repo: &Repo,
+    base_commitish: &str,
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+    meta_text: &str,
+) -> Result<String> {
     let layout = storage_layout_at(repo, base_commitish)?;
     ensure_v1_upgrade_preflight(repo, base_commitish)?;
     let existing_attributes = regular_blob_text_at(repo, base_commitish, meta::ATTRS_FILE)?;
@@ -360,7 +298,7 @@ pub fn session_snapshot_tree(
         .filter(|path| meta::is_storage_path_for(layout, path))
         .map(|path| (path, None))
         .collect();
-    for (path, bytes) in storage::snapshot_files(log, view)? {
+    for (path, bytes) in files {
         edits.insert(path, Some(bytes));
     }
     edits.insert(meta::FILE.to_owned(), Some(meta_text.as_bytes().to_vec()));
@@ -3355,85 +3293,6 @@ fn validate_tree_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn hash_owned_blobs(
-    git_dir: &std::path::Path,
-    scratch: &std::path::Path,
-    input: &[u8],
-    expected: usize,
-) -> Result<Vec<String>> {
-    let mut child = std::process::Command::new("git")
-        .arg("--no-replace-objects")
-        .args(["hash-object", "-w", "--no-filters", "--stdin-paths"])
-        .env("GIT_DIR", git_dir)
-        .current_dir(scratch)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .expect("hash-object stdin already taken")
-        .write_all(input)?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git hash-object --stdin-paths failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let stdout = String::from_utf8(out.stdout)?;
-    let hashes: Vec<String> = stdout.lines().map(str::to_string).collect();
-    if hashes.len() != expected
-        || hashes
-            .iter()
-            .any(|oid| oid.is_empty() || !oid.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        anyhow::bail!(
-            "git hash-object returned {} valid-looking object ids for {expected} inputs",
-            hashes.len()
-        );
-    }
-    Ok(hashes)
-}
-
-fn run_with_index(
-    repo: &Repo,
-    index: &std::path::Path,
-    args: &[&str],
-    stdin: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let mut child = std::process::Command::new("git")
-        .arg("--no-replace-objects")
-        .args(args)
-        .current_dir(repo.root())
-        .env("GIT_INDEX_FILE", index)
-        .stdin(if stdin.is_some() {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    if let Some(input) = stdin {
-        child
-            .stdin
-            .take()
-            .expect("git index stdin already taken")
-            .write_all(input)?;
-    }
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(out.stdout)
-}
-
 /// Worktree paths changed relative to `since_commit` (including untracked new files), minus
 /// `exclude`.
 ///
@@ -3950,6 +3809,125 @@ mod tests {
     }
 
     #[test]
+    fn owned_tree_apply_large_batch_finishes_without_a_pipe_protocol() {
+        const CHILD: &str = "AGIT_NATIVE_TREE_TEST_CHILD";
+        const TEST: &str = "commands::plumbing::tests::owned_tree_apply_large_batch_finishes_without_a_pipe_protocol";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "bulk tree subprocess failed: {status}");
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("bulk tree construction did not finish before the deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        repo.git(&["commit", "--allow-empty", "-m", "base"])
+            .unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let count = 20_000;
+        let edits = (0..count)
+            .map(|n| {
+                (
+                    format!("events/{n:08x}"),
+                    Some(format!("event {n}\n").into_bytes()),
+                )
+            })
+            .collect();
+        let tree = tree_apply_owned(&repo, &head, edits).unwrap();
+        assert_eq!(repo.ls_tree_result(&tree).unwrap().len(), count);
+        assert_eq!(cat_blob(&repo, &tree, "events/00004e1f"), b"event 19999\n");
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
+        assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn owned_tree_apply_preserves_modes_and_external_gitlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        let blob = raw_git(&repo, &["hash-object", "-w", "--stdin"], Some("payload")).unwrap();
+        let external = "1234567890123456789012345678901234567890";
+        let entries = format!(
+            "100755 blob {}\texecutable\n120000 blob {}\tlink\n160000 commit {external}\tmodule\n",
+            blob.trim(),
+            blob.trim()
+        );
+        let base = raw_git(&repo, &["mktree"], Some(&entries)).unwrap();
+        let tree = tree_apply_owned(
+            &repo,
+            base.trim(),
+            vec![("notes".into(), Some(b"new".to_vec()))],
+        )
+        .unwrap();
+        for path in ["executable", "link", "module"] {
+            assert_eq!(
+                repo.git(&["ls-tree", base.trim(), "--", path]).unwrap(),
+                repo.git(&["ls-tree", &tree, "--", path]).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_tree_apply_uses_the_repository_object_format() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet", "--object-format=sha256"])
+            .arg(directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let repo = Repo::open(directory.path()).unwrap();
+        repo.ensure_committer().unwrap();
+        repo.git(&["commit", "--allow-empty", "-m", "base"])
+            .unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let tree = tree_apply_owned(
+            &repo,
+            &head,
+            vec![("binary".into(), Some(vec![0, 255, 10]))],
+        )
+        .unwrap();
+        assert_eq!(tree.len(), 64);
+        assert_eq!(cat_blob(&repo, &tree, "binary"), vec![0, 255, 10]);
+        let empty = tree_apply_owned(&repo, &tree, vec![("binary".into(), None)]).unwrap();
+        assert!(repo.ls_tree_result(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn owned_tree_apply_ignores_replace_refs_for_base_trees() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        std::fs::write(repo.root().join("original"), "keep").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("base").unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let base = repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+        let replacement = tree_apply_owned(
+            &repo,
+            &head,
+            vec![("decoy".into(), Some(b"wrong".to_vec()))],
+        )
+        .unwrap();
+        repo.git(&["replace", &base, &replacement]).unwrap();
+        let tree =
+            tree_apply_owned(&repo, &head, vec![("new".into(), Some(b"right".to_vec()))]).unwrap();
+        assert_eq!(repo.ls_tree_result(&tree).unwrap(), vec!["new", "original"]);
+    }
+
+    #[test]
     fn owned_tree_apply_batches_binary_additions_and_deletions_without_checkout() {
         let d = tempfile::tempdir().unwrap();
         let repo = Repo::init(&d.path().join("r")).unwrap();
@@ -3963,8 +3941,7 @@ mod tests {
 
         let event_path = "events/01/23/45/67/0123456789abcdef0123456789abcdef01234567";
         let event_bytes = vec![0, 1, 2, b'\n', b'\r', 0xff, 0xfe, 0];
-        // Tabs and newlines prove that update-index is really consuming the `-z`
-        // form; a line-delimited or quoted implementation cannot round-trip this path.
+        // Tabs and newlines are literal bytes in a tree path, not record delimiters.
         let unusual_path = "events/tab\tand\nnewline.bin";
         let unusual_bytes = vec![0x80, b'\t', 0, b'\n', 0x81];
         let tree = tree_apply_owned(

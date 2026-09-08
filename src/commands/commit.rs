@@ -37,6 +37,8 @@
 //! A commit's author fields (git user.name/email) come from the credentials and cannot be
 //! backfilled, so the check runs up front instead of failing halfway through.
 
+mod native;
+
 use super::CmdResult;
 use crate::adapter::{EventKind, OpenCall, Session};
 use crate::domain::link::{self, Link};
@@ -1454,7 +1456,7 @@ fn optional_branch_commit(repo: &Repo, branch_ref: &str) -> crate::Result<Option
 /// meant a second first writer could silently observe the branch created by the winner and parent
 /// its already-consumed turn onto that mutable HEAD. Build the shared-file portion in a temporary
 /// index instead. AgentGit-owned paths are removed from that index and installed explicitly by
-/// [`unborn_session_snapshot_tree`], so neither the real index nor the worktree changes before the
+/// [`unborn_session_snapshot_files`], so neither the real index nor the worktree changes before the
 /// expected-absent ref CAS.
 fn unborn_worktree_tree(repo: &Repo) -> crate::Result<String> {
     let empty_tree = super::plumbing::raw_git(
@@ -1540,11 +1542,10 @@ fn unborn_worktree_tree(repo: &Repo) -> crate::Result<String> {
 /// correct for an existing branch but cannot resolve `HEAD^{commit}` while this branch is unborn.
 /// The caller has already proved the root namespace is free in the worktree; this helper only
 /// performs immutable tree edits and keeps user-owned `.gitattributes` rules.
-fn unborn_session_snapshot_tree(
+fn unborn_session_snapshot_files(
     repo: &Repo,
     base_tree: &str,
-    log: &str,
-    view: &str,
+    files: std::collections::BTreeMap<String, Vec<u8>>,
     meta_text: &str,
 ) -> crate::Result<String> {
     let attributes = super::plumbing::regular_blob_text_at(repo, base_tree, meta::ATTRS_FILE)?;
@@ -1554,7 +1555,7 @@ fn unborn_session_snapshot_tree(
         .filter(|path| meta::is_storage_path(path))
         .map(|path| (path, None))
         .collect();
-    for (path, bytes) in storage::snapshot_files(log, view)? {
+    for (path, bytes) in files {
         edits.insert(path, Some(bytes));
     }
     edits.insert(meta::FILE.to_owned(), Some(meta_text.as_bytes().to_vec()));
@@ -2080,41 +2081,38 @@ fn settle_bytes(
         None
     };
 
+    if !quiet && total > 1 {
+        eprintln!("  preparing {total} turns");
+    }
+    let mut native = if materialized_base.is_none() {
+        Some(native::NativeSnapshots::new(
+            &text,
+            &protected_full.text,
+            &ir,
+            source,
+            &claim,
+            new_chunks.last().expect("non-empty chunks").end_byte,
+        )?)
+    } else {
+        None
+    };
+    let observed_code = code_anchor
+        .as_ref()
+        .map(|(code, _)| code.clone())
+        .or_else(|| meta::code_of(Path::new(&cwd)));
+
     for (i, c) in new_chunks.iter().enumerate() {
         let turn_no = head_turn_base + 1 + i as u32;
         let absolute_end = region_start + c.end_byte;
-        let prefix = &text[..absolute_end];
-
-        let (log, view) = match &materialized_base {
-            Some((base_log, base_view)) => {
-                let protected_addition =
-                    secret_dictionary.protect_jsonl(&region[..c.end_byte], &global_secrets)?;
-                extend_materialized_snapshot(
-                    base_log,
-                    base_view,
-                    &protected_addition.text,
-                    source,
-                    &claim,
-                )?
-            }
-            None => {
-                let protected_prefix = secret_dictionary.protect_jsonl(prefix, &global_secrets)?;
-                let log = transcript::wrap_lines(&protected_prefix.text, source, &claim);
-                let view = transcript::view_of_live(prefix, source)?;
-                let protected_view = secret_dictionary.protect_jsonl(&view, &global_secrets)?;
-                let view = transcript::wrap_lines(&protected_view.text, source, &claim);
-                (log, view)
-            }
-        };
+        if !quiet && total > 1 {
+            eprintln!("  building turn {}/{}", i + 1, total);
+        }
 
         let mut snap = Meta::new(claim.clone(), source.to_string(), cwd.clone());
         snap.kind = Kind::Turn;
         snap.turn = Some(turn_no);
         snap.baseline_bytes = Some(absolute_end as u64);
-        snap.code = code_anchor
-            .as_ref()
-            .map(|(c, _)| c.clone())
-            .or_else(|| meta::code_of(Path::new(&cwd)));
+        snap.code = observed_code.clone();
         let last = i + 1 == total;
         if last {
             snap.cwd_state = cwd_state.clone();
@@ -2159,28 +2157,50 @@ fn settle_bytes(
         }
         let protected_message = secret_dictionary.protect_text(&msg, &global_secrets)?;
         let snap_text = meta::to_text(&snap)?;
-        if old_head.is_none() {
-            let base = pending_parent
-                .as_deref()
-                .or(unborn_base_tree.as_deref())
-                .expect("an unborn settlement has a shared-file base tree");
-            let tree = unborn_session_snapshot_tree(repo, base, &log, &view, &snap_text)?;
-            let parents = pending_parent
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            last_sha =
-                super::plumbing::commit_tree(repo, &tree, &parents, &protected_message.text)?;
-            pending_parent = Some(last_sha.clone());
-        } else if let Some(parent) = pending_parent.as_deref() {
-            let tree =
-                super::plumbing::session_snapshot_tree(repo, parent, &log, &view, &snap_text)?;
-            last_sha =
-                super::plumbing::commit_tree(repo, &tree, &[parent], &protected_message.text)?;
-            pending_parent = Some(last_sha.clone());
+        let base = pending_parent
+            .as_deref()
+            .or(unborn_base_tree.as_deref())
+            .expect("snapshot base tree");
+        let tree = if let Some(native) = native.as_mut() {
+            let mut files = native.files(c.end_byte)?;
+            if i == 0 {
+                if old_head.is_none() {
+                    unborn_session_snapshot_files(repo, base, files, &snap_text)?
+                } else {
+                    super::plumbing::session_snapshot_tree_files(repo, base, files, &snap_text)?
+                }
+            } else {
+                files.insert(meta::FILE.into(), snap_text.as_bytes().to_vec());
+                super::plumbing::tree_apply_owned(
+                    repo,
+                    base,
+                    files
+                        .into_iter()
+                        .map(|(path, bytes)| (path, Some(bytes)))
+                        .collect(),
+                )?
+            }
         } else {
-            unreachable!("an existing branch settlement always has a frozen parent")
-        }
+            let (base_log, base_view) = materialized_base
+                .as_ref()
+                .expect("materialized history retains its committed LOG and VIEW");
+            let protected_addition =
+                secret_dictionary.protect_jsonl(&region[..c.end_byte], &global_secrets)?;
+            let (log, view) = extend_materialized_snapshot(
+                base_log,
+                base_view,
+                &protected_addition.text,
+                source,
+                &claim,
+            )?;
+            super::plumbing::session_snapshot_tree(repo, base, &log, &view, &snap_text)?
+        };
+        let parents = pending_parent
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        last_sha = super::plumbing::commit_tree(repo, &tree, &parents, &protected_message.text)?;
+        pending_parent = Some(last_sha.clone());
         let protected_subject = protected_message
             .text
             .lines()
