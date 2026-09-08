@@ -260,6 +260,20 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
     }
+    if !args.link_only
+        && existing
+            .as_ref()
+            .is_some_and(|link| link.branch.is_some() && recorded_owner(link).is_none())
+        && destination
+            .as_ref()
+            .is_none_or(|target| target.base.is_none() && args.branch.is_none())
+    {
+        ui::error("this session claim has no recorded owner; its namespace cannot be inferred.");
+        ui::hint(
+            "re-adopt with an explicit `--into <owner>/<repo>@<branch>` and confirm that destination",
+        );
+        return Ok(ExitCode::Usage);
+    }
     let agent = destination
         .as_ref()
         .and_then(|t| t.repo.as_deref())
@@ -607,13 +621,15 @@ fn place_resolved_branch(
     // The same session already hangs on another branch: changing the branch reroutes every
     // settlement from here on, which is not something a re-run of import does silently. Ask; when
     // asking is impossible (no tty and no `-y`), refuse.
-    if let Some(prev) = claimed_elsewhere(lk, agent, &branch) {
+    if let Some(prev) = claimed_elsewhere(lk, owner, agent, &branch) {
+        let next = format!("{owner}/{agent}@{branch}");
         ui::warning(&format!(
-            "session {} is already claimed on {prev}; `-n {agent} -b {branch}` would re-route its future settlements",
+            "session {} is already claimed on {prev}; importing into {next} would re-route its future settlements",
             link::short(&lk.session_id)
         ));
         if std::env::var_os("AGIT_YES").is_none() {
-            match ui::prompt::confirm(&format!("re-claim it onto `{branch}`?"), false)? {
+            match ui::prompt::confirm(&format!("re-claim it from `{prev}` onto `{next}`?"), false)?
+            {
                 Some(true) => {}
                 Some(false) => {
                     println!("cancelled.");
@@ -622,7 +638,7 @@ fn place_resolved_branch(
                 None => {
                     ui::error("refusing to move the claim without confirmation");
                     ui::hint(&format!(
-                        "re-run against `{prev}` to settle where it already lives, or pass `-y` to move it"
+                        "inspect the recorded identity, then pass `-y` only if you intend to claim `{next}`"
                     ));
                     return Ok(Placed::Refused(ExitCode::Interactive));
                 }
@@ -665,23 +681,44 @@ fn birth_session_branch(
     let _branch_guard = link::lock_branch(store, &format!("{owner}/{agent}"), &branch)?;
     let _claim_guard = link::lock(store, &lk.source, &lk.session_id)?;
     let prev_link = link::get(store, &lk.source, &lk.session_id);
-    if let Some(current) = &prev_link {
-        // The link was first read before destination selection and a possible confirmation. Once
-        // the locks are held, the disk copy is authoritative for watermark and supersession state.
-        // A routing change invalidates the earlier confirmation; retrying is the only way to make
-        // that new destination part of the user's decision.
-        let routing_changed =
-            current.owner != lk.owner || current.agent != lk.agent || current.branch != lk.branch;
-        if routing_changed {
-            ui::error("the session claim changed while import was waiting for its branch lock");
-            ui::hint("inspect the current destination with `agit status`, then retry the import");
-            return Ok(Placed::Refused(ExitCode::Policy));
-        }
-        let discovered_cwd = lk.cwd.clone();
-        *lk = current.clone();
-        if lk.cwd.is_none() {
-            lk.cwd = discovered_cwd;
-        }
+    // Attachment must remain readable until placement holds its locks. Missing or malformed
+    // metadata cannot establish the current claim or supersession state and must not be replaced.
+    let Some(current) = prev_link.as_ref() else {
+        ui::error(
+            "the attached session link is missing or unreadable; inspect its metadata before retrying the import",
+        );
+        return Ok(Placed::Refused(ExitCode::Policy));
+    };
+    // The link was first read before destination selection and a possible confirmation. Once
+    // the locks are held, the disk copy is authoritative for watermark and supersession state.
+    // A routing change invalidates the earlier confirmation; retrying is the only way to make
+    // that new destination part of the user's decision.
+    let routing_changed =
+        current.owner != lk.owner || current.agent != lk.agent || current.branch != lk.branch;
+    if routing_changed {
+        ui::error("the session claim changed while import was waiting for its branch lock");
+        ui::hint("inspect the current destination with `agit status`, then retry the import");
+        return Ok(Placed::Refused(ExitCode::Policy));
+    }
+    let discovered_cwd = lk.cwd.clone();
+    *lk = current.clone();
+    if lk.cwd.is_none() {
+        lk.cwd = discovered_cwd;
+    }
+
+    if !lk.is_active() && repo.has_ref(&format!("refs/heads/{branch}")) {
+        ui::error(&format!(
+            "session {} was superseded by {} and cannot reclaim existing branch {owner}/{agent}@{branch}.",
+            link::short(&lk.session_id),
+            lk.superseded_by
+                .as_deref()
+                .unwrap_or("a newer runtime session")
+        ));
+        ui::hint(&format!(
+            "preserve its later work with `agit import {} --into {owner}/{agent}@<new-branch>`",
+            ui::session::shell_arg(&lk.session_id)
+        ));
+        return Ok(Placed::Refused(ExitCode::Policy));
     }
 
     // A repo with no `main` collapses the whole chain, at every link: a server-side bare repo's
@@ -754,15 +791,11 @@ fn birth_session_branch(
     // else's history. Once dropped, the continuity / claim checks refuse the combinations that
     // cannot be written.
     //
-    // An old link with no owner is not "no destination": that is the legacy link form whose
-    // namespace comes from the signed-in account, and the comparison fills it in the same way —
-    // from the `author` snapshot taken at the start of the command, not by reading the
-    // credentials again here (a sign-in identity swapped mid-import would make the comparison
-    // drift).
-    let prev_owner = lk.owner.as_deref().unwrap_or(author);
-    let rerouted = lk.branch.as_deref().is_some_and(|b| b != branch)
-        || lk.agent.as_deref().is_some_and(|a| a != agent)
-        || prev_owner != owner;
+    // A materialization baseline belongs to a recorded namespace. Missing ownership cannot
+    // prove that the destination carries its history, even when the repo and branch names match.
+    let rerouted = lk.branch.as_deref() != Some(branch.as_str())
+        || lk.agent.as_deref() != Some(agent)
+        || recorded_owner(lk) != Some(owner);
     if rerouted && !(created && onto_commit.is_some()) {
         lk.baseline_bytes = None;
         lk.baseline_hash = None;
@@ -789,13 +822,24 @@ fn birth_session_branch(
     })))
 }
 
-/// Returns the destination (`agent@branch`) when the link already hangs on a **different** one;
-/// `None` for the same destination or for no claim yet. A destination is the (agent, branch)
-/// pair: the same branch name under a different agent is a reroute too.
-fn claimed_elsewhere(lk: &Link, agent: &str, branch: &str) -> Option<String> {
+fn recorded_owner(lk: &Link) -> Option<&str> {
+    lk.owner.as_deref().filter(|owner| !owner.is_empty())
+}
+
+/// A recorded branch claim may be reused without confirmation only at its complete identity.
+/// Unknown ownership is displayed as unknown rather than borrowed from the current account.
+fn claimed_elsewhere(lk: &Link, owner: &str, agent: &str, branch: &str) -> Option<String> {
     let prev_branch = lk.branch.as_deref()?;
-    let prev_agent = lk.agent.as_deref().unwrap_or(agent);
-    (prev_agent != agent || prev_branch != branch).then(|| format!("{prev_agent}@{prev_branch}"))
+    let same = recorded_owner(lk) == Some(owner)
+        && lk.agent.as_deref() == Some(agent)
+        && prev_branch == branch;
+    (!same).then(|| {
+        format!(
+            "{}/{}@{prev_branch}",
+            recorded_owner(lk).unwrap_or("<unknown-owner>"),
+            lk.agent.as_deref().unwrap_or("<unknown-repo>")
+        )
+    })
 }
 
 /// Persist the routing fields as soon as import claims a branch.
@@ -1250,10 +1294,31 @@ fn powershell_selection_arg(value: &str) -> String {
 /// written, that agent may already have been used by several commits, and erasing it makes the
 /// next commit ask for the name again.
 fn attach(store: &Store, found: &Found, existing: Option<Link>) -> crate::Result<Link> {
+    let _guard = link::lock(store, found.runtime, &found.session_id)?;
+    let path = link::link_path(store, found.runtime, &found.session_id);
+    let current = match std::fs::symlink_metadata(&path) {
+        Ok(_) => Some(link::read(&path).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot read the existing session link at {}",
+                path.display()
+            )
+        })?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    // Destination selection can wait on remote permissions. Its link snapshot cannot replace a
+    // claim, supersession marker or watermark another writer publishes while that request waits.
+    if current.as_ref().map(Link::to_json).transpose()?
+        != existing.as_ref().map(Link::to_json).transpose()?
+    {
+        anyhow::bail!(
+            "the session link changed during destination selection; inspect its current claim with `agit status`, then retry the import"
+        );
+    }
     let s = ui::theme::symbols();
-    let was_tracked = existing.is_some();
+    let was_tracked = current.is_some();
 
-    let mut lk = existing.unwrap_or_else(|| Link::new(found.runtime, &found.session_id, None));
+    let mut lk = current.unwrap_or_else(|| Link::new(found.runtime, &found.session_id, None));
     if lk.cwd.is_none() {
         lk.cwd = found.cwd.clone();
     }
@@ -1593,27 +1658,38 @@ mod tests {
         assert_eq!(saved.branch.as_deref(), Some("work"));
     }
 
-    /// A re-run onto the same `agent@branch` is idle; a different branch *or* a different
-    /// agent counts as moving the claim. An implementation that compared only the branch
-    /// would let `-n other-agent -b work` re-route the session without a question, and
-    /// one that flagged every re-run would make the documented "settle later with
-    /// `agit commit`" flow ask a question it cannot answer.
+    /// Only a complete matching identity can reuse its claim without confirmation.
     #[test]
-    fn a_claim_is_elsewhere_when_agent_or_branch_differs() {
+    fn a_claim_is_elsewhere_when_any_identity_component_differs() {
         let mut lk = Link::new("codex", "AB", Some(Path::new("/repo/one")));
-        assert_eq!(claimed_elsewhere(&lk, "photo", "work"), None);
+        assert_eq!(claimed_elsewhere(&lk, "alice", "photo", "work"), None);
         lk.branch = Some("work".into());
-        assert_eq!(claimed_elsewhere(&lk, "photo", "work"), None);
         assert_eq!(
-            claimed_elsewhere(&lk, "photo", "other").as_deref(),
-            Some("photo@work")
+            claimed_elsewhere(&lk, "alice", "photo", "work").as_deref(),
+            Some("<unknown-owner>/<unknown-repo>@work")
         );
         lk.agent = Some("photo".into());
-        assert_eq!(claimed_elsewhere(&lk, "photo", "work"), None);
         assert_eq!(
-            claimed_elsewhere(&lk, "notes", "work").as_deref(),
-            Some("photo@work")
+            claimed_elsewhere(&lk, "alice", "photo", "work").as_deref(),
+            Some("<unknown-owner>/photo@work")
         );
+        lk.owner = Some(String::new());
+        assert_eq!(
+            claimed_elsewhere(&lk, "alice", "photo", "work").as_deref(),
+            Some("<unknown-owner>/photo@work")
+        );
+        lk.owner = Some("alice".into());
+        assert_eq!(claimed_elsewhere(&lk, "alice", "photo", "work"), None);
+        for (owner, agent, branch) in [
+            ("bob", "photo", "work"),
+            ("alice", "notes", "work"),
+            ("alice", "photo", "other"),
+        ] {
+            assert_eq!(
+                claimed_elsewhere(&lk, owner, agent, branch).as_deref(),
+                Some("alice/photo@work")
+            );
+        }
     }
 
     #[test]
@@ -1622,6 +1698,7 @@ mod tests {
         let store = Store::at(dir.path().join("store"));
         let mut existing = Link::new("codex", "AB", Some(Path::new("/repo/one")));
         existing.naming_ignored = true;
+        link::write(&store, &existing).unwrap();
         let found = Found {
             runtime: "codex",
             session_id: "AB".into(),
@@ -1632,6 +1709,138 @@ mod tests {
 
         assert!(!attached.naming_ignored);
         assert!(!link::get(&store, "codex", "AB").unwrap().naming_ignored);
+    }
+
+    /// Destination selection must not rewind a claim or its settlement state after a delayed lookup.
+    #[test]
+    fn attach_preserves_a_link_changed_during_destination_selection() {
+        for previously_present in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::at(dir.path().join("store"));
+            let mut old = Link::new("codex", "AB", Some(Path::new("/repo/one")));
+            old.owner = Some("alice".into());
+            old.agent = Some("photo".into());
+            old.branch = Some("work".into());
+            let expected = previously_present.then(|| old.clone());
+            let mut current = old;
+            current.owner = Some("organization".into());
+            current.branch = Some("continued".into());
+            current.superseded_by = Some("replacement".into());
+            current.baseline_bytes = Some(17);
+            current.baseline_hash = Some("new-baseline".into());
+            let path = link::write(&store, &current).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let found = Found {
+                runtime: "codex",
+                session_id: "AB".into(),
+                cwd: Some("/repo/one".into()),
+            };
+            let error = attach(&store, &found, expected).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("changed during destination selection")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    /// Unreadable existing metadata is evidence to preserve, never a fresh adoption slot.
+    #[test]
+    fn attach_preserves_an_unreadable_existing_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path().join("store"));
+        let path = link::write(&store, &Link::new("codex", "AB", None)).unwrap();
+        std::fs::write(&path, "{incomplete").unwrap();
+        let found = Found {
+            runtime: "codex",
+            session_id: "AB".into(),
+            cwd: None,
+        };
+        assert!(attach(&store, &found, None).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{incomplete");
+    }
+
+    /// Placement cannot recreate a lost attachment or overwrite unreadable supersession evidence.
+    #[test]
+    fn branch_placement_preserves_a_missing_or_unreadable_attached_link() {
+        const CHILD: &str = "AGIT_TEST_PLACEMENT_FINAL_LINK_CHILD";
+        const COMPLETE: &str = "placement final-link controls completed";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "commands::import::tests::branch_placement_preserves_a_missing_or_unreadable_attached_link",
+                    "--nocapture",
+                ])
+                .env_clear();
+            for key in ["PATH", "SystemRoot", "TEMP", "TMP"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            let output = command
+                .env(CHILD, "1")
+                .env("HOME", isolated.path())
+                .env("USERPROFILE", isolated.path())
+                .env("AGIT_HOME", isolated.path().join("agit"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETE));
+            return;
+        }
+        for malformed in [false, true] {
+            let (directory, repo) = repo_with_a_foreign_session();
+            let store = Store::at(directory.path().join("store"));
+            let found = Found {
+                runtime: "codex",
+                session_id: "AB".into(),
+                cwd: None,
+            };
+            let mut lk = attach(&store, &found, None).unwrap();
+            let path = link::link_path(&store, found.runtime, &found.session_id);
+            let evidence = b"{\"superseded_by\":\"replacement\",";
+            if malformed {
+                std::fs::write(&path, evidence).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let before_refs = repo.git(&["show-ref"]).unwrap();
+            let before_checkout = repo.current_branch();
+            let repo_dir = repo.root().to_path_buf();
+            let result = birth_session_branch(
+                &mut lk,
+                &store,
+                "photo",
+                "alice",
+                "alice",
+                repo_dir.clone(),
+                repo,
+                "recovery".into(),
+                None,
+            );
+            assert!(matches!(result.unwrap(), Placed::Refused(ExitCode::Policy)));
+            if malformed {
+                assert_eq!(std::fs::read(&path).unwrap(), evidence);
+            } else {
+                assert!(!path.exists());
+            }
+            let repo = Repo::open(&repo_dir).unwrap();
+            assert_eq!(repo.git(&["show-ref"]).unwrap(), before_refs);
+            assert_eq!(repo.current_branch(), before_checkout);
+            assert_eq!(lk.owner, None);
+            assert_eq!(lk.agent, None);
+            assert_eq!(lk.branch, None);
+        }
+        println!("{COMPLETE}");
     }
 
     #[test]

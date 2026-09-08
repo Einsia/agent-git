@@ -302,7 +302,7 @@ fn run_inner(args: Args) -> CmdResult {
                     "this session has no claimed branch; provide -b <branch> explicitly"
                 )
             })?;
-            let namespace = link.owner.clone().ok_or_else(|| {
+            let namespace = link.owner.clone().filter(|owner| !owner.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!(
                     "this session has no recorded repository owner; re-adopt it explicitly with `agit import {} --into <owner>/<repo>@<branch>` before committing",
                     ui::session::shell_arg(&link.session_id)
@@ -316,6 +316,10 @@ fn run_inner(args: Args) -> CmdResult {
                 );
             }
             let slug = format!("{namespace}/{agent}");
+            // Hooks settle an existing claim without creating or rerouting branches.
+            if quiet {
+                return settle(&store, &repo_dir, &slug, &branch, link, &owner, opts);
+            }
             let mut link = link;
             let landing = match super::import::place_legacy_commit_branch(
                 &mut link, &store, &agent, &namespace, &owner, &repo_dir, branch,
@@ -1193,9 +1197,23 @@ fn settle(
     // so releasing it after the check leaves a window in which the old transcript can still land
     // on the old branch.
     let _link_guard = link::lock(store, &lk.source, &lk.session_id)?;
-    if let Some(current) = link::get(store, &lk.source, &lk.session_id) {
-        lk = current;
+    // Missing or unreadable metadata cannot prove that the resolved claim remains active.
+    let Some(current) = link::get(store, &lk.source, &lk.session_id) else {
+        if quiet {
+            return Ok(ExitCode::Ok);
+        }
+        ui::error(
+            "the attached session link is missing or unreadable; inspect its metadata before retrying settlement",
+        );
+        return Ok(ExitCode::Policy);
+    };
+    // A hook's selection cannot authorize a routing identity changed while it waits for locks.
+    if quiet
+        && (current.owner != lk.owner || current.agent != lk.agent || current.branch != lk.branch)
+    {
+        return Ok(ExitCode::Ok);
     }
+    lk = current;
     let (target_owner, target_agent) = slug.split_once('/').unwrap_or(("", slug));
     if !link::claims_branch(&lk, target_owner, target_agent, branch) {
         if quiet {
@@ -3526,6 +3544,122 @@ mod tests {
         );
     }
 
+    /// A resolved claim cannot advance history after its persisted metadata becomes unreadable.
+    #[test]
+    fn settlement_preserves_a_missing_or_unreadable_resolved_link() {
+        const CHILD: &str = "AGIT_TEST_SETTLEMENT_FINAL_LINK_CHILD";
+        const COMPLETE: &str = "settlement final-link controls completed";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "commands::commit::tests::settlement_preserves_a_missing_or_unreadable_resolved_link",
+                    "--nocapture",
+                ])
+                .env_clear();
+            for key in ["PATH", "SystemRoot", "TEMP", "TMP"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            let output = command
+                .env(CHILD, "1")
+                .env("HOME", isolated.path())
+                .env("USERPROFILE", isolated.path())
+                .env("AGIT_HOME", isolated.path().join("agit"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETE));
+            return;
+        }
+        for malformed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::at(root.path().join("store"));
+            let repo_dir = root.path().join("repo");
+            std::fs::create_dir(&repo_dir).unwrap();
+            run_code_git(&repo_dir, &["init", "-b", "work"]);
+            let carriers = [
+                (meta::LOG_FILE, b"retained LOG evidence\n".as_slice()),
+                (meta::VIEW_FILE, b"retained VIEW evidence\n".as_slice()),
+            ];
+            for (path, bytes) in carriers {
+                std::fs::write(repo_dir.join(path), bytes).unwrap();
+            }
+            run_code_git(&repo_dir, &["add", "."]);
+            run_code_git(
+                &repo_dir,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-m",
+                    "fixture: preserve settlement carriers",
+                ],
+            );
+            let before_refs = run_code_git(&repo_dir, &["show-ref"]);
+            let before_tree = run_code_git(&repo_dir, &["rev-parse", "HEAD^{tree}"]);
+            let mut claim = Link::new("fixture-runtime", "AB", Some(&repo_dir));
+            claim.owner = Some("alice".into());
+            claim.agent = Some("photo".into());
+            claim.branch = Some("work".into());
+            let path = link::write(&store, &claim).unwrap();
+            let evidence = b"{\"superseded_by\":\"replacement\",";
+            if malformed {
+                std::fs::write(&path, evidence).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            for quiet in [false, true] {
+                let mut options = opts();
+                options.quiet = quiet;
+                let outcome = settle(
+                    &store,
+                    &repo_dir,
+                    "alice/photo",
+                    "work",
+                    claim.clone(),
+                    "alice",
+                    options,
+                )
+                .unwrap();
+                assert_eq!(
+                    outcome,
+                    if quiet {
+                        ExitCode::Ok
+                    } else {
+                        ExitCode::Policy
+                    }
+                );
+                if malformed {
+                    assert_eq!(std::fs::read(&path).unwrap(), evidence);
+                } else {
+                    assert!(!path.exists());
+                }
+                assert_eq!(run_code_git(&repo_dir, &["show-ref"]), before_refs);
+                assert_eq!(
+                    run_code_git(&repo_dir, &["rev-parse", "HEAD^{tree}"]),
+                    before_tree
+                );
+                for (path, bytes) in carriers {
+                    assert_eq!(std::fs::read(repo_dir.join(path)).unwrap(), bytes);
+                }
+            }
+        }
+        println!("{COMPLETE}");
+    }
+
     /// A destination change waits until the claimed branch publishes its pending transcript.
     /// The lock probe makes an early guard release fail even if the import thread is delayed.
     #[test]
@@ -3602,6 +3736,7 @@ mod tests {
         .unwrap();
         let repo_dir = crate::infra::config::repo_dir("alice", "photo").unwrap();
         let mut lk = Link::new("claude-code", runtime_id, Some(&workspace));
+        link::write(&store, &lk).unwrap();
         let placed = super::super::import::place_legacy_commit_branch(
             &mut lk,
             &store,

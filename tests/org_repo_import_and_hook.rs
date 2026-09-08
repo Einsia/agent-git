@@ -1704,8 +1704,7 @@ fn a_rerouted_claim_invalidates_the_materialization_baseline() {
     );
 }
 
-/// A legacy link with no owner takes its namespace from the signed-in account: a cross-namespace
-/// reroute invalidates the baseline all the same.
+/// Explicit adoption can replace unknown ownership, but cannot carry an unverifiable baseline.
 #[test]
 fn a_legacy_link_without_owner_still_counts_as_a_reroute() {
     let lab = Lab::new();
@@ -1714,8 +1713,7 @@ fn a_legacy_link_without_owner_still_counts_as_a_reroute() {
     let transcript = fs::read(lab.transcript(SID)).unwrap();
     let dir = lab.agit_home.join("store").join("claude-code");
     fs::create_dir_all(&dir).unwrap();
-    // Same agent name, same branch name, no owner — the legacy form means "me/qa@work" and the
-    // target is einsia/qa@work, so this is a reroute, not the same destination.
+    // Matching repo and branch names do not prove the namespace that owns the baseline.
     fs::write(
         dir.join(format!("{SID}.json")),
         serde_json::json!({
@@ -1742,6 +1740,572 @@ fn a_legacy_link_without_owner_still_counts_as_a_reroute() {
         commits_on(&lab.repo("einsia", "qa"), "work") >= 3,
         "a cross-namespace reroute must invalidate the baseline and settle turn by turn"
     );
+}
+
+/// An incomplete destination cannot prove that a materialized prefix belongs to the selected line.
+#[test]
+fn import_discards_the_baseline_when_the_recorded_repo_or_branch_is_missing() {
+    use sha2::{Digest as _, Sha256};
+
+    for missing_repo in [true, false] {
+        let lab = Lab::new();
+        lab.append_turn(
+            SID,
+            1,
+            "retain the unproven prefix",
+            "record the opening answer",
+        );
+        lab.append_turn(
+            SID,
+            2,
+            "retain the following turn",
+            "record the closing answer",
+        );
+        let transcript = fs::read(lab.transcript(SID)).unwrap();
+        let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+        let mut claim = agit::domain::link::Link::new("claude-code", SID, Some(&lab.work));
+        claim.owner = Some("me".into());
+        claim.agent = (!missing_repo).then(|| "recovery".into());
+        claim.branch = missing_repo.then(|| "work".into());
+        claim.baseline_bytes = Some(transcript.len() as u64);
+        claim.baseline_hash = Some(hex::encode(Sha256::digest(&transcript)));
+        agit::domain::link::write(&store, &claim).unwrap();
+
+        let output = lab
+            .agit(&["import", SID, "--into", "me/recovery@work", "-y"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let repo = Repo::open(lab.repo("me", "recovery")).unwrap();
+        let snapshot = agit::domain::meta::read_at_ref(&repo, "refs/heads/work").unwrap();
+        assert_eq!(snapshot.turn, Some(2));
+        let log =
+            agit::domain::storage::materialize_at(repo.root(), "refs/heads/work", "LOG").unwrap();
+        assert!(log.contains("retain the unproven prefix"));
+        assert!(log.contains("record the closing answer"));
+        let saved = agit::domain::link::get(&store, "claude-code", SID).unwrap();
+        assert_eq!(saved.owner.as_deref(), Some("me"));
+        assert_eq!(saved.agent.as_deref(), Some("recovery"));
+        assert_eq!(saved.branch.as_deref(), Some("work"));
+        assert_eq!(saved.baseline_bytes, None);
+        assert_eq!(saved.baseline_hash, None);
+        assert_eq!(saved.materialized_from, None);
+    }
+}
+
+/// Reusing a repository and branch name cannot hide a change in namespace ownership.
+#[test]
+fn import_requires_confirmation_when_only_the_claim_owner_changes() {
+    check_import_owner_confirmation(Some("me"), "einsia/qa@work");
+}
+
+/// An incomplete identity is not the signed-in account, even when every name matches.
+#[test]
+fn import_requires_confirmation_for_a_claim_without_an_owner() {
+    for owner in [None, Some("")] {
+        for target in ["me/qa@work", "einsia/qa@work"] {
+            check_import_owner_confirmation(owner, target);
+        }
+    }
+}
+
+fn check_import_owner_confirmation(previous_owner: Option<&str>, target: &str) {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "retain the explicit claim", "recorded");
+    assert!(
+        lab.agit(&["import", SID, "--into", "me/qa@work"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let link_path = agit::domain::link::link_path(&store, "claude-code", SID);
+    if previous_owner != Some("me") {
+        let mut claim = agit::domain::link::get(&store, "claude-code", SID).unwrap();
+        claim.owner = previous_owner.map(String::from);
+        claim.baseline_bytes = Some(fs::metadata(lab.transcript(SID)).unwrap().len());
+        claim.baseline_hash = Some("untrusted-baseline".into());
+        agit::domain::link::write(&store, &claim).unwrap();
+    }
+    let before_link = fs::read(&link_path).unwrap();
+    let original = Repo::open(lab.repo("me", "qa")).unwrap();
+    let before_head = original.git(&["rev-parse", "refs/heads/work"]).unwrap();
+    let refused = lab
+        .agit(&["import", SID, "--into", target])
+        .env_remove("AGIT_YES")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(8),
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(fs::read(&link_path).unwrap(), before_link);
+    assert_eq!(
+        original.git(&["rev-parse", "refs/heads/work"]).unwrap(),
+        before_head
+    );
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let previous = if previous_owner != Some("me") {
+        "<unknown-owner>/qa@work"
+    } else {
+        "me/qa@work"
+    };
+    assert!(diagnostic.contains(previous), "{diagnostic}");
+    assert!(diagnostic.contains(target), "{diagnostic}");
+    let accepted = lab
+        .agit(&["import", SID, "--into", target, "-y"])
+        .env_remove("AGIT_YES")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let claim = agit::domain::link::get(&store, "claude-code", SID).unwrap();
+    let (owner, _) = target.split_once('/').unwrap();
+    assert_eq!(claim.owner.as_deref(), Some(owner));
+    assert_eq!(claim.agent.as_deref(), Some("qa"));
+    assert_eq!(claim.branch.as_deref(), Some("work"));
+    assert_eq!(claim.baseline_bytes, None);
+    assert_eq!(claim.baseline_hash, None);
+    assert!(commits_on(&lab.repo(owner, "qa"), "work") >= 2);
+    let same = lab
+        .agit(&["import", SID, "--into", target])
+        .env_remove("AGIT_YES")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        same.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&same.stdout),
+        String::from_utf8_lossy(&same.stderr)
+    );
+}
+
+/// A native-id hook must settle an intact claim even when stdin has no hook payload.
+#[test]
+fn quiet_legacy_hook_settles_a_complete_existing_claim() {
+    check_quiet_legacy_hook_claim("healthy");
+}
+
+/// Losing the resolved claim before its locked read cannot recreate it or advance history.
+#[test]
+fn quiet_legacy_hook_preserves_a_claim_missing_at_the_final_read() {
+    check_quiet_legacy_hook_claim("missing");
+}
+
+/// Unreadable claim evidence must survive a quiet hook without lending its cached authority.
+#[test]
+fn quiet_legacy_hook_preserves_a_claim_malformed_at_the_final_read() {
+    check_quiet_legacy_hook_claim("malformed");
+}
+
+/// Losing the recorded owner cannot let a cached namespace authorize a quiet settlement.
+#[test]
+fn quiet_legacy_hook_preserves_a_claim_ownerless_at_the_final_read() {
+    check_quiet_legacy_hook_claim("ownerless");
+}
+
+struct QuietHookChild(std::process::Child);
+
+impl QuietHookChild {
+    fn wait_for(&mut self, label: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready() {
+            assert!(
+                self.0.try_wait().unwrap().is_none(),
+                "hook exited before {label}"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hook timed out before {label}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn wait(&mut self) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "quiet hook timed out after releasing its branch lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for QuietHookChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn quiet_hook_files(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn collect(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_name() == ".locks"
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+            {
+                continue;
+            }
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                collect(root, &path, files);
+            } else {
+                assert!(
+                    kind.is_file(),
+                    "fixture state must be a regular file: {path:?}"
+                );
+                files.insert(
+                    path.strip_prefix(root).unwrap().into(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+
+    let mut files = std::collections::BTreeMap::new();
+    collect(root, root, &mut files);
+    files
+}
+
+fn check_quiet_legacy_hook_claim(state: &str) {
+    use fs2::FileExt as _;
+    use sha2::{Digest as _, Sha256};
+
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "retain the claimed opening turn", "recorded");
+    let imported = lab
+        .agit(&["import", SID, "--into", "me/qa@work"])
+        .output()
+        .unwrap();
+    assert!(imported.status.success(), "{imported:?}");
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let link_path = agit::domain::link::link_path(&store, "claude-code", SID);
+    let claim = agit::domain::link::get(&store, "claude-code", SID).unwrap();
+    assert_eq!(claim.owner.as_deref(), Some("me"));
+    assert_eq!(claim.agent.as_deref(), Some("qa"));
+    assert_eq!(claim.branch.as_deref(), Some("work"));
+    let repo_dir = lab.repo("me", "qa").canonicalize().unwrap();
+    assert!(repo_dir.starts_with(lab._tmp.path().canonicalize().unwrap()));
+    assert!(repo_dir.join(".git").is_dir());
+    let git = |args: &[&str]| {
+        let mut command = Command::new("git");
+        command
+            .args(["--no-pager", "--no-replace-objects"])
+            .args(args)
+            .current_dir(&repo_dir)
+            .env_clear();
+        for key in ["PATH", "SystemRoot", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let output = command
+            .env("HOME", &lab.home)
+            .env("USERPROFILE", &lab.home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", null)
+            .env("GIT_CONFIG_GLOBAL", null)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let read_meta = || {
+        serde_json::from_str::<agit::domain::meta::Meta>(&git(&[
+            "show",
+            "refs/heads/work:session/meta.json",
+        ]))
+        .unwrap()
+    };
+    let materialize = |path: &str| {
+        let tip = git(&["rev-parse", "refs/heads/work"]);
+        let sequence = git(&["show", &format!("{}:{path}", tip.trim())]);
+        let ids = agit::domain::storage::parse_sequence(&sequence).unwrap();
+        let mut content = String::new();
+        for id in ids {
+            let path = agit::domain::meta::event_path(&id).unwrap();
+            let envelope = git(&["show", &format!("{}:{path}", tip.trim())]);
+            let parsed = agit::domain::storage::parse_envelopes(&envelope).unwrap();
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(agit::domain::storage::event_id(&envelope).unwrap(), id);
+            content.push_str(&envelope);
+        }
+        content
+    };
+    let before_refs = git(&["show-ref"]);
+    assert!(
+        !before_refs
+            .lines()
+            .any(|line| line.ends_with(&format!(" refs/heads/{SID}")))
+    );
+    let before_meta = read_meta();
+    assert_eq!(before_meta.layout, agit::domain::meta::LayoutVersion::V1);
+    let before_turn = before_meta.turn.unwrap();
+    let carriers = ["LOG", "VIEW"].map(|path| (path, materialize(path)));
+    lab.append_turn(
+        SID,
+        2,
+        "append the quiet hook turn",
+        "record the appended answer",
+    );
+    let before_transcript = fs::read(lab.transcript(SID)).unwrap();
+
+    let open_lock = |path: std::path::PathBuf| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    };
+    // Holding only the branch lock lets the child's repository guard prove resolution finished.
+    let branch_lock = open_lock(store.root().join(".locks/branches").join(format!(
+        "{}.lock",
+        hex::encode(Sha256::digest(b"me/qa\0work"))
+    )));
+    branch_lock.try_lock_exclusive().unwrap();
+    let repository_probe = open_lock(
+        store
+            .root()
+            .join(".locks/repositories")
+            .join(format!("{}.lock", hex::encode(Sha256::digest(b"me/qa")))),
+    );
+    repository_probe.try_lock_exclusive().unwrap();
+    fs2::FileExt::unlock(&repository_probe).unwrap();
+    let stdout_path = lab._tmp.path().join("quiet-hook.stdout");
+    let stderr_path = lab._tmp.path().join("quiet-hook.stderr");
+    let mut child = QuietHookChild(
+        lab.agit(&["commit", "--from-hook", SID])
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&stdout_path).unwrap())
+            .stderr(fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    child.wait_for("the repository read guard", || {
+        match repository_probe.try_lock_exclusive() {
+            Ok(()) => {
+                fs2::FileExt::unlock(&repository_probe).unwrap();
+                false
+            }
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                true
+            }
+            Err(error) => panic!("cannot probe the hook's repository guard: {error}"),
+        }
+    });
+    let link_lock = open_lock(link_path.with_extension("json.lock"));
+    child.wait_for("the session claim lock", || {
+        match link_lock.try_lock_exclusive() {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                false
+            }
+            Err(error) => panic!("cannot lock the fixture claim: {error}"),
+        }
+    });
+    match state {
+        "healthy" => {}
+        "missing" => fs::remove_file(&link_path).unwrap(),
+        "malformed" => fs::write(&link_path, b"{\"superseded_by\":\"replacement\",").unwrap(),
+        "ownerless" => {
+            let mut ownerless = claim.clone();
+            ownerless.owner = None;
+            agit::domain::link::write(&store, &ownerless).unwrap();
+        }
+        _ => unreachable!("unknown claim fixture"),
+    }
+    let before_files = quiet_hook_files(&lab.agit_home);
+    drop(link_lock);
+    drop(branch_lock);
+    let status = child.wait();
+    let stdout = fs::read(stdout_path).unwrap();
+    let stderr = fs::read(stderr_path).unwrap();
+    assert_eq!(status.code(), Some(0), "{state}: {stdout:?} {stderr:?}");
+    assert!(stdout.is_empty(), "{state}: {stdout:?}");
+    assert!(stderr.is_empty(), "{state}: {stderr:?}");
+    assert_eq!(fs::read(lab.transcript(SID)).unwrap(), before_transcript);
+
+    if state == "healthy" {
+        let settled_claim = agit::domain::link::get(&store, "claude-code", SID).unwrap();
+        assert_eq!(settled_claim.owner, claim.owner);
+        assert_eq!(settled_claim.agent, claim.agent);
+        assert_eq!(settled_claim.branch, claim.branch);
+        let after_refs = git(&["show-ref"]);
+        assert_ne!(after_refs, before_refs);
+        let other_refs = |refs: &str| {
+            refs.lines()
+                .filter(|line| !line.ends_with(" refs/heads/work"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(other_refs(&after_refs), other_refs(&before_refs));
+        assert_eq!(read_meta().turn, Some(before_turn + 1));
+        for (path, _) in carriers {
+            let content = materialize(path);
+            assert!(content.contains("retain the claimed opening turn"));
+            assert!(content.contains("append the quiet hook turn"));
+            assert!(content.contains("record the appended answer"));
+        }
+    } else {
+        assert_eq!(git(&["show-ref"]), before_refs);
+        for (path, content) in carriers {
+            assert_eq!(materialize(path), content);
+        }
+        assert_eq!(quiet_hook_files(&lab.agit_home), before_files);
+    }
+}
+
+/// Confirming unknown ownership cannot reactivate a superseded writer on an existing line.
+#[test]
+fn import_preserves_supersession_until_recovery_creates_a_new_branch() {
+    const REPLACEMENT: &str = "dddddddd-0000-4000-8000-000000000108";
+    for missing_owner in [false, true] {
+        let lab = Lab::new();
+        lab.append_turn(SID, 1, "the shared prefix", "recorded");
+        let imported = lab
+            .agit(&["import", SID, "--into", "me/qa@work"])
+            .output()
+            .unwrap();
+        assert!(imported.status.success());
+        let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+        let mut old = agit::domain::link::get(&store, "claude-code", SID).unwrap();
+        let mut replacement = old.clone();
+        replacement.session_id = REPLACEMENT.into();
+        agit::domain::link::write(&store, &replacement).unwrap();
+        old.superseded_by = Some(REPLACEMENT.into());
+        if missing_owner {
+            old.owner = None;
+        }
+        agit::domain::link::write(&store, &old).unwrap();
+        let path = agit::domain::link::link_path(&store, "claude-code", SID);
+        let before = fs::read(&path).unwrap();
+        let repo = Repo::open(lab.repo("me", "qa")).unwrap();
+        let tip = repo.git(&["rev-parse", "refs/heads/work"]).unwrap();
+        lab.append_turn(SID, 2, "work after supersession", "preserved separately");
+        let refused = lab
+            .agit(&["import", SID, "--into", "me/qa@work", "-y"])
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(7));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), tip);
+        let recovered = lab
+            .agit(&["import", SID, "--into", "me/qa@recovered", "-y"])
+            .output()
+            .unwrap();
+        assert!(
+            recovered.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&recovered.stdout),
+            String::from_utf8_lossy(&recovered.stderr)
+        );
+        let saved = agit::domain::link::get(&store, "claude-code", SID).unwrap();
+        assert!(saved.is_active());
+        assert_eq!(saved.branch.as_deref(), Some("recovered"));
+        assert_eq!(saved.owner.as_deref(), Some("me"));
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), tip);
+        assert_eq!(
+            agit::domain::meta::read_at_ref(&repo, "refs/heads/recovered")
+                .unwrap()
+                .turn,
+            Some(2)
+        );
+        assert_eq!(
+            agit::domain::link::get(&store, "claude-code", REPLACEMENT)
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("work")
+        );
+    }
+}
+
+/// Confirmation authorizes the supplied destination, never an owner inferred from credentials.
+#[test]
+fn import_requires_an_explicit_namespace_for_an_ownerless_claim() {
+    for owner in [None, Some("")] {
+        check_import_requires_explicit_namespace(owner);
+    }
+}
+
+fn check_import_requires_explicit_namespace(owner: Option<&str>) {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "retain the unknown namespace", "recorded");
+    assert!(
+        lab.agit(&["import", SID, "--into", "me/qa@work"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let mut claim = agit::domain::link::get(&store, "claude-code", SID).unwrap();
+    claim.owner = owner.map(String::from);
+    agit::domain::link::write(&store, &claim).unwrap();
+    let path = agit::domain::link::link_path(&store, "claude-code", SID);
+    let before = fs::read(&path).unwrap();
+    for args in [
+        vec!["import", SID, "-n", "qa", "-b", "work", "-y"],
+        vec!["commit", SID, "-n", "qa", "-b", "work", "-y"],
+    ] {
+        let output = lab.agit(&args).stdin(Stdio::null()).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "the unknown owner must not be filled from the current account"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            diagnostic.contains("owner") && diagnostic.contains("--into"),
+            "{diagnostic}"
+        );
+    }
 }
 
 /// A reroute onto a branch **someone else has claimed and that is not empty**: once the baseline
