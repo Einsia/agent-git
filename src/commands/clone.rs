@@ -96,6 +96,7 @@ use crate::infra::{config, credentials};
 use crate::{ExitCode, ui};
 use anyhow::Context;
 use clap::Args as ClapArgs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
@@ -243,8 +244,8 @@ pub fn run(args: Args) -> CmdResult {
             (o, n, r)
         }
         None => match resolve_from_repo(&client)? {
-            Some((o, n)) => (o, n, None),
-            None => return Ok(ExitCode::Usage),
+            Selection::Chosen(o, n) => (o, n, None),
+            Selection::Refused(code) => return Ok(code),
         },
     };
 
@@ -1012,12 +1013,17 @@ fn rename_links(from_owner: &str, from: &str, to_owner: &str, to: &str) -> crate
     Ok(())
 }
 
+enum Selection {
+    Chosen(String, String),
+    Refused(ExitCode),
+}
+
 /// With no argument: have the hub reverse-look-up which agents this repo has.
-fn resolve_from_repo(client: &crate::hub::Client) -> crate::Result<Option<(String, String)>> {
+fn resolve_from_repo(client: &crate::hub::Client) -> crate::Result<Selection> {
     let Some(origin) = config::repo_origin() else {
         ui::error("not inside a code repository, or this repo has no origin.");
         ui::hint("name what to copy: agit clone <owner>/<agent>");
-        return Ok(None);
+        return Ok(Selection::Refused(ExitCode::Usage));
     };
 
     let sp = ui::spinner("asking the hub which agents worked here…");
@@ -1030,7 +1036,7 @@ fn resolve_from_repo(client: &crate::hub::Client) -> crate::Result<Option<(Strin
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("reverse lookup failed: {e:#}"));
             ui::hint("name it: agit clone <owner>/<agent>");
-            return Ok(None);
+            return Ok(Selection::Refused(ExitCode::Usage));
         }
     };
 
@@ -1038,7 +1044,7 @@ fn resolve_from_repo(client: &crate::hub::Client) -> crate::Result<Option<(Strin
         0 => {
             println!("no agent has worked on this repo (or none are visible to you).");
             ui::hint("list what you can see: agit clone <owner>/<agent>");
-            Ok(None)
+            Ok(Selection::Refused(ExitCode::Usage))
         }
         1 => {
             let a = &candidates[0];
@@ -1047,14 +1053,23 @@ fn resolve_from_repo(client: &crate::hub::Client) -> crate::Result<Option<(Strin
                 ui::dim("agents on this repo:"),
                 ui::bold(&a.slug())
             );
-            Ok(Some((a.owner.clone(), a.name.clone())))
+            Ok(Selection::Chosen(a.owner.clone(), a.name.clone()))
         }
         _ => pick(&candidates),
     }
 }
 
 /// Let the user pick when there are several candidates.
-fn pick(candidates: &[RemoteAgent]) -> crate::Result<Option<(String, String)>> {
+fn pick(candidates: &[RemoteAgent]) -> crate::Result<Selection> {
+    if !std::io::stdin().is_terminal() || !ui::is_tty() {
+        ui::error("multiple candidates and nothing interactive to ask with.");
+        for a in candidates {
+            eprintln!("  {}", a.slug());
+        }
+        ui::hint("be explicit: agit clone <owner>/<agent>");
+        return Ok(Selection::Refused(ExitCode::Interactive));
+    }
+
     let labels: Vec<String> = candidates
         .iter()
         .map(|a| {
@@ -1069,19 +1084,13 @@ fn pick(candidates: &[RemoteAgent]) -> crate::Result<Option<(String, String)>> {
     let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
 
     match ui::prompt::select("several agents worked here — copy which?", &refs)? {
-        Some(i) => Ok(Some((
+        Some(i) => Ok(Selection::Chosen(
             candidates[i].owner.clone(),
             candidates[i].name.clone(),
-        ))),
+        )),
         None => {
-            // A non-interactive environment cannot be asked — list the candidates and make the
-            // user name one; never guess.
-            ui::error("multiple candidates and nothing interactive to ask with.");
-            for a in candidates {
-                println!("  {}", a.slug());
-            }
-            ui::hint("be explicit: agit clone <owner>/<agent>");
-            Ok(None)
+            ui::error("selection cancelled; no agent was selected.");
+            Ok(Selection::Refused(ExitCode::Usage))
         }
     }
 }
