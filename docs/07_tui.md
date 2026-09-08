@@ -214,13 +214,13 @@ press q at an empty list wastes an interaction.
 ### 3.3 `agit log` — the timeline
 
 ```text
-┌ agit log ── nana/payments @ refund-fix ───────────────────────────────┐
-│ ▸ # 14 3f2a1bc turn   fix refund retry idempotency   6m ago   ⌂ v0.3  │
-│   # 13 9c8e442 turn   add a regression test         18m ago           │
-│   # 11 77dd310 merge  merge spike-idx                1h ago           │
-│ ───────────────────────────────────────────────────────────────────── │
-│  code git@…:nana/payments.git@1839e61                                 │
-└───────────────────────────────────────────────────────────────────────┘
+┌ agit log ── nana/payments @ refund-fix ───────────────────────────────────────────┐
+│ ▸ # 14 3f2a1bc12 turn   18 events 4 ToolUse fix refund retry   6m ago   ⌂ v0.3    │
+│   # 13 9c8e442ab turn    8 events 2 ToolUse add a regression test   18m ago       │
+│        77dd310ab merge  merge spike-idx   1h ago                                  │
+│ ──────────────────────────────────────────────────────────────────────────────    │
+│  code git@…:nana/payments.git@1839e61                                             │
+└───────────────────────────────────────────────────────────────────────────────────┘
  ↑↓ move  enter read  tab branches  / filter  q quit
 ```
 
@@ -228,14 +228,22 @@ press q at an empty list wastes an interaction.
 the name, turn count, opening prompt, last activity and ahead/behind; enter
 there opens that branch's turn-by-turn history.
 
+Turn activity counts the frozen LOG addition: `events` are stored envelope records
+addressable by `#n.k`. The `ToolUse` column counts only IR `EventKind::ToolUse`;
+`ToolResult` and `FileEdit` are excluded, including native file calls classified as
+`FileEdit`. Each envelope supplies its source runtime. VIEW edits do not change
+historical counts, and non-turn rows carry no activity counts.
+
 Row width is budgeted in **columns**, not characters — a row of Chinese has half
 as many characters as it has columns. When width runs short the yield order is
 explicit: a turn row drops the message first, then the tag, and the time last; a
 branch row drops the opening prompt first, then the time, then the line-form
-marker, and only then narrows the name field. `#n`, the short sha, kind, turn
-count and `↑↓` **never yield** — the first of those are what you locate by (they
+marker, and only then narrows the name field. `#n`, the short sha, kind, activity,
+branch turn count and `↑↓` **never yield** — the first of those are what you locate by (they
 are what lets `agit show` reach that turn), and `↑↓` is the divergence warning,
 which the user will not act on without seeing it.
+If the terminal cannot fit those fields, the screen reports the required width;
+large counts increase that requirement instead of being clipped.
 
 ### 3.4 The transcript — reading that conversation
 

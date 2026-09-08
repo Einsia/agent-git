@@ -52,6 +52,9 @@ use std::path::{Path, PathBuf};
 
 pub struct OpenCode;
 
+mod compaction_state;
+pub(crate) use compaction_state::CompactionState;
+
 // ── Paths ────────────────────────────────────────────────────────────────────
 
 /// Where the session database lives. OpenCode follows XDG: `$XDG_DATA_HOME/opencode/`,
@@ -398,11 +401,47 @@ pub struct CompactionEvidence {
 /// Parse with the exact source coordinates used by the native compaction mapping.
 ///
 /// The session is identical to [`OpenCode::parse`]. Evidence describes that mapping's selected
-/// parts; it does not infer missing relationships or distinguish reused native identities.
-/// A caller combining independent native occurrences must isolate their identities before
-/// parsing and retain a coordinate mapping to its original records.
+/// parts, bound to message occurrences in source order. A caller combining independent native
+/// sessions must isolate their identities before parsing and retain a coordinate mapping to its
+/// original records.
 pub fn parse_with_compaction_evidence(text: &str) -> Result<ParsedSession> {
     parse_native(text, true)
+}
+
+/// Resolve within the ordered definitions of the same native identity and source session.
+/// A forward reference cannot choose between repeated definitions without inventing provenance.
+pub(crate) fn occurrence_at<T>(
+    definitions: &[T],
+    at: usize,
+    position: impl Fn(&T) -> usize,
+) -> Option<&T> {
+    let before = definitions.partition_point(|definition| position(definition) <= at);
+    before
+        .checked_sub(1)
+        .map(|index| &definitions[index])
+        .or_else(|| (definitions.len() == 1).then(|| &definitions[0]))
+}
+
+/// Retain the structural input needed to classify later parts through the native parser.
+/// Prior text and tool payloads cannot affect whether a selected part is a tool call.
+pub(crate) fn activity_context_record(value: &serde_json::Value) -> Option<String> {
+    let data = &value["data"];
+    let record = match value["kind"].as_str()? {
+        "message" => serde_json::json!({
+            "kind":"message",
+            "id":value["id"].as_str().unwrap_or_default(),
+            "time_created":value["time_created"].as_i64().unwrap_or_default(),
+            "data":{"role":data["role"].as_str(), "mode":data["mode"].as_str()},
+        }),
+        "part" if data["type"] == "compaction" => serde_json::json!({
+            "kind":"part",
+            "message_id":value["message_id"].as_str().unwrap_or_default(),
+            "time_created":value["time_created"].as_i64().unwrap_or_default(),
+            "data":{"type":"compaction"},
+        }),
+        _ => return None,
+    };
+    Some(format!("{record}\n"))
 }
 
 fn parse_native(text: &str, include_evidence: bool) -> Result<ParsedSession> {
@@ -416,6 +455,7 @@ fn parse_native(text: &str, include_evidence: bool) -> Result<ParsedSession> {
     // Line numbers are recorded on every raw line, blank and corrupt lines included —
     // `Event::line` has to locate that exact line in the cache file.
     let mut msgs: Vec<RawMsg> = vec![];
+    let mut consumption = CompactionState::default();
     let mut parts: Vec<RawPart> = vec![];
     for (lineno, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -450,7 +490,7 @@ fn parse_native(text: &str, include_evidence: bool) -> Result<ParsedSession> {
                 {
                     id = s.to_string();
                 }
-                msgs.push(RawMsg {
+                let message = RawMsg {
                     id: v
                         .get("id")
                         .and_then(|x| x.as_str())
@@ -464,9 +504,14 @@ fn parse_native(text: &str, include_evidence: bool) -> Result<ParsedSession> {
                         .unwrap_or_default()
                         .to_string(),
                     mode: data.get("mode").and_then(|x| x.as_str()).map(String::from),
-                });
+                };
+                consumption.message(&message.id, message.mode.as_deref() == Some("compaction"));
+                msgs.push(message);
             }
             "part" => {
+                if v["data"]["type"] == "compaction" {
+                    consumption.marker(v["message_id"].as_str().unwrap_or_default());
+                }
                 parts.push(RawPart {
                     message_id: v
                         .get("message_id")
@@ -484,24 +529,29 @@ fn parse_native(text: &str, include_evidence: bool) -> Result<ParsedSession> {
         }
     }
 
-    // Message-level mapping. Parts are grouped by host, keeping the canonical stream order.
-    let mut by_msg: HashMap<&str, Vec<&RawPart>> = HashMap::new();
-    for p in &parts {
-        by_msg.entry(p.message_id.as_str()).or_default().push(p);
+    // A repeated message identity defines another occurrence. Parts bind to the nearest
+    // preceding definition; a forward reference is usable only when its definition is unique.
+    // Keeping source coordinates on parts prevents a later header from moving earlier calls.
+    let mut msg_index: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, message) in msgs.iter().enumerate() {
+        msg_index.entry(&message.id).or_default().push(i);
     }
-    let msg_index: HashMap<&str, usize> = msgs
-        .iter()
-        .enumerate()
-        .map(|(i, m)| (m.id.as_str(), i))
-        .collect();
-    let mut consumed: HashSet<usize> = HashSet::new();
+    let mut by_msg: HashMap<usize, Vec<&RawPart>> = HashMap::new();
+    for part in &parts {
+        let Some(definitions) = msg_index.get(part.message_id.as_str()) else {
+            continue;
+        };
+        if let Some(&host) = occurrence_at(definitions, part.lineno, |&i| msgs[i].lineno) {
+            by_msg.entry(host).or_default().push(part);
+        }
+    }
     let mut claimed: HashSet<usize> = HashSet::new();
 
     for (i, m) in msgs.iter().enumerate() {
-        if consumed.contains(&i) {
+        if consumption.consumed(i) {
             continue;
         }
-        let mps = by_msg.get(m.id.as_str()).cloned().unwrap_or_default();
+        let mps = by_msg.get(&i).cloned().unwrap_or_default();
         for p in &mps {
             claimed.insert(p.lineno);
         }
@@ -528,12 +578,11 @@ fn parse_native(text: &str, include_evidence: bool) -> Result<ParsedSession> {
                 if n.mode.as_deref() != Some("compaction") {
                     return None;
                 }
-                consumed.insert(i + 1);
-                for p in by_msg.get(n.id.as_str()).cloned().unwrap_or_default() {
+                for p in by_msg.get(&(i + 1)).cloned().unwrap_or_default() {
                     claimed.insert(p.lineno);
                 }
                 let texts: Vec<&str> = by_msg
-                    .get(n.id.as_str())?
+                    .get(&(i + 1))?
                     .iter()
                     .filter(|p| p.data.get("type").and_then(|x| x.as_str()) == Some("text"))
                     .filter_map(|p| {
@@ -634,9 +683,6 @@ fn parse_native(text: &str, include_evidence: bool) -> Result<ParsedSession> {
     for p in &parts {
         if claimed.contains(&p.lineno) {
             continue;
-        }
-        if msg_index.contains_key(p.message_id.as_str()) {
-            continue; // Swallowed by a consumed compaction summary message; normal.
         }
         events.push(other_event(part_ts(p)).at_line(p.lineno));
     }
@@ -1949,7 +1995,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_evidence_describes_reused_identity_mapping_without_guessing_occurrences() {
+    fn compaction_evidence_keeps_reused_identities_on_their_source_occurrences() {
         let mut lines = compaction_block("boundary", "summary");
         lines.extend(lines.clone());
         let parsed = assert_evidence_matches_text(&lines.join("\n"));
@@ -1958,11 +2004,67 @@ mod tests {
             assert_eq!(
                 parsed.compactions[&index],
                 CompactionEvidence {
-                    boundary_lines: vec![1, 5],
-                    summary_lines: vec![3, 7],
+                    boundary_lines: vec![index * 4 + 1],
+                    summary_lines: vec![index * 4 + 3],
                 }
             );
         }
+    }
+
+    #[test]
+    fn repeated_message_definitions_do_not_duplicate_or_move_tool_parts() {
+        let tool = |id, host| {
+            part(
+                id,
+                host,
+                1100,
+                r#"{"type":"tool","tool":"bash","state":{"status":"completed"}}"#,
+            )
+        };
+        let mut lines = vec![
+            msg("host", 1000, r#"{"role":"assistant"}"#),
+            tool("call", "host"),
+        ];
+        let coordinates = |lines: &[String]| {
+            OpenCode
+                .parse(&lines.join("\n"))
+                .unwrap()
+                .events
+                .into_iter()
+                .filter(|event| event.kind == EventKind::ToolUse)
+                .map(|event| event.line.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(coordinates(&lines), [1]);
+        lines.extend([
+            msg("other", 2000, r#"{"role":"assistant"}"#),
+            tool("late", "host"),
+            msg("host", 3000, r#"{"role":"assistant","finish":"stop"}"#),
+            tool("call", "host"),
+        ]);
+        assert_eq!(coordinates(&lines), [1, 3, 5]);
+        assert_eq!(coordinates(&lines[..2]), [1]);
+    }
+
+    #[test]
+    fn forward_parts_require_a_unique_host_definition() {
+        let mut lines = vec![
+            part(
+                "call",
+                "host",
+                1000,
+                r#"{"type":"tool","tool":"bash","state":{"status":"completed"}}"#,
+            ),
+            msg("host", 2000, r#"{"role":"assistant"}"#),
+        ];
+        let parsed = OpenCode.parse(&lines.join("\n")).unwrap();
+        assert_eq!(parsed.events[0].kind, EventKind::ToolUse);
+        assert_eq!(parsed.events[0].line, Some(0));
+        lines.push(msg("host", 3000, r#"{"role":"assistant"}"#));
+        let parsed = OpenCode.parse(&lines.join("\n")).unwrap();
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].kind, EventKind::Other);
+        assert_eq!(parsed.events[0].line, Some(0));
     }
 
     #[test]

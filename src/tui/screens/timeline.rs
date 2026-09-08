@@ -10,8 +10,8 @@
 //!
 //! # Performance (`docs/07_tui.md` §3.3 / §4.1)
 //!
-//! The turn-by-turn view spends three git processes on the whole history (one `log`, one meta
-//! batch, one tag table). The branch-level view costs several more git calls per branch, so it
+//! The turn-by-turn view batches metadata, tags and frozen turn activity. The branch-level view
+//! costs more git calls per branch, so it
 //! fetches **on demand**: press no `Tab` and it costs nothing. `/` filtering acts only on rows
 //! **already fetched** — a filter that triggers a full recompute is the easiest trap on this
 //! screen.
@@ -68,7 +68,7 @@ pub enum Step {
 /// Below this width the list is not drawn; one sentence takes its place.
 ///
 /// The yield order guarantees "the message, the tags and the time may yield; `#n` / sha / kind /
-/// the turn count / `↑↓` may not"; [`widgets::clamp_line`] guarantees "a row never crosses the
+/// the activity counts / `↑↓` may not"; [`widgets::clamp_line`] guarantees "a row never crosses the
 /// frame". At a width too small even for the fields that never yield, the two **cannot both
 /// hold** — the last-resort truncation cuts from the end of the row into the locating fields and
 /// the divergence warning.
@@ -83,21 +83,13 @@ const MIN_USABLE_WIDTH: u16 = 44;
 /// leave those two columns out of the budget and a CJK row lands exactly on the right border.
 const BORDER_AND_MARKER: usize = 4;
 
-/// One turn-by-turn row: `#n` ordinal, kind, short sha, message, time, tags.
+/// One turn-by-turn row: `#n` ordinal, kind, short sha, activity, message, time, tags.
 ///
 /// A pure function: it touches neither the terminal nor git. Where the width does not suffice it
 /// is the **message** that is cut; `#n` and kind do not move — those two locate the turn, the
 /// message is only a hint.
 pub fn turn_line(t: &Turn, width: u16) -> Line<'static> {
-    // The turn ordinal is printed only on the commit that actually settled that turn; the rest
-    // stay blank — so the number in this column and what `<ref>#n` resolves to are the same
-    // commit. Blank is not empty: the placeholder still occupies four columns, otherwise the sha
-    // column jumps left and right between numbered and unnumbered rows.
-    let label = match t.turn {
-        Some(n) => format!("#{n:>3}"),
-        None => "    ".into(),
-    };
-    let head = format!("{label} {} {:<6} ", t.short, kind_word(t.kind));
+    let head = turn_head(t);
     let mut ago = format!("  {}", crate::ui::ago(t.at));
     let mut tags = if t.tags.is_empty() {
         String::new()
@@ -105,13 +97,8 @@ pub fn turn_line(t: &Turn, width: u16) -> Line<'static> {
         format!("  ⌂ {}", t.tags.join(","))
     };
 
-    // Yield order: the message goes first, then the tags, and the time last.
-    //
-    // `#n` / sha / kind never yield — they are what gets `agit show` to this turn; the message is
-    // only a hint. Everything is budgeted in **columns**: a CJK row has half as many characters
-    // as columns, so a character budget overflows the row, and the renderer cuts the overflow
-    // from the **end** — which takes exactly the fields that most need to stay. The width given
-    // here is the **frame** width; the content gets [`BORDER_AND_MARKER`] columns less.
+    // Identifiers and activity remain visible while message, tags and time yield. Width uses
+    // terminal columns so CJK text cannot displace those fields.
     let budget = (width as usize).saturating_sub(widgets::cols(&head) + BORDER_AND_MARKER);
     if widgets::cols(&ago) + widgets::cols(&tags) > budget {
         tags.clear();
@@ -120,17 +107,12 @@ pub fn turn_line(t: &Turn, width: u16) -> Line<'static> {
         ago.clear();
     }
     let room = budget.saturating_sub(widgets::cols(&ago) + widgets::cols(&tags));
-    // Under four columns, drop it entirely: a message reduced to an ellipsis carries nothing and
-    // still takes the space.
     let subject = if room >= 4 {
         widgets::truncate_cols(&t.subject, room)
     } else {
         String::new()
     };
 
-    // The yield order has an end: `head` itself never yields, and below its width every step
-    // above has already yielded everything. The row still must not cross the frame, so there is a
-    // backstop (see [`widgets::clamp_line`]).
     widgets::clamp_line(
         Line::from(vec![
             Span::styled(head, Style::default().fg(kind_color(t.kind))),
@@ -140,6 +122,24 @@ pub fn turn_line(t: &Turn, width: u16) -> Line<'static> {
         ]),
         (width as usize).saturating_sub(BORDER_AND_MARKER),
     )
+}
+
+fn turn_head(t: &Turn) -> String {
+    // The turn ordinal is printed only on the commit that actually settled that turn; the rest
+    // stay blank — so the number in this column and what `<ref>#n` resolves to are the same
+    // commit. Blank is not empty: the placeholder still occupies four columns, otherwise the sha
+    // column jumps left and right between numbered and unnumbered rows.
+    let label = match t.turn {
+        Some(n) => format!("#{n:>3}"),
+        None => "    ".into(),
+    };
+    let mut head = format!("{label} {} {:<6} ", t.short, kind_word(t.kind));
+    let activity = t.activity_label();
+    if !activity.is_empty() {
+        head.push_str(&activity);
+        head.push(' ');
+    }
+    head
 }
 
 /// Columns the branch-name field takes on a wide terminal. Row alignment rests on it.
@@ -482,11 +482,21 @@ fn draw(
     notice: Option<&str>,
 ) {
     let panes = widgets::layout_single(f.area());
-    if f.area().width < MIN_USABLE_WIDTH {
+    let minimum = if screen.view == View::Turns {
+        turns
+            .iter()
+            .map(|t| widgets::cols(&turn_head(t)) + BORDER_AND_MARKER)
+            .max()
+            .unwrap_or(0)
+            .max(MIN_USABLE_WIDTH as usize)
+    } else {
+        MIN_USABLE_WIDTH as usize
+    };
+    if (f.area().width as usize) < minimum {
         f.render_widget(
             Paragraph::new(format!(
-                "terminal too narrow — {MIN_USABLE_WIDTH} columns are needed to \
-                 identify a turn and show whether a branch diverged"
+                "terminal too narrow — {minimum} columns are needed to \
+                 identify a turn, show activity and preserve branch divergence"
             ))
             .wrap(ratatui::widgets::Wrap { trim: false })
             .block(widgets::pane("agit log")),
@@ -581,6 +591,10 @@ mod tests {
             tags: vec![],
             code: None,
             milestone: None,
+            activity: Some(crate::domain::turn::activity::Activity {
+                events: 4,
+                tools: 2,
+            }),
             at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         }
     }
@@ -701,7 +715,7 @@ mod tests {
             "fix the refund retry idempotency key, add a regression test and a note",
         );
         t.tags = vec!["v0.3".into()];
-        let wide = turn_line(&t, 120).to_string();
+        let wide = turn_line(&t, 160).to_string();
         assert!(wide.contains("# 14"), "{wide}");
         assert!(wide.contains(&t.short), "{wide}");
         assert!(wide.contains("turn"), "{wide}");
@@ -711,7 +725,7 @@ mod tests {
             "a wide row keeps the message: {wide}"
         );
 
-        let narrow = turn_line(&t, 44).to_string();
+        let narrow = turn_line(&t, 45).to_string();
         assert!(
             narrow.contains("# 14"),
             "the ordinal must not be cut: {narrow}"
@@ -721,8 +735,8 @@ mod tests {
             "the sha must not be cut: {narrow}"
         );
         assert!(
-            narrow.contains("⌂ v0.3"),
-            "the tags must not be cut: {narrow}"
+            narrow.contains("4 events 2 ToolUse"),
+            "activity must remain visible: {narrow}"
         );
         assert!(
             !narrow.contains("regression test"),
@@ -965,7 +979,8 @@ mod tests {
             rows_of(term.backend()).join("\n")
         };
 
-        let narrow = paint(MIN_USABLE_WIDTH - 1);
+        let minimum = (widgets::cols(&turn_head(&screen.turns[0])) + BORDER_AND_MARKER) as u16;
+        let narrow = paint(minimum - 1);
         assert!(narrow.contains("too narrow"), "{narrow}");
         assert!(
             !narrow.contains("#"),
@@ -973,9 +988,51 @@ mod tests {
         );
 
         // At exactly the usable width it draws as usual, with the locating fields present.
-        let ok = paint(MIN_USABLE_WIDTH);
+        let ok = paint(minimum);
         assert!(!ok.contains("too narrow"), "{ok}");
         assert!(ok.contains("# 14"), "{ok}");
+    }
+
+    #[test]
+    fn large_counts_expand_the_required_width_instead_of_being_clipped() {
+        let mut row = turn(14, "activity");
+        row.activity = Some(crate::domain::turn::activity::Activity {
+            events: 1_000_000,
+            tools: 2_000_000,
+        });
+        let minimum = (widgets::cols(&turn_head(&row)) + BORDER_AND_MARKER) as u16;
+        assert!(minimum > MIN_USABLE_WIDTH);
+        let screen = Screen {
+            slug: "me/counts".into(),
+            branch: "work".into(),
+            turns: vec![row],
+            branches: None,
+            view: View::Turns,
+        };
+        for width in [minimum - 1, minimum] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(
+                        frame,
+                        &screen,
+                        &[&screen.turns[0]],
+                        &[],
+                        &mut ListState::default(),
+                        &Filter::default(),
+                        None,
+                    );
+                })
+                .unwrap();
+            let text = rows_of(terminal.backend()).join("\n");
+            if width < minimum {
+                assert!(text.contains("too narrow"), "{text}");
+                assert!(!text.contains("# 14"), "{text}");
+            } else {
+                assert!(text.contains("1000000 events 2000000 ToolUse"), "{text}");
+                assert!(text.contains("# 14"), "{text}");
+            }
+        }
     }
 
     /// This pins that the branch view relabels its keys — `enter` here opens that branch's

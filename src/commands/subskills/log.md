@@ -29,6 +29,18 @@ With no arguments at a terminal, this opens a full-screen browser instead of pri
 | `--tui` / `--no-tui` | Force or forbid the full-screen interface. `--tui` overrides the agent-session check but not `--json` / `-q` / `-y` |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
+Turn rows show `events` and `ToolUse` in both text and Timeline. Events count the stored
+LOG envelope records added by that turn, matching the records addressed by `#n.k`.
+The `ToolUse` column counts only IR `EventKind::ToolUse`. `ToolResult` and `FileEdit`
+are separate categories and are excluded, including native file calls classified as `FileEdit`.
+The counts follow each record's source runtime and that turn's frozen LOG, including records
+hidden from the current VIEW. Native records may use earlier messages in that LOG as context;
+only calls anchored to the turn's added records count. Later commits cannot change an earlier
+turn's projection. Filters and limits keep the original turn ordinals and counts.
+
+File, VIEW and merge commits have no turn activity. Undeclared Git history shows `?` for
+unavailable counts; missing or corrupt declared LOG evidence is an error, never a zero count.
+
 ## Examples
 
 ```bash

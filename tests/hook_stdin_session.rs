@@ -199,7 +199,14 @@ const HUB: &str = "http://127.0.0.1:1";
 fn turn_subjects(log: &str) -> Vec<String> {
     log.lines()
         .filter(|l| l.contains("[turn ]"))
-        .map(|l| l.rsplit("] ").next().unwrap_or("").trim().to_string())
+        .map(|line| {
+            let (_, activity) = line.split_once("[turn ] ").unwrap();
+            let (events, rest) = activity.split_once(" events ").unwrap();
+            let (tools, subject) = rest.split_once(" ToolUse ").unwrap();
+            assert!(events.parse::<usize>().is_ok(), "{line}");
+            assert!(tools.parse::<usize>().is_ok(), "{line}");
+            subject.trim().to_string()
+        })
         .collect()
 }
 

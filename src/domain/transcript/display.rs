@@ -2,7 +2,7 @@
 
 use crate::Result;
 use crate::adapter::{self, Event, EventKind, Session};
-use crate::domain::storage;
+use crate::domain::{storage, transcript::Envelope};
 use anyhow::Context;
 use std::collections::BTreeMap;
 
@@ -12,11 +12,41 @@ struct NativeSession {
     positions: Vec<usize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SourceKey {
+    pub source: String,
+    session: String,
+    native_session: Option<String>,
+}
+
+pub(crate) fn source_key(envelope: &Envelope) -> SourceKey {
+    // A logical AgentGit session can contain copies of distinct native database sessions.
+    // Reused native message identifiers cannot correlate across those source identities.
+    let native_session = if envelope.source == "opencode" {
+        let field = if envelope.content["kind"] == "opencode.meta" {
+            "id"
+        } else {
+            "session_id"
+        };
+        envelope.content[field]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    SourceKey {
+        source: envelope.source.clone(),
+        session: envelope.session_id.clone(),
+        native_session,
+    }
+}
+
 /// Native parsers need records from the same source session to correlate messages and parts.
 /// Their line coordinates are mapped back to the selected sequence before rendering, so grouping
 /// cannot reorder interleaved history or fetch context excluded from that sequence.
 pub fn parse(envelopes: &str) -> Result<Session> {
-    let mut groups: BTreeMap<(String, String), NativeSession> = BTreeMap::new();
+    let mut groups: BTreeMap<SourceKey, NativeSession> = BTreeMap::new();
     let mut events = Vec::new();
     for (position, line) in envelopes.split_inclusive('\n').enumerate() {
         let envelope = storage::parse_envelope_line(line)?;
@@ -37,9 +67,7 @@ pub fn parse(envelopes: &str) -> Result<Session> {
             events.push(Event::text(EventKind::UserPrompt, text, None).at_line(position));
             continue;
         }
-        let group = groups
-            .entry((envelope.source, envelope.session_id))
-            .or_default();
+        let group = groups.entry(source_key(&envelope)).or_default();
         group
             .raw
             .push_str(&serde_json::to_string(&envelope.content)?);
@@ -47,9 +75,9 @@ pub fn parse(envelopes: &str) -> Result<Session> {
         group.positions.push(position);
     }
 
-    for ((source, _), group) in groups {
-        let parsed = adapter::get(&source)
-            .with_context(|| format!("cannot render saved transcript source `{source}`"))?
+    for (key, group) in groups {
+        let parsed = adapter::get(&key.source)
+            .with_context(|| format!("cannot render saved transcript source `{}`", key.source))?
             .parse(&group.raw)?;
         for mut event in parsed.events {
             let line = event
@@ -135,6 +163,29 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("cannot render saved transcript source")
+        );
+    }
+
+    #[test]
+    fn native_session_identity_separates_reused_message_ids_inside_a_logical_session() {
+        let text = [
+            wrap("opencode", 'a', json!({"kind":"opencode.meta", "id":"first"})),
+            wrap("opencode", 'a', json!({"kind":"message", "session_id":"first", "id":"shared", "data":{"role":"user"}})),
+            wrap("opencode", 'a', json!({"kind":"message", "session_id":"second", "id":"shared", "data":{"role":"assistant"}})),
+            wrap("opencode", 'a', json!({"kind":"part", "session_id":"first", "message_id":"shared", "data":{"type":"text", "text":"prompt"}})),
+            wrap("opencode", 'a', json!({"kind":"part", "session_id":"second", "message_id":"shared", "data":{"type":"text", "text":"reply"}})),
+        ].concat();
+        let parsed = parse(&text).unwrap();
+        assert_eq!(
+            parsed
+                .events
+                .iter()
+                .map(|event| (event.line, event.kind))
+                .collect::<Vec<_>>(),
+            [
+                (Some(3), adapter::EventKind::UserPrompt),
+                (Some(4), adapter::EventKind::AssistantReply),
+            ]
         );
     }
 

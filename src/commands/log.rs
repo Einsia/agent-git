@@ -9,9 +9,9 @@
 //! * `--graph`: a cross-branch ASCII graph (fork points and merge parents are both on it).
 //! * `-- <path>`: only the commits that touched one shared file.
 //!
-//! Performance discipline: the per-turn view reads session/meta.json once per commit (one object
-//! read); the branch-level view reads the first commit's gist once per branch. Neither opens a
-//! live transcript.
+//! Performance discipline: history metadata and selected turn evidence are read in batches;
+//! the branch-level view reads the first commit's gist once per branch. Neither opens a live
+//! transcript.
 
 use super::CmdResult;
 use crate::domain::meta::{self, Kind};
@@ -216,9 +216,15 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
     for r in &rows {
+        let activity = r.activity_label();
+        let activity = if activity.is_empty() {
+            activity
+        } else {
+            format!("{activity} ")
+        };
         if args.oneline {
             println!(
-                "{} {} {} {}",
+                "{} {} {} {activity}{}",
                 turn_label(r.turn),
                 r.short,
                 kind_badge(&r.kind),
@@ -226,7 +232,7 @@ pub fn run(args: Args) -> CmdResult {
             );
         } else {
             let mut line = format!(
-                "{} {} {} {}",
+                "{} {} {} {activity}{}",
                 turn_label(r.turn),
                 r.short,
                 kind_badge(&r.kind),
@@ -263,8 +269,19 @@ pub struct Turn {
     pub tags: Vec<String>,
     pub code: Option<String>,
     pub milestone: Option<String>,
+    pub activity: Option<crate::domain::turn::activity::Activity>,
     /// Commit time. The text rendering does not use it; Timeline shows "how long ago" from it.
     pub at: std::time::SystemTime,
+}
+
+impl Turn {
+    pub fn activity_label(&self) -> String {
+        match self.activity {
+            Some(a) => format!("{} events {} ToolUse", a.events, a.tools),
+            None if self.kind == Kind::Turn => "events ? ToolUse ?".into(),
+            None => String::new(),
+        }
+    }
 }
 
 fn kind_badge(k: &Kind) -> &'static str {
@@ -360,23 +377,35 @@ pub fn turns(
         {
             continue;
         }
-        rows.push(Turn {
-            turn: idx.and_then(|i| chain.label(i)),
-            short: sha[..9.min(sha.len())].to_string(),
-            kind: k,
-            subject: subject.to_string(),
-            tags: tag_of.get(sha).cloned().unwrap_or_default(),
-            code: snap.as_ref().and_then(|s| s.code.clone()),
-            milestone: snap.and_then(|s| s.milestone),
-            at,
-        });
+        rows.push((
+            idx,
+            Turn {
+                turn: idx.and_then(|i| chain.label(i)),
+                short: sha[..9.min(sha.len())].to_string(),
+                kind: k,
+                subject: subject.to_string(),
+                tags: tag_of.get(sha).cloned().unwrap_or_default(),
+                code: snap.as_ref().and_then(|s| s.code.clone()),
+                milestone: snap.and_then(|s| s.milestone),
+                activity: None,
+                at,
+            },
+        ));
     }
     // Take the last `limit` rows from the tail (`--reverse` plus `limit` means "most recent",
     // not "earliest").
     if rows.len() > limit {
         rows.drain(..rows.len() - limit);
     }
-    Ok(rows)
+    let selected: Vec<usize> = rows.iter().filter_map(|(i, _)| *i).collect();
+    let activity = crate::domain::turn::activity::read(repo, &chain, &selected)?;
+    Ok(rows
+        .into_iter()
+        .map(|(i, mut row)| {
+            row.activity = i.and_then(|i| activity.get(&i).copied());
+            row
+        })
+        .collect())
 }
 
 /// Every tag in the repo, grouped by the commit it points at, asked for in one `for-each-ref`.

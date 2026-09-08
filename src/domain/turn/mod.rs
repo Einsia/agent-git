@@ -72,6 +72,8 @@
 //! content get different uuids). A random identity cannot be recomputed, and that is what forces
 //! such a scheme to record every turn.
 
+pub mod activity;
+
 use crate::adapter::{Event, EventKind, Session};
 use sha2::{Digest, Sha256};
 
