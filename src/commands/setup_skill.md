@@ -89,7 +89,7 @@ agit push <owner/repo> -b main                         # publish the file line
 - `-m` on the file line is always a pure file commit; `--milestone`, `--tag` and `--code` belong to turn commits.
 - Without `-- <path>...` every change in the checkout is staged (`git add -A`); add `-- README.md` to limit the commit. AgentGit storage paths (`session/`, `LOG`, `VIEW`, `events/`) are excluded automatically.
 - On a session branch `-m` is legal only while no new turns are pending; settle turns with `agit commit` first.
-- In a directory bound to the repo, `agit commit main -m "..."` resolves the repo from context.
+- Use `agit commit <owner/repo>@main -m "..."` to select the file line explicitly. The shorter `agit commit main -m "..."` requires `AGIT_SESSION` to supply the repo; a workspace binding does not select it.
 - To write README.md for a repo the user names (for example "add a README to hachi/agit-dev"), use exactly this flow; do not `git commit` inside `~/.agit/repos` by hand.
 
 ## Command groups

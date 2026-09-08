@@ -26,6 +26,21 @@ Two words recur below:
 - **VIEW**: the context the agent really sees on the next resume. It is derived — when
   `agit revert` takes something out of it, the original record (the log) does not move a byte.
 
+### Select a repository and ref
+
+Use a full target such as `alice/payments@work`, or set
+`AGIT_SESSION=alice/payments@work` before using a local ref such as `work` or `main`.
+A workspace binding does not select an existing session for these commands.
+
+For an ordinary explicit ref, a missing local branch can resolve to a single matching
+remote-tracking branch. Several remotes carrying that name are ambiguous; a local branch
+keeps its identity even when its remote counterpart has advanced. A same-named tag or
+another matching object can still make an ordinary explicit ref ambiguous.
+
+`@` selects the exact local session branch in `AGIT_SESSION`. If that local branch is missing,
+it refuses instead of selecting a tag, remote-tracking ref, or checkout HEAD. Historical
+selectors such as `@#2` are applied after capturing that local branch's tip.
+
 ## 2. Getting started
 
 ### 2.1 Install
@@ -73,8 +88,7 @@ To mark a session offline first, use the `--link-only` of 3.1 below.
 agit setup
 ```
 
-It does four things; the first three are idempotent (the AGENTS.md one has a known flaw, see the
-note below):
+It configures the following integrations. Repeating setup updates existing managed entries:
 
 | What        | Where                                              | Effect                                                       |
 | ----------- | -------------------------------------------------- | ------------------------------------------------------------ |
@@ -101,9 +115,8 @@ approval before first use or after the installed command changes. OpenCode and C
 equivalent "turn finished" callback; the skill above injects the settlement discipline into the
 agent, and the agent types `agit commit` itself at the right moment.
 
-> Running `agit setup --agents-md` repeatedly appends another `<!-- agit:end -->` marker to
-> AGENTS.md every time. When you see a run of extra end markers, delete by hand until one pair is
-> left.
+`agit setup --agents-md` refreshes the managed section and normalizes nested AgentGit markers,
+preserving the text around that section. An unchanged repeat does not append another marker pair.
 
 ### 2.4 Create an agent repo inside a project
 
@@ -180,12 +193,12 @@ the commands below, or supply `alice/payments@ratelimit` directly to each sessio
 Adopting and recording the first version are **one command** — the in-between state ("linked, but
 unversioned") means nothing to anyone.
 
-Both arguments are required; agit does not guess:
-
-- `-n <agent>` which agent it lands in. A wrong guess hangs this memory on the wrong lineage, and
-  that kind of mistake is not noticed right away.
-- `-b <branch>` which branch it lands on. A session may never land on `main` (that is the file
-  line).
+A fresh claim needs an explicit destination repo and session branch. Use
+`--into alice/payments@ratelimit`, or `--repo alice/payments -b ratelimit`.
+The `-n <agent>` form names a repo for adoption and still needs `-b <branch>`;
+it is not required alongside a qualified `--into` target. Session turns cannot land on
+`main`, which is the file line. Use `--from codex` or `--from claude-code` to restrict
+the source runtime; the option is named `--from`, not `--runtime`.
 
 import **does not copy** the transcript; it writes a link. The original session keeps growing and
 the link keeps pointing at it.
@@ -208,7 +221,7 @@ one byte of the original enters history. claude-code only; other runtimes use
 
 The copy is **frozen** and carries its own new session id: the original session keeps growing, the
 copy does not follow. To publish later conversation, run
-`agit import <id> --privacy -b <new-branch>` again — every run is a new frozen copy, and the old
+`agit import <id> --privacy --into alice/payments@<new-branch>` again — every run is a new frozen copy, and the old
 branch, already taken by the old copy, is never refreshed.
 
 ### 3.2 Settle: get new conversation into history

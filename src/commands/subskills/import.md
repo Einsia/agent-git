@@ -17,6 +17,7 @@ Explicit arguments and non-interactive calls retain the command-line path.
 ## Synopsis
 
 ```bash
+agit import [session] --into <owner/name@branch> [options]
 agit import [session] --repo <owner/name> -b <branch> [options]
 ```
 
@@ -24,11 +25,12 @@ agit import [session] --repo <owner/name> -b <branch> [options]
 
 | Option | Meaning |
 |---|---|
-| `[session]` | Explicit runtime session ID, ID prefix, or transcript path; omitted targets require a choice in the interactive picker. `@` does not infer the current runtime session |
-| `-n, --name <agent>` | Repo name only when a new Agent repo must be created |
+| `[session]` | Explicit runtime session ID or ID prefix; omitted targets require a choice in the interactive picker. `@` does not infer the current runtime session |
+| `-n, --name <agent>` | Bare repo name for adoption; use `--into` to specify its owner and branch together |
 | `--from <runtime>` | Source runtime, such as `codex` or `claude-code` |
 | `--link-only` | Write the adoption link without importing/settling content |
-| `--repo <owner/name>` | Target Agent repo; recommended explicitly |
+| `--into <owner/name@branch>` | Explicit target Agent repo and session branch |
+| `--repo <owner/name>` | Alias of `--into`; pair a repo-only value with `-b` |
 | `-b, --branch <branch>` | Target session branch; recommended explicitly when creating/importing |
 | `--onto <ref>` | Attach imported content to an existing ref |
 | `--privacy` | Adopt a privacy-redacted transcript copy (currently Claude Code only) |
@@ -37,7 +39,7 @@ agit import [session] --repo <owner/name> -b <branch> [options]
 
 ## Scenarios and examples
 
-Use `--repo` and `--branch` to import an external runtime into an existing repo. If the session ID is unknown, start with `agit status` or filter with `--from`. Use `--link-only` when adoption should be recorded but content should wait.
+Use `--into <owner/repo>@<branch>`, or `--repo <owner/repo> -b <branch>`, to select the destination. Do not combine a branch in `--into` with `-b`. If the session ID is unknown, start with `agit status` or filter with `--from`. Use `--link-only` when adoption should be recorded but content should wait.
 
 After `--link-only`, sign in and run `agit import <session-id> --into <owner/repo>@<branch>`
 to record the opening version. The offline link has no repository owner or branch claim;
@@ -45,7 +47,7 @@ to record the opening version. The offline link has no repository owner or branc
 
 ```bash
 agit import 132bf69f-22a --from claude-code --repo szh/p1 -b fix-auth
-agit import /tmp/transcript.jsonl --repo szh/p1 -b imported --onto main
+agit import 132bf69f-22a --into szh/p1@imported --onto main
 agit import 132bf69f-22a --link-only
 agit import 132bf69f-22a --into szh/p1@pending
 ```
@@ -57,4 +59,4 @@ git -C "$(agit repo path szh/p1)" show-ref --verify refs/heads/fix-auth
 agit status
 ```
 
-`--name` names a repo; it does not create a branch in the current repo. When the target repo exists, use `--repo`.
+`--name` names a repo; it does not create a branch by itself. Prefer the qualified `--into` form when reusing a repository, especially in an organization namespace. Import does not change the parent shell's environment: subsequent commands need a full target or an explicitly set `AGIT_SESSION`.
