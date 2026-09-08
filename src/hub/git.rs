@@ -10,15 +10,9 @@
 //!
 //! # The token travels in the environment, not into `.git/config` and not into argv
 //!
-//! ```text
-//! GIT_CONFIG_COUNT=3
-//! GIT_CONFIG_KEY_0=http.extraHeader
-//! GIT_CONFIG_VALUE_0=
-//! GIT_CONFIG_KEY_1=http.extraHeader
-//! GIT_CONFIG_VALUE_1=Authorization: Bearer <access_token>
-//! GIT_CONFIG_KEY_2=http.extraHeader
-//! GIT_CONFIG_VALUE_2=X-AgentGit-Expected-Agent-Id: <agent_id>
-//! ```
+//! Git's configuration environment scopes the authorization and identity headers to the
+//! validated repository URL. An empty entry resets inherited headers at that scope. Redirects
+//! are disabled there because Git can reuse the initial URL's headers for later protocol calls.
 //!
 //! Of the three routes, only this one is safe:
 //!
@@ -48,8 +42,8 @@
 
 use crate::Result;
 use crate::domain::repo::Repo;
-use crate::infra::credentials;
 use anyhow::Context;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -83,47 +77,197 @@ fn transport_command() -> Command {
     command
 }
 
-/// Environment variables that inject the authentication header.
-///
-/// Respects a `GIT_CONFIG_COUNT` the caller already set: writing 1 outright silently drops the
-/// other entries the user configured through the same mechanism (their KEY_1 is still in the
-/// environment, but git no longer reads it).
-fn transport_env(token: Option<&str>, expected_agent_id: &str) -> Vec<(String, String)> {
-    let existing: usize = std::env::var("GIT_CONFIG_COUNT")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    transport_env_after(existing, token, expected_agent_id)
+/// Inherited Git parameters retain their bytes and precedence; transport guards follow them.
+fn transport_env(
+    token: Option<&str>,
+    expected_agent_id: &str,
+    urls: &[String],
+) -> Vec<(String, OsString)> {
+    let inherited = std::env::var_os("GIT_CONFIG_PARAMETERS");
+    transport_env_after(inherited.as_deref(), token, expected_agent_id, urls)
+}
+
+fn quote_git_parameter(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        if matches!(character, '\'' | '!') {
+            quoted.push('\'');
+            quoted.push('\\');
+            quoted.push(character);
+            quoted.push('\'');
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn transport_env_after(
-    existing: usize,
+    inherited: Option<&OsStr>,
     token: Option<&str>,
     expected_agent_id: &str,
-) -> Vec<(String, String)> {
-    // One empty value clears every http.extraHeader accumulated from system/global/local
-    // config and from the caller's existing environment. Otherwise, when the user has already
-    // configured a header of the same name, appending ours makes the server receive two
-    // Expected-Agent-Id headers; the hub has to reject that ambiguous request.
-    let mut values = vec![String::new()];
-    if let Some(token) = token {
-        values.push(format!("Authorization: Bearer {token}"));
+    urls: &[String],
+) -> Vec<(String, OsString)> {
+    let mut settings = vec![("http.extraHeader".to_string(), String::new())];
+    for url in urls {
+        let key = format!("http.{url}.extraHeader");
+        settings.push((key.clone(), String::new()));
+        if let Some(token) = token {
+            settings.push((key.clone(), format!("Authorization: Bearer {token}")));
+        }
+        settings.push((
+            key,
+            format!(
+                "{}: {expected_agent_id}",
+                super::identity::EXPECTED_AGENT_ID_HEADER
+            ),
+        ));
+        settings.push((format!("http.{url}.followRedirects"), "false".into()));
     }
-    values.push(format!(
-        "{}: {expected_agent_id}",
-        super::identity::EXPECTED_AGENT_ID_HEADER
-    ));
+    let mut parameters = inherited.unwrap_or_default().to_os_string();
+    for (key, value) in settings {
+        if !parameters.is_empty() {
+            parameters.push(" ");
+        }
+        parameters.push(quote_git_parameter(&key));
+        parameters.push("=");
+        parameters.push(quote_git_parameter(&value));
+    }
+    vec![("GIT_CONFIG_PARAMETERS".into(), parameters)]
+}
 
-    let mut out = vec![(
-        "GIT_CONFIG_COUNT".into(),
-        (existing + values.len()).to_string(),
-    )];
-    for (offset, value) in values.into_iter().enumerate() {
-        let i = existing + offset;
-        out.push((format!("GIT_CONFIG_KEY_{i}"), "http.extraHeader".into()));
-        out.push((format!("GIT_CONFIG_VALUE_{i}"), value));
+/// Destination validation and credential selection stay fixed across Git retries.
+struct TransportIdentity {
+    client: Option<super::Client>,
+    urls: Vec<String>,
+    agent_id: String,
+}
+
+impl TransportIdentity {
+    fn new(
+        dir: Option<&Path>,
+        args: &[&str],
+        identity: &super::identity::RemoteIdentity,
+    ) -> Result<Self> {
+        let command_index = args
+            .iter()
+            .position(|arg| matches!(*arg, "clone" | "fetch" | "push" | "pull" | "ls-remote"))
+            .context("Git transport command is missing")?;
+        let command = args[command_index];
+        let requested = args
+            .iter()
+            .skip(command_index + 1)
+            .find(|arg| !arg.starts_with('-'))
+            .copied()
+            .context("Git transport remote is missing")?;
+        let temporary;
+        // Clone reads global Git configuration without adopting the enclosing repository's
+        // local configuration. URL expansion must use the same configuration boundary.
+        let directory = match dir {
+            Some(directory) if command != "clone" => directory,
+            _ => {
+                temporary = tempfile::tempdir()?;
+                temporary.path()
+            }
+        };
+        let repo = Repo::at(directory);
+        let named = matches!(command, "push" | "fetch" | "pull");
+        let mut urls = Vec::new();
+        let mut unauthenticated = false;
+        let destinations = if named {
+            named_destinations(&repo, requested, command == "push")?
+        } else {
+            explicit_destination(&repo, requested)?
+        };
+        for (original, effective) in destinations {
+            let original_scope = require_transport_url(&original, identity)?;
+            let effective_scope = require_transport_url(&effective, identity)?;
+            if original_scope.is_some()
+                && let Some(url) = effective_scope
+            {
+                if !urls.contains(&url) {
+                    urls.push(url);
+                }
+            } else {
+                unauthenticated = true;
+            }
+        }
+        anyhow::ensure!(
+            urls.is_empty() || !unauthenticated,
+            "a Git remote cannot mix authenticated Hub URLs with other transports"
+        );
+        let client = (!urls.is_empty()).then(|| super::Client::for_stored_hub(&identity.hub));
+        Ok(Self {
+            client,
+            urls,
+            agent_id: identity.agent_id.clone(),
+        })
     }
-    out
+
+    fn token(&self) -> Result<Option<String>> {
+        self.client
+            .as_ref()
+            .map(super::Client::checked_access_token)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn refresh(&self) -> bool {
+        self.client
+            .as_ref()
+            .is_some_and(super::Client::refresh_access)
+    }
+
+    fn environment(&self) -> Result<Vec<(String, OsString)>> {
+        Ok(transport_env(
+            self.token()?.as_deref(),
+            &self.agent_id,
+            &self.urls,
+        ))
+    }
+}
+
+fn explicit_destination(repo: &Repo, requested: &str) -> Result<Vec<(String, String)>> {
+    let effective = repo.git(&["ls-remote", "--get-url", "--", requested])?;
+    let effective = effective.trim_end_matches(['\r', '\n']);
+    anyhow::ensure!(!effective.is_empty(), "Git transport URL is missing");
+    Ok(vec![(requested.to_string(), effective.to_string())])
+}
+
+fn named_destinations(repo: &Repo, requested: &str, push: bool) -> Result<Vec<(String, String)>> {
+    let mut args = vec!["remote", "get-url", "--all"];
+    if push {
+        args.push("--push");
+    }
+    args.push(requested);
+    let Some(effective) = repo.git_opt(&args) else {
+        return explicit_destination(repo, requested);
+    };
+    let read_urls = |field| {
+        repo.git_opt(&[
+            "config",
+            "--get-all",
+            &format!("remote.{requested}.{field}"),
+        ])
+    };
+    let original = if push {
+        read_urls("pushurl").or_else(|| read_urls("url"))
+    } else {
+        read_urls("url")
+    }
+    .context("Git transport remote changed while reading its URLs")?;
+    let mut original: Vec<_> = original.lines().map(str::to_string).collect();
+    let mut effective: Vec<_> = effective.lines().map(str::to_string).collect();
+    if !push {
+        original.truncate(1);
+        effective.truncate(1);
+    }
+    anyhow::ensure!(
+        !original.is_empty() && original.len() == effective.len(),
+        "Git transport remote changed while reading its URLs"
+    );
+    Ok(original.into_iter().zip(effective).collect())
 }
 
 /// The result of one git subprocess.
@@ -172,13 +316,16 @@ fn run_for_identity(
     args: &[&str],
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Outcome> {
-    // Exchange first when the expiry is already known locally, saving a round trip certain
-    // to 401.
-    if credentials::current().is_some_and(|c| c.access_expired()) {
-        refresh();
+    let transport = TransportIdentity::new(dir, args, identity)?;
+    if transport
+        .client
+        .as_ref()
+        .is_some_and(super::Client::access_expired)
+    {
+        transport.refresh();
     }
 
-    let (code, stderr) = spawn(dir, args, &identity.agent_id)?;
+    let (code, stderr) = spawn(dir, args, &transport)?;
     if code == 0 || !looks_like_auth_failure(&stderr) {
         return Ok(Outcome { code, stderr });
     }
@@ -186,10 +333,10 @@ fn run_for_identity(
     // Authentication failed: exchange the token once and try again. When the exchange fails,
     // hand this result back — the caller's hint (`agit login`) is more useful than reporting it
     // again ourselves.
-    if !refresh() {
+    if !transport.refresh() {
         return Ok(Outcome { code, stderr });
     }
-    let (code, stderr) = spawn(dir, args, &identity.agent_id)?;
+    let (code, stderr) = spawn(dir, args, &transport)?;
     Ok(Outcome { code, stderr })
 }
 
@@ -206,11 +353,8 @@ pub fn ls_remote_refs(dir: &Path, url: &str, include_tags: bool) -> Option<Remot
     let repo = Repo::at(dir);
     let identity =
         super::identity::require_current_expected(&repo, &crate::infra::config::hub_url()).ok()?;
-    let out = capture(
-        dir,
-        &remote_ref_args(url, include_tags),
-        Some(&identity.agent_id),
-    )?;
+    require_transport_url(url, &identity).ok()?;
+    let out = capture(dir, &remote_ref_args(url, include_tags), Some(&identity))?;
     parse_remote_refs(&out)
 }
 
@@ -299,14 +443,22 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// only somewhere else. So after a timeout the handles are dropped: the answer is not wanted any
 /// more, and each thread finishes on its own when the write end closes (nothing leaks, no zombie
 /// is left — the helper is git's child, not ours).
-fn capture(dir: &Path, args: &[&str], expected_agent_id: Option<&str>) -> Option<String> {
-    let once = |token: Option<String>| -> Option<(bool, String, String)> {
+fn capture(
+    dir: &Path,
+    args: &[&str],
+    identity: Option<&super::identity::RemoteIdentity>,
+) -> Option<String> {
+    let transport = identity
+        .map(|identity| TransportIdentity::new(Some(dir), args, identity))
+        .transpose()
+        .ok()?;
+    let once = || -> Option<(bool, String, String)> {
         let mut cmd = transport_command();
         cmd.arg("-C").arg(dir);
         cmd.args(args);
         cmd.env("GIT_TERMINAL_PROMPT", "0");
-        if let Some(expected_agent_id) = expected_agent_id {
-            for (k, v) in transport_env(token.as_deref(), expected_agent_id) {
+        if let Some(transport) = &transport {
+            for (k, v) in transport.environment().ok()? {
                 cmd.env(k, v);
             }
         }
@@ -357,14 +509,15 @@ fn capture(dir: &Path, args: &[&str], expected_agent_id: Option<&str>) -> Option
             String::from_utf8_lossy(&stderr).into_owned(),
         ))
     };
-    let (ok, stdout, stderr) = once(credentials::current().map(|c| c.access_token))?;
+    let (ok, stdout, stderr) = once()?;
     if ok {
         return Some(stdout);
     }
-    if !looks_like_auth_failure(&stderr) || !refresh() {
+    let transport = transport.as_ref()?;
+    if !looks_like_auth_failure(&stderr) || !transport.refresh() {
         return None;
     }
-    let (ok, stdout, _) = once(credentials::current().map(|c| c.access_token))?;
+    let (ok, stdout, _) = once()?;
     ok.then_some(stdout)
 }
 
@@ -386,6 +539,68 @@ fn drain(mut pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<
     rx
 }
 
+fn checked_transport_path(url: &str) -> Result<()> {
+    let rest = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or_default();
+    let path = rest
+        .split_once('/')
+        .map(|(_, path)| path)
+        .unwrap_or_default();
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().and_then(|byte| char::from(byte).to_digit(16));
+            let low = bytes.next().and_then(|byte| char::from(byte).to_digit(16));
+            let (Some(high), Some(low)) = (high, low) else {
+                anyhow::bail!("the Git destination has an invalid encoded path");
+            };
+            let byte = (high * 16 + low) as u8;
+            anyhow::ensure!(
+                !matches!(byte, b'/' | b'\\'),
+                "the Git destination contains an encoded path separator"
+            );
+            decoded.push(byte);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    anyhow::ensure!(
+        !decoded.iter().any(u8::is_ascii_control)
+            && !decoded
+                .split(|byte| matches!(byte, b'/' | b'\\'))
+                .any(|part| part == b"." || part == b".."),
+        "the Git destination contains an unsafe path segment"
+    );
+    Ok(())
+}
+
+fn require_transport_url(
+    url: &str,
+    identity: &super::identity::RemoteIdentity,
+) -> Result<Option<String>> {
+    let scheme = url.split(':').next().unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Ok(None);
+    }
+    checked_transport_path(&identity.hub)?;
+    checked_transport_path(url)?;
+    let authority = crate::infra::hub_authority::HubAuthority::parse(&identity.hub)?;
+    anyhow::ensure!(
+        authority.matches(url),
+        "the Git destination does not belong to the pinned Hub"
+    );
+    let hub = super::identity::normalize_hub(&identity.hub)?;
+    let destination = super::identity::normalize_hub(url)?;
+    anyhow::ensure!(
+        destination.starts_with(&format!("{hub}/")),
+        "the Git destination does not belong to the pinned Hub"
+    );
+    Ok(Some(destination))
+}
+
 /// Clone a repo on the hub, and pin the same remote identity into the new checkout as soon as it
 /// succeeds.
 pub fn clone(
@@ -393,6 +608,7 @@ pub fn clone(
     dest: &Path,
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Outcome> {
+    require_transport_url(url, identity)?;
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p).with_context(|| format!("cannot create {}", p.display()))?;
     }
@@ -418,7 +634,11 @@ fn with_progress<'a>(args: &[&'a str], tty: bool) -> Vec<&'a str> {
     full
 }
 
-fn spawn(dir: Option<&Path>, args: &[&str], expected_agent_id: &str) -> Result<(i32, String)> {
+fn spawn(
+    dir: Option<&Path>,
+    args: &[&str],
+    transport: &TransportIdentity,
+) -> Result<(i32, String)> {
     let mut cmd = transport_command();
     if let Some(d) = dir {
         cmd.arg("-C").arg(d);
@@ -429,8 +649,7 @@ fn spawn(dir: Option<&Path>, args: &[&str], expected_agent_id: &str) -> Result<(
     // immediately and let us see the authentication marker, instead of hanging on input in a
     // non-interactive environment.
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    let token = credentials::current().map(|c| c.access_token);
-    for (k, v) in transport_env(token.as_deref(), expected_agent_id) {
+    for (k, v) in transport.environment()? {
         cmd.env(k, v);
     }
 
@@ -463,11 +682,6 @@ fn spawn(dir: Option<&Path>, args: &[&str], expected_agent_id: &str) -> Result<(
         status.code().unwrap_or(1),
         String::from_utf8_lossy(&captured).into_owned(),
     ))
-}
-
-/// Exchange the refresh token for a new access token.
-fn refresh() -> bool {
-    super::Client::from_env().refresh_access()
 }
 
 /// Strip the credentials out of a URL.
@@ -513,27 +727,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transport_env_resets_inherited_headers_then_adds_one_identity() {
-        let e = transport_env_after(2, Some("tok123"), "00000000-0000-0000-0000-000000000001");
-        let get = |k: &str| {
-            e.iter()
-                .find(|(n, _)| n == k)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default()
-        };
-        assert_eq!(get("GIT_CONFIG_COUNT"), "5");
-        assert_eq!(get("GIT_CONFIG_KEY_2"), "http.extraHeader");
-        assert_eq!(get("GIT_CONFIG_VALUE_2"), "");
-        assert_eq!(get("GIT_CONFIG_VALUE_3"), "Authorization: Bearer tok123");
-        assert_eq!(
-            get("GIT_CONFIG_VALUE_4"),
-            "X-AgentGit-Expected-Agent-Id: 00000000-0000-0000-0000-000000000001"
+    fn transport_guards_follow_the_unmodified_inherited_parameters() {
+        let inherited = OsStr::new("'fixture.keep'='unchanged' 'http.extraHeader'='inherited'");
+        let environment = transport_env_after(
+            Some(inherited),
+            Some("synthetic-token"),
+            "00000000-0000-0000-0000-000000000001",
+            &["https://hub.example.test/alice/notes.git".into()],
         );
-        assert_eq!(
-            e.iter()
-                .filter(|(_, v)| v.starts_with("X-AgentGit-Expected-Agent-Id:"))
-                .count(),
-            1
+        assert_eq!(environment.len(), 1);
+        assert_eq!(environment[0].0, "GIT_CONFIG_PARAMETERS");
+        assert!(
+            environment[0]
+                .1
+                .as_encoded_bytes()
+                .starts_with(inherited.as_encoded_bytes())
+        );
+        assert!(
+            environment[0].1.to_str().unwrap().ends_with(
+                "'http.https://hub.example.test/alice/notes.git.followRedirects'='false'"
+            )
         );
     }
 
@@ -577,6 +790,58 @@ mod tests {
     }
 
     #[test]
+    fn explicit_transport_urls_preserve_the_pinned_hub_route() {
+        let identity = super::super::identity::RemoteIdentity::new(
+            "https://hub.example.test:8177/AgentGit",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .unwrap();
+        assert!(
+            require_transport_url(
+                "HTTPS://HUB.EXAMPLE.TEST:8177/AgentGit/alice/notes.git",
+                &identity
+            )
+            .is_ok()
+        );
+        for url in [
+            "https://other.example.test:8177/AgentGit/alice/notes.git",
+            "https://hub.example.test:8178/AgentGit/alice/notes.git",
+            "https://hub.example.test/AgentGit/alice/notes.git",
+            "http://hub.example.test:8177/AgentGit/alice/notes.git",
+            "https://hub.example.test:8177/agentgit/alice/notes.git",
+            "https://hub.example.test:8177/AgentGitElsewhere/alice/notes.git",
+            "https://hub.example.test:8177/alice/notes.git",
+            "https://user:secret@hub.example.test:8177/AgentGit/alice/notes.git",
+            "https://hub.example.test:8177/AgentGit/alice/notes.git?private",
+            "https://hub.example.test:8177/AgentGit/alice/notes.git#private",
+            "https://hub.example.test:8177/AgentGit/../alice/notes.git",
+            "https://hub.example.test:8177/AgentGit/./alice/notes.git",
+            "https://hub.example.test:8177/AgentGit/%2e%2E/alice/notes.git",
+            "https://hub.example.test:8177/AgentGit/.%2e/alice/notes.git",
+            "https://hub.example.test:8177/AgentGit/%2e./alice/notes.git",
+            "https://hub.example.test:8177/AgentGit/%2e%2e%2falice/notes.git",
+            "https://hub.example.test:8177/AgentGit/alice%2fnotes.git",
+            "https://hub.example.test:8177/AgentGit/%2f..%2falice/notes.git",
+            "https://hub.example.test:8177/AgentGit/%5c..%5calice/notes.git",
+            "https://hub.example.test:8177/AgentGit/%00/alice/notes.git",
+            "https://hub.example.test:8177/AgentGit/%invalid/alice/notes.git",
+        ] {
+            assert!(require_transport_url(url, &identity).is_err());
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("missing/clone");
+        assert!(
+            clone(
+                "https://other.example.test/alice/notes.git",
+                &destination,
+                &identity
+            )
+            .is_err()
+        );
+        assert!(!destination.parent().unwrap().exists());
+    }
+
+    #[test]
     fn advertised_tags_keep_their_exact_objects_separate_from_branch_tips() {
         let commit = "a".repeat(40);
         let tag = "b".repeat(40);
@@ -599,7 +864,12 @@ mod tests {
     #[test]
     fn token_never_appears_in_a_url_or_argv() {
         // The whole reason this module exists: the token lives only in an environment variable.
-        let e = transport_env_after(0, Some("s3cret"), "00000000-0000-0000-0000-000000000001");
+        let e = transport_env_after(
+            None,
+            Some("s3cret"),
+            "00000000-0000-0000-0000-000000000001",
+            &["https://hub.example.test/alice/notes.git".into()],
+        );
         assert!(
             e.iter().all(|(k, _)| k.starts_with("GIT_CONFIG_")),
             "only GIT_CONFIG_* entries are produced"
@@ -842,6 +1112,927 @@ mod probe_timeout_tests {
         assert!(
             took < PROBE_TIMEOUT / 2,
             "local probe took {took:?}, cap {PROBE_TIMEOUT:?} — that is the timeout, not an answer"
+        );
+    }
+}
+
+#[cfg(test)]
+mod git_credential_lifecycle_tests {
+    use super::{capture, run_for_identity};
+    use crate::hub::identity::RemoteIdentity;
+    use crate::infra::{config, credentials};
+    use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const AGENT_ID: &str = "00000000-0000-0000-0000-000000000001";
+    const FAKE_OID: &str = "1111111111111111111111111111111111111111";
+    const GIT_PATH: &str = "/alice/example.git/info/refs?service=git-upload-pack";
+
+    fn persistent_git_configuration() -> std::path::PathBuf {
+        static CONFIGURATIONS: std::sync::OnceLock<std::sync::Mutex<Vec<tempfile::TempDir>>> =
+            std::sync::OnceLock::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("empty.gitconfig");
+        std::fs::write(&path, b"").unwrap();
+        // Other Git children can inherit this path without holding the fixture's environment lock.
+        CONFIGURATIONS
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(directory);
+        path
+    }
+
+    struct IsolatedHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        home: tempfile::TempDir,
+        previous: Vec<(String, Option<OsString>)>,
+    }
+
+    impl IsolatedHome {
+        fn new() -> Self {
+            let lock = config::env_lock();
+            let home = tempfile::tempdir().unwrap();
+            let empty_config = persistent_git_configuration();
+            let mut settings: Vec<(String, Option<OsString>)> = [
+                "AGIT_HUB_URL",
+                "GIT_CONFIG",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_DIR",
+                "GIT_COMMON_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_NAMESPACE",
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_ASKPASS",
+                "SSH_ASKPASS",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ]
+            .into_iter()
+            .map(|name| (name.to_string(), None))
+            .collect();
+            settings.extend([
+                ("AGIT_HOME".into(), Some(home.path().as_os_str().into())),
+                ("GIT_CONFIG_COUNT".into(), Some("0".into())),
+                ("GIT_CONFIG_NOSYSTEM".into(), Some("1".into())),
+                (
+                    "GIT_CONFIG_GLOBAL".into(),
+                    Some(empty_config.as_os_str().into()),
+                ),
+                (
+                    "GIT_CONFIG_SYSTEM".into(),
+                    Some(empty_config.as_os_str().into()),
+                ),
+                ("GIT_TERMINAL_PROMPT".into(), Some("0".into())),
+                ("GCM_INTERACTIVE".into(), Some("never".into())),
+                ("NO_PROXY".into(), Some("*".into())),
+                ("no_proxy".into(), Some("*".into())),
+            ]);
+            settings.extend(std::env::vars_os().filter_map(|(name, _)| {
+                name.to_str()
+                    .filter(|name| name.starts_with("GIT_TRACE"))
+                    .map(|name| (name.to_string(), None))
+            }));
+            let previous = settings
+                .iter()
+                .map(|(name, _)| (name.clone(), std::env::var_os(name)))
+                .collect();
+            for (name, value) in settings {
+                // The shared environment lock outlives the Git children and server threads.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+            Self {
+                _lock: lock,
+                home,
+                previous,
+            }
+        }
+
+        fn workspace(&self) -> &Path {
+            self.home.path()
+        }
+    }
+
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                // Restoration remains inside the shared environment lock.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_git_configuration_outlives_the_fixture() {
+        let inherited = {
+            let _fixture = IsolatedHome::new();
+            std::env::vars_os().collect::<Vec<_>>()
+        };
+        for name in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+            let (_, path) = inherited.iter().find(|(key, _)| key == name).unwrap();
+            std::fs::read(path).expect(
+                "an inherited Git configuration must remain readable after fixture teardown",
+            );
+        }
+        let output = std::process::Command::new("git")
+            .args(["config", "--global", "--list"])
+            .env_clear()
+            .envs(inherited)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "an inherited Git configuration must remain readable after fixture teardown: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct WireRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl WireRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            let values: Vec<_> = self
+                .headers
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert!(values.len() <= 1, "the request header must be unambiguous");
+            values.first().copied()
+        }
+    }
+
+    struct Reply {
+        status: u16,
+        content_type: &'static str,
+        body: Vec<u8>,
+        headers: Vec<(String, String)>,
+    }
+
+    fn denied() -> Reply {
+        Reply {
+            status: 401,
+            content_type: "application/json",
+            headers: Vec::new(),
+            body: br#"{"error":"expired","kind":"unauthorized"}"#.to_vec(),
+        }
+    }
+
+    fn advertisement() -> Reply {
+        let mut body = Vec::new();
+        let mut packet = |line: &str| {
+            body.extend_from_slice(format!("{:04x}", line.len() + 4).as_bytes());
+            body.extend_from_slice(line.as_bytes());
+        };
+        packet("# service=git-upload-pack\n");
+        body.extend_from_slice(b"0000");
+        let line = format!("{FAKE_OID} refs/heads/main\0symref=HEAD:refs/heads/main\n");
+        body.extend_from_slice(format!("{:04x}", line.len() + 4).as_bytes());
+        body.extend_from_slice(line.as_bytes());
+        body.extend_from_slice(b"0000");
+        Reply {
+            status: 200,
+            content_type: "application/x-git-upload-pack-advertisement",
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    fn refreshed() -> Reply {
+        Reply {
+            status: 200,
+            content_type: "application/json",
+            headers: Vec::new(),
+            body: serde_json::to_vec(&serde_json::json!({
+                "access_token": "fake-alice-fresh-access",
+                "access_expires_at": "2099-01-01T00:00:00Z",
+                "refresh_token": "fake-alice-fresh-refresh",
+                "refresh_expires_at": "2099-02-01T00:00:00Z",
+            }))
+            .unwrap(),
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> std::io::Result<WireRequest> {
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break end + 4;
+            }
+            if bytes.len() >= 65536 {
+                return Err(std::io::Error::other(
+                    "fixture request headers exceed the limit",
+                ));
+            }
+            let mut buffer = [0; 4096];
+            let len = stream.read(&mut buffer)?;
+            if len == 0 {
+                return Err(std::io::Error::other(
+                    "fixture request headers are incomplete",
+                ));
+            }
+            bytes.extend_from_slice(&buffer[..len]);
+        };
+        let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+        let mut lines = header_text.lines();
+        let mut first = lines
+            .next()
+            .ok_or_else(|| std::io::Error::other("fixture request line is absent"))?
+            .split_whitespace();
+        let method = first.next().unwrap_or_default().to_string();
+        let path = first.next().unwrap_or_default().to_string();
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(key, value)| (key.to_string(), value.trim().to_string()))
+            .collect();
+        let body_len = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.parse::<usize>())
+            .transpose()
+            .map_err(|_| std::io::Error::other("fixture request length is invalid"))?
+            .unwrap_or(0);
+        if body_len > 65536 {
+            return Err(std::io::Error::other(
+                "fixture request body exceeds the limit",
+            ));
+        }
+        while bytes.len() < header_end + body_len {
+            let mut buffer = [0; 4096];
+            let len = stream.read(&mut buffer)?;
+            if len == 0 {
+                return Err(std::io::Error::other("fixture request body is incomplete"));
+            }
+            bytes.extend_from_slice(&buffer[..len]);
+        }
+        Ok(WireRequest {
+            method,
+            path,
+            headers,
+            body: bytes[header_end..header_end + body_len].to_vec(),
+        })
+    }
+
+    struct FakeHub {
+        base: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<std::io::Result<Vec<WireRequest>>>>,
+    }
+
+    impl FakeHub {
+        fn new(mut respond: impl FnMut(&WireRequest) -> Reply + Send + 'static) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut requests = Vec::new();
+                while !stopped.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false)?;
+                            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                            let request = read_request(&mut stream)?;
+                            let response = respond(&request);
+                            requests.push(request);
+                            let reason = if response.status == 200 {
+                                "OK"
+                            } else {
+                                "Unauthorized"
+                            };
+                            write!(
+                                stream,
+                                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                response.status,
+                                reason,
+                                response.content_type,
+                                response.body.len()
+                            )?;
+                            for (name, value) in response.headers {
+                                write!(stream, "{name}: {value}\r\n")?;
+                            }
+                            stream.write_all(b"\r\n")?;
+                            stream.write_all(&response.body)?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(requests)
+            });
+            Self {
+                base,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn finish(mut self) -> Vec<WireRequest> {
+            self.stop.store(true, Ordering::SeqCst);
+            self.thread
+                .take()
+                .unwrap()
+                .join()
+                .expect("the fixture server must not panic")
+                .expect("the fixture server must handle complete requests")
+        }
+    }
+
+    impl Drop for FakeHub {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn pair(hub: &str, username: &str) -> credentials::HubCredential {
+        credentials::HubCredential {
+            username: username.into(),
+            email: None,
+            hub: Some(hub.into()),
+            access_token: format!("fake-{username}-access"),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_token: format!("fake-{username}-refresh"),
+            refresh_expires_at: "2099-02-01T00:00:00Z".into(),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum EntryPoint {
+        Run,
+        Capture,
+    }
+
+    fn execute(entry: EntryPoint, dir: &Path, url: &str, identity: &RemoteIdentity) -> bool {
+        let args = [
+            "-c",
+            "credential.helper=",
+            "-c",
+            "http.proxy=",
+            "-c",
+            "http.lowSpeedLimit=1",
+            "-c",
+            "http.lowSpeedTime=3",
+            "-c",
+            "protocol.version=0",
+            "ls-remote",
+            url,
+        ];
+        match entry {
+            EntryPoint::Run => run_for_identity(Some(dir), &args, identity)
+                .expect("the Git subprocess must start")
+                .ok(),
+            EntryPoint::Capture => {
+                let output = capture(dir, &args, Some(identity));
+                if let Some(output) = &output {
+                    assert_eq!(output, &format!("{FAKE_OID}\trefs/heads/main\n"));
+                }
+                output.is_some()
+            }
+        }
+    }
+
+    fn assert_git_request(request: &WireRequest, token: Option<&str>, identity: bool) {
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, GIT_PATH);
+        assert_eq!(
+            request.header("Authorization"),
+            token.map(|token| format!("Bearer {token}")).as_deref()
+        );
+        assert_eq!(
+            request.header("X-AgentGit-Expected-Agent-Id"),
+            identity.then_some(AGENT_ID)
+        );
+        assert!(request.body.is_empty());
+    }
+
+    fn hub_change_during_git_keeps_the_captured_identity(entry: EntryPoint) {
+        let home = IsolatedHome::new();
+        let other = FakeHub::new(|_| denied());
+        let other_base = other.base.clone();
+        let mut git_requests = 0;
+        let hub = FakeHub::new(move |request| {
+            if request.path == GIT_PATH {
+                git_requests += 1;
+                if git_requests == 1 {
+                    config::set_global("hub.url", Some(&other_base)).unwrap();
+                    return denied();
+                }
+                return advertisement();
+            }
+            assert_eq!(request.path, "/api/auth/refresh");
+            refreshed()
+        });
+        config::set_global("hub.url", Some(&hub.base)).unwrap();
+        credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+        credentials::save(&other.base, &pair(&other.base, "bob")).unwrap();
+        let other_path = config::credentials_path(&other.base).unwrap();
+        let other_before = std::fs::read(&other_path).unwrap();
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        let url = format!("{}/alice/example.git", hub.base);
+        assert!(execute(entry, home.workspace(), &url, &identity));
+        assert_eq!(config::hub_url(), other.base);
+        let saved = credentials::load_checked(&hub.base).unwrap().unwrap();
+        assert_eq!(saved.username, "alice");
+        assert_eq!(saved.access_token, "fake-alice-fresh-access");
+        assert_eq!(saved.refresh_token, "fake-alice-fresh-refresh");
+        assert_eq!(std::fs::read(&other_path).unwrap(), other_before);
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 3);
+        assert_git_request(&requests[0], Some("fake-alice-access"), true);
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/api/auth/refresh");
+        assert_eq!(requests[1].header("Authorization"), None);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[1].body).unwrap(),
+            serde_json::json!({ "refresh_token": "fake-alice-refresh" })
+        );
+        assert_git_request(&requests[2], Some("fake-alice-fresh-access"), true);
+        assert!(other.finish().is_empty());
+    }
+
+    fn account_change_during_git_refuses_refresh_and_retry(entry: EntryPoint) {
+        let home = IsolatedHome::new();
+        let saved_by_login = Arc::new(std::sync::Mutex::new(None));
+        let login_snapshot = saved_by_login.clone();
+        let hub = FakeHub::new(move |request| {
+            assert_eq!(request.path, GIT_PATH);
+            let base = format!("http://{}", request.header("host").unwrap());
+            credentials::save(&base, &pair(&base, "bob")).unwrap();
+            *login_snapshot.lock().unwrap() =
+                Some(std::fs::read(config::credentials_path(&base).unwrap()).unwrap());
+            denied()
+        });
+        config::set_global("hub.url", Some(&hub.base)).unwrap();
+        credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        let url = format!("{}/alice/example.git", hub.base);
+        assert!(!execute(entry, home.workspace(), &url, &identity));
+        let saved = credentials::load_checked(&hub.base).unwrap().unwrap();
+        assert_eq!(saved.username, "bob");
+        assert_eq!(saved.access_token, "fake-bob-access");
+        assert_eq!(saved.refresh_token, "fake-bob-refresh");
+        assert_eq!(
+            std::fs::read(config::credentials_path(&hub.base).unwrap()).unwrap(),
+            saved_by_login.lock().unwrap().as_ref().unwrap().clone()
+        );
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1);
+        assert_git_request(&requests[0], Some("fake-alice-access"), true);
+    }
+
+    fn sibling_refresh_during_git_keeps_the_account_and_skips_another_exchange(entry: EntryPoint) {
+        let home = IsolatedHome::new();
+        let mut git_requests = 0;
+        let hub = FakeHub::new(move |request| {
+            assert_eq!(request.path, GIT_PATH);
+            git_requests += 1;
+            if git_requests == 1 {
+                let base = format!("http://{}", request.header("host").unwrap());
+                let mut fresh = pair(&base, "alice");
+                fresh.access_token = "fake-alice-sibling-access".into();
+                fresh.refresh_token = "fake-alice-sibling-refresh".into();
+                credentials::save(&base, &fresh).unwrap();
+                return denied();
+            }
+            advertisement()
+        });
+        config::set_global("hub.url", Some(&hub.base)).unwrap();
+        credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        let url = format!("{}/alice/example.git", hub.base);
+        assert!(execute(entry, home.workspace(), &url, &identity));
+        let saved = credentials::load_checked(&hub.base).unwrap().unwrap();
+        assert_eq!(saved.username, "alice");
+        assert_eq!(saved.access_token, "fake-alice-sibling-access");
+        assert_eq!(saved.refresh_token, "fake-alice-sibling-refresh");
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 2);
+        assert_git_request(&requests[0], Some("fake-alice-access"), true);
+        assert_git_request(&requests[1], Some("fake-alice-sibling-access"), true);
+    }
+
+    #[test]
+    fn streaming_git_adopts_a_siblings_rotation_for_the_same_account() {
+        sibling_refresh_during_git_keeps_the_account_and_skips_another_exchange(EntryPoint::Run);
+    }
+
+    #[test]
+    fn captured_git_adopts_a_siblings_rotation_for_the_same_account() {
+        sibling_refresh_during_git_keeps_the_account_and_skips_another_exchange(
+            EntryPoint::Capture,
+        );
+    }
+
+    #[test]
+    fn streaming_git_keeps_its_hub_after_persistent_selection_changes() {
+        hub_change_during_git_keeps_the_captured_identity(EntryPoint::Run);
+    }
+
+    #[test]
+    fn captured_git_keeps_its_hub_after_persistent_selection_changes() {
+        hub_change_during_git_keeps_the_captured_identity(EntryPoint::Capture);
+    }
+
+    #[test]
+    fn streaming_git_cannot_retry_as_a_concurrent_login() {
+        account_change_during_git_refuses_refresh_and_retry(EntryPoint::Run);
+    }
+
+    #[test]
+    fn captured_git_cannot_retry_as_a_concurrent_login() {
+        account_change_during_git_refuses_refresh_and_retry(EntryPoint::Capture);
+    }
+
+    #[test]
+    fn capture_without_identity_ignores_corrupt_saved_credentials() {
+        let home = IsolatedHome::new();
+        let hub = FakeHub::new(|_| advertisement());
+        config::set_global("hub.url", Some(&hub.base)).unwrap();
+        let path = config::credentials_path(&hub.base).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let malformed = b"invalid fake credential record";
+        std::fs::write(&path, malformed).unwrap();
+        let url = format!("{}/alice/example.git", hub.base);
+        let output = capture(
+            home.workspace(),
+            &[
+                "-c",
+                "credential.helper=",
+                "-c",
+                "http.proxy=",
+                "-c",
+                "http.lowSpeedLimit=1",
+                "-c",
+                "http.lowSpeedTime=3",
+                "-c",
+                "protocol.version=0",
+                "ls-remote",
+                &url,
+            ],
+            None,
+        );
+        assert_eq!(output, Some(format!("{FAKE_OID}\trefs/heads/main\n")));
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1);
+        assert_git_request(&requests[0], None, false);
+    }
+
+    fn pinned_repo(home: &IsolatedHome, hub: &str) -> crate::domain::repo::Repo {
+        let repo = crate::domain::repo::Repo::init(&home.workspace().join("repo")).unwrap();
+        let identity = RemoteIdentity::new(hub, AGENT_ID).unwrap();
+        crate::hub::identity::pin(&repo, &identity).unwrap();
+        repo.set_remote(&format!("{hub}/alice/example.git"))
+            .unwrap();
+        config::set_global("hub.url", Some(hub)).unwrap();
+        credentials::save(hub, &pair(hub, "alice")).unwrap();
+        repo
+    }
+
+    #[test]
+    fn explicit_foreign_http_destinations_never_start_a_transfer() {
+        let home = IsolatedHome::new();
+        let hub = FakeHub::new(|_| advertisement());
+        let other = FakeHub::new(|_| advertisement());
+        let repo = pinned_repo(&home, &hub.base);
+        let url = format!("{}/alice/example.git", other.base);
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        assert!(super::ls_remote_refs(repo.root(), &url, false).is_none());
+        let destination = home.workspace().join("missing/clone");
+        assert!(super::clone(&url, &destination, &identity).is_err());
+        assert!(!destination.parent().unwrap().exists());
+        assert!(hub.finish().is_empty());
+        assert!(other.finish().is_empty());
+    }
+
+    #[test]
+    fn rewritten_http_and_push_urls_must_match_the_pinned_hub() {
+        let home = IsolatedHome::new();
+        let hub = FakeHub::new(|_| advertisement());
+        let other = FakeHub::new(|_| advertisement());
+        let repo = pinned_repo(&home, &hub.base);
+        let url = format!("{}/alice/example.git", hub.base);
+        let foreign = format!("{}/alice/example.git", other.base);
+        repo.git(&["config", "remote.origin.pushurl", &foreign])
+            .unwrap();
+        assert!(super::run(&repo, &["push", "origin", "main"]).is_err());
+        repo.git(&[
+            "config",
+            "--global",
+            &format!("url.{}/.insteadOf", other.base),
+            &format!("{}/", hub.base),
+        ])
+        .unwrap();
+        assert!(super::ls_remote_refs(repo.root(), &url, false).is_none());
+        assert!(super::run(&repo, &["fetch", "origin"]).is_err());
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        assert!(super::clone(&url, &home.workspace().join("clone"), &identity).is_err());
+        assert!(hub.finish().is_empty());
+        assert!(other.finish().is_empty());
+    }
+
+    #[test]
+    fn repository_scoped_headers_override_inherited_headers_without_duplicates() {
+        let home = IsolatedHome::new();
+        let hub = FakeHub::new(|_| advertisement());
+        let repo = pinned_repo(&home, &hub.base);
+        let url = format!("{}/alice/example.git", hub.base);
+        let key = format!("http.{url}.extraHeader");
+        for value in [
+            "Authorization: Bearer inherited",
+            "X-AgentGit-Expected-Agent-Id: inherited",
+        ] {
+            repo.git(&["config", "--global", "--add", &key, value])
+                .unwrap();
+            repo.git(&["config", "--local", "--add", &key, value])
+                .unwrap();
+        }
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        assert!(execute(EntryPoint::Capture, repo.root(), &url, &identity));
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1);
+        assert_git_request(&requests[0], Some("fake-alice-access"), true);
+    }
+
+    #[test]
+    fn repository_scoped_redirect_refusal_overrides_inherited_redirects() {
+        let home = IsolatedHome::new();
+        let other = FakeHub::new(|_| advertisement());
+        let destination = format!(
+            "{}/alice/example.git/info/refs?service=git-upload-pack",
+            other.base
+        );
+        let hub = FakeHub::new(move |_| Reply {
+            status: 302,
+            content_type: "text/plain",
+            body: Vec::new(),
+            headers: vec![("Location".into(), destination.clone())],
+        });
+        let repo = pinned_repo(&home, &hub.base);
+        let url = format!("{}/alice/example.git", hub.base);
+        let key = format!("http.{url}.followRedirects");
+        repo.git(&["config", "--global", &key, "true"]).unwrap();
+        repo.git(&["config", "--local", &key, "true"]).unwrap();
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        assert!(!execute(EntryPoint::Capture, repo.root(), &url, &identity));
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1);
+        assert_git_request(&requests[0], Some("fake-alice-access"), true);
+        assert!(other.finish().is_empty());
+    }
+
+    #[test]
+    fn local_clones_do_not_load_or_refresh_hub_credentials() {
+        let home = IsolatedHome::new();
+        let hub = FakeHub::new(|_| denied());
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        let path = config::credentials_path(&hub.base).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"invalid saved identity").unwrap();
+        let source = crate::domain::repo::Repo::init(&home.workspace().join("source")).unwrap();
+        let destination = home.workspace().join("clone");
+        let result =
+            super::clone(source.root().to_str().unwrap(), &destination, &identity).unwrap();
+        assert!(result.ok());
+        let cloned = crate::domain::repo::Repo::at(&destination);
+        assert_eq!(crate::hub::identity::read(&cloned).unwrap(), Some(identity));
+        assert_eq!(std::fs::read(path).unwrap(), b"invalid saved identity");
+        assert!(hub.finish().is_empty());
+    }
+
+    fn inherited_parameters(settings: &[(&str, &str)]) -> OsString {
+        settings
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{}={}",
+                    super::quote_git_parameter(key),
+                    super::quote_git_parameter(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .into()
+    }
+
+    fn configuration_values(
+        home: &IsolatedHome,
+        inherited: &std::ffi::OsStr,
+        token: &str,
+        url: &str,
+        key: &str,
+    ) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(["config", "--null", "--get-all", key])
+            .current_dir(home.workspace())
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "fixture.keep")
+            .env("GIT_CONFIG_VALUE_0", "from-count")
+            .env("GIT_CONFIG_KEY_1", "fixture.countonly")
+            .env("GIT_CONFIG_VALUE_1", "count-only")
+            .envs(super::transport_env_after(
+                Some(inherited),
+                Some(token),
+                AGENT_ID,
+                &[url.into()],
+            ))
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn git_parameters_preserve_count_and_roundtrip_quoted_keys_and_values() {
+        let home = IsolatedHome::new();
+        let url = "https://hub.example.test/mount=one's!/alice/example.git";
+        let key = format!("http.{url}.extraHeader");
+        let mut inherited = OsString::from("'fixture.keep=legacy=value' ");
+        inherited.push(inherited_parameters(&[
+            ("fixture.keep", "modern's ! value"),
+            ("fixture.empty", ""),
+        ]));
+        for token in [
+            "",
+            "plain",
+            "apostrophe'and!bang",
+            "space tab\tline\nslash\\",
+            r#"equals=quote"dollar$backtick`"#,
+            "nonascii-ä-λ",
+        ] {
+            let output = configuration_values(&home, &inherited, token, url, &key);
+            assert!(
+                output.status.success(),
+                "Git must parse each quoted key and value"
+            );
+            let expected = format!(
+                "\0Authorization: Bearer {token}\0X-AgentGit-Expected-Agent-Id: {AGENT_ID}\0"
+            );
+            assert_eq!(output.stdout, expected.as_bytes());
+            assert_eq!(
+                configuration_values(&home, &inherited, token, url, "fixture.keep").stdout,
+                b"from-count\0legacy=value\0modern's ! value\0"
+            );
+            assert_eq!(
+                configuration_values(&home, &inherited, token, url, "fixture.countonly").stdout,
+                b"count-only\0"
+            );
+            assert_eq!(
+                configuration_values(&home, &inherited, token, url, "fixture.empty").stdout,
+                b"\0"
+            );
+            let redirect = format!("http.{url}.followRedirects");
+            assert_eq!(
+                configuration_values(&home, &inherited, token, url, &redirect).stdout,
+                b"false\0"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_git_parameter_bytes_are_not_lossily_reencoded() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let home = IsolatedHome::new();
+        let inherited = OsString::from_vec(b"'fixture.raw'='opaque-\xff-\xfe' ".to_vec());
+        let url = "https://hub.example.test/alice/example.git";
+        let environment = super::transport_env_after(
+            Some(&inherited),
+            Some("synthetic"),
+            AGENT_ID,
+            &[url.into()],
+        );
+        assert!(
+            environment[0]
+                .1
+                .as_bytes()
+                .starts_with(inherited.as_bytes())
+        );
+        let output = configuration_values(&home, &inherited, "synthetic", url, "fixture.raw");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"opaque-\xff-\xfe\0");
+    }
+
+    #[test]
+    fn inherited_parameters_cannot_reenable_same_origin_redirects_or_headers() {
+        let home = IsolatedHome::new();
+        let hub = FakeHub::new(|request| {
+            if request.path == GIT_PATH {
+                Reply {
+                    status: 302,
+                    content_type: "text/plain",
+                    body: Vec::new(),
+                    headers: vec![(
+                        "Location".into(),
+                        "/outside/example.git/info/refs?service=git-upload-pack".into(),
+                    )],
+                }
+            } else {
+                advertisement()
+            }
+        });
+        let repo = pinned_repo(&home, &hub.base);
+        let url = format!("{}/alice/example.git", hub.base);
+        let redirect = format!("http.{url}.followRedirects");
+        let headers = format!("http.{url}.extraHeader");
+        let mut parameters = OsString::from(format!("'{redirect}=true' "));
+        parameters.push(inherited_parameters(&[
+            (&headers, "X-Inherited: must-not-escape"),
+            (&headers, "X-AgentGit-Expected-Agent-Id: inherited"),
+            ("http.userAgent", "preserved inherited agent"),
+        ]));
+        // The fixture's environment lock and restoration cover the inherited parameter value.
+        unsafe { std::env::set_var("GIT_CONFIG_PARAMETERS", parameters) };
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        assert!(!execute(EntryPoint::Capture, repo.root(), &url, &identity));
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1);
+        assert_git_request(&requests[0], Some("fake-alice-access"), true);
+        assert_eq!(requests[0].header("X-Inherited"), None);
+        assert_eq!(
+            requests[0].header("User-Agent"),
+            Some("preserved inherited agent")
+        );
+    }
+
+    #[test]
+    fn inherited_parameter_rewrites_and_quoted_mounts_keep_their_wire_target() {
+        let home = IsolatedHome::new();
+        let hub = FakeHub::new(|_| advertisement());
+        let mount = format!("{}/mount=one's!", hub.base);
+        let identity = RemoteIdentity::new(&mount, AGENT_ID).unwrap();
+        credentials::save(&mount, &pair(&mount, "alice")).unwrap();
+        let requested = format!("{mount}/alice/requested.git");
+        let effective = format!("{mount}/alice/example.git");
+        let rewrite = format!("url.{effective}.insteadOf");
+        let headers = format!("http.{effective}.extraHeader");
+        let redirect = format!("http.{effective}.followRedirects");
+        let parameters = inherited_parameters(&[
+            (&rewrite, &requested),
+            (&headers, "X-Inherited: must-not-escape"),
+            (&redirect, "true"),
+            ("http.userAgent", "preserved inherited agent"),
+        ]);
+        // URL expansion and transport observe the same inherited non-security configuration.
+        unsafe { std::env::set_var("GIT_CONFIG_PARAMETERS", parameters) };
+        assert!(execute(
+            EntryPoint::Capture,
+            home.workspace(),
+            &requested,
+            &identity
+        ));
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            "/mount=one's!/alice/example.git/info/refs?service=git-upload-pack"
+        );
+        assert_eq!(
+            requests[0].header("Authorization"),
+            Some("Bearer fake-alice-access")
+        );
+        assert_eq!(
+            requests[0].header("X-AgentGit-Expected-Agent-Id"),
+            Some(AGENT_ID)
+        );
+        assert_eq!(requests[0].header("X-Inherited"), None);
+        assert_eq!(
+            requests[0].header("User-Agent"),
+            Some("preserved inherited agent")
         );
     }
 }

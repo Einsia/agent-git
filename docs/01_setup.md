@@ -148,10 +148,7 @@ Credentials are stored per address, so the public hub and a self-hosted instance
 each stay signed in; switching the environment variable switches identity.
 
 ```bash
-agit login              # needs a tty, prompts for the password
-# username: alice
-# password: [not echoed]
-# ✓ signed in as alice
+agit login              # authorize through the browser or choose device code
 
 agit doctor --check-backend
 #   [✓] sign-in          alice @ http://127.0.0.1:8177
@@ -160,41 +157,24 @@ agit doctor --check-backend
 agit logout             # revokes the server session + deletes local credentials, not the store
 ```
 
-Signing in returns a token pair, stored one file per hub in
-`~/.agit/credentials/<hub-host-key>.json` (0600, for example
-`127.0.0.1_8177.json`; see `infra::credentials`): access lasts an hour, refresh
-lasts thirty days. Once access expires the client swaps in a new one and
-retries, so one sign-in lasts a month. The mechanism is in
+Signing in returns a token pair, stored under `$AGIT_HOME/credentials/` (default
+`~/.agit/credentials/`). The CLI chooses the filename and binds its contents to
+the selected Hub authority. Unix files are private to their owner; Windows
+files use the current user's private access control list. The credential scope,
+refresh behavior, and compatibility rules are in
 [`commands/auth.md`](commands/auth.md).
 
-> The older single-file `~/.agit/credentials.json` with a `hubs` map is no
-> longer read. A script that hand-writes credentials in that format gets a
-> misleading `not signed in`.
-
-CI has no tty: call the API for the tokens and write the credential file
-yourself:
+CI uses a PAT supplied through stdin. Save the PAT as a secret file in the CI
+runner, then let the CLI validate and store the session:
 
 ```bash
 export AGIT_HOME=/tmp/agit-ci AGIT_HUB_URL=http://127.0.0.1:8177
-curl -s -X POST $AGIT_HUB_URL/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"your-password"}' \
-  | python3 -c "
-import json,sys,os,pathlib
-d=json.load(sys.stdin)
-home=pathlib.Path(os.environ['AGIT_HOME'])
-cred_dir=home/'credentials'; cred_dir.mkdir(parents=True, exist_ok=True)
-# the host key algorithm is in infra::config::hub_host_key: drop the scheme,
-# **drop the path**, replace ':' with '_'. Without the drop-the-path step, a hub
-# configured with a subpath (https://h/agit/) computes a filename containing a
-# slash, and the CLI never reads the credentials written there.
-host=os.environ['AGIT_HUB_URL'].split('://',1)[-1].split('/',1)[0].replace(':','_')
-keys=('username','access_token','access_expires_at','refresh_token','refresh_expires_at')
-p=cred_dir/f'{host}.json'
-p.write_text(json.dumps({k:d[k] for k in keys}))
-os.chmod(p, 0o600)
-"
+agit login --with-token < token.txt
+agit whoami --check
 ```
+
+Do not construct credential filenames or hand-write token JSON. Records without
+a valid Hub address cannot establish which destination may receive their tokens.
 
 ## Troubleshooting
 

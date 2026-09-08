@@ -72,9 +72,10 @@ impl Lab {
             })
             .collect();
         agit::infra::credentials::save_at(
-            &store
-                .join("credentials")
-                .join(format!("{}.json", agit::infra::config::hub_host_key(HUB))),
+            &store.join("credentials").join(format!(
+                "{}.json",
+                agit::infra::config::hub_host_key(HUB).unwrap()
+            )),
             &agit::infra::credentials::HubCredential {
                 username: "me".into(),
                 email: None,

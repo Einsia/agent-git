@@ -32,9 +32,10 @@ fn singleton_publish_state_cannot_replace_missing_or_rejected_identity() {
         refresh_expires_at: "2099-01-01T00:00:00Z".into(),
     };
     agit::infra::credentials::save_at(
-        &home
-            .join("credentials")
-            .join(format!("{}.json", agit::infra::config::hub_host_key(&hub))),
+        &home.join("credentials").join(format!(
+            "{}.json",
+            agit::infra::config::hub_host_key(&hub).unwrap()
+        )),
         &credential,
     )
     .unwrap();

@@ -431,7 +431,7 @@ fn save_cache(latest: &str) {
 
 /// Check for an update at a user-facing CLI startup.
 ///
-/// Machine-readable output, quiet mode, CI, local status, and internal commands skip both
+/// Machine-readable output, quiet mode, CI, local inspection, and internal commands skip both
 /// the network request and the notice. Eligible user-facing invocations share the daily cache.
 pub fn maybe_startup_nudge(command: &str, json: bool) {
     let quiet = std::env::var_os("AGIT_QUIET").is_some();
@@ -443,7 +443,7 @@ pub fn maybe_startup_nudge(command: &str, json: bool) {
 }
 
 fn startup_nudge_allowed(command: &str, json: bool, quiet: bool, ci: bool) -> bool {
-    !json && !quiet && !ci && !matches!(command, "upgrade" | "hooks" | "mcp" | "status")
+    !json && !quiet && !ci && !matches!(command, "upgrade" | "hooks" | "mcp" | "status" | "whoami")
 }
 
 fn maybe_nudge_with_timeout(timeout: std::time::Duration) {
@@ -511,7 +511,7 @@ mod tests {
         assert!(startup_nudge_allowed("run", false, false, false));
         assert!(startup_nudge_allowed("resume", false, false, false));
         assert!(startup_nudge_allowed("push", false, false, false));
-        for command in ["upgrade", "hooks", "mcp", "status"] {
+        for command in ["upgrade", "hooks", "mcp", "status", "whoami"] {
             assert!(!startup_nudge_allowed(command, false, false, false));
         }
         assert!(!startup_nudge_allowed("run", true, false, false));

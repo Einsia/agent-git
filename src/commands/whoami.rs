@@ -21,20 +21,29 @@ pub struct Args {
 }
 
 pub fn run(args: Args, json: bool) -> CmdResult {
-    if json {
-        return run_json(args);
-    }
-    run_human(args)
-}
-
-fn run_json(args: Args) -> CmdResult {
     let hub = config::hub_url();
-    let Some(cred) = credentials::current() else {
-        ui::error(&format!("not signed in to {hub}."));
+    let Some(cred) = credentials::load(&hub) else {
+        ui::error(&format!(
+            "not signed in to {}.",
+            crate::infra::hub_authority::safe_label(&hub)
+        ));
         ui::hint("next: `agit login`");
         return Ok(ExitCode::Auth);
     };
+    let client = crate::hub::Client::for_credential(&hub, &cred);
+    if json {
+        run_json(args, &hub, &cred, &client)
+    } else {
+        run_human(args, &hub, &cred, &client)
+    }
+}
 
+fn run_json(
+    args: Args,
+    hub: &str,
+    cred: &credentials::HubCredential,
+    client: &crate::hub::Client,
+) -> CmdResult {
     let mut check = Check::default();
     let mut result_code = ExitCode::Ok;
     if args.check {
@@ -46,7 +55,7 @@ fn run_json(args: Args) -> CmdResult {
         } else {
             // In JSON mode stdout carries that one document only: the human success line must
             // not print.
-            let (c, code) = verify_online(&hub, false);
+            let (c, code) = verify_online(hub, client, false);
             check = c;
             result_code = code;
         }
@@ -54,7 +63,7 @@ fn run_json(args: Args) -> CmdResult {
 
     println!(
         "{}",
-        serde_json::to_string(&json_report(&hub, &cred, args.check, &check))?
+        serde_json::to_string(&json_report(hub, cred, args.check, &check))?
     );
     Ok(result_code)
 }
@@ -73,8 +82,7 @@ struct Check {
 /// With `human` off nothing is written to stdout — errors and hints go to stderr and never take
 /// stdout; only the success line lands on stdout, and `--json` requires stdout to carry that one
 /// document only.
-fn verify_online(hub: &str, human: bool) -> (Check, ExitCode) {
-    let client = crate::hub::Client::from_env();
+fn verify_online(hub: &str, client: &crate::hub::Client, human: bool) -> (Check, ExitCode) {
     match client.me() {
         Ok(me) => {
             if human {
@@ -142,11 +150,11 @@ fn json_report(
         "email": cred.email,
         "tokens": {
             "access": {
-                "state": if cred.access_expired() { "expired" } else { "valid" },
+                "state": token_state(&cred.access_expires_at),
                 "expires_at": cred.access_expires_at,
             },
             "refresh": {
-                "state": if cred.refresh_expired() { "expired" } else { "valid" },
+                "state": token_state(&cred.refresh_expires_at),
                 "expires_at": cred.refresh_expires_at,
             },
         },
@@ -158,14 +166,12 @@ fn json_report(
     })
 }
 
-fn run_human(args: Args) -> CmdResult {
-    let hub = config::hub_url();
-    let Some(cred) = credentials::current() else {
-        ui::error(&format!("not signed in to {hub}."));
-        ui::hint("next: `agit login`");
-        return Ok(ExitCode::Auth);
-    };
-
+fn run_human(
+    args: Args,
+    hub: &str,
+    cred: &credentials::HubCredential,
+    client: &crate::hub::Client,
+) -> CmdResult {
     println!("hub   {hub}");
     println!("account  {}", cred.username);
     if let Some(email) = &cred.email {
@@ -173,8 +179,8 @@ fn run_human(args: Args) -> CmdResult {
     }
     println!(
         "tokens   access {} · refresh {}",
-        state(&cred.access_expires_at, cred.access_expired()),
-        state(&cred.refresh_expires_at, cred.refresh_expired()),
+        state(&cred.access_expires_at),
+        state(&cred.refresh_expires_at),
     );
 
     if args.check {
@@ -183,23 +189,65 @@ fn run_human(args: Args) -> CmdResult {
             ui::hint("next: sign in again with `agit login`");
             return Ok(ExitCode::Auth);
         }
-        let (_, code) = verify_online(&hub, true);
+        let (_, code) = verify_online(hub, client, true);
         return Ok(code);
     }
     Ok(ExitCode::Ok)
 }
 
-fn state(expires_at: &str, expired: bool) -> String {
-    format!(
-        "{} ({})",
-        if expired { "expired" } else { "valid" },
-        &expires_at[..expires_at.len().min(19)]
-    )
+fn parsed_state(expires_at: &chrono::DateTime<chrono::FixedOffset>) -> &'static str {
+    if *expires_at < chrono::Utc::now() {
+        "expired"
+    } else {
+        "valid"
+    }
+}
+
+fn token_state(expires_at: &str) -> &'static str {
+    chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map(|expires_at| parsed_state(&expires_at))
+        .unwrap_or("invalid")
+}
+
+fn state(expires_at: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(expires_at) {
+        Ok(expires_at) => format!(
+            "{} ({})",
+            parsed_state(&expires_at),
+            expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        Err(_) => "invalid expiry".into(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_expiry_is_explicit_without_slicing_or_displaying_its_bytes() {
+        for expiry in [
+            "é".repeat(10),
+            String::new(),
+            "invalid\n\u{1b}[31m".into(),
+            "2099-99-01T00:00:00Z".into(),
+        ] {
+            assert_eq!(token_state(&expiry), "invalid");
+            assert_eq!(state(&expiry), "invalid expiry");
+        }
+    }
+
+    #[test]
+    fn parsed_expiry_display_preserves_the_timezone() {
+        assert_eq!(
+            state("2099-01-01T00:00:00+08:00"),
+            "valid (2099-01-01T00:00:00+08:00)"
+        );
+        assert_eq!(
+            state("2000-01-01T00:00:00Z"),
+            "expired (2000-01-01T00:00:00Z)"
+        );
+    }
 
     #[test]
     fn json_report_uses_named_fields_instead_of_aligned_text() {

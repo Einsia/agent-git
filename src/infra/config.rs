@@ -101,16 +101,16 @@ pub fn credentials_dir() -> Result<PathBuf> {
 
 /// The credentials file of one hub: `credentials/<hub-host>.json`.
 pub fn credentials_path(hub: &str) -> Result<PathBuf> {
-    Ok(credentials_dir()?.join(format!("{}.json", hub_host_key(hub))))
+    Ok(credentials_dir()?.join(format!("{}.json", hub_host_key(hub)?)))
 }
 
-/// A hub address → a host key that is safe as a filename.
-///
-/// Only the authority (host[:port]) is taken, because "switching hub is switching identity" is
-/// said of the host; the scheme stays out of the key, or the same hub moving from http to https
-/// becomes two identities out of nowhere and demands signing in again. Every non-alphanumeric
-/// character becomes `_` (a colon is an illegal filename character on Windows).
-pub fn hub_host_key(hub: &str) -> String {
+/// Credential filenames depend on a checked authority, not lossy URL spelling.
+pub fn hub_host_key(hub: &str) -> Result<String> {
+    Ok(super::hub_authority::HubAuthority::parse(hub)?.storage_key())
+}
+
+/// The compatibility filename can identify a candidate only when its metadata agrees.
+pub fn legacy_hub_host_key(hub: &str) -> String {
     let s = hub.trim().trim_end_matches('/');
     let s = s
         .strip_prefix("https://")
@@ -133,6 +133,28 @@ pub fn hub_host_key(hub: &str) -> String {
     } else {
         key
     }
+}
+
+/// Case-preserving filesystems may retain a spelling different from a bound record's address.
+pub fn legacy_hub_record_matches(path: &std::path::Path, hub: &str) -> bool {
+    hub_record_key_matches(path, &legacy_hub_host_key(hub))
+}
+
+/// Filename aliases are admitted only when the filesystem resolves the expected name to the same file.
+pub(crate) fn hub_record_key_matches(path: &std::path::Path, key: &str) -> bool {
+    let expected_name = format!("{key}.json");
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name == expected_name {
+        return true;
+    }
+    if !name.eq_ignore_ascii_case(&expected_name) {
+        return false;
+    }
+    let expected_path = path.with_file_name(expected_name);
+    std::fs::symlink_metadata(&expected_path).is_ok_and(|metadata| metadata.is_file())
+        && same_file::is_same_file(path, &expected_path).unwrap_or(false)
 }
 
 /// The global config file: a few keys, no repo-level config (the PRD's `agit config` section).
@@ -529,16 +551,21 @@ mod tests {
 
     #[test]
     fn hub_host_key_is_a_filename_and_ignores_the_scheme() {
-        // The same hub under another scheme must not become two identities (or someone who
-        // signed in once is signed out on the next command).
-        assert_eq!(hub_host_key("https://agent-git.com"), "agent-git.com");
-        assert_eq!(hub_host_key("http://agent-git.com/"), "agent-git.com");
-        // The port stays (several local instances are told apart by it), but a colon cannot
-        // enter a filename.
-        assert_eq!(hub_host_key("http://127.0.0.1:8177"), "127.0.0.1_8177");
-        // The path stays out of the key: it is not part of the identity.
-        assert_eq!(hub_host_key("https://hub.corp.com/api/"), "hub.corp.com");
-        assert_eq!(hub_host_key(""), "unknown");
+        assert_eq!(
+            hub_host_key("https://agent-git.com").unwrap(),
+            hub_host_key("HTTP://AGENT-GIT.COM/").unwrap()
+        );
+        assert_ne!(
+            hub_host_key("http://127.0.0.1:8177").unwrap(),
+            hub_host_key("http://127.0.0.1:8178").unwrap()
+        );
+        assert_eq!(
+            hub_host_key("https://hub.corp.com/api/").unwrap(),
+            hub_host_key("https://hub.corp.com").unwrap()
+        );
+        assert!(hub_host_key("").is_err());
+        assert_eq!(legacy_hub_host_key("HTTP://host:8177"), "HTTP_");
+        assert_eq!(legacy_hub_host_key("http://host:8177"), "host_8177");
     }
 
     #[test]

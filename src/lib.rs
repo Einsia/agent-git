@@ -148,6 +148,8 @@ pub mod infra {
     pub mod config;
     /// Credential storage: where the token is kept, and how expiry is decided.
     pub mod credentials;
+    /// Canonical host-and-port binding shared by API and RC credentials.
+    pub mod hub_authority;
     /// Where each runtime's project memory directory is.
     pub mod runtime_memory;
     /// Discovery of the runtime session the current process belongs to (no CLI output here).

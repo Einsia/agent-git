@@ -160,6 +160,7 @@ fn scoped_doctor_contacts_the_backend_only_when_explicitly_requested() {
                 Err(error) => panic!("cannot accept backend check: {error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(3)))
             .unwrap();

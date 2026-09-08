@@ -7,6 +7,7 @@ use super::*;
 use crate::Result;
 use crate::infra::config;
 use crate::infra::credentials;
+use crate::infra::hub_authority::HubAuthority;
 use anyhow::Context;
 use std::time::Duration;
 
@@ -81,6 +82,7 @@ struct ErrorBody {
 
 pub struct Client {
     base: String,
+    credential_binding_valid: bool,
     /// The current access token.
     ///
     /// `RefCell` because every request method takes `&self`, while a 401 has to swap in a new
@@ -110,6 +112,14 @@ fn refresh_gate() -> &'static std::sync::Mutex<()> {
     &GATE
 }
 
+fn credential_matches_hub(base: &str, cred: &credentials::HubCredential) -> bool {
+    HubAuthority::parse(base).is_ok_and(|authority| {
+        cred.hub
+            .as_deref()
+            .is_some_and(|hub| authority.matches(hub))
+    })
+}
+
 impl Client {
     /// Build from the environment and the credentials file. The single construction entry point.
     pub fn from_env() -> Client {
@@ -121,6 +131,34 @@ impl Client {
     /// Normal commands get a generous timeout, while incidental work such as the startup
     /// version nudge must fail fast and never make the user's command feel hung.
     pub fn from_env_with_timeout(timeout: Duration) -> Client {
+        Self::stored_hub_with_timeout(config::hub_url(), timeout)
+    }
+
+    pub(crate) fn for_stored_hub(hub: &str) -> Client {
+        Self::stored_hub_with_timeout(hub.to_string(), Duration::from_secs(30))
+    }
+
+    fn stored_hub_with_timeout(base: String, timeout: Duration) -> Client {
+        match credentials::load_checked(&base) {
+            Ok(cred) => Self::new(base, cred, timeout),
+            Err(_) => {
+                let mut client = Self::new(base, None, timeout);
+                client.credential_binding_valid = false;
+                client
+            }
+        }
+    }
+
+    fn new(base: String, cred: Option<credentials::HubCredential>, timeout: Duration) -> Client {
+        let base = if HubAuthority::parse(&base).is_ok() {
+            base.trim().trim_end_matches('/').to_string()
+        } else {
+            base
+        };
+        let credential_binding_valid = cred
+            .as_ref()
+            .is_none_or(|cred| credential_matches_hub(&base, cred));
+        let cred = cred.filter(|_| credential_binding_valid);
         let cfg = ureq::Agent::config_builder()
             // A timeout is mandatory: hanging on an unresponsive hub buys nothing, and the
             // user reads it as agit being dead.
@@ -131,9 +169,9 @@ impl Client {
             // through [`Client::decode`] and the body reaches the user.
             .http_status_as_error(false)
             .build();
-        let cred = credentials::current();
         Client {
-            base: config::hub_url(),
+            base,
+            credential_binding_valid,
             token: std::cell::RefCell::new(cred.as_ref().map(|c| c.access_token.clone())),
             cred: std::cell::RefCell::new(cred),
             agent: cfg.into(),
@@ -143,11 +181,7 @@ impl Client {
     /// A named hub plus a whole credential: requests carry its access token, and a 401 renews
     /// with its own refresh token and stores the new pair back under **its** hub.
     pub fn for_credential(hub: &str, cred: &credentials::HubCredential) -> Client {
-        let mut c = Client::from_env();
-        c.base = hub.trim_end_matches('/').to_string();
-        *c.token.borrow_mut() = Some(cred.access_token.clone());
-        *c.cred.borrow_mut() = Some(cred.clone());
-        c
+        Self::new(hub.to_string(), Some(cred.clone()), Duration::from_secs(30))
     }
 
     pub fn base(&self) -> &str {
@@ -156,21 +190,15 @@ impl Client {
 
     /// A named hub with no credentials (the constructor for the browser / device login flow).
     pub fn for_hub(hub: &str) -> Client {
-        let mut c = Client::from_env();
-        c.base = hub.trim_end_matches('/').to_string();
-        *c.token.borrow_mut() = None;
-        *c.cred.borrow_mut() = None;
-        c
+        Self::new(hub.to_string(), None, Duration::from_secs(30))
     }
 
     /// A named hub plus a ready-made token (the constructor for `login --with-token`).
     pub fn for_hub_with_token(hub: &str, token: &str) -> Client {
-        let mut c = Client::from_env();
-        c.base = hub.trim_end_matches('/').to_string();
-        *c.token.borrow_mut() = Some(token.to_string());
-        // A bare token has no matching refresh token; refreshing with the "current hub" one
-        // renews the wrong account.
-        *c.cred.borrow_mut() = None;
+        let c = Self::for_hub(hub);
+        if HubAuthority::parse(hub).is_ok() {
+            *c.token.borrow_mut() = Some(token.to_string());
+        }
         c
     }
 
@@ -181,6 +209,27 @@ impl Client {
 
     pub fn has_token(&self) -> bool {
         self.token.borrow().is_some()
+    }
+
+    pub(crate) fn checked_access_token(&self) -> Result<Option<String>> {
+        self.ensure_destination()?;
+        Ok(self.token.borrow().clone())
+    }
+
+    pub(crate) fn access_expired(&self) -> bool {
+        self.cred
+            .borrow()
+            .as_ref()
+            .is_some_and(credentials::HubCredential::access_expired)
+    }
+
+    fn ensure_destination(&self) -> Result<()> {
+        HubAuthority::parse(&self.base)?;
+        anyhow::ensure!(
+            self.credential_binding_valid,
+            "credentials do not belong to the selected Hub"
+        );
+        Ok(())
     }
 
     fn url(&self, path: &str) -> String {
@@ -225,6 +274,7 @@ impl Client {
         T: serde::de::DeserializeOwned,
         F: Fn(Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     {
+        self.ensure_destination()?;
         let mut resp = {
             let t = self.token.borrow();
             send(t.as_deref())
@@ -306,12 +356,17 @@ impl Client {
         let Some(cred) = self.cred.borrow().clone() else {
             return false;
         };
+        if self.ensure_destination().is_err() || !credential_matches_hub(&self.base, &cred) {
+            return false;
+        }
         // One client renews at a time in-process: latecomers wait outside the gate, and by the
         // time they get in the one that went first has persisted the new pair, so they adopt
         // it — two clients never spend the same single-use refresh token.
         let _gate = refresh_gate().lock().unwrap_or_else(|e| e.into_inner());
-        if self.adopt_newer_from_disk(&cred) {
-            return true;
+        match self.adopt_newer_from_disk(&cred) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
         }
         if cred.refresh_expired() {
             return false;
@@ -327,16 +382,18 @@ impl Client {
         };
 
         let fresh = credentials::HubCredential {
-            username: cred.username,
-            email: cred.email,
-            hub: cred.hub,
+            username: cred.username.clone(),
+            email: cred.email.clone(),
+            hub: cred.hub.clone(),
             access_token: pair.access_token.clone(),
             access_expires_at: pair.access_expires_at,
             refresh_token: pair.refresh_token,
             refresh_expires_at: pair.refresh_expires_at,
         };
-        if credentials::save(&self.base, &fresh).is_err() {
-            return false;
+        match credentials::save_refreshed(&self.base, &cred, &fresh) {
+            Ok(true) => {}
+            Ok(false) => return self.adopt_newer_from_disk(&cred).unwrap_or(false),
+            Err(_) => return false,
         }
         *self.token.borrow_mut() = Some(pair.access_token);
         *self.cred.borrow_mut() = Some(fresh);
@@ -351,19 +408,23 @@ impl Client {
     /// account just as this 401 arrived; that pair on disk is also "newer and valid", but
     /// replaying the original request with it puts a different principal behind something the
     /// user started under another identity.
-    fn adopt_newer_from_disk(&self, ours: &credentials::HubCredential) -> bool {
-        let Some(disk) = credentials::load(&self.base) else {
-            return false;
-        };
-        if disk.username != ours.username
-            || disk.access_token == ours.access_token
-            || disk.refresh_expired()
-        {
-            return false;
+    fn adopt_newer_from_disk(&self, ours: &credentials::HubCredential) -> Result<bool> {
+        anyhow::ensure!(
+            credential_matches_hub(&self.base, ours),
+            "credentials do not belong to the selected Hub"
+        );
+        let disk = credentials::load_checked(&self.base)?
+            .ok_or_else(|| anyhow::anyhow!("the saved Hub credentials are no longer available"))?;
+        anyhow::ensure!(
+            credential_matches_hub(&self.base, &disk) && disk.username == ours.username,
+            "the saved Hub identity changed"
+        );
+        if disk.access_token == ours.access_token || disk.refresh_expired() {
+            return Ok(false);
         }
         *self.token.borrow_mut() = Some(disk.access_token.clone());
         *self.cred.borrow_mut() = Some(disk);
-        true
+        Ok(true)
     }
 
     /// Where a failed exchange of our own converges: a refresh token is single-use, and the
@@ -374,8 +435,10 @@ impl Client {
     /// already serialized outside [`refresh_gate`].
     fn wait_for_a_sibling_to_land(&self, ours: &credentials::HubCredential) -> bool {
         for _ in 0..REFRESH_SETTLE_POLLS {
-            if self.adopt_newer_from_disk(ours) {
-                return true;
+            match self.adopt_newer_from_disk(ours) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(_) => return false,
             }
             std::thread::sleep(REFRESH_SETTLE_STEP);
         }
@@ -430,6 +493,7 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T> {
+        self.ensure_destination()?;
         let resp = self
             .agent
             .post(self.url(path))
@@ -447,6 +511,7 @@ impl Client {
     }
 
     fn delete_inner(&self, path: &str, expected_agent_id: Option<&str>) -> Result<()> {
+        self.ensure_destination()?;
         let send = |token: Option<&str>| {
             let mut req = self.agent.delete(self.url(path));
             if let Some(expected_agent_id) = expected_agent_id {
@@ -744,6 +809,7 @@ impl Client {
     /// [`Self::with_retry`]; a second 401 is reported as expired credentials, not as "no
     /// permission".
     fn status_of(&self, path: &str, expected_agent_id: Option<&str>) -> Result<u16> {
+        self.ensure_destination()?;
         let send = |t: Option<&str>| {
             let mut req = self.agent.get(self.url(path));
             if let Some(t) = t {
@@ -945,6 +1011,7 @@ mod tests {
     fn client(base: &str) -> Client {
         Client {
             base: base.into(),
+            credential_binding_valid: true,
             token: std::cell::RefCell::new(None),
             cred: std::cell::RefCell::new(None),
             agent: ureq::Agent::new_with_defaults(),
@@ -1041,6 +1108,7 @@ mod tests {
             refresh_token: "rt-other-hub".into(),
             refresh_expires_at: "2099-01-01T00:00:00Z".into(),
         };
+        credentials::save(&base, &cred).unwrap();
         let client = Client::for_credential(&base, &cred);
         let result = client.logout();
         let saved = credentials::load(&base);
@@ -1163,6 +1231,246 @@ mod tests {
         }
     }
 
+    struct CredentialTestHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _home: tempfile::TempDir,
+        previous_home: Option<std::ffi::OsString>,
+        previous_hub: Option<std::ffi::OsString>,
+    }
+
+    impl CredentialTestHome {
+        fn new() -> Self {
+            let lock = config::env_lock();
+            let home = tempfile::tempdir().unwrap();
+            let previous_home = std::env::var_os("AGIT_HOME");
+            let previous_hub = std::env::var_os("AGIT_HUB_URL");
+            unsafe { std::env::set_var("AGIT_HOME", home.path()) };
+            Self {
+                _lock: lock,
+                _home: home,
+                previous_home,
+                previous_hub,
+            }
+        }
+    }
+
+    impl Drop for CredentialTestHome {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous_home {
+                    Some(value) => std::env::set_var("AGIT_HOME", value),
+                    None => std::env::remove_var("AGIT_HOME"),
+                }
+                match &self.previous_hub {
+                    Some(value) => std::env::set_var("AGIT_HUB_URL", value),
+                    None => std::env::remove_var("AGIT_HUB_URL"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_invalid_saved_identity_cannot_become_an_anonymous_request() {
+        let _home = CredentialTestHome::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        unsafe { std::env::set_var("AGIT_HUB_URL", &base) };
+        assert!(Client::from_env().ensure_destination().is_ok());
+        let path = config::credentials_path(&base).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"invalid credential").unwrap();
+        let client = Client::from_env();
+        assert_eq!(client.base(), base);
+        assert!(!client.has_token());
+        assert!(client.health().is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid credential");
+    }
+
+    #[test]
+    fn explicit_credentials_require_the_requested_authority_before_any_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let foreign = format!("HTTP://{}", other.local_addr().unwrap());
+        for recorded_hub in [
+            None,
+            Some(foreign),
+            Some("https://user:private-sentinel@example.test".into()),
+        ] {
+            let mut cred = old_pair(&base, "alice");
+            cred.hub = recorded_hub;
+            let client = Client::for_credential(&base, &cred);
+            assert!(!client.has_token());
+            let error = client.logout().unwrap_err().to_string();
+            assert!(!error.contains("private-sentinel"));
+            assert!(!client.refresh_access());
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn invalid_destinations_never_send_explicit_tokens_or_login_bodies() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        for base in [
+            format!("http://{address}/?private-sentinel"),
+            format!("http://{address}/#private-sentinel"),
+            format!("http://private-sentinel@{address}"),
+            format!("http://{address}\n"),
+        ] {
+            let public = Client::for_hub(&base);
+            assert!(!public.has_token());
+            let error = public.login_with_pat("fake-pat").unwrap_err().to_string();
+            assert!(!error.contains("private-sentinel"));
+            let token = Client::for_hub_with_token(&base, "fake-access-token");
+            assert!(!token.has_token());
+            assert!(token.logout().is_err());
+            assert!(token.delete("api/agents/alice/example").is_err());
+            assert!(token.status_of("api/health", None).is_err());
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn equivalent_recorded_authority_retains_the_selected_routing() {
+        let (base, hub) = fake_hub(1, |request| {
+            assert!(request.starts_with("POST /chosen/api/auth/logout "));
+            assert!(request.contains("Bearer at-old"));
+            (200, "{}".into())
+        });
+        let mut cred = old_pair(&base, "alice");
+        cred.hub = Some(format!("{}/recorded", base.replace("http://", "HTTPS://")));
+        let client = Client::for_credential(&format!("{base}/chosen/"), &cred);
+        assert!(client.has_token());
+        client.logout().unwrap();
+        assert_eq!(hub.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_or_invalid_saved_credentials_cannot_be_refreshed() {
+        let _home = CredentialTestHome::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let client = Client::for_credential(&base, &old_pair(&base, "alice"));
+        assert!(!client.refresh_access());
+        let path = config::credentials_path(&base).unwrap();
+        assert!(!path.exists());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"invalid credential").unwrap();
+        assert!(!client.refresh_access());
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid credential");
+        credentials::save_at(&path, &new_pair("http://elsewhere.test", "alice")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(!client.refresh_access());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    fn request_hub(request: &str) -> String {
+        let host = request
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.trim())
+            .unwrap();
+        format!("http://{host}")
+    }
+
+    #[test]
+    fn a_login_during_refresh_cannot_be_overwritten_or_used_for_retry() {
+        let _home = CredentialTestHome::new();
+        let (base, hub) = fake_hub(2, |request| {
+            assert!(!request.contains("Bearer at-new"));
+            if request.starts_with("POST /api/auth/refresh ") {
+                let base = request_hub(request);
+                credentials::save(&base, &new_pair(&base, "bob")).unwrap();
+                return (
+                    200,
+                    serde_json::to_string(&new_pair(&base, "alice")).unwrap(),
+                );
+            }
+            (401, r#"{"error":"expired","kind":"unauthorized"}"#.into())
+        });
+        let cred = old_pair(&base, "alice");
+        credentials::save(&base, &cred).unwrap();
+        let client = Client::for_credential(&base, &cred);
+        let error = client.logout().unwrap_err();
+        assert_eq!(error.downcast_ref::<ApiError>().unwrap().status, 401);
+        assert_eq!(credentials::load(&base).unwrap().username, "bob");
+        assert_eq!(client.cred.borrow().as_ref().unwrap().username, "alice");
+        assert_eq!(hub.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_sibling_pair_landing_during_refresh_wins_without_an_overwrite() {
+        let _home = CredentialTestHome::new();
+        let (base, hub) = fake_hub(3, |request| {
+            if request.starts_with("POST /api/auth/refresh ") {
+                let base = request_hub(request);
+                let mut sibling = new_pair(&base, "alice");
+                sibling.access_token = "at-sibling".into();
+                sibling.refresh_token = "rt-sibling".into();
+                credentials::save(&base, &sibling).unwrap();
+                return (
+                    200,
+                    serde_json::to_string(&new_pair(&base, "alice")).unwrap(),
+                );
+            }
+            if request.contains("Bearer at-sibling") {
+                return (200, "{}".into());
+            }
+            assert!(request.contains("Bearer at-old"));
+            (401, r#"{"error":"expired","kind":"unauthorized"}"#.into())
+        });
+        let cred = old_pair(&base, "alice");
+        credentials::save(&base, &cred).unwrap();
+        let client = Client::for_credential(&base, &cred);
+        client.logout().unwrap();
+        assert_eq!(credentials::load(&base).unwrap().access_token, "at-sibling");
+        assert_eq!(client.token.borrow().as_deref(), Some("at-sibling"));
+        assert_eq!(hub.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_logout_during_refresh_cannot_restore_credentials() {
+        let _home = CredentialTestHome::new();
+        let (base, hub) = fake_hub(2, |request| {
+            if request.starts_with("POST /api/auth/refresh ") {
+                let base = request_hub(request);
+                assert!(credentials::remove(&base).unwrap());
+                return (
+                    200,
+                    serde_json::to_string(&new_pair(&base, "alice")).unwrap(),
+                );
+            }
+            (401, r#"{"error":"expired","kind":"unauthorized"}"#.into())
+        });
+        let cred = old_pair(&base, "alice");
+        credentials::save(&base, &cred).unwrap();
+        let client = Client::for_credential(&base, &cred);
+        let error = client.logout().unwrap_err();
+        assert_eq!(error.downcast_ref::<ApiError>().unwrap().status, 401);
+        assert!(credentials::load(&base).is_none());
+        assert_eq!(hub.join().unwrap().len(), 2);
+    }
+
     /// Another **process** has just spent this refresh token while the new pair is not
     /// persisted yet: a failed exchange waits for that write and then adopts it, instead of
     /// handing the original 401 back. A thread plays that process here: it writes the new pair
@@ -1222,7 +1530,7 @@ mod tests {
     /// replayable as that other person.
     #[test]
     fn a_pair_from_another_account_is_never_adopted() {
-        let (base, hub) = fake_hub(2, |req| {
+        let (base, hub) = fake_hub(1, |req| {
             let first = req.lines().next().unwrap_or("").to_string();
             if first.starts_with("POST /api/auth/refresh") {
                 return (401, r#"{"error":"used","kind":"unauthorized"}"#.into());
@@ -1251,7 +1559,7 @@ mod tests {
         }
         let e = result.unwrap_err();
         assert_eq!(e.downcast_ref::<ApiError>().map(|a| a.status), Some(401));
-        assert_eq!(hub.join().unwrap().len(), 2);
+        assert_eq!(hub.join().unwrap().len(), 1);
     }
 
     /// A bare token has no refresh token to use: a 401 stays a 401, and no other hub's

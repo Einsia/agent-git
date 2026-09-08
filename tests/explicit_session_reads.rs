@@ -123,7 +123,7 @@ fn share_sends_only_the_selected_branch_to_the_requested_hub() {
         refresh_token: "synthetic-test-refresh".into(),
         refresh_expires_at: "2099-01-01T00:00:00Z".into(),
     };
-    let key = agit::infra::config::hub_host_key(&hub);
+    let key = agit::infra::config::hub_host_key(&hub).unwrap();
     agit::infra::credentials::save_at(
         &home.join("credentials").join(format!("{key}.json")),
         &credential,

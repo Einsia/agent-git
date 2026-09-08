@@ -417,7 +417,7 @@ fn start(args: StartArgs) -> CmdResult {
     }
 
     let hub = config::hub_url();
-    let conn = match identity::connection(&hub) {
+    let conn = match identity::connection(&hub)? {
         Some(c) => c,
         None => {
             // First run: pair through the existing device-code flow rather than
@@ -428,6 +428,7 @@ fn start(args: StartArgs) -> CmdResult {
             }
         }
     };
+    let opts = daemon_options(&hub, conn)?;
 
     let id = identity::identity()?;
     ui::section("agit rc");
@@ -442,6 +443,7 @@ fn start(args: StartArgs) -> CmdResult {
         let mut command = std::process::Command::new(exe);
         command
             .args(["rc", "start"])
+            .env("AGIT_HUB_URL", &hub)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -470,11 +472,6 @@ fn start(args: StartArgs) -> CmdResult {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let opts = crate::rc::daemon::Options {
-        hub,
-        token: conn.token,
-        connection_id: Some(conn.connection_id),
-    };
     match rt.block_on(crate::rc::daemon::Daemon::run(opts)) {
         Ok(()) => Ok(ExitCode::Ok),
         Err(e) => {
@@ -482,6 +479,30 @@ fn start(args: StartArgs) -> CmdResult {
             Ok(ExitCode::Failure)
         }
     }
+}
+
+fn daemon_options(
+    hub: &str,
+    connection: identity::Connection,
+) -> crate::Result<crate::rc::daemon::Options> {
+    let authority = crate::infra::hub_authority::HubAuthority::parse(hub)?;
+    anyhow::ensure!(
+        authority.matches(&connection.hub),
+        "the saved RC connection belongs to a different Hub"
+    );
+    let (scheme, routing) = hub
+        .trim()
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("Hub address must use HTTP or HTTPS"))?;
+    Ok(crate::rc::daemon::Options {
+        hub: format!(
+            "{}://{}",
+            scheme.to_ascii_lowercase(),
+            routing.trim_end_matches('/')
+        ),
+        token: connection.token,
+        connection_id: Some(connection.connection_id),
+    })
 }
 
 fn status() -> CmdResult {
@@ -706,7 +727,11 @@ fn pair() -> CmdResult {
 /// a connection token bound to this machine's fingerprint. The RC token is
 /// separate from the API token so it can be revoked on its own.
 fn pair_interactive(hub: &str) -> crate::Result<Option<identity::Connection>> {
-    let c = crate::hub::Client::from_env();
+    crate::infra::hub_authority::HubAuthority::parse(hub)?;
+    let c = match crate::infra::credentials::load_checked(hub)? {
+        Some(credential) => crate::hub::Client::for_credential(hub, &credential),
+        None => crate::hub::Client::for_hub(hub),
+    };
     if !c.has_token() {
         ui::error(&format!(
             "sign in to {hub} first — pairing a machine needs an account."
@@ -766,6 +791,42 @@ fn human_secs(s: u64) -> String {
 #[cfg(test)]
 mod tests {
     const AGENT_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+    #[test]
+    fn daemon_options_bind_the_token_to_the_captured_hub() {
+        let connection = crate::rc::identity::Connection {
+            connection_id: "synthetic-connection".into(),
+            token: "synthetic-rc-token".into(),
+            hub: "http://NODE.test:8177/previous-route".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let options =
+            super::daemon_options("hTtPs://node.test:8177/current-route/", connection.clone())
+                .unwrap();
+        assert_eq!(options.hub, "https://node.test:8177/current-route");
+        assert_eq!(options.token, connection.token);
+        assert_eq!(
+            options.connection_id.as_deref(),
+            Some("synthetic-connection")
+        );
+        assert_eq!(
+            crate::rc::link::ws_url(&options.hub),
+            "wss://node.test:8177/current-route/rc/ws"
+        );
+        for hub in [
+            "HTTP://node.test:8178",
+            "https://node.test",
+            "https://foreign.test:8177",
+            "https://user:secret@node.test:8177",
+        ] {
+            assert!(super::daemon_options(hub, connection.clone()).is_err());
+        }
+        let invalid_connection = crate::rc::identity::Connection {
+            hub: "HTTP://node.test:invalid".into(),
+            ..connection
+        };
+        assert!(super::daemon_options("http://node.test:8177", invalid_connection).is_err());
+    }
 
     /// `agit rc land`'s slug and branch name **come from the hub**; this machine does not produce
     /// them.

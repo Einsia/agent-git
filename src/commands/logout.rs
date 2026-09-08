@@ -7,6 +7,7 @@
 use super::CmdResult;
 use crate::infra::config;
 use crate::infra::credentials;
+use crate::infra::hub_authority::{HubAuthority, safe_label};
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
@@ -29,8 +30,8 @@ pub fn run(args: Args) -> CmdResult {
     // credentials are deleted. A failure does not block — with the hub unreachable the user still
     // gets to sign out of this machine (the local credentials must be cleared). The cost is that
     // the server-side row stays until it expires, so this says so.
-    if credentials::current().is_some()
-        && let Err(e) = crate::hub::Client::from_env().logout()
+    if let Some(cred) = credentials::load(&hub)
+        && let Err(e) = crate::hub::Client::for_credential(&hub, &cred).logout()
     {
         ui::warning(&format!("server-side revoke failed: {e:#}"));
         ui::hint("local credentials are still deleted; the server session expires on its own");
@@ -61,15 +62,12 @@ pub fn run(args: Args) -> CmdResult {
 /// A credential file name keeps only the host key, which does not reverse into an address; the
 /// address comes from the `hub` field inside the credential. A credential file without that field
 /// gets its local half deleted only, and says plainly that the server-side row expires on its own.
-/// The current hub's address is always known, so it is not subject to this limit.
 fn run_all() -> CmdResult {
-    let all = credentials::all();
+    let all = credentials::all_checked()?;
     if all.is_empty() {
         println!("no saved credentials.");
         return Ok(ExitCode::Ok);
     }
-    let current = config::hub_url();
-    let current_key = crate::infra::config::hub_host_key(&current);
     for (host, cred) in &all {
         let Some(cred) = cred else {
             ui::warning(&format!(
@@ -78,14 +76,16 @@ fn run_all() -> CmdResult {
             ui::hint("the file is still deleted; the server session expires on its own");
             continue;
         };
-        let hub = if *host == current_key {
-            Some(current.clone())
-        } else {
-            cred.hub.clone()
-        };
+        let hub = cred
+            .hub
+            .as_deref()
+            .filter(|hub| HubAuthority::parse(hub).is_ok());
         match hub {
-            Some(hub) => match crate::hub::Client::for_credential(&hub, cred).logout() {
-                Ok(()) => ui::success(&format!("revoked the server session at {hub}")),
+            Some(hub) => match crate::hub::Client::for_credential(hub, cred).logout() {
+                Ok(()) => ui::success(&format!(
+                    "revoked the server session at {}",
+                    safe_label(hub)
+                )),
                 // 401 = the server no longer accepts this token (and refresh cannot trade it
                 // back): the session is gone already, so there is nothing to revoke.
                 Err(e)
@@ -94,11 +94,17 @@ fn run_all() -> CmdResult {
                 {
                     println!(
                         "{}",
-                        ui::dim(&format!("  {hub}: session already expired or revoked"))
+                        ui::dim(&format!(
+                            "  {}: session already expired or revoked",
+                            safe_label(hub)
+                        ))
                     );
                 }
                 Err(e) => {
-                    ui::warning(&format!("server-side revoke failed for {hub}: {e:#}"));
+                    ui::warning(&format!(
+                        "server-side revoke failed for {}: {e:#}",
+                        safe_label(hub)
+                    ));
                     ui::hint(
                         "local credentials are still deleted; that server session expires on its own",
                     );

@@ -39,7 +39,7 @@ impl Lab {
             refresh_token: "fake".into(),
             refresh_expires_at: "2099-01-01T00:00:00Z".into(),
         };
-        let key = agit::infra::config::hub_host_key(HUB);
+        let key = agit::infra::config::hub_host_key(HUB).unwrap();
         agit::infra::credentials::save_at(
             &agit_home.join("credentials").join(format!("{key}.json")),
             &cred,
@@ -541,10 +541,10 @@ fn unclaimed_commit_hint_records_the_selected_first_version() {
 
 fn assert_offline_adoption_hint(from_commit: bool) {
     let lab = Lab::new();
-    let credential_path = lab
-        .agit_home
-        .join("credentials")
-        .join(format!("{}.json", agit::infra::config::hub_host_key(HUB)));
+    let credential_path = lab.agit_home.join("credentials").join(format!(
+        "{}.json",
+        agit::infra::config::hub_host_key(HUB).unwrap()
+    ));
     let credentials = fs::read(&credential_path).unwrap();
     fs::remove_file(&credential_path).unwrap();
     lab.append(A, &lab.turn(A, 1, "preserve offline work", "done"));

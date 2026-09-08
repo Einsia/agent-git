@@ -139,6 +139,7 @@ mod unix {
 
         let credentials = serde_json::json!({
             "username": "alice",
+            "hub": hub,
             "email": "alice@example.test",
             "access_token": "test-access-token",
             "access_expires_at": "2100-01-01T00:00:00Z",

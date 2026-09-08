@@ -42,19 +42,14 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> CmdResult {
-    let hub = match &args.hub {
-        Some(h) => {
-            let h = h.trim().trim_end_matches('/').to_string();
-            if !h.starts_with("http://") && !h.starts_with("https://") {
-                ui::error(&format!(
-                    "`--hub` needs a full address (https://…), got `{h}`"
-                ));
-                return Ok(ExitCode::Usage);
-            }
-            h
-        }
-        None => config::hub_url(),
-    };
+    let hub = args.hub.clone().unwrap_or_else(config::hub_url);
+    if crate::infra::hub_authority::HubAuthority::parse(&hub).is_err() {
+        ui::error(
+            "the Hub must be a valid HTTP or HTTPS address without user information, query, or fragment",
+        );
+        return Ok(ExitCode::Usage);
+    }
+    let hub = hub.trim().trim_end_matches('/').to_string();
     println!("hub: {}", ui::accent(&hub));
 
     let result = if args.with_token {

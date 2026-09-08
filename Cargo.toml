@@ -162,6 +162,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 
 # ── Filesystem ──────────────────────────────────────────────────────────
 walkdir = "2"
+same-file = "1"
 tempfile = "3"
 # File locks: hooks can fire concurrently (two sessions opened at once), so writes
 # to the store must be serialized.
@@ -170,6 +171,7 @@ fs2 = "0.4"
 # ── Cryptography ────────────────────────────────────────────────────────
 sha2 = "0.10"
 hex = "0.4"
+http = "1.4"
 # provenance: one ed25519 key per machine, a session carries a signature, and the
 # server verifies who it belongs to.
 ed25519-dalek = { version = "2", features = ["rand_core"] }

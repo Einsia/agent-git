@@ -210,7 +210,7 @@ impl Lab {
             refresh_token: "fake".into(),
             refresh_expires_at: "2099-01-01T00:00:00Z".into(),
         };
-        let key = agit::infra::config::hub_host_key(&hub);
+        let key = agit::infra::config::hub_host_key(&hub).unwrap();
         agit::infra::credentials::save_at(
             &agit_home.join("credentials").join(format!("{key}.json")),
             &cred,

@@ -138,7 +138,7 @@ impl Fixture {
             access_expires_at: "2099-01-01T00:00:00Z".into(),
             refresh_expires_at: "2099-01-01T00:00:00Z".into(),
         };
-        let key = agit::infra::config::hub_host_key(&hub.url);
+        let key = agit::infra::config::hub_host_key(&hub.url).unwrap();
         agit::infra::credentials::save_at(
             &home.join("credentials").join(format!("{key}.json")),
             &credential,

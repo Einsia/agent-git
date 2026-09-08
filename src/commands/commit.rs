@@ -3554,9 +3554,10 @@ mod tests {
 
         let hub = "http://127.0.0.1:1";
         credentials::save_at(
-            &root
-                .join("agit/credentials")
-                .join(format!("{}.json", crate::infra::config::hub_host_key(hub))),
+            &root.join("agit/credentials").join(format!(
+                "{}.json",
+                crate::infra::config::hub_host_key(hub).unwrap()
+            )),
             &credentials::HubCredential {
                 username: "alice".into(),
                 email: None,

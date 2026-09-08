@@ -39,17 +39,26 @@ polls `POST /api/auth/cli/poll`. Device code creates a request with
 `POST /api/auth/device/code` and polls `POST /api/auth/device/token`. The CLI
 saves credentials only after the Hub returns a session.
 
-Credentials live in `$AGIT_HOME/credentials/<hub-host-key>.json`, with
-`~/.agit` as the default home. Each file contains the access and refresh tokens,
+Credentials live under `$AGIT_HOME/credentials/`, with `~/.agit` as the default
+home. The CLI chooses a bounded filename from the validated Hub authority. Each file contains the access and refresh tokens,
 their expiry timestamps, the Hub address, username, and optional email. The
-host key includes the port when present; it is not a separate identity for
-each URL scheme or path. Unix credential files have mode `0600`; Windows
+authority includes an explicitly supplied port; omitting the port is a different
+identity from spelling it explicitly. Host and HTTP scheme lettercase are
+normalized; changing the URL scheme or path does not create another identity. Unix credential files have mode `0600`; Windows
 writes use the current user's private access control list.
 
 Requests carry the access token. On an authentication failure the Hub client
 can refresh and retry. Refresh tokens rotate, so processes sharing a credential
 file can adopt a newer pair saved by another process for the same account.
-Credentials for a different account are not substituted during that recovery.
+Credentials for a different account are not substituted during that recovery,
+and a completed login or logout cannot be overwritten by an in-flight refresh.
+
+Existing host-key files are reusable only when their recorded Hub agrees with
+the requested authority and the filename matches that record. Reads preserve
+those files. Missing Hub metadata, conflicting records, or an invalid current
+credential file require signing in again; a rejected current file does not fall
+back to an older token. Scripts should use `login --with-token` rather than
+constructing credential filenames or JSON.
 
 Recording a session uses the saved username and email for the Agent repo's Git
 author identity; a missing email falls back to `<username>@agit.local`. Login
