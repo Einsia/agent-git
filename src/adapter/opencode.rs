@@ -375,6 +375,306 @@ struct RawPart {
     data: serde_json::Value,
 }
 
+/// A native session and the source coordinates used to assemble its displayed summaries.
+#[derive(Debug)]
+pub struct ParsedSession {
+    pub session: Session,
+    /// Keys index the final, sorted `session.events` collection.
+    pub compactions: HashMap<usize, CompactionEvidence>,
+}
+
+/// Source coordinates for a parsed compaction event, in input line order.
+///
+/// Coordinates use the same origin as [`Event::line`], including blank or corrupt input lines.
+/// These are display dependencies, not a claim that the native history is complete or resumable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionEvidence {
+    /// Every compaction part grouped into the event's boundary message.
+    pub boundary_lines: Vec<usize>,
+    /// Text parts concatenated into the event's text. Empty when no summary text is selected.
+    pub summary_lines: Vec<usize>,
+}
+
+/// Parse with the exact source coordinates used by the native compaction mapping.
+///
+/// The session is identical to [`OpenCode::parse`]. Evidence describes that mapping's selected
+/// parts; it does not infer missing relationships or distinguish reused native identities.
+/// A caller combining independent native occurrences must isolate their identities before
+/// parsing and retain a coordinate mapping to its original records.
+pub fn parse_with_compaction_evidence(text: &str) -> Result<ParsedSession> {
+    parse_native(text, true)
+}
+
+fn parse_native(text: &str, include_evidence: bool) -> Result<ParsedSession> {
+    let mut id = String::new();
+    let mut cwd = None;
+    let mut events = vec![];
+    let mut compactions = HashMap::new();
+
+    // Read the structure in a streaming pass, then map at the message level:
+    // the tests a part is judged by (role, mode, synthetic) all come from its host message.
+    // Line numbers are recorded on every raw line, blank and corrupt lines included —
+    // `Event::line` has to locate that exact line in the cache file.
+    let mut msgs: Vec<RawMsg> = vec![];
+    let mut parts: Vec<RawPart> = vec![];
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // A corrupt or truncated record must not hide complete records elsewhere in the input.
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("kind").and_then(|x| x.as_str()).unwrap_or("") {
+            "opencode.meta" => {
+                if id.is_empty()
+                    && let Some(s) = v.get("id").and_then(|x| x.as_str())
+                {
+                    id = s.to_string();
+                }
+                if cwd.is_none()
+                    && let Some(c) = v
+                        .get("directory")
+                        .and_then(|x| x.as_str())
+                        .filter(|c| !c.is_empty())
+                {
+                    cwd = Some(c.to_string());
+                }
+            }
+            "message" => {
+                let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let tc = v.get("time_created").and_then(|x| x.as_i64()).unwrap_or(0);
+                if id.is_empty()
+                    && let Some(s) = v.get("session_id").and_then(|x| x.as_str())
+                {
+                    id = s.to_string();
+                }
+                msgs.push(RawMsg {
+                    id: v
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    lineno,
+                    time_created: tc,
+                    role: data
+                        .get("role")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    mode: data.get("mode").and_then(|x| x.as_str()).map(String::from),
+                });
+            }
+            "part" => {
+                parts.push(RawPart {
+                    message_id: v
+                        .get("message_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    lineno,
+                    time_created: v.get("time_created").and_then(|x| x.as_i64()).unwrap_or(0),
+                    data: v.get("data").cloned().unwrap_or(serde_json::Value::Null),
+                });
+            }
+            // An unrecognized outer line in canonical (a kind added by a later version):
+            // counted as Other (into dropped), never silently.
+            _ => events.push(other_event(None).at_line(lineno)),
+        }
+    }
+
+    // Message-level mapping. Parts are grouped by host, keeping the canonical stream order.
+    let mut by_msg: HashMap<&str, Vec<&RawPart>> = HashMap::new();
+    for p in &parts {
+        by_msg.entry(p.message_id.as_str()).or_default().push(p);
+    }
+    let msg_index: HashMap<&str, usize> = msgs
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.as_str(), i))
+        .collect();
+    let mut consumed: HashSet<usize> = HashSet::new();
+    let mut claimed: HashSet<usize> = HashSet::new();
+
+    for (i, m) in msgs.iter().enumerate() {
+        if consumed.contains(&i) {
+            continue;
+        }
+        let mps = by_msg.get(m.id.as_str()).cloned().unwrap_or_default();
+        for p in &mps {
+            claimed.insert(p.lineno);
+        }
+
+        // Compaction combines the boundary (a user message holding a
+        // compaction part) + the summary (the text part of an assistant message with
+        // mode=="compaction") + the continuation injection (synthetic user text, which takes
+        // the ordinary mapping and lands in Other).
+        if mps
+            .iter()
+            .any(|p| p.data.get("type").and_then(|x| x.as_str()) == Some("compaction"))
+        {
+            // The summary text is merged into the CompactSummary event. A summary is
+            // lossy and must never be fed to merge; its text is
+            // for display only. The boundary parameters (auto/overflow/tail_start_id) do
+            // not enter the IR and are read back from raw via Event.line.
+            let boundary_line = mps
+                .iter()
+                .find(|p| p.data.get("type").and_then(|x| x.as_str()) == Some("compaction"))
+                .map(|p| p.lineno)
+                .unwrap_or(m.lineno);
+            let mut summary_lines = vec![];
+            let summary = msgs.get(i + 1).and_then(|n| {
+                if n.mode.as_deref() != Some("compaction") {
+                    return None;
+                }
+                consumed.insert(i + 1);
+                for p in by_msg.get(n.id.as_str()).cloned().unwrap_or_default() {
+                    claimed.insert(p.lineno);
+                }
+                let texts: Vec<&str> = by_msg
+                    .get(n.id.as_str())?
+                    .iter()
+                    .filter(|p| p.data.get("type").and_then(|x| x.as_str()) == Some("text"))
+                    .filter_map(|p| {
+                        let text = p.data.get("text").and_then(|x| x.as_str())?;
+                        if text.trim().is_empty() {
+                            return None;
+                        }
+                        if include_evidence {
+                            summary_lines.push(p.lineno);
+                        }
+                        Some(text)
+                    })
+                    .collect();
+                (!texts.is_empty()).then(|| texts.join("\n"))
+            });
+            let mut e = match summary {
+                Some(t) => Event::text(EventKind::CompactSummary, t, ms_to_rfc3339(m.time_created)),
+                None => Event {
+                    kind: EventKind::CompactSummary,
+                    text: None,
+                    timestamp: ms_to_rfc3339(m.time_created),
+                    paths: vec![],
+                    tool: None,
+                    line: None,
+                },
+            };
+            e.line = Some(boundary_line);
+            if include_evidence {
+                let boundary_lines = mps
+                    .iter()
+                    .filter(|p| p.data.get("type").and_then(|x| x.as_str()) == Some("compaction"))
+                    .map(|p| p.lineno)
+                    .collect();
+                compactions.insert(
+                    events.len(),
+                    CompactionEvidence {
+                        boundary_lines,
+                        summary_lines,
+                    },
+                );
+            }
+            events.push(e);
+
+            // The boundary message's **other** parts, if any, map as usual — part_event
+            // already skips the compaction part.
+            for p in &mps {
+                if let Some(ev) = part_event(p, &m.role, m.mode.as_deref() == Some("compaction")) {
+                    events.push(ev);
+                }
+            }
+            continue;
+        }
+
+        // An ordinary message: parts map one by one; a file part attaches to the paths of
+        // the owning UserPrompt / ToolUse and records the filename. Attachment bodies
+        // stay in raw so their size does not determine the memory needed to display the IR.
+        let mut first_prompt: Option<usize> = None;
+        let mut first_tool: Option<usize> = None;
+        let mut files: Vec<String> = vec![];
+        for p in &mps {
+            if p.data.get("type").and_then(|x| x.as_str()) == Some("file") {
+                if let Some(f) = p.data.get("filename").and_then(|x| x.as_str()) {
+                    files.push(f.to_string());
+                }
+                continue;
+            }
+            if let Some(ev) = part_event(p, &m.role, m.mode.as_deref() == Some("compaction")) {
+                let idx = events.len();
+                match ev.kind {
+                    EventKind::UserPrompt if first_prompt.is_none() => first_prompt = Some(idx),
+                    EventKind::ToolUse | EventKind::FileEdit if first_tool.is_none() => {
+                        first_tool = Some(idx)
+                    }
+                    _ => {}
+                }
+                events.push(ev);
+            }
+        }
+        if !files.is_empty() {
+            match first_prompt.or(first_tool) {
+                Some(idx) => events[idx].paths.extend(files),
+                // No event to attach to (a message that is nothing but an attachment): an
+                // attachment must not vanish silently, so each one gets its own Other (the
+                // text is the filename, so it can be read back).
+                None => {
+                    for f in files {
+                        let mut e = Event::text(EventKind::Other, f, ms_to_rfc3339(m.time_created));
+                        e.line = Some(m.lineno);
+                        events.push(e);
+                    }
+                }
+            }
+        }
+    }
+
+    // An orphan part whose host message is missing must not vanish silently — each one
+    // counts as Other.
+    for p in &parts {
+        if claimed.contains(&p.lineno) {
+            continue;
+        }
+        if msg_index.contains_key(p.message_id.as_str()) {
+            continue; // Swallowed by a consumed compaction summary message; normal.
+        }
+        events.push(other_event(part_ts(p)).at_line(p.lineno));
+    }
+
+    // Put every event back in line-number order (a stable sort): unknown outer-kind lines
+    // are queued while scanning and never reach the message loop; the relative order of
+    // several events on one line is preserved by the sort's stability.
+    let (events, compactions) = if compactions.is_empty() {
+        events.sort_by_key(|event| event.line.unwrap_or(usize::MAX));
+        (events, compactions)
+    } else {
+        let mut indexed_events: Vec<_> = events.into_iter().enumerate().collect();
+        indexed_events.sort_by_key(|(_, event)| event.line.unwrap_or(usize::MAX));
+        let mut sorted_compactions = HashMap::new();
+        let events = indexed_events
+            .into_iter()
+            .enumerate()
+            .map(|(index, (original_index, event))| {
+                if let Some(evidence) = compactions.remove(&original_index) {
+                    sorted_compactions.insert(index, evidence);
+                }
+                event
+            })
+            .collect();
+        (events, sorted_compactions)
+    };
+
+    Ok(ParsedSession {
+        session: Session {
+            id,
+            runtime: "opencode".into(),
+            cwd,
+            events,
+        },
+        compactions,
+    })
+}
+
 /// Timestamp of a part event: `data.time.start` wins (the §9.1 assistant text row), falling back
 /// to the row-level `time_created` when it is absent — both are epoch milliseconds (§2.1).
 fn part_ts(p: &RawPart) -> Option<String> {
@@ -1138,235 +1438,7 @@ impl Adapter for OpenCode {
     }
 
     fn parse(&self, text: &str) -> Result<Session> {
-        let mut id = String::new();
-        let mut cwd = None;
-        let mut events = vec![];
-
-        // Read the structure out in one streaming pass, then map at the message level (§9.1):
-        // the tests a part is judged by (role, mode, synthetic) all come from its host message.
-        // Line numbers are recorded on every raw line, blank and corrupt lines included —
-        // `Event::line` has to locate that exact line in the cache file.
-        let mut msgs: Vec<RawMsg> = vec![];
-        let mut parts: Vec<RawPart> = vec![];
-        for (lineno, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            // Skip a corrupt line (as in the other three adapters): a transcript can be
-            // truncated, and a truncated session is still worth resuming.
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            match v.get("kind").and_then(|x| x.as_str()).unwrap_or("") {
-                "opencode.meta" => {
-                    if id.is_empty()
-                        && let Some(s) = v.get("id").and_then(|x| x.as_str())
-                    {
-                        id = s.to_string();
-                    }
-                    if cwd.is_none()
-                        && let Some(c) = v
-                            .get("directory")
-                            .and_then(|x| x.as_str())
-                            .filter(|c| !c.is_empty())
-                    {
-                        cwd = Some(c.to_string());
-                    }
-                }
-                "message" => {
-                    let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
-                    let tc = v.get("time_created").and_then(|x| x.as_i64()).unwrap_or(0);
-                    if id.is_empty()
-                        && let Some(s) = v.get("session_id").and_then(|x| x.as_str())
-                    {
-                        id = s.to_string();
-                    }
-                    msgs.push(RawMsg {
-                        id: v
-                            .get("id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        lineno,
-                        time_created: tc,
-                        role: data
-                            .get("role")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        mode: data.get("mode").and_then(|x| x.as_str()).map(String::from),
-                    });
-                }
-                "part" => {
-                    parts.push(RawPart {
-                        message_id: v
-                            .get("message_id")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        lineno,
-                        time_created: v.get("time_created").and_then(|x| x.as_i64()).unwrap_or(0),
-                        data: v.get("data").cloned().unwrap_or(serde_json::Value::Null),
-                    });
-                }
-                // An unrecognized outer line in canonical (a kind added by a later version):
-                // counted as Other (into dropped), never silently.
-                _ => events.push(other_event(None).at_line(lineno)),
-            }
-        }
-
-        // Message-level mapping. Parts are grouped by host, keeping the canonical stream order.
-        let mut by_msg: HashMap<&str, Vec<&RawPart>> = HashMap::new();
-        for p in &parts {
-            by_msg.entry(p.message_id.as_str()).or_default().push(p);
-        }
-        let msg_index: HashMap<&str, usize> = msgs
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.id.as_str(), i))
-            .collect();
-        let mut consumed: HashSet<usize> = HashSet::new();
-        let mut claimed: HashSet<usize> = HashSet::new();
-
-        for (i, m) in msgs.iter().enumerate() {
-            if consumed.contains(&i) {
-                continue;
-            }
-            let mps = by_msg.get(m.id.as_str()).cloned().unwrap_or_default();
-            for p in &mps {
-                claimed.insert(p.lineno);
-            }
-
-            // §7 compaction comes in three pieces: the boundary (a user message holding a
-            // compaction part) + the summary (the text part of an assistant message with
-            // mode=="compaction") + the continuation injection (synthetic user text, which takes
-            // the ordinary mapping and lands in Other).
-            if mps
-                .iter()
-                .any(|p| p.data.get("type").and_then(|x| x.as_str()) == Some("compaction"))
-            {
-                // The summary text is merged into this one CompactSummary event (the §9.1
-                // merge rule): a summary is lossy and must never be fed to merge; its text is
-                // for display only. The boundary parameters (auto/overflow/tail_start_id) do
-                // not enter the IR and are read back from raw via Event.line.
-                let boundary_line = mps
-                    .iter()
-                    .find(|p| p.data.get("type").and_then(|x| x.as_str()) == Some("compaction"))
-                    .map(|p| p.lineno)
-                    .unwrap_or(m.lineno);
-                let summary = msgs.get(i + 1).and_then(|n| {
-                    if n.mode.as_deref() != Some("compaction") {
-                        return None;
-                    }
-                    consumed.insert(i + 1);
-                    for p in by_msg.get(n.id.as_str()).cloned().unwrap_or_default() {
-                        claimed.insert(p.lineno);
-                    }
-                    let texts: Vec<&str> = by_msg
-                        .get(n.id.as_str())?
-                        .iter()
-                        .filter(|p| p.data.get("type").and_then(|x| x.as_str()) == Some("text"))
-                        .filter_map(|p| p.data.get("text").and_then(|x| x.as_str()))
-                        .filter(|t| !t.trim().is_empty())
-                        .collect();
-                    (!texts.is_empty()).then(|| texts.join("\n"))
-                });
-                let mut e = match summary {
-                    Some(t) => {
-                        Event::text(EventKind::CompactSummary, t, ms_to_rfc3339(m.time_created))
-                    }
-                    None => Event {
-                        kind: EventKind::CompactSummary,
-                        text: None,
-                        timestamp: ms_to_rfc3339(m.time_created),
-                        paths: vec![],
-                        tool: None,
-                        line: None,
-                    },
-                };
-                e.line = Some(boundary_line);
-                events.push(e);
-
-                // The boundary message's **other** parts, if any, map as usual — part_event
-                // already skips the compaction part.
-                for p in &mps {
-                    if let Some(ev) =
-                        part_event(p, &m.role, m.mode.as_deref() == Some("compaction"))
-                    {
-                        events.push(ev);
-                    }
-                }
-                continue;
-            }
-
-            // An ordinary message: parts map one by one; a file part attaches to the paths of
-            // the owning UserPrompt / ToolUse (§9.1) and records the filename — the base64 body
-            // does not enter the IR (a single 8.1 MB attachment would wreck the transcript
-            // page).
-            let mut first_prompt: Option<usize> = None;
-            let mut first_tool: Option<usize> = None;
-            let mut files: Vec<String> = vec![];
-            for p in &mps {
-                if p.data.get("type").and_then(|x| x.as_str()) == Some("file") {
-                    if let Some(f) = p.data.get("filename").and_then(|x| x.as_str()) {
-                        files.push(f.to_string());
-                    }
-                    continue;
-                }
-                if let Some(ev) = part_event(p, &m.role, m.mode.as_deref() == Some("compaction")) {
-                    let idx = events.len();
-                    match ev.kind {
-                        EventKind::UserPrompt if first_prompt.is_none() => first_prompt = Some(idx),
-                        EventKind::ToolUse | EventKind::FileEdit if first_tool.is_none() => {
-                            first_tool = Some(idx)
-                        }
-                        _ => {}
-                    }
-                    events.push(ev);
-                }
-            }
-            if !files.is_empty() {
-                match first_prompt.or(first_tool) {
-                    Some(idx) => events[idx].paths.extend(files),
-                    // No event to attach to (a message that is nothing but an attachment): an
-                    // attachment must not vanish silently, so each one gets its own Other (the
-                    // text is the filename, so it can be read back).
-                    None => {
-                        for f in files {
-                            let mut e =
-                                Event::text(EventKind::Other, f, ms_to_rfc3339(m.time_created));
-                            e.line = Some(m.lineno);
-                            events.push(e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // An orphan part whose host message is missing must not vanish silently — each one
-        // counts as Other.
-        for p in &parts {
-            if claimed.contains(&p.lineno) {
-                continue;
-            }
-            if msg_index.contains_key(p.message_id.as_str()) {
-                continue; // Swallowed by a consumed compaction summary message; normal.
-            }
-            events.push(other_event(part_ts(p)).at_line(p.lineno));
-        }
-
-        // Put every event back in line-number order (a stable sort): unknown outer-kind lines
-        // are queued while scanning and never reach the message loop; the relative order of
-        // several events on one line is preserved by the sort's stability.
-        events.sort_by_key(|e| e.line.unwrap_or(usize::MAX));
-
-        Ok(Session {
-            id,
-            runtime: "opencode".into(),
-            cwd,
-            events,
-        })
+        Ok(parse_native(text, false)?.session)
     }
 
     fn render(&self, session: &Session, new_id: &str, cwd: &Path) -> Result<String> {
@@ -1702,6 +1774,206 @@ mod tests {
             s.gist(10).as_deref(),
             Some("ask"),
             "the gist skips the compact boundary"
+        );
+    }
+
+    fn compaction_block(boundary_id: &str, summary_id: &str) -> Vec<String> {
+        vec![
+            msg(boundary_id, 1000, r#"{"role":"user"}"#),
+            part(
+                "boundary-part",
+                boundary_id,
+                1001,
+                r#"{"type":"compaction"}"#,
+            ),
+            msg(
+                summary_id,
+                2000,
+                r#"{"role":"assistant","mode":"compaction"}"#,
+            ),
+            part(
+                "summary-part",
+                summary_id,
+                2001,
+                r#"{"type":"text","text":"selected summary"}"#,
+            ),
+        ]
+    }
+
+    fn assert_evidence_matches_text(text: &str) -> ParsedSession {
+        let parsed = parse_with_compaction_evidence(text).unwrap();
+        assert!(parse_native(text, false).unwrap().compactions.is_empty());
+        assert_eq!(
+            serde_json::to_value(&parsed.session).unwrap(),
+            serde_json::to_value(OpenCode.parse(text).unwrap()).unwrap()
+        );
+        let lines: Vec<_> = text.lines().collect();
+        for (index, evidence) in &parsed.compactions {
+            let event = &parsed.session.events[*index];
+            assert_eq!(event.kind, EventKind::CompactSummary);
+            assert_eq!(event.line, evidence.boundary_lines.first().copied());
+            let bodies: Vec<_> = evidence
+                .summary_lines
+                .iter()
+                .map(|line| {
+                    let row: serde_json::Value = serde_json::from_str(lines[*line]).unwrap();
+                    assert_eq!(row["kind"], "part");
+                    assert_eq!(row["data"]["type"], "text");
+                    row["data"]["text"].as_str().unwrap().to_owned()
+                })
+                .collect();
+            let reconstructed = (!bodies.is_empty()).then(|| bodies.join("\n"));
+            assert_eq!(event.text, reconstructed);
+        }
+        parsed
+    }
+
+    #[test]
+    fn compaction_evidence_keeps_repeated_boundary_sources() {
+        let mut lines = compaction_block("boundary", "summary");
+        lines.push(lines[1].clone());
+        let parsed = assert_evidence_matches_text(&lines.join("\n"));
+        assert_eq!(parsed.session.events.len(), 1);
+        assert_eq!(
+            parsed.compactions[&0],
+            CompactionEvidence {
+                boundary_lines: vec![1, 4],
+                summary_lines: vec![3],
+            }
+        );
+    }
+
+    #[test]
+    fn compaction_evidence_keeps_isolated_occurrences_separate() {
+        let mut lines = compaction_block("boundary-a", "summary-a");
+        lines.extend(compaction_block("boundary-b", "summary-b"));
+        let parsed = assert_evidence_matches_text(&lines.join("\n"));
+        assert_eq!(parsed.compactions.len(), 2);
+        assert_eq!(
+            parsed.compactions[&0],
+            CompactionEvidence {
+                boundary_lines: vec![1],
+                summary_lines: vec![3],
+            }
+        );
+        assert_eq!(
+            parsed.compactions[&1],
+            CompactionEvidence {
+                boundary_lines: vec![5],
+                summary_lines: vec![7],
+            }
+        );
+    }
+
+    #[test]
+    fn compaction_evidence_indexes_sorted_events_and_unfiltered_input_lines() {
+        let mut lines = compaction_block("boundary", "summary");
+        lines.insert(2, r#"{"kind":"unknown"}"#.into());
+        lines.insert(0, "{".into());
+        lines.insert(0, String::new());
+        let parsed = assert_evidence_matches_text(&lines.join("\n"));
+        assert_eq!(parsed.session.events.len(), 2);
+        assert_eq!(parsed.session.events[1].kind, EventKind::Other);
+        assert_eq!(
+            parsed.compactions[&0],
+            CompactionEvidence {
+                boundary_lines: vec![3],
+                summary_lines: vec![6],
+            }
+        );
+    }
+
+    #[test]
+    fn compaction_evidence_records_only_contributing_summary_text() {
+        let mut lines = compaction_block("boundary", "summary");
+        lines.extend([
+            part("blank", "summary", 2100, r#"{"type":"text","text":"  \t"}"#),
+            part(
+                "reasoning",
+                "summary",
+                2200,
+                r#"{"type":"reasoning","text":"private reasoning"}"#,
+            ),
+            part("missing", "summary", 2300, r#"{"type":"text"}"#),
+            part(
+                "continuation",
+                "summary",
+                2400,
+                r#"{"type":"text","text":" continuation "}"#,
+            ),
+        ]);
+        let parsed = assert_evidence_matches_text(&lines.join("\n"));
+        assert_eq!(parsed.compactions[&0].summary_lines, vec![3, 7]);
+        assert_eq!(
+            parsed.session.events[0].text.as_deref(),
+            Some("selected summary\n continuation ")
+        );
+    }
+
+    #[test]
+    fn compaction_evidence_does_not_assign_parts_to_unrelated_empty_hosts() {
+        let mut lines = compaction_block("boundary", "summary");
+        lines.insert(0, msg("unused", 900, r#"{"role":"user"}"#));
+        let parsed = assert_evidence_matches_text(&lines.join("\n"));
+        assert_eq!(
+            parsed.compactions[&0],
+            CompactionEvidence {
+                boundary_lines: vec![2],
+                summary_lines: vec![4],
+            }
+        );
+    }
+
+    #[test]
+    fn compaction_evidence_preserves_missing_and_conflicting_host_mapping() {
+        let mut lines = compaction_block("boundary", "summary");
+        lines.insert(2, msg("unused", 1500, r#"{"role":"user"}"#));
+        let parsed = assert_evidence_matches_text(&lines.join("\n"));
+        assert_eq!(parsed.compactions[&0].summary_lines, Vec::<usize>::new());
+        assert_eq!(parsed.session.events[0].text, None);
+        assert_eq!(
+            parsed.session.events[1].text.as_deref(),
+            Some("selected summary")
+        );
+
+        let mut lines = compaction_block("boundary", "summary");
+        lines.remove(0);
+        let parsed = assert_evidence_matches_text(&lines.join("\n"));
+        assert!(parsed.compactions.is_empty());
+
+        let mut lines = compaction_block("boundary", "summary");
+        lines.truncate(2);
+        let parsed = assert_evidence_matches_text(&lines.join("\n"));
+        assert!(parsed.compactions[&0].summary_lines.is_empty());
+        assert_eq!(parsed.session.events[0].text, None);
+    }
+
+    #[test]
+    fn compaction_evidence_describes_reused_identity_mapping_without_guessing_occurrences() {
+        let mut lines = compaction_block("boundary", "summary");
+        lines.extend(lines.clone());
+        let parsed = assert_evidence_matches_text(&lines.join("\n"));
+        assert_eq!(parsed.compactions.len(), 2);
+        for index in [0, 1] {
+            assert_eq!(
+                parsed.compactions[&index],
+                CompactionEvidence {
+                    boundary_lines: vec![1, 5],
+                    summary_lines: vec![3, 7],
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_evidence_is_empty_for_ordinary_native_events() {
+        let parsed = assert_evidence_matches_text(&realistic());
+        assert!(parsed.compactions.is_empty());
+        assert!(
+            parse_with_compaction_evidence("")
+                .unwrap()
+                .compactions
+                .is_empty()
         );
     }
 
