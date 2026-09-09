@@ -237,6 +237,159 @@ fn all_noninteractive_candidates_are_actionable_without_adoption() {
 }
 
 #[test]
+fn an_ambiguous_explicit_prefix_requires_selection_without_stdout_or_adoption() {
+    let lab = Lab::new(2);
+    let before = lab.state();
+    for quiet in [false, true] {
+        for mode in [
+            vec!["--link-only"],
+            vec!["--into", "me/qa@work", "--independent"],
+        ] {
+            let mut command = lab.command();
+            if quiet {
+                command.arg("--quiet");
+            }
+            let output = command
+                .args(["import", "aaaaaaaa", "--from", "claude-code"])
+                .args(mode)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(8), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("matches 2 sessions"), "{stderr}");
+            for (id, _) in &lab.sources {
+                assert!(stderr.contains(id), "candidate {id} missing: {stderr}");
+            }
+            assert!(stderr.contains("give a longer prefix"), "{stderr}");
+            assert_eq!(lab.state(), before);
+        }
+    }
+}
+
+#[test]
+fn ambiguous_prefix_diagnostics_keep_the_candidate_limit() {
+    let lab = Lab::new(9);
+    let before = lab.state();
+    let output = lab
+        .command()
+        .args(["import", "aaaaaaaa", "--from", "claude-code", "--link-only"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(8), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("matches 9 sessions"), "{stderr}");
+    let listed = lab
+        .sources
+        .iter()
+        .filter(|(id, _)| stderr.contains(id))
+        .count();
+    assert_eq!(listed, 8, "{stderr}");
+    assert_eq!(lab.state(), before);
+}
+
+#[cfg(any(unix, all(windows, target_env = "msvc")))]
+#[test]
+fn ambiguous_prefix_json_keeps_candidates_in_diagnostics_and_requires_selection() {
+    let lab = Lab::new(2);
+    let before = lab.state();
+    for version in ["1", "2"] {
+        for mode in [
+            vec!["--link-only"],
+            vec!["--into", "me/qa@work", "--independent"],
+        ] {
+            let output = lab
+                .command()
+                .args([
+                    "--json",
+                    "--json-version",
+                    version,
+                    "import",
+                    "aaaaaaaa",
+                    "--from",
+                    "claude-code",
+                ])
+                .args(mode)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(8), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["schema_version"], version.parse::<u32>().unwrap());
+            assert_eq!(value["exit_code"], 8);
+            assert_eq!(value["ok"], false);
+            assert_eq!(
+                value["result"],
+                serde_json::json!({"format":"empty", "kind":"import"})
+            );
+            assert_eq!(value.get("fix").is_some(), version == "2");
+            let diagnostics = value["diagnostics"]["stderr"].as_array().unwrap();
+            for (id, _) in &lab.sources {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|row| row["message"].as_str().unwrap().contains(id)),
+                    "{value}"
+                );
+            }
+            assert!(
+                diagnostics.iter().any(|row| row["level"] == "error"
+                    && row["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("matches 2 sessions")),
+                "{value}"
+            );
+            assert_eq!(lab.state(), before);
+        }
+    }
+}
+
+#[test]
+fn a_longer_or_exact_native_id_selects_only_the_named_source() {
+    for exact in [false, true] {
+        let mut lab = Lab::new(2);
+        let selected = "aaaaaaaa-0000-4000-8000-111111111111";
+        let (old_id, old_path) = &lab.sources[1];
+        let text = fs::read_to_string(old_path)
+            .unwrap()
+            .replace(old_id, selected);
+        let path = old_path.with_file_name(format!("{selected}.jsonl"));
+        fs::write(&path, text).unwrap();
+        fs::remove_file(old_path).unwrap();
+        lab.sources[1] = (selected.into(), path);
+        let before = lab.state();
+        let selector = if exact { selected } else { &selected[..25] };
+        let output = lab
+            .command()
+            .args(["import", selector, "--from", "claude-code", "--link-only"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let link_path = lab
+            .store
+            .join("store/claude-code")
+            .join(format!("{selected}.json"));
+        let link = agit::domain::link::get(
+            &agit::domain::store::Store::at(lab.store.join("store")),
+            "claude-code",
+            selected,
+        )
+        .unwrap();
+        assert_eq!(link.session_id, selected);
+        assert_eq!(link.source, "claude-code");
+        let mut after = lab.state();
+        assert!(after.remove(&link_path).is_some());
+        assert_eq!(
+            after.remove(&link_path.with_extension("json.lock")),
+            Some(Vec::new())
+        );
+        assert_eq!(after, before);
+    }
+}
+
+#[test]
 fn no_candidates_is_an_empty_result() {
     let lab = Lab::new(0);
     let before = lab.state();

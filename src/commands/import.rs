@@ -1196,10 +1196,10 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
             // things into the agent's memory.
             ui::error(&format!("`{selector}` matches {n} sessions:"));
             for f in found.iter().take(8) {
-                println!("  {:12} {}", f.runtime, link::short(&f.session_id));
+                eprintln!("  {:12} {}", f.runtime, f.session_id);
             }
             ui::hint("give a longer prefix or select its runtime with `--from <runtime>`");
-            Ok(Pick::Explained(ExitCode::Usage))
+            Ok(Pick::Explained(ExitCode::Interactive))
         }
     }
 }
