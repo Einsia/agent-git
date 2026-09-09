@@ -77,6 +77,7 @@ cli = [
     "dep:dialoguer",
     "dep:ureq",
     "dep:self-replace",
+    "dep:sha1",
 ]
 
 # `agit rc` — the resident daemon (agitd) that supervises harness processes and
@@ -178,6 +179,7 @@ tempfile = "3"
 fs2 = "0.4"
 
 # ── Cryptography ────────────────────────────────────────────────────────
+sha1 = { version = "0.10", optional = true }
 sha2 = "0.10"
 hex = "0.4"
 http = "1.4"

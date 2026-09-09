@@ -305,6 +305,10 @@ pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
 /// path is where those two fields come from.
 pub fn read(path: &Path) -> Option<Link> {
     let body: Body = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    link_from_body(path, body)
+}
+
+fn link_from_body(path: &Path, body: Body) -> Option<Link> {
     let source = path.parent()?.file_name()?.to_str()?.to_string();
     let session_id = path.file_stem()?.to_str()?.to_string();
     Some(Link {
@@ -357,6 +361,210 @@ pub fn list(store: &Store) -> Vec<Link> {
     }
     out.sort_by(|a, b| (&a.source, &a.session_id).cmp(&(&b.source, &b.session_id)));
     out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkIssueKind {
+    UnreadableDirectory,
+    UnreadableFile,
+    InspectionLimit,
+    InvalidData,
+    InvalidPath,
+}
+
+impl LinkIssueKind {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::UnreadableDirectory => "unreadable link directory",
+            Self::UnreadableFile => "unreadable link file",
+            Self::InspectionLimit => "link file exceeds the inspection budget",
+            Self::InvalidData => "invalid link data",
+            Self::InvalidPath => "invalid link path",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LinkIssue {
+    pub path: PathBuf,
+    pub kind: LinkIssueKind,
+    pub repository: Option<(String, String)>,
+}
+
+/// Diagnostic enumeration retains unreadable adoption evidence without changing lenient readers.
+pub fn list_checked(store: &Store) -> (Vec<Link>, Vec<LinkIssue>) {
+    let root = store.root();
+    let root_issue = match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => None,
+        Ok(_) => Some(LinkIssueKind::InvalidPath),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Vec::new());
+        }
+        Err(_) => Some(LinkIssueKind::UnreadableDirectory),
+    };
+    if let Some(kind) = root_issue {
+        return (
+            Vec::new(),
+            vec![LinkIssue {
+                path: root.to_owned(),
+                kind,
+                repository: None,
+            }],
+        );
+    }
+    let mut links = Vec::new();
+    let mut issues = Vec::new();
+    for entry in walkdir::WalkDir::new(root).min_depth(1).max_depth(2) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let path = error.path().unwrap_or(root);
+                let runtime_directory = path.parent() == Some(root) && registered_runtime(path);
+                if path == root || runtime_directory || is_link_path(root, path) {
+                    issues.push(LinkIssue {
+                        path: path.to_owned(),
+                        kind: if path == root || runtime_directory {
+                            LinkIssueKind::UnreadableDirectory
+                        } else {
+                            LinkIssueKind::UnreadableFile
+                        },
+                        repository: None,
+                    });
+                }
+                continue;
+            }
+        };
+        if entry.depth() == 1 {
+            if registered_runtime(entry.path()) && !entry.file_type().is_dir() {
+                issues.push(LinkIssue {
+                    path: entry.path().to_owned(),
+                    kind: LinkIssueKind::InvalidPath,
+                    repository: None,
+                });
+            }
+            continue;
+        }
+        if !is_link_path(root, entry.path()) {
+            continue;
+        }
+        let path = entry.path();
+        if !entry.file_type().is_file() {
+            issues.push(LinkIssue {
+                path: path.to_owned(),
+                kind: LinkIssueKind::InvalidPath,
+                repository: None,
+            });
+            continue;
+        }
+        let bytes = match read_checked_record(path) {
+            Ok(bytes) => bytes,
+            Err(kind) => {
+                issues.push(LinkIssue {
+                    path: path.to_owned(),
+                    kind,
+                    repository: None,
+                });
+                continue;
+            }
+        };
+        match serde_json::from_slice::<Body>(&bytes) {
+            Ok(body) => match link_from_body(path, body) {
+                Some(link) => links.push(link),
+                None => issues.push(LinkIssue {
+                    path: path.to_owned(),
+                    kind: LinkIssueKind::InvalidPath,
+                    repository: issue_repository(&bytes),
+                }),
+            },
+            Err(_) => issues.push(LinkIssue {
+                path: path.to_owned(),
+                kind: LinkIssueKind::InvalidData,
+                repository: issue_repository(&bytes),
+            }),
+        }
+    }
+    links.sort_by(|a, b| (&a.source, &a.session_id).cmp(&(&b.source, &b.session_id)));
+    issues.sort_by(|a, b| a.path.cmp(&b.path));
+    (links, issues)
+}
+
+const MAX_CHECKED_LINK_BYTES: u64 = 1024 * 1024;
+
+/// Enumeration metadata cannot authorize a read after a record is replaced.
+fn read_checked_record(path: &Path) -> std::result::Result<Vec<u8>, LinkIssueKind> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|error| {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return LinkIssueKind::InvalidPath;
+        }
+        let _ = error;
+        LinkIssueKind::UnreadableFile
+    })?;
+    let metadata = file.metadata().map_err(|_| LinkIssueKind::UnreadableFile)?;
+    if !metadata.is_file() || metadata.is_symlink() {
+        return Err(LinkIssueKind::InvalidPath);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(LinkIssueKind::InvalidPath);
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CHECKED_LINK_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| LinkIssueKind::UnreadableFile)?;
+    if bytes.len() as u64 > MAX_CHECKED_LINK_BYTES {
+        return Err(LinkIssueKind::InspectionLimit);
+    }
+    Ok(bytes)
+}
+
+fn registered_runtime(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|runtime| adapter::RUNTIMES.contains(&runtime))
+}
+
+fn is_link_path(root: &Path, path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("json")
+        && path
+            .parent()
+            .is_some_and(|parent| parent.parent() == Some(root) && registered_runtime(parent))
+}
+
+fn issue_repository(bytes: &[u8]) -> Option<(String, String)> {
+    #[derive(Deserialize)]
+    struct Identity {
+        owner: String,
+        agent: String,
+    }
+
+    // Scope needs a complete, unambiguous identity even when another field has an invalid type.
+    let identity: Identity = serde_json::from_slice(bytes).ok()?;
+    for component in [&identity.owner, &identity.agent] {
+        if component.trim() != component || crate::domain::repo::valid_name(component).is_err() {
+            return None;
+        }
+    }
+    Some((identity.owner, identity.agent))
 }
 
 /// When a link was last updated.
@@ -685,6 +893,173 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let s = Store::at(&root);
         (d, s)
+    }
+
+    /// Diagnostics retain malformed records while ordinary discovery keeps its accepted links.
+    #[test]
+    fn checked_listing_preserves_links_and_reports_only_registered_records() {
+        let (_directory, store) = store();
+        write(&store, &Link::new("codex", "healthy", None)).unwrap();
+        let mut superseded = Link::new("claude-code", "historical", None);
+        superseded.superseded_by = Some("codex/healthy".into());
+        write(&store, &superseded).unwrap();
+        for path in [
+            "codex/broken.json",
+            "codex/typed.json",
+            "unknown/ignored.json",
+        ] {
+            let path = store.root().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{malformed").unwrap();
+        }
+        std::fs::write(store.root().join("stray.json"), "{malformed").unwrap();
+        std::fs::create_dir_all(store.root().join("codex/nested")).unwrap();
+        std::fs::write(store.root().join("codex/nested/ignored.json"), "{malformed").unwrap();
+        std::fs::create_dir_all(store.root().join("codex/directory.json")).unwrap();
+        std::fs::write(
+            store.root().join("codex/typed.json"),
+            r#"{"owner":"alice","agent":"fixture","baseline_bytes":"PRIVATE-SENTINEL"}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("broken.json", store.root().join("codex/ignored-link.json"))
+            .unwrap();
+
+        let legacy = list(&store);
+        let (checked, issues) = list_checked(&store);
+        let identities = |links: &[Link]| {
+            links
+                .iter()
+                .map(|link| {
+                    (
+                        link.source.clone(),
+                        link.session_id.clone(),
+                        link.to_json().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(identities(&checked), identities(&legacy));
+        assert_eq!(checked.len(), 2);
+        assert_eq!(issues.len(), 3 + usize::from(cfg!(unix)));
+        assert_eq!(issues[0].path.file_name().unwrap(), "broken.json");
+        assert_eq!(issues[0].kind, LinkIssueKind::InvalidData);
+        assert_eq!(issues[0].repository, None);
+        for issue in &issues[1..issues.len() - 1] {
+            assert_eq!(issue.kind, LinkIssueKind::InvalidPath);
+            assert_eq!(issue.repository, None);
+        }
+        let typed = issues.last().unwrap();
+        assert_eq!(typed.path.file_name().unwrap(), "typed.json");
+        assert_eq!(typed.kind, LinkIssueKind::InvalidData);
+        assert_eq!(typed.repository, Some(("alice".into(), "fixture".into())));
+        assert!(!format!("{issues:?}").contains("PRIVATE-SENTINEL"));
+    }
+
+    /// A partial or conflicting identity cannot attribute malformed evidence to a repository.
+    #[test]
+    fn issue_scope_requires_complete_valid_unambiguous_identity() {
+        for text in [
+            r#"{"owner":"alice","agent":"fixture""#,
+            r#"{"owner":"alice"}"#,
+            r#"{"owner":"alice","owner":"bob","agent":"fixture"}"#,
+            r#"{"owner":"../alice","agent":"fixture"}"#,
+            r#"{"owner":"alice ","agent":"fixture"}"#,
+            r#"{"owner":null,"agent":"fixture"}"#,
+        ] {
+            assert_eq!(issue_repository(text.as_bytes()), None);
+        }
+        assert_eq!(
+            issue_repository(br#"{"owner":"alice","agent":"fixture","baseline_bytes":false}"#),
+            Some(("alice".into(), "fixture".into()))
+        );
+    }
+
+    /// Oversized evidence stays unattributed instead of being parsed from a truncated prefix.
+    #[test]
+    fn checked_record_budget_preserves_lenient_readers() {
+        let (_directory, store) = store();
+        let runtime = store.root().join("codex");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let mut bytes = br#"{"owner":"alice","agent":"fixture","cwd":"PRIVATE-SENTINEL"}"#.to_vec();
+        bytes.resize(MAX_CHECKED_LINK_BYTES as usize, b' ');
+        let accepted = runtime.join("accepted.json");
+        std::fs::write(&accepted, &bytes).unwrap();
+        assert_eq!(read_checked_record(&accepted).unwrap(), bytes);
+        bytes.push(b' ');
+        let oversized = runtime.join("oversized.json");
+        std::fs::write(&oversized, &bytes).unwrap();
+        assert!(read(&oversized).is_some());
+        assert_eq!(list(&store).len(), 2);
+        let (links, issues) = list_checked(&store);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].session_id, "accepted");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].path, oversized);
+        assert_eq!(issues[0].kind, LinkIssueKind::InspectionLimit);
+        assert_eq!(issues[0].repository, None);
+        assert!(!format!("{issues:?}").contains("PRIVATE-SENTINEL"));
+        assert_eq!(std::fs::read(oversized).unwrap(), bytes);
+    }
+
+    /// A cached regular-file entry must not let a replacement symlink supply claim identity.
+    #[cfg(unix)]
+    #[test]
+    fn checked_record_rejects_symlink_replacement_after_enumeration() {
+        let (directory, store) = store();
+        let path = write(&store, &Link::new("codex", "candidate", None)).unwrap();
+        let entry = walkdir::WalkDir::new(store.root())
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(entry.file_type().is_file());
+        let foreign = directory.path().join("foreign.json");
+        let private = br#"{"owner":"foreign","agent":"PRIVATE-SENTINEL"}"#;
+        std::fs::write(&foreign, private).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&foreign, &path).unwrap();
+        assert_eq!(
+            read_checked_record(entry.path()),
+            Err(LinkIssueKind::InvalidPath)
+        );
+        assert_eq!(std::fs::read(&foreign).unwrap(), private);
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+    }
+
+    /// A replacement FIFO cannot make diagnostic reads wait for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn checked_record_rejects_fifo_replacement_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let (_directory, store) = store();
+        let path = write(&store, &Link::new("codex", "candidate", None)).unwrap();
+        let entry = walkdir::WalkDir::new(store.root())
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(entry.file_type().is_file());
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = sent.send(read_checked_record(entry.path()));
+        });
+        assert_eq!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("checked record inspection blocked on a FIFO"),
+            Err(LinkIssueKind::InvalidPath)
+        );
+        reader.join().unwrap();
+        assert!(!std::fs::symlink_metadata(&path).unwrap().is_file());
     }
 
     /// Runtime and session identity belong to the path, not the JSON body.

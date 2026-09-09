@@ -1750,6 +1750,9 @@ fn checkout_git_path_with_policy(
     name: &str,
     policy: crate::domain::repo::ReadPolicy,
 ) -> Result<std::path::PathBuf> {
+    if repo.is_local_inspection() {
+        return repo.git_path(name);
+    }
     if matches!(policy, crate::domain::repo::ReadPolicy::LocalOnly) {
         return repo.git_path_local(name);
     }

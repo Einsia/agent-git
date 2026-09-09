@@ -1448,7 +1448,7 @@ fn selection_command(args: &Args) -> String {
     command
 }
 
-fn selection_arg(value: &str) -> String {
+pub(super) fn selection_arg(value: &str) -> String {
     #[cfg(windows)]
     {
         powershell_selection_arg(value)

@@ -628,8 +628,18 @@ pub fn write_snapshot(root: &Path, log_env: &str, view_env: &str) -> Result<()> 
 /// Materialize LOG / VIEW back into full envelope JSONL, following the layout in the worktree
 /// meta.
 pub fn materialize_worktree(root: &Path, seq_file: &str) -> Result<String> {
-    let kind = SequenceKind::parse(seq_file)?;
+    SequenceKind::parse(seq_file)?;
     let layout = meta::resolve(root)?.layout;
+    materialize_worktree_with_layout(root, seq_file, layout)
+}
+
+/// A caller with validated metadata can inspect storage without rereading mutable metadata.
+pub(crate) fn materialize_worktree_with_layout(
+    root: &Path,
+    seq_file: &str,
+    layout: LayoutVersion,
+) -> Result<String> {
+    let kind = SequenceKind::parse(seq_file)?;
     match layout {
         LayoutVersion::V0 => {
             let path = root.join(kind.path(layout));
@@ -1684,12 +1694,46 @@ fn read_text_capped(path: &Path, limit: usize) -> Result<String> {
     String::from_utf8(bytes).with_context(|| format!("cannot read {} as UTF-8", path.display()))
 }
 
-fn read_bytes_capped(path: &Path, limit: usize) -> Result<Vec<u8>> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+fn open_regular_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
     let metadata = file
         .metadata()
         .with_context(|| format!("cannot stat open file {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.is_symlink(),
+        "refusing storage path {}: expected a regular file",
+        path.display()
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        anyhow::ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "refusing reparse-point storage path {}",
+            path.display()
+        );
+    }
+    Ok((file, metadata))
+}
+
+pub(crate) fn read_bytes_capped(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let (mut file, metadata) = open_regular_file(path)?;
     if metadata.len() > limit as u64 {
         anyhow::bail!("{} exceeds the {limit}-byte limit", path.display());
     }
@@ -1731,12 +1775,9 @@ fn inspect_worktree_event_sizes(root: &Path, ids: &[&str]) -> Result<Vec<usize>>
             "event {id} is missing at {}",
             path.display()
         );
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("cannot open event {}", path.display()))?;
-        let size = file
-            .metadata()
-            .with_context(|| format!("cannot stat open event {}", path.display()))?
-            .len();
+        let (_file, metadata) = open_regular_file(&path)
+            .with_context(|| format!("cannot inspect event {}", path.display()))?;
+        let size = metadata.len();
         let size = usize::try_from(size).context("event size does not fit memory")?;
         sizes.push(size);
     }
@@ -1757,14 +1798,9 @@ fn read_worktree_events_into_output(
             "event {id} is missing at {}",
             path.display()
         );
-        let mut file = std::fs::File::open(&path)
+        let (mut file, metadata) = open_regular_file(&path)
             .with_context(|| format!("cannot open event {}", path.display()))?;
-        let actual = usize::try_from(
-            file.metadata()
-                .with_context(|| format!("cannot stat open event {}", path.display()))?
-                .len(),
-        )
-        .context("event size does not fit memory")?;
+        let actual = usize::try_from(metadata.len()).context("event size does not fit memory")?;
         let expected = sizes[index];
         anyhow::ensure!(
             actual == expected,
@@ -2938,6 +2974,117 @@ mod tests {
             materialize_worktree(dir.path(), meta::LOG_FILE).unwrap(),
             log
         );
+    }
+
+    /// Explicit layout preserves storage validation without reopening the metadata file.
+    #[test]
+    fn worktree_materializer_with_layout_matches_metadata_dispatch() {
+        for layout in [LayoutVersion::V0, LayoutVersion::V1] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = format!("{}{}", line(SID_A, 1), line(SID_A, 2));
+            let view = line(SID_A, 2);
+            let mut snapshot_meta = meta::Meta::new(SID_A.into(), "codex".into(), "/r".into());
+            snapshot_meta.layout = layout;
+            meta::write(dir.path(), &snapshot_meta).unwrap();
+            match layout {
+                LayoutVersion::V0 => {
+                    std::fs::write(dir.path().join(meta::LEGACY_LOG_FILE), &log).unwrap();
+                    std::fs::write(dir.path().join(meta::LEGACY_VIEW_FILE), &view).unwrap();
+                }
+                LayoutVersion::V1 => write_snapshot(dir.path(), &log, &view).unwrap(),
+            }
+            for (sequence, expected) in [(meta::LOG_FILE, &log), (meta::VIEW_FILE, &view)] {
+                assert_eq!(
+                    materialize_worktree(dir.path(), sequence).unwrap(),
+                    *expected
+                );
+                assert_eq!(
+                    materialize_worktree_with_layout(dir.path(), sequence, layout).unwrap(),
+                    *expected
+                );
+            }
+            std::fs::remove_file(dir.path().join(meta::FILE)).unwrap();
+            assert!(materialize_worktree(dir.path(), meta::LOG_FILE).is_err());
+            assert_eq!(
+                materialize_worktree_with_layout(dir.path(), meta::LOG_FILE, layout).unwrap(),
+                log
+            );
+            assert!(materialize_worktree_with_layout(dir.path(), "other", layout).is_err());
+        }
+    }
+
+    /// Descriptor validation must not change the inclusive byte limit for regular files.
+    #[test]
+    fn capped_storage_reader_preserves_limits_and_rejects_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record");
+        let bytes = b"fixture";
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(read_bytes_capped(&path, bytes.len()).unwrap(), bytes);
+        assert!(read_bytes_capped(&path, bytes.len() - 1).is_err());
+        assert!(read_bytes_capped(dir.path(), bytes.len()).is_err());
+        assert!(read_bytes_capped(&dir.path().join("absent"), bytes.len()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// A regular-file precheck cannot authorize a replacement symlink or blocking carrier.
+    #[cfg(unix)]
+    #[test]
+    fn capped_storage_reader_rejects_replacements_after_precheck() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record");
+        let foreign = dir.path().join("foreign");
+        let private = b"PRIVATE-SENTINEL";
+        std::fs::write(&foreign, private).unwrap();
+        std::fs::write(&path, b"original").unwrap();
+        assert!(ensure_regular_file_or_missing(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&foreign, &path).unwrap();
+        let error = read_bytes_capped(&path, private.len()).unwrap_err();
+        assert!(!format!("{error:#}").contains("PRIVATE-SENTINEL"));
+        assert_eq!(std::fs::read(&foreign).unwrap(), private);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"original").unwrap();
+        assert!(ensure_regular_file_or_missing(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = read_bytes_capped(&path, private.len()).map_err(|error| error.to_string());
+            let _ = sent.send(result);
+        });
+        let error = received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("capped storage inspection blocked on a FIFO")
+            .unwrap_err();
+        assert!(error.contains("regular file"), "{error}");
+        reader.join().unwrap();
+    }
+
+    /// Event-size observations cannot authorize a different carrier during materialization.
+    #[cfg(unix)]
+    #[test]
+    fn worktree_event_reader_refuses_replacement_after_size_inspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let event = line(SID_A, 1);
+        write_snapshot(dir.path(), &event, &event).unwrap();
+        let id = event_id(&event).unwrap();
+        let ids = [id.as_str()];
+        let sizes = inspect_worktree_event_sizes(dir.path(), &ids).unwrap();
+        let path = event_destination(dir.path(), &id, false).unwrap();
+        let foreign = dir.path().join("foreign-event");
+        std::fs::write(&foreign, &event).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&foreign, &path).unwrap();
+        let mut output = vec![0; sizes[0]];
+        assert!(
+            read_worktree_events_into_output(dir.path(), &ids, &sizes, &[0], &mut output).is_err()
+        );
+        assert_eq!(output, vec![0; sizes[0]]);
+        assert_eq!(std::fs::read(&foreign).unwrap(), event.as_bytes());
     }
 
     #[cfg(unix)]

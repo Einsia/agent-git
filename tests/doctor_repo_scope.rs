@@ -22,7 +22,11 @@ impl Lab {
         fs::create_dir_all(&work).unwrap();
         fs::write(
             home.join("config.json"),
-            b"{\"secrets.keystore\":\"file\"}\n",
+            if cfg!(windows) {
+                "{\"secrets.keystore\":\"os\"}\n"
+            } else {
+                "{\"secrets.keystore\":\"file\"}\n"
+            },
         )
         .unwrap();
         Self {
@@ -42,7 +46,8 @@ impl Lab {
     }
 
     fn doctor(&self, hub: &str, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agit"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command
             .args(args)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -56,11 +61,36 @@ impl Lab {
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env("no_proxy", "127.0.0.1,localhost")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                self._root.path().join("absent-gitconfig"),
+            )
             .env("GIT_TERMINAL_PROMPT", "0")
-            .current_dir(&self.work)
-            .output()
-            .unwrap()
+            .current_dir(&self.work);
+        #[cfg(windows)]
+        command.env("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        #[cfg(windows)]
+        for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "ComSpec"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let output = command.output().unwrap();
+        if args.contains(&"--json") {
+            let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let version = args
+                .windows(2)
+                .find(|pair| pair[0] == "--json-version")
+                .map(|pair| pair[1].parse::<u64>().unwrap())
+                .unwrap_or(2);
+            assert_eq!(document["schema"], "cli-output");
+            assert_eq!(document["schema_version"], version);
+            assert_eq!(document["command"], "doctor");
+            assert_eq!(document["exit_code"], output.status.code().unwrap());
+            assert_eq!(document["ok"], output.status.success());
+            assert_eq!(document.get("fix").is_some(), version == 2);
+        }
+        output
     }
 
     fn pending(&self, name: &str, contents: &str) -> PathBuf {
@@ -108,10 +138,54 @@ fn assert_unchanged(root: &Path, before: &BTreeMap<PathBuf, Vec<u8>>) {
 
 fn formats() -> Vec<Vec<&'static str>> {
     let mut args = vec![vec!["doctor", "--repo", "alice/chosen"]];
-    if cfg!(unix) {
+    if cfg!(any(unix, all(windows, target_env = "msvc"))) {
         args.push(vec!["--json", "doctor", "--repo", "alice/chosen"]);
+        for version in ["1", "2"] {
+            args.push(vec![
+                "--json",
+                "--json-version",
+                version,
+                "doctor",
+                "--repo",
+                "alice/chosen",
+            ]);
+        }
     }
     args
+}
+
+#[test]
+fn global_doctor_does_not_contact_the_update_service() {
+    let lab = Lab::new();
+    lab.repo("alice/chosen");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let hub = format!("http://{}", listener.local_addr().unwrap());
+    let before = files(&lab.home);
+    let output = lab.doctor(&hub, &["doctor"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "doctor contacted the Hub without an explicit backend check"
+    );
+    assert_unchanged(&lab.home, &before);
+}
+
+#[test]
+fn global_doctor_preserves_pending_recovery() {
+    let lab = Lab::new();
+    lab.repo("alice/chosen");
+    lab.pending("chosen", "alice/chosen\n");
+    let before = files(&lab.home);
+    let output = lab.doctor("http://127.0.0.1:1", &["doctor"]);
+    assert_eq!(output.status.code(), Some(4), "{}", text(&output));
+    assert!(
+        text(&output).contains("pending recovery"),
+        "{}",
+        text(&output)
+    );
+    assert_unchanged(&lab.home, &before);
 }
 
 #[test]
@@ -140,11 +214,72 @@ fn scoped_doctor_skips_unrelated_repositories_recovery_and_automatic_network() {
 
 #[test]
 fn scoped_doctor_contacts_the_backend_only_when_explicitly_requested() {
+    for credential in ["absent", "valid"] {
+        public_backend_check(credential, None);
+    }
+}
+
+#[test]
+fn scoped_doctor_reports_unusable_credentials_without_blocking_public_health() {
+    for (credential, reason) in [
+        ("malformed", "saved Hub credentials are unreadable"),
+        (
+            "foreign",
+            "saved Hub credentials belong to another authority",
+        ),
+    ] {
+        public_backend_check(credential, Some(reason));
+    }
+}
+
+fn public_backend_check(credential: &str, expected_problem: Option<&str>) {
     let lab = Lab::new();
     lab.repo("alice/chosen");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let hub = format!("http://{}", listener.local_addr().unwrap());
+    if credential != "absent" {
+        let directory = lab.home.join("credentials");
+        fs::create_dir_all(&directory).unwrap();
+        let authority = agit::infra::hub_authority::HubAuthority::parse(&hub).unwrap();
+        let path = directory.join(format!("{}.json", authority.storage_key()));
+        let contents = if credential == "malformed" {
+            b"unparseable synthetic-private-token".to_vec()
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "username": "alice",
+                "hub": if credential == "foreign" { "http://127.0.0.2:1" } else { &hub },
+                "access_token": "synthetic-private-access",
+                "refresh_token": "synthetic-private-refresh",
+                "access_expires_at": "2099-01-01T00:00:00Z",
+                "refresh_expires_at": "2099-01-01T00:00:00Z",
+            }))
+            .unwrap()
+        };
+        fs::write(path, contents).unwrap();
+    }
+    let configured_hub = format!(" {hub}/ ");
+    let before = files(&lab.home);
+    let offline = lab.doctor(&configured_hub, &formats()[0]);
+    assert!(offline.status.success(), "{}", text(&offline));
+    if let Some(problem) = expected_problem {
+        assert!(text(&offline).contains(problem), "{}", text(&offline));
+        assert!(
+            !text(&offline).contains("not signed in"),
+            "{}",
+            text(&offline)
+        );
+    }
+    assert!(
+        !text(&offline).contains("synthetic-private"),
+        "{}",
+        text(&offline)
+    );
+    assert_unchanged(&lab.home, &before);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
     let server = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut stream = loop {
@@ -178,7 +313,7 @@ fn scoped_doctor_contacts_the_backend_only_when_explicitly_requested() {
     });
     let before = files(&lab.home);
     let output = lab.doctor(
-        &hub,
+        &configured_hub,
         &[
             "-C",
             lab.work.to_str().unwrap(),
@@ -190,6 +325,14 @@ fn scoped_doctor_contacts_the_backend_only_when_explicitly_requested() {
     );
     let request = server.join().unwrap();
     assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        !text(&output).contains("synthetic-private"),
+        "{}",
+        text(&output)
+    );
+    if let Some(problem) = expected_problem {
+        assert!(text(&output).contains(problem), "{}", text(&output));
+    }
     assert!(
         text(&output).contains("version synthetic"),
         "{}",

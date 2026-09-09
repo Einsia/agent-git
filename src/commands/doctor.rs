@@ -19,6 +19,9 @@
 //!
 //! Every conclusion points straight at the next action.
 
+mod history;
+mod transaction;
+
 use super::CmdResult;
 use super::skill_bundle;
 use crate::domain::link;
@@ -42,6 +45,10 @@ pub struct Args {
     /// Also check backend connectivity
     #[arg(long)]
     pub check_backend: bool,
+
+    /// Inspect the committed history reachable from local branches, tracking refs, tags, and HEAD
+    #[arg(long)]
+    pub deep: bool,
 }
 
 fn parse_repo(value: &str) -> Result<String, String> {
@@ -72,6 +79,7 @@ pub fn run(args: Args) -> CmdResult {
             ui::error(&format!("local repository {slug} is unavailable"));
             return Ok(ExitCode::Ref);
         };
+        let repo = repo.local_objects_only();
         if let Err(error) = super::migration::check_readonly_repo_startup(&repo) {
             ui::error(&format!("local storage inspection failed: {error:#}"));
             return Ok(ExitCode::Precondition);
@@ -114,11 +122,13 @@ pub fn run(args: Args) -> CmdResult {
     //
     // The counts come from the link files; no transcript is opened. The link list is hoisted to
     // the outer scope because the live-transcript comparison pairs against it too.
-    let store = Store::open()?;
-    let links: Vec<link::Link> = store
-        .as_ref()
-        .map(link::list)
-        .unwrap_or_default()
+    let store_root = config::store_root()?;
+    let store = match std::fs::symlink_metadata(&store_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        _ => Some(Store::at(store_root)),
+    };
+    let (links, link_issues) = store.as_ref().map(link::list_checked).unwrap_or_default();
+    let links: Vec<link::Link> = links
         .into_iter()
         .filter(|claim| {
             selected.as_ref().is_none_or(|(owner, name, _)| {
@@ -127,17 +137,31 @@ pub fn run(args: Args) -> CmdResult {
             })
         })
         .collect();
+    let link_issues: Vec<_> = link_issues
+        .into_iter()
+        .filter(|issue| {
+            selected.as_ref().is_none_or(|(owner, name, _)| {
+                issue
+                    .repository
+                    .as_ref()
+                    .is_none_or(|(issue_owner, issue_name)| {
+                        issue_owner == owner && issue_name == name
+                    })
+            })
+        })
+        .collect();
     match &store {
         Some(_) => {
             let committed = links.iter().filter(|l| l.agent.is_some()).count();
-            checks.push((
-                "local store".into(),
-                Check::Ok(format!(
-                    "{} adopted sessions, {} versioned",
-                    links.len(),
-                    committed
-                )),
-            ));
+            let detail = format!("{} adopted sessions, {} versioned", links.len(), committed);
+            let row = if link_issues.is_empty() {
+                Check::Ok(detail)
+            } else {
+                Check::Warn(format!(
+                    "{detail}; unreadable adoption evidence is listed below"
+                ))
+            };
+            checks.push(("local store".into(), row));
         }
         // Not an error: having adopted no session yet is the normal state of a fresh install.
         None => checks.push((
@@ -148,16 +172,45 @@ pub fn run(args: Args) -> CmdResult {
             ),
         )),
     }
+    if let Some(store) = &store {
+        for issue in &link_issues {
+            let path = issue.path.strip_prefix(store.root()).unwrap_or(&issue.path);
+            let path = if path.as_os_str().is_empty() {
+                Path::new("store")
+            } else {
+                path
+            };
+            let scope = if issue.repository.is_none() {
+                "; repository scope unavailable"
+            } else {
+                ""
+            };
+            checks.push((
+                "local store link".into(),
+                Check::Warn(format!(
+                    "{:?}: {}{scope}",
+                    path.to_string_lossy(),
+                    issue.kind.description()
+                )),
+            ));
+        }
+    }
 
     // ── Local repos ──
     let agents = match &selected {
         Some(repo) => vec![repo.clone()],
         None => super::clone::list_local()?,
     };
+    for (owner, name, root) in &agents {
+        let slug = format!("{owner}/{name}");
+        if let Some(status) = transaction::inspect(root, &slug) {
+            checks.push((slug, Check::Warn(status)));
+        }
+    }
     let unpushed: Vec<&String> = agents
         .iter()
         .filter(|(_, _, p)| {
-            let r = crate::domain::repo::Repo::at(p);
+            let r = crate::domain::repo::Repo::at(p).local_objects_only();
             !matches!(r.ahead_behind(), Some((0, _)))
         })
         .map(|(_, n, _)| n)
@@ -169,7 +222,7 @@ pub fn run(args: Args) -> CmdResult {
                 Check::Ok(format!("{}, all published", agents.len()))
             } else {
                 Check::Warn(format!(
-                    "{} of them, {} with unpublished commits: {}",
+                    "{} repositories, publication not confirmed for {}: {}",
                     agents.len(),
                     unpushed.len(),
                     unpushed
@@ -183,17 +236,15 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     // ── Sign-in ──
+    let hub = config::hub_url();
     checks.push((
         "sign-in".into(),
-        match credentials::current_user() {
-            Some(u) => Check::Ok(format!("{u} @ {}", config::hub_url())),
-            // Recording a version needs a sign-in (the commit author and the repo path both
-            // carry the account name), and `import` records an initial version by default;
-            // `--link-only` / log / show / doctor do not.
-            None => Check::Warn(
-                "not signed in — import / commit / push all need agit login first (except agit import --link-only)"
-                    .into(),
-            ),
+        match credentials::load_checked(&hub) {
+            Ok(credential) => credential_row(&hub, credential.as_ref(), chrono::Utc::now()),
+            Err(error) => Check::Warn(format!(
+                "local sign-in could not be checked: {}",
+                first_line(&error.to_string())
+            )),
         },
     ));
 
@@ -205,7 +256,7 @@ pub fn run(args: Args) -> CmdResult {
 
     // ── Backend ──
     if args.check_backend {
-        let client = crate::hub::Client::from_env();
+        let client = crate::hub::Client::for_hub(&hub);
         checks.push((
             "backend".into(),
             match client.health() {
@@ -263,17 +314,24 @@ pub fn run(args: Args) -> CmdResult {
 
         let mut findings: Vec<String> = vec![];
         let mut ok = 0usize;
+        let mut views = Vec::new();
         for (o, n, p) in &new_agents {
             let slug = format!("{o}/{n}");
-            let repo = crate::domain::repo::Repo::at(p);
+            let repo = crate::domain::repo::Repo::at(p).local_objects_only();
             // Every branch's metadata must be readable: the main checkout sits on main, so a
             // broken session branch is exposed by no checkout at all — this is the only place
             // that looks at it.
-            for error in session_roots_checked(p).1 {
+            let (roots, errors) = session_roots_checked(p);
+            views.extend(
+                roots
+                    .into_iter()
+                    .map(|(branch, root)| (format!("{slug}@{branch}"), root)),
+            );
+            for error in errors {
                 findings.push(format!("{slug}: {error}"));
             }
-            match meta::resolve(p) {
-                Ok(_) => {
+            match read_worktree_metadata(p) {
+                Ok(Some(_)) => {
                     // One of doctor's hard checks. A version ID is a commit SHA, which is
                     // itself the content address of the whole parent→tree→events→VIEW tree, so
                     // no per-commit machine tag has to be verified: HEAD only has to exist.
@@ -285,6 +343,7 @@ pub fn run(args: Args) -> CmdResult {
                         None => findings.push(format!("the repo of {slug} has no commits")),
                     }
                 }
+                Ok(None) => findings.push(format!("{slug}: session metadata is missing")),
                 Err(e) => findings.push(format!("{slug} {}", first_line(&format!("{e:#}")))),
             }
         }
@@ -292,10 +351,8 @@ pub fn run(args: Args) -> CmdResult {
         // ── View comparison: every event the VIEW references must be reachable in the log ──
         let mut view_ok = 0usize;
         let mut view_errs: Vec<String> = vec![];
-        for (o, n, p) in &new_agents {
-            for (branch, root) in session_roots(p) {
-                let slug = format!("{o}/{n}@{branch}");
-                match check_view_root(&root) {
+        for (slug, root) in views {
+            match check_view_root(&root) {
                     Ok(None) => {}
                     Ok(Some(ViewNote::Ok)) => view_ok += 1,
                     Ok(Some(ViewNote::MissingView)) => view_errs.push(format!(
@@ -314,7 +371,6 @@ pub fn run(args: Args) -> CmdResult {
                         first_line(&format!("{error:#}"))
                     )),
                 }
-            }
         }
         sp.finish_and_clear();
 
@@ -345,7 +401,7 @@ pub fn run(args: Args) -> CmdResult {
                 ui::dim("no views to compare yet (no repo has a session log)")
             ),
             0 => println!(
-                "  {} the VIEW of {view_ok} repos all reference reachable events",
+                "  {} the VIEW of {view_ok} session branches all reference reachable events",
                 ui::ok(s.check)
             ),
             e => {
@@ -385,6 +441,10 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
 
+    if args.deep {
+        print_history_checks(&agents);
+    }
+
     print_live_comparisons(&links);
 
     // ── Environment summary ──
@@ -411,6 +471,103 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         ExitCode::Ok
     })
+}
+
+fn print_history_checks(agents: &[(String, String, PathBuf)]) {
+    ui::section("committed history integrity");
+    if agents.is_empty() {
+        println!("  no local repository history to inspect");
+    }
+    for (owner, name, path) in agents {
+        let report = history::check(path);
+        let status = if report.incomplete {
+            "incomplete"
+        } else if report.findings.is_empty() {
+            "checked"
+        } else {
+            "problems found"
+        };
+        println!(
+            "  {owner}/{name}: {status}; {} frozen refs, {} commits, {} valid session VIEWs, {} file-line snapshots, {} undeclared snapshots",
+            report.roots, report.commits, report.views, report.file_lines, report.undeclared
+        );
+        for finding in &report.findings {
+            let version = finding.commit.as_deref().unwrap_or("history scope");
+            if let Some(reference) = &finding.reference {
+                println!("    {version} ({reference}): {}", finding.message);
+            } else {
+                println!("    {version}: {}", finding.message);
+            }
+        }
+        if report.incomplete {
+            println!(
+                "    the available evidence or inspection budget does not cover the full history"
+            );
+        }
+        if report.undeclared != 0 {
+            println!("    snapshots preceding a line declaration have no session VIEW to validate");
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialExpiry {
+    Valid,
+    Expired,
+    Unknown,
+}
+
+impl CredentialExpiry {
+    fn at(value: &str, now: chrono::DateTime<chrono::Utc>) -> Self {
+        match chrono::DateTime::parse_from_rfc3339(value) {
+            Ok(deadline) if now > deadline => Self::Expired,
+            Ok(_) => Self::Valid,
+            Err(_) => Self::Unknown,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Expired => "expired",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn credential_row(
+    hub: &str,
+    credential: Option<&credentials::HubCredential>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Check {
+    let Some(credential) = credential else {
+        return Check::Warn(
+            "not signed in — import / commit / push all need agit login first (except agit import --link-only)"
+                .into(),
+        );
+    };
+    let access = CredentialExpiry::at(&credential.access_expires_at, now);
+    let refresh = CredentialExpiry::at(&credential.refresh_expires_at, now);
+    let status = format!(
+        "{} @ {hub}; access {}; refresh {}",
+        credential.username,
+        access.label(),
+        refresh.label()
+    );
+    use CredentialExpiry::{Expired, Unknown, Valid};
+    match (access, refresh) {
+        (Valid, Valid) => Check::Ok(format!("{status} — local expiry only")),
+        (Unknown, _) | (_, Unknown) => Check::Warn(format!(
+            "{status} — expiry cannot be established locally; `agit login` obtains fresh credentials"
+        )),
+        (Expired, Valid) => Check::Warn(format!(
+            "{status} — the next authenticated request can renew access"
+        )),
+        (Valid, Expired) => Check::Warn(format!(
+            "{status} — access has not expired, but renewal needs `agit login`"
+        )),
+        (Expired, Expired) => Check::Warn(format!("{status} — sign in again with `agit login`")),
+    }
 }
 
 /// One keystore row: which store, whether it answers, and what stops working when it does not.
@@ -598,18 +755,38 @@ enum SessionRoot {
 impl SessionRoot {
     fn meta(&self) -> crate::Result<Option<meta::Meta>> {
         match self {
-            SessionRoot::Worktree(root) => {
-                if !meta::path_in(root).exists() {
-                    return Ok(None);
-                }
-                meta::resolve(root).map(Some)
+            SessionRoot::Worktree(root) => read_worktree_metadata(root),
+            SessionRoot::Ref { repo, branch } => {
+                let git = Repo::at(repo).local_objects_only();
+                read_branch_metadata(&git, branch).map(|(_, metadata)| metadata)
             }
-            SessionRoot::Ref { repo, branch } => meta::read_at_ref_result(
-                &crate::domain::repo::Repo::at(repo),
-                &format!("refs/heads/{branch}"),
-            ),
         }
     }
+}
+
+fn read_worktree_metadata(root: &Path) -> crate::Result<Option<meta::Meta>> {
+    meta::ensure_write_safe(root)?;
+    let path = meta::path_in(root);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let bytes = crate::domain::storage::read_bytes_capped(&path, 1024 * 1024)?;
+    let text = std::str::from_utf8(&bytes).context("session metadata is not UTF-8")?;
+    meta::parse_strict(text, "worktree")
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("session metadata is malformed or violates its invariants"))
+}
+
+fn read_branch_metadata(repo: &Repo, branch: &str) -> crate::Result<(String, Option<meta::Meta>)> {
+    let head = repo.git(&[
+        "rev-parse",
+        "--verify",
+        &format!("refs/heads/{branch}^{{commit}}"),
+    ])?;
+    let metadata = history::read_metadata(repo.root(), &head).map_err(anyhow::Error::msg)?;
+    Ok((head, metadata))
 }
 
 /// Where to read every session branch with a claimed identity in one repo; with none, this
@@ -619,30 +796,72 @@ impl SessionRoot {
 /// not "absent": it goes into the second return value and the caller records it as a finding —
 /// such a branch is exactly what doctor exists to diagnose.
 fn session_roots_checked(repo_root: &Path) -> (Vec<(String, SessionRoot)>, Vec<String>) {
-    let repo = crate::domain::repo::Repo::at(repo_root);
-    let worktrees = repo.worktrees().unwrap_or_default();
+    let repo = crate::domain::repo::Repo::at(repo_root).local_objects_only();
     let mut errors = Vec::new();
-    let mut out: Vec<(String, SessionRoot)> = repo
-        .local_branches()
+    let worktrees: std::collections::HashMap<_, _> = match repo.inspection_worktrees() {
+        Ok(worktrees) => {
+            worktrees
+                .into_iter()
+                .fold(std::collections::HashMap::new(), |mut paths, tree| {
+                    if let Some(branch) = tree.branch {
+                        // Git lists the primary checkout first; duplicate registrations must not hide it.
+                        paths.entry(branch).or_insert(tree.path);
+                    }
+                    paths
+                })
+        }
+        Err(_) => {
+            errors
+                .push("registered worktree inspection is unavailable or exceeds its budget".into());
+            std::collections::HashMap::new()
+        }
+    };
+    let branches = match history::local_branches(repo_root) {
+        Ok(branches) => branches,
+        Err(error) => {
+            errors.push(format!("local branch inspection is incomplete: {error}"));
+            return (Vec::new(), errors);
+        }
+    };
+    let mut metadata = match history::MetadataInspection::open(repo_root) {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            errors.push(format!("local metadata inspection is incomplete: {error}"));
+            return (Vec::new(), errors);
+        }
+    };
+    let mut cache = std::collections::HashMap::new();
+    let mut out: Vec<(String, SessionRoot)> = branches
         .into_iter()
-        .filter(
-            |branch| match meta::read_at_ref_result(&repo, &format!("refs/heads/{branch}")) {
-                Ok(Some(m)) => m.is_session_line() && !m.session.is_empty(),
-                Ok(None) => false,
-                Err(error) => {
-                    errors.push(format!(
-                        "branch `{branch}`: {}",
-                        first_line(&format!("{error:#}"))
+        .filter(|(branch, head)| {
+            let status = cache.entry(head.clone()).or_insert_with(|| {
+                let snapshot = metadata.metadata(head)?;
+                if let Some(snapshot) = snapshot {
+                    return Ok(snapshot.is_session_line() && !snapshot.session.is_empty());
+                }
+                let declaration = metadata
+                    .prior_declaration(head)
+                    .map_err(|error| format!("metadata history is unavailable: {error}"))?;
+                if declaration == Some(meta::Line::Session) {
+                    return Err(format!(
+                        "{} is missing from a declared session line",
+                        meta::FILE
                     ));
+                }
+                Ok(false)
+            });
+            match status {
+                Ok(is_session) => *is_session,
+                Err(error) => {
+                    errors.push(format!("branch `{branch}`: {error}"));
                     false
                 }
-            },
-        )
-        .map(|branch| {
+            }
+        })
+        .map(|(branch, _)| {
             let root = worktrees
-                .iter()
-                .find(|w| w.branch.as_deref() == Some(branch.as_str()))
-                .map(|w| SessionRoot::Worktree(w.path.clone()))
+                .get(&branch)
+                .map(|path| SessionRoot::Worktree(path.clone()))
                 .unwrap_or_else(|| SessionRoot::Ref {
                     repo: repo_root.to_path_buf(),
                     branch: branch.clone(),
@@ -657,10 +876,6 @@ fn session_roots_checked(repo_root: &Path) -> (Vec<(String, SessionRoot)>, Vec<S
         ));
     }
     (out, errors)
-}
-
-fn session_roots(repo_root: &Path) -> Vec<(String, SessionRoot)> {
-    session_roots_checked(repo_root).0
 }
 
 /// A claim is compared only with its recorded owner, repository, and local branch.
@@ -679,7 +894,8 @@ fn compare_claim(lk: &link::Link) -> crate::Result<(ContinuityNote, Option<Strin
         .map_err(anyhow::Error::msg)
         .context("claim has invalid repository identity")?;
     let repo = crate::domain::repo::Repo::open(config::repo_dir(owner, agent)?)
-        .context("claimed repository is not available locally")?;
+        .context("claimed repository is not available locally")?
+        .local_objects_only();
     if repo
         .git_status(&["check-ref-format", &format!("refs/heads/{branch}")])?
         .0
@@ -694,7 +910,8 @@ fn compare_claim(lk: &link::Link) -> crate::Result<(ContinuityNote, Option<Strin
             &format!("refs/heads/{branch}^{{commit}}"),
         ])
         .context("claimed local branch cannot be read")?;
-    let snapshot = meta::read_at_ref_result(&repo, &head)?
+    let snapshot = history::read_metadata(repo.root(), &head)
+        .map_err(anyhow::Error::msg)?
         .context("claimed branch has no committed session metadata")?;
     if !snapshot.is_session_line() || snapshot.session.is_empty() {
         anyhow::bail!("claimed branch is not a recorded session line");
@@ -709,10 +926,10 @@ fn compare_claim(lk: &link::Link) -> crate::Result<(ContinuityNote, Option<Strin
         return Ok((check_materialized(lk, &live)?, lineage));
     }
     let live = std::str::from_utf8(&live).context("live transcript is not valid UTF-8")?;
-    let log = repo
-        .show_result(&head, meta::LOG_FILE)?
-        .context("claimed branch has no committed LOG")?;
-    let committed = committed_content(&log)?;
+    let stored = history::read_snapshot(repo.root(), &head)
+        .map_err(anyhow::Error::msg)
+        .context("claimed committed storage is unavailable")?;
+    let committed = committed_content(&stored.log)?;
     let (committed, live) = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
         .hydrate_pair_readonly(&committed, live)
         .context("repository secret reconstruction is unavailable")?;
@@ -904,6 +1121,19 @@ fn check_view(repo_root: &Path) -> crate::Result<Option<ViewNote>> {
 }
 
 fn check_view_root(root: &SessionRoot) -> crate::Result<Option<ViewNote>> {
+    if let SessionRoot::Ref { repo, branch } = root {
+        let git = Repo::at(repo).local_objects_only();
+        let head = git.git(&[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ])?;
+        let stored = history::read_snapshot(repo, &head).map_err(anyhow::Error::msg)?;
+        if stored.meta.is_file_line() || stored.meta.session.is_empty() {
+            return Ok(None);
+        }
+        return check_view_content(&stored.log, &stored.view, stored.meta.layout);
+    }
     let Some(snapshot) = root.meta()? else {
         return Ok(None);
     };
@@ -916,8 +1146,12 @@ fn check_view_root(root: &SessionRoot) -> crate::Result<Option<ViewNote>> {
     };
     let (t, v) = match root {
         SessionRoot::Worktree(repo_root) => {
-            let t = crate::domain::storage::materialize_worktree(repo_root, meta::LOG_FILE)
-                .context("LOG is unreadable")?;
+            let t = crate::domain::storage::materialize_worktree_with_layout(
+                repo_root,
+                meta::LOG_FILE,
+                snapshot.layout,
+            )
+            .context("LOG is unreadable")?;
             match std::fs::symlink_metadata(repo_root.join(stored_view)) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(Some(ViewNote::MissingView));
@@ -925,23 +1159,26 @@ fn check_view_root(root: &SessionRoot) -> crate::Result<Option<ViewNote>> {
                 Err(error) => return Err(error.into()),
                 Ok(_) => {}
             }
-            let v = crate::domain::storage::materialize_worktree(repo_root, meta::VIEW_FILE)
-                .context("VIEW is unreadable")?;
+            let v = crate::domain::storage::materialize_worktree_with_layout(
+                repo_root,
+                meta::VIEW_FILE,
+                snapshot.layout,
+            )
+            .context("VIEW is unreadable")?;
             (t, v)
         }
-        SessionRoot::Ref { repo, branch } => {
-            let refname = format!("refs/heads/{branch}");
-            let t = crate::domain::storage::materialize_at(repo, &refname, meta::LOG_FILE)
-                .context("LOG is unreadable")?;
-            let git = crate::domain::repo::Repo::at(repo);
-            if git.show_raw(&refname, stored_view).is_none() {
-                return Ok(Some(ViewNote::MissingView));
-            }
-            let v = crate::domain::storage::materialize_at(repo, &refname, meta::VIEW_FILE)
-                .context("VIEW is unreadable")?;
-            (t, v)
+        SessionRoot::Ref { .. } => {
+            unreachable!("reference snapshots are inspected by immutable id")
         }
     };
+    check_view_content(&t, &v, snapshot.layout)
+}
+
+fn check_view_content(
+    t: &str,
+    v: &str,
+    layout: meta::LayoutVersion,
+) -> crate::Result<Option<ViewNote>> {
     let reachable: std::collections::HashSet<String> = t
         .split_inclusive('\n')
         .filter_map(|line| crate::domain::storage::event_id(line).ok())
@@ -952,14 +1189,17 @@ fn check_view_root(root: &SessionRoot) -> crate::Result<Option<ViewNote>> {
             unreachable += 1;
             continue;
         };
-        if !reachable.contains(&id) {
+        let legacy_synthetic = layout == meta::LayoutVersion::V0
+            && crate::domain::storage::parse_legacy_envelope_line(line)
+                .is_ok_and(|envelope| history::legacy_view_only_record(&envelope.content));
+        if !reachable.contains(&id) && !legacy_synthetic {
             unreachable += 1;
         }
     }
     if unreachable > 0 {
         return Ok(Some(ViewNote::Unreachable { count: unreachable }));
     }
-    let unbalanced = crate::domain::storage::unbalanced_view_markers(&v)?;
+    let unbalanced = crate::domain::storage::unbalanced_view_markers(v)?;
     if unbalanced != 0 {
         return Ok(Some(ViewNote::UnbalancedMarkers { count: unbalanced }));
     }
@@ -972,6 +1212,25 @@ fn first_line(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn worktree_metadata_keeps_the_ancestor_directory_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        crate::domain::meta::write(outside.path(), &crate::domain::meta::Meta::new_file_line())
+            .unwrap();
+        let foreign = outside.path().join(crate::domain::meta::FILE);
+        let before = std::fs::read(&foreign).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("session"), root.path().join("session"))
+            .unwrap();
+        let error = super::read_worktree_metadata(root.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("metadata directory"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(foreign).unwrap(), before);
+    }
+
     /// The main checkout sits on a healthy main while one session branch has broken metadata.
     /// This pins that the branch surfaces as a finding instead of vanishing from the
     /// enumeration.

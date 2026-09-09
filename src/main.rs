@@ -123,6 +123,7 @@ fn main() {
     let startup = match &command {
         Commands::Status(_) => Startup::Inspect,
         Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
+        Commands::Doctor(_) => Startup::Inspect,
         Commands::Import(args) if commands::import::needs_readonly_startup(args) => {
             Startup::ScopedImport
         }

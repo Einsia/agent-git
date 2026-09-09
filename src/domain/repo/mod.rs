@@ -280,6 +280,304 @@ pub struct Worktree {
     pub primary: bool,
 }
 
+const MAX_INSPECTION_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_INSPECTION_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+#[cfg(any(feature = "cli", test))]
+const MAX_INSPECTION_WORKTREES: usize = 4096;
+
+fn inspection_native_path(bytes: &[u8]) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(
+            std::str::from_utf8(bytes).context("Git inspection path is not valid UTF-8")?,
+        ))
+    }
+}
+
+#[cfg(any(feature = "cli", test))]
+fn inspection_worktrees_from_bytes(bytes: &[u8]) -> Result<Vec<Worktree>> {
+    anyhow::ensure!(
+        bytes.len() <= MAX_INSPECTION_OUTPUT_BYTES,
+        "worktree inspection exceeds its byte limit"
+    );
+    anyhow::ensure!(
+        bytes.ends_with(b"\0\0"),
+        "worktree inspection returned incomplete framing"
+    );
+    let mut output = Vec::new();
+    let mut current: Option<Worktree> = None;
+    for field in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        if field.is_empty() {
+            let worktree = current
+                .take()
+                .context("worktree inspection returned an empty registration")?;
+            output.push(worktree);
+            continue;
+        }
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            anyhow::ensure!(
+                current.is_none(),
+                "worktree registration has duplicate paths"
+            );
+            anyhow::ensure!(
+                output.len() < MAX_INSPECTION_WORKTREES,
+                "worktree inspection exceeds its registration limit"
+            );
+            anyhow::ensure!(!path.is_empty(), "worktree registration has an empty path");
+            current = Some(Worktree {
+                path: inspection_native_path(path)?,
+                branch: None,
+                head: None,
+                primary: output.is_empty(),
+            });
+            continue;
+        }
+        let worktree = current
+            .as_mut()
+            .context("worktree metadata has no registered path")?;
+        if let Some(head) = field.strip_prefix(b"HEAD ") {
+            anyhow::ensure!(
+                worktree.head.is_none(),
+                "worktree registration has duplicate heads"
+            );
+            anyhow::ensure!(
+                matches!(head.len(), 40 | 64) && head.iter().all(u8::is_ascii_hexdigit),
+                "worktree registration has an invalid head"
+            );
+            worktree.head = Some(std::str::from_utf8(head)?.to_owned());
+        } else if let Some(branch) = field.strip_prefix(b"branch ") {
+            anyhow::ensure!(
+                worktree.branch.is_none(),
+                "worktree registration has duplicate branches"
+            );
+            let branch = branch
+                .strip_prefix(b"refs/heads/")
+                .context("worktree registration names a non-local branch")?;
+            anyhow::ensure!(
+                !branch.is_empty(),
+                "worktree registration has an empty branch"
+            );
+            worktree.branch = Some(
+                std::str::from_utf8(branch)
+                    .context("worktree branch identity is not valid UTF-8")?
+                    .to_owned(),
+            );
+        }
+    }
+    anyhow::ensure!(current.is_none(), "worktree registration is incomplete");
+    Ok(output)
+}
+
+#[cfg(any(feature = "cli", test))]
+fn inspection_worktrees_from_legacy(bytes: &[u8]) -> Result<Vec<Worktree>> {
+    anyhow::ensure!(
+        bytes.len() <= MAX_INSPECTION_OUTPUT_BYTES
+            && bytes.ends_with(b"\n\n")
+            && !bytes.contains(&0),
+        "legacy worktree inspection returned incomplete framing"
+    );
+    let mut bare = false;
+    let mut head = false;
+    let mut branch = false;
+    let mut detached = false;
+    for field in bytes[..bytes.len() - 1].split(|byte| *byte == b'\n') {
+        if field.is_empty() {
+            anyhow::ensure!(
+                (bare && !head && !branch && !detached) || (!bare && head && !(branch && detached)),
+                "legacy worktree inspection has inconsistent registration state"
+            );
+            bare = false;
+            head = false;
+            branch = false;
+            detached = false;
+        } else if field == b"bare" {
+            anyhow::ensure!(!bare, "legacy worktree registration repeats its bare state");
+            bare = true;
+        } else if field == b"detached" {
+            anyhow::ensure!(
+                !detached,
+                "legacy worktree registration repeats its detached state"
+            );
+            detached = true;
+        } else if field.starts_with(b"HEAD ") {
+            head = true;
+        } else if field.starts_with(b"branch ") {
+            branch = true;
+        } else {
+            anyhow::ensure!(
+                field.starts_with(b"worktree ")
+                    || field == b"locked"
+                    || field.starts_with(b"locked ")
+                    || field.starts_with(b"prunable "),
+                "legacy worktree inspection contains an ambiguous field"
+            );
+        }
+    }
+    let framed: Vec<u8> = bytes
+        .iter()
+        .map(|byte| if *byte == b'\n' { 0 } else { *byte })
+        .collect();
+    inspection_worktrees_from_bytes(&framed)
+}
+
+#[cfg(any(feature = "cli", test))]
+fn worktree_nul_option_unsupported(output: &std::process::Output) -> bool {
+    output.status.code() == Some(129)
+        && output.stdout.is_empty()
+        && [
+            b"unknown switch `z'".as_slice(),
+            b"unknown switch 'z'",
+            b"unknown option `z'",
+            b"unknown option 'z'",
+        ]
+        .iter()
+        .any(|marker| {
+            output
+                .stderr
+                .windows(marker.len())
+                .any(|part| part == *marker)
+        })
+}
+
+#[cfg(any(feature = "cli", test))]
+fn inspect_real_worktree_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .context("legacy worktree registration directory is unavailable")?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.is_symlink(),
+        "legacy worktree registration uses a non-directory or symlink"
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        anyhow::ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "legacy worktree registration uses a reparse directory"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "cli", test))]
+fn legacy_worktree_path_is_representable(path: &Path) -> bool {
+    !path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'\n' | b'\r' | 0))
+}
+
+#[cfg(any(feature = "cli", test))]
+fn inspection_git_path_spelling(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::path::{Component, Prefix};
+
+        let mut components = path.components();
+        let prefix = match components.next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => {
+                    Some(OsString::from(format!("{}:", char::from(drive))))
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut prefix = OsString::from(r"\\");
+                    prefix.push(server);
+                    prefix.push(r"\");
+                    prefix.push(share);
+                    Some(prefix)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(prefix) = prefix {
+            return PathBuf::from(prefix).join(components.as_path());
+        }
+    }
+    path
+}
+
+fn bounded_inspection_output(mut command: Command, limit: usize) -> Result<std::process::Output> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("local Git inspection could not start")?;
+    let stdout = child.stdout.take().expect("piped inspection stdout");
+    let stderr = child.stderr.take().expect("piped inspection stderr");
+    let (send, receive) = std::sync::mpsc::channel();
+    let spawn_reader = |mut reader: Box<dyn std::io::Read + Send>, is_stdout, cap: usize| {
+        let send = send.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = reader
+                .by_ref()
+                .take((cap as u64).saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|_| anyhow::anyhow!("local Git inspection output could not be read"))
+                .and_then(|_| {
+                    anyhow::ensure!(
+                        bytes.len() <= cap,
+                        "local Git inspection exceeds its output limit"
+                    );
+                    Ok(bytes)
+                });
+            let _ = send.send((is_stdout, result));
+        })
+    };
+    let stdout_reader = spawn_reader(Box::new(stdout), true, limit);
+    let stderr_reader = spawn_reader(Box::new(stderr), false, MAX_INSPECTION_DIAGNOSTIC_BYTES);
+    drop(send);
+    let mut output = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut failure = None;
+    for _ in 0..2 {
+        match receive.recv() {
+            Ok((true, Ok(bytes))) => output = bytes,
+            Ok((false, Ok(bytes))) => diagnostics = bytes,
+            Ok((_, Err(error))) => {
+                failure = Some(error);
+                break;
+            }
+            Err(_) => {
+                failure = Some(anyhow::anyhow!(
+                    "local Git inspection reader did not finish"
+                ));
+                break;
+            }
+        }
+    }
+    if failure.is_some() {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    let stdout_joined = stdout_reader.join();
+    let stderr_joined = stderr_reader.join();
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    anyhow::ensure!(
+        stdout_joined.is_ok() && stderr_joined.is_ok(),
+        "local Git inspection reader did not finish"
+    );
+    Ok(std::process::Output {
+        status: status.context("local Git inspection could not be reaped")?,
+        stdout: output,
+        stderr: diagnostics,
+    })
+}
+
 /// The common git directory for a checkout root, with no git subprocess.
 ///
 /// The main checkout's `.git` is a directory and is already it; a linked worktree's `.git` is a
@@ -316,11 +614,54 @@ pub fn common_git_dir(root: &Path) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct Repo {
     root: PathBuf,
+    local_objects_only: bool,
 }
 
 impl Repo {
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Repo { root: root.into() }
+        Repo {
+            root: root.into(),
+            local_objects_only: false,
+        }
+    }
+
+    /// Missing objects remain unavailable to inspection instead of being fetched into the store.
+    pub(crate) fn local_objects_only(mut self) -> Self {
+        self.local_objects_only = true;
+        self
+    }
+
+    pub(crate) fn is_local_inspection(&self) -> bool {
+        self.local_objects_only
+    }
+
+    pub(crate) fn inspection_output(
+        &self,
+        args: &[&str],
+        limit: usize,
+    ) -> Result<std::process::Output> {
+        let mut command = self.clone().local_objects_only().cmd();
+        command.args(args);
+        bounded_inspection_output(command, limit)
+    }
+
+    fn inspection_path(&self, args: &[&str]) -> Result<PathBuf> {
+        let output = self.inspection_output(args, MAX_INSPECTION_OUTPUT_BYTES)?;
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "local Git inspection could not identify its storage path"
+        );
+        let bytes = output
+            .stdout
+            .strip_suffix(b"\n")
+            .context("local Git inspection path is incomplete")?;
+        anyhow::ensure!(!bytes.is_empty(), "local Git inspection path is empty");
+        let path = inspection_native_path(bytes)?;
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            self.root.join(path)
+        })
     }
 
     /// Open it when it already exists, otherwise None.
@@ -408,7 +749,14 @@ impl Repo {
     /// A linked worktree's `.git` is a file, so building `root/.git/<name>` there is ENOTDIR; every
     /// piece of per-worktree state (index, HEAD, checkout journal) is fetched through here.
     pub fn git_path(&self, name: &str) -> Result<PathBuf> {
+        if self.local_objects_only {
+            return self.inspection_path(&["rev-parse", "--git-path", name]);
+        }
         let value = self.git(&["rev-parse", "--git-path", name])?;
+        anyhow::ensure!(
+            !value.trim().is_empty(),
+            "Git returned an empty storage path"
+        );
         Ok(self.absolute(value.trim()))
     }
 
@@ -418,7 +766,14 @@ impl Repo {
     }
 
     pub(crate) fn common_dir_with_policy(&self, policy: ReadPolicy) -> Result<PathBuf> {
+        if self.local_objects_only {
+            return self.inspection_path(&["rev-parse", "--git-common-dir"]);
+        }
         let value = self.git_with_policy(&["rev-parse", "--git-common-dir"], policy)?;
+        anyhow::ensure!(
+            !value.trim().is_empty(),
+            "Git returned an empty common directory"
+        );
         Ok(self.absolute(value.trim()))
     }
 
@@ -479,6 +834,146 @@ impl Repo {
             }
         }
         Ok(out)
+    }
+
+    /// Inspection keeps every registration or reports that enumeration is incomplete.
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn inspection_worktrees(&self) -> Result<Vec<Worktree>> {
+        let output = self.inspection_worktree_output(true)?;
+        if worktree_nul_option_unsupported(&output) {
+            return self.inspection_worktrees_legacy();
+        }
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "local worktree inspection did not complete"
+        );
+        inspection_worktrees_from_bytes(&output.stdout)
+    }
+
+    #[cfg(any(feature = "cli", test))]
+    fn inspection_worktree_output(&self, nul: bool) -> Result<std::process::Output> {
+        let mut command = self.clone().local_objects_only().cmd();
+        command
+            .env("LC_ALL", "C")
+            .args(["worktree", "list", "--porcelain"]);
+        if nul {
+            command.arg("-z");
+        }
+        bounded_inspection_output(command, MAX_INSPECTION_OUTPUT_BYTES)
+    }
+
+    #[cfg(any(feature = "cli", test))]
+    fn inspection_worktrees_legacy(&self) -> Result<Vec<Worktree>> {
+        let before = self.legacy_inspection_registration_paths()?;
+        let output = self.inspection_worktree_output(false)?;
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "legacy worktree inspection did not complete"
+        );
+        let after = self.legacy_inspection_registration_paths()?;
+        anyhow::ensure!(
+            before == after,
+            "worktree registrations changed during inspection"
+        );
+        let listed = inspection_worktrees_from_legacy(&output.stdout)?;
+        anyhow::ensure!(
+            listed.first().map(|entry| &entry.path) == before.first(),
+            "legacy worktree inspection could not establish the primary path"
+        );
+        let expected: std::collections::BTreeSet<_> = before.iter().collect();
+        let actual: std::collections::BTreeSet<_> =
+            listed.iter().map(|entry| &entry.path).collect();
+        anyhow::ensure!(
+            actual.len() == listed.len() && actual == expected,
+            "legacy worktree inspection disagrees with registered paths"
+        );
+        Ok(listed)
+    }
+
+    /// Line-delimited output is usable only after native registration paths prove its framing.
+    #[cfg(any(feature = "cli", test))]
+    fn legacy_inspection_registration_paths(&self) -> Result<Vec<PathBuf>> {
+        anyhow::ensure!(
+            legacy_worktree_path_is_representable(self.root()),
+            "legacy worktree inspection cannot represent a line-break-containing path"
+        );
+        let common = self.clone().local_objects_only().common_dir()?;
+        anyhow::ensure!(
+            legacy_worktree_path_is_representable(&common),
+            "legacy worktree inspection cannot represent a line-break-containing common directory"
+        );
+        let common = inspection_git_path_spelling(
+            common
+                .canonicalize()
+                .context("legacy worktree common directory is unavailable")?,
+        );
+        anyhow::ensure!(
+            legacy_worktree_path_is_representable(&common),
+            "legacy worktree inspection cannot represent the resolved common directory"
+        );
+        let primary = if common.file_name().is_some_and(|name| name == ".git") {
+            common
+                .parent()
+                .context("legacy worktree common directory has no parent")?
+                .to_path_buf()
+        } else {
+            let bare = self.inspection_output(&["rev-parse", "--is-bare-repository"], 64)?;
+            anyhow::ensure!(
+                bare.status.success() && bare.stderr.is_empty() && bare.stdout == b"true\n",
+                "legacy worktree inspection cannot establish this common-directory layout"
+            );
+            common.clone()
+        };
+        let mut paths = vec![primary];
+        let registrations = common.join("worktrees");
+        match std::fs::symlink_metadata(&registrations) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+            Err(error) => {
+                return Err(error).context("legacy worktree registration directory is unavailable");
+            }
+            Ok(_) => inspect_real_worktree_directory(&registrations)?,
+        }
+        let mut total_bytes = 0usize;
+        for entry in std::fs::read_dir(&registrations)
+            .context("legacy worktree registrations could not be enumerated")?
+        {
+            anyhow::ensure!(
+                paths.len() < MAX_INSPECTION_WORKTREES,
+                "legacy worktree inspection exceeds its registration limit"
+            );
+            let entry = entry.context("legacy worktree registration is unreadable")?;
+            inspect_real_worktree_directory(&entry.path())?;
+            let bytes = crate::domain::storage::read_bytes_capped(
+                &entry.path().join("gitdir"),
+                MAX_INSPECTION_OUTPUT_BYTES - total_bytes,
+            )
+            .context("legacy worktree registration path is unavailable")?;
+            total_bytes += bytes.len();
+            let bytes = bytes
+                .strip_suffix(b"\r\n")
+                .or_else(|| bytes.strip_suffix(b"\n"))
+                .unwrap_or(&bytes);
+            let gitdir = inspection_native_path(bytes)?;
+            anyhow::ensure!(
+                gitdir.is_absolute()
+                    && gitdir.file_name().is_some_and(|name| name == ".git")
+                    && legacy_worktree_path_is_representable(&gitdir),
+                "legacy worktree inspection cannot represent the registered path unambiguously"
+            );
+            paths.push(
+                gitdir
+                    .parent()
+                    .context("legacy worktree registration has no checkout path")?
+                    .to_path_buf(),
+            );
+        }
+        paths[1..].sort();
+        let unique: std::collections::BTreeSet<_> = paths.iter().collect();
+        anyhow::ensure!(
+            unique.len() == paths.len(),
+            "legacy worktree registrations contain duplicate paths"
+        );
+        Ok(paths)
     }
 
     #[cfg(feature = "cli")]
@@ -615,6 +1110,29 @@ impl Repo {
     fn cmd(&self) -> Command {
         let mut cmd = git_command();
         cmd.arg("-C").arg(&self.root);
+        if self.is_local_inspection() {
+            cmd.env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_ALLOW_PROTOCOL", "")
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(["-c", "core.fsmonitor=false"]);
+            for name in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_NAMESPACE",
+                "GIT_SHALLOW_FILE",
+                "GIT_GRAFT_FILE",
+                "GIT_PREFIX",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_COUNT",
+            ] {
+                cmd.env_remove(name);
+            }
+        }
         cmd
     }
 
@@ -633,6 +1151,17 @@ impl Repo {
     }
 
     pub(crate) fn git_with_policy(&self, args: &[&str], policy: ReadPolicy) -> Result<String> {
+        if self.local_objects_only {
+            let output = self.inspection_output(args, MAX_INSPECTION_OUTPUT_BYTES)?;
+            anyhow::ensure!(
+                output.status.success() && output.stderr.is_empty(),
+                "local Git inspection did not complete"
+            );
+            let bytes = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+            return std::str::from_utf8(bytes)
+                .context("local Git inspection output is not valid UTF-8")
+                .map(str::to_owned);
+        }
         let mut command = self.cmd();
         policy.apply(&mut command);
         let out = command
@@ -1181,12 +1710,23 @@ impl Repo {
     /// git reports are **no longer equal** and cutting by length goes off by one; worse, a
     /// `split_at` landing inside a U+FFFD panics outright.
     pub fn git_bytes(&self, args: &[&str]) -> Option<Vec<u8>> {
+        if self.local_objects_only {
+            return self.git_bytes_result(args).ok();
+        }
         let out = self.cmd().args(args).output().ok()?;
         out.status.success().then_some(out.stdout)
     }
 
     /// Run Git and preserve raw stdout while propagating every spawn/exit failure.
     pub fn git_bytes_result(&self, args: &[&str]) -> Result<Vec<u8>> {
+        if self.local_objects_only {
+            let output = self.inspection_output(args, MAX_INSPECTION_OUTPUT_BYTES)?;
+            anyhow::ensure!(
+                output.status.success() && output.stderr.is_empty(),
+                "local Git byte inspection did not complete"
+            );
+            return Ok(output.stdout);
+        }
         let out = self
             .cmd()
             .args(args)
@@ -1222,6 +1762,18 @@ impl Repo {
         args: &[&str],
         allow_transport: bool,
     ) -> Result<(Option<i32>, String, String)> {
+        if self.local_objects_only {
+            let output = self.inspection_output(args, MAX_INSPECTION_OUTPUT_BYTES)?;
+            let stdout = std::str::from_utf8(&output.stdout)
+                .context("local Git status output is not valid UTF-8")?;
+            let stderr = std::str::from_utf8(&output.stderr)
+                .context("local Git status diagnostics are not valid UTF-8")?;
+            return Ok((
+                output.status.code(),
+                stdout.strip_suffix('\n').unwrap_or(stdout).to_owned(),
+                stderr.strip_suffix('\n').unwrap_or(stderr).to_owned(),
+            ));
+        }
         let mut command = self.cmd();
         if !allow_transport {
             ReadPolicy::LocalOnly.apply(&mut command);
@@ -1262,6 +1814,9 @@ impl Repo {
 
     /// Run git, treating a failure as "not there" (for queries).
     pub fn git_opt(&self, args: &[&str]) -> Option<String> {
+        if self.local_objects_only {
+            return self.git(args).ok();
+        }
         let out = self.cmd().args(args).output().ok()?;
         if !out.status.success() {
             return None;
@@ -1840,6 +2395,437 @@ impl LocalWorktreeRecord {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_inspection_canonical_paths_use_git_drive_and_unc_spelling() {
+        for (verbatim, ordinary) in [
+            (r"\\?\C:\fixture\with spaces", r"C:\fixture\with spaces"),
+            (
+                r"\\?\UNC\server\share\with spaces",
+                r"\\server\share\with spaces",
+            ),
+        ] {
+            assert_eq!(
+                inspection_git_path_spelling(PathBuf::from(verbatim)),
+                PathBuf::from(ordinary)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_inspection_worktrees_match_native_registry_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&directory.path().join("primary")).unwrap();
+        std::fs::write(repo.root().join("fixture"), "selected").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("fixture").unwrap();
+        let linked = directory.path().join("linked 🧪 with spaces");
+        let output = repo
+            .cmd()
+            .args(["worktree", "add", "--detach"])
+            .arg(&linked)
+            .arg("HEAD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let entries = repo.inspection_worktrees_legacy().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].path.canonicalize().unwrap(),
+            repo.root().canonicalize().unwrap()
+        );
+        assert_eq!(
+            entries[1].path.canonicalize().unwrap(),
+            linked.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_inspection_worktree_parser_keeps_literal_path_bytes() {
+        let head = "1".repeat(40);
+        let bytes = format!(
+            "worktree /literal \"quotes\" \\backslash\tpath\nHEAD {head}\ndetached\nlocked \"reason\\ncontinued\"\n\n"
+        );
+        let entries = inspection_worktrees_from_legacy(bytes.as_bytes()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].path,
+            PathBuf::from("/literal \"quotes\" \\backslash\tpath")
+        );
+        for fields in [
+            "bare\nHEAD ",
+            "bare\ndetached\nHEAD ",
+            "detached\nbranch refs/heads/main\nHEAD ",
+        ] {
+            let bytes = format!("worktree /invalid\n{fields}{head}\n\n");
+            assert!(inspection_worktrees_from_legacy(bytes.as_bytes()).is_err());
+        }
+        assert!(inspection_worktrees_from_legacy(b"worktree /invalid\nunknown value\n\n").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inspection_worktrees_probe() {
+        let Some(root) = std::env::var_os("AGIT_TEST_LEGACY_WORKTREE_ROOT") else {
+            return;
+        };
+        let repo = Repo::at(PathBuf::from(root));
+        let result = repo.inspection_worktrees();
+        match std::env::var("AGIT_TEST_LEGACY_WORKTREE_OUTCOME")
+            .unwrap()
+            .as_str()
+        {
+            "valid" => {
+                let entries = result.unwrap();
+                assert_eq!(entries.len(), 2);
+                assert!(entries[0].primary);
+                let linked =
+                    PathBuf::from(std::env::var_os("AGIT_TEST_LEGACY_WORKTREE_LINKED").unwrap());
+                assert_eq!(entries[1].path, linked);
+            }
+            "ambiguous" => {
+                assert!(result.unwrap_err().to_string().contains("cannot represent"));
+            }
+            "unsupported-other" => {
+                assert!(result.unwrap_err().to_string().contains("did not complete"));
+            }
+            _ => panic!("unknown synthetic worktree outcome"),
+        }
+    }
+
+    /// Legacy option fallback must preserve literal paths and refuse ambiguous registrations.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inspection_worktrees_fallback_with_old_git_wrapper() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&directory.path().join("primary")).unwrap();
+        std::fs::write(repo.root().join("fixture"), "selected").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("fixture").unwrap();
+        let linked = directory.path().join("linked\t \"quotes\" \\backslash 🧪");
+        let added = repo
+            .cmd()
+            .args(["worktree", "add", "--detach"])
+            .arg(&linked)
+            .arg("HEAD")
+            .output()
+            .unwrap();
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        let linked = linked.canonicalize().unwrap();
+        let original_path = std::env::var_os("PATH").unwrap();
+        let real_git = std::env::split_paths(&original_path)
+            .map(|directory| directory.join("git"))
+            .find(|path| path.is_file())
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let wrapper = bin.join("git");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+is_list=0
+previous=
+nul=0
+for argument do
+    if [ "$previous" = worktree ] && [ "$argument" = list ]; then is_list=1; fi
+    if [ "$argument" = -z ]; then nul=1; fi
+    previous="$argument"
+done
+if [ "$is_list" = 1 ]; then
+    if [ "$LC_ALL" != C ]; then exit 128; fi
+    if [ "$nul" = 1 ]; then
+        printf '%s\n' nul >> "$AGIT_TEST_LEGACY_WORKTREE_LOG"
+        if [ "$AGIT_TEST_LEGACY_WORKTREE_OUTCOME" = unsupported-other ]; then
+            printf '%s\n' "error: unknown switch 'q'" >&2
+        else
+            printf '%s\n' "error: unknown switch 'z'" >&2
+        fi
+        exit 129
+    fi
+    printf '%s\n' legacy >> "$AGIT_TEST_LEGACY_WORKTREE_LOG"
+fi
+exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path =
+            std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&original_path)))
+                .unwrap();
+        let log = directory.path().join("queries");
+        for outcome in ["valid", "unsupported-other", "ambiguous"] {
+            if outcome == "ambiguous" {
+                let ambiguous = directory.path().join("linked\nambiguous");
+                let added = repo
+                    .cmd()
+                    .args(["worktree", "add", "--detach"])
+                    .arg(ambiguous)
+                    .arg("HEAD")
+                    .output()
+                    .unwrap();
+                assert!(
+                    added.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&added.stderr)
+                );
+            }
+            std::fs::write(&log, b"").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "domain::repo::tests::legacy_inspection_worktrees_probe",
+                    "--nocapture",
+                ])
+                .env("PATH", &path)
+                .env("LC_ALL", "zh_CN.UTF-8")
+                .env("AGIT_TEST_LEGACY_REAL_GIT", &real_git)
+                .env("AGIT_TEST_LEGACY_WORKTREE_ROOT", repo.root())
+                .env("AGIT_TEST_LEGACY_WORKTREE_LINKED", &linked)
+                .env("AGIT_TEST_LEGACY_WORKTREE_OUTCOME", outcome)
+                .env("AGIT_TEST_LEGACY_WORKTREE_LOG", &log)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            let queries = std::fs::read_to_string(&log).unwrap();
+            assert_eq!(
+                queries,
+                if outcome == "valid" {
+                    "nul\nlegacy\n"
+                } else {
+                    "nul\n"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn inspection_worktree_parser_preserves_framing_and_registration_states() {
+        let head = "1".repeat(40);
+        let bytes = format!(
+            "worktree /primary\0bare\0\0worktree /linked\nwith whitespace \0HEAD {head}\0detached\0locked reason\0prunable reason\0\0"
+        );
+        let parsed = inspection_worktrees_from_bytes(bytes.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].primary);
+        assert_eq!(parsed[0].head, None);
+        assert_eq!(parsed[1].path, PathBuf::from("/linked\nwith whitespace "));
+        assert_eq!(parsed[1].branch, None);
+        assert_eq!(parsed[1].head.as_deref(), Some(head.as_str()));
+        for bad in [
+            b"worktree /a\0".as_slice(),
+            b"HEAD bad\0\0",
+            b"worktree /a\0worktree /b\0\0",
+        ] {
+            assert!(inspection_worktrees_from_bytes(bad).is_err());
+        }
+        let record = b"worktree /registered\0bare\0\0";
+        let mut capped = record.repeat(MAX_INSPECTION_WORKTREES);
+        assert_eq!(
+            inspection_worktrees_from_bytes(&capped).unwrap().len(),
+            MAX_INSPECTION_WORKTREES
+        );
+        capped.extend_from_slice(record);
+        assert!(
+            inspection_worktrees_from_bytes(&capped)
+                .unwrap_err()
+                .to_string()
+                .contains("registration limit")
+        );
+        assert!(
+            inspection_worktrees_from_bytes(&vec![b'x'; MAX_INSPECTION_OUTPUT_BYTES + 1]).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_worktree_parser_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let parsed =
+            inspection_worktrees_from_bytes(b"worktree /native/\xff\n \0bare\0\0").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path.as_os_str().as_bytes(), b"/native/\xff\n ");
+    }
+
+    #[test]
+    fn inspection_worktrees_preserve_native_registered_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&directory.path().join("primary")).unwrap();
+        std::fs::write(repo.root().join("fixture"), "selected").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("fixture").unwrap();
+        let name = std::ffi::OsString::from(if cfg!(windows) {
+            "checkout 🧪 with whitespace"
+        } else {
+            "checkout\n\t 🧪 with whitespace"
+        });
+        let linked = directory.path().join(&name);
+        let output = repo
+            .cmd()
+            .args(["worktree", "add", "--detach"])
+            .arg(&linked)
+            .arg("HEAD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let entries = repo.inspection_worktrees().unwrap();
+        assert_eq!(entries.len(), 2);
+        let registered = entries.iter().find(|entry| !entry.primary).unwrap();
+        assert_eq!(registered.path.file_name(), Some(name.as_os_str()));
+        assert_eq!(
+            registered.path.canonicalize().unwrap(),
+            linked.canonicalize().unwrap()
+        );
+        assert_eq!(registered.branch, None);
+        assert_eq!(
+            Repo::at(&linked)
+                .local_objects_only()
+                .common_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            repo.root().join(".git").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn local_inspection_repository_probe() {
+        let Some(root) = std::env::var_os("AGIT_TEST_INSPECTION_SELECTED_ROOT") else {
+            return;
+        };
+        let expected = std::env::var("AGIT_TEST_INSPECTION_SELECTED_HEAD").unwrap();
+        let redirected = std::env::var("AGIT_TEST_INSPECTION_FOREIGN_HEAD").unwrap();
+        let repo = Repo::at(PathBuf::from(root));
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), redirected);
+        let inspected = repo.local_objects_only();
+        assert_eq!(inspected.git(&["rev-parse", "HEAD"]).unwrap(), expected);
+        assert_eq!(
+            inspected.git_opt(&["rev-parse", "HEAD"]),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            inspected.git_bytes(&["rev-parse", "HEAD"]).unwrap(),
+            format!("{expected}\n").into_bytes()
+        );
+        assert_eq!(
+            inspected.git_status(&["rev-parse", "HEAD"]).unwrap(),
+            (Some(0), expected, String::new())
+        );
+        assert_eq!(
+            inspected.common_dir().unwrap().canonicalize().unwrap(),
+            inspected.root().join(".git").canonicalize().unwrap()
+        );
+        assert_eq!(inspected.inspection_worktrees().unwrap().len(), 1);
+    }
+
+    /// Inherited repository routing must not replace an explicitly inspected repository.
+    #[test]
+    fn local_inspection_removes_inherited_repository_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repositories = Vec::new();
+        for name in ["selected", "foreign"] {
+            let repo = Repo::init(&directory.path().join(name)).unwrap();
+            std::fs::write(repo.root().join("fixture"), name).unwrap();
+            repo.add_all().unwrap();
+            repo.commit(name).unwrap();
+            repositories.push(repo);
+        }
+        let selected = &repositories[0];
+        let foreign = &repositories[1];
+        let selected_head = selected.git(&["rev-parse", "HEAD"]).unwrap();
+        let foreign_head = foreign.git(&["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(selected_head, foreign_head);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "domain::repo::tests::local_inspection_repository_probe",
+                "--nocapture",
+            ])
+            .env("AGIT_TEST_INSPECTION_SELECTED_ROOT", selected.root())
+            .env("AGIT_TEST_INSPECTION_SELECTED_HEAD", &selected_head)
+            .env("AGIT_TEST_INSPECTION_FOREIGN_HEAD", &foreign_head)
+            .env("GIT_DIR", foreign.root().join(".git"))
+            .env("GIT_COMMON_DIR", foreign.root().join(".git"))
+            .env("GIT_WORK_TREE", foreign.root())
+            .env("GIT_INDEX_FILE", foreign.root().join(".git/index"))
+            .env("GIT_OBJECT_DIRECTORY", foreign.root().join(".git/objects"))
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                foreign.root().join(".git/objects"),
+            )
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.worktree")
+            .env("GIT_CONFIG_VALUE_0", foreign.root());
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn inspection_output_overflow_probe() {
+        use std::io::Write as _;
+
+        let Ok(stream) = std::env::var("AGIT_TEST_INSPECTION_FLOOD") else {
+            return;
+        };
+        let mut writer: Box<dyn std::io::Write> = if stream == "stderr" {
+            Box::new(std::io::stderr())
+        } else {
+            Box::new(std::io::stdout())
+        };
+        let bytes = [b'x'; 8192];
+        for _ in 0..1024 {
+            if writer.write_all(&bytes).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Overflow on either pipe must interrupt the child instead of blocking the other reader.
+    #[test]
+    fn inspection_output_overflow_kills_and_reaps_child() {
+        for stream in ["stdout", "stderr"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "domain::repo::tests::inspection_output_overflow_probe",
+                    "--nocapture",
+                ])
+                .env("AGIT_TEST_INSPECTION_FLOOD", stream);
+            let error = bounded_inspection_output(command, 1024).unwrap_err();
+            assert!(error.to_string().contains("output limit"), "{error:#}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

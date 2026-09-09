@@ -866,7 +866,7 @@ fn source_branch_for_tx(
     })
 }
 
-fn transaction_source_spec(tx: &Tx) -> crate::Result<refs::RefSpec> {
+pub(super) fn transaction_source_spec(tx: &Tx) -> crate::Result<refs::RefSpec> {
     let slug = tx
         .source_repo
         .as_deref()

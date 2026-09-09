@@ -444,7 +444,13 @@ pub fn maybe_startup_nudge(command: &str, json: bool) {
 }
 
 fn startup_nudge_allowed(command: &str, json: bool, quiet: bool, ci: bool) -> bool {
-    !json && !quiet && !ci && !matches!(command, "upgrade" | "hooks" | "mcp" | "status" | "whoami")
+    !json
+        && !quiet
+        && !ci
+        && !matches!(
+            command,
+            "upgrade" | "hooks" | "mcp" | "status" | "doctor" | "whoami"
+        )
 }
 
 fn maybe_nudge_with_timeout(timeout: std::time::Duration) {
@@ -512,7 +518,7 @@ mod tests {
         assert!(startup_nudge_allowed("run", false, false, false));
         assert!(startup_nudge_allowed("resume", false, false, false));
         assert!(startup_nudge_allowed("push", false, false, false));
-        for command in ["upgrade", "hooks", "mcp", "status", "whoami"] {
+        for command in ["upgrade", "hooks", "mcp", "status", "doctor", "whoami"] {
             assert!(!startup_nudge_allowed(command, false, false, false));
         }
         assert!(!startup_nudge_allowed("run", true, false, false));

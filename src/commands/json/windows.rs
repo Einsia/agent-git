@@ -122,10 +122,45 @@ impl Drop for Descriptor {
     }
 }
 
+#[derive(Debug)]
+struct CaptureFailure {
+    stage: &'static str,
+    os_code: Option<i32>,
+}
+
+impl CaptureFailure {
+    fn new(stage: &'static str, error: Option<&io::Error>) -> Self {
+        Self {
+            stage,
+            os_code: error.and_then(io::Error::raw_os_error),
+        }
+    }
+
+    fn diagnostic(&self, stream: &str) -> String {
+        let code = self
+            .os_code
+            .map(|code| format!("; OS code {code}"))
+            .unwrap_or_default();
+        format!(
+            "\nerror JSON output capture {stream}: {}{code}\n",
+            self.stage
+        )
+    }
+}
+
 #[derive(Default)]
 struct Output {
     bytes: Vec<u8>,
     incomplete: bool,
+    failure: Option<CaptureFailure>,
+}
+
+impl Output {
+    fn fail(&mut self, stage: &'static str, error: Option<&io::Error>) {
+        self.incomplete = true;
+        self.failure
+            .get_or_insert_with(|| CaptureFailure::new(stage, error));
+    }
 }
 
 fn read_pipe(mut file: File, done: Arc<AtomicBool>, limit: usize) -> Output {
@@ -146,8 +181,10 @@ fn read_pipe(mut file: File, done: Arc<AtomicBool>, limit: usize) -> Output {
             )
         };
         if peek == 0 {
-            output.incomplete |=
-                io::Error::last_os_error().raw_os_error() != Some(ERROR_BROKEN_PIPE as i32);
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_BROKEN_PIPE as i32) {
+                output.fail("pipe peek failed", Some(&error));
+            }
             return output;
         }
         if finished && tail.is_none() {
@@ -155,7 +192,7 @@ fn read_pipe(mut file: File, done: Arc<AtomicBool>, limit: usize) -> Output {
         }
         if tail == Some(0) {
             // A descendant retaining a writer cannot extend the caller's capture lifetime.
-            output.incomplete = true;
+            output.fail("writer remains after command completion", None);
             return output;
         }
         if available == 0 {
@@ -169,7 +206,7 @@ fn read_pipe(mut file: File, done: Arc<AtomicBool>, limit: usize) -> Output {
         // This thread owns the only reader, so the peeked bytes cannot be consumed elsewhere.
         match file.read(&mut buffer[..amount]) {
             Ok(0) => {
-                output.incomplete = true;
+                output.fail("pipe read ended before the observed bytes", None);
                 return output;
             }
             Ok(count) => {
@@ -180,11 +217,13 @@ fn read_pipe(mut file: File, done: Arc<AtomicBool>, limit: usize) -> Output {
                 output
                     .bytes
                     .extend_from_slice(&buffer[..count.min(remaining)]);
-                output.incomplete |= count > remaining;
+                if count > remaining {
+                    output.fail("output byte limit exceeded", None);
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => {
-                output.incomplete = true;
+            Err(error) => {
+                output.fail("pipe read failed", Some(&error));
                 return output;
             }
         }
@@ -227,15 +266,20 @@ struct Capture {
     redirected: [bool; 2],
     done: Arc<AtomicBool>,
     restored: bool,
-    incomplete: bool,
+    failure: Option<CaptureFailure>,
     retained: [bool; 2],
 }
 
-fn flush() -> bool {
+fn flush() -> Result<(), CaptureFailure> {
     let out = io::stdout().flush();
     let err = io::stderr().flush();
     let crt = unsafe { libc::fflush(std::ptr::null_mut()) };
-    out.is_ok() && err.is_ok() && crt == 0
+    out.map_err(|error| CaptureFailure::new("stdout flush failed", Some(&error)))?;
+    err.map_err(|error| CaptureFailure::new("stderr flush failed", Some(&error)))?;
+    if crt != 0 {
+        return Err(CaptureFailure::new("CRT flush failed", None));
+    }
+    Ok(())
 }
 
 impl Capture {
@@ -280,13 +324,13 @@ impl Capture {
             redirected: [false, false],
             done: Arc::new(AtomicBool::new(false)),
             restored: false,
-            incomplete: false,
+            failure: None,
             retained: [false, false],
         };
         capture.pipes[0] = Some(Pipe::new(capture.done.clone(), limit)?);
         capture.pipes[1] = Some(Pipe::new(capture.done.clone(), limit)?);
         // Pending output belongs to the old destination and must not enter the command envelope.
-        if !flush() {
+        if flush().is_err() {
             return Err(io::Error::other("cannot flush output before JSON capture"));
         }
         for (index, slot) in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
@@ -296,6 +340,14 @@ impl Capture {
             let pipe = capture.pipes[index].as_ref().unwrap();
             pipe.descriptor.install(index as i32 + 1)?;
             capture.redirected[index] = true;
+            // CRT duplication makes the installed copy inheritable. Child stdio uses explicit
+            // duplicates, so unrelated redirected children must not retain this private writer.
+            if unsafe {
+                SetHandleInformation(crt_handle(index as i32 + 1)?, HANDLE_FLAG_INHERIT, 0)
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
             install(slot, pipe.writer.as_raw_handle())?;
         }
         Ok(capture)
@@ -309,12 +361,23 @@ impl Capture {
         if self.restored {
             return;
         }
-        self.incomplete |= !flush();
+        if let Err(failure) = flush() {
+            self.failure.get_or_insert(failure);
+        }
         let mut restored_crt = self.original_crt;
         for (index, redirected) in self.redirected.iter().copied().enumerate() {
             if redirected {
                 if install(&self.saved[index], index as i32 + 1).is_err() {
-                    self.incomplete = true;
+                    self.failure.get_or_insert_with(|| {
+                        CaptureFailure::new(
+                            if index == 0 {
+                                "stdout CRT restore failed"
+                            } else {
+                                "stderr CRT restore failed"
+                            },
+                            None,
+                        )
+                    });
                     // Failed CRT replacement must not install the closed pre-capture handle.
                     restored_crt[index] =
                         crt_handle(self.saved[index].0).unwrap_or(std::ptr::null_mut());
@@ -335,7 +398,19 @@ impl Capture {
                 .position(|handle| *handle == original)
                 .map(|index| restored_crt[index])
                 .unwrap_or(original);
-            self.incomplete |= unsafe { SetStdHandle(slot, replacement) } == 0;
+            if unsafe { SetStdHandle(slot, replacement) } == 0 {
+                let error = io::Error::last_os_error();
+                self.failure.get_or_insert_with(|| {
+                    CaptureFailure::new(
+                        if index == 0 {
+                            "stdout Win32 restore failed"
+                        } else {
+                            "stderr Win32 restore failed"
+                        },
+                        Some(&error),
+                    )
+                });
+            }
         }
         self.restored = true;
     }
@@ -353,13 +428,14 @@ impl Capture {
         let [mut out, mut err] = readers.map(|reader| {
             reader
                 .and_then(|reader| reader.join().ok())
-                .unwrap_or_else(|| Output {
-                    incomplete: true,
-                    ..Output::default()
+                .unwrap_or_else(|| {
+                    let mut output = Output::default();
+                    output.fail("reader thread did not return", None);
+                    output
                 })
         });
-        out.incomplete |= self.incomplete;
-        err.incomplete |= self.incomplete;
+        out.incomplete |= self.failure.is_some();
+        err.incomplete |= self.failure.is_some();
         (out, err)
     }
 }
@@ -411,6 +487,15 @@ pub(super) fn capture(command: &str, version: Version, f: impl FnOnce() -> i32) 
         out.bytes.clear();
         err.bytes
             .extend_from_slice(b"\nerror JSON output capture is incomplete\n");
+        let details = [
+            ("stdout", out.failure.as_ref()),
+            ("stderr", err.failure.as_ref()),
+            ("restoration", capture.failure.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(stream, failure)| failure.map(|failure| failure.diagnostic(stream)))
+        .collect::<String>();
+        err.bytes.extend_from_slice(details.as_bytes());
     }
     if emit_version_checked(
         document(command, code, out.bytes, err.bytes),
@@ -430,7 +515,7 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Foundation::{GetHandleInformation, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
 
     const HELPER: &str = "commands::json::windows::tests::native_helper";
@@ -477,6 +562,23 @@ mod tests {
     }
 
     #[test]
+    fn failure_diagnostics_keep_only_the_stage_and_numeric_os_code() {
+        let mut output = Output::default();
+        output.fail("pipe read failed", Some(&io::Error::from_raw_os_error(5)));
+        output.fail("reader thread did not return", None);
+        assert!(output.incomplete);
+        assert_eq!(
+            output.failure.unwrap().diagnostic("stdout"),
+            "\nerror JSON output capture stdout: pipe read failed; OS code 5\n"
+        );
+        let private = io::Error::other("SYNTHETIC-PRIVATE-ERROR-TEXT");
+        assert_eq!(
+            CaptureFailure::new("pipe read failed", Some(&private)).diagnostic("stderr"),
+            "\nerror JSON output capture stderr: pipe read failed\n"
+        );
+    }
+
+    #[test]
     fn native_streams_capture_rust_crt_children_and_split_utf8() {
         native_case("streams");
     }
@@ -494,6 +596,11 @@ mod tests {
     #[test]
     fn native_capture_bounds_output_and_inherited_writer_lifetimes() {
         native_case("bounds");
+    }
+
+    #[test]
+    fn native_capture_excludes_writers_from_redirected_children() {
+        native_case("inheritance");
     }
 
     #[test]
@@ -652,6 +759,9 @@ mod tests {
         let output = capture.finish();
         assert!(output.0.incomplete);
         assert!(output.1.incomplete);
+        let failure = capture.failure.as_ref().unwrap();
+        assert_eq!(failure.stage, "stdout CRT restore failed");
+        assert_eq!(failure.os_code, None);
         drop(capture);
         io::stdout().write_all(b"SURVIVING-DESTINATION\n").unwrap();
     }
@@ -728,6 +838,12 @@ mod tests {
         err.join().unwrap();
         let output = capture.finish();
         assert!(output.0.incomplete && output.1.incomplete);
+        for output in [&output.0, &output.1] {
+            assert_eq!(
+                output.failure.as_ref().unwrap().stage,
+                "output byte limit exceeded"
+            );
+        }
         assert_eq!(output.0.bytes.len(), 1024);
         assert_eq!(output.1.bytes.len(), 1024);
         drop(capture);
@@ -742,6 +858,62 @@ mod tests {
             let _ = child.wait();
             assert!(elapsed < Duration::from_secs(5));
             assert!(output.0.incomplete || output.1.incomplete);
+            let failures: Vec<_> = [&output.0, &output.1]
+                .into_iter()
+                .filter_map(|output| output.failure.as_ref())
+                .collect();
+            if child_case == "sleep" {
+                assert!(
+                    failures
+                        .iter()
+                        .any(|failure| failure.stage == "writer remains after command completion")
+                );
+            }
+        }
+    }
+
+    fn inheritance() {
+        for inherited in [false, true] {
+            let mut capture = Capture::start(OUTPUT_LIMIT).unwrap();
+            for descriptor in [1, 2] {
+                let handle = crt_handle(descriptor).unwrap();
+                let mut flags = 0;
+                assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+                assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+                if inherited {
+                    assert_ne!(
+                        unsafe {
+                            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+                        },
+                        0
+                    );
+                }
+            }
+            let mut child = helper("sleep")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            io::stdout().write_all(TEXT.as_bytes()).unwrap();
+            io::stderr().write_all(TEXT.as_bytes()).unwrap();
+            let output = capture.finish();
+            let live = child.try_wait();
+            let _ = child.kill();
+            child.wait().unwrap();
+            assert!(live.unwrap().is_none());
+            assert_eq!(output.0.bytes, TEXT.as_bytes());
+            assert_eq!(output.1.bytes, TEXT.as_bytes());
+            if inherited {
+                for output in [&output.0, &output.1] {
+                    assert!(output.incomplete);
+                    assert_eq!(
+                        output.failure.as_ref().unwrap().stage,
+                        "writer remains after command completion"
+                    );
+                }
+            } else {
+                assert_complete(&output);
+            }
         }
     }
 
@@ -859,6 +1031,7 @@ mod tests {
             "aliases" => aliases(),
             "bounds" => bounds(),
             "handles" => handles(),
+            "inheritance" => inheritance(),
             "panic" => panic_document(),
             "console" => console(),
             "conpty_host" => conpty_host(),

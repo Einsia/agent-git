@@ -613,19 +613,23 @@ pub fn check_readonly_startup() -> Result<()> {
         "local storage has pending recovery; complete recovery through the original AgentGit store before inspecting status"
     );
     for (_, _, path) in super::clone::list_local()? {
-        let repo = Repo::at(&path);
-        let checkout_recovery = super::plumbing::interrupted_checkout_metadata_present(&repo)?;
-        let legacy_recovery = if checkout_recovery {
-            false
-        } else {
-            probe_legacy_storage_checkout_recovery(&repo, MigrationFailureKind::Skippable)
-                .map_err(RepoMigrationFailure::into_error)?
-        };
-        anyhow::ensure!(
-            !checkout_recovery && !legacy_recovery,
-            "{} has pending recovery; complete recovery through the original AgentGit store before inspecting status",
-            path.display()
-        );
+        let repo = Repo::at(&path).local_objects_only();
+        for worktree in repo.inspection_worktrees()? {
+            let checkout = Repo::at(&worktree.path).local_objects_only();
+            let checkout_recovery =
+                super::plumbing::interrupted_checkout_metadata_present(&checkout)?;
+            let legacy_recovery = if checkout_recovery {
+                false
+            } else {
+                probe_legacy_storage_checkout_recovery(&checkout, MigrationFailureKind::Skippable)
+                    .map_err(RepoMigrationFailure::into_error)?
+            };
+            anyhow::ensure!(
+                !checkout_recovery && !legacy_recovery,
+                "{} has pending recovery; complete recovery through the original AgentGit store before inspecting status",
+                worktree.path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -633,7 +637,10 @@ pub fn check_readonly_startup() -> Result<()> {
 /// A scoped inspection follows the selected repository's registered checkouts and aliases.
 /// Recovery evidence with unknown ownership cannot establish that the selected scope is settled.
 pub(super) fn check_readonly_repo_startup(repo: &Repo) -> Result<()> {
-    check_readonly_repo_startup_with_policy(repo, ReadPolicy::AllowTransport)
+    check_readonly_repo_startup_with_policy(
+        &repo.clone().local_objects_only(),
+        ReadPolicy::AllowTransport,
+    )
 }
 
 pub(super) fn check_readonly_repo_startup_local(repo: &Repo) -> Result<()> {
@@ -645,11 +652,12 @@ fn check_readonly_repo_startup_with_policy(repo: &Repo, policy: ReadPolicy) -> R
     let repos = crate::infra::config::repos_dir()?;
     let selected_common_dir = repo.common_dir_with_policy(policy)?.canonicalize()?;
     let mut roots = vec![repo.root().to_path_buf()];
-    roots.extend(
+    let registered = if repo.is_local_inspection() {
+        repo.inspection_worktrees()?
+    } else {
         repo.worktrees_with_policy(policy)?
-            .into_iter()
-            .map(|worktree| worktree.path),
-    );
+    };
+    roots.extend(registered.into_iter().map(|worktree| worktree.path));
     let mut canonical_roots = Vec::new();
     for root in &roots {
         canonical_roots.push(
@@ -671,6 +679,11 @@ fn check_readonly_repo_startup_with_policy(repo: &Repo, policy: ReadPolicy) -> R
         })?;
         let recovered_repo = Repo::open(&recovered_root)
             .context("recovery evidence does not identify an available local repository")?;
+        let recovered_repo = if repo.is_local_inspection() {
+            recovered_repo.local_objects_only()
+        } else {
+            recovered_repo
+        };
         let recovered_common_dir = recovered_repo
             .common_dir_with_policy(policy)?
             .canonicalize()?;
@@ -681,7 +694,11 @@ fn check_readonly_repo_startup_with_policy(repo: &Repo, policy: ReadPolicy) -> R
         );
     }
     for root in canonical_roots {
-        let checkout = Repo::at(&root);
+        let checkout = if repo.is_local_inspection() {
+            Repo::at(&root).local_objects_only()
+        } else {
+            Repo::at(&root)
+        };
         let pending =
             super::plumbing::interrupted_checkout_metadata_with_policy(&checkout, policy)?
                 || probe_legacy_storage_checkout_recovery_with_policy(
@@ -1256,6 +1273,31 @@ fn legacy_storage_checkout_paths_dirty_with_policy(
     repo: &Repo,
     policy: ReadPolicy,
 ) -> Result<bool> {
+    if repo.is_local_inspection() {
+        let output = repo.inspection_output(
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--",
+                meta::ATTRS_FILE,
+                meta::FILE,
+                meta::LOG_FILE,
+                meta::VIEW_FILE,
+                meta::LEGACY_LOG_FILE,
+                meta::LEGACY_VIEW_FILE,
+                meta::EVENTS_DIR,
+            ],
+            1024 * 1024,
+        )?;
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "legacy storage checkout inspection did not complete"
+        );
+        return Ok(!output.stdout.is_empty());
+    }
     let mut command = Command::new("git");
     policy.apply(&mut command);
     let output = command
@@ -1311,16 +1353,31 @@ fn current_branch_ref(repo: &Repo) -> Result<Option<String>> {
 }
 
 fn current_branch_ref_with_policy(repo: &Repo, policy: ReadPolicy) -> Result<Option<String>> {
-    let mut command = Command::new("git");
-    policy.apply(&mut command);
-    let output = command
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo.root())
-        .args(["symbolic-ref", "-q", "HEAD"])
-        .output()?;
+    let output = if repo.is_local_inspection() {
+        repo.inspection_output(&["symbolic-ref", "-q", "HEAD"], 64 * 1024)?
+    } else {
+        let mut command = Command::new("git");
+        policy.apply(&mut command);
+        command
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(repo.root())
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .output()?
+    };
+    if repo.is_local_inspection() {
+        anyhow::ensure!(
+            output.stderr.is_empty(),
+            "current branch inspection did not complete"
+        );
+    }
     if output.status.success() {
-        let name = String::from_utf8(output.stdout)?.trim().to_owned();
+        let raw = String::from_utf8(output.stdout)?;
+        let name = if repo.is_local_inspection() {
+            raw.strip_suffix('\n').unwrap_or(&raw).to_owned()
+        } else {
+            raw.trim().to_owned()
+        };
         anyhow::ensure!(
             name.starts_with("refs/heads/"),
             "HEAD names a non-branch ref"
@@ -1329,6 +1386,9 @@ fn current_branch_ref_with_policy(repo: &Repo, policy: ReadPolicy) -> Result<Opt
     }
     if output.status.code() == Some(1) {
         return Ok(None);
+    }
+    if repo.is_local_inspection() {
+        anyhow::bail!("current branch inspection did not complete");
     }
     anyhow::bail!(
         "git symbolic-ref HEAD failed: {}",
@@ -1341,19 +1401,32 @@ fn optional_ref(repo: &Repo, name: &str) -> Result<Option<String>> {
 }
 
 fn optional_ref_with_policy(repo: &Repo, name: &str, policy: ReadPolicy) -> Result<Option<String>> {
-    let mut command = Command::new("git");
-    policy.apply(&mut command);
-    let output = command
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo.root())
-        .args(["rev-parse", "--verify", "--quiet", name])
-        .output()?;
+    let output = if repo.is_local_inspection() {
+        repo.inspection_output(&["rev-parse", "--verify", "--quiet", name], 64 * 1024)?
+    } else {
+        let mut command = Command::new("git");
+        policy.apply(&mut command);
+        command
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(repo.root())
+            .args(["rev-parse", "--verify", "--quiet", name])
+            .output()?
+    };
+    if repo.is_local_inspection() {
+        anyhow::ensure!(
+            output.stderr.is_empty(),
+            "recovery ref inspection did not complete"
+        );
+    }
     if output.status.success() {
         return Ok(Some(String::from_utf8(output.stdout)?.trim().to_owned()));
     }
     if output.status.code() == Some(1) {
         return Ok(None);
+    }
+    if repo.is_local_inspection() {
+        anyhow::bail!("recovery ref inspection did not complete");
     }
     anyhow::bail!(
         "git rev-parse --verify {name} failed: {}",
@@ -1370,6 +1443,31 @@ fn read_meta_at_with_policy(
     commit: &str,
     policy: ReadPolicy,
 ) -> Result<Option<meta::Meta>> {
+    if repo.is_local_inspection() {
+        let spec = format!("{commit}:{}", meta::FILE);
+        let listed =
+            repo.inspection_output(&["ls-tree", "-z", commit, "--", meta::FILE], 64 * 1024)?;
+        anyhow::ensure!(
+            listed.status.success() && listed.stderr.is_empty(),
+            "legacy recovery metadata tree could not be inspected"
+        );
+        if listed.stdout.is_empty() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            listed.stdout.starts_with(b"100644 blob ")
+                || listed.stdout.starts_with(b"100755 blob "),
+            "legacy recovery metadata is not a regular Git blob"
+        );
+        let output = repo.inspection_output(&["cat-file", "blob", &spec], 1024 * 1024)?;
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "legacy recovery metadata is unavailable locally"
+        );
+        return serde_json::from_slice(&output.stdout)
+            .context("legacy recovery metadata is malformed")
+            .map(Some);
+    }
     if matches!(policy, ReadPolicy::LocalOnly) {
         let entry = repo.git_with_policy(
             &["ls-tree", "-z", "--full-name", commit, "--", meta::FILE],
@@ -2624,6 +2722,54 @@ mod tests {
             LayoutVersion::V0,
             "startup must stop before a later repository when legacy recovery cannot be proven"
         );
+    }
+
+    /// Inspection recognizes an interrupted legacy checkout without refreshing its files or index.
+    #[test]
+    fn local_inspection_detects_legacy_recovery_without_mutation() {
+        let home = tempfile::tempdir().unwrap();
+        let repos = home.path().join("repos");
+        let repo = local_repo_with_layout(&repos, "owner", "fixture", LayoutVersion::V0);
+        let old = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let new = migrate_tip(&repo, &old).unwrap();
+        update_refs_atomically(&repo, &[("refs/heads/main".to_owned(), old, new.clone())]).unwrap();
+        let metadata_path = meta::path_in(repo.root());
+        let metadata = std::fs::read(&metadata_path).unwrap();
+        let index_path = repo.root().join(".git/index");
+        let index = std::fs::read(&index_path).unwrap();
+        let inspected = repo.clone().local_objects_only();
+        assert!(
+            probe_legacy_storage_checkout_recovery(&inspected, MigrationFailureKind::Skippable)
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&metadata_path).unwrap(), metadata);
+        assert_eq!(std::fs::read(&index_path).unwrap(), index);
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), new);
+    }
+
+    /// An oversized metadata blob remains incomplete evidence without changing ordinary readers.
+    #[test]
+    fn local_inspection_caps_legacy_recovery_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = local_repo_with_layout(
+            &home.path().join("repos"),
+            "owner",
+            "fixture",
+            LayoutVersion::V1,
+        );
+        let path = meta::path_in(repo.root());
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["diagnostic_fixture"] = serde_json::Value::String("x".repeat(1024 * 1024));
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("metadata fixture").unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        assert!(read_meta_at(&repo, &head).unwrap().is_some());
+        let inspected = repo.clone().local_objects_only();
+        let error = read_meta_at(&inspected, &head).unwrap_err();
+        assert!(error.to_string().contains("output limit"), "{error:#}");
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
     }
 
     #[test]
