@@ -3,7 +3,7 @@
 use agit::domain::{link, repo::Repo, store::Store};
 use agit::hub::identity::{self, RemoteIdentity};
 use serde_json::json;
-use std::io::{Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
 use std::sync::{
@@ -22,6 +22,116 @@ fn same_name_promotion_moves_the_recorded_owner() {
 #[test]
 fn renamed_promotion_keeps_other_namespaces_and_legacy_claims_unchanged() {
     promotion("mine");
+}
+
+const MAX_REQUEST_HEADERS: usize = 8 * 1024;
+const MAX_REQUEST_BODY: usize = 16 * 1024;
+
+// Responding before the declared body is consumed can close the connection during its upload.
+fn read_request(stream: impl Read) -> io::Result<(String, Vec<u8>)> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    let mut reader = BufReader::new(stream);
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        if headers.len() == MAX_REQUEST_HEADERS {
+            return Err(invalid(
+                "local hub request headers exceed the fixture limit",
+            ));
+        }
+        let mut byte = [0];
+        reader.read_exact(&mut byte)?;
+        headers.push(byte[0]);
+    }
+    let headers = String::from_utf8(headers)
+        .map_err(|_| invalid("local hub request headers are not UTF-8"))?;
+    let mut length = None;
+    for line in headers
+        .split("\r\n")
+        .skip(1)
+        .filter(|line| !line.is_empty())
+    {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| invalid("local hub request has a malformed header"))?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(invalid("local hub fixture requires Content-Length framing"));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if length.is_some() {
+                return Err(invalid("local hub request repeats Content-Length"));
+            }
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid("local hub request has an invalid Content-Length"));
+            }
+            let value = value
+                .parse::<usize>()
+                .map_err(|_| invalid("local hub Content-Length cannot be represented"))?;
+            if value > MAX_REQUEST_BODY {
+                return Err(invalid("local hub request body exceeds the fixture limit"));
+            }
+            length = Some(value);
+        }
+    }
+    if headers.starts_with("POST ") && length.is_none() {
+        return Err(invalid("local hub POST omits Content-Length"));
+    }
+    let mut body = vec![0; length.unwrap_or(0)];
+    reader.read_exact(&mut body)?;
+    Ok((headers, body))
+}
+
+#[test]
+fn local_hub_consumes_the_complete_body_across_transport_chunks() {
+    let body = br#"{"name":"mine","expected_source_agent_id":"synthetic"}"#;
+    let headers = format!(
+        "POST /api/agents/alice/qa/clone HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let request = [headers.as_bytes(), body].concat();
+    for split in [headers.len() - 1, headers.len(), headers.len() + 1] {
+        let input =
+            std::io::Cursor::new(&request[..split]).chain(std::io::Cursor::new(&request[split..]));
+        let (actual_headers, actual_body) = read_request(input).unwrap();
+        assert_eq!(actual_headers, headers);
+        assert_eq!(actual_body, body);
+    }
+    let (headers, body) =
+        read_request(b"GET /api/agents/alice/qa HTTP/1.1\r\n\r\n".as_slice()).unwrap();
+    assert!(headers.starts_with("GET "));
+    assert!(body.is_empty());
+}
+
+#[test]
+fn local_hub_refuses_truncated_malformed_and_oversized_requests() {
+    for request in [
+        "POST / HTTP/1.1\r\n".to_owned(),
+        "POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nab".into(),
+    ] {
+        assert_eq!(
+            read_request(request.as_bytes()).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+    for headers in [
+        "Content-Length: -1".to_owned(),
+        "Content-Length: nope".into(),
+        "Content-Length:".into(),
+        "Content-Length: 99999999999999999999999999999999".into(),
+        "Content-Length: 0\r\ncontent-length: 0".into(),
+        "Content-Length: 0\r\nContent-Length: 1".into(),
+        "Transfer-Encoding: chunked".into(),
+        "Host: localhost".into(),
+        "malformed-header".into(),
+        format!("Content-Length: {}", MAX_REQUEST_BODY + 1),
+        format!("X-Fill: {}", "x".repeat(MAX_REQUEST_HEADERS)),
+    ] {
+        let request = format!("POST / HTTP/1.1\r\n{headers}\r\n\r\n");
+        assert_eq!(
+            read_request(request.as_bytes()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 }
 
 fn promotion(name: &str) {
@@ -50,24 +160,20 @@ fn promotion(name: &str) {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut part = [0; 1024];
-                let read = stream.read(&mut part).unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&part[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request);
+            let (request, body) =
+                read_request(&mut stream).expect("local hub request is incomplete or invalid");
             let response = if request.starts_with("POST /api/agents/alice/qa/clone ") {
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    body,
+                    json!({"name": (copy_name != "qa").then_some(copy_name.as_str()),
+                        "expected_source_agent_id": SOURCE})
+                );
                 json!({"agent_id":COPY,"forked_from":SOURCE,"owner":"me","name":copy_name,
                     "push_url":format!("{server_hub}/me/{copy_name}.git"),"web_url":format!("{server_hub}/me/{copy_name}")})
             } else {
                 assert!(request.starts_with("GET /api/agents/alice/qa "), "{request}");
+                assert!(body.is_empty());
                 json!({"agent_id":SOURCE,"owner":"alice","name":"qa","visibility":"public",
                     "clone_url":format!("{server_hub}/alice/qa.git")})
             }.to_string();

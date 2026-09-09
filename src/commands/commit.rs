@@ -280,10 +280,10 @@ fn run_inner(args: Args) -> CmdResult {
                 )?;
             }
             if !quiet {
-                println!(
+                ui::info(format_args!(
                     "{}",
                     ui::dim(&format!("  target: {slug} @ {branch} ({via})"))
-                );
+                ));
             }
             settle(&store, &repo_dir, &slug, &branch, link, &owner, opts)
         }
@@ -349,10 +349,10 @@ fn run_inner(args: Args) -> CmdResult {
             via,
         } => {
             if !quiet {
-                println!(
+                ui::info(format_args!(
                     "{}",
                     ui::dim(&format!("  target: {slug} @ {branch} ({via}, file line)"))
-                );
+                ));
             }
             settle_file_line(&repo_dir, &slug, &branch, &owner, opts)
         }
@@ -1976,7 +1976,7 @@ fn settle_bytes(
                 .as_deref()
                 .map(|tip| tip[..10.min(tip.len())].to_string())
                 .unwrap_or_default();
-            println!("nothing new since {tip_id}.");
+            ui::info(format_args!("nothing new since {tip_id}."));
             let tail = region.rsplit('\n').find(|l| !l.is_empty()).unwrap_or("");
             if !tail.is_empty() && serde_json::from_str::<serde_json::Value>(tail).is_err() {
                 println!(
@@ -2105,7 +2105,7 @@ fn settle_bytes(
     };
 
     if !quiet && total > 1 {
-        eprintln!("  preparing {total} turns");
+        ui::progress(format_args!("  preparing {total} turns"));
     }
     let mut native = if materialized_base.is_none() {
         Some(native::NativeSnapshots::new(
@@ -2128,7 +2128,7 @@ fn settle_bytes(
         let turn_no = head_turn_base + 1 + i as u32;
         let absolute_end = region_start + c.end_byte;
         if !quiet && total > 1 {
-            eprintln!("  building turn {}/{}", i + 1, total);
+            ui::progress(format_args!("  building turn {}/{}", i + 1, total));
         }
 
         let mut snap = Meta::new(claim.clone(), source.to_string(), cwd.clone());
@@ -2254,7 +2254,10 @@ fn settle_bytes(
     }
     if !quiet {
         for (turn_no, subject, sha) in &landed {
-            println!("#{turn_no} {} {subject}", &sha[..9.min(sha.len())]);
+            ui::info(format_args!(
+                "#{turn_no} {} {subject}",
+                &sha[..9.min(sha.len())]
+            ));
         }
     }
 
@@ -2294,23 +2297,23 @@ fn settle_bytes(
     }
 
     if !quiet {
-        println!(
+        ui::info(format_args!(
             "\n{} settled {} turns → {}",
             ui::ok(ui::theme::symbols().check),
             total,
             ui::bold(&format!("{slug} @ {branch}"))
-        );
+        ));
         if let Some(why) = &in_flight {
             explain_in_flight(why);
         }
         if protected_full.replacements > 0 {
-            println!(
+            ui::info(format_args!(
                 "{}",
                 ui::dim(&format!(
                     "  protected {} secret occurrence(s) with {} new repository-local key(s)",
                     protected_full.replacements, protected_full.new_records
                 ))
-            );
+            ));
         }
         // Say it out loud rather than in dim text: this settlement contains a
         // finding that no local key can reverse, so `agit push` will refuse it
@@ -2325,17 +2328,17 @@ fn settle_bytes(
             );
         }
         if fresh {
-            println!(
+            ui::info(format_args!(
                 "{}",
                 ui::dim(&format!(
                     "  created the local repo for {slug}; the first `agit push` will create the remote"
                 ))
-            );
+            ));
         }
-        println!(
+        ui::info(format_args!(
             "{}",
             ui::dim("  next: agit push to publish · agit log to read history")
-        );
+        ));
     }
     record_supervisor_result(&last_sha)?;
     Ok(ExitCode::Ok)
@@ -3018,9 +3021,9 @@ fn file_commit_inner(
     );
     if staged.is_empty() {
         if !quiet {
-            println!(
+            ui::info(format_args!(
                 "nothing staged (changes are all on the exclusion list). `agit commit` settles turns."
-            );
+            ));
         }
         return Ok(FileCommitOutcome::Noop);
     }

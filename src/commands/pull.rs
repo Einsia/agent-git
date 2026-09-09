@@ -114,7 +114,9 @@ pub fn run(args: Args) -> CmdResult {
             continue;
         }
         if !repo.has_ref(&format!("refs/remotes/origin/{b}")) {
-            println!("{b} has no upstream counterpart — skipped (local line)");
+            ui::info(format_args!(
+                "{b} has no upstream counterpart — skipped (local line)"
+            ));
             continue;
         }
         match repo.git_opt(&[
@@ -128,12 +130,14 @@ pub fn run(args: Args) -> CmdResult {
                 let ahead: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let behind: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 match (ahead, behind) {
-                    (0, 0) => println!("{b} is up to date"),
+                    (0, 0) => ui::info(format_args!("{b} is up to date")),
                     (0, behind) => match fast_forward(&repo, b) {
-                        Ok(()) => println!("{b} fast-forwarded +{behind}"),
+                        Ok(()) => ui::info(format_args!("{b} fast-forwarded +{behind}")),
                         Err(e) => ui::warning(&format!("{b}: fast-forward failed: {e:#}")),
                     },
-                    (ahead, 0) => println!("{b} is {ahead} turns ahead — publish with `agit push`"),
+                    (ahead, 0) => ui::info(format_args!(
+                        "{b} is {ahead} turns ahead — publish with `agit push`"
+                    )),
                     (ahead, behind) => {
                         diverged = true;
                         ui::error(&format!(

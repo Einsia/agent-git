@@ -125,18 +125,44 @@ pub fn capture(command: &str, f: impl FnOnce() -> i32) -> i32 {
     capture_version(command, Version::default(), f)
 }
 
+thread_local! {
+    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn is_capturing() -> bool {
+    CAPTURING.get()
+}
+
+struct CaptureScope(bool);
+
+impl CaptureScope {
+    fn enter() -> Self {
+        Self(CAPTURING.replace(true))
+    }
+}
+
+impl Drop for CaptureScope {
+    fn drop(&mut self) {
+        CAPTURING.set(self.0);
+    }
+}
+
 pub fn capture_version(command: &str, version: Version, f: impl FnOnce() -> i32) -> i32 {
+    let action = move || {
+        let _scope = CaptureScope::enter();
+        f()
+    };
     #[cfg(unix)]
     {
-        capture_unix(command, version, f)
+        capture_unix(command, version, action)
     }
     #[cfg(all(windows, target_env = "msvc"))]
     {
-        windows::capture(command, version, f)
+        windows::capture(command, version, action)
     }
     #[cfg(not(any(unix, all(windows, target_env = "msvc"))))]
     {
-        let _ = f;
+        let _ = action;
         emit_rejection_version(
             command,
             version,

@@ -229,9 +229,18 @@ pub fn run(args: Args) -> CmdResult {
     ) {
         Ok(b) => b,
         Err(r) => {
-            ui::error(&r.msg);
-            for h in &r.hints {
-                ui::hint(h);
+            if r.code == ExitCode::Ok {
+                ui::info(&r.msg);
+                if !ui::quiet() {
+                    for hint in &r.hints {
+                        ui::hint(hint);
+                    }
+                }
+            } else {
+                ui::error(&r.msg);
+                for hint in &r.hints {
+                    ui::hint(hint);
+                }
             }
             return Ok(r.code);
         }
@@ -242,7 +251,7 @@ pub fn run(args: Args) -> CmdResult {
     // **Only the inferred ones are skipped.** A branch the user named with `-b <branch>` is not
     // skipped quietly: that is the one they meant, and a silent skip that still exits 0 reads as
     // a successful publish. That case says why, and ends in failure.
-    let asked_explicitly = !args.branch.is_empty();
+    let asked_explicitly = !explicit_branches.is_empty();
     let (branches, unsettled): (Vec<String>, Vec<String>) = branches
         .into_iter()
         .partition(|b| has_settled_turns(&repo, b));
@@ -255,17 +264,19 @@ pub fn run(args: Args) -> CmdResult {
             ui::hint("`agit commit` records the conversation so far, then push");
             return Ok(ExitCode::Precondition);
         }
-        println!(
+        ui::info(format_args!(
             "{}",
             ui::dim(&format!(
                 "  skipping {} (claimed, nothing settled onto it yet)",
                 unsettled.join(", ")
             ))
-        );
+        ));
     }
     if branches.is_empty() {
-        println!("nothing to publish yet — no turns have been settled.");
-        ui::hint("`agit commit` records the conversation so far, then push");
+        ui::info("nothing to publish yet — no turns have been settled.");
+        if !ui::quiet() {
+            ui::hint("`agit commit` records the conversation so far, then push");
+        }
         return Ok(ExitCode::Ok);
     }
 
@@ -994,11 +1005,11 @@ fn ensure_remote(
         .into_iter()
         .collect();
 
-    println!(
+    ui::info(format_args!(
         "publishing {} to {}…",
         ui::bold(agent),
         ui::accent(client.base())
-    );
+    ));
     // An organization repo names the organization to create it under; your own passes nothing,
     // and the server defaults to the caller.
     let resp = client.publish(&PublishRequest {

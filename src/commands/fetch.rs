@@ -69,7 +69,7 @@ fn fetch_all() -> CmdResult {
                 match do_fetch(&repo, &owner, &name) {
                     Ok(()) => {
                         n += 1;
-                        println!("{slug} fetched");
+                        ui::info(format_args!("{slug} fetched"));
                     }
                     Err(e) => ui::warning(&format!("{slug}: fetch failed: {e:#}")),
                 }
@@ -117,12 +117,12 @@ fn fetch_slug(slug: &str) -> CmdResult {
             if fresh {
                 // Say what shape it is, or "where is the workspace?" is the guaranteed next
                 // question.
-                println!(
+                ui::info(format_args!(
                     "{}",
                     ui::dim(&format!(
                         "  a peer, not a checkout: objects and refs only. Take material with `agit cherry-pick {slug}@<branch>#<n>`"
                     ))
-                );
+                ));
             }
             Ok(ExitCode::Ok)
         }
@@ -152,11 +152,11 @@ fn adopt_peer(owner: &str, name: &str, dir: &Path) -> crate::Result<Repo> {
     // the read-permission check: without permission it fails here, while nothing is on disk yet.
     let client = crate::hub::Client::from_env();
     let remote = client.get_agent(owner, name)?;
-    println!(
+    ui::info(format_args!(
         "fetching {} from {}…",
         ui::bold(&format!("{owner}/{name}")),
         ui::accent(client.base())
-    );
+    ));
     let identity = RemoteIdentity::new(client.base(), &remote.agent_id)?;
     init_peer(dir, &remote.clone_url, &identity)
 }
@@ -179,10 +179,10 @@ fn fetch_context() -> CmdResult {
             return Ok(ExitCode::Ref);
         }
     };
-    println!(
+    ui::info(format_args!(
         "{}",
         ui::dim(&format!("  target: {} ({})", ctx.repo, ctx.via))
-    );
+    ));
     let (owner, name) = ctx.owner_name()?;
     let dir = crate::infra::config::repo_dir(&owner, &name)?;
     let Some(repo) = Repo::open(&dir) else {

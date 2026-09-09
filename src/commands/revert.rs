@@ -209,12 +209,9 @@ pub fn run(args: Args) -> CmdResult {
         "dropped {removed} events from the VIEW of {target} (view commit {})",
         &commit[..9.min(commit.len())]
     ));
-    println!(
-        "{}",
-        ui::dim(
-            "  the evidence in the log is untouched — physical deletion would mean deleting the branch and re-distilling"
-        )
-    );
+    ui::info(ui::dim(
+        "  the evidence in the log is untouched — physical deletion would mean deleting the branch and re-distilling",
+    ));
     Ok(ExitCode::Ok)
 }
 

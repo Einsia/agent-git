@@ -253,7 +253,7 @@ pub fn run(args: Args) -> CmdResult {
             // Never "N refs": what is scanned is the whole repo's publish surface, not the
             // union of the refs on the command line. Reporting it as a per-ref count makes the
             // user believe "scan again with another ref" shows something else.
-            ui::success("clean scan");
+            ui::success_result("clean scan");
         }
         Ok(ExitCode::Ok)
     }

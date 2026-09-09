@@ -241,8 +241,10 @@ pub fn run(args: Args) -> CmdResult {
     if !args.resume {
         // A fully qualified hint remains valid independently of the caller's environment.
         let full = format!("{}@{}", base.slug, args.branch);
-        println!("{}", ui::dim("  next:"));
-        println!("    agit resume {full:<40} bring this session up");
+        ui::info(ui::dim("  next:"));
+        ui::info(format_args!(
+            "    agit resume {full:<40} bring this session up"
+        ));
         return Ok(ExitCode::Ok);
     }
 

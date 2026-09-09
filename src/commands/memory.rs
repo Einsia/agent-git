@@ -948,6 +948,9 @@ pub fn distill(
 /// A reminder of how many items on this branch are not distilled into main yet. It fails
 /// silently — a reminder must not interrupt the main flow.
 pub fn remind_pending(primary: &Repo, branch: &str) {
+    if ui::quiet() {
+        return;
+    }
     let Ok(pending) = distill_pending(primary, branch) else {
         return;
     };
@@ -1238,7 +1241,9 @@ fn distill_cmd(target: &Target, paths: &[String], yes: bool) -> CmdResult {
         picked
     };
     if wanted.is_empty() {
-        println!("  memory on `{branch}` already matches main — nothing to distill.");
+        ui::info(format_args!(
+            "  memory on `{branch}` already matches main — nothing to distill."
+        ));
         return Ok(ExitCode::Ok);
     }
 
@@ -1291,7 +1296,7 @@ fn distill_cmd(target: &Target, paths: &[String], yes: bool) -> CmdResult {
         }
     }
     if chosen.is_empty() {
-        println!("  nothing carried.");
+        ui::info("  nothing carried.");
         return Ok(ExitCode::Ok);
     }
     let commit = distill(primary, &plan, &chosen)?.expect("chosen is non-empty");
@@ -1301,7 +1306,9 @@ fn distill_cmd(target: &Target, paths: &[String], yes: bool) -> CmdResult {
         if chosen.len() == 1 { "" } else { "s" },
         &commit[..9.min(commit.len())]
     ));
-    ui::hint("publish it: `agit push -b main`");
+    if !ui::quiet() {
+        ui::hint("publish it: `agit push -b main`");
+    }
     Ok(ExitCode::Ok)
 }
 
@@ -1314,7 +1321,9 @@ fn sync(target: &Target) -> CmdResult {
         return Ok(ExitCode::Precondition);
     };
     let Some(mem) = crate::infra::runtime_memory::locate(&runtime, &cwd) else {
-        println!("  {runtime} keeps no per-project memory directory — nothing to sync.");
+        ui::info(format_args!(
+            "  {runtime} keeps no per-project memory directory — nothing to sync."
+        ));
         return Ok(ExitCode::Ok);
     };
     let policy = Policy::from_config(Scope::EverythingIfNoBaseline);
@@ -1341,20 +1350,19 @@ fn sync(target: &Target) -> CmdResult {
 /// The one-line report on the settlement path.
 pub fn report_collect(report: &Report, branch: &str) {
     if report.tracking_off {
-        println!(
-            "{}",
-            ui::dim(&format!("  memory: not collected ({TRACK_KEY} = off)"))
-        );
+        ui::info(ui::dim(&format!(
+            "  memory: not collected ({TRACK_KEY} = off)"
+        )));
         return;
     }
     if let Some(commit) = &report.commit {
-        println!(
+        ui::info(format_args!(
             "  {} memory: {} change{} → `{branch}` ({})",
             ui::ok(ui::theme::symbols().check),
             report.collected,
             if report.collected == 1 { "" } else { "s" },
             &commit[..9.min(commit.len())]
-        );
+        ));
     }
     for refused in &report.refused {
         ui::warning(&format!(
@@ -1369,13 +1377,13 @@ pub fn report_collect(report: &Report, branch: &str) {
 /// The one-line report on the start path.
 pub fn report_materialize(report: &Report) {
     if report.placed > 0 {
-        println!(
+        ui::info(format_args!(
             "  {} memory: {} file{} → {}",
             ui::ok(ui::theme::symbols().check),
             report.placed,
             if report.placed == 1 { "" } else { "s" },
             ui::tilde(&report.dir.join(MIRROR_DIR))
-        );
+        ));
     }
     for name in &report.conflicts {
         ui::warning(&format!(

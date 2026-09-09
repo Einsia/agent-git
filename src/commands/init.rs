@@ -116,12 +116,9 @@ pub fn run(args: Args) -> CmdResult {
                 existing.git(&["symbolic-ref", "HEAD", "refs/heads/main"])?;
             }
             existing.ensure_committer()?;
-            println!(
-                "{}",
-                ui::dim(&format!(
-                    "  {owner}/{name} is an empty checkout — laying down its main file line in place"
-                ))
-            );
+            ui::info(ui::dim(&format!(
+                "  {owner}/{name} is an empty checkout — laying down its main file line in place"
+            )));
             existing
         }
         Some((CheckoutState::Unborn, _)) => {
@@ -158,12 +155,9 @@ pub fn run(args: Args) -> CmdResult {
     };
     if args.private {
         repo.set_visibility_preference("private")?;
-        println!(
-            "{}",
-            ui::dim(
-                "  preference recorded: the first `agit push` publishes private (`--public` overrides)"
-            )
-        );
+        ui::info(ui::dim(
+            "  preference recorded: the first `agit push` publishes private (`--public` overrides)",
+        ));
     }
 
     repo.add_all()?;
@@ -180,9 +174,9 @@ pub fn run(args: Args) -> CmdResult {
             "repo created: {owner}/{name} (main is the file line; scaffolding in {})",
             ui::tilde(repo.root())
         ));
-        println!("{}", ui::dim("  bound to this directory. Next:"));
-        println!("    agit import          adopt a running session (settles on import)");
-        println!("    agit new -b <name>   start a fresh session (inherits memory/skills)");
+        ui::info(ui::dim("  bound to this directory. Next:"));
+        ui::info("    agit import          adopt a running session (settles on import)");
+        ui::info("    agit new -b <name>   start a fresh session (inherits memory/skills)");
     } else {
         ui::success(&format!(
             "repo created: {owner}/{name} (no directory bound)"
@@ -253,7 +247,7 @@ fn checkout_state(repo: &Repo) -> CheckoutState {
 pub(super) fn seed_into(repo_root: &Path, project: &Path) -> crate::Result<usize> {
     let found = find_seed_assets(project);
     if found.is_empty() {
-        println!("  no adoptable assets found (AGENTS.md / CLAUDE.md / .claude/skills/ …)");
+        ui::info("  no adoptable assets found (AGENTS.md / CLAUDE.md / .claude/skills/ …)");
         return Ok(0);
     }
     let picked = pick_assets(&found);
@@ -356,12 +350,17 @@ fn pick_assets(found: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
     if policy != Seed::AskEach {
         let take = policy == Seed::All;
         for (dst, src) in found {
-            println!(
+            let notice = format!(
                 "  {} {} (from {})",
                 if take { "adopt" } else { "found" },
                 dst.display(),
                 src.display()
             );
+            if take {
+                ui::info(notice);
+            } else {
+                println!("{notice}");
+            }
         }
         if !take {
             ui::hint(
@@ -381,7 +380,7 @@ fn pick_assets(found: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
     for (item, label) in found.iter().zip(labels.iter()) {
         match prompt::confirm(&format!("adopt {label}?"), true) {
             Ok(Some(true)) => picked.push(item.clone()),
-            Ok(Some(false)) => println!("  skip {label}"),
+            Ok(Some(false)) => ui::info(format_args!("  skip {label}")),
             _ => break, // the tty is gone: stop asking, take nothing on the user's behalf
         }
     }

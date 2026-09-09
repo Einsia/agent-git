@@ -96,12 +96,9 @@ pub fn run(args: Args) -> CmdResult {
             repo.git(&["branch", "-m", &old, &new])?;
             super::worktree::rename(&repo, &old, &new)?;
             ui::success(&format!("{old} → {new}"));
-            println!(
-                "{}",
-                ui::dim(
-                    "  branch names are mere aliases: session identity, history and tags don’t move"
-                )
-            );
+            ui::info(ui::dim(
+                "  branch names are mere aliases: session identity, history and tags don’t move",
+            ));
             Ok(ExitCode::Ok)
         }
         Some(Cmd::Rm { name, force }) => {
@@ -145,10 +142,7 @@ pub fn run(args: Args) -> CmdResult {
             super::worktree::release(&repo, &name, force)?;
             repo.git(&["branch", "-D", &name])?;
             ui::success(&format!("local branch {name} deleted"));
-            println!(
-                "{}",
-                ui::dim("  published history on the hub is unaffected")
-            );
+            ui::info(ui::dim("  published history on the hub is unaffected"));
             Ok(ExitCode::Ok)
         }
         Some(Cmd::Seal { name }) => {
@@ -160,7 +154,7 @@ pub fn run(args: Args) -> CmdResult {
                 return Ok(ExitCode::Ref);
             }
             if is_sealed(&repo, &name) {
-                println!("`{name}` is already sealed.");
+                ui::info(format_args!("`{name}` is already sealed."));
                 return Ok(ExitCode::Ok);
             }
             // Sealing is a commit: the marker lands in the tree (auditable history, propagates

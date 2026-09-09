@@ -86,7 +86,7 @@ fn verify_online(hub: &str, client: &crate::hub::Client, human: bool) -> (Check,
     match client.me() {
         Ok(me) => {
             if human {
-                ui::success(&format!(
+                ui::success_result(&format!(
                     "{hub} accepts the credentials — signed in as {}",
                     me.username
                 ));

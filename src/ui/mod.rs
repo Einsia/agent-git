@@ -135,7 +135,30 @@ pub(crate) fn login_hint(hub: &str) -> String {
     }
 }
 
+/// Quiet changes routine presentation, never command authorization or exit status.
+pub(crate) fn quiet() -> bool {
+    std::env::var_os("AGIT_QUIET").is_some() && !crate::commands::json::is_capturing()
+}
+
+/// Routine notices are optional; requested data and recovery diagnostics use their own writers.
+pub(crate) fn info(message: impl std::fmt::Display) {
+    if !quiet() {
+        println!("{message}");
+    }
+}
+
+pub(crate) fn progress(message: impl std::fmt::Display) {
+    if !quiet() {
+        eprintln!("{message}");
+    }
+}
+
 pub fn success(msg: &str) {
+    info(format_args!("{} {msg}", ok(theme::symbols().check)));
+}
+
+/// An explicitly requested verification result remains data even under quiet output.
+pub(crate) fn success_result(msg: &str) {
     println!("{} {msg}", ok(theme::symbols().check));
 }
 
@@ -198,7 +221,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// the user like the program has hung.
 #[must_use = "a progress bar spins only while it is held — dropping it ends it immediately"]
 pub fn spinner(msg: &str) -> indicatif::ProgressBar {
-    if !is_tty() {
+    if quiet() || !is_tty() {
         return indicatif::ProgressBar::hidden();
     }
     let pb = indicatif::ProgressBar::new_spinner();

@@ -620,16 +620,18 @@ pub fn clone(
     Ok(out)
 }
 
-/// Run once, forwarding stderr while keeping a copy.
-/// Transfer subcommands get `--progress` (right after the subcommand; position matters to git).
-fn with_progress<'a>(args: &[&'a str], tty: bool) -> Vec<&'a str> {
+/// Presentation flags belong beside the known command, never beside a matching operand.
+fn with_progress<'a>(args: &[&'a str], tty: bool, quiet: bool) -> Vec<&'a str> {
     let mut full: Vec<&'a str> = args.to_vec();
-    if tty
-        && let Some(pos) = full
-            .iter()
-            .position(|a| matches!(*a, "fetch" | "clone" | "push" | "pull"))
-    {
-        full.insert(pos + 1, "--progress");
+    if matches!(
+        args.first().copied(),
+        Some("fetch" | "clone" | "push" | "pull")
+    ) {
+        if quiet {
+            full.insert(1, "--quiet");
+        } else if tty {
+            full.insert(1, "--progress");
+        }
     }
     full
 }
@@ -643,7 +645,11 @@ fn spawn(
     if let Some(d) = dir {
         cmd.arg("-C").arg(d);
     }
-    let full = with_progress(args, std::io::IsTerminal::is_terminal(&std::io::stderr()));
+    let full = with_progress(
+        args,
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        crate::ui::quiet(),
+    );
     cmd.args(&full);
     // Give git no chance to ask for a password interactively: with no usable token it must fail
     // immediately and let us see the authentication marker, instead of hanging on input in a
@@ -708,17 +714,66 @@ mod progress_tests {
     #[test]
     fn progress_follows_the_transfer_subcommand_only_on_a_tty() {
         assert_eq!(
-            with_progress(&["fetch", "origin", "--tags"], true),
+            with_progress(&["fetch", "origin", "--tags"], true, false),
             vec!["fetch", "--progress", "origin", "--tags"]
         );
         assert_eq!(
-            with_progress(&["fetch", "origin"], false),
+            with_progress(&["fetch", "origin"], false, false),
             vec!["fetch", "origin"]
         );
         assert_eq!(
-            with_progress(&["ls-remote", "origin"], true),
+            with_progress(&["ls-remote", "origin"], true, false),
             vec!["ls-remote", "origin"]
         );
+    }
+
+    #[test]
+    fn quiet_transfers_use_native_suppression_on_terminals_and_pipes() {
+        for command in ["fetch", "clone", "push", "pull"] {
+            for tty in [false, true] {
+                assert_eq!(
+                    with_progress(&[command, "origin", "main"], tty, true),
+                    vec![command, "--quiet", "origin", "main"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn presentation_does_not_interpret_operands_or_global_option_values() {
+        for args in [
+            vec![],
+            vec!["ls-remote", "fetch"],
+            vec!["config", "fixture.value", "push"],
+            vec!["-c", "fixture.value=fetch", "ls-remote", "origin"],
+            vec!["-C", "push", "ls-remote", "origin"],
+        ] {
+            for tty in [false, true] {
+                for quiet in [false, true] {
+                    assert_eq!(with_progress(&args, tty, quiet), args);
+                }
+            }
+        }
+        for args in [
+            vec![
+                "fetch",
+                "origin",
+                "refs/heads/push:refs/remotes/origin/fetch",
+            ],
+            vec![
+                "clone",
+                "--quiet",
+                "file:///owned/--progress/fetch",
+                "/owned/push",
+            ],
+            vec!["fetch", "--upload-pack", "--progress", "origin"],
+            vec!["push", "--", "--progress", "refs/heads/fetch"],
+        ] {
+            let actual = with_progress(&args, true, true);
+            assert_eq!(actual[0], args[0]);
+            assert_eq!(actual[1], "--quiet");
+            assert_eq!(&actual[2..], &args[1..]);
+        }
     }
 }
 
@@ -1161,6 +1216,7 @@ mod git_credential_lifecycle_tests {
             let empty_config = persistent_git_configuration();
             let mut settings: Vec<(String, Option<OsString>)> = [
                 "AGIT_HUB_URL",
+                "AGIT_QUIET",
                 "GIT_CONFIG",
                 "GIT_CONFIG_PARAMETERS",
                 "GIT_DIR",
@@ -1539,6 +1595,138 @@ mod git_credential_lifecycle_tests {
             identity.then_some(AGENT_ID)
         );
         assert!(request.body.is_empty());
+    }
+
+    #[test]
+    fn quiet_transfer_keeps_authenticated_retry_and_failure_evidence() {
+        for quiet in [None, Some(""), Some("1")] {
+            let home = IsolatedHome::new();
+            // The fixture owns the environment lock until its Git children have exited.
+            unsafe {
+                match quiet {
+                    Some(value) => std::env::set_var("AGIT_QUIET", value),
+                    None => std::env::remove_var("AGIT_QUIET"),
+                }
+            }
+            let hub = FakeHub::new(|request| {
+                if request.path == GIT_PATH {
+                    denied()
+                } else {
+                    assert_eq!(request.path, "/api/auth/refresh");
+                    refreshed()
+                }
+            });
+            config::set_global("hub.url", Some(&hub.base)).unwrap();
+            credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .current_dir(home.workspace())
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                output.stdout
+            };
+            git(&["init", "--quiet"]);
+            for (key, value) in [
+                ("credential.helper", ""),
+                ("http.proxy", ""),
+                ("http.lowSpeedLimit", "1"),
+                ("http.lowSpeedTime", "3"),
+                ("protocol.version", "0"),
+            ] {
+                git(&["config", "--local", key, value]);
+            }
+            let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+            let url = format!("{}/alice/example.git", hub.base);
+            let output =
+                run_for_identity(Some(home.workspace()), &["fetch", &url, "main"], &identity)
+                    .unwrap();
+            assert!(!output.ok());
+            assert!(super::looks_like_auth_failure(&output.stderr));
+            assert!(git(&["for-each-ref", "--format=%(refname)"]).is_empty());
+            let saved = credentials::load_checked(&hub.base).unwrap().unwrap();
+            assert_eq!(saved.username, "alice");
+            assert_eq!(saved.access_token, "fake-alice-fresh-access");
+            let requests = hub.finish();
+            assert_eq!(requests.len(), 3);
+            assert_git_request(&requests[0], Some("fake-alice-access"), true);
+            assert_eq!(requests[1].method, "POST");
+            assert_eq!(requests[1].path, "/api/auth/refresh");
+            assert_eq!(requests[1].header("Authorization"), None);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&requests[1].body).unwrap(),
+                serde_json::json!({"refresh_token":"fake-alice-refresh"})
+            );
+            assert_git_request(&requests[2], Some("fake-alice-fresh-access"), true);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quiet_transfers_preserve_remote_hook_warnings_and_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for quiet in [None, Some(""), Some("1")] {
+            let home = IsolatedHome::new();
+            // Child transfer settings remain inside the fixture's shared environment lock.
+            unsafe {
+                match quiet {
+                    Some(value) => std::env::set_var("AGIT_QUIET", value),
+                    None => std::env::remove_var("AGIT_QUIET"),
+                }
+            }
+            let source = crate::domain::repo::Repo::init(&home.workspace().join("source")).unwrap();
+            std::fs::write(source.root().join("fixture"), b"synthetic transfer data").unwrap();
+            source.add_all().unwrap();
+            assert!(source.commit("synthetic transfer root").unwrap());
+            let head = source.git(&["rev-parse", "HEAD"]).unwrap();
+            let identity = RemoteIdentity::new("http://hub.example.test", AGENT_ID).unwrap();
+            for reject in [false, true] {
+                let remote =
+                    home.workspace()
+                        .join(if reject { "reject.git" } else { "accept.git" });
+                let initialized = std::process::Command::new("git")
+                    .args(["init", "--bare", "--quiet"])
+                    .arg(&remote)
+                    .output()
+                    .unwrap();
+                assert!(initialized.status.success(), "{initialized:?}");
+                let hook = remote.join("hooks/pre-receive");
+                std::fs::write(
+                    &hook,
+                    format!(
+                        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' 'SYNTHETIC-REMOTE-NOTICE' >&2\nexit {}\n",
+                        i32::from(reject)
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let outcome = run_for_identity(
+                    Some(source.root()),
+                    &["push", remote.to_str().unwrap(), "HEAD:refs/heads/main"],
+                    &identity,
+                )
+                .unwrap();
+                assert_eq!(outcome.ok(), !reject, "{}", outcome.stderr);
+                assert!(outcome.stderr.contains("SYNTHETIC-REMOTE-NOTICE"));
+                if quiet.is_some() {
+                    assert!(!outcome.stderr.contains("Counting objects"));
+                    assert!(!outcome.stderr.contains("Writing objects"));
+                    assert!(!outcome.stderr.contains("[new branch]"));
+                }
+                let observed = std::process::Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&remote)
+                    .args(["show-ref", "--verify", "--hash", "refs/heads/main"])
+                    .output()
+                    .unwrap();
+                assert_eq!(observed.status.success(), !reject, "{observed:?}");
+                if !reject {
+                    assert_eq!(String::from_utf8(observed.stdout).unwrap().trim(), head);
+                }
+            }
+        }
     }
 
     fn hub_change_during_git_keeps_the_captured_identity(entry: EntryPoint) {

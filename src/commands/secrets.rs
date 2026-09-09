@@ -125,7 +125,7 @@ pub fn run(args: Args) -> CmdResult {
             };
             let added = store.add(&name, secret, allow_short)?;
             reload_daemon()?;
-            ui::success(&format!("registered {} ({})", added.name, added.id));
+            ui::success_result(&format!("registered {} ({})", added.name, added.id));
             Ok(ExitCode::Ok)
         }
         Action::List { json } => {
@@ -165,7 +165,7 @@ pub fn run(args: Args) -> CmdResult {
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else if status.initialized {
-                ui::success(&format!(
+                ui::success_result(&format!(
                     "secret-filter vault is healthy ({} rules, generation {})",
                     status.rules, status.generation
                 ));
@@ -210,7 +210,7 @@ pub fn run(args: Args) -> CmdResult {
             } => {
                 let secret = read_new_secret(stdin)?;
                 let added = repository_dictionary(repo)?.block_add(&name, secret, allow_short)?;
-                ui::success(&format!(
+                ui::success_result(&format!(
                     "repository block rule {} ({})",
                     added.name, added.id
                 ));
