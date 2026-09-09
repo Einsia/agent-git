@@ -50,14 +50,14 @@ pub fn run(args: Args) -> CmdResult {
         },
         None => None,
     };
-    let (repo, default_ref) = if let Some(target) = &parsed_target {
+    let (repo, slug, default_ref) = if let Some(target) = &parsed_target {
         if let Some(slug) = &target.repo {
             let (o, n) = super::parse_slug(slug)?;
             let Some(repo) = Repo::open(crate::infra::config::repo_dir(&o, &n)?) else {
                 ui::error(&format!("{slug} doesn’t exist locally."));
                 return Ok(ExitCode::Precondition);
             };
-            (repo, None)
+            (repo, slug.clone(), None)
         } else {
             let ctx = match super::context::resolve(&cwd) {
                 Ok(c) => c,
@@ -71,7 +71,7 @@ pub fn run(args: Args) -> CmdResult {
                 ui::error(&format!("{} does not exist locally.", ctx.repo));
                 return Ok(ExitCode::Precondition);
             };
-            (repo, Some(ctx.branch))
+            (repo, ctx.repo, Some(ctx.branch))
         }
     } else {
         let ctx = match super::context::resolve(&cwd) {
@@ -86,7 +86,7 @@ pub fn run(args: Args) -> CmdResult {
             ui::error(&format!("{} does not exist locally.", ctx.repo));
             return Ok(ExitCode::Precondition);
         };
-        (repo, Some(ctx.branch))
+        (repo, ctx.repo, Some(ctx.branch))
     };
     let spec = match parsed_target {
         Some(target) => crate::commands::target::to_spec(target),
@@ -98,6 +98,8 @@ pub fn run(args: Args) -> CmdResult {
             tail: refs::Tail::None,
         },
     };
+    let source = super::echo::Source::for_spec(&spec);
+    let selected_tip = spec.tail == refs::Tail::None;
     let spec = match super::context::substitute_at(spec) {
         Ok(spec) => spec,
         Err(e) => {
@@ -147,6 +149,19 @@ pub fn run(args: Args) -> CmdResult {
         println!("{}", serde_json::to_string_pretty(&items)?);
         return Ok(ExitCode::Ok);
     }
+
+    let selected_ref = if selected_tip {
+        resolved.branch.as_deref().unwrap_or(&resolved.sha)
+    } else {
+        &resolved.sha
+    };
+    super::echo::emit(
+        "view",
+        &[super::echo::Selection::new(
+            format!("{slug}@{selected_ref}"),
+            source,
+        )],
+    );
 
     println!(
         "{}",

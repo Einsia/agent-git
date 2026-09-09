@@ -9,6 +9,7 @@
 //! Refused while a merge transaction is open (`agit merge pick` is the way there).
 
 use super::CmdResult;
+use super::echo::{Selection, Source};
 use crate::domain::meta;
 use crate::domain::refs;
 use crate::domain::repo::Repo;
@@ -35,7 +36,7 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
     let cwd = std::env::current_dir()?;
-    let (repo, target) = if let Some(raw) = args.into.as_deref()
+    let (repo, slug, target, target_source) = if let Some(raw) = args.into.as_deref()
         && raw.contains('@')
         && raw != "@"
     {
@@ -57,7 +58,7 @@ pub fn run(args: Args) -> CmdResult {
             ui::error(&format!("{slug} doesn’t exist locally."));
             return Ok(ExitCode::Precondition);
         };
-        (repo, branch)
+        (repo, format!("{o}/{n}"), branch, Source::Explicit)
     } else {
         let ctx = match super::context::resolve(&cwd) {
             Ok(c) => c,
@@ -71,7 +72,16 @@ pub fn run(args: Args) -> CmdResult {
             ui::error(&format!("{} doesn’t exist locally.", ctx.repo));
             return Ok(ExitCode::Precondition);
         };
-        (repo, args.into.clone().unwrap_or(ctx.branch))
+        (
+            repo,
+            format!("{o}/{n}"),
+            args.into.clone().unwrap_or(ctx.branch),
+            if args.into.is_some() {
+                Source::Mixed
+            } else {
+                Source::Environment
+            },
+        )
     };
 
     // Only the locked branch is blocked: the transaction CASes the head of its target branch,
@@ -93,9 +103,14 @@ pub fn run(args: Args) -> CmdResult {
 
     // Gather the envelope lines to pick.
     let mut lines: Vec<String> = vec![];
+    let mut selections =
+        vec![Selection::new(format!("{slug}@{target}"), target_source).role("into")];
     for p in &args.picks {
-        match expand_one(&repo, p)? {
-            Some(ls) => lines.extend(ls),
+        match expand_one(&repo, &slug, target_source, p)? {
+            Some((ls, selection)) => {
+                lines.extend(ls);
+                selections.push(selection.role("from"));
+            }
             None => return Ok(ExitCode::Ref),
         }
     }
@@ -137,6 +152,7 @@ pub fn run(args: Args) -> CmdResult {
     let commit = super::plumbing::commit_tree(&repo, &tree, &[&head], &msg)?;
     super::plumbing::update_branch_cas_and_refresh(&repo, &target, &commit, &head, false)?;
 
+    super::echo::emit("cherry-pick", &selections);
     ui::success(&format!(
         "picked {} events → {target} (view commit {})",
         lines.len(),
@@ -146,10 +162,15 @@ pub fn run(args: Args) -> CmdResult {
 }
 
 /// Expand one turn-level ref into the matching envelope lines of that source branch's transcript.
-fn expand_one(target_repo: &Repo, p: &str) -> crate::Result<Option<Vec<String>>> {
+fn expand_one(
+    target_repo: &Repo,
+    target_slug: &str,
+    target_source: Source,
+    p: &str,
+) -> crate::Result<Option<(Vec<String>, Selection)>> {
     let spec = refs::parse(p)?;
     // Source repo: with an explicit owner/repo@..., it may be a different local repo.
-    let (repo, head) = match &spec.repo {
+    let (repo, head, slug, source) = match &spec.repo {
         refs::RepoSel::Slug(o, n) => {
             match Repo::open(crate::infra::config::repo_dir(o, n)?) {
                 Some(r) => {
@@ -165,7 +186,7 @@ fn expand_one(target_repo: &Repo, p: &str) -> crate::Result<Option<Vec<String>>>
                             return Ok(None);
                         }
                     };
-                    (r, head)
+                    (r, head, format!("{o}/{n}"), Source::Explicit)
                 }
                 None => {
                     ui::error(&format!("{o}/{n} doesn’t exist locally."));
@@ -178,7 +199,7 @@ fn expand_one(target_repo: &Repo, p: &str) -> crate::Result<Option<Vec<String>>>
             // `@` belongs to the session that supplied the source ref, not to
             // the target repo selected by `--into`.  Resolve both repo and
             // branch together before opening the source history.
-            let (repo, branch) = match context_source() {
+            let (repo, branch, slug) = match context_source() {
                 Ok(v) => v,
                 Err(e) => {
                     ui::error(&format!("{e:#}"));
@@ -188,7 +209,7 @@ fn expand_one(target_repo: &Repo, p: &str) -> crate::Result<Option<Vec<String>>>
             let head = repo
                 .git(&["rev-parse", &format!("refs/heads/{branch}")])
                 .map(|s| s.trim().to_string())?;
-            (repo, head)
+            (repo, head, slug, Source::Environment)
         }
         _ => {
             let head = match &spec.base {
@@ -213,7 +234,16 @@ fn expand_one(target_repo: &Repo, p: &str) -> crate::Result<Option<Vec<String>>>
                     return Ok(None);
                 }
             };
-            (Repo::at(target_repo.root()), head)
+            (
+                Repo::at(target_repo.root()),
+                head,
+                target_slug.to_string(),
+                if spec.base != refs::Base::At && target_source == Source::Explicit {
+                    Source::Explicit
+                } else {
+                    Source::Mixed
+                },
+            )
         }
     };
 
@@ -261,10 +291,12 @@ fn expand_one(target_repo: &Repo, p: &str) -> crate::Result<Option<Vec<String>>>
             return Ok(None);
         }
     }
-    Ok(Some(out))
+    let selector = p.find('#').map(|index| &p[index..]).unwrap_or_default();
+    let selection = Selection::new(format!("{slug}@{head}{selector}"), source);
+    Ok(Some((out, selection)))
 }
 
-fn context_source() -> crate::Result<(Repo, String)> {
+fn context_source() -> crate::Result<(Repo, String, String)> {
     // Repo and branch must come out of one read — an identity must not be split into two
     // observations.
     let ctx = super::context::at_context()?;
@@ -278,7 +310,7 @@ fn context_source() -> crate::Result<(Repo, String)> {
             ctx.repo
         )
     })?;
-    Ok((repo, branch))
+    Ok((repo, branch, format!("{owner}/{name}")))
 }
 
 /// Line i (0-based) of a materialized transcript, keeping the trailing LF that the event-id

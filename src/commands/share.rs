@@ -84,6 +84,13 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Precondition);
         }
     };
+    super::echo::emit(
+        "share",
+        &[super::echo::Selection::new(
+            source.label.clone(),
+            source.selection_source,
+        )],
+    );
 
     let raw = source.raw;
 
@@ -278,12 +285,14 @@ struct ShareSource {
     envelope: Option<String>,
     runtime: String,
     label: String,
+    selection_source: super::echo::Source,
 }
 
 struct SharePoint {
     repo: Repo,
     sha: String,
     slug: String,
+    selection_source: super::echo::Source,
 }
 
 fn selected_source(target: Option<&str>, full_log: bool) -> crate::Result<ShareSource> {
@@ -368,6 +377,7 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
             native.source,
             link::short(&native.session_id)
         ),
+        selection_source: super::echo::Source::Explicit,
     })
 }
 
@@ -375,6 +385,7 @@ fn resolve_point(
     mut spec: refs::RefSpec,
     native_available: bool,
 ) -> crate::Result<Option<SharePoint>> {
+    let selection_source = super::echo::Source::for_spec(&spec);
     if !matches!(
         spec.tail,
         refs::Tail::None | refs::Tail::Tilde(_) | refs::Tail::Turn(_)
@@ -423,7 +434,12 @@ fn resolve_point(
         None => anyhow::bail!("{slug} has no local AgentGit repo; clone it before sharing"),
     };
     let sha = refs::resolve(&repo, &spec)?.sha;
-    Ok(Some(SharePoint { repo, sha, slug }))
+    Ok(Some(SharePoint {
+        repo,
+        sha,
+        slug,
+        selection_source,
+    }))
 }
 
 /// Metadata, content and confirmation describe the same immutable saved point.
@@ -483,6 +499,7 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
             point.slug,
             &point.sha[..12.min(point.sha.len())]
         ),
+        selection_source: point.selection_source,
     })
 }
 
@@ -709,6 +726,7 @@ mod tests {
             repo: Repo::open(repo.root()).unwrap(),
             sha: repo.git(&["rev-parse", "refs/heads/session-a"]).unwrap(),
             slug: "me/paper".into(),
+            selection_source: crate::commands::echo::Source::Explicit,
         };
         let next = transcript::wrap_lines(
             &raw.replace("BRANCH-TRANSCRIPT", "LATER-CONTENT"),

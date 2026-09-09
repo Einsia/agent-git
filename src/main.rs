@@ -267,6 +267,7 @@ fn bare_help(verdict: agit::tui::Verdict, json: bool, version: commands::json::V
 /// The dispatch table. Deliberately too boring to get wrong — every change lives in the file
 /// being called.
 fn dispatch(cmd: Commands, json: bool) -> i32 {
+    let _echo = commands::echo::Invocation::enter(&cmd, json);
     let result = match cmd {
         Commands::Login(a) => commands::login::run(a),
         Commands::Rc(a) => commands::rc::run(a),

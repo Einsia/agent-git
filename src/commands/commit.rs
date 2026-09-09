@@ -248,6 +248,11 @@ fn run_inner(args: Args) -> CmdResult {
     let Some(target) = target else {
         return Ok(if quiet { ExitCode::Ok } else { ExitCode::Ref });
     };
+    let source = match args.target.as_deref() {
+        None | Some("@") => super::echo::Source::Environment,
+        Some(raw) if raw.contains('@') => super::echo::Source::Explicit,
+        Some(_) => super::echo::Source::Mixed,
+    };
 
     let opts = SettleOpts {
         milestone: args.milestone,
@@ -279,7 +284,19 @@ fn run_inner(args: Args) -> CmdResult {
                     &crate::infra::config::hub_url(),
                 )?;
             }
-            if !quiet {
+            if !quiet
+                && Repo::open(&repo_dir)
+                    .is_some_and(|repo| repo.has_ref(&format!("refs/heads/{branch}")))
+            {
+                super::echo::emit(
+                    "commit",
+                    &[super::echo::Selection::new(
+                        format!("{slug}@{branch}"),
+                        source,
+                    )],
+                );
+            }
+            if !quiet && super::echo::legacy_output("commit") {
                 ui::info(format_args!(
                     "{}",
                     ui::dim(&format!("  target: {slug} @ {branch} ({via})"))
@@ -328,6 +345,15 @@ fn run_inner(args: Args) -> CmdResult {
                 super::import::Placed::Ready(landing) => *landing,
                 super::import::Placed::Refused(code) => return Ok(code),
             };
+            if !quiet {
+                super::echo::emit(
+                    "commit",
+                    &[super::echo::Selection::new(
+                        format!("{slug}@{}", landing.branch()),
+                        super::echo::Source::Explicit,
+                    )],
+                );
+            }
             let outcome = settle(
                 &store,
                 landing.repo_dir(),
@@ -349,6 +375,15 @@ fn run_inner(args: Args) -> CmdResult {
             via,
         } => {
             if !quiet {
+                super::echo::emit(
+                    "commit",
+                    &[super::echo::Selection::new(
+                        format!("{slug}@{branch}"),
+                        source,
+                    )],
+                );
+            }
+            if !quiet && super::echo::legacy_output("commit") {
                 ui::info(format_args!(
                     "{}",
                     ui::dim(&format!("  target: {slug} @ {branch} ({via}, file line)"))

@@ -136,7 +136,29 @@ pub fn run(args: Args) -> CmdResult {
         Resolved::Refused(code) => return Ok(code),
     };
 
-    match resume_branch(&repo, &slug, &branch, &args)? {
+    let source = args
+        .target
+        .as_deref()
+        .map(refs::parse)
+        .transpose()?
+        .as_ref()
+        .map(|spec| match (&spec.repo, &spec.base) {
+            (refs::RepoSel::Slug(_, _), _) => super::echo::Source::Explicit,
+            (_, refs::Base::At | refs::Base::SessionBranch(_)) => super::echo::Source::Environment,
+            _ => super::echo::Source::Mixed,
+        })
+        .unwrap_or(super::echo::Source::Interactive);
+    match resume_branch_for(
+        &repo,
+        &slug,
+        &branch,
+        &args,
+        None,
+        ResumeRequest {
+            purpose: ResumePurpose::Continue,
+            echo_source: Some(source),
+        },
+    )? {
         Some(res) => finish(res, args.no_launch),
         None => Ok(ExitCode::Precondition),
     }
@@ -605,7 +627,17 @@ pub fn resume_branch_with_prompt(
     args: &Args,
     prompt: Option<&str>,
 ) -> crate::Result<Option<Resumed>> {
-    resume_branch_for(repo, slug, branch, args, prompt, ResumePurpose::Continue)
+    resume_branch_for(
+        repo,
+        slug,
+        branch,
+        args,
+        prompt,
+        ResumeRequest {
+            purpose: ResumePurpose::Continue,
+            echo_source: None,
+        },
+    )
 }
 
 /// Prepare the agent for an open merge whose source and target identities are frozen.
@@ -622,7 +654,10 @@ pub(crate) fn resume_merge_agent(
         &tx.target,
         args,
         Some(prompt),
-        ResumePurpose::Merge(tx),
+        ResumeRequest {
+            purpose: ResumePurpose::Merge(tx),
+            echo_source: None,
+        },
     )
 }
 
@@ -630,6 +665,11 @@ pub(crate) fn resume_merge_agent(
 enum ResumePurpose<'a> {
     Continue,
     Merge(&'a crate::domain::mergetx::Tx),
+}
+
+struct ResumeRequest<'a> {
+    purpose: ResumePurpose<'a>,
+    echo_source: Option<super::echo::Source>,
 }
 
 impl ResumePurpose<'_> {
@@ -655,8 +695,12 @@ fn resume_branch_for(
     branch: &str,
     args: &Args,
     prompt: Option<&str>,
-    purpose: ResumePurpose<'_>,
+    request: ResumeRequest<'_>,
 ) -> crate::Result<Option<Resumed>> {
+    let ResumeRequest {
+        purpose,
+        echo_source,
+    } = request;
     // Preconditions: it exists, it is not the file line, it is unsealed, and it is a branch head
     // (`resolve_branch` already guarantees the last).
     if !repo.has_ref(&format!("refs/heads/{branch}")) {
@@ -692,6 +736,16 @@ fn resume_branch_for(
             "start a fresh session off it: `agit new -b <name> --from {branch}`"
         ));
         return Ok(None);
+    }
+
+    if let Some(source) = echo_source {
+        super::echo::emit(
+            "resume",
+            &[super::echo::Selection::new(
+                format!("{slug}@{branch}"),
+                source,
+            )],
+        );
     }
 
     purpose.require_transaction(repo, branch, &head)?;

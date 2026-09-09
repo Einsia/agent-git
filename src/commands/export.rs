@@ -41,7 +41,7 @@ pub struct Args {
     /// Redact secrets on export.
     #[arg(long)]
     pub redact: bool,
-    /// Output path (default: stdout).
+    /// Output path (default or `-`: stdout).
     #[arg(short = 'o', long, value_name = "path")]
     pub out: Option<String>,
 }
@@ -55,6 +55,11 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Usage);
         }
     };
+    let source = if matches!(spec.repo, refs::RepoSel::Local(_)) {
+        super::echo::Source::Mixed
+    } else {
+        super::echo::Source::for_spec(&spec)
+    };
     let spec = match super::context::substitute_at(spec) {
         Ok(spec) => spec,
         Err(e) => {
@@ -63,7 +68,7 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
     // Repo resolution: an explicit owner/repo, a locally unique name, context.
-    let (repo, sha) = match &spec.repo {
+    let (repo, slug, resolved) = match &spec.repo {
         refs::RepoSel::Slug(o, n) => {
             let Some(r) = Repo::open(crate::infra::config::repo_dir(o, n).unwrap_or_default())
             else {
@@ -75,7 +80,7 @@ pub fn run(args: Args) -> CmdResult {
                 ui::error("the ref doesn’t resolve in this repo.");
                 return Ok(ExitCode::Ref);
             };
-            (r, res.sha)
+            (r, format!("{o}/{n}"), res)
         }
         _ => {
             let ctx = match super::context::resolve(&cwd) {
@@ -98,9 +103,10 @@ pub fn run(args: Args) -> CmdResult {
                     return Ok(ExitCode::Ref);
                 }
             };
-            (r, res.sha)
+            (r, ctx.repo, res)
         }
     };
+    let sha = resolved.sha.clone();
 
     let which = if args.view_only {
         meta::VIEW_FILE
@@ -165,11 +171,23 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     match &args.out {
-        Some(p) => {
+        Some(p) if p != "-" => {
             std::fs::write(p, &out)?;
+            let selected_ref = if spec.tail == refs::Tail::None {
+                resolved.branch.as_deref().unwrap_or(&sha)
+            } else {
+                &sha
+            };
+            super::echo::emit(
+                "export",
+                &[super::echo::Selection::new(
+                    format!("{slug}@{selected_ref}"),
+                    source,
+                )],
+            );
             ui::success(&format!("exported to {p} ({} bytes)", out.len()));
         }
-        None => {
+        _ => {
             let _ = std::io::stdout().write_all(out.as_bytes());
         }
     }

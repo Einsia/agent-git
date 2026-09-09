@@ -110,9 +110,16 @@ fn actual_log_counts_envelopes_and_calls_across_sources_and_filters() {
     let filtered = log(home.path(), &["--grep", "SECOND", "-n", "1"]);
     assert!(filtered.status.success());
     let text = String::from_utf8(filtered.stdout).unwrap();
-    assert_eq!(text.lines().count(), 1, "{text}");
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next(),
+        Some("target: me/counts@main (via explicit arguments)"),
+        "{text}"
+    );
+    let turn = lines.next().expect("one filtered turn follows the target");
+    assert!(lines.next().is_none(), "{text}");
     assert!(
-        text.contains("#  2") && text.contains("11 events 4 ToolUse"),
+        turn.contains("#  2") && turn.contains("11 events 4 ToolUse"),
         "{text}"
     );
 }

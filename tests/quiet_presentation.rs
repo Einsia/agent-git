@@ -368,17 +368,27 @@ fn successful_push_noop_is_informational_and_quiet_suppresses_it() {
 fn quiet_keeps_requested_history_raw_and_scan_results() {
     let lab = Lab::new();
     lab.seed();
-    for args in [
-        vec!["log", "me/quiet@work"],
-        vec!["show", "me/quiet@work", "--raw"],
-        vec!["scan", "me/quiet@work", "--secrets"],
+    for (args, notice) in [
+        (
+            vec!["log", "me/quiet@work"],
+            "target: me/quiet@work (via explicit arguments)\n",
+        ),
+        (vec!["show", "me/quiet@work", "--raw"], ""),
+        (
+            vec!["scan", "me/quiet@work", "--secrets"],
+            "target: repo=me/quiet (via explicit arguments)\n",
+        ),
     ] {
         let ordinary = success(lab.run(&args));
         assert!(!ordinary.stdout.is_empty(), "{args:?}");
         let mut selected = vec!["-q"];
         selected.extend_from_slice(&args);
         let quiet = success(lab.run(&selected));
-        assert_eq!(quiet.stdout, ordinary.stdout, "{args:?}");
+        assert_eq!(
+            quiet.stdout,
+            ordinary.stdout.strip_prefix(notice.as_bytes()).unwrap(),
+            "{args:?}"
+        );
     }
 }
 
@@ -756,7 +766,21 @@ fn quiet_memory_sync_commit_and_distill_preserve_their_landings() {
                 .unwrap(),
         );
         assert!(!status.stdout.is_empty());
-        assert_eq!(quiet_status.stdout, status.stdout);
+        let expected_header = if mode == "ordinary" {
+            "target: me/quiet@work (via explicit arguments)\n"
+        } else {
+            "  me/quiet @ work\n"
+        };
+        assert_eq!(
+            quiet_status
+                .stdout
+                .strip_prefix(expected_header.as_bytes())
+                .unwrap(),
+            status
+                .stdout
+                .strip_prefix(b"target: me/quiet@work (via explicit arguments)\n")
+                .unwrap()
+        );
         let diff = success(lab.run(&["memory", "diff", "--into", "me/quiet@work"]));
         assert!(String::from_utf8_lossy(&diff.stdout).contains("SYNTHETIC-EDITED"));
         assert_eq!(

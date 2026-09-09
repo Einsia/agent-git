@@ -148,7 +148,11 @@ fn unrelated_equal_content_never_becomes_a_claimed_fork_point() {
     let output = lab.diff("alice/left@topic...alice/right@topic", "--turns");
     assert!(String::from_utf8_lossy(&output.stderr).contains("no common Git ancestor"));
     let text = success(output);
-    assert!(text.starts_with("base") && !text.contains("fork point"));
+    let mut lines = text.lines();
+    let notice = lines.next().unwrap();
+    assert!(notice.starts_with("target: left=alice/left@"));
+    assert!(notice.contains("; right=alice/right@"));
+    assert!(lines.next().unwrap().starts_with("base") && !text.contains("fork point"));
     assert!(text.contains("B side    +1 turns"));
     let view = success(lab.diff("alice/left@topic..alice/right@topic", "--view"));
     assert!(view.contains("removed 0") && view.contains("added 0"));

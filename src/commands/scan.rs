@@ -29,6 +29,7 @@
 //!   at `--secrets`, which still works — it never pretends a machine reviewed anything.
 
 use super::CmdResult;
+use super::echo::{self, Selection, Source};
 use crate::domain::refs;
 use crate::domain::repo::Repo;
 use crate::domain::secrets;
@@ -74,6 +75,13 @@ pub fn run(args: Args) -> CmdResult {
         Ok(specs) => specs,
         Err(code) => return Ok(code),
     };
+    let sources: Vec<Source> = parsed_refs
+        .iter()
+        .map(|spec| match &spec.repo {
+            refs::RepoSel::Slug(_, _) | refs::RepoSel::Local(_) => Source::Explicit,
+            refs::RepoSel::Context => Source::for_spec(spec),
+        })
+        .collect();
     // `@` becomes a branch name before anyone reads these specs — including the repo derivation
     // below. The resolver reads no environment, so a `Base::At` handed down to it is refused.
     let parsed_refs: Vec<refs::RefSpec> = match parsed_refs
@@ -89,9 +97,13 @@ pub fn run(args: Args) -> CmdResult {
     };
     // An explicit ref only needs the repo resolved; only the zero-argument form has to resolve
     // the "current branch".
-    let (slug, default_branch) = if args.refs.is_empty() {
+    let (slug, default_branch, source) = if args.refs.is_empty() {
         match super::context::resolve(&cwd) {
-            Ok(c) => (super::context::qualify(&c.repo), Some(c.branch)),
+            Ok(c) => (
+                super::context::qualify(&c.repo),
+                Some(c.branch),
+                Source::Environment,
+            ),
             Err(e) => {
                 ui::error(&format!("{e:#}"));
                 return Ok(ExitCode::Ref);
@@ -100,23 +112,32 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         // An explicit `<owner/repo>@ref` also identifies the repository.  If
         // only a local ref was written, retain the legacy cwd-based lookup.
-        let explicit_repos: Vec<String> = parsed_refs
+        let explicit_repos: Vec<(String, Source)> = parsed_refs
             .iter()
-            .filter_map(|spec| match &spec.repo {
-                refs::RepoSel::Slug(owner, name) => Some(format!("{owner}/{name}")),
-                refs::RepoSel::Local(name) => Some(name.clone()),
+            .zip(&sources)
+            .filter_map(|(spec, source)| match &spec.repo {
+                refs::RepoSel::Slug(owner, name) => Some((format!("{owner}/{name}"), *source)),
+                refs::RepoSel::Local(name) => Some((name.clone(), *source)),
                 refs::RepoSel::Context => None,
             })
             .collect();
-        if explicit_repos.windows(2).any(|w| w[0] != w[1]) {
+        if explicit_repos.windows(2).any(|w| w[0].0 != w[1].0) {
             ui::error("all scan targets must belong to the same agent repo.");
             return Ok(ExitCode::Usage);
         }
         match explicit_repos.first() {
-            Some(r) if r.contains('/') => (r.clone(), None),
-            Some(r) => (super::context::qualify(r), None),
+            Some((r, source)) if r.contains('/') => (r.clone(), None, *source),
+            Some((r, source)) => (super::context::qualify(r), None, *source),
             None => match super::context::repo_for(&cwd) {
-                Ok(r) => (super::context::qualify(&r), None),
+                Ok(r) => (
+                    super::context::qualify(&r),
+                    None,
+                    if sources.iter().all(|source| *source == Source::Environment) {
+                        Source::Environment
+                    } else {
+                        Source::Mixed
+                    },
+                ),
                 Err(e) => {
                     ui::error(&format!("{e:#}"));
                     return Ok(ExitCode::Ref);
@@ -163,6 +184,7 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
     let found = collect(&repo, &n)?;
+    echo::emit("scan", &[Selection::new(slug, source).role("repo")]);
     let any_hit = !found.hits.is_empty();
     let truncated = found.truncated;
     let shown = found.hits.len();

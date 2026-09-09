@@ -142,6 +142,14 @@ fn create(client: &Client, target: &str, branch: &str, message: Option<&str>) ->
         message,
     ) {
         Ok(pr) => {
+            super::echo::emit(
+                "pr",
+                &[super::echo::Selection::new(
+                    format!("{so}/{sn}@{branch}"),
+                    super::echo::Source::Mixed,
+                )
+                .role("source")],
+            );
             ui::success(&format!(
                 "PR #{} opened: {}/{}:{} → {}/{}:{}",
                 pr.id, so, sn, branch, to, tn, target_branch

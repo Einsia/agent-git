@@ -125,13 +125,16 @@ pub struct DistillArgs {
 }
 
 pub fn run_distill(args: DistillArgs) -> CmdResult {
-    run(Args {
-        cmd: Some(Cmd::Distill {
-            paths: args.paths,
-            yes: args.yes,
-        }),
-        into: args.into,
-    })
+    run_inner(
+        Args {
+            cmd: Some(Cmd::Distill {
+                paths: args.paths,
+                yes: args.yes,
+            }),
+            into: args.into,
+        },
+        "distill",
+    )
 }
 
 /// The counts from one sync.
@@ -1001,13 +1004,33 @@ fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    run_inner(args, "memory")
+}
+
+fn run_inner(args: Args, command: &'static str) -> CmdResult {
     let Some(target) = target_of(args.into.as_deref())? else {
         return Ok(ExitCode::Precondition);
     };
+    let source = if args.into.is_some() {
+        super::echo::Source::Explicit
+    } else {
+        super::echo::Source::Environment
+    };
+    if !matches!(&args.cmd, Some(Cmd::Diff { .. } | Cmd::Distill { .. }))
+        && target.primary.has_ref(&tree_ref(&target.branch))
+    {
+        super::echo::emit(
+            command,
+            &[super::echo::Selection::new(
+                format!("{}@{}", target.slug, target.branch),
+                source,
+            )],
+        );
+    }
     match args.cmd.unwrap_or(Cmd::Status) {
         Cmd::Status => status(&target),
         Cmd::Diff { path } => diff(&target, path.as_deref()),
-        Cmd::Distill { paths, yes } => distill_cmd(&target, &paths, yes),
+        Cmd::Distill { paths, yes } => distill_cmd(&target, &paths, yes, command, source),
         Cmd::Sync => sync(&target),
     }
 }
@@ -1058,7 +1081,9 @@ fn status(target: &Target) -> CmdResult {
         _ => Default::default(),
     };
 
-    println!("{}", ui::dim(&format!("  {} @ {branch}", target.slug)));
+    if super::echo::legacy_output("memory") {
+        println!("{}", ui::dim(&format!("  {} @ {branch}", target.slug)));
+    }
     match &runtime {
         Some((rt, dir)) => println!(
             "{}",
@@ -1210,7 +1235,13 @@ fn diff(target: &Target, path: Option<&str>) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
-fn distill_cmd(target: &Target, paths: &[String], yes: bool) -> CmdResult {
+fn distill_cmd(
+    target: &Target,
+    paths: &[String],
+    yes: bool,
+    command: &'static str,
+    source: super::echo::Source,
+) -> CmdResult {
     let primary = &target.primary;
     let branch = target.branch.as_str();
     if branch == "main" {
@@ -1240,6 +1271,13 @@ fn distill_cmd(target: &Target, paths: &[String], yes: bool) -> CmdResult {
         }
         picked
     };
+    super::echo::emit(
+        command,
+        &[
+            super::echo::Selection::new(format!("{}@{branch}", target.slug), source).role("from"),
+            super::echo::Selection::new(format!("{}@main", target.slug), source).role("into"),
+        ],
+    );
     if wanted.is_empty() {
         ui::info(format_args!(
             "  memory on `{branch}` already matches main — nothing to distill."

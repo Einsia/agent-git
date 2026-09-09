@@ -96,6 +96,8 @@ pub fn run(args: Args) -> CmdResult {
     let Some((left_spec, right_spec, three_dot)) = endpoints else {
         return workdir_diff(&repo);
     };
+    let left_source = super::echo::Source::for_spec(&left_spec);
+    let left_repo_explicit = matches!(left_spec.repo, refs::RepoSel::Slug(_, _));
     let right_repo = match right_spec.as_ref() {
         Some(spec) => match right_repository(&repo, spec, at_context.as_ref()) {
             Ok(repo) => repo,
@@ -115,8 +117,8 @@ pub fn run(args: Args) -> CmdResult {
     }) else {
         return Ok(ExitCode::Ref);
     };
-    let b_sha = match right_spec {
-        Some(spec) => match resolve_spec(&right_repo, &spec, at_context.as_ref()) {
+    let b_sha = match right_spec.as_ref() {
+        Some(spec) => match resolve_spec(&right_repo, spec, at_context.as_ref()) {
             Err(e) => {
                 ui::error(&format!("{e:#}"));
                 return Ok(ExitCode::Usage);
@@ -177,15 +179,47 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
+    let (right_slug, right_source) = match right_spec.as_ref() {
+        Some(spec) => {
+            let selected_slug = match (&spec.repo, &spec.base, at_context.as_ref()) {
+                (refs::RepoSel::Slug(owner, name), _, _) => format!("{owner}/{name}"),
+                (refs::RepoSel::Context, refs::Base::At, Some(context)) => context.repo.clone(),
+                _ => slug.clone(),
+            };
+            let source = if left_repo_explicit
+                && spec.repo == refs::RepoSel::Context
+                && spec.base != refs::Base::At
+            {
+                super::echo::Source::Explicit
+            } else {
+                super::echo::Source::for_spec(spec)
+            };
+            (selected_slug, source)
+        }
+        None => (
+            slug.clone(),
+            if left_repo_explicit {
+                super::echo::Source::Explicit
+            } else {
+                super::echo::Source::Environment
+            },
+        ),
+    };
+    let selections = [
+        super::echo::Selection::new(format!("{slug}@{a_sha}"), left_source).role("left"),
+        super::echo::Selection::new(format!("{right_slug}@{b_sha}"), right_source).role("right"),
+    ];
+
     if args.view {
         let va = view_at(graph, &base)?;
         let vb = view_at(graph, &b_sha)?;
+        super::echo::emit("diff", &selections);
         view_diff(&va, &vb);
         return Ok(ExitCode::Ok);
     }
 
     // Default: the --turns reconnaissance.
-    turns_report(graph, &base, &a_sha, &b_sha, real_fork)?;
+    turns_report(graph, &base, &a_sha, &b_sha, real_fork, &selections)?;
     Ok(ExitCode::Ok)
 }
 
@@ -311,7 +345,14 @@ fn resolve_spec(
     }
 }
 
-fn turns_report(repo: &Repo, base: &str, a: &str, b: &str, three_dot: bool) -> crate::Result<()> {
+fn turns_report(
+    repo: &Repo,
+    base: &str,
+    a: &str,
+    b: &str,
+    three_dot: bool,
+    selections: &[super::echo::Selection],
+) -> crate::Result<()> {
     // The label follows the semantics: only the left end of `...` is the fork point, the left
     // end of `..` is `a` itself. Printing `fork point` in the two-point view is a lie — that
     // value is not a computed fork point, and the A side then counts zero new turns, which
@@ -341,6 +382,7 @@ fn turns_report(repo: &Repo, base: &str, a: &str, b: &str, three_dot: bool) -> c
         }
         sides.push((label, additions.len(), previews));
     }
+    super::echo::emit("diff", selections);
     println!("{label}  {}", &base[..9.min(base.len())]);
     for (label, count, previews) in sides {
         println!("{label} side    +{count} turns");

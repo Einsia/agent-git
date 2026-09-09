@@ -41,6 +41,35 @@ another matching object can still make an ordinary explicit ref ambiguous.
 it refuses instead of selecting a tag, remote-tracking ref, or checkout HEAD. Historical
 selectors such as `@#2` are applied after capturing that local branch's tip.
 
+Human command results begin with the verified target and how it was selected:
+
+```text
+target: alice/payments@work (via AGIT_SESSION)
+```
+
+Fully qualified arguments report `explicit arguments`; a local ref whose repository comes
+from the environment reports `explicit arguments + AGIT_SESSION`. An explicit picker choice
+reports `interactive selection`. Changing directories with `-C` does not select a session.
+An unresolved target never receives a notice. Startup diagnostics and
+acquisition progress can appear on stderr before the result.
+
+| Output | Target notice |
+| --- | --- |
+| `commit`, ordinary `log`/`show`/`view`, tag creation, `fork`/`run`/`resume`, memory status/sync | Verified session, branch, native session identity, or immutable history point |
+| Branch and tag lists, `log --branches`/`--graph`, selected-repository fetch, repository-wide pull, `scan` | Repository scope; scan covers the repository publish surface even when refs were supplied |
+| Branch/tag mutations, selected-branch push/pull | Actual selected refs; push labels the local source refs |
+| `diff`, `merge`, `cherry-pick`, `revert` | Labeled endpoints or target and sources on the same line; transaction sources are identified as recorded state |
+| `memory distill`, `distill` | Validated source branch and `main` destination |
+| File export, PR creation | Validated source; exported bytes and the remote request remain separate from the human result |
+
+JSON envelopes, quiet mode, active full-screen interfaces, hooks and MCP do not receive a new
+human target notice. The existing byte outputs of `show --raw`, `show ref:path`, `show ref#n.k`,
+stdout export, `diff --files`, working-state `diff`, `memory diff`, and `repo path` stay unchanged.
+Global listings, status, search, `fetch --all`, repository administration, and creation/adoption
+commands have their own scope or identity reports rather than an implicit session notice.
+For merge transaction controls, `recorded-from` describes the source stored in that transaction;
+`commit:<sha>` means its repository namespace was not recorded and is not inferred.
+
 ## 2. Getting started
 
 ### 2.1 Install
@@ -243,7 +272,7 @@ agit commit
 ```
 
 ```
-  target: alice/payments @ ratelimit (AGIT_SESSION)
+target: alice/payments@ratelimit (via AGIT_SESSION)
 #3 6b2bb67d8 make the rate-limit threshold configurable
 
 ✓ settled 1 turns → alice/payments @ ratelimit

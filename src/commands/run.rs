@@ -20,7 +20,7 @@ use crate::domain::repo::Repo;
 use crate::infra::config;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -51,6 +51,12 @@ pub fn run(args: Args) -> CmdResult {
             ui::error(&format!("{e:#}"));
             return Ok(ExitCode::Usage);
         }
+    };
+    let source = super::echo::Source::for_spec(&spec);
+    let legacy_output = super::echo::legacy_output("run");
+    let mut startup_notes = RunNotes {
+        defer: !legacy_output,
+        notes: Vec::new(),
     };
 
     // ── 1. Fetch. owner-qualified = explicitly networked ──
@@ -126,10 +132,7 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
     if networked {
-        println!(
-            "{}",
-            ui::dim(&format!("  fetched the latest history of {slug}"))
-        );
+        startup_notes.push(format!("  fetched the latest history of {slug}"));
     }
 
     // ── 2. Locate ──
@@ -156,7 +159,7 @@ pub fn run(args: Args) -> CmdResult {
     let base_name = match refs::version_alias(&repo, &base_name) {
         Some(b) => {
             folded_oid = crate::domain::meta::sha_from_id(&base_name).map(str::to_string);
-            println!("{}", ui::dim(&format!("  {base_name} → branch `{b}`")));
+            startup_notes.push(format!("  {base_name} → branch `{b}`"));
             b
         }
         None => base_name,
@@ -185,13 +188,10 @@ pub fn run(args: Args) -> CmdResult {
         match cur {
             None => {
                 repo.git(&["branch", &base_name, oid])?;
-                println!(
-                    "{}",
-                    ui::dim(&format!(
-                        "  created local `{base_name}` at {}",
-                        &oid[..9.min(oid.len())]
-                    ))
-                );
+                startup_notes.push(format!(
+                    "  created local `{base_name}` at {}",
+                    &oid[..9.min(oid.len())]
+                ));
             }
             Some(cur) if cur != *oid => {
                 if repo
@@ -201,25 +201,19 @@ pub fn run(args: Args) -> CmdResult {
                     super::plumbing::update_branch_cas_and_refresh(
                         &repo, &base_name, oid, &cur, false,
                     )?;
-                    println!(
-                        "{}",
-                        ui::dim(&format!(
-                            "  fast-forwarded `{base_name}` to {}",
-                            &oid[..9.min(oid.len())]
-                        ))
-                    );
+                    startup_notes.push(format!(
+                        "  fast-forwarded `{base_name}` to {}",
+                        &oid[..9.min(oid.len())]
+                    ));
                 } else if repo
                     .git_opt(&["merge-base", "--is-ancestor", oid, &cur])
                     .is_some()
                 {
                     // The local side is already ahead: the history the id names is contained in
                     // the local line, so it continues on the local head.
-                    println!(
-                        "{}",
-                        ui::dim(&format!(
-                            "  local `{base_name}` is ahead of the published tip — continuing on the local head"
-                        ))
-                    );
+                    startup_notes.push(format!(
+                        "  local `{base_name}` is ahead of the published tip — continuing on the local head"
+                    ));
                 } else {
                     ui::error(&format!(
                         "local `{base_name}` and the published tip have diverged — neither side can absorb the other"
@@ -280,6 +274,14 @@ pub fn run(args: Args) -> CmdResult {
     );
 
     if can_continue {
+        super::echo::emit(
+            "run",
+            &[super::echo::Selection::new(
+                format!("{slug}@{base_name}"),
+                source,
+            )],
+        );
+        startup_notes.flush();
         let head = match access {
             Some(super::Writability::Granted) => "a session branch head the hub lets you write",
             Some(super::Writability::Creatable) => {
@@ -298,6 +300,30 @@ pub fn run(args: Args) -> CmdResult {
             no_launch: args.no_launch,
             force: false,
         });
+    }
+
+    let (full_ref, fork_base) = match resolve_fork(&spec, &slug, &base_name, &cwd)? {
+        ForkResolution::Selected(full_ref, fork_base) => (full_ref, fork_base),
+        ForkResolution::Refused(code) => return Ok(code),
+    };
+    if !legacy_output {
+        let target = if matches!(spec.tail, refs::Tail::None) {
+            fork_base
+                .resolved
+                .branch
+                .as_ref()
+                .unwrap_or(&fork_base.resolved.sha)
+        } else {
+            &fork_base.resolved.sha
+        };
+        super::echo::emit(
+            "run",
+            &[super::echo::Selection::new(
+                format!("{slug}@{target}"),
+                source,
+            )],
+        );
+        startup_notes.flush();
     }
 
     // Everything else: it forks by necessity.
@@ -353,28 +379,6 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
 
-    // Fork (reusing fork's resolution and tree building). Every selector form is rebuilt from
-    // the normalized `slug@base_name` — the original input may carry the owner from before
-    // `--mine`, or a web id already folded back to a branch name, and handing it to fork
-    // unchanged undoes the fold.
-    let tail = match &spec.tail {
-        refs::Tail::None => String::new(),
-        refs::Tail::Tilde(n) => format!("~{n}"),
-        refs::Tail::Turn(n) => format!("#{}", turn_display(*n)),
-        refs::Tail::Event { turn, index } => format!("#{}.{}", turn_display(*turn), index),
-        refs::Tail::Range { .. } => {
-            ui::error("run can’t start from a range.");
-            return Ok(ExitCode::Usage);
-        }
-        refs::Tail::Path(_) => {
-            ui::error("run can’t start from an in-tree file.");
-            return Ok(ExitCode::Usage);
-        }
-    };
-    let full_ref = format!("{slug}@{base_name}{tail}");
-    let Some(fork_base) = super::fork::resolve_base(&full_ref, &cwd)? else {
-        return Ok(ExitCode::Ref);
-    };
     let Some(_) = super::fork::fork_branch(&fork_base, &full_ref, &new_name)? else {
         return Ok(ExitCode::Policy);
     };
@@ -392,6 +396,60 @@ pub fn run(args: Args) -> CmdResult {
         Some(res) => super::resume::finish_pub(res, args.no_launch),
         None => Ok(ExitCode::Precondition),
     }
+}
+
+struct RunNotes {
+    defer: bool,
+    notes: Vec<String>,
+}
+
+impl RunNotes {
+    fn push(&mut self, note: String) {
+        if self.defer {
+            self.notes.push(note);
+        } else {
+            println!("{}", ui::dim(&note));
+        }
+    }
+
+    fn flush(&mut self) {
+        for note in self.notes.drain(..) {
+            println!("{}", ui::dim(&note));
+        }
+    }
+}
+
+enum ForkResolution {
+    Selected(String, super::fork::ForkBase),
+    Refused(ExitCode),
+}
+
+/// Fork selection uses the actual checkout and folded branch with the requested selector.
+fn resolve_fork(
+    spec: &refs::RefSpec,
+    slug: &str,
+    base_name: &str,
+    cwd: &Path,
+) -> crate::Result<ForkResolution> {
+    let tail = match &spec.tail {
+        refs::Tail::None => String::new(),
+        refs::Tail::Tilde(n) => format!("~{n}"),
+        refs::Tail::Turn(n) => format!("#{}", turn_display(*n)),
+        refs::Tail::Event { turn, index } => format!("#{}.{}", turn_display(*turn), index),
+        refs::Tail::Range { .. } => {
+            ui::error("run can’t start from a range.");
+            return Ok(ForkResolution::Refused(ExitCode::Usage));
+        }
+        refs::Tail::Path(_) => {
+            ui::error("run can’t start from an in-tree file.");
+            return Ok(ForkResolution::Refused(ExitCode::Usage));
+        }
+    };
+    let full_ref = format!("{slug}@{base_name}{tail}");
+    let Some(fork_base) = super::fork::resolve_base(&full_ref, cwd)? else {
+        return Ok(ForkResolution::Refused(ExitCode::Ref));
+    };
+    Ok(ForkResolution::Selected(full_ref, fork_base))
 }
 
 fn turn_display(n: u32) -> String {
@@ -418,16 +476,7 @@ fn ensure_mine(slug: &str) -> crate::Result<()> {
     // launch; run materializes the target branch itself afterwards. No directory binding: this is
     // a promotion internal to run, and binding is a declaration the user makes only by typing
     // `clone` directly.
-    let code = super::clone::run(super::clone::Args {
-        target: Some(slug.to_string()),
-        mine: true,
-        name: None,
-        no_bind: true,
-        rebind: false,
-        adopt_legacy_agent_id: None,
-        as_runtime: None,
-        no_launch: true,
-    })?;
+    let code = super::clone::acquire_mine(slug)?;
     if code != ExitCode::Ok {
         anyhow::bail!("clone --mine didn’t succeed (exit {})", code.as_i32());
     }

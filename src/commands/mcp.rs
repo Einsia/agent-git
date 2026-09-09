@@ -99,9 +99,10 @@ fn result(id: Option<serde_json::Value>, r: serde_json::Value) -> String {
 fn call_tool(name: &str, args: &serde_json::Value) -> String {
     let exe = std::env::current_exe().unwrap_or_else(|_| "agit".into());
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--no-color");
-    // A tool's stdout is its result payload, even when the MCP server is quiet.
-    cmd.env_remove("AGIT_QUIET");
+    // A tool's stdout is its result payload, independent of human presentation.
+    cmd.arg("--no-color")
+        .env("AGIT_PROTOCOL_CHILD", "1")
+        .env_remove("AGIT_QUIET");
     match name {
         "search" => {
             cmd.arg("search");

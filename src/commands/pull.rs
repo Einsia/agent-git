@@ -89,6 +89,15 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     // 2. Fast-forward branch by branch.
+    let selection_source = if repo_arg.is_some() {
+        super::echo::Source::Explicit
+    } else if args.all || !args.branch.is_empty() {
+        super::echo::Source::Mixed
+    } else {
+        super::echo::Source::Environment
+    };
+    let repository_scope =
+        args.all || (repo_arg.is_some() && target_branch.is_none() && args.branch.is_empty());
     let want: Vec<String> = if let Some(b) = target_branch {
         vec![b]
     } else if args.all {
@@ -100,6 +109,27 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         repo.branches()
     };
+    if repository_scope {
+        super::echo::emit(
+            "pull",
+            &[super::echo::Selection::new(
+                format!("{owner}/{name}"),
+                selection_source,
+            )],
+        );
+    } else if want
+        .iter()
+        .all(|branch| repo.has_ref(&format!("refs/heads/{branch}")))
+    {
+        // A missing member cannot turn a branch selection into a notice for a partial set.
+        let selections: Vec<_> = want
+            .iter()
+            .map(|branch| {
+                super::echo::Selection::new(format!("{owner}/{name}@{branch}"), selection_source)
+            })
+            .collect();
+        super::echo::emit("pull", &selections);
+    }
     let history_update = super::migration::begin_startup_recovery(&repo, "pull-history")?;
 
     let mut diverged = false;

@@ -230,6 +230,19 @@ pub fn run(args: Args) -> CmdResult {
     let Some(commit) = fork_branch(&base, &args.source, &args.branch)? else {
         return Ok(ExitCode::Policy);
     };
+    let spec = refs::parse(&args.source)?;
+    let target = if matches!(spec.tail, refs::Tail::None) {
+        base.resolved.branch.as_ref().unwrap_or(&base.resolved.sha)
+    } else {
+        &base.resolved.sha
+    };
+    super::echo::emit(
+        "fork",
+        &[super::echo::Selection::new(
+            format!("{}@{target}", base.slug),
+            super::echo::Source::for_spec(&spec),
+        )],
+    );
     ui::success(&format!(
         "forked {} into {} ({} @ {} — new session in place)",
         args.source,

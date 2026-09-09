@@ -9,6 +9,7 @@
 //! `ref#7`.
 
 use super::CmdResult;
+use super::echo::{Selection, Source};
 use crate::domain::meta;
 use crate::domain::refs;
 use crate::domain::repo::Repo;
@@ -53,7 +54,7 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
     let cwd = std::env::current_dir()?;
-    let (repo, target) = if let Some(raw) = args.into.as_deref()
+    let (repo, slug, target, target_source) = if let Some(raw) = args.into.as_deref()
         && raw.contains('@')
         && raw != "@"
     {
@@ -75,14 +76,14 @@ pub fn run(args: Args) -> CmdResult {
             ui::error(&format!("{slug} doesn’t exist locally."));
             return Ok(ExitCode::Precondition);
         };
-        (repo, branch)
+        (repo, format!("{o}/{n}"), branch, Source::Explicit)
     } else if let Some((slug, branch)) = target_from_refs(&args.refs_, args.into.as_deref()) {
         let (o, n) = super::parse_slug(&slug)?;
         let Some(repo) = Repo::open(crate::infra::config::repo_dir(&o, &n)?) else {
             ui::error(&format!("{slug} doesn’t exist locally."));
             return Ok(ExitCode::Precondition);
         };
-        (repo, branch)
+        (repo, format!("{o}/{n}"), branch, Source::Explicit)
     } else {
         let ctx = match super::context::resolve(&cwd) {
             Ok(c) => c,
@@ -98,7 +99,13 @@ pub fn run(args: Args) -> CmdResult {
         };
         (
             repo,
+            format!("{o}/{n}"),
             args.into.clone().unwrap_or_else(|| ctx.branch.clone()),
+            if args.into.is_some() {
+                Source::Mixed
+            } else {
+                Source::Environment
+            },
         )
     };
     if super::branch::is_sealed(&repo, &target) {
@@ -129,6 +136,8 @@ pub fn run(args: Args) -> CmdResult {
     // the VIEW.
     let mut doomed: std::collections::BTreeMap<String, usize> = Default::default();
     let mut selected_coordinates: std::collections::BTreeSet<(String, usize)> = Default::default();
+    let mut selections =
+        vec![Selection::new(format!("{slug}@{target}"), target_source).role("into")];
     for r in &args.refs_ {
         let spec = refs::parse(r)?;
         let src_head = match &spec.base {
@@ -174,6 +183,14 @@ pub fn run(args: Args) -> CmdResult {
                 return Ok(ExitCode::Usage);
             }
         }
+        let selector = r.find('#').map(|index| &r[index..]).unwrap_or_default();
+        let source = if spec.base == refs::Base::At || target_source == Source::Explicit {
+            target_source
+        } else {
+            Source::Mixed
+        };
+        selections
+            .push(Selection::new(format!("{slug}@{src_head}{selector}"), source).role("from"));
     }
 
     // ── Remove the selected multiplicity from the VIEW, and append the revert marker to
@@ -205,6 +222,7 @@ pub fn run(args: Args) -> CmdResult {
     let commit = super::plumbing::commit_tree(&repo, &tree, &[&head], &msg)?;
     super::plumbing::update_branch_cas_and_refresh(&repo, &target, &commit, &head, false)?;
 
+    super::echo::emit("revert", &selections);
     ui::success(&format!(
         "dropped {removed} events from the VIEW of {target} (view commit {})",
         &commit[..9.min(commit.len())]

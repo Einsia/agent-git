@@ -217,6 +217,46 @@ enum Ref {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    run_with_progress(args, ProgressOutput::Stdout)
+}
+
+/// Human acquisition progress stays on stderr until the composed command validates its ref.
+pub(super) fn acquire_mine(slug: &str) -> CmdResult {
+    run_with_progress(
+        Args {
+            target: Some(slug.to_string()),
+            mine: true,
+            name: None,
+            no_bind: true,
+            rebind: false,
+            adopt_legacy_agent_id: None,
+            as_runtime: None,
+            no_launch: true,
+        },
+        if super::echo::legacy_output("run") {
+            ProgressOutput::Stdout
+        } else {
+            ProgressOutput::Stderr
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ProgressOutput {
+    Stdout,
+    Stderr,
+}
+
+impl ProgressOutput {
+    fn line(self, message: std::fmt::Arguments<'_>) {
+        match self {
+            Self::Stdout => println!("{message}"),
+            Self::Stderr => eprintln!("{message}"),
+        }
+    }
+}
+
+fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     let client = crate::hub::Client::from_env();
     let s = ui::theme::symbols();
 
@@ -250,7 +290,7 @@ pub fn run(args: Args) -> CmdResult {
     };
 
     // ── 2. Decide where it lands and what the two remotes are ──
-    let Some(plan) = plan(&client, &src_owner, &src_name, &args)? else {
+    let Some(plan) = plan(&client, &src_owner, &src_name, &args, progress)? else {
         return Ok(ExitCode::Usage);
     };
     let (owner, name) = (plan.owner.clone(), plan.name.clone());
@@ -261,12 +301,12 @@ pub fn run(args: Args) -> CmdResult {
     // pair of session links under the same agent, and `agit commit photo` then has to pick among
     // four candidates — an ambiguity created out of nowhere.
     if plan.promoted_in_place {
-        println!(
+        progress.line(format_args!(
             "{}",
             ui::dim(&format!(
                 "  keep working: agit commit {name}, then agit push {name}"
             ))
-        );
+        ));
         return Ok(ExitCode::Ok);
     }
 
@@ -289,7 +329,7 @@ pub fn run(args: Args) -> CmdResult {
     let history_update = super::migration::begin_startup_recovery_for_path(&dest, "clone-history")?;
 
     if existed {
-        println!("updating {}…", ui::bold(&slug));
+        progress.line(format_args!("updating {}…", ui::bold(&slug)));
         let store = Repo::at(&dest);
         // Align the remotes before fetching: the hub address changes, and a read-only checkout's
         // origin is the very source to fetch from.
@@ -310,15 +350,18 @@ pub fn run(args: Args) -> CmdResult {
                     anyhow::anyhow!("cannot fast-forward a detached existing checkout")
                 })?;
                 super::pull::fast_forward_to(&store, &branch, "@{upstream}")?;
-                println!("  {} fast-forwarded {behind} commits", ui::ok(s.check));
+                progress.line(format_args!(
+                    "  {} fast-forwarded {behind} commits",
+                    ui::ok(s.check)
+                ));
             }
         }
     } else {
-        println!(
+        progress.line(format_args!(
             "fetching {} from {}…",
             ui::bold(&slug),
             ui::accent(client.base())
-        );
+        ));
         if !crate::hub::git::clone(&clone_url, &dest, &plan.identity)?.ok() {
             ui::error("clone failed.");
             ui::hint(
@@ -334,7 +377,7 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     let store = Repo::at(&dest);
-    plan.report(&src_owner, &src_name);
+    plan.report(&src_owner, &src_name, progress);
 
     // ── 4. Local branches ──
     //
@@ -362,7 +405,11 @@ pub fn run(args: Args) -> CmdResult {
             }
             let target = format!("refs/tags/{v}");
             checkout_target(&store, &target, None)?;
-            println!("  {} version {}", ui::ok(s.check), ui::bold(v));
+            progress.line(format_args!(
+                "  {} version {}",
+                ui::ok(s.check),
+                ui::bold(v)
+            ));
         }
         Some(Ref::Branch(b)) => {
             let r = format!("origin/{b}");
@@ -379,7 +426,10 @@ pub fn run(args: Args) -> CmdResult {
                 match sync_explicit_branch(&store, b)? {
                     BranchSync::Created | BranchSync::Current => {}
                     BranchSync::FastForwarded(n) => {
-                        println!("  {} fast-forwarded {b} by {n} commits", ui::ok(s.check));
+                        progress.line(format_args!(
+                            "  {} fast-forwarded {b} by {n} commits",
+                            ui::ok(s.check)
+                        ));
                     }
                     BranchSync::Diverged { ahead, behind } => ui::warning(&format!(
                         "{b} has diverged from origin (ahead {ahead}, behind {behind}); opening the local line as it is"
@@ -390,7 +440,7 @@ pub fn run(args: Args) -> CmdResult {
                 checkout_target(&store, &r, Some(b))?;
             }
             let _ = store.git(&["branch", &format!("--set-upstream-to=origin/{b}"), b]);
-            println!("  {} branch {}", ui::ok(s.check), ui::bold(b));
+            progress.line(format_args!("  {} branch {}", ui::ok(s.check), ui::bold(b)));
         }
         None => {
             // Only a first pickup (or a HEAD left dangling) decides where to land.
@@ -405,12 +455,12 @@ pub fn run(args: Args) -> CmdResult {
     super::migration::finish_external_history_update(&store, history_update)?;
 
     let heads = local_branches(&store);
-    println!(
+    progress.line(format_args!(
         "  {} {} branches  {}",
         ui::ok(s.check),
         heads.len(),
         ui::dim(&ui::tilde(&dest))
-    );
+    ));
     if heads.is_empty() {
         // The remote has branches and not one came down locally: the fetch itself went wrong,
         // and it must not read as "this agent is empty".
@@ -418,7 +468,10 @@ pub fn run(args: Args) -> CmdResult {
         ui::hint(&format!("check what the hub has: `agit log {slug}`"));
         return Ok(ExitCode::Ok);
     }
-    println!("{}", ui::dim(&format!("    {}", heads.join(", "))));
+    progress.line(format_args!(
+        "{}",
+        ui::dim(&format!("    {}", heads.join(", ")))
+    ));
 
     // ── 6. Bind the current directory ──
     //
@@ -427,7 +480,10 @@ pub fn run(args: Args) -> CmdResult {
     if !args.no_bind {
         let here = std::env::current_dir()?;
         workspace::bind(&here, &slug, args.rebind)?;
-        println!("{}", ui::dim(&format!("  bound to {}", ui::tilde(&here))));
+        progress.line(format_args!(
+            "{}",
+            ui::dim(&format!("  bound to {}", ui::tilde(&here)))
+        ));
     }
 
     // An unreadable session/meta.json means something else (a plain git push) put this repo up.
@@ -446,28 +502,33 @@ pub fn run(args: Args) -> CmdResult {
     if args.as_runtime.is_some() {
         ui::hint("`--as` moved to `agit run --as <runtime>` — clone only fetches");
     }
-    println!();
+    progress.line(format_args!(""));
     let head = store.current_branch();
     let on_file_line = head
         .as_deref()
         .is_some_and(|b| meta::is_file_line_at(&store, &format!("refs/heads/{b}")));
     match (&head, plan.writable, on_file_line) {
         // Your own session line: carry straight on.
-        (Some(b), true, false) => println!("  {}", ui::accent(&format!("agit resume {b}"))),
+        (Some(b), true, false) => progress.line(format_args!(
+            "  {}",
+            ui::accent(&format!("agit resume {b}"))
+        )),
         // main is the file line and is never resumed — start a new session off it, inheriting
         // memory/skills.
-        (Some(_), true, true) => println!("  {}", ui::accent("agit new -b <name>")),
+        (Some(_), true, true) => {
+            progress.line(format_args!("  {}", ui::accent("agit new -b <name>")))
+        }
         // Someone else's: running it necessarily forks off a line you can write to.
-        (Some(b), false, _) => println!(
+        (Some(b), false, _) => progress.line(format_args!(
             "  {}",
             ui::accent(&format!("agit run {slug}@{b} -b <name>"))
-        ),
-        (None, _, _) => println!(
+        )),
+        (None, _, _) => progress.line(format_args!(
             "  {}",
             ui::accent(&format!("agit run {slug}@{} -b <name>", heads[0]))
-        ),
+        )),
     }
-    println!(
+    progress.line(format_args!(
         "{}",
         ui::dim(&if plan.writable {
             "  fetched only — that command materializes it into a runtime and continues".to_string()
@@ -478,7 +539,7 @@ pub fn run(args: Args) -> CmdResult {
                  agit clone {src_owner}/{src_name} --mine"
             )
         })
-    );
+    ));
     Ok(ExitCode::Ok)
 }
 
@@ -695,23 +756,23 @@ impl Plan {
     ///
     /// It has to be explicit: read-only and copy have entirely different next steps, while the
     /// rest of the output on both routes looks the same.
-    fn report(&self, src_owner: &str, src_name: &str) {
+    fn report(&self, src_owner: &str, src_name: &str, progress: ProgressOutput) {
         let s = ui::theme::symbols();
         if self.writable {
             if self.upstream.is_some() {
-                println!(
+                progress.line(format_args!(
                     "  {} your copy, sourced from {}",
                     ui::ok(s.check),
                     ui::bold(&format!("{src_owner}/{src_name}"))
-                );
+                ));
             }
             return;
         }
-        println!(
+        progress.line(format_args!(
             "  {} read-only: origin is {} — you can’t push to it",
             ui::dim(s.node),
             ui::bold(&format!("{src_owner}/{src_name}"))
-        );
+        ));
     }
 }
 
@@ -749,6 +810,7 @@ fn plan(
     src_owner: &str,
     src_name: &str,
     args: &Args,
+    progress: ProgressOutput,
 ) -> crate::Result<Option<Plan>> {
     let me = credentials::current_user();
     let mode = mode_of(me.as_deref(), src_owner, args.mine);
@@ -794,14 +856,15 @@ fn plan(
 
     let existing = config::repo_dir(src_owner, src_name)?;
     if existing.join(".git").exists() {
-        return promote(client, &existing, &source, args.name.as_deref()).map(Some);
+        return promote_with_progress(client, &existing, &source, args.name.as_deref(), progress)
+            .map(Some);
     }
 
-    println!(
+    progress.line(format_args!(
         "copying {} ({} sessions) into your namespace…",
         ui::bold(&source.slug()),
         source.session_count
-    );
+    ));
     let resp = client.clone_agent(
         src_owner,
         src_name,
@@ -809,19 +872,19 @@ fn plan(
         &source_identity.agent_id,
     )?;
     let copy_identity = validate_copy_response(client.base(), &resp, &source_identity)?;
-    println!(
+    progress.line(format_args!(
         "{} copied as {}",
         ui::ok(ui::theme::symbols().check),
         ui::bold(&format!("{}/{}", resp.owner, resp.name))
-    );
-    println!("  {}", ui::accent(&resp.web_url));
-    println!(
+    ));
+    progress.line(format_args!("  {}", ui::accent(&resp.web_url)));
+    progress.line(format_args!(
         "{}",
         ui::dim(&format!(
             "  your own copy now — visibility inherited ({}); publish independently with agit push.",
             visibility_of(&source)
         ))
-    );
+    ));
     Ok(Some(Plan {
         owner: resp.owner,
         name: resp.name,
@@ -892,6 +955,16 @@ pub fn promote(
     source: &RemoteAgent,
     as_name: Option<&str>,
 ) -> crate::Result<Plan> {
+    promote_with_progress(client, checkout, source, as_name, ProgressOutput::Stdout)
+}
+
+fn promote_with_progress(
+    client: &crate::hub::Client,
+    checkout: &Path,
+    source: &RemoteAgent,
+    as_name: Option<&str>,
+    progress: ProgressOutput,
+) -> crate::Result<Plan> {
     let s = ui::theme::symbols();
     let source_identity = RemoteIdentity::new(client.base(), &source.agent_id)?;
     let repo = Repo::at(checkout);
@@ -905,7 +978,10 @@ pub fn promote(
             source_identity.agent_id
         );
     }
-    println!("copying {} into your namespace…", ui::bold(&source.slug()));
+    progress.line(format_args!(
+        "copying {} into your namespace…",
+        ui::bold(&source.slug())
+    ));
     let resp = client.clone_agent(
         &source.owner,
         &source.name,
@@ -958,20 +1034,20 @@ pub fn promote(
     }
     rename_links(&source.owner, &source.name, &resp.owner, &resp.name)?;
 
-    println!(
+    progress.line(format_args!(
         "{} {} is now yours: {}",
         ui::ok(s.check),
         ui::bold(&source.slug()),
         ui::bold(&format!("{}/{}", resp.owner, resp.name))
-    );
-    println!("  {}", ui::accent(&resp.web_url));
-    println!(
+    ));
+    progress.line(format_args!("  {}", ui::accent(&resp.web_url)));
+    progress.line(format_args!(
         "{}",
         ui::dim(&format!(
             "  everything you committed locally survives; visibility inherits ({}).",
             visibility_of(source)
         ))
-    );
+    ));
 
     Ok(Plan {
         owner: resp.owner,

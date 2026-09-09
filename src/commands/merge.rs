@@ -177,11 +177,12 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
             ExitCode::Ref
         });
     };
-    println!(
-        "{}",
-        ui::dim(&format!("  target: {slug} @ {target} ({via})"))
-    );
-
+    if super::echo::legacy_output("merge") {
+        println!(
+            "{}",
+            ui::dim(&format!("  target: {slug} @ {target} ({via})"))
+        );
+    }
     if target == src_ref {
         ui::error("can’t merge a branch into itself.");
         return Ok(ExitCode::Usage);
@@ -247,6 +248,28 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
         }
     }
 
+    super::echo::emit(
+        "merge",
+        &[
+            super::echo::Selection::new(
+                format!("{slug}@{target}"),
+                target_selection_source(args.into.as_deref()),
+            )
+            .role("into"),
+            super::echo::Selection::new(
+                format!(
+                    "{}@{}",
+                    base.slug,
+                    base.resolved
+                        .branch
+                        .as_deref()
+                        .unwrap_or(&base.resolved.sha)
+                ),
+                selection_source(Some(src_ref)),
+            )
+            .role("from"),
+        ],
+    );
     reconnaissance.print();
 
     if args.dry_run {
@@ -471,12 +494,12 @@ fn merge_instruction(slug: &str, target: &str, src: &str, extra: Option<&str>) -
 fn transaction_repo(
     cwd: &std::path::Path,
     into: Option<&str>,
-) -> crate::Result<Option<(Repo, Option<String>)>> {
-    let (repo, selected_branch) = if let Some(into) = into {
-        let Some((repo, _slug, branch, _via)) = target_of(cwd, Some(into))? else {
+) -> crate::Result<Option<(Repo, String, Option<String>)>> {
+    let (repo, slug, selected_branch) = if let Some(into) = into {
+        let Some((repo, slug, branch, _via)) = target_of(cwd, Some(into))? else {
             return Ok(None);
         };
-        (repo, Some(branch))
+        (repo, slug, Some(branch))
     } else {
         let ctx = match super::context::resolve(cwd) {
             Ok(c) => c,
@@ -490,9 +513,56 @@ fn transaction_repo(
             ui::error(&format!("{} doesn’t exist locally.", ctx.repo));
             return Ok(None);
         };
-        (repo, Some(ctx.branch))
+        (repo, ctx.repo, Some(ctx.branch))
     };
-    Ok(Some((repo, selected_branch)))
+    Ok(Some((repo, slug, selected_branch)))
+}
+
+fn target_selection_source(into: Option<&str>) -> super::echo::Source {
+    match into {
+        None | Some("@") => super::echo::Source::Environment,
+        Some(raw) if raw.contains('@') => super::echo::Source::Explicit,
+        Some(_) => super::echo::Source::Mixed,
+    }
+}
+
+fn selection_source(raw: Option<&str>) -> super::echo::Source {
+    raw.map_or(super::echo::Source::Environment, |raw| {
+        refs::parse(raw)
+            .map(|spec| super::echo::Source::for_spec(&spec))
+            .unwrap_or(super::echo::Source::Mixed)
+    })
+}
+
+fn transaction_source_target(tx: &Tx) -> String {
+    let slug = tx.source_repo.clone().or_else(|| {
+        refs::parse(&tx.source)
+            .ok()
+            .and_then(|spec| match spec.repo {
+                refs::RepoSel::Slug(owner, name) => Some(format!("{owner}/{name}")),
+                _ => None,
+            })
+    });
+    match slug {
+        Some(slug) => format!("{slug}@{}", tx.source_head),
+        // An unrecorded source namespace cannot be recovered from the transaction's target.
+        None => format!("commit:{}", tx.source_head),
+    }
+}
+
+fn echo_transaction(slug: &str, tx: &Tx, into: Option<&str>) {
+    let source = target_selection_source(into);
+    super::echo::emit(
+        "merge",
+        &[
+            super::echo::Selection::new(format!("{slug}@{}", tx.target), source).role("into"),
+            super::echo::Selection::new(
+                transaction_source_target(tx),
+                super::echo::Source::Transaction,
+            )
+            .role("recorded-from"),
+        ],
+    );
 }
 
 fn read_selected_tx(repo: &Repo, selected_branch: Option<&str>) -> crate::Result<Option<Tx>> {
@@ -520,28 +590,35 @@ fn read_selected_tx(repo: &Repo, selected_branch: Option<&str>) -> crate::Result
     }
 }
 
-fn open_tx(cwd: &std::path::Path, into: Option<&str>) -> crate::Result<Option<(Repo, Tx)>> {
-    let Some((repo, branch)) = transaction_repo(cwd, into)? else {
+fn open_tx(cwd: &std::path::Path, into: Option<&str>) -> crate::Result<Option<(Repo, String, Tx)>> {
+    let Some((repo, slug, branch)) = transaction_repo(cwd, into)? else {
         return Ok(None);
     };
-    Ok(read_selected_tx(&repo, branch.as_deref())?.map(|tx| (repo, tx)))
+    let Some(tx) = read_selected_tx(&repo, branch.as_deref())? else {
+        return Ok(None);
+    };
+    Ok(Some((repo, slug, tx)))
 }
 
 fn open_tx_locked(
     cwd: &std::path::Path,
     into: Option<&str>,
-) -> crate::Result<Option<(Repo, Tx, mergetx::ControlGuard)>> {
-    let Some((repo, branch)) = transaction_repo(cwd, into)? else {
+) -> crate::Result<Option<(Repo, String, Tx, mergetx::ControlGuard)>> {
+    let Some((repo, slug, branch)) = transaction_repo(cwd, into)? else {
         return Ok(None);
     };
     let control = mergetx::ControlGuard::acquire(repo.root())?;
-    Ok(read_selected_tx(&repo, branch.as_deref())?.map(|tx| (repo, tx, control)))
+    let Some(tx) = read_selected_tx(&repo, branch.as_deref())? else {
+        return Ok(None);
+    };
+    Ok(Some((repo, slug, tx, control)))
 }
 
 fn status(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
-    let Some((_repo, tx)) = open_tx(cwd, into)? else {
+    let Some((_repo, slug, tx)) = open_tx(cwd, into)? else {
         return Ok(ExitCode::Precondition);
     };
+    echo_transaction(&slug, &tx, into);
     println!("merge transaction  {} → {}", tx.source, tx.target);
     println!(
         "  fork point    {}",
@@ -564,10 +641,11 @@ fn status(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
 }
 
 fn abort(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
-    let Some((_repo, tx, control)) = open_tx_locked(cwd, into)? else {
+    let Some((_repo, slug, tx, control)) = open_tx_locked(cwd, into)? else {
         return Ok(ExitCode::Precondition);
     };
     control.remove()?;
+    echo_transaction(&slug, &tx, into);
     ui::success(&format!(
         "dropped the {} → {} merge. The target ref never moved.",
         tx.source, tx.target
@@ -576,7 +654,7 @@ fn abort(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
 }
 
 fn pick_drop_summary(cwd: &std::path::Path, into: Option<&str>, cmd: PickCmd) -> CmdResult {
-    let Some((repo, expected, control)) = open_tx_locked(cwd, into)? else {
+    let Some((repo, slug, expected, control)) = open_tx_locked(cwd, into)? else {
         ui::error(
             "no merge transaction is open. Start one with `agit merge <source> --into <branch>`.",
         );
@@ -612,17 +690,20 @@ fn pick_drop_summary(cwd: &std::path::Path, into: Option<&str>, cmd: PickCmd) ->
         PickCmd::Pick { refs: picks } => {
             tx.pick_more(&picks);
             control.write(&tx)?;
+            echo_transaction(&slug, &tx, into);
             ui::success(&format!("picked {} items", picks.len()));
         }
         PickCmd::Drop { refs: drops } => {
             let n = tx.drop(&drops);
             control.write(&tx)?;
+            echo_transaction(&slug, &tx, into);
             ui::success(&format!("removed {n} items"));
         }
         PickCmd::Summary { message, .. } => {
             let text = message.expect("summary text is read before transaction admission");
             tx.set_summary(text);
             control.write(&tx)?;
+            echo_transaction(&slug, &tx, into);
             ui::success("merge summary written");
         }
     }
@@ -630,7 +711,7 @@ fn pick_drop_summary(cwd: &std::path::Path, into: Option<&str>, cmd: PickCmd) ->
 }
 
 fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
-    let Some((repo, tx, control)) = open_tx_locked(cwd, into)? else {
+    let Some((repo, slug, tx, control)) = open_tx_locked(cwd, into)? else {
         return Ok(ExitCode::Precondition);
     };
 
@@ -723,6 +804,21 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
         Some(v) => v,
         None => return Ok(ExitCode::Precondition),
     };
+    super::echo::emit(
+        "merge",
+        &[
+            super::echo::Selection::new(
+                format!("{slug}@{}", tx.target),
+                target_selection_source(into),
+            )
+            .role("into"),
+            super::echo::Selection::new(
+                format!("{}@{src_head}", base.slug),
+                super::echo::Source::Transaction,
+            )
+            .role("from"),
+        ],
+    );
     if !shared.is_empty() {
         println!(
             "{}",
@@ -1227,6 +1323,47 @@ pub fn turn_lines(repo: &Repo, head: &str, n: u32) -> crate::Result<Vec<usize>> 
 mod tests {
     use super::*;
     use crate::domain::meta::Meta;
+
+    #[test]
+    fn target_echo_tracks_the_merge_target_repository_selection() {
+        assert_eq!(
+            target_selection_source(None),
+            super::super::echo::Source::Environment
+        );
+        assert_eq!(
+            target_selection_source(Some("feature/topic")),
+            super::super::echo::Source::Mixed
+        );
+        assert_eq!(
+            target_selection_source(Some("alice/notes@feature/topic")),
+            super::super::echo::Source::Explicit
+        );
+    }
+
+    #[test]
+    fn transaction_echo_preserves_frozen_sources_without_inventing_a_repository() {
+        let head = "a".repeat(40);
+        let mut tx = Tx {
+            generation: None,
+            target: "target".into(),
+            source: "@#1".into(),
+            source_repo: Some("bob/notes".into()),
+            source_branch: Some("source".into()),
+            base: String::new(),
+            target_head: "b".repeat(40),
+            source_head: head.clone(),
+            picked: vec![],
+            summary: None,
+        };
+        assert_eq!(transaction_source_target(&tx), format!("bob/notes@{head}"));
+
+        tx.source_repo = None;
+        tx.source = "bob/notes@source".into();
+        assert_eq!(transaction_source_target(&tx), format!("bob/notes@{head}"));
+
+        tx.source = "source".into();
+        assert_eq!(transaction_source_target(&tx), format!("commit:{head}"));
+    }
 
     #[test]
     fn merge_agent_tty_gate_only_blocks_the_launching_path() {

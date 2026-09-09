@@ -244,6 +244,25 @@ pub fn run(args: Args) -> CmdResult {
         adapter::get(rt)?.parse(&content.text)?
     };
 
+    let selection = match (&selected_context, &args.agent, &target.branch) {
+        (Some(context), _, Some(branch)) => super::echo::Selection::new(
+            format!("{}@{branch}", context.repo),
+            super::echo::Source::Environment,
+        ),
+        (_, Some(slug), Some(branch)) => {
+            super::echo::Selection::new(format!("{slug}@{branch}"), super::echo::Source::Explicit)
+        }
+        (_, Some(slug), None) => super::echo::Selection::new(
+            format!("{slug} session={}", target.id),
+            super::echo::Source::Explicit,
+        ),
+        _ => super::echo::Selection::new(
+            format!("{} session={}", target.runtime, target.id),
+            super::echo::Source::Explicit,
+        ),
+    };
+    super::echo::emit("show", &[selection]);
+
     // ─── Header ───
     let mut kv: Vec<(&str, String)> = vec![
         ("session", ui::bold(&target.id)),
@@ -476,7 +495,7 @@ fn current_context_repo(cwd: &std::path::Path) -> crate::Result<Option<Repo>> {
 ///
 /// An unqualified reference uses the repository supplied through AGIT_SESSION; directory state
 /// cannot choose which repository owns a branch name.
-fn open_ref_repo(spec: &refs::RefSpec) -> crate::Result<Repo> {
+fn open_ref_repo(spec: &refs::RefSpec) -> crate::Result<(Repo, String)> {
     let (o, n) = match &spec.repo {
         refs::RepoSel::Slug(o, n) => (o.clone(), n.clone()),
         _ => {
@@ -485,7 +504,9 @@ fn open_ref_repo(spec: &refs::RefSpec) -> crate::Result<Repo> {
         }
     };
     let dir = crate::infra::config::repo_dir(&o, &n)?;
-    Repo::open(&dir).ok_or_else(|| anyhow::anyhow!("{o}/{n} doesn’t exist locally."))
+    Repo::open(&dir)
+        .map(|repo| (repo, format!("{o}/{n}")))
+        .ok_or_else(|| anyhow::anyhow!("{o}/{n} doesn’t exist locally."))
 }
 
 /// Whether a bare name is a reference the context repo can resolve (branch / tag / sha prefix).
@@ -500,7 +521,7 @@ fn names_local_ref(t: &str) -> crate::Result<bool> {
         return Ok(false);
     };
     let spec = super::context::substitute_at(spec)?;
-    let Ok(repo) = open_ref_repo(&spec) else {
+    let Ok((repo, _)) = open_ref_repo(&spec) else {
         return Ok(false);
     };
     match refs::resolve(&repo, &spec) {
@@ -515,7 +536,9 @@ fn names_local_ref(t: &str) -> crate::Result<bool> {
 /// `Some(exit code)` = handled (an already printed error included), `None` = fall back to the
 /// legacy path.
 fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
-    let spec = match super::context::substitute_at(refs::parse(t).ok()?) {
+    let spec = refs::parse(t).ok()?;
+    let source = super::echo::Source::for_spec(&spec);
+    let spec = match super::context::substitute_at(spec) {
         Ok(spec) => spec,
         Err(e) => {
             ui::error(&format!("{e:#}"));
@@ -532,7 +555,7 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
         );
         return Some(ExitCode::Usage);
     }
-    let repo = match open_ref_repo(&spec) {
+    let (repo, slug) = match open_ref_repo(&spec) {
         Ok(repo) => repo,
         Err(e) => {
             ui::error(&format!("{e:#}"));
@@ -566,6 +589,17 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
             if use_tui {
                 return Some(browse_ref_text(t, text, "turn LOG"));
             }
+            let base = match &spec.base {
+                refs::Base::Name(name) | refs::Base::SessionBranch(name) => name.as_str(),
+                _ => "HEAD",
+            };
+            super::echo::emit(
+                "show",
+                &[super::echo::Selection::new(
+                    format!("{slug}@{base}#{turn}"),
+                    source,
+                )],
+            );
             println!("{}", ui::dim(&format!("  turn {turn}")));
             return Some(render_envelopes(&text, args.max_chars));
         }
@@ -638,13 +672,15 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
             ui::error("this is a file line; use line output to read its tree and history.");
             return Some(ExitCode::Usage);
         }
-        return Some(match show_file_line(&repo, &resolved.sha, t) {
-            Ok(()) => ExitCode::Ok,
-            Err(error) => {
-                ui::error(&format!("cannot read this file line: {error:#}"));
-                ExitCode::Precondition
-            }
-        });
+        return Some(
+            match show_file_line(&repo, &resolved.sha, t, &slug, source) {
+                Ok(()) => ExitCode::Ok,
+                Err(error) => {
+                    ui::error(&format!("cannot read this file line: {error:#}"));
+                    ExitCode::Precondition
+                }
+            },
+        );
     }
 
     // The selected sequence is a visibility boundary. Unreadable VIEW content must not
@@ -665,6 +701,18 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
     if use_tui {
         return Some(browse_ref_text(t, env, repository_source(args.log_only)));
     }
+    let selected_ref = if spec.tail == refs::Tail::None {
+        resolved.branch.as_deref().unwrap_or(&resolved.sha)
+    } else {
+        &resolved.sha
+    };
+    super::echo::emit(
+        "show",
+        &[super::echo::Selection::new(
+            format!("{slug}@{selected_ref}"),
+            source,
+        )],
+    );
     if args.log_only {
         println!("{}", repository_source(true));
     }
@@ -696,7 +744,13 @@ fn browse_ref_text(target: &str, text: String, source: &str) -> ExitCode {
 }
 
 /// A file line has no conversation VIEW; its selected tree and history describe the point.
-fn show_file_line(repo: &Repo, sha: &str, target: &str) -> crate::Result<()> {
+fn show_file_line(
+    repo: &Repo,
+    sha: &str,
+    target: &str,
+    slug: &str,
+    source: super::echo::Source,
+) -> crate::Result<()> {
     let tree = repo.git(&["ls-tree", "--name-only", "--full-tree", sha])?;
     let history = repo.git(&[
         "log",
@@ -705,6 +759,10 @@ fn show_file_line(repo: &Repo, sha: &str, target: &str) -> crate::Result<()> {
         "--format=%h %s",
         sha,
     ])?;
+    super::echo::emit(
+        "show",
+        &[super::echo::Selection::new(format!("{slug}@{sha}"), source)],
+    );
     println!("file line {target} ({})", &sha[..9.min(sha.len())]);
     ui::section("tree");
     print!("{tree}");

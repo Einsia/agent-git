@@ -82,6 +82,10 @@ pub fn run(args: Args) -> CmdResult {
         }
         None => None,
     };
+    let source = parsed_target
+        .as_ref()
+        .map(|target| super::echo::Source::for_spec(&super::target::to_spec(target.clone())))
+        .unwrap_or(super::echo::Source::Environment);
     // `owner/repo` keeps the historical branch-list shorthand.  Once `@ref`
     // is present it is a normal explicit target and is rendered turn by turn.
     if let Some(parsed) = &parsed_target
@@ -162,6 +166,7 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     if args.branches {
+        super::echo::emit("log", &[super::echo::Selection::new(&slug, source)]);
         return branch_view_of(&repo, args.limit);
     }
     if args.graph {
@@ -173,20 +178,34 @@ pub fn run(args: Args) -> CmdResult {
             "--decorate",
             "--format=%h %d %s",
         ])?;
+        super::echo::emit("log", &[super::echo::Selection::new(&slug, source)]);
         print!("{out}");
         return Ok(ExitCode::Ok);
     }
 
     // Per-turn: resolve the starting ref.
-    let head = match &args.target {
+    let (head, selected_ref) = match &args.target {
         Some(t) => match resolve_head(&repo, t) {
-            Some(h) => h,
+            Some(resolved) => {
+                let selected = if parsed_target
+                    .as_ref()
+                    .is_some_and(|target| target.tail == crate::domain::refs::Tail::None)
+                {
+                    resolved
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| resolved.sha.clone())
+                } else {
+                    resolved.sha.clone()
+                };
+                (resolved.sha, selected)
+            }
             None => return Ok(ExitCode::Ref),
         },
         None => {
             let branch = branch.expect("targetless log has a context branch");
             match repo.git_opt(&["rev-parse", &format!("refs/heads/{branch}")]) {
-                Some(h) => h.trim().to_string(),
+                Some(h) => (h.trim().to_string(), branch),
                 None => {
                     ui::error(&format!(
                         "selected session branch `{slug}@{branch}` does not exist locally."
@@ -211,6 +230,13 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Precondition);
         }
     };
+    super::echo::emit(
+        "log",
+        &[super::echo::Selection::new(
+            format!("{slug}@{selected_ref}"),
+            source,
+        )],
+    );
     if rows.is_empty() {
         println!("no turns match.");
         return Ok(ExitCode::Ok);
@@ -439,7 +465,7 @@ fn tag_map(repo: &Repo) -> std::collections::HashMap<String, Vec<String>> {
     map
 }
 
-fn resolve_head(repo: &Repo, t: &str) -> Option<String> {
+fn resolve_head(repo: &Repo, t: &str) -> Option<crate::domain::refs::Resolved> {
     let spec = crate::commands::target::parse_spec_for_repo(repo, t).ok()?;
     let spec = match super::context::substitute_at(spec) {
         Ok(spec) => spec,
@@ -449,7 +475,7 @@ fn resolve_head(repo: &Repo, t: &str) -> Option<String> {
         }
     };
     match crate::domain::refs::resolve(repo, &spec) {
-        Ok(r) => Some(r.sha),
+        Ok(r) => Some(r),
         Err(e) => {
             ui::error(&format!("{e:#}"));
             None
@@ -503,6 +529,13 @@ fn branch_view(owner: &str, name: &str, _limit: usize) -> CmdResult {
         ui::hint(&format!("fetch it first: `agit clone {owner}/{name}`"));
         return Ok(ExitCode::Precondition);
     };
+    super::echo::emit(
+        "log",
+        &[super::echo::Selection::new(
+            format!("{owner}/{name}"),
+            super::echo::Source::Explicit,
+        )],
+    );
     branch_view_of(&repo, _limit)
 }
 

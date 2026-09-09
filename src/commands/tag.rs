@@ -41,6 +41,11 @@ pub fn run(args: Args) -> CmdResult {
         None => None,
     };
     let explicit = parsed_ref.as_ref().and_then(|t| t.repo.clone());
+    let repo_source = if explicit.is_some() {
+        super::echo::Source::Explicit
+    } else {
+        super::echo::Source::Environment
+    };
     let (slug, ctx_branch) = if let Some(slug) = explicit {
         (slug, None)
     } else {
@@ -61,10 +66,21 @@ pub fn run(args: Args) -> CmdResult {
     };
 
     match args.name {
-        None => list(&repo),
-        Some(tag) if args.delete => delete(&repo, &tag, args.force),
+        None => list(&repo, &slug, repo_source),
+        Some(tag) if args.delete => delete(
+            &repo,
+            &slug,
+            &tag,
+            args.force,
+            if repo_source == super::echo::Source::Environment {
+                super::echo::Source::Mixed
+            } else {
+                repo_source
+            },
+        ),
         Some(tag) => create(
             &repo,
+            &slug,
             &tag,
             args.ref_.as_deref(),
             args.message.as_deref(),
@@ -74,12 +90,13 @@ pub fn run(args: Args) -> CmdResult {
     }
 }
 
-fn list(repo: &Repo) -> CmdResult {
+fn list(repo: &Repo, slug: &str, source: super::echo::Source) -> CmdResult {
     let out = repo.git(&[
         "tag",
         "--list",
         "--format=%(refname:short)  %(objectname:short)  %(contents:subject)",
     ])?;
+    super::echo::emit("tag", &[super::echo::Selection::new(slug, source)]);
     if out.trim().is_empty() {
         println!("no tags yet. Mint one: `agit tag v1`.");
     } else {
@@ -99,6 +116,7 @@ fn on_remote(repo: &Repo, tag: &str) -> Option<bool> {
 
 fn create(
     repo: &Repo,
+    slug: &str,
     tag: &str,
     ref_: Option<&str>,
     message: Option<&str>,
@@ -141,10 +159,22 @@ fn create(
     // the head of the current branch.
     let spec = ref_.unwrap_or(ctx_branch);
     let spec = refs::parse(spec)?;
+    let source = if ref_.is_some() {
+        super::echo::Source::for_spec(&spec)
+    } else {
+        super::echo::Source::Environment
+    };
     let target = refs::resolve(repo, &spec).map_err(|e| {
         ui::error(&format!("{e:#}"));
         e
     })?;
+    super::echo::emit(
+        "tag",
+        &[super::echo::Selection::new(
+            format!("{slug}@{}", target.branch.as_deref().unwrap_or(&target.sha)),
+            source,
+        )],
+    );
 
     let mut cmd = vec!["tag"];
     if force {
@@ -165,11 +195,21 @@ fn create(
     Ok(ExitCode::Ok)
 }
 
-fn delete(repo: &Repo, tag: &str, force: bool) -> CmdResult {
+fn delete(
+    repo: &Repo,
+    slug: &str,
+    tag: &str,
+    force: bool,
+    source: super::echo::Source,
+) -> CmdResult {
     if !repo.has_tag(tag) {
         ui::error(&format!("no tag `{tag}`."));
         return Ok(ExitCode::Ref);
     }
+    super::echo::emit(
+        "tag",
+        &[super::echo::Selection::new(format!("{slug}@{tag}"), source)],
+    );
     match on_remote(repo, tag) {
         Some(true) => {
             ui::error(&format!(

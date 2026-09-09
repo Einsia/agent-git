@@ -93,7 +93,16 @@ fn fetch_slug(slug: &str) -> CmdResult {
     // Not on this machine yet: pull it down as a peer right now (objects and refs only).
     let fresh = existing.is_none();
     let repo = match existing {
-        Some(r) => r,
+        Some(r) => {
+            super::echo::emit(
+                "fetch",
+                &[super::echo::Selection::new(
+                    format!("{owner}/{name}"),
+                    super::echo::Source::Explicit,
+                )],
+            );
+            r
+        }
         None => match adopt_peer(&owner, &name, &dir) {
             Ok(r) => r,
             Err(e) => {
@@ -152,6 +161,13 @@ fn adopt_peer(owner: &str, name: &str, dir: &Path) -> crate::Result<Repo> {
     // the read-permission check: without permission it fails here, while nothing is on disk yet.
     let client = crate::hub::Client::from_env();
     let remote = client.get_agent(owner, name)?;
+    super::echo::emit(
+        "fetch",
+        &[super::echo::Selection::new(
+            format!("{owner}/{name}"),
+            super::echo::Source::Explicit,
+        )],
+    );
     ui::info(format_args!(
         "fetching {} from {}…",
         ui::bold(&format!("{owner}/{name}")),
@@ -179,10 +195,12 @@ fn fetch_context() -> CmdResult {
             return Ok(ExitCode::Ref);
         }
     };
-    ui::info(format_args!(
-        "{}",
-        ui::dim(&format!("  target: {} ({})", ctx.repo, ctx.via))
-    ));
+    if super::echo::legacy_output("fetch") {
+        ui::info(format_args!(
+            "{}",
+            ui::dim(&format!("  target: {} ({})", ctx.repo, ctx.via))
+        ));
+    }
     let (owner, name) = ctx.owner_name()?;
     let dir = crate::infra::config::repo_dir(&owner, &name)?;
     let Some(repo) = Repo::open(&dir) else {
@@ -190,6 +208,13 @@ fn fetch_context() -> CmdResult {
         ui::hint(&format!("fetch it first: `agit clone {}`", ctx.repo));
         return Ok(ExitCode::Precondition);
     };
+    super::echo::emit(
+        "fetch",
+        &[super::echo::Selection::new(
+            ctx.repo.clone(),
+            super::echo::Source::Environment,
+        )],
+    );
     // A read-only checkout (origin under someone else's name): anonymous / read-only fetching of
     // a read-only repo must still work — the server's upload-pack goes through authorize_read,
     // and a public repo needs no sign-in.

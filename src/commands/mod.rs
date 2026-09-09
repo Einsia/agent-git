@@ -36,6 +36,7 @@ pub mod run;
 // Adoption and status
 pub mod branch;
 pub mod context;
+pub mod echo;
 pub mod fix;
 pub mod import;
 pub mod json;

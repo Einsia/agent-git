@@ -245,6 +245,23 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(r.code);
         }
     };
+    let selection_source = match (
+        args.agent.is_some(),
+        !explicit_branches.is_empty() || args.all,
+    ) {
+        (true, false) if ctx_branch.is_some() => super::echo::Source::Mixed,
+        (true, _) => super::echo::Source::Explicit,
+        (false, true) => super::echo::Source::Mixed,
+        (false, false) => super::echo::Source::Environment,
+    };
+    let selections: Vec<_> = branches
+        .iter()
+        .map(|branch| {
+            super::echo::Selection::new(format!("{}@{branch}", checkout.slug()), selection_source)
+                .role("source")
+        })
+        .collect();
+    super::echo::emit("push", &selections);
     // A branch that was born but has not settled a single turn is not published. See
     // [`has_settled_turns`].
     //

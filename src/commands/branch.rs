@@ -80,6 +80,13 @@ fn ctx_repo(explicit: Option<&str>) -> Option<(Repo, String)> {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    let source = if args.repo.is_some() {
+        super::echo::Source::Explicit
+    } else if args.cmd.is_some() {
+        super::echo::Source::Mixed
+    } else {
+        super::echo::Source::Environment
+    };
     match args.cmd {
         Some(Cmd::Rename { old, new }) => {
             let Some((repo, slug)) = ctx_repo(args.repo.as_deref()) else {
@@ -93,6 +100,10 @@ pub fn run(args: Args) -> CmdResult {
                 ui::error(&format!("{e:#}"));
                 return Ok(ExitCode::Usage);
             }
+            super::echo::emit(
+                "branch",
+                &[super::echo::Selection::new(format!("{slug}@{old}"), source)],
+            );
             repo.git(&["branch", "-m", &old, &new])?;
             super::worktree::rename(&repo, &old, &new)?;
             ui::success(&format!("{old} → {new}"));
@@ -109,6 +120,13 @@ pub fn run(args: Args) -> CmdResult {
                 ui::error(&format!("{slug} has no branch `{name}`."));
                 return Ok(ExitCode::Ref);
             }
+            super::echo::emit(
+                "branch",
+                &[super::echo::Selection::new(
+                    format!("{slug}@{name}"),
+                    source,
+                )],
+            );
             // Only the local ref is deleted. An unpushed branch is really gone once deleted, so
             // that takes --force; a pushed one gets a line of reassurance (history on the hub is
             // unaffected).
@@ -153,6 +171,13 @@ pub fn run(args: Args) -> CmdResult {
                 ui::error(&format!("{slug} has no branch `{name}`."));
                 return Ok(ExitCode::Ref);
             }
+            super::echo::emit(
+                "branch",
+                &[super::echo::Selection::new(
+                    format!("{slug}@{name}"),
+                    source,
+                )],
+            );
             if is_sealed(&repo, &name) {
                 ui::info(format_args!("`{name}` is already sealed."));
                 return Ok(ExitCode::Ok);
@@ -193,6 +218,10 @@ pub fn run(args: Args) -> CmdResult {
             let Some((repo, slug)) = ctx_repo(args.repo.as_deref()) else {
                 return Ok(ExitCode::Precondition);
             };
+            super::echo::emit(
+                "branch",
+                &[super::echo::Selection::new(slug.clone(), source)],
+            );
             list(&repo, &slug, args.verbose, args.all)
         }
     }
