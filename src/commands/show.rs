@@ -283,13 +283,7 @@ pub fn run(args: Args) -> CmdResult {
     // meta — that one has not been fixed by a commit.
     match (&content.header, &link_info) {
         (Some((s, version)), _) => {
-            kv.push(("code repo", ui::tilde(std::path::Path::new(&s.cwd))));
-            if let Some(c) = &s.code {
-                kv.push(("code", c.clone()));
-            }
-            if let Some(version) = version {
-                kv.push(("version", version.clone()));
-            }
+            append_saved_metadata(&mut kv, s, version.as_deref());
         }
         (None, Some(lk)) => {
             if let Some(c) = &lk.cwd {
@@ -310,30 +304,15 @@ pub fn run(args: Args) -> CmdResult {
             (_, None) => ui::tilde(&target.path),
         },
     ));
-    print!("{}", ui::table::key_values(&kv));
-
-    // Lossy notice: how many events the IR dropped.
-    let c = parsed.counts();
-    if c.dropped > 0 {
-        println!(
-            "{}",
-            ui::dim(&format!(
-                "  ({} vendor-proprietary events aren’t rendered here — the raw transcript still has them whole)",
-                c.dropped
-            ))
-        );
-    }
-
-    ui::section("conversation");
-    print!(
-        "{}",
-        ui::transcript::render_transcript(&parsed, args.max_chars)
-    );
-
-    // Web link: a published session can be read in a browser.
-    if let Some(url) = repo.as_ref().and_then(|r| web_url(r, &target.id)) {
-        println!("\n{}", ui::dim(&format!("web: {url}")));
-    }
+    let web = repo.as_ref().and_then(|repo| {
+        let (snapshot, version) = content.header.as_ref()?;
+        web_url(
+            repo,
+            &snapshot.session,
+            meta::sha_from_id(version.as_deref()?)?,
+        )
+    });
+    render_session(&parsed, &kv, args.max_chars, web.as_deref());
     Ok(ExitCode::Ok)
 }
 
@@ -431,17 +410,78 @@ fn read_session(
     })
 }
 
-/// The web link of a published session.
-fn web_url(repo: &Repo, session_id: &str) -> Option<String> {
+/// A web link follows the repository's pinned Hub and a locally known published point.
+fn web_url(repo: &Repo, session_id: &str, sha: &str) -> Option<String> {
+    if !meta::is_bare_id(session_id) {
+        return None;
+    }
+    let identity = crate::hub::identity::read(repo).ok()??;
+    crate::infra::hub_authority::HubAuthority::parse(&identity.hub).ok()?;
     let remote = repo.remote_url()?;
-    let trimmed = remote.trim_end_matches(".git");
-    let mut parts = trimmed.rsplit('/');
-    let name = parts.next()?;
-    let owner = parts.next()?;
+    crate::infra::hub_authority::HubAuthority::parse(&remote).ok()?;
+    let remote = crate::hub::identity::normalize_hub(&remote).ok()?;
+    let (owner, name) = super::remote_slug(&remote)?;
+    crate::domain::repo::valid_name(&owner).ok()?;
+    crate::domain::repo::valid_name(&name).ok()?;
+    let expected = format!("{}/{owner}/{name}", identity.hub);
+    if remote != expected && remote != format!("{expected}.git") {
+        return None;
+    }
+    let (status, published, _) = repo
+        .git_status_local(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "--contains",
+            sha,
+            "refs/remotes/origin/",
+        ])
+        .ok()?;
+    if status != Some(0) || published.is_empty() {
+        return None;
+    }
     Some(format!(
-        "{}/{owner}/{name}/sessions/{session_id}",
-        crate::infra::config::hub_url()
+        "{}/@{owner}/{name}/s/{session_id}?ref={sha}",
+        identity.hub
     ))
+}
+
+fn append_saved_metadata(
+    rows: &mut Vec<(&'static str, String)>,
+    snapshot: &meta::Meta,
+    version: Option<&str>,
+) {
+    rows.push(("code repo", ui::tilde(std::path::Path::new(&snapshot.cwd))));
+    if let Some(code) = &snapshot.code {
+        rows.push(("code", code.clone()));
+    }
+    if let Some(version) = version {
+        rows.push(("version", version.to_owned()));
+    }
+}
+
+/// Metadata and loss diagnostics describe the same parsed selection that is rendered below them.
+fn render_session(
+    parsed: &adapter::Session,
+    rows: &[(&str, String)],
+    max_chars: usize,
+    web: Option<&str>,
+) {
+    print!("{}", ui::table::key_values(rows));
+    let counts = parsed.counts();
+    if counts.dropped > 0 {
+        println!(
+            "{}",
+            ui::dim(&format!(
+                "  ({} vendor-proprietary events aren’t rendered here — the raw transcript still has them whole)",
+                counts.dropped
+            ))
+        );
+    }
+    ui::section("conversation");
+    print!("{}", ui::transcript::render_transcript(parsed, max_chars));
+    if let Some(url) = web {
+        println!("\n{}", ui::dim(&format!("web: {url}")));
+    }
 }
 
 /// Sessions adopted in the local store, ordered by most recent activity.
@@ -713,10 +753,47 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
             source,
         )],
     );
-    if args.log_only {
-        println!("{}", repository_source(true));
+    Some(match render_saved_point(&repo, &resolved.sha, &env, args) {
+        Ok(()) => ExitCode::Ok,
+        Err(error) => {
+            ui::error(&format!("cannot render saved transcript: {error:#}"));
+            ExitCode::Precondition
+        }
+    })
+}
+
+fn render_saved_point(repo: &Repo, sha: &str, envelopes: &str, args: &Args) -> crate::Result<()> {
+    let parsed = transcript::display::parse(envelopes)?;
+    let snapshot = meta::read_at_ref_result(repo, sha)?
+        .ok_or_else(|| anyhow::anyhow!("this point has no session metadata"))?;
+    let (status, seconds, _) = repo.git_status_local(&[
+        "show",
+        "--no-patch",
+        "--no-show-signature",
+        "--format=%ct",
+        sha,
+    ])?;
+    anyhow::ensure!(status == Some(0), "cannot read the selected commit time");
+    let seconds = seconds.parse::<i64>()?;
+    let duration = std::time::Duration::from_secs(seconds.unsigned_abs());
+    let recorded = if seconds >= 0 {
+        std::time::UNIX_EPOCH.checked_add(duration)
+    } else {
+        std::time::UNIX_EPOCH.checked_sub(duration)
     }
-    Some(render_envelopes(&env, args.max_chars))
+    .ok_or_else(|| anyhow::anyhow!("the selected commit time is outside the supported range"))?;
+    let version = meta::id_from_sha(sha);
+    let mut rows = vec![
+        ("session", ui::bold(&snapshot.session)),
+        ("runtime", snapshot.runtime.clone()),
+        ("recorded", ui::ago(recorded)),
+        ("source", repository_source(args.log_only).into()),
+    ];
+    append_saved_metadata(&mut rows, &snapshot, Some(&version));
+    rows.push(("file", format!("{sha}:{}", sequence_file(args.log_only))));
+    let web = web_url(repo, &snapshot.session, sha);
+    render_session(&parsed, &rows, args.max_chars, web.as_deref());
+    Ok(())
 }
 
 /// Raw output retains every selected native value in order, without rendering or wrapper fields.

@@ -29,6 +29,12 @@ the display to LOG. The LOG browser opens the selected frozen session point.
 Saved records are parsed by their own runtime and source session, preserving interleaved
 conversation order. An unsupported saved runtime is reported instead of guessed.
 
+Line output for a saved session point includes its session identity, runtime, recording time,
+source, code context and version, followed by any rendering-loss notice. The metadata and
+conversation come from the same frozen commit. A web link uses that commit and the repository's
+pinned Hub when cached origin history shows it was published; displaying the link does not
+contact the Hub or establish its current availability.
+
 `--raw` emits the selected evidence as native JSONL: each stored envelope contributes its
 `content` value in the same order, without envelope fields, headings or message truncation.
 The default selects the frozen VIEW; `--log-only --raw` selects the complete LOG. Repository
