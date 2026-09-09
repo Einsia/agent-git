@@ -259,6 +259,9 @@ pub struct CallerClaim {
     /// Account id, for the audit trail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// Account handle resolved by the Hub, independent of request params.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     /// `viewer` | `operator` | `owner` — the caller's role **in the workspace
     /// named by [`CallerClaim::workspace_id`]**, as the hub resolved it.
     pub role: String,
@@ -593,6 +596,7 @@ pub mod method {
     pub const ITEM_DELTA: &str = "item.delta";
     pub const ITEM_COMPLETED: &str = "item.completed";
     pub const TURN_STARTED: &str = "turn.started";
+    pub const TURN_STEERED: &str = "turn.steered";
     pub const TURN_COMPLETED: &str = "turn.completed";
     pub const SESSION_STATUS: &str = "session.status";
     /// Generic alert only: never carries the local rule id, name or matched bytes.

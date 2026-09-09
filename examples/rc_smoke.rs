@@ -8,9 +8,9 @@
 //! Usage: `cargo run --example rc_smoke -- [runtime] [prompt]`
 
 use agit::protocol::{Frame, method};
-use agit::protocol::{SessionInfo, SessionStatus};
+use agit::protocol::{PermissionMode, SessionInfo, SessionStatus};
 use agit::rc::harness::LaunchSpec;
-use agit::rc::supervisor::{Command, Session};
+use agit::rc::supervisor::{Command, MessageAttribution, Session, SessionNote};
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -20,6 +20,9 @@ async fn main() -> anyhow::Result<()> {
     let prompt = args
         .next()
         .unwrap_or_else(|| "Run `echo agit-rc-works` with Bash, then reply with just: ok".into());
+
+    let deny_tools = std::env::var_os("AGIT_SMOKE_DENY_TOOLS").is_some();
+    let permission_mode = deny_tools.then_some(PermissionMode::Plan);
 
     let dir = std::env::temp_dir().join(format!("agit-rc-smoke-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
@@ -39,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
         last_seq: 0,
         gist: None,
         dangerous: false,
-        permission_mode: None,
+        permission_mode,
         created_at: now.clone(),
         updated_at: now,
     };
@@ -49,11 +52,34 @@ async fn main() -> anyhow::Result<()> {
         agit_session: None,
         model: std::env::var("AGIT_SMOKE_MODEL").ok(),
         dangerous: false,
-        permission_mode: None,
+        permission_mode,
     };
 
     let (ftx, mut frx) = mpsc::channel::<Frame>(4096);
-    let (notes_tx, _notes_rx) = tokio::sync::mpsc::channel(16);
+    let (notes_tx, mut notes_rx) = tokio::sync::mpsc::channel(16);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let notes_task = tokio::spawn(async move {
+        let mut ready = Some(ready_tx);
+        while let Some(note) = notes_rx.recv().await {
+            match note {
+                // A fresh, unversioned smoke launch has no inherited guard ledger to replace.
+                SessionNote::RestartGuardReady { ack, .. } => {
+                    let _ = ack.send(Ok(()));
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(());
+                    }
+                }
+                SessionNote::ObserveTurnGuard { ack, .. }
+                | SessionNote::ConfirmTurnRestartGuard { ack, .. }
+                | SessionNote::FailClosedTurnGuard { ack, .. } => {
+                    let _ = ack.send(Err(
+                        "the smoke runner cannot persist guarded mode transitions".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    });
     // Confinement is live in the real daemon (an owner unbinding a directory takes effect
     // immediately). The smoke script has one workspace, so a single send is enough; `_conf_tx`
     // must stay alive — dropping it makes the session's `Receiver` see the channel close.
@@ -83,15 +109,25 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     let (ctx, crx) = mpsc::channel::<Command>(16);
-    tokio::spawn(session.run(crx));
+    let mut supervisor = tokio::spawn(session.run(crx));
 
-    // Give the harness a moment to hand us its session id + transcript path.
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    if runtime == "codex" {
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(30), ready_rx).await;
+        if !matches!(ready, Ok(Ok(()))) {
+            let stopped = stop_supervisor(&ctx, &mut supervisor).await;
+            notes_task.abort();
+            stopped?;
+            anyhow::bail!("Codex did not reach its native Ready boundary");
+        }
+    }
 
     let (rtx, mut rrx) = agit::rc::ticket::ticket();
     ctx.send(Command::Turn {
         message: prompt,
-        by: Some("smoke".into()),
+        attribution: MessageAttribution {
+            by: Some("smoke".into()),
+            ..Default::default()
+        },
         guard_attempt: None,
         reply: rtx,
     })
@@ -101,11 +137,13 @@ async fn main() -> anyhow::Result<()> {
         rrx.wait(std::time::Duration::from_secs(60)).await
     );
 
-    // Auto-approve everything, the way an operator clicking "allow" would.
+    // Tool answers follow the explicit local probe setting.
     let ctx2 = ctx.clone();
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
     let mut completed = 0usize;
+    let mut turn_outcome = None;
+    let mut turn_error = None;
 
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -133,16 +171,23 @@ async fn main() -> anyhow::Result<()> {
                     response: agit::protocol::ApprovalResponse {
                         approval_id: p.approval_id,
                         session_id: p.session_id.clone(),
-                        decision: agit::protocol::ApprovalDecision::Allow,
+                        decision: if deny_tools {
+                            agit::protocol::ApprovalDecision::Deny
+                        } else {
+                            agit::protocol::ApprovalDecision::Allow
+                        },
                         scope: agit::protocol::ApprovalScope::Once,
-                        message: None,
+                        message: deny_tools.then(|| "This smoke test permits no tool use.".into()),
                         by: Some("smoke".into()),
                     },
                     reply: a,
                 })
                 .await?;
                 let _ = b.wait(std::time::Duration::from_secs(60)).await;
-                println!("            → allowed");
+                println!(
+                    "            → {}",
+                    if deny_tools { "denied" } else { "allowed" }
+                );
             }
             method::ITEM_COMPLETED => {
                 let p: serde_json::Value = f.params.clone().unwrap_or_default();
@@ -167,10 +212,15 @@ async fn main() -> anyhow::Result<()> {
             }
             method::TURN_COMPLETED => {
                 let p: serde_json::Value = f.params.clone().unwrap_or_default();
+                turn_outcome = p["outcome"].as_str().map(String::from);
+                turn_error = p["error"].as_str().map(String::from);
+                let cost = p["cost_usd"]
+                    .as_f64()
+                    .map(|value| format!("${value:.4}"))
+                    .unwrap_or_else(|| "not reported".into());
                 println!(
-                    "  TURN      completed outcome={} cost=${:.4}",
+                    "  TURN      completed outcome={} cost={cost}",
                     p["outcome"].as_str().unwrap_or("?"),
-                    p["cost_usd"].as_f64().unwrap_or(0.0)
                 );
                 // Let the tailer flush the last lines before we stop.
                 tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -192,16 +242,41 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let _ = ctx.send(Command::Shutdown).await;
+    let stopped = stop_supervisor(&ctx, &mut supervisor).await;
+    notes_task.abort();
+    stopped?;
     println!("\n--- frame counts ---");
     for (k, v) in &counts {
         println!("  {k:24} {v}");
     }
     println!("\nitem.completed total: {completed}");
+    anyhow::ensure!(
+        turn_outcome.as_deref() == Some("ok"),
+        "the native turn did not succeed: {}",
+        turn_error
+            .as_deref()
+            .unwrap_or("no successful completion was observed"),
+    );
     assert!(
         completed > 0,
         "no transcript-sourced items — the tailer never saw the file"
     );
     println!("OK");
+    Ok(())
+}
+
+async fn stop_supervisor(
+    commands: &mpsc::Sender<Command>,
+    supervisor: &mut tokio::task::JoinHandle<()>,
+) -> anyhow::Result<()> {
+    let _ = commands.send(Command::Shutdown).await;
+    match tokio::time::timeout(std::time::Duration::from_secs(10), &mut *supervisor).await {
+        Ok(joined) => joined?,
+        Err(_) => {
+            supervisor.abort();
+            let _ = supervisor.await;
+            anyhow::bail!("the smoke supervisor did not stop within its shutdown deadline");
+        }
+    }
     Ok(())
 }

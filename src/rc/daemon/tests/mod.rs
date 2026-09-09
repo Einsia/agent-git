@@ -167,6 +167,7 @@ use super::*;
 fn claim(role: &str, ws: &str) -> crate::protocol::CallerClaim {
     crate::protocol::CallerClaim {
         account_id: Some("a".into()),
+        username: None,
         role: role.into(),
         workspace_id: ws.into(),
     }

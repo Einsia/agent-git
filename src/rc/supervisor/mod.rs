@@ -503,15 +503,57 @@ struct PendingApproval {
     suggested_permission_mode: Option<PermissionMode>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MessageAttribution {
+    pub by: Option<String>,
+    pub sender: Option<crate::protocol::MessageSender>,
+    pub client_msg_id: Option<String>,
+}
+
+impl MessageAttribution {
+    fn same_sender(&self, other: &Self) -> bool {
+        match (&self.sender, &other.sender) {
+            (Some(left), Some(right)) => left.account_id == right.account_id,
+            (None, None) => self
+                .by
+                .as_ref()
+                .zip(other.by.as_ref())
+                .is_some_and(|(left, right)| !left.is_empty() && left == right),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn from_caller(
+        caller: &crate::protocol::CallerClaim,
+        legacy_by: Option<String>,
+        client_msg_id: Option<String>,
+    ) -> Self {
+        let sender = caller
+            .account_id
+            .as_ref()
+            .zip(caller.username.as_ref())
+            .filter(|(account_id, username)| !account_id.is_empty() && !username.is_empty())
+            .map(|(account_id, username)| crate::protocol::MessageSender {
+                account_id: account_id.clone(),
+                username: username.clone(),
+            });
+        Self {
+            by: caller.username.clone().or(legacy_by),
+            sender,
+            client_msg_id,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct InitialTurn {
     message: String,
-    by: Option<String>,
+    attribution: MessageAttribution,
 }
 
 struct PendingTurnCommand {
     message: String,
-    by: Option<String>,
+    attribution: MessageAttribution,
     /// `None` is the creation-time fire-and-forget prompt. Viewer-originated
     /// turns always retain their ticket until the exact native outcome.
     reply: Option<Ticket<TurnStartOutcome>>,
@@ -528,6 +570,7 @@ enum PendingInitialReply {
 #[derive(Clone)]
 struct ResolvedInitialTurn {
     message: String,
+    attribution: MessageAttribution,
     outcome: TurnStartOutcome,
 }
 
@@ -816,17 +859,17 @@ pub enum Command {
     /// may wait for the Codex Ready handshake in a dedicated single slot.
     InitialTurn {
         message: String,
-        by: Option<String>,
+        attribution: MessageAttribution,
     },
     Turn {
         message: String,
-        by: Option<String>,
+        attribution: MessageAttribution,
         guard_attempt: Option<crate::rc::harness::TurnGuardAttempt>,
         reply: Ticket<TurnStartOutcome>,
     },
     Steer {
         message: String,
-        by: Option<String>,
+        attribution: MessageAttribution,
         reply: Ticket<Delivery>,
     },
     Interrupt {
@@ -1387,7 +1430,7 @@ impl Session {
         {
             self.queued_initial_turn = Some(InitialTurn {
                 message: pending.message.clone(),
-                by: pending.by.clone(),
+                attribution: pending.attribution.clone(),
             });
         }
         if pending.initial
@@ -1409,7 +1452,7 @@ impl Session {
             match self.prepare_turn_started_once(
                 turn_id.clone(),
                 Some(pending.message.clone()),
-                Some((pending.by.clone(), pending.message.clone())),
+                Some((pending.attribution.clone(), pending.message.clone())),
                 true,
             ) {
                 Ok(prepared) => prepared_turn_started = prepared,
@@ -1452,7 +1495,7 @@ impl Session {
         );
         match &outcome {
             TurnStartOutcome::Accepted { .. } => {
-                self.announce_mode(pending.by.clone()).await;
+                self.announce_mode(pending.attribution.by.clone()).await;
                 if let Some(prepared) = prepared_turn_started {
                     self.publish_turn_started(prepared).await;
                 }
@@ -1496,6 +1539,7 @@ impl Session {
         {
             self.resolved_initial_turn = Some(ResolvedInitialTurn {
                 message: pending.message.clone(),
+                attribution: pending.attribution.clone(),
                 outcome: outcome.clone(),
             });
         }
@@ -1539,9 +1583,19 @@ impl Session {
     fn coalesce_pending_initial_reply(
         &mut self,
         message: &str,
+        attribution: &MessageAttribution,
         guard_attempt: Option<&TurnGuardAttempt>,
         reply: Ticket<TurnStartOutcome>,
     ) -> PendingInitialReply {
+        // Another member's submission cannot consume the creator's result,
+        // even when both people type the same text.
+        if self
+            .resolved_initial_turn
+            .as_ref()
+            .is_some_and(|resolved| !resolved.attribution.same_sender(attribution))
+        {
+            return PendingInitialReply::Absent(reply);
+        }
         // A different viewer prompt establishes that this is no longer a
         // retry of creation; taking the old result here prevents it from
         // leaking into a later, intentional same-text turn.
@@ -1571,7 +1625,10 @@ impl Session {
         else {
             return PendingInitialReply::Absent(reply);
         };
-        if pending.message != message || pending.reply.is_some() {
+        if pending.message != message
+            || !pending.attribution.same_sender(attribution)
+            || pending.reply.is_some()
+        {
             return PendingInitialReply::Blocked(reply);
         }
         if guard_attempt.is_some() {
@@ -1591,7 +1648,7 @@ impl Session {
         if let Some(initial) = self.queued_initial_turn.take() {
             self.begin_turn_start(PendingTurnCommand {
                 message: initial.message,
-                by: initial.by,
+                attribution: initial.attribution,
                 reply: None,
                 initial: true,
                 guard_attempt: None,
@@ -1680,7 +1737,7 @@ impl Session {
         &mut self,
         turn_id: String,
         native_prompt: Option<String>,
-        resolved_attribution: Option<(Option<String>, String)>,
+        resolved_attribution: Option<(MessageAttribution, String)>,
         mark_running: bool,
     ) -> Result<Option<PreparedTurnStarted>, String> {
         crate::rc::harness::validate_native_turn_id(&turn_id)
@@ -1688,13 +1745,14 @@ impl Session {
         if !self.remember_announced_turn(turn_id.clone())? {
             return Ok(None);
         }
-        let (by, command_prompt) = if let Some((by, prompt)) = resolved_attribution {
-            (by, Some(prompt))
-        } else if let Some(pending) = self.pending_turn_command.as_ref() {
-            (pending.by.clone(), Some(pending.message.clone()))
-        } else {
-            (None, None)
-        };
+        let (attribution, command_prompt) =
+            if let Some((attribution, prompt)) = resolved_attribution {
+                (attribution, Some(prompt))
+            } else if let Some(pending) = self.pending_turn_command.as_ref() {
+                (pending.attribution.clone(), Some(pending.message.clone()))
+            } else {
+                (MessageAttribution::default(), None)
+            };
         let prompt = native_prompt.or(command_prompt);
         let mut registered_ids = vec![];
         let prompt = prompt.map(|p| {
@@ -1705,12 +1763,14 @@ impl Session {
         Ok(Some(PreparedTurnStarted {
             frame: TurnStarted {
                 turn_id,
-                source: if by.is_some() {
+                source: if attribution.by.is_some() || attribution.sender.is_some() {
                     TurnSource::Remote
                 } else {
                     TurnSource::Local
                 },
-                by,
+                by: attribution.by,
+                sender: attribution.sender,
+                client_msg_id: attribution.client_msg_id,
                 prompt,
             },
             mark_running,
@@ -1735,7 +1795,7 @@ impl Session {
         &mut self,
         turn_id: String,
         native_prompt: Option<String>,
-        resolved_attribution: Option<(Option<String>, String)>,
+        resolved_attribution: Option<(MessageAttribution, String)>,
         mark_running: bool,
     ) -> Result<bool, String> {
         let Some(prepared) = self.prepare_turn_started_once(
@@ -1854,14 +1914,14 @@ impl Session {
                             debug_assert_eq!(self.info.runtime, "claude-code");
                             self.sync_turn_guard(TurnGuardBarrier::Ready).await;
                         }
-                        Some(Command::InitialTurn { message, by }) => {
+                        Some(Command::InitialTurn { message, attribution }) => {
                             if self.driver.runtime_thread_id().is_none() {
                                 // This is the one fire-and-forget path allowed
                                 // to wait for Codex Ready. A viewer TURN_START
                                 // always receives a retryable not-accepted
                                 // result instead of a false success receipt.
                                 if self.queued_initial_turn.is_none() {
-                                    self.queued_initial_turn = Some(InitialTurn { message, by });
+                                    self.queued_initial_turn = Some(InitialTurn { message, attribution });
                                 } else {
                                     tracing_note(&format!(
                                         "[{}] ignored a duplicate creation prompt while Codex was opening",
@@ -1871,7 +1931,7 @@ impl Session {
                             } else {
                                 self.begin_turn_start(PendingTurnCommand {
                                     message,
-                                    by,
+                                    attribution,
                                     reply: None,
                                     initial: true,
                                     guard_attempt: None,
@@ -1884,12 +1944,13 @@ impl Session {
                         }
                         Some(Command::Turn {
                             message,
-                            by,
+                            attribution,
                             guard_attempt,
                             reply,
                         }) => {
                             let reply = match self.coalesce_pending_initial_reply(
                                 &message,
+                                &attribution,
                                 guard_attempt.as_ref(),
                                 reply,
                             ) {
@@ -1905,7 +1966,9 @@ impl Session {
                                 PendingInitialReply::Absent(reply) => reply,
                             };
                             if let Some(initial) = self.queued_initial_turn.take() {
-                                if initial.message != message {
+                                if initial.message != message
+                                    || !initial.attribution.same_sender(&attribution)
+                                {
                                     self.queued_initial_turn = Some(initial);
                                     reply.finish(Ok(TurnStartOutcome::ConcurrentNotAccepted {
                                         message: "the creation prompt is still waiting for Codex; wait for it to start before sending another turn".into(),
@@ -1918,7 +1981,7 @@ impl Session {
                                 // following turn.
                                 self.begin_turn_start(PendingTurnCommand {
                                     message,
-                                    by: initial.by,
+                                    attribution: initial.attribution,
                                     reply: Some(reply),
                                     initial: true,
                                     guard_attempt,
@@ -1927,7 +1990,7 @@ impl Session {
                             } else {
                                 self.begin_turn_start(PendingTurnCommand {
                                     message,
-                                    by,
+                                    attribution,
                                     reply: Some(reply),
                                     initial: false,
                                     guard_attempt,
@@ -1938,7 +2001,7 @@ impl Session {
                                 return;
                             }
                         }
-                        Some(Command::Steer { message, by: _, reply }) => {
+                        Some(Command::Steer { message, attribution, reply }) => {
                             // The steer reaches the local harness unchanged — redaction is
                             // only for the copy that leaves the machine. The hit is still
                             // reported: a registered secret that enters this session through a
@@ -1957,6 +2020,19 @@ impl Session {
                                 self.handle_protocol_invariant(message, None, None).await;
                                 reply.finish(result);
                                 return;
+                            }
+                            if let Ok(delivery) = result.as_ref() {
+                                self.emit(
+                                    method::TURN_STEERED,
+                                    crate::protocol::TurnSteered {
+                                        message: report.text,
+                                        delivery: *delivery,
+                                        by: attribution.by,
+                                        sender: attribution.sender,
+                                        client_msg_id: attribution.client_msg_id,
+                                    },
+                                )
+                                .await;
                             }
                             reply.finish(result);
                         }
@@ -2426,6 +2502,7 @@ impl Session {
             HarnessEvent::TurnCompleted {
                 turn_id,
                 outcome,
+                error,
                 cost_usd,
                 duration_ms,
             } => {
@@ -2477,6 +2554,13 @@ impl Session {
                 // snapshots nobody wants to read.
                 self.settle_and_push(SettlementBoundary::Turn).await;
 
+                let error = match error {
+                    Some(message) => {
+                        let report = self.redactor.scrub(&message);
+                        Some(self.finish_scrub(report, "turn_error").await)
+                    }
+                    None => None,
+                };
                 self.emit(
                     method::TURN_COMPLETED,
                     TurnCompleted {
@@ -2486,7 +2570,7 @@ impl Session {
                             TurnOutcome::Interrupted => PTurnOutcome::Interrupted,
                             TurnOutcome::Error => PTurnOutcome::Error,
                         },
-                        error: None,
+                        error,
                         cost_usd,
                         duration_ms,
                     },

@@ -43,7 +43,9 @@ use crate::rc::harness::{
 };
 use crate::rc::roster::{self, Roster};
 use crate::rc::supervisor::SettlementState;
-use crate::rc::supervisor::{Command, DangerAuthorization, Session, SessionNote};
+use crate::rc::supervisor::{
+    Command, DangerAuthorization, MessageAttribution, Session, SessionNote,
+};
 use crate::rc::terminal::{Terminal, TerminalEvent};
 use crate::rc::{control, identity, journal::Journal, link, mirror::Mirror, policy};
 use std::collections::HashMap;

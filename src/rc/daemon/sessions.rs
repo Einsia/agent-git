@@ -254,7 +254,14 @@ impl Daemon {
                 permission_mode: entry.restart_permission_mode(),
             };
             let session = self
-                .spawn_session(info, spec, danger, frames, p.prompt, p.by)
+                .spawn_session(
+                    info,
+                    spec,
+                    danger,
+                    frames,
+                    p.prompt,
+                    MessageAttribution::from_caller(caller, p.by, None),
+                )
                 .await?;
             return Ok(serde_json::to_value(SessionResumeResult { session }).unwrap());
         }
@@ -430,7 +437,14 @@ impl Daemon {
             permission_mode: Some(inherited_mode),
         };
         let session = self
-            .spawn_session(info, spec, danger, frames, p.prompt, p.by)
+            .spawn_session(
+                info,
+                spec,
+                danger,
+                frames,
+                p.prompt,
+                MessageAttribution::from_caller(caller, p.by, None),
+            )
             .await?;
         Ok(serde_json::to_value(SessionResumeResult { session }).unwrap())
     }
@@ -592,7 +606,7 @@ impl Daemon {
                     danger::TranscriptDanger::fresh_transcript(),
                     frames,
                     p.prompt,
-                    p.by,
+                    MessageAttribution::from_caller(caller, p.by, None),
                 )
                 .await?;
             return Ok(serde_json::to_value(SessionStartResult {
@@ -657,7 +671,7 @@ impl Daemon {
                 danger::TranscriptDanger::fresh_transcript(),
                 frames,
                 p.prompt,
-                p.by,
+                MessageAttribution::from_caller(caller, p.by, None),
             )
             .await
         {
@@ -755,7 +769,7 @@ impl Daemon {
         danger: danger::TranscriptDanger,
         frames: &mpsc::Sender<Frame>,
         prompt: Option<String>,
-        by: Option<String>,
+        attribution: MessageAttribution,
     ) -> Result<SessionInfo, SpawnFailure> {
         // **Resuming a transcript requires having judged it and having judged whoever asks for
         // it.**
@@ -1024,7 +1038,7 @@ impl Daemon {
             let _ = bootstrap_tx
                 .send(Command::InitialTurn {
                     message: prompt,
-                    by,
+                    attribution,
                 })
                 .await;
         }

@@ -4,6 +4,7 @@ use crate::protocol::CallerClaim;
 fn claim(role: &str) -> CallerClaim {
     CallerClaim {
         account_id: Some("acct".into()),
+        username: None,
         role: role.into(),
         workspace_id: "ws1".into(),
     }

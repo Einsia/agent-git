@@ -273,6 +273,7 @@ pub enum HarnessEvent {
     TurnCompleted {
         turn_id: String,
         outcome: TurnOutcome,
+        error: Option<String>,
         cost_usd: Option<f64>,
         duration_ms: Option<u64>,
     },

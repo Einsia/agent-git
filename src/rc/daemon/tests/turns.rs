@@ -1671,3 +1671,53 @@ fn an_applied_approval_mode_must_match_the_trusted_suggestion_exactly() {
             });
     });
 }
+
+#[tokio::test]
+async fn message_attribution_comes_from_the_caller_claim_not_request_params() {
+    for method_name in [method::TURN_START, method::TURN_STEER] {
+        let (tx, _rx) = mpsc::channel(1);
+        let daemon = rpc_test_daemon(
+            [(
+                "session-a".into(),
+                rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default),
+            )]
+            .into_iter()
+            .collect(),
+            Roster::default(),
+        );
+        let mut frame = Frame::request(
+            method_name,
+            serde_json::json!({
+                "session_id": "session-a",
+                "message": "inspect",
+                "by": "forged-owner",
+                "sender": {"account_id": "forged-account", "username": "forged-owner"},
+                "client_msg_id": "message-a",
+            }),
+        );
+        let mut caller = claim("operator", "ws-a");
+        caller.username = Some("alice".into());
+        frame.caller = Some(caller);
+        let prepared = daemon.lock().await.prepare_session_rpc(&frame).unwrap();
+        let attribution = match prepared.operation {
+            SessionRpcOperation::Turn {
+                command: Command::Turn { attribution, .. },
+                ..
+            }
+            | SessionRpcOperation::Steer {
+                command: Command::Steer { attribution, .. },
+                ..
+            } => attribution,
+            _ => panic!("unexpected message command"),
+        };
+        assert_eq!(attribution.by.as_deref(), Some("alice"));
+        assert_eq!(
+            attribution.sender,
+            Some(crate::protocol::MessageSender {
+                account_id: "a".into(),
+                username: "alice".into(),
+            })
+        );
+        assert_eq!(attribution.client_msg_id.as_deref(), Some("message-a"));
+    }
+}

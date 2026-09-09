@@ -115,7 +115,10 @@ async fn claude_restart_guard_waits_for_durable_ack_then_accepts_the_first_turn(
     commands
         .send(Command::Turn {
             message: "first message after recovery".into(),
-            by: Some("owner".into()),
+            attribution: MessageAttribution {
+                by: Some("owner".into()),
+                ..Default::default()
+            },
             guard_attempt: None,
             reply: ticket,
         })
@@ -212,7 +215,10 @@ async fn a_pre_ready_retry_restores_the_initial_slot_and_ready_runs_it_once() {
     );
     session.queued_initial_turn = Some(InitialTurn {
         message: "creation prompt".into(),
-        by: Some("creator".into()),
+        attribution: MessageAttribution {
+            by: Some("creator".into()),
+            ..Default::default()
+        },
     });
     session
         .driver
@@ -229,7 +235,7 @@ async fn a_pre_ready_retry_restores_the_initial_slot_and_ready_runs_it_once() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: initial.message,
-            by: initial.by,
+            attribution: initial.attribution,
             reply: Some(ticket),
             initial: true,
             guard_attempt: None,
@@ -277,7 +283,10 @@ async fn a_pre_ready_retry_restores_the_initial_slot_and_ready_runs_it_once() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "following prompt".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                ..Default::default()
+            },
             reply: Some(ticket),
             initial: false,
             guard_attempt: Some(crate::rc::harness::TurnGuardAttempt {
@@ -331,7 +340,10 @@ async fn a_completed_turn_stays_idle_when_its_acceptance_response_arrives_late()
     session
         .begin_turn_start(PendingTurnCommand {
             message: "quick".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                ..Default::default()
+            },
             reply: Some(ticket),
             initial: false,
             guard_attempt: None,
@@ -376,7 +388,10 @@ async fn a_same_prompt_retry_attaches_to_an_initial_turn_awaiting_native_accepta
     session
         .begin_turn_start(PendingTurnCommand {
             message: "creation prompt".into(),
-            by: Some("creator".into()),
+            attribution: MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
             reply: None,
             initial: true,
             guard_attempt: None,
@@ -387,7 +402,15 @@ async fn a_same_prompt_retry_attaches_to_an_initial_turn_awaiting_native_accepta
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
     assert!(ticket.accept());
     assert!(matches!(
-        session.coalesce_pending_initial_reply("creation prompt", None, ticket),
+        session.coalesce_pending_initial_reply(
+            "creation prompt",
+            &MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
+            None,
+            ticket
+        ),
         PendingInitialReply::Attached
     ));
     let event = session.driver.next_event().await.unwrap();
@@ -418,7 +441,10 @@ async fn a_guarded_retry_never_attaches_to_a_pending_initial_turn() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "creation prompt".into(),
-            by: Some("creator".into()),
+            attribution: MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
             reply: None,
             initial: true,
             guard_attempt: None,
@@ -437,7 +463,15 @@ async fn a_guarded_retry_never_attaches_to_a_pending_initial_turn() {
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
     assert!(ticket.accept());
     assert!(matches!(
-        session.coalesce_pending_initial_reply("creation prompt", Some(&guard), ticket),
+        session.coalesce_pending_initial_reply(
+            "creation prompt",
+            &MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
+            Some(&guard),
+            ticket
+        ),
         PendingInitialReply::Attached
     ));
     assert!(matches!(
@@ -460,7 +494,15 @@ async fn a_guarded_retry_never_attaches_to_a_pending_initial_turn() {
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
     assert!(ticket.accept());
     assert!(matches!(
-        session.coalesce_pending_initial_reply("creation prompt", None, ticket),
+        session.coalesce_pending_initial_reply(
+            "creation prompt",
+            &MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
+            None,
+            ticket
+        ),
         PendingInitialReply::Attached
     ));
     let event = session.driver.next_event().await.unwrap();
@@ -493,7 +535,10 @@ async fn a_guarded_retry_never_replays_a_resolved_initial_turn() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "creation prompt".into(),
-            by: Some("creator".into()),
+            attribution: MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
             reply: None,
             initial: true,
             guard_attempt: None,
@@ -515,7 +560,15 @@ async fn a_guarded_retry_never_replays_a_resolved_initial_turn() {
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
     assert!(ticket.accept());
     assert!(matches!(
-        session.coalesce_pending_initial_reply("creation prompt", Some(&guard), ticket),
+        session.coalesce_pending_initial_reply(
+            "creation prompt",
+            &MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
+            Some(&guard),
+            ticket
+        ),
         PendingInitialReply::Attached
     ));
     assert!(matches!(
@@ -535,7 +588,15 @@ async fn a_guarded_retry_never_replays_a_resolved_initial_turn() {
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
     assert!(ticket.accept());
     assert!(matches!(
-        session.coalesce_pending_initial_reply("creation prompt", None, ticket),
+        session.coalesce_pending_initial_reply(
+            "creation prompt",
+            &MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
+            None,
+            ticket
+        ),
         PendingInitialReply::Attached
     ));
     assert!(matches!(
@@ -566,7 +627,10 @@ async fn an_event_first_initial_result_prevents_a_duplicate_viewer_turn() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "creation prompt".into(),
-            by: Some("creator".into()),
+            attribution: MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
             reply: None,
             initial: true,
             guard_attempt: None,
@@ -580,7 +644,15 @@ async fn an_event_first_initial_result_prevents_a_duplicate_viewer_turn() {
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
     assert!(ticket.accept());
     assert!(matches!(
-        session.coalesce_pending_initial_reply("creation prompt", None, ticket),
+        session.coalesce_pending_initial_reply(
+            "creation prompt",
+            &MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
+            None,
+            ticket
+        ),
         PendingInitialReply::Attached
     ));
     let outcome = receipt
@@ -613,7 +685,10 @@ async fn a_completed_initial_turn_allows_a_future_identical_prompt() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "same text".into(),
-            by: Some("creator".into()),
+            attribution: MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
             reply: None,
             initial: true,
             guard_attempt: None,
@@ -631,14 +706,25 @@ async fn a_completed_initial_turn_allows_a_future_identical_prompt() {
 
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
     assert!(ticket.accept());
-    let ticket = match session.coalesce_pending_initial_reply("same text", None, ticket) {
+    let ticket = match session.coalesce_pending_initial_reply(
+        "same text",
+        &MessageAttribution {
+            by: Some("operator".into()),
+            ..Default::default()
+        },
+        None,
+        ticket,
+    ) {
         PendingInitialReply::Absent(ticket) => ticket,
         _ => panic!("a post-completion prompt is a new turn, not a creation retry"),
     };
     session
         .begin_turn_start(PendingTurnCommand {
             message: "same text".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                ..Default::default()
+            },
             reply: Some(ticket),
             initial: false,
             guard_attempt: None,
@@ -677,7 +763,10 @@ async fn a_terminal_initial_response_never_creates_a_late_tombstone() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "creation".into(),
-            by: Some("creator".into()),
+            attribution: MessageAttribution {
+                by: Some("creator".into()),
+                ..Default::default()
+            },
             reply: None,
             initial: true,
             guard_attempt: None,
@@ -723,7 +812,10 @@ async fn later_turn_evidence_never_overwrites_awaiting_approval_status() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "inspect".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                ..Default::default()
+            },
             reply: Some(ticket),
             initial: false,
             guard_attempt: None,
@@ -783,7 +875,14 @@ async fn an_exact_response_synthesizes_one_remote_head_with_full_attribution() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "inspect the race".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                sender: Some(crate::protocol::MessageSender {
+                    account_id: "account-operator".into(),
+                    username: "operator".into(),
+                }),
+                client_msg_id: Some("submitted-message".into()),
+            },
             reply: Some(ticket),
             initial: false,
             guard_attempt: None,
@@ -803,6 +902,14 @@ async fn an_exact_response_synthesizes_one_remote_head_with_full_attribution() {
     assert_eq!(heads[0].source, TurnSource::Remote);
     assert_eq!(heads[0].by.as_deref(), Some("operator"));
     assert_eq!(heads[0].prompt.as_deref(), Some("inspect the race"));
+    assert_eq!(
+        heads[0].sender,
+        Some(crate::protocol::MessageSender {
+            account_id: "account-operator".into(),
+            username: "operator".into(),
+        })
+    );
+    assert_eq!(heads[0].client_msg_id.as_deref(), Some("submitted-message"));
 
     let event = session.driver.next_event().await.unwrap();
     assert!(matches!(event, HarnessEvent::Delta { .. }));
@@ -862,7 +969,10 @@ async fn completion_only_acceptance_synthesizes_exactly_one_turn_head() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "quick".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                ..Default::default()
+            },
             reply: Some(ticket),
             initial: false,
             guard_attempt: None,
@@ -913,7 +1023,10 @@ async fn delayed_passive_frames_for_completed_a_do_not_terminate_live_b() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "A".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                ..Default::default()
+            },
             reply: Some(first_ticket),
             initial: false,
             guard_attempt: None,
@@ -933,7 +1046,10 @@ async fn delayed_passive_frames_for_completed_a_do_not_terminate_live_b() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "B".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                ..Default::default()
+            },
             reply: Some(second_ticket),
             initial: false,
             guard_attempt: None,
@@ -977,7 +1093,10 @@ async fn accepted_mode_mismatch_becomes_unknown_and_retires_the_harness() {
             .resolve_turn_start(
                 PendingTurnCommand {
                     message: "unsafe result".into(),
-                    by: Some("operator".into()),
+                    attribution: MessageAttribution {
+                        by: Some("operator".into()),
+                        ..Default::default()
+                    },
                     reply: Some(ticket),
                     initial: false,
                     guard_attempt,
@@ -1025,7 +1144,10 @@ fn protocol_invariant_kills_before_waiting_for_durability_and_finishes_ticket_be
             assert!(ticket.accept());
             session.pending_turn_command = Some(PendingTurnCommand {
                 message: "possibly written".into(),
-                by: Some("operator".into()),
+                attribution: MessageAttribution {
+                    by: Some("operator".into()),
+                    ..Default::default()
+                },
                 reply: Some(ticket),
                 initial: false,
                 guard_attempt: Some(crate::rc::harness::TurnGuardAttempt {
@@ -1130,7 +1252,10 @@ async fn a_protocol_invariant_resolves_the_pending_turn_ticket_before_ending() {
     session
         .begin_turn_start(PendingTurnCommand {
             message: "inspect".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                ..Default::default()
+            },
             reply: Some(ticket),
             initial: false,
             guard_attempt: None,
@@ -1348,7 +1473,10 @@ fn unknown_without_a_mode_never_releases_a_still_unproven_harness() {
             session
                 .begin_turn_start(PendingTurnCommand {
                     message: "maybe accepted".into(),
-                    by: Some("operator".into()),
+                    attribution: MessageAttribution {
+                        by: Some("operator".into()),
+                        ..Default::default()
+                    },
                     reply: Some(ticket),
                     initial: false,
                     guard_attempt: None,
@@ -1442,7 +1570,10 @@ fn fatal_prewrite_exhaustion_retires_the_generation_before_releasing_its_ticket(
                 session
                     .begin_turn_start(PendingTurnCommand {
                         message: "never written".into(),
-                        by: Some("operator".into()),
+                        attribution: MessageAttribution {
+                            by: Some("operator".into()),
+                            ..Default::default()
+                        },
                         reply: Some(ticket),
                         initial: false,
                         guard_attempt: Some(TurnGuardAttempt {
@@ -1516,7 +1647,10 @@ async fn exhausted_steer_and_interrupt_each_retire_the_generation() {
             commands
                 .send(Command::Steer {
                     message: "never written".into(),
-                    by: Some("operator".into()),
+                    attribution: MessageAttribution {
+                        by: Some("operator".into()),
+                        ..Default::default()
+                    },
                     reply: ticket,
                 })
                 .await
@@ -1558,7 +1692,10 @@ async fn announced_identity_budget_failure_kills_without_a_turn_head_or_running_
         .resolve_turn_start(
             PendingTurnCommand {
                 message: "cannot announce".into(),
-                by: Some("operator".into()),
+                attribution: MessageAttribution {
+                    by: Some("operator".into()),
+                    ..Default::default()
+                },
                 reply: Some(ticket),
                 initial: false,
                 guard_attempt: None,
@@ -2073,7 +2210,10 @@ async fn an_explicitly_refused_creation_prompt_does_not_stay_in_the_slot_that_bo
     );
     session.queued_initial_turn = Some(InitialTurn {
         message: "creation prompt".into(),
-        by: Some("creator".into()),
+        attribution: MessageAttribution {
+            by: Some("creator".into()),
+            ..Default::default()
+        },
     });
 
     // This is what the `HarnessEvent::Ready` arm does: after Ready the slot is empty, and no
@@ -2122,7 +2262,10 @@ async fn a_creation_prompt_requeued_after_ready_is_flushed_at_the_next_turn_boun
     session
         .begin_turn_start(PendingTurnCommand {
             message: "the turn already running".into(),
-            by: Some("operator".into()),
+            attribution: MessageAttribution {
+                by: Some("operator".into()),
+                ..Default::default()
+            },
             reply: Some(ticket),
             initial: false,
             guard_attempt: None,
@@ -2136,7 +2279,10 @@ async fn a_creation_prompt_requeued_after_ready_is_flushed_at_the_next_turn_boun
     // prompt goes back into the slot.
     session.queued_initial_turn = Some(InitialTurn {
         message: "creation prompt".into(),
-        by: Some("creator".into()),
+        attribution: MessageAttribution {
+            by: Some("creator".into()),
+            ..Default::default()
+        },
     });
     session.flush_initial_turn_if_ready().await;
     assert_eq!(
@@ -2201,4 +2347,295 @@ async fn the_launch_time_binding_announce_never_waits_on_a_full_notes_channel() 
         "Session::launch's binding announce blocked on a full notes channel; in the daemon that is a permanent deadlock, because the only consumer of that channel is the select loop currently awaiting this launch under the global lock",
     );
     session.driver.shutdown().await.expect("stop test process");
+}
+
+#[test]
+fn legacy_caller_metadata_does_not_invent_an_authenticated_sender() {
+    let caller: crate::protocol::CallerClaim = serde_json::from_value(serde_json::json!({
+        "account_id": "account-a", "role": "operator", "workspace_id": "workspace-a",
+    }))
+    .unwrap();
+    let attribution = MessageAttribution::from_caller(&caller, Some("legacy-handle".into()), None);
+    assert_eq!(attribution.by.as_deref(), Some("legacy-handle"));
+    assert!(attribution.sender.is_none());
+    let legacy: TurnStarted = serde_json::from_value(serde_json::json!({
+        "turn_id": "turn-a", "source": "remote", "by": "legacy-handle", "prompt": "inspect",
+    }))
+    .unwrap();
+    assert!(legacy.sender.is_none());
+    assert!(legacy.client_msg_id.is_none());
+}
+
+#[tokio::test]
+async fn steering_publishes_attributed_redacted_history_only_after_native_acceptance() {
+    for accepted in [true, false] {
+        let response = if accepted {
+            serde_json::json!({"id": 1, "result": {}})
+        } else {
+            serde_json::json!({"id": 1, "error": {"message": "turn already ended"}})
+        };
+        let mut driver =
+            crate::rc::harness::codex::CodexDriver::test_responder(Some("thread-a"), &[response]);
+        driver.set_test_current_turn("turn-a");
+        let (mut session, mut out, _notes) = harness_test_session_with_channels(
+            AnyDriver::Codex(Box::new(driver)),
+            "codex",
+            SessionStatus::Running,
+        );
+        session.redactor = redact::Redactor::new(redact::Persona {
+            home: Some("/private/collaborator-home".into()),
+            ..Default::default()
+        });
+        let sender = crate::protocol::MessageSender {
+            account_id: "account-alice".into(),
+            username: "alice".into(),
+        };
+        let message = "inspect /private/collaborator-home/project";
+        let expected_message = session.redactor.scrub(message).text;
+        assert_ne!(expected_message, message);
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            session.run_inner(&mut command_rx).await;
+            session
+        });
+        let (ticket, mut receipt) = crate::rc::ticket::ticket();
+        commands
+            .send(Command::Steer {
+                message: message.into(),
+                attribution: MessageAttribution {
+                    by: Some("alice".into()),
+                    sender: Some(sender.clone()),
+                    client_msg_id: Some("steer-a".into()),
+                },
+                reply: ticket,
+            })
+            .await
+            .unwrap();
+        let result = receipt
+            .wait(std::time::Duration::from_secs(2))
+            .await
+            .expect("native steer resolves")
+            .expect("receipt stays open");
+        assert_eq!(result.is_ok(), accepted);
+        let frames: Vec<_> = std::iter::from_fn(|| out.try_recv().ok())
+            .filter(|frame| frame.method() == method::TURN_STEERED)
+            .collect();
+        assert_eq!(frames.len(), usize::from(accepted));
+        if accepted {
+            let event: crate::protocol::TurnSteered = frames[0].params_as().unwrap();
+            assert_eq!(event.message, expected_message);
+            assert_eq!(event.sender, Some(sender));
+            assert_eq!(event.by.as_deref(), Some("alice"));
+            assert_eq!(event.client_msg_id.as_deref(), Some("steer-a"));
+            assert_eq!(event.delivery, Delivery::Immediate);
+            let mut journal = crate::rc::journal::Journal::new();
+            let recorded = journal.record("session-turn-test", frames[0].clone());
+            assert_eq!(journal.replay("session-turn-test", 0).0, vec![recorded]);
+        }
+        drop(commands);
+        let mut session = worker.await.unwrap();
+        session
+            .driver
+            .shutdown()
+            .await
+            .expect("stop protocol fixture");
+    }
+}
+
+fn authenticated_attribution(account_id: &str, username: &str) -> MessageAttribution {
+    MessageAttribution {
+        by: Some(username.into()),
+        sender: Some(crate::protocol::MessageSender {
+            account_id: account_id.into(),
+            username: username.into(),
+        }),
+        client_msg_id: None,
+    }
+}
+
+#[test]
+fn sender_matching_uses_account_identity_and_keeps_legacy_claims_separate() {
+    let original = authenticated_attribution("account-a", "alice");
+    let renamed = authenticated_attribution("account-a", "renamed-alice");
+    let reused_name = authenticated_attribution("account-b", "alice");
+    let legacy = MessageAttribution {
+        by: Some("alice".into()),
+        ..Default::default()
+    };
+    assert!(original.same_sender(&renamed));
+    assert!(!original.same_sender(&reused_name));
+    assert!(!original.same_sender(&legacy));
+    assert!(legacy.same_sender(&legacy));
+    assert!(!MessageAttribution::default().same_sender(&MessageAttribution::default()));
+}
+
+#[tokio::test]
+async fn another_members_same_text_does_not_attach_to_the_creators_native_result() {
+    for resolved in [false, true] {
+        let mut session = codex_turn_test_session(
+            Some("thread-a"),
+            &[serde_json::json!({"id": 1, "result": {"turn": {"id": "initial-turn"}}})],
+        );
+        let creator = authenticated_attribution("account-a", "alice");
+        let other = authenticated_attribution("account-b", "alice");
+        session
+            .begin_turn_start(PendingTurnCommand {
+                message: "continue".into(),
+                attribution: creator.clone(),
+                reply: None,
+                initial: true,
+                guard_attempt: None,
+            })
+            .await;
+        if resolved {
+            let event = session.driver.next_event().await.unwrap();
+            session.on_harness_event(event).await;
+        }
+        let (ticket, _receipt) = crate::rc::ticket::ticket();
+        assert!(ticket.accept());
+        let other_reply = session.coalesce_pending_initial_reply("continue", &other, None, ticket);
+        if resolved {
+            assert!(matches!(other_reply, PendingInitialReply::Absent(_)));
+            assert!(session.resolved_initial_turn.is_some());
+        } else {
+            assert!(matches!(other_reply, PendingInitialReply::Blocked(_)));
+            assert!(
+                session
+                    .pending_turn_command
+                    .as_ref()
+                    .unwrap()
+                    .reply
+                    .is_none()
+            );
+        }
+        let (ticket, mut receipt) = crate::rc::ticket::ticket();
+        assert!(ticket.accept());
+        let renamed_creator = authenticated_attribution("account-a", "renamed-alice");
+        assert!(matches!(
+            session.coalesce_pending_initial_reply("continue", &renamed_creator, None, ticket,),
+            PendingInitialReply::Attached
+        ));
+        if !resolved {
+            let event = session.driver.next_event().await.unwrap();
+            session.on_harness_event(event).await;
+        }
+        assert!(
+            matches!(receipt.wait(std::time::Duration::from_secs(1)).await
+            .unwrap().unwrap().unwrap(), TurnStartOutcome::Accepted { turn_id, .. }
+            if turn_id == "initial-turn")
+        );
+        session.driver.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn another_members_same_text_does_not_drain_the_queued_creation_prompt() {
+    let mut session = codex_turn_test_session(None, &[]);
+    session.queued_initial_turn = Some(InitialTurn {
+        message: "continue".into(),
+        attribution: authenticated_attribution("account-a", "alice"),
+    });
+    let (commands, mut command_rx) = mpsc::channel(1);
+    let worker = tokio::spawn(async move {
+        session.run_inner(&mut command_rx).await;
+        session
+    });
+    let (ticket, mut receipt) = crate::rc::ticket::ticket();
+    commands
+        .send(Command::Turn {
+            message: "continue".into(),
+            attribution: authenticated_attribution("account-b", "alice"),
+            guard_attempt: None,
+            reply: ticket,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        receipt
+            .wait(std::time::Duration::from_secs(1))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        TurnStartOutcome::ConcurrentNotAccepted { .. }
+    ));
+    drop(commands);
+    let mut session = worker.await.unwrap();
+    assert!(session.pending_turn_command.is_none());
+    let queued = session.queued_initial_turn.as_ref().unwrap();
+    assert_eq!(
+        queued.attribution.sender.as_ref().unwrap().account_id,
+        "account-a"
+    );
+    session.driver.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "secret-vault")]
+#[tokio::test]
+async fn native_failure_reaches_viewers_after_persona_and_secret_redaction() {
+    let failure =
+        "Upgrade the runtime at /private/audit-home/tool; diagnostic confidential-fixture";
+    let driver = AnyDriver::Codex(Box::new(
+        crate::rc::harness::codex::CodexDriver::test_responder(
+            Some("thread-error"),
+            &[
+                serde_json::json!({"id": 1, "result": {"turn": {"id": "turn-error"}}}),
+                serde_json::json!({"method":"turn/completed", "params":{"turn":{
+                    "id":"turn-error", "status":"failed", "error":{"message":failure}
+                }}}),
+            ],
+        ),
+    ));
+    let (mut session, mut out, _notes) =
+        harness_test_session_with_channels(driver, "codex", SessionStatus::Idle);
+    session.redactor = redact::Redactor::with_registered(
+        redact::Persona {
+            home: Some("/private/audit-home".into()),
+            ..Default::default()
+        },
+        crate::domain::secret_filter::MatcherHandle::new(
+            crate::domain::secret_filter::Matcher::for_test(&[(
+                "sec_diagnostic",
+                "confidential-fixture",
+            )]),
+        ),
+    );
+    let (ticket, _receipt) = crate::rc::ticket::ticket();
+    assert!(ticket.accept());
+    session
+        .begin_turn_start(PendingTurnCommand {
+            message: "inspect".into(),
+            attribution: authenticated_attribution("account-a", "alice"),
+            reply: Some(ticket),
+            initial: false,
+            guard_attempt: None,
+        })
+        .await;
+    for _ in 0..2 {
+        let event = session.driver.next_event().await.unwrap();
+        session.on_harness_event(event).await;
+    }
+    let frames: Vec<_> = std::iter::from_fn(|| out.try_recv().ok()).collect();
+    let completed: crate::protocol::TurnCompleted = frames
+        .iter()
+        .find(|frame| frame.method() == method::TURN_COMPLETED)
+        .unwrap()
+        .params_as()
+        .unwrap();
+    let message = completed.error.unwrap();
+    assert_eq!(completed.outcome, PTurnOutcome::Error);
+    assert!(message.contains("Upgrade the runtime"));
+    assert!(!message.contains("/private/audit-home"));
+    assert!(!message.contains("confidential-fixture"));
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.method() == method::SECRET_DETECTED)
+    );
+    assert!(
+        !serde_json::to_string(&frames)
+            .unwrap()
+            .contains("confidential-fixture")
+    );
+    session.driver.shutdown().await.unwrap();
 }

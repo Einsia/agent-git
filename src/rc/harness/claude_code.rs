@@ -898,6 +898,7 @@ impl ClaudeCodeDriver {
                     return Some(HarnessEvent::TurnCompleted {
                         turn_id: turn,
                         outcome: TurnOutcome::Interrupted,
+                        error: None,
                         cost_usd: None,
                         duration_ms: None,
                     });
@@ -958,6 +959,7 @@ impl ClaudeCodeDriver {
                     } else {
                         TurnOutcome::Ok
                     },
+                    error: None,
                     cost_usd: v.get("total_cost_usd").and_then(|x| x.as_f64()),
                     duration_ms: v.get("duration_api_ms").and_then(|x| x.as_u64()),
                 })

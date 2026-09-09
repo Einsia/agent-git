@@ -789,6 +789,7 @@ mod tests {
         );
         f.caller = Some(crate::protocol::CallerClaim {
             account_id: Some("acct-1".into()),
+            username: None,
             role: "viewer".into(),
             workspace_id: "ws-a".into(),
         });

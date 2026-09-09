@@ -945,15 +945,39 @@ pub enum TurnSource {
     System,
 }
 
+/// An authenticated account snapshot supplied by the Hub's caller claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSender {
+    pub account_id: String,
+    pub username: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnStarted {
     pub turn_id: String,
     pub source: TurnSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<MessageSender>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_msg_id: Option<String>,
     /// The user text that opened the turn (for the timeline header).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+}
+
+/// A steering message accepted by the native driver, replayable with the session stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnSteered {
+    pub message: String,
+    pub delivery: Delivery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<MessageSender>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_msg_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

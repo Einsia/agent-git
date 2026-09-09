@@ -474,7 +474,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                         danger::TranscriptDanger::fresh_transcript(),
                         &frames,
                         None,
-                        None,
+                        Default::default(),
                     )
                     .await
                     .expect_err("the unsupported test runtime cannot actually launch");
@@ -556,7 +556,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                         danger::TranscriptDanger::fresh_transcript(),
                         &frames,
                         None,
-                        None,
+                        Default::default(),
                     )
                     .await
                     .expect_err(
@@ -616,7 +616,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     &home.path().to_string_lossy(),
                 );
                 let error = state
-                    .spawn_session(info, spec, watched, &frames, None, None)
+                    .spawn_session(info, spec, watched, &frames, None, Default::default())
                     .await
                     .expect_err("a read-only follow verdict cannot launch a session");
                 assert_eq!(
@@ -2418,7 +2418,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
                 danger::TranscriptDanger::fresh_transcript(),
                 &frames,
                 None,
-                None,
+                Default::default(),
             )
             .await
             .is_err()

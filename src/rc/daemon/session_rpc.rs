@@ -103,7 +103,11 @@ impl Daemon {
                         tx: d.tx,
                         command: Command::Turn {
                             message: p.message,
-                            by: p.by,
+                            attribution: MessageAttribution::from_caller(
+                                &caller,
+                                p.by,
+                                p.client_msg_id,
+                            ),
                             guard_attempt: guard_attempt.clone(),
                             reply: ticket,
                         },
@@ -122,7 +126,11 @@ impl Daemon {
                         tx: d.tx,
                         command: Command::Steer {
                             message: p.message,
-                            by: p.by,
+                            attribution: MessageAttribution::from_caller(
+                                &caller,
+                                p.by,
+                                p.client_msg_id,
+                            ),
                             reply: ticket,
                         },
                         reply: SessionReceipt(reply),

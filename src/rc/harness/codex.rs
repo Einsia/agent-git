@@ -304,6 +304,7 @@ pub struct CodexDriver {
     pending_approvals: HashMap<String, PendingApproval>,
     cwd: PathBuf,
     resume_from: Option<String>,
+    model: Option<String>,
     started: bool,
     /// The handshake-chain request still awaiting its response: `(request id, method name)`.
     ///
@@ -377,6 +378,7 @@ impl CodexDriver {
             pending_approvals: Default::default(),
             cwd: spec.cwd.clone(),
             resume_from: spec.resume_from.clone(),
+            model: spec.model.clone(),
             started: false,
             handshake_request: None,
             mode: spec.effective_mode(),
@@ -428,7 +430,7 @@ impl CodexDriver {
         // `config.toml` says — so "take this conversation over from the web"
         // could come back with a different guard than it had, in either
         // direction, and nothing on screen would say so.
-        let (method, params) = match &self.resume_from {
+        let (method, mut params) = match &self.resume_from {
             Some(tid) => (
                 "thread/resume",
                 json!({
@@ -447,6 +449,9 @@ impl CodexDriver {
                 }),
             ),
         };
+        if let Some(model) = &self.model {
+            params["model"] = json!(model);
+        }
         self.send(&json!({"id": id, "method": method, "params": params}))
             .await?;
         self.started = true;
@@ -1288,6 +1293,14 @@ impl CodexDriver {
                         "failed" => TurnOutcome::Error,
                         _ => TurnOutcome::Ok,
                     },
+                    error: (status == "failed")
+                        .then(|| {
+                            turn.get("error")?
+                                .get("message")?
+                                .as_str()
+                                .map(String::from)
+                        })
+                        .flatten(),
                     cost_usd: None,
                     duration_ms: turn.get("durationMs").and_then(|x| x.as_u64()),
                 })
@@ -1490,6 +1503,7 @@ impl CodexDriver {
             pending_approvals: Default::default(),
             cwd,
             resume_from: None,
+            model: None,
             started: thread_id.is_some(),
             handshake_request: None,
             mode: PermissionMode::Default,
@@ -1565,6 +1579,7 @@ mod tests {
             pending_approvals: Default::default(),
             cwd,
             resume_from: None,
+            model: None,
             started: false,
             handshake_request: None,
             mode: PermissionMode::Default,
@@ -1573,6 +1588,60 @@ mod tests {
             retired_turn_starts: Default::default(),
             completed_turn_ids: Default::default(),
             pushback: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_completion_keeps_its_native_message_without_polluting_later_turns() {
+        let mut driver = probe();
+        driver.current_turn = Some("failed-turn".into());
+        let completed = json!({
+            "method": "turn/completed",
+            "params": {"turn": {"id": "failed-turn", "status": "failed",
+                "error": {"message": "Upgrade the native runtime before retrying.", "additionalDetails": "private diagnostic"}}}
+        });
+        assert!(matches!(driver.classify(completed.clone()).await,
+            Some(HarnessEvent::TurnCompleted { outcome: TurnOutcome::Error, error: Some(message), .. })
+            if message == "Upgrade the native runtime before retrying."));
+        driver.current_turn = Some("next-turn".into());
+        assert!(driver.classify(completed).await.is_none());
+        assert!(
+            matches!(driver.classify(json!({
+            "method": "turn/completed", "params": {"turn": {"id":"next-turn", "status":"completed"}}
+        })).await, Some(HarnessEvent::TurnCompleted { outcome: TurnOutcome::Ok, error: None, .. }))
+        );
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn thread_start_and_resume_preserve_an_explicit_model_override() {
+        for resume in [None, Some("existing-thread")] {
+            for model in [None, Some("caller-selected-model")] {
+                let mut driver = probe();
+                driver.resume_from = resume.map(String::from);
+                driver.model = model.map(String::from);
+                driver.open_thread().await.unwrap();
+                let queued =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), driver.proc.next())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let Line::Json(request) = queued.line() else {
+                    panic!("the native transport must receive a JSON request");
+                };
+                assert_eq!(
+                    request["method"],
+                    if resume.is_some() {
+                        "thread/resume"
+                    } else {
+                        "thread/start"
+                    }
+                );
+                assert_eq!(request["params"]["model"].as_str(), model);
+                assert_eq!(request["params"].get("model").is_some(), model.is_some());
+                assert_eq!(request["params"]["threadId"].as_str(), resume);
+                driver.shutdown().await.unwrap();
+            }
         }
     }
 
