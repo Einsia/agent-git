@@ -87,7 +87,7 @@ impl Lab {
         )
         .unwrap();
         lab.ok(&["init", "qa"]);
-        lab.ok(&["import", SID, "--into", "me/qa@work"]);
+        lab.ok(&["import", SID, "--into", "me/qa@work", "--independent"]);
         lab.ok(&["revert", "me/qa@work#2"]);
         lab
     }

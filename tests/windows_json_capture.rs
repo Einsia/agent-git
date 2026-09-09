@@ -146,6 +146,7 @@ impl Lab {
                 "claude-code",
                 "--into",
                 "me/qa@work",
+                "--independent",
             ],
         ] {
             let (output, value) = self.json(&args);

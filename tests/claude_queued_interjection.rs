@@ -154,7 +154,15 @@ fn an_absorbed_message_is_readable_in_the_view_and_does_not_split_the_turn() {
     lab.write_transcript(&one_turn_with_an_interjection(&lab.work));
 
     lab.run(&["init", "qa"]);
-    lab.run(&["import", SID, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        SID,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
 
     let log = lab.run(&["log", "me/qa@s1", "--oneline"]);
     let turns: Vec<&str> = log.lines().filter(|l| l.contains("[turn ]")).collect();

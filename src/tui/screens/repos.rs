@@ -205,7 +205,12 @@ pub fn shared_of(paths: &[String]) -> Shared {
 // ── Fetching data (the only part that touches the filesystem) ──────────
 
 pub fn collect(from: &str) -> Vec<Row> {
-    assemble(&gather(from))
+    assemble(&gather(from, false))
+}
+
+/// Import discovery reads only local metadata and never repairs a partial clone.
+pub(super) fn collect_local(from: &str) -> Vec<Row> {
+    assemble(&gather(from, true))
 }
 
 /// The two refs a name can land on: the local one, and one that exists only on the remote.
@@ -243,27 +248,52 @@ fn collapse(
     )
 }
 
-fn gather(from: &str) -> Input {
+fn gather(from: &str, local_only: bool) -> Input {
     let me = crate::infra::credentials::current_user();
     let mut scans = Vec::new();
     for (owner, name, path) in crate::commands::clone::list_local().unwrap_or_default() {
         let Some(repo) = Repo::open(&path) else {
             continue;
         };
-        let branches = repo.branches();
+        let branches = if local_only {
+            let Ok(branches) = repo.branches_local_bounded(512) else {
+                continue;
+            };
+            branches
+        } else {
+            repo.branches()
+        };
         // Two candidates per branch, plus a trailing pair for the inheritance point itself —
         // `--from` can be a tag or a sha and need not appear in the branch list. All of it goes
         // into the same batch, still two `cat-file` runs.
         let mut refs: Vec<String> = branches.iter().flat_map(|b| both_places(b)).collect();
         refs.push(from.to_string());
         refs.push(format!("origin/{from}"));
-        let read = crate::domain::meta::lines_at_refs(&repo, &refs);
+        let read = if local_only {
+            crate::domain::meta::at_refs_with_policy(
+                &repo,
+                &refs,
+                crate::domain::repo::ReadPolicy::LocalOnly,
+                64 * 1024,
+            )
+            .into_iter()
+            .map(|metadata| metadata.map(|metadata| metadata.line))
+            .collect()
+        } else {
+            crate::domain::meta::lines_at_refs(&repo, &refs)
+        };
         let (lines, from_line) = collapse(&read, branches.len());
         // The second half of the read-only test costs a git question, so it is asked only for a
         // checkout that is **not yours**: once the first half does not hold the answer is decided,
         // and asking anyway burns one process per repo for nothing.
         let foreign = me.as_deref().is_some_and(|me| me != owner);
-        let has_upstream = foreign && repo.upstream_url().is_some();
+        let has_upstream = foreign
+            && if local_only {
+                repo.git_status_local(&["remote", "get-url", "upstream"])
+                    .is_ok_and(|(status, _, _)| status == Some(0))
+            } else {
+                repo.upstream_url().is_some()
+            };
         scans.push(Scan {
             owner,
             name,

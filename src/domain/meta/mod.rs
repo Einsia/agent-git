@@ -729,6 +729,20 @@ pub fn line_at_ref(repo: &crate::domain::repo::Repo, git_ref: &str) -> Option<Li
 /// Any failure falls back to a whole row of `None`: these answers display counts and block
 /// picking a wrong starting point, and guessing one is worse than admitting ignorance.
 pub fn at_refs(repo: &crate::domain::repo::Repo, refs: &[String]) -> Vec<Option<Meta>> {
+    at_refs_with_policy(
+        repo,
+        refs,
+        crate::domain::repo::ReadPolicy::AllowTransport,
+        usize::MAX,
+    )
+}
+
+pub(crate) fn at_refs_with_policy(
+    repo: &crate::domain::repo::Repo,
+    refs: &[String],
+    policy: crate::domain::repo::ReadPolicy,
+    max_bytes: usize,
+) -> Vec<Option<Meta>> {
     let mut out: Vec<Option<Meta>> = refs.iter().map(|_| None).collect();
     if refs.is_empty() {
         return out;
@@ -739,7 +753,7 @@ pub fn at_refs(repo: &crate::domain::repo::Repo, refs: &[String]) -> Vec<Option<
     // cannot read, and "no meta at this point" is a normal case that must not carry away the
     // answers for the other objects in the batch.
     let mut present: Vec<bool> = Vec::with_capacity(names.len());
-    let checked = repo.git_cat_file_batch_check(names.clone(), |_, kind, _| {
+    let checked = repo.git_cat_file_batch_check_with_policy(names.clone(), policy, |_, kind, _| {
         present.push(kind != "missing");
         Ok(())
     });
@@ -754,10 +768,7 @@ pub fn at_refs(repo: &crate::domain::repo::Repo, refs: &[String]) -> Vec<Option<
         .map(|(n, _)| n.clone())
         .collect();
     let mut read: Vec<Option<Meta>> = Vec::with_capacity(wanted.len());
-    // The cap is `usize::MAX`: this layer has no "too big to read" requirement, and setting a
-    // cap costs one more `--batch-check` pass (see `Repo::git_cat_file_batch`) — exactly what is
-    // being saved here.
-    let got = repo.git_cat_file_batch(wanted, usize::MAX, |_, _, body| {
+    let got = repo.git_cat_file_batch_with_policy(wanted, max_bytes, policy, |_, _, body| {
         let crate::domain::repo::ObjectBody::Read(bytes) = body else {
             read.push(None);
             return Ok(());

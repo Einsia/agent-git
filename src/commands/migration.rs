@@ -8,7 +8,7 @@
 //! repository moves.
 
 use crate::domain::meta::{self, LayoutVersion};
-use crate::domain::repo::Repo;
+use crate::domain::repo::{ReadPolicy, Repo};
 use crate::domain::storage;
 use anyhow::{Context, Result};
 use fs2::FileExt as _;
@@ -633,11 +633,23 @@ pub fn check_readonly_startup() -> Result<()> {
 /// A scoped inspection follows the selected repository's registered checkouts and aliases.
 /// Recovery evidence with unknown ownership cannot establish that the selected scope is settled.
 pub(super) fn check_readonly_repo_startup(repo: &Repo) -> Result<()> {
+    check_readonly_repo_startup_with_policy(repo, ReadPolicy::AllowTransport)
+}
+
+pub(super) fn check_readonly_repo_startup_local(repo: &Repo) -> Result<()> {
+    check_readonly_repo_startup_with_policy(repo, ReadPolicy::LocalOnly)
+}
+
+fn check_readonly_repo_startup_with_policy(repo: &Repo, policy: ReadPolicy) -> Result<()> {
     let home = crate::infra::config::agit_home()?;
     let repos = crate::infra::config::repos_dir()?;
-    let selected_common_dir = repo.common_dir()?.canonicalize()?;
+    let selected_common_dir = repo.common_dir_with_policy(policy)?.canonicalize()?;
     let mut roots = vec![repo.root().to_path_buf()];
-    roots.extend(repo.worktrees()?.into_iter().map(|worktree| worktree.path));
+    roots.extend(
+        repo.worktrees_with_policy(policy)?
+            .into_iter()
+            .map(|worktree| worktree.path),
+    );
     let mut canonical_roots = Vec::new();
     for root in &roots {
         canonical_roots.push(
@@ -659,7 +671,9 @@ pub(super) fn check_readonly_repo_startup(repo: &Repo) -> Result<()> {
         })?;
         let recovered_repo = Repo::open(&recovered_root)
             .context("recovery evidence does not identify an available local repository")?;
-        let recovered_common_dir = recovered_repo.common_dir()?.canonicalize()?;
+        let recovered_common_dir = recovered_repo
+            .common_dir_with_policy(policy)?
+            .canonicalize()?;
         anyhow::ensure!(
             !canonical_roots.contains(&recovered_root)
                 && recovered_common_dir != selected_common_dir,
@@ -668,8 +682,13 @@ pub(super) fn check_readonly_repo_startup(repo: &Repo) -> Result<()> {
     }
     for root in canonical_roots {
         let checkout = Repo::at(&root);
-        let pending = super::plumbing::interrupted_checkout_metadata_present(&checkout)?
-            || probe_legacy_storage_checkout_recovery(&checkout, MigrationFailureKind::Skippable)
+        let pending =
+            super::plumbing::interrupted_checkout_metadata_with_policy(&checkout, policy)?
+                || probe_legacy_storage_checkout_recovery_with_policy(
+                    &checkout,
+                    MigrationFailureKind::Skippable,
+                    policy,
+                )
                 .map_err(RepoMigrationFailure::into_error)?;
         anyhow::ensure!(
             !pending,
@@ -1168,28 +1187,35 @@ struct InterruptedStorageCheckout {
 }
 
 fn interrupted_storage_checkout(repo: &Repo) -> Result<Option<InterruptedStorageCheckout>> {
-    let Some(current_ref) = current_branch_ref(repo)? else {
+    interrupted_storage_checkout_with_policy(repo, ReadPolicy::AllowTransport)
+}
+
+fn interrupted_storage_checkout_with_policy(
+    repo: &Repo,
+    policy: ReadPolicy,
+) -> Result<Option<InterruptedStorageCheckout>> {
+    let Some(current_ref) = current_branch_ref_with_policy(repo, policy)? else {
         return Ok(None);
     };
     let branch = current_ref
         .strip_prefix("refs/heads/")
         .context("current branch ref has an unexpected shape")?;
     let recovery = format!("refs/agit/layout-v0/{branch}");
-    let Some(old) = optional_ref(repo, &recovery)? else {
+    let Some(old) = optional_ref_with_policy(repo, &recovery, policy)? else {
         return Ok(None);
     };
-    let head = repo.git(&["rev-parse", "--verify", "HEAD^{commit}"])?;
-    let Some(snapshot) = read_meta_at(repo, &head)? else {
+    let head = repo.git_with_policy(&["rev-parse", "--verify", "HEAD^{commit}"], policy)?;
+    let Some(snapshot) = read_meta_at_with_policy(repo, &head, policy)? else {
         return Ok(None);
     };
     if snapshot.layout != LayoutVersion::V1 {
         return Ok(None);
     }
-    let subject = repo.git(&["show", "-s", "--format=%s", &head])?;
+    let subject = repo.git_with_policy(&["show", "-s", "--format=%s", &head], policy)?;
     if subject != meta::STORAGE_MIGRATION_MESSAGE {
         return Ok(None);
     }
-    let parent = repo.git(&["rev-parse", &format!("{head}^1")])?;
+    let parent = repo.git_with_policy(&["rev-parse", &format!("{head}^1")], policy)?;
     if parent != old {
         return Ok(None);
     }
@@ -1210,14 +1236,29 @@ fn probe_legacy_storage_checkout_recovery(
     repo: &Repo,
     inherited: MigrationFailureKind,
 ) -> RepoMigrationResult<bool> {
-    let Some(_) = inherited.result(interrupted_storage_checkout(repo))? else {
-        return Ok(false);
-    };
-    MigrationFailureKind::Recovery.result(legacy_storage_checkout_paths_dirty(repo))
+    probe_legacy_storage_checkout_recovery_with_policy(repo, inherited, ReadPolicy::AllowTransport)
 }
 
-fn legacy_storage_checkout_paths_dirty(repo: &Repo) -> Result<bool> {
-    let output = Command::new("git")
+fn probe_legacy_storage_checkout_recovery_with_policy(
+    repo: &Repo,
+    inherited: MigrationFailureKind,
+    policy: ReadPolicy,
+) -> RepoMigrationResult<bool> {
+    let Some(_) = inherited.result(interrupted_storage_checkout_with_policy(repo, policy))? else {
+        return Ok(false);
+    };
+    MigrationFailureKind::Recovery.result(legacy_storage_checkout_paths_dirty_with_policy(
+        repo, policy,
+    ))
+}
+
+fn legacy_storage_checkout_paths_dirty_with_policy(
+    repo: &Repo,
+    policy: ReadPolicy,
+) -> Result<bool> {
+    let mut command = Command::new("git");
+    policy.apply(&mut command);
+    let output = command
         .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("--no-replace-objects")
         .args(["-c", "core.fsmonitor=false"])
@@ -1266,7 +1307,13 @@ fn finish_interrupted_checkout(repo: &Repo) -> Result<()> {
 }
 
 fn current_branch_ref(repo: &Repo) -> Result<Option<String>> {
-    let output = std::process::Command::new("git")
+    current_branch_ref_with_policy(repo, ReadPolicy::AllowTransport)
+}
+
+fn current_branch_ref_with_policy(repo: &Repo, policy: ReadPolicy) -> Result<Option<String>> {
+    let mut command = Command::new("git");
+    policy.apply(&mut command);
+    let output = command
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -1290,7 +1337,13 @@ fn current_branch_ref(repo: &Repo) -> Result<Option<String>> {
 }
 
 fn optional_ref(repo: &Repo, name: &str) -> Result<Option<String>> {
-    let output = std::process::Command::new("git")
+    optional_ref_with_policy(repo, name, ReadPolicy::AllowTransport)
+}
+
+fn optional_ref_with_policy(repo: &Repo, name: &str, policy: ReadPolicy) -> Result<Option<String>> {
+    let mut command = Command::new("git");
+    policy.apply(&mut command);
+    let output = command
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -1309,6 +1362,25 @@ fn optional_ref(repo: &Repo, name: &str) -> Result<Option<String>> {
 }
 
 fn read_meta_at(repo: &Repo, commit: &str) -> Result<Option<meta::Meta>> {
+    read_meta_at_with_policy(repo, commit, ReadPolicy::AllowTransport)
+}
+
+fn read_meta_at_with_policy(
+    repo: &Repo,
+    commit: &str,
+    policy: ReadPolicy,
+) -> Result<Option<meta::Meta>> {
+    if matches!(policy, ReadPolicy::LocalOnly) {
+        let entry = repo.git_with_policy(
+            &["ls-tree", "-z", "--full-name", commit, "--", meta::FILE],
+            policy,
+        )?;
+        return if entry.is_empty() {
+            Ok(None)
+        } else {
+            storage::metadata_local(repo.root(), commit).map(Some)
+        };
+    }
     let Some(text) = repo.show_raw_result(commit, meta::FILE)? else {
         return Ok(None);
     };

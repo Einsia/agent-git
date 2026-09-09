@@ -304,8 +304,9 @@ fn run_inner(args: Args) -> CmdResult {
             })?;
             let namespace = link.owner.clone().filter(|owner| !owner.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "this session has no recorded repository owner; re-adopt it explicitly with `agit import {} --into <owner>/<repo>@<branch>` before committing",
-                    ui::session::shell_arg(&link.session_id)
+                    "this session has no recorded repository owner; re-adopt it explicitly with `agit import {} --from {} --into <owner>/<repo>@<branch>` before committing",
+                    ui::session::shell_arg(&link.session_id),
+                    ui::session::shell_arg(&link.source)
                 )
             })?;
             let repo_dir = crate::infra::config::repo_dir(&namespace, &agent)?;
@@ -550,8 +551,9 @@ fn link_slug(lk: &Link, agent: &str) -> Option<String> {
     let Some(owner) = lk.owner.as_deref().filter(|owner| !owner.is_empty()) else {
         ui::warning("this session link has no owner; its hook cannot select a repository");
         ui::hint(&format!(
-            "adopt it explicitly: `agit import {} --into <owner>/<repo>@<branch>`",
-            ui::session::shell_arg(&lk.session_id)
+            "adopt it explicitly: `agit import {} --from {} --into <owner>/<repo>@<branch>`",
+            ui::session::shell_arg(&lk.session_id),
+            ui::session::shell_arg(&lk.source)
         ));
         return None;
     };
@@ -570,10 +572,11 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
         && let Some(lk) = superseded_harness_link(store)?
     {
         anyhow::bail!(
-            "session {} was superseded by {} and cannot settle implicitly. Preserve later work with `agit import {} --into <owner>/<repo>@<new-branch>`, or name an explicit owner/repo@branch target to select its active writer.",
+            "session {} was superseded by {} and cannot settle implicitly. Preserve later work with `agit import {} --from {} --into <owner>/<repo>@<new-branch>`, or name an explicit owner/repo@branch target to select its active writer.",
             link::short(&lk.session_id),
             lk.superseded_by.as_deref().unwrap_or("another runtime"),
             ui::session::shell_arg(&lk.session_id),
+            ui::session::shell_arg(&lk.source),
         );
     }
 
@@ -742,8 +745,9 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
                         if !quiet {
                             ui::error("this session has no claimed repository or branch.");
                             ui::hint(&format!(
-                                "agit import {} --into <owner/repo>@<branch>",
-                                ui::session::shell_arg(&l.session_id)
+                                "agit import {} --from {} --into <owner/repo>@<branch>",
+                                ui::session::shell_arg(&l.session_id),
+                                ui::session::shell_arg(&l.source)
                             ));
                         }
                         return Ok(None);
@@ -1228,8 +1232,9 @@ fn settle(
                     .unwrap_or("a newer runtime session")
             ));
             ui::hint(&format!(
-                "preserve later work on a new line with `agit import {} --into {slug}@<new-branch>`",
-                lk.session_id
+                "preserve later work on a new line with `agit import {} --from {} --into {slug}@<new-branch>`",
+                ui::session::shell_arg(&lk.session_id),
+                ui::session::shell_arg(&lk.source)
             ));
         } else {
             let actual = match (
@@ -1843,7 +1848,7 @@ fn settle_bytes(
                     ui::bold(&link::short(&lk.session_id))
                 );
                 ui::hint(
-                    "one branch, one session: adopt this one onto a new branch with `agit import <session> -n <agent> -b <new-branch>`; add `--onto <ref>` if it continues an existing turn",
+                    "one branch, one session: adopt this one onto a new branch with `agit import <session> --from <runtime> --into <owner/repo>@<new-branch>`; choose a proposed base, pass `--onto <ref>`, or explicitly request `--independent`",
                 );
                 return Ok(ExitCode::Policy);
             }
@@ -3780,6 +3785,8 @@ mod tests {
                 repo: None,
                 branch: Some("work".into()),
                 onto: None,
+                propose_lineage: false,
+                independent: true,
                 privacy: false,
             });
             let repo = Repo::open(&importer_repo).unwrap();

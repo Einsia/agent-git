@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode;
 
-fn projects_dir() -> Result<PathBuf> {
+pub(super) fn projects_dir() -> Result<PathBuf> {
     let home = crate::infra::config::user_home().context("the user home is not set")?;
     Ok(home.join(".claude").join("projects"))
 }

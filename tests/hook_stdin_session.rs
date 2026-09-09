@@ -80,6 +80,32 @@ impl Lab {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    fn choose_independent_from_hint(&self, args: &[&str]) {
+        let before = self.local_state();
+        let output = self.agit(args).arg("--json").output().unwrap();
+        assert_eq!(output.status.code(), Some(8), "{output:?}");
+        assert_eq!(self.local_state(), before);
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let report = &document["result"]["value"];
+        assert_eq!(report["operation"], "choice_required");
+        let action = &report["independent"];
+        let argv: Vec<_> = action["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(argv[0], "agit");
+        assert!(argv.contains(&"--independent"));
+        let mut command = self.agit(&argv[1..]);
+        command.current_dir(action["cwd"].as_str().unwrap());
+        for (name, value) in action["env"].as_object().unwrap() {
+            command.env(name, value.as_str().unwrap());
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
     /// Feed the hook JSON in on stdin the way Claude Code does.
     fn hook(&self, args: &[&str], session_id: &str, agit_session: Option<&str>) {
         self.hook_env(args, session_id, agit_session, &[]);
@@ -217,7 +243,15 @@ fn a_stop_hook_settles_the_stdin_session_and_nothing_else() {
     lab.append(B, &lab.turn(B, 1, "B turn 1", "B answer 1"));
 
     lab.run(&["init", "qa"]);
-    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
     // B has only been pre-registered by SessionStart: it has a cwd and is unmanaged.
     lab.hook(&["hooks", "ingest"], B, None);
 
@@ -280,7 +314,15 @@ fn imported_history_cannot_claim_the_code_state_observed_by_a_later_hook() {
         &lab.turn(A, 2, "later historical request", "later historical answer"),
     );
     lab.run(&["init", "qa"]);
-    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
 
     let repo = Repo::open(lab.agit_home.join("repos/me/qa")).unwrap();
     let head = repo.git(&["rev-parse", "refs/heads/s1"]).unwrap();
@@ -322,7 +364,15 @@ fn a_supervised_stop_hook_leaves_local_state_alone() {
     let lab = Lab::new();
     lab.append(A, &lab.turn(A, 1, "A turn 1", "A answer 1"));
     lab.run(&["init", "qa"]);
-    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
     lab.append(A, &lab.turn(A, 2, "A turn 2", "A answer 2"));
 
     let before = lab.local_state();
@@ -369,7 +419,15 @@ fn someone_elses_checkout_settles_under_its_owner(stop: &[&str]) {
 
     // The checkout and link name Alice while the workspace remains bound to the current user.
     lab.run(&["init", "qa"]);
-    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
     let repos = lab.agit_home.join("repos");
     fs::create_dir_all(repos.join("alice")).unwrap();
     fs::rename(repos.join("me/qa"), repos.join("alice/qa")).unwrap();
@@ -408,7 +466,15 @@ fn ownerless_hook_claims_require_explicit_readoption() {
     let lab = Lab::new();
     lab.append(A, &lab.turn(A, 1, "registered turn", "done"));
     lab.run(&["init", "qa"]);
-    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
     let link_path = lab
         .agit_home
         .join("store/claude-code")
@@ -446,7 +512,15 @@ fn ownerless_hook_claims_require_explicit_readoption() {
             );
         }
     }
-    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
     let claim: serde_json::Value = serde_json::from_slice(&fs::read(&link_path).unwrap()).unwrap();
     assert_eq!(claim["owner"], "me");
     let settled = repo.git(&["rev-parse", "refs/heads/s1"]).unwrap();
@@ -461,7 +535,15 @@ fn native_id_commit_requires_the_recorded_repository_owner() {
     let lab = Lab::new();
     lab.append(A, &lab.turn(A, 1, "saved under Alice", "done"));
     lab.run(&["init", "qa"]);
-    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
     let repos = lab.agit_home.join("repos");
     fs::create_dir_all(repos.join("alice")).unwrap();
     fs::rename(repos.join("me/qa"), repos.join("alice/qa")).unwrap();
@@ -501,7 +583,7 @@ fn native_id_commit_requires_the_recorded_repository_owner() {
     assert!(!repos.join("me/qa").exists());
 }
 
-/// An unmanaged-session refusal prints an executable adoption command for its detected native ID.
+/// An unmanaged-session refusal preserves native identity while leaving lineage as an explicit choice.
 #[test]
 fn new_guard_adoption_hint_preserves_the_detected_conversation() {
     let lab = Lab::new();
@@ -524,7 +606,7 @@ fn new_guard_adoption_hint_preserves_the_detected_conversation() {
         .expect("adoption hint");
     let arguments: Vec<_> = hint.split_whitespace().collect();
     assert_eq!(arguments[2], A, "{hint}");
-    lab.run(&arguments[1..]);
+    lab.choose_independent_from_hint(&arguments[1..]);
     let repo = Repo::open(lab.agit_home.join("repos/me/qa")).unwrap();
     assert!(repo.has_ref("refs/heads/saved"));
     let log = lab.run(&["log", "me/qa@saved", "--oneline"]);
@@ -534,13 +616,13 @@ fn new_guard_adoption_hint_preserves_the_detected_conversation() {
     );
 }
 
-/// Offline adoption leaves identity unclaimed until its printed command selects a repository.
+/// Offline adoption leaves identity unclaimed until a printed command and lineage choice are accepted.
 #[test]
 fn offline_import_hint_records_the_selected_first_version() {
     assert_offline_adoption_hint(false);
 }
 
-/// Committing an unclaimed offline link directs the caller to an executable explicit import.
+/// Committing an unclaimed offline link directs the caller to explicit native and lineage selection.
 #[test]
 fn unclaimed_commit_hint_records_the_selected_first_version() {
     assert_offline_adoption_hint(true);
@@ -591,7 +673,7 @@ fn assert_offline_adoption_hint(from_commit: bool) {
     let arguments: Vec<_> = command.split_whitespace().collect();
     assert_eq!(arguments[1], "import", "{hint}");
     assert_eq!(arguments[2], A, "{hint}");
-    lab.run(&arguments[1..]);
+    lab.choose_independent_from_hint(&arguments[1..]);
     let repo = Repo::open(lab.agit_home.join("repos/me/qa")).unwrap();
     assert!(repo.has_ref("refs/heads/saved"));
     let claim: serde_json::Value = serde_json::from_slice(&fs::read(&link_path).unwrap()).unwrap();

@@ -78,6 +78,57 @@ impl FixCommand {
         )
     }
 
+    /// A copied command retains its observed directory and routing without changing the shell.
+    pub(crate) fn human_command(&self) -> Option<String> {
+        if self
+            .argv
+            .iter()
+            .chain(std::iter::once(&self.cwd))
+            .chain(self.env.values())
+            .any(|value| value.chars().any(char::is_control))
+        {
+            return None;
+        }
+        #[cfg(windows)]
+        {
+            Some(self.powershell_command())
+        }
+        #[cfg(not(windows))]
+        {
+            let mut words = self
+                .env
+                .iter()
+                .map(|(name, value)| format!("{name}={}", posix_literal(value)))
+                .collect::<Vec<_>>();
+            words.push(posix_literal(&self.argv[0]));
+            words.push("-C".into());
+            words.push(posix_literal(&self.cwd));
+            words.extend(self.argv[1..].iter().map(|arg| posix_literal(arg)));
+            Some(words.join(" "))
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn powershell_command(&self) -> String {
+        let mut words = vec![
+            "&".into(),
+            powershell_literal(&self.argv[0]),
+            "'-C'".into(),
+            powershell_literal(&self.cwd),
+        ];
+        words.extend(self.argv[1..].iter().map(|arg| powershell_literal(arg)));
+        format!(
+            "pwsh -NoProfile -Command {{ \
+             if ($PSVersionTable.PSVersion -lt [version]'7.3') {{ throw 'This command requires PowerShell 7.3 or newer.' }}; \
+             $ErrorActionPreference = 'Stop'; \
+             $PSNativeCommandArgumentPassing = 'Standard'; \
+             $env:AGIT_HOME = {}; $env:AGIT_HUB_URL = {}; {}; exit $LASTEXITCODE }}",
+            powershell_literal(&self.env["AGIT_HOME"]),
+            powershell_literal(&self.env["AGIT_HUB_URL"]),
+            words.join(" "),
+        )
+    }
+
     fn in_context(
         args: Vec<OsString>,
         context: Context,
@@ -121,6 +172,27 @@ impl FixCommand {
             requires_interaction,
         })
     }
+}
+
+#[cfg(not(windows))]
+fn posix_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(any(windows, test))]
+fn powershell_literal(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        quoted.push(character);
+        if matches!(
+            character,
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}'
+        ) {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 #[derive(Default)]
@@ -262,6 +334,29 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn human_commands_keep_routing_and_reject_terminal_control_characters() {
+        let command = action("literal'branch");
+        let text = command.human_command().unwrap();
+        assert!(text.contains("AGIT_HOME"));
+        assert!(text.contains("AGIT_HUB_URL"));
+        assert!(text.contains("-C"));
+        for value in ["line\nnext", "\u{1b}[31m", "\u{85}"] {
+            assert!(action(value).human_command().is_none());
+        }
+        let powershell = command.powershell_command();
+        assert!(powershell.contains("'literal''branch'"));
+        assert!(powershell.contains("$PSNativeCommandArgumentPassing = 'Standard'"));
+        assert!(powershell.starts_with("pwsh -NoProfile -Command {"));
+        assert!(powershell.contains("exit $LASTEXITCODE"));
+        for quote in ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'] {
+            assert_eq!(
+                powershell_literal(&quote.to_string()),
+                format!("'{quote}{quote}'")
+            );
+        }
     }
 
     #[test]

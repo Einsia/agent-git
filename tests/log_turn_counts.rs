@@ -331,6 +331,7 @@ fn native_opencode_import_counts_a_late_part_on_an_earlier_turns_host() {
             "opencode",
             "--into",
             "me/counts@work",
+            "--independent",
         ]);
         assert!(
             imported.status.success(),

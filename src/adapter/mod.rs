@@ -32,6 +32,7 @@ pub mod codex_index;
 pub(crate) mod codex_provider;
 pub mod cursor;
 pub mod enrich;
+pub mod native_snapshot;
 pub mod opencode;
 
 use crate::Result;
@@ -555,6 +556,27 @@ pub trait Adapter {
     /// cwd, so passing it goes straight there. The slug rule is not one we can guarantee, so a
     /// failed direct hit must fall back to the lookup by id.
     fn resolve(&self, session_id: &str, cwd: Option<&Path>) -> Option<PathBuf>;
+
+    /// Read-only inspection requires an explicit full identity and refuses ambiguous sources.
+    fn lookup_native_readonly(
+        &self,
+        session_id: &str,
+        limits: native_snapshot::Limits,
+    ) -> native_snapshot::Result<native_snapshot::Source> {
+        native_snapshot::lookup_files(self.id(), session_id, limits)
+    }
+
+    /// A selected source is read without creating an export cache or an adoption link.
+    fn snapshot_native_readonly(
+        &self,
+        source: &native_snapshot::Source,
+        limits: native_snapshot::Limits,
+    ) -> native_snapshot::Result<native_snapshot::Snapshot> {
+        if source.runtime != self.id() {
+            return Err(native_snapshot::Unavailable::Unsupported);
+        }
+        native_snapshot::read_file(source, limits)
+    }
 
     /// List **every** session of this runtime (not limited to one repo).
     ///

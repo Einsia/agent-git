@@ -40,8 +40,9 @@ agit commit <session-id> -n photo -b fix-auth           # requires a recorded re
 ```
 
 An offline `agit import <session-id> --link-only` record has no repository owner or branch claim.
-After sign-in, use `agit import <session-id> --into <owner/repo>@<branch>` to establish that identity
-and record its opening version. Neither `-n` nor the signed-in account supplies a missing owner.
+After sign-in, use `agit import <session-id> --from <runtime> --into <owner/repo>@<branch>` to choose
+lineage, establish that identity and record its opening version. Neither `-n` nor the signed-in
+account supplies a missing owner.
 
 Supervisors/hooks may settle each user turn, but the CLI does not promise an automatic push. Use `agit push` when the history must be shared.
 

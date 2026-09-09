@@ -73,7 +73,7 @@ pub(super) fn codex_home() -> Result<PathBuf> {
     .context("neither $CODEX_HOME nor the user home is set")
 }
 
-fn sessions_root() -> Result<PathBuf> {
+pub(super) fn sessions_root() -> Result<PathBuf> {
     Ok(codex_home()?.join("sessions"))
 }
 
@@ -124,7 +124,7 @@ fn primary_meta(path: &Path) -> Option<(String, String)> {
 /// Take the uuid out of `rollout-2026-07-25T18-20-01-<uuid>.jsonl`.
 ///
 /// The uuid is the last five `-`-separated segments (8-4-4-4-12); the timestamp is in front of it.
-fn id_from_filename(path: &Path) -> Option<String> {
+pub(super) fn id_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let parts: Vec<&str> = stem.split('-').collect();
     if parts.len() < 5 {

@@ -123,12 +123,15 @@ fn main() {
     let startup = match &command {
         Commands::Status(_) => Startup::Inspect,
         Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
+        Commands::Import(args) if commands::import::needs_readonly_startup(args) => {
+            Startup::ScopedImport
+        }
         _ => Startup::Migrate,
     };
     // A best-effort, once-a-day update hint belongs to the process startup path so it also
     // appears for ordinary commands, not only after a successful push. The helper skips the JSON
     // path because stdout there is a strict machine-readable envelope.
-    if !matches!(startup, Startup::ScopedDoctor) {
+    if !matches!(startup, Startup::ScopedDoctor | Startup::ScopedImport) {
         commands::upgrade::maybe_startup_nudge(command_name, json);
     }
     if json {
@@ -182,7 +185,7 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
     let prepared = match startup {
         Startup::Inspect => commands::migration::check_readonly_startup(),
         Startup::Migrate => commands::migration::migrate_startup().map(|_| ()),
-        Startup::ScopedDoctor => Ok(()),
+        Startup::ScopedDoctor | Startup::ScopedImport => Ok(()),
     };
     if let Err(e) = prepared {
         agit::ui::error(&format!("local storage preparation failed: {e:#}"));
@@ -197,6 +200,8 @@ enum Startup {
     Inspect,
     /// The command validates its explicit local scope before inspecting recovery evidence.
     ScopedDoctor,
+    /// Explicit import inspection checks only its selected local repository before discovery.
+    ScopedImport,
 }
 
 /// What to do when no subcommand is given and the interface is **not** entered.
@@ -274,7 +279,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Run(a) => commands::run::run(a),
         Commands::Repo(a) => commands::repo::run(a),
 
-        Commands::Import(a) => commands::import::run(a),
+        Commands::Import(a) => commands::import::run_with_output(a, json),
         Commands::Status(a) => commands::status::run(a),
         Commands::Memory(a) => commands::memory::run(a),
         Commands::Distill(a) => commands::memory::run_distill(a),

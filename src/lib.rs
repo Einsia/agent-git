@@ -91,6 +91,8 @@ pub mod ui;
 /// catch-all `core/` from growing.
 pub mod domain {
     pub mod comparison;
+    #[cfg(feature = "secret-vault")]
+    pub mod import_lineage;
     /// Install a session into a runtime (the native format is rewritten byte by byte;
     /// cross-runtime goes through the IR).
     pub mod install;
@@ -102,6 +104,7 @@ pub mod domain {
     /// Session metadata `session/meta.json`: the product of `agit commit`, and the version ID
     /// itself.
     pub mod meta;
+    pub mod native_archive;
     /// Search query syntax (`in:` / `owner:` / `-excluded` / `"phrase"`). Shared by the backend
     /// and the CLI.
     pub mod query;

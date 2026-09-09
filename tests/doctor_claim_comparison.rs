@@ -160,7 +160,7 @@ impl Lab {
         }
         lab.run(&["init", "qa"]);
         fs::write(&lab.live, format!("{}{}", lab.turn(1), lab.turn(2))).unwrap();
-        lab.run(&["import", SID, "--into", "alice/qa@work"]);
+        lab.run(&["import", SID, "--into", "alice/qa@work", "--independent"]);
         lab
     }
 
@@ -508,7 +508,13 @@ fn doctor_handles_later_secret_mappings_and_missing_reconstruction_evidence() {
     let later = "bbbbbbbb-0000-4000-8000-000000000002";
     let later_path = lab.live.parent().unwrap().join(format!("{later}.jsonl"));
     fs::write(&later_path, lab.turn(1).replace(SID, later)).unwrap();
-    lab.run(&["import", later, "--into", "alice/qa@after-mapping"]);
+    lab.run(&[
+        "import",
+        later,
+        "--into",
+        "alice/qa@after-mapping",
+        "--independent",
+    ]);
     assert_eq!(fs::read(&lab.live).unwrap(), original);
     let dictionary = lab.repo().join(".git/agit/secret-dictionary/vault.json");
     let before = fs::read(&dictionary).unwrap();

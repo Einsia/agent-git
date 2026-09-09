@@ -37,6 +37,30 @@ pub struct ProtectionReport {
     pub intact: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("read-only hydration exceeds its output byte budget")]
+pub(crate) struct HydrationBudgetExceeded;
+
+struct HydrationBudget {
+    remaining: usize,
+}
+
+impl HydrationBudget {
+    fn new(remaining: usize) -> Self {
+        Self { remaining }
+    }
+
+    fn reserve_escaped(&mut self, bytes: usize) -> crate::Result<()> {
+        // Every input byte covers its longest JSON escape; inserted secrets reserve separately.
+        let bytes = bytes.checked_mul(6).ok_or(HydrationBudgetExceeded)?;
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .ok_or(HydrationBudgetExceeded)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HydrationReport {
     pub text: String,
@@ -195,6 +219,35 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         committed: &str,
         live: &str,
     ) -> crate::Result<(HydrationReport, HydrationReport)> {
+        self.with_readonly_hydrator(&[committed, live], None, |hydrate| {
+            Ok((hydrate(committed)?, hydrate(live)?))
+        })
+    }
+
+    /// Each input retains its own record boundaries and unresolved-token result.
+    /// The expansion budget is shared before any replacement string is allocated.
+    pub(crate) fn hydrate_batch_readonly_bounded(
+        &self,
+        inputs: &[&str],
+        max_output_bytes: usize,
+    ) -> crate::Result<Vec<crate::Result<HydrationReport>>> {
+        self.with_readonly_hydrator(inputs, Some(max_output_bytes), |hydrate| {
+            Ok(inputs.iter().copied().map(hydrate).collect())
+        })
+    }
+
+    fn with_readonly_hydrator<T>(
+        &self,
+        inputs: &[&str],
+        max_output_bytes: Option<usize>,
+        consume: impl FnOnce(&mut dyn FnMut(&str) -> crate::Result<HydrationReport>) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let mut budget = max_output_bytes.map(HydrationBudget::new);
+        if let Some(budget) = &mut budget {
+            for input in inputs {
+                budget.reserve_escaped(input.len())?;
+            }
+        }
         let (unlocked, records) = match std::fs::symlink_metadata(&self.store.path) {
             Ok(_) => {
                 let unlocked = self.store.unlock_existing()?;
@@ -228,14 +281,22 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                     .context("cannot build the repository secret hydrator")?,
             )
         };
-        let hydrate = |text: &str| -> crate::Result<HydrationReport> {
+        let mut hydrate = |text: &str| -> crate::Result<HydrationReport> {
             let mut unresolved = 0;
             let (text, replacements) = transform_jsonl(text, |value| {
                 unresolved += token_segments(value)
                     .filter(|(_, _, token)| !known_tokens.contains(*token))
                     .count();
                 Ok(match &matcher {
-                    Some(matcher) => replace_known_tokens(value, matcher, &secrets),
+                    Some(matcher) => {
+                        if let Some(budget) = &mut budget {
+                            for found in matcher.find_iter(value.as_bytes()) {
+                                budget
+                                    .reserve_escaped(secrets[found.pattern().as_usize()].len())?;
+                            }
+                        }
+                        replace_known_tokens(value, matcher, &secrets)
+                    }
                     None => (value.to_owned(), 0),
                 })
             })?;
@@ -245,7 +306,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 unresolved,
             })
         };
-        Ok((hydrate(committed)?, hydrate(live)?))
+        consume(&mut hydrate)
     }
 
     /// Project only records that came from explicit/global registration (plus
@@ -1180,6 +1241,114 @@ mod tests {
             self.0.lock().unwrap().remove(vault_id);
             Ok(())
         }
+    }
+
+    #[test]
+    fn bounded_readonly_batch_preserves_frames_and_preflights_secret_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary/vault.json");
+        let dictionary = RepositoryDictionary::new(path.clone(), MemoryKeys::default());
+        let secret = format!("{}\n\"suffix", "private payload ".repeat(128));
+        let raw = format!("{}\n", serde_json::json!({"message": secret}));
+        let protected = dictionary
+            .protect_jsonl(&raw, &Matcher::for_test(&[("explicit", &secret)]))
+            .unwrap();
+        let repeated = format!("{}{}", protected.text, protected.text);
+        let partial = protected.text.trim_end_matches('\n');
+        let unknown = format!(
+            "{{{{AGIT_SECRET_V1:00000000-0000-4000-8000-000000000001:sec_{}}}}}",
+            "a".repeat(32)
+        );
+        let unknown = serde_json::json!({"message": unknown}).to_string();
+        let inputs = [
+            "",
+            protected.text.as_str(),
+            repeated.as_str(),
+            partial,
+            unknown.as_str(),
+        ];
+        let baseline = inputs.iter().map(|input| input.len() * 6).sum::<usize>();
+        let before = std::fs::read(&path).unwrap();
+        let keys = dictionary.store.keys.0.lock().unwrap().clone();
+        let lock = path.parent().unwrap().join("vault.lock");
+        std::fs::remove_file(&lock).unwrap();
+        let exhausted = dictionary
+            .hydrate_batch_readonly_bounded(&inputs, baseline)
+            .unwrap();
+        assert!(exhausted.iter().any(|report| {
+            report
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<HydrationBudgetExceeded>().is_some())
+        }));
+        let reports = dictionary
+            .hydrate_batch_readonly_bounded(&inputs, baseline + secret.len() * 6 * 4)
+            .unwrap()
+            .into_iter()
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(reports.len(), inputs.len());
+        assert_eq!(reports[0].text, "");
+        assert_eq!(reports[1].text, raw);
+        assert_eq!(reports[2].text, format!("{raw}{raw}"));
+        assert_eq!(reports[3].text, raw.trim_end_matches('\n'));
+        assert_eq!(reports[4].unresolved, 1);
+        assert_eq!(reports[2].text.lines().count(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(*dictionary.store.keys.0.lock().unwrap(), keys);
+        assert!(!lock.exists());
+        assert_eq!(
+            dictionary
+                .hydrate_pair_readonly(&protected.text, &raw)
+                .unwrap()
+                .0
+                .text,
+            raw
+        );
+    }
+
+    #[test]
+    fn bounded_batch_isolates_candidate_key_collisions_without_rereading_or_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary/vault.json");
+        let dictionary = RepositoryDictionary::new(path.clone(), MemoryKeys::default());
+        let secret = "literal private key";
+        let raw = format!("{}\n", serde_json::json!({"message":secret}));
+        let protected = dictionary
+            .protect_jsonl(&raw, &Matcher::for_test(&[("explicit", secret)]))
+            .unwrap()
+            .text;
+        let value: Value = serde_json::from_str(&protected).unwrap();
+        let placeholder = value["message"].as_str().unwrap();
+        let collision = Value::Object(serde_json::Map::from_iter([
+            (secret.to_owned(), Value::from(1)),
+            (placeholder.to_owned(), Value::from(2)),
+        ]))
+        .to_string();
+        let before = std::fs::read(&path).unwrap();
+        let keys = dictionary.store.keys.0.lock().unwrap().clone();
+        let lock = path.parent().unwrap().join("vault.lock");
+        std::fs::remove_file(&lock).unwrap();
+        let reports = dictionary
+            .hydrate_batch_readonly_bounded(&[&protected, &collision, &protected], 1024 * 1024)
+            .unwrap();
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0].as_ref().unwrap().text, raw);
+        assert!(
+            reports[1]
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate JSON key")
+        );
+        assert_eq!(reports[2].as_ref().unwrap().text, raw);
+        assert!(
+            dictionary
+                .hydrate_pair_readonly(&collision, &protected)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(*dictionary.store.keys.0.lock().unwrap(), keys);
+        assert!(!lock.exists());
     }
 
     #[test]

@@ -241,6 +241,109 @@ fn to_ref(l: Listed, cache_root: &Path) -> SessionRef {
 // discipline already rests on one serialization shape, determinism is the requirement, and the
 // key order drawn above is only illustrative.
 
+mod native_snapshot;
+
+pub(super) enum CanonicalRecord<'a> {
+    Meta {
+        id: &'a str,
+        project_id: &'a str,
+        parent_id: Option<&'a str>,
+        directory: &'a str,
+        created: i64,
+        version: &'a str,
+    },
+    Message {
+        id: &'a str,
+        session: &'a str,
+        created: i64,
+        data: &'a str,
+    },
+    Part {
+        id: &'a str,
+        message: &'a str,
+        session: &'a str,
+        created: i64,
+        data: &'a str,
+    },
+}
+
+impl CanonicalRecord<'_> {
+    fn write_to(&self, mut output: impl std::io::Write) -> std::io::Result<()> {
+        fn quoted(output: &mut impl std::io::Write, value: &str) -> std::io::Result<()> {
+            serde_json::to_writer(output, value).map_err(std::io::Error::other)
+        }
+        match self {
+            Self::Meta {
+                id,
+                project_id,
+                parent_id,
+                directory,
+                created,
+                version,
+            } => {
+                #[derive(serde::Serialize)]
+                struct Meta<'a> {
+                    directory: &'a str,
+                    id: &'a str,
+                    kind: &'static str,
+                    parent_id: Option<&'a str>,
+                    project_id: &'a str,
+                    time_created: i64,
+                    version: &'a str,
+                }
+                serde_json::to_writer(
+                    &mut output,
+                    &Meta {
+                        directory,
+                        id,
+                        kind: "opencode.meta",
+                        parent_id: *parent_id,
+                        project_id,
+                        time_created: *created,
+                        version,
+                    },
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            Self::Message {
+                id,
+                session,
+                created,
+                data,
+            } => {
+                output.write_all(b"{\"id\":")?;
+                quoted(&mut output, id)?;
+                output.write_all(b",\"kind\":\"message\",\"session_id\":")?;
+                quoted(&mut output, session)?;
+                write!(output, ",\"time_created\":{created},\"data\":{data}}}")?;
+            }
+            Self::Part {
+                id,
+                message,
+                session,
+                created,
+                data,
+            } => {
+                output.write_all(b"{\"id\":")?;
+                quoted(&mut output, id)?;
+                output.write_all(b",\"kind\":\"part\",\"message_id\":")?;
+                quoted(&mut output, message)?;
+                output.write_all(b",\"session_id\":")?;
+                quoted(&mut output, session)?;
+                write!(output, ",\"time_created\":{created},\"data\":{data}}}")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn text(&self) -> String {
+        let mut bytes = Vec::new();
+        self.write_to(&mut bytes)
+            .expect("writing canonical native bytes into memory succeeds");
+        String::from_utf8(bytes).expect("canonical native fields are UTF-8")
+    }
+}
+
 struct Materialized {
     text: String,
     /// `session.time_updated`: the mtime written onto the materialized file, so the link's
@@ -277,16 +380,15 @@ fn materialize(con: &Connection, session_id: &str) -> Option<Materialized> {
         created_ms,
         0,
         id.clone(),
-        serde_json::json!({
-            "id": id,
-            "kind": "opencode.meta",
-            "project_id": project_id,
-            "parent_id": parent_id,
-            "directory": directory,
-            "time_created": created_ms,
-            "version": version,
-        })
-        .to_string(),
+        CanonicalRecord::Meta {
+            id: &id,
+            project_id: &project_id,
+            parent_id: parent_id.as_deref(),
+            directory: &directory,
+            created: created_ms,
+            version: &version,
+        }
+        .text(),
     ));
 
     let mut ms = con
@@ -303,18 +405,17 @@ fn materialize(con: &Connection, session_id: &str) -> Option<Materialized> {
         .ok()?;
     for row in msg_rows.filter_map(|r| r.ok()) {
         let (mid, tc, data) = row;
-        let q = |s: &str| serde_json::Value::String(s.to_string()).to_string();
         lines.push((
             tc,
             0,
             mid.clone(),
-            format!(
-                "{{\"id\":{},\"kind\":\"message\",\"session_id\":{},\"time_created\":{},\"data\":{}}}",
-                q(&mid),
-                q(&id),
-                tc,
-                data
-            ),
+            CanonicalRecord::Message {
+                id: &mid,
+                session: &id,
+                created: tc,
+                data: &data,
+            }
+            .text(),
         ));
     }
 
@@ -333,19 +434,18 @@ fn materialize(con: &Connection, session_id: &str) -> Option<Materialized> {
         .ok()?;
     for row in part_rows.filter_map(|r| r.ok()) {
         let (pid, mid, tc, data) = row;
-        let q = |s: &str| serde_json::Value::String(s.to_string()).to_string();
         lines.push((
             tc,
             1,
             pid.clone(),
-            format!(
-                "{{\"id\":{},\"kind\":\"part\",\"message_id\":{},\"session_id\":{},\"time_created\":{},\"data\":{}}}",
-                q(&pid),
-                q(&mid),
-                q(&id),
-                tc,
-                data
-            ),
+            CanonicalRecord::Part {
+                id: &pid,
+                message: &mid,
+                session: &id,
+                created: tc,
+                data: &data,
+            }
+            .text(),
         ));
     }
 
@@ -1483,6 +1583,23 @@ impl Adapter for OpenCode {
         Some(path)
     }
 
+    fn lookup_native_readonly(
+        &self,
+        session_id: &str,
+        limits: super::native_snapshot::Limits,
+    ) -> super::native_snapshot::Result<super::native_snapshot::Source> {
+        let database = db_path().ok_or(super::native_snapshot::Unavailable::NotFound)?;
+        native_snapshot::lookup(&database, session_id, limits)
+    }
+
+    fn snapshot_native_readonly(
+        &self,
+        source: &super::native_snapshot::Source,
+        limits: super::native_snapshot::Limits,
+    ) -> super::native_snapshot::Result<super::native_snapshot::Snapshot> {
+        native_snapshot::read(source, limits)
+    }
+
     fn parse(&self, text: &str) -> Result<Session> {
         Ok(parse_native(text, false)?.session)
     }
@@ -1574,6 +1691,46 @@ fn install_via(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_record_emission_preserves_native_wrapper_bytes() {
+        let meta = CanonicalRecord::Meta {
+            id: "se\"s",
+            project_id: "project",
+            parent_id: Some("p"),
+            directory: "/a\nb",
+            created: -4,
+            version: "v\\t",
+        }
+        .text();
+        assert_eq!(
+            meta,
+            r#"{"directory":"/a\nb","id":"se\"s","kind":"opencode.meta","parent_id":"p","project_id":"project","time_created":-4,"version":"v\\t"}"#
+        );
+        let message = CanonicalRecord::Message {
+            id: "m\"",
+            session: "s",
+            created: -3,
+            data: r#"{ "z": 1, "a": [true] }"#,
+        }
+        .text();
+        assert_eq!(
+            message,
+            r#"{"id":"m\"","kind":"message","session_id":"s","time_created":-3,"data":{ "z": 1, "a": [true] }}"#
+        );
+        let part = CanonicalRecord::Part {
+            id: "p",
+            message: "m",
+            session: "s",
+            created: 0,
+            data: r#"{"type":"future","payload":"kept"}"#,
+        }
+        .text();
+        assert_eq!(
+            part,
+            r#"{"id":"p","kind":"part","message_id":"m","session_id":"s","time_created":0,"data":{"type":"future","payload":"kept"}}"#
+        );
+    }
 
     // ── Real shapes from the probing documentation (§2.1/§2.2), inlined as fixtures ──
 

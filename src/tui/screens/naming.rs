@@ -56,6 +56,8 @@ impl ImportChoice {
             repo: Some(format!("{}@{}", self.slug, self.branch)),
             branch: None,
             onto: None,
+            propose_lineage: false,
+            independent: false,
             privacy: false,
         }
     }

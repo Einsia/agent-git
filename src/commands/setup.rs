@@ -1364,8 +1364,14 @@ mod tests {
     fn skill_distinguishes_importing_current_session_from_starting_a_new_one() {
         let skill = include_str!("setup_skill.md");
         assert!(skill.contains("agit status --check-missing"));
-        assert!(skill.contains("agit import <session-id> --repo <owner/repo> -b <branch>"));
+        assert!(
+            skill.contains(
+                "agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>"
+            )
+        );
         assert!(skill.contains("`agit import` links that existing transcript"));
+        assert!(skill.contains("--propose-lineage"));
+        assert!(skill.contains("pipes, JSON, CI and agent calls return choices without adopting"));
         assert!(skill.contains("`agit new` cannot take over the session that is already running"));
     }
 

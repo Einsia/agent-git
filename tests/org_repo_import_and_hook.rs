@@ -403,7 +403,7 @@ fn push_dispatches_one_startup_update_check_and_suppressed_modes_dispatch_none()
     let lab = Lab::new();
     lab.append_turn(SID, 1, "publish this turn", "done");
     let imported = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(
@@ -483,7 +483,7 @@ fn an_org_import_lands_in_the_org_repo_and_the_next_stop_hook_follows_it() {
     lab.append_turn(SID, 1, "start the org line", "ok");
 
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(
@@ -596,7 +596,13 @@ fn an_org_owner_may_import_into_a_repo_that_does_not_exist_yet() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "brand new", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/fresh@work"])
+        .agit(&[
+            "import",
+            "--independent",
+            SID,
+            "--into",
+            "einsia/fresh@work",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -616,7 +622,13 @@ fn an_import_the_hub_refuses_lands_nothing() {
     lab.append_turn(SID, 1, "hello", "hi");
 
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/locked@work"])
+        .agit(&[
+            "import",
+            "--independent",
+            SID,
+            "--into",
+            "einsia/locked@work",
+        ])
         .output()
         .unwrap();
     assert_eq!(
@@ -633,7 +645,7 @@ fn an_import_the_hub_refuses_lands_nothing() {
     // Does not exist and I am only a plain member: a plain member cannot create an agent under
     // the org.
     let out = lab
-        .agit(&["import", SID, "--into", "acme/ghost@work"])
+        .agit(&["import", "--independent", SID, "--into", "acme/ghost@work"])
         .output()
         .unwrap();
     assert_eq!(
@@ -654,6 +666,7 @@ fn an_import_the_hub_refuses_lands_nothing() {
         "a non-lowercase owner is rejected at the entrance:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("owner names are lowercase"));
     assert!(!lab.repo("Einsia", "qa").exists());
 }
 
@@ -666,7 +679,7 @@ fn run_continues_a_granted_org_branch_and_forks_once_the_gate_closes() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(
@@ -741,7 +754,13 @@ fn run_continues_an_org_owners_branch_the_hub_does_not_have_yet() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "brand new", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/fresh@work"])
+        .agit(&[
+            "import",
+            "--independent",
+            SID,
+            "--into",
+            "einsia/fresh@work",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -777,7 +796,7 @@ fn a_cross_runtime_resume_baselines_what_the_live_read_returns() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -826,7 +845,7 @@ fn runtime_default_does_not_replace_an_existing_native_session() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "keep the native runtime", "ok");
     assert!(
-        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
             .output()
             .unwrap()
             .status
@@ -867,7 +886,7 @@ fn repeated_no_launch_reuses_the_prepared_session() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     let imported = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(imported.status.success());
@@ -917,7 +936,7 @@ fn repeated_no_launch_reuses_a_claude_desktop_session() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     assert!(
-        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
             .output()
             .unwrap()
             .status
@@ -988,7 +1007,7 @@ fn check_superseded_harness_refusal(ownerless: bool) {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     assert!(
-        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
             .output()
             .unwrap()
             .status
@@ -1177,7 +1196,7 @@ fn a_nested_runtime_on_another_line_does_not_mask_a_superseded_harness() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     assert!(
-        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
             .output()
             .unwrap()
             .status
@@ -1259,7 +1278,7 @@ fn check_rc_rerouted_settlement(legacy_personal: bool) {
             String::from_utf8_lossy(&output.stderr)
         );
     };
-    run(&["import", SID, "--into", source]);
+    run(&["import", "--independent", SID, "--into", source]);
     run(&["resume", source, "--force", "--no-launch"]);
     let mut active = active_links_on(&lab, source_owner, "qa", "work")
         .pop()
@@ -1282,6 +1301,7 @@ fn check_rc_rerouted_settlement(legacy_personal: bool) {
     lab.append_turn(unrelated, 1, "unrelated context", "unrelated answer");
     run(&[
         "import",
+        "--independent",
         unrelated,
         "--into",
         &format!("einsia/qa@{destination_branch}"),
@@ -1340,7 +1360,7 @@ fn a_materialized_commit_refuses_after_its_source_tip_moves() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     let imported = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(imported.status.success());
@@ -1423,7 +1443,7 @@ fn an_advanced_branch_refuses_to_supersede_unsettled_content() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     assert!(
-        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
             .output()
             .unwrap()
             .status
@@ -1477,7 +1497,7 @@ fn an_advanced_branch_refuses_to_supersede_a_rewritten_baseline() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     assert!(
-        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
             .output()
             .unwrap()
             .status
@@ -1528,7 +1548,7 @@ fn an_advanced_branch_refuses_to_supersede_an_unverifiable_baseline() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     assert!(
-        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
             .output()
             .unwrap()
             .status
@@ -1578,7 +1598,7 @@ fn concurrent_no_launch_prepares_leave_one_active_claim() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     assert!(
-        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
             .output()
             .unwrap()
             .status
@@ -1611,7 +1631,7 @@ fn legacy_multiple_link_error_offers_session_id_disambiguation() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     assert!(
-        lab.agit(&["import", SID, "--into", "einsia/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
             .output()
             .unwrap()
             .status
@@ -1689,7 +1709,7 @@ fn a_rerouted_claim_invalidates_the_materialization_baseline() {
     .unwrap();
 
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(
@@ -1727,7 +1747,7 @@ fn a_legacy_link_without_owner_still_counts_as_a_reroute() {
     )
     .unwrap();
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(
@@ -1772,7 +1792,14 @@ fn import_discards_the_baseline_when_the_recorded_repo_or_branch_is_missing() {
         agit::domain::link::write(&store, &claim).unwrap();
 
         let output = lab
-            .agit(&["import", SID, "--into", "me/recovery@work", "-y"])
+            .agit(&[
+                "import",
+                "--independent",
+                SID,
+                "--into",
+                "me/recovery@work",
+                "-y",
+            ])
             .output()
             .unwrap();
         assert!(
@@ -1818,7 +1845,7 @@ fn check_import_owner_confirmation(previous_owner: Option<&str>, target: &str) {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "retain the explicit claim", "recorded");
     assert!(
-        lab.agit(&["import", SID, "--into", "me/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "me/qa@work"])
             .status()
             .unwrap()
             .success()
@@ -1836,7 +1863,7 @@ fn check_import_owner_confirmation(previous_owner: Option<&str>, target: &str) {
     let original = Repo::open(lab.repo("me", "qa")).unwrap();
     let before_head = original.git(&["rev-parse", "refs/heads/work"]).unwrap();
     let refused = lab
-        .agit(&["import", SID, "--into", target])
+        .agit(&["import", "--independent", SID, "--into", target])
         .env_remove("AGIT_YES")
         .stdin(Stdio::null())
         .output()
@@ -1866,7 +1893,7 @@ fn check_import_owner_confirmation(previous_owner: Option<&str>, target: &str) {
     assert!(diagnostic.contains(previous), "{diagnostic}");
     assert!(diagnostic.contains(target), "{diagnostic}");
     let accepted = lab
-        .agit(&["import", SID, "--into", target, "-y"])
+        .agit(&["import", "--independent", SID, "--into", target, "-y"])
         .env_remove("AGIT_YES")
         .stdin(Stdio::null())
         .output()
@@ -1886,7 +1913,7 @@ fn check_import_owner_confirmation(previous_owner: Option<&str>, target: &str) {
     assert_eq!(claim.baseline_hash, None);
     assert!(commits_on(&lab.repo(owner, "qa"), "work") >= 2);
     let same = lab
-        .agit(&["import", SID, "--into", target])
+        .agit(&["import", "--from=claude-code", SID, "--into", target])
         .env_remove("AGIT_YES")
         .stdin(Stdio::null())
         .output()
@@ -2011,7 +2038,7 @@ fn check_quiet_legacy_hook_claim(state: &str) {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "retain the claimed opening turn", "recorded");
     let imported = lab
-        .agit(&["import", SID, "--into", "me/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "me/qa@work"])
         .output()
         .unwrap();
     assert!(imported.status.success(), "{imported:?}");
@@ -2206,7 +2233,7 @@ fn import_preserves_supersession_until_recovery_creates_a_new_branch() {
         let lab = Lab::new();
         lab.append_turn(SID, 1, "the shared prefix", "recorded");
         let imported = lab
-            .agit(&["import", SID, "--into", "me/qa@work"])
+            .agit(&["import", "--independent", SID, "--into", "me/qa@work"])
             .output()
             .unwrap();
         assert!(imported.status.success());
@@ -2226,14 +2253,21 @@ fn import_preserves_supersession_until_recovery_creates_a_new_branch() {
         let tip = repo.git(&["rev-parse", "refs/heads/work"]).unwrap();
         lab.append_turn(SID, 2, "work after supersession", "preserved separately");
         let refused = lab
-            .agit(&["import", SID, "--into", "me/qa@work", "-y"])
+            .agit(&["import", "--independent", SID, "--into", "me/qa@work", "-y"])
             .output()
             .unwrap();
         assert_eq!(refused.status.code(), Some(7));
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(repo.git(&["rev-parse", "refs/heads/work"]).unwrap(), tip);
         let recovered = lab
-            .agit(&["import", SID, "--into", "me/qa@recovered", "-y"])
+            .agit(&[
+                "import",
+                "--independent",
+                SID,
+                "--into",
+                "me/qa@recovered",
+                "-y",
+            ])
             .output()
             .unwrap();
         assert!(
@@ -2275,7 +2309,7 @@ fn check_import_requires_explicit_namespace(owner: Option<&str>) {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "retain the unknown namespace", "recorded");
     assert!(
-        lab.agit(&["import", SID, "--into", "me/qa@work"])
+        lab.agit(&["import", "--independent", SID, "--into", "me/qa@work"])
             .status()
             .unwrap()
             .success()
@@ -2287,7 +2321,16 @@ fn check_import_requires_explicit_namespace(owner: Option<&str>) {
     let path = agit::domain::link::link_path(&store, "claude-code", SID);
     let before = fs::read(&path).unwrap();
     for args in [
-        vec!["import", SID, "-n", "qa", "-b", "work", "-y"],
+        vec![
+            "import",
+            "--independent",
+            SID,
+            "-n",
+            "qa",
+            "-b",
+            "work",
+            "-y",
+        ],
         vec!["commit", SID, "-n", "qa", "-b", "work", "-y"],
     ] {
         let output = lab.agit(&args).stdin(Stdio::null()).output().unwrap();
@@ -2317,7 +2360,7 @@ fn a_reroute_onto_a_claimed_branch_is_refused_not_grafted() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -2344,7 +2387,7 @@ fn a_reroute_onto_a_claimed_branch_is_refused_not_grafted() {
     )
     .unwrap();
     let out = lab
-        .agit(&["import", SID2, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID2, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(
@@ -2367,7 +2410,7 @@ fn a_refused_import_restores_the_previous_link() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -2381,7 +2424,7 @@ fn a_refused_import_restores_the_previous_link() {
     // Explicitly aimed at main (the file line): the settlement precondition refuses it and the
     // command fails.
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@main"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@main"])
         .output()
         .unwrap();
     assert!(
@@ -2420,7 +2463,7 @@ fn resume_falls_back_to_the_invocation_directory_not_the_git_toplevel() {
     );
     lab.append_turn(SID, 1, "start the org line", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -2494,7 +2537,7 @@ fn a_web_id_forks_on_the_folded_branch_from_context() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -2541,7 +2584,7 @@ fn a_web_id_fast_forwards_a_stale_local_branch_before_arbitration() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -2599,7 +2642,7 @@ fn a_web_id_behind_the_local_head_continues_on_the_local_line() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "start the org line", "ok");
     let out = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -2666,7 +2709,7 @@ fn missing_repository_recovery_preserves_workspace_binding_through_resume() {
     let publisher = Lab::new();
     publisher.append_turn(SID, 1, "restore this published session", "synthetic reply");
     let imported = publisher
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .env("CI", "1")
         .output()
         .unwrap();
@@ -3167,7 +3210,7 @@ fn promotion_lab() -> Lab {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "preserve the promoted line", "ok");
     let imported = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(
@@ -3226,7 +3269,7 @@ fn resume_tracking_fixture(shape: &str) -> (Lab, Repo, String) {
         "synthetic reply",
     );
     let imported = lab
-        .agit(&["import", SID, "--into", "einsia/qa@work"])
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
         .output()
         .unwrap();
     assert!(

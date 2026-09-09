@@ -68,7 +68,15 @@ impl Lab {
         )
         .unwrap();
         lab.success(&["init", "qa", "--no-bind"]);
-        lab.success(&["import", ID, "--from", "codex", "--into", "me/qa@work"]);
+        lab.success(&[
+            "import",
+            ID,
+            "--from",
+            "codex",
+            "--into",
+            "me/qa@work",
+            "--independent",
+        ]);
         let head = lab.git(&["rev-parse", "refs/heads/work"]);
         lab.git(&["branch", "source", &head]);
         lab

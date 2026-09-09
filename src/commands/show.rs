@@ -203,7 +203,9 @@ pub fn run(args: Args) -> CmdResult {
                     return Ok(ExitCode::Ref);
                 }
                 println!("no sessions adopted yet.");
-                ui::hint("`agit import <session-id> -n <agent-name>`");
+                ui::hint(
+                    "`agit import <session-id> --from <runtime> --into <owner/repo>@<branch>`",
+                );
                 return Ok(ExitCode::Ok);
             };
             // A target is guaranteed here: zero-argument show resolves a local repo above.

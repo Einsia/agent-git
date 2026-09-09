@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "import-lineage-v1.json",
+  "title": "Explicit local import lineage evidence",
+  "description": "Candidate evidence is advisory and never selects or applies an import. Resolve the cli-output-v2.json schema ID from the bundled CLI output schema for typed commands.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "operation",
+    "native",
+    "destination",
+    "scan_state",
+    "semantic_discovery_available",
+    "candidates",
+    "unavailable",
+    "independent"
+  ],
+  "properties": {
+    "schema": {
+      "const": "import-lineage"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "operation": {
+      "enum": [
+        "preview",
+        "choice_required"
+      ]
+    },
+    "native": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime",
+        "session_id"
+      ],
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "minLength": 1
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "destination": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scan_state": {
+      "enum": [
+        "complete",
+        "incomplete"
+      ]
+    },
+    "semantic_discovery_available": {
+      "const": false
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "commit",
+          "reachable_from",
+          "completed_turns",
+          "records",
+          "evidence",
+          "apply"
+        ],
+        "properties": {
+          "commit": {
+            "type": "string",
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+          },
+          "reachable_from": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^refs/"
+            },
+            "uniqueItems": true
+          },
+          "completed_turns": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "records": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "evidence": {
+            "enum": [
+              "exact_native_records",
+              "verified_materialized_source"
+            ]
+          },
+          "apply": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "cli-output-v2.json#/$defs/fix_command"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "unavailable": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "commit",
+          "reason"
+        ],
+        "properties": {
+          "commit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "string",
+                "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+              }
+            ]
+          },
+          "reason": {
+            "description": "git_worktree_format means the selected Git cannot provide NUL-framed worktree output, normally available in Git 2.36 or newer. Other Git or recovery failures retain their own reason.",
+            "enum": [
+              "reference_scan",
+              "commit_walk",
+              "scan_budget",
+              "native_records",
+              "stored_evidence",
+              "secret_mapping",
+              "materialization",
+              "native_not_found",
+              "native_ambiguous",
+              "native_unsupported",
+              "native_budget",
+              "native_read",
+              "native_database",
+              "native_incomplete",
+              "native_changed",
+              "session_link",
+              "local_repository",
+              "recovery",
+              "git_worktree_format"
+            ]
+          }
+        }
+      }
+    },
+    "independent": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "cli-output-v2.json#/$defs/fix_command"
+        }
+      ]
+    }
+  }
+}

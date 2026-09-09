@@ -95,7 +95,15 @@ mod unix {
             ].map(|value| format!("{value}\n")).concat()).unwrap();
             for args in [
                 vec!["init", "qa", "--no-bind"],
-                vec!["import", SID, "--from", "codex", "--into", branch],
+                vec![
+                    "import",
+                    SID,
+                    "--from",
+                    "codex",
+                    "--into",
+                    branch,
+                    "--independent",
+                ],
             ] {
                 let output = self.command(&args).output().unwrap();
                 assert!(output.status.success(), "{output:?}");

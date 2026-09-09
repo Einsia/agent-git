@@ -180,7 +180,7 @@ pub fn run(args: Args) -> CmdResult {
     let Some(repo) = Repo::open(&checkout.path) else {
         ui::error(&format!("no local repo for {}.", checkout.slug()));
         ui::hint(&format!(
-            "record a first version: `agit import <session-id> -n {agent}`"
+            "record a first version: `agit import <session-id> --from <runtime> --into <owner>/{agent}@<branch>`"
         ));
         return Ok(ExitCode::Usage);
     };

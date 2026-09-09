@@ -181,9 +181,193 @@ pub fn thread_by_id(id: &str) -> Option<Thread> {
     rows.next()?.ok()
 }
 
+/// An inspection reads only the exact identity's path and propagates incomplete index evidence.
+pub(super) fn native_path_readonly(
+    id: &str,
+    limits: super::native_snapshot::Limits,
+) -> super::native_snapshot::Result<Option<PathBuf>> {
+    use super::native_snapshot::Unavailable;
+    let root = super::codex::codex_home().map_err(|_| Unavailable::Read)?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(Unavailable::Read),
+    };
+    let mut selected: Option<(u32, PathBuf)> = None;
+    for (visited, entry) in entries.enumerate() {
+        if visited >= limits.lookup_entries {
+            return Err(Unavailable::BudgetExceeded);
+        }
+        let entry = entry.map_err(|_| Unavailable::Read)?;
+        let name = entry.file_name();
+        let version = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("state_"))
+            .and_then(|name| name.strip_suffix(".sqlite"))
+            .and_then(|version| version.parse::<u32>().ok());
+        if let Some(version) = version
+            && selected
+                .as_ref()
+                .is_none_or(|(current, _)| version > *current)
+        {
+            selected = Some((version, entry.path()));
+        }
+    }
+    let Some((_, path)) = selected else {
+        return Ok(None);
+    };
+    native_path_at(&path, id, limits)
+}
+
+fn native_path_at(
+    database: &Path,
+    id: &str,
+    limits: super::native_snapshot::Limits,
+) -> super::native_snapshot::Result<Option<PathBuf>> {
+    use super::native_snapshot::Unavailable;
+    if limits.lookup_entries == 0 {
+        return Err(Unavailable::BudgetExceeded);
+    }
+    let metadata = std::fs::symlink_metadata(database).map_err(|_| Unavailable::Read)?;
+    if !metadata.file_type().is_file() {
+        return Err(Unavailable::Read);
+    }
+    let connection = open(database).ok_or(Unavailable::Database)?;
+    let mut statement = connection
+        .prepare("SELECT id, rollout_path FROM threads WHERE id = ?1 AND rollout_path IS NOT NULL")
+        .map_err(|_| Unavailable::Database)?;
+    let mut rows = statement.query([id]).map_err(|_| Unavailable::Database)?;
+    let Some(row) = rows.next().map_err(|_| Unavailable::Database)? else {
+        return Ok(None);
+    };
+    let selected = row
+        .get_ref(0)
+        .map_err(|_| Unavailable::Database)?
+        .as_str()
+        .map_err(|_| Unavailable::Database)?;
+    if selected != id {
+        return Err(Unavailable::Database);
+    }
+    let path = row
+        .get_ref(1)
+        .map_err(|_| Unavailable::Database)?
+        .as_str()
+        .map_err(|_| Unavailable::Database)?;
+    if path.len() > limits.bytes.min(limits.working_bytes) {
+        return Err(Unavailable::BudgetExceeded);
+    }
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(Unavailable::Database);
+    }
+    if rows.next().map_err(|_| Unavailable::Database)?.is_some() {
+        return Err(Unavailable::Ambiguous);
+    }
+    Ok(Some(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readonly_native_lookup_ignores_payload_columns_and_refuses_ambiguous_or_bad_paths() {
+        use super::super::native_snapshot::{Limits, Unavailable};
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("index.sqlite");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT, rollout_path TEXT, first_user_message BLOB);",
+            )
+            .unwrap();
+        let path = directory.path().join("selected.jsonl");
+        connection
+            .execute(
+                "INSERT INTO threads VALUES ('selected', ?1, zeroblob(1048576))",
+                [path.to_str().unwrap()],
+            )
+            .unwrap();
+        let before = std::fs::read(&database).unwrap();
+        assert_eq!(
+            native_path_at(&database, "selected", Limits::default()).unwrap(),
+            Some(path)
+        );
+        assert_eq!(
+            native_path_at(&database, "select", Limits::default()).unwrap(),
+            None
+        );
+        assert_eq!(
+            native_path_at(
+                &database,
+                "selected",
+                Limits {
+                    working_bytes: 0,
+                    ..Limits::default()
+                }
+            )
+            .unwrap_err(),
+            Unavailable::BudgetExceeded
+        );
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        connection
+            .execute(
+                "INSERT INTO threads VALUES ('selected', '/different', NULL)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            native_path_at(&database, "selected", Limits::default()).unwrap_err(),
+            Unavailable::Ambiguous
+        );
+        connection.execute("DELETE FROM threads", []).unwrap();
+        connection
+            .execute("INSERT INTO threads VALUES ('selected', x'0102', NULL)", [])
+            .unwrap();
+        assert_eq!(
+            native_path_at(&database, "selected", Limits::default()).unwrap_err(),
+            Unavailable::Database
+        );
+        connection.execute("DROP TABLE threads", []).unwrap();
+        assert_eq!(
+            native_path_at(&database, "selected", Limits::default()).unwrap_err(),
+            Unavailable::Database
+        );
+    }
+
+    #[test]
+    fn readonly_native_identity_is_exact_even_with_a_permissive_index_collation() {
+        use super::super::native_snapshot::{Limits, Unavailable};
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("index.sqlite");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE threads (id TEXT COLLATE NOCASE, rollout_path TEXT);")
+            .unwrap();
+        let path = directory.path().join("native.jsonl");
+        connection
+            .execute(
+                "INSERT INTO threads VALUES ('aBc-session', ?1)",
+                [path.to_str().unwrap()],
+            )
+            .unwrap();
+        let matched: String = connection
+            .query_row(
+                "SELECT id FROM threads WHERE id = ?1",
+                ["abc-session"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matched, "aBc-session");
+        assert_eq!(
+            native_path_at(&database, "aBc-session", Limits::default()).unwrap(),
+            Some(path)
+        );
+        assert_eq!(
+            native_path_at(&database, "abc-session", Limits::default()).unwrap_err(),
+            Unavailable::Database
+        );
+    }
 
     /// A temporary database for the query logic, with no dependency on a real Codex home.
     fn fixture() -> (tempfile::TempDir, PathBuf) {

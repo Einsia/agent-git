@@ -12,7 +12,7 @@ so "that conversation last Wednesday that finally cracked the bug" becomes
 something you can find, continue, and hand to a teammate.
 
 ```
-agit import <session> -n <agent>   adopt an existing claude / codex / opencode / cursor session and record its first version
+agit import <session> --from <runtime> --into <owner/repo>@<branch>   choose lineage, then adopt and record the session
 agit commit <agent>                record another version (snapshot of the session's full current content)
 agit push <agent>                  publish to the hub, get a link
 agit clone <owner>/<agent>         fetch (with git history) and pick up right away; --mine creates a copy under your name
@@ -26,6 +26,14 @@ skip this reminder.
 Adopting and recording the first version are one command — the in-between
 state ("linked, but unversioned") means nothing to anyone. To mark a session
 without versioning it (e.g. offline), pass `--link-only`.
+
+Use a full native session ID and an explicit runtime and destination for lineage discovery.
+The terminal offers verified local bases, independent import, or cancellation. Noninteractive
+calls return choices without writing; pass `--onto <ref>` or `--independent` to select a path.
+`--propose-lineage` prints a read-only report without adopting the session.
+Inspecting lineage in an existing repository requires NUL-framed Git worktree output,
+normally available in Git 2.36 or newer. An unsupported Git reports `git_worktree_format`;
+explicit `--onto`, `--independent`, and `--link-only` imports retain their ordinary checks.
 
 `agit clone` is **read-only by default**: nothing is created in your name,
 `origin` points at the source, the session is installed into your runtime and

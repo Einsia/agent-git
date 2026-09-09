@@ -30,7 +30,10 @@ pub fn warn_new(current: &Current, target: &str, branch: &str) {
     ));
     eprintln!("\n`agit new` starts an empty session and will not include this conversation.\n");
     eprintln!("To adopt the current conversation:");
-    eprintln!("  agit import {session_arg} --into {destination}\n");
+    eprintln!(
+        "  agit import {session_arg} --from {} --into {destination}\n",
+        current.runtime
+    );
     eprintln!("To intentionally start fresh:");
     eprintln!("  agit new {target_arg} -b {branch_arg} --fresh");
 }

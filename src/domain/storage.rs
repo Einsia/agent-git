@@ -8,6 +8,7 @@
 
 use crate::Result;
 use crate::domain::meta::{self, LayoutVersion};
+use crate::domain::repo::ReadPolicy;
 use crate::domain::transcript::{self, Envelope};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
@@ -15,6 +16,26 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct ReadLimitExceeded(String);
+
+fn read_limit(condition: bool, message: impl FnOnce() -> String) -> Result<()> {
+    if !condition {
+        return Err(ReadLimitExceeded(message()).into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "secret-vault")]
+fn immutable_local_oid(commit: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "local evidence reads require an immutable commit object id"
+    );
+    Ok(())
+}
 
 /// Read limit for one event object.
 pub const MAX_EVENT_BYTES: usize = 64 * 1024 * 1024;
@@ -174,7 +195,10 @@ pub fn parse_sequence(text: &str) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     for (index, id) in body.split('\n').enumerate() {
         if ids.len() == MAX_SEQUENCE_EVENTS {
-            anyhow::bail!("event sequence exceeds {MAX_SEQUENCE_EVENTS} entries");
+            return Err(ReadLimitExceeded(format!(
+                "event sequence exceeds {MAX_SEQUENCE_EVENTS} entries"
+            ))
+            .into());
         }
         if !meta::is_event_id(id) {
             anyhow::bail!(
@@ -756,6 +780,40 @@ fn materialize_pair_at_with_limits(
     max_sequence_bytes: usize,
     max_unique_event_bytes: usize,
 ) -> Result<(String, String)> {
+    materialize_pair_with_policy(
+        repo_root,
+        git_ref,
+        max_sequence_bytes,
+        max_unique_event_bytes,
+        ReadPolicy::AllowTransport,
+    )
+}
+
+/// Candidate discovery reads bounded existing evidence without invoking a Git transport.
+#[cfg(feature = "secret-vault")]
+pub(crate) fn materialize_pair_local(
+    repo_root: &Path,
+    commit: &str,
+    max_sequence_bytes: usize,
+    max_unique_event_bytes: usize,
+) -> Result<(String, String)> {
+    immutable_local_oid(commit)?;
+    materialize_pair_with_policy(
+        repo_root,
+        commit,
+        max_sequence_bytes,
+        max_unique_event_bytes,
+        ReadPolicy::LocalOnly,
+    )
+}
+
+fn materialize_pair_with_policy(
+    repo_root: &Path,
+    git_ref: &str,
+    max_sequence_bytes: usize,
+    max_unique_event_bytes: usize,
+    policy: ReadPolicy,
+) -> Result<(String, String)> {
     if git_ref.is_empty()
         || git_ref.len() > 1024
         || git_ref.starts_with('-')
@@ -763,17 +821,29 @@ fn materialize_pair_at_with_limits(
     {
         anyhow::bail!("git ref must be a bounded non-option string without newlines");
     }
-    let commit = resolve_commit(repo_root, git_ref)?;
-    let meta_bytes = git_blob_at(repo_root, &commit, meta::FILE, MAX_EVENT_BYTES)?;
+    let commit = resolve_commit_with_policy(repo_root, git_ref, policy)?;
+    let local = matches!(policy, ReadPolicy::LocalOnly);
+    let meta_limit = if local { 1024 * 1024 } else { MAX_EVENT_BYTES };
+    let sequence_limit = if local {
+        max_sequence_bytes.min(MAX_MATERIALIZED_BYTES)
+    } else {
+        MAX_MATERIALIZED_BYTES
+    };
+    let event_limit = if local {
+        max_unique_event_bytes.min(MAX_EVENT_BYTES)
+    } else {
+        MAX_EVENT_BYTES
+    };
+    let meta_bytes = git_blob_with_policy(repo_root, &commit, meta::FILE, meta_limit, policy)?;
     let snapshot: meta::Meta = serde_json::from_slice(&meta_bytes)
         .context("invalid session/meta.json at requested ref")?;
 
     match snapshot.layout {
-        LayoutVersion::V0 => materialize_v0_pair_at(repo_root, &commit, max_sequence_bytes)
+        LayoutVersion::V0 => materialize_v0_pair_at(repo_root, &commit, max_sequence_bytes, policy)
             .with_context(|| format!("invalid v0 storage at {git_ref}")),
         LayoutVersion::V1 => {
             let log_bytes =
-                git_blob_at(repo_root, &commit, meta::LOG_FILE, MAX_MATERIALIZED_BYTES)?;
+                git_blob_with_policy(repo_root, &commit, meta::LOG_FILE, sequence_limit, policy)?;
             let log_sequence = String::from_utf8(log_bytes)
                 .with_context(|| format!("{git_ref}:{} is not UTF-8", meta::LOG_FILE))?;
             let log_ids = parse_sequence(&log_sequence)
@@ -781,7 +851,7 @@ fn materialize_pair_at_with_limits(
             drop(log_sequence);
 
             let view_bytes =
-                git_blob_at(repo_root, &commit, meta::VIEW_FILE, MAX_MATERIALIZED_BYTES)?;
+                git_blob_with_policy(repo_root, &commit, meta::VIEW_FILE, sequence_limit, policy)?;
             let view_sequence = String::from_utf8(view_bytes)
                 .with_context(|| format!("{git_ref}:{} is not UTF-8", meta::VIEW_FILE))?;
             let view_ids = parse_sequence(&view_sequence)
@@ -791,18 +861,19 @@ fn materialize_pair_at_with_limits(
             materialize_pair_ids_with_limits(
                 &log_ids,
                 &view_ids,
-                MAX_EVENT_BYTES,
+                event_limit,
                 max_sequence_bytes,
                 max_unique_event_bytes,
-                |unique| inspect_git_event_sizes(repo_root, &commit, unique),
+                |unique| inspect_git_event_sizes_with_policy(repo_root, &commit, unique, policy),
                 |unique, sizes, first_offsets, output| {
-                    read_git_events_into_output(
+                    read_git_events_into_output_with_policy(
                         repo_root,
                         &commit,
                         unique,
                         sizes,
                         first_offsets,
                         output,
+                        policy,
                     )
                 },
             )
@@ -814,39 +885,51 @@ fn materialize_v0_pair_at(
     repo_root: &Path,
     commit: &str,
     max_sequence_bytes: usize,
+    policy: ReadPolicy,
 ) -> Result<(String, String)> {
     let mut sizes = [0usize; 2];
-    visit_v0_pair(repo_root, commit, |sequence, canonical| {
-        sizes[sequence] = sizes[sequence]
-            .checked_add(canonical.len())
-            .context("canonical v0 sequence size overflow")?;
-        anyhow::ensure!(
-            sizes[sequence] <= max_sequence_bytes,
-            "materialized transcript exceeds the {max_sequence_bytes}-byte limit"
-        );
-        Ok(())
-    })?;
+    visit_v0_pair(
+        repo_root,
+        commit,
+        max_sequence_bytes,
+        policy,
+        |sequence, canonical| {
+            sizes[sequence] = sizes[sequence]
+                .checked_add(canonical.len())
+                .context("canonical v0 sequence size overflow")?;
+            read_limit(sizes[sequence] <= max_sequence_bytes, || {
+                format!("materialized transcript exceeds the {max_sequence_bytes}-byte limit")
+            })?;
+            Ok(())
+        },
+    )?;
     validate_pair_result_bound(sizes[0], sizes[1], max_sequence_bytes)?;
 
     let mut log = allocate_materialization_output(sizes[0])?;
     let mut view = allocate_materialization_output(sizes[1])?;
     let mut offsets = [0usize; 2];
-    visit_v0_pair(repo_root, commit, |sequence, canonical| {
-        let (output, offset) = match sequence {
-            0 => (&mut log, &mut offsets[0]),
-            1 => (&mut view, &mut offsets[1]),
-            _ => unreachable!("v0 pair has exactly LOG and VIEW"),
-        };
-        let end = offset
-            .checked_add(canonical.len())
-            .context("canonical v0 output offset overflow")?;
-        output
-            .get_mut(*offset..end)
-            .context("canonical v0 output exceeded its preflight size")?
-            .copy_from_slice(canonical.as_bytes());
-        *offset = end;
-        Ok(())
-    })?;
+    visit_v0_pair(
+        repo_root,
+        commit,
+        max_sequence_bytes,
+        policy,
+        |sequence, canonical| {
+            let (output, offset) = match sequence {
+                0 => (&mut log, &mut offsets[0]),
+                1 => (&mut view, &mut offsets[1]),
+                _ => unreachable!("v0 pair has exactly LOG and VIEW"),
+            };
+            let end = offset
+                .checked_add(canonical.len())
+                .context("canonical v0 output offset overflow")?;
+            output
+                .get_mut(*offset..end)
+                .context("canonical v0 output exceeded its preflight size")?
+                .copy_from_slice(canonical.as_bytes());
+            *offset = end;
+            Ok(())
+        },
+    )?;
     anyhow::ensure!(
         offsets == sizes,
         "canonical v0 output size changed between immutable passes"
@@ -860,14 +943,28 @@ fn materialize_v0_pair_at(
 fn visit_v0_pair(
     repo_root: &Path,
     commit: &str,
+    max_sequence_bytes: usize,
+    policy: ReadPolicy,
     mut visit: impl FnMut(usize, &str) -> Result<()>,
 ) -> Result<()> {
-    visit_v0_pair_at_with_limits(
+    let local = matches!(policy, ReadPolicy::LocalOnly);
+    visit_v0_pair_with_policy(
         repo_root,
         commit,
-        MAX_EVENT_BYTES,
-        MAX_MATERIALIZED_BYTES,
-        MAX_SEQUENCE_EVENTS,
+        (
+            if local {
+                max_sequence_bytes.min(MAX_EVENT_BYTES)
+            } else {
+                MAX_EVENT_BYTES
+            },
+            if local {
+                max_sequence_bytes.min(MAX_MATERIALIZED_BYTES)
+            } else {
+                MAX_MATERIALIZED_BYTES
+            },
+            MAX_SEQUENCE_EVENTS,
+        ),
+        policy,
         |kind, _, canonical| {
             visit(
                 match kind {
@@ -891,8 +988,25 @@ pub(crate) fn visit_v0_pair_at_with_limits(
     max_event_bytes: usize,
     max_blob_bytes: usize,
     max_events: usize,
+    visit: impl FnMut(SequenceKind, usize, &str) -> Result<()>,
+) -> Result<()> {
+    visit_v0_pair_with_policy(
+        repo_root,
+        commit,
+        (max_event_bytes, max_blob_bytes, max_events),
+        ReadPolicy::AllowTransport,
+        visit,
+    )
+}
+
+fn visit_v0_pair_with_policy(
+    repo_root: &Path,
+    commit: &str,
+    limits: (usize, usize, usize),
+    policy: ReadPolicy,
     mut visit: impl FnMut(SequenceKind, usize, &str) -> Result<()>,
 ) -> Result<()> {
+    let (max_event_bytes, max_blob_bytes, max_events) = limits;
     anyhow::ensure!(
         matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "legacy pair reader requires an immutable commit object id"
@@ -901,7 +1015,7 @@ pub(crate) fn visit_v0_pair_at_with_limits(
         (SequenceKind::Log, meta::LEGACY_LOG_FILE),
         (SequenceKind::View, meta::LEGACY_VIEW_FILE),
     ];
-    with_legacy_pair_batch(repo_root, commit, |reader| {
+    with_legacy_pair_batch(repo_root, commit, policy, |reader| {
         for (sequence, path) in PATHS {
             let spec = format!("{commit}:{path}");
             let header = read_batch_header(reader)?;
@@ -909,7 +1023,9 @@ pub(crate) fn visit_v0_pair_at_with_limits(
             let mut line_number = 0usize;
             while let Some(raw) = read_bounded_blob_line(reader, &mut remaining, max_event_bytes)? {
                 if line_number == max_events {
-                    anyhow::bail!("{path} exceeds {max_events} events");
+                    return Err(
+                        ReadLimitExceeded(format!("{path} exceeds {max_events} events")).into(),
+                    );
                 }
                 line_number += 1;
                 let line = std::str::from_utf8(&raw)
@@ -917,10 +1033,11 @@ pub(crate) fn visit_v0_pair_at_with_limits(
                 let envelope = parse_legacy_envelope_line(line)
                     .with_context(|| format!("invalid {spec} envelope at line {line_number}"))?;
                 let canonical = envelope_line(&envelope);
-                anyhow::ensure!(
-                    canonical.len() <= max_event_bytes,
-                    "{spec} line {line_number} canonicalizes above the {max_event_bytes}-byte event limit"
-                );
+                read_limit(canonical.len() <= max_event_bytes, || {
+                    format!(
+                        "{spec} line {line_number} canonicalizes above the {max_event_bytes}-byte event limit"
+                    )
+                })?;
                 visit(sequence, raw.len(), &canonical)?;
             }
             let mut separator = [0u8; 1];
@@ -939,16 +1056,15 @@ pub(crate) fn visit_v0_pair_at_with_limits(
 fn with_legacy_pair_batch<T>(
     repo_root: &Path,
     commit: &str,
+    policy: ReadPolicy,
     consume: impl FnOnce(&mut BufReader<std::process::ChildStdout>) -> Result<T>,
 ) -> Result<T> {
     let specs = [
         format!("{commit}:{}", meta::LEGACY_LOG_FILE),
         format!("{commit}:{}", meta::LEGACY_VIEW_FILE),
     ];
-    let mut child = Command::new("git")
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo_root)
+    let mut command = read_command(repo_root, policy);
+    let mut child = command
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1016,10 +1132,9 @@ fn legacy_blob_size_from_header(spec: &str, header: &str, max_blob_bytes: usize)
         object_type == "blob",
         "{spec} is a {object_type}, not a blob"
     );
-    anyhow::ensure!(
-        size <= max_blob_bytes as u64,
-        "{spec} exceeds the {max_blob_bytes}-byte read cap"
-    );
+    read_limit(size <= max_blob_bytes as u64, || {
+        format!("{spec} exceeds the {max_blob_bytes}-byte read cap")
+    })?;
     usize::try_from(size).context("v0 blob size does not fit memory")
 }
 
@@ -1038,10 +1153,9 @@ fn read_bounded_blob_line<R: BufRead>(
         let available = &available[..available.len().min(*remaining)];
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take = newline.map_or(available.len(), |index| index + 1);
-        anyhow::ensure!(
-            line.len().saturating_add(take) <= max_line_bytes,
-            "v0 event exceeds the {max_line_bytes}-byte limit"
-        );
+        read_limit(line.len().saturating_add(take) <= max_line_bytes, || {
+            format!("v0 event exceeds the {max_line_bytes}-byte limit")
+        })?;
         line.try_reserve(take)
             .context("cannot allocate bounded v0 event line")?;
         line.extend_from_slice(&available[..take]);
@@ -1062,11 +1176,23 @@ fn ensure_view_reachable(view: &[String], log: &[String]) -> Result<()> {
 }
 
 fn resolve_commit(repo_root: &Path, git_ref: &str) -> Result<String> {
+    resolve_commit_with_policy(repo_root, git_ref, ReadPolicy::AllowTransport)
+}
+
+fn read_command(repo_root: &Path, policy: ReadPolicy) -> Command {
+    let mut command = Command::new("git");
+    command.arg("--no-replace-objects").arg("-C").arg(repo_root);
+    policy.apply(&mut command);
+    command
+}
+
+fn resolve_commit_with_policy(
+    repo_root: &Path,
+    git_ref: &str,
+    policy: ReadPolicy,
+) -> Result<String> {
     let expression = format!("{git_ref}^{{commit}}");
-    let output = Command::new("git")
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo_root)
+    let output = read_command(repo_root, policy)
         .args(["rev-parse", "--verify", &expression])
         .output()
         .with_context(|| format!("cannot resolve {git_ref}"))?;
@@ -1222,7 +1348,10 @@ fn validate_event_sizes(ids: &[&str], sizes: &[usize], max_event_bytes: usize) -
     );
     for (id, size) in ids.iter().zip(sizes) {
         if *size > max_event_bytes {
-            anyhow::bail!("event {id} is {size} bytes, above the {max_event_bytes}-byte limit");
+            return Err(ReadLimitExceeded(format!(
+                "event {id} is {size} bytes, above the {max_event_bytes}-byte limit"
+            ))
+            .into());
         }
     }
     Ok(())
@@ -1234,10 +1363,9 @@ fn validate_unique_event_bytes(sizes: &[usize], max_unique_event_bytes: usize) -
         total = total
             .checked_add(*size)
             .context("unique event byte count overflow")?;
-        anyhow::ensure!(
-            total <= max_unique_event_bytes,
-            "unique event bytes exceed the {max_unique_event_bytes}-byte snapshot limit"
-        );
+        read_limit(total <= max_unique_event_bytes, || {
+            format!("unique event bytes exceed the {max_unique_event_bytes}-byte snapshot limit")
+        })?;
     }
     Ok(())
 }
@@ -1253,10 +1381,11 @@ fn validate_pair_result_bound(
     let max_pair_bytes = max_sequence_bytes
         .checked_mul(2)
         .context("paired materialization byte limit overflow")?;
-    anyhow::ensure!(
-        pair_bytes <= max_pair_bytes,
-        "LOG and VIEW require {pair_bytes} result bytes, above the explicit {max_pair_bytes}-byte process bound"
-    );
+    read_limit(pair_bytes <= max_pair_bytes, || {
+        format!(
+            "LOG and VIEW require {pair_bytes} result bytes, above the explicit {max_pair_bytes}-byte process bound"
+        )
+    })?;
     Ok(())
 }
 
@@ -1283,7 +1412,10 @@ fn sequence_layout(
             .checked_add(sizes[index])
             .context("materialized size overflow")?;
         if total > max_total_bytes {
-            anyhow::bail!("materialized transcript exceeds the {max_total_bytes}-byte limit");
+            return Err(ReadLimitExceeded(format!(
+                "materialized transcript exceeds the {max_total_bytes}-byte limit"
+            ))
+            .into());
         }
     }
     Ok((first_offsets, total))
@@ -1304,7 +1436,10 @@ fn expanded_sequence_size(
             .checked_add(sizes[index])
             .context("materialized size overflow")?;
         if total > max_total_bytes {
-            anyhow::bail!("materialized transcript exceeds the {max_total_bytes}-byte limit");
+            return Err(ReadLimitExceeded(format!(
+                "materialized transcript exceeds the {max_total_bytes}-byte limit"
+            ))
+            .into());
         }
     }
     Ok(total)
@@ -1715,11 +1850,34 @@ fn git_blob_first_line(
 }
 
 fn git_blob_at(repo_root: &Path, git_ref: &str, path: &str, limit: usize) -> Result<Vec<u8>> {
+    git_blob_with_policy(repo_root, git_ref, path, limit, ReadPolicy::AllowTransport)
+}
+
+#[cfg(feature = "secret-vault")]
+pub(crate) fn metadata_local(repo_root: &Path, commit: &str) -> Result<meta::Meta> {
+    immutable_local_oid(commit)?;
+    let bytes = git_blob_with_policy(
+        repo_root,
+        commit,
+        meta::FILE,
+        1024 * 1024,
+        ReadPolicy::LocalOnly,
+    )?;
+    meta::parse_strict(
+        std::str::from_utf8(&bytes).context("session metadata is not UTF-8")?,
+        commit,
+    )
+}
+
+fn git_blob_with_policy(
+    repo_root: &Path,
+    git_ref: &str,
+    path: &str,
+    limit: usize,
+    policy: ReadPolicy,
+) -> Result<Vec<u8>> {
     let spec = format!("{git_ref}:{path}");
-    let size = Command::new("git")
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo_root)
+    let size = read_command(repo_root, policy)
         .args(["cat-file", "-s", &spec])
         .output()
         .with_context(|| format!("cannot inspect {spec}"))?;
@@ -1735,13 +1893,13 @@ fn git_blob_at(repo_root: &Path, git_ref: &str, path: &str, limit: usize) -> Res
         .parse()
         .with_context(|| format!("git returned an invalid size for {spec}"))?;
     if size > limit {
-        anyhow::bail!("{spec} is {size} bytes, above the {limit}-byte limit");
+        return Err(ReadLimitExceeded(format!(
+            "{spec} is {size} bytes, above the {limit}-byte limit"
+        ))
+        .into());
     }
 
-    let output = Command::new("git")
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo_root)
+    let output = read_command(repo_root, policy)
         .args(["cat-file", "blob", &spec])
         .output()
         .with_context(|| format!("cannot read {spec}"))?;
@@ -1779,12 +1937,10 @@ fn with_event_batch<T>(
     git_ref: &str,
     ids: &[&str],
     mode: &str,
+    policy: ReadPolicy,
     consume: impl FnOnce(&mut BufReader<std::process::ChildStdout>) -> Result<T>,
 ) -> Result<T> {
-    let mut child = Command::new("git")
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo_root)
+    let mut child = read_command(repo_root, policy)
         .args(["cat-file", mode])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1835,7 +1991,16 @@ fn with_event_batch<T>(
 }
 
 fn inspect_git_event_sizes(repo_root: &Path, git_ref: &str, ids: &[&str]) -> Result<Vec<usize>> {
-    with_event_batch(repo_root, git_ref, ids, "--batch-check", |reader| {
+    inspect_git_event_sizes_with_policy(repo_root, git_ref, ids, ReadPolicy::AllowTransport)
+}
+
+fn inspect_git_event_sizes_with_policy(
+    repo_root: &Path,
+    git_ref: &str,
+    ids: &[&str],
+    policy: ReadPolicy,
+) -> Result<Vec<usize>> {
+    with_event_batch(repo_root, git_ref, ids, "--batch-check", policy, |reader| {
         let mut sizes = Vec::new();
         sizes
             .try_reserve_exact(ids.len())
@@ -1856,7 +2021,27 @@ fn read_git_events_into_output(
     first_offsets: &[usize],
     output: &mut [u8],
 ) -> Result<()> {
-    with_event_batch(repo_root, git_ref, ids, "--batch", |reader| {
+    read_git_events_into_output_with_policy(
+        repo_root,
+        git_ref,
+        ids,
+        sizes,
+        first_offsets,
+        output,
+        ReadPolicy::AllowTransport,
+    )
+}
+
+fn read_git_events_into_output_with_policy(
+    repo_root: &Path,
+    git_ref: &str,
+    ids: &[&str],
+    sizes: &[usize],
+    first_offsets: &[usize],
+    output: &mut [u8],
+    policy: ReadPolicy,
+) -> Result<()> {
+    with_event_batch(repo_root, git_ref, ids, "--batch", policy, |reader| {
         for (index, id) in ids.iter().enumerate() {
             let header = read_batch_header(reader)?;
             let actual = event_size_from_header(git_ref, id, &header)?;

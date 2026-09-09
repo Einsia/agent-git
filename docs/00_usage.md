@@ -161,14 +161,22 @@ agit import                       # no argument: lists the unadopted sessions in
 
 At a terminal, the zero-argument form opens a full-screen candidate list. Pick a session, choose
 the destination repo with `Tab`, type a new branch, or press `l` for the offline `--link-only`
-path. The screen closes before the ordinary import command writes anything or prints its result.
-Pipes, CI and agent sessions keep the existing inline behavior.
+path. The screen closes before lineage selection or the ordinary import command writes anything.
+Pipes, CI and agent sessions list explicit choices and leave local state unchanged.
 
-Once you have picked one (or given the id prefix directly):
+With a full native ID, runtime and destination, inspect and choose the lineage:
 
 ```sh
-agit import 7f3a1c2e --into alice/payments@ratelimit
+agit import 7f3a1c2e-1111-4a4a-8b8b-000000000001 --from claude-code --into alice/payments@ratelimit
 ```
+
+The terminal offers verified local prefix candidates, an independent import, and cancellation.
+A single candidate still requires a choice. Noninteractive calls return the choices and exit
+without adopting; `--onto <ref>` selects a base and `--independent` explicitly starts a separate
+line. `--propose-lineage` prints the same local evidence without applying a choice. Semantic
+comparison is unavailable, so a missing verified prefix does not prove unrelated history.
+
+After accepting an independent import, the session's turns are recorded:
 
 ```
 ✓ adopted claude-code 7f3a1c2e-111
@@ -195,10 +203,10 @@ unversioned") means nothing to anyone.
 
 A fresh claim needs an explicit destination repo and session branch. Use
 `--into alice/payments@ratelimit`, or `--repo alice/payments -b ratelimit`.
-The `-n <agent>` form names a repo for adoption and still needs `-b <branch>`;
-it is not required alongside a qualified `--into` target. Session turns cannot land on
-`main`, which is the file line. Use `--from codex` or `--from claude-code` to restrict
-the source runtime; the option is named `--from`, not `--runtime`.
+The compatibility `-n <agent>` form names a repo for an explicit independent/base import and
+still needs `-b <branch>`; read-only lineage discovery requires the qualified destination.
+Session turns cannot land on `main`, which is the file line. Use `--from codex` or
+`--from claude-code` to name the source runtime; the option is named `--from`, not `--runtime`.
 
 import **does not copy** the transcript; it writes a link. The original session keeps growing and
 the link keeps pointing at it.
@@ -207,8 +215,8 @@ the link keeps pointing at it.
 
 ```sh
 agit import 7f3a1c2e --link-only    # mark it only, record no version
-# back online: run import again — the link is still there, and this time the first version lands
-agit import 7f3a1c2e --into alice/payments@ratelimit
+# back online: choose lineage before recording the first version
+agit import 7f3a1c2e-1111-4a4a-8b8b-000000000001 --from claude-code --into alice/payments@ratelimit
 ```
 
 The offline link has no repository owner or branch claim. The explicit import target establishes
@@ -221,7 +229,7 @@ one byte of the original enters history. claude-code only; other runtimes use
 
 The copy is **frozen** and carries its own new session id: the original session keeps growing, the
 copy does not follow. To publish later conversation, run
-`agit import <id> --privacy --into alice/payments@<new-branch>` again — every run is a new frozen copy, and the old
+`agit import <id> --privacy --into alice/payments@<new-branch> --independent` again — every run is a new frozen copy, and the old
 branch, already taken by the old copy, is never refreshed.
 
 ### 3.2 Settle: get new conversation into history

@@ -187,7 +187,9 @@ pub fn run(args: Args) -> CmdResult {
             if missing.len() > 8 {
                 println!("    {}", ui::dim(&format!("… {} more", missing.len() - 8)));
             }
-            ui::hint("`agit import <session-id> -n <name>` adopts the one you want");
+            ui::hint(
+                "`agit import <session-id> --from <runtime> --into <owner/repo>@<branch>` lets you choose its lineage",
+            );
         }
     } else {
         ui::hint("--check-missing lists this repo’s unadopted sessions");

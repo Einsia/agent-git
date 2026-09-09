@@ -259,7 +259,13 @@ fn an_explicit_native_id_still_selects_only_that_transcript() {
     let lab = Lab::new(2);
     let output = lab
         .command()
-        .args(["import", &lab.sources[1].0, "--into", "me/qa@work"])
+        .args([
+            "import",
+            &lab.sources[1].0,
+            "--into",
+            "me/qa@work",
+            "--independent",
+        ])
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -311,7 +317,7 @@ fn retry_templates_preserve_known_options_and_request_only_missing_target_parts(
         ),
         (
             vec!["import", "-n", "qa"],
-            "agit import <session-id> -n qa --from <runtime> -b <branch>",
+            "agit import <session-id> -n qa --from <runtime> --into <owner/repo>@<branch>",
         ),
         (
             vec![
@@ -482,7 +488,11 @@ fn the_retry_template_preserves_shell_sensitive_known_arguments() {
             .lines()
             .find_map(|line| line.split_once("agit import ").map(|(_, rest)| rest))
             .unwrap();
-        let output = lab.retry(template, &lab.sources[1].0, "claude-code");
+        let output = lab.retry(
+            &format!("{template} --independent"),
+            &lab.sources[1].0,
+            "claude-code",
+        );
         assert!(output.status.success(), "{output:?}");
         let link: serde_json::Value = serde_json::from_slice(
             &fs::read(
@@ -501,4 +511,36 @@ fn the_retry_template_preserves_shell_sensitive_known_arguments() {
                 .exists()
         );
     }
+}
+
+#[test]
+fn an_explicit_independent_decision_survives_the_no_id_retry() {
+    let lab = Lab::new(2);
+    let before = lab.state();
+    let output = lab
+        .command()
+        .args(["import", "--into", "me/qa@work", "--independent"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(8), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let template = stderr
+        .lines()
+        .find_map(|line| line.split_once("agit import ").map(|(_, rest)| rest))
+        .unwrap();
+    assert!(template.ends_with("--independent"), "{template}");
+    assert_eq!(lab.state(), before);
+    let retry = lab.retry(template, &lab.sources[1].0, "claude-code");
+    assert!(retry.status.success(), "{retry:?}");
+    let directory = lab.store.join("store/claude-code");
+    assert!(
+        directory
+            .join(format!("{}.json", lab.sources[1].0))
+            .exists()
+    );
+    assert!(
+        !directory
+            .join(format!("{}.json", lab.sources[0].0))
+            .exists()
+    );
 }

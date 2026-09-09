@@ -8,7 +8,7 @@
 //! and the version is recorded here:
 //!
 //! ```text
-//! agit import <session-id> -n photo
+//! agit import <session-id> --from <runtime> --into <owner>/photo@<branch>
 //! ```
 //!
 //! The version half calls [`super::commit::record`] directly — the same code path as
@@ -51,8 +51,9 @@ use crate::infra::config;
 use crate::ui::quote_powershell_argument as powershell_selection_arg;
 use crate::{ExitCode, adapter, ui};
 use clap::Args as ClapArgs;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+
+mod lineage;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -85,6 +86,14 @@ pub struct Args {
     #[arg(long, value_name = "ref")]
     pub onto: Option<String>,
 
+    /// Inspect verified local lineage candidates without adopting or changing the native session.
+    #[arg(long, long_help = "Inspect verified local lineage candidates without adopting or changing the native session. Inspecting an existing repository requires Git with NUL-framed worktree output (normally Git 2.36 or newer); unsupported output is reported as git_worktree_format without falling back to ambiguous paths.", requires_all = ["session", "from", "repo"], conflicts_with_all = ["onto", "link_only", "privacy", "name", "independent"])]
+    pub propose_lineage: bool,
+
+    /// Explicitly import without selecting a prior session history as the base.
+    #[arg(long, conflicts_with_all = ["onto", "link_only", "propose_lineage"])]
+    pub independent: bool,
+
     /// Adopt a privacy-scrubbed COPY instead of the live transcript: secrets →
     /// [redacted:<rule>], home dir / username / hostname / public IPs get stable
     /// pseudonyms. The copy is a new session id and does not follow the original
@@ -110,11 +119,32 @@ enum Pick {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    run_with_output(args, false)
+}
+
+/// An undecided import inspects before account refresh, storage migration or adoption.
+pub fn needs_readonly_startup(args: &Args) -> bool {
+    args.propose_lineage
+        || args.session.is_none()
+        || (!args.link_only && args.onto.is_none() && !args.independent)
+}
+
+pub fn run_with_output(args: Args, json: bool) -> CmdResult {
+    if args.propose_lineage {
+        return lineage::preview(&args, json);
+    }
+    let deferred_startup = needs_readonly_startup(&args);
+    if args.privacy && !args.link_only && args.onto.is_none() && !args.independent {
+        ui::error(
+            "--privacy requires an explicit --onto or --independent choice before creating a copy",
+        );
+        return Ok(ExitCode::Usage);
+    }
     let mut args = args;
     // A bare import is a request to choose, not a request to guess. The TUI fills in the same
     // explicit session and destination arguments the command accepts, then leaves the alternate
-    // screen before this function reaches any precondition or write below. Every non-TTY and
-    // explicitly parameterized call keeps the existing path byte for byte.
+    // screen before this function reaches any precondition or write below. Explicit lineage
+    // decisions bypass this picker.
     if wants_tui(&args) {
         match crate::tui::should_enter() {
             crate::tui::Verdict::Enter => {
@@ -132,6 +162,47 @@ pub fn run(args: Args) -> CmdResult {
             crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
             crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
             crate::tui::Verdict::Skip => {}
+        }
+    }
+
+    if args.session.is_none() {
+        let store = Store::at(std::env::current_dir()?.join(config::store_root()?));
+        match pick_here_with_preview(&store, &args, false)? {
+            Pick::One(found) => {
+                args.session = Some(found.session_id);
+                args.from = Some(found.runtime.into());
+            }
+            Pick::Explained(code) => return Ok(code),
+        }
+    }
+
+    let mut accepted = None;
+    let mut same_claim = None;
+    if !args.link_only && args.onto.is_none() && !args.independent {
+        match lineage::choose(&mut args, json)? {
+            lineage::Decision::Stop(code) => return Ok(code),
+            lineage::Decision::SameClaim(selected) => same_claim = Some(*selected),
+            lineage::Decision::Apply(selected) => accepted = Some(*selected),
+        }
+    }
+    if deferred_startup && accepted.is_none() {
+        if let Err(error) = super::migration::migrate_startup() {
+            ui::error(&format!("local storage preparation failed: {error:#}"));
+            return Ok(ExitCode::Precondition);
+        }
+        if let Some(before) = same_claim.as_ref() {
+            let store = Store::at(std::env::current_dir()?.join(config::store_root()?));
+            let current = link::get(&store, &before.source, &before.session_id);
+            if !current.as_ref().is_some_and(|current| {
+                current.is_active()
+                    && current.owner == before.owner
+                    && current.agent == before.agent
+                    && current.branch == before.branch
+            }) {
+                ui::error("the session claim changed before its existing import could continue");
+                return Ok(ExitCode::Policy);
+            }
+            same_claim = current;
         }
     }
 
@@ -159,21 +230,28 @@ pub fn run(args: Args) -> CmdResult {
         repo::valid_name(n)?;
     }
 
-    let store = Store::open_or_init()?;
+    let store = match &accepted {
+        Some(selected) => selected.store(),
+        None => Store::open_or_init()?,
+    };
 
     // ── 2. Find that session ──
-    let picked = match &args.session {
-        Some(sel) if sel == "@" => {
-            ui::error(
-                "import requires a native session id; `@` does not infer the current runtime session.",
-            );
-            ui::hint(
-                "use `agit import <session-id> --into <owner>/<repo>@<branch>`, or choose a session in the interactive import picker",
-            );
-            return Ok(ExitCode::Usage);
+    let picked = if let Some(selected) = &accepted {
+        Pick::One(selected.found())
+    } else {
+        match &args.session {
+            Some(sel) if sel == "@" => {
+                ui::error(
+                    "import requires a native session id; `@` does not infer the current runtime session.",
+                );
+                ui::hint(
+                    "use `agit import <session-id> --from <runtime> --into <owner>/<repo>@<branch>`, or choose a session in the interactive import picker",
+                );
+                return Ok(ExitCode::Usage);
+            }
+            Some(sel) => by_selector(sel, args.from.as_deref())?,
+            None => pick_here(&store, &args)?,
         }
-        Some(sel) => by_selector(sel, args.from.as_deref())?,
-        None => pick_here(&store, &args)?,
     };
     let found = match picked {
         Pick::One(f) => f,
@@ -195,7 +273,11 @@ pub fn run(args: Args) -> CmdResult {
     // An already-adopted session reuses the agent it is managed under; otherwise the name must be
     // given explicitly. **Never guess**: a name chosen automatically silently decides which
     // lineage this memory lands on, and that kind of mistake is not noticed right away.
-    let existing = link::get(&store, found.runtime, &found.session_id);
+    let existing = if let Some(selected) = &accepted {
+        selected.initial_link()
+    } else {
+        same_claim.or_else(|| link::get(&store, found.runtime, &found.session_id))
+    };
     let destination = args
         .repo
         .as_deref()
@@ -286,8 +368,9 @@ pub fn run(args: Args) -> CmdResult {
     if agent.is_none() && !args.link_only {
         ui::error("versioning needs a destination agent named first.");
         ui::hint(&format!(
-            "agit import {} -n {}",
-            link::short(&found.session_id),
+            "agit import {} --from {} --into <owner>/{}@<branch>",
+            ui::session::shell_arg(&found.session_id),
+            found.runtime,
             suggested_name(found.cwd.as_deref())
         ));
         ui::hint("adopt without versioning (works offline): add --link-only");
@@ -295,14 +378,18 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     // ── 4. Adoption: write the link ──
-    let lk = attach(&store, &found, existing)?;
+    let lk = match &accepted {
+        Some(selected) => selected.link(),
+        None => attach(&store, &found, existing)?,
+    };
 
     if args.link_only {
         println!(
             "\n{}",
             ui::dim(&format!(
-                "  `agit import {} --into <owner/repo>@<branch>` records the first version after sign-in",
-                ui::session::shell_arg(&lk.session_id)
+                "  `agit import {} --from {} --into <owner/repo>@<branch>` chooses lineage and records the first version after sign-in",
+                ui::session::shell_arg(&lk.session_id),
+                ui::session::shell_arg(&lk.source)
             ))
         );
         return Ok(ExitCode::Ok);
@@ -327,6 +414,7 @@ pub fn run(args: Args) -> CmdResult {
         &owner,
         &args,
         destination.as_ref(),
+        accepted.as_ref(),
     )? {
         Placed::Ready(l) => *l,
         Placed::Refused(code) => return Ok(code),
@@ -351,6 +439,8 @@ fn wants_tui(args: &Args) -> bool {
         && args.repo.is_none()
         && args.branch.is_none()
         && args.onto.is_none()
+        && !args.propose_lineage
+        && !args.independent
         && !args.privacy
 }
 
@@ -376,8 +466,12 @@ pub(super) struct Landing {
     /// goes back only while the disk still equals them byte for byte — between the snapshot and
     /// the rollback a concurrent settlement (the Stop hook) may have advanced the watermark, and
     /// an unconditional write back would rewind it to the old snapshot.
+    claim_source: String,
+    claim_session: String,
     claimed_path: PathBuf,
     claimed_bytes: Vec<u8>,
+    /// A selected application restores the complete original image, including its absence.
+    previous_image: Option<Option<Vec<u8>>>,
 }
 
 impl Landing {
@@ -413,7 +507,32 @@ impl Landing {
                 return;
             }
         }
-        if let Some(prev) = &self.prev_link {
+        if let Some(previous) = &self.previous_image {
+            match link::lock(&self.store, &self.claim_source, &self.claim_session) {
+                Ok(_guard) => {
+                    if std::fs::read(&self.claimed_path)
+                        .is_ok_and(|current| current == self.claimed_bytes)
+                    {
+                        let restored = match previous {
+                            Some(bytes) => std::fs::write(&self.claimed_path, bytes),
+                            None => std::fs::remove_file(&self.claimed_path),
+                        };
+                        if let Err(error) = restored {
+                            ui::warning(&format!(
+                                "could not restore the previous import claim: {error}"
+                            ));
+                        }
+                    } else {
+                        ui::warning(
+                            "the session claim advanced after this import; preserving its current state",
+                        );
+                    }
+                }
+                Err(error) => ui::warning(&format!(
+                    "could not lock the import claim for rollback: {error}"
+                )),
+            }
+        } else if let Some(prev) = &self.prev_link {
             // The same lock as the claim: no other write may slip in between the comparison
             // and the restore. When the lock cannot be taken, warn and restore nothing — a link
             // left pointing at the new destination is better than a blind write.
@@ -480,6 +599,7 @@ pub(super) enum Placed {
 /// Every check runs before any write: anything uncertain is asked before a ref or a checkout is
 /// touched, and the failure that remains (settlement itself refused) is cleaned up by
 /// [`Landing::rollback`].
+#[allow(clippy::too_many_arguments)]
 fn place_on_branch(
     lk: &mut Link,
     store: &Store,
@@ -488,20 +608,29 @@ fn place_on_branch(
     author: &str,
     args: &Args,
     destination: Option<&crate::commands::target::Target>,
+    accepted: Option<&lineage::Accepted>,
 ) -> crate::Result<Placed> {
     // An explicitly named destination is that directory; no searching by name for a same-named
     // checkout in another namespace. When a personal repo and an org repo share a name, guessing
     // picks the other one.
-    let repo_dir = if destination.is_some() {
+    let repo_dir = if let Some(selected) = accepted {
+        selected.repo_dir().to_owned()
+    } else if destination.is_some() {
         crate::infra::config::repo_dir(owner, agent)?
     } else {
         super::clone::checkout_for_recording(owner, agent)?
     };
-    let repo = Repo::open_or_init(&repo_dir)?;
+    let repo = if accepted.is_some() {
+        Repo::at(&repo_dir)
+    } else {
+        Repo::open_or_init(&repo_dir)?
+    };
 
     // --onto: the lineage attachment point. The point must exist; the new branch grows off it
     // (identity is inherited, not claimed again).
-    let onto_commit = if let Some(o) = &args.onto {
+    let onto_commit = if accepted.is_some() {
+        args.onto.clone()
+    } else if let Some(o) = &args.onto {
         let spec = crate::domain::refs::parse(o)?;
         let spec = match crate::commands::context::substitute_at(spec) {
             Ok(spec) => spec,
@@ -523,7 +652,11 @@ fn place_on_branch(
     };
 
     // The target branch name.
-    let cur = repo.current_branch();
+    let cur = if accepted.is_some() {
+        None
+    } else {
+        repo.current_branch()
+    };
     let cur_is_session = cur
         .as_deref()
         .and_then(|b| crate::domain::meta::read_at_ref(&repo, &format!("refs/heads/{b}")))
@@ -544,8 +677,9 @@ fn place_on_branch(
                 let suggested = format!("{}-{}", agent, crate::domain::link::short(&lk.session_id));
                 ui::error("claiming a fresh session line needs -b <branch>.");
                 ui::hint(&format!(
-                    "e.g. `agit import {} -n {agent} -b {suggested}`",
-                    link::short(&lk.session_id)
+                    "e.g. `agit import {} --from {} --into {owner}/{agent}@{suggested}`",
+                    ui::session::shell_arg(&lk.session_id),
+                    ui::session::shell_arg(&lk.source)
                 ));
                 return Ok(Placed::Refused(ExitCode::Usage));
             }
@@ -562,6 +696,7 @@ fn place_on_branch(
         repo,
         branch,
         onto_commit,
+        accepted,
     )
 }
 
@@ -594,6 +729,7 @@ pub(super) fn place_legacy_commit_branch(
         repo,
         branch,
         None,
+        None,
     )
 }
 
@@ -609,11 +745,12 @@ fn place_resolved_branch(
     repo: Repo,
     branch: String,
     onto_commit: Option<String>,
+    accepted: Option<&lineage::Accepted>,
 ) -> crate::Result<Placed> {
     // Only the name of a branch about to be **created** goes through the prefix check: an
     // existing branch is a fact on the ground, and stopping it only leaves a line that already
     // exists unable to settle from then on.
-    if !repo.has_ref(&format!("refs/heads/{branch}"))
+    if (accepted.is_some() || !repo.has_ref(&format!("refs/heads/{branch}")))
         && let Err(e) = repo::valid_branch_name(&branch)
     {
         ui::error(&format!("{e:#}"));
@@ -658,6 +795,7 @@ fn place_resolved_branch(
         repo,
         branch,
         onto_commit,
+        accepted,
     )
 }
 
@@ -676,37 +814,50 @@ fn birth_session_branch(
     repo: Repo,
     branch: String,
     onto_commit: Option<String>,
+    accepted: Option<&lineage::Accepted>,
 ) -> crate::Result<Placed> {
     // Import and materialization both create active branch claims. Serialize their branch/ref and
     // link updates under the same key so a concurrent `run --no-launch` cannot observe an empty
     // destination and install a second writer while this claim is being placed.
     let _branch_guard = link::lock_branch(store, &format!("{owner}/{agent}"), &branch)?;
     let _claim_guard = link::lock(store, &lk.source, &lk.session_id)?;
-    let prev_link = link::get(store, &lk.source, &lk.session_id);
-    // Attachment must remain readable until placement holds its locks. Missing or malformed
-    // metadata cannot establish the current claim or supersession state and must not be replaced.
-    let Some(current) = prev_link.as_ref() else {
-        ui::error(
-            "the attached session link is missing or unreadable; inspect its metadata before retrying the import",
-        );
+    if let Some(selected) = accepted
+        && let Err(error) =
+            selected.verify(store, &repo, owner, agent, &branch, onto_commit.as_deref())
+    {
+        ui::error(&format!(
+            "the import choice is stale: {error:#}; inspect and choose again"
+        ));
         return Ok(Placed::Refused(ExitCode::Policy));
+    }
+    let prev_link = if let Some(selected) = accepted {
+        selected.initial_link()
+    } else {
+        link::get(store, &lk.source, &lk.session_id)
     };
-    // The link was first read before destination selection and a possible confirmation. Once
-    // the locks are held, the disk copy is authoritative for watermark and supersession state.
-    // A routing change invalidates the earlier confirmation; retrying is the only way to make
-    // that new destination part of the user's decision.
-    let routing_changed =
-        current.owner != lk.owner || current.agent != lk.agent || current.branch != lk.branch;
-    if routing_changed {
-        ui::error("the session claim changed while import was waiting for its branch lock");
-        ui::hint("inspect the current destination with `agit status`, then retry the import");
-        return Ok(Placed::Refused(ExitCode::Policy));
+    if accepted.is_none() {
+        let Some(current) = prev_link.as_ref() else {
+            ui::error(
+                "the attached session link is missing or unreadable; inspect its metadata before retrying the import",
+            );
+            return Ok(Placed::Refused(ExitCode::Policy));
+        };
+        if current.owner != lk.owner || current.agent != lk.agent || current.branch != lk.branch {
+            ui::error("the session claim changed while import was waiting for its branch lock");
+            ui::hint("inspect the current destination with `agit status`, then retry the import");
+            return Ok(Placed::Refused(ExitCode::Policy));
+        }
+        let discovered_cwd = lk.cwd.clone();
+        *lk = current.clone();
+        if lk.cwd.is_none() {
+            lk.cwd = discovered_cwd;
+        }
     }
-    let discovered_cwd = lk.cwd.clone();
-    *lk = current.clone();
-    if lk.cwd.is_none() {
-        lk.cwd = discovered_cwd;
-    }
+    let repo = if accepted.is_some() {
+        Repo::open_or_init(&repo_dir)?
+    } else {
+        repo
+    };
 
     if !lk.is_active() && repo.has_ref(&format!("refs/heads/{branch}")) {
         ui::error(&format!(
@@ -717,9 +868,23 @@ fn birth_session_branch(
                 .unwrap_or("a newer runtime session")
         ));
         ui::hint(&format!(
-            "preserve its later work with `agit import {} --into {owner}/{agent}@<new-branch>`",
-            ui::session::shell_arg(&lk.session_id)
+            "preserve its later work with `agit import {} --from {} --into {owner}/{agent}@<new-branch>`",
+            ui::session::shell_arg(&lk.session_id),
+            ui::session::shell_arg(&lk.source)
         ));
+        return Ok(Placed::Refused(ExitCode::Policy));
+    }
+
+    if let Some(base) = onto_commit.as_deref()
+        && repo.has_ref(&format!("refs/heads/{branch}"))
+        && !existing_onto_is_lineage(&repo, &branch, base)?
+    {
+        ui::error(&format!(
+            "--onto {base} is not on the first-parent history of existing branch {owner}/{agent}@{branch}."
+        ));
+        ui::hint(
+            "choose a new destination branch to attach at that commit; the existing branch is unchanged",
+        );
         return Ok(Placed::Refused(ExitCode::Policy));
     }
 
@@ -819,9 +984,32 @@ fn birth_session_branch(
         prev_checkout,
         store: store.clone(),
         prev_link,
+        claim_source: lk.source.clone(),
+        claim_session: lk.session_id.clone(),
         claimed_path,
         claimed_bytes,
+        previous_image: accepted.map(|selected| selected.previous_image()),
     })))
+}
+
+/// Repeating an attachment may reuse its descendant, but a merged side branch is not its base.
+fn existing_onto_is_lineage(repo: &Repo, branch: &str, base: &str) -> crate::Result<bool> {
+    let mut found = false;
+    let base = base.trim().as_bytes();
+    repo.git_stream_split(
+        &[
+            "rev-list",
+            "--first-parent",
+            &format!("refs/heads/{branch}"),
+            "--",
+        ],
+        b'\n',
+        |oid| {
+            found |= oid == base;
+            Ok(())
+        },
+    )?;
+    Ok(found)
 }
 
 fn recorded_owner(lk: &Link) -> Option<&str> {
@@ -1108,9 +1296,15 @@ fn scrub_copy(found: &Found) -> crate::Result<Option<Found>> {
 /// Candidates come from the runtime index (Codex queries the `threads` table, Claude Code reads
 /// the directory), with **no transcript opened**.
 fn pick_here(store: &Store, args: &Args) -> crate::Result<Pick> {
+    pick_here_with_preview(store, args, true)
+}
+
+fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> crate::Result<Pick> {
     let Some(repo) = config::repo_root().or_else(|| std::env::current_dir().ok()) else {
         ui::error("can’t determine the current directory.");
-        ui::hint("be explicit: agit import <session-id> -n <name>");
+        ui::hint(
+            "be explicit: agit import <session-id> --from <runtime> --into <owner/repo>@<branch>",
+        );
         return Ok(Pick::Explained(ExitCode::Usage));
     };
 
@@ -1121,7 +1315,7 @@ fn pick_here(store: &Store, args: &Args) -> crate::Result<Pick> {
         .collect();
 
     let sp = ui::spinner("looking for sessions under this directory…");
-    let mut cands: Vec<(&'static str, std::path::PathBuf, String)> = vec![];
+    let mut cands = Vec::new();
     let selected_runtime = args.from.as_deref().map(adapter::normalize).transpose()?;
     for rt in adapter::RUNTIMES {
         if selected_runtime.is_some_and(|selected| selected != *rt) {
@@ -1130,7 +1324,7 @@ fn pick_here(store: &Store, args: &Args) -> crate::Result<Pick> {
         let Ok(ad) = adapter::get(rt) else { continue };
         for sr in ad.sessions_for(&repo).unwrap_or_default() {
             if !known.contains(&(ad.id(), sr.id.as_str())) {
-                cands.push((ad.id(), sr.path, sr.id));
+                cands.push((ad.id(), sr.path, sr.id, sr.gist));
             }
         }
     }
@@ -1147,23 +1341,29 @@ fn pick_here(store: &Store, args: &Args) -> crate::Result<Pick> {
             ))
         );
         ui::hint(
-            "session ran in another directory? give the id directly: agit import <session-id> -n <name>",
+            "session ran in another directory? give the id directly: agit import <session-id> --from <runtime> --into <owner/repo>@<branch>",
         );
         return Ok(Pick::Explained(ExitCode::Ok));
     }
 
-    // The list shows the opening prompt so the user can tell which session is which.
-    //
-    // On the Codex side `first_user_message` comes straight from the `threads` table, with no
-    // file opened. Claude Code has no equivalent index, so the file has to be read — the **only**
-    // exception to "listing must not parse transcripts", because without the prompt a column of
-    // uuids means nothing to the user in an interactive list. Two bounds hold it down: only the
-    // unadopted candidates under the current directory, and only when the list is shown.
-    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    // Before identity selection, an indexed gist is advisory; absent previews do not open native caches.
+    let signals = crate::tui::Signals::from_process();
+    let interactive = signals.interactive
+        && (legacy_preview
+            || (signals.off.is_none()
+                && signals.agent_session.is_none()
+                && std::env::var_os("CI").is_none()));
     let labels: Vec<String> = cands
         .iter()
-        .map(|(rt, p, id)| {
-            let gist = gist_for(rt, id, p);
+        .map(|(rt, p, id, indexed_gist)| {
+            let gist = if legacy_preview {
+                gist_for(rt, id, p)
+            } else {
+                indexed_gist
+                    .as_deref()
+                    .map(|gist| ui::truncate(gist, 48))
+                    .unwrap_or_else(|| "preview deferred until selection".into())
+            };
             let identity = if interactive {
                 link::short(id)
             } else {
@@ -1186,7 +1386,7 @@ fn pick_here(store: &Store, args: &Args) -> crate::Result<Pick> {
 
     match ui::prompt::select("which session to adopt?", &refs)? {
         Some(i) => {
-            let (rt, _, id) = &cands[i];
+            let (rt, _, id, _) = &cands[i];
             Ok(Pick::One(Found {
                 runtime: rt,
                 session_id: id.clone(),
@@ -1202,7 +1402,9 @@ fn pick_here(store: &Store, args: &Args) -> crate::Result<Pick> {
             for l in labels.iter().take(12) {
                 println!("  {l}");
             }
-            ui::hint("be explicit: agit import <session-id> -n <name>");
+            ui::hint(
+                "be explicit: agit import <session-id> --from <runtime> --into <owner/repo>@<branch>",
+            );
             Ok(Pick::Explained(ExitCode::Usage))
         }
     }
@@ -1226,7 +1428,9 @@ fn selection_command(args: &Args) -> String {
     }
     if args.link_only {
         command.push_str(" --link-only");
-    } else if args.repo.is_none() && args.name.is_none() {
+    } else if args.repo.is_none()
+        && (args.name.is_none() || (args.onto.is_none() && !args.independent))
+    {
         command.push_str(if args.branch.is_some() {
             " --into <owner/repo>"
         } else {
@@ -1237,6 +1441,9 @@ fn selection_command(args: &Args) -> String {
     }
     if args.privacy {
         command.push_str(" --privacy");
+    }
+    if args.independent {
+        command.push_str(" --independent");
     }
     command
 }
@@ -1530,6 +1737,9 @@ mod tests {
             .trim()
             .to_string();
         let landing = Landing {
+            claim_source: "codex".into(),
+            claim_session: "AB".into(),
+            previous_image: None,
             repo_dir: r.root().to_path_buf(),
             branch: "ghost".into(),
             created: true,
@@ -1564,6 +1774,9 @@ mod tests {
             .trim()
             .to_string();
         let landing = Landing {
+            claim_source: "codex".into(),
+            claim_session: "AB".into(),
+            previous_image: None,
             repo_dir: r.root().to_path_buf(),
             branch: "line".into(),
             created: true,
@@ -1604,6 +1817,9 @@ mod tests {
         link::write(&store, &advanced).unwrap();
         let (_rd, r) = repo_with_a_foreign_session();
         let landing = Landing {
+            claim_source: "codex".into(),
+            claim_session: "AB".into(),
+            previous_image: None,
             repo_dir: r.root().to_path_buf(),
             branch: "x".into(),
             created: false,
@@ -1618,6 +1834,48 @@ mod tests {
         let now = link::get(&store, "codex", "AB").unwrap();
         assert_eq!(now.baseline_bytes, Some(999), "watermark is not rewound");
         assert_eq!(now.branch.as_deref(), Some("new"));
+    }
+
+    /// A failed selected import removes only its own claim, or restores the exact prior image.
+    #[test]
+    fn selected_rollback_retains_raw_unknown_fields_and_preserves_concurrent_claims() {
+        for prior in [
+            None,
+            Some(b"{\"extension\":true,\"agent\":\"prior\"}\n".to_vec()),
+        ] {
+            for advanced in [false, true] {
+                let (directory, repo) = repo_with_a_foreign_session();
+                let store = Store::at(directory.path().join("store"));
+                let claimed = Link::new("codex", "AB", None);
+                let claimed_path = link::write(&store, &claimed).unwrap();
+                let claimed_bytes = std::fs::read(&claimed_path).unwrap();
+                let landing = Landing {
+                    repo_dir: repo.root().to_owned(),
+                    branch: "unused".into(),
+                    created: false,
+                    created_oid: None,
+                    prev_checkout: None,
+                    store: store.clone(),
+                    prev_link: None,
+                    claim_source: "codex".into(),
+                    claim_session: "AB".into(),
+                    claimed_path: claimed_path.clone(),
+                    claimed_bytes,
+                    previous_image: Some(prior.clone()),
+                };
+                if advanced {
+                    std::fs::write(&claimed_path, b"concurrent image").unwrap();
+                }
+                landing.rollback();
+                if advanced {
+                    assert_eq!(std::fs::read(&claimed_path).unwrap(), b"concurrent image");
+                } else if let Some(prior) = &prior {
+                    assert_eq!(std::fs::read(&claimed_path).unwrap(), *prior);
+                } else {
+                    assert!(!claimed_path.exists());
+                }
+            }
+        }
     }
 
     /// An in-flight first turn makes settlement a no-op. The claim must already
@@ -1803,6 +2061,7 @@ mod tests {
                 repo,
                 "recovery".into(),
                 None,
+                None,
             );
             assert!(matches!(result.unwrap(), Placed::Refused(ExitCode::Policy)));
             if malformed {
@@ -1856,6 +2115,117 @@ mod tests {
         assert!(W::parse_from(["x", "AB", "--link-only"]).a.link_only);
     }
 
+    /// An explicit base must describe the destination's attachment line, not merely a merged input.
+    #[test]
+    fn an_existing_destination_checks_the_explicit_onto_base() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&d.path().join("repo")).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        super::super::init::scaffold(repo.root()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("main file line").unwrap();
+        let base = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        repo.git(&["branch", "work", &base]).unwrap();
+        repo.git(&["branch", "side", &base]).unwrap();
+        let tree = repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+        let first = repo
+            .git(&["commit-tree", &tree, "-p", &base, "-m", "work"])
+            .unwrap();
+        let side = repo
+            .git(&["commit-tree", &tree, "-p", &base, "-m", "side"])
+            .unwrap();
+        let merged = repo
+            .git(&[
+                "commit-tree",
+                &tree,
+                "-p",
+                &first,
+                "-p",
+                &side,
+                "-m",
+                "merged",
+            ])
+            .unwrap();
+        repo.git(&["update-ref", "refs/heads/work", &merged])
+            .unwrap();
+        repo.git(&["update-ref", "refs/heads/side", &side]).unwrap();
+
+        assert!(existing_onto_is_lineage(&repo, "work", &merged).unwrap());
+        assert!(existing_onto_is_lineage(&repo, "work", &first).unwrap());
+        assert!(existing_onto_is_lineage(&repo, "work", &base).unwrap());
+        assert!(!existing_onto_is_lineage(&repo, "work", &side).unwrap());
+        let unrelated = repo
+            .git(&["commit-tree", &tree, "-m", "independent"])
+            .unwrap();
+        assert!(!existing_onto_is_lineage(&repo, "work", &unrelated).unwrap());
+
+        let store = Store::at(d.path().join("store"));
+        let mut lk = Link::new("codex", "synthetic-session", None);
+        lk.owner = Some("alice".into());
+        lk.agent = Some("repo".into());
+        lk.branch = Some("work".into());
+        let link_path = link::write(&store, &lk).unwrap();
+        let link_before = std::fs::read(&link_path).unwrap();
+        let refs_before = repo.git(&["show-ref"]).unwrap();
+        let checkout_before = repo.current_branch();
+        let placed = birth_session_branch(
+            &mut lk,
+            &store,
+            "repo",
+            "alice",
+            "alice",
+            repo.root().to_path_buf(),
+            Repo::at(repo.root()),
+            "work".into(),
+            Some(side),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(placed, Placed::Refused(ExitCode::Policy)));
+        assert_eq!(std::fs::read(link_path).unwrap(), link_before);
+        assert_eq!(repo.git(&["show-ref"]).unwrap(), refs_before);
+        assert_eq!(repo.current_branch(), checkout_before);
+    }
+
+    /// A matching tip cannot hide a later failure to read its first-parent ancestry.
+    #[test]
+    fn existing_onto_requires_a_successful_walk_after_a_matching_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&directory.path().join("repo")).unwrap();
+        super::super::init::scaffold(repo.root()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("root").unwrap();
+        let root = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let tree = repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+        let middle = repo
+            .git(&["commit-tree", &tree, "-p", &root, "-m", "middle"])
+            .unwrap();
+        let tip = repo
+            .git(&["commit-tree", &tree, "-p", &middle, "-m", "tip"])
+            .unwrap();
+        repo.git(&["update-ref", "refs/heads/work", &tip]).unwrap();
+        std::fs::remove_file(
+            repo.root()
+                .join(".git/objects")
+                .join(&root[..2])
+                .join(&root[2..]),
+        )
+        .unwrap();
+
+        let mut saw_tip = false;
+        let walk = repo.git_stream_split(
+            &["rev-list", "--first-parent", "refs/heads/work", "--"],
+            b'\n',
+            |oid| {
+                saw_tip |= oid == tip.as_bytes();
+                Ok(())
+            },
+        );
+        assert!(saw_tip);
+        assert!(walk.is_err());
+        assert!(existing_onto_is_lineage(&repo, "work", &tip).is_err());
+    }
+
     #[test]
     fn importing_onto_legacy_history_publishes_a_migrated_tip_with_exact_rollback() {
         let directory = tempfile::tempdir().unwrap();
@@ -1892,6 +2262,7 @@ mod tests {
             repo,
             "replay".into(),
             Some(frozen.clone()),
+            None,
         )
         .unwrap();
         let Placed::Ready(landing) = placed else {

@@ -327,7 +327,15 @@ impl Lab {
         )
         .unwrap();
         lab.success(&["init", "qa", "--no-bind"]);
-        lab.success(&["import", SID, "--from", "codex", "--into", "me/qa@work"]);
+        lab.success(&[
+            "import",
+            SID,
+            "--from",
+            "codex",
+            "--into",
+            "me/qa@work",
+            "--independent",
+        ]);
         assert!(
             !lab.rpc_log.exists(),
             "adoption queried native configuration"

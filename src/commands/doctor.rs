@@ -143,7 +143,7 @@ pub fn run(args: Args) -> CmdResult {
         None => checks.push((
             "local store".into(),
             Check::Warn(
-                "no sessions adopted yet (adopt one with `agit import <session-id> -n <name>`)"
+                "no sessions adopted yet (adopt one with `agit import <session-id> --from <runtime> --into <owner/repo>@<branch>`)"
                     .into(),
             ),
         )),

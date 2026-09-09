@@ -48,3 +48,41 @@ Token values themselves are never included.
 The hidden `hooks` and `mcp` commands are excluded: they own stdin/stdout as
 line-oriented protocols, so wrapping their stream would make the protocol
 invalid. Their existing protocol formats remain unchanged.
+
+## Local import lineage reports
+
+`agit import <full-native-id> --from <runtime> --into <owner/repo@branch>
+--propose-lineage --json` returns an `import-lineage` object inside
+`result.value`. Its separate contract is
+[`import-lineage-schema.json`](import-lineage-schema.json). Register the existing
+[`cli-json-schema-v2.json`](cli-json-schema-v2.json) schema under its
+`cli-output-v2.json` ID when validating the report's typed commands offline.
+Both outer envelope versions preserve the same nested report; successful previews
+have an empty v2 `fix` array, and v1 has no top-level `fix` field.
+
+A report identifies the explicitly supplied native session and destination. Each
+candidate carries a frozen commit, references reaching it, completed prefix turns,
+native records, and an evidence class. Exact native record equality and verified
+materialization evidence support an explicit base choice; they do not assert an
+observed Git parent of the external native transcript. No transcript content,
+secret values, or transcript digests appear in the report.
+
+`scan_state: complete` means the bounded local inspection had no unavailable
+component. It never claims that semantic discovery is available. Missing local
+repositories, unreadable claims, partial native data, missing Git objects, and
+inspection limits produce `incomplete` with typed `unavailable` reasons. A report
+can retain valid candidates alongside unavailable evidence. A missing or
+ambiguous native identity is a command error instead of an empty report.
+
+The report's `apply` and `independent` fields contain advisory `FixCommand` data;
+no action runs during reporting. They are `null` when safe command routing cannot
+be represented. Candidate actions use the full frozen OID and explicit native
+and destination arguments. The independent action supplies `--independent` and
+keeps the ordinary import's claim, permission, and settlement checks. Neither
+option authorizes rerouting an existing claim without its normal confirmation.
+An import without `--onto`, `--independent`, or `--link-only` requires an explicit
+choice unless it repeats the same active destination claim. Non-interactive
+invocations return exit code `8` with `operation: "choice_required"`; v2 also puts
+the available actions in `fix`, while v1 keeps its existing envelope. `--yes` does
+not choose a candidate. The interactive menu defaults to cancellation and
+revalidates an accepted observation before acquiring write authority.

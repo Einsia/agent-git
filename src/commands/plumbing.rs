@@ -531,8 +531,15 @@ pub fn recover_interrupted_checkout(repo: &Repo) -> Result<bool> {
 /// writable Git directory merely to prove that there is no transaction to recover. File shape and
 /// journal contents remain the locked recovery path's responsibility.
 pub(super) fn interrupted_checkout_metadata_present(repo: &Repo) -> Result<bool> {
+    interrupted_checkout_metadata_with_policy(repo, crate::domain::repo::ReadPolicy::AllowTransport)
+}
+
+pub(super) fn interrupted_checkout_metadata_with_policy(
+    repo: &Repo,
+    policy: crate::domain::repo::ReadPolicy,
+) -> Result<bool> {
     for name in [CHECKOUT_JOURNAL_NAME, CHECKOUT_ATTRIBUTES_SIDECAR_NAME] {
-        let path = checkout_git_path(repo, name)?;
+        let path = checkout_git_path_with_policy(repo, name, policy)?;
         match std::fs::symlink_metadata(&path) {
             Ok(_) => return Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1735,7 +1742,18 @@ fn remove_checkout_sidecar(path: &std::path::Path) -> Result<bool> {
 }
 
 fn checkout_git_path(repo: &Repo, name: &str) -> Result<std::path::PathBuf> {
-    let value = repo.git(&["rev-parse", "--git-path", name])?;
+    checkout_git_path_with_policy(repo, name, crate::domain::repo::ReadPolicy::AllowTransport)
+}
+
+fn checkout_git_path_with_policy(
+    repo: &Repo,
+    name: &str,
+    policy: crate::domain::repo::ReadPolicy,
+) -> Result<std::path::PathBuf> {
+    if matches!(policy, crate::domain::repo::ReadPolicy::LocalOnly) {
+        return repo.git_path_local(name);
+    }
+    let value = repo.git_with_policy(&["rev-parse", "--git-path", name], policy)?;
     anyhow::ensure!(!value.is_empty(), "git returned an empty path for {name}");
     let path = std::path::PathBuf::from(value);
     Ok(if path.is_absolute() {

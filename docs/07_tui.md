@@ -303,8 +303,17 @@ session queries never erase each other.
 
 The screen creates nothing. It leaves the alternate screen and fills in the
 ordinary `agit import <id> --from <runtime> --into <repo>@<branch>` arguments, or
-the equivalent `--link-only` form. Permission checks, branch creation, linking
-and the opening settlement all stay on the command path.
+the equivalent `--link-only` form. Its repository metadata reads are bounded and
+local-only, and it does not refresh RC status or create the store. Selected native
+previews use the bounded read-only snapshot provider, including OpenCode's coherent
+database snapshot without an export cache.
+
+An undecided versioned import then offers verified local lineage candidates,
+independent import, and cancellation on the normal screen. Cancellation is the
+initial choice even for a singleton candidate. Acceptance rereads the observed
+source and target before, and under, the existing branch and claim locks.
+Permission checks, branch creation, linking, and the opening settlement remain
+on the command path.
 
 ### 3.6 `agit init` — create the file line
 

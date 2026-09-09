@@ -56,10 +56,10 @@ agit status --check-missing
 This reports the resolved identity, if any, and scans the runtime directories for sessions that no Agent repo has adopted yet; the transcript you are running in is one of them. When the user asks to upload, save, or adopt the current session, identify and explicitly pass its native session ID (or choose it in the interactive import picker) and adopt it into the repo chosen by the rules above:
 
 ```bash
-agit import <session-id> --repo <owner/repo> -b <branch>
+agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>
 ```
 
-`agit import` links that existing transcript to a real session branch and records its first version. `agit new` cannot take over the session that is already running: it launches a different session with an empty VIEW. Use `new` only when the user explicitly asks to start a fresh session. `-n <agent-name>` is only for naming a new Agent repo when none can be reused; it does not pick the branch.
+`agit import` links that existing transcript to a real session branch and records its first version after an explicit lineage choice. Use the full native ID and `--from` runtime. A terminal offers verified bases, independent import, or cancellation; pipes, JSON, CI and agent calls return choices without adopting. Pass `--onto <ref>` or `--independent` to make the decision explicitly in automation. `--propose-lineage` only inspects local evidence. `agit new` cannot take over the session that is already running: it launches a different session with an empty VIEW. Use `new` only when the user explicitly asks to start a fresh session. `-n <agent-name>` is only for naming a new Agent repo when none can be reused; it does not pick the branch.
 
 ## Pick the command
 
@@ -67,7 +67,7 @@ agit import <session-id> --repo <owner/repo> -b <branch>
 |---|---|---|
 | Create the first Agent repo | `agit init <name>` | Creates the local repo and `main`, optionally binding the directory |
 | Start an empty session in an existing repo | `agit new <owner/repo> -b <branch>` | Creates a real session branch and starts a runtime |
-| Import an existing Codex/Claude conversation | `agit import <runtime-id> --repo <owner/repo> -b <branch>` | Adopts the transcript and settles it immediately |
+| Import an existing Codex/Claude conversation | `agit import <runtime-id> --from <runtime> --repo <owner/repo> -b <branch>` | Chooses lineage, then adopts and settles the transcript |
 | Open a line from an old point | `agit fork <source> -b <branch>` | Creates a branch; add `--resume` to start it |
 | Continue an existing session | `agit resume <branch>` or `agit resume @` | Restores that session's VIEW and starts it |
 | Run a frozen ref | `agit run <owner/repo>@<ref>` | Automatically chooses resume or fork |
@@ -186,7 +186,7 @@ Ordinary commands select an existing session from explicit arguments or `AGIT_SE
 3. Otherwise refuse and request an explicit target
 ```
 
-`@` refers only to `AGIT_SESSION`. A registered native runtime claim may reveal that this environment value is stale after a runtime session switch; agit then refuses it and asks for an explicit target or a corrected environment value. It never chooses the runtime’s branch automatically. Hook payloads name their session explicitly and do not let an inherited environment value override that identity. A legacy link without a recorded owner cannot settle through hooks; run `agit import <session-id> --into <owner>/<repo>@<branch>` to record the complete claim.
+`@` refers only to `AGIT_SESSION`. A registered native runtime claim may reveal that this environment value is stale after a runtime session switch; agit then refuses it and asks for an explicit target or a corrected environment value. It never chooses the runtime’s branch automatically. Hook payloads name their session explicitly and do not let an inherited environment value override that identity. A legacy link without a recorded owner cannot settle through hooks; run `agit import <session-id> --from <runtime> --into <owner>/<repo>@<branch>` to record the complete claim.
 
 Workspace bindings remain descriptive repo routes for creation and status. Native session links, cwd matches, the current checkout and the newest transcript cannot fill in a missing session target. Interactive import and resume pickers collect an explicit user choice.
 

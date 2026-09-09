@@ -25,6 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod repository;
 
+pub(crate) use repository::HydrationBudgetExceeded;
 pub use repository::{
     HydrationReport, ProtectionReport, RepositoryDictionary, RepositoryRecordSummary,
 };

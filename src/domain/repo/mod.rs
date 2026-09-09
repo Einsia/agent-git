@@ -161,6 +161,78 @@ fn git_command() -> Command {
     cmd
 }
 
+#[derive(Debug)]
+pub(crate) struct GitRecordBudgetExceeded;
+
+impl std::fmt::Display for GitRecordBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Git output exceeds the record byte budget")
+    }
+}
+
+impl std::error::Error for GitRecordBudgetExceeded {}
+
+#[derive(Debug)]
+struct GitStreamFailure {
+    command: String,
+    status: Option<i32>,
+}
+
+impl std::fmt::Display for GitStreamFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "git {} failed", self.command)
+    }
+}
+
+impl std::error::Error for GitStreamFailure {}
+
+#[derive(Debug)]
+pub(crate) struct GitWorktreeFormatUnavailable;
+
+impl std::fmt::Display for GitWorktreeFormatUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "local lineage inspection requires NUL-framed worktree output (normally Git 2.36 or newer)",
+        )
+    }
+}
+
+impl std::error::Error for GitWorktreeFormatUnavailable {}
+
+/// Discovery reads cannot repair missing objects or acquire authority through inherited Git state.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadPolicy {
+    AllowTransport,
+    LocalOnly,
+}
+
+impl ReadPolicy {
+    pub(crate) fn apply(self, command: &mut Command) {
+        if matches!(self, Self::LocalOnly) {
+            command
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_ALLOW_PROTOCOL", "")
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .env("GIT_GRAFT_FILE", "");
+            for key in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_COMMON_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_NAMESPACE",
+                "GIT_CONFIG_COUNT",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_REPLACE_REF_BASE",
+                "GIT_SHALLOW_FILE",
+            ] {
+                command.env_remove(key);
+            }
+        }
+    }
+}
+
 /// The body of an object — **or "I did not read it"**.
 ///
 /// The two variants are not two spellings of one thing, they are two things: bytes that were read,
@@ -342,7 +414,11 @@ impl Repo {
 
     /// The git directory shared by every worktree (object store, refs, config, lock files).
     pub fn common_dir(&self) -> Result<PathBuf> {
-        let value = self.git(&["rev-parse", "--git-common-dir"])?;
+        self.common_dir_with_policy(ReadPolicy::AllowTransport)
+    }
+
+    pub(crate) fn common_dir_with_policy(&self, policy: ReadPolicy) -> Result<PathBuf> {
+        let value = self.git_with_policy(&["rev-parse", "--git-common-dir"], policy)?;
         Ok(self.absolute(value.trim()))
     }
 
@@ -370,7 +446,14 @@ impl Repo {
 
     /// `git worktree list --porcelain`: the first entry is always the main checkout.
     pub fn worktrees(&self) -> Result<Vec<Worktree>> {
-        let text = self.git(&["worktree", "list", "--porcelain"])?;
+        self.worktrees_with_policy(ReadPolicy::AllowTransport)
+    }
+
+    pub(crate) fn worktrees_with_policy(&self, policy: ReadPolicy) -> Result<Vec<Worktree>> {
+        if matches!(policy, ReadPolicy::LocalOnly) {
+            return self.worktrees_local();
+        }
+        let text = self.git_with_policy(&["worktree", "list", "--porcelain"], policy)?;
         let mut out = Vec::new();
         for block in text.split("\n\n") {
             let mut path: Option<PathBuf> = None;
@@ -396,6 +479,70 @@ impl Repo {
             }
         }
         Ok(out)
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn git_path_local(&self, name: &str) -> Result<PathBuf> {
+        let mut value = None;
+        self.git_stream_split_with_limit(
+            &["rev-parse", "--git-path", name],
+            0,
+            ReadPolicy::LocalOnly,
+            64 * 1024,
+            |record| {
+                anyhow::ensure!(value.is_none(), "Git path contains a protocol separator");
+                value = Some(record.to_vec());
+                Ok(())
+            },
+        )?;
+        let value = value.context("Git returned no path")?;
+        Ok(self.absolute(local_git_path_text(&value)?))
+    }
+
+    fn worktrees_local(&self) -> Result<Vec<Worktree>> {
+        const FIELD_BYTES: usize = 64 * 1024;
+        const WORKTREES: usize = 512;
+        let mut entries = Vec::new();
+        let mut record = LocalWorktreeRecord::default();
+        let result = self.git_stream_split_with_limit(
+            &["worktree", "list", "--porcelain", "-z"],
+            0,
+            ReadPolicy::LocalOnly,
+            FIELD_BYTES,
+            |field| {
+                if field.is_empty() {
+                    anyhow::ensure!(
+                        entries.len() < WORKTREES,
+                        "worktree inspection budget reached"
+                    );
+                    let entry = std::mem::take(&mut record).finish(entries.is_empty())?;
+                    anyhow::ensure!(
+                        !entries
+                            .iter()
+                            .any(|prior: &Worktree| prior.path == entry.path),
+                        "duplicate registered worktree path"
+                    );
+                    entries.push(entry);
+                } else {
+                    record.field(field)?;
+                }
+                Ok(())
+            },
+        );
+        if let Err(error) = result {
+            if error
+                .downcast_ref::<GitStreamFailure>()
+                .is_some_and(|failure| failure.status == Some(129))
+            {
+                return Err(GitWorktreeFormatUnavailable.into());
+            }
+            return Err(error);
+        }
+        anyhow::ensure!(
+            record.is_empty() && !entries.is_empty(),
+            "incomplete worktree listing"
+        );
+        Ok(entries)
     }
 
     /// The worktree that has this branch checked out (main or linked).
@@ -482,8 +629,13 @@ impl Repo {
     /// a global `commit.gpgsign=true`, gpg cannot ask for the passphrase and fails outright,
     /// breaking the whole automatic settlement chain (`gpg: cannot open '/dev/tty'`).
     pub fn git(&self, args: &[&str]) -> Result<String> {
-        let out = self
-            .cmd()
+        self.git_with_policy(args, ReadPolicy::AllowTransport)
+    }
+
+    pub(crate) fn git_with_policy(&self, args: &[&str], policy: ReadPolicy) -> Result<String> {
+        let mut command = self.cmd();
+        policy.apply(&mut command);
+        let out = command
             .args(args)
             .output()
             .with_context(|| format!("failed to run git {}", args.join(" ")))?;
@@ -524,11 +676,60 @@ impl Repo {
         &self,
         args: &[&str],
         sep: u8,
+        on_record: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.git_stream_split_with_policy(args, sep, ReadPolicy::AllowTransport, on_record)
+    }
+
+    #[cfg(feature = "secret-vault")]
+    pub(crate) fn git_stream_split_local(
+        &self,
+        args: &[&str],
+        sep: u8,
+        on_record: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.git_stream_split_with_policy(args, sep, ReadPolicy::LocalOnly, on_record)
+    }
+
+    #[cfg(feature = "secret-vault")]
+    pub(crate) fn git_stream_split_local_bounded(
+        &self,
+        args: &[&str],
+        sep: u8,
+        max_record_bytes: usize,
+        on_record: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.git_stream_split_with_limit(
+            args,
+            sep,
+            ReadPolicy::LocalOnly,
+            max_record_bytes,
+            on_record,
+        )
+    }
+
+    fn git_stream_split_with_policy(
+        &self,
+        args: &[&str],
+        sep: u8,
+        policy: ReadPolicy,
+        on_record: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.git_stream_split_with_limit(args, sep, policy, usize::MAX, on_record)
+    }
+
+    fn git_stream_split_with_limit(
+        &self,
+        args: &[&str],
+        sep: u8,
+        policy: ReadPolicy,
+        max_record_bytes: usize,
         mut on_record: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
         use std::io::Read;
-        let mut child = self
-            .cmd()
+        let mut command = self.cmd();
+        policy.apply(&mut command);
+        let mut child = command
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -554,11 +755,18 @@ impl Repo {
             // Hand over every complete record, leaving only the trailing partial one in the
             // buffer.
             while let Some(i) = buf.iter().position(|c| *c == sep) {
+                if i > max_record_bytes {
+                    fail = Some(GitRecordBudgetExceeded.into());
+                    break;
+                }
                 let rec: Vec<u8> = buf.drain(..=i).take(i).collect();
                 if let Err(e) = on_record(&rec) {
                     fail = Some(e);
                     break;
                 }
+            }
+            if buf.len() > max_record_bytes && fail.is_none() {
+                fail = Some(GitRecordBudgetExceeded.into());
             }
             if fail.is_some() {
                 break;
@@ -574,7 +782,11 @@ impl Repo {
             return Err(e);
         }
         if !status.success() {
-            anyhow::bail!("git {} failed", args.join(" "));
+            return Err(GitStreamFailure {
+                command: args.join(" "),
+                status: status.code(),
+            }
+            .into());
         }
         Ok(())
     }
@@ -653,6 +865,16 @@ impl Repo {
         &self,
         oids: Vec<String>,
         max_bytes: usize,
+        on_object: impl FnMut(&str, &str, ObjectBody<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.git_cat_file_batch_with_policy(oids, max_bytes, ReadPolicy::AllowTransport, on_object)
+    }
+
+    pub(crate) fn git_cat_file_batch_with_policy(
+        &self,
+        oids: Vec<String>,
+        max_bytes: usize,
+        policy: ReadPolicy,
         mut on_object: impl FnMut(&str, &str, ObjectBody<'_>) -> Result<()>,
     ) -> Result<()> {
         use std::io::{Read, Write};
@@ -675,7 +897,7 @@ impl Repo {
         } else {
             let mut keep = Vec::with_capacity(oids.len());
             let cap = max_bytes as u64;
-            self.git_cat_file_batch_check(oids, |oid, kind, size| {
+            self.git_cat_file_batch_check_with_policy(oids, policy, |oid, kind, size| {
                 // `missing` still goes to `--batch`: an object that cannot be read gets its
                 // "what we asked for is not there" verdict from that side; filtering it out
                 // quietly here turns it into "there is nothing here".
@@ -703,8 +925,9 @@ impl Repo {
             return Ok(());
         }
 
-        let mut child = self
-            .cmd()
+        let mut command = self.cmd();
+        policy.apply(&mut command);
+        let mut child = command
             .args(["cat-file", "--batch"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -871,14 +1094,24 @@ impl Repo {
     pub fn git_cat_file_batch_check(
         &self,
         oids: Vec<String>,
+        on_object: impl FnMut(&str, &str, u64) -> Result<()>,
+    ) -> Result<()> {
+        self.git_cat_file_batch_check_with_policy(oids, ReadPolicy::AllowTransport, on_object)
+    }
+
+    pub(crate) fn git_cat_file_batch_check_with_policy(
+        &self,
+        oids: Vec<String>,
+        policy: ReadPolicy,
         mut on_object: impl FnMut(&str, &str, u64) -> Result<()>,
     ) -> Result<()> {
         use std::io::Write;
         if oids.is_empty() {
             return Ok(());
         }
-        let mut child = self
-            .cmd()
+        let mut command = self.cmd();
+        policy.apply(&mut command);
+        let mut child = command
             .args(["cat-file", "--batch-check"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -991,9 +1224,7 @@ impl Repo {
     ) -> Result<(Option<i32>, String, String)> {
         let mut command = self.cmd();
         if !allow_transport {
-            command.env("GIT_NO_LAZY_FETCH", "1");
-            // The transport allowlist also blocks Git versions that ignore the lazy-fetch switch.
-            command.env("GIT_ALLOW_PROTOCOL", "");
+            ReadPolicy::LocalOnly.apply(&mut command);
         }
         let out = command
             .args(args)
@@ -1192,6 +1423,36 @@ impl Repo {
     /// built by `agit init` plainly holds branches, and `agit log <owner/repo>` says "no branches"
     /// about them. Anything that genuinely wants only the remote side (building local tracking
     /// branches after a clone) goes through [`Repo::remote_branches`].
+    /// The picker cannot silently truncate names and then offer an existing branch as new.
+    #[cfg(feature = "cli")]
+    pub(crate) fn branches_local_bounded(&self, maximum: usize) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        self.git_stream_split_with_limit(
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/",
+                "refs/remotes/origin/",
+            ],
+            b'\n',
+            ReadPolicy::LocalOnly,
+            4096,
+            |record| {
+                anyhow::ensure!(
+                    names.len() < maximum,
+                    "the repository has too many branch references to preview"
+                );
+                if let Some(name) = branch_name_of(std::str::from_utf8(record)?.trim()) {
+                    names.push(name);
+                }
+                Ok(())
+            },
+        )?;
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     pub fn branches(&self) -> Vec<String> {
         // One `for-each-ref` takes both patterns, rather than two calls merged afterwards:
         // `same_repo_branches()` calls this function once for **every** local repo, and
@@ -1468,8 +1729,221 @@ pub(crate) fn v0_repo_with_shadowing_user_files(root: &Path) -> (Repo, String, S
     (repo, head, transcript)
 }
 
+#[cfg(feature = "cli")]
+fn local_git_path_text(output: &[u8]) -> Result<&str> {
+    let path = output
+        .strip_suffix(b"\n")
+        .context("Git path has no protocol terminator")?;
+    anyhow::ensure!(
+        !path.is_empty() && !path.contains(&0),
+        "Git returned an invalid path"
+    );
+    std::str::from_utf8(path).context("local recovery path is not valid UTF-8")
+}
+
+#[derive(Default)]
+struct LocalWorktreeRecord {
+    path: Option<PathBuf>,
+    branch: Option<String>,
+    head: Option<String>,
+    fields: std::collections::BTreeSet<&'static str>,
+}
+
+impl LocalWorktreeRecord {
+    fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    fn field(&mut self, field: &[u8]) -> Result<()> {
+        let (name, value) = field
+            .iter()
+            .position(|byte| *byte == b' ')
+            .map_or((field, None), |at| (&field[..at], Some(&field[at + 1..])));
+        let name = match name {
+            b"worktree" => "worktree",
+            b"HEAD" => "HEAD",
+            b"branch" => "branch",
+            b"bare" => "bare",
+            b"detached" => "detached",
+            b"locked" => "locked",
+            b"prunable" => "prunable",
+            _ => anyhow::bail!("unknown worktree listing field"),
+        };
+        anyhow::ensure!(self.fields.insert(name), "duplicate worktree listing field");
+        anyhow::ensure!(
+            name == "worktree" || self.path.is_some(),
+            "worktree path must precede its fields"
+        );
+        match name {
+            "worktree" => {
+                let value = value.context("worktree listing has no path")?;
+                #[cfg(unix)]
+                let path = {
+                    use std::os::unix::ffi::OsStrExt;
+                    PathBuf::from(std::ffi::OsStr::from_bytes(value))
+                };
+                #[cfg(not(unix))]
+                let path = PathBuf::from(
+                    std::str::from_utf8(value).context("worktree path is not valid UTF-8")?,
+                );
+                anyhow::ensure!(
+                    !value.is_empty() && path.is_absolute(),
+                    "worktree path must be absolute"
+                );
+                self.path = Some(path);
+            }
+            "HEAD" => {
+                let value = value.context("worktree listing has no head")?;
+                anyhow::ensure!(
+                    matches!(value.len(), 40 | 64) && value.iter().all(u8::is_ascii_hexdigit),
+                    "invalid worktree head"
+                );
+                self.head = Some(std::str::from_utf8(value)?.to_owned());
+            }
+            "branch" => {
+                let value = std::str::from_utf8(value.context("worktree listing has no branch")?)?;
+                let branch = value
+                    .strip_prefix("refs/heads/")
+                    .context("worktree branch is not a local branch")?;
+                anyhow::ensure!(!branch.is_empty(), "worktree branch must not be empty");
+                self.branch = Some(branch.to_owned());
+            }
+            "bare" | "detached" => {
+                anyhow::ensure!(value.is_none(), "unexpected worktree flag value")
+            }
+            "locked" | "prunable" => {}
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn finish(self, primary: bool) -> Result<Worktree> {
+        let path = self.path.context("worktree entry has no path")?;
+        let bare = self.fields.contains("bare");
+        let detached = self.fields.contains("detached");
+        anyhow::ensure!(
+            if bare {
+                self.head.is_none() && self.branch.is_none() && !detached
+            } else {
+                self.head.is_some() && (self.branch.is_some() != detached)
+            },
+            "incomplete or contradictory worktree entry"
+        );
+        Ok(Worktree {
+            path,
+            branch: self.branch,
+            head: self.head,
+            primary,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn local_worktree_paths_preserve_embedded_line_separators() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&directory.path().join("repo")).unwrap();
+        std::fs::write(repo.root().join("fixture"), b"synthetic").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("synthetic root").unwrap();
+        let linked = directory.path().join("other\n\nsuffix");
+        let prefix = directory.path().join("other");
+        Repo::init(&prefix).unwrap();
+        repo.git(&["worktree", "add", "-b", "linked", linked.to_str().unwrap()])
+            .unwrap();
+        let listing = repo
+            .worktrees_with_policy(super::ReadPolicy::LocalOnly)
+            .unwrap();
+        assert_eq!(listing.len(), 2);
+        assert!(listing[0].primary);
+        assert!(!listing[1].primary);
+        assert_eq!(listing[1].path, linked.canonicalize().unwrap());
+        assert_ne!(listing[1].path, prefix);
+        assert_eq!(listing[1].branch.as_deref(), Some("linked"));
+    }
+
+    #[test]
+    fn local_worktree_records_reject_incomplete_or_ambiguous_fields() {
+        let path = format!(
+            "worktree {}",
+            std::env::temp_dir().join("synthetic").display()
+        );
+        let head = format!("HEAD {}", "a".repeat(40));
+        let mut valid = super::LocalWorktreeRecord::default();
+        for field in [path.as_bytes(), head.as_bytes(), b"branch refs/heads/topic"] {
+            valid.field(field).unwrap();
+        }
+        assert_eq!(
+            valid.finish(false).unwrap().branch.as_deref(),
+            Some("topic")
+        );
+        let mut incomplete = super::LocalWorktreeRecord::default();
+        incomplete.field(path.as_bytes()).unwrap();
+        assert!(incomplete.finish(false).is_err());
+        let mut duplicate = super::LocalWorktreeRecord::default();
+        duplicate.field(path.as_bytes()).unwrap();
+        assert!(duplicate.field(path.as_bytes()).is_err());
+        let mut contradict = super::LocalWorktreeRecord::default();
+        for field in [
+            path.as_bytes(),
+            head.as_bytes(),
+            b"branch refs/heads/topic",
+            b"detached",
+        ] {
+            contradict.field(field).unwrap();
+        }
+        assert!(contradict.finish(false).is_err());
+        let mut missing_path = super::LocalWorktreeRecord::default();
+        assert!(missing_path.field(head.as_bytes()).is_err());
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn local_recovery_path_text_rejects_lossy_decoding_and_protocol_truncation() {
+        assert_eq!(
+            super::local_git_path_text(b"other\n\nsuffix\n").unwrap(),
+            "other\n\nsuffix"
+        );
+        assert!(super::local_git_path_text(b"other-\xff\n").is_err());
+        assert!(super::local_git_path_text(b"unterminated").is_err());
+        assert!(super::local_git_path_text(b"embedded\0separator\n").is_err());
+        assert!(super::local_git_path_text(b"\n").is_err());
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn bounded_picker_rejects_oversized_packed_refs_and_retains_ordinary_stream_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&directory.path().join("repo")).unwrap();
+        std::fs::write(repo.root().join("fixture"), b"synthetic").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("synthetic root").unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let packed = repo.git_path("packed-refs").unwrap();
+        let oversized = format!("refs/heads/{}", "a".repeat(200_000));
+        std::fs::write(&packed, format!("{head} {oversized}\n")).unwrap();
+        let mut saw_oversized = false;
+        repo.git_stream_split(
+            &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+            b'\n',
+            |record| {
+                saw_oversized |= record == oversized.as_bytes();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(saw_oversized);
+        assert!(repo.branches_local_bounded(512).is_err());
+        std::fs::write(&packed, format!("{head} refs/heads/picked\n")).unwrap();
+        assert_eq!(
+            repo.branches_local_bounded(512).unwrap(),
+            ["main", "picked"]
+        );
+        assert!(repo.branches_local_bounded(1).is_err());
+    }
 
     /// The preference is only ever the repo's own: a same-named key that git would
     /// otherwise pick up from the global or command scope must read as "not set".

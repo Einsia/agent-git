@@ -19,7 +19,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 /// The explicit arguments the screen gives back to `agit import`.
@@ -36,7 +36,6 @@ pub struct Picked {
 struct Candidate {
     runtime: String,
     session_id: String,
-    path: PathBuf,
     gist: Option<String>,
     last_active: SystemTime,
     live: bool,
@@ -191,7 +190,9 @@ fn move_selection(state: &mut ListState, len: usize, delta: isize) {
 
 /// Gather unmanaged sessions in this directory without opening their transcripts.
 fn collect(cwd: &Path) -> Vec<Candidate> {
-    let store = crate::domain::store::Store::open_or_init().ok();
+    let store = crate::infra::config::store_root()
+        .ok()
+        .map(crate::domain::store::Store::at);
     let links = store.as_ref().map(link::list).unwrap_or_default();
     let link_refs = links.iter().collect::<Vec<_>>();
     let now = SystemTime::now();
@@ -203,7 +204,6 @@ fn collect(cwd: &Path) -> Vec<Candidate> {
             Candidate {
                 runtime: session.runtime.to_string(),
                 session_id: session.id,
-                path: session.path,
                 gist: session.gist,
                 last_active: session.mtime,
                 live: sessions::is_live(session.mtime, now),
@@ -224,18 +224,17 @@ pub fn pick(cwd: &Path) -> crate::Result<Option<Picked>> {
             ))
         );
         crate::ui::hint(
-            "session ran in another directory? give the id directly: agit import <session-id> -n <name>",
+            "session ran in another directory? give the id directly: agit import <full-session-id> --from <runtime> --into <owner/repo>@<branch>",
         );
         return Ok(None);
     }
 
-    let repos = repos::collect(crate::commands::new::DEFAULT_FROM);
+    let repos = repos::collect_local(crate::commands::new::DEFAULT_FROM);
     let preferred = crate::commands::context::repo_for(cwd).ok();
     let repo_index = preferred
         .as_deref()
         .and_then(|slug| repos.iter().position(|repo| repo.slug() == slug))
         .unwrap_or(0);
-    widgets::refresh_rc_status();
     let picked = {
         let mut guard = crate::tui::term::Guard::enter()?;
         let outcome = run_loop(&candidates, &repos, repo_index);
@@ -252,11 +251,19 @@ fn preview(candidate: &Candidate) -> String {
         .filter(|gist| !gist.trim().is_empty())
         .map(|gist| crate::ui::truncate(gist, 72))
         .unwrap_or_else(|| {
-            crate::commands::import::gist_for(
-                &candidate.runtime,
-                &candidate.session_id,
-                &candidate.path,
-            )
+            let read = || -> crate::Result<Option<String>> {
+                let adapter = crate::adapter::get(&candidate.runtime)?;
+                let limits = crate::adapter::native_snapshot::Limits::default();
+                let source = adapter.lookup_native_readonly(&candidate.session_id, limits)?;
+                let snapshot = adapter.snapshot_native_readonly(&source, limits)?;
+                Ok(adapter
+                    .parse(std::str::from_utf8(&snapshot.bytes)?)?
+                    .gist(48))
+            };
+            read()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "(preview unavailable)".into())
         })
 }
 
@@ -899,7 +906,6 @@ mod tests {
         Candidate {
             runtime: "codex".into(),
             session_id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
-            path: "/tmp/session.jsonl".into(),
             gist: Some("fix the retry path".into()),
             last_active: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
             live,

@@ -150,7 +150,15 @@ fn the_strict_result_names_the_branch_tip_not_the_primary_head() {
     let lab = Lab::new();
     lab.append(A, &lab.turn(A, 1, "first turn", "answer one"));
     lab.run(&["init", "qa"]);
-    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
 
     // Pin the checkout to an immutable identity the way `agit clone` does: the supervisor's
     // strict path requires it.
@@ -208,7 +216,15 @@ fn the_strict_result_follows_the_memory_commit() {
     let lab = Lab::new();
     lab.append(A, &lab.turn(A, 1, "first turn", "answer one"));
     lab.run(&["init", "qa"]);
-    lab.run(&["import", A, "--from", "claude-code", "--into", "me/qa@s1"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
     let repo = Repo::open(lab.agit_home.join("repos/me/qa")).unwrap();
     let identity = agit::hub::identity::RemoteIdentity::new(HUB, AGENT_ID).unwrap();
     agit::hub::identity::pin(&repo, &identity).unwrap();

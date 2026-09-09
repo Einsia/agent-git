@@ -150,6 +150,29 @@ impl Link {
         }
     }
 
+    /// Explicit inspection retains known claim fields without treating malformed data as absence.
+    #[cfg(feature = "cli")]
+    pub(crate) fn from_json(source: &str, session_id: &str, bytes: &[u8]) -> Result<Self> {
+        anyhow::ensure!(
+            bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{'),
+            "the session link must be a JSON object"
+        );
+        let body: Body = serde_json::from_slice(bytes).context("invalid session link fields")?;
+        Ok(Self {
+            source: source.to_owned(),
+            session_id: session_id.to_owned(),
+            cwd: body.cwd,
+            agent: body.agent,
+            owner: body.owner,
+            branch: body.branch,
+            baseline_bytes: body.baseline_bytes,
+            baseline_hash: body.baseline_hash,
+            materialized_from: body.materialized_from,
+            superseded_by: body.superseded_by,
+            naming_ignored: body.naming_ignored,
+        })
+    }
+
     fn body(&self) -> Body {
         Body {
             cwd: self.cwd.clone(),
@@ -630,7 +653,7 @@ pub fn find(store: &Store, selector: &str) -> Result<Link> {
     match matches.len() {
         0 => bail!(
             "no session `{sel}` in the store.\n  \
-             `agit import {sel} -n <agent-name>` links it and records a first version, or `agit log` lists what you have."
+             `agit import <full-session-id> --from <runtime> --into <owner/repo>@<branch>` lets you choose its lineage, or `agit log` lists what you have."
         ),
         1 => Ok(matches.into_iter().next().unwrap()),
         n => {
@@ -874,7 +897,16 @@ mod tests {
             e.contains("agit import"),
             "the error must give the next step: {e}"
         );
-        assert!(e.contains("-n"), "the next step carries an agent name: {e}");
+        assert!(
+            e.contains(
+                "agit import <full-session-id> --from <runtime> --into <owner/repo>@<branch>"
+            ),
+            "the next step requires complete source and destination identity: {e}"
+        );
+        assert!(
+            !e.contains("agit import nope"),
+            "a missing selector is not a resolved native ID: {e}"
+        );
     }
 
     fn cand(id: &str, touched: bool) -> Candidate {
