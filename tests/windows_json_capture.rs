@@ -239,6 +239,7 @@ fn unauthenticated_search_captures_diagnostics_and_typed_login_without_running_i
                     Err(error) => panic!("cannot accept the fixture request: {error}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

@@ -197,8 +197,8 @@ pub struct Snapshot {
     /// "still append-only" against).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_bytes: Option<u64>,
-    /// The runtime instances registered on this branch (the logical session id is fixed, the
-    /// instance varies). Element form: `<runtime>/<local session id>`.
+    /// Compatibility data, never current instance ownership. Local links hold runtime claims;
+    /// these entries cannot prove liveness or authorize a writer on another machine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_instances: Vec<String>,
 }

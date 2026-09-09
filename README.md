@@ -88,7 +88,7 @@ the binary to `~/.local/bin/agit`. Common flags:
 ```
 
 To build a binary whose built-in hub is the staging deployment, set the build-time default
-explicitly. Runtime `AGIT_HUB_URL` and `agit config set hub.url ...` still take precedence:
+explicitly. Runtime `AGIT_HUB_URL` and `agit config hub.url ...` still take precedence:
 
 ```sh
 AGIT_DEFAULT_HUB_URL=https://staging.agent-git.com cargo build --release --locked

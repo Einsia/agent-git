@@ -34,6 +34,6 @@ agit hooks settle < hook.json    # Stop
 
 ## Notes
 
-Both actions **always exit 0** — a failing hook must not disturb the session. `settle` is silent. A successful Claude SessionStart may return one structured hook response with a session title and, only for an unnamed session, adoption guidance. Codex uses the same response envelope but exposes no title field, so only an unnamed Codex session receives a response, containing adoption guidance. Every other path is silent. `agit config set commit.auto false` turns automatic settlement off.
+Both actions **always exit 0** — a failing hook must not disturb the session. `settle` is silent. A successful Claude SessionStart may return one structured hook response with a session title and, only for an unnamed session, adoption guidance. Codex uses the same response envelope but exposes no title field, so only an unnamed Codex session receives a response, containing adoption guidance. Every other path is silent. `agit config commit.auto false` turns automatic settlement off.
 
 The input schema is produced by the runtime hook; do not hand-forge it to claim another person's session.

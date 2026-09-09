@@ -344,8 +344,8 @@ impl CwdState {
 /// * **`parent`** — a git commit already records its parent; no second copy of it here.
 /// * **`signer` / `key` / `sig`** — meta carries no signature. Content integrity comes from the
 ///   git commit hash, and git's `user.name` / `user.email` record who authored the commit.
-/// * **the runtime's local session id** — it identifies "this install on this machine", not a
-///   durable identity. Recording it only tempts others to use it as one.
+/// * **new runtime-instance registrations** — local links own native session identity and
+///   settlement baselines. Serialized compatibility entries cannot establish live ownership.
 /// * `version` — that is the version ID (the commit hash); it would be self-referential.
 /// * `captured_at` / `signed_at` — unverifiable self-report. Ask the git commit for times.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,8 +398,8 @@ pub struct Meta {
     /// tests "still append-only" against).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_bytes: Option<u64>,
-    /// The runtime instances registered on this branch (the logical session id is fixed, the
-    /// instance is not). Element form: `<runtime>/<local session id>`.
+    /// Compatibility data, never current instance ownership. Local links hold runtime claims;
+    /// these entries cannot prove liveness or authorize a writer on another machine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_instances: Vec<String>,
 }

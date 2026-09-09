@@ -31,11 +31,15 @@ This grouping offers candidates; it does not select a session target.
 | `--as <runtime>` | Runtime to use |
 | `--cwd <dir>` | Runtime working directory |
 | `--no-launch` | Resolve/materialize without starting |
-| `--force` | Replace an active runtime claim; known unintegrated tracking history still refuses |
+| `--force` | Explicitly replace local active claims; known unintegrated tracking history still refuses |
 | `--tui` / `--no-tui` | Force or forbid the full-screen interface. `--tui` overrides the agent-session check but not `--json` / `-q` / `-y` |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
-Preparing the same branch tip, runtime, and directory again reuses the existing runtime session. A materialized instance whose branch advanced is superseded only when its recorded baseline proves that no new content exists; otherwise resume refuses before creating another writer.
+Preparing the same branch tip, runtime, and directory again reuses the existing runtime session when its recorded baseline remains valid. Without `--force`, a materialized instance whose branch advanced is superseded only when its recorded baseline proves that no new content exists; otherwise resume refuses before creating another writer.
+
+Instance ownership is scoped to the selected local AgentGit store (`AGIT_HOME`, default `~/.agit`). New claims in `store/<runtime>/<native-id>.json` bind the native session to its owner/repository and branch; materialized claims also record the baseline used to detect unsettled content. Resume rechecks active claims and the selected branch head under local locks. Separate stores have separate claims, even on the same machine. A serialized `runtime_instances` field is retained for compatibility, but is not populated as an active registry or consulted for ownership.
+
+Resume can prepare locally available history offline and does not acquire a Hub branch lease. It cannot establish whether another machine is still running the same branch. If machines advance independently, reconcile the histories explicitly with merge or fork. `--force` deliberately replaces local active claims even when their transcripts cannot be proven settled; it leaves those transcripts available for recovery. It cannot revoke an instance on another machine, and the selected branch and tracking-history checks still apply. Remote Control operates through the connected machine's daemon and does not turn this local claim mechanism into a global branch lease.
 
 Resume checks the tracking ref configured for the explicitly selected branch, even when the primary checkout is on another branch. The tracking check uses only local objects and does not fetch updates; absent tracking refs are allowed. A known tracking tip must already be an ancestor of the local tip; remote advances and divergence refuse both native reuse and materialization, including `--force`. Tracking identity and tip changes across confirmation prompts also require a retry.
 
