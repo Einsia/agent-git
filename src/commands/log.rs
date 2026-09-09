@@ -43,7 +43,7 @@ pub struct Args {
     #[arg(long)]
     pub branches: bool,
     /// Only one kind.
-    #[arg(long, value_name = "turn|merge|view|file")]
+    #[arg(long, value_name = "turn|merge|view|file|archive")]
     pub kind: Option<String>,
     /// Filter by message.
     #[arg(long, value_name = "pat")]
@@ -316,6 +316,7 @@ fn kind_badge(k: &Kind) -> &'static str {
         Kind::Merge => "[merge]",
         Kind::View => "[view ]",
         Kind::File => "[file ]",
+        Kind::Archive => "[archive]",
     }
 }
 
@@ -920,6 +921,24 @@ mod tests {
     }
 
     #[test]
+    fn archive_kind_filter_reports_evidence_without_a_turn_label() {
+        let (_temporary, repo) = crate::domain::refs::fixtures::forked_history();
+        let head = crate::domain::refs::fixtures::archive_tail(&repo);
+        let rows = turns(&repo, &head, 50, Some("archive"), None, None, &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, Kind::Archive);
+        assert_eq!(rows[0].turn, None);
+        assert_eq!(rows[0].short, head[..9]);
+        assert_eq!(kind_badge(&rows[0].kind), "[archive]");
+        assert_eq!(turn_label(rows[0].turn), "    ");
+        let ordinary = turns(&repo, &head, 50, Some("turn"), None, None, &[]).unwrap();
+        assert_eq!(
+            ordinary.iter().map(|row| row.turn).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3), Some(4)]
+        );
+    }
+
+    #[test]
     fn branch_turns_ignore_non_conversation_commits() {
         let init = meta::Meta::new_file_line();
         assert_eq!(branch_turns(Some(&init)), 0, "init");
@@ -936,6 +955,7 @@ mod tests {
             (Kind::Turn, "fork"),
             (Kind::File, "file"),
             (Kind::Merge, "merge"),
+            (Kind::Archive, "archive"),
         ] {
             head.kind = kind;
             assert_eq!(branch_turns(Some(&head)), 1, "{operation}");

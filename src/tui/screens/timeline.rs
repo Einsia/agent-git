@@ -232,6 +232,7 @@ fn kind_word(k: Kind) -> &'static str {
         Kind::Merge => "merge",
         Kind::View => "view",
         Kind::File => "file",
+        Kind::Archive => "archive",
     }
 }
 
@@ -549,7 +550,9 @@ fn draw(
         Some(n) => n.to_string(),
         None => match screen.view {
             View::Turns => strip_text(state.selected().and_then(|i| turns.get(i)).copied()),
-            View::Branches => "kind: turn/merge/view/file   enter opens that branch’s turns".into(),
+            View::Branches => {
+                "kind: turn/merge/view/file/archive   enter opens that branch’s turns".into()
+            }
         },
     };
     f.render_widget(
@@ -611,6 +614,21 @@ mod tests {
             file_line: false,
             ahead_behind: String::new(),
         }
+    }
+
+    #[test]
+    fn archive_rows_are_named_and_keep_their_commit_identity_without_a_turn_number() {
+        let mut row = turn(4, "retain synthetic exploration");
+        row.kind = Kind::Archive;
+        row.turn = None;
+        for width in [40, 60, 120] {
+            let text = turn_line(&row, width).to_string();
+            assert!(text.contains("archive"), "{text}");
+            assert!(text.contains(&row.short), "{text}");
+            assert!(!text.contains('#'), "{text}");
+            assert!(widgets::cols(&text) <= width as usize, "{text}");
+        }
+        assert!(turn_haystack(&row).contains("archive"));
     }
 
     /// `Tab` flips between the two views; two presses land back where it started.

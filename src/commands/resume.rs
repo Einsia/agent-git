@@ -862,13 +862,13 @@ fn resume_branch_for(
         && !switches_rt
         && args.cwd.is_none()
         && !args.force
-        && !history_rewrote_view(repo, &head)?
+        && !history_requires_view_materialization(repo, &head)?
         && let [lk] = active.as_slice()
         && lk.baseline_bytes.is_none()
+        && head_view_matches_log(repo, &head, &snap)?
     {
-        // The branch head must have been settled out of this native session: committed is the
-        // prefix of live, and nobody touched the VIEW after that commit (continuity covers this
-        // test — objects brought in by a merge stop committed from being the prefix of live).
+        // Native reuse requires both saved VIEW equality and a native LOG prefix. History
+        // overlays cannot authorize replaying evidence excluded from the current snapshot.
         if let Ok(live) = lk.read() {
             let projected = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
                 .protect_existing_jsonl(&live)?;
@@ -1194,24 +1194,41 @@ pub fn launch_branch(slug: &str, branch: &str) -> CmdResult {
     }
 }
 
-/// Whether this branch's history ever carried VIEW surgery (`revert` / `cherry-pick` / `merge`).
+/// The validated LOG must name the same immutable bytes as VIEW before native reuse.
+/// History can be shallow or grafted; absence of a visible rewrite cannot prove this equality.
+fn head_view_matches_log(repo: &Repo, head: &str, snapshot: &meta::Meta) -> crate::Result<bool> {
+    if snapshot.session.is_empty() {
+        return Ok(true);
+    }
+    let paths = match snapshot.layout {
+        meta::LayoutVersion::V0 => [meta::LEGACY_LOG_FILE, meta::LEGACY_VIEW_FILE],
+        meta::LayoutVersion::V1 => [meta::LOG_FILE, meta::VIEW_FILE],
+    };
+    let mut objects = Vec::new();
+    repo.git_cat_file_batch_check(
+        paths.iter().map(|path| format!("{head}:{path}")).collect(),
+        |oid, kind, _| {
+            objects.push((kind == "blob").then(|| oid.to_owned()));
+            Ok(())
+        },
+    )?;
+    Ok(matches!(objects.as_slice(), [Some(log), Some(view)] if log == view))
+}
+
+/// Whether session history can make the native transcript differ from the saved VIEW.
 ///
-/// The fast path reuses the native session on the test "the committed LOG is the prefix of the
-/// live transcript". VIEW surgery does not touch the LOG: what a revert takes out and what a
-/// cherry-pick brings in change only the VIEW, and the LOG prefix relation still holds — so the
-/// fast path sends the agent back to the **native transcript**, where it still sees the reverted
-/// content and not one word of what the cherry-pick brought in. Once VIEW and LOG part ways,
-/// materialization from the head VIEW is mandatory (the slow path). A merge already fails the LOG
-/// continuity test; it is listed here only so the rule reads complete.
-///
-/// Only surgery on the **session line** counts: a reconciling merge on the file line also carries
-/// `kind: merge`, and the VIEW of a session line growing out of it was never rewritten — counting
-/// that merge in would permanently close the fast path for every descendant session over a single
-/// operation that merges nothing but shared files.
-fn history_rewrote_view(repo: &Repo, head: &str) -> crate::Result<bool> {
-    Ok(first_parent_metas(repo, head)?
-        .iter()
-        .any(|m| m.is_session_line() && matches!(m.kind, meta::Kind::View | meta::Kind::Merge)))
+/// Native reuse proves LOG continuity, which does not prove VIEW equality. VIEW surgery can
+/// remove context from VIEW, and archives can append LOG-only evidence. Once either operation
+/// appears in session history, continuing from saved VIEW requires materialization.
+/// File-line merges only reconcile shared files and do not impose this requirement.
+fn history_requires_view_materialization(repo: &Repo, head: &str) -> crate::Result<bool> {
+    Ok(first_parent_metas(repo, head)?.iter().any(|m| {
+        m.is_session_line()
+            && matches!(
+                m.kind,
+                meta::Kind::View | meta::Kind::Merge | meta::Kind::Archive
+            )
+    }))
 }
 
 /// The meta of every commit on the first-parent chain that carries `session/meta.json`, from the
@@ -2570,15 +2587,15 @@ mod tests {
     #[test]
     fn a_view_surgery_in_the_history_forces_materialization() {
         let (_d, r, head) = claimed_but_never_settled();
-        assert!(!super::history_rewrote_view(&r, &head).unwrap());
+        assert!(!super::history_requires_view_materialization(&r, &head).unwrap());
 
         let after = stack(&r, meta::Kind::View, meta::Line::Session, "revert");
-        assert!(super::history_rewrote_view(&r, &after).unwrap());
+        assert!(super::history_requires_view_materialization(&r, &after).unwrap());
 
         // Settling another turn afterwards leaves the surgery in the history: the verdict does
         // not flip back because the head is a turn again.
         let later = stack(&r, meta::Kind::Turn, meta::Line::Session, "turn");
-        assert!(super::history_rewrote_view(&r, &later).unwrap());
+        assert!(super::history_requires_view_materialization(&r, &later).unwrap());
     }
 
     /// A reconciling merge on the file line is not VIEW surgery: a session line growing out of
@@ -2592,17 +2609,17 @@ mod tests {
             meta::Line::File,
             "reconcile shared files",
         );
-        assert!(!super::history_rewrote_view(&r, &merged).unwrap());
+        assert!(!super::history_requires_view_materialization(&r, &merged).unwrap());
         let session = stack(
             &r,
             meta::Kind::Turn,
             meta::Line::Session,
             "turn on the new session",
         );
-        assert!(!super::history_rewrote_view(&r, &session).unwrap());
+        assert!(!super::history_requires_view_materialization(&r, &session).unwrap());
         // The same kind counts only when it lands on the session line.
         let surgery = stack(&r, meta::Kind::Merge, meta::Line::Session, "session merge");
-        assert!(super::history_rewrote_view(&r, &surgery).unwrap());
+        assert!(super::history_requires_view_materialization(&r, &surgery).unwrap());
     }
 
     /// A long history is read in one pass: every commit carrying a meta is in the list, and a
@@ -2645,7 +2662,7 @@ mod tests {
             metas.iter().filter(|m| m.kind == meta::Kind::Turn).count(),
             turns
         );
-        assert!(!super::history_rewrote_view(&r, &head).unwrap());
+        assert!(!super::history_requires_view_materialization(&r, &head).unwrap());
     }
 
     /// The exemption covers only the "identity not claimed yet" stretch: a missing LOG on a

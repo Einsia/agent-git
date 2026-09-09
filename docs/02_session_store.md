@@ -266,10 +266,21 @@ state at the time they actually happened inferred back from the current
 workspace, so they keep the default value rather than passing the current state
 off as a historical fact.
 
-`kind` is the kind of this commit (`turn` / `merge` / `view` / `file`), and
+`kind` is the kind of this commit (`turn` / `merge` / `view` / `file` / `archive`), and
 `turn` is the turn ordinal. Empty fields are never serialized — making "no
 identity" look like "the identity is the empty string" gives downstream one more
 state to tell apart.
+
+An `archive` snapshot retains additional native evidence in LOG without changing VIEW,
+shared files, the logical session identity, or the completed-turn ordinal. It is a
+session-line operation, never a file-line operation. Archive entries have no `#n`
+turn label and remain selectable by their commit ID. Reader support alone does not
+make a runtime produce these snapshots.
+
+The `archive` kind extends a closed metadata enum. CLI releases whose readers do
+not recognize it cannot read a history containing it and must be upgraded; adding
+the reader does not rewrite any existing snapshot or change the storage layout.
+The legacy `snapshot.json` format does not acquire this kind.
 
 `session` is this branch's session identity (one session per branch, see
 `docs/03_branch_model.md`): the root snapshot claims it with a content hash —

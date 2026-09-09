@@ -904,6 +904,27 @@ pub(crate) mod fixtures {
         (d, r)
     }
 
+    /// Add archive evidence while retaining the exact projection and completed-turn metadata.
+    pub(crate) fn archive_tail(repo: &Repo) -> String {
+        let view = storage::materialize_at(repo.root(), "HEAD", meta::VIEW_FILE).unwrap();
+        let mut log = storage::materialize_at(repo.root(), "HEAD", meta::LOG_FILE).unwrap();
+        log.push_str(&transcript::wrap_lines(
+            "{\"type\":\"system\",\"subtype\":\"synthetic-native-tail\"}\n",
+            "claude-code",
+            &claim(),
+        ));
+        storage::write_snapshot(repo.root(), &log, &view).unwrap();
+        let mut metadata = meta::read_at_ref(repo, "HEAD").unwrap();
+        metadata.kind = meta::Kind::Archive;
+        meta::write(repo.root(), &metadata).unwrap();
+        repo.add_all().unwrap();
+        assert!(
+            repo.commit("agit: retain synthetic merge exploration")
+                .unwrap()
+        );
+        repo.git(&["rev-parse", "HEAD"]).unwrap()
+    }
+
     /// The sha of the turn commit numbered `turn` on `f1` (found by subject, independent of
     /// the code under test).
     pub(crate) fn turn_sha(r: &Repo, turn: u32) -> String {
@@ -922,6 +943,72 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Evidence archives remain visible in history without stealing a completed turn's address.
+    #[test]
+    fn archive_snapshots_do_not_create_or_replace_turn_ordinals() {
+        use crate::domain::{meta, storage, transcript};
+        let (_temporary, repo) = fixtures::forked_history();
+        let before = Chain::read(&repo, "HEAD").unwrap();
+        let turns = before
+            .turns()
+            .into_iter()
+            .map(|(n, sha)| (n, sha.to_owned()))
+            .collect::<Vec<_>>();
+        let view = storage::materialize_at(repo.root(), "HEAD", meta::VIEW_FILE).unwrap();
+        let archive = fixtures::archive_tail(&repo);
+        let log = storage::materialize_at(repo.root(), &archive, meta::LOG_FILE).unwrap();
+        let after = Chain::read(&repo, "HEAD").unwrap();
+        assert_eq!(after.entries.len(), before.entries.len() + 1);
+        assert_eq!(after.label(after.entries.len() - 1), None);
+        assert_eq!(
+            after
+                .turns()
+                .into_iter()
+                .map(|(n, sha)| (n, sha.to_owned()))
+                .collect::<Vec<_>>(),
+            turns
+        );
+        assert_ne!(turn_in(&after, LAST_TURN).unwrap().1, archive);
+        assert_eq!(
+            storage::materialize_at(repo.root(), &archive, meta::VIEW_FILE).unwrap(),
+            view
+        );
+        assert_eq!(
+            storage::materialize_at(repo.root(), &archive, meta::LOG_FILE).unwrap(),
+            log
+        );
+        let addition = transcript::wrap_lines(
+            &format!(
+                "{}\n{}\n",
+                fixtures::user_line(5),
+                fixtures::assistant_line(5)
+            ),
+            "claude-code",
+            &fixtures::claim(),
+        );
+        storage::write_snapshot(
+            repo.root(),
+            &format!("{log}{addition}"),
+            &format!("{view}{addition}"),
+        )
+        .unwrap();
+        let mut ordinary = meta::read_at_ref(&repo, &archive).unwrap();
+        ordinary.kind = meta::Kind::Turn;
+        ordinary.turn = Some(5);
+        meta::write(repo.root(), &ordinary).unwrap();
+        repo.add_all().unwrap();
+        assert!(
+            repo.commit("agit: synthetic ordinary turn after archive")
+                .unwrap()
+        );
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let followed = Chain::read(&repo, &head).unwrap();
+        assert_eq!(turn_in(&followed, LAST_TURN).unwrap(), (5, head));
+        for (ordinal, expected) in turns {
+            assert_eq!(turn_in(&followed, ordinal).unwrap(), (ordinal, expected));
+        }
+    }
 
     /// Captured branch identity bypasses unrelated names and tails stay on its frozen history.
     #[test]

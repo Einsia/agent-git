@@ -104,6 +104,7 @@ pub mod domain {
     /// Session metadata `session/meta.json`: the product of `agit commit`, and the version ID
     /// itself.
     pub mod meta;
+    pub mod metadata_facts;
     pub mod native_archive;
     /// Search query syntax (`in:` / `owner:` / `-excluded` / `"phrase"`). Shared by the backend
     /// and the CLI.

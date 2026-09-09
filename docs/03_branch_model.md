@@ -13,7 +13,7 @@ new branch; the old one stays.
 
 Precisely: a branch has **two forms**, fixed the moment it is born and never convertible (the
 `line` field of `session/meta.json`). A **session line** is bound to one session for life and
-takes turn / merge / view commits; a **file line** never claims a session, takes only commits of
+takes turn / merge / view / file / archive commits; a **file line** never claims a session, takes only commits of
 the shared files (memory, skills, AGENTS.md), cannot be resumed, and serves only as the starting
 point of a fork / new. The `main` that `agit init` creates is a file line, and sessions each sit
 on their own session line — so "how many sessions an agent has" counts session branches, not

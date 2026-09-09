@@ -21,7 +21,7 @@ With no arguments at a terminal, this opens a full-screen browser instead of pri
 | `-n, --limit <count>` | Maximum entries; default 20 |
 | `--graph` | Show the branch graph |
 | `--branches` | Group/show by branch |
-| `--kind <turn\|merge\|view\|file>` | Filter by event kind |
+| `--kind <turn\|merge\|view\|file\|archive>` | Filter by event kind |
 | `--grep <text>` | Search messages/content |
 | `--since <duration>` | Show only a recent period, such as `24h`, `7d`, or `4w` |
 | `--oneline` | One-line summaries |

@@ -38,6 +38,10 @@ fn main() {
             unindexed_resume_uses_rollout_header,
         ),
         (
+            "archive evidence and saved native context",
+            archive_evidence_stays_out_of_native_resume,
+        ),
+        (
             "registered provider identity",
             registered_provider_is_preserved,
         ),
@@ -786,6 +790,197 @@ fn unindexed_resume_uses_rollout_header() {
         assert!(text.contains("model_provider=\"openai\""), "{text}");
         assert_eq!(snapshot(&lab.codex_home), before);
         lab.assert_rpc(true);
+    }
+}
+
+/// LOG continuity cannot authorize replaying evidence excluded from the saved VIEW.
+fn archive_evidence_stays_out_of_native_resume() {
+    use agit::domain::{meta, storage, transcript};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum History {
+        Complete,
+        Shallow,
+        LocalGraft,
+        InheritedGraft,
+    }
+
+    for (following_turn, history) in [
+        (false, History::Complete),
+        (true, History::Complete),
+        (true, History::Shallow),
+        (true, History::LocalGraft),
+        (true, History::InheritedGraft),
+    ] {
+        let lab = Lab::new("OpenAI", absent_registry());
+        let (_, original_claim) = lab.claim("work");
+        assert!(original_claim["baseline_bytes"].is_null());
+        assert!(original_claim["materialized_from"].is_null());
+        let worktrees = lab.git(&["worktree", "list", "--porcelain"]);
+        let path = worktrees
+            .split("\n\n")
+            .find(|entry| entry.lines().any(|line| line == "branch refs/heads/work"))
+            .and_then(|entry| {
+                entry
+                    .lines()
+                    .find_map(|line| line.strip_prefix("worktree "))
+            })
+            .map(PathBuf::from)
+            .unwrap();
+        let git = |args: &[&str]| lab.git(&[&["-C", path.to_str().unwrap()], args].concat());
+        let original_head = git(&["rev-parse", "HEAD"]);
+        let mut snapshot = meta::read(&path).unwrap();
+        let mut log = storage::materialize_at(&path, &original_head, meta::LOG_FILE).unwrap();
+        let mut view = storage::materialize_at(&path, &original_head, meta::VIEW_FILE).unwrap();
+        assert_eq!(log, view);
+        let archive = format!(
+            "{}\n",
+            json!({"type":"response_item","payload":{
+            "type":"message","role":"assistant","content":[{
+                "type":"output_text","text":"SYNTHETIC-ARCHIVE-ONLY-EVIDENCE"}]}})
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&lab.native)
+            .unwrap()
+            .write_all(archive.as_bytes())
+            .unwrap();
+        log.push_str(&transcript::wrap_lines(
+            &archive,
+            "codex",
+            &snapshot.session,
+        ));
+        storage::write_snapshot(&path, &log, &view).unwrap();
+        snapshot.kind = meta::Kind::Archive;
+        meta::write(&path, &snapshot).unwrap();
+        git(&["add", "--all"]);
+        git(&["commit", "-m", "Retain synthetic archive evidence"]);
+        let archive_head = git(&["rev-parse", "HEAD"]);
+        if following_turn {
+            let native = [
+                json!({"type":"response_item","payload":{"type":"message","role":"user",
+                    "content":[{"type":"input_text","text":"SYNTHETIC-FOLLOWING-QUESTION"}]}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                    "content":[{"type":"output_text","text":"SYNTHETIC-FOLLOWING-ANSWER"}]}}),
+            ]
+            .into_iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&lab.native)
+                .unwrap()
+                .write_all(native.as_bytes())
+                .unwrap();
+            let addition = transcript::wrap_lines(&native, "codex", &snapshot.session);
+            log.push_str(&addition);
+            view.push_str(&addition);
+            storage::write_snapshot(&path, &log, &view).unwrap();
+            snapshot.kind = meta::Kind::Turn;
+            snapshot.turn = Some(snapshot.turn.unwrap() + 1);
+            meta::write(&path, &snapshot).unwrap();
+            git(&["add", "--all"]);
+            git(&["commit", "-m", "Settle synthetic turn after archive"]);
+        }
+        let native = fs::read_to_string(&lab.native).unwrap();
+        assert!(matches!(
+            transcript::continuity(&log, &native),
+            transcript::Continuity::Noop
+        ));
+        let head = git(&["rev-parse", "HEAD"]);
+        assert!(
+            git(&["--no-replace-objects", "rev-list", "--first-parent", &head])
+                .lines()
+                .any(|oid| oid == archive_head)
+        );
+        let common = PathBuf::from(git(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ]));
+        let graph_file = match history {
+            History::Complete => None,
+            History::Shallow => Some(common.join("shallow")),
+            History::LocalGraft => Some(common.join("info/grafts")),
+            History::InheritedGraft => Some(lab.home.join("selected-grafts")),
+        };
+        if let Some(file) = &graph_file {
+            assert!(following_turn);
+            assert_ne!(head, archive_head);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            assert!(!file.exists());
+            fs::write(file, format!("{head}\n")).unwrap();
+        }
+        let with_history = |mut command: Command| {
+            if history == History::InheritedGraft {
+                command.env("GIT_GRAFT_FILE", graph_file.as_ref().unwrap());
+            }
+            command
+        };
+        let mut graph_probe = lab.command("git");
+        graph_probe
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(&path)
+            .args(["rev-list", "--first-parent", &head]);
+        let graph_probe = bounded_output(with_history(graph_probe));
+        assert!(graph_probe.status.success(), "{history:?}: {graph_probe:?}");
+        let visible = String::from_utf8(graph_probe.stdout).unwrap();
+        if history == History::Complete {
+            assert!(visible.lines().any(|oid| oid == archive_head));
+        } else {
+            assert_eq!(visible.lines().collect::<Vec<_>>(), [head.as_str()]);
+            assert!(!visible.lines().any(|oid| oid == archive_head));
+        }
+        let immutable_log = storage::materialize_at(&path, &head, meta::LOG_FILE).unwrap();
+        let immutable_view = storage::materialize_at(&path, &head, meta::VIEW_FILE).unwrap();
+        assert_eq!(immutable_log, log);
+        assert_eq!(immutable_view, view);
+        assert!(immutable_log.contains("SYNTHETIC-ARCHIVE-ONLY-EVIDENCE"));
+        assert!(!immutable_view.contains("SYNTHETIC-ARCHIVE-ONLY-EVIDENCE"));
+        assert_ne!(immutable_log, immutable_view);
+        let refs_before = lab.git(&["show-ref"]);
+        let success = |args: &[&str]| {
+            let mut command = lab.command(env!("CARGO_BIN_EXE_agit"));
+            command.args(args);
+            let output = bounded_output(with_history(command));
+            assert!(output.status.success(), "{history:?} {args:?}: {output:?}");
+            assert!(
+                !output_text(&output).contains(PRIVATE),
+                "private native configuration escaped: {args:?}"
+            );
+            output
+        };
+        let source_log = success(&["show", "me/qa@work", "--raw", "--log-only"]).stdout;
+        let output = success(&["resume", "me/qa@work", "--no-launch"]);
+        let text = output_text(&output);
+        assert!(!text.contains("zero-copy"), "{text}");
+        let (id, claim) = lab.claim("work");
+        assert_ne!(id, SID);
+        assert_eq!(claim["materialized_from"], head);
+        let installed = fs::read_to_string(lab.rollout(&id)).unwrap();
+        assert!(!installed.contains("SYNTHETIC-ARCHIVE-ONLY-EVIDENCE"));
+        assert!(installed.contains("SYNTHETIC-PROVIDER-QUESTION"));
+        assert_eq!(
+            installed.contains("SYNTHETIC-FOLLOWING-QUESTION"),
+            following_turn
+        );
+        assert_eq!(fs::read_to_string(&lab.native).unwrap(), native);
+        assert_eq!(git(&["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            success(&["show", "me/qa@work", "--raw", "--log-only"]).stdout,
+            source_log
+        );
+        let prepared = lab.claim("work");
+        let installed_before = crate::snapshot(&lab.codex_home);
+        let again = success(&["resume", "me/qa@work", "--no-launch"]);
+        assert!(output_text(&again).contains("reusing the prepared runtime session"));
+        assert_eq!(lab.claim("work"), prepared);
+        assert_eq!(crate::snapshot(&lab.codex_home), installed_before);
+        assert_eq!(lab.git(&["show-ref"]), refs_before);
+        if let Some(file) = graph_file {
+            assert_eq!(fs::read_to_string(file).unwrap(), format!("{head}\n"));
+        }
     }
 }
 

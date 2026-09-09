@@ -246,10 +246,9 @@ pub fn is_bare_id(s: &str) -> bool {
     }
 }
 
-/// The commit kinds (PRD, section "the four commit kinds").
+/// Commit kinds distinguish user turns, history surgery, shared files, and evidence archives.
 ///
-/// The default is `turn`: every commit on a session line is a settlement, semantically the same
-/// thing.
+/// Missing kind declares a user-turn snapshot; evidence archival must be explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -262,6 +261,8 @@ pub enum Kind {
     View,
     /// `agit commit -m`: changes shared files only (memory/skills/AGENTS.md).
     File,
+    /// Retains additional evidence in LOG while preserving VIEW and the completed-turn ordinal.
+    Archive,
 }
 
 /// How far the code anchor can be trusted (PRD, section "code anchor").
@@ -571,6 +572,12 @@ fn ensure_real_directory(path: &Path, create_if_missing: bool) -> Result<()> {
 /// The meta invariants. Both the write-to-disk path and the tree-building (plumbing) path go
 /// through here.
 pub fn validate(meta: &Meta) -> Result<()> {
+    if meta.kind == Kind::Archive {
+        anyhow::ensure!(
+            meta.is_session_line() && !meta.session.is_empty() && meta.layout == LayoutVersion::V1,
+            "an archive requires a claimed session line in storage layout v1"
+        );
+    }
     if meta.is_file_line() {
         // A file line carrying a session declares itself a session — exactly the ambiguity
         // Line exists to remove.
@@ -674,7 +681,12 @@ fn sort_json_objects(value: &mut serde_json::Value) {
 
 /// Read `session/meta.json` from the worktree.
 pub fn read(repo_root: &Path) -> Option<Meta> {
-    serde_json::from_str(&std::fs::read_to_string(path_in(repo_root)).ok()?).ok()
+    let snapshot: Meta =
+        serde_json::from_str(&std::fs::read_to_string(path_in(repo_root)).ok()?).ok()?;
+    if snapshot.kind == Kind::Archive {
+        validate(&snapshot).ok()?;
+    }
+    Some(snapshot)
 }
 
 /// Read the `session/meta.json` at a git ref (without switching the worktree).
@@ -1563,5 +1575,76 @@ mod tests {
     fn short_trims_to_prefix_plus_8() {
         let id = format!("{ID_PREFIX}{}", "3f9c8a12".repeat(5));
         assert_eq!(short(&id), "agit-3f9c8a12");
+    }
+}
+
+#[cfg(test)]
+mod archive_reader_tests {
+    use super::*;
+
+    #[test]
+    fn archive_metadata_retains_the_existing_session_and_turn() {
+        let mut original = Meta::new(
+            "agit-0123456789abcdef0123456789abcdef01234567".into(),
+            "codex".into(),
+            "/synthetic".into(),
+        );
+        original.turn = Some(7);
+        original.kind = Kind::Archive;
+        let encoded = to_text(&original).unwrap();
+        let decoded = parse_strict(&encoded, "synthetic-archive").unwrap();
+        assert_eq!(decoded.kind, Kind::Archive);
+        assert_eq!(decoded.turn, Some(7));
+        assert_eq!(decoded.session, original.session);
+        assert_eq!(decoded.runtime, original.runtime);
+        assert_eq!(to_text(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn archive_metadata_cannot_claim_a_file_line_or_legacy_layout() {
+        let mut snapshot = Meta::new_file_line();
+        snapshot.kind = Kind::Archive;
+        assert!(to_text(&snapshot).is_err());
+        snapshot.line = Line::Session;
+        assert!(to_text(&snapshot).is_err());
+        snapshot.session = "agit-0123456789abcdef0123456789abcdef01234567".into();
+        snapshot.runtime = "codex".into();
+        snapshot.layout = LayoutVersion::V0;
+        assert!(to_text(&snapshot).is_err());
+        snapshot.layout = LayoutVersion::V1;
+        assert!(to_text(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn worktree_archive_readers_apply_the_same_metadata_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        ensure_session_dir(directory.path()).unwrap();
+        let path = path_in(directory.path());
+        let mut snapshot = Meta::new_file_line();
+        snapshot.kind = Kind::Archive;
+        for layout in [LayoutVersion::V0, LayoutVersion::V1] {
+            snapshot.layout = layout;
+            std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            assert!(read(directory.path()).is_none());
+        }
+        snapshot.line = Line::Session;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(read(directory.path()).is_none());
+        snapshot.session = "agit-0123456789abcdef0123456789abcdef01234567".into();
+        snapshot.runtime = "codex".into();
+        snapshot.layout = LayoutVersion::V0;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(read(directory.path()).is_none());
+        snapshot.layout = LayoutVersion::V1;
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(read(directory.path()).unwrap().kind, Kind::Archive);
+    }
+
+    #[test]
+    fn unknown_commit_kinds_remain_explicit_metadata_errors() {
+        let mut value = serde_json::to_value(Meta::new_file_line()).unwrap();
+        value["kind"] = serde_json::json!("future-unrecognized-kind");
+        let error = parse_strict(&value.to_string(), "synthetic-newer-metadata").unwrap_err();
+        assert!(format!("{error:#}").contains("unknown variant"));
     }
 }
