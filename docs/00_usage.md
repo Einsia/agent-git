@@ -382,6 +382,17 @@ agit diff --files v0.1..ratelimit           # text diff of the shared files
 agit diff                                   # no range: what is still unsettled in the workspace
 ```
 
+With unrelated Git histories, `diff --turns` and merge reconnaissance also report a
+**semantic prefix** and each side's remaining normalized LOG turns. This comparison
+uses the full saved LOG even when VIEW has been compacted or edited. Its turn ordinals
+are content positions, not `#n` commit selectors. A semantic hash is never a Git merge
+base, and it does not change merge parents or the endpoints used by `--view` and `--files`.
+
+Semantic comparison uses the shared runtime IR: it excludes timestamps, runtime identity,
+path metadata, tool results, compaction and unmodeled content. Tool details depend on what
+the native adapter represents. Matching hashes therefore do not establish complete
+transcript equality. An endpoint without comparable user turns is reported as unavailable.
+
 **See what the VIEW is made of** (the scouting command before a merge):
 
 ```sh

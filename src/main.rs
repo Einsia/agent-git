@@ -122,6 +122,7 @@ fn main() {
     let command_name = commands::command_name(&command);
     let startup = match &command {
         Commands::Status(_) => Startup::Inspect,
+        Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
         Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
         Commands::Doctor(_) => Startup::Inspect,
         Commands::Import(args) if commands::import::needs_readonly_startup(args) => {
@@ -186,7 +187,7 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
     let prepared = match startup {
         Startup::Inspect => commands::migration::check_readonly_startup(),
         Startup::Migrate => commands::migration::migrate_startup().map(|_| ()),
-        Startup::ScopedDoctor | Startup::ScopedImport => Ok(()),
+        Startup::ScopedDoctor | Startup::ScopedDiff | Startup::ScopedImport => Ok(()),
     };
     if let Err(e) = prepared {
         agit::ui::error(&format!("local storage preparation failed: {e:#}"));
@@ -201,6 +202,7 @@ enum Startup {
     Inspect,
     /// The command validates its explicit local scope before inspecting recovery evidence.
     ScopedDoctor,
+    ScopedDiff,
     /// Explicit import inspection checks only its selected local repository before discovery.
     ScopedImport,
 }

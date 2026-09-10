@@ -553,6 +553,10 @@ carried by the envelopes in the repo (every line's full original text goes into
 content, and the line-level hash is in §4), so keeping only the semantics here
 is safe.
 
+The modeled kind, optional tool name and text are length-framed before hashing, so
+separator characters inside text cannot impersonate additional fields or events.
+These hashes remain computed diagnostics rather than persisted identifiers.
+
 ```
 agit log db57fdab
 

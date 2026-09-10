@@ -2,7 +2,8 @@
 //!
 //! * `--turns` (default): the fork point plus the turns each side added, the reconnaissance view
 //!   before a merge. A fork point is a verified Git merge-base, including shared history stored
-//!   in separate local repositories. Equal transcript content alone does not prove ancestry.
+//!   in separate local repositories. Unrelated histories also compare normalized LOG turns,
+//!   explicitly labeled semantic; equal projected content alone does not prove ancestry.
 //! * `--view`: insertions and deletions between the two VIEW sequences — what a merge or a
 //!   distill actually swapped into the agent's context.
 //! * `--files`: an ordinary text diff of the shared files.
@@ -10,13 +11,15 @@
 //! Zero arguments shows working-state changes to shared files plus a summary of unsettled turns.
 
 use super::CmdResult;
-use crate::domain::comparison::Comparison;
+use crate::domain::comparison::{Comparison, SemanticPrefix};
 use crate::domain::meta;
 use crate::domain::refs;
 use crate::domain::repo::Repo;
 use crate::domain::storage;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
+
+mod pending;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -36,6 +39,27 @@ pub struct Args {
 
 pub fn run(args: Args) -> CmdResult {
     let cwd = std::env::current_dir()?;
+    if args.range.is_none() {
+        let context = match super::context::resolve(&cwd) {
+            Ok(context) => context,
+            Err(error) => {
+                ui::error(&format!("{error:#}"));
+                return Ok(ExitCode::Ref);
+            }
+        };
+        let (owner, name) = context.owner_name()?;
+        let Some(repo) = Repo::open(crate::infra::config::repo_dir(&owner, &name)?) else {
+            ui::error(&format!("{} does not exist locally.", context.repo));
+            return Ok(ExitCode::Precondition);
+        };
+        return match workdir_diff(&repo, &context) {
+            Ok(code) => Ok(code),
+            Err(error) => {
+                ui::error(&format!("pending inspection unavailable: {error:#}"));
+                Ok(ExitCode::Precondition)
+            }
+        };
+    }
     let endpoints = match args.range.as_deref().map(parse_endpoints).transpose() {
         Ok(endpoints) => endpoints,
         Err(error) => {
@@ -93,9 +117,7 @@ pub fn run(args: Args) -> CmdResult {
         ui::error(&format!("{slug} does not exist locally."));
         return Ok(ExitCode::Precondition);
     };
-    let Some((left_spec, right_spec, three_dot)) = endpoints else {
-        return workdir_diff(&repo);
-    };
+    let (left_spec, right_spec, three_dot) = endpoints.expect("working-state mode handled above");
     let left_source = super::echo::Source::for_spec(&left_spec);
     let left_repo_explicit = matches!(left_spec.repo, refs::RepoSel::Slug(_, _));
     let right_repo = match right_spec.as_ref() {
@@ -219,7 +241,18 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     // Default: the --turns reconnaissance.
+    let semantic = if real_fork {
+        None
+    } else if three_dot || matches!(comparison.merge_base(&a_sha, &b_sha), Ok(None)) {
+        Some(SemanticPrefix::read(graph, &a_sha, &b_sha)?)
+    } else {
+        // Explicit endpoint comparison does not require a unique or complete ancestry graph.
+        None
+    };
     turns_report(graph, &base, &a_sha, &b_sha, real_fork, &selections)?;
+    if let Some(semantic) = semantic {
+        ui::semantic_prefix::print(&semantic, "A", "B");
+    }
     Ok(ExitCode::Ok)
 }
 
@@ -521,9 +554,15 @@ fn occurrence_lis_len(a: &[String], b: &[String]) -> usize {
 }
 
 /// Zero arguments: working-state changes to shared files plus a summary of unsettled turns.
-fn workdir_diff(repo: &Repo) -> CmdResult {
+fn workdir_diff(repo: &Repo, context: &super::context::Context) -> CmdResult {
+    super::migration::check_readonly_repo_startup_with(repo, pending::check_readonly_repository)?;
     let out = repo.git(&[
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
         "diff",
+        "--no-ext-diff",
+        "--no-textconv",
         "--",
         ".",
         ":(exclude)session",
@@ -534,26 +573,21 @@ fn workdir_diff(repo: &Repo) -> CmdResult {
     if out.trim().is_empty() {
         println!("no shared-file changes in the working state.");
     } else {
-        print!("{out}");
+        println!("{out}");
     }
-    // Unsettled-turn summary: the turn in HEAD meta against the link's settlement baseline,
-    // approximated cheaply by the length of the working log against the length of the log in
-    // the head commit.
-    if let (Ok(head), Ok(wt)) = (
-        crate::domain::storage::materialize_at(repo.root(), "HEAD", meta::LOG_FILE),
-        crate::domain::storage::materialize_worktree(repo.root(), meta::LOG_FILE),
-    ) {
-        let extra = wt.len().saturating_sub(head.len());
-        if extra > 0 {
+    match pending::inspect(repo, &context.repo, &context.branch) {
+        Ok(summary) => {
+            println!("pending {}@{}: {summary}", context.repo, context.branch);
+            Ok(ExitCode::Ok)
+        }
+        Err(error) => {
             println!(
-                "{}",
-                ui::dim(&format!(
-                    "  the working transcript is {extra} bytes past the settled state (unsettled content)"
-                ))
+                "pending {}@{}: unavailable ({error:#})",
+                context.repo, context.branch
             );
+            Ok(ExitCode::Precondition)
         }
     }
-    Ok(ExitCode::Ok)
 }
 
 #[cfg(test)]

@@ -37,6 +37,14 @@ pub(super) fn projects_dir() -> Result<PathBuf> {
     Ok(home.join(".claude").join("projects"))
 }
 
+#[cfg(feature = "cli")]
+pub(crate) fn resolve_readonly(session_id: &str) -> Result<PathBuf> {
+    let name = format!("{session_id}.jsonl");
+    super::unique_native_file(&projects_dir()?, 2, |path| {
+        path.file_name().is_some_and(|file| file == name.as_str())
+    })
+}
+
 /// Map a cwd onto Claude Code's project directory name.
 ///
 /// Must match Claude Code's own algorithm, or it never finds the session installed into it.

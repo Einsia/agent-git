@@ -10,6 +10,7 @@
 //! This degradation is not polish — it decides whether agit can be consumed by a script.
 
 pub mod prompt;
+pub mod semantic_prefix;
 pub mod session;
 pub mod table;
 pub mod theme;

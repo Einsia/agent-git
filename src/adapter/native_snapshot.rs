@@ -183,10 +183,27 @@ pub(crate) fn read_file(source: &Source, limits: Limits) -> Result<Snapshot> {
     if source.database {
         return Err(Unavailable::Unsupported);
     }
-    let before = std::fs::symlink_metadata(&source.path).map_err(|_| Unavailable::Read)?;
+    finish(
+        source.clone(),
+        read_file_bytes(&source.path, limits)?,
+        limits,
+    )
+}
+
+/// Byte inspection pins a regular carrier; record completeness belongs to the caller.
+pub(crate) fn read_file_bytes(path: &Path, limits: Limits) -> Result<Vec<u8>> {
+    // Windows timestamps can survive replacement; keep the initial file identity alive.
+    #[cfg(windows)]
+    let initial = open_attributes(path).map_err(|_| Unavailable::Read)?;
+    #[cfg(windows)]
+    let before = initial.metadata().map_err(|_| Unavailable::Read)?;
+    #[cfg(not(windows))]
+    let before = std::fs::symlink_metadata(path).map_err(|_| Unavailable::Read)?;
     if !before.file_type().is_file() {
         return Err(Unavailable::Read);
     }
+    #[cfg(windows)]
+    let initial_identity = file_identity(&initial)?;
     let cap = limits
         .bytes
         .checked_add(1)
@@ -208,9 +225,15 @@ pub(crate) fn read_file(source: &Source, limits: Limits) -> Result<Snapshot> {
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options.open(&source.path).map_err(|_| Unavailable::Read)?;
+    #[cfg(test)]
+    read_observation::notify(read_observation::Stage::BeforeOpen);
+    let file = options.open(path).map_err(|_| Unavailable::Read)?;
     let opened = file.metadata().map_err(|_| Unavailable::Read)?;
     if !same_file(&before, &opened) {
+        return Err(Unavailable::Changed);
+    }
+    #[cfg(windows)]
+    if file_identity(&file)? != initial_identity {
         return Err(Unavailable::Changed);
     }
     let mut bytes = Vec::new();
@@ -239,44 +262,94 @@ pub(crate) fn read_file(source: &Source, limits: Limits) -> Result<Snapshot> {
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
+    #[cfg(test)]
+    read_observation::notify(read_observation::Stage::BeforeVerify);
     let after = file.metadata().map_err(|_| Unavailable::Read)?;
-    let current = std::fs::symlink_metadata(&source.path).map_err(|_| Unavailable::Changed)?;
+    let current = std::fs::symlink_metadata(path).map_err(|_| Unavailable::Changed)?;
     if u64::try_from(bytes.len()).ok() != Some(opened.len())
         || !same_file(&opened, &after)
         || !same_file(&opened, &current)
-        || !is_current_file(&file, &source.path)?
+        || !is_current_file(&file, path)?
     {
         return Err(Unavailable::Changed);
     }
-    finish(source.clone(), bytes, limits)
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod read_observation {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Stage {
+        BeforeOpen,
+        BeforeVerify,
+    }
+
+    type Observer = Box<dyn FnMut(Stage)>;
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn notify(stage: Stage) {
+        OBSERVER.with_borrow_mut(|observer| {
+            if let Some(observer) = observer {
+                observer(stage);
+            }
+        });
+    }
+
+    pub(super) fn during<T>(observer: impl FnMut(Stage) + 'static, run: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                OBSERVER.with_borrow_mut(|observer| *observer = None);
+            }
+        }
+        OBSERVER.with_borrow_mut(|slot| {
+            assert!(slot.is_none(), "native read observations must not nest");
+            *slot = Some(Box::new(observer));
+        });
+        let _reset = Reset;
+        run()
+    }
+}
+
+#[cfg(windows)]
+fn open_attributes(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn file_identity(file: &std::fs::File) -> Result<(u32, u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(Unavailable::Read);
+    }
+    Ok((
+        information.dwVolumeSerialNumber,
+        information.nFileIndexHigh,
+        information.nFileIndexLow,
+    ))
 }
 
 #[cfg(windows)]
 fn is_current_file(file: &std::fs::File, path: &Path) -> Result<bool> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-        GetFileInformationByHandle,
-    };
-    let identity = |file: &std::fs::File| -> Result<(u32, u32, u32)> {
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0
-            || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        {
-            return Err(Unavailable::Read);
-        }
-        Ok((
-            information.dwVolumeSerialNumber,
-            information.nFileIndexHigh,
-            information.nFileIndexLow,
-        ))
-    };
-    let current = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|_| Unavailable::Changed)?;
-    Ok(identity(file)? == identity(&current)?)
+    let current = open_attributes(path).map_err(|_| Unavailable::Changed)?;
+    Ok(file_identity(file)? == file_identity(&current)?)
 }
 
 #[cfg(not(windows))]
@@ -317,6 +390,210 @@ fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_bytes_preserve_an_incomplete_tail_without_weakening_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        let bytes = b"{\"type\":\"complete\"}\n{\"type\":";
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(read_file_bytes(&path, Limits::default()).unwrap(), bytes);
+        let source = Source {
+            runtime: "codex",
+            session_id: "native".into(),
+            path: path.clone(),
+            database: false,
+        };
+        assert_eq!(
+            read_file(&source, Limits::default()).unwrap_err(),
+            Unavailable::Incomplete
+        );
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn substituted_regular_carriers_are_refused_at_both_read_boundaries() {
+        use read_observation::Stage;
+        for stage in [Stage::BeforeOpen, Stage::BeforeVerify] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("native.jsonl");
+            let moved = root.path().join("retained.jsonl");
+            std::fs::write(&path, b"{}\n").unwrap();
+            let replacement = path.clone();
+            let retained = moved.clone();
+            let result = read_observation::during(
+                move |current| {
+                    if current == stage {
+                        std::fs::rename(&replacement, &retained).unwrap();
+                        std::fs::write(&replacement, b"{}\n").unwrap();
+                        let modified = std::fs::metadata(&retained).unwrap().modified().unwrap();
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&replacement)
+                            .unwrap()
+                            .set_times(std::fs::FileTimes::new().set_modified(modified))
+                            .unwrap();
+                    }
+                },
+                || read_file_bytes(&path, Limits::default()),
+            );
+            assert_eq!(result.unwrap_err(), Unavailable::Changed);
+            assert_eq!(std::fs::read(path).unwrap(), b"{}\n");
+            assert_eq!(std::fs::read(moved).unwrap(), b"{}\n");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn matching_windows_timestamps_cannot_rebind_the_native_carrier() {
+        use read_observation::Stage;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle, SetFileTime,
+        };
+
+        for stage in [Stage::BeforeOpen, Stage::BeforeVerify] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("native.jsonl");
+            let moved = root.path().join("retained.jsonl");
+            std::fs::write(&path, b"{}\n").unwrap();
+            let replacement = path.clone();
+            let retained = moved.clone();
+            let result = read_observation::during(
+                move |current| {
+                    if current == stage {
+                        std::fs::rename(&replacement, &retained).unwrap();
+                        std::fs::write(&replacement, b"{}\n").unwrap();
+                        let original = std::fs::File::open(&retained).unwrap();
+                        let substitute = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&replacement)
+                            .unwrap();
+                        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+                        assert_ne!(
+                            unsafe {
+                                GetFileInformationByHandle(
+                                    original.as_raw_handle(),
+                                    &mut information,
+                                )
+                            },
+                            0
+                        );
+                        assert_ne!(
+                            unsafe {
+                                SetFileTime(
+                                    substitute.as_raw_handle(),
+                                    &information.ftCreationTime,
+                                    std::ptr::null(),
+                                    &information.ftLastWriteTime,
+                                )
+                            },
+                            0
+                        );
+                        drop(substitute);
+                        let substitute = std::fs::File::open(&replacement).unwrap();
+                        assert!(same_file(
+                            &original.metadata().unwrap(),
+                            &substitute.metadata().unwrap()
+                        ));
+                        assert_ne!(
+                            file_identity(&original).unwrap(),
+                            file_identity(&substitute).unwrap()
+                        );
+                    }
+                },
+                || read_file_bytes(&path, Limits::default()),
+            );
+            assert_eq!(result.unwrap_err(), Unavailable::Changed);
+            assert_eq!(std::fs::read(path).unwrap(), b"{}\n");
+            assert_eq!(std::fs::read(moved).unwrap(), b"{}\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substituted_symlinks_are_refused_before_open_and_after_read() {
+        use read_observation::Stage;
+        for stage in [Stage::BeforeOpen, Stage::BeforeVerify] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("native.jsonl");
+            let target = root.path().join("foreign.jsonl");
+            std::fs::write(&path, b"{}\n").unwrap();
+            std::fs::write(&target, b"{}\n").unwrap();
+            let replacement = path.clone();
+            let foreign = target.clone();
+            let result = read_observation::during(
+                move |current| {
+                    if current == stage {
+                        std::fs::remove_file(&replacement).unwrap();
+                        std::os::unix::fs::symlink(&foreign, &replacement).unwrap();
+                    }
+                },
+                || read_file_bytes(&path, Limits::default()),
+            );
+            assert!(matches!(
+                result,
+                Err(Unavailable::Read | Unavailable::Changed)
+            ));
+            assert!(
+                std::fs::symlink_metadata(path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(target).unwrap(), b"{}\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substituted_fifo_cannot_block_before_the_carrier_check() {
+        use std::os::unix::ffi::OsStrExt;
+        const CHILD: &str = "AGIT_TEST_NATIVE_FIFO_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let path = std::path::PathBuf::from(path);
+            let replacement = path.clone();
+            let result = read_observation::during(
+                move |stage| {
+                    if stage == read_observation::Stage::BeforeOpen {
+                        std::fs::remove_file(&replacement).unwrap();
+                        let name =
+                            std::ffi::CString::new(replacement.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    }
+                },
+                || read_file_bytes(&path, Limits::default()),
+            );
+            assert_eq!(result.unwrap_err(), Unavailable::Changed);
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("native.jsonl");
+        std::fs::write(&path, b"{}\n").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "adapter::native_snapshot::tests::substituted_fifo_cannot_block_before_the_carrier_check", "--nocapture"])
+            .env(CHILD, &path).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "FIFO carrier refusal child failed");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("FIFO substitution blocked native carrier inspection");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
 
     #[test]
     fn selected_files_are_bounded_complete_and_unchanged() {

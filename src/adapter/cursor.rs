@@ -62,6 +62,17 @@ fn projects_dir() -> Result<PathBuf> {
     Ok(home.join(".cursor").join("projects"))
 }
 
+#[cfg(feature = "cli")]
+pub(crate) fn resolve_readonly(session_id: &str) -> Result<PathBuf> {
+    let name = format!("{session_id}.jsonl");
+    super::unique_native_file(&projects_dir()?, 5, |path| {
+        path.file_name().is_some_and(|file| file == name.as_str())
+            && path
+                .components()
+                .any(|part| part.as_os_str() == TRANSCRIPTS)
+    })
+}
+
 /// Maps a cwd to Cursor's project directory name.
 ///
 /// The Claude Code slug with the leading `-` removed, in every sample observed:

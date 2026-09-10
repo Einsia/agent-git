@@ -637,17 +637,30 @@ pub fn check_readonly_startup() -> Result<()> {
 /// A scoped inspection follows the selected repository's registered checkouts and aliases.
 /// Recovery evidence with unknown ownership cannot establish that the selected scope is settled.
 pub(super) fn check_readonly_repo_startup(repo: &Repo) -> Result<()> {
+    check_readonly_repo_startup_with(repo, |_| Ok(()))
+}
+
+pub(super) fn check_readonly_repo_startup_with(
+    repo: &Repo,
+    preflight: impl Fn(&Repo) -> Result<()>,
+) -> Result<()> {
     check_readonly_repo_startup_with_policy(
         &repo.clone().local_objects_only(),
         ReadPolicy::AllowTransport,
+        preflight,
     )
 }
 
 pub(super) fn check_readonly_repo_startup_local(repo: &Repo) -> Result<()> {
-    check_readonly_repo_startup_with_policy(repo, ReadPolicy::LocalOnly)
+    check_readonly_repo_startup_with_policy(repo, ReadPolicy::LocalOnly, |_| Ok(()))
 }
 
-fn check_readonly_repo_startup_with_policy(repo: &Repo, policy: ReadPolicy) -> Result<()> {
+fn check_readonly_repo_startup_with_policy(
+    repo: &Repo,
+    policy: ReadPolicy,
+    preflight: impl Fn(&Repo) -> Result<()>,
+) -> Result<()> {
+    preflight(repo)?;
     let home = crate::infra::config::agit_home()?;
     let repos = crate::infra::config::repos_dir()?;
     let selected_common_dir = repo.common_dir_with_policy(policy)?.canonicalize()?;
@@ -668,6 +681,9 @@ fn check_readonly_repo_startup_with_policy(repo: &Repo, policy: ReadPolicy) -> R
     }
     canonical_roots.sort();
     canonical_roots.dedup();
+    for root in &canonical_roots {
+        preflight(&Repo::at(root))?;
+    }
 
     for evidence in startup_recovery_evidence(&home)? {
         let relative = recovery_evidence_repo(&evidence)?;

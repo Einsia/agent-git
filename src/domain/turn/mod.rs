@@ -187,45 +187,19 @@ fn turn_hash(parent: Option<&str>, normalized: &str) -> String {
     hex::encode(h.finalize())[..HEX_LEN].to_string()
 }
 
-/// Normalize the events of one turn into the string to be hashed.
-///
-/// **Only the part the IR models**, without the runtime's wrapper fields (uuid, parentUuid,
-/// sessionId, file paths). Those fields necessarily differ after `agit clone` (`mint_id()` mints
-/// new UUIDs, `render` re-renders), and including them gives the same conversation a different
-/// hash on two machines — recognizing "the same conversation" is a turn hash's only job.
-///
-/// `EventKind::Other` **takes no part** — it is what the IR does not model (encrypted reasoning,
-/// vendor-proprietary encodings) and a cross-runtime conversion drops it anyway. Including it
-/// makes the hash differ across runtimes. How much was dropped is recorded in `Turn::dropped`, so
-/// the loss is visible rather than silent.
-///
-/// Integrity of those excluded bytes is carried by the snapshot ID (it hashes the raw transcript
-/// bytes), so keeping only the semantics here is safe.
+/// Normalize modeled content without runtime identity, timestamps or path metadata.
+/// Excluded native content remains covered by stored event hashes; this projection cannot
+/// establish complete transcript equality. Field boundaries are explicit even inside text.
 fn normalize(events: &[&Event]) -> String {
     let mut s = String::new();
+    fn field(out: &mut String, value: &str) {
+        use std::fmt::Write;
+        write!(out, "{}:", value.len()).unwrap();
+        out.push_str(value);
+    }
     for e in events {
-        // `TurnEnd` takes no part either: it is a runtime signal rather than content, and only
-        // Codex has it, so including it gives the same conversation different hashes under two
-        // runtimes.
-        //
-        // Compact boundaries (both forms) take no part either, for the `TurnEnd` reason carried a
-        // step further: the two runtimes' compact mechanisms are **fundamentally different**
-        // (Claude Code writes a lossy summary tens of thousands of characters long, Codex writes
-        // one filter marker carrying a window number), so once the same conversation has been
-        // compacted by each of them the body of the boundary event cannot match. Including them
-        // makes the cross-runtime hash differ; integrity of the boundary itself is carried by the
-        // snapshot ID (it hashes the raw transcript bytes).
-        // Tool output takes no part either, for the same kind of reason as `TurnEnd` but harder:
-        //
-        // A CC session has hundreds of `tool_result` (673 in the 3176-line one), while a Codex
-        // session of the same order of magnitude has only 2-3 `function_call_output`; granularity
-        // and shape both differ. Including it makes the same conversation hash differently under
-        // the two runtimes — and recognizing "the same conversation" is a turn hash's only job
-        // (see the module header).
-        //
-        // It must not count toward `Turn::dropped` either: that number means "what the IR cannot
-        // express and a conversion loses", and tool output **is in the IR**, it just takes no part
-        // in identity. Mixing it in distorts the "lossy" signal.
+        // Runtime signals, compaction, tool outputs and unmodeled events do not participate
+        // in this comparison. Tool outputs remain modeled data rather than dropped events.
         if e.kind == EventKind::Other
             || e.kind == EventKind::TurnEnd
             || e.kind == EventKind::ToolResult
@@ -235,29 +209,32 @@ fn normalize(events: &[&Event]) -> String {
         }
         // Type tag + body. The tool name takes part, because "which tool was called" is
         // substantive content.
-        s.push_str(match e.kind {
-            EventKind::UserPrompt => "u",
-            // An interjection takes part in the hash: it is content the model really read in
-            // this turn.
-            EventKind::UserInterjection => "i",
-            EventKind::AssistantReply => "a",
-            EventKind::ToolUse => "t",
-            EventKind::FileEdit => "e",
-            EventKind::CompactFiltered
-            | EventKind::CompactSummary
-            | EventKind::TurnEnd
-            | EventKind::ToolResult
-            | EventKind::Other => unreachable!("filtered above"),
-        });
-        s.push('\x1f');
-        if let Some(t) = &e.tool {
-            s.push_str(t);
-            s.push('\x1f');
+        field(
+            &mut s,
+            match e.kind {
+                EventKind::UserPrompt => "u",
+                // An interjection takes part in the hash: it is content the model really read in
+                // this turn.
+                EventKind::UserInterjection => "i",
+                EventKind::AssistantReply => "a",
+                EventKind::ToolUse => "t",
+                EventKind::FileEdit => "e",
+                EventKind::CompactFiltered
+                | EventKind::CompactSummary
+                | EventKind::TurnEnd
+                | EventKind::ToolResult
+                | EventKind::Other => unreachable!("filtered above"),
+            },
+        );
+        // Length framing keeps text containing separators from impersonating another event.
+        match &e.tool {
+            Some(tool) => {
+                s.push('1');
+                field(&mut s, tool);
+            }
+            None => s.push('0'),
         }
-        if let Some(t) = &e.text {
-            s.push_str(t);
-        }
-        s.push('\x1e');
+        field(&mut s, e.text.as_deref().unwrap_or_default());
     }
     s
 }
@@ -347,6 +324,32 @@ pub fn chain_of(session: &Session) -> Chain {
 mod tests {
     use super::*;
     use crate::adapter::Event;
+
+    #[test]
+    fn field_framing_preserves_event_and_optional_tool_boundaries() {
+        let joined = session(vec![ev(EventKind::UserPrompt, "x\x1ea\x1fy", None)]);
+        let split = session(vec![
+            ev(EventKind::UserPrompt, "x", None),
+            ev(EventKind::AssistantReply, "y", None),
+        ]);
+        assert_eq!(chain_of(&joined).fork_point(&chain_of(&split)), 0);
+
+        let mut named = ev(EventKind::ToolUse, "body", None);
+        named.tool = Some("shell".into());
+        let embedded = ev(EventKind::ToolUse, "shell\x1fbody", None);
+        let prompt = ev(EventKind::UserPrompt, "run", None);
+        assert_ne!(
+            chain_of(&session(vec![prompt.clone(), named])).tip(),
+            chain_of(&session(vec![prompt.clone(), embedded])).tip()
+        );
+        let absent = ev(EventKind::ToolUse, "body", None);
+        let mut empty = absent.clone();
+        empty.tool = Some(String::new());
+        assert_ne!(
+            chain_of(&session(vec![prompt.clone(), absent])).tip(),
+            chain_of(&session(vec![prompt, empty])).tip()
+        );
+    }
 
     fn ev(kind: EventKind, text: &str, ts: Option<&str>) -> Event {
         Event {

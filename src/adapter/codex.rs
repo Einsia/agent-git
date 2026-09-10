@@ -146,6 +146,15 @@ fn all_rollouts(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Inspection reads a unique rollout directly; opening a native index may create WAL sidecars.
+#[cfg(feature = "cli")]
+pub(crate) fn resolve_readonly(session_id: &str) -> Result<PathBuf> {
+    super::unique_native_file(&sessions_root()?, usize::MAX, |path| {
+        path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+            && id_from_filename(path).as_deref() == Some(session_id)
+    })
+}
+
 /// One row of the index database → `SessionRef`.
 ///
 /// mtime comes from the database's `updated_at_ms` rather than a stat of the file — sorting must

@@ -48,6 +48,37 @@ pub const RUNTIMES: &[&str] = &[
     "opencode",
 ];
 
+/// Inspection requires a unique physical carrier; discovery order and modification time
+/// cannot establish which copy belongs to an active native session.
+#[cfg(feature = "cli")]
+fn unique_native_file(
+    root: &Path,
+    max_depth: usize,
+    matches: impl Fn(&Path) -> bool,
+) -> Result<PathBuf> {
+    let mut found = None;
+    for entry in walkdir::WalkDir::new(root).max_depth(max_depth) {
+        let entry =
+            entry.map_err(|_| anyhow::anyhow!("the native transcript inventory cannot be read"))?;
+        anyhow::ensure!(
+            !entry.file_type().is_symlink(),
+            "the native transcript inventory contains a symlink and cannot prove a unique carrier"
+        );
+        if matches(entry.path()) {
+            anyhow::ensure!(
+                entry.file_type().is_file(),
+                "the selected native transcript carrier is not a regular file"
+            );
+            anyhow::ensure!(
+                found.is_none(),
+                "multiple native transcript files have the selected session identity"
+            );
+            found = Some(entry.into_path());
+        }
+    }
+    found.ok_or_else(|| anyhow::anyhow!("the selected native transcript cannot be located"))
+}
+
 /// Normalize a runtime name typed by the user. Common short forms are accepted because users
 /// type both.
 ///

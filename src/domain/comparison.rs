@@ -1,6 +1,60 @@
 //! Read-only graph comparison across existing local repositories.
 
 use crate::domain::repo::Repo;
+use crate::domain::{meta, storage, transcript, turn};
+
+/// A common prefix of normalized LOG turns is content evidence, never Git ancestry.
+/// The count does not identify stored turn commits or authorize dropping any raw events.
+pub enum SemanticPrefix {
+    Available {
+        common: usize,
+        left_turns: usize,
+        right_turns: usize,
+        hash: Option<String>,
+    },
+    Unavailable(&'static str),
+}
+
+impl SemanticPrefix {
+    pub fn read(repo: &Repo, left: &str, right: &str) -> crate::Result<Self> {
+        let left = Self::chain_at(repo, left)?;
+        let right = Self::chain_at(repo, right)?;
+        let (Some(left), Some(right)) = (left, right) else {
+            return Ok(Self::Unavailable(
+                "an endpoint has no AgentGit session declaration",
+            ));
+        };
+        if left.is_empty() || right.is_empty() {
+            return Ok(Self::Unavailable(
+                "an endpoint has no comparable user turns",
+            ));
+        }
+        let common = left.fork_point(&right);
+        Ok(Self::Available {
+            common,
+            left_turns: left.len(),
+            right_turns: right.len(),
+            hash: common
+                .checked_sub(1)
+                .map(|index| left.turns[index].hash.clone()),
+        })
+    }
+
+    fn chain_at(repo: &Repo, head: &str) -> crate::Result<Option<turn::Chain>> {
+        let Some(snapshot) = meta::read_at_ref_result(repo, head)? else {
+            anyhow::ensure!(
+                !crate::domain::refs::Chain::read(repo, head)?.declared,
+                "cannot compare semantic turns: the selected declared history is missing its session metadata"
+            );
+            return Ok(None);
+        };
+        if snapshot.is_file_line() || snapshot.session.is_empty() {
+            return Ok(Some(turn::Chain::default()));
+        }
+        let log = storage::materialize_at(repo.root(), head, meta::LOG_FILE)?;
+        Ok(Some(turn::chain_of(&transcript::display::parse(&log)?)))
+    }
+}
 
 /// An object graph spanning the selected repositories without importing into either source.
 /// Keep this owner alive while reading through its repository, so temporary alternates remain

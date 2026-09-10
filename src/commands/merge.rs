@@ -382,7 +382,7 @@ enum Reconnaissance {
         target_turns: usize,
         source_turns: usize,
     },
-    Unrelated,
+    Unrelated(crate::domain::comparison::SemanticPrefix),
 }
 
 impl Reconnaissance {
@@ -395,7 +395,13 @@ impl Reconnaissance {
         }
         let comparison = crate::domain::comparison::Comparison::new(left, right)?;
         let Some(fork_point) = comparison.merge_base(target, source)? else {
-            return Ok(Self::Unrelated);
+            return Ok(Self::Unrelated(
+                crate::domain::comparison::SemanticPrefix::read(
+                    comparison.repository(),
+                    target,
+                    source,
+                )?,
+            ));
         };
         let graph = comparison.repository();
         Ok(Self::Related {
@@ -408,7 +414,7 @@ impl Reconnaissance {
     fn fork_point(&self) -> Option<&str> {
         match self {
             Self::Related { fork_point, .. } => Some(fork_point),
-            Self::Unrelated => None,
+            Self::Unrelated(_) => None,
         }
     }
 
@@ -422,9 +428,10 @@ impl Reconnaissance {
                 println!("fork point  {}", &fork_point[..9.min(fork_point.len())]);
                 println!("this side  +{target_turns} turns    source side  +{source_turns} turns");
             }
-            Self::Unrelated => {
+            Self::Unrelated(semantic) => {
                 println!("fork point  unavailable (no common Git ancestor)");
                 println!("this side  unknown    source side  unknown");
+                ui::semantic_prefix::print(semantic, "this side", "source side");
             }
         }
     }
