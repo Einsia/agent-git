@@ -609,6 +609,28 @@ pub fn clone(
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Outcome> {
     require_transport_url(url, identity)?;
+    match std::fs::symlink_metadata(dest) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_dir()
+                    && std::fs::read_dir(dest)
+                        .with_context(|| format!(
+                            "cannot inspect clone destination {}",
+                            dest.display()
+                        ))?
+                        .next()
+                        .transpose()?
+                        .is_none(),
+                "clone destination {} already exists and is not an empty directory",
+                dest.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect clone destination {}", dest.display()));
+        }
+    }
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p).with_context(|| format!("cannot create {}", p.display()))?;
     }

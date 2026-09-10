@@ -99,6 +99,26 @@ use crate::{ExitCode, Result};
 
 pub type CmdResult = Result<ExitCode>;
 
+#[derive(Debug)]
+struct RemoteRequest;
+
+impl std::fmt::Display for RemoteRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("remote request failed")
+    }
+}
+
+/// Only client I/O earns a network fallback; surrounding local validation retains its type.
+pub(crate) fn remote_request<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if error.is::<crate::hub::client::RequestConfiguration>() {
+            error
+        } else {
+            error.context(RemoteRequest)
+        }
+    })
+}
+
 /// Require sign-in, otherwise give an actionable next step.
 ///
 /// Several commands need this precondition, so the wording lives in one place.
@@ -150,6 +170,8 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
                 .is_some_and(|api| api.status == 401)
     }) {
         ExitCode::Auth
+    } else if error.is::<RemoteRequest>() {
+        ExitCode::Network
     } else if error.is::<InteractionRequired>() {
         ExitCode::Interactive
     } else if crate::domain::refs::is_not_found(error) || error.is::<target::MissingLocalRepo>() {
@@ -1507,6 +1529,27 @@ mod terminal_error_tests {
     use super::{LoginRequired, terminal_error_code};
     use crate::ExitCode;
     use crate::domain::refs::NotFound;
+
+    #[test]
+    fn remote_request_context_preserves_authentication_and_does_not_classify_by_words() {
+        let error = super::remote_request::<()>(Err(anyhow::Error::new(LoginRequired {
+            hub: "https://hub.example.test".into(),
+        })))
+        .unwrap_err();
+        assert_eq!(terminal_error_code(&error, ExitCode::Usage), ExitCode::Auth);
+        for message in ["HTTP 401", "Authentication failed", "remote request failed"] {
+            let error = anyhow::Error::msg(message);
+            assert_eq!(
+                terminal_error_code(&error, ExitCode::Usage),
+                ExitCode::Usage
+            );
+            let error = super::remote_request::<()>(Err(error)).unwrap_err();
+            assert_eq!(
+                terminal_error_code(&error, ExitCode::Usage),
+                ExitCode::Network
+            );
+        }
+    }
 
     #[test]
     fn missing_refs_keep_their_category_through_context() {

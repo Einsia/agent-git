@@ -432,8 +432,13 @@ fn capture_unix(command: &str, version: Version, f: impl FnOnce() -> i32) -> i32
 
     let stdout = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
-    emit_version(document(command, code, stdout, stderr), version, fixes);
-    code
+    if emit_version_checked(document(command, code, stdout, stderr), version, fixes).is_err()
+        && code == 0
+    {
+        crate::ExitCode::Precondition.as_i32()
+    } else {
+        code
+    }
 }
 
 #[cfg(unix)]

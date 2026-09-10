@@ -11,6 +11,16 @@ use crate::infra::hub_authority::HubAuthority;
 use anyhow::Context;
 use std::time::Duration;
 
+/// Request configuration is local even when the caller expects a network operation.
+#[derive(Debug)]
+pub(crate) struct RequestConfiguration;
+
+impl std::fmt::Display for RequestConfiguration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid Hub request configuration")
+    }
+}
+
 /// A response the hub answered explicitly, with an error status.
 ///
 /// # Why the server's wording is carried through
@@ -271,12 +281,15 @@ impl Client {
     }
 
     fn ensure_destination(&self) -> Result<()> {
-        HubAuthority::parse(&self.base)?;
-        anyhow::ensure!(
-            self.credential_binding_valid,
-            "credentials do not belong to the selected Hub"
-        );
-        Ok(())
+        let check = || -> Result<()> {
+            HubAuthority::parse(&self.base)?;
+            anyhow::ensure!(
+                self.credential_binding_valid,
+                "credentials do not belong to the selected Hub"
+            );
+            Ok(())
+        };
+        check().context(RequestConfiguration)
     }
 
     fn url(&self, path: &str) -> String {

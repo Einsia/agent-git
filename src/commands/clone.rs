@@ -150,7 +150,7 @@ pub struct Args {
 /// Read-only clone (does not bind the current directory).
 pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<Repo> {
     let client = crate::hub::Client::from_env();
-    let a = client.get_agent(owner, name)?;
+    let a = super::remote_request(client.get_agent(owner, name))?;
     let identity = crate::hub::identity::RemoteIdentity::new(client.base(), &a.agent_id)?;
     let dest = config::repo_dir(owner, name)?;
     let history_update =
@@ -273,7 +273,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     if args.mine && !client.has_token() {
         ui::error(&format!("not signed in to {}.", client.base()));
         ui::hint("`--mine` creates a copy under your name — sign in first with `agit login`");
-        return Ok(ExitCode::Usage);
+        return Ok(ExitCode::Auth);
     }
 
     // ── 1. Decide which agent and which version to fetch ──
@@ -337,7 +337,10 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         // Fast-forward only. Divergence does no text merge — that interleaves two sessions' lines
         // and breaks the message chain, producing a syntactically valid but semantically corrupt
         // transcript.
-        let out = crate::hub::git::run(&store, &["fetch", "origin", "--tags"])?;
+        let out = match crate::hub::git::run(&store, &["fetch", "origin", "--tags"]) {
+            Ok(out) => out,
+            Err(error) => return local_transport_failure(error),
+        };
         if !out.ok() {
             ui::warning("fetch failed — continuing with the local copy.");
         } else if let Some((ahead, behind)) = store.ahead_behind() {
@@ -362,7 +365,11 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             ui::bold(&slug),
             ui::accent(client.base())
         ));
-        if !crate::hub::git::clone(&clone_url, &dest, &plan.identity)?.ok() {
+        let outcome = match crate::hub::git::clone(&clone_url, &dest, &plan.identity) {
+            Ok(outcome) => outcome,
+            Err(error) => return local_transport_failure(error),
+        };
+        if !outcome.ok() {
             ui::error("clone failed.");
             ui::hint(
                 "private agents need the owner’s grant — check the account used with `agit login`",
@@ -371,7 +378,13 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
                 "remote: {}",
                 crate::hub::git::redact_url(&clone_url)
             ));
-            return Ok(ExitCode::Failure);
+            return Ok(
+                if crate::hub::git::looks_like_auth_failure(&outcome.stderr) {
+                    ExitCode::Auth
+                } else {
+                    ExitCode::Network
+                },
+            );
         }
         plan.apply_remotes(&Repo::at(&dest), false, None)?;
     }
@@ -401,7 +414,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             {
                 ui::error(&format!("{slug} has no version {v}."));
                 ui::hint(&format!("see available versions with `agit log {slug}`"));
-                return Ok(ExitCode::Failure);
+                return Ok(ExitCode::Ref);
             }
             let target = format!("refs/tags/{v}");
             checkout_target(&store, &target, None)?;
@@ -415,7 +428,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             let r = format!("origin/{b}");
             if store.git_opt(&["rev-parse", "--verify", &r]).is_none() {
                 ui::error(&format!("{slug} has no branch {b}."));
-                return Ok(ExitCode::Failure);
+                return Ok(ExitCode::Ref);
             }
             if b != "main" && store.has_ref("refs/heads/main") {
                 // Session branches each get their own worktree; the main checkout sits on the
@@ -799,6 +812,12 @@ fn mode_of(me: Option<&str>, src_owner: &str, mine: bool) -> Mode {
     }
 }
 
+fn local_transport_failure(error: anyhow::Error) -> CmdResult {
+    super::fix::register_terminal_api_error(&error);
+    ui::error(&format!("{error:#}"));
+    Ok(super::terminal_error_code(&error, ExitCode::Precondition))
+}
+
 /// Decide where this pickup lands and what its remotes are. `None` means the reason is already
 /// stated and the caller exits.
 ///
@@ -824,7 +843,7 @@ fn plan(
             ));
             return Ok(None);
         }
-        let remote = client.get_agent(src_owner, src_name)?;
+        let remote = super::remote_request(client.get_agent(src_owner, src_name))?;
         let identity = RemoteIdentity::new(client.base(), &remote.agent_id)?;
         return Ok(Some(Plan {
             owner: remote.owner,
@@ -839,7 +858,7 @@ fn plan(
 
     // Confirm the source exists and is readable first — otherwise the copy request fails with a
     // vaguer error.
-    let source = client.get_agent(src_owner, src_name)?;
+    let source = super::remote_request(client.get_agent(src_owner, src_name))?;
     let source_identity = RemoteIdentity::new(client.base(), &source.agent_id)?;
 
     if mode == Mode::ReadOnly {
@@ -865,12 +884,12 @@ fn plan(
         ui::bold(&source.slug()),
         source.session_count
     ));
-    let resp = client.clone_agent(
+    let resp = super::remote_request(client.clone_agent(
         src_owner,
         src_name,
         args.name.as_deref(),
         &source_identity.agent_id,
-    )?;
+    ))?;
     let copy_identity = validate_copy_response(client.base(), &resp, &source_identity)?;
     progress.line(format_args!(
         "{} copied as {}",
@@ -982,12 +1001,12 @@ fn promote_with_progress(
         "copying {} into your namespace…",
         ui::bold(&source.slug())
     ));
-    let resp = client.clone_agent(
+    let resp = super::remote_request(client.clone_agent(
         &source.owner,
         &source.name,
         as_name,
         &source_identity.agent_id,
-    )?;
+    ))?;
     let copy_identity = validate_copy_response(client.base(), &resp, &source_identity)?;
 
     let store = Store::open_or_init()?;
@@ -1109,13 +1128,7 @@ fn resolve_from_repo(client: &crate::hub::Client) -> crate::Result<Selection> {
     let candidates = match candidates {
         Ok(c) => c,
         Err(e) => {
-            if super::terminal_error_code(&e, ExitCode::Usage) == ExitCode::Auth {
-                return Err(e.context("reverse lookup failed"));
-            }
-            super::fix::register_terminal_api_error(&e);
-            ui::error(&format!("reverse lookup failed: {e:#}"));
-            ui::hint("name it: agit clone <owner>/<agent>");
-            return Ok(Selection::Refused(ExitCode::Usage));
+            return super::remote_request(Err(e.context("reverse lookup failed")));
         }
     };
 

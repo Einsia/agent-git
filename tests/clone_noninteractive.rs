@@ -410,14 +410,14 @@ fn ambiguous_clone_json_has_no_selected_result() {
 
 #[test]
 fn missing_lookup_preconditions_keep_their_exit_classification() {
-    for (origin, count, status, message) in [
-        (false, 2, 200, "no origin"),
-        (true, 0, 200, "no agent has worked"),
-        (true, 2, 500, "reverse lookup failed"),
+    for (origin, count, status, code, message) in [
+        (false, 2, 200, 2, "no origin"),
+        (true, 0, 200, 2, "no agent has worked"),
+        (true, 2, 500, 6, "reverse lookup failed"),
     ] {
         let lab = Lab::new(count, status, origin);
         let out = lab.clone(&[]);
-        assert_eq!(out.status.code(), Some(2));
+        assert_eq!(out.status.code(), Some(code));
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),

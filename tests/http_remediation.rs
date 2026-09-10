@@ -826,6 +826,12 @@ mod unix {
         for (args, method, target, code) in [
             (vec!["--json", "share", "list"], "GET", "/api/shares", 5),
             (
+                vec!["--json", "clone", "me/qa", "--no-bind"],
+                "GET",
+                "/api/agents/me/qa",
+                5,
+            ),
+            (
                 vec!["--json", "repo", "create", "qa"],
                 "POST",
                 "/api/agents",

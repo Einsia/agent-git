@@ -25,6 +25,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows library without RC failed to compile' 
 if ($LASTEXITCODE -ne 0) { throw 'Windows native CLI integration tests failed' }
 & cargo test --locked --release --target $target --test share_search_categories -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows sharing and search terminal category tests failed' }
+& cargo test --locked --release --target $target --test clone_ref_categories -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows clone reference category tests failed' }
+& cargo test --locked --release --target $target --test export_output_categories -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows export output category tests failed' }
+& cargo test --locked --release --target $target --lib commands::export::tests::output_flush_failure_is_not_a_successful_delivery -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows export flush failure test failed' }
 & cargo test --locked --release --target $target --test resume_cwd_selection -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows resume cwd selection tests failed' }
 & cargo test --locked --release --target $target --lib commands::scan:: -- --nocapture --test-threads=1

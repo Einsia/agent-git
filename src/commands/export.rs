@@ -22,7 +22,6 @@ use crate::domain::repo::Repo;
 use crate::domain::transcript;
 use crate::{ExitCode, adapter, ui};
 use clap::Args as ClapArgs;
-use std::io::Write as _;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -169,7 +168,10 @@ pub fn run(args: Args) -> CmdResult {
 
     match &args.out {
         Some(p) if p != "-" => {
-            std::fs::write(p, &out)?;
+            if let Err(error) = std::fs::write(p, &out) {
+                ui::error(&format!("cannot write export to {p}: {error}"));
+                return Ok(ExitCode::Precondition);
+            }
             let selected_ref = if spec.tail == refs::Tail::None {
                 resolved.branch.as_deref().unwrap_or(&sha)
             } else {
@@ -185,10 +187,18 @@ pub fn run(args: Args) -> CmdResult {
             ui::success(&format!("exported to {p} ({} bytes)", out.len()));
         }
         _ => {
-            let _ = std::io::stdout().write_all(out.as_bytes());
+            if let Err(error) = write_output(&mut std::io::stdout().lock(), out.as_bytes()) {
+                ui::error(&format!("cannot write export to stdout: {error}"));
+                return Ok(ExitCode::Precondition);
+            }
         }
     }
     Ok(ExitCode::Ok)
+}
+
+fn write_output(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    writer.write_all(bytes)?;
+    writer.flush()
 }
 
 fn required_sequence(repo: &Repo, sha: &str, which: &str) -> crate::Result<String> {
@@ -350,6 +360,31 @@ fn to_native(raw: &str, repo: &Repo, sha: &str, args: &Args) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_flush_failure_is_not_a_successful_delivery() {
+        #[derive(Default)]
+        struct FlushFailure {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl std::io::Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Err(std::io::Error::other("synthetic output flush failure"))
+            }
+        }
+        let mut writer = FlushFailure::default();
+        let error = super::write_output(&mut writer, b"synthetic output").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(writer.bytes, b"synthetic output");
+        assert_eq!(writer.flushes, 1);
+    }
+
     use super::*;
     use crate::domain::meta::Meta;
 
