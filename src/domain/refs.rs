@@ -100,10 +100,10 @@ pub fn parse(input: &str) -> Result<RefSpec> {
         None => Base::Default,
         Some("@") => Base::At,
         Some(name) => {
-            validate_name(name)?;
             if repo_part.is_none() && name.contains('@') && !name.starts_with('@') {
                 // `repo@ref` (a locally unique repo name with the owner omitted)
                 let (r, b) = name.split_once('@').unwrap_or((name, ""));
+                validate_name(r)?;
                 return Ok(RefSpec {
                     repo: RepoSel::Local(r.to_string()),
                     base: if b.is_empty() {
@@ -117,6 +117,7 @@ pub fn parse(input: &str) -> Result<RefSpec> {
                     tail,
                 });
             }
+            validate_name(name)?;
             Base::Name(name.to_string())
         }
     };
@@ -391,6 +392,18 @@ impl std::fmt::Display for NotFound {
 
 impl std::error::Error for NotFound {}
 
+/// Resolution found competing identities that require an explicit selection.
+#[derive(Debug)]
+pub struct Ambiguous(pub String);
+
+impl std::fmt::Display for Ambiguous {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Ambiguous {}
+
 /// Whether this error is plainly "not found" (see [`NotFound`]).
 pub fn is_not_found(e: &anyhow::Error) -> bool {
     e.downcast_ref::<NotFound>().is_some()
@@ -449,7 +462,10 @@ fn object_by_prefix(repo: &crate::domain::repo::Repo, prefix: &str) -> Result<Op
     })?;
     match kind.as_str() {
         "missing" => Ok(None),
-        "ambiguous" => anyhow::bail!("`{prefix}` matches more than one object, write more digits"),
+        "ambiguous" => Err(Ambiguous(format!(
+            "`{prefix}` matches more than one object, write more digits"
+        ))
+        .into()),
         _ => peel_to_commit(repo, prefix).map(Some),
     }
 }
@@ -474,27 +490,33 @@ pub fn version_alias(repo: &crate::domain::repo::Repo, name: &str) -> Option<Str
     let mut heads: Vec<(String, String)> = vec![];
     // A prefix rather than `/*`: fnmatch's `*` does not cross `/`, so branch names carrying a
     // slash would be missed.
+    // Full refnames keep branch spelling stable when an unrelated tag shares the same name.
     if let Some(list) = repo.git_opt(&[
         "for-each-ref",
-        "--format=%(refname:short) %(objectname)",
+        "--format=%(refname) %(objectname)",
         "refs/heads",
     ]) {
         for line in list.lines() {
-            if let Some((b, sha)) = line.split_once(' ') {
-                heads.push((b.to_string(), sha.to_string()));
+            if let Some((full_ref, sha)) = line.split_once(' ')
+                && let Some(branch) = full_ref.strip_prefix("refs/heads/")
+            {
+                heads.push((branch.to_string(), sha.to_string()));
             }
         }
     }
     if let Some(list) = repo.git_opt(&[
         "for-each-ref",
-        "--format=%(refname:short) %(objectname)",
+        "--format=%(refname) %(objectname)",
         "refs/remotes",
     ]) {
         for line in list.lines() {
-            let Some((short, sha)) = line.split_once(' ') else {
+            let Some((full_ref, sha)) = line.split_once(' ') else {
                 continue;
             };
-            let Some((_, branch)) = short.split_once('/') else {
+            let Some(remote_ref) = full_ref.strip_prefix("refs/remotes/") else {
+                continue;
+            };
+            let Some((_, branch)) = remote_ref.split_once('/') else {
                 continue;
             };
             // A remote with the same name at the same head is only the local branch's
@@ -576,7 +598,10 @@ fn resolve_base(repo: &crate::domain::repo::Repo, name: &str) -> Result<String> 
                 .map(|r| format!("  - remote branch {}", &r["refs/remotes/".len()..]))
                 .collect::<Vec<_>>()
                 .join("\n");
-            anyhow::bail!("`{name}` exists on multiple remotes — pick one:\n{list}");
+            return Err(Ambiguous(format!(
+                "`{name}` exists on multiple remotes — pick one:\n{list}"
+            ))
+            .into());
         }
     }
     // Version id: how the web interface writes a commit — strip the prefix and look the object
@@ -619,7 +644,7 @@ fn resolve_base(repo: &crate::domain::repo::Repo, name: &str) -> Result<String> 
                 .map(|(what, _)| format!("  - {what}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            anyhow::bail!("`{name}` is ambiguous, be more specific:\n{list}")
+            Err(Ambiguous(format!("`{name}` is ambiguous, be more specific:\n{list}")).into())
         }
     }
 }
@@ -1079,6 +1104,65 @@ mod tests {
     }
 
     #[test]
+    fn local_repo_qualifiers_split_before_ref_name_validation() {
+        for (input, base, tail) in [
+            ("qa@main", Base::Name("main".into()), Tail::None),
+            ("qa@", Base::Default, Tail::None),
+            ("qa@@", Base::At, Tail::None),
+            ("qa@@#2", Base::At, Tail::Turn(2)),
+            (
+                "qa@topic/one~1",
+                Base::Name("topic/one".into()),
+                Tail::Tilde(1),
+            ),
+            (
+                "qa@main#1.2",
+                Base::Name("main".into()),
+                Tail::Event { turn: 1, index: 2 },
+            ),
+            (
+                "qa@main#1..#2",
+                Base::Name("main".into()),
+                Tail::Range { a: 1, b: 2 },
+            ),
+            (
+                "qa@main:memory/team.md",
+                Base::Name("main".into()),
+                Tail::Path("memory/team.md".into()),
+            ),
+        ] {
+            assert_eq!(
+                parse(input).unwrap(),
+                RefSpec {
+                    repo: RepoSel::Local("qa".into()),
+                    base,
+                    tail,
+                },
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_repo_qualifiers_validate_both_names_and_keep_tail_refusals() {
+        for input in [
+            "bad repo@main",
+            "bad\trepo@main",
+            "qa@bad ref",
+            "qa@bad\tref",
+            "qa@main@other",
+            "qa@@@",
+            "@@main",
+            "qa@main#0",
+            "qa@main~bad",
+            "qa@main#1~2",
+            "qa@main:",
+        ] {
+            assert!(parse(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
     fn parses_turn_event_range_path() {
         assert_eq!(parse("refund-fix#5").unwrap().tail, Tail::Turn(5));
         assert_eq!(
@@ -1312,10 +1396,12 @@ mod tests {
         let (_d, r) = fixtures::forked_history();
         let miss = resolve(&r, &parse("nope").unwrap()).unwrap_err();
         assert!(is_not_found(&miss), "{miss:#}");
+        assert!(!miss.is::<Ambiguous>());
         let sha = r.git(&["rev-parse", "s1"]).unwrap();
         r.git(&["tag", "f1", sha.trim()]).unwrap();
         let amb = resolve(&r, &parse("f1").unwrap()).unwrap_err();
         assert!(!is_not_found(&amb), "{amb:#}");
+        assert!(amb.is::<Ambiguous>());
         assert!(amb.to_string().contains("ambiguous"), "{amb:#}");
     }
 
@@ -1331,6 +1417,7 @@ mod tests {
             .unwrap();
         let e = resolve(&r, &parse("broken").unwrap()).unwrap_err();
         assert!(!is_not_found(&e), "{e:#}");
+        assert!(!e.is::<Ambiguous>());
         assert!(
             e.to_string().contains("does not resolve to a commit"),
             "{e:#}"
@@ -1397,7 +1484,9 @@ mod version_id_tests {
         assert_eq!(resolve_base(&r, &vid).unwrap(), tip, "agreement is one hit");
         r.git(&["tag", "-d", &vid]).unwrap();
         r.git(&["tag", &vid, "refs/heads/s1"]).unwrap();
-        let err = resolve_base(&r, &vid).unwrap_err().to_string();
+        let err = resolve_base(&r, &vid).unwrap_err();
+        assert!(!err.is::<Ambiguous>());
+        let err = err.to_string();
         assert!(
             err.contains("corrupt or reused"),
             "a tag on the wrong object must be reported as corrupt: {err}"
@@ -1428,6 +1517,8 @@ mod version_id_tests {
             .to_string();
         r.git(&["update-ref", "refs/remotes/origin/f1", &advanced])
             .unwrap();
+        r.git(&["tag", "f1", "refs/heads/main"]).unwrap();
+        r.git(&["tag", "origin/f1", "refs/heads/main"]).unwrap();
         assert_eq!(
             version_alias(&r, &format!("agit-{advanced}")).as_deref(),
             Some("f1"),
@@ -1457,5 +1548,61 @@ mod version_id_tests {
         }
         r.git(&["branch", "-D", "s1"]).unwrap();
         assert_eq!(version_alias(&r, &fixtures::claim()).as_deref(), Some("f1"));
+    }
+
+    #[test]
+    fn web_aliases_preserve_branch_names_despite_tag_collisions() {
+        for branch in ["f1", "heads/topic"] {
+            let (_d, r) = fixtures::forked_history();
+            let tip = r.git(&["rev-parse", "refs/heads/f1"]).unwrap();
+            let tip = tip.trim();
+            r.git(&["branch", "-D", "s1"]).unwrap();
+            if branch != "f1" {
+                r.git(&["branch", "-m", "f1", branch]).unwrap();
+            }
+            r.git(&["tag", branch, "refs/heads/main"]).unwrap();
+            r.git(&["update-ref", &format!("refs/remotes/origin/{branch}"), tip])
+                .unwrap();
+            for id in [format!("agit-{tip}"), fixtures::claim()] {
+                assert_eq!(version_alias(&r, &id).as_deref(), Some(branch));
+            }
+            r.git(&["branch", "competing", tip]).unwrap();
+            for id in [format!("agit-{tip}"), fixtures::claim()] {
+                assert_eq!(version_alias(&r, &id), None, "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_web_aliases_preserve_nested_branches_and_ignore_remote_head() {
+        let (_d, r) = fixtures::forked_history();
+        let tip = r.git(&["rev-parse", "refs/heads/f1"]).unwrap();
+        let tip = tip.trim();
+        r.git(&["switch", "main"]).unwrap();
+        r.git(&["branch", "-D", "s1", "f1"]).unwrap();
+        r.git(&["update-ref", "refs/remotes/origin/topic/nested", tip])
+            .unwrap();
+        r.git(&["tag", "origin/topic/nested", "refs/heads/main"])
+            .unwrap();
+        r.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/topic/nested",
+        ])
+        .unwrap();
+        for id in [format!("agit-{tip}"), fixtures::claim()] {
+            assert_eq!(version_alias(&r, &id).as_deref(), Some("topic/nested"));
+        }
+        r.git(&["update-ref", "refs/remotes/upstream/topic/nested", tip])
+            .unwrap();
+        assert_eq!(
+            version_alias(&r, &format!("agit-{tip}")).as_deref(),
+            Some("topic/nested")
+        );
+        r.git(&["update-ref", "refs/remotes/upstream/competing", tip])
+            .unwrap();
+        for id in [format!("agit-{tip}"), fixtures::claim()] {
+            assert_eq!(version_alias(&r, &id), None, "{id}");
+        }
     }
 }

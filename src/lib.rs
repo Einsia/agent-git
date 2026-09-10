@@ -186,12 +186,12 @@ pub fn warn(msg: &str) {
 /// |------|---------|
 /// | 0    | success (including nothing to do) |
 /// | 2    | usage error |
-/// | 3    | a reference does not resolve, or is ambiguous |
+/// | 3    | a reference does not resolve, or is ambiguous at an interactive terminal |
 /// | 4    | a precondition is not met |
 /// | 5    | not signed in, or the credentials are no longer valid |
 /// | 6    | network / hub error |
 /// | 7    | policy refusal (secret scan, gate) |
-/// | 8    | interaction is required but this run is non-interactive |
+/// | 8    | interaction or an explicit candidate selection is required in a non-interactive run |
 ///
 /// `Failure(1)` is kept only while the legacy call sites migrate; new code must use one of the
 /// kinds above. A named type rather than a bare i32 makes every command's signature
@@ -202,7 +202,7 @@ pub enum ExitCode {
     /// Migration leftover; new code uses a more precise kind.
     Failure = 1,
     Usage = 2,
-    /// A reference does not resolve, or is ambiguous.
+    /// A reference does not resolve, or is ambiguous at an interactive terminal.
     Ref = 3,
     /// A precondition is not met.
     Precondition = 4,
@@ -212,7 +212,7 @@ pub enum ExitCode {
     Network = 6,
     /// Policy refusal (secret scan, gate).
     Policy = 7,
-    /// Interaction is required but this run is non-interactive.
+    /// Interaction or an explicit candidate selection is required in a non-interactive run.
     Interactive = 8,
 }
 

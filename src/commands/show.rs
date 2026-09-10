@@ -531,14 +531,15 @@ fn current_context_repo(cwd: &std::path::Path) -> crate::Result<Option<Repo>> {
     }
 }
 
-/// The local repo a reference lives in: `owner/repo@` names it, otherwise it is the context repo.
+/// The local repo a normalized reference lives in; only an unqualified ref uses context.
 ///
 /// An unqualified reference uses the repository supplied through AGIT_SESSION; directory state
 /// cannot choose which repository owns a branch name.
 fn open_ref_repo(spec: &refs::RefSpec) -> crate::Result<(Repo, String)> {
     let (o, n) = match &spec.repo {
         refs::RepoSel::Slug(o, n) => (o.clone(), n.clone()),
-        _ => {
+        refs::RepoSel::Local(_) => anyhow::bail!("the local repository qualifier was not resolved"),
+        refs::RepoSel::Context => {
             let cwd = std::env::current_dir()?;
             super::parse_slug(&super::context::repo_for(&cwd)?)?
         }
@@ -578,6 +579,13 @@ fn names_local_ref(t: &str) -> crate::Result<bool> {
 fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
     let spec = refs::parse(t).ok()?;
     let source = super::echo::Source::for_spec(&spec);
+    let spec = match super::target::resolve_local_repo(spec) {
+        Ok(spec) => spec,
+        Err(error) => {
+            ui::error(&format!("{error:#}"));
+            return Some(super::terminal_error_code(&error, ExitCode::Ref));
+        }
+    };
     let spec = match super::context::substitute_at(spec) {
         Ok(spec) => spec,
         Err(e) => {

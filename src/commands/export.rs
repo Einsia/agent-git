@@ -55,11 +55,8 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Usage);
         }
     };
-    let source = if matches!(spec.repo, refs::RepoSel::Local(_)) {
-        super::echo::Source::Mixed
-    } else {
-        super::echo::Source::for_spec(&spec)
-    };
+    let source = super::echo::Source::for_spec(&spec);
+    let spec = super::target::resolve_local_repo(spec)?;
     let spec = match super::context::substitute_at(spec) {
         Ok(spec) => spec,
         Err(e) => {

@@ -1311,6 +1311,27 @@ pub fn checkouts_named(me: &str, name: &str) -> crate::Result<Vec<Checkout>> {
     Ok(out)
 }
 
+/// A local qualifier selects one checkout; account ordering cannot break a name collision.
+pub fn unique_checkout(name: &str) -> crate::Result<Option<Checkout>> {
+    let me = crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
+    let found = checkouts_named(&me, name)?;
+    match found.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        many => {
+            let candidates = many
+                .iter()
+                .map(|checkout| format!("  {}", checkout.slug()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(crate::domain::refs::Ambiguous(format!(
+                "`{name}` names multiple local repos — write owner/repo:\n{candidates}"
+            ))
+            .into())
+        }
+    }
+}
+
 /// Which repo this agent name records versions into.
 ///
 /// Three tiers:

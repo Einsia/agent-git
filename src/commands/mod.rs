@@ -130,7 +130,7 @@ impl std::fmt::Display for LoginRequired {
 
 impl std::error::Error for LoginRequired {}
 
-/// Only typed authentication failures override a command's existing failure category.
+/// Typed failures retain their category across command-specific diagnostic context.
 pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCode {
     if error.chain().any(|cause| {
         cause.is::<LoginRequired>()
@@ -139,6 +139,14 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
                 .is_some_and(|api| api.status == 401)
     }) {
         ExitCode::Auth
+    } else if error.is::<target::MissingLocalRepo>() {
+        ExitCode::Ref
+    } else if error.is::<crate::domain::refs::Ambiguous>() {
+        if crate::ui::prompt::interactive() {
+            ExitCode::Ref
+        } else {
+            ExitCode::Interactive
+        }
     } else {
         fallback
     }

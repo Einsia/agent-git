@@ -268,6 +268,92 @@ fn an_ambiguous_explicit_prefix_requires_selection_without_stdout_or_adoption() 
 }
 
 #[test]
+fn a_missing_explicit_native_id_is_a_reference_error_without_adoption() {
+    for count in [0, 2] {
+        let lab = Lab::new(count);
+        let before = lab.state();
+        for quiet in [false, true] {
+            for mode in [
+                vec!["--link-only"],
+                vec!["--into", "me/qa@work", "--independent"],
+            ] {
+                let mut command = lab.command();
+                if quiet {
+                    command.arg("--quiet");
+                }
+                let output = command
+                    .args(["import", "missing-native-session", "--from", "claude-code"])
+                    .args(mode)
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(3), "{output:?}");
+                assert!(output.stdout.is_empty(), "{output:?}");
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(
+                    stderr.contains("no session named `missing-native-session`"),
+                    "{stderr}"
+                );
+                assert_eq!(lab.state(), before);
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, all(windows, target_env = "msvc")))]
+#[test]
+fn a_missing_explicit_native_id_has_the_same_reference_error_in_json() {
+    for count in [0, 2] {
+        let lab = Lab::new(count);
+        let before = lab.state();
+        for version in ["1", "2"] {
+            for mode in [
+                vec!["--link-only"],
+                vec!["--into", "me/qa@work", "--independent"],
+            ] {
+                let output = lab
+                    .command()
+                    .args([
+                        "--json",
+                        "--json-version",
+                        version,
+                        "import",
+                        "missing-native-session",
+                        "--from",
+                        "claude-code",
+                    ])
+                    .args(mode)
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(3), "{output:?}");
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["schema_version"], version.parse::<u32>().unwrap());
+                assert_eq!(value["exit_code"], 3);
+                assert_eq!(value["ok"], false);
+                assert_eq!(
+                    value["result"],
+                    serde_json::json!({"format":"empty", "kind":"import"})
+                );
+                assert_eq!(value.get("fix").is_some(), version == "2");
+                assert!(
+                    value["diagnostics"]["stderr"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["level"] == "error"
+                            && row["message"]
+                                .as_str()
+                                .unwrap()
+                                .contains("no session named `missing-native-session`")),
+                    "{value}"
+                );
+                assert_eq!(lab.state(), before);
+            }
+        }
+    }
+}
+
+#[test]
 fn ambiguous_prefix_diagnostics_keep_the_candidate_limit() {
     let lab = Lab::new(9);
     let before = lab.state();
@@ -696,4 +782,441 @@ fn an_explicit_independent_decision_survives_the_no_id_retry() {
             .join(format!("{}.json", lab.sources[0].0))
             .exists()
     );
+}
+
+fn target_selection_state(lab: &Lab) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut result = BTreeMap::new();
+    for root in [
+        lab.store.join("repos"),
+        lab.store.join("store"),
+        lab.store.join("secret-filter"),
+        lab.home.join(".claude"),
+    ] {
+        if root.exists() {
+            for entry in walkdir::WalkDir::new(root) {
+                let entry = entry.unwrap();
+                let bytes = entry
+                    .file_type()
+                    .is_file()
+                    .then(|| fs::read(entry.path()).unwrap());
+                result.insert(entry.path().to_owned(), bytes);
+            }
+        }
+    }
+    result
+}
+
+fn target_git(lab: &Lab, repo: &std::path::Path, args: &[&str]) -> String {
+    let environment = lab.command();
+    let mut command = Command::new("git");
+    command.env_clear();
+    for (key, value) in environment.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    let output = command
+        .args(["-c", "commit.gpgsign=false", "-C"])
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn competing_checkout(lab: &Lab) -> PathBuf {
+    let path = lab.store.join("repos/other/qa");
+    fs::create_dir_all(path.join("session")).unwrap();
+    target_git(lab, &path, &["init", "-q", "--initial-branch=main"]);
+    fs::write(
+        path.join("session/meta.json"),
+        "{\"layout\":\"v1\",\"line\":\"file\",\"kind\":\"file\"}\n",
+    )
+    .unwrap();
+    target_git(lab, &path, &["add", "."]);
+    target_git(
+        lab,
+        &path,
+        &[
+            "-c",
+            "user.name=Synthetic",
+            "-c",
+            "user.email=synthetic@example.test",
+            "commit",
+            "-qm",
+            "synthetic competitor",
+        ],
+    );
+    path
+}
+
+/// Selection failures cannot adopt a link, create a privacy copy or touch either checkout.
+#[test]
+fn legacy_import_target_refusals_precede_adoption_and_privacy_writes() {
+    let lab = Lab::new(1);
+    let repo = lab.store.join("repos/me/qa");
+    competing_checkout(&lab);
+    target_git(&lab, &repo, &["branch", "collision", "main"]);
+    target_git(&lab, &repo, &["tag", "collision", "main"]);
+    let cases = [
+        (
+            vec!["-n", "qa", "-b", "selected", "--independent"],
+            8,
+            vec!["me/qa", "other/qa"],
+        ),
+        (
+            vec!["--into", "me/qa@selected", "--onto", "collision"],
+            8,
+            vec!["branch collision", "tag collision"],
+        ),
+        (
+            vec!["--into", "me/qa@selected", "--onto", "absent"],
+            3,
+            vec!["not a branch, tag, or commit prefix"],
+        ),
+        (
+            vec!["--into", "me/absent@selected", "--onto", "main"],
+            3,
+            vec!["requires an existing destination repository"],
+        ),
+        (vec!["--independent"], 2, vec!["needs a destination agent"]),
+    ];
+    for (arguments, code, candidates) in cases {
+        for privacy in [false, true] {
+            for flags in [
+                vec![],
+                vec!["--quiet"],
+                vec!["--json", "--json-version", "1"],
+                vec!["--json", "--json-version", "2"],
+            ] {
+                let before = target_selection_state(&lab);
+                let mut command = lab.command();
+                command
+                    .args(&flags)
+                    .args(["import", &lab.sources[0].0, "--from", "claude-code"])
+                    .args(&arguments);
+                if privacy {
+                    command.arg("--privacy");
+                }
+                let output = command.stdin(std::process::Stdio::null()).output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(code),
+                    "{arguments:?}: {output:?}"
+                );
+                assert_eq!(
+                    target_selection_state(&lab),
+                    before,
+                    "target refusal changed source or destination data"
+                );
+                let diagnostic = if flags.contains(&"--json") {
+                    assert!(output.stderr.is_empty(), "{output:?}");
+                    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert_eq!(value["ok"], false);
+                    assert_eq!(value["exit_code"], code);
+                    assert_eq!(
+                        value["schema_version"],
+                        flags.last().unwrap().parse::<u64>().unwrap()
+                    );
+                    assert_eq!(value["result"]["format"], "empty");
+                    value["diagnostics"]["stderr"].to_string()
+                } else {
+                    assert!(output.stdout.is_empty(), "{output:?}");
+                    String::from_utf8(output.stderr).unwrap()
+                };
+                for candidate in &candidates {
+                    assert!(
+                        diagnostic.contains(candidate),
+                        "missing {candidate}: {diagnostic}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Invalid branch names cannot create a native copy, adoption claim or destination repository.
+#[test]
+fn invalid_import_branch_names_precede_all_local_writes() {
+    let lab = Lab::new(1);
+    for name in ["qa", "absent"] {
+        for branch in ["bad.lock", "foo//bar", "HEAD", "-topic", "@{-1}"] {
+            for privacy in [false, true] {
+                for flags in [
+                    vec![],
+                    vec!["--quiet"],
+                    vec!["--json", "--json-version", "1"],
+                    vec!["--json", "--json-version", "2"],
+                ] {
+                    let before = target_selection_state(&lab);
+                    let mut command = lab.command();
+                    command
+                        .args(&flags)
+                        .args([
+                            "import",
+                            &lab.sources[0].0,
+                            "--from",
+                            "claude-code",
+                            "-n",
+                            name,
+                            "--independent",
+                        ])
+                        .arg(format!("--branch={branch}"));
+                    if privacy {
+                        command.arg("--privacy");
+                    }
+                    let output = command.stdin(std::process::Stdio::null()).output().unwrap();
+                    assert_eq!(output.status.code(), Some(2), "{name}@{branch}: {output:?}");
+                    assert_eq!(
+                        target_selection_state(&lab),
+                        before,
+                        "invalid branch selection changed source or destination data"
+                    );
+                    let diagnostic = if flags.contains(&"--json") {
+                        assert!(output.stderr.is_empty(), "{output:?}");
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(value["ok"], false);
+                        assert_eq!(value["exit_code"], 2);
+                        assert_eq!(
+                            value["schema_version"],
+                            flags.last().unwrap().parse::<u64>().unwrap()
+                        );
+                        assert_eq!(value["result"]["format"], "empty");
+                        value["diagnostics"]["stderr"].to_string()
+                    } else {
+                        assert!(output.stdout.is_empty(), "{output:?}");
+                        String::from_utf8(output.stderr).unwrap()
+                    };
+                    assert!(
+                        diagnostic.contains("not a valid Git ref"),
+                        "{name}@{branch}: {diagnostic}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Hierarchical branch names remain available even when the destination does not exist yet.
+#[test]
+fn import_branch_preflight_accepts_hierarchical_names_for_new_repositories() {
+    let lab = Lab::new(1);
+    let source = fs::read(&lab.sources[0].1).unwrap();
+    let output = lab
+        .command()
+        .args([
+            "import",
+            &lab.sources[0].0,
+            "--from",
+            "claude-code",
+            "-n",
+            "absent",
+            "-b",
+            "topic/valid",
+            "--independent",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let store = agit::domain::store::Store::at(lab.store.join("store"));
+    let link = agit::domain::link::get(&store, "claude-code", &lab.sources[0].0).unwrap();
+    assert_eq!(
+        (
+            link.owner.as_deref(),
+            link.agent.as_deref(),
+            link.branch.as_deref()
+        ),
+        (Some("me"), Some("absent"), Some("topic/valid"))
+    );
+    target_git(
+        &lab,
+        &lab.store.join("repos/me/absent"),
+        &["show-ref", "--verify", "refs/heads/topic/valid"],
+    );
+    assert_eq!(fs::read(&lab.sources[0].1).unwrap(), source);
+}
+
+/// An explicit owner disambiguates a name without borrowing another checkout's history.
+#[test]
+fn legacy_import_consumes_the_explicit_checkout_with_a_competing_name() {
+    let lab = Lab::new(1);
+    let competitor = competing_checkout(&lab);
+    let competitor_refs = target_git(&lab, &competitor, &["show-ref"]);
+    let source = fs::read(&lab.sources[0].1).unwrap();
+    let output = lab
+        .command()
+        .args([
+            "import",
+            &lab.sources[0].0,
+            "--from",
+            "claude-code",
+            "--into",
+            "me/qa@selected",
+            "--independent",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let store = agit::domain::store::Store::at(lab.store.join("store"));
+    let link = agit::domain::link::get(&store, "claude-code", &lab.sources[0].0).unwrap();
+    assert_eq!(
+        (
+            link.owner.as_deref(),
+            link.agent.as_deref(),
+            link.branch.as_deref()
+        ),
+        (Some("me"), Some("qa"), Some("selected"))
+    );
+    target_git(
+        &lab,
+        &lab.store.join("repos/me/qa"),
+        &["show-ref", "--verify", "refs/heads/selected"],
+    );
+    assert_eq!(
+        target_git(&lab, &competitor, &["show-ref"]),
+        competitor_refs
+    );
+    assert_eq!(fs::read(&lab.sources[0].1).unwrap(), source);
+}
+
+/// Repository qualifiers and partial selectors cannot be discarded during base selection.
+#[test]
+fn legacy_import_onto_scope_refusals_preserve_all_source_and_destination_data() {
+    let lab = Lab::new(1);
+    competing_checkout(&lab);
+    let cases = [
+        ("other/qa@main", None, 2, "selected destination repository"),
+        ("other@main", None, 2, "selected destination repository"),
+        ("@", Some("other/qa@main"), 2, "session repository"),
+        ("me/qa@@", Some("other/qa@main"), 2, "session repository"),
+        ("qa@main", None, 8, "names multiple local repos"),
+        ("main#1.1", None, 2, "requires a whole commit"),
+        ("main#1..#1", None, 2, "requires a whole commit"),
+        ("main:AGENTS.md", None, 2, "requires a whole commit"),
+    ];
+    for (onto, session, code, diagnostic) in cases {
+        for privacy in [false, true] {
+            for flags in [
+                vec![],
+                vec!["--quiet"],
+                vec!["--json", "--json-version", "1"],
+                vec!["--json", "--json-version", "2"],
+            ] {
+                let before = target_selection_state(&lab);
+                let mut command = lab.command();
+                command.args(&flags).args([
+                    "import",
+                    &lab.sources[0].0,
+                    "--from",
+                    "claude-code",
+                    "--into",
+                    "me/qa@selected",
+                    "--onto",
+                    onto,
+                ]);
+                if let Some(session) = session {
+                    command.env("AGIT_SESSION", session);
+                }
+                if privacy {
+                    command.arg("--privacy");
+                }
+                let output = command.stdin(std::process::Stdio::null()).output().unwrap();
+                assert_eq!(output.status.code(), Some(code), "{onto}: {output:?}");
+                assert_eq!(target_selection_state(&lab), before);
+                let text = if flags.contains(&"--json") {
+                    assert!(output.stderr.is_empty(), "{output:?}");
+                    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert_eq!(value["ok"], false);
+                    assert_eq!(value["exit_code"], code);
+                    assert_eq!(value["result"]["format"], "empty");
+                    value["diagnostics"]["stderr"].to_string()
+                } else {
+                    assert!(output.stdout.is_empty(), "{output:?}");
+                    String::from_utf8(output.stderr).unwrap()
+                };
+                assert!(text.contains(diagnostic), "{onto}: {text}");
+                if code == 8 {
+                    assert!(
+                        text.contains("me/qa") && text.contains("other/qa"),
+                        "{text}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Same-repository qualifiers and historic whole commits retain their selected lineage.
+#[test]
+fn legacy_import_onto_accepts_qualified_session_and_historic_commit_targets() {
+    let lab = Lab::new(1);
+    let repo = lab.store.join("repos/me/qa");
+    let source = fs::read(&lab.sources[0].1).unwrap();
+    let seed = lab
+        .command()
+        .args([
+            "import",
+            &lab.sources[0].0,
+            "--from",
+            "claude-code",
+            "--into",
+            "me/qa@seed",
+            "--independent",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(seed.status.success(), "{seed:?}");
+    let main = target_git(&lab, &repo, &["rev-parse", "main"]);
+    let seed = target_git(&lab, &repo, &["rev-parse", "seed"]);
+    let cases = [
+        ("main", None, main.as_str()),
+        ("me/qa@main", None, main.as_str()),
+        ("qa@main", None, main.as_str()),
+        ("@", Some("me/qa@main"), main.as_str()),
+        ("seed~0", None, seed.as_str()),
+        ("seed#1", None, seed.as_str()),
+        ("me/qa@seed#1", None, seed.as_str()),
+    ];
+    for (i, (onto, session, expected)) in cases.into_iter().enumerate() {
+        let branch = format!("positive-{i}");
+        let mut command = lab.command();
+        command.args([
+            "-y",
+            "import",
+            &lab.sources[0].0,
+            "--from",
+            "claude-code",
+            "--into",
+            &format!("me/qa@{branch}"),
+            "--onto",
+            onto,
+        ]);
+        if let Some(session) = session {
+            command.env("AGIT_SESSION", session);
+        }
+        let output = command.stdin(std::process::Stdio::null()).output().unwrap();
+        assert!(output.status.success(), "{onto}: {output:?}");
+        let history = target_git(&lab, &repo, &["rev-list", "--first-parent", &branch]);
+        assert!(
+            history.lines().any(|oid| oid == expected),
+            "{onto}: {history}"
+        );
+        let store = agit::domain::store::Store::at(lab.store.join("store"));
+        let link = agit::domain::link::get(&store, "claude-code", &lab.sources[0].0).unwrap();
+        assert_eq!(
+            (
+                link.owner.as_deref(),
+                link.agent.as_deref(),
+                link.branch.as_deref()
+            ),
+            (Some("me"), Some("qa"), Some(branch.as_str()))
+        );
+        assert_eq!(fs::read(&lab.sources[0].1).unwrap(), source);
+    }
 }

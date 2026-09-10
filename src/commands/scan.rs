@@ -58,7 +58,7 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
     let cwd = std::env::current_dir()?;
-    let parsed_refs: Vec<refs::RefSpec> = match args
+    let mut parsed_refs: Vec<refs::RefSpec> = match args
         .refs
         .iter()
         .map(
@@ -75,6 +75,9 @@ pub fn run(args: Args) -> CmdResult {
         Ok(specs) => specs,
         Err(code) => return Ok(code),
     };
+    for spec in &mut parsed_refs {
+        *spec = super::target::resolve_local_repo(spec.clone())?;
+    }
     let sources: Vec<Source> = parsed_refs
         .iter()
         .map(|spec| match &spec.repo {

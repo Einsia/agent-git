@@ -91,23 +91,13 @@ pub fn run(args: Args) -> CmdResult {
                 (slug, true)
             }
         }
-        refs::RepoSel::Local(name) => {
-            let me = crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
-            match super::clone::checkouts_named(&me, name)
-                .unwrap_or_default()
-                .as_slice()
-            {
-                [only] => (only.slug(), false),
-                many => {
-                    ui::error(&format!(
-                        "`{name}` exists {} times locally — or not at all",
-                        many.len()
-                    ));
-                    ui::hint(&format!("write the full form: agit run owner/{name}@<ref>"));
-                    return Ok(ExitCode::Ref);
-                }
+        refs::RepoSel::Local(name) => match super::clone::unique_checkout(name)? {
+            Some(checkout) => (checkout.slug(), false),
+            None => {
+                ui::error(&format!("no local repo named `{name}` — write owner/repo."));
+                return Ok(ExitCode::Ref);
             }
-        }
+        },
         refs::RepoSel::Context => match super::context::resolve(&cwd) {
             Ok(c) => (c.repo, false),
             Err(e) => {
@@ -150,6 +140,20 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Usage);
         }
     };
+
+    // An ordinary name must select one identity before branch continuation can take priority.
+    // Tailed selectors already pass through fork resolution and cannot continue a branch head.
+    // Web ids retain their declaration/version alias contract instead of resolving its branch
+    // spelling again, which could introduce unrelated tag or object-prefix candidates.
+    if matches!(spec.tail, refs::Tail::None)
+        && !crate::domain::meta::is_bare_id(&base_name)
+        && let Err(error) = refs::resolve(&repo, &spec)
+    {
+        ui::error(&format!(
+            "failed to resolve `{slug}@{base_name}`: {error:#}"
+        ));
+        return Ok(super::terminal_error_code(&error, ExitCode::Ref));
+    }
 
     // The `agit-...` id the web interface shows (session declaration / version) folds back to
     // a branch name first: both id forms and the branch-name entry point land in one arbitration,

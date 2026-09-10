@@ -143,7 +143,9 @@ pub fn run(args: Args) -> CmdResult {
         .transpose()?
         .as_ref()
         .map(|spec| match (&spec.repo, &spec.base) {
-            (refs::RepoSel::Slug(_, _), _) => super::echo::Source::Explicit,
+            (refs::RepoSel::Slug(_, _) | refs::RepoSel::Local(_), _) => {
+                super::echo::Source::Explicit
+            }
             (_, refs::Base::At | refs::Base::SessionBranch(_)) => super::echo::Source::Environment,
             _ => super::echo::Source::Mixed,
         })
@@ -179,7 +181,7 @@ enum Resolved {
 fn resolve_branch(args: &Args, cwd: &Path) -> crate::Result<Resolved> {
     // Explicit target: refs syntax (may be owner/repo@branch).
     if let Some(t) = &args.target {
-        let spec = refs::parse(t)?;
+        let spec = super::target::resolve_local_repo(refs::parse(t)?)?;
         let (slug, base_name) = match &spec.repo {
             refs::RepoSel::Slug(o, n) => {
                 let name = match &spec.base {
@@ -196,7 +198,8 @@ fn resolve_branch(args: &Args, cwd: &Path) -> crate::Result<Resolved> {
                 };
                 (format!("{o}/{n}"), name)
             }
-            _ => {
+            refs::RepoSel::Local(_) => unreachable!("local repository qualifiers are resolved"),
+            refs::RepoSel::Context => {
                 // A bare branch still needs the repository supplied by AGIT_SESSION.
                 match &spec.base {
                     refs::Base::Name(b) | refs::Base::SessionBranch(b) => {

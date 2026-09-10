@@ -121,20 +121,15 @@ pub fn run(args: Args) -> CmdResult {
                 .unwrap_or_else(|| r.to_string());
             match super::parse_slug(&repo_name) {
                 Ok((o, n)) => (format!("{o}/{n}"), true),
-                Err(_) => {
-                    // A bare name: the one local repo carrying it.
-                    let me =
-                        crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
-                    match super::clone::checkouts_named(&me, r)?.as_slice() {
-                        [only] => (only.slug(), false),
-                        _ => {
-                            ui::error(&format!(
-                                "`{r}` is ambiguous or missing — write owner/repo."
-                            ));
-                            return Ok(ExitCode::Ref);
-                        }
+                Err(_) => match super::clone::unique_checkout(&repo_name)? {
+                    Some(checkout) => (checkout.slug(), false),
+                    None => {
+                        ui::error(&format!(
+                            "no local repo named `{repo_name}` — write owner/repo."
+                        ));
+                        return Ok(ExitCode::Ref);
                     }
-                }
+                },
             }
         }
         // An explicit environment can supply the destination repo; directory state cannot.
@@ -203,6 +198,9 @@ pub fn run(args: Args) -> CmdResult {
     let from_spec = crate::commands::target::parse_local(&from_ref)?;
     let from_head = match crate::domain::refs::resolve(&repo, &from_spec) {
         Ok(resolved) => resolved.sha,
+        Err(e) if e.is::<crate::domain::refs::Ambiguous>() => {
+            return Err(e.context(format!("cannot select `{from_ref}` in {slug}")));
+        }
         Err(e) => {
             ui::error(&format!("{slug} has no ref `{from_ref}`: {e:#}"));
             return Ok(ExitCode::Ref);

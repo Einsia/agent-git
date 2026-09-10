@@ -451,6 +451,232 @@ fn raw_event_file_and_export_modes_preserve_their_exact_payload_bytes() {
 }
 
 #[test]
+fn a_local_export_qualifier_keeps_the_named_repository_in_every_presentation() {
+    let lab = Lab::new();
+    let (other, _) = lab.other_repo();
+    let original = lab.git(&lab.repo, &["show-ref"]);
+    let selected = lab.git(&other, &["show-ref"]);
+    let expected = native_turn("OTHER-REPOSITORY");
+    for flags in [
+        vec![],
+        vec!["--quiet"],
+        vec!["--json", "--json-version", "1"],
+        vec!["--json", "--json-version", "2"],
+    ] {
+        let mut args = flags.clone();
+        args.extend(["export", "other@topic"]);
+        let output = lab.run(Some(SELECTED), &args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        if flags.contains(&"--json") {
+            let mut qualified = flags;
+            qualified.extend(["export", "bob/other@topic"]);
+            let reference = lab.run(Some(SELECTED), &qualified);
+            assert!(reference.status.success(), "{reference:?}");
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let reference: Value = serde_json::from_slice(&reference.stdout).unwrap();
+            assert_eq!(actual["result"], reference["result"]);
+            assert!(actual["result"].to_string().contains("OTHER-REPOSITORY"));
+            assert!(!actual["result"].to_string().contains("SELECTED-FIRST"));
+        } else {
+            assert_eq!(output.stdout, expected.as_bytes());
+        }
+        assert_eq!(lab.git(&lab.repo, &["show-ref"]), original);
+        assert_eq!(lab.git(&other, &["show-ref"]), selected);
+    }
+}
+
+#[test]
+fn local_scan_qualifiers_resolve_before_comparing_repository_scope() {
+    let lab = Lab::new();
+    let (other, _) = lab.other_repo();
+    let original = lab.git(&lab.repo, &["show-ref"]);
+    let selected = lab.git(&other, &["show-ref"]);
+    notice(
+        lab.run(Some(SELECTED), &["scan", "other@topic", "--secrets"]),
+        "target: repo=bob/other (via explicit arguments)",
+    );
+    notice(
+        lab.run(
+            Some(SELECTED),
+            &["scan", "other@topic", "bob/other@topic", "--secrets"],
+        ),
+        "target: repo=bob/other (via explicit arguments)",
+    );
+    let refused = lab.run(
+        Some(SELECTED),
+        &["scan", "other@topic", SELECTED, "--secrets"],
+    );
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("all scan targets must belong"),
+        "{refused:?}"
+    );
+    assert_eq!(lab.git(&lab.repo, &["show-ref"]), original);
+    assert_eq!(lab.git(&other, &["show-ref"]), selected);
+}
+
+#[test]
+fn local_show_qualifiers_read_the_named_checkout_in_every_presentation() {
+    let lab = Lab::new();
+    let (other, _) = lab.other_repo();
+    let original = lab.git(&lab.repo, &["show-ref"]);
+    let selected = lab.git(&other, &["show-ref"]);
+    for flags in [
+        vec![],
+        vec!["--quiet"],
+        vec!["--json", "--json-version", "1"],
+        vec!["--json", "--json-version", "2"],
+    ] {
+        let mut args = flags.clone();
+        args.extend(["show", "other@topic", "--raw"]);
+        let output = lab.run(Some(SELECTED), &args);
+        assert!(output.status.success(), "{output:?}");
+        if flags.contains(&"--json") {
+            let mut qualified = flags;
+            qualified.extend(["show", "bob/other@topic", "--raw"]);
+            let reference = lab.run(Some(SELECTED), &qualified);
+            assert!(reference.status.success(), "{reference:?}");
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let reference: Value = serde_json::from_slice(&reference.stdout).unwrap();
+            assert_eq!(actual["result"], reference["result"]);
+            assert!(actual["result"].to_string().contains("OTHER-REPOSITORY"));
+            assert!(!actual["result"].to_string().contains("SELECTED-SECOND"));
+        } else {
+            assert_eq!(output.stdout, native_turn("OTHER-REPOSITORY").as_bytes());
+        }
+        assert_eq!(lab.git(&lab.repo, &["show-ref"]), original);
+        assert_eq!(lab.git(&other, &["show-ref"]), selected);
+    }
+}
+
+#[test]
+fn local_resume_qualifiers_materialize_only_the_named_checkout() {
+    let lab = Lab::new();
+    let (other, _) = lab.other_repo();
+    let original = lab.git(&lab.repo, &["show-ref"]);
+    let selected = lab.git(&other, &["show-ref"]);
+    notice(
+        lab.run(
+            Some(SELECTED),
+            &["resume", "other@topic", "--no-launch", "--as", "codex"],
+        ),
+        "target: bob/other@topic (via explicit arguments)",
+    );
+    let store = agit::domain::store::Store::at(lab.store.join("store"));
+    let installed = agit::domain::link::list(&store)
+        .into_iter()
+        .filter(|link| link.branch.as_deref() == Some("topic"))
+        .collect::<Vec<_>>();
+    assert_eq!(installed.len(), 1, "{installed:?}");
+    assert_eq!(installed[0].owner.as_deref(), Some("bob"));
+    assert_eq!(installed[0].agent.as_deref(), Some("other"));
+    assert_eq!(installed[0].source, "codex");
+    let suffix = format!("-{}.jsonl", installed[0].session_id);
+    let carriers = walkdir::WalkDir::new(lab.home.join(".codex/sessions"))
+        .into_iter()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry.file_type().is_file() && entry.file_name().to_string_lossy().ends_with(&suffix)
+        })
+        .map(walkdir::DirEntry::into_path)
+        .collect::<Vec<_>>();
+    assert_eq!(carriers.len(), 1, "{carriers:?}");
+    let native = fs::read_to_string(&carriers[0]).unwrap();
+    assert!(native.contains("OTHER-REPOSITORY"), "{native}");
+    assert!(!native.contains("SELECTED-SECOND"), "{native}");
+    assert_eq!(lab.git(&lab.repo, &["show-ref"]), original);
+    assert_eq!(lab.git(&other, &["show-ref"]), selected);
+}
+
+#[test]
+fn local_cherry_pick_sources_do_not_borrow_the_target_repository() {
+    let lab = Lab::new();
+    let (other, _) = lab.other_repo();
+    lab.git(&lab.repo, &["branch", "topic", "selected"]);
+    let other_refs = lab.git(&other, &["show-ref"]);
+    let newest = lab.git(&lab.repo, &["rev-parse", "newest"]);
+    success(lab.run(Some(SELECTED), &["cherry-pick", "other@topic#1"]));
+    let view = storage::materialize_at(lab.repo.root(), "selected", meta::VIEW_FILE).unwrap();
+    assert!(view.contains("OTHER-REPOSITORY"), "{view}");
+    assert!(view.contains("SELECTED-SECOND"), "{view}");
+    assert!(!view.contains("SELECTED-FIRST"), "{view}");
+    assert_eq!(lab.git(&other, &["show-ref"]), other_refs);
+    assert_eq!(lab.git(&lab.repo, &["rev-parse", "newest"]), newest);
+    assert_eq!(
+        lab.git(&lab.repo, &["rev-parse", "topic"]).trim(),
+        lab.selected_sha
+    );
+}
+
+#[test]
+fn local_revert_refs_select_the_named_repository_and_preserve_sibling_branches() {
+    for sibling in [false, true] {
+        let lab = Lab::new();
+        let (other, source_sha) = lab.other_repo();
+        lab.git(&lab.repo, &["branch", "topic", "selected"]);
+        let original = lab.git(&lab.repo, &["show-ref"]);
+        if sibling {
+            lab.git(&other, &["branch", "sibling", "topic"]);
+        }
+        let mut args = vec!["revert", "other@topic#1"];
+        if sibling {
+            args.extend(["--into", "sibling"]);
+        }
+        success(lab.run(Some(SELECTED), &args));
+        let target = if sibling { "sibling" } else { "topic" };
+        let view = storage::materialize_at(other.root(), target, meta::VIEW_FILE).unwrap();
+        let log = storage::materialize_at(other.root(), target, meta::LOG_FILE).unwrap();
+        assert!(!view.contains("OTHER-REPOSITORY"), "{view}");
+        assert!(log.contains("OTHER-REPOSITORY"), "{log}");
+        assert_eq!(lab.git(&lab.repo, &["show-ref"]), original);
+        if sibling {
+            assert_eq!(lab.git(&other, &["rev-parse", "topic"]).trim(), source_sha);
+        }
+    }
+}
+
+#[test]
+fn revert_rejects_foreign_repo_coordinates_before_changing_either_view() {
+    let lab = Lab::new();
+    let (other, _) = lab.other_repo();
+    lab.git(&lab.repo, &["branch", "topic", "selected"]);
+    let original = lab.git(&lab.repo, &["show-ref"]);
+    let selected = lab.git(&other, &["show-ref"]);
+    for flags in [
+        vec![],
+        vec!["--quiet"],
+        vec!["--json", "--json-version", "1"],
+        vec!["--json", "--json-version", "2"],
+    ] {
+        for targets in [
+            vec!["other@topic#1", "--into", SELECTED],
+            vec!["context@selected#2", "other@topic#1"],
+        ] {
+            let mut args = flags.clone();
+            args.push("revert");
+            args.extend(targets);
+            let output = lab.run(Some(SELECTED), &args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            let diagnostic = if flags.contains(&"--json") {
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["ok"], false);
+                assert_eq!(value["exit_code"], 2);
+                assert_eq!(value["result"]["format"], "empty");
+                value["diagnostics"]["stderr"].to_string()
+            } else {
+                assert!(output.stdout.is_empty(), "{output:?}");
+                String::from_utf8(output.stderr).unwrap()
+            };
+            assert!(diagnostic.contains("all revert references must belong"));
+            assert_eq!(lab.git(&lab.repo, &["show-ref"]), original);
+            assert_eq!(lab.git(&other, &["show-ref"]), selected);
+        }
+    }
+}
+
+#[test]
 fn mcp_subprocess_results_keep_the_tool_payload_without_cli_notices() {
     let lab = Lab::new();
     let rendered = notice(

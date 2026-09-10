@@ -107,6 +107,22 @@ behavior.
 
 ## Choose before adoption
 
+With `--link-only` or `--independent`, a native ID or prefix that matches no
+session returns exit code `3`. An ambiguous prefix requires selection and returns
+exit code `8`. Listing without an ID succeeds when there are no unadopted
+sessions. Human and JSON output use the same exit codes.
+
+The legacy `-n <name>` form requires a unique local checkout. Competing repo or
+`--onto` candidates return `8` without a terminal; a missing `--onto` base returns
+`3`. These checks precede adoption and privacy-copy creation. Once selected, the
+repo path and base commit are retained rather than resolved again from moving names.
+
+`--onto` selects a whole commit in that destination repository. A qualified ref must
+name the same repo; a bare repo qualifier must be locally unique. `@` requires an
+`AGIT_SESSION` in the same repo. Commit ancestry (`~n`) and a single turn (`#n`) are
+supported; event, range, and file selectors are rejected rather than widened to a
+whole commit.
+
 Without an explicit lineage decision, supply the full native ID, `--from`, and a
 qualified destination branch. A call without an ID can list unmanaged native
 identities and an explicit retry command; it does not adopt a discovered row. The command inspects only local evidence before

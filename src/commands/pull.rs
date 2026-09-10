@@ -44,7 +44,7 @@ pub fn run(args: Args) -> CmdResult {
     let _ = args.prune; // fetch already carries --prune; this flag is reserved for selective prune.
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (repo_arg, target_branch) = match args.repo.as_deref() {
+    let (mut repo_arg, target_branch) = match args.repo.as_deref() {
         Some(raw) => match split_pull_target(raw) {
             Ok(v) => v,
             Err(e) => {
@@ -57,6 +57,13 @@ pub fn run(args: Args) -> CmdResult {
     if target_branch.is_some() && (!args.branch.is_empty() || args.all) {
         ui::error("a branch in `<owner>/<repo>@<branch>` cannot be combined with `-b` or `--all`.");
         return Ok(ExitCode::Usage);
+    }
+    if let Some(name) = repo_arg.as_ref().filter(|name| !name.contains('/')) {
+        let Some(checkout) = super::clone::unique_checkout(name)? else {
+            ui::error(&format!("no local repo named `{name}` — write owner/repo."));
+            return Ok(ExitCode::Ref);
+        };
+        repo_arg = Some(checkout.slug());
     }
     let (owner, name, ctx_branch) = match resolve_targets(&repo_arg, &cwd) {
         Ok(v) => v,
@@ -217,13 +224,6 @@ fn split_pull_target(raw: &str) -> crate::Result<(Option<String>, Option<String>
     let repo = parsed
         .repo
         .ok_or_else(|| anyhow::anyhow!("pull target must name a repository"))?;
-    let repo = if repo.contains('/') {
-        repo
-    } else {
-        let owner = crate::infra::credentials::current_user()
-            .ok_or_else(|| anyhow::anyhow!("a bare repo target needs a signed-in owner"))?;
-        format!("{owner}/{repo}")
-    };
     let branch = match parsed.base.as_deref() {
         None => None,
         Some("@") => anyhow::bail!("pull target must name a branch explicitly"),

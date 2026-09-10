@@ -11,7 +11,7 @@
 //! agit import <session-id> --from <runtime> --into <owner>/photo@<branch>
 //! ```
 //!
-//! The version half calls [`super::commit::record`] directly — the same code path as
+//! The version half calls [`super::commit::record_at`] directly — the same code path as
 //! `agit commit`, so the two produce byte-identical snapshots.
 //!
 //! # By session id only, never a bulk import
@@ -122,11 +122,9 @@ pub fn run(args: Args) -> CmdResult {
     run_with_output(args, false)
 }
 
-/// An undecided import inspects before account refresh, storage migration or adoption.
+/// Target selection precedes storage migration and adoption.
 pub fn needs_readonly_startup(args: &Args) -> bool {
-    args.propose_lineage
-        || args.session.is_none()
-        || (!args.link_only && args.onto.is_none() && !args.independent)
+    args.propose_lineage || args.session.is_none() || !args.link_only
 }
 
 pub fn run_with_output(args: Args, json: bool) -> CmdResult {
@@ -185,26 +183,6 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
             lineage::Decision::Apply(selected) => accepted = Some(*selected),
         }
     }
-    if deferred_startup && accepted.is_none() {
-        if let Err(error) = super::migration::migrate_startup() {
-            ui::error(&format!("local storage preparation failed: {error:#}"));
-            return Ok(ExitCode::Precondition);
-        }
-        if let Some(before) = same_claim.as_ref() {
-            let store = Store::at(std::env::current_dir()?.join(config::store_root()?));
-            let current = link::get(&store, &before.source, &before.session_id);
-            if !current.as_ref().is_some_and(|current| {
-                current.is_active()
-                    && current.owner == before.owner
-                    && current.agent == before.agent
-                    && current.branch == before.branch
-            }) {
-                ui::error("the session claim changed before its existing import could continue");
-                return Ok(ExitCode::Policy);
-            }
-            same_claim = current;
-        }
-    }
 
     // ── 1. Ask the preconditions first, then touch the disk ──
     //
@@ -232,7 +210,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
 
     let store = match &accepted {
         Some(selected) => selected.store(),
-        None => Store::open_or_init()?,
+        None => Store::at(config::store_root()?),
     };
 
     // ── 2. Find that session ──
@@ -258,31 +236,26 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
         Pick::Explained(code) => return Ok(code),
     };
 
-    // ── 2.5 --privacy: swap in a redacted copy; no byte of the original enters history ──
-    let found = if args.privacy {
-        match scrub_copy(&found)? {
-            Some(f) => f,
-            None => return Ok(ExitCode::Usage),
-        }
-    } else {
-        found
-    };
-
     // ── 3. The name ──
     //
     // An already-adopted session reuses the agent it is managed under; otherwise the name must be
     // given explicitly. **Never guess**: a name chosen automatically silently decides which
     // lineage this memory lands on, and that kind of mistake is not noticed right away.
-    let existing = if let Some(selected) = &accepted {
+    let mut existing = if args.privacy {
+        None
+    } else if let Some(selected) = &accepted {
         selected.initial_link()
     } else {
-        same_claim.or_else(|| link::get(&store, found.runtime, &found.session_id))
+        same_claim
+            .clone()
+            .or_else(|| link::get(&store, found.runtime, &found.session_id))
     };
     let destination = args
         .repo
         .as_deref()
         .map(crate::commands::target::parse)
         .transpose()?;
+    let mut creation_notice = None;
     if let Some(dest) = &destination {
         let Some(repo) = dest.repo.as_deref() else {
             ui::error("import destination must name a repository: `<owner>/<repo>@<branch>`.");
@@ -317,12 +290,9 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
         match super::writability(me, &dest_owner, &dest_name)? {
             super::Writability::Mine | super::Writability::Granted => {}
             super::Writability::Creatable => {
-                println!(
-                    "{}",
-                    ui::dim(&format!(
-                        "  {repo} isn’t on the hub yet — the first push creates it under the {dest_owner} organization"
-                    ))
-                );
+                creation_notice = Some(format!(
+                    "  {repo} isn’t on the hub yet — the first push creates it under the {dest_owner} organization"
+                ));
             }
             super::Writability::ReadOnly => {
                 ui::error(&format!(
@@ -377,6 +347,78 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
 
+    let prepared = if args.link_only {
+        None
+    } else {
+        let author = owner.as_deref().unwrap();
+        let namespace = destination
+            .as_ref()
+            .and_then(|target| target.repo.as_deref())
+            .and_then(|slug| super::parse_slug(slug).ok().map(|(owner, _)| owner))
+            .unwrap_or_else(|| author.to_owned());
+        let selected_link = existing
+            .clone()
+            .unwrap_or_else(|| Link::new(found.runtime, &found.session_id, None));
+        match prepare_target(
+            &selected_link,
+            agent.as_deref().unwrap(),
+            &namespace,
+            &args,
+            destination.as_ref(),
+            accepted.as_ref(),
+        )? {
+            TargetSelection::Ready(target) => Some(target),
+            TargetSelection::Refused(code) => return Ok(code),
+        }
+    };
+
+    if deferred_startup && accepted.is_none() {
+        if let Err(error) = super::migration::migrate_startup() {
+            ui::error(&format!("local storage preparation failed: {error:#}"));
+            return Ok(ExitCode::Precondition);
+        }
+        if let Some(before) = same_claim.as_ref() {
+            let store = Store::at(std::env::current_dir()?.join(config::store_root()?));
+            let current = link::get(&store, &before.source, &before.session_id);
+            if !current.as_ref().is_some_and(|current| {
+                current.is_active()
+                    && current.owner == before.owner
+                    && current.agent == before.agent
+                    && current.branch == before.branch
+            }) {
+                ui::error("the session claim changed before its existing import could continue");
+                return Ok(ExitCode::Policy);
+            }
+            existing = current;
+        }
+    }
+
+    if let Some(target) = &prepared
+        && accepted.is_none()
+    {
+        target.verify()?;
+    }
+
+    // ── --privacy: swap in a redacted copy; no byte of the original enters history ──
+    let found = if args.privacy {
+        match scrub_copy(&found)? {
+            Some(f) => f,
+            None => return Ok(ExitCode::Usage),
+        }
+    } else {
+        found
+    };
+
+    if let Some(target) = &prepared
+        && accepted.is_none()
+    {
+        target.verify()?;
+    }
+
+    if let Some(notice) = creation_notice {
+        println!("{}", ui::dim(&notice));
+    }
+
     // ── 4. Adoption: write the link ──
     let lk = match &accepted {
         Some(selected) => selected.link(),
@@ -398,22 +440,15 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
     // ── 5. Record the opening version (turn-by-turn settlement, the `agit commit` path) ──
     let agent = agent.unwrap();
     let owner = owner.unwrap();
-    // The destination decides which namespace the repo lands in (an org repo is `<org>/<name>`);
-    // the author identity is always the signed-in account. The two coincide only in your own repo.
-    let namespace = destination
-        .as_ref()
-        .and_then(|t| t.repo.as_deref())
-        .and_then(|r| super::parse_slug(r).ok().map(|(o, _)| o))
-        .unwrap_or_else(|| owner.clone());
+    let prepared = prepared.unwrap();
+    let namespace = prepared.namespace.clone();
     let mut lk = lk;
     let landing = match place_on_branch(
         &mut lk,
         &store,
         &agent,
-        &namespace,
         &owner,
-        &args,
-        destination.as_ref(),
+        &prepared,
         accepted.as_ref(),
     )? {
         Placed::Ready(l) => *l,
@@ -422,7 +457,8 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
     println!();
     // Settlement that did not succeed = this import did not happen: put the ref that was created
     // and the checkout that was switched back the way they were.
-    let outcome = super::commit::record(&store, lk, &agent, &namespace, &owner);
+    let outcome =
+        super::commit::record_at(&store, lk, &agent, &namespace, &owner, landing.repo_dir());
     if !matches!(outcome, Ok(ExitCode::Ok)) {
         landing.rollback();
     }
@@ -593,65 +629,193 @@ pub(super) enum Placed {
     Refused(ExitCode),
 }
 
-/// Decide which branch this import lands on, and create it (PRD: import claiming an existing
-/// transcript creates a branch; `main` is the file line, and a session never lands on it).
-///
-/// Every check runs before any write: anything uncertain is asked before a ref or a checkout is
-/// touched, and the failure that remains (settlement itself refused) is cleaned up by
-/// [`Landing::rollback`].
-#[allow(clippy::too_many_arguments)]
-fn place_on_branch(
-    lk: &mut Link,
-    store: &Store,
+/// A legacy destination is selected without creating a link, a privacy copy or a repository.
+struct PreparedTarget {
+    namespace: String,
+    repo_dir: PathBuf,
+    branch: String,
+    onto_commit: Option<String>,
+    repository: Option<(lineage::PathIdentity, lineage::PathIdentity)>,
+}
+
+impl PreparedTarget {
+    fn verify(&self) -> crate::Result<()> {
+        lineage::verify_git_routing()?;
+        if let Some((root, common)) = &self.repository {
+            root.verify()?;
+            common.verify()?;
+            let repo = Repo::open(&self.repo_dir)
+                .ok_or_else(|| anyhow::anyhow!("the selected import repository disappeared"))?
+                .local_objects_only();
+            let common_dir = repo.common_dir_with_policy(repo::ReadPolicy::LocalOnly)?;
+            common.verify_at(&common_dir)?;
+            match std::fs::metadata(common_dir.join("info/grafts")) {
+                Ok(metadata) => anyhow::ensure!(
+                    metadata.len() == 0,
+                    "remove Git graft overlays before applying an import target"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let (status, toplevel, _) = repo.git_status_local(&["rev-parse", "--show-toplevel"])?;
+            anyhow::ensure!(
+                status == Some(0),
+                "the selected import checkout is unreadable"
+            );
+            root.verify_at(Path::new(&toplevel))?;
+            if let Some(oid) = &self.onto_commit {
+                let (status, current, _) = repo.git_status_local(&[
+                    "rev-parse",
+                    "--verify",
+                    &format!("{oid}^{{commit}}"),
+                ])?;
+                anyhow::ensure!(
+                    status == Some(0) && current == *oid,
+                    "the selected import base is no longer a readable commit"
+                );
+            }
+        } else {
+            anyhow::ensure!(
+                std::fs::symlink_metadata(&self.repo_dir)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "the import destination appeared after it was selected"
+            );
+        }
+        Ok(())
+    }
+}
+
+enum TargetSelection {
+    Ready(Box<PreparedTarget>),
+    Refused(ExitCode),
+}
+
+fn prepare_target(
+    lk: &Link,
     agent: &str,
     owner: &str,
-    author: &str,
     args: &Args,
     destination: Option<&crate::commands::target::Target>,
     accepted: Option<&lineage::Accepted>,
-) -> crate::Result<Placed> {
-    // An explicitly named destination is that directory; no searching by name for a same-named
-    // checkout in another namespace. When a personal repo and an org repo share a name, guessing
-    // picks the other one.
-    let repo_dir = if let Some(selected) = accepted {
-        selected.repo_dir().to_owned()
+) -> crate::Result<TargetSelection> {
+    let (repo_dir, namespace) = if let Some(selected) = accepted {
+        (selected.repo_dir().to_owned(), owner.to_owned())
     } else if destination.is_some() {
-        crate::infra::config::repo_dir(owner, agent)?
+        (config::repo_dir(owner, agent)?, owner.to_owned())
     } else {
-        super::clone::checkout_for_recording(owner, agent)?
+        match super::clone::checkouts_named(owner, agent)?.as_slice() {
+            [] => (config::repo_dir(owner, agent)?, owner.to_owned()),
+            [only] => (only.path.clone(), only.owner.clone()),
+            many => {
+                let candidates = many
+                    .iter()
+                    .map(|checkout| format!("  {}", checkout.slug()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(crate::domain::refs::Ambiguous(format!(
+                    "`{agent}` names multiple local repos — choose --into <owner/repo@branch>:\n{candidates}"
+                )).into());
+            }
+        }
     };
-    let repo = if accepted.is_some() {
-        Repo::at(&repo_dir)
+    let repo = Repo::at(&repo_dir).local_objects_only();
+    let repository = if accepted.is_some() {
+        None
     } else {
-        Repo::open_or_init(&repo_dir)?
+        lineage::verify_git_routing()?;
+        if Repo::open(&repo_dir).is_some() {
+            Some((
+                lineage::PathIdentity::capture(&repo_dir, true)?,
+                lineage::PathIdentity::capture(
+                    &repo.common_dir_with_policy(repo::ReadPolicy::LocalOnly)?,
+                    true,
+                )?,
+            ))
+        } else {
+            anyhow::ensure!(
+                std::fs::symlink_metadata(&repo_dir)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                "the destination is not an absent or readable repository"
+            );
+            None
+        }
     };
-
-    // --onto: the lineage attachment point. The point must exist; the new branch grows off it
-    // (identity is inherited, not claimed again).
     let onto_commit = if accepted.is_some() {
         args.onto.clone()
-    } else if let Some(o) = &args.onto {
-        let spec = crate::domain::refs::parse(o)?;
-        let spec = match crate::commands::context::substitute_at(spec) {
-            Ok(spec) => spec,
-            Err(e) => {
-                ui::error(&format!("--onto `{o}` failed to resolve: {e:#}"));
-                return Ok(Placed::Refused(ExitCode::Ref));
+    } else if let Some(onto) = &args.onto {
+        use crate::domain::refs::{Base, RepoSel, Tail};
+        let mut spec = crate::domain::refs::parse(onto)?;
+        if matches!(
+            spec.tail,
+            Tail::Event { .. } | Tail::Range { .. } | Tail::Path(_)
+        ) {
+            ui::error("--onto requires a whole commit, not an event, turn range, or file path");
+            return Ok(TargetSelection::Refused(ExitCode::Usage));
+        }
+        let slug = format!("{namespace}/{agent}");
+        let same_repo = match &spec.repo {
+            RepoSel::Context => true,
+            RepoSel::Slug(owner, name) => owner == &namespace && name == agent,
+            RepoSel::Local(name) if name == agent => {
+                match super::clone::checkouts_named(&namespace, name)?.as_slice() {
+                    [only] => only.owner == namespace && only.path == repo_dir,
+                    [] => false,
+                    many => {
+                        let candidates = many
+                            .iter()
+                            .map(|checkout| format!("  {}", checkout.slug()))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Err(crate::domain::refs::Ambiguous(format!(
+                            "--onto `{onto}` names multiple local repos — qualify it as {slug}@<ref>:\n{candidates}"
+                        )).into());
+                    }
+                }
             }
+            RepoSel::Local(_) => false,
         };
-        let resolved = match crate::domain::refs::resolve(&repo, &spec) {
-            Ok(r) => r,
-            Err(e) => {
-                ui::error(&format!("--onto `{o}` failed to resolve: {e:#}"));
-                return Ok(Placed::Refused(ExitCode::Ref));
+        if !same_repo {
+            ui::error(&format!(
+                "--onto `{onto}` must refer to the selected destination repository `{slug}`"
+            ));
+            return Ok(TargetSelection::Refused(ExitCode::Usage));
+        }
+        if spec.base == Base::At {
+            let context = match super::context::at_context() {
+                Ok(context) => context,
+                Err(error) => {
+                    ui::error(&format!("--onto `{onto}` failed to resolve: {error:#}"));
+                    return Ok(TargetSelection::Refused(ExitCode::Ref));
+                }
+            };
+            if context.repo != slug {
+                ui::error(&format!(
+                    "--onto `{onto}` selects session repository `{}`, not the destination `{slug}`",
+                    context.repo
+                ));
+                return Ok(TargetSelection::Refused(ExitCode::Usage));
             }
-        };
-        Some(resolved.sha)
+            spec.base = Base::SessionBranch(context.branch);
+        }
+        if repository.is_none() {
+            ui::error(&format!(
+                "--onto `{onto}` requires an existing destination repository"
+            ));
+            return Ok(TargetSelection::Refused(ExitCode::Ref));
+        }
+        match crate::domain::refs::resolve(&repo, &spec) {
+            Ok(resolved) => Some(resolved.sha),
+            Err(error) if error.is::<crate::domain::refs::Ambiguous>() => {
+                return Err(error.context(format!("cannot select --onto `{onto}`")));
+            }
+            Err(error) => {
+                ui::error(&format!("--onto `{onto}` failed to resolve: {error:#}"));
+                return Ok(TargetSelection::Refused(ExitCode::Ref));
+            }
+        }
     } else {
         None
     };
-
-    // The target branch name.
     let cur = if accepted.is_some() {
         None
     } else {
@@ -659,44 +823,80 @@ fn place_on_branch(
     };
     let cur_is_session = cur
         .as_deref()
-        .and_then(|b| crate::domain::meta::read_at_ref(&repo, &format!("refs/heads/{b}")))
-        .is_some_and(|m| m.is_session_line());
-    let target_branch = destination.and_then(|t| match t.base.as_deref() {
+        .and_then(|branch| crate::domain::meta::read_at_ref(&repo, &format!("refs/heads/{branch}")))
+        .is_some_and(|meta| meta.is_session_line());
+    let target_branch = destination.and_then(|target| match target.base.as_deref() {
         Some("@") | None => None,
-        Some(b) => Some(b.to_string()),
+        Some(branch) => Some(branch.to_owned()),
     });
     let branch = match target_branch.as_ref().or(args.branch.as_ref()) {
-        Some(b) => b.clone(),
+        Some(branch) => branch.clone(),
+        None if onto_commit.is_none() && cur_is_session => cur.unwrap(),
         None => {
-            if onto_commit.is_none() && cur_is_session {
-                cur.clone().unwrap()
-            } else {
-                // A fresh claim requires an explicit -b: a guessed name is forgotten by
-                // tomorrow, and it is what goes into the sharing link. The `main` file line is
-                // even less something to pick on the user's behalf.
-                let suggested = format!("{}-{}", agent, crate::domain::link::short(&lk.session_id));
-                ui::error("claiming a fresh session line needs -b <branch>.");
-                ui::hint(&format!(
-                    "e.g. `agit import {} --from {} --into {owner}/{agent}@{suggested}`",
-                    ui::session::shell_arg(&lk.session_id),
-                    ui::session::shell_arg(&lk.source)
-                ));
-                return Ok(Placed::Refused(ExitCode::Usage));
-            }
+            let suggested = format!("{}-{}", agent, link::short(&lk.session_id));
+            ui::error("claiming a fresh session line needs -b <branch>.");
+            ui::hint(&format!(
+                "e.g. `agit import {} --from {} --into {namespace}/{agent}@{suggested}`",
+                ui::session::shell_arg(&lk.session_id),
+                ui::session::shell_arg(&lk.source)
+            ));
+            return Ok(TargetSelection::Refused(ExitCode::Usage));
         }
     };
+    // Raw ref syntax and branch-only rules must pass before any local writes; raw validation
+    // also prevents branch shorthand from being expanded against the caller's checkout.
+    let validator = Repo::at(std::env::current_dir()?);
+    let (status, _, _) =
+        validator.git_status_local(&["check-ref-format", &format!("refs/heads/{branch}")])?;
+    if status != Some(0) {
+        ui::error("the destination session branch is not a valid Git ref");
+        return Ok(TargetSelection::Refused(ExitCode::Usage));
+    }
+    let (status, _, _) = validator.git_status_local(&["check-ref-format", "--branch", &branch])?;
+    if status != Some(0) {
+        ui::error("the destination session branch is not a valid Git ref for a branch");
+        return Ok(TargetSelection::Refused(ExitCode::Usage));
+    }
+    if (accepted.is_some() || !repo.has_ref(&format!("refs/heads/{branch}")))
+        && let Err(error) = repo::valid_branch_name(&branch)
+    {
+        ui::error(&format!("{error:#}"));
+        return Ok(TargetSelection::Refused(ExitCode::Usage));
+    }
+    let selected = PreparedTarget {
+        namespace,
+        repo_dir,
+        branch,
+        onto_commit,
+        repository,
+    };
+    if accepted.is_none() {
+        selected.verify()?;
+    }
+    Ok(TargetSelection::Ready(Box::new(selected)))
+}
 
+/// Placement consumes the selected identity; mutable names are not resolved again after adoption.
+fn place_on_branch(
+    lk: &mut Link,
+    store: &Store,
+    agent: &str,
+    author: &str,
+    selected: &PreparedTarget,
+    accepted: Option<&lineage::Accepted>,
+) -> crate::Result<Placed> {
     place_resolved_branch(
         lk,
         store,
         agent,
-        owner,
+        &selected.namespace,
         author,
-        repo_dir,
-        repo,
-        branch,
-        onto_commit,
+        selected.repo_dir.clone(),
+        Repo::at(&selected.repo_dir),
+        selected.branch.clone(),
+        selected.onto_commit.clone(),
         accepted,
+        Some(selected),
     )
 }
 
@@ -730,6 +930,7 @@ pub(super) fn place_legacy_commit_branch(
         branch,
         None,
         None,
+        None,
     )
 }
 
@@ -746,6 +947,7 @@ fn place_resolved_branch(
     branch: String,
     onto_commit: Option<String>,
     accepted: Option<&lineage::Accepted>,
+    prepared: Option<&PreparedTarget>,
 ) -> crate::Result<Placed> {
     // Only the name of a branch about to be **created** goes through the prefix check: an
     // existing branch is a fact on the ground, and stopping it only leaves a line that already
@@ -796,6 +998,7 @@ fn place_resolved_branch(
         branch,
         onto_commit,
         accepted,
+        prepared,
     )
 }
 
@@ -815,6 +1018,7 @@ fn birth_session_branch(
     branch: String,
     onto_commit: Option<String>,
     accepted: Option<&lineage::Accepted>,
+    prepared: Option<&PreparedTarget>,
 ) -> crate::Result<Placed> {
     // Import and materialization both create active branch claims. Serialize their branch/ref and
     // link updates under the same key so a concurrent `run --no-launch` cannot observe an empty
@@ -827,6 +1031,15 @@ fn birth_session_branch(
     {
         ui::error(&format!(
             "the import choice is stale: {error:#}; inspect and choose again"
+        ));
+        return Ok(Placed::Refused(ExitCode::Policy));
+    }
+    if accepted.is_none()
+        && let Some(selected) = prepared
+        && let Err(error) = selected.verify()
+    {
+        ui::error(&format!(
+            "the import target changed before placement: {error:#}"
         ));
         return Ok(Placed::Refused(ExitCode::Policy));
     }
@@ -853,7 +1066,7 @@ fn birth_session_branch(
             lk.cwd = discovered_cwd;
         }
     }
-    let repo = if accepted.is_some() {
+    let repo = if accepted.is_some() || prepared.is_some() {
         Repo::open_or_init(&repo_dir)?
     } else {
         repo
@@ -1188,7 +1401,7 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
             ui::hint(
                 "`agit import -n <name>` without a session argument lists this repo’s candidates",
             );
-            Ok(Pick::Explained(ExitCode::Failure))
+            Ok(Pick::Explained(ExitCode::Ref))
         }
         1 => Ok(Pick::One(found.into_iter().next().unwrap())),
         n => {
@@ -2062,6 +2275,7 @@ mod tests {
                 "recovery".into(),
                 None,
                 None,
+                None,
             );
             assert!(matches!(result.unwrap(), Placed::Refused(ExitCode::Policy)));
             if malformed {
@@ -2075,6 +2289,199 @@ mod tests {
             assert_eq!(lk.owner, None);
             assert_eq!(lk.agent, None);
             assert_eq!(lk.branch, None);
+        }
+        println!("{COMPLETE}");
+    }
+
+    /// A selected checkout and commit survive name drift; locked placement still rejects lost evidence.
+    #[test]
+    fn prepared_target_is_consumed_and_revalidated_under_the_claim_lock() {
+        const CHILD: &str = "AGIT_TEST_IMPORT_TARGET_CHILD";
+        const COMPLETE: &str = "prepared target controls completed";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact", "commands::import::tests::prepared_target_is_consumed_and_revalidated_under_the_claim_lock", "--nocapture",
+            ]).env_clear();
+            for key in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "ComSpec"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            let output = command
+                .env(CHILD, "1")
+                .env("HOME", isolated.path())
+                .env("USERPROFILE", isolated.path())
+                .env("AGIT_HOME", isolated.path().join("agit"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", isolated.path().join("absent-config"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETE));
+            return;
+        }
+        fn repository(owner: &str, name: &str) -> Repo {
+            let repo = Repo::init(&config::repo_dir(owner, name).unwrap()).unwrap();
+            repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+            meta::write(repo.root(), &Meta::new_file_line()).unwrap();
+            repo.add_all().unwrap();
+            repo.commit("synthetic file line").unwrap();
+            repo
+        }
+        let store = Store::open_or_init().unwrap();
+        for shape in ["stable", "object", "claim", "repository", "grafts"] {
+            let repo = repository("alice", shape);
+            let oid = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+            repo.git(&["branch", "base", &oid]).unwrap();
+            let found = Found {
+                runtime: "codex",
+                session_id: shape.into(),
+                cwd: None,
+            };
+            let mut lk = Link::new(found.runtime, &found.session_id, None);
+            let args = W::parse_from([
+                "x", shape, "--from", "codex", "-n", shape, "-b", "selected", "--onto", "base",
+            ])
+            .a;
+            let TargetSelection::Ready(selected) =
+                prepare_target(&lk, shape, "alice", &args, None, None).unwrap()
+            else {
+                panic!("the explicit base must be selectable");
+            };
+            let repo_dir = selected.repo_dir.clone();
+            assert_eq!(selected.onto_commit.as_deref(), Some(oid.as_str()));
+            if shape == "stable" {
+                let other = repository("bob", shape);
+                let other_refs = other.git(&["show-ref"]).unwrap();
+                let tree = repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+                let advanced = repo
+                    .git(&["commit-tree", &tree, "-p", &oid, "-m", "advanced name"])
+                    .unwrap();
+                repo.git(&["update-ref", "refs/heads/base", &advanced])
+                    .unwrap();
+                selected.verify().unwrap();
+                lk = attach(&store, &found, None).unwrap();
+                let placed =
+                    place_on_branch(&mut lk, &store, shape, "alice", &selected, None).unwrap();
+                assert!(matches!(placed, Placed::Ready(_)));
+                assert_eq!(repo.git(&["rev-parse", "selected^"]).unwrap().trim(), oid);
+                assert_eq!(other.git(&["show-ref"]).unwrap(), other_refs);
+                assert_eq!(
+                    (lk.owner.as_deref(), lk.agent.as_deref()),
+                    (Some("alice"), Some(shape))
+                );
+                continue;
+            }
+            lk = attach(&store, &found, None).unwrap();
+            let guard = link::lock(&store, found.runtime, &found.session_id).unwrap();
+            let worker_store = store.clone();
+            let worker = std::thread::spawn(move || {
+                place_on_branch(&mut lk, &worker_store, shape, "alice", &selected, None)
+            });
+            use fs2::FileExt as _;
+            use sha2::Digest as _;
+            let mut digest = sha2::Sha256::new();
+            digest.update(format!("alice/{shape}").as_bytes());
+            digest.update([0]);
+            digest.update(b"selected");
+            let lock_path = store
+                .root()
+                .join(".locks/branches")
+                .join(format!("{}.lock", hex::encode(digest.finalize())));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Ok(file) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                {
+                    match file.try_lock_exclusive() {
+                        Ok(()) => fs2::FileExt::unlock(&file).unwrap(),
+                        Err(error)
+                            if error.raw_os_error()
+                                == fs2::lock_contended_error().raw_os_error() =>
+                        {
+                            break;
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+                assert!(
+                    !worker.is_finished(),
+                    "placement completed without the held claim lock"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "placement did not reach its branch lock"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let path = link::link_path(&store, found.runtime, &found.session_id);
+            match shape {
+                "object" => {
+                    std::fs::remove_file(
+                        repo_dir
+                            .join(".git/objects")
+                            .join(&oid[..2])
+                            .join(&oid[2..]),
+                    )
+                    .unwrap();
+                }
+                "claim" => {
+                    let mut current = link::get(&store, found.runtime, &found.session_id).unwrap();
+                    current.owner = Some("bob".into());
+                    current.agent = Some("other".into());
+                    current.branch = Some("continued".into());
+                    link::write(&store, &current).unwrap();
+                }
+                "repository" => {
+                    match std::fs::rename(&repo_dir, repo_dir.with_extension("retained")) {
+                        Ok(()) => {}
+                        #[cfg(windows)]
+                        Err(error) if error.raw_os_error() == Some(5) => {
+                            // Open child handles can fence a Windows directory rename. Replacing
+                            // its leaf Git directory still changes the selected repository identity.
+                            assert!(repo_dir.is_dir());
+                            assert!(!repo_dir.with_extension("retained").exists());
+                            std::fs::rename(
+                                repo_dir.join(".git"),
+                                repo_dir.with_extension("retained-git"),
+                            )
+                            .unwrap();
+                        }
+                        Err(error) => panic!("cannot replace the selected repository: {error}"),
+                    }
+                    repository("alice", shape);
+                }
+                "grafts" => {
+                    std::fs::write(repo_dir.join(".git/info/grafts"), format!("{oid}\n")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before_link = std::fs::read(&path).unwrap();
+            let current_repo = Repo::at(&repo_dir);
+            let git_image = || {
+                walkdir::WalkDir::new(repo_dir.join(".git"))
+                    .into_iter()
+                    .map(|entry| entry.unwrap())
+                    .filter(|entry| entry.file_type().is_file())
+                    .map(|entry| {
+                        (
+                            entry.path().to_owned(),
+                            std::fs::read(entry.path()).unwrap(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before_git = git_image();
+            drop(guard);
+            let outcome = worker.join().unwrap().unwrap();
+            assert!(matches!(outcome, Placed::Refused(ExitCode::Policy)));
+            assert_eq!(std::fs::read(path).unwrap(), before_link);
+            assert_eq!(git_image(), before_git);
+            assert!(!current_repo.has_ref("refs/heads/selected"));
         }
         println!("{COMPLETE}");
     }
@@ -2179,6 +2586,7 @@ mod tests {
             "work".into(),
             Some(side),
             None,
+            None,
         )
         .unwrap();
         assert!(matches!(placed, Placed::Refused(ExitCode::Policy)));
@@ -2262,6 +2670,7 @@ mod tests {
             repo,
             "replay".into(),
             Some(frozen.clone()),
+            None,
             None,
         )
         .unwrap();

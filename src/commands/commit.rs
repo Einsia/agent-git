@@ -3427,19 +3427,34 @@ fn locate(store: &Store, sel: &str) -> crate::Result<Located> {
 /// the latter's name. When the link records a namespace, that is the directory — no guessing by
 /// name.
 pub fn record(store: &Store, lk: Link, agent: &str, owner: &str, author: &str) -> CmdResult {
-    let branch = lk
-        .branch
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("the imported session has no explicit branch claim"))?;
+    if lk.branch.is_none() {
+        anyhow::bail!("the imported session has no explicit branch claim");
+    }
     let repo_dir = if lk.owner.is_some() {
         crate::infra::config::repo_dir(owner, agent)?
     } else {
         super::clone::checkout_for_recording(owner, agent)?
     };
+    record_at(store, lk, agent, owner, author, &repo_dir)
+}
+
+/// Import settlement uses the repository selected before its adoption writes.
+pub(super) fn record_at(
+    store: &Store,
+    lk: Link,
+    agent: &str,
+    owner: &str,
+    author: &str,
+    repo_dir: &Path,
+) -> CmdResult {
+    let branch = lk
+        .branch
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("the imported session has no explicit branch claim"))?;
     let slug = format!("{owner}/{agent}");
     settle(
         store,
-        &repo_dir,
+        repo_dir,
         &slug,
         &branch,
         lk,

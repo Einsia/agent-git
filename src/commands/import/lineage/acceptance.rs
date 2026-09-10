@@ -261,7 +261,7 @@ fn native_cwd(source: &native_snapshot::Source, bytes: &[u8]) -> crate::Result<O
     Ok(None)
 }
 
-struct PathIdentity {
+pub(in crate::commands::import) struct PathIdentity {
     path: PathBuf,
     canonical: PathBuf,
     handle: same_file::Handle,
@@ -269,7 +269,10 @@ struct PathIdentity {
 }
 
 impl PathIdentity {
-    fn capture(path: &Path, directory: bool) -> crate::Result<Self> {
+    pub(in crate::commands::import) fn capture(
+        path: &Path,
+        directory: bool,
+    ) -> crate::Result<Self> {
         let metadata = std::fs::symlink_metadata(path)?;
         ensure!(
             if directory {
@@ -329,8 +332,12 @@ impl PathIdentity {
         })
     }
 
-    fn verify(&self) -> crate::Result<()> {
-        let current = Self::capture(&self.path, self.directory)?;
+    pub(in crate::commands::import) fn verify(&self) -> crate::Result<()> {
+        self.verify_at(&self.path)
+    }
+
+    pub(in crate::commands::import) fn verify_at(&self, path: &Path) -> crate::Result<()> {
+        let current = Self::capture(path, self.directory)?;
         ensure!(
             self.canonical == current.canonical && self.handle == current.handle,
             "the selected filesystem source was replaced"
@@ -363,6 +370,30 @@ fn branch_tip(repo: &Repo, branch: &str) -> crate::Result<Option<String>> {
         Some(1) => Ok(None),
         _ => anyhow::bail!("the destination branch could not be inspected"),
     }
+}
+
+pub(in crate::commands::import) fn verify_git_routing() -> crate::Result<()> {
+    // Observation ignores inherited Git overrides; ordinary application must target the same repository.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_GRAFT_FILE",
+    ] {
+        ensure!(
+            std::env::var_os(key).is_none(),
+            "unset {key} before applying a lineage choice"
+        );
+    }
+    Ok(())
 }
 
 pub(super) struct Snapshot {
@@ -460,26 +491,7 @@ impl Snapshot {
     }
 
     fn verify(&self, candidate: Option<&import_lineage::Candidate>) -> crate::Result<()> {
-        // Observation ignores inherited Git overrides; ordinary application must target the same repository.
-        for key in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_NAMESPACE",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_PARAMETERS",
-            "GIT_REPLACE_REF_BASE",
-            "GIT_SHALLOW_FILE",
-            "GIT_GRAFT_FILE",
-        ] {
-            ensure!(
-                std::env::var_os(key).is_none(),
-                "unset {key} before applying a lineage choice"
-            );
-        }
+        verify_git_routing()?;
         ensure!(
             std::env::current_dir()? == self.cwd && config::hub_url() == self.hub,
             "the import routing changed after the choice was prepared"

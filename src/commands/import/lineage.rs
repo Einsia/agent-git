@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 mod acceptance;
-pub(super) use acceptance::Accepted;
+pub(super) use acceptance::{Accepted, PathIdentity, verify_git_routing};
 
 const MAX_LINK_BYTES: u64 = 64 * 1024;
 

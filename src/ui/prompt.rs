@@ -14,7 +14,7 @@ use crate::Result;
 use dialoguer::{Confirm, Input, Password, Select};
 use std::io::IsTerminal;
 
-fn interactive() -> bool {
+pub(crate) fn interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 

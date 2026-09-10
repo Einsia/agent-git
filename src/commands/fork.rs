@@ -72,6 +72,9 @@ pub fn resolve_base(source: &str, cwd: &std::path::Path) -> crate::Result<Option
             slug,
             resolved,
         })),
+        Err(e) if e.is::<refs::Ambiguous>() => {
+            Err(e.context(format!("failed to resolve `{source}`")))
+        }
         Err(e) => {
             ui::error(&format!("failed to resolve `{source}`: {e:#}"));
             Ok(None)
@@ -98,30 +101,13 @@ fn open_source_repo(
                 }
             }
         }
-        refs::RepoSel::Local(name) => {
-            let me = crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
-            let found = super::clone::checkouts_named(&me, name)?;
-            match found.as_slice() {
-                [only] => Ok(Some((Repo::at(&only.path), only.slug()))),
-                [] => {
-                    ui::error(&format!("no local repo named `{name}`."));
-                    ui::hint(&format!(
-                        "`agit repo list` shows what’s local; or write the full owner/{name}"
-                    ));
-                    Ok(None)
-                }
-                many => {
-                    ui::error(&format!(
-                        "`{name}` exists {} times locally — write the full form:",
-                        many.len()
-                    ));
-                    for c in many {
-                        eprintln!("  {}", c.slug());
-                    }
-                    Ok(None)
-                }
+        refs::RepoSel::Local(name) => match super::clone::unique_checkout(name)? {
+            Some(checkout) => Ok(Some((Repo::at(&checkout.path), checkout.slug()))),
+            None => {
+                ui::error(&format!("no local repo named `{name}` — write owner/repo."));
+                Ok(None)
             }
-        }
+        },
         refs::RepoSel::Context => {
             let ctx = match super::context::resolve(cwd) {
                 Ok(c) => c,

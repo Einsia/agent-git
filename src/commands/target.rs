@@ -23,6 +23,31 @@ pub fn parse(input: &str) -> Result<Target> {
     Ok(from_spec(spec))
 }
 
+#[derive(Debug)]
+pub(crate) struct MissingLocalRepo(String);
+
+impl std::fmt::Display for MissingLocalRepo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "no local repo named `{}` — write owner/repo.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for MissingLocalRepo {}
+
+/// An explicit local qualifier must identify one checkout before any context is substituted.
+pub(crate) fn resolve_local_repo(mut spec: RefSpec) -> Result<RefSpec> {
+    if let RepoSel::Local(name) = &spec.repo {
+        let checkout =
+            super::clone::unique_checkout(name)?.ok_or_else(|| MissingLocalRepo(name.clone()))?;
+        spec.repo = RepoSel::Slug(checkout.owner, checkout.name);
+    }
+    Ok(spec)
+}
+
 /// Parse a ref that is already scoped to a selected repository.
 ///
 /// A bare ref may contain `/` (`topic/foo`), which the public grammar normally

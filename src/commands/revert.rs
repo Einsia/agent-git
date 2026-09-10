@@ -32,15 +32,15 @@ pub struct Args {
 /// When the ref itself spells out `owner/repo@branch`, that branch is where it lands (`--into`
 /// with a bare branch name still takes the repo from the ref) — dropped events land on the same
 /// line they live on, so there is no need to ask who owns this directory.
-fn target_from_refs(refs_: &[String], into: Option<&str>) -> Option<(String, String)> {
-    let spec = refs::parse(refs_.first()?).ok()?;
-    let refs::RepoSel::Slug(o, n) = spec.repo else {
+fn target_from_refs(refs_: &[refs::RefSpec], into: Option<&str>) -> Option<(String, String)> {
+    let spec = refs_.first()?;
+    let refs::RepoSel::Slug(o, n) = &spec.repo else {
         return None;
     };
     let branch = match into {
         Some(b) => b.to_string(),
-        None => match spec.base {
-            refs::Base::Name(b) => b,
+        None => match &spec.base {
+            refs::Base::Name(b) => b.clone(),
             _ => return None,
         },
     };
@@ -53,6 +53,11 @@ pub fn run(args: Args) -> CmdResult {
         ui::hint("e.g.: agit revert @#12.4  or  agit revert @#7");
         return Ok(ExitCode::Usage);
     }
+    let specs = args
+        .refs_
+        .iter()
+        .map(|raw| super::target::resolve_local_repo(refs::parse(raw)?))
+        .collect::<crate::Result<Vec<_>>>()?;
     let cwd = std::env::current_dir()?;
     let (repo, slug, target, target_source) = if let Some(raw) = args.into.as_deref()
         && raw.contains('@')
@@ -77,7 +82,7 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Precondition);
         };
         (repo, format!("{o}/{n}"), branch, Source::Explicit)
-    } else if let Some((slug, branch)) = target_from_refs(&args.refs_, args.into.as_deref()) {
+    } else if let Some((slug, branch)) = target_from_refs(&specs, args.into.as_deref()) {
         let (o, n) = super::parse_slug(&slug)?;
         let Some(repo) = Repo::open(crate::infra::config::repo_dir(&o, &n)?) else {
             ui::error(&format!("{slug} doesn’t exist locally."));
@@ -108,6 +113,14 @@ pub fn run(args: Args) -> CmdResult {
             },
         )
     };
+    for spec in &specs {
+        if let refs::RepoSel::Slug(owner, name) = &spec.repo
+            && format!("{owner}/{name}") != slug
+        {
+            ui::error("all revert references must belong to the selected target repository");
+            return Ok(ExitCode::Usage);
+        }
+    }
     if super::branch::is_sealed(&repo, &target) {
         ui::error(&format!("`{target}` is sealed."));
         return Ok(ExitCode::Policy);
@@ -138,8 +151,7 @@ pub fn run(args: Args) -> CmdResult {
     let mut selected_coordinates: std::collections::BTreeSet<(String, usize)> = Default::default();
     let mut selections =
         vec![Selection::new(format!("{slug}@{target}"), target_source).role("into")];
-    for r in &args.refs_ {
-        let spec = refs::parse(r)?;
+    for (r, spec) in args.refs_.iter().zip(&specs) {
         let src_head = match &spec.base {
             refs::Base::At => head.clone(),
             refs::Base::Name(b) | refs::Base::SessionBranch(b) => repo

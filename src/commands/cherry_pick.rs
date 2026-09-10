@@ -168,7 +168,7 @@ fn expand_one(
     target_source: Source,
     p: &str,
 ) -> crate::Result<Option<(Vec<String>, Selection)>> {
-    let spec = refs::parse(p)?;
+    let spec = super::target::resolve_local_repo(refs::parse(p)?)?;
     // Source repo: with an explicit owner/repo@..., it may be a different local repo.
     let (repo, head, slug, source) = match &spec.repo {
         refs::RepoSel::Slug(o, n) => {
@@ -211,7 +211,8 @@ fn expand_one(
                 .map(|s| s.trim().to_string())?;
             (repo, head, slug, Source::Environment)
         }
-        _ => {
+        refs::RepoSel::Local(_) => unreachable!("local repository qualifiers are resolved"),
+        refs::RepoSel::Context => {
             let head = match &spec.base {
                 refs::Base::Name(b) | refs::Base::SessionBranch(b) => target_repo
                     .git(&["rev-parse", &format!("refs/heads/{b}")])
