@@ -16,6 +16,8 @@ use crate::infra::config;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
+mod branches;
+
 #[derive(ClapArgs)]
 pub struct Args {
     /// Also inspect runtime indexes for unadopted sessions (slower; SQLite may maintain sidecars)
@@ -47,15 +49,15 @@ pub fn run(args: Args) -> CmdResult {
 
     // ── Local store ──
     ui::section("local");
-    let Some(store) = Store::open()? else {
+    let store = Store::open()?;
+    if store.is_none() {
         println!("  no sessions adopted yet.");
         ui::hint(
             "`agit import -n <name>` lists this repo’s sessions — pick one and record its first version",
         );
-        return Ok(ExitCode::Ok);
-    };
+    }
 
-    let mut links = link::list(&store);
+    let mut links = store.as_ref().map(link::list).unwrap_or_default();
     // Historical links remain visible for recovery, but they must not push the branch's current
     // writer below the display limit. The stable sort keeps `link::list`'s deterministic order
     // inside each group and avoids a filesystem metadata read in every comparator call.
@@ -65,7 +67,7 @@ pub fn run(args: Args) -> CmdResult {
     print!(
         "{}",
         ui::table::key_values(&[
-            ("store", ui::tilde(store.root())),
+            ("store", ui::tilde(&config::store_root()?)),
             (
                 "adopted sessions",
                 format!("{} ({committed} versioned)", links.len())
@@ -110,36 +112,62 @@ pub fn run(args: Args) -> CmdResult {
     let agents = super::clone::list_local()?;
     if !agents.is_empty() {
         ui::section("agent repos");
-        let rows: Vec<Vec<String>> = agents
-            .iter()
-            .map(|(o, n, p)| {
-                let r = Repo::at(p);
-                // "current" is the version ID of the HEAD commit (= its SHA).
-                let head = r
-                    .git_opt(&["rev-parse", "HEAD"])
-                    .map(|sha| meta::short(&meta::id_from_sha(sha.trim())))
-                    .unwrap_or_else(|| "—".into());
-                let state = match r.ahead_behind() {
-                    None => ui::warn_text("never pushed").to_string(),
-                    Some((0, 0)) => ui::dim("in sync").to_string(),
-                    Some((a, 0)) => ui::warn_text(&format!("{a} to publish")).to_string(),
-                    Some((0, b)) => format!("behind {b}"),
-                    Some((a, b)) => {
-                        ui::warn_text(&format!("diverged (ahead {a}, behind {b})")).to_string()
+        let mut rows = Vec::new();
+        let mut omitted = 0;
+        for (index, (owner, name, path)) in agents.iter().enumerate() {
+            if rows.len() >= 128 {
+                omitted += agents.len() - index;
+                break;
+            }
+            let slug = format!("{owner}/{name}");
+            match branches::inspect(&Repo::at(path), 128 - rows.len()) {
+                Ok(page) if page.branches.is_empty() => rows.push(vec![
+                    slug,
+                    "—".into(),
+                    "—".into(),
+                    "—".into(),
+                    "no branch refs".into(),
+                ]),
+                Ok(page) => {
+                    omitted += page.omitted;
+                    for branch in page.branches {
+                        rows.push(vec![
+                            slug.clone(),
+                            branch.name,
+                            meta::short(&meta::id_from_sha(&branch.head)),
+                            if branch.tracking.is_empty() {
+                                "—".into()
+                            } else {
+                                branch.tracking
+                            },
+                            branch.state,
+                        ]);
                     }
-                };
-                vec![
-                    format!("{o}/{n}"),
-                    r.versions().len().to_string(),
-                    head,
-                    state,
-                ]
-            })
-            .collect();
+                }
+                Err(error) => rows.push(vec![
+                    slug,
+                    "—".into(),
+                    "—".into(),
+                    "—".into(),
+                    format!("unavailable: {error:#}"),
+                ]),
+            }
+        }
         println!(
             "{}",
-            ui::table::render(&["AGENT", "versions", "current", "state"], &rows)
+            ui::table::render(
+                &["repo", "branch", "last commit", "tracking ref", "state"],
+                &rows
+            )
         );
+        if omitted > 0 {
+            ui::warning(
+                "status is incomplete: additional branches or repositories exceed the display budget",
+            );
+            ui::hint(
+                "inspect a repository with `agit branch --repo <owner/repo> --all` for its remaining branches",
+            );
+        }
     }
 
     // ── Current repo ──
@@ -163,7 +191,7 @@ pub fn run(args: Args) -> CmdResult {
     if args.check_missing {
         ui::section("unadopted sessions");
         let sp = ui::spinner("checking runtime indexes…");
-        let missing = uncaptured(&store);
+        let missing = uncaptured(&links);
         sp.finish_and_clear();
         if missing.is_empty() {
             println!(
@@ -202,14 +230,11 @@ pub fn run(args: Args) -> CmdResult {
 ///
 /// Uses only the runtime indexes (Codex queries the `threads` table, CC reads a directory),
 /// **opening no transcript**.
-fn uncaptured(store: &Store) -> Vec<(&'static str, String)> {
+fn uncaptured(links: &[link::Link]) -> Vec<(&'static str, String)> {
     let Some(repo) = config::repo_root().or_else(|| std::env::current_dir().ok()) else {
         return vec![];
     };
-    let known: std::collections::HashSet<String> = link::list(store)
-        .into_iter()
-        .map(|l| l.session_id)
-        .collect();
+    let known: std::collections::HashSet<_> = links.iter().map(|l| l.session_id.as_str()).collect();
 
     let mut out = vec![];
     for rt in crate::adapter::RUNTIMES {
@@ -217,7 +242,7 @@ fn uncaptured(store: &Store) -> Vec<(&'static str, String)> {
             continue;
         };
         for sr in ad.sessions_for(&repo).unwrap_or_default() {
-            if !known.contains(&sr.id) {
+            if !known.contains(sr.id.as_str()) {
                 out.push((ad.id(), sr.id));
             }
         }

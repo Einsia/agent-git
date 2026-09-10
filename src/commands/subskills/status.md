@@ -7,7 +7,7 @@ description: Show current context, directory bindings, adopted sessions, and loc
 
 ## Purpose
 
-Answer “who am I, am I in a session, and is the repo synchronized?” It reports workspace bindings, adopted runtime sessions, Agent repo version counts, and push state.
+Answer "who am I, am I in a session, and is the repo synchronized?" It reports workspace bindings, adopted runtime sessions, local branches, and their relationship to fetched tracking refs.
 
 Default status reads local state without checking for updates, creating storage, or migrating history.
 Remote state means the refs already fetched locally. If interrupted storage recovery is pending,
@@ -36,8 +36,23 @@ Neither form performs a startup migration or an update check.
 
 - `no session target supplied through AGIT_SESSION`: no usable explicit process identity.
 - `bound repo`: the cwd's Agent repo route; it does not prove that a branch exists.
-- `never pushed`: the local Agent repo has commits/refs that have not reached the Hub.
-- `in sync`: local and known remote state agree.
+
+The repository table lists branches even when no runtime session has been adopted. Each row
+includes the last commit and its tracking ref. An explicit upstream takes precedence; otherwise
+a fetched `origin` branch with the same name supplies the comparison. Remote-only branches from
+any remote remain visible. Status does not contact those remotes.
+
+- `in sync`: the local branch and its known tracking ref identify the same commit.
+- `ahead`, `behind`, or `diverged`: complete local commit ancestry establishes the difference.
+- `no known tracking ref`: no upstream or same-name fetched `origin` branch is known locally.
+- `tracking ref unavailable locally`: the configured upstream is missing or cannot be mapped to a local ref; status does not substitute an origin branch.
+- `comparison unavailable`: local ancestry is missing, malformed, or exceeds the inspection budget.
+- `remote only`: a fetched remote branch has no corresponding local branch in the table.
+
+Status bounds the displayed rows and ancestry inspection. An incomplete display includes a warning;
+use `agit branch --repo <owner/repo> --all` to inspect another repository's refs. A missing tracking
+ref does not establish whether the branch has ever been published. Shallow or grafted history
+produces counts only when the immutable parent graph can be reconstructed completely.
 
 ## Examples
 

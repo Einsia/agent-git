@@ -542,13 +542,21 @@ fn cwd_resume_decision(snapshot: &meta::Meta, cwd: &Path) -> crate::Result<CwdRe
         }
         CwdStateComparison::Equal => unreachable!(),
     }
-    println!("  recorded cwd:  {}", snapshot.cwd);
-    println!("  recorded state: {}", display_cwd_state(recorded));
-    println!("  current cwd:    {}", cwd.display());
-    println!("  current state:  {}", display_cwd_state(&current));
+    eprintln!("  recorded cwd:  {}", snapshot.cwd);
+    eprintln!("  recorded state: {}", display_cwd_state(recorded));
+    eprintln!("  current cwd:    {}", cwd.display());
+    eprintln!("  current state:  {}", display_cwd_state(&current));
 
     if std::env::var_os("AGIT_YES").is_some() {
         return Ok(CwdResumeDecision::Continue);
+    }
+
+    if !ui::prompt::interactive() {
+        return Err(super::InteractionRequired(
+            "the resume cwd requires an explicit decision:\n  - continue anyway (--yes)\n  - continue and inject an environment notice (interactive terminal)\n  - cancel\nrerun from a terminal to choose, or pass --yes to continue without an environment notice"
+                .to_owned(),
+        )
+        .into());
     }
 
     let options = [

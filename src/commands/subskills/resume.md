@@ -47,6 +47,11 @@ The refusal prints a manual merge command for that exact known tracking version 
 
 ## Examples
 
+When both Git snapshots are available, different states or an uncertain worktree comparison require a decision.
+Without an interactive terminal it reports the states and choices on stderr and exits with
+code `8` before native session reuse or materialization. Use a terminal to choose whether to
+inject an environment notice, or pass `--yes` to continue without that notice.
+
 ```bash
 agit resume feature-a
 agit resume @ --as codex --cwd ~/Projects/p1
