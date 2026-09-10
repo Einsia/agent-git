@@ -79,6 +79,7 @@ pub mod journal;
 pub mod lineage;
 pub mod link;
 pub mod mirror;
+pub(crate) mod navigation;
 pub mod outbound;
 pub mod policy;
 pub mod roster;

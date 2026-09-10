@@ -483,6 +483,10 @@ fn start(args: StartArgs) -> CmdResult {
     ui::section("agit rc");
     println!("  machine   {}", ui::accent(&id.display_name));
     println!("  hub       {hub}");
+    println!(
+        "  workspaces {}",
+        crate::rc::navigation::workspaces_url(&opts.hub)
+    );
     println!("  runtimes  {}", runtimes_line());
     println!();
 

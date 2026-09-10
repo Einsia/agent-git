@@ -662,6 +662,11 @@ impl Daemon {
                     res.connection_id,
                     res.workspaces.len()
                 );
+                for line in
+                    crate::rc::navigation::connected_guidance(&self.opts.hub, &res.workspaces)
+                {
+                    eprintln!("{line}");
+                }
             }
             link::LinkEvent::Disconnected(why) => {
                 self.online = false;

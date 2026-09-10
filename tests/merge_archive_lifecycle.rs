@@ -1748,6 +1748,7 @@ fn rc_land_to_strict_archive_settlement_retains_native_authority() {
                         error => panic!("RC fixture request unavailable: {error:?}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
