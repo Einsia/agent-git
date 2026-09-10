@@ -21,10 +21,10 @@ SQLite database (the jsonl-layout era is over), but the official byte path is co
 the database and accepts a full id remint, `opencode --session <id>` resumes. The install recipe =
 remint every id, re-render the export JSON → `opencode import` in the target directory.
 
-**Rows are not append-only — the assistant message in flight, and its parts, are rewritten in
-place** ([observed], line-by-line diff of two copies, see §3). agit's continuity check "live =
-committed prefix + appended" has to become "draw the line at the last row past its terminal state",
-leaving the tail for the next commit.
+**Rows are not append-only.** Streaming writes change the current assistant and parts; asynchronous
+summary and compaction also update earlier rows. A terminal message admits a complete first
+observation but cannot establish an immutable byte prefix. Archive keeps observations and explicit
+revisions; the ordinary adapter's import/resume behavior is separate from this Archive contract.
 
 ---
 
@@ -82,8 +82,8 @@ Key points:
   the moment. It goes into `Event.model` rather than at session level, matching the conclusion in
   `cursor-kiro-formats.md` §3.2.
 - On an assistant message in flight, `finish`/`tokens`/`time.completed` are filled in later (§3).
-- `summary.diffs` hangs off the user message and references an on-disk diff [inferred, medium
-  confidence]; it does not enter the IR.
+- `summary.diffs` hangs off the user message and is asynchronously rewritten by the summary
+  service (v1.18.13 source); it does not enter the IR.
 
 ### 2.2 The full part-type set
 
@@ -134,18 +134,52 @@ was compared row by row. Results (full text in `samples/opencode/mutation-eviden
   accumulating as it streams, tool `state.status running→completed` gaining output/metadata.
 - **Zero deletions, zero reordering.**
 
-Conclusions ([inferred], high confidence; every change point is corroborated by an `*.updated.1`
-event-table row as the normal path):
+The paired snapshots establish that in-flight rows change, but do not establish the order of
+`finish` and `time.completed` writes inside that interval. The runtime lifecycle provides the
+additional boundary ([source-verified], OpenCode v1.18.13
+[session processor](https://github.com/anomalyco/opencode/blob/v1.18.13/packages/opencode/src/session/processor.ts)):
+`step-finish` persists `finish` and usage before a possible patch append; final cleanup closes
+text/reasoning and outstanding tools, then persists `time.completed`. Error and interruption
+paths also run cleanup and can have `time.completed` without a `finish` reason.
 
-1. **A row past its terminal state never changes** (terminal state = the assistant message's
-   `finish` is non-empty, its tool parts' `status ∈ {completed,error}`).
-2. **The trailing assistant message still being written, and its parts, can be rewritten in place.**
-3. `time_updated` is a noise column (a user message is touched even with no data change), so
-   **every hash and every comparison must exclude it**.
+A completed assistant does **not** freeze earlier rows. The processor forks the summary service
+asynchronously; [summary.ts](https://github.com/anomalyco/opencode/blob/v1.18.13/packages/opencode/src/session/summary.ts)
+updates the parent user message's `summary.diffs`. In
+[compaction.ts](https://github.com/anomalyco/opencode/blob/v1.18.13/packages/opencode/src/session/compaction.ts),
+pruning updates old tool `state.time.compacted`, and compaction can update `tail_start_id`.
+These writes are legitimate revisions even after an earlier capture saw completed tools.
 
-→ agit's snapshot line-drawing rule: **the boundary is the last terminal-state assistant message**;
-the incomplete tail after it is not committed and the next read overwrites it. The continuity
-check = committed and live are byte-for-byte equal before that boundary.
+### Archive observation contract
+
+- Activation seeds a bounded private row index from the exact installed native bytes before
+  launch. Its row identities and raw hashes distinguish inherited data from first observations;
+  inherited records are not appended again merely because a merge starts.
+- A first observation is admitted through the last completed assistant before any unfinished
+  assistant, with terminal tools. `finish` alone remains insufficient. This is an observation
+  boundary, not a promise that the admitted records will never change.
+- Every subsequent complete snapshot compares previously observed row identities and hashes.
+  Unchanged records are skipped. New eligible rows are retained as native records. Changed data
+  appends `{"kind":"opencode.archive.revision","id":<native id>,"revision":<ordinal>,"record":<complete native record>}`.
+  The complete nested data passes the same structural secret protection and envelope encoding as
+  other native evidence; it is not reduced to a diff or summary. Raw hashes remain private.
+  Both first observations and revisions use the existing envelope canonicalization, including
+  its numeric normalization. Archive retains historical occurrences, not byte-exact native backups.
+- The revision kind is reserved for Archive output and refused as native input. Existing readers
+  classify it as `Other`, not a new user turn. Archive appends LOG evidence while the inherited
+  VIEW remains unchanged; revisions do not retroactively rewrite either history or its locators.
+- The observation cursor is a cumulative observation-stream commitment, not a current SQLite
+  byte offset. A prepared Git publication retains its exact next row index and installs that
+  index only with publication completion. Crash replay uses the retained candidate before any
+  new native read, so later summary updates cannot replace an already prepared observation.
+- Canonical row ordering may change without repeating unchanged evidence. Duplicate IDs, changed
+  session/message/part identity, malformed or incomplete snapshots, missing observed rows, or
+  exhausted row/private-state bounds refuse capture. In particular,
+  [native revert cleanup](https://github.com/anomalyco/opencode/blob/v1.18.13/packages/opencode/src/session/revert.ts)
+  deletes rows: abort or detach an attached Archive exploration before using that destructive
+  native operation. Compaction data updates are revisions; they do not delete retained evidence.
+- An unfinished assistant/tool tail still prevents final capture from reporting success.
+  Canonical materialization excludes `time_updated`; touches that do not change data create no
+  revision. Append-only runtimes retain their existing exact native-prefix contract.
 
 ## 4. Canonical text format (agit's hashing and storage shape, the final spec)
 

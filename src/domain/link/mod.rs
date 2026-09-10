@@ -40,8 +40,8 @@
 //! * `agit commit` fills in cwd, ownership and branch as it settles, so committing the same
 //!   session again and again needs no session id.
 //!
-//! A branch can retain historical runtime instances, but only links without `superseded_by` are
-//! active claims. Materialization records the exact branch tip in `materialized_from`; a repeated
+//! A branch can retain historical runtime instances, but superseded and merge archive links
+//! are excluded from ordinary active claims. Materialization records the exact branch tip in `materialized_from`; a repeated
 //! prepare can therefore reuse the same instance, while a newer tip can replace an instance only
 //! after its byte baseline proves that no runtime content was appended.
 //!
@@ -55,6 +55,7 @@
 
 use crate::Result;
 use crate::adapter;
+use crate::domain::merge_archive::{MergeArchiveRole, RuntimeLinkKey};
 use crate::domain::store::Store;
 use crate::domain::turn;
 use anyhow::{Context, bail};
@@ -102,6 +103,9 @@ pub struct Link {
     /// The transcript remains in the runtime for recovery, but a superseded link is no longer a
     /// candidate for implicit context or branch settlement.
     pub superseded_by: Option<String>,
+    /// A static local role binds exploration capture to its exact merge archive journal.
+    /// It cannot authorize ordinary settlement, context selection, or branch reclamation.
+    pub merge_archive: Option<MergeArchiveRole>,
     /// The user dismissed this unclaimed session from the naming inbox.
     pub naming_ignored: bool,
 }
@@ -125,6 +129,8 @@ struct Body {
     materialized_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merge_archive: Option<MergeArchiveRole>,
     #[serde(default, skip_serializing_if = "is_false")]
     naming_ignored: bool,
 }
@@ -146,6 +152,7 @@ impl Link {
             baseline_hash: None,
             materialized_from: None,
             superseded_by: None,
+            merge_archive: None,
             naming_ignored: false,
         }
     }
@@ -158,19 +165,7 @@ impl Link {
             "the session link must be a JSON object"
         );
         let body: Body = serde_json::from_slice(bytes).context("invalid session link fields")?;
-        Ok(Self {
-            source: source.to_owned(),
-            session_id: session_id.to_owned(),
-            cwd: body.cwd,
-            agent: body.agent,
-            owner: body.owner,
-            branch: body.branch,
-            baseline_bytes: body.baseline_bytes,
-            baseline_hash: body.baseline_hash,
-            materialized_from: body.materialized_from,
-            superseded_by: body.superseded_by,
-            naming_ignored: body.naming_ignored,
-        })
+        Ok(from_body(source.to_owned(), session_id.to_owned(), body))
     }
 
     fn body(&self) -> Body {
@@ -183,6 +178,7 @@ impl Link {
             baseline_hash: self.baseline_hash.clone(),
             materialized_from: self.materialized_from.clone(),
             superseded_by: self.superseded_by.clone(),
+            merge_archive: self.merge_archive.clone(),
             naming_ignored: self.naming_ignored,
         }
     }
@@ -194,7 +190,29 @@ impl Link {
 
     /// Only active links may resolve implicit context or advance their claimed branch.
     pub fn is_active(&self) -> bool {
-        self.superseded_by.is_none()
+        self.superseded_by.is_none() && self.merge_archive.is_none()
+    }
+
+    /// Archive authority requires the exact local runtime, journal role, and complete route.
+    /// A role alone cannot authorize a missing namespace or a superseded runtime instance.
+    pub fn is_archive_for(&self, role: &MergeArchiveRole, source: &str, session_id: &str) -> bool {
+        let Some((owner, agent)) = role.slug.split_once('/') else {
+            return false;
+        };
+        role.validate(role.origin_head.len()).is_ok()
+            && RuntimeLinkKey {
+                runtime: source.to_owned(),
+                session_id: session_id.to_owned(),
+            }
+            .validate()
+            .is_ok()
+            && self.source == source
+            && self.session_id == session_id
+            && self.merge_archive.as_ref() == Some(role)
+            && self.superseded_by.is_none()
+            && self.owner.as_deref() == Some(owner)
+            && self.agent.as_deref() == Some(agent)
+            && self.branch.as_deref() == Some(role.branch.as_str())
     }
 
     /// The on-disk JSON. Shared by the tests and `write`, so what you see is what is written.
@@ -299,6 +317,184 @@ pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
     Ok(lp)
 }
 
+/// An exact local Link image retained by a merge archive transition journal.
+/// Unknown JSON fields remain in `json` so a transition can preserve unrelated metadata.
+#[derive(Debug, Clone)]
+pub struct ArchiveLinkSnapshot {
+    pub link: Link,
+    pub json: String,
+}
+
+const MAX_ARCHIVE_LINK_BYTES: u64 = 64 * 1024;
+
+fn archive_key(source: &str, session_id: &str) -> Result<()> {
+    RuntimeLinkKey {
+        runtime: source.to_owned(),
+        session_id: session_id.to_owned(),
+    }
+    .validate()
+}
+
+fn is_redirect(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn archive_link_directory_exists(path: &Path) -> Result<bool> {
+    crate::domain::merge_archive::authority_directory_exists(path)
+}
+
+/// Read a regular, bounded Link image without treating unreadable metadata as absence.
+/// The caller holds the participating Link lock through transition publication.
+pub fn read_archive_link_snapshot(
+    store: &Store,
+    source: &str,
+    session_id: &str,
+) -> Result<Option<ArchiveLinkSnapshot>> {
+    use std::io::Read as _;
+
+    archive_key(source, session_id)?;
+    if !archive_link_directory_exists(store.root())?
+        || !archive_link_directory_exists(&store.root().join(source))?
+    {
+        return Ok(None);
+    }
+    let path = link_path(store, source, session_id);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_file() && !is_redirect(&metadata),
+            "archive Link {} is a redirect or non-regular file",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("cannot open archive Link {}", path.display()))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && !is_redirect(&metadata),
+        "archive Link {} is a redirect or non-regular file",
+        path.display()
+    );
+    let mut json = String::new();
+    file.take(MAX_ARCHIVE_LINK_BYTES + 1)
+        .read_to_string(&mut json)
+        .with_context(|| format!("cannot read archive Link {}", path.display()))?;
+    anyhow::ensure!(
+        json.len() as u64 <= MAX_ARCHIVE_LINK_BYTES,
+        "archive Link image is too large"
+    );
+    Ok(Some(parse_archive_link_image(source, session_id, json)?))
+}
+
+pub(crate) fn parse_archive_link_image(
+    source: &str,
+    session_id: &str,
+    json: String,
+) -> Result<ArchiveLinkSnapshot> {
+    archive_key(source, session_id)?;
+    crate::domain::merge_archive::checked_link_image(&json)?;
+    crate::domain::metadata_facts::JsonFacts::parse(&json)?;
+    let body: Body = serde_json::from_str(&json).context("archive Link image is unreadable")?;
+    Ok(ArchiveLinkSnapshot {
+        link: from_body(source.to_owned(), session_id.to_owned(), body),
+        json,
+    })
+}
+
+/// Publish an exact Link image after the command journals its expected and planned states.
+/// The caller holds the Link lock; this function does not acquire or release that lock.
+/// A publication error can follow a successful rename, so recovery rereads the journal and Link
+/// instead of assuming the old image remains installed or attempting an unconditional rollback.
+pub fn publish_archive_transition_locked(
+    store: &Store,
+    source: &str,
+    session_id: &str,
+    expected_json: Option<&str>,
+    planned_json: &str,
+) -> Result<PathBuf> {
+    archive_key(source, session_id)?;
+    anyhow::ensure!(
+        planned_json.len() as u64 <= MAX_ARCHIVE_LINK_BYTES,
+        "planned archive Link image is too large"
+    );
+    crate::domain::merge_archive::checked_link_image(planned_json)?;
+    let planned: Body =
+        serde_json::from_str(planned_json).context("planned archive Link image is unreadable")?;
+    if let Some(role) = &planned.merge_archive {
+        role.validate(role.origin_head.len())?;
+        let (owner, agent) = role
+            .slug
+            .split_once('/')
+            .context("invalid archive repository")?;
+        anyhow::ensure!(
+            planned.owner.as_deref() == Some(owner)
+                && planned.agent.as_deref() == Some(agent)
+                && planned.branch.as_deref() == Some(role.branch.as_str()),
+            "planned archive Link route does not match its role"
+        );
+    }
+    let current = read_archive_link_snapshot(store, source, session_id)?;
+    anyhow::ensure!(
+        current.as_ref().map(|snapshot| snapshot.json.as_str()) == expected_json,
+        "archive Link changed before transition publication"
+    );
+    anyhow::ensure!(
+        archive_link_directory_exists(store.root())?
+            && archive_link_directory_exists(&store.root().join(source))?,
+        "archive Link parent is missing; acquire its Link lock before publication"
+    );
+    let path = link_path(store, source, session_id);
+    crate::domain::merge_archive::durable_publish_transition_bytes(
+        &path,
+        planned_json.as_bytes(),
+        current.is_some(),
+    )?;
+    Ok(path)
+}
+
+fn from_body(source: String, session_id: String, body: Body) -> Link {
+    Link {
+        source,
+        session_id,
+        cwd: body.cwd,
+        agent: body.agent,
+        owner: body.owner,
+        branch: body.branch,
+        baseline_bytes: body.baseline_bytes,
+        baseline_hash: body.baseline_hash,
+        materialized_from: body.materialized_from,
+        superseded_by: body.superseded_by,
+        merge_archive: body.merge_archive,
+        naming_ignored: body.naming_ignored,
+    }
+}
+
 /// Read one link.
 ///
 /// `runtime` comes from the parent directory name and `session_id` from the file name, so the
@@ -311,19 +507,7 @@ pub fn read(path: &Path) -> Option<Link> {
 fn link_from_body(path: &Path, body: Body) -> Option<Link> {
     let source = path.parent()?.file_name()?.to_str()?.to_string();
     let session_id = path.file_stem()?.to_str()?.to_string();
-    Some(Link {
-        source,
-        session_id,
-        cwd: body.cwd,
-        agent: body.agent,
-        owner: body.owner,
-        branch: body.branch,
-        baseline_bytes: body.baseline_bytes,
-        baseline_hash: body.baseline_hash,
-        materialized_from: body.materialized_from,
-        superseded_by: body.superseded_by,
-        naming_ignored: body.naming_ignored,
-    })
+    Some(from_body(source, session_id, body))
 }
 
 /// List every link in the store.
@@ -361,6 +545,67 @@ pub fn list(store: &Store) -> Vec<Link> {
     }
     out.sort_by(|a, b| (&a.source, &a.session_id).cmp(&(&b.source, &b.session_id)));
     out
+}
+
+/// Archive preparation cannot treat unreadable Link metadata as an absent branch claim.
+/// Every registered runtime directory is inspected before selecting the requested route.
+pub(crate) fn archive_claims_for_branch(
+    store: &Store,
+    owner: &str,
+    agent: &str,
+    branch: &str,
+) -> Result<Vec<ArchiveLinkSnapshot>> {
+    let mut selected = Vec::new();
+    let mut entries = 0usize;
+    let mut bytes = 0usize;
+    if !archive_link_directory_exists(store.root())? {
+        return Ok(selected);
+    }
+    for runtime in adapter::RUNTIMES {
+        let directory = store.root().join(runtime);
+        if !archive_link_directory_exists(&directory)? {
+            continue;
+        }
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            entries += 1;
+            anyhow::ensure!(
+                entries <= 8192,
+                "archive claim inventory exceeds its entry limit"
+            );
+            let path = entry.path();
+            if path.extension() != Some(std::ffi::OsStr::new("json")) {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("archive claim filename is not a valid native ID")
+                })?;
+            let snapshot = read_archive_link_snapshot(store, runtime, id)?
+                .ok_or_else(|| anyhow::anyhow!("archive claim disappeared during inventory"))?;
+            bytes = bytes
+                .checked_add(snapshot.json.len())
+                .ok_or_else(|| anyhow::anyhow!("archive claim inventory byte count overflowed"))?;
+            anyhow::ensure!(
+                bytes <= 8 * 1024 * 1024,
+                "archive claim inventory exceeds its byte limit"
+            );
+            if claims_branch(&snapshot.link, owner, agent, branch) {
+                anyhow::ensure!(
+                    snapshot.link.owner.as_deref() == Some(owner),
+                    "archive preparation requires an explicit owner on every prior claim"
+                );
+                selected.push(snapshot);
+                anyhow::ensure!(selected.len() <= 128, "too many archive previous claims");
+            }
+        }
+    }
+    selected.sort_by(|a, b| {
+        (&a.link.source, &a.link.session_id).cmp(&(&b.link.source, &b.link.session_id))
+    });
+    Ok(selected)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -587,6 +832,17 @@ pub fn touched_at(store: &Store, link: &Link) -> std::time::SystemTime {
 pub struct BranchLock {
     _branch: std::fs::File,
     _repository: std::fs::File,
+    route: (PathBuf, String, String),
+}
+
+impl BranchLock {
+    pub(crate) fn require_route(&self, store: &Store, slug: &str, branch: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.route.0 == store.root() && self.route.1 == slug && self.route.2 == branch,
+            "branch guard belongs to a different preparation route"
+        );
+        Ok(())
+    }
 }
 
 pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock> {
@@ -613,6 +869,7 @@ pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock
     Ok(BranchLock {
         _branch: file,
         _repository: repository,
+        route: (store.root().to_owned(), slug.to_owned(), branch.to_owned()),
     })
 }
 
@@ -780,7 +1037,10 @@ pub fn dismiss_naming(
 /// branch and no baseline; it has no recoverable version identity yet, so the current
 /// conversation stays under `new`'s protection.
 pub fn is_managed(link: &Link) -> bool {
-    link.agent.is_some() || link.branch.is_some() || link.baseline_bytes.is_some()
+    link.merge_archive.is_some()
+        || link.agent.is_some()
+        || link.branch.is_some()
+        || link.baseline_bytes.is_some()
 }
 
 /// One session recorded under an agent name.
@@ -807,7 +1067,7 @@ pub struct Candidate {
 pub fn for_agent(store: &Store, agent: &str) -> Vec<Candidate> {
     list(store)
         .into_iter()
-        .filter(|l| l.agent.as_deref() == Some(agent))
+        .filter(|l| l.is_active() && l.agent.as_deref() == Some(agent))
         .map(|l| {
             let link_at = touched_at(store, &l);
             let touched = l
@@ -834,10 +1094,15 @@ pub fn for_agent(store: &Store, agent: &str) -> Vec<Candidate> {
 /// none touched) — picking wrong records a stretch of work into another lineage, and is not
 /// noticed right away.
 pub fn only_one(cands: &[Candidate]) -> Option<&Candidate> {
-    if let [only] = cands {
-        return Some(only);
+    let mut active = cands.iter().filter(|candidate| candidate.link.is_active());
+    match (active.next(), active.next()) {
+        (Some(only), None) => return Some(only),
+        (None, _) => return None,
+        _ => {}
     }
-    let mut touched = cands.iter().filter(|c| c.touched);
+    let mut touched = cands
+        .iter()
+        .filter(|candidate| candidate.link.is_active() && candidate.touched);
     match (touched.next(), touched.next()) {
         (Some(one), None) => Some(one),
         _ => None,
@@ -1194,6 +1459,476 @@ mod tests {
         let round_trip = get(&s, "codex", "OLD").unwrap();
         assert_eq!(round_trip.materialized_from, Some("a".repeat(40)));
         assert_eq!(round_trip.superseded_by.as_deref(), Some("codex/NEW"));
+    }
+
+    fn archive_role() -> MergeArchiveRole {
+        MergeArchiveRole {
+            generation: "019e8308-072a-739c-a75b-604d0848ba6f".to_owned(),
+            slug: "alice/photo".to_owned(),
+            branch: "work".to_owned(),
+            origin_head: "a".repeat(40),
+            logical_session: format!("agit-{}", "b".repeat(40)),
+        }
+    }
+
+    fn archive_link(source: &str, session_id: &str) -> Link {
+        let mut link = Link::new(source, session_id, None);
+        link.owner = Some("alice".to_owned());
+        link.agent = Some("photo".to_owned());
+        link.branch = Some("work".to_owned());
+        link.merge_archive = Some(archive_role());
+        link
+    }
+
+    #[test]
+    fn archive_roles_round_trip_without_repeating_native_identity() {
+        let (_directory, store) = store();
+        let legacy = Link::new("codex", "LEGACY", None);
+        let legacy_path = write(&store, &legacy).unwrap();
+        assert!(read(&legacy_path).unwrap().merge_archive.is_none());
+        assert!(legacy.is_active());
+
+        let archived = archive_link("codex", "ARCHIVE");
+        let path = write(&store, &archived).unwrap();
+        let saved = read(&path).unwrap();
+        assert_eq!(saved.merge_archive, archived.merge_archive);
+        assert!(saved.is_archive_for(&archive_role(), "codex", "ARCHIVE"));
+        assert!(!saved.is_active());
+        let body: serde_json::Value = serde_json::from_str(&saved.to_json().unwrap()).unwrap();
+        for forbidden in ["source", "session_id", "runtime"] {
+            assert!(body.get(forbidden).is_none());
+            assert!(body["merge_archive"].get(forbidden).is_none());
+        }
+    }
+
+    #[test]
+    fn archive_authority_requires_exact_role_native_key_and_route() {
+        let link = archive_link("codex", "ARCHIVE");
+        let role = archive_role();
+        assert!(link.is_archive_for(&role, "codex", "ARCHIVE"));
+        assert!(!link.is_archive_for(&role, "claude-code", "ARCHIVE"));
+        assert!(!link.is_archive_for(&role, "codex", "OTHER"));
+        let mut other_role = role.clone();
+        other_role.generation = "019e8308-072b-7748-a4d0-a7c3114a7f88".to_owned();
+        assert!(!link.is_archive_for(&other_role, "codex", "ARCHIVE"));
+        other_role = role.clone();
+        other_role.origin_head = "c".repeat(40);
+        assert!(!link.is_archive_for(&other_role, "codex", "ARCHIVE"));
+        let mut superseded = link.clone();
+        superseded.superseded_by = Some("codex/NEXT".to_owned());
+        assert!(!superseded.is_archive_for(&role, "codex", "ARCHIVE"));
+        assert!(!superseded.is_active());
+        let mut ownerless = link.clone();
+        ownerless.owner = None;
+        assert!(!ownerless.is_archive_for(&role, "codex", "ARCHIVE"));
+        assert!(!claims_branch(&ownerless, "alice", "photo", "work"));
+        let mut rerouted = link.clone();
+        rerouted.branch = Some("other".to_owned());
+        assert!(!rerouted.is_archive_for(&role, "codex", "ARCHIVE"));
+        let mut invalid = link;
+        invalid.merge_archive.as_mut().unwrap().generation = "invalid".to_owned();
+        assert!(!invalid.is_active());
+        assert!(!invalid.is_archive_for(
+            invalid.merge_archive.as_ref().unwrap(),
+            "codex",
+            "ARCHIVE"
+        ));
+    }
+
+    #[test]
+    fn archive_roles_never_become_ordinary_candidates() {
+        let (_directory, store) = store();
+        let archive = archive_link("codex", "ARCHIVE");
+        write(&store, &archive).unwrap();
+        assert!(active_for_branch(&store, "alice", "photo", "work").is_empty());
+        assert!(latest(&store).is_none());
+        assert!(for_agent(&store, "photo").is_empty());
+        assert!(!claims_branch(&archive, "alice", "photo", "work"));
+        assert!(is_managed(&archive));
+        let archived_candidate = Candidate {
+            link: archive,
+            touched: true,
+        };
+        assert!(only_one(std::slice::from_ref(&archived_candidate)).is_none());
+
+        let mut ordinary = Link::new("claude-code", "ORDINARY", None);
+        ordinary.owner = Some("alice".to_owned());
+        ordinary.agent = Some("photo".to_owned());
+        ordinary.branch = Some("work".to_owned());
+        write(&store, &ordinary).unwrap();
+        assert_eq!(latest(&store).unwrap().session_id, "ORDINARY");
+        assert_eq!(active_for_branch(&store, "alice", "photo", "work").len(), 1);
+        assert_eq!(for_agent(&store, "photo").len(), 1);
+        let candidates = [
+            archived_candidate,
+            Candidate {
+                link: ordinary,
+                touched: false,
+            },
+        ];
+        assert_eq!(only_one(&candidates).unwrap().link.session_id, "ORDINARY");
+        assert_eq!(
+            get(&store, "codex", "ARCHIVE").unwrap().session_id,
+            "ARCHIVE"
+        );
+    }
+
+    #[test]
+    fn archive_transition_compares_exact_bytes_and_preserves_unknown_fields() {
+        let (_directory, store) = store();
+        let _guard = lock(&store, "codex", "ARCHIVE").unwrap();
+        let mut image: serde_json::Value =
+            serde_json::from_str(&archive_link("codex", "ARCHIVE").to_json().unwrap()).unwrap();
+        image["extension"] = serde_json::json!({"retained": true});
+        let original = format!("{}\n", serde_json::to_string(&image).unwrap());
+        let path =
+            publish_archive_transition_locked(&store, "codex", "ARCHIVE", None, &original).unwrap();
+        let snapshot = read_archive_link_snapshot(&store, "codex", "ARCHIVE")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.json, original);
+        assert!(
+            snapshot
+                .link
+                .is_archive_for(&archive_role(), "codex", "ARCHIVE")
+        );
+        image["naming_ignored"] = serde_json::json!(true);
+        let planned = serde_json::to_string(&image).unwrap();
+        publish_archive_transition_locked(
+            &store,
+            "codex",
+            "ARCHIVE",
+            Some(&snapshot.json),
+            &planned,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), planned);
+        assert!(
+            publish_archive_transition_locked(
+                &store,
+                "codex",
+                "ARCHIVE",
+                Some(&snapshot.json),
+                &original
+            )
+            .is_err()
+        );
+        assert!(
+            publish_archive_transition_locked(&store, "codex", "ARCHIVE", None, &original).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), planned);
+
+        let reformatted = serde_json::to_string_pretty(&image).unwrap();
+        std::fs::write(&path, &reformatted).unwrap();
+        assert!(
+            publish_archive_transition_locked(
+                &store,
+                "codex",
+                "ARCHIVE",
+                Some(&planned),
+                &original
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), reformatted);
+    }
+
+    #[test]
+    fn archive_transitions_allow_journaled_ordinary_retirement_and_restore() {
+        let (_directory, store) = store();
+        let _guard = lock(&store, "codex", "ORDINARY").unwrap();
+        let original = "{\"owner\":\"alice\",\"agent\":\"photo\",\"branch\":\"work\"}\n";
+        let retired = "{\"owner\":\"alice\",\"agent\":\"photo\",\"branch\":\"work\",\"superseded_by\":\"codex/ARCHIVE\"}\n";
+        publish_archive_transition_locked(&store, "codex", "ORDINARY", None, original).unwrap();
+        publish_archive_transition_locked(&store, "codex", "ORDINARY", Some(original), retired)
+            .unwrap();
+        assert!(!get(&store, "codex", "ORDINARY").unwrap().is_active());
+        publish_archive_transition_locked(&store, "codex", "ORDINARY", Some(retired), original)
+            .unwrap();
+        assert!(get(&store, "codex", "ORDINARY").unwrap().is_active());
+    }
+
+    /// Ordinary Link permissions do not prevent a byte-checked transition to private authority.
+    #[cfg(unix)]
+    #[test]
+    fn archive_transition_accepts_owner_controlled_ordinary_links() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_directory, store) = store();
+        let _guard = lock(&store, "codex", "ORDINARY").unwrap();
+        let mut ordinary = archive_link("codex", "ORDINARY");
+        ordinary.merge_archive = None;
+        let path = write(&store, &ordinary).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let planned = archive_link("codex", "ORDINARY").to_json().unwrap();
+        publish_archive_transition_locked(&store, "codex", "ORDINARY", Some(&original), &planned)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), planned);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        publish_archive_transition_locked(&store, "codex", "ORDINARY", Some(&planned), &original)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(get(&store, "codex", "ORDINARY").unwrap().is_active());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(
+            publish_archive_transition_locked(
+                &store,
+                "codex",
+                "ORDINARY",
+                Some(&original),
+                &planned
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o664
+        );
+    }
+
+    /// File privacy cannot protect authority when another user can replace a containing directory.
+    #[cfg(unix)]
+    #[test]
+    fn archive_transition_rejects_writable_authority_ancestry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_directory, store) = store();
+        let _guard = lock(&store, "codex", "ORDINARY").unwrap();
+        let mut ordinary = archive_link("codex", "ORDINARY");
+        ordinary.merge_archive = None;
+        let path = write(&store, &ordinary).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let planned = archive_link("codex", "ORDINARY").to_json().unwrap();
+        for directory in [
+            store.root().join("codex"),
+            store.root().to_path_buf(),
+            store.root().parent().unwrap().to_path_buf(),
+        ] {
+            let permissions = std::fs::metadata(&directory).unwrap().permissions();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                publish_archive_transition_locked(
+                    &store,
+                    "codex",
+                    "ORDINARY",
+                    Some(&original),
+                    &planned
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            std::fs::set_permissions(&directory, permissions).unwrap();
+        }
+        publish_archive_transition_locked(&store, "codex", "ORDINARY", Some(&original), &planned)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), planned);
+    }
+
+    /// A readable ordinary Link becomes private even when its directory grants inherited reads.
+    #[cfg(windows)]
+    #[test]
+    fn archive_transition_replaces_inherited_public_reads_with_private_acl() {
+        use crate::infra::windows_security;
+
+        let (_directory, store) = store();
+        let runtime = store.root().join("codex");
+        windows_security::private_directory(&runtime).unwrap();
+        let acl = std::process::Command::new("icacls")
+            .arg(&runtime)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .output()
+            .unwrap();
+        assert!(acl.status.success());
+        let _guard = lock(&store, "codex", "ORDINARY").unwrap();
+        let mut ordinary = archive_link("codex", "ORDINARY");
+        ordinary.merge_archive = None;
+        let path = write(&store, &ordinary).unwrap();
+        windows_security::validate_path(&path, false, false).unwrap();
+        assert!(windows_security::validate_path(&path, false, true).is_err());
+        let original = std::fs::read_to_string(&path).unwrap();
+        let planned = archive_link("codex", "ORDINARY").to_json().unwrap();
+        publish_archive_transition_locked(&store, "codex", "ORDINARY", Some(&original), &planned)
+            .unwrap();
+        windows_security::validate_path(&path, false, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), planned);
+    }
+
+    #[test]
+    fn archive_transition_refuses_missing_corrupt_and_rerouted_expected_links() {
+        let (_directory, store) = store();
+        let _guard = lock(&store, "codex", "ARCHIVE").unwrap();
+        let planned = archive_link("codex", "ARCHIVE").to_json().unwrap();
+        let path = link_path(&store, "codex", "ARCHIVE");
+        assert!(
+            read_archive_link_snapshot(&store, "codex", "ARCHIVE")
+                .unwrap()
+                .is_none()
+        );
+        assert!(get(&store, "codex", "ARCHIVE").is_none());
+        assert!(
+            publish_archive_transition_locked(&store, "codex", "ARCHIVE", Some(&planned), &planned)
+                .is_err()
+        );
+        assert!(!path.exists());
+        for corrupt in ["{", "[]", "{\"owner\":false}", "{\"merge_archive\":{}}"] {
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(read_archive_link_snapshot(&store, "codex", "ARCHIVE").is_err());
+            assert!(
+                publish_archive_transition_locked(
+                    &store,
+                    "codex",
+                    "ARCHIVE",
+                    Some(corrupt),
+                    &planned
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        }
+        let rerouted = "{\"owner\":\"mallory\",\"agent\":\"other\",\"branch\":\"elsewhere\"}";
+        std::fs::write(&path, rerouted).unwrap();
+        assert!(
+            publish_archive_transition_locked(&store, "codex", "ARCHIVE", Some(&planned), &planned)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), rerouted);
+        for invalid in ["{", "[]"] {
+            assert!(
+                publish_archive_transition_locked(
+                    &store,
+                    "codex",
+                    "ARCHIVE",
+                    Some(rerouted),
+                    invalid
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(std::fs::read_to_string(path).unwrap(), rerouted);
+    }
+
+    #[test]
+    fn archive_transition_refuses_invalid_roles_keys_and_nonregular_paths() {
+        let (_directory, store) = store();
+        let _guard = lock(&store, "codex", "ARCHIVE").unwrap();
+        let mut link = archive_link("codex", "ARCHIVE");
+        link.owner = None;
+        assert!(
+            publish_archive_transition_locked(
+                &store,
+                "codex",
+                "ARCHIVE",
+                None,
+                &link.to_json().unwrap()
+            )
+            .is_err()
+        );
+        let planned = archive_link("codex", "ARCHIVE").to_json().unwrap();
+        for (source, session_id) in [
+            ("../codex", "ARCHIVE"),
+            ("codex", "../outside"),
+            ("unknown", "ARCHIVE"),
+        ] {
+            assert!(
+                publish_archive_transition_locked(&store, source, session_id, None, &planned)
+                    .is_err()
+            );
+        }
+        let path = link_path(&store, "codex", "ARCHIVE");
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_archive_link_snapshot(&store, "codex", "ARCHIVE").is_err());
+        assert!(
+            publish_archive_transition_locked(&store, "codex", "ARCHIVE", None, &planned).is_err()
+        );
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn archive_transition_bounds_link_images_before_publication() {
+        let (_directory, store) = store();
+        let _guard = lock(&store, "codex", "ARCHIVE").unwrap();
+        let oversized = format!(
+            "{{\"extension\":\"{}\"}}",
+            "x".repeat(MAX_ARCHIVE_LINK_BYTES as usize)
+        );
+        let path = link_path(&store, "codex", "ARCHIVE");
+        assert!(
+            publish_archive_transition_locked(&store, "codex", "ARCHIVE", None, &oversized)
+                .is_err()
+        );
+        assert!(!path.exists());
+        std::fs::write(&path, &oversized).unwrap();
+        assert!(read_archive_link_snapshot(&store, "codex", "ARCHIVE").is_err());
+        assert!(
+            publish_archive_transition_locked(&store, "codex", "ARCHIVE", Some(&oversized), "{}")
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), oversized);
+    }
+
+    #[test]
+    fn archive_transition_uses_runtime_path_even_for_duplicate_native_ids() {
+        let (_directory, store) = store();
+        let _codex = lock(&store, "codex", "SAME").unwrap();
+        let _claude = lock(&store, "claude-code", "SAME").unwrap();
+        let planned = archive_link("codex", "SAME").to_json().unwrap();
+        publish_archive_transition_locked(&store, "codex", "SAME", None, &planned).unwrap();
+        publish_archive_transition_locked(&store, "claude-code", "SAME", None, "{}").unwrap();
+        assert!(get(&store, "codex", "SAME").unwrap().is_archive_for(
+            &archive_role(),
+            "codex",
+            "SAME"
+        ));
+        assert!(get(&store, "claude-code", "SAME").unwrap().is_active());
+        assert!(find(&store, "SAME").is_err());
+        assert_eq!(
+            read_archive_link_snapshot(&store, "claude-code", "SAME")
+                .unwrap()
+                .unwrap()
+                .json,
+            "{}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_transition_refuses_redirected_file_and_runtime_directory() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, store) = store();
+        let _guard = lock(&store, "codex", "ARCHIVE").unwrap();
+        let outside = directory.path().join("outside.json");
+        std::fs::write(&outside, "{}").unwrap();
+        let path = link_path(&store, "codex", "ARCHIVE");
+        symlink(&outside, &path).unwrap();
+        assert!(read_archive_link_snapshot(&store, "codex", "ARCHIVE").is_err());
+        assert!(
+            publish_archive_transition_locked(&store, "codex", "ARCHIVE", Some("{}"), "{}")
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "{}");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_file(&path).unwrap();
+        let outside_directory = directory.path().join("outside");
+        std::fs::create_dir(&outside_directory).unwrap();
+        symlink(&outside_directory, store.root().join("claude-code")).unwrap();
+        assert!(read_archive_link_snapshot(&store, "claude-code", "ARCHIVE").is_err());
+        assert!(
+            publish_archive_transition_locked(&store, "claude-code", "ARCHIVE", None, "{}")
+                .is_err()
+        );
+        assert!(!outside_directory.join("ARCHIVE.json").exists());
     }
 
     #[test]

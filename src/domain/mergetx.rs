@@ -36,8 +36,25 @@ pub const LOCK_FILE: &str = "AGIT_MERGE_TX";
 /// "this repo has a merge running", never "it runs in my session".
 pub const ENV: &str = "AGIT_MERGE_TX";
 
+/// A launched merge agent may mutate only the transaction instance that prepared it.
+pub const GENERATION_ENV: &str = "AGIT_MERGE_GENERATION";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    Manual,
+    SessionAgent,
+    FileAgent,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
+    /// The preparation mode is immutable and controls whether a native archive binding is required.
+    #[serde(default)]
+    pub mode: Option<Mode>,
+    /// Native evidence belongs to an explicitly installed instance of this transaction.
+    #[serde(default)]
+    pub exploration: Option<crate::domain::merge_archive::ExplorationBinding>,
     /// A preparation belongs to this transaction instance even when another uses identical refs.
     #[serde(default)]
     pub generation: Option<String>,
@@ -73,6 +90,8 @@ impl Tx {
     /// Mutable progress belongs to the same creation and frozen source/target selection.
     pub fn same_instance(&self, other: &Self) -> bool {
         self.generation == other.generation
+            && self.exploration == other.exploration
+            && self.mode == other.mode
             && self.target == other.target
             && self.target_head == other.target_head
             && self.source == other.source
@@ -80,6 +99,41 @@ impl Tx {
             && self.source_repo == other.source_repo
             && self.source_branch == other.source_branch
             && self.base == other.base
+    }
+
+    /// Human commands select the current transaction; launched agents retain their generation.
+    pub fn require_agent_context(&self, slug: &str) -> Result<()> {
+        let read = |name| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("{name} is not valid Unicode; refusing merge-agent authority")
+            }
+        };
+        self.require_agent_context_values(
+            slug,
+            read(ENV)?.as_deref(),
+            read(GENERATION_ENV)?.as_deref(),
+        )
+    }
+
+    fn require_agent_context_values(
+        &self,
+        slug: &str,
+        marker: Option<&str>,
+        generation: Option<&str>,
+    ) -> Result<()> {
+        if marker.is_none() && generation.is_none() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            marker == Some(format!("{slug}@{}", self.target).as_str())
+                && generation.is_some_and(|generation| {
+                    !generation.is_empty() && self.generation.as_deref() == Some(generation)
+                }),
+            "this merge agent does not own the selected transaction generation; inspect the current transaction from a separate terminal before retrying"
+        );
+        Ok(())
     }
 
     /// The pick list (the raw ref text, for example `B#3..#5`).
@@ -181,6 +235,30 @@ pub fn read(repo_root: &Path) -> Result<Option<Tx>> {
     }
 }
 
+const MAX_ACTIVATION_TRANSACTION_BYTES: u64 = 256 * 1024;
+
+/// Exact transaction bytes bind archive activation without discarding unknown fields or progress.
+#[derive(Debug, Clone)]
+pub struct ActivationSnapshot {
+    pub tx: Tx,
+    pub json: String,
+}
+
+pub(crate) fn checked_activation_image(json: &str) -> Result<Tx> {
+    anyhow::ensure!(
+        json.len() as u64 <= MAX_ACTIVATION_TRANSACTION_BYTES,
+        "archive activation transaction exceeds its byte limit"
+    );
+    anyhow::ensure!(
+        matches!(
+            crate::domain::metadata_facts::JsonFacts::parse(json)?,
+            crate::domain::metadata_facts::JsonFacts::Object(_)
+        ),
+        "archive activation transaction must be a JSON object"
+    );
+    Ok(serde_json::from_str(json)?)
+}
+
 /// Serialize transaction publication, progress, cancellation, and launch admission.
 /// The handle is not inherited by spawned runtimes, so cancellation never waits for their lifetime.
 pub struct ControlGuard {
@@ -215,26 +293,172 @@ impl ControlGuard {
         }
     }
 
-    fn publish(&self, tx: &Tx, replace: bool) -> Result<()> {
-        use anyhow::Context as _;
-        use std::io::Write as _;
+    /// Activation reads retain exact bytes and refuse missing, redirected or corrupt authority.
+    pub fn read_activation_snapshot(&self) -> Result<Option<ActivationSnapshot>> {
+        let Some(bytes) = crate::domain::merge_archive::read_transition_bytes(
+            &self.path,
+            MAX_ACTIVATION_TRANSACTION_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        let json = String::from_utf8(bytes)?;
+        let tx = checked_activation_image(&json)?;
+        Ok(Some(ActivationSnapshot { tx, json }))
+    }
 
-        let mut pending = tempfile::NamedTempFile::new_in(
+    /// The caller journals both images before binding activation; replay accepts exact endpoints.
+    /// Replacement persists the private successor and its parent directory before returning.
+    pub fn publish_activation_binding(
+        &self,
+        expected_json: &str,
+        planned_json: &str,
+    ) -> Result<()> {
+        use crate::domain::metadata_facts::JsonFacts;
+        let expected = checked_activation_image(expected_json)?;
+        let planned = checked_activation_image(planned_json)?;
+        anyhow::ensure!(
+            planned.exploration.is_some()
+                && (expected.exploration.is_none() || expected.exploration == planned.exploration),
+            "archive activation cannot replace another transaction binding"
+        );
+        let JsonFacts::Object(mut before) = JsonFacts::parse(expected_json)? else {
+            unreachable!()
+        };
+        let JsonFacts::Object(mut after) = JsonFacts::parse(planned_json)? else {
+            unreachable!()
+        };
+        before.remove("exploration");
+        after.remove("exploration");
+        anyhow::ensure!(
+            before == after,
+            "archive activation cannot change transaction progress or selection"
+        );
+        let current = self.read_activation_snapshot()?;
+        anyhow::ensure!(
+            current.as_ref().map(|snapshot| snapshot.json.as_str()) == Some(expected_json),
+            "merge transaction changed before archive activation publication"
+        );
+        crate::domain::merge_archive::durable_publish_transition_bytes(
+            &self.path,
+            planned_json.as_bytes(),
+            true,
+        )
+    }
+
+    fn retained_archive_intent(&self, tx: &Tx) -> Result<bool> {
+        let Some(generation) = tx.generation.as_deref() else {
+            return Ok(false);
+        };
+        crate::domain::merge_archive::has_retained_intent(
             self.path
                 .parent()
-                .ok_or_else(|| anyhow::anyhow!("the transaction has no parent directory"))?,
-        )?;
-        writeln!(pending, "{}", serde_json::to_string_pretty(tx)?)?;
-        pending.as_file().sync_all()?;
-        if replace {
-            pending
-                .persist(&self.path)
-                .map_err(|error| error.error)
-                .context("cannot update the merge transaction")?;
-        } else {
-            pending.persist_noclobber(&self.path).map_err(|error| error.error)
-                .context("cannot open the merge transaction without replacing existing state; inspect `agit merge --status`")?;
+                .ok_or_else(|| anyhow::anyhow!("transaction has no common directory"))?,
+            generation,
+        )
+    }
+
+    fn publish(&self, tx: &Tx, replace: bool) -> Result<()> {
+        if replace && let Some(current) = self.read()? {
+            if current.exploration.is_some() {
+                anyhow::ensure!(
+                    current.same_instance(tx),
+                    "ordinary transaction publication cannot replace archive exploration authority"
+                );
+                let snapshot = self
+                    .read_activation_snapshot()?
+                    .ok_or_else(|| anyhow::anyhow!("archive transaction disappeared"))?;
+                anyhow::ensure!(
+                    snapshot.tx.same_instance(tx),
+                    "archive transaction changed before progress publication"
+                );
+                crate::domain::merge_archive::require_open_progress(
+                    self.path
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("transaction has no common directory"))?,
+                    snapshot.tx.exploration.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("archive transaction binding disappeared")
+                    })?,
+                )?;
+                use crate::domain::metadata_facts::JsonFacts;
+                let JsonFacts::Object(mut facts) = JsonFacts::parse(&snapshot.json)? else {
+                    unreachable!()
+                };
+                facts.insert(
+                    "picked".into(),
+                    JsonFacts::parse(&serde_json::to_string(&tx.picked)?)?,
+                );
+                facts.insert(
+                    "summary".into(),
+                    JsonFacts::parse(&serde_json::to_string(&tx.summary)?)?,
+                );
+                let mut json = String::new();
+                JsonFacts::Object(facts).write_json(&mut json)?;
+                json.push('\n');
+                checked_activation_image(&json)?;
+                return crate::domain::merge_archive::durable_publish_transition_bytes(
+                    &self.path,
+                    json.as_bytes(),
+                    true,
+                );
+            }
+            anyhow::ensure!(
+                !self.retained_archive_intent(&current)?,
+                "preparing archive authority prevents ordinary transaction replacement"
+            );
         }
+        anyhow::ensure!(
+            !self.retained_archive_intent(tx)?,
+            "retained archive authority prevents ordinary transaction admission"
+        );
+        anyhow::ensure!(
+            tx.exploration.is_none(),
+            "archive exploration must be bound through durable activation"
+        );
+
+        #[cfg(windows)]
+        {
+            // Preparing can cancel before activation replaces this ordinary transaction.
+            // Its initial carrier must already satisfy private completion ownership.
+            let json = format!("{}\n", serde_json::to_string_pretty(tx)?);
+            crate::domain::merge_archive::durable_publish_transition_bytes(
+                &self.path,
+                json.as_bytes(),
+                replace,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            use anyhow::Context as _;
+            use std::io::Write as _;
+
+            let mut pending = tempfile::NamedTempFile::new_in(
+                self.path
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("the transaction has no parent directory"))?,
+            )?;
+            writeln!(pending, "{}", serde_json::to_string_pretty(tx)?)?;
+            pending.as_file().sync_all()?;
+            if replace {
+                pending
+                    .persist(&self.path)
+                    .map_err(|error| error.error)
+                    .context("cannot update the merge transaction")?;
+            } else {
+                pending.persist_noclobber(&self.path).map_err(|error| error.error)
+                    .context("cannot open the merge transaction without replacing existing state; inspect `agit merge --status`")?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Ordinary landing must recheck archive admission after acquiring transaction control.
+    /// This observation takes no journal lock, preserving the archive lock order.
+    pub fn require_ordinary(&self, tx: &Tx) -> Result<()> {
+        anyhow::ensure!(
+            tx.exploration.is_none() && !self.retained_archive_intent(tx)?,
+            "retained archive authority requires archive lifecycle dispatch; retry the selected command"
+        );
         Ok(())
     }
 
@@ -243,11 +467,64 @@ impl ControlGuard {
     }
 
     pub fn remove(&self) -> Result<()> {
+        if let Some(tx) = self.read()? {
+            anyhow::ensure!(
+                tx.exploration.is_none() && !self.retained_archive_intent(&tx)?,
+                "archive exploration requires durable disposition before its transaction can be removed"
+            );
+        }
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// A completed archive disposition retires only its exact transaction image.
+    /// Missing authority succeeds only with the matching durable completion carrier.
+    pub fn complete_archive_landing(
+        &self,
+        binding: &crate::domain::merge_archive::ExplorationBinding,
+        transaction_json: &str,
+        merge_commit: &str,
+    ) -> Result<()> {
+        use crate::domain::merge_archive;
+        merge_archive::checked_landing_transaction(transaction_json, binding)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("transaction has no common directory"))?;
+        merge_archive::require_landed_transaction(parent, binding, transaction_json, merge_commit)?;
+        let retired = self
+            .path
+            .with_extension(format!("landed-{}.json", binding.role.generation));
+        merge_archive::durable_retire_transition_bytes(
+            &self.path,
+            &retired,
+            transaction_json.as_bytes(),
+        )
+    }
+
+    /// Cancellation retires only the image whose restoration has a settled Aborted journal.
+    pub fn complete_archive_abort(
+        &self,
+        binding: &crate::domain::merge_archive::ExplorationBinding,
+        transaction_json: &str,
+    ) -> Result<()> {
+        use crate::domain::merge_archive;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("transaction has no common directory"))?;
+        merge_archive::require_aborted_transaction(parent, binding, transaction_json)?;
+        let retired = self
+            .path
+            .with_extension(format!("aborted-{}.json", binding.role.generation));
+        merge_archive::durable_retire_transition_bytes(
+            &self.path,
+            &retired,
+            transaction_json.as_bytes(),
+        )
     }
 }
 
@@ -276,6 +553,8 @@ mod tests {
         std::fs::create_dir_all(&git).unwrap();
         assert!(!is_locked(d.path()));
         let tx = Tx {
+            mode: Some(crate::domain::mergetx::Mode::Manual),
+            exploration: None,
             generation: None,
             target: "a".into(),
             source: "b".into(),
@@ -296,6 +575,8 @@ mod tests {
 
     fn tx_on(target: &str) -> Tx {
         Tx {
+            mode: Some(crate::domain::mergetx::Mode::Manual),
+            exploration: None,
             generation: None,
             target: target.into(),
             source: "b".into(),
@@ -307,6 +588,174 @@ mod tests {
             picked: vec![],
             summary: None,
         }
+    }
+
+    #[cfg(windows)]
+    fn windows_file_identity(path: &Path) -> [u32; 3] {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let file = std::fs::File::open(path).unwrap();
+        let mut facts = BY_HANDLE_FILE_INFORMATION::default();
+        assert_ne!(
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut facts) },
+            0
+        );
+        [
+            facts.dwVolumeSerialNumber,
+            facts.nFileIndexHigh,
+            facts.nFileIndexLow,
+        ]
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_transaction_publication_is_private_before_archive_activation() {
+        use crate::infra::windows_security as security;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(&temporary.path().join("repo")).unwrap();
+        let path = lock_path(repo.root());
+        let mut tx = tx_on("work");
+        create(repo.root(), &tx).unwrap();
+        security::validate_path(&path, false, true).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let identity = windows_file_identity(&path);
+        assert_eq!(
+            original,
+            format!("{}\n", serde_json::to_string_pretty(&tx).unwrap()).as_bytes()
+        );
+        assert!(create(repo.root(), &tx_on("other")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(windows_file_identity(&path), identity);
+        security::validate_path(&path, false, true).unwrap();
+
+        tx.summary = Some("Synthetic ordinary progress".into());
+        lock(repo.root(), &tx).unwrap();
+        security::validate_path(&path, false, true).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            format!("{}\n", serde_json::to_string_pretty(&tx).unwrap()).as_bytes()
+        );
+        assert_eq!(read(repo.root()).unwrap().unwrap().summary, tx.summary);
+        unlock(repo.root()).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_publication_refuses_an_unsafe_existing_transaction_without_repair() {
+        use crate::infra::windows_security as security;
+        use std::io::Write;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_NEW, CreateFileW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(&temporary.path().join("repo")).unwrap();
+        let path = lock_path(repo.root());
+        let tx = tx_on("work");
+        let bytes = format!("{}\n", serde_json::to_string_pretty(&tx).unwrap());
+        let sid = security::current_sid().unwrap();
+        let sddl = security::wide(format!("O:{sid}D:P(A;;GA;;;{sid})(A;;GW;;;WD)")).unwrap();
+        let mut descriptor = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let descriptor = security::LocalAllocation(descriptor);
+        let attributes = security::attributes(&descriptor);
+        let name = security::wide(&path).unwrap();
+        let handle = security::Handle::new(unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &attributes,
+                CREATE_NEW,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        })
+        .unwrap();
+        let raw = handle.0;
+        std::mem::forget(handle);
+        let mut file = unsafe { std::fs::File::from_raw_handle(raw) };
+        file.write_all(bytes.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let identity = windows_file_identity(&path);
+        for replace in [false, true] {
+            let control = ControlGuard::acquire(repo.root()).unwrap();
+            assert!(control.publish(&tx, replace).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+            assert_eq!(windows_file_identity(&path), identity);
+            assert!(security::validate_path(&path, false, false).is_err());
+            assert!(security::validate_path(&path, false, true).is_err());
+        }
+    }
+
+    #[test]
+    fn launched_agent_authority_requires_the_exact_repository_and_generation() {
+        let mut transaction = tx_on("work@nested");
+        transaction.generation = Some("current-generation".into());
+        assert!(
+            transaction
+                .require_agent_context_values("me/qa", None, None)
+                .is_ok()
+        );
+        assert!(
+            transaction
+                .require_agent_context_values(
+                    "me/qa",
+                    Some("me/qa@work@nested"),
+                    Some("current-generation")
+                )
+                .is_ok()
+        );
+        for (marker, generation) in [
+            (Some("me/qa@work@nested"), Some("old-generation")),
+            (Some("other/qa@work@nested"), Some("current-generation")),
+            (Some("me/qa@another"), Some("current-generation")),
+            (Some("me/qa@work@nested"), None),
+            (None, Some("current-generation")),
+            (Some("me/qa@work@nested"), Some("")),
+            (Some(""), Some("current-generation")),
+        ] {
+            assert!(
+                transaction
+                    .require_agent_context_values("me/qa", marker, generation)
+                    .is_err()
+            );
+        }
+        transaction.generation = None;
+        assert!(
+            transaction
+                .require_agent_context_values("me/qa", None, None)
+                .is_ok()
+        );
+        assert!(
+            transaction
+                .require_agent_context_values(
+                    "me/qa",
+                    Some("me/qa@work@nested"),
+                    Some("current-generation")
+                )
+                .is_err()
+        );
     }
 
     #[test]

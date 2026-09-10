@@ -1,9 +1,12 @@
-//! Captures complete native records after an unchanged materialized prefix.
+//! Captures append-only native bytes or explicit observations of mutable OpenCode rows.
 //!
 //! The materialized prefix is already represented by the session VIEW. Archiving it again
-//! duplicates inherited evidence, so only verified append bytes can cross this frontier.
+//! duplicates inherited evidence. Append-only runtimes verify that prefix; OpenCode retains a
+//! bounded installed-row index and appends explicit revisions without replacing old evidence.
 
-use std::collections::BTreeSet;
+pub mod opencode;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
 
@@ -11,7 +14,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// A persisted frontier binds the next capture to the exact consumed native prefix.
+/// An append-only native prefix, or the cumulative OpenCode observation stream commitment.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Frontier {
@@ -53,6 +56,8 @@ pub enum CaptureError {
     NonObjectRecord { offset: u64 },
     #[error("native archive frontier cannot be represented")]
     FrontierOutOfRange,
+    #[error("OpenCode archive record at byte {offset} has an invalid canonical identity")]
+    InvalidOpenCodeRecord { offset: u64 },
 }
 
 /// Captures newline-terminated object records without interpreting runtime-specific fields.
@@ -119,6 +124,107 @@ pub fn capture<'a>(
         },
         unconsumed: &appended[completed_len..],
     })
+}
+
+fn opencode_observable_end(snapshot: &[u8]) -> Result<(usize, BTreeSet<String>), CaptureError> {
+    struct Message {
+        start: usize,
+        end: usize,
+        assistant: bool,
+        terminal: bool,
+    }
+    let text = std::str::from_utf8(snapshot).map_err(|_| CaptureError::InvalidRecordUtf8)?;
+    let mut session = None;
+    let mut ids = BTreeSet::new();
+    let mut messages = BTreeMap::<String, Message>::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let invalid = || CaptureError::InvalidOpenCodeRecord {
+            offset: offset as u64,
+        };
+        let record: serde_json::Value =
+            serde_json::from_str(line).map_err(|source| CaptureError::InvalidRecord {
+                offset: offset as u64,
+                source,
+            })?;
+        let id = record["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(invalid)?;
+        if !ids.insert(id.to_owned()) {
+            return Err(invalid());
+        }
+        let end = offset + line.len();
+        match record["kind"].as_str() {
+            Some("opencode.meta") if session.is_none() && offset == 0 => {
+                session = Some(id.to_owned());
+            }
+            Some("message") | Some("part") => {
+                if session.is_none() || record["session_id"].as_str() != session.as_deref() {
+                    return Err(invalid());
+                }
+                let data = record["data"].as_object().ok_or_else(invalid)?;
+                if record["kind"] == "message" {
+                    let assistant = match data.get("role").and_then(|role| role.as_str()) {
+                        Some("assistant") => true,
+                        Some("user") => false,
+                        _ => return Err(invalid()),
+                    };
+                    // Step finish precedes cleanup; only cleanup closes text, patches and errors.
+                    let terminal = !assistant
+                        || data
+                            .get("time")
+                            .and_then(|time| time.get("completed"))
+                            .and_then(|completed| completed.as_u64())
+                            .is_some();
+                    messages.insert(
+                        id.to_owned(),
+                        Message {
+                            start: offset,
+                            end,
+                            assistant,
+                            terminal,
+                        },
+                    );
+                } else {
+                    let parent = record["message_id"].as_str().ok_or_else(invalid)?;
+                    let message = messages.get_mut(parent).ok_or_else(invalid)?;
+                    message.end = end;
+                    let kind = data
+                        .get("type")
+                        .and_then(|kind| kind.as_str())
+                        .ok_or_else(invalid)?;
+                    if message.assistant && kind == "tool" {
+                        let status = data
+                            .get("state")
+                            .and_then(|state| state.get("status"))
+                            .and_then(|status| status.as_str());
+                        message.terminal &= matches!(status, Some("completed" | "error"));
+                    }
+                }
+            }
+            _ => return Err(invalid()),
+        }
+        offset = end;
+    }
+    let barrier = messages
+        .values()
+        .filter(|message| message.assistant && !message.terminal)
+        .map(|message| message.start)
+        .min()
+        .unwrap_or(snapshot.len());
+    // A later terminal message cannot authorize bytes belonging to an earlier streaming one.
+    let end = messages
+        .values()
+        .filter(|message| message.assistant && message.terminal && message.end <= barrier)
+        .map(|message| message.end)
+        .max()
+        .unwrap_or(0);
+    let unfinished = messages
+        .into_iter()
+        .filter_map(|(id, message)| (message.assistant && !message.terminal).then_some(id))
+        .collect();
+    Ok((end, unfinished))
 }
 
 /// The content occupies the same nesting position as it does in a stored envelope.

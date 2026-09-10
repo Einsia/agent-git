@@ -166,6 +166,8 @@ mod tests {
         repo.git(&["branch", "work"]).unwrap();
         let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
         let tx = Tx {
+            mode: None,
+            exploration: None,
             generation: None,
             target: "work".into(),
             source: head.clone(),

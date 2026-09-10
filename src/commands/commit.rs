@@ -17,8 +17,8 @@
 //!   the code anchor.
 //! * The `-m` form is legal only when there are no new turns and only shared files
 //!   (memory/skills/AGENTS.md...) changed; it lands one file commit, and the message is required.
-//! * `--from-hook` belongs to hooks: quiet, non-blocking on failure, skipped automatically during
-//!   a merge transaction.
+//! * Ordinary `--from-hook` settlement stays quiet during a merge transaction. Archive hooks
+//!   retain exploration until landing and report failures instead of acknowledging lost evidence.
 //!
 //! # Two settlement modes
 //!
@@ -37,6 +37,7 @@
 //! A commit's author fields (git user.name/email) come from the credentials and cannot be
 //! backfilled, so the check runs up front instead of failing halfway through.
 
+pub(crate) mod archive;
 mod native;
 
 use super::CmdResult;
@@ -189,9 +190,8 @@ pub fn run(args: Args) -> CmdResult {
     let from_hook = args.from_hook;
     match run_inner(args) {
         Ok(c) => Ok(c),
-        // A --from-hook failure never blocks the runtime: exit 0 quietly. Error text on stderr
-        // is only noise — nobody reads it in a hook.
-        Err(_) if from_hook => Ok(ExitCode::Ok),
+        // Ordinary hook failures stay quiet; archive capture failures must remain observable.
+        Err(ref error) if from_hook && !archive::is_failure(error) => Ok(ExitCode::Ok),
         // A hand-typed `agit commit` runs the same run_inner, so this arm must test from_hook:
         // swallowing every internal error into a wordless exit 0 shows whoever is diagnosing
         // "the command succeeded and nothing happened". Quiet belongs to hooks alone.
@@ -218,32 +218,84 @@ fn run_inner(args: Args) -> CmdResult {
         return Ok(ExitCode::Precondition);
     }
 
-    // The sign-in check comes first: a commit's author fields come from the credentials and
-    // cannot be backfilled.
-    let Some(owner) = owner_for_recording(quiet)? else {
-        return Ok(if quiet { ExitCode::Ok } else { ExitCode::Auth });
+    let store = match archive::process_store()? {
+        Some(store) => store,
+        None => match Store::open()? {
+            Some(store) => store,
+            None => {
+                if owner_for_recording(quiet)?.is_none() {
+                    return Ok(if quiet { ExitCode::Ok } else { ExitCode::Auth });
+                }
+                Store::open_or_init()?
+            }
+        },
     };
-
-    // The store indexes "which sessions this machine tracks", and empty is a legal state: `-m`
-    // on the file line depends on no session, and a machine that never ran import/new must still
-    // be able to commit shared files to main. A missing store means there is no link, not a
-    // reason to refuse.
-    let store = Store::open_or_init()?;
-
-    // When the Stop hook names the transcript it fired for, settle that one only — its stdin is
-    // the only source that knows "which conversation this Stop belongs to". See [`hook_target`].
     let hook_input = if args.from_hook {
         HookInput::from_stdin()
     } else {
         None
     };
-    let target = match hook_input.as_ref().and_then(|h| h.session_id.as_deref()) {
-        Some(sid) => hook_target(
+    // Hook payload identity is authoritative even when the launching process still names another
+    // runtime or branch. Explicit native IDs and launcher keys never enumerate old generations.
+    let payload_id = hook_input
+        .as_ref()
+        .and_then(|input| input.session_id.as_deref());
+    if args.from_hook {
+        archive::require_hook_identity(payload_id.is_some())?;
+    }
+    if hook_input.is_some() && payload_id.is_none() {
+        return Ok(ExitCode::Ok);
+    }
+    let selected = if let Some(session_id) = payload_id {
+        archive::exact_session(
             &store,
-            sid,
-            hook_input.as_ref().and_then(|h| h.cwd.as_deref()),
-        ),
-        None => resolve_target(&store, &args, quiet)?,
+            session_id,
+            hook_input
+                .as_ref()
+                .and_then(|input| input.runtime.as_deref()),
+        )?
+    } else {
+        let explicit = args.target.as_deref().filter(|target| {
+            crate::domain::merge_archive::RuntimeLinkKey {
+                runtime: "codex".into(),
+                session_id: (*target).to_owned(),
+            }
+            .validate()
+            .is_ok()
+        });
+        match explicit
+            .map(|id| archive::exact_session(&store, id, None))
+            .transpose()?
+            .flatten()
+        {
+            Some(link) => Some(link),
+            None => archive::process_link(&store)?,
+        }
+    };
+    archive::require_selected_role(selected.as_ref())?;
+    let is_archive = selected
+        .as_ref()
+        .is_some_and(|link| link.merge_archive.is_some());
+    let owner = owner_for_recording(quiet);
+    let owner = if is_archive {
+        archive::checked(owner)?
+    } else {
+        owner?
+    };
+    let Some(owner) = owner else {
+        if is_archive {
+            return archive::checked(Err(anyhow::anyhow!("archive settlement requires sign-in")));
+        }
+        return Ok(if quiet { ExitCode::Ok } else { ExitCode::Auth });
+    };
+    if let Some(link) = selected.as_ref().filter(|_| is_archive) {
+        archive::require_options(&args, link)?;
+        return archive::settle(&store, link).map(|code| code.expect("selected archive role"));
+    }
+    let target = if payload_id.is_some() {
+        selected.and_then(hook_link_target)
+    } else {
+        resolve_target(&store, &args, quiet)?
     };
     let Some(target) = target else {
         return Ok(if quiet { ExitCode::Ok } else { ExitCode::Ref });
@@ -309,6 +361,11 @@ fn run_inner(args: Args) -> CmdResult {
             agent,
             branch: requested_branch,
         } => {
+            if link.merge_archive.is_some() {
+                return archive::checked(Err(anyhow::anyhow!(
+                    "archive settlement requires its exact native session id"
+                )));
+            }
             if std::env::var_os(crate::hub::identity::EXPECTED_AGENT_ID_ENV).is_some() {
                 anyhow::bail!(
                     "an identity-fenced RC settlement did not resolve to its exact branch checkout"
@@ -463,11 +520,30 @@ pub fn owner_for_recording(quiet: bool) -> crate::Result<Option<String>> {
 /// The Stop hook's payload already carries the answer to **which session the turn that just
 /// ended happened in**, so this goes from the link straight to the branch and guesses nothing.
 ///
-/// Quiet: every unmet precondition returns `Ok`, since nobody reads output in a hook.
+/// Ordinary hook preconditions stay quiet; Archive authority and capture failures propagate.
 pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
-    let Some(owner) = owner_for_recording(true)? else {
+    if let Some(code) = delegated_settlement(true)? {
+        return Ok(code);
+    }
+    if super::config::get("commit.auto").as_deref() == Some("false") {
+        return Ok(ExitCode::Ok);
+    }
+    archive::require_selected_role(Some(&lk))?;
+    let owner = owner_for_recording(true);
+    let owner = if lk.merge_archive.is_some() {
+        archive::checked(owner)?
+    } else {
+        owner?
+    };
+    let Some(owner) = owner else {
+        if lk.merge_archive.is_some() {
+            return archive::checked(Err(anyhow::anyhow!("archive settlement requires sign-in")));
+        }
         return Ok(ExitCode::Ok);
     };
+    if let Some(code) = archive::settle(store, &lk)? {
+        return Ok(code);
+    }
     // An unadopted session does not settle — hook convenience does not get to break the premise
     // that adoption is explicit.
     let (Some(agent), Some(branch)) = (lk.agent.clone(), lk.branch.clone()) else {
@@ -510,7 +586,7 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct HookInput {
     session_id: Option<String>,
-    cwd: Option<std::path::PathBuf>,
+    runtime: Option<String>,
 }
 
 impl HookInput {
@@ -524,22 +600,41 @@ impl HookInput {
         }
         let mut buf = String::new();
         stdin.lock().read_to_string(&mut buf).ok()?;
-        Self::parse(&buf)
+        if buf.trim().is_empty() {
+            None
+        } else {
+            Some(Self::parse(&buf).unwrap_or_default())
+        }
     }
 
     fn parse(text: &str) -> Option<HookInput> {
         let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+        let runtime = v
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .and_then(|runtime| crate::adapter::normalize(runtime).ok())
+            .or_else(|| {
+                v.get("transcript_path")
+                    .and_then(|value| value.as_str())
+                    .and_then(|path| {
+                        let path = path.replace('\\', "/");
+                        if path.contains("/.codex/") {
+                            Some("codex")
+                        } else if path.contains("/.claude/") {
+                            Some("claude-code")
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .map(str::to_owned);
         Some(HookInput {
+            runtime,
             session_id: v
                 .get("session_id")
                 .and_then(|s| s.as_str())
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
-            cwd: v
-                .get("cwd")
-                .and_then(|s| s.as_str())
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from),
         })
     }
 }
@@ -556,10 +651,13 @@ impl HookInput {
 /// link is the only place that records a claim by session id: settle a claimed one, and treat a
 /// `hooks ingest` pre-registration, or no registration at all, as a conversation nobody has
 /// adopted yet — exit quietly and let `agit import` decide where it goes.
+#[cfg(test)]
 fn hook_target(store: &Store, session_id: &str, _hook_cwd: Option<&Path>) -> Option<Target> {
-    let lk = link::list(store)
-        .into_iter()
-        .find(|l| l.session_id == session_id)?;
+    let lk = archive::exact_session(store, session_id, None).ok()??;
+    hook_link_target(lk)
+}
+
+fn hook_link_target(lk: Link) -> Option<Target> {
     let (agent, branch) = hook_claim(&lk)?;
     let slug = link_slug(&lk, &agent)?;
     let (owner, name) = super::parse_slug(&slug).ok()?;
@@ -1246,6 +1344,11 @@ fn settle(
         );
         return Ok(ExitCode::Policy);
     };
+    if current.merge_archive.is_some() {
+        return archive::checked(Err(anyhow::anyhow!(
+            "ordinary settlement Link changed to an archive role; retry with its exact native identity"
+        )));
+    }
     // A hook's selection cannot authorize a routing identity changed while it waits for locks.
     if quiet
         && (current.owner != lk.owner || current.agent != lk.agent || current.branch != lk.branch)
@@ -1392,59 +1495,23 @@ fn settle(
             return Ok(code);
         }
         let candidate = primary.git(&["rev-parse", &format!("refs/heads/{branch}")])?;
-        if advance_materialized_file_tip(&primary, &mut current, candidate.trim())? {
+        if advance_materialized_tip(&primary, &mut current, candidate.trim())? {
             link::write(store, &current)?;
         }
     }
     Ok(code)
 }
 
-/// File-only descendants may advance a runtime watermark while retaining its exact evidence.
-/// A concurrent history rewrite must remain visible to the next settlement's lineage check.
-fn advance_materialized_file_tip(
-    repo: &Repo,
-    link: &mut Link,
-    candidate: &str,
-) -> crate::Result<bool> {
+/// Each archive or file edge must preserve the runtime's materialized context before its
+/// watermark advances. Endpoint equality cannot hide an intervening context change.
+fn advance_materialized_tip(repo: &Repo, link: &mut Link, candidate: &str) -> crate::Result<bool> {
     let Some(source) = link.materialized_from.as_deref() else {
         return Ok(false);
     };
-    if source == candidate {
-        return Ok(false);
-    }
-    let (status, _, _) = repo.git_status(&["merge-base", "--is-ancestor", source, candidate])?;
-    if status != Some(0) {
-        return Ok(false);
-    }
-    let (Some(mut before), Some(mut after)) = (
-        meta::read_at_ref(repo, source),
-        meta::read_at_ref(repo, candidate),
-    ) else {
-        return Ok(false);
-    };
-    if after.kind != Kind::File {
-        return Ok(false);
-    }
-    before.kind = Kind::File;
-    before.milestone = None;
-    after.milestone = None;
-    if meta::to_text(&before)? != meta::to_text(&after)? {
-        return Ok(false);
-    }
-    let changed = repo.git(&[
-        "diff",
-        "--name-only",
-        "--no-renames",
-        source,
-        candidate,
-        "--",
-        meta::LOG_FILE,
-        meta::VIEW_FILE,
-        meta::LEGACY_LOG_FILE,
-        meta::LEGACY_VIEW_FILE,
-        meta::EVENTS_DIR,
-    ])?;
-    if !changed.trim().is_empty() {
+    if source == candidate
+        || crate::domain::archive_history::verify_materialized_chain(repo, source, candidate)
+            .is_err()
+    {
         return Ok(false);
     }
     link.materialized_from = Some(candidate.to_string());
@@ -1665,6 +1732,10 @@ fn settle_bytes(
     if materialized_mode
         && let Some(source_tip) = lk.materialized_from.as_deref()
         && settlement_tip.as_deref() != Some(source_tip)
+        && !settlement_tip.as_deref().is_some_and(|candidate| {
+            crate::domain::archive_history::verify_materialized_chain(repo, source_tip, candidate)
+                .is_ok()
+        })
     {
         if !quiet {
             let current_tip = settlement_tip.as_deref().unwrap_or("an unborn branch");
@@ -5615,7 +5686,7 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
         let file_tip = file_child(&base);
         let mut current = link();
         current.materialized_from = Some(base.clone());
-        assert!(advance_materialized_file_tip(&repo, &mut current, &file_tip).unwrap());
+        assert!(advance_materialized_tip(&repo, &mut current, &file_tip).unwrap());
         assert_eq!(
             current.materialized_from.as_deref(),
             Some(file_tip.as_str())
@@ -5637,7 +5708,7 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
             super::super::plumbing::commit_tree(&repo, &tree, &[&file_tip], "change context")
                 .unwrap();
         let concurrent_tip = file_child(&view_tip);
-        assert!(!advance_materialized_file_tip(&repo, &mut current, &concurrent_tip).unwrap());
+        assert!(!advance_materialized_tip(&repo, &mut current, &concurrent_tip).unwrap());
         assert_eq!(
             current.materialized_from.as_deref(),
             Some(file_tip.as_str())
@@ -5652,10 +5723,260 @@ printf 'pre\n' >> .git/file-commit-hook-order"#,
             "unrelated root",
         )
         .unwrap();
-        assert!(!advance_materialized_file_tip(&repo, &mut current, &orphan).unwrap());
+        assert!(!advance_materialized_tip(&repo, &mut current, &orphan).unwrap());
         let mut legacy = link();
-        assert!(!advance_materialized_file_tip(&repo, &mut legacy, &file_tip).unwrap());
+        assert!(!advance_materialized_tip(&repo, &mut legacy, &file_tip).unwrap());
         assert!(legacy.materialized_from.is_none());
+    }
+
+    struct MaterializedArchiveFixture {
+        _store_dir: tempfile::TempDir,
+        _repo_dir: tempfile::TempDir,
+        store: Store,
+        repo: Repo,
+        selected: Link,
+        prefix: String,
+        source: String,
+    }
+
+    impl MaterializedArchiveFixture {
+        fn new() -> Self {
+            use sha2::Digest as _;
+
+            let (store_dir, store) = store();
+            let (repo_dir, repo) = setup_repo();
+            let prefix = format!(
+                "{META}\n{}{}",
+                codex_user("visible work"),
+                codex_asst("done")
+            );
+            let mut metadata = Meta::new(
+                format!("agit-{}", "a".repeat(40)),
+                "codex".into(),
+                "/repo/one".into(),
+            );
+            metadata.turn = Some(1);
+            let evidence = transcript::wrap_lines(&prefix, "codex", &metadata.session);
+            meta::write(repo.root(), &metadata).unwrap();
+            storage::write_snapshot(repo.root(), &evidence, &evidence).unwrap();
+            repo.add_all().unwrap();
+            repo.commit("materialized source fixture").unwrap();
+            let source = repo.git(&["rev-parse", "HEAD"]).unwrap();
+            let mut selected = link();
+            selected.owner = Some("alice".into());
+            selected.baseline_bytes = Some(prefix.len() as u64);
+            selected.baseline_hash = Some(hex::encode(sha2::Sha256::digest(prefix.as_bytes())));
+            selected.materialized_from = Some(source.clone());
+            link::write(&store, &selected).unwrap();
+            Self {
+                _store_dir: store_dir,
+                _repo_dir: repo_dir,
+                store,
+                repo,
+                selected,
+                prefix,
+                source,
+            }
+        }
+
+        fn child(&self, parent: &str, kind: Kind, label: &str) -> String {
+            let mut metadata = meta::read_at_ref(&self.repo, parent).unwrap();
+            metadata.kind = kind;
+            let tree = if kind == Kind::Archive {
+                let log =
+                    storage::materialize_at(self.repo.root(), parent, meta::LOG_FILE).unwrap();
+                let view =
+                    storage::materialize_at(self.repo.root(), parent, meta::VIEW_FILE).unwrap();
+                let addition =
+                    transcript::wrap_lines(&codex_asst(label), "codex", &metadata.session);
+                super::super::plumbing::session_snapshot_tree(
+                    &self.repo,
+                    parent,
+                    &format!("{log}{addition}"),
+                    &view,
+                    &meta::to_text(&metadata).unwrap(),
+                )
+                .unwrap()
+            } else {
+                assert_eq!(kind, Kind::File);
+                metadata.milestone = None;
+                super::super::plumbing::tree_apply(
+                    &self.repo,
+                    parent,
+                    &[
+                        (meta::FILE, Some(&meta::to_text(&metadata).unwrap())),
+                        ("memory/note.md", Some(label)),
+                    ],
+                )
+                .unwrap()
+            };
+            super::super::plumbing::commit_tree(&self.repo, &tree, &[parent], "neutral fixture")
+                .unwrap()
+        }
+
+        fn publish(&self, candidate: &str) {
+            let old = self.repo.git(&["rev-parse", "HEAD"]).unwrap();
+            super::super::plumbing::update_branch_cas_and_refresh(
+                &self.repo, "main", candidate, &old, false,
+            )
+            .unwrap();
+        }
+
+        fn settle(&self, selected: Link, bytes: &[u8]) -> CmdResult {
+            settle_bytes(
+                &self.store,
+                &self.repo,
+                "alice/photo",
+                "main",
+                selected,
+                bytes,
+                "alice",
+                opts(),
+                false,
+                false,
+            )
+        }
+    }
+
+    #[test]
+    fn materialized_archive_interleavings_settle_only_native_suffix_into_view() {
+        use sha2::Digest as _;
+
+        for kinds in [
+            [Kind::Archive, Kind::File, Kind::Archive],
+            [Kind::File, Kind::Archive, Kind::File],
+        ] {
+            let fixture = MaterializedArchiveFixture::new();
+            let mut tip = fixture.source.clone();
+            for (index, kind) in kinds.into_iter().enumerate() {
+                tip = fixture.child(&tip, kind, &format!("archival or memory record {index}"));
+            }
+            fixture.publish(&tip);
+            let old_log =
+                storage::materialize_at(fixture.repo.root(), &tip, meta::LOG_FILE).unwrap();
+            let old_view =
+                storage::materialize_at(fixture.repo.root(), &tip, meta::VIEW_FILE).unwrap();
+            assert_ne!(old_log, old_view);
+            assert_eq!(
+                fixture
+                    .settle(fixture.selected.clone(), fixture.prefix.as_bytes())
+                    .unwrap(),
+                ExitCode::Ok
+            );
+            assert_eq!(fixture.repo.git(&["rev-parse", "HEAD"]).unwrap(), tip);
+            assert_eq!(
+                link::get(&fixture.store, "codex", "AB")
+                    .unwrap()
+                    .materialized_from,
+                fixture.selected.materialized_from
+            );
+            let suffix = format!("{}{}", codex_user("new work"), codex_asst("new answer"));
+            let grown = format!("{}{suffix}", fixture.prefix);
+            assert_eq!(
+                fixture
+                    .settle(fixture.selected.clone(), grown.as_bytes())
+                    .unwrap(),
+                ExitCode::Ok
+            );
+            let landed = fixture.repo.git(&["rev-parse", "HEAD"]).unwrap();
+            assert_eq!(fixture.repo.git(&["rev-parse", "HEAD^1"]).unwrap(), tip);
+            let metadata = meta::read_at_ref(&fixture.repo, &landed).unwrap();
+            assert_eq!(metadata.kind, Kind::Turn);
+            assert_eq!(metadata.turn, Some(2));
+            let addition = transcript::wrap_lines(&suffix, "codex", &metadata.session);
+            assert_eq!(
+                storage::materialize_at(fixture.repo.root(), &landed, meta::LOG_FILE).unwrap(),
+                format!("{old_log}{addition}")
+            );
+            assert_eq!(
+                storage::materialize_at(fixture.repo.root(), &landed, meta::VIEW_FILE).unwrap(),
+                format!("{old_view}{addition}")
+            );
+            let current = link::get(&fixture.store, "codex", "AB").unwrap();
+            assert_eq!(current.materialized_from.as_deref(), Some(landed.as_str()));
+            assert_eq!(current.baseline_bytes, Some(grown.len() as u64));
+            assert_eq!(
+                current.baseline_hash.as_deref(),
+                Some(hex::encode(sha2::Sha256::digest(grown.as_bytes())).as_str())
+            );
+            assert_eq!(
+                fixture.settle(current.clone(), grown.as_bytes()).unwrap(),
+                ExitCode::Ok
+            );
+            assert_eq!(fixture.repo.git(&["rev-parse", "HEAD"]).unwrap(), landed);
+
+            let file = fixture.child(&landed, Kind::File, "memory after settlement");
+            let archived = fixture.child(&file, Kind::Archive, "late exploration response");
+            fixture.publish(&archived);
+            let mut watermark = current.clone();
+            assert!(advance_materialized_tip(&fixture.repo, &mut watermark, &archived).unwrap());
+            assert_eq!(watermark.baseline_bytes, current.baseline_bytes);
+            assert_eq!(watermark.baseline_hash, current.baseline_hash);
+            assert_eq!(
+                watermark.materialized_from.as_deref(),
+                Some(archived.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn archived_materialized_history_still_requires_the_original_native_prefix() {
+        let fixture = MaterializedArchiveFixture::new();
+        let tip = fixture.child(&fixture.source, Kind::Archive, "late exploration");
+        fixture.publish(&tip);
+        let path = link::link_path(&fixture.store, "codex", "AB");
+        let before_link = std::fs::read(&path).unwrap();
+        let rewritten = fixture.prefix.replace("visible work", "changed work");
+        let grown = format!(
+            "{rewritten}{}{}",
+            codex_user("new work"),
+            codex_asst("answer")
+        );
+        assert_eq!(
+            fixture
+                .settle(fixture.selected.clone(), grown.as_bytes())
+                .unwrap(),
+            ExitCode::Policy
+        );
+        assert_eq!(fixture.repo.git(&["rev-parse", "HEAD"]).unwrap(), tip);
+        assert_eq!(std::fs::read(path).unwrap(), before_link);
+    }
+
+    #[test]
+    fn a_concurrent_archive_after_proof_cannot_change_the_settlement_parent() {
+        let fixture = MaterializedArchiveFixture::new();
+        let tip = fixture.child(&fixture.source, Kind::Archive, "first late response");
+        let competing = fixture.child(&tip, Kind::Archive, "concurrent late response");
+        fixture.publish(&tip);
+        let expected = competing.clone();
+        interleave_next_publication(move |repo, branch| {
+            repo.git(&[
+                "update-ref",
+                &format!("refs/heads/{branch}"),
+                &expected,
+                &tip,
+            ])
+            .unwrap();
+        });
+        let path = link::link_path(&fixture.store, "codex", "AB");
+        let before_link = std::fs::read(&path).unwrap();
+        let grown = format!(
+            "{}{}{}",
+            fixture.prefix,
+            codex_user("new work"),
+            codex_asst("answer")
+        );
+        assert!(
+            fixture
+                .settle(fixture.selected.clone(), grown.as_bytes())
+                .is_err()
+        );
+        assert_eq!(fixture.repo.git(&["rev-parse", "HEAD"]).unwrap(), competing);
+        assert_eq!(std::fs::read(path).unwrap(), before_link);
+        assert_eq!(
+            storage::materialize_at(fixture.repo.root(), &competing, meta::VIEW_FILE).unwrap(),
+            storage::materialize_at(fixture.repo.root(), &fixture.source, meta::VIEW_FILE).unwrap()
+        );
     }
 
     /// Materialized offsets address raw bytes, so decoding must not move the watermark.

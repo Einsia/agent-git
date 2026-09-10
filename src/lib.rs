@@ -90,6 +90,7 @@ pub mod ui;
 /// The test: a function only one domain uses stays inside that domain. The rule keeps another
 /// catch-all `core/` from growing.
 pub mod domain {
+    pub mod archive_history;
     pub mod comparison;
     #[cfg(feature = "secret-vault")]
     pub mod import_lineage;
@@ -98,6 +99,7 @@ pub mod domain {
     pub mod install;
     /// Links: what stands for a session in the store (not a copy).
     pub mod link;
+    pub mod merge_archive;
     /// The merge transaction lock (the target branch is locked between opening the merge and
     /// recording it).
     pub mod mergetx;

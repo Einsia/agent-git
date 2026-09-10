@@ -714,6 +714,128 @@ pub(crate) fn resume_merge_agent(
     )
 }
 
+/// Runtime availability is checked before merge preparation changes local authority.
+pub(crate) fn archive_runtime(
+    repo: &Repo,
+    head: &str,
+    requested: Option<&str>,
+) -> crate::Result<String> {
+    let snapshot = meta::read_at_ref_result(repo, head)?
+        .ok_or_else(|| anyhow::anyhow!("the archive target has no session metadata"))?;
+    let runtime = requested
+        .map(adapter::normalize)
+        .transpose()?
+        .or_else(|| {
+            config::get_global("runtime.default")
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(|runtime| adapter::normalize(runtime).ok())
+        })
+        .unwrap_or(adapter::normalize(&snapshot.runtime)?);
+    let adapter = adapter::get(runtime)?;
+    anyhow::ensure!(
+        adapter.capability() == adapter::Capability::Resumable,
+        "{runtime} cannot carry a merge transaction's process identity through its handoff."
+    );
+    anyhow::ensure!(
+        adapter.available(),
+        "the {runtime} executable `{}` is not on PATH",
+        adapter.cli()
+    );
+    Ok(runtime.to_owned())
+}
+
+pub(crate) struct ArchiveLaunch {
+    pub runtime: String,
+    pub cwd: PathBuf,
+    system_prompt: Option<String>,
+    tracking: ResumeTracking,
+}
+
+/// Inspect the selected environment without installing or claiming a runtime instance.
+pub(crate) fn archive_launch_context(
+    repo: &Repo,
+    slug: &str,
+    branch: &str,
+    head: &str,
+    runtime: String,
+    fallback_cwd: &Path,
+) -> crate::Result<Option<ArchiveLaunch>> {
+    let snapshot = meta::read_at_ref_result(repo, head)?
+        .ok_or_else(|| anyhow::anyhow!("the archive target has no session metadata"))?;
+    anyhow::ensure!(
+        snapshot.is_session_line(),
+        "archive exploration requires a session line"
+    );
+    anyhow::ensure!(
+        !super::branch::is_sealed(repo, branch),
+        "the archive target is sealed"
+    );
+    let tracking = ResumeTracking::read(repo, branch)?;
+    let (owner, agent) = super::parse_slug(slug)?;
+    let claims =
+        link::archive_claims_for_branch(&Store::at(config::store_root()?), &owner, &agent, branch)?;
+    let cwd = match claims.as_slice() {
+        [only] => only.link.cwd.as_deref().map(PathBuf::from),
+        _ => None,
+    }
+    .unwrap_or_else(|| fallback_cwd.to_owned());
+    let cwd = std::path::absolute(cwd)?;
+    let system_prompt = match cwd_resume_decision(&snapshot, &cwd)? {
+        CwdResumeDecision::Continue => None,
+        CwdResumeDecision::Inject(prompt) => Some(prompt),
+        CwdResumeDecision::Cancel => return Ok(None),
+    };
+    confirm_conversion(&snapshot.runtime, &runtime)?;
+    Ok(Some(ArchiveLaunch {
+        runtime,
+        cwd,
+        system_prompt,
+        tracking,
+    }))
+}
+
+pub(crate) fn require_archive_launch_state(
+    repo: &Repo,
+    branch: &str,
+    head: &str,
+    launch: &ArchiveLaunch,
+) -> crate::Result<()> {
+    require_resume_state(repo, branch, head, &launch.tracking)
+}
+
+/// The installed archive identity is resumed directly; ordinary materialization is forbidden.
+pub(crate) fn prepared_archive_resume(
+    launch: &ArchiveLaunch,
+    sid: &str,
+    slug: &str,
+    branch: &str,
+    prompt: &str,
+) -> crate::Result<Resumed> {
+    prepared_resume(
+        &launch.runtime,
+        sid,
+        &launch.cwd,
+        slug,
+        branch,
+        Some(prompt),
+        launch.system_prompt.as_deref(),
+    )
+    .filter(|prepared| prepared.cmd.is_some())
+    .ok_or_else(|| anyhow::anyhow!("the installed archive runtime has no native launch command"))
+}
+
+/// Memory collection can advance the old branch and therefore precedes the frozen transaction.
+pub(crate) fn prepare_archive_memory(
+    repo: &Repo,
+    slug: &str,
+    branch: &str,
+    launch: &ArchiveLaunch,
+) {
+    materialize_memory(repo, branch, slug, &launch.runtime, &launch.cwd);
+}
+
 #[derive(Clone, Copy)]
 enum ResumePurpose<'a> {
     Continue,
@@ -857,6 +979,17 @@ fn resume_branch_for(
                 .and_then(|runtime| adapter::normalize(runtime).ok())
         })
         .unwrap_or(from);
+    if matches!(purpose, ResumePurpose::Merge(_))
+        && adapter::get(to_runtime)?.capability() != adapter::Capability::Resumable
+    {
+        ui::error(&format!(
+            "{to_runtime} cannot carry a merge transaction's process identity through its handoff."
+        ));
+        ui::hint(
+            "choose a resumable merge runtime with `--as claude-code`, `--as codex`, or `--as opencode`",
+        );
+        return Ok(None);
+    }
     // ── The fast-path test: continue the local native session ──
     let switches_rt = requested_runtime.is_some_and(|runtime| runtime != from);
     // VIEW is only a projection of the committed LOG. Validate the evidence carrier even when the
@@ -1405,7 +1538,27 @@ fn require_merge_claim(
     let bytes = claim.read_bytes().map_err(|_| anyhow::anyhow!(
         "cannot read the active runtime transcript; merge cannot prove {slug}@{branch} is settled"
     ))?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| anyhow::anyhow!(
+    require_merge_claim_with_bytes(
+        repo,
+        committed,
+        claim,
+        slug,
+        branch,
+        &bytes,
+        allow_settlement,
+    )
+}
+
+pub(crate) fn require_merge_claim_with_bytes(
+    repo: &Repo,
+    committed: &str,
+    claim: &Link,
+    slug: &str,
+    branch: &str,
+    bytes: &[u8],
+    allow_settlement: bool,
+) -> crate::Result<()> {
+    let text = std::str::from_utf8(bytes).map_err(|_| anyhow::anyhow!(
         "the active runtime transcript contains invalid text; inspect it before merging {slug}@{branch}"
     ))?;
     anyhow::ensure!(
@@ -1415,7 +1568,7 @@ fn require_merge_claim(
         "the active runtime transcript contains an incomplete or malformed record; finish or recover it before merging {slug}@{branch}"
     );
     let activity = if claim.baseline_bytes.is_some() {
-        match link::materialization_activity_with_bytes(claim, &bytes) {
+        match link::materialization_activity_with_bytes(claim, bytes) {
             link::MaterializationActivity::Untouched => ClaimActivity::Untouched,
             link::MaterializationActivity::Appended => ClaimActivity::Appended,
             link::MaterializationActivity::Rewritten => ClaimActivity::Rewritten,
@@ -2535,6 +2688,8 @@ mod tests {
         let (_dir, repo, head) = claimed_but_never_settled();
         let branch = repo.current_branch().unwrap();
         let expected = Tx {
+            mode: Some(crate::domain::mergetx::Mode::Manual),
+            exploration: None,
             generation: Some("synthetic-generation".into()),
             target: branch.clone(),
             source: "source".into(),

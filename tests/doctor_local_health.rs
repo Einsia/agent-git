@@ -141,6 +141,8 @@ fn doctor_reports_an_open_merge_and_target_movement_without_changing_the_transac
     let lab = Lab::new();
     let head = lab.repo.git(&["rev-parse", "refs/heads/work"]).unwrap();
     let tx = agit::domain::mergetx::Tx {
+        mode: None,
+        exploration: None,
         generation: None,
         target: "work".into(),
         source: head.clone(),
@@ -188,6 +190,8 @@ fn inherited_git_repository_routing_cannot_redirect_doctor_to_a_foreign_transact
     let foreign = Lab::new();
     let head = foreign.repo.git(&["rev-parse", "HEAD"]).unwrap();
     let tx = agit::domain::mergetx::Tx {
+        mode: None,
+        exploration: None,
         generation: None,
         target: "foreign-transaction-marker".into(),
         source: head.clone(),

@@ -31,6 +31,37 @@ impl JsonFacts {
     pub fn parse(input: &str) -> Result<Self> {
         JsonParser::parse(input)
     }
+
+    /// Parsed atom tokens remain exact when authority images are written again.
+    pub(crate) fn write_json(&self, out: &mut String) -> Result<()> {
+        match self {
+            JsonFacts::Object(fields) => {
+                out.push('{');
+                for (index, (key, value)) in fields.iter().enumerate() {
+                    if index != 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::to_string(key)?);
+                    out.push(':');
+                    value.write_json(out)?;
+                }
+                out.push('}');
+            }
+            JsonFacts::Array(items) => {
+                out.push('[');
+                for (index, value) in items.iter().enumerate() {
+                    if index != 0 {
+                        out.push(',');
+                    }
+                    value.write_json(out)?;
+                }
+                out.push(']');
+            }
+            JsonFacts::String(value) => out.push_str(&serde_json::to_string(value)?),
+            JsonFacts::Atom(value) => out.push_str(value),
+        }
+        Ok(())
+    }
 }
 
 impl<'a> JsonParser<'a> {

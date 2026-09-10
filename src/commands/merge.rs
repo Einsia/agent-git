@@ -23,6 +23,8 @@
 //!
 //! B is left untouched.
 
+pub mod archive;
+
 use super::CmdResult;
 use crate::domain::mergetx::{self, Tx};
 use crate::domain::meta;
@@ -62,7 +64,7 @@ pub struct Args {
     /// Validate and commit.
     #[arg(long)]
     pub continue_: bool,
-    /// Abandon this merge (the target ref was never touched).
+    /// Cancel this merge; a visible archive landing is completed without rollback.
     #[arg(long)]
     pub abort: bool,
 
@@ -207,6 +209,7 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     let mut target_head = target_head.trim().to_string();
     let mut reconnaissance =
         Reconnaissance::read(&repo, &base.repo, &target_head, &base.resolved.sha)?;
+    let mut archive_runtime = None;
 
     if !args.dry_run {
         // Starting the merge agent is the only part of this command that needs an interactive
@@ -223,6 +226,14 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
                 "run `agit merge ... --manual` to drive the transaction without launching a runtime",
             );
             return Ok(ExitCode::Interactive);
+        }
+
+        if !args.manual && !meta::is_file_line_at(&repo, &target_head) {
+            archive_runtime = Some(super::resume::archive_runtime(
+                &repo,
+                &target_head,
+                args.as_runtime.as_deref(),
+            )?);
         }
 
         let store = crate::domain::store::Store::open_or_init()?;
@@ -280,6 +291,24 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
+    // Old writers are settled before freezing the transaction. The new native instance must
+    // never pass through ordinary settlement or resume materialization after activation.
+    let archive_launch = if let Some(runtime) = archive_runtime {
+        match super::resume::archive_launch_context(
+            &repo,
+            &slug,
+            &target,
+            &target_head,
+            runtime,
+            cwd,
+        )? {
+            Some(launch) => Some(launch),
+            None => return Ok(ExitCode::Precondition),
+        }
+    } else {
+        None
+    };
+
     let store = crate::domain::store::Store::open_or_init()?;
     let branch_guard = crate::domain::link::lock_branch(&store, &slug, &target)?;
     anyhow::ensure!(
@@ -288,13 +317,33 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     );
     super::resume::require_merge_claims(&repo, &store, &slug, &target, &target_head, false)?;
 
+    if let Some(launch) = &archive_launch {
+        super::resume::require_archive_launch_state(&repo, &target, &target_head, launch)?;
+        super::resume::prepare_archive_memory(&repo, &slug, &target, launch);
+        let head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
+        super::resume::require_archive_launch_state(&repo, &target, &head, launch)?;
+        super::resume::require_merge_claims(&repo, &store, &slug, &target, &head, false)?;
+        if head != target_head {
+            reconnaissance = Reconnaissance::read(&repo, &base.repo, &head, &base.resolved.sha)?;
+            target_head = head;
+        }
+    }
+
     // The target branch's worktree comes first: the merge agent reconciles shared files there,
     // and `--continue` collects the edits from there. During the transaction its path comes from
     // `agit repo path <repo>@<target>`.
-    super::worktree::checkout(&repo, &target)?;
+    let destination = super::worktree::checkout(&repo, &target)?;
 
     // Take the lock.
     let tx = Tx {
+        mode: Some(if args.manual {
+            mergetx::Mode::Manual
+        } else if meta::is_file_line_at(&repo, &target_head) {
+            mergetx::Mode::FileAgent
+        } else {
+            mergetx::Mode::SessionAgent
+        }),
+        exploration: None,
         generation: Some(uuid::Uuid::now_v7().to_string()),
         target: target.clone(),
         source: src_ref.to_string(),
@@ -321,6 +370,26 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
+    let instruction = merge_instruction(&slug, &target, src_ref, args.message.as_deref());
+    if let Some(launch) = archive_launch {
+        let mut launched = archive::launch::start(
+            &destination,
+            &base.repo,
+            &store,
+            &tx,
+            &slug,
+            &launch,
+            &instruction,
+        )?;
+        print_merge_instruction(&instruction);
+        return archive::completion::finish(
+            &destination,
+            &store,
+            &launched.binding,
+            &mut launched.child,
+        );
+    }
+
     // resume merge agent: materialized from the target head (its instance carries the
     // AGIT_MERGE_TX marker).
     let rargs = super::resume::Args {
@@ -333,7 +402,6 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     // The instruction goes in as the merge agent's **opening message**. Without it the agent
     // comes up with no idea that it is the merge agent — that is what leaves it sitting there
     // waiting after launch.
-    let instruction = merge_instruction(&slug, &target, src_ref, args.message.as_deref());
     match super::resume::resume_merge_agent(&repo, &slug, &tx, &rargs, &instruction)? {
         Some(mut res) => {
             let child = res.cmd.as_ref().map(|cmd| {
@@ -341,18 +409,18 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
                     .arg("-c")
                     .arg(cmd)
                     .env(mergetx::ENV, format!("{slug}@{target}"))
+                    .env(
+                        mergetx::GENERATION_ENV,
+                        tx.generation
+                            .as_deref()
+                            .expect("new transaction generation"),
+                    )
                     .spawn()
             });
             drop(res.merge_launch_guard.take());
             let child = child.transpose()?;
             res.emit_launch_messages();
-            println!();
-            println!(
-                "merge-agent protocol (sent as its opening message; the skill is on the scene too):"
-            );
-            for line in instruction.lines() {
-                println!("  {}", ui::dim(line));
-            }
+            print_merge_instruction(&instruction);
             match child {
                 Some(mut child) => {
                     let status = child.wait()?;
@@ -373,6 +441,14 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
             ui::hint("agit merge pick … → agit merge summary -m … → agit merge --continue");
             Ok(ExitCode::Precondition)
         }
+    }
+}
+
+fn print_merge_instruction(instruction: &str) {
+    println!();
+    println!("merge-agent protocol (sent as its opening message; the skill is on the scene too):");
+    for line in instruction.lines() {
+        println!("  {}", ui::dim(line));
     }
 }
 
@@ -572,20 +648,14 @@ fn echo_transaction(slug: &str, tx: &Tx, into: Option<&str>) {
     );
 }
 
-fn read_selected_tx(repo: &Repo, selected_branch: Option<&str>) -> crate::Result<Option<Tx>> {
+fn read_selected_tx(
+    repo: &Repo,
+    slug: &str,
+    selected_branch: Option<&str>,
+) -> crate::Result<Option<Tx>> {
     match mergetx::read(repo.root())? {
         Some(tx) => {
-            if let Some(branch) = selected_branch
-                && tx.target != branch
-            {
-                ui::error(&format!(
-                    "this repo has a merge open on `{}`; the requested target is `{branch}`.",
-                    tx.target
-                ));
-                ui::hint(&format!(
-                    "use `agit merge --into <owner/repo>@{} --status|--abort`",
-                    tx.target
-                ));
+            if !selected_tx_matches_context(&tx, slug, selected_branch) {
                 return Ok(None);
             }
             Ok(Some(tx))
@@ -597,11 +667,32 @@ fn read_selected_tx(repo: &Repo, selected_branch: Option<&str>) -> crate::Result
     }
 }
 
+fn selected_tx_matches_context(tx: &Tx, slug: &str, selected_branch: Option<&str>) -> bool {
+    if let Err(error) = tx.require_agent_context(slug) {
+        ui::error(&format!("{error:#}"));
+        return false;
+    }
+    if let Some(branch) = selected_branch
+        && tx.target != branch
+    {
+        ui::error(&format!(
+            "this repo has a merge open on `{}`; the requested target is `{branch}`.",
+            tx.target
+        ));
+        ui::hint(&format!(
+            "use `agit merge --into <owner/repo>@{} --status|--abort`",
+            tx.target
+        ));
+        return false;
+    }
+    true
+}
+
 fn open_tx(cwd: &std::path::Path, into: Option<&str>) -> crate::Result<Option<(Repo, String, Tx)>> {
     let Some((repo, slug, branch)) = transaction_repo(cwd, into)? else {
         return Ok(None);
     };
-    let Some(tx) = read_selected_tx(&repo, branch.as_deref())? else {
+    let Some(tx) = read_selected_tx(&repo, &slug, branch.as_deref())? else {
         return Ok(None);
     };
     Ok(Some((repo, slug, tx)))
@@ -615,10 +706,86 @@ fn open_tx_locked(
         return Ok(None);
     };
     let control = mergetx::ControlGuard::acquire(repo.root())?;
-    let Some(tx) = read_selected_tx(&repo, branch.as_deref())? else {
+    let Some(tx) = read_selected_tx(&repo, &slug, branch.as_deref())? else {
         return Ok(None);
     };
     Ok(Some((repo, slug, tx, control)))
+}
+
+enum Lifecycle {
+    Archive {
+        repo: Repo,
+        slug: String,
+        binding: Box<crate::domain::merge_archive::ExplorationBinding>,
+    },
+    Ordinary {
+        repo: Repo,
+        slug: String,
+        tx: Box<Tx>,
+        control: mergetx::ControlGuard,
+    },
+}
+
+/// Selection releases all observation guards before the archive core takes branch-first locks.
+fn open_lifecycle(cwd: &std::path::Path, into: Option<&str>) -> crate::Result<Option<Lifecycle>> {
+    let Some((repo, slug, branch)) = transaction_repo(cwd, into)? else {
+        return Ok(None);
+    };
+    let observed = mergetx::read(repo.root())?;
+    if let Some(tx) = observed.as_ref()
+        && !selected_tx_matches_context(tx, &slug, branch.as_deref())
+    {
+        return Ok(None);
+    }
+    if let Some(binding) =
+        archive::dispatch::select(&repo, &slug, branch.as_deref(), observed.as_ref())?
+    {
+        let repo = archive::dispatch::destination(&repo, &binding.role.branch)?;
+        return Ok(Some(Lifecycle::Archive {
+            repo,
+            slug,
+            binding: Box::new(binding),
+        }));
+    }
+    let control = mergetx::ControlGuard::acquire(repo.root())?;
+    let Some(tx) = read_selected_tx(&repo, &slug, branch.as_deref())? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        observed
+            .as_ref()
+            .is_some_and(|observed| observed.same_instance(&tx)),
+        "the selected merge transaction changed before lifecycle admission"
+    );
+    control.require_ordinary(&tx)?;
+    Ok(Some(Lifecycle::Ordinary {
+        repo,
+        slug,
+        tx: Box::new(tx),
+        control,
+    }))
+}
+
+fn echo_archive(
+    slug: &str,
+    binding: &crate::domain::merge_archive::ExplorationBinding,
+    into: Option<&str>,
+) {
+    super::echo::emit(
+        "merge",
+        &[
+            super::echo::Selection::new(
+                format!("{slug}@{}", binding.role.branch),
+                target_selection_source(into),
+            )
+            .role("into"),
+            super::echo::Selection::new(
+                format!("{}@{}", binding.source.slug, binding.source.head),
+                super::echo::Source::Transaction,
+            )
+            .role("recorded-from"),
+        ],
+    );
 }
 
 fn status(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
@@ -648,8 +815,34 @@ fn status(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
 }
 
 fn abort(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
-    let Some((_repo, slug, tx, control)) = open_tx_locked(cwd, into)? else {
+    let Some(selected) = open_lifecycle(cwd, into)? else {
         return Ok(ExitCode::Precondition);
+    };
+    let Lifecycle::Ordinary {
+        slug, tx, control, ..
+    } = selected
+    else {
+        let Lifecycle::Archive {
+            repo,
+            slug,
+            binding,
+        } = selected
+        else {
+            unreachable!()
+        };
+        let store = crate::domain::store::Store::at(crate::infra::config::store_root()?);
+        let outcome = archive::dispatch::abort_selected(&repo, &store, &binding)?;
+        echo_archive(&slug, &binding, into);
+        match outcome {
+            archive::abort::AbortOutcome::Aborted => ui::success(
+                "merge cancelled; prior claims restored and native exploration retained.",
+            ),
+            archive::abort::AbortOutcome::AlreadyLanded(outcome) => ui::success(&format!(
+                "merge already landed at {}; visible history retained.",
+                outcome.commit
+            )),
+        }
+        return Ok(ExitCode::Ok);
     };
     control.remove()?;
     echo_transaction(&slug, &tx, into);
@@ -718,8 +911,32 @@ fn pick_drop_summary(cwd: &std::path::Path, into: Option<&str>, cmd: PickCmd) ->
 }
 
 fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
-    let Some((repo, slug, tx, control)) = open_tx_locked(cwd, into)? else {
+    let Some(selected) = open_lifecycle(cwd, into)? else {
         return Ok(ExitCode::Precondition);
+    };
+    let Lifecycle::Ordinary {
+        repo,
+        slug,
+        tx,
+        control,
+    } = selected
+    else {
+        let Lifecycle::Archive {
+            repo,
+            slug,
+            binding,
+        } = selected
+        else {
+            unreachable!()
+        };
+        let store = crate::domain::store::Store::at(crate::infra::config::store_root()?);
+        let outcome = archive::dispatch::continue_selected(&repo, &store, &binding)?;
+        echo_archive(&slug, &binding, into);
+        ui::success(&format!(
+            "merge commit landed: {} (archived records: {})",
+            outcome.commit, outcome.archived_records
+        ));
+        return Ok(ExitCode::Ok);
     };
 
     // Validation: with no summary this is a proposal only.
@@ -952,7 +1169,7 @@ fn merge_tree(
     target_is_file_line: bool,
 ) -> crate::Result<Option<(String, String)>> {
     if !target_is_file_line {
-        let Some(prepared) = prepare_session_merge(repo, source_repo, tx, src_head)? else {
+        let Some(prepared) = prepare_session_merge(repo, source_repo, tx, src_head, None)? else {
             return Ok(None);
         };
         super::plumbing::import_commit_graph(repo, source_repo, src_head)?;
@@ -1025,12 +1242,17 @@ fn prepare_session_merge(
     source_repo: &Repo,
     tx: &Tx,
     src_head: &str,
+    frozen_source: Option<&crate::domain::archive_history::FrozenSourceLog>,
 ) -> crate::Result<Option<PreparedSessionMerge>> {
     let snap = meta::read_at_ref(target_repo, &tx.target_head)
         .ok_or_else(|| anyhow::anyhow!("the target head is missing {}", meta::FILE))?;
     let a_log = storage::materialize_at(target_repo.root(), &tx.target_head, meta::LOG_FILE)?;
     let a_view = storage::materialize_at(target_repo.root(), &tx.target_head, meta::VIEW_FILE)?;
-    let b_log = match storage::materialize_at(source_repo.root(), src_head, meta::LOG_FILE) {
+    let source_log = match frozen_source {
+        Some(source) => source.log_at(src_head).map(str::to_owned),
+        None => storage::materialize_at(source_repo.root(), src_head, meta::LOG_FILE),
+    };
+    let b_log = match source_log {
         Ok(log) => log,
         Err(error) => {
             // A source branch whose log cannot be read offers nothing to select from. Falling
@@ -1050,7 +1272,27 @@ fn prepare_session_merge(
     // The selected events: resolve the picked refs into envelope lines of the source transcript.
     // A ref that does not resolve fails validation = a proposal; the target ref does not move,
     // and the transaction stays open for the selection to be fixed.
-    let picked = match expand_picked(source_repo, tx) {
+    let selection = match frozen_source {
+        Some(source) => {
+            anyhow::ensure!(
+                tx.source_head == src_head,
+                "merge selection differs from its frozen source"
+            );
+            expand_picked_with(
+                tx,
+                |ordinal| {
+                    if ordinal == refs::LAST_TURN {
+                        source.turn_lines(ordinal).map(|(turn, _)| turn)
+                    } else {
+                        Ok(ordinal)
+                    }
+                },
+                |ordinal| source.turn_lines(ordinal).map(|(_, lines)| lines),
+            )
+        }
+        None => expand_picked(source_repo, tx),
+    };
+    let picked = match selection {
         Ok(p) => p,
         Err(e) => {
             ui::error(&format!("{e:#}"));
@@ -1209,6 +1451,18 @@ pub fn envelope_line(raw: &str, runtime: &str, claim: &str) -> String {
 /// transaction): turn n = the lines that turn's commit adds to the transcript relative to its
 /// parent (in log order; the log is append-only, so the numbering is stable).
 fn expand_picked(source_repo: &Repo, tx: &Tx) -> crate::Result<Vec<usize>> {
+    expand_picked_with(
+        tx,
+        |ordinal| refs::real_turn(source_repo, &tx.source_head, ordinal),
+        |ordinal| turn_lines(source_repo, &tx.source_head, ordinal),
+    )
+}
+
+fn expand_picked_with(
+    tx: &Tx,
+    mut real_turn: impl FnMut(u32) -> crate::Result<u32>,
+    mut turn_lines: impl FnMut(u32) -> crate::Result<Vec<usize>>,
+) -> crate::Result<Vec<usize>> {
     let mut out: Vec<usize> = vec![];
     for r in tx.picked_refs() {
         // The full `try-ratelimit#3..#5` is allowed, as is a bare `#3` (relative to the
@@ -1222,24 +1476,17 @@ fn expand_picked(source_repo: &Repo, tx: &Tx) -> crate::Result<Vec<usize>> {
                 anyhow::bail!("`{r}` is not a turn-level ref (pick takes `#n` / `#n.k` / `#a..#b`)")
             }
         };
-        let head = &tx.source_head;
         let before = out.len();
         match tail {
-            refs::Tail::Turn(n) => out.extend(turn_lines(
-                source_repo,
-                head,
-                refs::real_turn(source_repo, head, n)?,
-            )?),
+            refs::Tail::Turn(n) => out.extend(turn_lines(real_turn(n)?)?),
             refs::Tail::Range { a, b } => {
-                for n in
-                    refs::real_turn(source_repo, head, a)?..=refs::real_turn(source_repo, head, b)?
-                {
-                    out.extend(turn_lines(source_repo, head, n)?);
+                for n in real_turn(a)?..=real_turn(b)? {
+                    out.extend(turn_lines(n)?);
                 }
             }
             refs::Tail::Event { turn, index } => {
-                let n = refs::real_turn(source_repo, head, turn)?;
-                let lines = turn_lines(source_repo, head, n)?;
+                let n = real_turn(turn)?;
+                let lines = turn_lines(n)?;
                 let k = (index as usize).saturating_sub(1);
                 match lines.get(k) {
                     Some(l) => out.push(*l),
@@ -1351,6 +1598,8 @@ mod tests {
     fn transaction_echo_preserves_frozen_sources_without_inventing_a_repository() {
         let head = "a".repeat(40);
         let mut tx = Tx {
+            mode: None,
+            exploration: None,
             generation: None,
             target: "target".into(),
             source: "@#1".into(),
@@ -1432,6 +1681,8 @@ mod tests {
         let turn = refs::fixtures::turn_sha(&repo, 3);
         repo.git(&["tag", "f1", "refs/heads/main"]).unwrap();
         let tx = Tx {
+            mode: Some(crate::domain::mergetx::Mode::Manual),
+            exploration: None,
             generation: None,
             target: "main".into(),
             source: "@#3".into(),
@@ -1560,6 +1811,8 @@ mod tests {
         repo.git(&["checkout", "-q", "main"]).unwrap();
 
         let tx = Tx {
+            mode: Some(crate::domain::mergetx::Mode::Manual),
+            exploration: None,
             generation: None,
             target: "main".into(),
             source: "b".into(),
@@ -1862,6 +2115,8 @@ mod tests {
         let status_before = target.git(&["status", "--porcelain=v1"]).unwrap();
 
         let tx = Tx {
+            mode: Some(crate::domain::mergetx::Mode::Manual),
+            exploration: None,
             generation: None,
             target: "main".into(),
             source: "elsewhere/source@main".into(),

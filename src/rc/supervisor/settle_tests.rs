@@ -61,6 +61,13 @@ fn strict_settlement_requires_a_new_commit_and_a_confirmed_push() {
             .is_none(),
         "clearing the pending SHA after notification prevents duplicates"
     );
+    let withheld = Some(crate::commands::commit::archive::WITHHELD_RESULT);
+    assert_eq!(
+        strict_settlement_candidate("new", &ok, "new", withheld, Some("new")).unwrap(),
+        None
+    );
+    assert!(strict_settlement_candidate("old", &ok, "new", withheld, None).is_err());
+    assert!(strict_settlement_candidate("new", &failed, "new", withheld, None).is_err());
 }
 
 /// Guards against "the predicate is right and the inputs are the test's own invention": the
@@ -870,6 +877,199 @@ async fn a_pending_settlement_that_died_with_the_daemon_is_rederived_from_git() 
         orphan,
         "the orphaned commit was still never pushed"
     );
+}
+
+/// An actual strict child can withhold exploration while an older local commit remains pending.
+/// Neither durable nor in-memory retry evidence grants an ACK for the current journal cursor.
+#[cfg(unix)]
+#[tokio::test]
+async fn withheld_archive_children_never_push_or_ack_an_older_pending_head() {
+    for pending in ["memory", "receipt", "unpushed", "missing-result"] {
+        let fixture = SettlementFixture::new(false);
+        let repo = fixture.repo.to_string_lossy().into_owned();
+        fixture_git(&[
+            "-C",
+            &repo,
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "prior settled turn",
+        ]);
+        let prior = fixture.head();
+        let tracking = fixture.tracking();
+        assert_ne!(prior, tracking);
+        let calls = fixture.exe.with_extension("calls");
+        let script = std::fs::read_to_string(&fixture.exe).unwrap();
+        let ordinary = "commit)\n    :\n";
+        assert_eq!(script.matches(ordinary).count(), 1);
+        let disposition = if pending == "missing-result" {
+            format!(
+                "rm -- \"${}\"",
+                crate::commands::commit::SUPERVISOR_RESULT_ENV
+            )
+        } else {
+            format!(
+                "printf '%s\\n' '{}' > \"${}\"",
+                crate::commands::commit::archive::WITHHELD_RESULT,
+                crate::commands::commit::SUPERVISOR_RESULT_ENV,
+            )
+        };
+        let script = script.replace(
+            ordinary,
+            &format!("commit)\n    test \"$2\" = --from-supervisor\n    {disposition}\n",),
+        );
+        let script = script.replace(
+            "case \"$1\" in",
+            &format!(
+                "printf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in",
+                calls.display()
+            ),
+        );
+        std::fs::write(&fixture.exe, script).unwrap();
+        let (mut session, mut out, _notes, _tx, _lease) = fixture.session();
+        if pending != "unpushed" {
+            record_unacked_settlement(&fixture.receipt(), &prior, &fixture.branch);
+        }
+        if pending == "memory" {
+            session.pending_settlement = Some(PendingSettlement {
+                sha: prior.clone(),
+                delivery: None,
+                receipt: Some(fixture.receipt()),
+            });
+        }
+        let receipt = std::fs::read(fixture.receipt()).ok();
+        for boundary in [SettlementBoundary::Turn, SettlementBoundary::SessionExit] {
+            let frames = settle_draining(&mut session, &mut out, boundary).await;
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame.method.as_deref() != Some(method::COMMIT_SETTLED)),
+                "withheld exploration acknowledged the current cursor: {pending}"
+            );
+            assert_eq!(fixture.head(), prior);
+            assert_eq!(fixture.tracking(), tracking);
+            assert_eq!(std::fs::read(fixture.receipt()).ok(), receipt);
+            assert_eq!(
+                session
+                    .pending_settlement
+                    .as_ref()
+                    .map(|value| value.sha.as_str()),
+                (pending == "memory").then_some(prior.as_str())
+            );
+        }
+        let calls = std::fs::read_to_string(calls).unwrap();
+        assert_eq!(calls.lines().filter(|call| *call == "commit").count(), 2);
+        assert!(!calls.lines().any(|call| call == "push"));
+    }
+}
+
+/// A fresh land result must preserve the Archive classification retained by the supervisor.
+/// Failure clears current validity without clearing the expectation sent to the next child.
+#[cfg(unix)]
+#[tokio::test]
+async fn repeated_archive_landing_retains_expectations_before_any_strict_child() {
+    use crate::commands::commit::archive::{NATIVE_ENV, RC_PREFIX, ROLE_ENV, RcHandoff};
+    use crate::domain::merge_archive::{MergeArchiveRole, RuntimeLinkKey};
+    for result in ["missing", "changed", "failed", "same"] {
+        let fixture = SettlementFixture::new(false);
+        let (mut session, mut out, _notes, _tx, lease) = fixture.session();
+        let thread = session.driver.runtime_thread_id().unwrap();
+        let handoff = RcHandoff {
+            native: RuntimeLinkKey {
+                runtime: "claude-code".into(),
+                session_id: thread.clone(),
+            },
+            role: MergeArchiveRole {
+                generation: uuid::Uuid::now_v7().to_string(),
+                slug: "alice/photo".into(),
+                branch: fixture.branch.clone(),
+                origin_head: fixture.head(),
+                logical_session: "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            },
+        };
+        handoff.role.validate(40).unwrap();
+        handoff.native.validate().unwrap();
+        let response = fixture.exe.with_extension("response");
+        let failure = fixture.exe.with_extension("failure");
+        let unexpected = fixture.exe.with_extension("unexpected");
+        let native_env = fixture.exe.with_extension("native-env");
+        let role_env = fixture.exe.with_extension("role-env");
+        std::fs::write(
+            &response,
+            format!("{RC_PREFIX}{}\n", serde_json::to_string(&handoff).unwrap()),
+        )
+        .unwrap();
+        std::fs::write(
+            &fixture.exe,
+            format!(
+                "#!/bin/sh\nset -e\nif test \"$1\" != rc; then touch '{}'; exit 9; fi\n\
+             test \"$2\" = land\nprintf '%s\\n' \"${{{NATIVE_ENV}-}}\" > '{}'\n\
+             printf '%s\\n' \"${{{ROLE_ENV}-}}\" > '{}'\n\
+             if test -e '{}'; then exit 8; fi\ncat '{}'\n",
+                unexpected.display(),
+                native_env.display(),
+                role_env.display(),
+                failure.display(),
+                response.display(),
+            ),
+        )
+        .unwrap();
+        let head = fixture.head();
+        let tracking = fixture.tracking();
+        session.land(&thread, lease).await;
+        assert_eq!(session.landed_thread.as_deref(), Some(thread.as_str()));
+        assert_eq!(session.archive_handoff.as_ref(), Some(&handoff));
+        assert_eq!(std::fs::read_to_string(&role_env).unwrap().trim(), "");
+        match result {
+            "missing" => std::fs::write(&response, "").unwrap(),
+            "changed" => {
+                let mut changed = handoff.clone();
+                changed.role.generation = uuid::Uuid::now_v7().to_string();
+                std::fs::write(
+                    &response,
+                    format!("{RC_PREFIX}{}\n", serde_json::to_string(&changed).unwrap()),
+                )
+                .unwrap();
+            }
+            "failed" => std::fs::write(&failure, "refused").unwrap(),
+            "same" => {}
+            _ => unreachable!(),
+        }
+        session.land(&thread, lease).await;
+        assert_eq!(session.archive_handoff.as_ref(), Some(&handoff));
+        assert_eq!(
+            session.landed_thread.as_deref(),
+            (result == "same").then_some(thread.as_str())
+        );
+        if result != "same" {
+            let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame.method.as_deref() != Some(method::COMMIT_SETTLED))
+            );
+            assert!(session.landed_thread.is_none());
+            assert_eq!(session.archive_handoff.as_ref(), Some(&handoff));
+        }
+        assert_eq!(
+            serde_json::from_str::<RuntimeLinkKey>(&std::fs::read_to_string(native_env).unwrap())
+                .unwrap(),
+            handoff.native
+        );
+        assert_eq!(
+            serde_json::from_str::<MergeArchiveRole>(&std::fs::read_to_string(role_env).unwrap())
+                .unwrap(),
+            handoff.role
+        );
+        assert!(
+            !unexpected.exists(),
+            "refused land reached strict commit or push"
+        );
+        assert_eq!(fixture.head(), head);
+        assert_eq!(fixture.tracking(), tracking);
+        assert!(!fixture.receipt().exists());
+    }
 }
 
 /// Regression (a lost settlement notification): the push succeeds, the hub has not confirmed it

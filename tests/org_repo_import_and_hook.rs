@@ -3435,7 +3435,7 @@ fn interactive_merge_launches_for_diverged_tracking_after_settlement() {
     let runtime = bin.join("codex");
     fs::write(
         &runtime,
-        "#!/bin/sh\nprintf '%s\\0' \"$AGIT_SESSION\" \"$AGIT_MERGE_TX\" \"$@\" > \"$AGIT_TEST_MERGE_LAUNCH\"\n",
+        "#!/bin/sh\nprintf '%s\\0' \"$AGIT_SESSION\" \"$AGIT_MERGE_TX\" \"$@\" > \"$AGIT_TEST_MERGE_LAUNCH\"\nprintf '%s' \"$AGIT_MERGE_GENERATION\" > \"$AGIT_TEST_MERGE_LAUNCH.generation\"\n",
     )
     .unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3490,7 +3490,13 @@ fn interactive_merge_launches_for_diverged_tracking_after_settlement() {
     };
     drop(pty.master);
     let output = output.join().unwrap();
-    assert!(status.is_some_and(|status| status.success()), "{output}");
+    assert_eq!(status.map(|status| status.exit_code()), Some(4), "{output}");
+    assert!(
+        output.contains(
+            "archive merge child exited before the merge landed; the transaction remains open"
+        ),
+        "{output}"
+    );
     assert_eq!(output.matches("fork point  ").count(), 1, "{output}");
     assert!(
         output.contains("this side  +2 turns    source side  +1 turns"),
@@ -3509,6 +3515,10 @@ fn interactive_merge_launches_for_diverged_tracking_after_settlement() {
     assert!(arguments.last().unwrap().contains("as the merge agent"));
     assert!(arguments.last().unwrap().contains(&source));
     let tx = agit::domain::mergetx::read(repo.root()).unwrap().unwrap();
+    assert_eq!(
+        fs::read_to_string(capture.with_extension("generation")).unwrap(),
+        tx.generation.as_deref().unwrap()
+    );
     assert_eq!(tx.target, "work");
     assert_eq!(tx.source_head, tracking);
     assert_ne!(tx.target_head, initial_head);
@@ -3521,18 +3531,31 @@ fn interactive_merge_launches_for_diverged_tracking_after_settlement() {
         repo.git(&["merge-base", &tx.target_head, &tracking])
             .unwrap()
     );
-    let links = active_links_on(&lab, "einsia", "qa", "work");
-    assert_eq!(links.len(), 1);
-    assert_eq!(links[0].source, "codex");
+    assert!(active_links_on(&lab, "einsia", "qa", "work").is_empty());
+    let binding = tx.exploration.as_ref().unwrap();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let successor = agit::domain::link::read_archive_link_snapshot(
+        &store,
+        &binding.native.runtime,
+        &binding.native.session_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(successor.link.is_archive_for(
+        &binding.role,
+        &binding.native.runtime,
+        &binding.native.session_id,
+    ));
+    assert_eq!(successor.link.source, "codex");
     assert_eq!(
-        links[0].materialized_from.as_deref(),
+        successor.link.materialized_from.as_deref(),
         Some(tx.target_head.as_str())
     );
-    assert_eq!(arguments[3], links[0].session_id);
+    assert_eq!(arguments[3], binding.native.session_id);
     let installed = resume_json_snapshot(&lab.home.join(".codex/sessions"));
     let transcript = installed
         .iter()
-        .find(|(path, _)| path.to_string_lossy().contains(&links[0].session_id))
+        .find(|(path, _)| path.to_string_lossy().contains(&binding.native.session_id))
         .map(|(_, content)| String::from_utf8_lossy(content))
         .unwrap();
     assert!(transcript.contains("settle before freezing the merge"));
@@ -3555,6 +3578,81 @@ fn interactive_merge_launches_for_diverged_tracking_after_settlement() {
         .output()
         .unwrap();
     assert!(aborted.status.success());
+}
+
+/// A desktop handoff cannot retain transaction authority and must not install an unbound agent.
+#[cfg(all(unix, feature = "rc"))]
+#[test]
+fn merge_refuses_unbound_desktop_handoff_before_runtime_or_claim_changes() {
+    use std::time::{Duration, Instant};
+
+    let (lab, repo, initial_head) = resume_tracking_fixture("diverged");
+    let tracking = repo
+        .git(&["rev-parse", "refs/remotes/mirror/topic"])
+        .unwrap();
+    let source = format!("einsia/qa@{}", agit::domain::meta::id_from_sha(&tracking));
+    let native_before = resume_json_snapshot(&lab.home);
+    let links_before = resume_json_snapshot(&lab.agit_home.join("store"));
+    let template = lab.agit(&[]);
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+    command.args([
+        "merge",
+        &source,
+        "--into",
+        "einsia/qa@work",
+        "--as",
+        "claude-desktop",
+    ]);
+    command.cwd(&lab.work);
+    command.env_clear();
+    for (name, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    command.env("AGIT_YES", "1");
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize::default())
+        .unwrap();
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let output = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let mut child = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(pty.master);
+    let output = output.join().unwrap();
+    assert!(status.is_some_and(|status| !status.success()), "{output}");
+    assert!(
+        output.contains("cannot carry a merge transaction"),
+        "{output}"
+    );
+    assert_eq!(
+        repo.git(&["rev-parse", "refs/heads/work"]).unwrap(),
+        initial_head
+    );
+    assert_eq!(resume_json_snapshot(&lab.home), native_before);
+    assert_eq!(
+        resume_json_snapshot(&lab.agit_home.join("store")),
+        links_before
+    );
+    lab.agit(&["merge", "--abort", "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
 }
 
 /// Invalid graph preflight cannot settle the target's pending transcript before refusing.

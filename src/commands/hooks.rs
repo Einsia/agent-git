@@ -6,9 +6,9 @@
 //!   answer** to "which session is running now", see below.
 //! * **`settle` (Stop)**: a turn ended, so settle it.
 //!
-//! Always exit 0: a hook failure must not disturb the session. `settle` stays silent; `ingest`
-//! may return one valid SessionStart JSON response so the runtime can expose the session state.
-//! Failures and sessions that are none of agit's business produce no output.
+//! Ordinary hook failures stay quiet. Archive settlement errors return failure so lost evidence
+//! cannot be acknowledged as saved. `ingest` may return one valid SessionStart JSON response;
+//! sessions that are none of agit's business produce no output.
 //!
 //! # Why SessionStart is authoritative and `AGIT_SESSION` is not
 //!
@@ -470,7 +470,11 @@ fn env_file_belongs_to(path: &str, session_id: &str) -> bool {
 /// Environment propagation requires a complete recorded claim. A missing namespace must not
 /// become an implicit account selection for commands launched after this hook.
 fn session_env_value(lk: &Link) -> Option<String> {
-    if !lk.is_active() {
+    let propagates = match lk.merge_archive.as_ref() {
+        Some(role) => lk.is_archive_for(role, &lk.source, &lk.session_id),
+        None => lk.is_active(),
+    };
+    if !propagates {
         return None;
     }
     let branch = lk.branch.as_deref()?;
@@ -494,29 +498,45 @@ fn settle(runtime: Option<&str>) -> CmdResult {
     if super::commit::delegated_settlement(true)?.is_some() {
         return Ok(ExitCode::Ok);
     }
-    let _ = settle_inner(runtime);
-    Ok(ExitCode::Ok)
+    match settle_inner(runtime) {
+        Err(error) if super::commit::archive::is_failure(&error) => {
+            crate::ui::error(&format!("{error:#}"));
+            Ok(super::terminal_error_code(&error, ExitCode::Failure))
+        }
+        _ => Ok(ExitCode::Ok),
+    }
 }
 
-fn settle_inner(runtime: Option<&str>) -> Option<()> {
+fn settle_inner(runtime: Option<&str>) -> crate::Result<()> {
     if super::config::get("commit.auto").as_deref() == Some("false") {
-        return None; // automatic settlement is explicitly off
+        return Ok(());
     }
-    let ev = read_event()?;
+    let Some(ev) = read_event() else {
+        super::commit::archive::require_hook_identity(false)?;
+        return Ok(());
+    };
     let rt = runtime_of(runtime, ev.transcript_path.as_deref());
-    let store = Store::open_or_init().ok()?;
-
-    // **This is where the whole fix lands**: locating goes through the payload's session_id, not
-    // through the environment variable.
-    let lk = link::get(&store, rt, &ev.session_id)?;
-
-    // An unadopted session is not settled — the premise "adoption is explicit" does not bend for
-    // the hook's convenience.
-    lk.agent.as_ref()?;
-    lk.branch.as_ref()?;
-
-    let _ = super::commit::settle_from_link(&store, lk);
-    Some(())
+    let (store, archive_required) = match super::commit::archive::process_store()? {
+        Some(store) => (store, true),
+        None => (Store::open_or_init()?, false),
+    };
+    let Some(lk) = super::commit::archive::native_link(
+        &store,
+        &crate::domain::merge_archive::RuntimeLinkKey {
+            runtime: rt.into(),
+            session_id: ev.session_id,
+        },
+    )?
+    else {
+        if archive_required {
+            return super::commit::archive::checked(Err(anyhow::anyhow!(
+                "the selected Archive hook native Link is missing"
+            )));
+        }
+        return Ok(());
+    };
+    super::commit::settle_from_link(&store, lk)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -831,6 +851,62 @@ mod tests {
         assert!(super::session_env_value(&lk).is_none());
         let bare = crate::domain::link::Link::new("claude-code", "S2", None);
         assert!(super::session_env_value(&bare).is_none());
+    }
+
+    #[test]
+    fn archive_environment_requires_its_exact_complete_role() {
+        use crate::domain::merge_archive::MergeArchiveRole;
+        let mut link = crate::domain::link::Link::new(
+            "claude-code",
+            "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+            None,
+        );
+        link.owner = Some("alice".into());
+        link.agent = Some("target".into());
+        link.branch = Some("work".into());
+        link.merge_archive = Some(MergeArchiveRole {
+            generation: "019e8308-072a-739c-a75b-604d0848ba6f".into(),
+            slug: "alice/target".into(),
+            branch: "work".into(),
+            origin_head: "a".repeat(40),
+            logical_session: format!("agit-{}", "b".repeat(40)),
+        });
+        assert!(!link.is_active());
+        assert_eq!(
+            super::session_env_value(&link).as_deref(),
+            Some("alice/target@work")
+        );
+        for change in [
+            "superseded",
+            "owner",
+            "agent",
+            "branch",
+            "runtime",
+            "native",
+            "generation",
+            "origin",
+            "logical-session",
+        ] {
+            let mut invalid = link.clone();
+            match change {
+                "superseded" => invalid.superseded_by = Some("codex/other".into()),
+                "owner" => invalid.owner = None,
+                "agent" => invalid.agent = Some("other".into()),
+                "branch" => invalid.branch = Some("other".into()),
+                "runtime" => invalid.source = "unknown-runtime".into(),
+                "native" => invalid.session_id.clear(),
+                "generation" => invalid.merge_archive.as_mut().unwrap().generation.clear(),
+                "origin" => invalid.merge_archive.as_mut().unwrap().origin_head = "z".repeat(40),
+                "logical-session" => invalid
+                    .merge_archive
+                    .as_mut()
+                    .unwrap()
+                    .logical_session
+                    .clear(),
+                _ => unreachable!(),
+            }
+            assert!(super::session_env_value(&invalid).is_none(), "{change}");
+        }
     }
 
     /// Only **this session's own** environment file is written.

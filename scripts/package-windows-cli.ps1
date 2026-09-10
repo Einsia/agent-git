@@ -21,7 +21,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows CLI build failed' }
 $binary = "target/$target/release/agit.exe"
 & cargo check --locked --release --no-default-features --target $target --lib
 if ($LASTEXITCODE -ne 0) { throw 'Windows library without RC failed to compile' }
-& cargo test --locked --release --target $target --test windows_rc --test import_noninteractive_selection --test show_ref_header --test diff_pending --test diff_pending_opencode --test import_lineage_preview --test ref_selection --test merge_recon --test merge_settlement --test hub_credential_binding --test whoami_identity_snapshot --test codex_resume_provider --test windows_json_capture --test quiet_presentation --test doctor_deep --test doctor_link_integrity --test doctor_local_health --test doctor_repo_scope --test context_echo --test context_echo_run_mine --test semantic_turn_prefix --test status_branch_sync --test sensitive_review --test terminal_failure_categories -- --nocapture
+& cargo test --locked --release --target $target --test windows_rc --test import_noninteractive_selection --test show_ref_header --test diff_pending --test diff_pending_opencode --test import_lineage_preview --test ref_selection --test merge_recon --test merge_settlement --test hub_credential_binding --test whoami_identity_snapshot --test codex_resume_provider --test windows_json_capture --test quiet_presentation --test doctor_deep --test doctor_link_integrity --test doctor_local_health --test doctor_repo_scope --test context_echo --test context_echo_run_mine --test semantic_turn_prefix --test status_branch_sync --test merge_archive_lifecycle --test sensitive_review --test terminal_failure_categories -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows native CLI integration tests failed' }
 & cargo test --locked --release --target $target --test share_search_categories -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows sharing and search terminal category tests failed' }
@@ -37,9 +37,11 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows resume cwd selection tests failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Windows sensitive review library tests failed' }
 & cargo test --locked --release --target $target --lib commands::json::windows::tests -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows native JSON capture lifecycle tests failed' }
+& cargo test --locked --release --target $target --lib domain::link::tests::archive_transition_replaces_inherited_public_reads_with_private_acl -- --exact --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows archive Link privacy transition test failed' }
 & cargo test --locked --release --target $target --lib hub::git:: -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows Git transport tests failed' }
-foreach ($suite in @('native_snapshot', 'domain::native_archive::tests', 'adapter::codex_index::tests', 'domain::import_lineage::tests', 'domain::repo::tests::local_', 'domain::repo::tests::inspection_', 'domain::repo::tests::legacy_inspection_', 'commands::fix::tests', 'commands::import::tests::prepared_target_', 'commands::terminal_error_tests')) {
+foreach ($suite in @('native_snapshot', 'domain::native_archive::', 'adapter::opencode::tests::archive_frontier_', 'adapter::codex_index::tests', 'domain::import_lineage::tests', 'domain::repo::tests::local_', 'domain::repo::tests::inspection_', 'domain::repo::tests::legacy_inspection_', 'commands::fix::tests', 'commands::import::tests::prepared_target_', 'commands::merge::archive::', 'commands::commit::archive::tests', 'domain::merge_archive::tests', 'domain::archive_history::tests', 'domain::mergetx::tests', 'commands::terminal_error_tests')) {
     & cargo test --locked --release --target $target --lib $suite -- --nocapture
     if ($LASTEXITCODE -ne 0) { throw "Windows import lineage suite failed: $suite" }
 }

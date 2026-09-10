@@ -635,3 +635,380 @@ fn settlement_recovery_hint_preserves_the_literal_branch_argument() {
         );
     }
 }
+
+/// A canceled runtime must not borrow authority from a replacement transaction on the same target.
+#[test]
+fn merge_agent_generation_cannot_modify_a_replacement_transaction() {
+    let lab = Lab::new();
+    assert!(lab.merge().status.success());
+    let transaction_path = lab.repo().join(".git/AGIT_MERGE_TX");
+    let original: serde_json::Value =
+        serde_json::from_slice(&fs::read(&transaction_path).unwrap()).unwrap();
+    let previous_generation = original["generation"].as_str().unwrap();
+    lab.success(&["merge", "--abort", "--into", "me/qa@work"]);
+    assert!(lab.merge().status.success());
+    let before = fs::read(&transaction_path).unwrap();
+    let current: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_ne!(current["generation"].as_str().unwrap(), previous_generation);
+    let head = lab.git(&["rev-parse", "refs/heads/work"]);
+    for arguments in [
+        vec!["merge", "--into", "me/qa@work", "pick", "me/qa@source#1"],
+        vec!["merge", "--into", "me/qa@work", "drop", "me/qa@source#1"],
+        vec![
+            "merge",
+            "--into",
+            "me/qa@work",
+            "summary",
+            "-m",
+            "obsolete runtime intent",
+        ],
+        vec!["merge", "--into", "me/qa@work", "--continue"],
+        vec!["merge", "--into", "me/qa@work", "--abort"],
+    ] {
+        let output = lab
+            .command()
+            .args(&arguments)
+            .env("AGIT_MERGE_TX", "me/qa@work")
+            .env("AGIT_MERGE_GENERATION", previous_generation)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4), "{arguments:?}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("generation"));
+        assert_eq!(fs::read(&transaction_path).unwrap(), before);
+        assert_eq!(lab.git(&["rev-parse", "refs/heads/work"]), head);
+    }
+    let valid = lab
+        .command()
+        .args([
+            "merge",
+            "--into",
+            "me/qa@work",
+            "summary",
+            "-m",
+            "current runtime intent",
+        ])
+        .env("AGIT_MERGE_TX", "me/qa@work")
+        .env(
+            "AGIT_MERGE_GENERATION",
+            current["generation"].as_str().unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert!(valid.status.success(), "{valid:?}");
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&transaction_path).unwrap()).unwrap();
+    assert_eq!(recorded["summary"], "current runtime intent");
+    lab.success(&["merge", "--abort", "--into", "me/qa@work"]);
+}
+
+#[cfg(unix)]
+struct ArchiveTerminal {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    _writer: Box<dyn std::io::Write + Send>,
+    output: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+#[cfg(unix)]
+impl ArchiveTerminal {
+    fn start(lab: &Lab, exit: u8) -> Self {
+        Self::start_with_runtime(lab, exit, true)
+    }
+
+    fn start_with_runtime(lab: &Lab, exit: u8, available: bool) -> Self {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let bin = lab.home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        if available {
+            let shim = bin.join("codex");
+            fs::write(&shim, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$AGIT_SESSION\" \"$AGIT_MERGE_TX\" \"$AGIT_MERGE_GENERATION\" \"$*\" > \"$ARCHIVE_LAUNCH_RECEIPT\"\nexit \"$ARCHIVE_EXIT_CODE\"\n").unwrap();
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut path = vec![bin.clone()];
+        if available {
+            path.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+        } else {
+            for tool in ["git", "sh"] {
+                std::os::unix::fs::symlink(agit::adapter::which(tool).unwrap(), bin.join(tool))
+                    .unwrap();
+            }
+        }
+        let template = lab.command();
+        let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for (key, value) in template.get_envs() {
+            if key != "CI"
+                && let Some(value) = value
+            {
+                command.env(key, value);
+            }
+        }
+        command.env("PATH", std::env::join_paths(path).unwrap());
+        command.env("ARCHIVE_EXIT_CODE", exit.to_string());
+        command.env("ARCHIVE_LAUNCH_RECEIPT", lab.home.join("launch-receipt"));
+        command.env("TERM", "xterm-256color");
+        command.args([
+            "merge",
+            "me/qa@source",
+            "--into",
+            "me/qa@work",
+            "--as",
+            "codex",
+        ]);
+        command.cwd(&lab.work);
+        let pty = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .unwrap();
+        let mut reader = pty.master.try_clone_reader().unwrap();
+        let writer = pty.master.take_writer().unwrap();
+        let (send, output) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while let Ok(size) = reader.read(&mut buffer) {
+                if size == 0 || send.send(buffer[..size].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let child = pty.slave.spawn_command(command).unwrap();
+        drop(pty.slave);
+        Self {
+            child,
+            _master: pty.master,
+            _writer: writer,
+            output,
+        }
+    }
+
+    fn finish(mut self) -> (u32, String) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut output = Vec::new();
+        loop {
+            if let Ok(bytes) = self
+                .output
+                .recv_timeout(std::time::Duration::from_millis(10))
+            {
+                output.extend_from_slice(&bytes);
+                assert!(
+                    output.len() <= 1024 * 1024,
+                    "controlled runtime output exceeded its bound"
+                );
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                while let Ok(bytes) = self.output.try_recv() {
+                    output.extend_from_slice(&bytes);
+                }
+                return (
+                    status.exit_code(),
+                    String::from_utf8_lossy(&output).into_owned(),
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ArchiveTerminal {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// The old complete turn is saved before Tx freezes; only the installed instance receives authority.
+#[test]
+#[cfg(unix)]
+fn session_agent_start_settles_old_content_then_activates_archive_before_spawn() {
+    use agit::domain::{link, merge_archive, mergetx, meta, repo::Repo, storage, store::Store};
+    for pending in [false, true] {
+        let lab = Lab::new();
+        let original = lab.git(&["rev-parse", "refs/heads/work"]);
+        let source = lab.git(&["rev-parse", "refs/heads/source"]);
+        if pending {
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&lab.native)
+                .unwrap()
+                .write_all(
+                    format!(
+                        "{}{}",
+                        message("user", "SYNTHETIC-BEFORE-ARCHIVE"),
+                        message("assistant", "SYNTHETIC-COMPLETE-REPLY")
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        }
+        let native = fs::read(&lab.native).unwrap();
+        let (status, output) = ArchiveTerminal::start(&lab, 0).finish();
+        assert_eq!(status, 4, "{output}");
+        assert!(
+            output.contains(
+                "archive merge child exited before the merge landed; the transaction remains open"
+            ),
+            "{output}"
+        );
+        let repo = Repo::open(lab.repo()).unwrap();
+        let tx = mergetx::read(repo.root()).unwrap().unwrap();
+        assert_eq!(tx.mode, Some(mergetx::Mode::SessionAgent));
+        assert!(tx.summary.is_none());
+        assert_eq!(tx.source_head, source);
+        assert_eq!(tx.target_head, lab.git(&["rev-parse", "refs/heads/work"]));
+        assert_eq!(tx.target_head != original, pending);
+        let log = storage::materialize_at(repo.root(), &tx.target_head, meta::LOG_FILE).unwrap();
+        assert_eq!(log.contains("SYNTHETIC-BEFORE-ARCHIVE"), pending);
+        let binding = tx.exploration.as_ref().unwrap();
+        assert_eq!(binding.role.origin_head, tx.target_head);
+        assert_eq!(Some(&binding.role.generation), tx.generation.as_ref());
+        assert_ne!(binding.native.session_id, ID);
+        let journal = merge_archive::read(repo.root(), &binding.role.generation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.phase, merge_archive::ArchivePhase::Open);
+        assert!(journal.activation.is_none());
+        assert_eq!(journal.consumed, binding.installed);
+        assert_eq!(journal.previous_claims.len(), 1);
+        let store = Store::at(lab.store.join("store"));
+        let successor =
+            link::read_archive_link_snapshot(&store, "codex", &binding.native.session_id)
+                .unwrap()
+                .unwrap();
+        assert!(
+            successor
+                .link
+                .is_archive_for(&binding.role, "codex", &binding.native.session_id)
+        );
+        assert_eq!(successor.link.baseline_bytes, Some(binding.installed.bytes));
+        let previous = link::read_archive_link_snapshot(&store, "codex", ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.json, journal.previous_claims[0].retired_json);
+        assert_eq!(fs::read(&lab.native).unwrap(), native);
+        let receipt = fs::read_to_string(lab.home.join("launch-receipt")).unwrap();
+        let rows: Vec<_> = receipt.lines().collect();
+        assert_eq!(
+            &rows[..3],
+            &["me/qa@work", "me/qa@work", binding.role.generation.as_str()]
+        );
+        assert!(rows[3..].join("\n").contains(&binding.native.session_id));
+        assert!(rows[3..].join("\n").contains("merge"));
+        lab.success(&["merge", "--abort", "--into", "me/qa@work"]);
+        assert_eq!(lab.git(&["rev-parse", "refs/heads/work"]), tx.target_head);
+        assert_eq!(
+            fs::read_to_string(lab.link()).unwrap(),
+            journal.previous_claims[0].original_json
+        );
+    }
+}
+
+/// A failed runtime keeps the same generation cancellable without summary or a surviving source ref.
+#[test]
+#[cfg(unix)]
+fn failed_archive_runtime_keeps_installed_authority_for_explicit_abort() {
+    use agit::domain::{merge_archive, mergetx, repo::Repo};
+    let lab = Lab::new();
+    let head = lab.git(&["rev-parse", "refs/heads/work"]);
+    let (status, output) = ArchiveTerminal::start(&lab, 7).finish();
+    assert_eq!(status, 4, "{output}");
+    let repo = Repo::open(lab.repo()).unwrap();
+    let tx = mergetx::read(repo.root()).unwrap().unwrap();
+    let binding = tx.exploration.as_ref().unwrap();
+    let old_link = merge_archive::read(repo.root(), &binding.role.generation)
+        .unwrap()
+        .unwrap()
+        .previous_claims[0]
+        .original_json
+        .clone();
+    let before = fs::read(repo.git_path(mergetx::LOCK_FILE).unwrap()).unwrap();
+    let repeated = lab
+        .command()
+        .args(["merge", "me/qa@source", "--into", "me/qa@work"])
+        .output()
+        .unwrap();
+    assert_eq!(repeated.status.code(), Some(4), "{repeated:?}");
+    assert_eq!(
+        fs::read(repo.git_path(mergetx::LOCK_FILE).unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(lab.git(&["rev-parse", "refs/heads/work"]), head);
+    lab.git(&["update-ref", "-d", "refs/heads/source"]);
+    lab.success(&["merge", "--abort", "--into", "me/qa@work"]);
+    assert!(mergetx::read(repo.root()).unwrap().is_none());
+    assert_eq!(
+        merge_archive::read(repo.root(), &binding.role.generation)
+            .unwrap()
+            .unwrap()
+            .phase,
+        merge_archive::ArchivePhase::Aborted
+    );
+    assert_eq!(fs::read_to_string(lab.link()).unwrap(), old_link);
+    assert_eq!(lab.git(&["rev-parse", "refs/heads/work"]), head);
+}
+
+/// Runtime absence and unverifiable old records cannot consume the old claim or create a Tx.
+#[test]
+#[cfg(unix)]
+fn archive_start_preflight_refusals_preserve_old_pending_authority() {
+    use agit::domain::{mergetx, repo::Repo};
+    for change in ["unavailable", "in-flight", "malformed"] {
+        let lab = Lab::new();
+        let original = fs::read(&lab.native).unwrap();
+        let suffix = match change {
+            "unavailable" => format!(
+                "{}{}",
+                message("user", "SYNTHETIC-PENDING"),
+                message("assistant", "SYNTHETIC-DONE")
+            ),
+            "in-flight" => message("user", "SYNTHETIC-PENDING"),
+            _ => "{\"incomplete\":".into(),
+        };
+        fs::write(&lab.native, [original, suffix.into_bytes()].concat()).unwrap();
+        let native = fs::read(&lab.native).unwrap();
+        let link = fs::read(lab.link()).unwrap();
+        let head = lab.git(&["rev-parse", "refs/heads/work"]);
+        let (status, output) =
+            ArchiveTerminal::start_with_runtime(&lab, 0, change != "unavailable").finish();
+        assert_ne!(status, 0, "{change}: {output}");
+        assert!(
+            output.contains(if change == "unavailable" {
+                "not on PATH"
+            } else if change == "malformed" {
+                "malformed"
+            } else {
+                "unsettled"
+            }),
+            "{change}: {output}"
+        );
+        assert!(
+            mergetx::read(Repo::open(lab.repo()).unwrap().root())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!lab.home.join("launch-receipt").exists());
+        assert_eq!(lab.git(&["rev-parse", "refs/heads/work"]), head);
+        assert_eq!(fs::read(&lab.native).unwrap(), native);
+        assert_eq!(fs::read(lab.link()).unwrap(), link);
+        assert_eq!(
+            fs::read_dir(lab.store.join("store/codex"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json"))
+                .count(),
+            1
+        );
+    }
+}

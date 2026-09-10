@@ -37,9 +37,9 @@
 //!
 //! # Row mutability (why remint instead of editing in place)
 //!
-//! §3: a row past its terminal state never changes, but **the trailing assistant message still
-//! being written, and its parts, are rewritten in place** (`finish`/`tokens`/`time.completed`
-//! are filled in afterwards, a tool's `state.status` flips from running to completed).
+//! §3: streaming messages and parts change in place, and asynchronous summaries and compaction
+//! can revise earlier completed rows. Completion is not a whole-prefix immutability guarantee.
+//! Archive therefore records explicit observations and later revisions in its evidence LOG.
 //! `time_updated` is a noise column; canonical materialization and every comparison must
 //! exclude it.
 
@@ -2328,6 +2328,120 @@ mod tests {
         )
         .unwrap();
         (d, p)
+    }
+
+    /// Step-finish cannot admit an unfinished first observation; later reads use retained row state.
+    #[test]
+    fn archive_frontier_survives_sqlite_streaming_row_updates() {
+        use crate::domain::native_archive;
+        use sha2::{Digest, Sha256};
+        for (finish, tool_status) in [
+            (Some("stop"), None),
+            (Some("tool-calls"), Some("completed")),
+            (None, Some("error")),
+        ] {
+            let (_directory, path) = fixture_db();
+            let con = Connection::open(&path).unwrap();
+            // The inherited fixture message is an installed, completed assistant.
+            con.execute("UPDATE message SET data = ?1 WHERE id = 'msg_m2'", [r#"{"role":"assistant","parentID":"msg_m1","time":{"created":120,"completed":125},"finish":"stop"}"#]).unwrap();
+            let installed = materialize(&con, "ses_one").unwrap().text;
+            let initial_hash = hex::encode(Sha256::digest(installed.as_bytes()));
+            let state = native_archive::opencode::State::installed(installed.as_bytes(), "ses_one")
+                .unwrap();
+            let initial = native_archive::Frontier {
+                bytes: installed.len() as u64,
+                sha256: initial_hash.clone(),
+            };
+            con.execute(
+                "INSERT INTO message VALUES ('msg_active', 'ses_one', 130, ?1)",
+                [r#"{"role":"assistant","time":{"created":130}}"#],
+            )
+            .unwrap();
+            if tool_status.is_some() {
+                con.execute(
+                    "INSERT INTO part VALUES ('prt_active', 'msg_active', 'ses_one', 131, ?1)",
+                    [r#"{"type":"tool","state":{"status":"running","output":"partial"}}"#],
+                )
+                .unwrap();
+            }
+            let held = |text: &str| {
+                let result = state.observe(text.as_bytes(), &initial).unwrap();
+                assert_eq!(result.record_count, 0);
+                assert_eq!(result.frontier.bytes, installed.len() as u64);
+                assert_eq!(result.pending_bytes, text.len() - installed.len());
+            };
+            held(&materialize(&con, "ses_one").unwrap().text);
+            if let Some(status) = tool_status {
+                con.execute("UPDATE part SET data = ?1 WHERE id = 'prt_active'", [format!(r#"{{"type":"tool","state":{{"status":"{status}","output":"final output","future":9007199254740993.00000000001}}}}"#)]).unwrap();
+            }
+            let mut message = serde_json::json!({"role":"assistant","tokens":{"output":17},"time":{"created":130}});
+            if let Some(finish) = finish {
+                message["finish"] = finish.into();
+            } else {
+                message["error"] = serde_json::json!({"name":"MessageAbortedError"});
+            }
+            con.execute(
+                "UPDATE message SET data = ?1 WHERE id = 'msg_active'",
+                [message.to_string()],
+            )
+            .unwrap();
+            let step_finish = materialize(&con, "ses_one").unwrap().text;
+            held(&step_finish);
+            // Generic line capture models the invalid early frontier as a negative control.
+            let early = native_archive::capture(
+                step_finish.as_bytes(),
+                installed.len() as u64,
+                &initial_hash,
+            )
+            .unwrap();
+            assert_eq!(early.record_count, 1 + usize::from(tool_status.is_some()));
+            con.execute(
+                "INSERT INTO part VALUES ('prt_patch', 'msg_active', 'ses_one', 132, ?1)",
+                [r#"{"type":"patch","hash":"synthetic-patch","files":["synthetic.txt"]}"#],
+            )
+            .unwrap();
+            held(&materialize(&con, "ses_one").unwrap().text);
+            message["time"]["completed"] = 140.into();
+            con.execute(
+                "UPDATE message SET data = ?1 WHERE id = 'msg_active'",
+                [message.to_string()],
+            )
+            .unwrap();
+            let terminal = materialize(&con, "ses_one").unwrap().text;
+            assert!(matches!(
+                native_archive::capture(
+                    terminal.as_bytes(),
+                    early.frontier.bytes,
+                    &early.frontier.sha256
+                ),
+                Err(native_archive::CaptureError::BaselineChanged)
+            ));
+            let accepted = state.observe(terminal.as_bytes(), &initial).unwrap();
+            assert_eq!(
+                accepted.record_count,
+                2 + usize::from(tool_status.is_some())
+            );
+            assert_eq!(accepted.records, &terminal[installed.len()..]);
+            assert!(accepted.records.contains("synthetic-patch"));
+            if tool_status.is_some() {
+                assert!(accepted.records.contains("9007199254740993.00000000001"));
+                assert!(!accepted.records.contains("partial"));
+            }
+            assert_eq!(accepted.pending_bytes, 0);
+            con.execute(
+                "UPDATE session SET time_updated = time_updated + 1 WHERE id = 'ses_one'",
+                [],
+            )
+            .unwrap();
+            let reread = materialize(&con, "ses_one").unwrap().text;
+            assert_eq!(reread, terminal);
+            let repeated = accepted
+                .state
+                .observe(reread.as_bytes(), &accepted.frontier)
+                .unwrap();
+            assert_eq!(repeated.record_count, 0);
+            assert_eq!(repeated.frontier, accepted.frontier);
+        }
     }
 
     /// The §4 canonical shape matches the spec **byte for byte**: the meta line carries

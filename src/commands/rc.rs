@@ -288,6 +288,55 @@ fn land(args: LandArgs) -> CmdResult {
         );
     }
 
+    let native = crate::domain::merge_archive::RuntimeLinkKey {
+        runtime: crate::adapter::normalize(&args.runtime)?.into(),
+        session_id: args.session.clone(),
+    };
+    let expected_archive = super::commit::archive::expected_rc_handoff()?;
+    if let Some(expected) = &expected_archive {
+        anyhow::ensure!(
+            expected.native == native
+                && expected.role.slug == args.slug
+                && expected.role.branch == args.branch,
+            "RC landing differs from its retained Archive identity"
+        );
+    }
+    if let Some(store) = crate::domain::store::Store::open()?
+        && let Some(link) = super::commit::archive::native_link(&store, &native)?
+        && link.merge_archive.is_some()
+    {
+        anyhow::ensure!(
+            expected_archive
+                .as_ref()
+                .is_none_or(|expected| { link.merge_archive.as_ref() == Some(&expected.role) }),
+            "RC Archive role changed after its retained handoff"
+        );
+        let repo = crate::domain::repo::Repo::open(&dest)
+            .ok_or_else(|| anyhow::anyhow!("the RC archive checkout is missing"))?;
+        anyhow::ensure!(
+            crate::hub::identity::require_current_expected(&repo, client.base())? == expected,
+            "RC archive checkout identity differs from the supervisor"
+        );
+        let handoff = super::commit::archive::rc_handoff(
+            &store,
+            &repo,
+            &link,
+            &args.slug,
+            &args.branch,
+            std::path::Path::new(&args.cwd),
+        )?;
+        println!(
+            "{}{}",
+            super::commit::archive::RC_PREFIX,
+            serde_json::to_string(&handoff)?
+        );
+        return Ok(ExitCode::Ok);
+    }
+    anyhow::ensure!(
+        expected_archive.is_none(),
+        "the retained RC Archive Link or role is missing; ordinary landing is forbidden"
+    );
+
     let history_update =
         super::migration::begin_startup_recovery_for_path(&dest, "rc-land-history")?;
 

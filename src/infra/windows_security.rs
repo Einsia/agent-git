@@ -291,6 +291,48 @@ fn trusted_system_sid(sid: &str) -> bool {
     )
 }
 
+/// Control files keep their existing identity and deny replacement while the handle is held.
+pub(crate) fn open_private_control(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+    };
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| denied("Private state needs a containing directory"))?;
+    validate_path(parent, true, false)?;
+    let sid = current_sid()?;
+    let descriptor = private_descriptor(&sid, false)?;
+    let attributes = attributes(&descriptor);
+    let name = wide(path)?;
+    let handle = Handle::new(unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &attributes,
+            OPEN_ALWAYS,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    })?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle.0, &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(denied("Private control state must be an ordinary file"));
+    }
+    validate_acl(handle.0, &sid, true, false)?;
+    validate_path(path, false, true)?;
+    let raw = handle.0;
+    std::mem::forget(handle);
+    Ok(unsafe { std::fs::File::from_raw_handle(raw) })
+}
+
 pub(crate) fn write_private_file(path: &Path, body: &[u8]) -> io::Result<()> {
     use std::io::Write;
     use std::os::windows::io::FromRawHandle;

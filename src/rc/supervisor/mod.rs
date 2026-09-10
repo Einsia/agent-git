@@ -375,6 +375,13 @@ fn strict_settlement_candidate(
     if after.is_empty() {
         return Err("strict commit left an unreadable HEAD");
     }
+    if reported == Some(crate::commands::commit::archive::WITHHELD_RESULT) {
+        return if after == before {
+            Ok(None)
+        } else {
+            Err("withheld archive exploration changed HEAD")
+        };
+    }
     if let Some(reported) = reported {
         if reported != after || reported == before {
             return Err("strict commit result does not name the newly published HEAD");
@@ -656,6 +663,8 @@ pub struct Session {
     /// whether it landed leaves the link pointing forever at the transcript nobody appends to,
     /// and every later turn settles nothing.
     landed_thread: Option<String>,
+    /// Retained classification survives failed refreshes; only `landed_thread` grants fresh use.
+    archive_handoff: Option<crate::commands::commit::archive::RcHandoff>,
     /// Tells the daemon the harness's own id. A separate channel rather than the event stream:
     /// this id never reaches the wire (viewers address only the logical id), but the daemon
     /// needs it for the double-writer guard and the roster.
@@ -1106,6 +1115,7 @@ impl Session {
             pending: Default::default(),
             consumed_bytes: 0,
             landed_thread: None,
+            archive_handoff: None,
             notes,
             confinement,
             settlement,
@@ -1233,10 +1243,13 @@ impl Session {
         // proof before every network revalidation so failure cannot fall
         // through to commit/push.
         self.landed_thread = None;
+        let expected_archive = self.archive_handoff.clone();
         let Some(agit_session) = self.agit_session.clone() else {
             // Unmanaged (no project bound) means there is nowhere to land, which is not a
             // failure.
-            self.landed_thread = Some(thread_id.to_string());
+            if expected_archive.is_none() {
+                self.landed_thread = Some(thread_id.to_string());
+            }
             return;
         };
         // `commands::rc::land_argv` builds the argv — it lives next to the clap definition, so
@@ -1257,12 +1270,66 @@ impl Session {
                 crate::hub::identity::EXPECTED_AGENT_ID_ENV,
                 agit_session.agent_id(),
             );
+            command
+                .env_remove(crate::commands::commit::archive::NATIVE_ENV)
+                .env_remove(crate::commands::commit::archive::ROLE_ENV);
+            if let Some(expected) = &expected_archive {
+                let (Ok(native), Ok(role)) = (
+                    serde_json::to_string(&expected.native),
+                    serde_json::to_string(&expected.role),
+                ) else {
+                    return;
+                };
+                command
+                    .env(crate::commands::commit::archive::NATIVE_ENV, native)
+                    .env(crate::commands::commit::archive::ROLE_ENV, role);
+            }
             guarded_output(&mut self.settlement, lease, command).await
         } else {
             None
         };
         match out {
-            Some(o) if o.status.success() => self.landed_thread = Some(thread_id.to_string()),
+            Some(o) if o.status.success() => {
+                let handoffs: Vec<_> = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        line.strip_prefix(crate::commands::commit::archive::RC_PREFIX)
+                    })
+                    .map(serde_json::from_str::<crate::commands::commit::archive::RcHandoff>)
+                    .collect();
+                if handoffs.is_empty() {
+                    if expected_archive.is_none() {
+                        self.landed_thread = Some(thread_id.to_string());
+                    } else {
+                        tracing_note("RC landing lost its retained Archive classification");
+                    }
+                } else if handoffs.len() == 1 {
+                    match handoffs.into_iter().next().unwrap() {
+                        Ok(handoff)
+                            if handoff.native.session_id == thread_id
+                                && crate::adapter::normalize(&self.info.runtime).ok()
+                                    == Some(handoff.native.runtime.as_str())
+                                && handoff.role.slug == agit_session.slug()
+                                && handoff.role.branch == agit_session.branch()
+                                && expected_archive
+                                    .as_ref()
+                                    .is_none_or(|expected| expected == &handoff)
+                                && handoff
+                                    .role
+                                    .validate(handoff.role.origin_head.len())
+                                    .is_ok() =>
+                        {
+                            self.archive_handoff = Some(handoff);
+                            self.landed_thread = Some(thread_id.to_string());
+                        }
+                        _ => tracing_note(
+                            "archive landing returned a different native identity or generation",
+                        ),
+                    }
+                } else {
+                    tracing_note("archive landing returned multiple authority handoffs");
+                }
+            }
             Some(o) => tracing_note(&format!(
                 "lineage landing failed for {agit_session}: {} (will retry next turn)",
                 String::from_utf8_lossy(&o.stderr).trim()
@@ -2897,7 +2964,23 @@ impl Session {
         };
         let result_path = result_file.path().to_path_buf();
         let mut strict_commit = command(&["commit", "--from-supervisor"]);
-        strict_commit.env(crate::commands::commit::SUPERVISOR_RESULT_ENV, &result_path);
+        strict_commit
+            .env(crate::commands::commit::SUPERVISOR_RESULT_ENV, &result_path)
+            .env(
+                crate::commands::commit::archive::NATIVE_ENV,
+                serde_json::json!({
+                    "runtime": crate::adapter::normalize(&self.info.runtime).map(str::to_owned).unwrap_or_else(|_| self.info.runtime.clone()),
+                    "session_id": thread_id,
+                })
+                .to_string(),
+            );
+        strict_commit.env_remove(crate::commands::commit::archive::ROLE_ENV);
+        if let Some(handoff) = &self.archive_handoff {
+            let Ok(role) = serde_json::to_string(&handoff.role) else {
+                return;
+            };
+            strict_commit.env(crate::commands::commit::archive::ROLE_ENV, role);
+        }
         let Some(commit) = guarded_output(&mut self.settlement, lease, strict_commit).await else {
             return;
         };
@@ -2909,10 +2992,11 @@ impl Session {
             return;
         }
         let after = String::from_utf8_lossy(&after.stdout).trim().to_string();
-        let reported = std::fs::read_to_string(&result_path)
-            .ok()
-            .map(|sha| sha.trim().to_string())
-            .filter(|sha| !sha.is_empty());
+        let Ok(report) = std::fs::read_to_string(&result_path) else {
+            tracing_note("strict settlement result could not be read");
+            return;
+        };
+        let reported = Some(report.trim().to_string()).filter(|report| !report.is_empty());
         let pending = match self
             .pending_settlement
             .as_ref()

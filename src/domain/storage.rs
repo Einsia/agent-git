@@ -1222,7 +1222,7 @@ fn resolve_commit_with_policy(
     Ok(commit)
 }
 
-fn canonical_v0(text: &str) -> Result<String> {
+pub(crate) fn canonical_v0(text: &str) -> Result<String> {
     if text.is_empty() {
         return Ok(String::new());
     }

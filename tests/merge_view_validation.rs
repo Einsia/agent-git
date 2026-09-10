@@ -57,6 +57,8 @@ impl MergeFixture {
         mergetx::lock(
             repo.root(),
             &mergetx::Tx {
+                mode: Some(mergetx::Mode::Manual),
+                exploration: None,
                 generation: None,
                 target: "target".into(),
                 source: format!("{source_slug}@source"),

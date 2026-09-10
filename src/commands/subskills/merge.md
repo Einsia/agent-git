@@ -31,7 +31,7 @@ agit merge --continue | --abort
 | `--dry-run` | Reconnaissance only; no lock, launch, or history change |
 | `--status` | Show the open merge transaction |
 | `--continue` | Validate the summary and commit the merge |
-| `--abort` | Abandon the transaction; target ref does not move |
+| `--abort` | Cancel the transaction; a visible Archive landing is completed without rollback |
 | `pick <refs>` | Select source turns/events |
 | `drop <refs>` | Remove picks |
 | `summary -m <text>` / `summary -F, --file <path>` | Write the required reconciliation conclusion from inline text or a file |
@@ -66,4 +66,23 @@ Merge preflight settles complete local content and then verifies every known act
 
 If a runtime writes while its replacement is being installed, the original claim stays active and the merge transaction remains available for manual recovery. The prepared replacement remains unclaimed and can be found with `agit status --check-missing`; merge does not discard the original transcript or launch that replacement.
 
-Cancellation and merge-agent launch share a transaction control guard. If cancellation completes before final publication, the prepared session stays unclaimed and no agent is spawned. Once spawning wins admission, the guard is released immediately; a later abort clears the transaction without waiting for or terminating that runtime. Transaction progress and landing hold the same guard from their state read through their update, so an aborted transaction cannot be revived by a delayed command.
+For a transaction without Archive authority, cancellation and merge-agent launch share a transaction control guard. If cancellation completes before final publication, the prepared session stays unclaimed and no agent is spawned. Once spawning wins admission, the guard is released immediately; a later abort clears the transaction without waiting for or terminating that runtime. Transaction progress and landing hold the same guard from their state read through their update, so an aborted transaction cannot be revived by a delayed command.
+
+## Retained Archive lifecycle
+
+A selected session transaction with retained Archive authority uses that generation for
+`--continue` and `--abort`. Continue reads the frozen source commit from its recorded local
+repository, even if the source branch moves or disappears. Once a candidate is retained,
+replay uses its imported objects without rereading native exploration or resolving the source
+branch. Pending publication, cancellation and completed generations reject `pick`, `drop`
+and `summary` changes.
+
+Before landing, abort restores the exact prior claims and retains native exploration. If the
+candidate is already visible, abort completes that landing and reports that history is retained.
+It does not terminate the runtime or erase its native transcript.
+
+After transaction retirement, `--into` alone does not identify a historical operation. Replay
+requires the matching `AGIT_MERGE_TX=owner/repo@branch` and `AGIT_MERGE_GENERATION` pair from
+that operation, plus its durable completion evidence. Missing or conflicting identity refuses;
+the command never chooses the first or newest historical journal. Manual and file-line merges
+without Archive authority keep their ordinary transaction behavior.

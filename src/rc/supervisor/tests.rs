@@ -39,6 +39,7 @@ pub(super) fn harness_test_session_with_channels(
         resuming: false,
         agit_session: None,
         landed_thread: None,
+        archive_handoff: None,
         notes,
         cwd: PathBuf::from("/"),
         generation: 1,
