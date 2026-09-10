@@ -102,7 +102,6 @@ fn from_harness_env() -> Option<(Context, bool)> {
     let Ok(Some(store)) = crate::domain::store::Store::open() else {
         return None;
     };
-    let all = link::list(&store);
     for (var, runtime) in crate::infra::runtime_session::ENV_SESSIONS {
         let Ok(sid) = std::env::var(var) else {
             continue;
@@ -110,12 +109,9 @@ fn from_harness_env() -> Option<(Context, bool)> {
         if sid.is_empty() {
             continue;
         }
-        let hits: Vec<_> = all
-            .iter()
-            .filter(|l| l.source == *runtime && l.session_id == sid)
-            .collect();
-        if let [lk] = hits.as_slice()
-            && let Some(repo) = slug_of_link(lk)
+        if let Some(lk) = link::get(&store, runtime, &sid)
+            .filter(|link| link.source == *runtime && link.session_id == sid)
+            && let Some(repo) = slug_of_link(&lk)
         {
             let pinned = lk.owner.is_some();
             return Some((

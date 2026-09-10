@@ -16,7 +16,7 @@ agit revert [REFS]... [options]
 | Option | Meaning |
 |---|---|
 | `[REFS]...` | `<ref|@>#n[.k]`; repeatable |
-| `--into <branch>` | Target branch; context branch by default |
+| `--into <owner/repo@branch>` | Explicit target branch; otherwise the first source, when fully qualified, selects its repo and branch, or `AGIT_SESSION` supplies them. A bare `--into` changes the branch within that selected repo |
 | `-m, --message <message>` | Operation message |
 | `--expected-head <SHA>` | Refuse if the target no longer has this full commit SHA; the final update also checks that head atomically |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
@@ -24,8 +24,8 @@ agit revert [REFS]... [options]
 ## Examples
 
 ```bash
-agit revert @#7
-agit revert szh/p1@other#3.1 --into review -m "Drop the wrong assumption"
+agit revert szh/p1@review#7
+agit revert szh/p1@other#3.1 --into szh/p1@review -m "Drop the wrong assumption"
 ```
 
 Revert changes only the VIEW and never deletes the evidence log. It is not a history rewrite or compression tool.

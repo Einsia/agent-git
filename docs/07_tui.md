@@ -107,6 +107,11 @@ result both leave a trace.
 
 ### 3.1 Bare `agit` / `agit resume` — which one to continue
 
+`resume` continues an existing local session and never creates a fork. To start
+from a tag, historical point or another author's source, use `agit open <ref>`;
+it continues a writable session head when possible and otherwise creates a new
+writable session. `agit run` remains a hidden compatibility alias for `open`.
+
 ```text
 ┌ agit ── nana @ agent-git.com ── rc: online ── ⚠ 2 unnamed ───────────┐
 │  sessions                          │  refund-fix                      │
@@ -180,6 +185,20 @@ press q at an empty list wastes an interaction.
 
 ### 3.2 `agit new` — pick a repo, type a name
 
+Local repositories appear first. When signed in, the picker then loads repositories
+owned by the current Hub account without delaying the first frame. Hub-only rows
+show `Hub · clone on selection`; an exact `owner/repo` already present locally
+keeps its local metadata and validation. Other users' visible repositories are
+still available through an explicit `agit new <owner/repo> -b <name>`.
+
+Loading, unavailable, signed-out, and empty states explain what is happening.
+Press `r` to retry Hub discovery or `q` to cancel, including while a request is
+pending. Discovery makes a bounded authenticated read; it does not clone or
+create repositories. Selecting a Hub row asks for an explicit branch name, then
+uses the ordinary `new` command to clone and validate `--from` before creating
+the local session. Its shared files and inheritance line are therefore marked
+as unverified until cloning completes.
+
 ```text
 ┌ agit new ─────────────────────────────────────────────────────────────┐
 │  pick a repo                       │  nana/payments                   │
@@ -212,6 +231,12 @@ press q at an empty list wastes an interaction.
   error at the very end.
 
 ### 3.3 `agit log` — the timeline
+
+With no arguments, log first offers a session picker even when the directory
+has no binding or adopted session. It uses the same saved-session list as share:
+the current repository first, full repo and branch identities, and `/` filtering.
+Enter opens the selected branch's timeline without pinning it. Explicit targets,
+filters and output options keep the ordinary command-line path.
 
 ```text
 ┌ agit log ── nana/payments @ refund-fix ───────────────────────────────────────────┐
@@ -342,6 +367,48 @@ either operation, so the screen never implies that changing `config.json` can
 change the current process environment. Explicit key/value and `--list` forms
 keep their command-line behavior.
 
+### 3.8 `agit share` — choose a conversation and link settings
+
+With no arguments, share lists settled sessions across local repositories.
+Sessions in the current directory's repository appear first, then other
+repositories, with the most recently saved first within each group. Every row
+keeps the full `owner/repo@branch` visible as its identity. `/` filters by repo,
+branch or runtime. Selection applies only to this command and changes no
+workspace pin.
+
+After choosing a session, the settings screen offers visibility, expiry, view
+limit and an optional passphrase. Arrow keys move between fields; Left/Right,
+Space or Enter change a setting. "Continue to confirmation" leaves the
+alternate screen. The ordinary command scans the selected saved VIEW,
+asks for a passphrase when enabled, and confirms the exact saved point and settings
+before creating the link. Esc or `q` cancels without publishing.
+
+The defaults are an encrypted link expiring after seven days. Both encrypted
+and public links can be read by anyone who has the complete link; only the
+encrypted form keeps the service from reading its content. The screen states
+that distinction beside the visibility setting.
+
+Explicit forms such as `agit share me/repo@work --expire 24h` retain their CLI
+behavior. Saved points share their VIEW by default; `--full-log` deliberately
+includes their complete LOG. `@` uses the explicit `AGIT_SESSION` selection.
+Outside the TUI an omitted target requires that environment value; directory
+bindings and discovered runtime sessions never supply an implicit replacement.
+
+### 3.9 `agit push` — select the session to publish
+
+With no target in a human terminal, push opens the saved-session picker. Enter
+passes one explicit `owner/repo@branch` to the existing publishing path; `q`
+cancels before signing in or contacting the Hub. `-b` and `--all` keep their
+ordinary behavior and require an explicit repo or `AGIT_SESSION`.
+
+`agit switch` and directory branch pins are removed. Ordinary commands use an
+explicit argument or `AGIT_SESSION`; neither the only local repository nor the
+only adopted conversation in a directory replaces that selection. Runtime
+identity can reject a stale environment target but never silently substitutes
+another branch. Directory bindings support setup, display and picker ordering.
+A picker turns the user's selection into an explicit command argument without
+changing persistent session context.
+
 ## 4. Two disciplines
 
 ### 4.1 The list does not parse transcripts
@@ -411,12 +478,27 @@ it into "on", the worst kind of counter-intuitive.
 
 Here: session selection (bare `agit` / `agit resume`), repo selection
 (`agit new`), the timeline (`agit log`), transcript reading (`agit show --tui`
-and enter from the timeline), session adoption (`agit import`), and the terminal
-handoff running through all of them.
+and enter from the timeline), session adoption (`agit import`), repository
+initialization (`agit init`), configuration (`agit config`), sharing
+(`agit share`), and the terminal handoff running through all of them.
 
 All zero-argument interface forms in this document now use the shared shell.
 
 ## 8. Runtime validation
+
+Native session changes are tracked through the runtime's SessionStart event.
+An existing adopted session is resolved by its runtime identity, including when
+it is resumed from another directory; its recorded repo and branch are supplied
+to the agent explicitly. Claude titles are preserved during startup, resume and
+fork handling. Clear and compact events do not repeatedly ask for a title.
+Unadopted conversations remain available in the naming inbox.
+
+Turn commits retain a bounded description of the working directory's Git state.
+When a resumed session has moved, has mismatched or unknown Git state, or opens
+outside a Git repository, an environment notice is supplied automatically to
+the runtime. A matching dirty summary is still only a coarse observation and
+does not prove that the changed files have identical contents. The notice does
+not check out files, stash changes, or restore the code repository.
 
 The Codex hook contract has an executable end-to-end probe at
 [`../scripts/codex-hook-probe.py`](../scripts/codex-hook-probe.py). It creates

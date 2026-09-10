@@ -122,6 +122,7 @@ fn main() {
     let command_name = commands::command_name(&command);
     let startup = match &command {
         Commands::Status(_) => Startup::Inspect,
+        Commands::Search(_) => Startup::RemoteSearch,
         Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
         Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
         Commands::Doctor(_) => Startup::Inspect,
@@ -195,7 +196,8 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
         Startup::ScopedDoctor
         | Startup::ScopedDiff
         | Startup::ScopedImport
-        | Startup::ScopedReview => Ok(()),
+        | Startup::ScopedReview
+        | Startup::RemoteSearch => Ok(()),
     };
     if let Err(e) = prepared {
         agit::ui::error(&format!("local storage preparation failed: {e:#}"));
@@ -215,6 +217,8 @@ enum Startup {
     ScopedImport,
     /// Review and guarded edits inspect recovery only after selecting their repository.
     ScopedReview,
+    /// Search queries the Hub without inspecting or migrating local repositories.
+    RemoteSearch,
 }
 
 /// What to do when no subcommand is given and the interface is **not** entered.

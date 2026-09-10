@@ -323,6 +323,14 @@ pub struct CwdState {
 }
 
 impl CwdState {
+    /// Remove URL authentication and query data before rendering historical observations.
+    /// Stored metadata is external input and needs the same redaction as live observations.
+    pub fn sanitized(&self) -> Self {
+        let mut state = self.clone();
+        state.origin = state.origin.as_deref().and_then(sanitize_git_origin);
+        state
+    }
+
     fn unknown(origin: Option<String>, head: Option<String>, branch: Option<String>) -> Self {
         Self {
             origin,
@@ -749,63 +757,85 @@ pub fn at_refs(repo: &crate::domain::repo::Repo, refs: &[String]) -> Vec<Option<
     )
 }
 
+/// Read metadata in input order, preserving absent files and rejecting unreadable declarations.
+/// Machine-readable callers must not report a damaged session as a healthy undeclared branch.
+pub fn at_refs_result(
+    repo: &crate::domain::repo::Repo,
+    refs: &[String],
+) -> Result<Vec<Option<Meta>>> {
+    at_refs_impl(
+        repo,
+        refs,
+        true,
+        crate::domain::repo::ReadPolicy::AllowTransport,
+        usize::MAX,
+    )
+}
+
 pub(crate) fn at_refs_with_policy(
     repo: &crate::domain::repo::Repo,
     refs: &[String],
     policy: crate::domain::repo::ReadPolicy,
     max_bytes: usize,
 ) -> Vec<Option<Meta>> {
-    let mut out: Vec<Option<Meta>> = refs.iter().map(|_| None).collect();
+    at_refs_impl(repo, refs, false, policy, max_bytes).unwrap_or_else(|_| vec![None; refs.len()])
+}
+
+fn at_refs_impl(
+    repo: &crate::domain::repo::Repo,
+    refs: &[String],
+    strict: bool,
+    policy: crate::domain::repo::ReadPolicy,
+    max_bytes: usize,
+) -> Result<Vec<Option<Meta>>> {
+    let mut out = vec![None; refs.len()];
     if refs.is_empty() {
-        return out;
+        return Ok(out);
     }
     let names: Vec<String> = refs.iter().map(|r| format!("{r}:{FILE}")).collect();
-
-    // Ask "is it there" first. `cat-file --batch` aborts **the whole batch** on an object it
-    // cannot read, and "no meta at this point" is a normal case that must not carry away the
-    // answers for the other objects in the batch.
-    let mut present: Vec<bool> = Vec::with_capacity(names.len());
-    let checked = repo.git_cat_file_batch_check_with_policy(names.clone(), policy, |_, kind, _| {
+    let mut present = vec![];
+    repo.git_cat_file_batch_check_with_policy(names.clone(), policy, |_, kind, _| {
         present.push(kind != "missing");
         Ok(())
-    });
-    if checked.is_err() || present.len() != names.len() {
-        return out;
-    }
-
-    let wanted: Vec<String> = names
+    })?;
+    anyhow::ensure!(
+        present.len() == refs.len(),
+        "incomplete metadata presence response"
+    );
+    let slots: Vec<usize> = present
         .iter()
-        .zip(&present)
-        .filter(|(_, ok)| **ok)
-        .map(|(n, _)| n.clone())
+        .enumerate()
+        .filter_map(|(i, found)| found.then_some(i))
         .collect();
-    let mut read: Vec<Option<Meta>> = Vec::with_capacity(wanted.len());
-    let got = repo.git_cat_file_batch_with_policy(wanted, max_bytes, policy, |_, _, body| {
-        let crate::domain::repo::ObjectBody::Read(bytes) = body else {
-            read.push(None);
-            return Ok(());
-        };
-        read.push(
-            std::str::from_utf8(bytes)
-                .ok()
-                .and_then(|t| serde_json::from_str::<Meta>(t).ok())
-                .filter(|m| validate(m).is_ok()),
-        );
-        Ok(())
-    });
-    if got.is_err() {
-        return out;
-    }
-
-    // The two sides share one order: each true slot in `present` corresponds, in order, to one
-    // entry in `read`.
-    let mut answers = read.into_iter();
-    for (slot, ok) in out.iter_mut().zip(present) {
-        if ok {
-            *slot = answers.next().flatten();
-        }
-    }
-    out
+    let mut cursor = 0;
+    repo.git_cat_file_batch_with_policy(
+        slots.iter().map(|&i| names[i].clone()).collect(),
+        max_bytes,
+        policy,
+        |_, _, body| {
+            let index = *slots
+                .get(cursor)
+                .ok_or_else(|| anyhow::anyhow!("extra metadata response"))?;
+            cursor += 1;
+            let crate::domain::repo::ObjectBody::Read(bytes) = body else {
+                if strict {
+                    anyhow::bail!("{} is too large to read", names[index]);
+                }
+                return Ok(());
+            };
+            let snapshot = std::str::from_utf8(bytes)
+                .with_context(|| format!("{} is not UTF-8", names[index]))
+                .and_then(|text| parse_strict(text, &refs[index]));
+            out[index] = if strict {
+                Some(snapshot?)
+            } else {
+                snapshot.ok()
+            };
+            Ok(())
+        },
+    )?;
+    anyhow::ensure!(cursor == slots.len(), "incomplete metadata response");
+    Ok(out)
 }
 
 /// The branch shape of each ref in a batch. A thin wrapper over [`at_refs`].
@@ -842,7 +872,7 @@ pub fn resolve(repo_root: &Path) -> Result<Meta> {
 /// which repo to look in), and an origin alone matches no particular version. Half an answer is
 /// easier to misuse than no answer.
 pub fn code_of(cwd: &Path) -> Option<String> {
-    let origin = git_field(cwd, &["remote", "get-url", "origin"])?;
+    let origin = sanitize_git_origin(&git_field(cwd, &["remote", "get-url", "origin"])?)?;
     let sha = git_field(cwd, &["rev-parse", "--short", "HEAD"])?;
     Some(format!("{origin}@{sha}"))
 }
@@ -850,7 +880,9 @@ pub fn code_of(cwd: &Path) -> Option<String> {
 /// Read the worktree status without retaining the paths and contents from Git's output.
 pub fn cwd_state_of(cwd: &Path) -> Option<CwdState> {
     git_field(cwd, &["rev-parse", "--show-toplevel"])?;
-    let origin = git_field(cwd, &["remote", "get-url", "origin"]);
+    let origin = git_field(cwd, &["remote", "get-url", "origin"])
+        .as_deref()
+        .and_then(sanitize_git_origin);
     let head = git_field(cwd, &["rev-parse", "--verify", "HEAD"]);
     let branch = git_field(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
     if configured_clean_filters(cwd).is_some() {
@@ -870,6 +902,102 @@ pub fn cwd_state_of(cwd: &Path) -> Option<CwdState> {
         conflicted,
         status_digest,
     })
+}
+
+/// Keep a remote coordinate without embedding URL credentials in conversation history.
+/// SSH routing usernames remain part of the coordinate; passwords never do. URL queries
+/// and fragments are omitted, while the same characters in local/SCP paths remain literal.
+pub fn sanitize_git_origin(origin: &str) -> Option<String> {
+    let origin = origin.trim();
+    if origin.is_empty() || origin.chars().any(char::is_control) {
+        return None;
+    }
+    // Remote helpers own an arbitrary address/command grammar, so no URL redaction can
+    // establish that their payload is safe to retain as a repository coordinate.
+    if let Some((transport, _)) = origin.split_once("::")
+        && transport.starts_with(|c: char| c.is_ascii_alphabetic())
+        && transport
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-' | '.'))
+    {
+        return None;
+    }
+    if let Some((scheme, rest)) = origin.split_once("://")
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        let rest = rest.split(['?', '#']).next()?;
+        let end = rest.find('/').unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(end);
+        let authority = match authority.rsplit_once('@') {
+            Some((userinfo, host)) if scheme.eq_ignore_ascii_case("ssh") => {
+                let username = userinfo.split(':').next().unwrap_or_default();
+                if username.is_empty() || username.contains('@') {
+                    host.to_owned()
+                } else {
+                    format!("{username}@{host}")
+                }
+            }
+            Some((_, host)) => host.to_owned(),
+            None => authority.to_owned(),
+        };
+        let host_port = authority.rsplit('@').next().unwrap_or_default();
+        if !(scheme.eq_ignore_ascii_case("file") && host_port.is_empty())
+            && !safe_remote_authority(host_port)
+        {
+            return None;
+        }
+        return Some(format!("{scheme}://{authority}{path}"));
+    }
+
+    // SCP-style remotes use their username for SSH routing. Only interpret userinfo when
+    // the suffix has a host/path separator; a local path containing '@' stays a local path.
+    if let Some((userinfo, host_path)) = origin.rsplit_once('@')
+        && !userinfo.contains(['/', '\\'])
+        && host_path
+            .split_once(':')
+            .is_some_and(|(host, _)| !host.contains('/'))
+    {
+        let username = userinfo.split(':').next().unwrap_or_default();
+        return Some(
+            if username.is_empty() || username.contains('@') || username.contains('/') {
+                host_path.to_owned()
+            } else {
+                format!("{username}@{host_path}")
+            },
+        );
+    }
+    Some(origin.to_owned())
+}
+
+fn safe_remote_authority(authority: &str) -> bool {
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '\\' | '%' | '@'))
+    {
+        return false;
+    }
+    let port = if let Some(address_and_port) = authority.strip_prefix('[') {
+        let Some((address, suffix)) = address_and_port.split_once(']') else {
+            return false;
+        };
+        if address.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        if suffix.is_empty() {
+            return true;
+        }
+        let Some(port) = suffix.strip_prefix(':') else {
+            return false;
+        };
+        Some(port)
+    } else {
+        authority.split_once(':').map(|(_, port)| port)
+    };
+    port.is_none_or(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Query the repository-level filter configuration; where a filter exists, status capture must
@@ -1083,6 +1211,145 @@ mod tests {
             .status()
             .unwrap()
             .success()
+    }
+
+    #[test]
+    fn git_origin_redaction_preserves_coordinates_without_url_secrets() {
+        for (input, expected) in [
+            (
+                "https://alice:password@example.invalid/team/repo.git?token=hidden#private",
+                "https://example.invalid/team/repo.git",
+            ),
+            (
+                "HTTPS://token@example.invalid/repo.git",
+                "HTTPS://example.invalid/repo.git",
+            ),
+            (
+                "https://alice%3Apassword@example.invalid/repo.git",
+                "https://example.invalid/repo.git",
+            ),
+            (
+                "https://alice:pass@word@example.invalid/repo.git",
+                "https://example.invalid/repo.git",
+            ),
+            (
+                "https://token@[2001:db8::1]:8443/repo.git?signature=hidden",
+                "https://[2001:db8::1]:8443/repo.git",
+            ),
+            (
+                "ssh://git@example.invalid:2222/team/repo.git",
+                "ssh://git@example.invalid:2222/team/repo.git",
+            ),
+            (
+                "ssh://git:password@example.invalid/team/repo.git#hidden",
+                "ssh://git@example.invalid/team/repo.git",
+            ),
+            (
+                "ssh://alice:pass@word@example.invalid/repo.git",
+                "ssh://alice@example.invalid/repo.git",
+            ),
+            (
+                "git@example.invalid:team/repo.git",
+                "git@example.invalid:team/repo.git",
+            ),
+            (
+                "git:password@example.invalid:team/repo.git",
+                "git@example.invalid:team/repo.git",
+            ),
+            (
+                "file:///srv/repos/local.git?token=hidden",
+                "file:///srv/repos/local.git",
+            ),
+            ("/srv/repos/my local.git", "/srv/repos/my local.git"),
+            ("../local@backup:2026", "../local@backup:2026"),
+        ] {
+            assert_eq!(
+                sanitize_git_origin(input).as_deref(),
+                Some(expected),
+                "{input}"
+            );
+        }
+        for input in [
+            "",
+            "https://alice:password#@example.invalid/repo",
+            "https://alice:password/invalid@example.invalid/repo",
+            "https://token@",
+            "https://example.invalid/repo\nsecret",
+        ] {
+            assert!(sanitize_git_origin(input).is_none(), "{input}");
+        }
+    }
+
+    #[test]
+    fn remote_helper_payloads_are_omitted_without_rewriting_local_paths() {
+        for origin in [
+            "ext::env TOKEN=synthetic-token ssh host %S repo",
+            "custom-helper::opaque synthetic-password payload",
+            "custom_helper::token=synthetic-token",
+        ] {
+            assert!(sanitize_git_origin(origin).is_none(), "{origin}");
+        }
+        for origin in [
+            "/local/path::literal",
+            "./custom-helper::literal",
+            "git@host:repo::literal",
+        ] {
+            assert_eq!(sanitize_git_origin(origin).as_deref(), Some(origin));
+        }
+    }
+
+    #[test]
+    fn local_and_scp_origin_paths_keep_query_and_fragment_characters() {
+        for prefix in [
+            "/srv/",
+            "../",
+            "git@example.invalid:team/",
+            "example.invalid:team/",
+        ] {
+            let first = format!("{prefix}repo#one?copy");
+            let second = format!("{prefix}repo#two?copy");
+            assert_eq!(sanitize_git_origin(&first).as_deref(), Some(first.as_str()));
+            assert_eq!(
+                sanitize_git_origin(&second).as_deref(),
+                Some(second.as_str())
+            );
+            assert_ne!(sanitize_git_origin(&first), sanitize_git_origin(&second));
+        }
+        for path in ["?local-repo", "/srv/local://repo#copy?one"] {
+            assert_eq!(sanitize_git_origin(path).as_deref(), Some(path));
+        }
+    }
+
+    #[test]
+    fn captured_and_historical_origins_are_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        git_for_test(dir.path(), &["init", "-q"]);
+        git_for_test(dir.path(), &["config", "user.name", "Test"]);
+        git_for_test(
+            dir.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git_for_test(dir.path(), &["commit", "--allow-empty", "-q", "-m", "seed"]);
+        let origin =
+            "https://alice:synthetic-password@example.invalid/repo?token=synthetic-token#private";
+        git_for_test(dir.path(), &["remote", "add", "origin", origin]);
+        let state = cwd_state_of(dir.path()).unwrap();
+        assert_eq!(
+            state.origin.as_deref(),
+            Some("https://example.invalid/repo")
+        );
+        let code = code_of(dir.path()).unwrap();
+        assert!(code.starts_with("https://example.invalid/repo@"));
+        assert!(!code.contains("synthetic"));
+
+        let historical = CwdState {
+            origin: Some(origin.to_owned()),
+            ..state
+        };
+        let rendered = serde_json::to_string(&historical.sanitized()).unwrap();
+        assert!(!rendered.contains("synthetic"));
+        assert!(!rendered.contains("private"));
+        assert_eq!(historical.origin.as_deref(), Some(origin));
     }
 
     #[test]

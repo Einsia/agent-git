@@ -233,7 +233,7 @@ pub(super) fn acquire_mine(slug: &str) -> CmdResult {
             as_runtime: None,
             no_launch: true,
         },
-        if super::echo::legacy_output("run") {
+        if super::echo::legacy_output("open") {
             ProgressOutput::Stdout
         } else {
             ProgressOutput::Stderr

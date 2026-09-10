@@ -291,89 +291,67 @@ fn raw_git(repo: &Repo, args: &[&str], stdin: Option<&str>) -> crate::Result<Str
 }
 
 fn list(repo: &Repo, slug: &str, verbose: bool, all: bool) -> CmdResult {
-    let branches = repo.local_branches();
-    if branches.is_empty() {
-        println!("{slug} has no branches yet.");
-        ui::hint(
-            "branches are born only via `agit import` / `fork` / `new` / `run` — no empty session, no empty branch",
+    let selection = if all {
+        super::log::BranchSelection::All
+    } else {
+        super::log::BranchSelection::Local
+    };
+    let detail = if super::json::requested() {
+        super::log::BranchDetail::History
+    } else if verbose {
+        super::log::BranchDetail::Sync
+    } else {
+        super::log::BranchDetail::Summary
+    };
+    let rows = super::log::branch_details(repo, selection, detail)?;
+    if super::json::requested() {
+        let branches = rows;
+        println!(
+            "{}",
+            serde_json::json!({"schema_version": 1, "repo": slug, "branches": branches})
         );
         return Ok(ExitCode::Ok);
     }
-    let cur = repo.current_branch();
-    for b in &branches {
-        let star = if Some(b) == cur.as_ref() { "*" } else { " " };
-        let head = format!("refs/heads/{b}");
-        // Session metadata: shape, session short code, runtime, turns, last activity.
-        let snap = meta::read_at_ref(repo, &head);
-        // An empty session means "this session line has not settled a first turn yet"; it
-        // displays as the same dash as "no identity", but the shape column must tell the truth.
-        let sid_of = |m: &meta::Meta| {
-            if m.session.is_empty() {
-                "-".to_string()
-            } else {
-                m.session.clone()
-            }
-        };
-        let turns = repo
-            .git_opt(&["rev-list", "--first-parent", "--count", &head])
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(0);
-        let when = repo
-            .git_opt(&["log", "-1", "--format=%cr", &head])
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        let sealed = if is_sealed(repo, b) { " [sealed]" } else { "" };
-        let file_line = match snap.as_ref().map(|m| m.line) {
+    let local: Vec<_> = rows.iter().filter(|row| row.local).collect();
+    if local.is_empty() {
+        println!("{slug} has no branches yet.");
+        ui::hint("branches are born via `agit import` / `fork` / `new` / `open`");
+    }
+    for row in local {
+        let star = if row.current { "*" } else { " " };
+        let b = &row.name;
+        let turns = row.turns;
+        let when = &row.when;
+        let sealed = if row.sealed { " [sealed]" } else { "" };
+        let file_line = match row.line {
             Some(meta::Line::File) => " [file line]",
             Some(meta::Line::Session) => "",
             None => " [no line declared]",
         };
+        let sid = row.session_id.as_deref().unwrap_or("-");
         if verbose {
-            let ab = repo
-                .git_opt(&[
-                    "rev-list",
-                    "--left-right",
-                    "--count",
-                    &format!("{head}...origin/{b}"),
-                ])
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "-".into());
+            let ab = match (row.sync.ahead, row.sync.behind) {
+                (Some(ahead), Some(behind)) => format!("{ahead}\t{behind}"),
+                _ => "-".into(),
+            };
             println!(
-                "{star} {b}{sealed}{file_line}\n    session {} · runtime {} · {turns} turns · {when} · ahead/behind {ab}",
-                snap.as_ref().map(sid_of).unwrap_or_else(|| "-".into()),
-                snap.as_ref()
-                    .map(|s| s.runtime.clone())
-                    .filter(|r| !r.is_empty())
-                    .unwrap_or_else(|| "-".into()),
+                "{star} {b}{sealed}{file_line}\n    session {sid} · runtime {} · {turns} turns · {when} · ahead/behind {ab}",
+                row.runtime.as_deref().unwrap_or("-")
             );
-            if let Some(code) = snap.and_then(|s| s.code) {
+            if let Some(code) = &row.code_anchor {
                 println!("    code anchor {code}");
             }
         } else {
-            let sid = snap
-                .as_ref()
-                .map(sid_of)
-                .map(|s| s[..s.len().min(13)].to_string())
-                .unwrap_or_else(|| "-".into());
+            let sid: String = sid.chars().take(13).collect();
             println!("{star} {b:<24} {sid} {turns:>4} turns · {when}{sealed}{file_line}");
         }
     }
-    if all
-        && repo.remote("origin").is_some()
-        && let Some(rs) = repo.git_opt(&[
-            "for-each-ref",
-            "--format=%(refname:short)",
-            "refs/remotes/origin/",
-        ])
-    {
-        let extra: Vec<_> = rs
-            .lines()
-            .filter(|l| !l.is_empty() && *l != "origin/HEAD")
-            .collect();
-        if !extra.is_empty() {
+    if all {
+        let remote: Vec<_> = rows.iter().filter(|row| !row.local).collect();
+        if !remote.is_empty() {
             println!("\nremote:");
-            for r in extra {
-                println!("  {r}");
+            for row in remote {
+                println!("  origin/{}", row.name);
             }
         }
     }

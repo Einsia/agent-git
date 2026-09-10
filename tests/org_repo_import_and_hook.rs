@@ -399,7 +399,7 @@ fn update_notice_count(output: &std::process::Output) -> usize {
 /// all the way through Git so a second call reintroduced at the tail would print the cached
 /// notice twice. Suppressed modes start without a cache, making any bypass visible as a request.
 #[test]
-fn push_dispatches_one_startup_update_check_and_suppressed_modes_dispatch_none() {
+fn redirected_push_never_dispatches_startup_update_checks() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "publish this turn", "done");
     let imported = lab
@@ -439,13 +439,13 @@ fn push_dispatches_one_startup_update_check_and_suppressed_modes_dispatch_none()
         String::from_utf8_lossy(&ordinary.stderr)
     );
     assert_eq!(
-        requests, 1,
-        "ordinary push asks for the latest version once"
+        requests, 0,
+        "redirected push must not request an incidental update"
     );
     assert_eq!(
         update_notice_count(&ordinary),
-        1,
-        "ordinary push prints exactly one startup notice"
+        0,
+        "redirected push must not print an update notice"
     );
 
     for (label, args, env) in [
@@ -574,11 +574,13 @@ fn an_org_import_lands_in_the_org_repo_and_the_next_stop_hook_follows_it() {
         response["hookSpecificOutput"]["sessionTitle"],
         "agit einsia/qa@work"
     );
+    let context = response["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(context.contains("einsia/qa@work"), "{response}");
     assert!(
-        response["hookSpecificOutput"]
-            .get("additionalContext")
-            .is_none(),
-        "a managed session must not be told to import itself again: {response}"
+        context.contains("Do not import this session again"),
+        "{response}"
     );
     let written = fs::read_to_string(&env_file).unwrap();
     assert!(
@@ -586,6 +588,21 @@ fn an_org_import_lands_in_the_org_repo_and_the_next_stop_hook_follows_it() {
         "SessionStart must write the claimed org slug back, got: {written}"
     );
     assert!(!written.contains("me/qa"), "{written}");
+
+    let native = lab.hook(
+        "ingest",
+        SID,
+        &[("source", "resume"), ("session_title", "My chosen name")],
+        &[],
+    );
+    let response: serde_json::Value = serde_json::from_slice(&native.stdout).unwrap();
+    assert!(response["hookSpecificOutput"].get("sessionTitle").is_none());
+    assert!(
+        response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("einsia/qa@work")
+    );
 }
 
 /// An org owner may import a session into a repo the hub does not have yet: the first push

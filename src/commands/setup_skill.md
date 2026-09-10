@@ -1,6 +1,6 @@
 ---
 name: agit
-description: The English AgentGit guide: understand Agent repos, session branches, workspaces, and code repos; adopt the current session with import when AGIT_SESSION is absent; choose the right init/new/import/fork/resume/commit/push command and follow AgentGit history and collaboration rules.
+description: "Use AgentGit to adopt native conversations, select explicit session targets, save completed turns, inspect or resume saved context, and publish session history. Read command references only when needed."
 ---
 
 # AgentGit overview
@@ -20,6 +20,26 @@ main file line       = AGENTS.md / memory/ / skills/ shared across sessions
 
 Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also touches the project code repository; ordinary `agit commit` records the AgentGit conversation repository. Each directory has at most one persisted `bound repo`. Multiple session links may share the same cwd and belong to different repos. Every existing-session operation selects its target through explicit arguments or `AGIT_SESSION`; directory state and native runtime IDs never select a session.
 
+## Working from an agent or script
+
+- Start with `agit status --json` in the intended project directory. Existing
+  sessions require an explicit `<owner/repo>@<branch>` or `AGIT_SESSION`.
+  Workspace bindings and discovered runtime sessions do not supply that target.
+- `@` means the session supplied through `AGIT_SESSION`. A known conflicting
+  native runtime claim makes that environment stale; use the explicit target
+  reported by the runtime hook or correct the environment before continuing.
+- Use `--json` for a stable envelope: check `ok` and `exit_code`, then inspect
+  `result.format`. Structured data is in `result.value`; text-only commands
+  expose `result.lines`. Errors and hints are in `diagnostics.stderr`.
+- Machine output disables terminal pickers. Supply required targets and options;
+  runtime-launching commands require `--no-launch` with `--json`. `--yes` only
+  answers confirmation prompts and never selects a session identity.
+- Search prior work with `agit search "question" --repo owner/name --json`.
+  Repeat `--query` to batch related searches with shared filters. Read
+  `references/commands/search.md` for pagination, limits, and uncertainty fields.
+- Read only the command reference needed for the operation; use
+  `agit <command> --help` to check this installed build's exact options.
+
 ## Choose an Agent repo before starting a session
 
 Before creating or importing a session, run this in the target workspace:
@@ -32,7 +52,7 @@ Follow these rules in order. Never guess from a directory name, the first repo i
 
 1. A persisted `bound repo` records the workspace’s intended repo for session creation. Name that repo explicitly in `new` or `import`; the binding never selects an existing session branch. Do not run `agit init` merely because this is a new session.
 2. Adopted session links are discovery results, not default targets. If no destination repo has been selected, ask the user to choose or use an interactive picker; never infer it from the sole link or a native runtime ID.
-3. If there is no reusable Agent repo or uniquely selected session, run `agit init` first, then create the session branch.
+3. If no suitable Agent repo exists, run `agit init` first, then create the session branch.
 4. If the user has named an existing Agent repo, always reuse it; this takes precedence over directory state and session-link ambiguity. If it is not local, run `agit clone <owner/repo>` first, not `agit init`.
 5. Organization repos (`<org>/<name>`) accept `import`, `commit` and `push` from whoever the Hub lets push to that repo (the org owner, and team members granted on it); an org owner may also import into a repo that does not exist yet — the first push creates it under the org. The CLI asks the Hub before importing or pushing, so a refusal names the real reason. The checkout lives under `~/.agit/repos/<org>/<name>`, versions are authored by the signed-in account, and org repos are always public on the Hub. Write owner names in lowercase. Do not `clone --mine` a copy just because the owner is not the user.
 
@@ -53,13 +73,19 @@ If `AGIT_SESSION` is absent, do not assume the current transcript is already man
 agit status --check-missing
 ```
 
-This reports the resolved identity, if any, and scans the runtime directories for sessions that no Agent repo has adopted yet; the transcript you are running in is one of them. When the user asks to upload, save, or adopt the current session, identify and explicitly pass its native session ID (or choose it in the interactive import picker) and adopt it into the repo chosen by the rules above:
+This reports the resolved identity, if any, and scans the runtime directories for sessions that no Agent repo has adopted yet. The current transcript may already be adopted even when `AGIT_SESSION` is absent. Match its native session ID from the runtime or hook against the reported metadata; never choose by recency alone. When the user asks to upload, save, or adopt the current session, explicitly pass its native session ID (or choose it in the interactive import picker) and adopt it into the repo chosen by the rules above:
 
 ```bash
 agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>
 ```
 
 `agit import` links that existing transcript to a real session branch and records its first version after an explicit lineage choice. Use the full native ID and `--from` runtime. A terminal offers verified bases, independent import, or cancellation; pipes, JSON, CI and agent calls return choices without adopting. Pass `--onto <ref>` or `--independent` to make the decision explicitly in automation. `--propose-lineage` only inspects local evidence. `agit new` cannot take over the session that is already running: it launches a different session with an empty VIEW. Use `new` only when the user explicitly asks to start a fresh session. `-n <agent-name>` is only for naming a new Agent repo when none can be reused; it does not pick the branch.
+
+Import cannot change the calling process's environment. Keep using the selected
+`<owner/repo>@<branch>` explicitly for later commands, or supply that exact
+`AGIT_SESSION` to each invocation. To inspect saved context without preparing a
+runtime, use `show` or `view`. `resume --no-launch --json` prepares a runtime
+session and records its claim; it is not a read-only preview.
 
 ## Pick the command
 
@@ -69,11 +95,11 @@ agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>
 | Start an empty session in an existing repo | `agit new <owner/repo> -b <branch>` | Creates a real session branch and starts a runtime |
 | Import an existing Codex/Claude conversation | `agit import <runtime-id> --from <runtime> --repo <owner/repo> -b <branch>` | Chooses lineage, then adopts and settles the transcript |
 | Open a line from an old point | `agit fork <source> -b <branch>` | Creates a branch; add `--resume` to start it |
-| Continue an existing session | `agit resume <branch>` or `agit resume @` | Restores that session's VIEW and starts it |
-| Run a frozen ref | `agit run <owner/repo>@<ref>` | Automatically chooses resume or fork |
-| Save the current turn | `agit commit` | Records new content on the current session branch |
+| Continue an existing session | `agit resume <owner/repo>@<branch>` | Restores that session's VIEW and starts it; never forks |
+| Open a branch or saved point | `agit open <owner/repo>@<ref>` | Continues a writable branch head; forks other saved points (`run` is an alias) |
+| Save completed turns | `agit commit <owner/repo>@<branch>` | Records completed pending turns; an in-progress turn waits for settlement after it ends |
 | Edit shared files on the file line (README.md, AGENTS.md, memory/, skills/) | `agit commit <owner/repo>@main -m "<msg>" [-- <path>...]` | Pure file commit on `main`; needs no session; publish with `agit push <owner/repo> -b main` |
-| Publish local history | `agit push <owner/repo> -b <branch>` | Scans secrets, then publishes existing refs |
+| Publish local history | `agit push <owner/repo>@<branch>` | Scans secrets, then publishes existing refs |
 
 ## Shared files on the file line
 
@@ -111,7 +137,7 @@ agit push <owner/repo> -b main                         # publish the file line
 | `clone` | Fetch an existing Agent repo; read-only by default, `--mine` makes a copy in your namespace |
 | `repo` | Manage repo create/list/info/visibility/collaborators/rename/delete/path |
 | `new` | Create an empty session branch in a selected repo |
-| `run` | Resolve any frozen ref, choosing resume or fork, and start a runtime |
+| `open` | Open a branch or saved point, continuing a writable head or forking; `run` is a compatibility alias |
 | `resume` | Strictly continue an existing writable session branch |
 
 ### Adoption, context, and sessions
@@ -188,7 +214,7 @@ Ordinary commands select an existing session from explicit arguments or `AGIT_SE
 
 `@` refers only to `AGIT_SESSION`. A registered native runtime claim may reveal that this environment value is stale after a runtime session switch; agit then refuses it and asks for an explicit target or a corrected environment value. It never chooses the runtime’s branch automatically. Hook payloads name their session explicitly and do not let an inherited environment value override that identity. A legacy link without a recorded owner cannot settle through hooks; run `agit import <session-id> --from <runtime> --into <owner>/<repo>@<branch>` to record the complete claim.
 
-Workspace bindings remain descriptive repo routes for creation and status. Native session links, cwd matches, the current checkout and the newest transcript cannot fill in a missing session target. Interactive import and resume pickers collect an explicit user choice.
+Workspace bindings remain descriptive repo routes for creation and status. Native session links, cwd matches, the current checkout and the newest transcript cannot fill in a missing session target. Human terminal pickers collect an explicit user choice for the current command. `agit`, without a subcommand, opens the resume picker; `log`, `push`, and `share` can also select a session without saving a directory-wide default.
 
 `new` and `import` create/adopt identity and should name the destination repo explicitly. `branch --repo <owner/repo>` manages a repo without selecting a current session.
 
@@ -198,7 +224,7 @@ Workspace bindings remain descriptive repo routes for creation and status. Nativ
 - One user turn normally becomes one AgentGit commit. When a phase genuinely completes (working feature and passing tests), settle it:
 
   ```bash
-  agit commit --milestone "short phase summary" --tag ms-short --code
+  agit commit <owner/repo>@<branch> --milestone "short phase summary" --tag ms-short --code
   ```
 
 - Memory flows by itself between the runtime's memory directory and the session branch (materialized at `new`/`resume`, collected at every `agit commit`). `main` only moves when you distill: at a milestone run `agit memory status`, then `agit distill` (or `agit memory distill <file>…`) to carry the facts worth sharing into `main`; `commit --milestone` and `push` remind you when files are pending.
@@ -222,8 +248,7 @@ Claude hooks may run `agit hooks settle` at Stop (older installs wrote `agit com
 
 `agit setup --skill` installs the same progressive-disclosure bundle for every
 supported runtime. Each target is a real Skill directory containing one
-entrypoint and one reference for every top-level command (41 references in the
-current build):
+entrypoint and a reference for every top-level command:
 
 ```text
 <runtime skill root>/agit/

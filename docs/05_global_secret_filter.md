@@ -107,6 +107,13 @@ on every other day. With the OS store selected and no usable keyring, initializa
 unlocking fail explicitly rather than degrade to a plaintext key file in the same directory;
 the error names the setting, and `agit doctor` reports the keystore's state.
 
+On macOS, credential operations allow Keychain authorization dialogs only when both stdin
+and stdout are terminals. Piped commands, JSON capture, runtime hooks, and other headless
+callers fail promptly when Keychain needs approval. Run the affected command from a terminal
+in the macOS login session and approve access before retrying automation. An authorization
+failure does not mean the store is unavailable: keep the selected keystore and its existing
+vault key. This policy also covers the OS-store probe in `agit doctor`.
+
 Every AES-GCM encryption uses a fresh 96-bit CSPRNG nonce. The AAD binds the application
 domain, the vault id, the record id and the format version. An authentication failure makes
 the vault unusable as a whole; a rule is never silently skipped and the scan then declared

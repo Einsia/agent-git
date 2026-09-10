@@ -1,7 +1,8 @@
 ## Session version control (agit)
 
-This project's agent sessions are managed by agit. Rules:
+Use agit to manage this project's agent sessions:
 
-- Settle when a phase completes: `agit commit --milestone "<summary>"` (add `--code` when relevant).
-- `agit status` at session start; if you were resumed as a merge agent, follow the `AGIT_MERGE_TX` protocol (see the agit skill).
-- Never rebase / force-push; remove context with `agit revert @#n.k`.
+- Start with `agit status --json`. An adopted session still needs an explicit `<owner/repo>@<branch>` or `AGIT_SESSION`; directory bindings and native runtime IDs do not select it.
+- Settle completed phases with `agit commit <owner/repo>@<branch> --milestone "<summary>"` (add `--code` when relevant). Importing a session does not set `AGIT_SESSION` in the calling process.
+- If resumed as a merge agent, follow the `AGIT_MERGE_TX` protocol in the agit skill.
+- Never rebase or force-push AgentGit history; remove context with `agit revert <owner/repo>@<branch>#n.k`. `@` requires `AGIT_SESSION`.

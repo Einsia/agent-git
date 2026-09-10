@@ -346,7 +346,30 @@ fn draw(
             },
         },
     );
-    let list_area = widgets::list_area_with_notice(frame, panes, notice);
+    let mut list_area = widgets::list_area_with_notice(frame, panes, notice);
+    if panes.detail.is_none() {
+        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(list_area);
+        list_area = rows[0];
+        let width = rows[1].width.saturating_sub(2) as usize;
+        let repo = repo
+            .map(|repo| repo.slug())
+            .unwrap_or_else(|| "no local repo".into());
+        let branch = if branch.is_empty() && !editing {
+            "<Enter to type>".into()
+        } else if !editing {
+            widgets::truncate_cols(branch, width.saturating_sub(7))
+        } else {
+            widgets::draft_tail(branch, width.saturating_sub(7))
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                widgets::clamp_line(Line::from(format!("repo   {repo}")), width),
+                Line::from(format!("branch {branch}")),
+            ])
+            .block(widgets::pane("adopt")),
+            rows[1],
+        );
+    }
     let width = list_area.width.saturating_sub(4) as usize;
 
     let items: Vec<ListItem> = view
@@ -376,6 +399,8 @@ fn draw(
         panes.footer,
         if editing {
             "type branch   enter adopt   esc stop editing"
+        } else if panes.detail.is_none() {
+            "↑↓ session  tab repo  enter name  s skip  x ignore  q quit"
         } else {
             "↑↓ session   tab repo   enter name   s skip   x ignore   q quit"
         },
@@ -473,6 +498,7 @@ mod tests {
 
     fn repo(branches: &[&str]) -> repos::Row {
         repos::Row {
+            source: repos::Source::Local,
             owner: "nana".into(),
             name: "payments".into(),
             path: "/repo".into(),
@@ -578,5 +604,39 @@ mod tests {
             text.contains(&crate::ui::ago(rows[0].last_active)),
             "the session row must expose last activity: {text}"
         );
+    }
+
+    #[test]
+    fn narrow_naming_keeps_the_destination_and_editing_cursor_visible() {
+        use ratatui::backend::TestBackend;
+        let row = session("codex", "ABC", false);
+        let view = vec![&row];
+        let target = repo(&[]);
+        let draft = format!("{}cursor-end", "branch/".repeat(20));
+        for (width, height) in [(40, 10), (60, 14), (79, 24)] {
+            let mut state = ListState::default();
+            state.select(Some(0));
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|frame| draw(frame, &view, &mut state, Some(&target), &draft, true, None))
+                .unwrap();
+            let buffer = term.backend().buffer();
+            let text = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for expected in [
+                "nana/payments",
+                "branch",
+                "cursor-end_",
+                "ABC",
+                "enter adopt",
+            ] {
+                assert!(text.contains(expected), "missing {expected:?}: {text}");
+            }
+        }
     }
 }

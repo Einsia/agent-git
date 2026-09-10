@@ -373,7 +373,7 @@ fn legacy_streams(output: &Output, mode: &str) -> (String, String) {
     );
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(document["schema"], "cli-output");
-    assert_eq!(document["command"], "run");
+    assert_eq!(document["command"], "open");
     assert_eq!(document["ok"], output.status.success());
     assert_eq!(document["exit_code"], output.status.code().unwrap());
     assert_eq!(document["result"]["format"], "text");

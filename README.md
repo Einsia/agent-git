@@ -11,13 +11,25 @@ cleaned up at any moment. `agit` puts snapshots and versions on top of them,
 so "that conversation last Wednesday that finally cracked the bug" becomes
 something you can find, continue, and hand to a teammate.
 
+```text
+agit                              choose a session to continue
+agit new                          choose a repo and name a fresh conversation
+agit import                       choose an existing runtime conversation to adopt
+agit log                          choose a session and browse its history
+agit push                         choose a saved session to publish
+agit share                        choose a session and review link settings
+agit open owner/repo@ref           open a saved source, forking when needed
 ```
-agit import <session> --from <runtime> --into <owner/repo>@<branch>   choose lineage, then adopt and record the session
-agit commit <agent>                record another version (snapshot of the session's full current content)
-agit push <agent>                  publish to the hub, get a link
-agit clone <owner>/<agent>         fetch (with git history) and pick up right away; --mine creates a copy under your name
-agit upgrade                       upgrade the CLI itself to the latest release the hub announces
-```
+
+These bare commands open their interfaces in a human terminal. `agit resume`
+continues the same session and never forks; `agit open` can start a new writable
+session from a tag, historical point or another author's source. `agit run`
+remains a compatibility alias for `open`.
+
+Inside an adopted agent session, `agit commit` saves completed turns and
+`agit push` publishes that session. For scripts, pass the target explicitly,
+for example `agit push owner/repo@branch --json`. Directory branch pins do not
+choose targets for `commit`, `push` or `share`.
 
 On user-facing startup, `agit` checks for a newer release at most once a day and prints a
 reminder to stderr; it never upgrades automatically. JSON/quiet/CI and internal hook/MCP paths
@@ -35,12 +47,10 @@ Inspecting lineage in an existing repository requires NUL-framed Git worktree ou
 normally available in Git 2.36 or newer. An unsupported Git reports `git_worktree_format`;
 explicit `--onto`, `--independent`, and `--link-only` imports retain their ordinary checks.
 
-`agit clone` is **read-only by default**: nothing is created in your name,
-`origin` points at the source, the session is installed into your runtime and
-you can `agit commit` locally as usual. When you decide to take over, use
-`--mine` — that creates your copy on the hub, repoints `origin` at it, and
-remembers the source as `upstream`. Running `agit push` from a read-only
-checkout offers exactly that.
+`agit clone` fetches repository history locally. Use `agit open` or `agit resume`
+to start a runtime. A clone is **read-only by default** on the Hub: nothing is
+created in your name and `origin` points at the source. `agit clone --mine`
+creates your copy, repoints `origin` and remembers the source as `upstream`.
 
 The full command list is in `agit --help`.
 

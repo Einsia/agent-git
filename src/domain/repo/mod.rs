@@ -1178,6 +1178,24 @@ impl Repo {
         Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     }
 
+    /// Feed a captured revision set through a file, avoiding argument limits and pipe deadlocks.
+    pub fn git_with_stdin_file(&self, args: &[&str], input: std::fs::File) -> Result<String> {
+        let out = self
+            .cmd()
+            .args(args)
+            .stdin(input)
+            .output()
+            .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+        if !out.status.success() {
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    }
+
     /// Run git and cut stdout into records at `sep`, **streaming**, handing each one to the
     /// callback.
     ///

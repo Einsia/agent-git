@@ -330,6 +330,8 @@ pub struct SearchPage<T> {
     /// recognized.
     #[serde(rename = "type", default)]
     pub kind: String,
+    #[serde(default)]
+    pub applied_filters: SearchFilters,
     /// Total hits. **For the sessions category this can be a lower bound**; see `incomplete`.
     pub total: usize,
     #[serde(default)]
@@ -353,6 +355,58 @@ pub struct SearchPage<T> {
     /// The body terms parsed out, with the qualifiers stripped.
     #[serde(default)]
     pub terms: Vec<String>,
+}
+
+/// Filters over the selected saved session version, independently of transcript event time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+}
+
+impl SearchFilters {
+    pub fn active(&self) -> bool {
+        self.author.is_some() || self.since.is_some() || self.before.is_some()
+    }
+
+    pub fn normalized(&self) -> crate::Result<Self> {
+        use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+        let time = |raw: &str| -> crate::Result<DateTime<Utc>> {
+            DateTime::parse_from_rfc3339(raw)
+                .map(|t| t.with_timezone(&Utc))
+                .or_else(|_| {
+                    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                        .map(|d| d.and_hms_opt(0, 0, 0).expect("midnight exists").and_utc())
+                })
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "time filters require YYYY-MM-DD (UTC) or RFC3339 with a timezone"
+                    )
+                })
+        };
+        let author = self.author.as_ref().map(|s| s.trim().to_lowercase());
+        anyhow::ensure!(
+            !author
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 512 || s.chars().any(char::is_control)),
+            "--author requires a name or email without control characters (at most 512 bytes)"
+        );
+        let since = self.since.as_deref().map(time).transpose()?;
+        let before = self.before.as_deref().map(time).transpose()?;
+        anyhow::ensure!(
+            !since.zip(before).is_some_and(|(start, end)| start >= end),
+            "--since must be earlier than --before"
+        );
+        Ok(Self {
+            author,
+            since: since.map(|t| t.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
+            before: before.map(|t| t.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
+        })
+    }
 }
 
 /// One agent hit.

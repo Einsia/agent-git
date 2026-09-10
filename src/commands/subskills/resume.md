@@ -7,7 +7,7 @@ description: Strictly resume a writable session branch.
 
 ## Purpose
 
-Continue the current head of an existing branch. It does not turn a tag, historical commit, sealed branch, or someone else's branch into a new line; use `fork` or `run` for those cases.
+Continue the current head of an existing branch. It does not turn a tag, historical commit, sealed branch, or someone else's branch into a new line; use `fork` or `open` for those cases.
 
 ## Synopsis
 
@@ -53,13 +53,18 @@ code `8` before native session reuse or materialization. Use a terminal to choos
 inject an environment notice, or pass `--yes` to continue without that notice.
 
 ```bash
-agit resume feature-a
-agit resume @ --as codex --cwd ~/Projects/p1
-agit resume handoff --no-launch
+agit resume szh/p1@feature-a
+agit resume szh/p1@feature-a --as codex --cwd ~/Projects/p1
+agit resume szh/p1@handoff --no-launch --json
 ```
 
 On failure, run `agit status` to check `AGIT_SESSION`, sealing, and the real ref.
 
+Agent and script calls use `--no-launch --json` to prepare a runtime without
+starting a nested TUI. Preparation may write a native transcript, session claim,
+and shared memory files. Use `agit show szh/p1@handoff --json` or
+`agit view szh/p1@handoff --json` for read-only inspection.
+
 Without a target, `resume` offers the candidates it finds; when there is no terminal to choose with, it lists them on stderr and exits 8 — name the branch instead. A branch whose history contains a `revert`, `cherry-pick`, or `merge` is always materialized from its head VIEW rather than reusing the native session, because those commits change what the agent should see without changing the underlying log.
 
-Turn commits record a compact `cwd_state` Git summary. Before launching either resume path, AgentGit compares that summary with the selected `--cwd`. On a mismatch it shows the recorded and current states and offers three choices: continue, continue with an environment notice injected as runtime system/developer instructions, or cancel. If the selected cwd is not a Git repository, comparison is unavailable; AgentGit warns and continues normally.
+Turn commits record a compact `cwd_state` Git summary: origin, HEAD, branch, staged/unstaged/untracked/conflict counts, and a status digest. Before launching either resume path, AgentGit compares that summary with the selected cwd. Different or uncertain comparable states require the choice described above. Selecting the environment notice appends it to Claude system instructions. `--yes` continues without that CLI notice; a non-Git directory warns and continues. Configured native SessionStart hooks provide historical context independently of the CLI choice. Codex receives historical state through the AgentGit SessionStart hook: install with `agit setup --hooks --runtime codex`, then enable and trust it through Codex `/hooks`. AgentGit does not override configured Codex developer instructions or invent a user message. No code files are checked out or restored. Older sessions without a saved summary remain resumable. Matching status counts and digests do not prove that uncommitted file contents match; inspect the current checkout before relying on earlier code changes.

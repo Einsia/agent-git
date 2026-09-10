@@ -234,6 +234,32 @@ pub fn cols(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
 }
 
+/// Show the end of an append-only draft because that is where the editing cursor lives.
+pub fn draft_tail(buffer: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if cols(buffer).saturating_add(1) <= width {
+        return format!("{buffer}_");
+    }
+    if width == 1 {
+        return "_".into();
+    }
+
+    let content_budget = width - 2; // leading ellipsis and trailing cursor
+    let mut start = buffer.len();
+    let mut used = 0;
+    for (index, ch) in buffer.char_indices().rev() {
+        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + char_width > content_budget {
+            break;
+        }
+        start = index;
+        used += char_width;
+    }
+    format!("…{}_", &buffer[start..])
+}
+
 /// Truncate to at most `max` **columns**, ending with an ellipsis when anything was cut.
 ///
 /// The split with [`crate::ui::truncate`]: that one cuts by **character** and serves text

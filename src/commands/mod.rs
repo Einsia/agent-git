@@ -1179,7 +1179,9 @@ use clap::{Parser, Subcommand};
     about = "git for agent sessions",
     long_about = "agit is git for agent sessions: a repo holds one agent's sessions plus shared \
                   memory/skills, a branch is one session, a commit is one user turn.\n\n\
-                  Six verbs get you through the day: run, import, commit, push, resume, merge.",
+                  Start with `agit` to choose a session. Use `new` for a fresh conversation, \
+                  `resume` to continue one, and `open <ref>` to start from a saved source.\n\n\
+                  Daily commands: import, log, commit, push, share.",
     propagate_version = true
 )]
 pub struct Cli {
@@ -1241,9 +1243,10 @@ pub enum Commands {
     // ── Repositories ────────────────────────────────────────────────
     /// Create an agent repo: the main file line + scaffolding (memory/ skills/ AGENTS.md), bound to this directory
     Init(init::Args),
-    /// Clone a repo locally (fetch only — running is run/resume's job)
+    /// Fetch a repo locally; use open or resume to start a session
     Clone(clone::Args),
-    /// Run any frozen ref: fetch + arbitrate (fork if needed) + materialize + launch
+    /// Open a saved source: continue a writable session or fork a new one when needed
+    #[command(name = "open", alias = "run")]
     Run(run::Args),
     /// Repo administration: create/list/info/visibility/collab/rename/delete/path
     Repo(repo::Args),
@@ -1253,7 +1256,7 @@ pub enum Commands {
     Import(import::Args),
     /// Who am I, adopted sessions, sync state (instant, offline)
     Status(status::Args),
-    /// Branch listing and hygiene: rename / rm / seal (branches are born only via import/fork/new/run)
+    /// List, rename, remove, or seal session branches
     Branch(branch::Args),
 
     // ── Recording ───────────────────────────────────────────────────
@@ -1281,7 +1284,7 @@ pub enum Commands {
     Fork(fork::Args),
     /// Start a fresh session (empty VIEW, shared files inherited from main)
     New(new::Args),
-    /// The strict entry point for continuing a session
+    /// Continue an existing local session; never create a fork (no target opens the picker)
     Resume(resume::Args),
 
     // ── Merging ─────────────────────────────────────────────────────
@@ -1301,9 +1304,9 @@ pub enum Commands {
     Pull(pull::Args),
 
     // ── Discovery and sharing ───────────────────────────────────────
-    /// Search the corpus you can read for “has anyone done this” (MCP is the primary surface)
+    /// Find matching sessions, repositories, pull requests, or people
     Search(search::Args),
-    /// Mint a one-shot read-only link for people without agit
+    /// Create a read-only link to a conversation
     Share(share::Args),
     /// Pull requests: create / list / show / fetch / merge
     Pr(pr::Args),
@@ -1343,7 +1346,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Config(_) => "config",
         Commands::Init(_) => "init",
         Commands::Clone(_) => "clone",
-        Commands::Run(_) => "run",
+        Commands::Run(_) => "open",
         Commands::Repo(_) => "repo",
         Commands::Import(_) => "import",
         Commands::Status(_) => "status",
@@ -1427,6 +1430,26 @@ mod json_cli_tests {
                 .json;
             assert!(json_requested(json, &command_of(argv)));
         }
+    }
+
+    #[test]
+    fn open_is_canonical_and_run_remains_a_compatible_alias() {
+        for spelling in ["open", "run"] {
+            let command = command_of(vec!["agit", spelling, "me/repo@v1", "--no-launch"]);
+            assert!(matches!(command, Commands::Run(_)));
+            assert_eq!(command_name(&command), "open");
+            assert_eq!(
+                json::command_from_argv(&["agit".into(), spelling.into()]),
+                "open"
+            );
+        }
+        let names: Vec<_> = cli_def()
+            .get_subcommands()
+            .filter(|command| !command.is_hide_set())
+            .map(|command| command.get_name().to_string())
+            .collect();
+        assert!(names.iter().any(|name| name == "open"));
+        assert!(!names.iter().any(|name| name == "run" || name == "switch"));
     }
 
     #[test]

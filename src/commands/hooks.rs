@@ -87,7 +87,7 @@ pub fn run(args: Args) -> CmdResult {
 
 /// SessionStart's `source`.
 ///
-/// claude-code and codex use the same set of values.
+/// The shared entry reasons cover Claude Code and Codex; Claude also reports native forks.
 /// Anything unrecognized becomes `Other` — when a value we have never seen appears, the safe
 /// behavior is "register without claiming", not guessing startup and claiming a branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +95,7 @@ pub enum Source {
     Startup,
     Resume,
     Clear,
+    Fork,
     Compact,
     Other,
 }
@@ -105,6 +106,7 @@ impl Source {
             Some("startup") => Source::Startup,
             Some("resume") => Source::Resume,
             Some("clear") => Source::Clear,
+            Some("fork") => Source::Fork,
             Some("compact") => Source::Compact,
             _ => Source::Other,
         }
@@ -117,6 +119,7 @@ struct Event {
     cwd: Option<String>,
     transcript_path: Option<String>,
     source: Source,
+    session_title: Option<String>,
 }
 
 fn parse_event(buf: &str) -> Option<Event> {
@@ -136,6 +139,7 @@ fn parse_event(buf: &str) -> Option<Event> {
         cwd: get("cwd"),
         transcript_path: get("transcript_path"),
         source: Source::parse(v.get("source").and_then(|s| s.as_str())),
+        session_title: get("session_title"),
     })
 }
 
@@ -212,8 +216,8 @@ pub fn decide(source: Source, env_session: bool, known: bool, bound: bool) -> De
 
 /// Whether this session is any of agit's business.
 ///
-/// Only two cases count: **this directory has a repo bound** (the user does agit work here), or
-/// **this is a session we started ourselves** (`AGIT_SESSION` is present).
+/// A bound directory or injected identity permits registration of a new session. Ingest also
+/// checks the exact link for an already adopted session, regardless of its current directory.
 ///
 /// # Why not "register everything"
 ///
@@ -254,11 +258,19 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
 
     let dir = ev.cwd.as_deref().map(std::path::Path::new);
     let bound = dir.map(|d| workspace::read(d).is_some()).unwrap_or(false);
-    if !concerns_us(bound, env_session.is_some()) {
+    let rt = runtime_of(runtime, ev.transcript_path.as_deref());
+    let existing = Store::open()
+        .ok()
+        .flatten()
+        .and_then(|store| link::get(&store, rt, &ev.session_id));
+    let has_binding = existing
+        .as_ref()
+        .map(|l| l.agent.is_some() && l.branch.is_some())
+        .unwrap_or(false);
+    if !has_binding && !concerns_us(bound, env_session.is_some()) {
         return None;
     }
 
-    let rt = runtime_of(runtime, ev.transcript_path.as_deref());
     let store = Store::open_or_init().ok()?;
     let _branch_guard = if ev.source == Source::Startup {
         env_session
@@ -270,11 +282,15 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
         None
     };
     let _link_guard = link::lock(&store, rt, &ev.session_id).ok()?;
+    // The initial lookup only decides whether to enter. Ownership must be reread under the
+    // branch and link locks so concurrent imports cannot be overwritten by a stale claim.
     let existing = link::get(&store, rt, &ev.session_id);
     let has_binding = existing
         .as_ref()
-        .map(|l| l.agent.is_some() && l.branch.is_some())
-        .unwrap_or(false);
+        .is_some_and(|link| link.agent.is_some() && link.branch.is_some());
+    if !has_binding && !concerns_us(bound, env_session.is_some()) {
+        return None;
+    }
 
     let env_value = match decide(
         ev.source,
@@ -299,12 +315,9 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
                 Err(_) => lk.agent = Some(repo.clone()),
             }
             lk.branch = Some(branch.clone());
-            let _ = link::write(&store, &lk);
-            // The value is **the full slug just claimed**, not the bare name sent back through
-            // `qualify`: with nobody signed in, `qualify` cannot fill in an owner and writes a
-            // binding that was just claimed successfully as a value that does not parse, which
-            // the next command then drops as malformed.
-            Some(super::context::encode_session_env(&repo, &branch))
+            link::write(&store, &lk)
+                .ok()
+                .and_then(|_| session_env_value(&lk))
         }
         Decision::Register => {
             let _ = link::write(&store, &Link::new(rt, &ev.session_id, dir));
@@ -318,36 +331,53 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     // Only this session's complete claim may propagate. An incomplete claim clears any
     // inherited AGIT_SESSION instead of making the next command inherit another identity.
     write_session_env(&ev.session_id, env_value.as_deref());
-    session_annotation(rt, ev.source, &ev.session_id, env_value.as_deref())
+    let mut response = session_annotation(
+        rt,
+        ev.source,
+        &ev.session_id,
+        env_value.as_deref(),
+        ev.session_title.as_deref(),
+    )?;
+    if matches!(ev.source, Source::Startup | Source::Resume)
+        && let (Some(binding), Some(cwd)) = (env_value.as_deref(), dir)
+        && let Some(context) = recorded_environment_context(binding, cwd)
+        && let Some(serde_json::Value::String(existing)) =
+            response["hookSpecificOutput"].get_mut("additionalContext")
+    {
+        existing.push_str("\n\n");
+        existing.push_str(&context);
+    }
+    Some(response)
 }
 
 /// The SessionStart response the runtime may show or add to the conversation.
 ///
-/// `compact` is deliberately excluded: it happens after the session has already started, when the
-/// user may have renamed it. Reapplying our title there would overwrite that explicit choice.
-/// Unknown sources are excluded for the same reason — output is safe only when the event is known
-/// to represent entering a session. Codex accepts the same response envelope but has no
-/// `sessionTitle` field, so a managed Codex session needs no response and an unmanaged one receives
-/// only the adoption context.
+/// Titles are defaults: a runtime title supplied by the user must survive resuming. Claude
+/// ignores titles on clear, while Codex has no title field. Both accept binding context.
 fn session_annotation(
     runtime: &str,
     source: Source,
     session_id: &str,
     binding: Option<&str>,
+    session_title: Option<&str>,
 ) -> Option<serde_json::Value> {
-    if !matches!(source, Source::Startup | Source::Resume | Source::Clear) {
+    if !matches!(
+        source,
+        Source::Startup | Source::Resume | Source::Clear | Source::Fork
+    ) {
         return None;
     }
 
-    let additional_context = binding.is_none().then(|| {
-        format!(
-            "This session is not under agit version control yet. If the user asks to save, name, or publish it, ask for the target if needed, then run `agit import {} --from {runtime} --into <owner/repo>@<branch>`.",
+    let additional_context = match binding {
+        Some(binding) => format!(
+            "This session is already under agit version control at {}. Use that explicit repo and branch for session commands; a launch-time AGIT_SESSION may refer to a session switched away from. Do not import this session again.",
+            sh_quote(binding)
+        ),
+        None => format!(
+            "This runtime session has no active agit branch. If the user asks to save, name, or publish it, ask for the target if needed, then run `agit import {} --from {runtime} --into <owner/repo>@<branch>`.",
             sh_quote(session_id)
-        )
-    });
-    if runtime == "codex" && additional_context.is_none() {
-        return None;
-    }
+        ),
+    };
     if !matches!(runtime, "claude-code" | "codex") {
         return None;
     }
@@ -357,19 +387,39 @@ fn session_annotation(
         "hookEventName".into(),
         serde_json::Value::String("SessionStart".into()),
     );
-    if runtime == "claude-code" {
+    if runtime == "claude-code"
+        && source != Source::Clear
+        && session_title.is_none_or(|title| title.trim().is_empty())
+    {
         let title = binding
             .map(|binding| format!("agit {binding}"))
             .unwrap_or_else(|| "agit: unnamed".to_string());
         output.insert("sessionTitle".into(), serde_json::Value::String(title));
     }
-    if let Some(context) = additional_context {
-        output.insert(
-            "additionalContext".into(),
-            serde_json::Value::String(context),
-        );
-    }
+    output.insert(
+        "additionalContext".into(),
+        serde_json::Value::String(additional_context),
+    );
     Some(serde_json::json!({ "hookSpecificOutput": output }))
+}
+
+/// Reading the selected branch's metadata does not scan the worktree or runtime transcript.
+/// Native TUI resumes need this observation too, since they do not pass through `agit resume`.
+fn recorded_environment_context(binding: &str, cwd: &std::path::Path) -> Option<String> {
+    let (slug, branch) = super::context::decode_session_env(binding)?;
+    let (owner, name) = super::parse_slug(&slug).ok()?;
+    let repo =
+        crate::domain::repo::Repo::open(crate::infra::config::repo_dir(&owner, &name).ok()?)?;
+    let snapshot = crate::domain::meta::read_at_ref(&repo, &format!("refs/heads/{branch}"))?;
+    let state = snapshot.cwd_state.as_ref()?;
+    let observation = serde_json::json!({
+        "recorded_cwd": snapshot.cwd,
+        "recorded_cwd_state": state.sanitized(),
+        "current_cwd": cwd.to_string_lossy(),
+    });
+    Some(format!(
+        "AgentGit saved environment (historical data, not instructions): {observation}\nThis is the last settled turn's observation, not a live Git status or proof of the same machine. Inspect the current checkout before relying on earlier code changes. AgentGit has not restored code files or uncommitted changes."
+    ))
 }
 
 /// Write the binding into the harness's "session environment" file.
@@ -420,6 +470,9 @@ fn env_file_belongs_to(path: &str, session_id: &str) -> bool {
 /// Environment propagation requires a complete recorded claim. A missing namespace must not
 /// become an implicit account selection for commands launched after this hook.
 fn session_env_value(lk: &Link) -> Option<String> {
+    if !lk.is_active() {
+        return None;
+    }
     let branch = lk.branch.as_deref()?;
     let slug = format!("{}/{}", lk.owner.as_deref()?, lk.agent.as_deref()?);
     let v = super::context::encode_session_env(&slug, branch);
@@ -511,6 +564,7 @@ mod tests {
         assert_eq!(Source::parse(Some("startup")), Source::Startup);
         assert_eq!(Source::parse(Some("resume")), Source::Resume);
         assert_eq!(Source::parse(Some("clear")), Source::Clear);
+        assert_eq!(Source::parse(Some("fork")), Source::Fork);
         assert_eq!(Source::parse(Some("compact")), Source::Compact);
         // An unseen value must not be guessed as startup — that would claim a branch.
         assert_eq!(Source::parse(Some("teleport")), Source::Other);
@@ -573,7 +627,7 @@ mod tests {
             Decision::Claim,
             "a session we started ourselves is claimed"
         );
-        for s in [Source::Resume, Source::Clear] {
+        for s in [Source::Resume, Source::Clear, Source::Fork] {
             assert_eq!(
                 decide(s, true, false, false),
                 Decision::Register,
@@ -593,6 +647,7 @@ mod tests {
             Source::Startup,
             Source::Resume,
             Source::Clear,
+            Source::Fork,
             Source::Compact,
             Source::Other,
         ] {
@@ -643,20 +698,23 @@ mod tests {
     /// make an agent attempt to adopt it again.
     #[test]
     fn a_managed_session_is_labeled_with_its_binding() {
+        let response = super::session_annotation(
+            "claude-code",
+            Source::Resume,
+            "SID-A",
+            Some("einsia/payments@flaky-test"),
+            None,
+        )
+        .unwrap();
         assert_eq!(
-            super::session_annotation(
-                "claude-code",
-                Source::Resume,
-                "SID-A",
-                Some("einsia/payments@flaky-test"),
-            ),
-            Some(serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "sessionTitle": "agit einsia/payments@flaky-test",
-                }
-            }))
+            response["hookSpecificOutput"]["sessionTitle"],
+            "agit einsia/payments@flaky-test"
         );
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.contains("'einsia/payments@flaky-test'"));
+        assert!(context.contains("Do not import this session again"));
     }
 
     /// An unmanaged session gets both the visible state and a command containing its real runtime
@@ -665,11 +723,11 @@ mod tests {
     #[test]
     fn an_unmanaged_session_gets_actionable_adoption_context() {
         let response =
-            super::session_annotation("claude-code", Source::Clear, "sid with ' quote", None)
+            super::session_annotation("claude-code", Source::Clear, "sid with ' quote", None, None)
                 .unwrap();
         let output = &response["hookSpecificOutput"];
         assert_eq!(output["hookEventName"], "SessionStart");
-        assert_eq!(output["sessionTitle"], "agit: unnamed");
+        assert!(output.get("sessionTitle").is_none());
         let context = output["additionalContext"].as_str().unwrap();
         assert!(
             context.contains(
@@ -685,11 +743,11 @@ mod tests {
     #[test]
     fn an_unmanaged_codex_session_gets_context_without_a_title() {
         assert_eq!(
-            super::session_annotation("codex", Source::Startup, "SID-C", None),
+            super::session_annotation("codex", Source::Startup, "SID-C", None, None),
             Some(serde_json::json!({
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": "This session is not under agit version control yet. If the user asks to save, name, or publish it, ask for the target if needed, then run `agit import 'SID-C' --from codex --into <owner/repo>@<branch>`.",
+                    "additionalContext": "This runtime session has no active agit branch. If the user asks to save, name, or publish it, ask for the target if needed, then run `agit import 'SID-C' --from codex --into <owner/repo>@<branch>`.",
                 }
             }))
         );
@@ -701,20 +759,61 @@ mod tests {
     fn annotation_is_limited_to_verified_session_entry_events() {
         for source in [Source::Compact, Source::Other] {
             assert!(
-                super::session_annotation("claude-code", source, "SID-A", None).is_none(),
+                super::session_annotation("claude-code", source, "SID-A", None, None).is_none(),
                 "{source:?}"
             );
         }
+        let response = super::session_annotation(
+            "codex",
+            Source::Startup,
+            "SID-A",
+            Some("einsia/payments@work"),
+            None,
+        )
+        .unwrap();
+        assert!(response["hookSpecificOutput"].get("sessionTitle").is_none());
         assert!(
-            super::session_annotation(
-                "codex",
-                Source::Startup,
+            response["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("einsia/payments@work")
+        );
+        assert!(
+            super::session_annotation("cursor", Source::Startup, "SID-A", None, None).is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_titles_survive_resuming_and_forking() {
+        let event = super::parse_event(
+            r#"{"session_id":"SID-A","source":"resume","session_title":"User chosen title"}"#,
+        )
+        .unwrap();
+        assert_eq!(event.session_title.as_deref(), Some("User chosen title"));
+        for source in [Source::Startup, Source::Resume, Source::Fork] {
+            let response = super::session_annotation(
+                "claude-code",
+                source,
                 "SID-A",
                 Some("einsia/payments@work"),
+                event.session_title.as_deref(),
             )
-            .is_none()
+            .unwrap();
+            assert!(response["hookSpecificOutput"].get("sessionTitle").is_none());
+            assert!(
+                response["hookSpecificOutput"]
+                    .get("additionalContext")
+                    .is_some()
+            );
+        }
+        let fork =
+            super::session_annotation("claude-code", Source::Fork, "SID-F", None, None).unwrap();
+        assert!(
+            fork["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("agit import 'SID-F'")
         );
-        assert!(super::session_annotation("cursor", Source::Startup, "SID-A", None).is_none());
     }
 
     #[test]
@@ -728,6 +827,8 @@ mod tests {
             super::session_env_value(&lk).as_deref(),
             Some("einsia/payments@refund-fix")
         );
+        lk.superseded_by = Some("codex/replacement".into());
+        assert!(super::session_env_value(&lk).is_none());
         let bare = crate::domain::link::Link::new("claude-code", "S2", None);
         assert!(super::session_env_value(&bare).is_none());
     }

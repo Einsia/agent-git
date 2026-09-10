@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(target_os = "macos")]
+mod os_keychain;
 mod repository;
 
 pub(crate) use repository::HydrationBudgetExceeded;
@@ -176,6 +178,13 @@ impl OsKeyStore {
     /// credential store or selecting the file keystore; for the second, that advice would
     /// leave the existing vault behind with its key in the store it was created in.
     fn is_unavailable(error: &keyring::Error) -> bool {
+        #[cfg(target_os = "macos")]
+        if matches!(
+            error,
+            keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_)
+        ) {
+            return os_keychain::is_unavailable(error);
+        }
         matches!(
             error,
             keyring::Error::NoDefaultStore
@@ -188,6 +197,12 @@ impl OsKeyStore {
     /// The error of one store operation, with the remedy guidance appended only when the
     /// store is unavailable; any other failure keeps its own meaning.
     fn failure(operation: &str, error: keyring::Error) -> anyhow::Error {
+        #[cfg(target_os = "macos")]
+        if os_keychain::requires_authorization(&error) {
+            return anyhow::Error::new(error).context(format!(
+                "{operation}; macOS Keychain requires user authorization; rerun this command from a terminal in your macOS login session and approve Keychain access, then retry automation; keep the current keystore so the existing vault key remains accessible"
+            ));
+        }
         if Self::is_unavailable(&error) {
             anyhow::Error::new(error)
                 .context(format!("{operation}; {OS_KEYSTORE_UNAVAILABLE_GUIDANCE}"))
@@ -196,31 +211,43 @@ impl OsKeyStore {
         }
     }
 
-    fn entry(vault_id: &str) -> crate::Result<keyring::Entry> {
-        // The store fails to open on a machine with no desktop session (an SSH login, a CI
-        // runner): there is no Secret Service to answer. Name both explicit remedies and say
-        // that agit did not silently change the user's storage boundary.
-        keyring::Entry::new(KEYRING_SERVICE, vault_id).map_err(|error| {
-            Self::failure("cannot open the operating-system credential store", error)
-        })
+    fn with_entry<T>(
+        vault_id: &str,
+        operation: impl FnOnce(keyring::Entry) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let access = || {
+            // Store initialization belongs inside the access policy too: a platform provider
+            // can contact the credential service while creating an entry.
+            let entry = keyring::Entry::new(KEYRING_SERVICE, vault_id).map_err(|error| {
+                Self::failure("cannot open the operating-system credential store", error)
+            })?;
+            operation(entry)
+        };
+        #[cfg(target_os = "macos")]
+        return os_keychain::with_access(access);
+        #[cfg(not(target_os = "macos"))]
+        access()
     }
 }
 
 impl KeyStore for OsKeyStore {
     fn get(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
-        let key = Self::entry(vault_id)?.get_secret().map_err(|error| match error {
-            // A reachable store with no matching key is a recovery problem, not an unavailable
-            // backend. Suggesting a different backend here would strand the existing vault too.
-            keyring::Error::NoEntry => anyhow::Error::new(keyring::Error::NoEntry).context(
-                format!(
-                    "the secret-filter vault exists, but its key `{vault_id}` is not in the operating-system credential store ({} = os)",
-                    SecretKeystore::KEY
+        let key = Self::with_entry(vault_id, |entry| {
+            entry.get_secret().map_err(|error| match error {
+                // A reachable store with no matching key is a recovery problem. Switching
+                // backends would leave the existing vault behind without its key.
+                keyring::Error::NoEntry => {
+                    let message = format!(
+                        "the secret-filter vault exists, but its key `{vault_id}` is not in the operating-system credential store ({} = os)",
+                        SecretKeystore::KEY
+                    );
+                    anyhow::Error::new(keyring::Error::NoEntry).context(message)
+                }
+                error => Self::failure(
+                    "cannot read the secret-filter KEK from the operating-system credential store",
+                    error,
                 ),
-            ),
-            error => Self::failure(
-                "cannot read the secret-filter KEK from the operating-system credential store",
-                error,
-            ),
+            })
         })?;
         validate_key(&key, "KEK")?;
         Ok(Zeroizing::new(key))
@@ -228,20 +255,23 @@ impl KeyStore for OsKeyStore {
 
     fn set(&self, vault_id: &str, key: &[u8]) -> crate::Result<()> {
         validate_key(key, "KEK")?;
-        Self::entry(vault_id)?.set_secret(key).map_err(|error| {
-            Self::failure(
-                "cannot save the secret-filter KEK in the operating-system credential store",
-                error,
-            )
+        Self::with_entry(vault_id, |entry| {
+            entry.set_secret(key).map_err(|error| {
+                Self::failure(
+                    "cannot save the secret-filter KEK in the operating-system credential store",
+                    error,
+                )
+            })
         })
     }
 
     fn delete(&self, vault_id: &str) -> crate::Result<()> {
-        Self::entry(vault_id)?.delete_credential().map_err(|error| {
-            Self::failure(
-                "cannot delete the secret-filter KEK from the operating-system credential store",
-                error,
-            )
+        Self::with_entry(vault_id, |entry| {
+            let operation =
+                "cannot delete the secret-filter KEK from the operating-system credential store";
+            entry
+                .delete_credential()
+                .map_err(|error| Self::failure(operation, error))
         })
     }
 }
@@ -522,32 +552,33 @@ fn probe_key() -> Zeroizing<Vec<u8>> {
 }
 
 fn probe_os_store() -> crate::Result<()> {
-    let entry = OsKeyStore::entry(&probe_id())?;
-    let probe = probe_key();
-    entry.set_secret(&probe).map_err(|error| {
-        OsKeyStore::failure(
-            "the operating-system credential store refused a write",
-            error,
-        )
-    })?;
-    let back = entry.get_secret().map(Zeroizing::new).map_err(|error| {
-        OsKeyStore::failure(
-            "the operating-system credential store cannot read back what it stored",
-            error,
-        )
-    });
-    // The probe entry is not left behind whatever the read said; a store that cannot delete
-    // is reported too.
-    let removed = entry.delete_credential().map_err(|error| {
-        OsKeyStore::failure(
-            "the operating-system credential store cannot delete what it stored",
-            error,
-        )
-    });
-    if *back? != *probe {
-        bail!("the operating-system credential store returned different bytes than it stored");
-    }
-    removed
+    OsKeyStore::with_entry(&probe_id(), |entry| {
+        let probe = probe_key();
+        entry.set_secret(&probe).map_err(|error| {
+            OsKeyStore::failure(
+                "the operating-system credential store refused a write",
+                error,
+            )
+        })?;
+        let back = entry.get_secret().map(Zeroizing::new).map_err(|error| {
+            OsKeyStore::failure(
+                "the operating-system credential store cannot read back what it stored",
+                error,
+            )
+        });
+        // The probe entry is not left behind whatever the read said; a store that cannot delete
+        // is reported too.
+        let removed = entry.delete_credential().map_err(|error| {
+            OsKeyStore::failure(
+                "the operating-system credential store cannot delete what it stored",
+                error,
+            )
+        });
+        if *back? != *probe {
+            bail!("the operating-system credential store returned different bytes than it stored");
+        }
+        removed
+    })
 }
 
 /// A round trip through the production file store. A missing directory is created the way the

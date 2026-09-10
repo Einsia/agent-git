@@ -13,11 +13,16 @@ agit share list
 agit share rm <slug>
 ```
 
+A bare `agit share` in a human terminal opens a wizard: choose a saved session,
+then encrypted or public visibility and an expiry. The selection is temporary;
+it does not bind another command to that session. Agents and scripts supply a
+saved ref or `AGIT_SESSION`. `--yes` skips final confirmation, not target selection.
+
 ## Options
 
 | Option | Meaning |
 |---|---|
-| `[ref-or-session]` | An explicit saved ref or native session ID/prefix; omitted targets require the exact branch in `AGIT_SESSION` |
+| `[ref-or-session]` | Explicit `owner/repo@branch`, another saved ref, `@`, or native session ID/prefix; omitted targets and `@` require `AGIT_SESSION` outside the terminal picker |
 | `--full-log` | Share the saved point's full LOG instead of its VIEW; requires a saved ref |
 | `--public` | Create an unencrypted link that can be fetched directly |
 | `--expire <24h\|7d\|30d\|never>` | Expiration; default `7d` |
@@ -30,7 +35,8 @@ agit share rm <slug>
 ## Examples
 
 ```bash
-agit share --expire 24h --password
+agit share
+agit share owner/repo@branch --expire 24h --password
 agit share 132bf69f-22a --public --views 10
 agit share list
 agit share rm abc123

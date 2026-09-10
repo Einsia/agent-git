@@ -12,15 +12,15 @@ Record one turn on the current session branch. A normal commit writes to `~/.agi
 ## Synopsis
 
 ```bash
-agit commit [branch|@] [options] [-- <path>...]
+agit commit [target] [options] [-- <path>...]
 ```
 
 ## Options
 
 | Option | Meaning |
 |---|---|
-| `[branch|@]` | Explicit owner/repo@branch or adopted native session ID; omitted targets and `@` require `AGIT_SESSION` |
-| `[-- <path>...]` | Include only these paths in the code commit |
+| `[target]` | Explicit owner/repo@branch or adopted native session ID; omitted targets and `@` require `AGIT_SESSION` |
+| `[-- <path>...]` | Limit a code commit or a file-line commit to these paths |
 | `--milestone <summary>` | Mark a completed phase with a short summary |
 | `--tag <name>` | Tag the commit |
 | `--code` | Also commit the code repo and cross-link both commits; outside Git, warn and settle the session turn without the code side commit |
@@ -29,12 +29,16 @@ agit commit [branch|@] [options] [-- <path>...]
 | `-b, --branch <branch>` | Legacy native-ID compatibility with a recorded owner: choose the session branch; `main` is refused for turn settlement |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
+Workspace bindings and runtime discovery do not select a branch. Use a complete
+`<owner/repo>@<branch>` when `AGIT_SESSION` is absent, including for a file commit
+on `main`. A native session ID must already have an explicit adoption claim.
+
 ## Examples
 
 ```bash
-agit commit                                             # settle the pending turns of the current session
-agit commit @ --milestone "Phase one passed tests" --tag ms-auth
-agit commit --code -- src/auth.rs                       # also commit the code repo, scoped to one path
+agit commit szh/p1@fix-auth --json
+agit commit szh/p1@fix-auth --milestone "Phase one passed tests" --tag ms-auth
+agit commit szh/p1@fix-auth --code -- src/auth.rs       # also commit the code repo, scoped to one path
 agit commit <owner/repo>@main -m "docs: add README" -- README.md
 agit commit <session-id> -n photo -b fix-auth           # requires a recorded repository owner
 ```

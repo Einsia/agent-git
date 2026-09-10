@@ -12,14 +12,14 @@ Publish refs that already exist locally. `push` is not a replacement for `new`, 
 ## Synopsis
 
 ```bash
-agit push [repo] [options]
+agit push [owner/repo@branch] [options]
 ```
 
 ## Options
 
 | Option | Meaning |
 |---|---|
-| `[repo]` | `<owner/name>`; context resolution when omitted |
+| `[owner/repo@branch]` | Explicit saved branch; a bare repo with `-b` is also accepted. An omitted target requires `AGIT_SESSION` outside the terminal picker |
 | `-b, --branch <branch>` | Branches to publish; repeatable |
 | `--all` | Publish all local branches/refs |
 | `--private` | Publish privately |
@@ -29,11 +29,16 @@ agit push [repo] [options]
 
 Visibility is settled once, at first publish. Without `--private` / `--public`, push takes the repo preference recorded by `agit init --private`, then the global `push.visibility` (`public` or `private`; `ask` means ask), and otherwise asks on a TTY (non-interactive runs default to private). `--dry-run` prints which of these applies.
 
+A bare `agit push` in a human terminal selects a saved session in the TUI. The
+choice applies only to this invocation. Agent and script callers use a complete
+target or `AGIT_SESSION`; workspace bindings, native IDs, and the newest session
+do not choose what to publish. `--yes` does not select a missing target.
+
 ## Examples
 
 ```bash
-agit push szh/p1 -b feature-a
-agit push --all
+agit push szh/p1@feature-a
+agit push szh/p1 --all
 agit push szh/p1 -b feature-a --dry-run
 ```
 

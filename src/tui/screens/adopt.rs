@@ -914,6 +914,7 @@ mod tests {
 
     fn repo(branches: &[&str]) -> repos::Row {
         repos::Row {
+            source: repos::Source::Local,
             owner: "nana".into(),
             name: "payments".into(),
             path: "/repo".into(),

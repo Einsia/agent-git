@@ -55,7 +55,8 @@ pub struct Args {
 }
 
 /// Where the effective value shown by the editor comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Source {
     Environment,
     Stored,
@@ -64,7 +65,7 @@ pub(crate) enum Source {
 }
 
 /// One config row, keeping the effective and persisted values separate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Entry {
     pub key: &'static str,
     pub description: &'static str,
@@ -94,24 +95,31 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
 
-    if args.list {
-        let stored = config::list_global()?;
-        for (key, desc) in KEYS {
-            // The read goes through the full resolution chain (env var > file), so what the
-            // user sees is the effective value.
-            let effective =
-                config::get_global(key)?.or_else(|| default_value(key).map(str::to_owned));
-            let mark = if stored.contains_key(key) {
-                ""
-            } else {
-                " (default)"
+    if args.list || (super::json::requested() && args.key.is_none() && !args.unset) {
+        let entries = collect()?;
+        if super::json::requested() {
+            println!(
+                "{}",
+                serde_json::json!({"schema_version": 1, "operation": "list", "settings": entries})
+            );
+            return Ok(ExitCode::Ok);
+        }
+        for entry in entries {
+            let mark = match entry.source {
+                Source::Stored => String::new(),
+                Source::Environment => format!(
+                    " (environment: {})",
+                    entry.environment_name.unwrap_or_default()
+                ),
+                Source::Default => " (default)".to_owned(),
+                Source::Unset => String::new(),
             };
             println!(
                 "{} = {}{}\n    {}",
-                key,
-                effective.as_deref().unwrap_or("(unset)"),
+                entry.key,
+                entry.effective.as_deref().unwrap_or("(unset)"),
                 mark,
-                desc
+                entry.description
             );
         }
         return Ok(ExitCode::Ok);
@@ -136,12 +144,18 @@ pub fn run(args: Args) -> CmdResult {
 
     if args.unset {
         config::set_global(&key, None)?;
+        if super::json::requested() {
+            return structured_entry("unset", &key);
+        }
         ui::success(&format!("deleted {key}"));
         return Ok(ExitCode::Ok);
     }
 
     match args.value {
         None => {
+            if super::json::requested() {
+                return structured_entry("get", &key);
+            }
             let v = config::get_global(&key)?;
             match v {
                 Some(v) => println!("{v}"),
@@ -157,9 +171,24 @@ pub fn run(args: Args) -> CmdResult {
                 e
             })?;
             config::set_global(&key, Some(&v))?;
+            if super::json::requested() {
+                return structured_entry("set", &key);
+            }
             ui::success(&format!("{key} = {v}"));
         }
     }
+    Ok(ExitCode::Ok)
+}
+
+fn structured_entry(operation: &str, key: &str) -> CmdResult {
+    let entry = collect()?
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .ok_or_else(|| anyhow::anyhow!("unknown config key `{key}`"))?;
+    println!(
+        "{}",
+        serde_json::json!({"schema_version": 1, "operation": operation, "setting": entry})
+    );
     Ok(ExitCode::Ok)
 }
 

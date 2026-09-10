@@ -3,9 +3,11 @@
 
 pub mod adopt;
 pub mod configuration;
+pub mod history;
 pub mod initialize;
 pub mod naming;
 pub mod repos;
 pub mod sessions;
+pub mod sharing;
 pub mod timeline;
 pub mod transcript;

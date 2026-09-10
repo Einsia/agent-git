@@ -116,6 +116,7 @@ impl ErrorBody {
     }
 }
 
+#[derive(Clone)]
 pub struct Client {
     base: String,
     credential_binding_valid: bool,
@@ -212,6 +213,16 @@ impl Client {
             cred: std::cell::RefCell::new(cred),
             agent: cfg.into(),
         }
+    }
+
+    /// Use stored access credentials for a disposable background read.
+    ///
+    /// A caller that can exit without joining the request must not rotate a single-use refresh
+    /// token: process exit could interrupt persistence after the server invalidates the old pair.
+    pub(crate) fn from_env_without_refresh(timeout: Duration) -> Client {
+        let mut client = Self::from_env_with_timeout(timeout);
+        *client.cred.get_mut() = None;
+        client
     }
 
     /// A named hub plus a whole credential: requests carry its access token, and a 401 renews
@@ -898,6 +909,11 @@ impl Client {
         self.get("api/agents")
     }
 
+    /// List visible repositories in one namespace without loading the rest of the Hub.
+    pub fn agents_owned_by(&self, owner: &str) -> Result<Vec<RemoteAgent>> {
+        self.get(&format!("api/agents?owner={}", urlencode(owner)))
+    }
+
     pub fn get_agent(&self, owner: &str, name: &str) -> Result<RemoteAgent> {
         self.get(&format!("api/agents/{owner}/{name}"))
     }
@@ -971,6 +987,20 @@ impl Client {
         page: usize,
         per: usize,
     ) -> Result<SearchPage<T>> {
+        self.search_page_filtered(kind, query, sort, page, per, &SearchFilters::default())
+    }
+
+    /// Require acknowledgement so an older Hub cannot silently omit a requested filter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_page_filtered<T: serde::de::DeserializeOwned>(
+        &self,
+        kind: &str,
+        query: &str,
+        sort: Option<&str>,
+        page: usize,
+        per: usize,
+        filters: &SearchFilters,
+    ) -> Result<SearchPage<T>> {
         let mut path = format!("api/search/{kind}?q={}", urlencode(query));
         if let Some(s) = sort {
             path.push_str(&format!("&sort={}", urlencode(s)));
@@ -981,7 +1011,22 @@ impl Client {
         if per > 0 {
             path.push_str(&format!("&per={per}"));
         }
-        self.get(&path)
+        let filters = filters.normalized()?;
+        for (key, value) in [
+            ("author", &filters.author),
+            ("since", &filters.since),
+            ("before", &filters.before),
+        ] {
+            if let Some(value) = value {
+                path.push_str(&format!("&{key}={}", urlencode(value)));
+            }
+        }
+        let response: SearchPage<T> = self.get(&path)?;
+        anyhow::ensure!(
+            response.applied_filters == filters,
+            "the Hub did not acknowledge the requested author/time filters; upgrade the Hub before relying on these results"
+        );
+        Ok(response)
     }
 
     /// How many hits each of the four categories has.

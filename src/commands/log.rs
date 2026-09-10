@@ -9,15 +9,15 @@
 //! * `--graph`: a cross-branch ASCII graph (fork points and merge parents are both on it).
 //! * `-- <path>`: only the commits that touched one shared file.
 //!
-//! Performance discipline: history metadata and selected turn evidence are read in batches;
-//! the branch-level view reads the first commit's gist once per branch. Neither opens a live
-//! transcript.
+//! History and evidence reads share batched metadata, ref facts, and commit graphs.
+//! Neither view opens a live transcript.
 
 use super::CmdResult;
 use crate::domain::meta::{self, Kind};
 use crate::domain::repo::Repo;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
+use serde::Serialize;
 
 /// How many turns to show when `-n` is absent.
 ///
@@ -37,7 +37,7 @@ pub struct Args {
     #[arg(short = 'n', long, default_value_t = DEFAULT_LIMIT)]
     pub limit: usize,
     /// Cross-branch ASCII graph.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "branches")]
     pub graph: bool,
     /// Branch-level view.
     #[arg(long)]
@@ -61,6 +61,27 @@ pub struct Args {
 
 pub fn run(args: Args) -> CmdResult {
     let cwd = std::env::current_dir()?;
+    if wants_tui(&args) {
+        match crate::tui::should_enter() {
+            crate::tui::Verdict::Enter => {
+                let Some(picked) = crate::tui::screens::history::pick(&cwd, "agit log")? else {
+                    return Ok(ExitCode::Ok);
+                };
+                let repo = Repo::open(&picked.path)
+                    .ok_or_else(|| anyhow::anyhow!("{} is no longer available", picked.slug))?;
+                let head = repo.git(&["rev-parse", &format!("refs/heads/{}", picked.branch)])?;
+                return crate::tui::screens::timeline::run(
+                    &repo,
+                    &picked.slug,
+                    &picked.branch,
+                    head.trim(),
+                );
+            }
+            crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
+            crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
+            crate::tui::Verdict::Skip => {}
+        }
+    }
     let parsed_target = match args.target.as_deref() {
         Some(raw) => {
             // `--branches` and `--graph` explicitly ask for the
@@ -92,6 +113,7 @@ pub fn run(args: Args) -> CmdResult {
         && parsed.repo.is_some()
         && parsed.base.is_none()
         && parsed.tail == crate::domain::refs::Tail::None
+        && !args.graph
     {
         let slug = parsed.repo.clone().unwrap();
         let (o, n) = match super::parse_slug(&slug) {
@@ -130,46 +152,31 @@ pub fn run(args: Args) -> CmdResult {
             None => return Ok(ExitCode::Ref),
         },
     };
-    // With no arguments, and when the criterion holds, this enters Timeline
-    // (`docs/07_tui.md` §3.3).
-    //
-    // Not one narrowing argument may be present: `--kind` / `--grep` / `--since` / `--oneline` /
-    // `-n` each say "the text of this one slice is what I want", and that is a different thing
-    // from opening a full-screen browser. `--graph` / `--branches` likewise — they have their
-    // own shape.
-    //
-    // Every verdict is handled: being blocked inside an agent session must say so, and asking
-    // for `--tui` explicitly with no terminal must report `Interactive`. The three entry points
-    // must not have two behaviors.
-    if args.target.is_none()
-        && !args.branches
-        && !args.graph
-        && !args.oneline
-        && args.kind.is_none()
-        && args.grep.is_none()
-        && args.since.is_none()
-        && args.paths.is_empty()
-        && args.limit == DEFAULT_LIMIT
-        && let Some(b) = branch.clone()
-    {
-        match crate::tui::should_enter() {
-            crate::tui::Verdict::Enter => {
-                // Timeline starts only from the selected local branch, never another checkout's HEAD.
-                if let Some(head) = repo.git_opt(&["rev-parse", &format!("refs/heads/{b}")]) {
-                    return crate::tui::screens::timeline::run(&repo, &slug, &b, head.trim());
-                }
-            }
-            crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
-            crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
-            crate::tui::Verdict::Skip => {}
-        }
-    }
-
     if args.branches {
         super::echo::emit("log", &[super::echo::Selection::new(&slug, source)]);
-        return branch_view_of(&repo, args.limit);
+        return branch_view_of(&repo, &slug, args.limit);
     }
     if args.graph {
+        if super::json::requested() {
+            let facts = ref_facts(&repo)?;
+            let graph = Graph::read(&repo, &facts)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "view": "graph",
+                    "repo": slug,
+                    "commits": graph.order.iter().filter_map(|oid| graph.nodes.get(oid).map(|node| {
+                        serde_json::json!({"oid": oid, "parents": node.parents, "subject": node.subject,
+                            "committed_at": node.committed_at})
+                    })).collect::<Vec<_>>(),
+                    "refs": facts.iter().map(|(name, fact)| {
+                        serde_json::json!({"ref": name, "oid": fact.oid, "peeled_oid": fact.peeled_oid})
+                    }).collect::<Vec<_>>()
+                })
+            );
+            return Ok(ExitCode::Ok);
+        }
         let out = repo.git(&[
             "log",
             "--graph",
@@ -215,7 +222,7 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
     };
-    let rows = match turns(
+    let rows = match read_turn_history(
         &repo,
         &head,
         args.limit,
@@ -223,13 +230,43 @@ pub fn run(args: Args) -> CmdResult {
         args.grep.as_deref(),
         args.since.as_deref(),
         &args.paths,
-    ) {
+    )
+    .and_then(|history| {
+        if super::json::requested() {
+            Ok(history.metadata())
+        } else {
+            history.with_activity(&repo)
+        }
+    }) {
         Ok(rows) => rows,
         Err(e) => {
             ui::error(&format!("cannot read this branch's history: {e:#}"));
             return Ok(ExitCode::Precondition);
         }
     };
+    if super::json::requested() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1,
+                "view": "turns",
+                "repo": slug,
+                "target": format!("{slug}@{head}"),
+                "head_oid": head,
+                "turns": rows.iter().map(|row| serde_json::json!({
+                    "oid": row.oid,
+                    "turn": row.turn,
+                    "kind": row.kind,
+                    "subject": row.subject,
+                    "tags": row.tags,
+                    "code_anchor": row.code,
+                    "milestone": row.milestone,
+                    "committed_at": chrono::DateTime::<chrono::Utc>::from(row.at).timestamp(),
+                })).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(ExitCode::Ok);
+    }
     super::echo::emit(
         "log",
         &[super::echo::Selection::new(
@@ -279,6 +316,18 @@ pub fn run(args: Args) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
+fn wants_tui(args: &Args) -> bool {
+    args.target.is_none()
+        && !args.branches
+        && !args.graph
+        && !args.oneline
+        && args.kind.is_none()
+        && args.grep.is_none()
+        && args.since.is_none()
+        && args.paths.is_empty()
+        && args.limit == DEFAULT_LIMIT
+}
+
 /// One row of the per-turn view.
 ///
 /// `log`'s text rendering and the Timeline screen share this one — two separate fetches would
@@ -289,6 +338,7 @@ pub struct Turn {
     /// The turn ordinal: only a `kind: turn` commit has one. Birth, fork, file and merge take
     /// no number.
     pub turn: Option<u32>,
+    pub oid: String,
     pub short: String,
     pub kind: Kind,
     pub subject: String,
@@ -330,13 +380,7 @@ fn turn_label(turn: Option<u32>) -> String {
     }
 }
 
-/// Rows for the per-turn view: first-parent, counted from the root. **This is the only place
-/// that fetches them**; rendering belongs to the caller.
-///
-/// History that cannot be read (git failed, some commit's `session/meta.json` is corrupt) is an
-/// error, reported at the command boundary — flattened into an empty list, the outer layer says
-/// "no turns match" and exits successfully, and one corrupt spot makes the whole history vanish
-/// with no symptom.
+/// Text and Timeline rows include activity derived from the selected immutable turn additions.
 pub fn turns(
     repo: &Repo,
     head: &str,
@@ -346,6 +390,43 @@ pub fn turns(
     since_git: Option<&str>,
     paths: &[String],
 ) -> crate::Result<Vec<Turn>> {
+    read_turn_history(repo, head, limit, kind, grep, since_git, paths)?.with_activity(repo)
+}
+
+struct TurnHistory {
+    chain: crate::domain::refs::Chain,
+    rows: Vec<(Option<usize>, Turn)>,
+}
+
+impl TurnHistory {
+    fn metadata(self) -> Vec<Turn> {
+        self.rows.into_iter().map(|(_, row)| row).collect()
+    }
+
+    fn with_activity(self, repo: &Repo) -> crate::Result<Vec<Turn>> {
+        let selected: Vec<usize> = self.rows.iter().filter_map(|(i, _)| *i).collect();
+        let activity = crate::domain::turn::activity::read(repo, &self.chain, &selected)?;
+        Ok(self
+            .rows
+            .into_iter()
+            .map(|(i, mut row)| {
+                row.activity = i.and_then(|i| activity.get(&i).copied());
+                row
+            })
+            .collect())
+    }
+}
+
+/// Commit metadata is independent of event availability; activity readers load their own evidence.
+fn read_turn_history(
+    repo: &Repo,
+    head: &str,
+    limit: usize,
+    kind: Option<&str>,
+    grep: Option<&str>,
+    since_git: Option<&str>,
+    paths: &[String],
+) -> crate::Result<TurnHistory> {
     let mut cmd: Vec<String> = vec![
         "log".into(),
         "--first-parent".into(),
@@ -387,8 +468,15 @@ pub fn turns(
         // `%ct` is part of the format string — the commit time costs no extra `git`.
         let at = parts
             .next()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .and_then(|secs| {
+                let duration = std::time::Duration::from_secs(secs.unsigned_abs());
+                if secs >= 0 {
+                    std::time::UNIX_EPOCH.checked_add(duration)
+                } else {
+                    std::time::UNIX_EPOCH.checked_sub(duration)
+                }
+            })
             .unwrap_or(std::time::UNIX_EPOCH);
         let idx = by_sha.get(sha).copied();
         let snap = idx.and_then(|i| chain.entries[i].meta.clone());
@@ -408,6 +496,7 @@ pub fn turns(
             idx,
             Turn {
                 turn: idx.and_then(|i| chain.label(i)),
+                oid: sha.to_string(),
                 short: sha[..9.min(sha.len())].to_string(),
                 kind: k,
                 subject: subject.to_string(),
@@ -424,15 +513,7 @@ pub fn turns(
     if rows.len() > limit {
         rows.drain(..rows.len() - limit);
     }
-    let selected: Vec<usize> = rows.iter().filter_map(|(i, _)| *i).collect();
-    let activity = crate::domain::turn::activity::read(repo, &chain, &selected)?;
-    Ok(rows
-        .into_iter()
-        .map(|(i, mut row)| {
-            row.activity = i.and_then(|i| activity.get(&i).copied());
-            row
-        })
-        .collect())
+    Ok(TurnHistory { chain, rows })
 }
 
 /// Every tag in the repo, grouped by the commit it points at, asked for in one `for-each-ref`.
@@ -537,7 +618,7 @@ fn branch_view(owner: &str, name: &str, _limit: usize) -> CmdResult {
             super::echo::Source::Explicit,
         )],
     );
-    branch_view_of(&repo, _limit)
+    branch_view_of(&repo, &format!("{owner}/{name}"), _limit)
 }
 
 /// One row of the branch-level view. Fetching and rendering are separate for the same reason as
@@ -568,180 +649,378 @@ pub struct BranchRow {
 /// Asking per branch spawns processes linearly in the branch count when this page opens, and
 /// every branch walks the shared stretch of history again.
 pub fn branch_rows(repo: &Repo) -> Vec<BranchRow> {
-    // Local branches first (including ones just made by import / fork / new that have not been
-    // pushed), then the remote-tracking-only ones (just cloned).
-    let local = repo.local_branches();
-    let mut branches = local.clone();
-    let remote: Vec<String> = repo.remote_branches();
-    for b in &remote {
-        if !branches.contains(b) {
-            branches.push(b.clone());
+    branch_details(repo, BranchSelection::Preferred, BranchDetail::History)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| BranchRow {
+            name: row.name,
+            head: row.reference,
+            turns: row.turns,
+            when: row.when,
+            gist: ui::truncate(&row.opening_subject, 60),
+            file_line: row.line == Some(meta::Line::File),
+            ahead_behind: row.sync.display(),
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BranchSelection {
+    Local,
+    All,
+    Preferred,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BranchDetail {
+    Summary,
+    Sync,
+    History,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct BranchDetails {
+    pub name: String,
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub oid: String,
+    pub local: bool,
+    pub current: bool,
+    pub line: Option<meta::Line>,
+    pub session_id: Option<String>,
+    pub runtime: Option<String>,
+    pub turns: u32,
+    pub committed_at: Option<i64>,
+    pub opening_subject: String,
+    pub sealed: bool,
+    pub code_anchor: Option<String>,
+    pub sync: BranchSync,
+    #[serde(skip)]
+    pub when: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct BranchSync {
+    pub upstream_ref: Option<String>,
+    pub ahead: Option<usize>,
+    pub behind: Option<usize>,
+}
+
+impl BranchSync {
+    fn display(&self) -> String {
+        match (self.ahead, self.behind) {
+            (Some(0), Some(0)) | (None, _) | (_, None) => String::new(),
+            (Some(ahead), Some(behind)) => format!("{ahead}/{behind}"),
         }
     }
-    let has_local: std::collections::HashSet<String> = local.into_iter().collect();
-    let heads: Vec<String> = branches
+}
+
+/// Branch reads share one ref snapshot and commit graph. Metadata and seal markers are read
+/// through immutable object IDs so a concurrent branch update cannot combine different tips.
+pub(super) fn branch_details(
+    repo: &Repo,
+    selection: BranchSelection,
+    detail: BranchDetail,
+) -> crate::Result<Vec<BranchDetails>> {
+    let facts = ref_facts(repo)?;
+    let graph = match detail {
+        BranchDetail::Summary => None,
+        BranchDetail::Sync | BranchDetail::History => Some(Graph::read(repo, &facts)?),
+    };
+    let refs: Vec<_> = facts
         .iter()
-        .map(|b| {
-            if has_local.contains(b) {
-                format!("refs/heads/{b}")
-            } else {
-                format!("refs/remotes/origin/{b}")
-            }
+        .filter_map(|(reference, fact)| {
+            reference
+                .strip_prefix("refs/heads/")
+                .map(|name| (reference, fact, name, true))
+                .or_else(|| {
+                    reference
+                        .strip_prefix("refs/remotes/origin/")
+                        .filter(|name| {
+                            *name != "HEAD"
+                                && match selection {
+                                    BranchSelection::Local => false,
+                                    BranchSelection::All => true,
+                                    BranchSelection::Preferred => {
+                                        !facts.contains_key(&format!("refs/heads/{name}"))
+                                    }
+                                }
+                        })
+                        .map(|name| (reference, fact, name, false))
+                })
         })
         .collect();
-    let snaps = meta::at_refs(repo, &heads);
-    let facts = ref_facts(repo);
-    let graph = Graph::read(repo);
-    let remote: std::collections::HashSet<String> = remote.into_iter().collect();
-    branches
+    let oids: Vec<String> = refs
         .iter()
-        .zip(heads.iter())
-        .zip(snaps)
-        .map(|((b, head), snap)| {
-            let f = facts.get(head.as_str());
-            let upstream = f
-                .map(|f| f.upstream.clone())
-                .filter(|upstream| !upstream.is_empty())
-                .or_else(|| {
-                    (has_local.contains(b) && remote.contains(b))
-                        .then(|| format!("refs/remotes/origin/{b}"))
-                });
-            BranchRow {
-                name: b.clone(),
-                head: head.clone(),
-                turns: branch_turns(snap.as_ref()),
-                when: f.map(|f| f.when.clone()).unwrap_or_default(),
-                gist: graph
-                    .opening(head)
-                    .map(|g| ui::truncate(&g, 60))
-                    .unwrap_or_default(),
-                file_line: snap.as_ref().is_some_and(|m| m.is_file_line()),
-                ahead_behind: upstream
-                    .map(|upstream| graph.divergence(head, &upstream))
-                    .unwrap_or_default(),
+        .map(|(_, fact, _, _)| fact.oid.clone())
+        .collect();
+    let ancestry = match (&graph, detail) {
+        (Some(graph), BranchDetail::History) => graph.first_parent_union(&oids),
+        _ => oids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    };
+    let metadata = meta::at_refs_result(repo, &ancestry)?;
+    let metadata: std::collections::HashMap<_, _> = ancestry.into_iter().zip(metadata).collect();
+    let openings = match (&graph, detail) {
+        (Some(graph), BranchDetail::History) => graph.opening_subjects(&metadata),
+        _ => Default::default(),
+    };
+    let mut sealed = Vec::with_capacity(oids.len());
+    repo.git_cat_file_batch_check(
+        oids.iter()
+            .map(|oid| format!("{oid}:{}", super::branch::SEAL_FILE))
+            .collect(),
+        |_, kind, _| {
+            sealed.push(kind != "missing");
+            Ok(())
+        },
+    )?;
+    anyhow::ensure!(
+        sealed.len() == refs.len(),
+        "incomplete branch seal marker response"
+    );
+    Ok(refs
+        .into_iter()
+        .zip(sealed)
+        .map(|((reference, fact, name, local), sealed)| {
+            let snap = metadata.get(&fact.oid).and_then(Option::as_ref);
+            let upstream_ref = local.then(|| fact.upstream.clone()).flatten().or_else(|| {
+                (local && facts.contains_key(&format!("refs/remotes/origin/{name}")))
+                    .then(|| format!("refs/remotes/origin/{name}"))
+            });
+            let counts = graph.as_ref().and_then(|graph| {
+                upstream_ref
+                    .as_deref()
+                    .and_then(|upstream| graph.divergence(reference, upstream))
+            });
+            BranchDetails {
+                name: name.to_owned(),
+                reference: reference.clone(),
+                oid: fact.oid.clone(),
+                local,
+                current: fact.current,
+                line: snap.map(|m| m.line),
+                session_id: snap.map(|m| m.session.clone()).filter(|id| !id.is_empty()),
+                runtime: snap
+                    .map(|m| m.runtime.clone())
+                    .filter(|runtime| !runtime.is_empty()),
+                turns: branch_turns(snap),
+                committed_at: fact.committed_at,
+                opening_subject: openings
+                    .get(fact.oid.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    .to_owned(),
+                sealed,
+                code_anchor: snap.and_then(|m| m.code.clone()),
+                sync: BranchSync {
+                    upstream_ref,
+                    ahead: counts.map(|(ahead, _)| ahead),
+                    behind: counts.map(|(_, behind)| behind),
+                },
+                when: fact.when.clone(),
             }
         })
-        .collect()
+        .collect())
 }
 
-/// The facts about one ref that `for-each-ref` answers directly.
 struct RefFacts {
-    /// git's relative time (the same rendering as `%cr`).
+    oid: String,
+    peeled_oid: Option<String>,
+    commit_oid: Option<String>,
     when: String,
-    /// The full upstream ref; an empty string means no upstream is configured.
-    upstream: String,
+    committed_at: Option<i64>,
+    upstream: Option<String>,
+    current: bool,
 }
 
-/// Each ref's time and tracking state, asked for in one `for-each-ref`. Local and remote refs
-/// are both collected.
-fn ref_facts(repo: &Repo) -> std::collections::HashMap<String, RefFacts> {
-    let Some(out) = repo.git_opt(&[
+fn ref_facts(repo: &Repo) -> crate::Result<std::collections::BTreeMap<String, RefFacts>> {
+    let out = repo.git(&[
         "for-each-ref",
-        "--format=%(refname)%09%(committerdate:relative)%09%(upstream)",
-        "refs/heads/",
-        "refs/remotes/origin/",
-    ]) else {
-        return Default::default();
-    };
+        "--format=%(refname)%09%(objectname)%09%(committerdate:relative)%09%(committerdate:unix)%09%(upstream)%09%(HEAD)%09%(*objectname)%09%(objecttype)%09%(*objecttype)",
+        "refs/heads/", "refs/remotes/", "refs/tags/",
+    ])?;
     out.lines()
-        .filter_map(|line| {
+        .map(|line| {
             let mut f = line.split('\t');
-            let name = f.next()?;
-            let when = f.next().unwrap_or("").trim().to_string();
-            let upstream = f.next().unwrap_or("").trim().to_string();
-            Some((name.to_string(), RefFacts { when, upstream }))
+            let name = f.next().unwrap_or_default();
+            let oid = f.next().unwrap_or_default().to_string();
+            anyhow::ensure!(
+                !name.is_empty() && !oid.is_empty(),
+                "incomplete branch ref response"
+            );
+            let when = f.next().unwrap_or_default().to_string();
+            let committed_at = f.next().and_then(|at| at.parse().ok());
+            let upstream = f.next().filter(|r| !r.is_empty()).map(str::to_owned);
+            let current = f.next() == Some("*");
+            let peeled_oid = f.next().filter(|oid| !oid.is_empty()).map(str::to_owned);
+            let kind = f.next().unwrap_or_default();
+            let peeled_kind = f.next().unwrap_or_default();
+            let commit_oid = if kind == "commit" {
+                Some(oid.clone())
+            } else if peeled_kind == "commit" {
+                peeled_oid.clone()
+            } else {
+                None
+            };
+            Ok((
+                name.to_owned(),
+                RefFacts {
+                    oid,
+                    peeled_oid,
+                    commit_oid,
+                    when,
+                    committed_at,
+                    upstream,
+                    current,
+                },
+            ))
         })
         .collect()
 }
 
-/// The whole repo's commit graph: every commit's parents and subject, read in one
-/// `git log --all`.
-///
-/// The opening prompt is "the subject of the second commit from the root along the first-parent
-/// chain". Walking that per branch traverses the shared stretch of history over and over — and a
-/// branch is usually forked off that shared history. One walk of the whole graph is strictly
-/// less work, and spawns a single process.
+/// The captured ref snapshot's commit graph, shared by every branch comparison and opener.
+/// Commit OIDs enter Git through stdin so branch renames cannot change the traversed history.
 struct Graph {
-    /// sha → (all parents, subject)
-    nodes: std::collections::HashMap<String, (Vec<String>, String)>,
-    /// ref → the sha it points at
+    nodes: std::collections::HashMap<String, GraphNode>,
+    order: Vec<String>,
     tips: std::collections::HashMap<String, String>,
 }
 
+struct GraphNode {
+    parents: Vec<String>,
+    subject: String,
+    committed_at: Option<i64>,
+}
+
 impl Graph {
-    fn read(repo: &Repo) -> Graph {
-        let nodes = repo
-            .git_opt(&["log", "--all", "--format=%H%x00%P%x00%s"])
-            .map(|out| {
-                out.lines()
-                    .filter_map(|line| {
-                        let mut f = line.split('\0');
-                        let sha = f.next()?.to_string();
-                        let parents = f
-                            .next()
-                            .unwrap_or("")
-                            .split_whitespace()
-                            .map(str::to_string)
-                            .collect();
-                        Some((sha, (parents, f.next().unwrap_or("").to_string())))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let tips = repo
-            .git_opt(&[
-                "for-each-ref",
-                "--format=%(refname)%09%(objectname)",
-                "refs/heads/",
-                "refs/remotes/",
-            ])
-            .map(|out| {
-                out.lines()
-                    .filter_map(|l| l.split_once('\t'))
-                    .map(|(r, o)| (r.to_string(), o.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Graph { nodes, tips }
-    }
-
-    /// This ref's opening prompt: the subject of the second commit from the root along the
-    /// first-parent chain.
-    fn opening(&self, head: &str) -> Option<String> {
-        let mut sha = self.tips.get(head)?.clone();
-        let mut chain = vec![sha.clone()];
-        // A git commit graph has no cycles, but this reads external data — a cap keeps one
-        // bad dataset from hanging this screen in a loop.
-        while chain.len() <= self.nodes.len() {
-            let Some((parents, _)) = self.nodes.get(&sha) else {
-                break;
-            };
-            let Some(p) = parents.first().cloned() else {
-                break;
-            };
-            chain.push(p.clone());
-            sha = p;
-        }
-        // The second one counting back from the root.
-        let second = chain.get(chain.len().checked_sub(2)?)?;
-        self.nodes.get(second).map(|(_, subject)| subject.clone())
-    }
-
-    /// The difference between two refs' reachable sets; nothing is shown when the far side does
-    /// not exist or the two are aligned.
-    fn divergence(&self, head: &str, upstream: &str) -> String {
-        let (Some(left), Some(right)) = (self.tips.get(head), self.tips.get(upstream)) else {
-            return String::new();
+    fn read(
+        repo: &Repo,
+        facts: &std::collections::BTreeMap<String, RefFacts>,
+    ) -> crate::Result<Graph> {
+        let tips = facts
+            .iter()
+            .map(|(name, fact)| (name.clone(), fact.oid.clone()))
+            .collect();
+        let mut graph = Graph {
+            nodes: Default::default(),
+            order: vec![],
+            tips,
         };
+        if facts.is_empty() {
+            return Ok(graph);
+        }
+        use std::io::{Seek as _, Write as _};
+        let mut input = tempfile::tempfile()?;
+        let revisions: std::collections::BTreeSet<_> = facts
+            .values()
+            .filter_map(|fact| fact.commit_oid.as_ref())
+            .collect();
+        if revisions.is_empty() {
+            return Ok(graph);
+        }
+        for oid in revisions {
+            writeln!(input, "{oid}")?;
+        }
+        input.rewind()?;
+        let out = repo.git_with_stdin_file(
+            &[
+                "log",
+                "--stdin",
+                "--topo-order",
+                "--format=%H%x00%P%x00%s%x00%ct",
+            ],
+            input,
+        )?;
+        for line in out.lines() {
+            let mut fields = line.split('\0');
+            let oid = fields.next().unwrap_or_default().to_owned();
+            let parents = fields
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+            let subject = fields.next().unwrap_or_default().to_owned();
+            let committed_at = fields.next().and_then(|at| at.parse().ok());
+            graph.order.push(oid.clone());
+            graph.nodes.insert(
+                oid,
+                GraphNode {
+                    parents,
+                    subject,
+                    committed_at,
+                },
+            );
+        }
+        Ok(graph)
+    }
+
+    fn first_parent_union(&self, tips: &[String]) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        for tip in tips {
+            let mut next = Some(tip.as_str());
+            while let Some(oid) = next {
+                if !seen.insert(oid.to_owned()) {
+                    break;
+                }
+                next = self
+                    .nodes
+                    .get(oid)
+                    .and_then(|node| node.parents.first())
+                    .map(String::as_str);
+            }
+        }
+        self.order
+            .iter()
+            .filter(|oid| seen.contains(*oid))
+            .cloned()
+            .collect()
+    }
+
+    fn opening_subjects<'a>(
+        &'a self,
+        metadata: &std::collections::HashMap<String, Option<meta::Meta>>,
+    ) -> std::collections::HashMap<&'a str, &'a str> {
+        let mut openings = std::collections::HashMap::new();
+        for oid in self.order.iter().rev() {
+            let Some(current) = metadata.get(oid).and_then(Option::as_ref) else {
+                continue;
+            };
+            if current.is_file_line() || current.session.is_empty() {
+                continue;
+            }
+            let node = &self.nodes[oid];
+            let inherited = node.parents.first().and_then(|parent| {
+                let previous = metadata.get(parent)?.as_ref()?;
+                (previous.session == current.session)
+                    .then(|| openings.get(parent.as_str()).copied())
+                    .flatten()
+            });
+            if let Some(subject) = inherited {
+                openings.insert(oid.as_str(), subject);
+            } else if current.kind == Kind::Turn && current.turn.is_some() {
+                openings.insert(oid.as_str(), node.subject.as_str());
+            }
+        }
+        openings
+    }
+
+    fn divergence(&self, head: &str, upstream: &str) -> Option<(usize, usize)> {
+        let (left, right) = (self.tips.get(head)?, self.tips.get(upstream)?);
+        if left == right {
+            return Some((0, 0));
+        }
         let left = self.reachable(left);
         let right = self.reachable(right);
-        let ahead = left.difference(&right).count();
-        let behind = right.difference(&left).count();
-        if ahead == 0 && behind == 0 {
-            String::new()
-        } else {
-            format!("{ahead}/{behind}")
-        }
+        Some((
+            left.difference(&right).count(),
+            right.difference(&left).count(),
+        ))
     }
 
     fn reachable(&self, tip: &str) -> std::collections::HashSet<String> {
@@ -751,15 +1030,23 @@ impl Graph {
             if !seen.insert(sha.clone()) {
                 continue;
             }
-            if let Some((parents, _)) = self.nodes.get(&sha) {
-                pending.extend(parents.iter().cloned());
+            if let Some(node) = self.nodes.get(&sha) {
+                pending.extend(node.parents.iter().cloned());
             }
         }
         seen
     }
 }
 
-fn branch_view_of(repo: &Repo, _limit: usize) -> CmdResult {
+fn branch_view_of(repo: &Repo, slug: &str, _limit: usize) -> CmdResult {
+    if super::json::requested() {
+        let branches = branch_details(repo, BranchSelection::Preferred, BranchDetail::History)?;
+        println!(
+            "{}",
+            serde_json::json!({"schema_version": 1, "view": "branches", "repo": slug, "branches": branches})
+        );
+        return Ok(ExitCode::Ok);
+    }
     let rows = branch_rows(repo);
     if rows.is_empty() {
         println!("no branches yet — they’re born only via import / fork / new / run.");
@@ -897,6 +1184,32 @@ mod tests {
         assert_eq!(row("tracked").ahead_behind, "1/1");
         assert_eq!(row("only").ahead_behind, "");
         assert_eq!(row("only").head, "refs/remotes/origin/only");
+    }
+
+    #[test]
+    fn captured_graph_survives_ref_removal_and_skips_non_commit_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("note"), "root").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("root").unwrap();
+        let root = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(dir.path().join("note"), "child").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("child").unwrap();
+        let child = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let blob = repo.git(&["rev-parse", "HEAD:note"]).unwrap();
+        repo.git(&["tag", "note-blob", &blob]).unwrap();
+        let facts = ref_facts(&repo).unwrap();
+        repo.git(&["update-ref", "-d", "refs/heads/main"]).unwrap();
+
+        let captured = Graph::read(&repo, &facts).unwrap();
+        assert_eq!(captured.nodes.len(), 2);
+        assert_eq!(captured.nodes[&child].parents, vec![root]);
+        assert_eq!(captured.tips["refs/heads/main"], child);
+        assert!(!captured.nodes.contains_key(&blob));
+        let current = Graph::read(&repo, &ref_facts(&repo).unwrap()).unwrap();
+        assert!(current.nodes.is_empty());
     }
 
     #[test]

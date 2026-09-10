@@ -102,6 +102,7 @@ secret-vault = [
     "dep:aes-gcm",
     "dep:base64",
     "dep:keyring",
+    "dep:security-framework",
     "dep:zeroize",
 ]
 
@@ -228,6 +229,9 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # rc/harness/mod.rs); the two want opposite things.
 portable-pty = { version = "0.9", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", optional = true }
+
 [target.'cfg(windows)'.dependencies]
 self-replace = { version = "1.5", optional = true }
 # Harness and settlement subprocesses must be born suspended, attached to a
@@ -247,6 +251,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+shlex = "2"
 # `test-util` makes `#[tokio::test(start_paused = true)]` usable: the tests for
 # timeout semantics wait on the session timeout, and waiting on it in real time
 # leaves the whole suite unrunnable.

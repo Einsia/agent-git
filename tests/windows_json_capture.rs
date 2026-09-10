@@ -199,8 +199,13 @@ fn unicode_config_mutation_is_captured_and_survives_native_readback() {
         .unwrap();
     let document = envelope(&output);
     assert!(output.status.success(), "{document}");
-    assert_eq!(document["result"]["format"], "text");
-    assert_eq!(document["result"]["lines"], json!([value]));
+    assert_eq!(document["result"]["format"], "json");
+    let result = &document["result"]["value"];
+    assert_eq!(result["operation"], "get");
+    assert_eq!(result["setting"]["key"], "hub.url");
+    assert_eq!(result["setting"]["stored"], value);
+    assert_eq!(result["setting"]["effective"], value);
+    assert_eq!(result["setting"]["source"], "stored");
 }
 
 #[test]

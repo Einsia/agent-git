@@ -139,6 +139,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
     let mut args = args;
+    let mut selected = None;
     // A bare import is a request to choose, not a request to guess. The TUI fills in the same
     // explicit session and destination arguments the command accepts, then leaves the alternate
     // screen before this function reaches any precondition or write below. Explicit lineage
@@ -150,6 +151,11 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
                 let Some(picked) = crate::tui::screens::adopt::pick(&cwd)? else {
                     return Ok(ExitCode::Ok);
                 };
+                selected = Some(Found {
+                    runtime: adapter::normalize(&picked.runtime)?,
+                    session_id: picked.session_id.clone(),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                });
                 args.session = Some(picked.session_id);
                 args.from = Some(picked.runtime);
                 args.link_only = picked.link_only;
@@ -216,6 +222,8 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
     // ── 2. Find that session ──
     let picked = if let Some(selected) = &accepted {
         Pick::One(selected.found())
+    } else if let Some(found) = selected {
+        Pick::One(found)
     } else {
         match &args.session {
             Some(sel) if sel == "@" => {

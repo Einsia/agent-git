@@ -25,7 +25,7 @@ agit config --unset <key>
 | `<value>` | Value to write |
 | `--unset` | Remove the key |
 | `--list` | List all settings |
-| `--json` | Emit the unified CLI JSON envelope |
+| `--json` | Return typed settings under `result.value`; no arguments lists every setting |
 | `-y, --yes` | Skip confirmation |
 | `-q, --quiet` | Reduce output |
 | `-C, --directory <dir>` | Use the given directory |
@@ -49,3 +49,11 @@ Configuration is not session metadata; changing it does not change an existing b
 On a TTY, the zero-argument form opens a full-screen editor. It labels each effective value as
 coming from the environment, stored config, a built-in default, or no source, while showing the
 stored value separately. Explicit arguments and non-interactive calls retain the command-line path.
+
+JSON reads and successful writes distinguish `effective`, `stored`, and `source`
+(`environment`, `stored`, `default`, or `unset`). When an environment override is
+active, a successful write still reports that override as effective alongside
+the newly stored value. `operation` identifies `list`, `get`, `set`, or `unset`.
+Values retain the configuration's string representation, including booleans.
+An unset `commit.auto` has the effective default `true`; displaying it never
+writes that default to disk.

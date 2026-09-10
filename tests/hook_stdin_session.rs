@@ -222,6 +222,72 @@ impl Lab {
 
 const HUB: &str = "http://127.0.0.1:1";
 
+#[test]
+fn native_resume_receives_saved_environment_without_a_workspace_binding() {
+    let lab = Lab::new();
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&lab.work)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(git.status.success());
+    fs::write(lab.work.join("earlier.txt"), "uncommitted code").unwrap();
+    lab.append(A, &lab.turn(A, 1, "work on code", "code updated"));
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+    lab.append(
+        A,
+        &lab.turn(A, 2, "record the current code state", "current turn done"),
+    );
+    lab.hook(&["hooks", "settle"], A, Some("me/qa@s1"));
+    fs::remove_dir_all(lab.agit_home.join("workspaces")).unwrap();
+    fs::write(lab.work.join("later.txt"), "a newer change").unwrap();
+
+    let mut child = lab
+        .agit(&["hooks", "ingest", "--runtime", "claude-code"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = serde_json::json!({
+        "session_id": A,
+        "cwd": lab.work,
+        "transcript_path": lab.transcript(A),
+        "source": "resume",
+        "session_title": "User chosen title",
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let context = response["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(context.contains("me/qa@s1"), "{context}");
+    assert!(context.contains("\"untracked\":1"), "{context}");
+    assert!(context.contains("not a live Git status"), "{context}");
+    assert!(
+        !context.contains("earlier.txt") && !context.contains("later.txt"),
+        "{context}"
+    );
+    assert!(response["hookSpecificOutput"].get("sessionTitle").is_none());
+}
+
 fn turn_subjects(log: &str) -> Vec<String> {
     log.lines()
         .filter(|l| l.contains("[turn ]"))

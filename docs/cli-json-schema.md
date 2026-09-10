@@ -45,6 +45,23 @@ and refresh token states with expiry timestamps, and `check` fields including
 whether an online check was requested and whether the server was reachable.
 Token values themselves are never included.
 
+## Platforms and execution
+
+The envelope is available on macOS, Linux, and native Windows MSVC builds.
+Capture runs in process and preserves arguments, stdin, diagnostics, and the
+command's exit code without dispatching the command again. Windows redirects
+both CRT descriptors and Win32 standard handles. JSON v2 retains typed recovery
+actions; `--json-version 1` selects the compatible legacy envelope.
+
+Capture setup failures reject the command before it runs. Incomplete capture
+returns a failure with an explicit diagnostic; the command may already have run,
+so inspect its state before retrying a mutation.
+
+Interactive and long-running commands reject JSON before preparing storage or
+starting work. Use the corresponding finite form, such as `login --with-token`,
+`open --no-launch`, `new --no-launch`, `resume --no-launch`, `merge --manual`,
+or `rc start --detach`, when requesting a JSON document.
+
 The hidden `hooks` and `mcp` commands are excluded: they own stdin/stdout as
 line-oriented protocols, so wrapping their stream would make the protocol
 invalid. Their existing protocol formats remain unchanged.
@@ -86,3 +103,14 @@ invocations return exit code `8` with `operation: "choice_required"`; v2 also pu
 the available actions in `fix`, while v1 keeps its existing envelope. `--yes` does
 not choose a candidate. The interactive menu defaults to cancellation and
 revalidates an accepted observation before acquiring write authority.
+
+## Local branch synchronization in status
+
+The status report lists each repository's bounded `branches` page. Its `items`
+retain full branch tips and tracking refs, a human-readable `state`, and numeric
+`ahead`/`behind` values when the locally available immutable history proves them.
+Unknown or unavailable comparisons use null counts. A failed inspection uses
+`items: null` and a non-null `error`; it does not claim an empty repository.
+`omitted` counts undisplayed branches, while top-level `repositories_omitted`
+counts repositories outside the shared display budget. Status neither fetches
+missing objects nor treats the primary checkout's HEAD as every branch's sync state.

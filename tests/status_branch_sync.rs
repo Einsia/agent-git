@@ -260,27 +260,62 @@ impl Lab {
                 assert_eq!(value["command"], "status");
                 assert_eq!(value["ok"], true);
                 assert_eq!(value["exit_code"], 0);
-                assert_eq!(value["result"]["format"], "text");
+                assert_eq!(value["result"]["format"], "json");
                 assert_eq!(value["result"]["kind"], "status");
                 if version == "2" {
                     assert_eq!(value["fix"], serde_json::json!([]));
                 } else {
                     assert!(value.get("fix").is_none());
                 }
+                let status = &value["result"]["value"];
+                assert_eq!(status["sessions"]["total"], 0);
+                let mut lines = vec![
+                    "  no sessions adopted yet.".to_owned(),
+                    "repo\tbranch\tlast commit\ttracking ref\tstate".to_owned(),
+                ];
+                let mut incomplete = status["repositories_omitted"].as_u64().unwrap() > 0;
+                for repo in status["repositories"].as_array().unwrap() {
+                    assert_eq!(repo["repo"], "local/qa");
+                    let page = &repo["branches"];
+                    if let Some(error) = page["error"].as_str() {
+                        assert!(page["items"].is_null());
+                        lines.push(format!("local/qa\t—\t—\t—\tunavailable: {error}"));
+                        continue;
+                    }
+                    incomplete |= page["omitted"].as_u64().unwrap() > 0;
+                    let branches = page["items"].as_array().unwrap();
+                    if branches.is_empty() {
+                        lines.push("local/qa\t—\t—\t—\tno branch refs".to_owned());
+                    }
+                    for branch in branches {
+                        let state = branch["state"].as_str().unwrap();
+                        let compared = state.starts_with("ahead ")
+                            || state.starts_with("diverged ")
+                            || state.starts_with("in sync ");
+                        for field in ["ahead", "behind"] {
+                            if compared {
+                                let count = branch[field].as_u64().unwrap();
+                                assert!(state.contains(&format!("{field} {count}")));
+                            } else {
+                                assert!(branch[field].is_null());
+                            }
+                        }
+                        let tracking = branch["tracking"].as_str().unwrap();
+                        lines.push(row(
+                            branch["name"].as_str().unwrap(),
+                            branch["head"].as_str().unwrap(),
+                            if tracking.is_empty() { "—" } else { tracking },
+                            state,
+                        ));
+                    }
+                }
                 Screen {
-                    lines: value["result"]["lines"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|line| line.as_str().unwrap().to_owned())
-                        .collect(),
-                    warnings: value["diagnostics"]["stderr"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter(|entry| entry["level"] == "warning")
-                        .map(|entry| entry["message"].as_str().unwrap().to_owned())
-                        .collect(),
+                    lines,
+                    warnings: if incomplete {
+                        vec!["status is incomplete: additional branches or repositories exceed the display budget".to_owned()]
+                    } else {
+                        Vec::new()
+                    },
                 }
             } else {
                 Screen {
@@ -313,7 +348,11 @@ impl Lab {
             );
             if let Some(first) = screens.first() {
                 let first: &Screen = first;
-                assert_eq!(screen.lines, first.lines, "JSON changed the status data");
+                assert_eq!(
+                    screen.rows(),
+                    first.rows(),
+                    "JSON changed the branch status data"
+                );
                 assert_eq!(screen.warnings, first.warnings);
             }
             screens.push(screen);

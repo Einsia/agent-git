@@ -57,13 +57,7 @@ fn handle(req: &serde_json::Value) -> Option<String> {
             id,
             serde_json::json!({
                 "tools": [
-                    // The description is **all** the documentation the model sees: it does
-                    // not read --help, and there is nowhere else to learn the qualifiers. So
-                    // the syntax lives here, together with the test for which results can be
-                    // trusted — an `in:tool` hit is someone who actually ran it, a
-                    // `secondhand` one is what a compact summary paraphrased, and the two
-                    // differ by an order of magnitude in evidential strength.
-                    {"name": "search", "description": "Search the corpus you can access for \"has anyone done this before\". Qualifiers narrow by WHERE the match landed, which is the point: in:prompt (someone asked), in:reply, in:tool (someone actually ran it), in:output (what a tool printed), in:edit, in:summary. Also owner:, agent:, runtime:, tool:, path:, turns:>20, \"quoted phrases\", -exclude. Hits carry scope and secondhand — a secondhand hit comes from a compact summary, so a summariser wrote it and nobody said it; open the session before relying on it. type defaults to sessions, which is where the work is.", "inputSchema": {"type":"object","properties":{"query":{"type":"string","description":"query with optional qualifiers"},"type":{"type":"string","enum":["sessions","agents","prs","people"],"description":"defaults to sessions"},"sort":{"type":"string","enum":["best","recent","turns"]},"limit":{"type":"integer"}},"required":["query"]}},
+                    {"name": "search", "description": "Search readable AgentGit history. Use query for one search, or queries for an ordered batch (up to 16, four in flight). Shared filters: repo (owner/name), owner, author (saved Git author name/email), since (inclusive UTC saved time), before (exclusive UTC saved time), runtime, scopes (prompt/reply/tool/output/edit/summary), tool, path. Queries also accept quoted phrases, -exclude and qualifiers such as turns:>20. Inspect incomplete and unknown before concluding no work exists. Scope identifies the evidence; secondhand means a compact summary. Outcome/confidence are heuristics: open a hit before relying on it. Pagination includes page, per and has_more.", "inputSchema": {"type":"object","properties":{"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},"type":{"type":"string","enum":["sessions","agents","prs","people"]},"sort":{"type":"string","enum":["best","recent","turns"]},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1},"repo":{"type":"string"},"owner":{"type":"string"},"author":{"type":"string"},"since":{"type":"string"},"before":{"type":"string"},"runtime":{"type":"string"},"scopes":{"type":"array","items":{"type":"string","enum":["prompt","reply","tool","output","edit","summary"]}},"tool":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}},
                     {"name": "show", "description": "Read part of a session (ref, ref#n, ref#n.k)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "view", "description": "the ordered composition of a VIEW (plumbing)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "status", "description": "who am I + sync status", "inputSchema": {"type":"object","properties":{}}},
@@ -83,7 +77,8 @@ fn handle(req: &serde_json::Value) -> Option<String> {
             Some(result(
                 id,
                 serde_json::json!({
-                    "content": [{"type": "text", "text": out}],
+                    "content": [{"type": "text", "text": out.text}],
+                    "isError": out.is_error,
                 }),
             ))
         }
@@ -95,47 +90,101 @@ fn result(id: Option<serde_json::Value>, r: serde_json::Value) -> String {
     serde_json::json!({"jsonrpc": "2.0", "id": id, "result": r}).to_string()
 }
 
-/// A tool is the stdout of the matching CLI subcommand.
-fn call_tool(name: &str, args: &serde_json::Value) -> String {
+struct ToolOutput {
+    text: String,
+    is_error: bool,
+}
+
+impl ToolOutput {
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            is_error: true,
+        }
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchArgs {
+    query: Option<String>,
+    #[serde(default)]
+    queries: Vec<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    sort: Option<String>,
+    limit: Option<usize>,
+    page: Option<usize>,
+    repo: Option<String>,
+    owner: Option<String>,
+    author: Option<String>,
+    since: Option<String>,
+    before: Option<String>,
+    runtime: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    tool: Option<String>,
+    path: Option<String>,
+}
+
+fn search_arguments(args: &serde_json::Value) -> Result<Vec<String>, String> {
+    let args: SearchArgs = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
+    let mut out = vec!["search".to_owned(), "--mcp".to_owned()];
+    for query in args.query.into_iter().chain(args.queries) {
+        out.extend(["--query".to_owned(), query]);
+    }
+    for (flag, value) in [
+        ("--type", args.kind),
+        ("--sort", args.sort),
+        ("--repo", args.repo),
+        ("--owner", args.owner),
+        ("--author", args.author),
+        ("--since", args.since),
+        ("--before", args.before),
+        ("--runtime", args.runtime),
+        ("--tool", args.tool),
+        ("--path", args.path),
+        ("--limit", args.limit.map(|n| n.to_string())),
+        ("--page", args.page.map(|n| n.to_string())),
+    ] {
+        if let Some(value) = value {
+            out.extend([flag.to_owned(), value]);
+        }
+    }
+    for scope in args.scopes {
+        out.extend(["--in".to_owned(), scope]);
+    }
+    Ok(out)
+}
+
+/// Subprocess stdin must be closed so a CLI prompt cannot consume the MCP request stream.
+fn call_tool(name: &str, args: &serde_json::Value) -> ToolOutput {
     let exe = std::env::current_exe().unwrap_or_else(|_| "agit".into());
     let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--no-color").stdin(std::process::Stdio::null());
+    if !matches!(name, "search" | "show") {
+        cmd.arg("--json");
+    }
     // A tool's stdout is its result payload, independent of human presentation.
-    cmd.arg("--no-color")
-        .env("AGIT_PROTOCOL_CHILD", "1")
-        .env_remove("AGIT_QUIET");
+    cmd.env("AGIT_PROTOCOL_CHILD", "1").env_remove("AGIT_QUIET");
     match name {
-        "search" => {
-            cmd.arg("search");
-            if let Some(q) = args.get("query").and_then(|v| v.as_str()) {
-                cmd.arg(q);
+        "search" => match search_arguments(args) {
+            Ok(arguments) => {
+                cmd.args(arguments);
             }
-            if let Some(t) = args.get("type").and_then(|v| v.as_str()) {
-                cmd.args(["--type", t]);
-            }
-            if let Some(s) = args.get("sort").and_then(|v| v.as_str()) {
-                cmd.args(["--sort", s]);
-            }
-            if let Some(n) = args.get("limit").and_then(|v| v.as_u64()) {
-                cmd.args(["-n", &n.to_string()]);
-            }
-            // `--mcp` is not optional: without it the model gets the layout meant for people
-            // (tree glyphs, hint lines, the "this command is also exposed over MCP" sentence)
-            // and has to guess the fields out of it. In the JSON form scope / secondhand / line
-            // are structured.
-            cmd.arg("--mcp");
-        }
+            Err(error) => return ToolOutput::error(format!("invalid search arguments: {error}")),
+        },
         "show" => {
             cmd.arg("show");
             if let Some(r) = args.get("ref").and_then(|v| v.as_str()) {
-                cmd.arg(r);
+                cmd.arg("--").arg(r);
             }
         }
         "view" => {
             cmd.arg("view");
             if let Some(r) = args.get("ref").and_then(|v| v.as_str()) {
-                cmd.arg(r);
+                cmd.arg("--").arg(r);
             }
-            cmd.arg("--json");
         }
         "status" => {
             cmd.arg("status");
@@ -152,31 +201,35 @@ fn call_tool(name: &str, args: &serde_json::Value) -> String {
         "rc_list" => {
             cmd.args(["rc", "list"]);
         }
-        other => return format!("unknown tool {other}"),
+        other => return ToolOutput::error(format!("unknown tool {other}")),
     }
     match cmd.output() {
         Ok(o) => {
             let stdout = String::from_utf8_lossy(&o.stdout);
             let stderr = String::from_utf8_lossy(&o.stderr);
             if o.status.success() {
-                mcp_result(name, &stdout)
+                ToolOutput {
+                    text: mcp_result(name, &stdout),
+                    is_error: false,
+                }
             } else {
-                format!(
+                if serde_json::from_str::<serde_json::Value>(&stdout).is_ok() {
+                    return ToolOutput::error(stdout.into_owned());
+                }
+                ToolOutput::error(format!(
                     "(exit {})\n{}{}",
                     o.status.code().unwrap_or(-1),
                     stdout,
                     stderr
-                )
+                ))
             }
         }
-        Err(e) => format!("could not run the tool: {e}"),
+        Err(e) => ToolOutput::error(format!("could not run the tool: {e}")),
     }
 }
 
-/// `view --json` is now wrapped in the common CLI envelope.  MCP predates the
-/// envelope and its tool contract is the VIEW value itself, so unwrap only a
-/// successful JSON result here.  Other commands (and failures) keep their
-/// stdout unchanged.
+/// The VIEW tool returns its structured value directly; the CLI envelope is transport.
+/// Other tools and failed operations retain their own result contracts.
 fn mcp_result(name: &str, stdout: &str) -> String {
     if name != "view" {
         return stdout.to_owned();
@@ -213,6 +266,48 @@ mod workspace_tool_tests {
         assert_eq!(mcp_result("view", envelope), envelope);
         assert_eq!(mcp_result("status", envelope), envelope);
         assert_eq!(mcp_result("view", "plain output\n"), "plain output\n");
+    }
+
+    #[test]
+    fn search_batch_arguments_are_literal_and_typed() {
+        let arguments = super::search_arguments(&serde_json::json!({
+            "queries": ["--counts", "cache"], "repo":"alice/demo", "author":"Bob", "since":"2026-09-01", "page":2,
+            "scopes":["tool", "output"], "limit":5,
+        }))
+        .unwrap();
+        assert_eq!(
+            &arguments[..6],
+            ["search", "--mcp", "--query", "--counts", "--query", "cache"]
+        );
+        use clap::Parser;
+        let command = super::super::Cli::try_parse_from(
+            std::iter::once("agit").chain(arguments.iter().map(String::as_str)),
+        )
+        .unwrap();
+        let Some(super::super::Commands::Search(args)) = command.command else {
+            panic!("search command expected")
+        };
+        assert!(!args.counts);
+        assert_eq!(args.queries, ["--counts", "cache"]);
+        assert_eq!(args.repo.as_deref(), Some("alice/demo"));
+        assert!(super::search_arguments(&serde_json::json!({"limit":-1})).is_err());
+        assert!(super::search_arguments(&serde_json::json!({"queries":[false]})).is_err());
+        assert!(super::search_arguments(&serde_json::json!({"author_typo":"alice"})).is_err());
+    }
+
+    #[test]
+    fn tool_failures_are_marked_as_errors() {
+        let response = super::handle(&serde_json::json!({"id":1, "method":"tools/call",
+            "params":{"name":"search", "arguments":{"limit":-1}}}))
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("invalid search arguments")
+        );
     }
 
     /// MCP exposes only the **read** side of the workspace tools.

@@ -431,14 +431,11 @@ fn quiet_preserves_json_envelopes_and_typed_authentication_recovery() {
         ]));
         let data: serde_json::Value = serde_json::from_slice(&getter.stdout).unwrap();
         assert_eq!(data["schema_version"], version.parse::<u64>().unwrap());
-        assert_eq!(data["result"]["format"], "text");
-        assert!(
-            data["result"]["lines"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|line| line == "(unset)")
-        );
+        assert_eq!(data["result"]["format"], "json");
+        assert_eq!(data["result"]["value"]["operation"], "get");
+        assert_eq!(data["result"]["value"]["setting"]["key"], "commit.auto");
+        assert!(data["result"]["value"]["setting"]["stored"].is_null());
+        assert_eq!(data["result"]["value"]["setting"]["effective"], "true");
     }
 }
 
@@ -650,14 +647,14 @@ fn quiet_json_mutations_keep_their_complete_command_result() {
         let quiet = success(lab.run(&quiet));
         assert_eq!(quiet.stdout, regular.stdout);
         let value: serde_json::Value = serde_json::from_slice(&quiet.stdout).unwrap();
-        assert_eq!(value["result"]["format"], "text");
-        assert!(
-            value["result"]["lines"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|line| { line.as_str().unwrap().contains("runtime.default = codex") })
+        assert_eq!(value["result"]["format"], "json");
+        assert_eq!(value["result"]["value"]["operation"], "set");
+        assert_eq!(
+            value["result"]["value"]["setting"]["key"],
+            "runtime.default"
         );
+        assert_eq!(value["result"]["value"]["setting"]["stored"], "codex");
+        assert_eq!(value["result"]["value"]["setting"]["effective"], "codex");
     }
 }
 

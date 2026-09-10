@@ -24,7 +24,7 @@ agit merge --continue | --abort
 | Option | Meaning |
 |---|---|
 | `[SOURCE]` | Source branch, tag, or `owner/repo@ref`; `@` requires the session supplied through `AGIT_SESSION` |
-| `--into <branch>` | Landing branch; current `@` by default |
+| `--into <owner/repo@branch>` | Explicit landing branch; a bare branch or an omitted target requires `AGIT_SESSION` |
 | `--as <runtime>` | Runtime used to start the merge agent |
 | `-m, --message <instruction>` | Extra constraints for the merge agent |
 | `--manual` | Do not start a model; print fork point, new turns, and plumbing commands |
@@ -42,10 +42,10 @@ agit merge --continue | --abort
 ```bash
 agit view szh/p1@other --json
 agit show szh/p1@other#3.2
-agit merge szh/p1@other --into main
-agit merge pick szh/p1@other#3..#5
-agit merge summary -m "Keep the new rate-limit policy and use uid on the target line"
-agit merge --continue
+agit merge szh/p1@other --into szh/p1@review --manual
+agit merge --into szh/p1@review pick szh/p1@other#3..#5
+agit merge --into szh/p1@review summary -m "Keep the new rate-limit policy and use uid on the target line"
+agit merge --into szh/p1@review --continue
 ```
 
 If the intents cannot be reconciled, use `agit merge --abort`; do not rebase or force-push.

@@ -27,12 +27,12 @@ agit import [session] --repo <owner/name> -b <branch> [options]
 
 | Option | Meaning |
 |---|---|
-| `[session]` | Explicit runtime session ID or ID prefix; omitted targets require a choice in the interactive picker. `@` does not infer the current runtime session |
-| `-n, --name <agent>` | Bare repo name for adoption; use `--into` to specify its owner and branch together |
+| `[session]` | Explicit native runtime session ID or unique ID prefix from runtime discovery; omitted targets require a choice in the interactive picker. Arbitrary transcript paths and `@` do not select the current runtime session |
+| `-n, --name <agent>` | Repo name only when a new Agent repo must be created |
 | `--from <runtime>` | Source runtime, such as `codex` or `claude-code` |
 | `--link-only` | Write the adoption link without importing/settling content |
-| `--into <owner/name@branch>` | Explicit target Agent repo and session branch |
-| `--repo <owner/name>` | Alias of `--into`; pair a repo-only value with `-b` |
+| `--into <owner/name>@<branch>` | Explicit destination Agent repo and session branch |
+| `--repo <owner/name>` | Compatibility alias for `--into`; supply `-b` separately when the value omits the branch |
 | `-b, --branch <branch>` | Target session branch; recommended explicitly when creating/importing |
 | `--propose-lineage` | Read-only local prefix report; requires a full native ID, `--from`, and qualified destination branch |
 | `--independent` | Explicitly use the ordinary no-base import path; existing claim and settlement checks still apply |
@@ -43,7 +43,7 @@ agit import [session] --repo <owner/name> -b <branch> [options]
 
 ## Scenarios and examples
 
-Use `--into <owner/repo>@<branch>`, or `--repo <owner/repo> -b <branch>`, to select the destination. Do not combine a branch in `--into` with `-b`. If the session ID is unknown, start with `agit status` or filter with `--from`. Use `--link-only` when adoption should be recorded but content should wait.
+Use `--into <owner/repo>@<branch>`, or `--repo <owner/repo> -b <branch>`, to select the destination. Do not combine a branch in `--into` with `-b`. If the session ID is unknown, start with `agit status --check-missing` or filter with `--from`. Use `--link-only` when adoption should be recorded but content should wait.
 
 After `--link-only`, sign in and run `agit import <session-id> --from <runtime> --into <owner/repo>@<branch>`
 to record the opening version. The offline link has no repository owner or branch claim;

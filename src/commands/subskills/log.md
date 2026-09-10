@@ -18,11 +18,11 @@ With no arguments at a terminal, this opens a full-screen browser instead of pri
 | Option | Meaning |
 |---|---|
 | `[ref|owner/repo]` | Branch, tag, commit, `@`, or repo; the branch supplied through `AGIT_SESSION` when omitted |
-| `-n, --limit <count>` | Maximum entries; default 20 |
-| `--graph` | Show the branch graph |
-| `--branches` | Group/show by branch |
+| `-n, --limit <count>` | Maximum matching turn-history entries; default 20 |
+| `--graph` | Show the commit graph for the selected repository; conflicts with `--branches` |
+| `--branches` | Show the branch overview; conflicts with `--graph` |
 | `--kind <turn\|merge\|view\|file\|archive>` | Filter by event kind |
-| `--grep <text>` | Search messages/content |
+| `--grep <text>` | Match literal text in commit subjects; does not search transcripts |
 | `--since <duration>` | Show only a recent period, such as `24h`, `7d`, or `4w` |
 | `--oneline` | One-line summaries |
 | `[-- <path>...]` | Filter by path |
@@ -45,8 +45,29 @@ unavailable counts; missing or corrupt declared LOG evidence is an error, never 
 
 ```bash
 agit log @ --oneline -n 30
-agit log szh/p1 --branches --graph
+agit log szh/p1 --branches
+agit log szh/p1 --graph
 agit log @ --kind merge --grep "auth"
+agit log alice/payments@investigation --json --kind turn -n 10
 ```
 
 `agit log` is AgentGit context history. Use `git -C <project> log` for project-code history.
+
+## Structured reads
+
+With `--json`, read the command payload from `result.value` in the CLI envelope. The payload
+has `schema_version: 1`, `repo`, and a `view` discriminator:
+
+- `turns`: `target` is the frozen repo/commit reference, `head_oid` is the full commit ID,
+  and `turns` contains `oid`, `turn`, `kind`, the complete `subject`, `tags`, `code_anchor`,
+  `milestone`, and `committed_at` (Unix seconds). Non-turn events have a null `turn`.
+- `branches`: `branches` has the same structured records as `agit branch --json`.
+  A local branch takes precedence over its origin tracking copy; remote-only branches retain
+  their full `refs/remotes/origin/...` reference.
+- `graph`: `commits` contains full `oid`, `parents`, `subject`, and `committed_at`; `refs`
+  contains full ref names and object IDs, with `peeled_oid` for annotated tags.
+
+Turn filters (`--kind`, `--grep`, `--since`, paths, and `-n`) retain the original turn ordinals;
+they apply to the per-turn view. `--oneline` does not discard structured fields. An empty
+successful view returns an empty array. An unreadable history fails through the envelope.
+These reads use Git metadata and do not open a transcript.

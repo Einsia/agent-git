@@ -1,52 +1,10 @@
-//! `agit search` — search the corpus you can read for "has anyone done this before".
+//! Search readable conversation history with evidence and pagination metadata intact.
 //!
-//! # The main entry point is MCP, not the terminal
-//!
-//! The moment it is really needed is the moment an **agent is stuck**, not the moment a person
-//! opens a terminal. Alice's agent gets stuck configuring the CI cache; rather than ask Alice, it
-//! searches "has anyone in this company handled the build cache of this monorepo", finds a session
-//! from another team three months back, reads it, and carries on working.
-//!
-//! So the terminal form of this command mainly serves to check search quality by hand; `--mcp`
-//! emits the JSON the MCP tool consumes directly.
-//!
-//! # This is the only part with a network effect
-//!
-//! Handoff is worth a linear amount (each further team is one further share; teams do not compound
-//! each other); search is worth a superlinear amount (a larger corpus hits more often, and every
-//! use enlarges the corpus). This is the real reason "public is free" — public sessions are the
-//! fuel for search, and free storage buys a corpus nobody else can copy.
-//!
-//! # Three things that must be right
-//!
-//! 1. **Deduplication**: several people have hit the same trap, so return the most complete one
-//!    rather than all of them. Two levels: a hit is granular to the **session**, not to the event
-//!    (a word recurring throughout one session still yields a single row, carrying `+N more`);
-//!    above that, sessions that open by asking the same thing are collapsed by the hub into one
-//!    row, carrying `group_size` and `N more like this`.
-//! 2. **Quality signal**: separate "it worked" from "it was tried and did not". The hub adds
-//!    `confidence` and a one-line `outcome_reason` to `outcome` (`worked`/`failed`/`unknown`); the
-//!    verdict is read off the shape of the transcript (whether the same question gets asked again,
-//!    whether it ends in a change that landed), **not guessed by an LLM** — a wrong label that
-//!    looks grounded is worse than a blank one. `unknown` is the normal case. `scope` is still an
-//!    important signal of evidence strength: "someone actually ran this command" is far stronger
-//!    than "someone asked about this word", and that is why `in:` exists.
-//! 3. **Permission filtering**: the scope is strictly the corpus the caller may read, and it must
-//!    be a **query condition** rather than a post-filter — a post-filter lets the hit count itself
-//!    leak the existence of content the caller cannot see.
-//!
-//! # Why the terminal form shows `unknown` and `incomplete`
-//!
-//! Both are cases of "what you think happened is not what happened":
-//!
-//! * `unknown`: the user writes `runtim:codex` (one letter off) and it is searched as an ordinary
-//!   word. Unreported, the results just look inexplicable, and the user does not suspect their own
-//!   syntax — they suspect search is broken.
-//! * `incomplete`: the hub returned a partial result without identifying the cause. The count is
-//!   a lower bound, so an empty result cannot establish that matching readable content is absent.
+//! Machine output preserves uncertainty and unknown qualifiers because an incomplete scan
+//! or an unsupported filter cannot establish that no relevant prior work exists.
 
 use super::{CmdResult, require_login};
-use crate::hub::{AgentHit, PersonHit, PrHit, SearchHit, SearchPage};
+use crate::hub::{AgentHit, PersonHit, PrHit, SearchFilters, SearchHit, SearchPage};
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
@@ -57,15 +15,61 @@ const KINDS: &[&str] = &["sessions", "agents", "prs", "people"];
 pub struct Args {
     /// Query. Supports qualifiers: in:prompt|reply|tool|output|edit|summary, owner:,
     /// agent:, runtime:, tool:, path:, turns:>20, "quoted phrases", -exclude
-    #[arg(value_name = "query")]
+    #[arg(value_name = "query", default_value = "")]
     pub query: String,
+
+    /// Additional query; repeat to search a batch with shared options
+    #[arg(
+        short = 'Q',
+        long = "query",
+        value_name = "query",
+        allow_hyphen_values = true
+    )]
+    pub queries: Vec<String>,
+
+    /// Restrict to one Agent repo (owner/name)
+    #[arg(long, value_name = "owner/name")]
+    pub repo: Option<String>,
+
+    /// Restrict to a repo owner (person or organization)
+    #[arg(long, value_name = "name")]
+    pub owner: Option<String>,
+
+    /// Match the saved version's Git author name or email (exact, case insensitive)
+    #[arg(long, value_name = "name/email")]
+    pub author: Option<String>,
+
+    /// Saved at or after this UTC date or RFC3339 timestamp
+    #[arg(long, value_name = "date/time")]
+    pub since: Option<String>,
+
+    /// Saved before this UTC date or RFC3339 timestamp (exclusive)
+    #[arg(long, value_name = "date/time")]
+    pub before: Option<String>,
+
+    /// Restrict to a runtime, such as claude-code or codex
+    #[arg(long, value_name = "runtime")]
+    pub runtime: Option<String>,
+
+    /// Match event scope; repeat to include multiple scopes
+    #[arg(long = "in", value_parser = ["prompt", "reply", "tool", "output", "edit", "summary"])]
+    pub scopes: Vec<String>,
+
+    /// Restrict to calls of this tool
+    #[arg(long, value_name = "name")]
+    pub tool: Option<String>,
+
+    /// Restrict to file-edit paths containing this fragment
+    #[arg(long, value_name = "fragment")]
+    pub path: Option<String>,
 
     /// What to search: sessions, agents, prs, people
     #[arg(
         short = 't',
         long = "type",
         default_value = "sessions",
-        value_name = "kind"
+        value_name = "kind",
+        value_parser = clap::builder::PossibleValuesParser::new(KINDS.iter().copied())
     )]
     pub kind: String,
 
@@ -78,41 +82,226 @@ pub struct Args {
     pub page: usize,
 
     /// Order: best, recent, turns
-    #[arg(long, value_name = "order")]
+    #[arg(long, value_name = "order", value_parser = ["best", "recent", "turns"])]
     pub sort: Option<String>,
 
     /// Show how many hits each type has, then exit
     #[arg(long)]
     pub counts: bool,
 
-    /// Emit JSON consumable by the MCP tool
+    /// Emit raw structured JSON (also the default when stdout is not a terminal)
     #[arg(long)]
     pub mcp: bool,
 }
 
-pub fn run(args: Args) -> CmdResult {
+impl Args {
+    fn saved_filters(&self) -> Result<SearchFilters, String> {
+        let filters = SearchFilters {
+            author: self.author.clone(),
+            since: self.since.clone(),
+            before: self.before.clone(),
+        }
+        .normalized()
+        .map_err(|e| e.to_string())?;
+        if filters.active() && (self.kind != "sessions" || self.counts) {
+            return Err("--author, --since and --before require session search; use its total for the filtered count".into());
+        }
+        Ok(filters)
+    }
+}
+
+const MAX_BATCH_QUERIES: usize = 16;
+const BATCH_CONCURRENCY: usize = 4;
+const MAX_QUERY_CHARS: usize = 256;
+
+pub fn run(mut args: Args) -> CmdResult {
+    let queries = match effective_queries(&args) {
+        Ok(queries) => queries,
+        Err(message) => {
+            ui::error(&message);
+            return Ok(ExitCode::Usage);
+        }
+    };
     let client = require_login()?;
-
-    if args.query.trim().is_empty() {
-        ui::error("query must not be empty.");
-        return Ok(ExitCode::Usage);
+    if queries.len() > 1 {
+        let (value, failed) = batch(&client, &args, &queries);
+        println!("{}", serde_json::to_string(&value)?);
+        return Ok(if failed {
+            ExitCode::Failure
+        } else {
+            ExitCode::Ok
+        });
     }
-    if !KINDS.contains(&args.kind.as_str()) {
-        ui::error(&format!("unknown type “{}”.", args.kind));
-        ui::hint(&format!("one of: {}", KINDS.join(", ")));
-        return Ok(ExitCode::Usage);
+    args.query = queries
+        .into_iter()
+        .next()
+        .expect("a validated query exists");
+    if args.mcp || !ui::is_tty() {
+        return match structured(&client, &args, &args.query) {
+            Ok(value) => {
+                println!("{}", serde_json::to_string(&value)?);
+                Ok(ExitCode::Ok)
+            }
+            Err(error) => failed(error),
+        };
     }
-
     if args.counts {
         return counts(&client, &args);
     }
-
     match args.kind.as_str() {
         "sessions" => sessions(&client, &args),
         "agents" => agents(&client, &args),
         "prs" => prs(&client, &args),
         _ => people(&client, &args),
     }
+}
+
+fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
+    let saved_filters = args.saved_filters()?;
+    if !(1..=100).contains(&args.limit) {
+        return Err("--limit must be between 1 and 100".into());
+    }
+    if args.page == 0 {
+        return Err("--page must be at least 1".into());
+    }
+    let mut filters = Vec::new();
+    for (name, value) in [
+        ("repo", &args.repo),
+        ("owner", &args.owner),
+        ("runtime", &args.runtime),
+        ("tool", &args.tool),
+        ("path", &args.path),
+    ] {
+        if let Some(value) = value {
+            if value.trim().is_empty() || value.contains('"') || value.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "--{name} must be nonempty and contain no quotes or control characters"
+                ));
+            }
+            filters.push(format!("{name}:\"{value}\""));
+        }
+    }
+    filters.extend(args.scopes.iter().map(|scope| format!("in:{scope}")));
+    let mut queries: Vec<String> = if args.query.is_empty() {
+        Vec::new()
+    } else {
+        vec![args.query.clone()]
+    };
+    queries.extend(args.queries.clone());
+    if queries.is_empty() && (!filters.is_empty() || saved_filters.active()) {
+        queries.push(String::new());
+    }
+    if queries.is_empty() {
+        return Err("provide a query or a filter; use --query repeatedly for a batch".into());
+    }
+    if queries.len() > MAX_BATCH_QUERIES {
+        return Err(format!(
+            "a batch supports at most {MAX_BATCH_QUERIES} queries"
+        ));
+    }
+    let explicit_queries = !args.query.is_empty() || !args.queries.is_empty();
+    for query in &mut queries {
+        if query.trim().is_empty()
+            && ((filters.is_empty() && !saved_filters.active()) || explicit_queries)
+        {
+            return Err("queries must not be empty".into());
+        }
+        if !filters.is_empty() {
+            if !query.matches('"').count().is_multiple_of(2) {
+                return Err(
+                    "queries with explicit filters must have balanced double quotes".into(),
+                );
+            }
+            if !query.is_empty() {
+                query.push(' ');
+            }
+            query.push_str(&filters.join(" "));
+        }
+        if query.chars().count() > MAX_QUERY_CHARS {
+            return Err(format!(
+                "each query must be at most {MAX_QUERY_CHARS} characters"
+            ));
+        }
+    }
+    Ok(queries)
+}
+
+fn structured(
+    client: &crate::hub::Client,
+    args: &Args,
+    query: &str,
+) -> anyhow::Result<serde_json::Value> {
+    if args.counts {
+        let counts = client.search_counts(query)?;
+        return Ok(serde_json::json!({
+            "query": query,
+            "counts": {
+                "sessions": counts.sessions, "agents": counts.agents,
+                "prs": counts.prs, "people": counts.people,
+                "sessions_incomplete": counts.sessions_incomplete,
+            },
+        }));
+    }
+    let page: SearchPage<serde_json::Value> = client.search_page_filtered(
+        &args.kind,
+        query,
+        args.sort.as_deref(),
+        args.page,
+        args.limit,
+        &args.saved_filters().map_err(anyhow::Error::msg)?,
+    )?;
+    Ok(serde_json::json!({
+        "query": query, "type": args.kind, "total": page.total,
+        "page": page.page, "per": page.per,
+        "has_more": page.per > 0 && page.page.saturating_mul(page.per) < page.total,
+        "incomplete": page.incomplete, "unknown": page.unknown,
+        "terms": page.terms, "hits": page.items, "applied_filters": page.applied_filters,
+    }))
+}
+
+fn batch(
+    client: &crate::hub::Client,
+    args: &Args,
+    queries: &[String],
+) -> (serde_json::Value, bool) {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(queries.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..BATCH_CONCURRENCY.min(queries.len()) {
+            let client = client.clone();
+            let next = &next;
+            let results = &results;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(query) = queries.get(index) else {
+                        break;
+                    };
+                    let result = structured(&client, args, query);
+                    results
+                        .lock()
+                        .expect("batch result lock is available")
+                        .push((index, result));
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().expect("batch results are available");
+    results.sort_by_key(|(index, _)| *index);
+    let failed = results.iter().any(|(_, result)| result.is_err());
+    let results: Vec<_> = results.into_iter().map(|(index, result)| match result {
+        Ok(value) => serde_json::json!({"query": queries[index], "ok": true, "result": value}),
+        Err(error) => serde_json::json!({"query": queries[index], "ok": false, "error": format!("{error:#}")}),
+    }).collect();
+    (
+        serde_json::json!({"batch": true, "results": results}),
+        failed,
+    )
 }
 
 /// The one exit for a failed request.
@@ -132,22 +321,6 @@ fn counts(client: &crate::hub::Client, args: &Args) -> CmdResult {
         Ok(c) => c,
         Err(e) => return failed(e),
     };
-    if args.mcp {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "query": args.query,
-                "counts": {
-                    "sessions": c.sessions,
-                    "agents": c.agents,
-                    "prs": c.prs,
-                    "people": c.people,
-                    "sessions_incomplete": c.sessions_incomplete,
-                },
-            }))?
-        );
-        return Ok(ExitCode::Ok);
-    }
     // The session count can be a lower bound, hence `≥` — a number that looks exact is taken for
     // a conclusion more readily than one marked uncertain.
     let sess = if c.sessions_incomplete {
@@ -172,6 +345,15 @@ fn counts(client: &crate::hub::Client, args: &Args) -> CmdResult {
 /// The line carrying the query string and the total, plus the notices that qualify it. Shared by
 /// every type.
 fn header<T>(p: &SearchPage<T>, query: &str) {
+    for (key, value) in [
+        ("author", &p.applied_filters.author),
+        ("since", &p.applied_filters.since),
+        ("before", &p.applied_filters.before),
+    ] {
+        if let Some(value) = value {
+            println!("{key}: {value}");
+        }
+    }
     let total = if p.incomplete {
         format!("≥{}", p.total)
     } else {
@@ -184,7 +366,7 @@ fn header<T>(p: &SearchPage<T>, query: &str) {
     );
     if !p.unknown.is_empty() {
         ui::warning(&format!(
-            "not {}: {} — searched as plain text instead",
+            "unsupported {}: {} — inspect the query before relying on these results",
             if p.unknown.len() == 1 {
                 "a qualifier"
             } else {
@@ -210,20 +392,18 @@ fn footer<T>(p: &SearchPage<T>) {
 }
 
 fn sessions(client: &crate::hub::Client, args: &Args) -> CmdResult {
-    let p: SearchPage<SearchHit> = match client.search_page(
+    let p: SearchPage<SearchHit> = match client.search_page_filtered(
         "sessions",
         &args.query,
         args.sort.as_deref(),
         args.page,
         args.limit,
+        &args.saved_filters().map_err(anyhow::Error::msg)?,
     ) {
         Ok(p) => p,
         Err(e) => return failed(e),
     };
 
-    if args.mcp {
-        return mcp_sessions(&p, &args.query);
-    }
     if p.items.is_empty() {
         return nothing(&args.query, &p);
     }
@@ -298,7 +478,7 @@ fn sessions(client: &crate::hub::Client, args: &Args) -> CmdResult {
         println!();
     }
     footer(&p);
-    ui::hint("this command is also exposed to agents over MCP (--mcp shows the JSON form)");
+    ui::hint("use --json for structured results; --query adds another search to a batch");
     Ok(ExitCode::Ok)
 }
 
@@ -339,25 +519,17 @@ fn verdict_label(outcome: Option<&str>) -> Option<String> {
 }
 
 fn agents(client: &crate::hub::Client, args: &Args) -> CmdResult {
-    let p: SearchPage<AgentHit> = match client.search_page(
+    let p: SearchPage<AgentHit> = match client.search_page_filtered(
         "agents",
         &args.query,
         args.sort.as_deref(),
         args.page,
         args.limit,
+        &args.saved_filters().map_err(anyhow::Error::msg)?,
     ) {
         Ok(p) => p,
         Err(e) => return failed(e),
     };
-    if args.mcp {
-        return mcp_json(&p, &args.query, |h: &AgentHit| {
-            serde_json::json!({
-                "slug": h.slug, "visibility": h.visibility, "category": h.category,
-                "fork": h.fork, "size_bytes": h.size_bytes,
-                "updated_at": h.updated_at, "url": h.url,
-            })
-        });
-    }
     if p.items.is_empty() {
         return nothing(&args.query, &p);
     }
@@ -387,25 +559,17 @@ fn agents(client: &crate::hub::Client, args: &Args) -> CmdResult {
 }
 
 fn prs(client: &crate::hub::Client, args: &Args) -> CmdResult {
-    let p: SearchPage<PrHit> = match client.search_page(
+    let p: SearchPage<PrHit> = match client.search_page_filtered(
         "prs",
         &args.query,
         args.sort.as_deref(),
         args.page,
         args.limit,
+        &args.saved_filters().map_err(anyhow::Error::msg)?,
     ) {
         Ok(p) => p,
         Err(e) => return failed(e),
     };
-    if args.mcp {
-        return mcp_json(&p, &args.query, |h: &PrHit| {
-            serde_json::json!({
-                "number": h.number, "agent": h.agent, "title": h.title,
-                "state": h.state, "source": h.source, "target_branch": h.target_branch,
-                "created_by": h.created_by, "matched_in": h.matched_in, "url": h.url,
-            })
-        });
-    }
     if p.items.is_empty() {
         return nothing(&args.query, &p);
     }
@@ -441,23 +605,17 @@ fn prs(client: &crate::hub::Client, args: &Args) -> CmdResult {
 }
 
 fn people(client: &crate::hub::Client, args: &Args) -> CmdResult {
-    let p: SearchPage<PersonHit> = match client.search_page(
+    let p: SearchPage<PersonHit> = match client.search_page_filtered(
         "people",
         &args.query,
         args.sort.as_deref(),
         args.page,
         args.limit,
+        &args.saved_filters().map_err(anyhow::Error::msg)?,
     ) {
         Ok(p) => p,
         Err(e) => return failed(e),
     };
-    if args.mcp {
-        return mcp_json(&p, &args.query, |h: &PersonHit| {
-            serde_json::json!({
-                "name": h.name, "kind": h.kind, "agents": h.agents, "url": h.url,
-            })
-        });
-    }
     if p.items.is_empty() {
         return nothing(&args.query, &p);
     }
@@ -497,68 +655,6 @@ fn nothing<T>(query: &str, p: &SearchPage<T>) -> CmdResult {
 
 /// The MCP shape of a session.
 ///
-/// The field selection is for the **model**, not for a person: `scope` / `secondhand` / `turns`
-/// are all there because the model judges from them whether a hit is worth trusting — "someone
-/// actually ran this command" and "the word turns up in a compact summary" are completely
-/// different strengths of evidence. `line` lets it go back to the raw transcript for detail (the
-/// intermediate representation (IR) is a lossy projection; tool arguments and diffs are not in it).
-///
-/// `outcome` / `confidence` / `outcome_reason` come out together: the tag on its own is taken for a
-/// truth value when it is only a heuristic read off the shape of the transcript. `failed` is **just
-/// as useful** to the model — "this path was tried and did not work" lets it skip a plan outright.
-fn mcp_sessions(p: &SearchPage<SearchHit>, query: &str) -> CmdResult {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "query": query,
-            "type": "sessions",
-            "total": p.total,
-            "incomplete": p.incomplete,
-            "unknown": p.unknown,
-            "hits": p.items.iter().map(|h| serde_json::json!({
-                "agent": h.agent,
-                "session_id": h.session_id,
-                "scope": h.scope,
-                "secondhand": h.secondhand,
-                "runtime": h.runtime,
-                "tool": h.tool,
-                "paths": h.paths,
-                "turns": h.turns,
-                "other_hits": h.other_hits,
-                "line": h.line,
-                "excerpt": h.excerpt,
-                "url": h.url,
-                // The verdict fields ship together. With `outcome` and no `outcome_reason` the
-                // model can only use the tag as a truth value — and it is a heuristic. Only with
-                // the reason present can the model decide for itself whether to believe it.
-                "outcome": h.outcome,
-                "confidence": h.confidence,
-                "outcome_reason": h.outcome_reason,
-                // Collapse information: `group_size > 1` means other sessions opened by asking
-                // the same thing.
-                "group_size": h.group_size,
-                "grouped": h.grouped,
-            })).collect::<Vec<_>>(),
-        }))?
-    );
-    Ok(ExitCode::Ok)
-}
-
-fn mcp_json<T>(p: &SearchPage<T>, query: &str, f: impl Fn(&T) -> serde_json::Value) -> CmdResult {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "query": query,
-            "type": p.kind,
-            "total": p.total,
-            "incomplete": p.incomplete,
-            "unknown": p.unknown,
-            "hits": p.items.iter().map(f).collect::<Vec<_>>(),
-        }))?
-    );
-    Ok(ExitCode::Ok)
-}
-
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -570,10 +666,12 @@ mod tests {
     }
 
     #[test]
-    fn mcp_output_is_opt_in_and_plain() {
-        // The terminal form is for people, the MCP form is for agents; the two do not mix.
+    fn raw_json_flag_is_optional() {
         let w = W::parse_from(["x", "query term"]);
-        assert!(!w.a.mcp, "the default is the human-readable form");
+        assert!(
+            !w.a.mcp,
+            "output mode can follow the terminal without a flag"
+        );
         assert_eq!(w.a.query, "query term");
     }
 
@@ -594,14 +692,219 @@ mod tests {
         );
     }
 
-    /// Qualifiers are part of the query string, not flags.
-    ///
-    /// `agit search "cache in:tool"`, not `agit search cache --in tool`: one query string pastes
-    /// unchanged between the terminal, the web interface and MCP. As flags, every added qualifier
-    /// means editing every client, and the string no longer pastes.
     #[test]
-    fn qualifiers_ride_inside_the_query_string() {
-        let w = W::parse_from(["x", "cache in:tool owner:alice -deprecated"]);
-        assert_eq!(w.a.query, "cache in:tool owner:alice -deprecated");
+    fn shared_filters_preserve_values_and_batch_order() {
+        let w = W::parse_from([
+            "x",
+            "cache",
+            "--query",
+            "-stale",
+            "--repo",
+            "alice/demo",
+            "--path",
+            "my folder",
+            "--in",
+            "tool",
+            "--in",
+            "output",
+        ]);
+        let queries = super::effective_queries(&w.a).unwrap();
+        assert_eq!(queries.len(), 2);
+        assert!(queries[0].starts_with("cache "));
+        assert!(queries[1].starts_with("-stale "));
+        let parsed = crate::domain::query::Query::parse(&queries[0]);
+        assert_eq!(parsed.agent.as_deref(), Some("alice/demo"));
+        assert_eq!(parsed.path.as_deref(), Some("my folder"));
+        assert_eq!(parsed.scopes.len(), 2);
+    }
+
+    #[test]
+    fn explicit_filters_cannot_be_swallowed_by_an_unclosed_query_phrase() {
+        for query in ["\"cache", "-\"cache", "cache \"miss"] {
+            let args = W::parse_from(["x", "--query", query, "--repo", "alice/service"]);
+            assert!(
+                super::effective_queries(&args.a)
+                    .unwrap_err()
+                    .contains("balanced double quotes")
+            );
+        }
+        let args = W::parse_from(["x", "--query", "-\"cache miss\"", "--repo", "alice/service"]);
+        let queries = super::effective_queries(&args.a).unwrap();
+        let parsed = crate::domain::query::Query::parse(&queries[0]);
+        assert_eq!(parsed.agent.as_deref(), Some("alice/service"));
+        assert!(parsed.unknown.is_empty());
+    }
+
+    #[test]
+    fn malformed_or_unbounded_requests_fail_before_login() {
+        for argv in [
+            vec!["x"],
+            vec!["x", "term", "--limit", "0"],
+            vec!["x", "term", "--limit", "101"],
+            vec!["x", "term", "--page", "0"],
+            vec!["x", "term", "--repo", r#""owner:other"#],
+            vec!["x", "--query", " ", "--owner", "alice"],
+        ] {
+            let w = W::parse_from(&argv);
+            assert!(super::effective_queries(&w.a).is_err(), "{argv:?}");
+        }
+        let mut argv = vec!["x"];
+        for _ in 0..=super::MAX_BATCH_QUERIES {
+            argv.extend(["--query", "cache"]);
+        }
+        assert!(super::effective_queries(&W::parse_from(argv).a).is_err());
+        let long = "x".repeat(super::MAX_QUERY_CHARS + 1);
+        assert!(super::effective_queries(&W::parse_from(["x", &long]).a).is_err());
+        assert!(W::try_parse_from(["x", "cache", "--sort", "fast"]).is_err());
+        assert!(W::try_parse_from(["x", "cache", "--type", "whatever"]).is_err());
+        assert_eq!(
+            super::effective_queries(&W::parse_from(["x", "--owner", "alice"]).a).unwrap(),
+            vec!["owner:\"alice\""]
+        );
+    }
+
+    #[test]
+    fn saved_filters_validate_before_login_and_allow_filter_only_queries() {
+        let args = W::parse_from([
+            "x",
+            "--author",
+            " Bob ",
+            "--since",
+            "2026-09-01T08:00:00+08:00",
+            "--before",
+            "2026-09-02",
+        ])
+        .a;
+        assert_eq!(super::effective_queries(&args).unwrap(), vec![""]);
+        let filters = args.saved_filters().unwrap();
+        assert_eq!(filters.author.as_deref(), Some("bob"));
+        assert_eq!(filters.since.as_deref(), Some("2026-09-01T00:00:00Z"));
+        for argv in [
+            vec!["x", "--author", " "],
+            vec!["x", "--since", "2026-02-30"],
+            vec!["x", "--since", "2026-09-01T08:00:00"],
+            vec!["x", "--since", "2026-09-02", "--before", "2026-09-02"],
+            vec!["x", "--author", "Bob", "--counts"],
+            vec!["x", "--author", "Bob", "--type", "people"],
+        ] {
+            assert!(
+                super::effective_queries(&W::parse_from(&argv).a).is_err(),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_filters_require_matching_hub_acknowledgement() {
+        use std::io::{Read, Write};
+        for acknowledgement in [None, Some("other@example.org"), Some("bob@example.org")] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut connection, _) = listener.accept().unwrap();
+                connection
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut buffer = [0; 8192];
+                let n = connection.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                assert!(request.contains("author=bob%40example.org"));
+                assert!(request.contains("since=2026-09-01T00%3A00%3A00Z"));
+                let mut body = serde_json::json!({"type":"sessions", "total":0, "page":1, "per":10, "items":[]});
+                if let Some(author) = acknowledgement {
+                    body["applied_filters"] =
+                        serde_json::json!({"author":author, "since":"2026-09-01T00:00:00Z"});
+                }
+                let body = body.to_string();
+                write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let args = W::parse_from([
+                "x",
+                "cache",
+                "--author",
+                "BOB@example.org",
+                "--since",
+                "2026-09-01",
+            ])
+            .a;
+            let result = super::structured(&crate::hub::Client::for_hub(&base), &args, "cache");
+            server.join().unwrap();
+            assert_eq!(result.is_ok(), acknowledgement == Some("bob@example.org"));
+            if let Err(error) = result {
+                assert!(error.to_string().contains("did not acknowledge"));
+            }
+        }
+    }
+
+    #[test]
+    fn batch_preserves_wire_metadata_order_and_partial_failure() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let server_peak = Arc::clone(&peak);
+        let server = std::thread::spawn(move || {
+            std::thread::scope(|scope| {
+                for connection in listener.incoming().take(9) {
+                    let mut connection = connection.unwrap();
+                    let active = Arc::clone(&active);
+                    let peak = Arc::clone(&server_peak);
+                    scope.spawn(move || {
+                        connection.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                        let mut buffer = [0; 8192];
+                        let n = connection.read(&mut buffer).unwrap();
+                        let request = String::from_utf8_lossy(&buffer[..n]);
+                        assert!(request.contains("author=bob"));
+                        let index = request.split("q=q").nth(1).unwrap().chars().next().unwrap().to_digit(10).unwrap();
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(count, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        let (status, body) = if index == 3 {
+                            ("500 Internal Server Error", serde_json::json!({"error":"search unavailable"}))
+                        } else {
+                            ("200 OK", serde_json::json!({"type":"sessions", "total":11, "page":2,
+                                "per":5, "applied_filters":{"author":"bob"}, "incomplete":true, "unknown":["runtim:codex"], "terms":["cache"],
+                                "items":[{"session_id":format!("s{index}"), "timestamp":"2026-09-08T00:00:00Z",
+                                    "future_field":"preserved", "scope":"tool", "outcome":"unknown"}]}))
+                        };
+                        let body = body.to_string();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        write!(connection, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    });
+                }
+            });
+        });
+        let args = W::parse_from([
+            "x", "cache", "--page", "2", "--limit", "5", "--author", "Bob",
+        ])
+        .a;
+        let queries = (0..9).map(|n| format!("q{n}")).collect::<Vec<_>>();
+        let (value, failed) = super::batch(&crate::hub::Client::for_hub(&base), &args, &queries);
+        server.join().unwrap();
+        assert!(failed);
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert!(peak.load(Ordering::SeqCst) <= super::BATCH_CONCURRENCY);
+        let results = value["results"].as_array().unwrap();
+        assert_eq!(results.len(), queries.len());
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(result["query"], queries[index]);
+            assert_eq!(result["ok"], index != 3);
+            if index != 3 {
+                assert_eq!(
+                    result["result"]["hits"][0]["session_id"],
+                    format!("s{index}")
+                );
+                assert_eq!(result["result"]["hits"][0]["future_field"], "preserved");
+                assert_eq!(result["result"]["page"], 2);
+                assert_eq!(result["result"]["has_more"], true);
+                assert_eq!(result["result"]["incomplete"], true);
+                assert_eq!(result["result"]["unknown"][0], "runtim:codex");
+            }
+        }
     }
 }

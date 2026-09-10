@@ -17,12 +17,14 @@ struct Ref {
     tracking_config: Vec<(String, String)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(super) struct Branch {
     pub name: String,
     pub head: String,
     pub tracking: String,
     pub state: String,
+    pub ahead: Option<usize>,
+    pub behind: Option<usize>,
 }
 
 pub(super) struct Page {
@@ -96,12 +98,16 @@ pub(super) fn inspect(repo: &Repo, limit: usize) -> crate::Result<Page> {
     let graph = ancestry(&repo, &tips);
     let mut rows = Vec::new();
     for (name, head, tracking, fixed_state) in selected {
+        let mut ahead_count = None;
+        let mut behind_count = None;
         let state = if let Some(state) = fixed_state {
             state
         } else if tracking.is_empty() {
             "no known tracking ref".to_owned()
         } else if let Some(remote) = before.get(&tracking) {
             if head == remote.sha {
+                ahead_count = Some(0);
+                behind_count = Some(0);
                 "in sync (ahead 0, behind 0)".to_owned()
             } else {
                 match &graph {
@@ -110,6 +116,8 @@ pub(super) fn inspect(repo: &Repo, limit: usize) -> crate::Result<Page> {
                         let upstream = reachable(graph, &remote.sha);
                         let ahead = local.difference(&upstream).count();
                         let behind = upstream.difference(&local).count();
+                        ahead_count = Some(ahead);
+                        behind_count = Some(behind);
                         if ahead > 0 && behind > 0 {
                             format!("diverged (ahead {ahead}, behind {behind})")
                         } else {
@@ -127,6 +135,8 @@ pub(super) fn inspect(repo: &Repo, limit: usize) -> crate::Result<Page> {
             head,
             tracking,
             state,
+            ahead: ahead_count,
+            behind: behind_count,
         });
     }
     ensure!(

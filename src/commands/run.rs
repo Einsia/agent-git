@@ -1,4 +1,4 @@
-//! `agit run` — start any frozen ref.
+//! `agit open` — start from a saved source (`run` remains a compatibility alias).
 //!
 //! One command covers the whole path: fetch (the owner-qualified form = explicitly networked) →
 //! locate → branch arbitration → materialize → launch. Arbitration has a single rule (the PRD's
@@ -53,7 +53,7 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
     let source = super::echo::Source::for_spec(&spec);
-    let legacy_output = super::echo::legacy_output("run");
+    let legacy_output = super::echo::legacy_output("open");
     let mut startup_notes = RunNotes {
         defer: !legacy_output,
         notes: Vec::new(),
@@ -102,7 +102,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(c) => (c.repo, false),
             Err(e) => {
                 ui::error(&format!("{e:#}"));
-                ui::hint("or fetch explicitly: agit run <owner/repo>@<ref>");
+                ui::hint("or fetch explicitly: agit open <owner/repo>@<ref>");
                 return Ok(ExitCode::Ref);
             }
         },
@@ -129,14 +129,14 @@ pub fn run(args: Args) -> CmdResult {
     let base_name = match &spec.base {
         refs::Base::Name(b) | refs::Base::SessionBranch(b) => b.clone(),
         refs::Base::Default => {
-            ui::error("run needs a ref to aim at (branch / tag / commit / #n).");
+            ui::error("open needs a ref to aim at (branch / tag / commit / #n).");
             ui::hint(&format!(
-                "e.g. `agit run {slug}@main` or `agit run {slug}@v2`"
+                "e.g. `agit open {slug}@main` or `agit open {slug}@v2`"
             ));
             return Ok(ExitCode::Usage);
         }
         refs::Base::At => {
-            ui::error("run doesn’t take `@` (your own line belongs to `agit resume`).");
+            ui::error("open doesn’t take `@` (your own line belongs to `agit resume`).");
             return Ok(ExitCode::Usage);
         }
     };
@@ -279,7 +279,7 @@ pub fn run(args: Args) -> CmdResult {
 
     if can_continue {
         super::echo::emit(
-            "run",
+            "open",
             &[super::echo::Selection::new(
                 format!("{slug}@{base_name}"),
                 source,
@@ -321,7 +321,7 @@ pub fn run(args: Args) -> CmdResult {
             &fork_base.resolved.sha
         };
         super::echo::emit(
-            "run",
+            "open",
             &[super::echo::Selection::new(
                 format!("{slug}@{target}"),
                 source,
@@ -369,14 +369,14 @@ pub fn run(args: Args) -> CmdResult {
                 Ok(Some(true)) => suggestion,
                 Ok(Some(false)) => {
                     println!(
-                        "cancelled. to name it yourself: `agit run {} -b <name>`",
+                        "cancelled. to name it yourself: `agit open {} -b <name>`",
                         args.source
                     );
                     return Ok(ExitCode::Ok);
                 }
                 _ => {
                     ui::error("non-interactive runs must pass -b <new-branch>.");
-                    ui::hint(&format!("e.g. `agit run {} -b {suggestion}`", args.source));
+                    ui::hint(&format!("e.g. `agit open {} -b {suggestion}`", args.source));
                     return Ok(ExitCode::Interactive);
                 }
             }
@@ -441,11 +441,11 @@ fn resolve_fork(
         refs::Tail::Turn(n) => format!("#{}", turn_display(*n)),
         refs::Tail::Event { turn, index } => format!("#{}.{}", turn_display(*turn), index),
         refs::Tail::Range { .. } => {
-            ui::error("run can’t start from a range.");
+            ui::error("open can’t start from a range.");
             return Ok(ForkResolution::Refused(ExitCode::Usage));
         }
         refs::Tail::Path(_) => {
-            ui::error("run can’t start from an in-tree file.");
+            ui::error("open can’t start from an in-tree file.");
             return Ok(ForkResolution::Refused(ExitCode::Usage));
         }
     };

@@ -15,7 +15,7 @@ agit view [TARGET] [--json]
 
 | Option | Meaning |
 |---|---|
-| `[TARGET]` | Branch, tag, session, or `owner/repo@ref`; current context when omitted |
+| `[TARGET]` | Branch, tag, session, or `owner/repo@ref`; a bare ref, omitted target, or `@` requires `AGIT_SESSION` |
 | `--json` | Print structured VIEW for scripts, MCP, or merge agents |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options |
 

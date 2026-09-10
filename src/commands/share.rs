@@ -26,7 +26,7 @@ use clap::{Args as ClapArgs, Subcommand};
 #[derive(ClapArgs)]
 pub struct Args {
     /// AgentGit ref or native session ID/prefix; omitted targets use AGIT_SESSION.
-    #[arg(value_name = "session")]
+    #[arg(value_name = "owner/repo@ref | session")]
     pub target: Option<String>,
 
     /// Share the selected saved point's full LOG instead of its VIEW.
@@ -64,7 +64,21 @@ pub enum Cmd {
     },
 }
 
-pub fn run(args: Args) -> CmdResult {
+pub fn run(mut args: Args) -> CmdResult {
+    if wants_tui(&args) {
+        match crate::tui::should_enter() {
+            crate::tui::Verdict::Enter => {
+                let Some(picked) = crate::tui::screens::sharing::pick(&std::env::current_dir()?)?
+                else {
+                    return Ok(ExitCode::Ok);
+                };
+                args = picked;
+            }
+            crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
+            crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
+            crate::tui::Verdict::Skip => {}
+        }
+    }
     let client = require_login()?;
 
     match &args.cmd {
@@ -213,7 +227,10 @@ pub fn run(args: Args) -> CmdResult {
                 return Ok(ExitCode::Ok);
             }
             None => {
-                ui::error("creating a share requires confirmation.");
+                ui::error(&format!(
+                    "creating a share for {} requires confirmation.",
+                    source.label
+                ));
                 ui::hint(
                     "rerun with -y (or --yes) to confirm the target and visibility, or confirm from a terminal",
                 );
@@ -287,6 +304,16 @@ pub fn run(args: Args) -> CmdResult {
     }
     ui::hint(&format!("revoke: agit share rm {}", resp.slug));
     Ok(ExitCode::Ok)
+}
+
+fn wants_tui(args: &Args) -> bool {
+    args.target.is_none()
+        && args.cmd.is_none()
+        && !args.full_log
+        && !args.public
+        && args.expire == "7d"
+        && args.views.is_none()
+        && !args.password
 }
 
 struct ShareSource {

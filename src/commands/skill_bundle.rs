@@ -56,6 +56,7 @@ pub const SUBSKILLS: &[(&str, &str)] = subskills![
     "memory",
     "merge",
     "new",
+    "open",
     "pr",
     "pull",
     "push",
@@ -63,7 +64,6 @@ pub const SUBSKILLS: &[(&str, &str)] = subskills![
     "repo",
     "resume",
     "revert",
-    "run",
     "scan",
     "search",
     "secrets",
@@ -88,6 +88,135 @@ pub fn version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
+
+    fn command_examples(body: &str) -> Vec<(usize, Vec<String>)> {
+        let mut examples = Vec::new();
+        let mut bash = false;
+        let mut synopsis = false;
+        let mut pending = String::new();
+        let mut start = 0;
+        for (line_index, line) in body.lines().enumerate() {
+            let line = line.trim();
+            if line.starts_with("## ") {
+                synopsis = line == "## Synopsis";
+            }
+            if line.starts_with("```") {
+                bash = line == "```bash";
+                continue;
+            }
+            if !bash || synopsis || (pending.is_empty() && !line.starts_with("agit ")) {
+                continue;
+            }
+            if pending.is_empty() {
+                start = line_index + 1;
+            }
+            if let Some(part) = line.strip_suffix('\\') {
+                pending.push_str(part);
+                pending.push(' ');
+                continue;
+            }
+            pending.push_str(line);
+            let words = shlex::split(&pending).expect("command example must have balanced quoting");
+            examples.push((
+                start,
+                words
+                    .into_iter()
+                    .take_while(|word| !matches!(word.as_str(), ">" | ">>" | "<" | "|" | "&&"))
+                    .collect(),
+            ));
+            pending.clear();
+        }
+        assert!(pending.is_empty(), "unfinished command example");
+        examples
+    }
+
+    #[test]
+    fn documented_shell_examples_parse_without_running_commands() {
+        let mut commands = std::collections::BTreeSet::new();
+        for (name, body) in
+            std::iter::once(("SKILL", entrypoint())).chain(SUBSKILLS.iter().copied())
+        {
+            for (line, words) in command_examples(body) {
+                let cli = crate::commands::Cli::try_parse_from(&words)
+                    .unwrap_or_else(|error| panic!("{name}:{line}: {words:?}\n{error}"));
+                if let Some(command) = cli.command {
+                    commands.insert(crate::commands::command_name(&command));
+                }
+            }
+        }
+        for command in [
+            "import", "commit", "search", "new", "resume", "open", "merge",
+        ] {
+            assert!(
+                commands.contains(command),
+                "no checked example for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_injection_examples_parse_without_running_commands() {
+        let section = include_str!("setup_agents_section.md");
+        for example in section.split('`').skip(1).step_by(2) {
+            if example.starts_with("agit ") {
+                let words = shlex::split(example).unwrap();
+                crate::commands::Cli::try_parse_from(&words)
+                    .unwrap_or_else(|error| panic!("{example}: {error}"));
+            }
+        }
+    }
+
+    #[test]
+    fn descriptions_quote_yaml_mapping_delimiters() {
+        for (name, body) in
+            std::iter::once(("SKILL", entrypoint())).chain(SUBSKILLS.iter().copied())
+        {
+            let frontmatter = body
+                .strip_prefix("---\n")
+                .unwrap()
+                .split("\n---")
+                .next()
+                .unwrap();
+            let description = frontmatter
+                .lines()
+                .find_map(|line| line.strip_prefix("description: "))
+                .unwrap_or_else(|| panic!("{name}: description must be a single scalar"));
+            if description.starts_with('"') {
+                serde_json::from_str::<String>(description).unwrap_or_else(|error| {
+                    panic!("{name}: malformed quoted description: {error}")
+                });
+            } else {
+                assert!(
+                    !description.contains(": "),
+                    "{name}: quote the YAML mapping delimiter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn example_reader_preserves_ref_selectors_and_quoted_values() {
+        let body = "## Synopsis\n```bash\nagit commit [options]\n```\n\
+                    ## Examples\n```bash\n  agit merge --into me/repo@review \\\n                    summary -m \"Keep #3 and its evidence\" # explanation\n\
+                    agit view me/repo@topic#3 --json > /tmp/view.json\n```";
+        let examples = command_examples(body);
+        assert_eq!(
+            examples.iter().map(|(_, words)| words).collect::<Vec<_>>(),
+            [
+                &[
+                    "agit",
+                    "merge",
+                    "--into",
+                    "me/repo@review",
+                    "summary",
+                    "-m",
+                    "Keep #3 and its evidence"
+                ][..],
+                &["agit", "view", "me/repo@topic#3", "--json"][..],
+            ]
+        );
+    }
 
     #[test]
     fn every_subskill_has_frontmatter_and_unique_name() {

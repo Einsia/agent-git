@@ -4,7 +4,7 @@
 //! Environment overrides therefore remain visible while a stored value is edited or removed.
 
 use crate::commands::config::{self, Entry, Source};
-use crate::tui::widgets;
+use crate::tui::widgets::{self, draft_tail};
 use crate::ui::theme;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::prelude::*;
@@ -159,32 +159,6 @@ fn editing_row(key: &str, buffer: &str, width: usize) -> String {
     };
     let value_budget = width.saturating_sub(widgets::cols(&prefix));
     format!("{prefix}{}", draft_tail(buffer, value_budget))
-}
-
-/// Show the end of an append-only draft because that is where the editing cursor lives.
-fn draft_tail(buffer: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if widgets::cols(buffer).saturating_add(1) <= width {
-        return format!("{buffer}_");
-    }
-    if width == 1 {
-        return "_".into();
-    }
-
-    let content_budget = width - 2; // leading ellipsis and trailing cursor
-    let mut start = buffer.len();
-    let mut used = 0;
-    for (index, ch) in buffer.char_indices().rev() {
-        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + char_width > content_budget {
-            break;
-        }
-        start = index;
-        used += char_width;
-    }
-    format!("…{}_", &buffer[start..])
 }
 
 fn draw(

@@ -26,6 +26,8 @@
 use crate::domain::meta::Line as BranchLine;
 use crate::domain::repo::Repo;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 
 /// The inheritance point when `--from` is omitted. **Refers to the one in `new`** instead of
 /// spelling `"main"` a second time here.
@@ -69,9 +71,17 @@ pub struct Input {
     pub scans: Vec<Scan>,
 }
 
+/// Where a repository is available before the user selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Local,
+    Hub,
+}
+
 /// One row of the list.
 #[derive(Debug, Clone)]
 pub struct Row {
+    pub source: Source,
     pub owner: String,
     pub name: String,
     pub path: PathBuf,
@@ -112,6 +122,7 @@ pub fn assemble(input: &Input) -> Vec<Row> {
         .scans
         .iter()
         .map(|s| Row {
+            source: Source::Local,
             owner: s.owner.clone(),
             name: s.name.clone(),
             path: s.path.clone(),
@@ -159,6 +170,11 @@ pub enum Outcome {
 /// spot that this would be a `fork` (`docs/07_tui.md` §3.2).
 pub fn choose(r: &Row) -> Result<Outcome, String> {
     let (slug, from) = (r.slug(), &r.from_ref);
+    // Hub metadata cannot prove a git ref's line. The explicit `new` path clones and validates
+    // the selected repository before it creates a session.
+    if r.source == Source::Hub {
+        return Ok(Outcome::Pick(slug));
+    }
     match r.from_line {
         Some(BranchLine::File) => Ok(Outcome::Pick(slug)),
         Some(BranchLine::Session) => Err(format!(
@@ -311,6 +327,162 @@ fn gather(from: &str, local_only: bool) -> Input {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HubStatus {
+    SignedOut,
+    Loading,
+    Ready,
+    Unavailable,
+    SignInRequired,
+}
+
+impl HubStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SignedOut => "Hub: sign in with agit login",
+            Self::Loading => "Hub: loading repositories",
+            Self::Ready => "Hub: repositories loaded",
+            Self::Unavailable => "Hub: unavailable · r retry",
+            Self::SignInRequired => "Hub: sign in with agit login · r retry",
+        }
+    }
+
+    fn empty_text(self) -> &'static str {
+        match self {
+            Self::Loading => "Looking for your Hub repositories…\nYou can cancel with q.",
+            Self::Unavailable => {
+                "No local repositories.\nHub repositories could not be loaded.\nPress r to retry, or q to cancel.\nCreate a local repo: agit init <name>"
+            }
+            Self::SignInRequired | Self::SignedOut => {
+                "No local repositories.\nSign in to find your Hub repos: agit login\nCreate a repo: agit init <name>\nPress q to return to the shell."
+            }
+            Self::Ready => {
+                "No repositories found.\nCreate one: agit init <name>\nOr clone one: agit clone <owner>/<repo>\nPress q to return to the shell."
+            }
+        }
+    }
+}
+
+struct HubDiscovery {
+    started: bool,
+    status: HubStatus,
+    pending: Option<Receiver<Result<Vec<crate::hub::RemoteAgent>, HubStatus>>>,
+}
+
+impl HubDiscovery {
+    fn new() -> Self {
+        Self {
+            started: false,
+            status: if crate::infra::credentials::current_user().is_some() {
+                HubStatus::Loading
+            } else {
+                HubStatus::SignedOut
+            },
+            pending: None,
+        }
+    }
+
+    fn start(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        self.started = true;
+        let Some(me) = crate::infra::credentials::current_user() else {
+            self.status = HubStatus::SignedOut;
+            return;
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.status = HubStatus::Loading;
+        // Only one request may be outstanding. Dropping the picker drops its receiver, so a
+        // late response cannot update another screen or keep cancellation waiting on the Hub.
+        let spawned = std::thread::Builder::new()
+            .name("agit-repo-picker".into())
+            .spawn(move || {
+                let result = crate::hub::Client::from_env_without_refresh(Duration::from_secs(4))
+                    .agents_owned_by(&me)
+                    .map(|agents| owned_agents(agents, &me))
+                    .map_err(|error| {
+                        if error
+                            .downcast_ref::<crate::hub::client::ApiError>()
+                            .is_some_and(|error| matches!(error.status, 401 | 403))
+                        {
+                            HubStatus::SignInRequired
+                        } else {
+                            HubStatus::Unavailable
+                        }
+                    });
+                let _ = sender.send(result);
+            });
+        if spawned.is_ok() {
+            self.pending = Some(receiver);
+        } else {
+            self.status = HubStatus::Unavailable;
+        }
+    }
+
+    fn poll(&mut self, rows: &mut Vec<Row>, from: &str) -> bool {
+        let Some(receiver) = &self.pending else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => Err(HubStatus::Unavailable),
+        };
+        self.pending = None;
+        match result {
+            Ok(agents) => {
+                merge_hub_rows(rows, agents, from);
+                self.status = HubStatus::Ready;
+                true
+            }
+            Err(status) => {
+                self.status = status;
+                false
+            }
+        }
+    }
+}
+
+fn owned_agents(agents: Vec<crate::hub::RemoteAgent>, me: &str) -> Vec<crate::hub::RemoteAgent> {
+    agents
+        .into_iter()
+        .filter(|agent| {
+            agent.owner == me
+                && [&agent.owner, &agent.name].into_iter().all(|part| {
+                    part.trim() == part.as_str() && crate::domain::repo::valid_name(part).is_ok()
+                })
+        })
+        .collect()
+}
+
+fn merge_hub_rows(rows: &mut Vec<Row>, agents: Vec<crate::hub::RemoteAgent>, from: &str) {
+    rows.retain(|row| row.source == Source::Local);
+    let mut slugs: std::collections::HashSet<String> = rows.iter().map(Row::slug).collect();
+    let mut remote: Vec<Row> = agents
+        .into_iter()
+        .filter_map(|agent| {
+            if !slugs.insert(agent.slug()) {
+                return None;
+            }
+            Some(Row {
+                source: Source::Hub,
+                owner: agent.owner,
+                name: agent.name,
+                // A Hub row has no checkout. Filesystem reads are gated on Source::Local.
+                path: PathBuf::new(),
+                sessions: agent.session_count,
+                from_ref: from.to_string(),
+                from_line: None,
+                branches: Vec::new(),
+                read_only: false,
+            })
+        })
+        .collect();
+    remote.sort_by_key(Row::slug);
+    rows.extend(remote);
+}
+
 // ── Screen: rendering and keys ────────────────────────────────────────
 
 use crate::tui::widgets::{self, Filter};
@@ -328,25 +500,18 @@ pub struct Picked {
 
 /// One pass of "pick a repo → name it". `None` = the user gave up, or there is nothing to pick.
 pub fn pick(from: &str) -> crate::Result<Option<Picked>> {
-    let rows = collect(from);
-    if rows.is_empty() {
-        // No candidates means no empty shell: making the user press q at an empty list wastes
-        // an interaction.
-        println!("no agit repo on this machine yet.");
-        crate::ui::hint(
-            "make one with `agit init <name>`, or fetch one with `agit clone <owner>/<repo>`",
-        );
-        return Ok(None);
-    }
+    let mut rows = collect(from);
+    let mut hub = HubDiscovery::new();
     widgets::refresh_rc_status();
     let picked = {
         let mut guard = crate::tui::term::Guard::enter()?;
-        let out = run_loop(&rows);
+        let out = run_loop(&mut rows, from, &mut hub);
         // Give the terminal back first: the questions and summary below belong in the scrollback,
         // not in the alt screen.
         guard.suspend()?;
         out?
     };
+    drop(hub);
     let Outcome::Pick(slug) = picked else {
         return Ok(None);
     };
@@ -370,8 +535,18 @@ fn name_it(slug: &str, row: Option<&Row>) -> Option<String> {
             "  {}  {} {}",
             crate::ui::dim("from    "),
             r.from_ref,
-            crate::ui::dim(&format!("({})", line_label(r.from_line)))
+            crate::ui::dim(&format!(
+                "({})",
+                if r.source == Source::Hub {
+                    "verified after clone"
+                } else {
+                    line_label(r.from_line)
+                }
+            ))
         );
+        if r.source == Source::Hub {
+            println!("  source   Hub — cloned after you enter a branch name");
+        }
         if r.read_only {
             println!(
                 "  {}  {} is a read-only checkout — publishing needs `agit push --mine`",
@@ -394,6 +569,29 @@ fn name_it(slug: &str, row: Option<&Row>) -> Option<String> {
             crate::ui::error("a name is required.");
             continue;
         }
+        if let Err(error) = crate::domain::repo::valid_branch_name(&branch) {
+            crate::ui::error(&format!("{error:#}"));
+            continue;
+        }
+        if let Err(error) = crate::commands::target::branch_only(&format!("{slug}@{branch}")) {
+            crate::ui::error(&format!("{error:#}"));
+            continue;
+        }
+        match std::process::Command::new("git")
+            .args(["check-ref-format", "--branch", &branch])
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(_) => {
+                crate::ui::error(&format!("invalid branch name `{branch}`; choose another."));
+                continue;
+            }
+            Err(error) => {
+                crate::ui::error(&format!("cannot validate the branch name: {error:#}"));
+                continue;
+            }
+        }
         if row.is_some_and(|r| r.branches.contains(&branch)) {
             crate::ui::error(&format!(
                 "`{branch}` already exists in {slug} — pick another."
@@ -413,7 +611,7 @@ fn line_label(line: Option<BranchLine>) -> &'static str {
     }
 }
 
-fn run_loop(rows: &[Row]) -> crate::Result<Outcome> {
+fn run_loop(rows: &mut Vec<Row>, from: &str, hub: &mut HubDiscovery) -> crate::Result<Outcome> {
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     let mut state = ListState::default();
     state.select(Some(0));
@@ -424,10 +622,26 @@ fn run_loop(rows: &[Row]) -> crate::Result<Outcome> {
     let mut shared: std::collections::HashMap<String, Shared> = std::collections::HashMap::new();
 
     loop {
+        let selected = rows
+            .iter()
+            .filter(|r| filter.matches(&r.haystack()))
+            .nth(state.selected().unwrap_or(0))
+            .map(Row::slug);
+        if hub.poll(rows, from) {
+            let index = selected.as_ref().and_then(|slug| {
+                rows.iter()
+                    .filter(|r| filter.matches(&r.haystack()))
+                    .position(|r| r.slug() == *slug)
+            });
+            state.select(index.or(Some(0)));
+        }
         let view: Vec<&Row> = rows
             .iter()
             .filter(|r| filter.matches(&r.haystack()))
             .collect();
+        if state.selected().is_none() && !view.is_empty() {
+            state.select(Some(0));
+        }
         if state.selected().unwrap_or(0) >= view.len() {
             state.select(if view.is_empty() {
                 None
@@ -435,15 +649,37 @@ fn run_loop(rows: &[Row]) -> crate::Result<Outcome> {
                 Some(view.len() - 1)
             });
         }
-        if let Some(r) = state.selected().and_then(|i| view.get(i)) {
+        if let Some(r) = state.selected().and_then(|i| view.get(i))
+            && r.source == Source::Local
+        {
             let key = r.slug();
             shared.entry(key).or_insert_with(|| read_shared(r));
         }
-        term.draw(|f| draw(f, &view, &mut state, &filter, &shared, notice.as_deref()))?;
-
+        term.draw(|f| {
+            draw(
+                f,
+                &view,
+                &mut state,
+                &filter,
+                &shared,
+                notice.as_deref(),
+                &hub.status,
+            )
+        })?;
+        // Render local choices before starting network work. A slow Hub must not hold the
+        // first frame or prevent the user from leaving the screen.
+        if !hub.started {
+            hub.start();
+        }
+        if hub.pending.is_some() && !crossterm::event::poll(Duration::from_millis(80))? {
+            continue;
+        }
         let Some(key) = crate::tui::term::next_key()? else {
             continue;
         };
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(Outcome::Quit);
+        }
         if filter.is_active() {
             match key.code {
                 KeyCode::Esc => filter.close(),
@@ -458,10 +694,8 @@ fn run_loop(rows: &[Row]) -> crate::Result<Outcome> {
         let n = view.len();
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(Outcome::Quit),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(Outcome::Quit);
-            }
             KeyCode::Char('/') => filter.open(),
+            KeyCode::Char('r') => hub.start(),
             KeyCode::Down | KeyCode::Char('j') => {
                 let i = state.selected().unwrap_or(0);
                 state.select(Some((i + 1).min(n.saturating_sub(1))));
@@ -510,6 +744,7 @@ fn draw(
     filter: &Filter,
     shared: &std::collections::HashMap<String, Shared>,
     notice: Option<&str>,
+    hub_status: &HubStatus,
 ) {
     let panes = widgets::layout(f.area());
     widgets::render_status(
@@ -524,24 +759,48 @@ fn draw(
         },
     );
     let list_area = widgets::list_area_with_notice(f, panes, notice);
+    let list_panes = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(list_area);
+    f.render_widget(
+        Paragraph::new(hub_status.label()).style(Style::default().fg(theme::MUTED)),
+        list_panes[0],
+    );
+    let list_area = list_panes[1];
 
     let items: Vec<ListItem> = view.iter().map(|r| ListItem::new(row_lines(r))).collect();
     let title = match filter.hint() {
         Some(q) => format!("pick a repo  {q}"),
         None => format!("pick a repo ({})", view.len()),
     };
-    f.render_stateful_widget(
-        List::new(items)
-            .block(widgets::pane(&title))
-            .highlight_style(theme::selected())
-            .highlight_symbol("▸ "),
-        list_area,
-        state,
-    );
+    if view.is_empty() {
+        let text = if filter.hint().is_some() {
+            "Nothing matches this filter."
+        } else {
+            hub_status.empty_text()
+        };
+        f.render_widget(
+            Paragraph::new(text)
+                .block(widgets::pane(&title))
+                .wrap(Wrap { trim: false }),
+            list_area,
+        );
+    } else {
+        f.render_stateful_widget(
+            List::new(items)
+                .block(widgets::pane(&title))
+                .highlight_style(theme::selected())
+                .highlight_symbol("▸ "),
+            list_area,
+            state,
+        );
+    }
 
     if let Some(area) = panes.detail {
         let sel = state.selected().and_then(|i| view.get(i)).copied();
-        let text = detail_text(sel, sel.and_then(|r| shared.get(&r.slug())), notice);
+        let text = if sel.is_none() && filter.hint().is_none() {
+            hub_status.empty_text().to_string()
+        } else {
+            detail_text(sel, sel.and_then(|r| shared.get(&r.slug())), notice)
+        };
         f.render_widget(
             Paragraph::new(text)
                 .block(widgets::pane("inherits"))
@@ -555,7 +814,7 @@ fn draw(
         if filter.is_active() {
             "type to filter   enter apply   esc cancel"
         } else {
-            "↑↓ move   enter pick   / filter   q cancel"
+            "↑↓ move   enter pick   / filter   r retry   q cancel"
         },
     );
 }
@@ -570,7 +829,10 @@ fn draw(
 /// line and the status another, and neither depends on width to survive.
 fn row_lines(r: &Row) -> Vec<Line<'static>> {
     let mut status = vec![Span::styled(
-        format!("  {}", plural(r.sessions, "session")),
+        match r.source {
+            Source::Local => format!("  {}", plural(r.sessions, "session")),
+            Source::Hub => "  Hub · clone on selection".to_string(),
+        },
         Style::default().fg(theme::MUTED),
     )];
     if r.read_only {
@@ -600,6 +862,14 @@ fn detail_text(r: Option<&Row>, shared: Option<&Shared>, notice: Option<&str>) -
         out.push_str("\n\n");
     }
     out.push_str(&format!("repo      {}\n", r.slug()));
+    if r.source == Source::Hub {
+        out.push_str(&format!(
+            "source    Hub (not cloned)\nfrom      {} (verified after clone)\n",
+            r.from_ref
+        ));
+        out.push_str("\nAfter you select this repo and name the session, agit clones it locally and validates the inheritance point.\n\nNo repository or branch is created on the Hub.");
+        return out;
+    }
     out.push_str(&format!(
         "from      {} ({})\n",
         r.from_ref,
@@ -662,6 +932,91 @@ mod tests {
             from: from.into(),
             scans,
         }
+    }
+
+    fn remote(owner: &str, name: &str) -> crate::hub::RemoteAgent {
+        crate::hub::RemoteAgent {
+            agent_id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+            owner: owner.into(),
+            name: name.into(),
+            clone_url: "https://example.test/unused.git".into(),
+            visibility: "private".into(),
+            session_count: 8,
+            updated_at: None,
+            last_gist: None,
+        }
+    }
+
+    #[test]
+    fn hub_choices_are_owned_repositories_with_safe_exact_slugs() {
+        let agents = owned_agents(
+            vec![
+                remote("nana", "mine"),
+                remote("other", "visible"),
+                remote("nana", "../escape"),
+                remote("nana", "bad\u{1b}[2J"),
+                remote("nana", " padded "),
+            ],
+            "nana",
+        );
+        assert_eq!(
+            agents.iter().map(|agent| agent.slug()).collect::<Vec<_>>(),
+            ["nana/mine"]
+        );
+    }
+
+    #[test]
+    fn remote_discovery_preserves_local_validation_and_deduplicates_exact_slugs() {
+        let mut rows = assemble(&me(vec![
+            scan("nana", "broken", &[None]),
+            scan("other", "shared", &[Some(BranchLine::File)]),
+        ]));
+        merge_hub_rows(
+            &mut rows,
+            vec![
+                remote("nana", "shared"),
+                remote("nana", "broken"),
+                remote("nana", "shared"),
+            ],
+            "release",
+        );
+        assert_eq!(
+            rows.iter().map(Row::slug).collect::<Vec<_>>(),
+            ["nana/broken", "other/shared", "nana/shared"]
+        );
+        assert_eq!(rows[0].source, Source::Local);
+        assert!(
+            choose(&rows[0]).is_err(),
+            "Hub metadata cannot hide a broken local file line"
+        );
+        let hub = &rows[2];
+        assert_eq!(hub.source, Source::Hub);
+        assert_eq!(hub.from_ref, "release");
+        assert_eq!(choose(hub), Ok(Outcome::Pick("nana/shared".into())));
+        let text = detail_text(Some(hub), None, None);
+        assert!(text.contains("release (verified after clone)"), "{text}");
+        assert!(
+            !text.contains("no declaration"),
+            "unknown remote refs are not corrupt local refs"
+        );
+    }
+
+    #[test]
+    fn discovery_failure_keeps_rows_and_allows_retry_without_an_outstanding_worker() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut discovery = HubDiscovery {
+            started: true,
+            status: HubStatus::Loading,
+            pending: Some(receiver),
+        };
+        let mut rows = assemble(&me(vec![scan("nana", "mine", &[Some(BranchLine::File)])]));
+        assert!(!discovery.poll(&mut rows, "main"));
+        assert!(discovery.pending.is_some());
+        sender.send(Err(HubStatus::Unavailable)).unwrap();
+        assert!(!discovery.poll(&mut rows, "main"));
+        assert!(discovery.pending.is_none());
+        assert_eq!(rows[0].slug(), "nana/mine");
+        assert!(discovery.status.label().contains("r retry"));
     }
 
     /// The session count counts session lines only.
@@ -896,6 +1251,7 @@ mod tests {
                 &Filter::default(),
                 &std::collections::HashMap::new(),
                 None,
+                &HubStatus::SignedOut,
             )
         })
         .unwrap();

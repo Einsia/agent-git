@@ -15,7 +15,7 @@ agit pull [REPO] [options]
 
 | Option | Meaning |
 |---|---|
-| `[REPO]` | `<owner/name>`; context resolution when omitted |
+| `[REPO]` | `<owner/name>@<branch>` or a bare repo; an omitted repo requires `AGIT_SESSION` |
 | `-b, --branch <branch>` | Branches to pull; repeatable |
 | `--all` | Pull every local branch |
 | `--prune` | Remove missing remote refs when supported by the CLI |
@@ -23,11 +23,11 @@ agit pull [REPO] [options]
 
 ## Selection
 
-Without `--all` or `-b`, a context branch limits the pull to that branch; without branch context, the command may pull all local branches. Only fast-forward is accepted. Missing local branches, missing upstreams, and divergence are skipped with warnings.
+An explicit `owner/repo@branch` pulls that branch and cannot be combined with `-b` or `--all`. For a bare repo, `-b` selects branches; otherwise all local branches are considered. When the repo is omitted, `AGIT_SESSION` selects both repo and branch unless `-b` or `--all` overrides the branch selection. Only fast-forward is accepted. Missing local branches, missing upstreams, and divergence are skipped with warnings.
 
 ## Examples
 
 ```bash
 agit pull szh/p1 -b feature-a
-agit pull --all
+agit pull szh/p1 --all
 ```

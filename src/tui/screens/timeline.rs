@@ -588,6 +588,7 @@ mod tests {
     fn turn(n: u32, subject: &str) -> Turn {
         Turn {
             turn: Some(n),
+            oid: format!("{n:0>40}"),
             short: format!("{n:0>9}"),
             kind: Kind::Turn,
             subject: subject.into(),

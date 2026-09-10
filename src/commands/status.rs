@@ -23,9 +23,19 @@ pub struct Args {
     /// Also inspect runtime indexes for unadopted sessions (slower; SQLite may maintain sidecars)
     #[arg(long)]
     pub check_missing: bool,
+    /// Session rows per page (text: 8; JSON: 100).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    pub limit: Option<u16>,
+    /// Skip this many session rows.
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
 }
 
 pub fn run(args: Args) -> CmdResult {
+    if super::json::requested() {
+        return structured(&args);
+    }
+    let limit = args.limit.unwrap_or(8) as usize;
     let s = ui::theme::symbols();
 
     // ── Who am I (PRD status, first block: the context resolution result and its route) ──
@@ -53,7 +63,7 @@ pub fn run(args: Args) -> CmdResult {
     if store.is_none() {
         println!("  no sessions adopted yet.");
         ui::hint(
-            "`agit import -n <name>` lists this repo’s sessions — pick one and record its first version",
+            "`agit import` opens the session picker; use `agit import <id> --into <owner/repo>@<branch>` for an explicit target",
         );
     }
 
@@ -79,7 +89,8 @@ pub fn run(args: Args) -> CmdResult {
     if !links.is_empty() {
         let rows: Vec<Vec<String>> = links
             .iter()
-            .take(8)
+            .skip(args.offset)
+            .take(limit)
             .map(|l| {
                 vec![
                     link::short(&l.session_id),
@@ -99,8 +110,11 @@ pub fn run(args: Args) -> CmdResult {
             "{}",
             ui::table::render(&["session", "runtime", "AGENT", "state"], &rows)
         );
-        if links.len() > 8 {
-            println!("{}", ui::dim(&format!("… {} more", links.len() - 8)));
+        let remaining = links
+            .len()
+            .saturating_sub(args.offset.saturating_add(limit));
+        if remaining > 0 {
+            println!("{}", ui::dim(&format!("… {remaining} more")));
         }
     }
 
@@ -191,14 +205,15 @@ pub fn run(args: Args) -> CmdResult {
     if args.check_missing {
         ui::section("unadopted sessions");
         let sp = ui::spinner("checking runtime indexes…");
-        let missing = uncaptured(&links);
+        let discovery = uncaptured(&links);
+        let missing = &discovery.sessions;
         sp.finish_and_clear();
-        if missing.is_empty() {
+        if missing.is_empty() && discovery.errors.is_empty() {
             println!(
-                "  {} every session in this repo is adopted",
+                "  {} no unadopted sessions found in the checked indexes",
                 ui::ok(s.check)
             );
-        } else {
+        } else if !missing.is_empty() {
             println!(
                 "  {} {} sessions not adopted yet",
                 ui::dim(s.idle),
@@ -219,6 +234,12 @@ pub fn run(args: Args) -> CmdResult {
                 "`agit import <session-id> --from <runtime> --into <owner/repo>@<branch>` lets you choose its lineage",
             );
         }
+        for error in discovery.errors {
+            ui::warning(&format!(
+                "{} index could not be checked: {}",
+                error.runtime, error.message
+            ));
+        }
     } else {
         ui::hint("--check-missing lists this repo’s unadopted sessions");
     }
@@ -226,24 +247,142 @@ pub fn run(args: Args) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
-/// Sessions in this repo that are not adopted yet.
-///
-/// Uses only the runtime indexes (Codex queries the `threads` table, CC reads a directory),
-/// **opening no transcript**.
-fn uncaptured(links: &[link::Link]) -> Vec<(&'static str, String)> {
-    let Some(repo) = config::repo_root().or_else(|| std::env::current_dir().ok()) else {
-        return vec![];
+fn structured(args: &Args) -> CmdResult {
+    let cwd = std::env::current_dir()?;
+    let selection = match super::context::resolve(&cwd) {
+        Ok(context) => serde_json::json!({
+            "repo": context.repo, "branch": context.branch, "source": context.via,
+        }),
+        Err(error) => {
+            serde_json::json!({"repo": null, "branch": null, "reason": error.to_string()})
+        }
     };
-    let known: std::collections::HashSet<_> = links.iter().map(|l| l.session_id.as_str()).collect();
+    let store = Store::open()?;
+    let mut links = store.as_ref().map(link::list).unwrap_or_default();
+    links.sort_by_key(|link| !link.is_active());
+    let limit = args.limit.unwrap_or(100) as usize;
+    let items: Vec<_> = links
+        .iter()
+        .skip(args.offset)
+        .take(limit)
+        .map(|link| {
+            let target = match (&link.owner, &link.agent, &link.branch) {
+                (Some(owner), Some(repo), Some(branch)) => Some(format!("{owner}/{repo}@{branch}")),
+                _ => None,
+            };
+            serde_json::json!({
+                "runtime": link.source, "session_id": link.session_id,
+                "owner": link.owner, "repository_name": link.agent, "branch": link.branch,
+                "target": target, "cwd": link.cwd, "active": link.is_active(),
+                "superseded_by": link.superseded_by,
+            })
+        })
+        .collect();
+    let next = args.offset.saturating_add(items.len());
+    let agents = super::clone::list_local()?;
+    let mut repositories = Vec::new();
+    let mut remaining = 128;
+    let mut repositories_omitted = 0;
+    for (index, (owner, name, path)) in agents.iter().enumerate() {
+        if remaining == 0 {
+            repositories_omitted = agents.len() - index;
+            break;
+        }
+        let branch_sync = match branches::inspect(&Repo::at(path), remaining) {
+            Ok(page) => {
+                remaining -= page.branches.len().max(1);
+                serde_json::json!({
+                    "items": page.branches, "omitted": page.omitted, "error": null,
+                })
+            }
+            Err(error) => {
+                remaining -= 1;
+                serde_json::json!({"items": null, "omitted": null, "error": format!("{error:#}")})
+            }
+        };
+        repositories.push(serde_json::json!({
+            "repo": format!("{owner}/{name}"), "path": path, "branches": branch_sync,
+        }));
+    }
+    let missing = if args.check_missing {
+        let discovery = uncaptured(&links);
+        Some((discovery.sessions.into_iter().map(|(runtime, session_id)| {
+            serde_json::json!({"runtime": runtime, "session_id": session_id})
+        }).collect::<Vec<_>>(), discovery.errors))
+    } else {
+        None
+    };
+    let code_repo = config::repo_root();
+    let adopted_here = code_repo.as_ref().map(|root| {
+        links
+            .iter()
+            .filter(|link| link.cwd.as_deref() == root.to_str())
+            .count()
+    });
+    let result = serde_json::json!({
+        "schema_version": 1, "cwd": cwd, "selection": selection,
+        "bound_repo": crate::domain::workspace::read(&cwd).map(|workspace| workspace.repo),
+        "store_path": store.as_ref().map(|store| store.root()),
+        "sessions": {"items": items, "total": links.len(), "offset": args.offset,
+            "limit": limit, "next_offset": (next < links.len()).then_some(next)},
+        "repositories": repositories, "repositories_omitted": repositories_omitted,
+        "code_repository": {"path": code_repo, "adopted_sessions": adopted_here},
+        "unadopted": {"checked": args.check_missing,
+            "sessions": missing.as_ref().map(|(sessions, _)| sessions),
+            "incomplete": missing.as_ref().map(|(_, errors)| !errors.is_empty()),
+            "errors": missing.as_ref().map(|(_, errors)| errors)},
+    });
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(ExitCode::Ok)
+}
 
-    let mut out = vec![];
+#[derive(Default)]
+struct Discovery {
+    sessions: Vec<(&'static str, String)>,
+    errors: Vec<IndexError>,
+}
+
+#[derive(serde::Serialize)]
+struct IndexError {
+    runtime: &'static str,
+    message: String,
+}
+
+/// Runtime indexes define discovery; an unreadable index is not evidence of an empty one.
+fn uncaptured(links: &[link::Link]) -> Discovery {
+    let Some(repo) = config::repo_root().or_else(|| std::env::current_dir().ok()) else {
+        return Discovery::default();
+    };
+    let mut known: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
+        std::collections::HashMap::new();
+    for link in links {
+        known
+            .entry(&link.source)
+            .or_default()
+            .insert(&link.session_id);
+    }
+
+    let mut out = Discovery::default();
     for rt in crate::adapter::RUNTIMES {
         let Ok(ad) = crate::adapter::get(rt) else {
             continue;
         };
-        for sr in ad.sessions_for(&repo).unwrap_or_default() {
-            if !known.contains(sr.id.as_str()) {
-                out.push((ad.id(), sr.id));
+        let sessions = match ad.sessions_for(&repo) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                out.errors.push(IndexError {
+                    runtime: ad.id(),
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+        for sr in sessions {
+            if !known
+                .get(ad.id())
+                .is_some_and(|ids| ids.contains(sr.id.as_str()))
+            {
+                out.sessions.push((ad.id(), sr.id));
             }
         }
     }
@@ -258,7 +397,9 @@ mod tests {
         // default path.
         assert!(
             !super::Args {
-                check_missing: false
+                check_missing: false,
+                limit: None,
+                offset: 0,
             }
             .check_missing
         );

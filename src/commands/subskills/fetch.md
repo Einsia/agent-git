@@ -19,7 +19,7 @@ agit fetch [repo] [options]
 
 | Option | Meaning |
 |---|---|
-| `[repo]` | `<owner/name>`; context/remote resolution when omitted |
+| `[repo]` | `<owner/name>`; an omitted repo requires `AGIT_SESSION` and fetches that repo's origin |
 | `--all` | Process every local Agent repo with an `origin` |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 

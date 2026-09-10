@@ -541,13 +541,10 @@ fn whoami_only_contacts_the_hub_for_explicit_identity_verification() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    if agit::infra::config::is_production_release() {
-        assert!(
-            hub.requests()
-                .iter()
-                .any(|request| request.target == "/api/cli/version")
-        );
-    }
+    assert!(
+        hub.requests().is_empty(),
+        "redirected config must stay offline"
+    );
     hub.requests.lock().unwrap().clear();
 
     let lab = Lab::new();

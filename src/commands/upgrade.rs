@@ -437,14 +437,14 @@ fn save_cache(latest: &str) {
 pub fn maybe_startup_nudge(command: &str, json: bool) {
     let quiet = std::env::var_os("AGIT_QUIET").is_some();
     let ci = std::env::var_os("CI").is_some();
-    if !startup_nudge_allowed(command, json, quiet, ci) {
+    if !startup_nudge_allowed(command, json, quiet, ci, ui::is_tty()) {
         return;
     }
     maybe_nudge_with_timeout(std::time::Duration::from_secs(NUDGE_TIMEOUT_SECS));
 }
 
-fn startup_nudge_allowed(command: &str, json: bool, quiet: bool, ci: bool) -> bool {
-    !json
+fn startup_nudge_allowed(command: &str, json: bool, quiet: bool, ci: bool, tty: bool) -> bool {
+    tty && !json
         && !quiet
         && !ci
         && !matches!(
@@ -515,16 +515,17 @@ mod tests {
 
     #[test]
     fn startup_nudge_is_only_for_interactive_user_commands() {
-        assert!(startup_nudge_allowed("run", false, false, false));
-        assert!(startup_nudge_allowed("resume", false, false, false));
-        assert!(startup_nudge_allowed("push", false, false, false));
+        assert!(startup_nudge_allowed("open", false, false, false, true));
+        assert!(startup_nudge_allowed("resume", false, false, false, true));
+        assert!(startup_nudge_allowed("push", false, false, false, true));
+        assert!(!startup_nudge_allowed("search", false, false, false, false));
         for command in [
             "upgrade", "hooks", "mcp", "status", "doctor", "whoami", "diff",
         ] {
-            assert!(!startup_nudge_allowed(command, false, false, false));
+            assert!(!startup_nudge_allowed(command, false, false, false, true));
         }
-        assert!(!startup_nudge_allowed("run", true, false, false));
-        assert!(!startup_nudge_allowed("run", false, true, false));
-        assert!(!startup_nudge_allowed("run", false, false, true));
+        assert!(!startup_nudge_allowed("open", true, false, false, true));
+        assert!(!startup_nudge_allowed("open", false, true, false, true));
+        assert!(!startup_nudge_allowed("open", false, false, true, true));
     }
 }

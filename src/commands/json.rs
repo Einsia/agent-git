@@ -133,6 +133,11 @@ pub(crate) fn is_capturing() -> bool {
     CAPTURING.get()
 }
 
+/// Command-specific serializers use the active envelope mode.
+pub fn requested() -> bool {
+    is_capturing()
+}
+
 struct CaptureScope(bool);
 
 impl CaptureScope {
@@ -368,7 +373,11 @@ pub fn command_from_argv(args: &[std::ffi::OsString]) -> String {
         if arg.starts_with('-') {
             continue;
         }
-        return arg.into_owned();
+        return if arg == "run" {
+            "open".to_owned()
+        } else {
+            arg.into_owned()
+        };
     }
     "cli".to_string()
 }

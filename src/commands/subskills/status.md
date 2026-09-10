@@ -26,6 +26,7 @@ agit status
 | Option | Meaning |
 |---|---|
 | `--check-missing` | Also inspect runtime indexes for unadopted sessions; SQLite may maintain WAL sidecar files |
+| `--limit <n>` / `--offset <n>` | Page adopted sessions; limit 1–1000, default 8 for text and 100 for JSON |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
 ## Reading the output
@@ -33,6 +34,21 @@ agit status
 The explicit `--check-missing` option uses the runtime index readers and may cause SQLite to
 maintain its sidecar files. Use default status when inspection must leave local files unchanged.
 Neither form performs a startup migration or an update check.
+
+With `--json`, `result.value` contains typed selection, workspace binding,
+session identities, repository heads, and fetched-ref synchronization counts.
+`sessions.next_offset` continues the session page; it is null when no rows remain.
+Session IDs are complete and paired with their runtime, and superseded claims
+remain explicitly marked. A bound repository does not populate `selection`.
+`unadopted.checked=false` and `sessions=null` mean the optional index scan did
+not run; they are not evidence that every runtime session is adopted.
+
+Explicit discovery also works before the first adoption, without creating an
+AgentGit store. Runtime and native ID together identify a session; an adopted
+Claude ID does not hide an equal Codex ID. Known index failures are reported in
+`unadopted.errors` and mark `unadopted.incomplete=true`. Discovery reflects the
+runtime indexes available to this machine, rather than proving that no other
+conversation exists.
 
 - `no session target supplied through AGIT_SESSION`: no usable explicit process identity.
 - `bound repo`: the cwd's Agent repo route; it does not prove that a branch exists.

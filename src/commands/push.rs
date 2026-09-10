@@ -129,25 +129,36 @@ pub struct Args {
     pub dry_run: bool,
 }
 
-pub fn run(args: Args) -> CmdResult {
+pub fn run(mut args: Args) -> CmdResult {
     if crate::rc::harness::settlement_is_delegated() {
         ui::error(crate::rc::harness::SUPERVISED_SETTLEMENT_MESSAGE);
         ui::hint("finish the turn and let agitd push it under the live identity lease");
         return Ok(ExitCode::Failure);
     }
+    // The context resolves once: it answers both "which repo" and "which branch", and both
+    // answers must come from the same resolution — otherwise "repo from the context, branch
+    // from the checkout" is a half-right, half-wrong combination.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    if args.agent.is_none() && args.branch.is_empty() && !args.all {
+        match crate::tui::should_enter() {
+            crate::tui::Verdict::Enter => {
+                let Some(picked) = crate::tui::screens::history::pick(&cwd, "agit push")? else {
+                    return Ok(ExitCode::Ok);
+                };
+                args.agent = Some(picked.target());
+            }
+            crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
+            crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
+            crate::tui::Verdict::Skip => {}
+        }
+    }
     let client = require_login()?;
     let s = ui::theme::symbols();
-
     let Some(me) = credentials::current_user() else {
         ui::error("no account name in the stored credentials.");
         ui::hint("re-run `agit login`");
         return Ok(ExitCode::Failure);
     };
-
-    // The context resolves once: it answers both "which repo" and "which branch", and both
-    // answers must come from the same resolution — otherwise "repo from the context, branch
-    // from the checkout" is a half-right, half-wrong combination.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let ctx = super::context::resolve(&cwd).ok();
 
     // ── 1. Decide which agent to push ──
