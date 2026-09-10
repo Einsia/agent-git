@@ -27,6 +27,9 @@ pub struct Args {
     /// Note (goes into the commit message).
     #[arg(short = 'm', long)]
     pub message: Option<String>,
+    /// Refuse unless the target still has this reviewed commit as its head.
+    #[arg(long, value_name = "SHA")]
+    pub expected_head: Option<String>,
 }
 
 /// When the ref itself spells out `owner/repo@branch`, that branch is where it lands (`--into`
@@ -52,6 +55,39 @@ pub fn run(args: Args) -> CmdResult {
         ui::error("no ref to drop was given.");
         ui::hint("e.g.: agit revert @#12.4  or  agit revert @#7");
         return Ok(ExitCode::Usage);
+    }
+    if args
+        .expected_head
+        .as_deref()
+        .is_some_and(|head| head.len() != 40 || !head.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        ui::error("--expected-head requires a full commit SHA.");
+        return Ok(ExitCode::Usage);
+    }
+    if args.expected_head.is_some() {
+        // Inspection ignores inherited routing, so publication must refuse those overrides.
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_SHALLOW_FILE",
+            "GIT_GRAFT_FILE",
+            "GIT_PREFIX",
+        ] {
+            if std::env::var_os(key).is_some() {
+                ui::error(&format!(
+                    "unset {key} before applying a reviewed VIEW change; no repository was changed."
+                ));
+                return Ok(ExitCode::Precondition);
+            }
+        }
     }
     let specs = args
         .refs_
@@ -121,13 +157,44 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Usage);
         }
     }
-    if super::branch::is_sealed(&repo, &target) {
+    let read_repo = if args.expected_head.is_some() {
+        repo.clone().local_objects_only()
+    } else {
+        repo.clone()
+    };
+    if args.expected_head.is_some()
+        && let Err(error) = super::migration::check_readonly_repo_startup_local(&read_repo)
+    {
+        ui::error(&format!(
+            "guarded revert requires settled local storage: {error:#}"
+        ));
+        return Ok(ExitCode::Precondition);
+    }
+    if super::branch::is_sealed(&read_repo, &target) {
         ui::error(&format!("`{target}` is sealed."));
         return Ok(ExitCode::Policy);
     }
 
-    let head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
+    let head = read_repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
     let head = head.trim().to_string();
+    if !matches_expected_head(&head, args.expected_head.as_deref()) {
+        ui::error("the target changed after it was reviewed; no VIEW or branch was changed.");
+        ui::hint("review the current branch again before applying its new remedy");
+        return Ok(ExitCode::Precondition);
+    }
+    let guarded_log = if args.expected_head.is_some() {
+        match super::scan::freeze_review_log(&read_repo, &head) {
+            Ok(proof) => Some(proof),
+            Err(_) => {
+                ui::error(
+                    "guarded revert requires complete immutable history; no VIEW or branch was changed.",
+                );
+                return Ok(ExitCode::Precondition);
+            }
+        }
+    } else {
+        None
+    };
     let Some(snap) = meta::read_at_ref(&repo, &head) else {
         ui::error(&format!(
             "`{target}` carries no {} — its line was never declared.",
@@ -154,7 +221,8 @@ pub fn run(args: Args) -> CmdResult {
     for (r, spec) in args.refs_.iter().zip(&specs) {
         let src_head = match &spec.base {
             refs::Base::At => head.clone(),
-            refs::Base::Name(b) | refs::Base::SessionBranch(b) => repo
+            refs::Base::Name(b) | refs::Base::SessionBranch(b) if b == &target => head.clone(),
+            refs::Base::Name(b) | refs::Base::SessionBranch(b) => read_repo
                 .git(&["rev-parse", &format!("refs/heads/{b}")])
                 .map(|s| s.trim().to_string())?,
             refs::Base::Default => {
@@ -162,12 +230,37 @@ pub fn run(args: Args) -> CmdResult {
                 return Ok(ExitCode::Ref);
             }
         };
-        let raw = storage::materialize_at(repo.root(), &src_head, meta::LOG_FILE)?;
+        let source_log = if guarded_log.is_some() && src_head != head {
+            match super::scan::freeze_review_log(&read_repo, &src_head) {
+                Ok(proof) => Some(proof),
+                Err(_) => {
+                    ui::error(
+                        "guarded revert source requires complete immutable history; no VIEW or branch was changed.",
+                    );
+                    return Ok(ExitCode::Precondition);
+                }
+            }
+        } else {
+            None
+        };
+        let proof = source_log.as_ref().or(guarded_log.as_ref());
+        let raw = match proof {
+            Some(proof) => proof.log.clone(),
+            None => storage::materialize_at(repo.root(), &src_head, meta::LOG_FILE)?,
+        };
         let lines: Vec<&str> = raw.split_inclusive('\n').collect();
+        let turn_lines = |ordinal| -> crate::Result<(u32, Vec<usize>)> {
+            if let Some(proof) = proof {
+                proof.turn_lines(ordinal)
+            } else {
+                let turn = refs::real_turn(&repo, &src_head, ordinal)?;
+                Ok((turn, super::merge::turn_lines(&repo, &src_head, turn)?))
+            }
+        };
         match &spec.tail {
             refs::Tail::Turn(n) => {
-                let n = crate::domain::refs::real_turn(&repo, &src_head, *n)?;
-                for i in super::merge::turn_lines(&repo, &src_head, n)? {
+                let (_, selected) = turn_lines(*n)?;
+                for i in selected {
                     let line = lines.get(i).ok_or_else(|| {
                         anyhow::anyhow!("selected LOG coordinate {i} is out of bounds")
                     })?;
@@ -175,8 +268,7 @@ pub fn run(args: Args) -> CmdResult {
                 }
             }
             refs::Tail::Event { turn, index } => {
-                let n = crate::domain::refs::real_turn(&repo, &src_head, *turn)?;
-                let ls = super::merge::turn_lines(&repo, &src_head, n)?;
+                let (n, ls) = turn_lines(*turn)?;
                 match ls.get((*index as usize).saturating_sub(1)) {
                     Some(&i) => {
                         let l = lines.get(i).ok_or_else(|| {
@@ -232,6 +324,7 @@ pub fn run(args: Args) -> CmdResult {
         args.message.clone().unwrap_or_default()
     );
     let commit = super::plumbing::commit_tree(&repo, &tree, &[&head], &msg)?;
+    // The same frozen head guards both selection and the final CAS, so a concurrent advance cannot apply stale review coordinates.
     super::plumbing::update_branch_cas_and_refresh(&repo, &target, &commit, &head, false)?;
 
     super::echo::emit("revert", &selections);
@@ -243,6 +336,10 @@ pub fn run(args: Args) -> CmdResult {
         "  the evidence in the log is untouched — physical deletion would mean deleting the branch and re-distilling",
     ));
     Ok(ExitCode::Ok)
+}
+
+fn matches_expected_head(head: &str, expected: Option<&str>) -> bool {
+    expected.is_none_or(|expected| head.eq_ignore_ascii_case(expected))
 }
 
 fn add_occurrence(

@@ -23,7 +23,8 @@
 //! * `--sensitive`: **brings up a local review agent** to vet the transcript (content off the
 //!   session's topic, out-of-scope sensitive information, directory structure leaked through
 //!   absolute paths). Every entry in the report carries an `@#n.k` locator and a directly
-//!   runnable remedy (`agit revert @#12.4`). It reports; it changes nothing.
+//!   runnable remedy guarded by the reviewed head. AgentGit reports without changing LOG or VIEW;
+//!   the trusted native runtime retains its authentication housekeeping and administrator policies.
 //!
 //!   With no model available it reports the unmet precondition explicitly (exit 4) and points
 //!   at `--secrets`, which still works — it never pretends a machine reviewed anything.
@@ -35,6 +36,13 @@ use crate::domain::repo::Repo;
 use crate::domain::secrets;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
+
+mod json;
+mod review;
+mod runtime;
+mod scope;
+
+pub(super) use scope::freeze_review_log;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -154,17 +162,6 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Precondition);
     };
 
-    if args.sensitive {
-        ui::error(
-            "--sensitive needs a local review agent (model) to run; none is available on this machine.",
-        );
-        ui::hint(
-            "the structured scan still works: `agit scan --secrets` (the same one `push` runs built-in)",
-        );
-        return Ok(ExitCode::Precondition);
-    }
-
-    // --secrets: scan repo-wide, **once**.
     let targets: Vec<refs::RefSpec> = match default_branch {
         // The context branch is a branch name, never repository syntax — a
         // slash in it (`topic/foo`) must stay inside the name.
@@ -173,6 +170,18 @@ pub fn run(args: Args) -> CmdResult {
         ],
         None => parsed_refs,
     };
+    if args.sensitive {
+        let repo = repo.local_objects_only();
+        if let Err(error) = super::migration::check_readonly_repo_startup_local(&repo) {
+            ui::error(&format!(
+                "sensitive review requires settled local storage: {error:#}"
+            ));
+            return Ok(ExitCode::Precondition);
+        }
+        return run_sensitive(&repo, &slug, &targets, args.json);
+    }
+
+    // --secrets: scan repo-wide, **once**.
     // Every ref is resolved first: a mistyped ref says so before a whole-repo scan is spent on
     // it.
     //
@@ -282,6 +291,151 @@ pub fn run(args: Args) -> CmdResult {
         }
         Ok(ExitCode::Ok)
     }
+}
+
+fn run_sensitive(repo: &Repo, slug: &str, targets: &[refs::RefSpec], json: bool) -> CmdResult {
+    let selected = match scope::collect(repo, targets) {
+        Ok(selected) => selected,
+        Err(error) => {
+            if let Some(ambiguity) = error.downcast_ref::<refs::Ambiguous>() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "check": "sensitive", "status": "incomplete", "complete": false,
+                            "reason": "selected reference requires an explicit choice",
+                            "findings": [], "scopes": []
+                        })
+                    );
+                }
+                ui::error(&ambiguity.to_string());
+                return Ok(super::terminal_error_code(&error, ExitCode::Precondition));
+            }
+            let exit = if refs::is_not_found(&error) {
+                ExitCode::Ref
+            } else {
+                ExitCode::Precondition
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "check": "sensitive", "status": "incomplete", "complete": false,
+                        "reason": "selected VIEW/LOG could not be read within the review limits",
+                        "findings": [], "scopes": []
+                    })
+                );
+            }
+            ui::error(
+                "sensitive review is incomplete: the selected committed VIEW/LOG is unavailable, invalid, or exceeds the review limits.",
+            );
+            ui::hint(
+                "select a valid session ref or a smaller turn range; `agit scan --secrets` remains a separate check",
+            );
+            return Ok(exit);
+        }
+    };
+    let count: usize = selected.iter().map(|scope| scope.events.len()).sum();
+    let complete = selected
+        .iter()
+        .all(|scope| scope.unlocated_events == 0 && scope.missing_events == 0);
+    let mut scopes: Vec<serde_json::Value> = selected.iter().map(|scope| serde_json::json!({
+        "snapshot": scope.sha, "branch": scope.branch, "events_selected": scope.events.len(),
+        "events_reviewed": 0,
+        "unlocated_events": scope.unlocated_events, "missing_events": scope.missing_events,
+    })).collect();
+    let reviewed = if count == 0 {
+        Ok(Vec::new())
+    } else {
+        ui::hint(
+            "the configured local runtime/provider performs this review; native authentication housekeeping and administrator policies remain active",
+        );
+        review::prompt(&selected)
+            .and_then(|prompt| runtime::review(&prompt, &review::schema()))
+            .and_then(|response| review::validate(&response, &selected, slug))
+    };
+    let mut findings = match reviewed {
+        Ok(findings) => findings,
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "check": "sensitive", "status": "incomplete", "complete": false,
+                        "reason": error.to_string(), "findings": [], "scopes": scopes,
+                    })
+                );
+            }
+            ui::error(&format!("sensitive review is incomplete: {error}"));
+            ui::hint(
+                "check the configured local runtime; `agit scan --secrets` remains a separate deterministic check",
+            );
+            return Ok(ExitCode::Precondition);
+        }
+    };
+    for (report, scope) in scopes.iter_mut().zip(&selected) {
+        report["events_reviewed"] = serde_json::json!(scope.events.len());
+    }
+    for finding in &mut findings {
+        if selected[finding.scope]
+            .branch
+            .as_deref()
+            .is_some_and(|branch| super::branch::is_sealed(repo, branch))
+        {
+            finding.remedies.retain(|remedy| remedy.action == "inspect");
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "check": "sensitive", "status": if complete { "reviewed" } else { "incomplete" },
+                "complete": complete, "scopes": scopes, "findings": findings,
+                "evidence_log_unchanged": true,
+                "runtime": if count > 0 { Some("claude-code") } else { None },
+                "runtime_boundary": "model tools and user/project customizations are disabled; native authentication housekeeping and administrator policies remain active",
+            }))?
+        );
+    } else {
+        for finding in &findings {
+            println!(
+                "  {} {}: {}",
+                &finding.snapshot[..12],
+                finding.locator,
+                finding.explanation
+            );
+            for remedy in &finding.remedies {
+                println!("    {}", remedy.command);
+            }
+        }
+        if count == 0 {
+            println!("no located events to review in the selected VIEW");
+        } else if findings.is_empty() && complete {
+            println!("no sensitive findings reported in {count} selected VIEW events");
+        }
+    }
+    if !complete {
+        ui::error(
+            "sensitive review is incomplete: some selected VIEW events have no safe turn/event location.",
+        );
+    }
+    if !findings.is_empty() {
+        ui::hint(
+            "review each suspicion before removing it from the VIEW; revert preserves the evidence LOG",
+        );
+        if selected.iter().any(|scope| scope.branch.is_none()) {
+            ui::hint(
+                "historical snapshots have inspection remedies only; fork explicitly before changing their VIEW",
+            );
+        }
+    }
+    Ok(if !complete {
+        ExitCode::Precondition
+    } else if findings.is_empty() {
+        ExitCode::Ok
+    } else {
+        ExitCode::Policy
+    })
 }
 
 /// Every hit from one `--secrets` scan, each carrying **the location it really belongs to**.

@@ -43,6 +43,9 @@ impl Drop for OwnedHandle {
 /// (including descendants that create nested jobs on Windows 8+).
 pub(crate) struct Job {
     handle: OwnedHandle,
+    drain_on_drop: bool,
+    #[cfg(test)]
+    nonempty_accounting: std::sync::atomic::AtomicBool,
 }
 
 impl Job {
@@ -53,6 +56,9 @@ impl Job {
         }
         let job = Self {
             handle: OwnedHandle(raw),
+            drain_on_drop: true,
+            #[cfg(test)]
+            nonempty_accounting: std::sync::atomic::AtomicBool::new(false),
         };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -91,6 +97,13 @@ impl Job {
     }
 
     pub(crate) fn active_processes(&self) -> io::Result<u32> {
+        #[cfg(test)]
+        if self
+            .nonempty_accounting
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(1);
+        }
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         let queried = unsafe {
             QueryInformationJobObject(
@@ -115,6 +128,21 @@ impl Job {
         Ok(())
     }
 
+    /// Request termination and close the kill-on-close owner without draining accounting.
+    /// The result reports only the termination request, never proof that the processes exited.
+    /// A bounded caller must preserve an unverified-cleanup error after its deadline expires.
+    pub(crate) fn terminate_and_close(mut self) -> io::Result<()> {
+        let requested = self.terminate();
+        self.drain_on_drop = false;
+        requested
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_nonempty_accounting(&self) {
+        self.nonempty_accounting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) async fn wait_empty(&self) -> io::Result<()> {
         loop {
             if self.active_processes()? == 0 {
@@ -127,6 +155,9 @@ impl Job {
 
 impl Drop for Job {
     fn drop(&mut self) {
+        if !self.drain_on_drop {
+            return;
+        }
         // The ordinary path has already reaped the direct child and observed
         // ActiveProcesses == 0. This is the cancellation/panic backstop: do not
         // close the owner while its tree can still execute.

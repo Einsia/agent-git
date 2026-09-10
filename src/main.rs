@@ -125,6 +125,8 @@ fn main() {
         Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
         Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
         Commands::Doctor(_) => Startup::Inspect,
+        Commands::Scan(args) if args.sensitive => Startup::ScopedReview,
+        Commands::Revert(args) if args.expected_head.is_some() => Startup::ScopedReview,
         Commands::Import(args) if commands::import::needs_readonly_startup(args) => {
             Startup::ScopedImport
         }
@@ -133,7 +135,10 @@ fn main() {
     // A best-effort, once-a-day update hint belongs to the process startup path so it also
     // appears for ordinary commands, not only after a successful push. The helper skips the JSON
     // path because stdout there is a strict machine-readable envelope.
-    if !matches!(startup, Startup::ScopedDoctor | Startup::ScopedImport) {
+    if !matches!(
+        startup,
+        Startup::ScopedDoctor | Startup::ScopedImport | Startup::ScopedReview
+    ) {
         commands::upgrade::maybe_startup_nudge(command_name, json);
     }
     if json {
@@ -187,7 +192,10 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
     let prepared = match startup {
         Startup::Inspect => commands::migration::check_readonly_startup(),
         Startup::Migrate => commands::migration::migrate_startup().map(|_| ()),
-        Startup::ScopedDoctor | Startup::ScopedDiff | Startup::ScopedImport => Ok(()),
+        Startup::ScopedDoctor
+        | Startup::ScopedDiff
+        | Startup::ScopedImport
+        | Startup::ScopedReview => Ok(()),
     };
     if let Err(e) = prepared {
         agit::ui::error(&format!("local storage preparation failed: {e:#}"));
@@ -205,6 +213,8 @@ enum Startup {
     ScopedDiff,
     /// Explicit import inspection checks only its selected local repository before discovery.
     ScopedImport,
+    /// Review and guarded edits inspect recovery only after selecting their repository.
+    ScopedReview,
 }
 
 /// What to do when no subcommand is given and the interface is **not** entered.

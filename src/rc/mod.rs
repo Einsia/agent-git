@@ -87,7 +87,7 @@ pub mod tail;
 pub mod terminal;
 pub mod ticket;
 #[cfg(windows)]
-mod windows_job;
+pub(crate) mod windows_job;
 #[cfg(windows)]
 use crate::infra::windows_security;
 
