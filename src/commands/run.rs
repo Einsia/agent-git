@@ -121,7 +121,7 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Precondition);
         }
     };
-    if networked {
+    if networked && !ui::quiet() {
         startup_notes.push(format!("  fetched the latest history of {slug}"));
     }
 

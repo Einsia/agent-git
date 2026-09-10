@@ -394,28 +394,48 @@ fn legacy_streams(output: &Output, mode: &str) -> (String, String) {
     (stdout, stderr)
 }
 
-fn assert_legacy_acquisition(stdout: &str, stderr: &str, selected: bool) {
-    assert!(
-        stdout.starts_with("copying alice/qa into your namespace"),
-        "{stdout}"
-    );
+fn assert_legacy_acquisition(stdout: &str, stderr: &str, selected: bool, mode: &str) {
+    let quiet = mode == "--quiet";
+    if !quiet {
+        assert!(
+            stdout.starts_with("copying alice/qa into your namespace"),
+            "{stdout}"
+        );
+    }
     assert!(!stdout.lines().any(|line| line.starts_with("target:")));
     assert!(!stderr.lines().any(|line| line.starts_with("target:")));
     for message in PROMOTION_MESSAGES {
-        assert!(
-            stdout.contains(message),
-            "acquisition output changed: {stdout}"
-        );
+        if quiet && *message == PROMOTION_MESSAGES[0] {
+            assert!(
+                !stdout.contains(message),
+                "routine promotion notice escaped quiet output: {stdout}"
+            );
+        } else {
+            assert!(
+                stdout.contains(message),
+                "acquisition output changed: {stdout}"
+            );
+        }
         assert!(
             !stderr.contains(message),
             "acquisition output moved to diagnostics: {stderr}"
         );
     }
     let acquired = stdout.find("keep working: agit commit qa").unwrap();
-    let fetched = stdout.find("fetched the latest history of me/qa").unwrap();
-    assert!(acquired < fetched, "{stdout}");
+    let ready = if quiet {
+        assert!(
+            !stdout.contains("fetched the latest history of me/qa")
+                && !stderr.contains("fetched the latest history of me/qa"),
+            "routine fetch notice escaped quiet output: {stdout}\n{stderr}"
+        );
+        acquired
+    } else {
+        let fetched = stdout.find("fetched the latest history of me/qa").unwrap();
+        assert!(acquired < fetched, "{stdout}");
+        fetched
+    };
     if selected {
-        assert!(fetched < stdout.find("arbitration:").unwrap(), "{stdout}");
+        assert!(ready < stdout.find("arbitration:").unwrap(), "{stdout}");
     } else {
         assert!(!stdout.contains("arbitration:"), "{stdout}");
     }
@@ -438,7 +458,7 @@ fn legacy_run_mine_preserves_acquisition_stdout_without_a_target_echo() {
             "--no-launch",
         ]);
         let (stdout, stderr) = legacy_streams(&output, mode);
-        assert_legacy_acquisition(&stdout, &stderr, true);
+        assert_legacy_acquisition(&stdout, &stderr, true, mode);
         assert_eq!(
             stdout.contains("forked out me/qa @ continued"),
             mode == "--json",
@@ -468,7 +488,7 @@ fn legacy_invalid_run_mine_keeps_acquisition_but_refuses_before_the_fork_prompt(
                 "{output:?}"
             );
             let (stdout, stderr) = legacy_streams(&output, mode);
-            assert_legacy_acquisition(&stdout, &stderr, false);
+            assert_legacy_acquisition(&stdout, &stderr, false, mode);
             assert!(!stdout.contains("forked out"), "{stdout}");
             assert!(
                 stderr.contains("failed to resolve `me/qa@absent`"),

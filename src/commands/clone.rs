@@ -248,6 +248,12 @@ enum ProgressOutput {
 }
 
 impl ProgressOutput {
+    fn notice(self, message: std::fmt::Arguments<'_>) {
+        if !ui::quiet() {
+            self.line(message);
+        }
+    }
+
     fn line(self, message: std::fmt::Arguments<'_>) {
         match self {
             Self::Stdout => println!("{message}"),
@@ -329,7 +335,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     let history_update = super::migration::begin_startup_recovery_for_path(&dest, "clone-history")?;
 
     if existed {
-        progress.line(format_args!("updating {}…", ui::bold(&slug)));
+        progress.notice(format_args!("updating {}…", ui::bold(&slug)));
         let store = Repo::at(&dest);
         // Align the remotes before fetching: the hub address changes, and a read-only checkout's
         // origin is the very source to fetch from.
@@ -353,14 +359,14 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
                     anyhow::anyhow!("cannot fast-forward a detached existing checkout")
                 })?;
                 super::pull::fast_forward_to(&store, &branch, "@{upstream}")?;
-                progress.line(format_args!(
+                progress.notice(format_args!(
                     "  {} fast-forwarded {behind} commits",
                     ui::ok(s.check)
                 ));
             }
         }
     } else {
-        progress.line(format_args!(
+        progress.notice(format_args!(
             "fetching {} from {}…",
             ui::bold(&slug),
             ui::accent(client.base())
@@ -439,7 +445,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
                 match sync_explicit_branch(&store, b)? {
                     BranchSync::Created | BranchSync::Current => {}
                     BranchSync::FastForwarded(n) => {
-                        progress.line(format_args!(
+                        progress.notice(format_args!(
                             "  {} fast-forwarded {b} by {n} commits",
                             ui::ok(s.check)
                         ));
@@ -879,7 +885,7 @@ fn plan(
             .map(Some);
     }
 
-    progress.line(format_args!(
+    progress.notice(format_args!(
         "copying {} ({} sessions) into your namespace…",
         ui::bold(&source.slug()),
         source.session_count
@@ -997,7 +1003,7 @@ fn promote_with_progress(
             source_identity.agent_id
         );
     }
-    progress.line(format_args!(
+    progress.notice(format_args!(
         "copying {} into your namespace…",
         ui::bold(&source.slug())
     ));
