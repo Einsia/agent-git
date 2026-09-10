@@ -141,7 +141,7 @@ impl std::fmt::Display for InteractionRequired {
 
 impl std::error::Error for InteractionRequired {}
 
-/// Typed failures retain their category across command-specific diagnostic context.
+/// Typed failures preserve their category through context; authentication takes precedence.
 pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCode {
     if error.chain().any(|cause| {
         cause.is::<LoginRequired>()
@@ -152,7 +152,7 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
         ExitCode::Auth
     } else if error.is::<InteractionRequired>() {
         ExitCode::Interactive
-    } else if error.is::<target::MissingLocalRepo>() {
+    } else if crate::domain::refs::is_not_found(error) || error.is::<target::MissingLocalRepo>() {
         ExitCode::Ref
     } else if error.is::<crate::domain::refs::Ambiguous>() {
         if crate::ui::prompt::interactive() {
@@ -1476,5 +1476,48 @@ mod json_cli_tests {
                 "unexpected rejection"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_error_tests {
+    use super::{LoginRequired, terminal_error_code};
+    use crate::ExitCode;
+    use crate::domain::refs::NotFound;
+
+    #[test]
+    fn missing_refs_keep_their_category_through_context() {
+        for fallback in [ExitCode::Usage, ExitCode::Failure, ExitCode::Precondition] {
+            let error = anyhow::Error::new(NotFound("absent".into()));
+            assert_eq!(terminal_error_code(&error, fallback), ExitCode::Ref);
+            let error = error
+                .context("selecting a tag target")
+                .context("tag failed");
+            assert_eq!(terminal_error_code(&error, fallback), ExitCode::Ref);
+        }
+    }
+
+    #[test]
+    fn reference_wording_and_unknown_errors_keep_the_callers_fallback() {
+        for fallback in [ExitCode::Usage, ExitCode::Failure, ExitCode::Network] {
+            for message in [
+                NotFound("absent".into()).to_string(),
+                "unknown failure".into(),
+            ] {
+                let error = anyhow::Error::msg(message).context("selecting a tag target");
+                assert_eq!(terminal_error_code(&error, fallback), fallback);
+            }
+        }
+    }
+
+    #[test]
+    fn authentication_takes_precedence_over_a_reference_context() {
+        let error = anyhow::Error::new(LoginRequired {
+            hub: "https://hub.example.test".into(),
+        })
+        .context(NotFound("absent".into()))
+        .context("selecting a tag target");
+        assert!(crate::domain::refs::is_not_found(&error));
+        assert_eq!(terminal_error_code(&error, ExitCode::Usage), ExitCode::Auth);
     }
 }

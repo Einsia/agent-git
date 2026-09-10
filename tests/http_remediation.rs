@@ -511,9 +511,9 @@ mod unix {
             (
                 vec!["search", "needle"],
                 "/api/search/sessions?q=needle&per=10",
-                1,
+                6,
             ),
-            (vec!["share", "list"], "/api/shares", 2),
+            (vec!["share", "list"], "/api/shares", 6),
             (vec!["rc", "list"], "/api/rc/connections", 6),
         ] {
             for status in [401, 403, 404, 500] {
@@ -584,7 +584,7 @@ mod unix {
                     args.extend(["--json-version", version]);
                 }
                 args.extend(["search", "needle"]);
-                let value = lab.json(&hub.base, &args, if status == 401 { 5 } else { 1 });
+                let value = lab.json(&hub.base, &args, if status == 401 { 5 } else { 6 });
                 assert!(value.to_string().contains("synthetic credential refusal"));
                 assert!(value.to_string().contains(&hub.base));
                 assert_eq!(
@@ -603,7 +603,7 @@ mod unix {
             let output = run_bounded(lab.command(&hub.base, &["search", "needle"]));
             assert_eq!(
                 output.status.code(),
-                Some(if status == 401 { 5 } else { 1 })
+                Some(if status == 401 { 5 } else { 6 })
             );
             assert!(output.stdout.is_empty());
             let text = String::from_utf8(output.stderr).unwrap();

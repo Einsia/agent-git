@@ -70,7 +70,9 @@ pub fn run(args: Args) -> CmdResult {
     match &args.cmd {
         Some(Cmd::List) => return list(&client),
         Some(Cmd::Rm { slug }) => {
-            client.revoke_share(slug)?;
+            if let Err(error) = client.revoke_share(slug) {
+                return failed(error);
+            }
             ui::success(&format!("revoked {slug}"));
             return Ok(ExitCode::Ok);
         }
@@ -143,7 +145,7 @@ pub fn run(args: Args) -> CmdResult {
                 "registered-secret rules ignore allowlists; inspect labels with `agit secrets list` and unregister one only if the value is no longer secret",
             );
         }
-        return Ok(ExitCode::Failure);
+        return Ok(ExitCode::Policy);
     }
 
     // Render a readable transcript before sharing — a share exists to be read by people, not
@@ -163,9 +165,13 @@ pub fn run(args: Args) -> CmdResult {
     let password_hash = if args.password {
         match ui::prompt::password("set a view passphrase")? {
             Some(p) if !p.is_empty() => Some(hash_password(&p)),
-            _ => {
-                ui::error("--password needs an interactive terminal to read the passphrase.");
+            Some(_) => {
+                ui::error("the view passphrase must not be empty.");
                 return Ok(ExitCode::Usage);
+            }
+            None => {
+                ui::error("--password needs an interactive terminal to read the passphrase.");
+                return Ok(ExitCode::Interactive);
             }
         }
     } else {
@@ -216,13 +222,16 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
 
-    let resp = client.create_share(&ShareRequest {
+    let resp = match client.create_share(&ShareRequest {
         payload,
         encrypted: !args.public,
         expire_seconds: expire_secs,
         max_views: args.views,
         password_hash,
-    })?;
+    }) {
+        Ok(response) => response,
+        Err(error) => return failed(error),
+    };
 
     let s = ui::theme::symbols();
     println!("{} share created", ui::ok(s.check));
@@ -535,8 +544,17 @@ fn legacy_synthetic(content: &serde_json::Value) -> bool {
         && content["message"]["content"].is_string()
 }
 
+fn failed(error: anyhow::Error) -> CmdResult {
+    super::fix::register_terminal_api_error(&error);
+    ui::error(&format!("{error:#}"));
+    Ok(super::terminal_error_code(&error, ExitCode::Network))
+}
+
 fn list(client: &crate::hub::Client) -> CmdResult {
-    let shares = client.list_shares()?;
+    let shares = match client.list_shares() {
+        Ok(shares) => shares,
+        Err(error) => return failed(error),
+    };
     if shares.is_empty() {
         println!("no active shares.");
         return Ok(ExitCode::Ok);
