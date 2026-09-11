@@ -5,11 +5,11 @@
 //! deliberately process-local: it moves on for this visit without making a future decision for
 //! the user.
 //!
-//! # No transcript parsing
+//! # Rendering collected rows
 //!
-//! Candidates come from the Sessions screen's already assembled rows, and repositories come from
-//! the same batched scan as `agit new`. The first frame therefore opens no transcript. The only
-//! operation that does is an adoption the user explicitly submits, inside `import`.
+//! Candidates come from the Sessions screen's bounded discovery, and repositories come from the
+//! same batched scan as `agit new`. Rendering does not reopen native content. Adoption delegates
+//! the complete selected source read to `import` after explicit submission.
 
 use super::{repos, sessions};
 use crate::domain::store::Store;
@@ -69,6 +69,8 @@ pub enum Outcome {
     Adopt(ImportChoice),
     /// Every remaining item was skipped for this visit.
     Done,
+    Projects,
+    Runtimes,
     /// Quit the resident TUI entirely.
     Quit,
 }
@@ -95,7 +97,7 @@ pub fn run(
         .as_deref()
         .and_then(|slug| repos.iter().position(|repo| repo.slug() == slug))
         .unwrap_or(0);
-    run_loop(rows, &repos, repo_index, cwd, deferred, focus)
+    run_loop(rows, &repos, repo_index, deferred, focus)
 }
 
 /// Run the selected import on the normal screen, then wait before taking the terminal back.
@@ -138,6 +140,9 @@ fn validate(
     repo: Option<&repos::Row>,
     branch: &str,
 ) -> Result<ImportChoice, String> {
+    if candidate.ambiguous {
+        return Err("this runtime id has multiple indexed sources; inspect the runtime sources before importing it.".into());
+    }
     if candidate.live {
         return Err(
             "this session still looks active. exit it in its own terminal before adopting it."
@@ -174,11 +179,11 @@ fn run_loop(
     rows: &[sessions::Row],
     repos: &[repos::Row],
     mut repo_index: usize,
-    cwd: &Path,
     deferred: &mut HashSet<Identity>,
     focus: Option<&Identity>,
 ) -> crate::Result<Outcome> {
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    term.clear()?;
     let mut state = ListState::default();
     let initial = candidates(rows, deferred);
     let selected = focus
@@ -205,8 +210,9 @@ fn run_loop(
             state.select(Some(view.len() - 1));
         }
         let repo = (!repos.is_empty()).then(|| &repos[repo_index]);
+        let mut page_area = Rect::default();
         term.draw(|frame| {
-            draw(
+            page_area = draw(
                 frame,
                 &view,
                 &mut state,
@@ -214,7 +220,7 @@ fn run_loop(
                 &branch,
                 editing,
                 notice.as_deref(),
-            )
+            );
         })?;
 
         let Some(key) = crate::tui::term::next_key()? else {
@@ -256,6 +262,21 @@ fn run_loop(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(Outcome::Quit);
             }
+            KeyCode::PageDown | KeyCode::PageUp => {
+                let heights: Vec<_> = view
+                    .iter()
+                    .map(|row| row_lines(row, page_area).len())
+                    .collect();
+                state.select(widgets::page_selection(
+                    state.selected(),
+                    &heights,
+                    page_area.height.saturating_sub(2) as usize,
+                    key.code == KeyCode::PageDown,
+                ));
+                branch.clear();
+            }
+            KeyCode::Char('a') => return Ok(Outcome::Projects),
+            KeyCode::Char('r') => return Ok(Outcome::Runtimes),
             KeyCode::Down | KeyCode::Char('j') => {
                 let index = state.selected().unwrap_or(0);
                 state.select(Some((index + 1).min(n - 1)));
@@ -303,14 +324,7 @@ fn run_loop(
                     continue;
                 };
                 let store = Store::open_or_init();
-                match store.and_then(|store| {
-                    crate::domain::link::dismiss_naming(
-                        &store,
-                        &identity.runtime,
-                        &identity.session_id,
-                        Some(cwd),
-                    )
-                }) {
+                match store.and_then(|store| ignore_candidate(&store, candidate)) {
                     Ok(_) => {
                         deferred.insert(identity);
                         branch.clear();
@@ -323,6 +337,22 @@ fn run_loop(
     }
 }
 
+fn ignore_candidate(store: &Store, candidate: &sessions::Row) -> crate::Result<()> {
+    anyhow::ensure!(
+        !candidate.ambiguous,
+        "this runtime id has multiple indexed sources; no single session can be ignored."
+    );
+    let identity = Identity::of(candidate)
+        .ok_or_else(|| anyhow::anyhow!("this row has no runtime session identity."))?;
+    crate::domain::link::dismiss_naming(
+        store,
+        &identity.runtime,
+        &identity.session_id,
+        candidate.cwd.as_deref().map(Path::new),
+    )?;
+    Ok(())
+}
+
 fn draw(
     frame: &mut Frame,
     view: &[&sessions::Row],
@@ -331,7 +361,7 @@ fn draw(
     branch: &str,
     editing: bool,
     notice: Option<&str>,
-) {
+) -> Rect {
     let panes = widgets::layout(frame.area());
     widgets::render_status(
         frame,
@@ -370,11 +400,9 @@ fn draw(
             rows[1],
         );
     }
-    let width = list_area.width.saturating_sub(4) as usize;
-
     let items: Vec<ListItem> = view
         .iter()
-        .map(|row| ListItem::new(row_lines(row, width)))
+        .map(|row| ListItem::new(row_lines(row, list_area)))
         .collect();
     frame.render_stateful_widget(
         List::new(items)
@@ -400,14 +428,16 @@ fn draw(
         if editing {
             "type branch   enter adopt   esc stop editing"
         } else if panes.detail.is_none() {
-            "↑↓ session  tab repo  enter name  s skip  x ignore  q quit"
+            "enter name · s skip · a projects · r runtime · tab repo · q quit"
         } else {
-            "↑↓ session   tab repo   enter name   s skip   x ignore   q quit"
+            "enter name   s skip   a projects   r runtime   tab repo   x ignore   q quit"
         },
     );
+    list_area
 }
 
-fn row_lines(row: &sessions::Row, width: usize) -> Vec<Line<'static>> {
+fn row_lines(row: &sessions::Row, area: Rect) -> Vec<Line<'static>> {
+    let width = area.width.saturating_sub(4) as usize;
     let id = row
         .session_id
         .as_deref()
@@ -421,12 +451,22 @@ fn row_lines(row: &sessions::Row, width: usize) -> Vec<Line<'static>> {
         Line::from(format!("{identity}  {active}")),
         width,
     )];
+    lines.push(widgets::clamp_line(
+        Line::from(Span::styled(
+            format!("  {}", super::selector::project_label(row.cwd.as_deref())),
+            theme::muted(),
+        )),
+        width,
+    ));
     if let Some(gist) = &row.gist {
         lines.push(widgets::clamp_line(
             Line::from(Span::styled(format!("  {gist}"), theme::muted())),
             width,
         ));
     }
+    // A ListItem must fit the inner viewport or the selected row disappears entirely.
+    // Keep identity before project and preview when the destination pane leaves less space.
+    lines.truncate(area.height.saturating_sub(2) as usize);
     lines
 }
 
@@ -446,6 +486,10 @@ fn detail_text(
         out.push_str("\n\n");
     }
     out.push_str(&format!("runtime  {}\n", row.runtime));
+    out.push_str(&format!(
+        "project  {}\n",
+        super::selector::project_label(row.cwd.as_deref())
+    ));
     if let Some(id) = &row.session_id {
         out.push_str(&format!("session  {}\n", crate::domain::link::short(id)));
     }
@@ -485,6 +529,9 @@ mod tests {
 
     fn session(runtime: &str, id: &str, live: bool) -> sessions::Row {
         sessions::Row {
+            ambiguous: false,
+            cwd: Some("/work".into()),
+            here: true,
             badge: sessions::Badge::Unnamed,
             slug: None,
             branch: None,
@@ -508,6 +555,85 @@ mod tests {
             branches: branches.iter().map(|branch| (*branch).into()).collect(),
             read_only: false,
         }
+    }
+
+    #[test]
+    fn ignore_keeps_the_selected_project_and_preserves_a_concurrent_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("store"));
+        let selected = directory.path().join("selected-project");
+        let mut row = session("codex", "other-project", false);
+        row.cwd = Some(selected.to_string_lossy().into_owned());
+        ignore_candidate(&store, &row).unwrap();
+        let ignored = crate::domain::link::get(&store, "codex", "other-project").unwrap();
+        assert_eq!(ignored.cwd.as_deref(), selected.to_str());
+        assert!(ignored.naming_ignored);
+        assert!(ignored.agent.is_none());
+
+        row.session_id = Some("unknown-project".into());
+        row.cwd = None;
+        ignore_candidate(&store, &row).unwrap();
+        assert!(
+            crate::domain::link::get(&store, "codex", "unknown-project")
+                .unwrap()
+                .cwd
+                .is_none()
+        );
+
+        let mut claimed = crate::domain::link::Link::new("codex", "claimed", Some(&selected));
+        claimed.agent = Some("qa".into());
+        claimed.branch = Some("work".into());
+        crate::domain::link::write(&store, &claimed).unwrap();
+        row.session_id = Some("claimed".into());
+        ignore_candidate(&store, &row).unwrap();
+        let current = crate::domain::link::get(&store, "codex", "claimed").unwrap();
+        assert_eq!(current.cwd, claimed.cwd);
+        assert_eq!(current.agent, claimed.agent);
+        assert_eq!(current.branch, claimed.branch);
+        assert!(!current.naming_ignored);
+    }
+
+    #[test]
+    fn naming_refuses_duplicate_sources_even_when_an_empty_copy_is_hidden() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("store"));
+        let input = sessions::Input {
+            cwd: "/work".into(),
+            all_projects: true,
+            seen: [
+                ("claude-code", true),
+                ("claude-code", false),
+                ("codex", true),
+            ]
+            .into_iter()
+            .map(|(runtime, worth_naming)| sessions::Seen {
+                runtime: runtime.into(),
+                id: "same-id".into(),
+                cwd: Some("/work".into()),
+                mtime: SystemTime::UNIX_EPOCH,
+                gist: None,
+                worth_naming,
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let rows = sessions::assemble(&input, SystemTime::UNIX_EPOCH + Duration::from_secs(1000));
+        assert_eq!(rows.len(), 2);
+        let ambiguous = rows
+            .iter()
+            .find(|row| row.runtime == "claude-code")
+            .unwrap();
+        assert!(validate(ambiguous, Some(&repo(&[])), "fresh").is_err());
+        assert!(ignore_candidate(&store, ambiguous).is_err());
+        assert!(!store.root().exists());
+        let unique = rows.iter().find(|row| row.runtime == "codex").unwrap();
+        assert_eq!(
+            validate(unique, Some(&repo(&[])), "fresh")
+                .unwrap()
+                .identity
+                .runtime,
+            "codex"
+        );
     }
 
     #[test]
@@ -575,7 +701,7 @@ mod tests {
                 "retry-fix",
                 false,
                 None,
-            )
+            );
         })
         .unwrap();
         let buffer = term.backend().buffer();
@@ -617,8 +743,10 @@ mod tests {
             let mut state = ListState::default();
             state.select(Some(0));
             let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
-            term.draw(|frame| draw(frame, &view, &mut state, Some(&target), &draft, true, None))
-                .unwrap();
+            term.draw(|frame| {
+                draw(frame, &view, &mut state, Some(&target), &draft, true, None);
+            })
+            .unwrap();
             let buffer = term.backend().buffer();
             let text = (0..buffer.area.height)
                 .map(|y| {
@@ -636,6 +764,72 @@ mod tests {
                 "enter adopt",
             ] {
                 assert!(text.contains(expected), "missing {expected:?}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_naming_keeps_the_selected_identity_when_feedback_takes_a_row() {
+        use ratatui::backend::TestBackend;
+        let rows = [
+            session("codex", "FIRST", false),
+            session("codex", "MIDDLE", false),
+            session("codex", "LAST", false),
+        ];
+        let view = rows.iter().collect::<Vec<_>>();
+        let target = repo(&[]);
+        for (height, notice, previous_page) in [
+            (10, None, 1),
+            (10, Some("choose another branch"), 1),
+            (12, None, 0),
+        ] {
+            let mut state = ListState::default();
+            state.select(Some(2));
+            let mut term = Terminal::new(TestBackend::new(40, height)).unwrap();
+            let mut area = Rect::default();
+            term.draw(|frame| {
+                area = draw(
+                    frame,
+                    &view,
+                    &mut state,
+                    Some(&target),
+                    "retry-fix",
+                    true,
+                    notice,
+                );
+            })
+            .unwrap();
+            let buffer = term.backend().buffer();
+            let text = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for required in ["LAST", "nana/payments", "retry-fix_", "enter adopt"] {
+                assert!(text.contains(required), "missing {required:?}: {text}");
+            }
+            if let Some(notice) = notice {
+                assert!(text.contains(notice), "{text}");
+            }
+            assert_eq!(state.selected(), Some(2));
+            let inner_height = area.height.saturating_sub(2) as usize;
+            let heights = rows
+                .iter()
+                .map(|row| row_lines(row, area).len())
+                .collect::<Vec<_>>();
+            assert!(heights.iter().all(|height| *height <= inner_height));
+            assert_eq!(
+                widgets::page_selection(Some(2), &heights, inner_height, false),
+                Some(previous_page)
+            );
+            if inner_height >= 2 {
+                assert!(text.contains("/work"), "{text}");
+            }
+            if inner_height >= 3 {
+                assert!(text.contains("fix the retry path"), "{text}");
             }
         }
     }

@@ -123,17 +123,39 @@ writable session. `agit run` remains a hidden compatibility alias for `open`.
  ↑↓ move  enter continue  / filter  q quit
 ```
 
-Three sources:
+Sources and project badges:
 
 | Badge | Meaning |
 |---|---|
 | `here` | a session adopted in this directory |
 | `same-repo` | a branch in the same code repo |
 | `unnamed` | a session that exists in the runtime but is not managed yet |
+| `elsewhere` | an adopted session in another project, shown only in all-project scope |
 
 All three sources share one recency axis; on an exact tie an adopted session
 comes first. The status bar keeps the number of `unnamed` sessions visible
 without letting the badge split the list into a second ordering rule.
+
+Import and resume start with an explicit runtime scope when candidates span multiple
+recognized runtimes; a single-runtime list needs no additional step. The scope can
+include all available runtimes to preserve the combined recency view. Tab or arrow
+keys change this preselection and Enter opens candidates; Esc cancels without adopting.
+
+`a` toggles current-project and all-project candidates. Current scope retains the
+same-repo discovery signal for adopted branches. Every row carries its recorded
+project directory; missing directories remain `unknown`, never decoded from a slug.
+In the resume list, Tab cycles runtime scope. Import's existing stage navigation and
+the naming inbox keep their Tab meaning; `r` returns to runtime preselection there.
+Scope keys do not intercept filter input or branch-name editing. They change the
+visible candidates, never the selected command identity.
+
+Discovery reads runtime indexes and local claims. Missing opening prompts and paths
+use a bounded opening window on the leading unmanaged candidates, with a cached
+window for a newly highlighted import candidate. Cursor's project is recovered only
+when that candidate is highlighted, using the native body/path convention. An
+unreadable or incomplete window displays an unavailable preview; it does not open
+the rest of a transcript or materialize a runtime export. Enter still delegates to
+ordinary import/resume, which revalidates the explicitly selected identity.
 
 Every screen also carries one bounded snapshot of `agit rc status`. The probe
 runs before the alternate screen is entered and is refreshed after a runtime
@@ -329,9 +351,10 @@ session queries never erase each other.
 The screen creates nothing. It leaves the alternate screen and fills in the
 ordinary `agit import <id> --from <runtime> --into <repo>@<branch>` arguments, or
 the equivalent `--link-only` form. Its repository metadata reads are bounded and
-local-only, and it does not refresh RC status or create the store. Selected native
-previews use the bounded read-only snapshot provider, including OpenCode's coherent
-database snapshot without an export cache.
+local-only, and it does not refresh RC status or create the store. Selected Claude,
+Codex, and Cursor previews read bounded opening windows from native transcripts.
+OpenCode rows use indexed metadata without opening a selected-session snapshot or
+creating an export cache.
 
 An undecided versioned import then offers verified local lineage candidates,
 independent import, and cancellation on the normal screen. Cancellation is the
@@ -455,7 +478,18 @@ The same on every screen, nothing to relearn:
 enter       main action           tab       switch view (when a second exists)
 /           filter                q / esc   quit
 f / b       page (conversation)   ctrl-c    quit
+page up/down  page (candidates)
 ```
+
+The fallback import and resume candidate lists also use descending activity time across
+runtimes and sources. Native index times take precedence for adopted sessions; an
+unavailable native timestamp falls back to the link timestamp. Saved branches use
+their head commit time, including packed refs. Ordering never selects an identity.
+
+In the import and resume selectors and the naming inbox, PageUp and PageDown move by the visible
+list height, including multiline candidate rows. They stay within the filtered
+list and stop at its ends. Paging changes only the highlighted candidate; Enter
+still confirms it, and resizing recalculates the next page from the new layout.
 
 While a filter is being typed the footer keys change with it — there `q` goes
 into the query, it does not quit. A footer still reading `q quit` is the screen

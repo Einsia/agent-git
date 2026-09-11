@@ -154,7 +154,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
                 selected = Some(Found {
                     runtime: adapter::normalize(&picked.runtime)?,
                     session_id: picked.session_id.clone(),
-                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    cwd: picked.cwd,
                 });
                 args.session = Some(picked.session_id);
                 args.from = Some(picked.runtime);
@@ -1545,11 +1545,12 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
         let Ok(ad) = adapter::get(rt) else { continue };
         for sr in ad.sessions_for(&repo).unwrap_or_default() {
             if !known.contains(&(ad.id(), sr.id.as_str())) {
-                cands.push((ad.id(), sr.path, sr.id, sr.gist));
+                cands.push((ad.id(), sr.path, sr.id, sr.gist, sr.mtime));
             }
         }
     }
     sp.finish_and_clear();
+    cands.sort_by_key(|candidate| std::cmp::Reverse(candidate.4));
 
     let here = repo.to_string_lossy().to_string();
 
@@ -1576,15 +1577,17 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
                 && std::env::var_os("CI").is_none()));
     let labels: Vec<String> = cands
         .iter()
-        .map(|(rt, p, id, indexed_gist)| {
-            let gist = if legacy_preview {
-                gist_for(rt, id, p)
-            } else {
-                indexed_gist
-                    .as_deref()
-                    .map(|gist| ui::truncate(gist, 48))
-                    .unwrap_or_else(|| "preview deferred until selection".into())
-            };
+        .map(|(rt, p, id, indexed_gist, _)| {
+            let gist = indexed_gist
+                .clone()
+                .or_else(|| {
+                    legacy_preview
+                        .then(|| crate::tui::screens::selector::preview(rt, p).gist)
+                        .flatten()
+                })
+                .as_deref()
+                .map(|gist| ui::truncate(gist, 60))
+                .unwrap_or_else(|| "preview deferred until selection".into());
             let identity = if interactive {
                 link::short(id)
             } else {
@@ -1607,7 +1610,7 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
 
     match ui::prompt::select("which session to adopt?", &refs)? {
         Some(i) => {
-            let (rt, _, id, _) = &cands[i];
+            let (rt, _, id, _, _) = &cands[i];
             Ok(Pick::One(Found {
                 runtime: rt,
                 session_id: id.clone(),
@@ -1807,25 +1810,6 @@ fn cwd_of(runtime: &str, session_id: &str, path: &Path) -> Option<String> {
         "cursor" => adapter::get(runtime).ok()?.parse_at(path).ok()?.cwd,
         _ => None,
     }
-}
-
-/// The opening prompt for the interactive list.
-///
-/// Codex takes it from the index; Claude Code can only read the file (the only exception, see the
-/// comment at the call site).
-pub(crate) fn gist_for(runtime: &str, session_id: &str, path: &Path) -> String {
-    if runtime == "codex"
-        && let Some(m) =
-            adapter::codex_index::thread_by_id(session_id).and_then(|t| t.first_user_message)
-    {
-        let one = m.split_whitespace().collect::<Vec<_>>().join(" ");
-        return ui::truncate(&one, 48);
-    }
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| adapter::get(runtime).ok()?.parse(&t).ok())
-        .and_then(|ir| ir.gist(48))
-        .unwrap_or_else(|| "(content unreadable)".into())
 }
 
 #[cfg(test)]

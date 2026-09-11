@@ -14,15 +14,12 @@
 //! (`resume::gather_candidates`); the third is unique to this screen — it is the UI entry point
 //! for "waiting to be named".
 //!
-//! # No transcript parsing
+//! # Discovery and presentation
 //!
-//! Everything this layer works from comes from the runtime index and the store links (the
-//! performance discipline in `docs/07_tui.md` §4.1). [`assemble`] is outright a **pure function**:
-//! it has no filesystem, so "the first frame parses no transcript" is not a discipline a test has
-//! to watch; it is something the types make impossible.
-//!
-//! The only thing that touches a file is [`worth_naming`], and it runs **only on unadopted
-//! candidates**, with a bounded read.
+//! [`assemble`] is a pure function over already collected rows; it performs no filesystem I/O.
+//! Discovery uses runtime indexes and local claims, with bounded empty-shell and opening-window
+//! probes for unmanaged candidates. The index and exact recorded paths remain discovery data,
+//! never authority to adopt or resume a session.
 
 use crate::adapter::SessionRef;
 use crate::domain::link::Link;
@@ -65,6 +62,7 @@ pub(super) struct ProbedSession {
 pub enum Badge {
     Here,
     SameRepo,
+    Elsewhere,
     Unnamed,
 }
 
@@ -73,6 +71,7 @@ impl Badge {
         match self {
             Badge::Here => "here",
             Badge::SameRepo => "same-repo",
+            Badge::Elsewhere => "elsewhere",
             Badge::Unnamed => "unnamed",
         }
     }
@@ -82,23 +81,20 @@ impl Badge {
 #[derive(Debug, Clone)]
 pub struct Row {
     pub badge: Badge,
-    /// `owner/name`. An unnamed session is unmanaged, so this is `None`.
-    ///
-    /// **Always the qualified form.** A store link holds the **bare** agent name, while the
-    /// `same-repo` source carries a full slug by construction; with both forms in one field,
-    /// dedup compares them against each other and one branch shows up as two rows, once as
-    /// `here` and once as `same-repo`. Qualifying happens in [`assemble`] (the caller takes the
-    /// owner from the credentials, see [`Input::owner`]).
+    /// `owner/name` when the namespace is known. An ownerless legacy name stays unqualified
+    /// and cannot suppress a qualified candidate; an unnamed session has no repository.
     pub slug: Option<String>,
     pub branch: Option<String>,
     pub runtime: String,
     pub session_id: Option<String>,
-    /// Gist of the opening prompt. Present only when the runtime index hands it over for free
-    /// (codex does, claude does not).
+    pub cwd: Option<String>,
+    pub here: bool,
+    /// An indexed opening prompt or an advisory prompt from a bounded opening window.
     pub gist: Option<String>,
     pub last_active: SystemTime,
     /// The transcript is still growing — a second writer must not take it over.
     pub live: bool,
+    pub ambiguous: bool,
 }
 
 impl Row {
@@ -108,15 +104,17 @@ impl Row {
             self.slug.as_deref().unwrap_or_default(),
             self.branch.as_deref().unwrap_or_default(),
             &self.runtime,
+            self.cwd.as_deref().unwrap_or_default(),
             self.gist.as_deref().unwrap_or_default(),
         ]
         .join(" ")
     }
 }
 
-/// A session already seen (from the runtime index, **with no transcript ever opened**).
+/// A runtime-index session enriched by the bounded advisory probe policy.
 #[derive(Debug, Clone)]
 pub struct Seen {
+    pub cwd: Option<String>,
     pub id: String,
     pub runtime: String,
     pub mtime: SystemTime,
@@ -129,6 +127,7 @@ pub struct Seen {
 impl Seen {
     pub fn from_ref(sr: &SessionRef, worth_naming: bool) -> Seen {
         Seen {
+            cwd: sr.cwd.clone(),
             id: sr.id.clone(),
             runtime: sr.runtime.to_string(),
             mtime: sr.mtime,
@@ -141,6 +140,8 @@ impl Seen {
 /// One branch in the same code repo.
 #[derive(Debug, Clone)]
 pub struct SameRepo {
+    pub runtime: String,
+    pub cwd: Option<String>,
     pub slug: String,
     pub branch: String,
     pub last_active: SystemTime,
@@ -148,8 +149,8 @@ pub struct SameRepo {
     /// session for it at all.
     ///
     /// The single-writer gate rests on this. Sessions from this source run in **another
-    /// directory**, so they never show up in [`Input::seen`] (which scans only the current cwd),
-    /// and on resume `resume` may reuse that same native session — two writers appending to one
+    /// directory**, so a current-project index can omit them. On resume, `resume` may reuse
+    /// that same native session — two writers appending to one
     /// transcript, both histories destroyed (`docs/07_tui.md` §3.1: this is data corruption, not
     /// an experience problem).
     pub last_seen: Option<SystemTime>,
@@ -170,26 +171,15 @@ pub struct Adopted {
 pub struct Input {
     /// The canonical path of the current directory.
     pub cwd: String,
+    pub all_projects: bool,
     /// The current account name, used to qualify a link's bare agent name into `owner/name`.
     ///
-    /// The caller takes it from the credentials rather than [`assemble`] reading it — that would
-    /// stop [`assemble`] being a pure function, and the pure function is what makes "the first
-    /// frame parses no transcript" a guarantee in the types. `None` when not signed in; both
-    /// sources then degrade to bare names and dedup still holds.
+    /// The caller supplies the identity so [`assemble`] remains a pure function over collected
+    /// facts. An ownerless link stays unqualified when no account is available.
     pub owner: Option<String>,
     pub links: Vec<Adopted>,
     pub seen: Vec<Seen>,
     pub same_repo: Vec<SameRepo>,
-}
-
-/// The bare name of a slug (its last segment).
-///
-/// **Dedup always compares bare names, never full slugs.** When not signed in `owner` is `None`,
-/// so the `here` source cannot qualify while `same-repo` carries the owner by construction;
-/// comparing full slugs walks straight back into the same bug — the same trade-off `same_target`
-/// makes in [`crate::commands::context`].
-fn bare(slug: &str) -> &str {
-    slug.rsplit('/').next().unwrap_or(slug)
 }
 
 /// Qualify a bare agent name into `owner/name`; with no owner it comes back unchanged.
@@ -210,10 +200,10 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
             .find(|s| s.runtime == runtime && s.id == id)
     };
 
-    // ① here: a link whose cwd matches this directory and that is already managed.
+    // Managed links retain their recorded project; all-project scope also includes other directories.
     for a in &input.links {
         let l = &a.link;
-        if !l.is_active() || l.cwd.as_deref() != Some(input.cwd.as_str()) {
+        if !l.is_active() || (!input.all_projects && l.cwd.as_deref() != Some(input.cwd.as_str())) {
             continue;
         }
         let (Some(agent), Some(branch)) = (&l.agent, &l.branch) else {
@@ -221,7 +211,14 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
         };
         let s = seen_by_identity(&l.source, &l.session_id);
         rows.push(Row {
-            badge: Badge::Here,
+            ambiguous: false,
+            badge: if l.cwd.as_deref() == Some(input.cwd.as_str()) {
+                Badge::Here
+            } else {
+                Badge::Elsewhere
+            },
+            cwd: l.cwd.clone(),
+            here: l.cwd.as_deref() == Some(input.cwd.as_str()),
             // The owner recorded on the link wins: for a session in an org repo (einsia/...)
             // or a read-only checkout (acme/...), qualifying with the login name points
             // at a repo that does not exist, and enter reports "no branch" outright.
@@ -262,13 +259,26 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
         .filter(|l| l.naming_ignored)
         .map(|l| (l.source.as_str(), l.session_id.as_str()))
         .collect();
+    let mut occurrences = std::collections::HashMap::new();
+    for seen in &input.seen {
+        *occurrences
+            .entry((seen.runtime.as_str(), seen.id.as_str()))
+            .or_insert(0usize) += 1;
+    }
     for s in &input.seen {
         let identity = (s.runtime.as_str(), s.id.as_str());
-        if adopted.contains(&identity) || ignored.contains(&identity) || !s.worth_naming {
+        if adopted.contains(&identity)
+            || ignored.contains(&identity)
+            || !s.worth_naming
+            || (!input.all_projects && s.cwd.as_deref().is_none_or(|cwd| cwd != input.cwd))
+        {
             continue;
         }
         rows.push(Row {
+            ambiguous: occurrences[&identity] > 1,
             badge: Badge::Unnamed,
+            cwd: s.cwd.clone(),
+            here: s.cwd.as_deref() == Some(input.cwd.as_str()),
             slug: None,
             branch: None,
             runtime: s.runtime.clone(),
@@ -281,19 +291,26 @@ pub fn assemble(input: &Input, now: SystemTime) -> Vec<Row> {
 
     // ③ same-repo: branches in the same code repo, minus the ones already listed as here.
     for sr in &input.same_repo {
-        let dup = rows.iter().any(|r| {
-            r.slug.as_deref().map(bare) == Some(bare(&sr.slug))
-                && r.branch.as_deref() == Some(&sr.branch)
+        let existing = rows.iter_mut().find(|r| {
+            r.slug.as_deref() == Some(sr.slug.as_str()) && r.branch.as_deref() == Some(&sr.branch)
         });
-        if dup {
+        if let Some(row) = existing {
+            if row.badge == Badge::Elsewhere {
+                row.badge = Badge::SameRepo;
+                row.here = true;
+                row.live |= sr.last_seen.is_some_and(|seen| is_live(seen, now));
+            }
             continue;
         }
         rows.push(Row {
+            ambiguous: false,
             badge: Badge::SameRepo,
             slug: Some(sr.slug.clone()),
             branch: Some(sr.branch.clone()),
-            runtime: String::new(),
+            runtime: sr.runtime.clone(),
             session_id: None,
+            cwd: sr.cwd.clone(),
+            here: true,
             gist: None,
             last_active: sr.last_active,
             // With no session for it on this machine there is no transcript to collide with;
@@ -350,16 +367,26 @@ pub fn worth_naming(runtime: &str, path: &Path, gist: Option<&str>) -> bool {
     if runtime != "claude-code" {
         return true; // an unrecognized runtime yields no verdict
     }
-    let Ok(meta) = std::fs::metadata(path) else {
+    use std::io::Read;
+    let Some(file) = super::selector::opening_file(path) else {
+        return true;
+    };
+    let Ok(meta) = file.metadata() else {
         return true;
     };
     if meta.len() > NAMING_PROBE_BYTES {
         return true; // an incomplete read yields no verdict: a file this large is no empty shell
     }
-    match std::fs::read(path) {
-        Ok(bytes) => contains_bytes(&bytes, br#""type":"user""#),
-        Err(_) => true,
+    let mut bytes = Vec::new();
+    if file
+        .take(NAMING_PROBE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > NAMING_PROBE_BYTES
+    {
+        return true;
     }
+    contains_bytes(&bytes, br#""type":"user""#)
 }
 
 /// Substring search. The transcript is UTF-8, but turning it into a `String` first copies the
@@ -372,15 +399,19 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Gather the raw material from the store and the runtime index once, and assemble the list.
 ///
-/// **No transcript is opened**, the one exception being [`worth_naming`]'s bounded probe on
-/// unadopted candidates.
+/// Native reads are restricted to bounded advisory opening windows on unadopted candidates.
 pub fn collect(cwd: &Path) -> Vec<Row> {
     let now = SystemTime::now();
-    assemble(&gather(cwd, now), now)
+    assemble(&gather(cwd, now, false), now)
 }
 
 /// Gather the raw material. Split out so [`assemble`] stays a pure function.
-fn gather(cwd: &Path, now: SystemTime) -> Input {
+fn collect_all(cwd: &Path) -> Vec<Row> {
+    let now = SystemTime::now();
+    assemble(&gather(cwd, now, true), now)
+}
+
+fn gather(cwd: &Path, now: SystemTime, all_projects: bool) -> Input {
     let cwd_s = cwd.to_string_lossy().to_string();
     let store = crate::domain::store::Store::open_or_init().ok();
     let links: Vec<Adopted> = store
@@ -397,7 +428,7 @@ fn gather(cwd: &Path, now: SystemTime) -> Input {
         .unwrap_or_default();
 
     let link_refs = links.iter().map(|item| &item.link).collect::<Vec<_>>();
-    let seen = probe_sessions_for_naming(cwd, &link_refs)
+    let seen = probe_sessions_for_scope(cwd, &link_refs, all_projects)
         .iter()
         .map(|item| Seen::from_ref(&item.session, item.worth_naming))
         .collect();
@@ -405,6 +436,7 @@ fn gather(cwd: &Path, now: SystemTime) -> Input {
     let same_repo = same_repo_branches(&links, now);
     Input {
         cwd: cwd_s,
+        all_projects,
         owner: crate::infra::credentials::current_user(),
         links,
         seen,
@@ -416,17 +448,51 @@ fn gather(cwd: &Path, now: SystemTime) -> Input {
 ///
 /// Every TUI that offers unmanaged sessions uses this path so opening a screen cannot multiply
 /// transcript reads by the number of candidates in the directory.
-pub(super) fn probe_sessions_for_naming(cwd: &Path, links: &[&Link]) -> Vec<ProbedSession> {
+pub(super) fn probe_sessions_for_scope(
+    cwd: &Path,
+    links: &[&Link],
+    all_projects: bool,
+) -> Vec<ProbedSession> {
     let mut refs: Vec<SessionRef> = Vec::new();
     for rt in crate::adapter::RUNTIMES {
         let Ok(ad) = crate::adapter::get(rt) else {
             continue;
         };
-        refs.extend(ad.sessions_for(cwd).unwrap_or_default());
+        let here = ad.sessions_for(cwd).unwrap_or_default();
+        let mut known: std::collections::HashSet<_> = here
+            .iter()
+            .map(|row| (row.id.clone(), row.path.clone()))
+            .collect();
+        refs.extend(here);
+        if all_projects {
+            refs.extend(
+                ad.all_sessions()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|row| known.insert((row.id.clone(), row.path.clone()))),
+            );
+        }
     }
-    apply_naming_probe(refs, links, |session| {
+    let mut rows = apply_naming_probe(refs, links, |session| {
         worth_naming(session.runtime, &session.path, session.gist.as_deref())
-    })
+    });
+    for item in rows
+        .iter_mut()
+        .filter(|item| item.worth_naming)
+        .take(NAMING_PROBE_LIMIT)
+    {
+        let session = &mut item.session;
+        if session.runtime != "cursor" && (session.gist.is_none() || session.cwd.is_none()) {
+            let preview = super::selector::preview(session.runtime, &session.path);
+            if session.gist.is_none() {
+                session.gist = preview.gist;
+            }
+            if let Some(cwd) = preview.cwd {
+                session.cwd = Some(cwd);
+            }
+        }
+    }
+    rows
 }
 
 fn apply_naming_probe(
@@ -486,6 +552,9 @@ fn branch_last_seen(
     branch: &str,
     now: SystemTime,
 ) -> Option<SystemTime> {
+    let Some((owner, agent)) = slug.split_once('/') else {
+        return Some(now);
+    };
     // **Every** matching link counts, and the most recent one wins.
     //
     // One branch can carry more than one link: every session switch inside the runtime has the
@@ -493,14 +562,14 @@ fn branch_last_seen(
     // sorting declares the branch takeable whenever "the first one stopped long ago, some later
     // one is still being written" — and those are exactly the two writers this gate stops.
     //
-    // Compare bare names, for the reason in [`bare`]: a link holds the bare agent name, while
-    // this source carries a full slug by construction.
+    // Recorded owners cannot lend activity to another namespace. The ordinary claim predicate
+    // retains the conservative legacy ownerless claim gate without merging those display rows.
     let mut latest: Option<SystemTime> = None;
-    for link in links.iter().map(|a| &a.link).filter(|l| {
-        l.is_active()
-            && l.branch.as_deref() == Some(branch)
-            && l.agent.as_deref().map(bare) == Some(bare(slug))
-    }) {
+    for link in links
+        .iter()
+        .map(|a| &a.link)
+        .filter(|link| crate::domain::link::claims_branch(link, owner, agent, branch))
+    {
         // An unreadable file is treated as being written right now: calling it "live" wrongly
         // only blocks one takeover, calling it "dead" wrongly interleaves two streams of appends
         // into one transcript.
@@ -548,10 +617,11 @@ fn same_repo_branches(links: &[Adopted], now: SystemTime) -> Vec<SameRepo> {
             let slug = format!("{owner}/{name}");
             let last_seen = branch_last_seen(links, &slug, b, now);
             out.push(SameRepo {
+                runtime: snap.runtime.clone(),
+                cwd: (!snap.cwd.is_empty()).then(|| snap.cwd.clone()),
                 slug,
                 branch: b.clone(),
-                // A branch's "last active" = the time of its head commit. Missing means the
-                // row sinks, and that says the ref disappeared between the two git calls.
+                // Missing or unrepresentable commit activity sinks the row without hiding it.
                 last_active: committed
                     .get(b.as_str())
                     .copied()
@@ -570,10 +640,12 @@ fn same_repo_branches(links: &[Adopted], now: SystemTime) -> Vec<SameRepo> {
 /// the whole batch of branches degrades to `UNIX_EPOCH` and sinks to the bottom of the list.
 /// Asking git holds for packed-refs too, and does not reach around `domain::repo` to touch the
 /// layout of .git.
-fn committed_at(repo: &crate::domain::repo::Repo) -> std::collections::HashMap<String, SystemTime> {
+pub(crate) fn committed_at(
+    repo: &crate::domain::repo::Repo,
+) -> std::collections::HashMap<String, SystemTime> {
     let Some(out) = repo.git_opt(&[
         "for-each-ref",
-        "--format=%(refname:short)%09%(committerdate:unix)",
+        "--format=%(refname)%09%(committerdate:unix)",
         "refs/heads/",
     ]) else {
         return Default::default();
@@ -583,8 +655,8 @@ fn committed_at(repo: &crate::domain::repo::Repo) -> std::collections::HashMap<S
             let (name, secs) = line.split_once('\t')?;
             let secs: u64 = secs.trim().parse().ok()?;
             Some((
-                name.to_string(),
-                SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                name.strip_prefix("refs/heads/")?.to_string(),
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))?,
             ))
         })
         .collect()
@@ -618,7 +690,7 @@ pub enum Outcome {
 /// the runtime exits → take the terminal back → rescan → back to the list (`docs/07_tui.md` §2).
 /// So this function does not return until the user presses q.
 pub fn run(cwd: &Path) -> crate::CmdResultAlias {
-    let rows = collect(cwd);
+    let rows = collect_all(cwd);
     if rows.is_empty() {
         // No candidate means no empty shell: making the user press q at an empty list wastes
         // an interaction.
@@ -630,7 +702,11 @@ pub fn run(cwd: &Path) -> crate::CmdResultAlias {
     }
     widgets::refresh_rc_status();
     let mut guard = crate::tui::term::Guard::enter()?;
-    let out = resident(&mut guard, cwd, rows);
+    let runtimes = super::selector::runtimes(rows.iter().map(|row| row.runtime.as_str()));
+    let out = match super::selector::preselect(&runtimes, "agit resume")? {
+        Some(scope) => resident(&mut guard, cwd, rows, scope),
+        None => Ok(crate::ExitCode::Ok),
+    };
     // Give the terminal back before letting the result (an error above all) propagate: those
     // words belong on the normal screen, not in the alt screen — whatever is written in the alt
     // screen goes with it the moment it exits.
@@ -643,6 +719,7 @@ fn resident(
     guard: &mut crate::tui::term::Guard,
     cwd: &Path,
     mut rows: Vec<Row>,
+    mut scope: super::selector::Scope,
 ) -> crate::CmdResultAlias {
     let mut deferred = std::collections::HashSet::new();
     let mut naming_focus: Option<super::naming::Identity> = None;
@@ -651,14 +728,35 @@ fn resident(
         // the runtime hands the terminal back. A skip lives in `deferred` only for this resident
         // visit; selecting that unnamed row from the Sessions screen removes it and opens the
         // inbox again.
-        if super::naming::has_pending(&rows, &deferred) {
-            match super::naming::run(&rows, cwd, &mut deferred, naming_focus.as_ref())? {
+        let scoped_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| scope.includes(&row.runtime, row.here))
+            .cloned()
+            .collect();
+        if super::naming::has_pending(&scoped_rows, &deferred) {
+            match super::naming::run(&scoped_rows, cwd, &mut deferred, naming_focus.as_ref())? {
                 super::naming::Outcome::Quit => return Ok(crate::ExitCode::Ok),
                 super::naming::Outcome::Done => naming_focus = None,
+                super::naming::Outcome::Projects => {
+                    scope.all_projects = !scope.all_projects;
+                    naming_focus = None;
+                    continue;
+                }
+                super::naming::Outcome::Runtimes => {
+                    let runtimes =
+                        super::selector::runtimes(rows.iter().map(|row| row.runtime.as_str()));
+                    let Some(selected) = super::selector::preselect(&runtimes, "agit resume")?
+                    else {
+                        return Ok(crate::ExitCode::Ok);
+                    };
+                    scope.runtime = selected.runtime;
+                    naming_focus = None;
+                    continue;
+                }
                 super::naming::Outcome::Adopt(choice) => {
                     naming_focus = None;
                     let _ = super::naming::execute_import(guard, &choice)?;
-                    rows = collect(cwd);
+                    rows = collect_all(cwd);
                     if rows.is_empty() {
                         return Ok(crate::ExitCode::Ok);
                     }
@@ -666,7 +764,7 @@ fn resident(
                 }
             }
         }
-        match run_loop(&rows)? {
+        match run_loop(&rows, &mut scope)? {
             Outcome::Quit | Outcome::Nothing => return Ok(crate::ExitCode::Ok),
             Outcome::Adopt {
                 runtime,
@@ -720,15 +818,17 @@ fn handoff(
     // this screen too.
     crate::commands::resume::launch_branch(slug, branch)?;
     // Rescan on the way back: new sessions and changes in management are seen at this step.
-    // All of it comes from the runtime index and the store; no transcript is opened (§6.3).
-    let rows = collect(cwd);
+    // The rescan applies the same bounded discovery probes as initial entry.
+    let rows = collect_all(cwd);
     widgets::refresh_rc_status();
     guard.resume()?;
     Ok(rows)
 }
 
-fn run_loop(rows: &[Row]) -> crate::Result<Outcome> {
+fn run_loop(rows: &[Row], scope: &mut super::selector::Scope) -> crate::Result<Outcome> {
+    let runtimes = super::selector::runtimes(rows.iter().map(|row| row.runtime.as_str()));
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    term.clear()?;
     let mut state = ListState::default();
     state.select(Some(0));
     let mut filter = Filter::default();
@@ -737,7 +837,7 @@ fn run_loop(rows: &[Row]) -> crate::Result<Outcome> {
     loop {
         let view: Vec<&Row> = rows
             .iter()
-            .filter(|r| filter.matches(&r.haystack()))
+            .filter(|r| scope.includes(&r.runtime, r.here) && filter.matches(&r.haystack()))
             .collect();
         if state.selected().unwrap_or(0) >= view.len() {
             state.select(if view.is_empty() {
@@ -746,7 +846,10 @@ fn run_loop(rows: &[Row]) -> crate::Result<Outcome> {
                 Some(view.len() - 1)
             });
         }
-        term.draw(|f| draw(f, &view, &mut state, &filter, notice.as_deref()))?;
+        let mut page_area = Rect::default();
+        term.draw(|f| {
+            page_area = draw(f, &view, &mut state, &filter, notice.as_deref(), scope);
+        })?;
 
         let Some(key) = crate::tui::term::next_key()? else {
             continue;
@@ -770,6 +873,26 @@ fn run_loop(rows: &[Row]) -> crate::Result<Outcome> {
                 return Ok(Outcome::Quit);
             }
             KeyCode::Char('/') => filter.open(),
+            KeyCode::Char('a') => {
+                scope.all_projects = !scope.all_projects;
+                state.select(Some(0));
+            }
+            KeyCode::Tab => {
+                scope.cycle_runtime(&runtimes);
+                state.select(Some(0));
+            }
+            KeyCode::PageDown | KeyCode::PageUp => {
+                let heights = view
+                    .iter()
+                    .map(|row| row_lines(row, page_area).len())
+                    .collect::<Vec<_>>();
+                state.select(widgets::page_selection(
+                    state.selected(),
+                    &heights,
+                    page_area.height.saturating_sub(2) as usize,
+                    key.code == KeyCode::PageDown,
+                ));
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 let i = state.selected().unwrap_or(0);
                 state.select(Some((i + 1).min(n.saturating_sub(1))));
@@ -830,7 +953,8 @@ fn draw(
     state: &mut ListState,
     filter: &Filter,
     notice: Option<&str>,
-) {
+    scope: &super::selector::Scope,
+) -> Rect {
     let panes = widgets::layout(f.area());
     let unnamed = view.iter().filter(|r| r.badge == Badge::Unnamed).count();
     widgets::render_status(
@@ -846,14 +970,13 @@ fn draw(
     );
     let list_area = widgets::list_area_with_notice(f, panes, notice);
 
-    let width = list_area.width.saturating_sub(4) as usize;
     let items: Vec<ListItem> = view
         .iter()
-        .map(|r| ListItem::new(row_line(r, width)))
+        .map(|row| ListItem::new(row_lines(row, list_area)))
         .collect();
     let title = match filter.hint() {
-        Some(q) => format!("sessions  {q}"),
-        None => format!("sessions ({})", view.len()),
+        Some(q) => format!("sessions · {}  {q}", scope.label()),
+        None => format!("sessions ({}) · {}", view.len(), scope.label()),
     };
     f.render_stateful_widget(
         List::new(items)
@@ -881,9 +1004,18 @@ fn draw(
         if filter.is_active() {
             "type to filter   enter apply   esc cancel"
         } else {
-            "↑↓ move   enter continue   / filter   q quit"
+            "enter continue   a projects   tab runtime   pgup/pgdn page   / filter   q quit"
         },
     );
+    list_area
+}
+
+fn row_lines(row: &Row, area: Rect) -> Vec<Line<'static>> {
+    let width = area.width.saturating_sub(4) as usize;
+    let mut lines = vec![row_line(row, width), project_line(row, width)];
+    // A list item must fit the inner viewport to keep its selected identity visible.
+    lines.truncate(area.height.saturating_sub(2) as usize);
+    lines
 }
 
 fn row_line(r: &Row, width: usize) -> Line<'static> {
@@ -923,6 +1055,21 @@ fn row_line(r: &Row, width: usize) -> Line<'static> {
     )
 }
 
+fn project_line(row: &Row, width: usize) -> Line<'static> {
+    widgets::clamp_line(
+        Line::from(Span::styled(
+            format!(
+                "  {} · {} · {}",
+                row.runtime,
+                super::selector::project_label(row.cwd.as_deref()),
+                crate::ui::truncate(row.gist.as_deref().unwrap_or("preview unavailable"), 60)
+            ),
+            theme::muted(),
+        )),
+        width,
+    )
+}
+
 fn detail_text(r: Option<&Row>, notice: Option<&str>) -> String {
     let Some(r) = r else {
         return "nothing matches this filter.".into();
@@ -944,6 +1091,10 @@ fn detail_text(r: Option<&Row>, notice: Option<&str>) -> String {
     if let Some(id) = &r.session_id {
         out.push_str(&format!("session  {}\n", crate::domain::link::short(id)));
     }
+    out.push_str(&format!(
+        "project  {}\n",
+        super::selector::project_label(r.cwd.as_deref())
+    ));
     out.push_str(&format!("active   {}\n", crate::ui::ago(r.last_active)));
     if let Some(g) = &r.gist {
         out.push_str(&format!("\n{g}\n"));
@@ -965,6 +1116,7 @@ mod tests {
     }
     fn seen(id: &str, at: u64) -> Seen {
         Seen {
+            cwd: Some("/w".into()),
             id: id.into(),
             runtime: "claude-code".into(),
             mtime: t(at),
@@ -996,6 +1148,7 @@ mod tests {
     #[test]
     fn the_three_sources_land_on_one_recency_axis() {
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             owner: Some("nana".into()),
             links: vec![
@@ -1004,6 +1157,8 @@ mod tests {
             ],
             seen: vec![seen("A", 500), seen("B", 100)],
             same_repo: vec![SameRepo {
+                runtime: "claude-code".into(),
+                cwd: Some("/other".into()),
                 slug: "nana/infra".into(),
                 branch: "deploy".into(),
                 last_active: t(900),
@@ -1026,6 +1181,7 @@ mod tests {
         let mut historical = link("old", "/w", Some("photo"), Some("work"));
         historical.link.superseded_by = Some("claude-code/current".into());
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             owner: Some("alice".into()),
             links: vec![
@@ -1034,6 +1190,8 @@ mod tests {
             ],
             seen: vec![seen("old", 1000), seen("current", 0)],
             same_repo: vec![SameRepo {
+                runtime: "claude-code".into(),
+                cwd: Some("/other".into()),
                 slug: "alice/photo".into(),
                 branch: "work".into(),
                 last_active: t(0),
@@ -1054,6 +1212,7 @@ mod tests {
         let mut l = link("A", "/w", Some("agent-git"), Some("run-1"));
         l.link.owner = Some("acme".into());
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             owner: Some("hachi".into()),
             links: vec![l],
@@ -1078,6 +1237,7 @@ mod tests {
     #[test]
     fn another_directorys_session_is_not_listed() {
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             links: vec![link("A", "/elsewhere", Some("x"), Some("b"))],
             ..Default::default()
@@ -1085,10 +1245,147 @@ mod tests {
         assert!(assemble(&input, t(1)).is_empty());
     }
 
+    #[test]
+    fn project_scope_keeps_recorded_paths_and_runtime_filters_intersect_all_projects() {
+        let input = Input {
+            cwd: "/w".into(),
+            all_projects: true,
+            links: vec![
+                link("local", "/w", Some("qa"), Some("local")),
+                link("remote", "/another", Some("qa"), Some("remote")),
+            ],
+            seen: vec![
+                seen("local", 100),
+                Seen {
+                    cwd: Some("/another".into()),
+                    ..seen("remote", 200)
+                },
+                Seen {
+                    cwd: None,
+                    runtime: "codex".into(),
+                    ..seen("unknown", 300)
+                },
+            ],
+            ..Default::default()
+        };
+        let rows = assemble(&input, t(1000));
+        let mut scope = super::super::selector::Scope::default();
+        let selected = |scope: &super::super::selector::Scope| {
+            rows.iter()
+                .filter(|row| scope.includes(&row.runtime, row.here))
+                .map(|row| row.session_id.as_deref().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(selected(&scope), ["local"]);
+        scope.all_projects = true;
+        assert_eq!(selected(&scope), ["unknown", "remote", "local"]);
+        scope.runtime = Some("claude-code".into());
+        assert_eq!(selected(&scope), ["remote", "local"]);
+        assert_eq!(rows[1].badge, Badge::Elsewhere);
+        assert_eq!(rows[1].cwd.as_deref(), Some("/another"));
+        assert!(rows[0].cwd.is_none());
+        assert!(detail_text(Some(&rows[0]), None).contains("project  unknown"));
+    }
+
+    #[test]
+    fn all_project_inventory_does_not_hide_an_existing_same_repo_link_in_current_scope() {
+        let mut adopted = link("other", "/other", Some("qa"), Some("work"));
+        adopted.link.owner = Some("nana".into());
+        let input = Input {
+            cwd: "/w".into(),
+            all_projects: true,
+            owner: Some("different-account".into()),
+            links: vec![adopted],
+            seen: vec![Seen {
+                cwd: Some("/other".into()),
+                ..seen("other", 100)
+            }],
+            same_repo: vec![SameRepo {
+                slug: "nana/qa".into(),
+                branch: "work".into(),
+                runtime: "claude-code".into(),
+                cwd: Some("/other".into()),
+                last_active: t(200),
+                last_seen: Some(t(950)),
+            }],
+        };
+        let rows = assemble(&input, t(1000));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].badge, Badge::SameRepo);
+        assert!(rows[0].here);
+        assert!(rows[0].live);
+        assert_eq!(rows[0].cwd.as_deref(), Some("/other"));
+        assert_eq!(rows[0].session_id.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn another_owners_same_named_branch_stays_separate_from_current_project_candidates() {
+        for account in [None, Some("other")] {
+            let mut adopted = link("external", "/other", Some("qa"), Some("work"));
+            adopted.link.owner = Some("other".into());
+            let input = Input {
+                cwd: "/w".into(),
+                all_projects: true,
+                owner: account.map(str::to_owned),
+                links: vec![adopted],
+                seen: vec![Seen {
+                    cwd: Some("/other".into()),
+                    ..seen("external", 100)
+                }],
+                same_repo: vec![SameRepo {
+                    slug: "mine/qa".into(),
+                    branch: "work".into(),
+                    runtime: "claude-code".into(),
+                    cwd: Some("/current-repo-checkout".into()),
+                    last_active: t(200),
+                    last_seen: None,
+                }],
+            };
+            let rows = assemble(&input, t(1000));
+            assert_eq!(rows.len(), 2);
+            let mut scope = super::super::selector::Scope::default();
+            let current: Vec<_> = rows
+                .iter()
+                .filter(|row| scope.includes(&row.runtime, row.here))
+                .collect();
+            assert_eq!(current.len(), 1);
+            assert_eq!(current[0].badge, Badge::SameRepo);
+            assert_eq!(current[0].cwd.as_deref(), Some("/current-repo-checkout"));
+            assert_eq!(
+                choose(current[0]).unwrap(),
+                Outcome::Resume {
+                    slug: "mine/qa".into(),
+                    branch: "work".into(),
+                }
+            );
+            scope.all_projects = true;
+            let all: Vec<_> = rows
+                .iter()
+                .filter(|row| scope.includes(&row.runtime, row.here))
+                .collect();
+            assert_eq!(all.len(), 2);
+            let external = all
+                .iter()
+                .find(|row| row.session_id.as_deref() == Some("external"))
+                .unwrap();
+            assert_eq!(external.badge, Badge::Elsewhere);
+            assert!(!external.here);
+            assert_eq!(external.cwd.as_deref(), Some("/other"));
+            assert_eq!(
+                choose(external).unwrap(),
+                Outcome::Resume {
+                    slug: "other/qa".into(),
+                    branch: "work".into(),
+                }
+            );
+        }
+    }
+
     /// An adopted session does not show up a second time as "waiting to be named".
     #[test]
     fn an_adopted_session_is_not_also_offered_for_naming() {
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             links: vec![link("A", "/w", Some("payments"), Some("refund-fix"))],
             seen: vec![seen("A", 10)],
@@ -1108,6 +1405,7 @@ mod tests {
         dismissed.link.source = "codex".into();
         dismissed.link.naming_ignored = true;
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             links: vec![dismissed],
             seen: vec![
@@ -1134,6 +1432,7 @@ mod tests {
         let mut adopted = link("A", "/w", Some("payments"), Some("refund-fix"));
         adopted.link.source = "codex".into();
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             links: vec![adopted],
             seen: vec![
@@ -1169,11 +1468,14 @@ mod tests {
     #[test]
     fn same_repo_does_not_duplicate_a_row_already_here() {
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             owner: Some("nana".into()),
             links: vec![link("A", "/w", Some("payments"), Some("refund-fix"))],
             seen: vec![seen("A", 10)],
             same_repo: vec![SameRepo {
+                runtime: "claude-code".into(),
+                cwd: Some("/other".into()),
                 slug: "nana/payments".into(), // a full slug — a different form from the link's
                 branch: "refund-fix".into(),
                 last_active: t(10),
@@ -1193,23 +1495,65 @@ mod tests {
         );
     }
 
-    /// With no sign-in there is no owner to qualify with; both sources degrade to bare names,
-    /// and dedup still holds.
+    /// An ownerless display row cannot hide a qualified branch discovered through its code anchor.
     #[test]
-    fn dedup_still_holds_when_the_owner_is_unknown() {
+    fn an_unknown_owner_does_not_suppress_a_qualified_same_repo_candidate() {
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             owner: None,
             links: vec![link("A", "/w", Some("payments"), Some("refund-fix"))],
             seen: vec![seen("A", 10)],
             same_repo: vec![SameRepo {
+                runtime: "claude-code".into(),
+                cwd: Some("/other".into()),
                 slug: "nana/payments".into(),
                 branch: "refund-fix".into(),
                 last_active: t(10),
                 last_seen: None,
             }],
         };
-        assert_eq!(assemble(&input, t(20)).len(), 1);
+        let rows = assemble(&input, t(1000));
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| { row.badge == Badge::Here && row.slug.as_deref() == Some("payments") })
+        );
+        let qualified = rows
+            .iter()
+            .find(|row| row.badge == Badge::SameRepo)
+            .unwrap();
+        assert_eq!(
+            choose(qualified).unwrap(),
+            Outcome::Resume {
+                slug: "nana/payments".into(),
+                branch: "refund-fix".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn branch_activity_uses_recorded_owners_and_keeps_unresolved_claims_conservative() {
+        let now = t(1000);
+        for (owner, agent, branch, superseded, expected) in [
+            (Some("other"), "qa", "work", false, None),
+            (Some("mine"), "qa", "work", false, Some(now)),
+            (None, "qa", "work", false, Some(now)),
+            (Some("mine"), "different", "work", false, None),
+            (Some("mine"), "qa", "different", false, None),
+            (Some("mine"), "qa", "work", true, None),
+        ] {
+            let mut adopted = link("unresolved", "/other", Some(agent), Some(branch));
+            adopted.link.source = "unavailable-fixture-runtime".into();
+            adopted.link.owner = owner.map(str::to_owned);
+            adopted.link.superseded_by = superseded.then(|| "replacement".into());
+            assert_eq!(
+                branch_last_seen(&[adopted], "mine/qa", "work", now),
+                expected,
+                "owner={owner:?}, agent={agent}, branch={branch}, superseded={superseded}"
+            );
+        }
+        assert_eq!(branch_last_seen(&[], "unqualified", "work", now), Some(now));
     }
 
     /// A session missing from the index must not sink, and must not be declared takeable.
@@ -1220,6 +1564,7 @@ mod tests {
     #[test]
     fn a_session_missing_from_the_index_is_neither_sunk_nor_declared_dead() {
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             owner: Some("nana".into()),
             links: vec![Adopted {
@@ -1249,6 +1594,7 @@ mod tests {
         let mut s = seen("B", 10);
         s.worth_naming = false;
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             seen: vec![s],
             ..Default::default()
@@ -1270,6 +1616,8 @@ mod tests {
             cwd: "/w".into(),
             owner: Some("nana".into()),
             same_repo: vec![SameRepo {
+                runtime: "claude-code".into(),
+                cwd: Some("/other".into()),
                 slug: "nana/infra".into(),
                 branch: "deploy".into(),
                 last_active: t(900),
@@ -1389,9 +1737,113 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn empty_shell_probe_keeps_special_and_unselected_sources_without_reading_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("empty.jsonl");
+        std::fs::write(&source, "{}\n").unwrap();
+        assert!(!worth_naming("claude-code", &source, None));
+        let alias = directory.path().join("alias.jsonl");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert!(worth_naming("claude-code", &alias, None));
+        let fifo = directory.path().join("fifo.jsonl");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(worth_naming("claude-code", &fifo, None));
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "{}\n");
+        assert!(std::fs::symlink_metadata(&alias).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn committed_activity_keeps_exact_branch_names_with_tags_and_packed_refs() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(directory.path()).unwrap();
+        repo.git(&["config", "user.name", "Candidate fixture"])
+            .unwrap();
+        repo.git(&["config", "user.email", "candidate@example.test"])
+            .unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        repo.git(&["commit", "--allow-empty", "-m", "candidate fixture"])
+            .unwrap();
+        repo.git(&["branch", "collision"]).unwrap();
+        repo.git(&["tag", "collision"]).unwrap();
+        repo.git(&["pack-refs", "--all"]).unwrap();
+        let times = committed_at(&repo);
+        assert!(times.contains_key("collision"));
+        assert!(!times.contains_key("heads/collision"));
+        let seconds = repo
+            .git(&["show", "-s", "--format=%ct", "refs/heads/collision"])
+            .unwrap();
+        assert_eq!(
+            times["collision"],
+            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds.trim().parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn committed_activity_keeps_branches_with_unrepresentable_git_dates() {
+        use crate::commands::plumbing::raw_git;
+
+        let directory = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(directory.path()).unwrap();
+        let tree = raw_git(&repo, &["mktree"], Some("")).unwrap();
+        let ordinary_seconds = 1_700_000_000;
+        let extreme_seconds = i64::MAX as u64;
+        for (branch, seconds) in [("ordinary", ordinary_seconds), ("extreme", extreme_seconds)] {
+            let commit = format!(
+                "tree {}\nauthor Candidate fixture <candidate@example.test> {seconds} +0000\ncommitter Candidate fixture <candidate@example.test> {seconds} +0000\n\nSynthetic activity\n",
+                tree.trim()
+            );
+            let oid = raw_git(
+                &repo,
+                &["hash-object", "-t", "commit", "-w", "--stdin"],
+                Some(&commit),
+            )
+            .unwrap();
+            repo.git(&["update-ref", &format!("refs/heads/{branch}"), oid.trim()])
+                .unwrap();
+        }
+        for packed in [false, true] {
+            if packed {
+                repo.git(&["pack-refs", "--all", "--prune"]).unwrap();
+                assert!(!repo.git_path("refs/heads/extreme").unwrap().exists());
+            }
+            let records = repo
+                .git(&[
+                    "for-each-ref",
+                    "--format=%(refname)%09%(committerdate:unix)",
+                    "refs/heads/",
+                ])
+                .unwrap();
+            assert!(
+                records
+                    .lines()
+                    .any(|line| line == "refs/heads/ordinary\t1700000000")
+            );
+            assert!(
+                records
+                    .lines()
+                    .any(|line| line == "refs/heads/extreme\t9223372036854775807")
+            );
+            let times = committed_at(&repo);
+            assert_eq!(times["ordinary"], t(ordinary_seconds));
+            let representable =
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(extreme_seconds));
+            match representable {
+                Some(expected) => assert_eq!(times.get("extreme"), Some(&expected)),
+                None => assert!(!times.contains_key("extreme")),
+            }
+            let branches = repo.branches();
+            assert!(branches.iter().any(|branch| branch == "ordinary"));
+            assert!(branches.iter().any(|branch| branch == "extreme"));
+        }
+    }
+
     #[test]
     fn a_row_matches_on_repo_branch_runtime_and_gist() {
         let input = Input {
+            all_projects: false,
             cwd: "/w".into(),
             links: vec![link("A", "/w", Some("payments"), Some("refund-fix"))],
             seen: vec![Seen {
@@ -1408,6 +1860,92 @@ mod tests {
                 h.contains(needle),
                 "{needle} is not in the filterable text: {h}"
             );
+        }
+    }
+
+    #[test]
+    fn short_session_panes_keep_the_selected_identity_and_page_by_visible_rows() {
+        use ratatui::backend::TestBackend;
+
+        let input = Input {
+            cwd: "/work".into(),
+            owner: Some("nana".into()),
+            links: ["FIRST", "MIDDLE", "LAST"]
+                .into_iter()
+                .map(|name| link(name, "/work", Some("payments"), Some(name)))
+                .collect(),
+            seen: ["FIRST", "MIDDLE", "LAST"]
+                .into_iter()
+                .map(|name| Seen {
+                    cwd: Some("/work".into()),
+                    ..seen(name, 0)
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let rows = assemble(&input, t(1000));
+        let view = rows.iter().collect::<Vec<_>>();
+        let mut state = ListState::default();
+        state.select(Some(2));
+        for (width, height, notice, inner_height, previous_page) in [
+            (79, 5, None, 1, 1),
+            (79, 6, Some("choose another session"), 1, 1),
+            (200, 5, Some("choose another session"), 1, 1),
+            (79, 6, None, 2, 1),
+            (79, 8, None, 4, 0),
+            (79, 5, None, 1, 1),
+        ] {
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut area = Rect::default();
+            term.draw(|frame| {
+                area = draw(
+                    frame,
+                    &view,
+                    &mut state,
+                    &Filter::default(),
+                    notice,
+                    &super::super::selector::Scope::default(),
+                );
+            })
+            .unwrap();
+            let inner = widgets::pane("").inner(area);
+            assert_eq!(inner.height, inner_height);
+            let buffer = term.backend().buffer();
+            let text = (inner.y..inner.bottom())
+                .map(|y| {
+                    (inner.x..inner.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            for required in ["nana/payments @ LAST", "▸ "] {
+                assert!(text.contains(required), "missing {required:?}: {text}");
+            }
+            assert_eq!(state.selected(), Some(2));
+            assert_eq!(
+                choose(view[2]),
+                Ok(Outcome::Resume {
+                    slug: "nana/payments".into(),
+                    branch: "LAST".into(),
+                })
+            );
+            let heights = view
+                .iter()
+                .map(|row| row_lines(row, area).len())
+                .collect::<Vec<_>>();
+            assert!(
+                heights
+                    .iter()
+                    .all(|height| *height <= inner.height as usize)
+            );
+            assert_eq!(
+                widgets::page_selection(Some(2), &heights, inner.height as usize, false),
+                Some(previous_page)
+            );
+            if inner.height >= 2 {
+                assert!(text.contains("/work"), "{text}");
+            }
         }
     }
 }

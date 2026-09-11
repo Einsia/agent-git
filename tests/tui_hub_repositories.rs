@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "support/terminal_screen.rs"]
+mod terminal_screen;
+
 use agit::domain::{meta, repo::Repo};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::{Value, json};
@@ -12,6 +15,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
+use terminal_screen::screen_text;
 
 const AGENT_ID: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 
@@ -328,7 +332,7 @@ impl Terminal {
         format!(
             "{}\n{}",
             ansi.replace_all(&captured, ""),
-            screen_text(&captured, &ansi)
+            screen_text(&captured, &ansi, 28, 120)
         )
     }
 
@@ -426,83 +430,6 @@ fn terminal_flags(
         flags.control_flags.bits(),
         flags.local_flags.bits(),
     )
-}
-
-// A renderer emits only changed cells. Replaying cursor movements keeps unchanged characters
-// in a status line visible to assertions when adjacent characters arrive in another frame.
-fn screen_text(output: &str, csi: &regex::Regex) -> String {
-    let mut cells = vec![vec![' '; 120]; 28];
-    let (mut row, mut col, mut previous) = (0usize, 0usize, 0usize);
-    for escape in csi.find_iter(output) {
-        paint_text(
-            &output[previous..escape.start()],
-            &mut cells,
-            &mut row,
-            &mut col,
-        );
-        let sequence = escape.as_str();
-        let params = &sequence[2..sequence.len() - 1];
-        let values: Vec<usize> = params.split(';').map(|n| n.parse().unwrap_or(0)).collect();
-        let first = values.first().copied().unwrap_or(0);
-        match sequence.as_bytes().last().copied().unwrap() {
-            b'H' | b'f' => {
-                row = first.max(1).saturating_sub(1).min(cells.len() - 1);
-                col = values
-                    .get(1)
-                    .copied()
-                    .unwrap_or(1)
-                    .max(1)
-                    .saturating_sub(1)
-                    .min(119);
-            }
-            b'A' => row = row.saturating_sub(first.max(1)),
-            b'B' => row = (row + first.max(1)).min(cells.len() - 1),
-            b'C' => col = (col + first.max(1)).min(119),
-            b'D' => col = col.saturating_sub(first.max(1)),
-            b'G' => col = first.max(1).saturating_sub(1).min(119),
-            b'J' if first == 2 => cells.iter_mut().for_each(|line| line.fill(' ')),
-            b'K' => match first {
-                0 => cells[row][col.min(119)..].fill(' '),
-                1 => cells[row][..=col.min(119)].fill(' '),
-                2 => cells[row].fill(' '),
-                _ => {}
-            },
-            _ => {}
-        }
-        previous = escape.end();
-    }
-    paint_text(&output[previous..], &mut cells, &mut row, &mut col);
-    cells
-        .into_iter()
-        .map(|line| line.into_iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn paint_text(text: &str, cells: &mut [Vec<char>], row: &mut usize, col: &mut usize) {
-    for character in text.chars() {
-        match character {
-            '\r' => *col = 0,
-            '\n' => {
-                if *row + 1 < cells.len() {
-                    *row += 1;
-                } else {
-                    cells.rotate_left(1);
-                    cells.last_mut().unwrap().fill(' ');
-                }
-            }
-            '\u{8}' => *col = col.saturating_sub(1),
-            c if !c.is_control() => {
-                if *col >= cells[0].len() {
-                    *col = 0;
-                    *row = (*row + 1).min(cells.len() - 1);
-                }
-                cells[*row][*col] = c;
-                *col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            }
-            _ => {}
-        }
-    }
 }
 
 #[test]

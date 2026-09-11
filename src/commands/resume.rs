@@ -23,7 +23,7 @@
 //! * the target must be a session-line branch head (historic points and tags go through `fork`,
 //!   the file line through `new`);
 //! * unsealed (`agit branch seal` leaves only forking and viewing);
-//! * an omitted branch is not guessed: a tty enters the picker (here first, same-repo after), a
+//! * an omitted branch is not guessed: a tty enters the picker (one activity order across sources), a
 //!   non-tty lists the candidates and exits 8.
 
 use super::CmdResult;
@@ -251,6 +251,7 @@ struct Candidate {
     slug: String,
     branch: String,
     detail: String,
+    last_active: std::time::SystemTime,
 }
 
 /// Two signals: a link whose cwd matches this directory (here); a code anchor whose origin
@@ -259,6 +260,14 @@ fn gather_candidates(cwd: &Path) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = vec![];
     let cwd_s = cwd.to_string_lossy().to_string();
     if let Ok(store) = Store::open_or_init() {
+        let mut seen = std::collections::HashMap::new();
+        for runtime in crate::adapter::RUNTIMES {
+            if let Ok(adapter) = crate::adapter::get(runtime) {
+                for session in adapter.sessions_for(cwd).unwrap_or_default() {
+                    seen.insert((session.runtime.to_string(), session.id), session.mtime);
+                }
+            }
+        }
         for l in link::list(&store) {
             if l.is_active()
                 && l.cwd.as_deref() == Some(cwd_s.as_str())
@@ -270,6 +279,10 @@ fn gather_candidates(cwd: &Path) -> Vec<Candidate> {
                     slug,
                     branch: branch.clone(),
                     detail: format!("{} {}", l.source, link::short(&l.session_id)),
+                    last_active: seen
+                        .get(&(l.source.clone(), l.session_id.clone()))
+                        .copied()
+                        .unwrap_or_else(|| link::touched_at(&store, &l)),
                 });
             }
         }
@@ -283,6 +296,7 @@ fn gather_candidates(cwd: &Path) -> Vec<Candidate> {
             let Some(repo) = Repo::open(&path) else {
                 continue;
             };
+            let committed = crate::tui::screens::sessions::committed_at(&repo);
             for b in repo.branches() {
                 if let Some(snap) = meta::read_at_ref(&repo, &format!("refs/heads/{b}"))
                     && let Some(code) = &snap.code
@@ -297,11 +311,16 @@ fn gather_candidates(cwd: &Path) -> Vec<Candidate> {
                         slug,
                         branch: b.clone(),
                         detail: snap.milestone.clone().unwrap_or_default(),
+                        last_active: committed
+                            .get(&b)
+                            .copied()
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
                     });
                 }
             }
         }
     }
+    out.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_active));
     out
 }
 

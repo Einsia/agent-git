@@ -7,11 +7,10 @@
 //! # Bounded previews
 //!
 //! The shared naming collector spends a fixed probe budget rejecting empty startup transcripts.
-//! Codex then hands the opening prompt over in its index. Claude does not, so the selected row is
-//! parsed on demand and cached. Moving the cursor may parse one more candidate; filtering never
-//! refetches data, and candidates beyond the probe budget cost nothing until selected.
+//! Indexed opening prompts cost no native reads. Missing prompts and project paths use bounded
+//! opening windows, cached for the selected row; no preview materializes a runtime export.
 
-use super::{repos, sessions};
+use super::{repos, selector, sessions};
 use crate::domain::link;
 use crate::tui::widgets::{self, Filter};
 use crate::ui::theme;
@@ -27,6 +26,7 @@ use std::time::SystemTime;
 pub struct Picked {
     pub runtime: String,
     pub session_id: String,
+    pub cwd: Option<String>,
     /// `None` is the `--link-only` path; otherwise the repo and new branch are both explicit.
     pub destination: Option<(String, String)>,
     pub link_only: bool,
@@ -36,22 +36,37 @@ pub struct Picked {
 struct Candidate {
     runtime: String,
     session_id: String,
+    path: std::path::PathBuf,
+    cwd: Option<String>,
+    here: bool,
+    ambiguous: bool,
     gist: Option<String>,
     last_active: SystemTime,
     live: bool,
 }
 
 impl Candidate {
-    fn key(&self) -> (String, String) {
-        (self.runtime.clone(), self.session_id.clone())
+    fn key(&self) -> (String, String, std::path::PathBuf) {
+        (
+            self.runtime.clone(),
+            self.session_id.clone(),
+            self.path.clone(),
+        )
     }
 
-    fn haystack(&self, preview: Option<&str>) -> String {
+    fn haystack(&self, preview: Option<&selector::Preview>) -> String {
         format!(
-            "{} {} {}",
+            "{} {} {} {}",
             self.runtime,
             self.session_id,
-            preview.or(self.gist.as_deref()).unwrap_or_default()
+            preview
+                .and_then(|preview| preview.gist.as_deref())
+                .or(self.gist.as_deref())
+                .unwrap_or_default(),
+            self.cwd
+                .as_deref()
+                .or_else(|| preview.and_then(|preview| preview.cwd.as_deref()))
+                .unwrap_or_default()
         )
     }
 }
@@ -188,7 +203,7 @@ fn move_selection(state: &mut ListState, len: usize, delta: isize) {
     state.select(Some(next));
 }
 
-/// Gather unmanaged sessions in this directory without opening their transcripts.
+/// Gather unmanaged index rows; only a bounded opening window enriches advisory row metadata.
 fn collect(cwd: &Path) -> Vec<Candidate> {
     let store = crate::infra::config::store_root()
         .ok()
@@ -196,14 +211,36 @@ fn collect(cwd: &Path) -> Vec<Candidate> {
     let links = store.as_ref().map(link::list).unwrap_or_default();
     let link_refs = links.iter().collect::<Vec<_>>();
     let now = SystemTime::now();
-    sessions::probe_sessions_for_naming(cwd, &link_refs)
-        .into_iter()
+    candidates_from_rows(
+        sessions::probe_sessions_for_scope(cwd, &link_refs, true),
+        cwd,
+        now,
+    )
+}
+
+fn candidates_from_rows(
+    rows: Vec<sessions::ProbedSession>,
+    cwd: &Path,
+    now: SystemTime,
+) -> Vec<Candidate> {
+    let mut counts = HashMap::new();
+    for item in &rows {
+        *counts
+            .entry((item.session.runtime, item.session.id.clone()))
+            .or_insert(0usize) += 1;
+    }
+    rows.into_iter()
         .filter(|item| item.worth_naming)
         .map(|item| {
             let session = item.session;
+            let ambiguous = counts[&(session.runtime, session.id.clone())] > 1;
             Candidate {
                 runtime: session.runtime.to_string(),
                 session_id: session.id,
+                path: session.path,
+                here: session.cwd.as_deref() == cwd.to_str(),
+                cwd: session.cwd,
+                ambiguous,
                 gist: session.gist,
                 last_active: session.mtime,
                 live: sessions::is_live(session.mtime, now),
@@ -237,34 +274,34 @@ pub fn pick(cwd: &Path) -> crate::Result<Option<Picked>> {
         .unwrap_or(0);
     let picked = {
         let mut guard = crate::tui::term::Guard::enter()?;
-        let outcome = run_loop(&candidates, &repos, repo_index);
+        let runtimes = selector::runtimes(
+            candidates
+                .iter()
+                .map(|candidate| candidate.runtime.as_str()),
+        );
+        let outcome = match selector::preselect(&runtimes, "agit import")? {
+            Some(scope) => run_loop(&candidates, &repos, repo_index, scope),
+            None => Ok(None),
+        };
         guard.suspend()?;
         outcome?
     };
     Ok(picked)
 }
 
-fn preview(candidate: &Candidate) -> String {
-    candidate
-        .gist
-        .as_deref()
-        .filter(|gist| !gist.trim().is_empty())
-        .map(|gist| crate::ui::truncate(gist, 72))
-        .unwrap_or_else(|| {
-            let read = || -> crate::Result<Option<String>> {
-                let adapter = crate::adapter::get(&candidate.runtime)?;
-                let limits = crate::adapter::native_snapshot::Limits::default();
-                let source = adapter.lookup_native_readonly(&candidate.session_id, limits)?;
-                let snapshot = adapter.snapshot_native_readonly(&source, limits)?;
-                Ok(adapter
-                    .parse(std::str::from_utf8(&snapshot.bytes)?)?
-                    .gist(48))
-            };
-            read()
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "(preview unavailable)".into())
-        })
+fn preview(candidate: &Candidate) -> selector::Preview {
+    let mut preview = if candidate.gist.is_none() || candidate.cwd.is_none() {
+        selector::preview(&candidate.runtime, &candidate.path)
+    } else {
+        selector::Preview::default()
+    };
+    if let Some(gist) = &candidate.gist {
+        preview.gist = Some(crate::ui::truncate(gist, 60));
+    }
+    if let Some(cwd) = &candidate.cwd {
+        preview.cwd = Some(cwd.clone());
+    }
+    preview
 }
 
 fn validate(
@@ -274,6 +311,9 @@ fn validate(
     link_only: bool,
     signed_in: bool,
 ) -> Result<Picked, String> {
+    if candidate.ambiguous {
+        return Err("this runtime id has multiple indexed sources; inspect the runtime sources before importing it.".into());
+    }
     if candidate.live {
         return Err(
             "this session still looks active. exit it in its own terminal before adopting it."
@@ -284,6 +324,7 @@ fn validate(
         return Ok(Picked {
             runtime: candidate.runtime.clone(),
             session_id: candidate.session_id.clone(),
+            cwd: candidate.cwd.clone(),
             destination: None,
             link_only: true,
         });
@@ -314,6 +355,7 @@ fn validate(
     Ok(Picked {
         runtime: candidate.runtime.clone(),
         session_id: candidate.session_id.clone(),
+        cwd: candidate.cwd.clone(),
         destination: Some((slug, branch.to_string())),
         link_only: false,
     })
@@ -323,15 +365,23 @@ fn run_loop(
     candidates: &[Candidate],
     repos: &[repos::Row],
     repo_index: usize,
+    mut scope: selector::Scope,
 ) -> crate::Result<Option<Picked>> {
+    let runtimes = selector::runtimes(
+        candidates
+            .iter()
+            .map(|candidate| candidate.runtime.as_str()),
+    );
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    term.clear()?;
     let mut session_state = ListState::default();
     session_state.select(Some(0));
     let mut repo_state = ListState::default();
     repo_state.select((!repos.is_empty()).then_some(repo_index % repos.len().max(1)));
     let mut session_filter = Filter::default();
     let mut repo_filter = Filter::default();
-    let mut previews: HashMap<(String, String), String> = HashMap::new();
+    let mut previews: HashMap<(String, String, std::path::PathBuf), selector::Preview> =
+        HashMap::new();
     let mut branch = String::new();
     let mut link_only = false;
     let mut notice: Option<String> = None;
@@ -346,8 +396,9 @@ fn run_loop(
         let session_view: Vec<&Candidate> = candidates
             .iter()
             .filter(|candidate| {
-                let cached = previews.get(&candidate.key()).map(String::as_str);
-                session_filter.matches(&candidate.haystack(cached))
+                let cached = previews.get(&candidate.key());
+                scope.includes(&candidate.runtime, candidate.here)
+                    && session_filter.matches(&candidate.haystack(cached))
             })
             .collect();
         let repo_view: Vec<&repos::Row> = repos
@@ -369,7 +420,9 @@ fn run_loop(
             .selected()
             .and_then(|index| repo_view.get(index))
             .copied();
+        let mut page_layout = None;
         term.draw(|frame| {
+            page_layout = Some(areas(frame.area(), notice.is_some()));
             draw(
                 frame,
                 &repo_view,
@@ -384,8 +437,10 @@ fn run_loop(
                 &session_filter,
                 &previews,
                 notice.as_deref(),
+                &scope,
             )
         })?;
+        let page_layout = page_layout.expect("the terminal rendered its current layout");
 
         let Some(key) = crate::tui::term::next_key()? else {
             continue;
@@ -427,7 +482,14 @@ fn run_loop(
                         continue;
                     };
                     match validate(candidate, repo, &branch, link_only, signed_in) {
-                        Ok(picked) => return Ok(Some(picked)),
+                        Ok(mut picked) => {
+                            if picked.cwd.is_none() {
+                                picked.cwd = previews
+                                    .get(&candidate.key())
+                                    .and_then(|preview| preview.cwd.clone());
+                            }
+                            return Ok(Some(picked));
+                        }
                         Err(error) => notice = Some(error),
                     }
                 }
@@ -460,6 +522,49 @@ fn run_loop(
             KeyCode::Char('/') => match focus {
                 Focus::Repos if !link_only => repo_filter.open(),
                 Focus::Sessions => session_filter.open(),
+                Focus::Repos | Focus::Destination => {}
+            },
+            KeyCode::Char('a') => {
+                scope.all_projects = !scope.all_projects;
+                session_state.select(Some(0));
+                branch.clear();
+            }
+            KeyCode::Char('r') => {
+                let Some(selected) = selector::preselect(&runtimes, "agit import")? else {
+                    return Ok(None);
+                };
+                scope.runtime = selected.runtime;
+                term.clear()?;
+                session_state.select(Some(0));
+                branch.clear();
+            }
+            KeyCode::PageDown | KeyCode::PageUp => match focus {
+                Focus::Repos if !link_only => repo_state.select(widgets::page_selection(
+                    repo_state.selected(),
+                    &vec![2; repo_view.len()],
+                    page_layout.repos.height.saturating_sub(2) as usize,
+                    key.code == KeyCode::PageDown,
+                )),
+                Focus::Sessions => {
+                    let heights: Vec<_> = session_view
+                        .iter()
+                        .map(|candidate| {
+                            row_lines(
+                                candidate,
+                                previews.get(&candidate.key()),
+                                page_layout.sessions,
+                            )
+                            .len()
+                        })
+                        .collect();
+                    session_state.select(widgets::page_selection(
+                        session_state.selected(),
+                        &heights,
+                        page_layout.sessions.height.saturating_sub(2) as usize,
+                        key.code == KeyCode::PageDown,
+                    ));
+                    branch.clear();
+                }
                 Focus::Repos | Focus::Destination => {}
             },
             KeyCode::Down | KeyCode::Char('j') => match focus {
@@ -541,15 +646,16 @@ fn draw(
     link_only: bool,
     repo_filter: &Filter,
     session_filter: &Filter,
-    previews: &HashMap<(String, String), String>,
+    previews: &HashMap<(String, String, std::path::PathBuf), selector::Preview>,
     notice: Option<&str>,
+    scope: &selector::Scope,
 ) {
     let layout = areas(frame.area(), notice.is_some());
     widgets::render_status(
         frame,
         layout.status,
         &widgets::Status {
-            title: "agit import".into(),
+            title: format!("agit import · {}", scope.label()),
             identity: crate::infra::credentials::current_user()
                 .map(|user| format!("{user} @ {}", crate::infra::config::hub_url())),
             rc_online: None,
@@ -569,7 +675,7 @@ fn draw(
         branch,
         focus == Focus::Destination,
         link_only,
-        selected_preview.map(String::as_str),
+        selected_preview,
         notice,
     );
 
@@ -669,10 +775,12 @@ fn draw(
         "type to filter   enter keep   esc clear"
     } else if link_only && focus == Focus::Repos {
         "repo skipped   tab/enter next   l versioned   shift-tab stay   q quit"
+    } else if frame.area().width < widgets::MIN_TWO_PANE_WIDTH {
+        "tab/enter next  a project  r runtime  l mode  / filter  q quit"
     } else if link_only {
-        "↑↓ move   tab/enter next   shift-tab/esc back   l versioned   / filter   q quit"
+        "↑↓ move   pgup/pgdn page   a projects   r runtime   tab/enter next   shift-tab/esc back   l versioned   / filter   q quit"
     } else {
-        "↑↓ move   tab/enter next   shift-tab/esc back   l link-only   / filter   q quit"
+        "↑↓ move   pgup/pgdn page   a projects   r runtime   tab/enter next   shift-tab/esc back   l link-only   / filter   q quit"
     };
     widgets::render_footer(frame, layout.footer, footer);
 }
@@ -762,14 +870,13 @@ fn render_session_pane(
     state: &mut ListState,
     active: bool,
     filter: &Filter,
-    previews: &HashMap<(String, String), String>,
+    previews: &HashMap<(String, String, std::path::PathBuf), selector::Preview>,
 ) {
-    let width = area.width.saturating_sub(4) as usize;
     let items = view
         .iter()
         .map(|candidate| {
-            let preview = previews.get(&candidate.key()).map(String::as_str);
-            ListItem::new(row_lines(candidate, preview, width))
+            let preview = previews.get(&candidate.key());
+            ListItem::new(row_lines(candidate, preview, area))
         })
         .collect::<Vec<_>>();
     let title = pane_title("2 sessions", view.len(), filter, active);
@@ -801,7 +908,12 @@ fn render_destination_pane(frame: &mut Frame, area: Rect, text: String, active: 
     );
 }
 
-fn row_lines(candidate: &Candidate, preview: Option<&str>, width: usize) -> Vec<Line<'static>> {
+fn row_lines(
+    candidate: &Candidate,
+    preview: Option<&selector::Preview>,
+    area: Rect,
+) -> Vec<Line<'static>> {
+    let width = area.width.saturating_sub(4) as usize;
     let live = if candidate.live { " · active" } else { "" };
     let mut lines = vec![widgets::clamp_line(
         Line::from(format!(
@@ -813,12 +925,32 @@ fn row_lines(candidate: &Candidate, preview: Option<&str>, width: usize) -> Vec<
         )),
         width,
     )];
-    if let Some(preview) = preview {
+    lines.push(widgets::clamp_line(
+        Line::from(Span::styled(
+            format!(
+                "  {}",
+                selector::project_label(
+                    candidate
+                        .cwd
+                        .as_deref()
+                        .or_else(|| preview.and_then(|preview| preview.cwd.as_deref()))
+                )
+            ),
+            theme::muted(),
+        )),
+        width,
+    ));
+    if let Some(preview) = preview
+        .and_then(|preview| preview.gist.as_deref())
+        .or(candidate.gist.as_deref())
+    {
         lines.push(widgets::clamp_line(
             Line::from(Span::styled(format!("  {preview}"), theme::muted())),
             width,
         ));
     }
+    // The selected item must fit the viewport; metadata cannot hide its identity.
+    lines.truncate(area.height.saturating_sub(2) as usize);
     lines
 }
 
@@ -828,7 +960,7 @@ fn detail_text(
     branch: &str,
     editing: bool,
     link_only: bool,
-    preview: Option<&str>,
+    preview: Option<&selector::Preview>,
     notice: Option<&str>,
 ) -> String {
     let Some(candidate) = candidate else {
@@ -865,6 +997,15 @@ fn detail_text(
     ));
     out.push_str(&format!("runtime    {}\n", candidate.runtime));
     out.push_str(&format!(
+        "project    {}\n",
+        selector::project_label(
+            candidate
+                .cwd
+                .as_deref()
+                .or_else(|| preview.and_then(|preview| preview.cwd.as_deref()))
+        )
+    ));
+    out.push_str(&format!(
         "session    {}\n",
         link::short(&candidate.session_id)
     ));
@@ -879,7 +1020,10 @@ fn detail_text(
     if link_only {
         out.push_str("           records only the session link\n");
     }
-    if let Some(preview) = preview {
+    if let Some(preview) = preview
+        .and_then(|preview| preview.gist.as_deref())
+        .or(candidate.gist.as_deref())
+    {
         out.push_str(&format!("\n{preview}\n"));
     }
     if candidate.live {
@@ -905,6 +1049,10 @@ mod tests {
     fn candidate(live: bool) -> Candidate {
         Candidate {
             runtime: "codex".into(),
+            path: "/missing".into(),
+            cwd: Some("/work".into()),
+            here: true,
+            ambiguous: false,
             session_id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
             gist: Some("fix the retry path".into()),
             last_active: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
@@ -938,7 +1086,13 @@ mod tests {
         let mut session_state = ListState::default();
         session_state.select(Some(0));
         let mut previews = HashMap::new();
-        previews.insert(rows[0].key(), "fix the retry path".into());
+        previews.insert(
+            rows[0].key(),
+            selector::Preview {
+                gist: Some("fix the retry path".into()),
+                cwd: Some("/work".into()),
+            },
+        );
         let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
         term.draw(|frame| {
             draw(
@@ -955,6 +1109,7 @@ mod tests {
                 &Filter::default(),
                 &previews,
                 notice,
+                &selector::Scope::default(),
             )
         })
         .unwrap();
@@ -976,6 +1131,60 @@ mod tests {
         assert_eq!(picked.session_id, "aaaaaaaa-0000-4000-8000-000000000001");
         assert!(picked.destination.is_none());
         assert!(picked.link_only);
+    }
+
+    #[test]
+    fn hidden_empty_sources_still_make_the_same_runtime_identity_ambiguous() {
+        let rows = [
+            ("claude-code", "/one", true),
+            ("claude-code", "/two", false),
+            ("codex", "/three", true),
+        ]
+        .into_iter()
+        .map(|(runtime, path, worth_naming)| sessions::ProbedSession {
+            session: crate::adapter::SessionRef {
+                id: "same-id".into(),
+                runtime,
+                path: path.into(),
+                cwd: Some("/work".into()),
+                mtime: SystemTime::UNIX_EPOCH,
+                gist: None,
+            },
+            worth_naming,
+        })
+        .collect();
+        let candidates = candidates_from_rows(
+            rows,
+            Path::new("/work"),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1000),
+        );
+        assert_eq!(candidates.len(), 2);
+        assert!(validate(&candidates[0], None, "", true, false).is_err());
+        let selected = validate(&candidates[1], None, "", true, false).unwrap();
+        assert_eq!(selected.runtime, "codex");
+        assert_eq!(selected.session_id, "same-id");
+    }
+
+    #[test]
+    fn a_duplicate_native_identity_is_not_adopted_and_unknown_project_stays_unknown() {
+        let mut row = candidate(false);
+        row.ambiguous = true;
+        assert!(
+            validate(&row, None, "", true, false)
+                .unwrap_err()
+                .contains("multiple indexed sources")
+        );
+        row.ambiguous = false;
+        row.cwd = None;
+        assert!(validate(&row, None, "", true, false).unwrap().cwd.is_none());
+        row.cwd = Some("/explicit-other-project".into());
+        assert_eq!(
+            validate(&row, None, "", true, false)
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some("/explicit-other-project")
+        );
     }
 
     #[test]
@@ -1038,6 +1247,83 @@ mod tests {
         }
         let narrow = rendered(79, Focus::Destination, None);
         assert!(narrow.contains("[*] 3 destination"), "{narrow}");
+    }
+
+    #[test]
+    fn selected_import_identity_survives_short_panes_and_resizing() {
+        use ratatui::backend::TestBackend;
+
+        let rows = ["aaaaaaaa", "bbbbbbbb", "cccccccc"].map(|prefix| {
+            let mut row = candidate(false);
+            row.session_id = format!("{prefix}-0000-4000-8000-000000000001");
+            row
+        });
+        let view = rows.iter().collect::<Vec<_>>();
+        let previews = HashMap::new();
+        for selected in [0, 2] {
+            let mut state = ListState::default();
+            state.select(Some(selected));
+            let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            for (width, height, notice, expected_inner, previous_page) in [
+                (100, 20, false, 8, 0),
+                (100, 15, false, 3, 1),
+                (100, 14, false, 2, 1),
+                (100, 13, false, 1, 1),
+                (100, 17, true, 3, 1),
+                (100, 16, true, 2, 1),
+                (100, 15, true, 1, 1),
+                (120, 5, false, 1, 1),
+                (79, 6, false, 1, 1),
+                (100, 20, false, 8, 0),
+            ] {
+                term.backend_mut().resize(width, height);
+                let mut area = Rect::default();
+                term.draw(|frame| {
+                    area = areas(frame.area(), notice).sessions;
+                    render_session_pane(
+                        frame,
+                        area,
+                        &view,
+                        &mut state,
+                        true,
+                        &Filter::default(),
+                        &previews,
+                    );
+                })
+                .unwrap();
+                let inner = widgets::pane("").inner(area);
+                assert_eq!(inner.height, expected_inner);
+                let buffer = term.backend().buffer();
+                let text = (inner.y..inner.bottom())
+                    .map(|y| {
+                        (inner.x..inner.right())
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    text.contains(&link::short(&rows[selected].session_id)),
+                    "selected identity hidden in {width}x{height}, notice={notice}: {text}"
+                );
+                assert!(text.contains('▸'), "{text}");
+                assert_eq!(state.selected(), Some(selected));
+                if inner.height >= 2 {
+                    assert!(text.contains("/work"), "{text}");
+                }
+                if inner.height >= 3 {
+                    assert!(text.contains("fix the retry path"), "{text}");
+                }
+                let heights = rows
+                    .iter()
+                    .map(|row| row_lines(row, None, area).len())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    widgets::page_selection(Some(2), &heights, inner.height as usize, false),
+                    Some(previous_page)
+                );
+            }
+        }
     }
 
     #[test]

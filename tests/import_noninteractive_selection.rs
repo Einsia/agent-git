@@ -216,6 +216,112 @@ impl Drop for Lab {
 }
 
 #[test]
+fn fallback_candidates_share_activity_order_across_runtimes_without_adoption() {
+    let mut lab = Lab::new(2);
+    let codex_id = "cccccccc-0000-4000-8000-000000000001";
+    let codex = lab.home.join(".codex/sessions/rollout-recency.jsonl");
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    fs::write(
+        &codex,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session_meta", "payload": {"id": codex_id, "cwd": lab.work}
+            })
+        ),
+    )
+    .unwrap();
+    for (path, seconds) in [
+        (&lab.sources[0].1, 300),
+        (&codex, 200),
+        (&lab.sources[1].1, 100),
+    ] {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + seconds),
+            )
+            .unwrap();
+    }
+    lab.sources.push((codex_id.into(), codex));
+    let expected = [&lab.sources[0].0, &lab.sources[2].0, &lab.sources[1].0];
+    for adopted in [false, true] {
+        if adopted {
+            for (index, (id, _)) in lab.sources.iter().enumerate() {
+                let runtime = if index == 2 { "codex" } else { "claude-code" };
+                let mut link = agit::domain::link::Link::new(runtime, id, Some(&lab.work));
+                link.owner = Some("me".into());
+                link.agent = Some("qa".into());
+                link.branch = Some(format!("line-{index}"));
+                agit::domain::link::write(
+                    &agit::domain::store::Store::at(lab.store.join("store")),
+                    &link,
+                )
+                .unwrap();
+            }
+        }
+        let before = lab.state();
+        for flags in [
+            vec![],
+            vec!["--quiet"],
+            vec!["--json", "--json-version", "1"],
+            vec!["--json", "--json-version", "2"],
+        ] {
+            let output = lab
+                .command()
+                .env("CODEX_HOME", lab.home.join(".codex"))
+                .args(&flags)
+                .args(if adopted {
+                    vec!["resume", "--no-launch"]
+                } else {
+                    vec!["import", "--link-only"]
+                })
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(8), "{output:?}");
+            let text = if flags.contains(&"--json") {
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["exit_code"], 8);
+                value["diagnostics"]["stderr"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["message"].as_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                assert!(output.stdout.is_empty(), "{output:?}");
+                String::from_utf8(output.stderr).unwrap()
+            };
+            let positions: Vec<_> = if adopted {
+                ["line-0", "line-2", "line-1"]
+                    .iter()
+                    .map(|id| {
+                        text.find(id).unwrap_or_else(|| {
+                            panic!("missing candidate {id:?}; flags={flags:?}: {text}")
+                        })
+                    })
+                    .collect()
+            } else {
+                expected
+                    .iter()
+                    .map(|id| {
+                        text.find(id.as_str()).unwrap_or_else(|| {
+                            panic!("missing candidate {id:?}; flags={flags:?}: {text}")
+                        })
+                    })
+                    .collect()
+            };
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+            assert_eq!(lab.state(), before);
+        }
+    }
+}
+
+#[test]
 fn all_noninteractive_candidates_are_actionable_without_adoption() {
     for count in [1, 2, 17] {
         let lab = Lab::new(count);

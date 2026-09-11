@@ -7,6 +7,7 @@ pub mod history;
 pub mod initialize;
 pub mod naming;
 pub mod repos;
+pub(crate) mod selector;
 pub mod sessions;
 pub mod sharing;
 pub mod timeline;

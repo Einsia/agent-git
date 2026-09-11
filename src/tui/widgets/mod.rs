@@ -410,10 +410,44 @@ impl Filter {
     }
 }
 
+/// Move through the filtered list by its rendered height without selecting outside that list.
+pub(crate) fn page_selection(
+    selected: Option<usize>,
+    row_heights: &[usize],
+    viewport_height: usize,
+    forward: bool,
+) -> Option<usize> {
+    let last = row_heights.len().checked_sub(1)?;
+    let mut index = selected.unwrap_or(0).min(last);
+    let mut remaining = viewport_height.max(1);
+    while if forward { index < last } else { index > 0 } {
+        let height = row_heights[if forward { index } else { index - 1 }].max(1);
+        index = if forward { index + 1 } else { index - 1 };
+        if height >= remaining {
+            break;
+        }
+        remaining -= height;
+    }
+    Some(index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn pages_follow_rendered_height_and_clamp_after_filtering() {
+        let rows = [2, 1, 3, 1, 2, 1];
+        assert_eq!(page_selection(Some(0), &rows, 6, true), Some(3));
+        assert_eq!(page_selection(Some(3), &rows, 6, false), Some(0));
+        assert_eq!(page_selection(Some(3), &rows, 6, true), Some(5));
+        assert_eq!(page_selection(Some(5), &rows[..2], 6, false), Some(0));
+        assert_eq!(page_selection(Some(5), &[], 6, true), None);
+        assert_eq!(page_selection(None, &[2], 0, true), Some(0));
+        assert_eq!(page_selection(Some(0), &[0, 0, 0], 0, true), Some(1));
+        assert_eq!(page_selection(Some(0), &[usize::MAX, 1], 8, true), Some(1));
+    }
 
     fn area(w: u16, h: u16) -> Rect {
         Rect::new(0, 0, w, h)

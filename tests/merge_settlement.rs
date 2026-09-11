@@ -706,7 +706,7 @@ struct ArchiveTerminal {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
     _writer: Box<dyn std::io::Write + Send>,
-    output: std::sync::mpsc::Receiver<Vec<u8>>,
+    output: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
 }
 
 #[cfg(unix)]
@@ -794,9 +794,19 @@ impl ArchiveTerminal {
         let (send, output) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = [0; 4096];
-            while let Ok(size) = reader.read(&mut buffer) {
-                if size == 0 || send.send(buffer[..size].to_vec()).is_err() {
-                    break;
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        if send.send(Ok(buffer[..size].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        let _ = send.send(Err(error));
+                        break;
+                    }
                 }
             }
         });
@@ -810,32 +820,43 @@ impl ArchiveTerminal {
         }
     }
 
-    fn finish(mut self) -> (u32, String) {
+    fn finish(mut self) -> (portable_pty::ExitStatus, String) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut output = Vec::new();
+        let mut status = None;
+        let mut output_closed = false;
         loop {
-            if let Ok(bytes) = self
-                .output
-                .recv_timeout(std::time::Duration::from_millis(10))
-            {
-                output.extend_from_slice(&bytes);
-                assert!(
-                    output.len() <= 1024 * 1024,
-                    "controlled runtime output exceeded its bound"
-                );
+            if status.is_none() {
+                status = self.child.try_wait().unwrap();
             }
-            if let Some(status) = self.child.try_wait().unwrap() {
-                while let Ok(bytes) = self.output.try_recv() {
-                    output.extend_from_slice(&bytes);
+            if output_closed {
+                if let Some(status) = status {
+                    return (status, String::from_utf8_lossy(&output).into_owned());
                 }
-                return (
-                    status.exit_code(),
-                    String::from_utf8_lossy(&output).into_owned(),
-                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            } else {
+                match self
+                    .output
+                    .recv_timeout(std::time::Duration::from_millis(10))
+                {
+                    Ok(Ok(bytes)) => {
+                        output.extend_from_slice(&bytes);
+                        assert!(
+                            output.len() <= 1024 * 1024,
+                            "controlled runtime output exceeded its bound; status={status:?}"
+                        );
+                    }
+                    Ok(Err(error)) => panic!(
+                        "terminal read failed: {error}; status={status:?}; output={}",
+                        String::from_utf8_lossy(&output)
+                    ),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => output_closed = true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "{}",
+                "terminal did not finish; status={status:?}; output_closed={output_closed}; output={}",
                 String::from_utf8_lossy(&output)
             );
         }
@@ -879,7 +900,7 @@ fn session_agent_start_settles_old_content_then_activates_archive_before_spawn()
         }
         let native = fs::read(&lab.native).unwrap();
         let (status, output) = ArchiveTerminal::start(&lab, 0).finish();
-        assert_eq!(status, 4, "{output}");
+        assert_eq!(status.exit_code(), 4, "{status:?}: {output}");
         assert!(
             output.contains(
                 "archive merge child exited before the merge landed; the transaction remains open"
@@ -947,7 +968,7 @@ fn failed_archive_runtime_keeps_installed_authority_for_explicit_abort() {
     let lab = Lab::new();
     let head = lab.git(&["rev-parse", "refs/heads/work"]);
     let (status, output) = ArchiveTerminal::start(&lab, 7).finish();
-    assert_eq!(status, 4, "{output}");
+    assert_eq!(status.exit_code(), 4, "{status:?}: {output}");
     let repo = Repo::open(lab.repo()).unwrap();
     let tx = mergetx::read(repo.root()).unwrap().unwrap();
     let binding = tx.exploration.as_ref().unwrap();
@@ -1006,7 +1027,7 @@ fn archive_start_preflight_refusals_preserve_old_pending_authority() {
         let head = lab.git(&["rev-parse", "refs/heads/work"]);
         let (status, output) =
             ArchiveTerminal::start_with_runtime(&lab, 0, change != "unavailable").finish();
-        assert_ne!(status, 0, "{change}: {output}");
+        assert_ne!(status.exit_code(), 0, "{change}: {status:?}: {output}");
         assert!(
             output.contains(if change == "unavailable" {
                 "not on PATH"
@@ -1288,7 +1309,7 @@ fn file_agent_public_launch_lands_and_captures_only_the_visible_session_branch()
         let native = fs::read(&lab.native).unwrap();
         let (status, output) =
             ArchiveTerminal::start_selected(&lab, 0, true, "main", runtime, Some(mode)).finish();
-        assert_eq!(status, 0, "{runtime}: {output}");
+        assert_eq!(status.exit_code(), 0, "{runtime}: {status:?}: {output}");
         let repo = Repo::open(lab.repo()).unwrap();
         let main = lab.git(&["rev-parse", "refs/heads/main"]);
         assert_ne!(main, old);
@@ -1385,7 +1406,7 @@ fn file_agent_public_failed_launch_remains_abortable_without_a_native_file() {
         let (status, output) =
             ArchiveTerminal::start_selected(&lab, 0, true, "main", "claude-code", Some(mode))
                 .finish();
-        assert_eq!(status, 4, "{mode}: {output}");
+        assert_eq!(status.exit_code(), 4, "{mode}: {status:?}: {output}");
         assert_eq!(lab.git(&["rev-parse", "refs/heads/main"]), main);
         let repo = Repo::open(lab.repo()).unwrap();
         let evidence = lab.git(&[

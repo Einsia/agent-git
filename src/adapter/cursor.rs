@@ -181,14 +181,7 @@ impl Adapter for Cursor {
     fn parse_at(&self, path: &Path) -> Result<Session> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        let (mut s, hints) = parse_text(&text);
-        s.id = path
-            .file_stem()
-            .and_then(|x| x.to_str())
-            .unwrap_or_default()
-            .to_string();
-        s.cwd = cwd_from(path, &hints);
-        Ok(s)
+        Ok(parse_preview_at(path, &text))
     }
 
     /// Bare text parse. **The id and the cwd come back empty**, because the transcript has no
@@ -545,7 +538,10 @@ fn collect_cwd_hints(input: Option<&serde_json::Value>, out: &mut Vec<String>) {
     }
     let Some(v) = input else { return };
     let mut push = |s: &str| {
-        if s.starts_with('/') && out.len() < CAP && !out.iter().any(|x| x == s) {
+        if (s.starts_with('/') || Path::new(s).is_absolute())
+            && out.len() < CAP
+            && !out.iter().any(|x| x == s)
+        {
             out.push(s.to_string());
         }
     };
@@ -561,6 +557,18 @@ fn collect_cwd_hints(input: Option<&serde_json::Value>, out: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Apply the native path convention to an already read window without opening the source again.
+pub(crate) fn parse_preview_at(path: &Path, text: &str) -> Session {
+    let (mut session, hints) = parse_text(text);
+    session.id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    session.cwd = cwd_from(path, &hints);
+    session
 }
 
 /// Recovers the cwd from the transcript path.
@@ -976,6 +984,40 @@ mod tests {
             cwd_from(path, &hints).as_deref(),
             Some("/Users/nana/Projects/AgentGit")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cwd_uses_qualified_drive_and_share_path_evidence() {
+        let mut relative = vec![];
+        collect_cwd_hints(
+            Some(&serde_json::json!({"paths": [
+                r"C:projects\agent-repo\a.rs",
+                r"\projects\agent-repo\a.rs",
+                "projects/agent-repo/a.rs"
+            ]})),
+            &mut relative,
+        );
+        assert!(relative.is_empty());
+
+        for cwd in [
+            Path::new(r"C:\projects\agent-repo"),
+            Path::new(r"\\host\share\projects\agent-repo"),
+            Path::new(r"\\?\C:\projects\agent-repo"),
+            Path::new(r"\\?\UNC\host\share\projects\agent-repo"),
+        ] {
+            let path = Path::new(r"C:\cursor")
+                .join(slug_for(cwd))
+                .join("agent-transcripts/session.jsonl");
+            let text = format!(
+                "{}\n",
+                serde_json::json!({"role":"assistant", "message":{"content":[
+                    {"type":"tool_use", "name":"Read", "input":{"path":cwd.join("a.rs")}}
+                ]}})
+            );
+            let observed = parse_preview_at(&path, &text);
+            assert_eq!(observed.cwd.as_deref(), cwd.to_str());
+        }
     }
 
     /// Three kinds of slug are not paths at all; when nothing can be recovered, say so.
