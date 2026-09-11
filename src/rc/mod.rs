@@ -79,6 +79,7 @@ pub mod journal;
 pub mod lineage;
 pub mod link;
 pub mod mirror;
+pub(crate) mod native_inbox;
 pub(crate) mod navigation;
 pub mod outbound;
 pub mod policy;

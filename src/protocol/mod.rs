@@ -587,6 +587,7 @@ pub mod method {
     pub const SESSION_LIST: &str = "session.list";
     pub const SESSION_SUBSCRIBE: &str = "session.subscribe";
     pub const SESSION_WATCH: &str = "session.watch";
+    pub const SESSION_ENQUEUE: &str = "session.enqueue";
     /// A viewer stops watching. The machine stops that tail only when the last subscriber
     /// leaves — without it, every session someone has watched leaves a permanent file poll
     /// behind on that machine.

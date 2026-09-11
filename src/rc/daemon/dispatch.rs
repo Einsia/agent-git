@@ -608,6 +608,7 @@ impl Daemon {
                     total_lines,
                     absolute_lines,
                     read_only: true,
+                    native_inbox: (runtime == "codex").then(|| "codex_queue".into()),
                 })
                 .unwrap())
             }
@@ -793,6 +794,57 @@ mod tests {
             session_generation: 0,
             confinement: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn native_inbox_checks_scope_and_role_before_locating_a_transcript() {
+        let daemon = watching_daemon();
+        let mut frame = Frame::request(
+            method::SESSION_ENQUEUE,
+            serde_json::json!({
+                "workspace_id":"ws-a", "session_id":uuid::Uuid::new_v4().to_string(),
+                "client_msg_id":uuid::Uuid::new_v4().to_string(), "message":"hello"
+            }),
+        );
+        frame.caller = Some(crate::protocol::CallerClaim {
+            account_id: Some("member".into()),
+            username: Some("alice".into()),
+            role: "viewer".into(),
+            workspace_id: "ws-a".into(),
+        });
+        assert_eq!(
+            daemon.prepare_native_inbox(&frame).err().unwrap().code,
+            ErrorCode::Forbidden as i32
+        );
+        frame.caller.as_mut().unwrap().role = "operator".into();
+        assert!(
+            !danger::judge(
+                &daemon.roster,
+                "codex",
+                frame.params.as_ref().unwrap()["session_id"]
+                    .as_str()
+                    .unwrap(),
+                "ws-a",
+                "/unregistered-native-session",
+            )
+            .ever_dangerous()
+        );
+        assert_eq!(
+            daemon.prepare_native_inbox(&frame).err().unwrap().code,
+            ErrorCode::Forbidden as i32,
+            "an unregistered native process may have full access outside the daemon's ledger"
+        );
+        frame.caller.as_mut().unwrap().role = "owner".into();
+        frame.caller.as_mut().unwrap().workspace_id = "ws-b".into();
+        assert_eq!(
+            daemon.prepare_native_inbox(&frame).err().unwrap().code,
+            ErrorCode::WorkspaceNotFound as i32
+        );
+        frame.caller.as_mut().unwrap().workspace_id = "ws-a".into();
+        assert_eq!(
+            daemon.prepare_native_inbox(&frame).err().unwrap().code,
+            ErrorCode::SessionNotFound as i32
+        );
     }
 
     fn watching_tail(stream: &str) -> WatchLive {

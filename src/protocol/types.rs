@@ -773,8 +773,11 @@ pub struct SessionWatchResult {
     /// with committed history.
     #[serde(default = "yes")]
     pub absolute_lines: bool,
-    /// Always true — the viewer must disable its composer.
+    /// The daemon does not own the native runtime's controls.
     pub read_only: bool,
+    /// Messages may be submitted to the existing runtime without resuming another writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_inbox: Option<String>,
 }
 
 /// An older daemon sends no `absolute_lines`, and its numbers **are** physical

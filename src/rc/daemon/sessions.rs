@@ -460,6 +460,73 @@ impl Daemon {
         })
     }
 
+    pub(super) fn prepare_native_inbox(
+        &self,
+        frame: &Frame,
+    ) -> Result<crate::rc::native_inbox::Prepared, RpcError> {
+        let caller = caller_scope(frame)?;
+        require_role(&caller, method::SESSION_ENQUEUE)?;
+        let request: crate::rc::native_inbox::Request = frame.params_as()?;
+        request
+            .validate()
+            .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
+        let local = self.locate_local(&request.workspace_id, &request.session_id)?;
+        if local.runtime != "codex" {
+            return Err(RpcError::new(
+                ErrorCode::RuntimeUnavailable,
+                "this runtime does not offer a native inbox",
+            ));
+        }
+        let cwd = policy::require_within(&local.cwd, &self.mirror.roots(&request.workspace_id))
+            .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
+        let transcript = {
+            use crate::adapter::Adapter;
+            crate::adapter::codex::Codex
+                .resolve(&request.session_id, Some(&cwd))
+                .ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::SessionNotFound,
+                        "cannot locate this Codex transcript",
+                    )
+                })?
+        };
+        let codex = crate::adapter::which("codex")
+            .and_then(|path| path.canonicalize().ok())
+            .ok_or_else(|| {
+                RpcError::new(ErrorCode::RuntimeUnavailable, "Codex CLI is unavailable")
+            })?;
+        let receipts = crate::rc::rc_dir()
+            .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))?
+            .join("native-inbox");
+        Ok(crate::rc::native_inbox::Prepared {
+            request,
+            transcript,
+            cwd,
+            codex,
+            receipts,
+            hub: self.opts.hub.clone(),
+            connection: self.opts.connection_id.clone().unwrap_or_default(),
+            account: caller
+                .account_id
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::Unauthenticated,
+                        "native messages require an authenticated account",
+                    )
+                })?,
+            username: caller
+                .username
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    RpcError::new(
+                        ErrorCode::Unauthenticated,
+                        "native messages require an authenticated username",
+                    )
+                })?,
+        })
+    }
+
     pub(super) async fn start_session(
         &mut self,
         p: SessionStart,

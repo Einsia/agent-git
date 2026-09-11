@@ -56,3 +56,21 @@ DNS, TCP connection, CONNECT, TLS and WebSocket negotiation share a 30-second
 deadline. Connection errors identify whether the attempt was direct or through
 a proxy. Set the environment in the shell that starts the daemon; changing a
 different shell does not change the environment of an already running process.
+
+## Messages to a session open in Codex
+
+Full-access workspace members can follow an existing Codex conversation and send messages through
+its native inbox. This uses `codex queue --thread <UUID> --message <text>` and keeps
+the existing Codex process in control of its transcript. Install a Codex CLI that
+supports `codex queue` on the machine running `agit rc`.
+
+The web composer reports "Queued" when the native inbox accepts a message. Codex
+processes queued messages at a turn boundary. Permission modes, interruptions, and
+approvals for that native process remain in Codex; the workspace terminal and other
+workspace actions continue to follow the member's normal role.
+
+The Hub authenticates the member and stamps their identity. The daemon checks the
+workspace, full-access role, bound folder, and exact native session before
+delivery. Reusing a client message identifier returns its saved receipt instead of
+enqueuing another message. An uncertain delivery must be checked with the same
+identifier.

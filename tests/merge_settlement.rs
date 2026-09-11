@@ -1104,6 +1104,7 @@ fn file_merge_runtime_probe() {
             "fresh Claude UUID must not resolve to an existing empty session"
         );
         if mode != "abort-missing" {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, b"").unwrap();
         }
         path
