@@ -214,6 +214,10 @@ pub struct Frame {
     /// Clones in the journal/outbound queues share the same delivery state.
     #[serde(skip)]
     pub(crate) connection_delivery: Option<Arc<ConnectionDelivery>>,
+    /// Local journal boundary shared by a completed turn and its later publication.
+    /// Wire deserialization cannot supply a trusted settlement coordinate.
+    #[serde(skip)]
+    pub(crate) settlement_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Who the hub says is asking, and with what standing.
     ///
     /// # Why the daemon cannot just trust `params`
@@ -421,6 +425,7 @@ impl Frame {
             caller: None,
             reliable: false,
             connection_delivery: None,
+            settlement_boundary: None,
         }
     }
     pub fn request_with_id(
@@ -446,6 +451,7 @@ impl Frame {
             caller: None,
             reliable: false,
             connection_delivery: None,
+            settlement_boundary: None,
         }
     }
     /// An event notification: a notification that also carries `seq` + `stream`.
@@ -474,6 +480,7 @@ impl Frame {
             caller: None,
             reliable: false,
             connection_delivery: None,
+            settlement_boundary: None,
         }
     }
     pub fn error_response(id: RequestId, err: RpcError) -> Frame {
@@ -490,6 +497,7 @@ impl Frame {
             caller: None,
             reliable: false,
             connection_delivery: None,
+            settlement_boundary: None,
         }
     }
 
@@ -610,6 +618,22 @@ pub mod method {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_boundary_is_local_unforgeable_metadata() {
+        let mut frame = Frame::notification("turn.completed", serde_json::json!({}));
+        frame.settlement_boundary = Some(Arc::new(std::sync::atomic::AtomicU64::new(17)));
+        let wire = serde_json::to_string(&frame).unwrap();
+        assert!(!wire.contains("settlement_boundary"));
+        let roundtrip: Frame = serde_json::from_str(&wire).unwrap();
+        assert!(roundtrip.settlement_boundary.is_none());
+        assert_eq!(frame, roundtrip);
+        let forged: Frame = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"commit.settled","settlement_boundary":17}"#,
+        )
+        .unwrap();
+        assert!(forged.settlement_boundary.is_none());
+    }
 
     #[test]
     fn frame_forms_round_trip() {

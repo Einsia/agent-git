@@ -114,12 +114,29 @@ impl Daemon {
                 delivery.invalidate();
                 return None;
             }
-            obj.insert(
-                "through_seq".into(),
-                serde_json::json!(self.journal.last_seq(&stream)),
+            let through_seq = frame.settlement_boundary.as_ref().map_or_else(
+                || self.journal.last_seq(&stream),
+                |boundary| boundary.load(std::sync::atomic::Ordering::Acquire),
+            );
+            if through_seq > self.journal.last_seq(&stream) {
+                delivery.invalidate();
+                return None;
+            }
+            obj.insert("through_seq".into(), serde_json::json!(through_seq));
+        }
+        let boundary = if frame.method() == method::TURN_COMPLETED {
+            frame.settlement_boundary.take()
+        } else {
+            None
+        };
+        let frame = self.journal.record(&stream, frame);
+        if let Some(boundary) = boundary {
+            boundary.store(
+                frame.seq.expect("journal assigns a sequence"),
+                std::sync::atomic::Ordering::Release,
             );
         }
-        Some(self.journal.record(&stream, frame))
+        Some(frame)
     }
 
     /// A session reports its harness id: this completes the test the

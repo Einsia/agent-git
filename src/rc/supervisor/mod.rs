@@ -132,6 +132,47 @@ struct PendingSettlement {
     receipt: Option<PathBuf>,
 }
 
+struct Publication(tokio::task::JoinHandle<Option<Arc<crate::protocol::ConnectionDelivery>>>);
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn publish_settlement(
+    mut state: tokio::sync::watch::Receiver<SettlementState>,
+    lease: SettlementState,
+    command: tokio::process::Command,
+    sha: String,
+    mut notification: Frame,
+    out: mpsc::Sender<Frame>,
+) -> Option<Arc<crate::protocol::ConnectionDelivery>> {
+    let push = guarded_output(&mut state, lease, command).await?;
+    if confirmed_strict_push(&push, &sha).is_none() {
+        tracing_note(&format!(
+            "RC push failed; the pending commit will retry next turn: {}",
+            String::from_utf8_lossy(&push.stderr).trim()
+        ));
+        return None;
+    }
+    if !settlement_lease_is_current(&state, lease) {
+        return None;
+    }
+    let delivery = crate::protocol::ConnectionDelivery::new(
+        lease.epoch,
+        crate::protocol::ConnectionFeature::AgentIdentityV1,
+    );
+    notification.connection_delivery = Some(delivery.clone());
+    if out.send(notification).await.is_err() {
+        delivery.invalidate();
+        return None;
+    }
+    wait_for_connection_delivery_within(&mut state, lease, &delivery, SETTLEMENT_DELIVERY_WAIT)
+        .await;
+    Some(delivery)
+}
+
 /// The settlement whose `commit.settled` the hub has not confirmed — a watermark on disk.
 ///
 /// # Why git reachability cannot be this watermark
@@ -290,6 +331,13 @@ async fn guarded_output(
             biased;
             changed = state.changed() => {
                 if changed.is_err() || !settlement_lease_is_current(state, lease) {
+                    #[cfg(unix)]
+                    {
+                        if let Some(pgid) = group.0.take() {
+                            unsafe { libc::kill(-pgid, libc::SIGKILL); }
+                        }
+                        let _ = (&mut wait).await;
+                    }
                     #[cfg(windows)]
                     {
                         // Keep both owners alive until the direct child is
@@ -692,6 +740,10 @@ pub struct Session {
     /// result yet. A later turn retries the idempotent push even when strict
     /// commit reports no new transcript content.
     pending_settlement: Option<PendingSettlement>,
+    /// Publication owns the repository writer until its process tree has finished.
+    publication: Option<Publication>,
+    settlement_due: bool,
+    completed_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// See [`SettlementChild`]: test-only, always `None` in production.
     settlement_child: Option<SettlementChild>,
     /// Creation may supply a prompt before Codex has a thread id. It is the
@@ -1124,6 +1176,9 @@ impl Session {
             confinement,
             settlement,
             pending_settlement: None,
+            publication: None,
+            settlement_due: false,
+            completed_boundary: None,
             settlement_child: None,
             queued_initial_turn: None,
             pending_turn_command: None,
@@ -1202,6 +1257,10 @@ impl Session {
     /// subprocesses for the network and a git clone, while launch is awaited under the daemon's
     /// global lock inside the main select loop.
     async fn bind_if_known(&mut self) {
+        if self.publication.is_some() {
+            self.announce_binding().await;
+            return;
+        }
         self.announce_binding().await;
         let Some(thread_id) = self.driver.runtime_thread_id() else {
             return;
@@ -1936,9 +1995,16 @@ impl Session {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(TAIL_POLL_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        let mut deferred_command = None;
         loop {
             tokio::select! {
-                cmd = commands.recv() => {
+                biased;
+                cmd = async {
+                    match deferred_command.take() {
+                        Some(command) => command,
+                        None => commands.recv().await,
+                    }
+                } => {
                     // **Do not do it when nobody is waiting.**
                     //
                     // The daemon's wait for an answer is bounded (a slow settlement can hold it
@@ -2373,7 +2439,7 @@ impl Session {
                             return;
                         }
                         Some(e) => {
-                            self.on_harness_event(e).await;
+                            deferred_command = self.on_harness_event_with_commands(e, Some(commands)).await;
                             if self.info.status == SessionStatus::Ended {
                                 return;
                             }
@@ -2382,6 +2448,14 @@ impl Session {
                 }
 
                 _ = ticker.tick() => {
+                    self.finish_publication(false).await;
+                    if self.settlement_due
+                        && self.publication.is_none()
+                        && self.info.status == SessionStatus::Idle
+                        && self.pending_turn_command.is_none()
+                    {
+                        deferred_command = self.settle_until_command(commands).await;
+                    }
                     // **The mode is a value to poll, not a series of events each call site
                     // must remember to broadcast.**
                     //
@@ -2454,7 +2528,17 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     async fn on_harness_event(&mut self, ev: HarnessEvent) {
+        self.on_harness_event_with_commands(ev, None).await;
+    }
+
+    async fn on_harness_event_with_commands(
+        &mut self,
+        ev: HarnessEvent,
+        commands: Option<&mut mpsc::Receiver<Command>>,
+    ) -> Option<Option<Command>> {
+        let mut deferred_command = None;
         match ev {
             HarnessEvent::Ready {
                 runtime_thread_id,
@@ -2504,7 +2588,7 @@ impl Session {
                         "[{}] ignored a turn/start response with no pending command",
                         self.info.session_id
                     ));
-                    return;
+                    return None;
                 };
                 self.resolve_turn_start(pending, outcome).await;
             }
@@ -2583,7 +2667,7 @@ impl Session {
                     .await
                 {
                     self.handle_protocol_invariant(message, None, None).await;
-                    return;
+                    return None;
                 }
                 if self.resolved_initial_turn.as_ref().is_some_and(|resolved| {
                     matches!(
@@ -2616,16 +2700,6 @@ impl Session {
                 // allowed — the harness may already be dead).
                 self.settle_transcript().await;
                 self.set_status(SessionStatus::Idle).await;
-                // One turn ended = one settlement = one commit, pushed immediately.
-                //
-                // This is where "sync on every update" actually lands: the harness's own Stop
-                // hook triggers the settlement (`agit commit --from-hook`), and once it has
-                // persisted we push the branch to this project's private repo. The push sits on
-                // the turn boundary rather than on every event, because a commit is what makes
-                // a meaningful version; pushing per event produces a string of half-finished
-                // snapshots nobody wants to read.
-                self.settle_and_push(SettlementBoundary::Turn).await;
-
                 let error = match error {
                     Some(message) => {
                         let report = self.redactor.scrub(&message);
@@ -2633,7 +2707,7 @@ impl Session {
                     }
                     None => None,
                 };
-                self.emit(
+                let mut completion = Frame::notification(
                     method::TURN_COMPLETED,
                     TurnCompleted {
                         turn_id,
@@ -2646,8 +2720,19 @@ impl Session {
                         cost_usd,
                         duration_ms,
                     },
-                )
-                .await;
+                );
+                let boundary = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+                completion.settlement_boundary = Some(boundary.clone());
+                self.completed_boundary = Some(boundary);
+                let _ = self.out.send(completion).await;
+                // Local transactions finish before another native turn starts. Publication
+                // runs separately and retains the completed turn's journal boundary.
+                if let Some(commands) = commands {
+                    deferred_command = self.settle_until_command(commands).await;
+                } else {
+                    self.settle_and_push(SettlementBoundary::Turn).await;
+                }
+
                 // The creation prompt can fall back into the slot **after** `Ready` — a turn
                 // happened to be running at that moment and native answered "a turn is already
                 // running". `Ready` comes once; the turn boundary is where that reason
@@ -2667,7 +2752,7 @@ impl Session {
                     .await
                 {
                     self.handle_protocol_invariant(message, None, None).await;
-                    return;
+                    return None;
                 }
                 req.session_id = self.info.session_id.clone();
                 // Whether this approval goes back to the owner is decided **here** — only the
@@ -2768,6 +2853,56 @@ impl Session {
             }
             HarnessEvent::Exited { .. } => {}
         }
+        deferred_command
+    }
+
+    /// Ordinary controls leave repository transactions intact; publication cannot block them.
+    async fn settle_until_command(
+        &mut self,
+        commands: &mut mpsc::Receiver<Command>,
+    ) -> Option<Option<Command>> {
+        self.finish_publication(false).await;
+        if self.publication.is_some() {
+            self.settlement_due = true;
+            return None;
+        }
+        self.settlement_due = false;
+        let boundary = self.completed_boundary.clone();
+        let mut settle =
+            std::pin::pin!(self.settle_and_push_inner(SettlementBoundary::Turn, boundary));
+        tokio::select! {
+            () = &mut settle => None,
+            command = commands.recv() => {
+                settle.await;
+                Some(command)
+            }
+        }
+    }
+
+    async fn finish_publication(&mut self, wait: bool) {
+        if !self
+            .publication
+            .as_ref()
+            .is_some_and(|task| wait || task.0.is_finished())
+        {
+            return;
+        }
+        let mut task = self.publication.take().expect("publication is present");
+        if let Ok(Some(delivery)) = (&mut task.0).await {
+            self.apply_publication_delivery(delivery);
+        }
+    }
+
+    fn apply_publication_delivery(&mut self, delivery: Arc<crate::protocol::ConnectionDelivery>) {
+        match delivery.status() {
+            crate::protocol::DeliveryStatus::Delivered => self.settlement_acked(),
+            crate::protocol::DeliveryStatus::Pending => {
+                if let Some(pending) = self.pending_settlement.as_mut() {
+                    pending.delivery = Some(delivery);
+                }
+            }
+            crate::protocol::DeliveryStatus::Stale => {}
+        }
     }
 
     /// The last transcript drain and settlement before the session closes.
@@ -2780,6 +2915,7 @@ impl Session {
     /// persisted. Called **after** `driver.shutdown()`: the process tree is already reaped, the
     /// transcript takes no more appends, and this drain reads everything.
     async fn settle_on_exit(&mut self) {
+        self.finish_publication(true).await;
         // Funnelled here for the same reason as the drain: the tail a streaming redactor holds
         // back leaves only on a flush, while Shutdown, driver EOF and harness Exited each
         // return on their own — adding the line to every exit path always misses one, and the
@@ -2813,6 +2949,15 @@ impl Session {
     /// truth, and the push only copies it to the hub. What is unacceptable is the reverse —
     /// interrupting a session that is doing work because a push failed.
     async fn settle_and_push(&mut self, boundary: SettlementBoundary) {
+        self.finish_publication(true).await;
+        self.settle_and_push_inner(boundary, None).await;
+    }
+
+    async fn settle_and_push_inner(
+        &mut self,
+        boundary: SettlementBoundary,
+        journal_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) {
         let Some(lease) = settlement_lease(&self.settlement) else {
             return;
         };
@@ -2821,7 +2966,9 @@ impl Session {
             .as_ref()
             .and_then(|pending| pending.delivery.clone())
         {
-            let status = if delivery.epoch() == lease.epoch {
+            let status = if delivery.epoch() == lease.epoch && journal_boundary.is_some() {
+                delivery.status()
+            } else if delivery.epoch() == lease.epoch {
                 wait_for_connection_delivery_within(
                     &mut self.settlement,
                     lease,
@@ -2852,6 +2999,7 @@ impl Session {
                 // `settle_on_exit` plugs.
                 crate::protocol::DeliveryStatus::Pending => {
                     if boundary == SettlementBoundary::Turn {
+                        self.settlement_due = journal_boundary.is_some();
                         return;
                     }
                 }
@@ -3062,66 +3210,32 @@ impl Session {
             receipt: Some(receipt_path),
         });
 
-        let Some(push) =
-            guarded_output(&mut self.settlement, lease, command(&["push", &slug])).await
-        else {
-            return;
-        };
-        let Some(confirmed_sha) = confirmed_strict_push(&push, &sha) else {
-            tracing_note(&format!(
-                "RC push failed; the pending commit will retry next turn: {}",
-                String::from_utf8_lossy(&push.stderr).trim()
-            ));
-            return;
-        };
-        if !settlement_lease_is_current(&self.settlement, lease) {
-            return;
-        }
-        let delivery = crate::protocol::ConnectionDelivery::new(
-            lease.epoch,
-            crate::protocol::ConnectionFeature::AgentIdentityV1,
-        );
         let mut notification = Frame::notification(
             method::COMMIT_SETTLED,
             CommitSettled {
                 session_id: self.info.session_id.clone(),
                 agent: Some(slug),
-                expected_agent_id: Some(expected_agent_id),
+                expected_agent_id: Some(expected_agent_id.clone()),
                 branch: Some(branch),
-                commit_sha: confirmed_sha,
-                // The daemon fills in the real value when it numbers the frame — which stream
-                // seq this commit covers is a journal coordinate the supervisor cannot see at
-                // all. See the daemon's main pump.
+                commit_sha: sha.clone(),
+                // The daemon resolves the captured boundary in its own journal coordinates.
                 through_seq: 0,
                 turns: None,
             },
         );
-        notification.connection_delivery = Some(delivery.clone());
-        if let Some(pending) = self.pending_settlement.as_mut() {
-            pending.delivery = Some(delivery.clone());
-        }
-        if self.out.send(notification).await.is_err() {
-            delivery.invalidate();
-            if let Some(pending) = self.pending_settlement.as_mut() {
-                pending.delivery = None;
-            }
-            return;
-        }
-        match wait_for_connection_delivery_within(
-            &mut self.settlement,
+        notification.settlement_boundary = journal_boundary.clone();
+        let publish = publish_settlement(
+            self.settlement.clone(),
             lease,
-            &delivery,
-            SETTLEMENT_DELIVERY_WAIT,
-        )
-        .await
-        {
-            crate::protocol::DeliveryStatus::Delivered => self.settlement_acked(),
-            crate::protocol::DeliveryStatus::Stale => {
-                if let Some(pending) = self.pending_settlement.as_mut() {
-                    pending.delivery = None;
-                }
-            }
-            crate::protocol::DeliveryStatus::Pending => {}
+            command(&["push", &agit_session.slug()]),
+            sha,
+            notification,
+            self.out.clone(),
+        );
+        if journal_boundary.is_some() {
+            self.publication = Some(Publication(tokio::spawn(publish)));
+        } else if let Some(delivery) = publish.await {
+            self.apply_publication_delivery(delivery);
         }
     }
 

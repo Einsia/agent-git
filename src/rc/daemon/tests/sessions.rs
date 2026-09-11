@@ -2444,3 +2444,45 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         "a failed replacement must not fence the last materialized generation"
     );
 }
+
+#[tokio::test]
+async fn delayed_publication_covers_only_its_captured_turn_boundary() {
+    let daemon = rpc_test_daemon(Default::default(), Roster::default());
+    let mut state = daemon.lock().await;
+    state
+        .latest_session_generations
+        .insert("session-a".into(), 2);
+    set_connection_features(&state.settlement, 7, true, true);
+    let boundary = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let mut completed = tagged_test_notification(
+        "session-a",
+        2,
+        method::TURN_COMPLETED,
+        serde_json::json!({"turn_id":"old","outcome":"error"}),
+    );
+    completed.settlement_boundary = Some(boundary.clone());
+    assert_eq!(state.project_session_frame(completed).unwrap().seq, Some(1));
+    state
+        .project_session_frame(tagged_test_notification(
+            "session-a",
+            2,
+            method::ITEM_DELTA,
+            serde_json::json!({"item_id":"new","text":"not yet committed"}),
+        ))
+        .unwrap();
+    let mut commit = tagged_test_notification(
+        "session-a",
+        2,
+        method::COMMIT_SETTLED,
+        serde_json::json!({"commit_sha":"old","through_seq":999}),
+    );
+    let delivery = crate::protocol::ConnectionDelivery::new(
+        7,
+        crate::protocol::ConnectionFeature::AgentIdentityV1,
+    );
+    commit.connection_delivery = Some(delivery);
+    commit.settlement_boundary = Some(boundary);
+    let commit = state.project_session_frame(commit).unwrap();
+    assert_eq!(commit.params.unwrap()["through_seq"], 1);
+    assert_eq!(commit.seq, Some(3));
+}

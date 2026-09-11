@@ -952,6 +952,28 @@ impl ClaudeCodeDriver {
                 // are more than one.
                 let turn = self.current_turn.take()?;
                 let is_err = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+                let error = is_err.then(|| {
+                    let errors = v
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|message| !message.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !errors.is_empty() {
+                        errors
+                    } else {
+                        v.get("result")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|message| !message.is_empty())
+                            .unwrap_or("Claude Code ended the turn with an error.")
+                            .to_owned()
+                    }
+                });
                 Some(HarnessEvent::TurnCompleted {
                     turn_id: turn,
                     outcome: if is_err {
@@ -959,7 +981,7 @@ impl ClaudeCodeDriver {
                     } else {
                         TurnOutcome::Ok
                     },
-                    error: None,
+                    error,
                     cost_usd: v.get("total_cost_usd").and_then(|x| x.as_f64()),
                     duration_ms: v.get("duration_api_ms").and_then(|x| x.as_u64()),
                 })
@@ -1188,6 +1210,52 @@ mod tests {
             pushback: Default::default(),
             awaiting_echoes: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn api_failure_preserves_native_diagnostics_and_closes_only_its_turn() {
+        let mut driver = probe();
+        for (payload, expected) in [
+            (
+                json!({"type":"result", "subtype":"success", "is_error":true,
+                "result":"API Error: 403 provider refused this client"}),
+                Some("API Error: 403 provider refused this client"),
+            ),
+            (
+                json!({"type":"result", "subtype":"error_during_execution", "is_error":true,
+                "errors":["API request failed", "Retry limit reached"], "result":""}),
+                Some("API request failed\nRetry limit reached"),
+            ),
+            (
+                json!({"type":"result", "is_error":true, "errors":[null, " ", {}]}),
+                Some("Claude Code ended the turn with an error."),
+            ),
+            (
+                json!({"type":"result", "is_error":false, "result":"normal answer"}),
+                None,
+            ),
+        ] {
+            assert!(matches!(
+                driver.classify(
+                    json!({"type":"user", "message":{"role":"user", "content":"next prompt"}})
+                ),
+                Some(HarnessEvent::TurnStarted { .. })
+            ));
+            let Some(HarnessEvent::TurnCompleted {
+                error,
+                outcome,
+                turn_id,
+                ..
+            }) = driver.classify(payload)
+            else {
+                panic!("a native result must close its open turn");
+            };
+            assert_eq!(error.as_deref(), expected);
+            assert!(!turn_id.is_empty());
+            assert_eq!(matches!(outcome, TurnOutcome::Error), expected.is_some());
+            assert!(driver.current_turn.is_none());
+        }
+        driver.shutdown().await.unwrap();
     }
 
     fn interrupted_line() -> Value {

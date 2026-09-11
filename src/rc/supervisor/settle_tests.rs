@@ -1268,3 +1268,193 @@ async fn a_backlogged_delivery_does_not_swallow_the_final_settlement() {
         );
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_publication_releases_controls_and_serializes_later_settlement() {
+    let fixture = SettlementFixture::new(true);
+    let original = std::fs::read_to_string(&fixture.exe).unwrap();
+    let marker = fixture._dir.path().join("push-pid");
+    let release = fixture._dir.path().join("release-push");
+    let paused = original.replace(
+        "push)\n",
+        &format!(
+            "push)\n    echo $$ > '{}'\n    while [ ! -f '{}' ]; do sleep 0.05; done\n",
+            marker.display(),
+            release.display()
+        ),
+    );
+    std::fs::write(&fixture.exe, paused).unwrap();
+    let (mut session, mut out, _notes, _lease_tx, lease) = fixture.session();
+    session.completed_boundary = Some(Arc::new(std::sync::atomic::AtomicU64::new(17)));
+    let (commands, mut receiver) = mpsc::channel(4);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.settle_until_command(&mut receiver),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let first_sha = fixture.head();
+    let pid: i32 = std::fs::read_to_string(&marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "publication must keep running"
+    );
+    let (ticket, receipt) = crate::rc::ticket::ticket();
+    commands
+        .send(Command::Steer {
+            message: "next prompt".into(),
+            attribution: MessageAttribution::default(),
+            reply: ticket,
+        })
+        .await
+        .unwrap();
+    let next = receiver.recv().await.unwrap();
+    assert!(
+        accept(&next),
+        "the command pump can own a control during publication"
+    );
+    drop(next);
+    drop(receipt);
+    session.completed_boundary = Some(Arc::new(std::sync::atomic::AtomicU64::new(29)));
+    assert!(session.settle_until_command(&mut receiver).await.is_none());
+    assert!(session.settlement_due);
+    assert_eq!(
+        fixture.head(),
+        first_sha,
+        "an in-flight push owns the local repository writer"
+    );
+    assert_eq!(*session.settlement.borrow(), lease);
+    assert_ne!(fixture.tracking(), first_sha);
+    std::fs::write(release, "go").unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        frame.params_as::<CommitSettled>().unwrap().commit_sha,
+        first_sha
+    );
+    assert_eq!(
+        frame
+            .settlement_boundary
+            .as_ref()
+            .unwrap()
+            .load(std::sync::atomic::Ordering::Acquire),
+        17
+    );
+    frame.connection_delivery.unwrap().mark_delivered();
+    session.finish_publication(true).await;
+    assert!(!fixture.receipt().exists());
+    let settled =
+        only_settled_frame(settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await);
+    assert_ne!(settled.commit_sha, first_sha);
+    assert_eq!(fixture.tracking(), settled.commit_sha);
+    assert!(!fixture.receipt().exists());
+    session.driver.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn incoming_control_preserves_an_owned_git_reference_transaction() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = SettlementFixture::new(true);
+    let hooks = fixture._dir.path().join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let held = fixture._dir.path().join("held");
+    let release = fixture._dir.path().join("release");
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(&hook, format!(
+        "#!/bin/sh\nif [ \"$1\" = prepared ]; then touch '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; fi\n",
+        held.display(), release.display()
+    )).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let original = std::fs::read_to_string(&fixture.exe).unwrap();
+    std::fs::write(
+        &fixture.exe,
+        original.replace(
+            "commit -q --allow-empty",
+            &format!(
+                "-c core.hooksPath={} commit -q --allow-empty",
+                hooks.display()
+            ),
+        ),
+    )
+    .unwrap();
+    let (mut session, mut out, _notes, _lease_tx, _) = fixture.session();
+    session.completed_boundary = Some(Arc::new(std::sync::atomic::AtomicU64::new(17)));
+    let (commands, mut receiver) = mpsc::channel(4);
+    let (ticket, receipt) = crate::rc::ticket::ticket();
+    let deferred = {
+        let mut settle = std::pin::pin!(session.settle_until_command(&mut receiver));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    _ = &mut settle => panic!("the local transaction must be held"),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => if held.exists() { break; }
+                }
+            }
+        }).await.unwrap();
+        let lock = fixture.repo.join(".git/refs/heads/s/settlement.lock");
+        assert!(
+            lock.exists(),
+            "the real Git transaction holds its reference lock"
+        );
+        commands
+            .send(Command::Steer {
+                message: "next prompt".into(),
+                attribution: MessageAttribution::default(),
+                reply: ticket,
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut settle)
+                .await
+                .is_err(),
+            "a queued control must not kill the local Git writer"
+        );
+        assert!(lock.exists());
+        std::fs::write(release, "go").unwrap();
+        let command = tokio::time::timeout(std::time::Duration::from_secs(5), settle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !lock.exists(),
+            "Git releases its lock by committing the transaction"
+        );
+        command
+    };
+    assert_eq!(receipt.abandon(), crate::rc::ticket::Abandon::NeverRan);
+    assert!(!accept(&deferred));
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    first.connection_delivery.unwrap().mark_delivered();
+    session.finish_publication(true).await;
+    let before = fixture.head();
+    let settled =
+        only_settled_frame(settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await);
+    assert_ne!(before, settled.commit_sha);
+    assert_eq!(fixture.tracking(), settled.commit_sha);
+    assert!(!fixture.receipt().exists());
+    session.driver.shutdown().await.unwrap();
+}
