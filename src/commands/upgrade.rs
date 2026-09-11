@@ -84,10 +84,12 @@ pub fn run(args: Args) -> CmdResult {
 
     match compare(cur, &latest.version) {
         Ordering::Less => {
-            println!(
-                "agit {} is available (you have {cur}).",
-                ui::accent(&latest.version)
-            );
+            if args.check || !ui::quiet() {
+                println!(
+                    "agit {} is available (you have {cur}).",
+                    ui::accent(&latest.version)
+                );
+            }
             if latest.stale {
                 println!(
                     "  {}",
@@ -100,10 +102,12 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
         Ordering::Same | Ordering::Newer => {
-            println!(
-                "{} agit {cur} is up to date.",
-                ui::ok(ui::theme::symbols().check)
-            );
+            if args.check || !ui::quiet() {
+                println!(
+                    "{} agit {cur} is up to date.",
+                    ui::ok(ui::theme::symbols().check)
+                );
+            }
             return Ok(ExitCode::Ok);
         }
     }
@@ -226,7 +230,7 @@ fn download_and_replace(latest: &crate::hub::CliVersion) -> Result<()> {
         tag = latest.tag
     );
 
-    println!("{}", ui::dim(&format!("downloading {asset} from {base}")));
+    ui::info(ui::dim(&format!("downloading {asset} from {base}")));
     let tarball = download(&format!("{base}/{asset}"))?;
     // SHA256SUMS is one file with a line per asset (release.yml): find this line by bare
     // filename; a missing line = an incomplete release — better not to upgrade than install blind.
@@ -336,10 +340,10 @@ fn download_from_npm(latest: &crate::hub::CliVersion) -> Result<()> {
     let pkg = format!("{}-{}", latest.npm_package, npm_platform_key()?);
     let meta_url = format!("{registry}/{}/{}", pkg.replace('/', "%2F"), latest.version);
 
-    println!(
-        "{}",
-        ui::dim(&format!("fetching {pkg}@{} metadata", latest.version))
-    );
+    ui::info(ui::dim(&format!(
+        "fetching {pkg}@{} metadata",
+        latest.version
+    )));
     let meta = download(&meta_url).with_context(|| format!("GET {meta_url}"))?;
     let meta: serde_json::Value =
         serde_json::from_slice(&meta).context("registry metadata is not JSON")?;
@@ -358,7 +362,7 @@ fn download_from_npm(latest: &crate::hub::CliVersion) -> Result<()> {
         .context("only sha512 SRI is supported")?
         .to_string();
 
-    println!("{}", ui::dim(&format!("downloading {tarball_url}")));
+    ui::info(ui::dim(&format!("downloading {tarball_url}")));
     let tgz = download(&tarball_url)?;
     let got = {
         use base64::Engine as _;

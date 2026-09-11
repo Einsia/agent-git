@@ -151,7 +151,7 @@ pub fn run(args: Args) -> CmdResult {
             report.items
         ));
     } else {
-        println!("Nothing to install.");
+        ui::info(format_args!("Nothing to install."));
     }
     Ok(ExitCode::Ok)
 }
@@ -213,10 +213,10 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
                     report.merge(installed);
                     if installed.succeeded() {
                         if capability.enabled {
-                            println!(
+                            ui::info(format_args!(
                                 "  {} Codex may ask you to trust these hooks when their command changes",
                                 ui::dim("·")
-                            );
+                            ));
                         } else {
                             ui::warning(
                                 "Codex hooks are configured but its `hooks` feature is disabled",
@@ -233,7 +233,10 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
                 ui::warning("cannot install Codex hooks: this Codex does not report hook support");
                 report.merge(SetupReport::failure());
             }
-            None => println!("  {} Codex hooks unavailable; skipping", ui::dim("·")),
+            None => ui::info(format_args!(
+                "  {} Codex hooks unavailable; skipping",
+                ui::dim("·")
+            )),
         }
     }
 
@@ -315,6 +318,20 @@ fn install_hook_file(
         return SetupReport::failure();
     }
 
+    for event in HOOKS
+        .iter()
+        .map(|(event, _)| *event)
+        .chain(RETIRED_HOOKS.iter().map(|(event, _)| *event))
+    {
+        if hooks.get(event).is_some_and(|value| !value.is_array()) {
+            ui::warning(&format!(
+                "cannot install {label} hooks: `{event}` in {} must be an array",
+                path.display()
+            ));
+            return SetupReport::failure();
+        }
+    }
+
     let mut added = 0;
     for (event, argv) in RETIRED_HOOKS {
         added += retire_hook(hooks, event, argv);
@@ -327,13 +344,16 @@ fn install_hook_file(
             ui::warning(&format!("failed to write {}", path.display()));
             return SetupReport::failure();
         }
-        println!(
+        ui::info(format_args!(
             "  {} {label} hooks → {}",
             ui::ok(ui::theme::symbols().check),
             ui::tilde(path)
-        );
+        ));
     } else {
-        println!("  {} {label} hooks already in place", ui::dim("·"));
+        ui::info(format_args!(
+            "  {} {label} hooks already in place",
+            ui::dim("·")
+        ));
     }
     SetupReport::item()
 }
@@ -434,7 +454,16 @@ fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str) -> usize {
         .or_insert_with(|| serde_json::json!([]));
     let arr = arr.as_array_mut().expect("hook event must be an array");
     for group in arr.iter() {
-        if group.to_string().contains(cmd) {
+        if group
+            .get("hooks")
+            .and_then(|value| value.as_array())
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.get("type").and_then(|value| value.as_str()) == Some("command")
+                        && entry.get("command").and_then(|value| value.as_str()) == Some(cmd)
+                })
+            })
+        {
             return 0;
         }
     }
@@ -575,11 +604,11 @@ fn install_skill_dir(dir: &Path, runtime: &str) -> SetupReport {
                 }
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
-                        println!(
+                        ui::info(format_args!(
                             "  {} stale skill reference removed → {}",
                             ui::ok(ui::theme::symbols().check),
                             ui::tilde(&path)
-                        );
+                        ));
                         report.merge(SetupReport::item());
                     }
                     Err(error) => {
@@ -741,11 +770,11 @@ fn remove_marked_block_if_versioned(
         ui::warning(&format!("{label} removal failed: {}", path.display()));
         return SetupReport::failure();
     }
-    println!(
+    ui::info(format_args!(
         "  {} {label} removed → {}",
         ui::ok(ui::theme::symbols().check),
         ui::tilde(&PathBuf::from(path))
-    );
+    ));
     SetupReport::item()
 }
 
@@ -764,15 +793,14 @@ fn register_mcp(runtime: Option<&str>) -> SetupReport {
             .map(|s| s.success())
             .unwrap_or(false);
         if ok {
-            println!(
+            ui::info(format_args!(
                 "  {} mcp → claude mcp add agit",
                 ui::ok(ui::theme::symbols().check)
-            );
+            ));
         } else {
-            println!(
-                "  {} mcp: register manually with `claude mcp add agit -- {exe} mcp`",
-                ui::dim("·")
-            );
+            ui::hint(&format!(
+                "register MCP manually with `claude mcp add agit -- {exe} mcp`"
+            ));
         }
         report.merge(SetupReport::item());
     }
@@ -821,37 +849,77 @@ fn register_mcp(runtime: Option<&str>) -> SetupReport {
     report
 }
 
-/// The codex MCP entry lives in config.toml. A toml-editing dependency cannot be pulled in, so
-/// this is a minimal hand-written upsert: the section name `[mcp_servers.agit]` being present
-/// counts as registered (nobody else's content is touched), and otherwise a section is appended at
-/// the end of the file. The section body is ours, so checking the section name before appending
-/// again is enough to be idempotent.
+/// Registration is determined by parsed TOML keys, and executable paths remain literal strings.
+/// An invalid namespace is user-owned configuration and cannot be repaired by replacing it.
 fn upsert_codex_mcp(path: &Path, exe: &str) -> SetupReport {
-    let block = format!(
-        "\n[mcp_servers.agit]\n# session version control tools: search / show / view / status / commit\ncommand = \"{exe}\"\nargs = [\"mcp\"]\n"
-    );
-    upsert_toml_section(path, "[mcp_servers.agit]", &block)
-}
-
-fn upsert_toml_section(path: &Path, section: &str, block: &str) -> SetupReport {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    if existing.contains(section) {
-        println!(
+    let label = path.display().to_string();
+    let mut doc = match std::fs::read_to_string(path) {
+        Ok(text) => match text.parse::<toml::Table>() {
+            Ok(doc) => doc,
+            Err(_) => {
+                ui::warning(&format!(
+                    "cannot install Codex MCP: {label} is not valid TOML"
+                ));
+                return SetupReport::failure();
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(_) => {
+            ui::warning(&format!("cannot install Codex MCP: failed to read {label}"));
+            return SetupReport::failure();
+        }
+    };
+    let namespace = doc
+        .entry("mcp_servers")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(servers) = namespace.as_table_mut() else {
+        ui::warning(&format!(
+            "cannot install Codex MCP: `mcp_servers` in {label} must be a table"
+        ));
+        return SetupReport::failure();
+    };
+    if let Some(existing) = servers.get("agit") {
+        if !existing.is_table() {
+            ui::warning(&format!(
+                "cannot install Codex MCP: `mcp_servers.agit` in {label} must be a table"
+            ));
+            return SetupReport::failure();
+        }
+        ui::info(format_args!(
             "  {} mcp({}) already in place",
             ui::dim("·"),
             path.file_name().unwrap_or_default().to_string_lossy()
-        );
+        ));
         return SetupReport::item();
     }
-    if write_append(path, block).is_err() {
-        ui::warning(&format!("failed to write {}", path.display()));
+    servers.insert(
+        "agit".into(),
+        toml::Value::Table(toml::Table::from_iter([
+            ("command".into(), toml::Value::String(exe.into())),
+            (
+                "args".into(),
+                toml::Value::Array(vec![toml::Value::String("mcp".into())]),
+            ),
+        ])),
+    );
+    let rendered = match toml::to_string_pretty(&doc) {
+        Ok(rendered) => rendered,
+        Err(_) => {
+            ui::warning(&format!(
+                "cannot serialize Codex MCP configuration for {label}"
+            ));
+            return SetupReport::failure();
+        }
+    };
+    if write_append_overwrite(path, &rendered).is_err() {
+        ui::warning(&format!("failed to write {label}"));
         return SetupReport::failure();
     }
-    println!(
+    ui::info(format_args!(
         "  {} mcp → {}",
         ui::ok(ui::theme::symbols().check),
-        ui::tilde(&std::path::PathBuf::from(path))
-    );
+        ui::tilde(path)
+    ));
     SetupReport::item()
 }
 
@@ -865,23 +933,42 @@ fn upsert_json_mcp(
     name: &str,
     entry: serde_json::Value,
 ) -> SetupReport {
-    let mut doc: serde_json::Value = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let root = doc
-        .as_object_mut()
-        .expect("config file must be an object")
+    let label = path.display().to_string();
+    let mut doc = match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(doc) => doc,
+            Err(_) => {
+                ui::warning(&format!("cannot install MCP: {label} is not valid JSON"));
+                return SetupReport::failure();
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(_) => {
+            ui::warning(&format!("cannot install MCP: failed to read {label}"));
+            return SetupReport::failure();
+        }
+    };
+    let Some(root) = doc.as_object_mut() else {
+        ui::warning(&format!(
+            "cannot install MCP: {label} must contain a JSON object"
+        ));
+        return SetupReport::failure();
+    };
+    let namespace = root
         .entry(root_key)
         .or_insert_with(|| serde_json::json!({}));
-    let map = root.as_object_mut().expect("mcp config must be an object");
-    let label = path.display().to_string();
+    let Some(map) = namespace.as_object_mut() else {
+        ui::warning(&format!(
+            "cannot install MCP: `{root_key}` in {label} must be an object"
+        ));
+        return SetupReport::failure();
+    };
     if map.contains_key(name) {
-        println!(
+        ui::info(format_args!(
             "  {} mcp({}) already in place",
             ui::dim("·"),
             path.file_name().unwrap_or_default().to_string_lossy()
-        );
+        ));
         return SetupReport::item();
     }
     map.insert(name.to_string(), entry);
@@ -889,11 +976,11 @@ fn upsert_json_mcp(
         ui::warning(&format!("failed to write {label}"));
         return SetupReport::failure();
     }
-    println!(
+    ui::info(format_args!(
         "  {} mcp → {}",
         ui::ok(ui::theme::symbols().check),
         ui::tilde(&std::path::PathBuf::from(path))
-    );
+    ));
     SetupReport::item()
 }
 
@@ -938,7 +1025,7 @@ fn exe_str() -> String {
 /// quietly).
 fn write_if_changed(path: &Path, body: &str, label: &str) -> SetupReport {
     if std::fs::read_to_string(path).ok().as_deref() == Some(body) {
-        println!("  {} {label} is up to date", ui::dim("·"));
+        ui::info(format_args!("  {} {label} is up to date", ui::dim("·")));
         return SetupReport::item();
     }
     let ok = path
@@ -949,11 +1036,11 @@ fn write_if_changed(path: &Path, body: &str, label: &str) -> SetupReport {
         ui::warning(&format!("{label} write failed: {}", path.display()));
         return SetupReport::failure();
     }
-    println!(
+    ui::info(format_args!(
         "  {} {label} → {}",
         ui::ok(ui::theme::symbols().check),
         ui::tilde(&PathBuf::from(path))
-    );
+    ));
     SetupReport::item()
 }
 
@@ -1000,21 +1087,21 @@ fn upsert_marked_block_with_markers(
         format!("{}\n\n{block}\n", existing.trim_end())
     };
     if new == existing && !existing.is_empty() {
-        println!(
+        ui::info(format_args!(
             "  {} {label} block already present (idempotent)",
             ui::dim("·")
-        );
+        ));
         return SetupReport::item();
     }
     if write_append_overwrite(path, &new).is_err() {
         ui::warning(&format!("{label} write failed: {}", path.display()));
         return SetupReport::failure();
     }
-    println!(
+    ui::info(format_args!(
         "  {} {label} → {}",
         ui::ok(ui::theme::symbols().check),
         ui::tilde(&PathBuf::from(path))
-    );
+    ));
     SetupReport::item()
 }
 
@@ -1035,18 +1122,6 @@ fn strip_markers<'a>(mut inner: &'a str, begin_marker: &str, end_marker: &str) -
         }
         inner = stripped;
     }
-}
-
-fn write_append(path: &Path, block: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    f.write_all(block.as_bytes())
 }
 
 fn write_append_overwrite(path: &Path, text: &str) -> std::io::Result<()> {
@@ -1083,6 +1158,25 @@ fn print_completions(shell: &str) -> SetupReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_registration_matches_native_arguments_instead_of_serialized_substrings() {
+        for command in [r"C:\tools\agit.exe hooks ingest", "agit hooks ingest"] {
+            let original = serde_json::json!([
+                {"description": command, "hooks": [{"type": "command", "command": "user-hook"}]},
+                {"hooks": [{"type": "prompt", "command": command}]},
+                {"hooks": [{"type": "command", "command": format!("{command} --extra")}]}
+            ]);
+            let mut hooks = serde_json::json!({"SessionStart": original.clone()});
+            assert_eq!(upsert_hook(&mut hooks, "SessionStart", command), 1);
+            let groups = hooks["SessionStart"].as_array().unwrap();
+            assert_eq!(&groups[..3], original.as_array().unwrap());
+            assert_eq!(groups[3]["hooks"][0]["command"], command);
+            let installed = hooks.clone();
+            assert_eq!(upsert_hook(&mut hooks, "SessionStart", command), 0);
+            assert_eq!(hooks, installed);
+        }
+    }
 
     #[test]
     fn runtime_filter_accepts_none_all_and_exact_match() {
@@ -1597,30 +1691,80 @@ mod tests {
     }
 
     #[test]
-    fn toml_section_upsert_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!("agit-setup-toml-{}", std::process::id()));
-        let p = dir.join("config.toml");
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(
-            upsert_toml_section(
-                &p,
-                "[mcp_servers.agit]",
-                "\n[mcp_servers.agit]\ncommand = \"agit\"\n"
-            )
-            .items,
-            1
-        );
-        assert_eq!(
-            upsert_toml_section(
-                &p,
-                "[mcp_servers.agit]",
-                "\n[mcp_servers.agit]\ncommand = \"changed\"\n"
-            )
-            .items,
-            1
-        );
-        let text = std::fs::read_to_string(&p).unwrap();
-        assert_eq!(text.matches("[mcp_servers.agit]").count(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn codex_mcp_paths_roundtrip_without_toml_escape_interpretation() {
+        for exe in [
+            r"C:\Users\synthetic\agit.exe",
+            r"C:\tools\agit.exe",
+            "C:\\quoted\\\"agit\".exe",
+            "line\ncarriage\rtab\tcontrol\u{1f}\\agit",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            assert!(upsert_codex_mcp(&path, exe).succeeded());
+            let installed = std::fs::read_to_string(&path).unwrap();
+            let doc: toml::Table = installed.parse().unwrap();
+            assert_eq!(doc["mcp_servers"]["agit"]["command"].as_str(), Some(exe));
+            assert_eq!(
+                doc["mcp_servers"]["agit"]["args"].as_array().unwrap(),
+                &[toml::Value::String("mcp".into())]
+            );
+            assert!(upsert_codex_mcp(&path, "changed").succeeded());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), installed);
+        }
+    }
+
+    #[test]
+    fn codex_mcp_registration_uses_keys_and_preserves_unrelated_values() {
+        for original in [
+            "# [mcp_servers.agit] is only a comment\nmodel = 'SYNTHETIC'\n[mcp_servers.other]\ncommand = 'other'\n",
+            "mcp_servers = { other = { command = 'other' } }\nmodel = 'SYNTHETIC'\n",
+            "['mcp_servers']\nother = { command = 'other' }\n",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, original).unwrap();
+            let expected: toml::Table = original.parse().unwrap();
+            assert!(upsert_codex_mcp(&path, "synthetic-agit").succeeded());
+            let mut actual: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            let entry = actual["mcp_servers"]
+                .as_table_mut()
+                .unwrap()
+                .remove("agit")
+                .unwrap();
+            assert_eq!(entry["command"].as_str(), Some("synthetic-agit"));
+            assert_eq!(actual, expected);
+        }
+        for original in [
+            "['mcp_servers'.'agit']\ncommand = 'user-choice'\n# retained\n",
+            "mcp_servers = { agit = { command = 'user-choice' } }\n# retained\n",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, original).unwrap();
+            assert!(upsert_codex_mcp(&path, "replacement").succeeded());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn codex_mcp_refuses_unreadable_invalid_or_non_table_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for bytes in [
+            b"model = [\n".as_slice(),
+            b"mcp_servers = 'user-data'\n".as_slice(),
+            b"[mcp_servers]\nagit = 'user-data'\n".as_slice(),
+            b"[mcp_servers.agit]\ncommand = 'x'\nmodel = [\n".as_slice(),
+            &[0xff, 0xfe],
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(upsert_codex_mcp(&path, "agit").failures, 1);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(upsert_codex_mcp(&path, "agit").failures, 1);
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
     }
 }

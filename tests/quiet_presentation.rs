@@ -194,6 +194,459 @@ fn silent(output: Output) {
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 
+fn setup_files(lab: &Lab) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    walkdir::WalkDir::new(lab.root.path())
+        .into_iter()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            entry.file_type().is_file().then(|| {
+                (
+                    entry
+                        .path()
+                        .strip_prefix(lab.root.path())
+                        .unwrap()
+                        .to_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn quiet_setup_keeps_installation_and_idempotence_without_routine_notices() {
+    for mode in ["flag", "", "0", "ordinary"] {
+        let lab = Lab::new();
+        let claude = lab.home.join(".claude");
+        let opencode = lab.home.join(".config/opencode");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::create_dir_all(&opencode).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"userPreference":"retained"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            opencode.join("opencode.json"),
+            r#"{"userPreference":"retained"}"#,
+        )
+        .unwrap();
+        let agents = lab.root.path().join("AGENTS.md");
+        std::fs::write(&agents, "User-owned instructions.\n").unwrap();
+        let commands: &[&[&str]] = &[
+            &["setup", "--hooks", "--runtime", "claude-code"],
+            &[
+                "setup",
+                "--skill",
+                "--mcp",
+                "--agents-md",
+                "--runtime",
+                "opencode",
+            ],
+        ];
+        for args in commands {
+            let output = success(lab.quiet_command(args, mode).output().unwrap());
+            if mode == "ordinary" {
+                assert!(!output.stdout.is_empty(), "{output:?}");
+            } else {
+                silent(output);
+            }
+        }
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(claude.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["userPreference"], "retained");
+        for event in ["SessionStart", "Stop"] {
+            assert!(settings["hooks"][event].is_array());
+        }
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(opencode.join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["userPreference"], "retained");
+        assert_eq!(config["mcp"]["agit"]["type"], "local");
+        assert!(opencode.join("skills/agit/SKILL.md").is_file());
+        assert!(
+            opencode
+                .join("skills/agit/references/commands/setup.md")
+                .is_file()
+        );
+        let instructions = std::fs::read_to_string(&agents).unwrap();
+        assert!(instructions.starts_with("User-owned instructions.\n"));
+        assert_eq!(instructions.matches("<!-- agit:begin -->").count(), 1);
+        let installed = setup_files(&lab);
+        for args in commands {
+            let output = success(lab.quiet_command(args, mode).output().unwrap());
+            if mode == "ordinary" {
+                assert!(!output.stdout.is_empty(), "{output:?}");
+            } else {
+                silent(output);
+            }
+        }
+        assert_eq!(setup_files(&lab), installed);
+    }
+}
+
+fn setup_config_command(lab: &Lab, args: &[&str], mode: &str) -> Command {
+    let mut command = lab.command(args);
+    match mode {
+        "quiet" => {
+            command.arg("--quiet");
+        }
+        "1" | "2" => {
+            command.args(["--json", "--json-version", mode]);
+        }
+        "ordinary" => {}
+        _ => panic!("unknown setup output mode"),
+    }
+    command
+}
+
+fn setup_config_refusal(output: Output, diagnostic: &str, mode: &str) {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(rendered.contains(diagnostic), "{output:?}");
+    assert!(rendered.contains("Setup incomplete"), "{output:?}");
+    assert!(!rendered.contains("All set"), "{output:?}");
+    if matches!(mode, "1" | "2") {
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema_version"], mode.parse::<u32>().unwrap());
+        assert_eq!(value["command"], "setup");
+        assert_eq!(value["ok"], false);
+    } else {
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+}
+
+#[test]
+fn json_mcp_setup_refuses_invalid_configuration_and_preserves_other_fields() {
+    for mode in ["ordinary", "quiet", "1", "2"] {
+        for (runtime, relative, key) in [
+            ("opencode", ".config/opencode/opencode.json", "mcp"),
+            ("cursor", ".cursor/mcp.json", "mcpServers"),
+        ] {
+            let lab = Lab::new();
+            success(lab.run(&["setup", "--completions", "bash"]));
+            let path = lab.home.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let args = ["setup", "--mcp", "--runtime", runtime];
+            for (bytes, diagnostic) in [
+                (
+                    b"{\"userPreference\":\"retained\",\n".to_vec(),
+                    "not valid JSON",
+                ),
+                (b"[]".to_vec(), "must contain a JSON object"),
+                (
+                    format!(r#"{{"{key}":[],"userPreference":"retained"}}"#).into_bytes(),
+                    "must be an object",
+                ),
+                (vec![0xff, 0xfe], "failed to read"),
+            ] {
+                std::fs::write(&path, &bytes).unwrap();
+                let before = setup_files(&lab);
+                setup_config_refusal(
+                    setup_config_command(&lab, &args, mode).output().unwrap(),
+                    diagnostic,
+                    mode,
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(setup_files(&lab), before);
+            }
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let before = setup_files(&lab);
+            setup_config_refusal(
+                setup_config_command(&lab, &args, mode).output().unwrap(),
+                "failed to read",
+                mode,
+            );
+            assert!(path.is_dir());
+            assert_eq!(setup_files(&lab), before);
+            std::fs::remove_dir(&path).unwrap();
+
+            success(setup_config_command(&lab, &args, mode).output().unwrap());
+            let created: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let entry = created[key]["agit"].clone();
+            assert!(entry.is_object());
+            let original = serde_json::json!({
+                "userPreference": {"model": "SYNTHETIC-USER-MODEL", "enabled": false},
+                key: {"other": {"command": "SYNTHETIC-OTHER-SERVER"}}
+            });
+            std::fs::write(&path, original.to_string()).unwrap();
+            let mut expected_files = setup_files(&lab);
+            success(setup_config_command(&lab, &args, mode).output().unwrap());
+            let installed = std::fs::read(&path).unwrap();
+            let mut expected = original;
+            expected[key]["agit"] = entry;
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&installed).unwrap(),
+                expected
+            );
+            expected_files.insert(
+                path.strip_prefix(lab.root.path()).unwrap().to_owned(),
+                installed,
+            );
+            assert_eq!(setup_files(&lab), expected_files);
+            success(setup_config_command(&lab, &args, mode).output().unwrap());
+            assert_eq!(setup_files(&lab), expected_files);
+        }
+    }
+}
+
+#[test]
+fn codex_mcp_setup_preserves_invalid_files_and_installs_a_literal_executable() {
+    for mode in ["ordinary", "quiet", "1", "2"] {
+        let lab = Lab::new();
+        success(lab.run(&["setup", "--completions", "bash"]));
+        let path = lab.home.join(".codex/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let args = ["setup", "--mcp", "--runtime", "codex"];
+        for (bytes, diagnostic) in [
+            (b"model = [\n".to_vec(), "not valid TOML"),
+            (b"mcp_servers = 'user-data'\n".to_vec(), "must be a table"),
+            (b"[mcp_servers]\nagit = 1\n".to_vec(), "must be a table"),
+            (vec![0xff, 0xfe], "failed to read"),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let before = setup_files(&lab);
+            setup_config_refusal(
+                setup_config_command(&lab, &args, mode).output().unwrap(),
+                diagnostic,
+                mode,
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(setup_files(&lab), before);
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let before = setup_files(&lab);
+        setup_config_refusal(
+            setup_config_command(&lab, &args, mode).output().unwrap(),
+            "failed to read",
+            mode,
+        );
+        assert!(path.is_dir());
+        assert_eq!(setup_files(&lab), before);
+        std::fs::remove_dir(&path).unwrap();
+
+        for original in [
+            None,
+            Some(
+                "# [mcp_servers.agit] is only a comment\nmodel = 'SYNTHETIC'\n['mcp_servers'.'other']\ncommand = 'other'\n",
+            ),
+            Some("model = 'SYNTHETIC'\nmcp_servers = { other = { command = 'other' } }\n"),
+        ] {
+            if let Some(original) = original {
+                std::fs::write(&path, original).unwrap();
+            }
+            let mut expected_files = setup_files(&lab);
+            let expected: toml::Table = original.unwrap_or_default().parse().unwrap();
+            success(setup_config_command(&lab, &args, mode).output().unwrap());
+            let installed = std::fs::read(&path).unwrap();
+            let mut actual: toml::Table = std::str::from_utf8(&installed).unwrap().parse().unwrap();
+            let servers = actual
+                .get_mut("mcp_servers")
+                .unwrap()
+                .as_table_mut()
+                .unwrap();
+            let entry = servers.remove("agit").unwrap();
+            assert_eq!(
+                std::path::Path::new(entry["command"].as_str().unwrap())
+                    .canonicalize()
+                    .unwrap(),
+                std::path::Path::new(env!("CARGO_BIN_EXE_agit"))
+                    .canonicalize()
+                    .unwrap()
+            );
+            assert_eq!(
+                entry["args"].as_array().unwrap(),
+                &[toml::Value::String("mcp".into())]
+            );
+            if !expected.contains_key("mcp_servers") {
+                assert!(servers.is_empty());
+                actual.remove("mcp_servers");
+            }
+            assert_eq!(actual, expected);
+            expected_files.insert(
+                path.strip_prefix(lab.root.path()).unwrap().to_owned(),
+                installed,
+            );
+            assert_eq!(setup_files(&lab), expected_files);
+            success(setup_config_command(&lab, &args, mode).output().unwrap());
+            assert_eq!(setup_files(&lab), expected_files);
+        }
+        let quoted = "# keep this user configuration\n['mcp_servers'.'agit']\ncommand = 'user-selected-agit'\nargs = ['mcp']\n";
+        std::fs::write(&path, quoted).unwrap();
+        let before = setup_files(&lab);
+        success(setup_config_command(&lab, &args, mode).output().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), quoted);
+        assert_eq!(setup_files(&lab), before);
+    }
+}
+
+#[test]
+fn hook_setup_refuses_non_array_events_before_editing_configuration() {
+    for mode in ["ordinary", "quiet", "1", "2"] {
+        let lab = Lab::new();
+        success(lab.run(&["setup", "--completions", "bash"]));
+        let path = lab.home.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let args = ["setup", "--hooks", "--runtime", "claude-code"];
+        for event in ["SessionStart", "Stop"] {
+            let bytes = serde_json::json!({
+                "userPreference": "retained",
+                "hooks": {event: {"userConfiguration": "retained"}}
+            })
+            .to_string();
+            std::fs::write(&path, &bytes).unwrap();
+            let before = setup_files(&lab);
+            setup_config_refusal(
+                setup_config_command(&lab, &args, mode).output().unwrap(),
+                &format!("`{event}`"),
+                mode,
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+            assert_eq!(setup_files(&lab), before);
+        }
+        let original = serde_json::json!({
+            "userPreference": "retained",
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "user-hook"}]}],
+                "Stop": [],
+                "UserPromptSubmit": [{"hooks": [{"type": "prompt", "prompt": "keep"}]}]
+            }
+        });
+        std::fs::write(&path, original.to_string()).unwrap();
+        let mut expected_files = setup_files(&lab);
+        success(setup_config_command(&lab, &args, mode).output().unwrap());
+        let installed = std::fs::read(&path).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&installed).unwrap();
+        assert_eq!(doc["userPreference"], original["userPreference"]);
+        assert_eq!(
+            doc["hooks"]["UserPromptSubmit"],
+            original["hooks"]["UserPromptSubmit"]
+        );
+        assert_eq!(
+            doc["hooks"]["SessionStart"][0],
+            original["hooks"]["SessionStart"][0]
+        );
+        assert_eq!(doc["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert_eq!(doc["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        expected_files.insert(
+            path.strip_prefix(lab.root.path()).unwrap().to_owned(),
+            installed,
+        );
+        assert_eq!(setup_files(&lab), expected_files);
+        success(setup_config_command(&lab, &args, mode).output().unwrap());
+        assert_eq!(setup_files(&lab), expected_files);
+    }
+}
+
+#[test]
+fn quiet_setup_retains_refusals_completion_data_and_json_results() {
+    for mode in ["flag", "", "0"] {
+        let lab = Lab::new();
+        let settings = lab.home.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "[]").unwrap();
+        let output = lab
+            .quiet_command(&["setup", "--hooks", "--runtime", "claude-code"], mode)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("must contain a JSON object"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Setup incomplete"));
+        assert_eq!(std::fs::read(&settings).unwrap(), b"[]");
+
+        let plain = success(lab.run(&["setup", "--completions", "bash"]));
+        let quiet = success(
+            lab.quiet_command(&["setup", "--completions", "bash"], mode)
+                .output()
+                .unwrap(),
+        );
+        let normal = String::from_utf8(plain.stdout).unwrap();
+        let shell = std::str::from_utf8(&quiet.stdout).unwrap();
+        assert!(!shell.is_empty());
+        assert!(normal.starts_with(shell));
+        assert!(!shell.contains("All set"));
+        assert!(quiet.stderr.is_empty(), "{quiet:?}");
+
+        for version in ["1", "2"] {
+            let args = ["setup", "--agents-md", "--json", "--json-version", version];
+            success(lab.run(&args));
+            // Quiet and ordinary JSON represent the same idempotent operation.
+            let plain = success(lab.run(&args));
+            let quiet = success(lab.quiet_command(&args, mode).output().unwrap());
+            assert_eq!(quiet.stdout, plain.stdout);
+            assert_eq!(quiet.stderr, plain.stderr);
+            let value: serde_json::Value = serde_json::from_slice(&quiet.stdout).unwrap();
+            assert_eq!(value["schema_version"], version.parse::<u32>().unwrap());
+            assert_eq!(value["command"], "setup");
+            assert_eq!(value["ok"], true);
+            assert_eq!(value["result"]["format"], "text");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn quiet_setup_preserves_native_registration_output_and_manual_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let lab = Lab::new();
+    let bin = lab.root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let child = bin.join("claude");
+    std::fs::write(
+        &child,
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'SYNTHETIC-MCP-STDOUT\\n'\n",
+            "printf 'SYNTHETIC-MCP-DIAGNOSTIC\\n' >&2\n",
+            "printf '%s\\n' \"$@\" > \"$SYNTHETIC_MCP_ARGS\"\n",
+            "exit \"$SYNTHETIC_MCP_EXIT\"\n",
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+    let recorded = lab.root.path().join("child-args");
+    for mode in ["ordinary", "flag", "", "0"] {
+        for child_exit in ["0", "1"] {
+            let output = success(
+                lab.quiet_command(&["setup", "--mcp", "--runtime", "claude-code"], mode)
+                    .env("PATH", &path)
+                    .env("SYNTHETIC_MCP_ARGS", &recorded)
+                    .env("SYNTHETIC_MCP_EXIT", child_exit)
+                    .output()
+                    .unwrap(),
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stdout.contains("SYNTHETIC-MCP-STDOUT"));
+            assert!(stderr.contains("SYNTHETIC-MCP-DIAGNOSTIC"));
+            assert_eq!(stderr.contains("register MCP manually"), child_exit != "0");
+            let arguments = std::fs::read_to_string(&recorded).unwrap();
+            let args: Vec<_> = arguments.lines().collect();
+            assert_eq!(&args[..4], &["mcp", "add", "agit", "--"]);
+            assert_eq!(
+                std::path::Path::new(args[4]),
+                std::path::Path::new(env!("CARGO_BIN_EXE_agit"))
+            );
+            assert_eq!(args[5], "mcp");
+            assert_eq!(args.len(), 6);
+        }
+    }
+}
+
 #[test]
 fn quiet_config_mutates_silently_but_getters_remain_data() {
     let lab = Lab::new();

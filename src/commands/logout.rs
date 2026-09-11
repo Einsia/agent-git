@@ -41,12 +41,11 @@ pub fn run(args: Args) -> CmdResult {
         ui::success(&format!("logged out of {hub}"));
         // Say outright that the store is untouched — a user may fear that signing out loses
         // sessions.
-        println!(
-            "{}",
-            ui::dim("  locally captured sessions are unaffected (in $AGIT_HOME/store)")
-        );
+        ui::info(ui::dim(
+            "  locally captured sessions are unaffected (in $AGIT_HOME/store)",
+        ));
     } else {
-        println!("not logged in to {hub}.");
+        ui::info(format_args!("not logged in to {hub}."));
         let others = credentials::logged_in_hosts();
         if !others.is_empty() {
             ui::hint(&format!("logged-in hubs: {}", others.join(", ")));
@@ -65,7 +64,7 @@ pub fn run(args: Args) -> CmdResult {
 fn run_all() -> CmdResult {
     let all = credentials::all_checked()?;
     if all.is_empty() {
-        println!("no saved credentials.");
+        ui::info("no saved credentials.");
         return Ok(ExitCode::Ok);
     }
     for (host, cred) in &all {
@@ -92,13 +91,10 @@ fn run_all() -> CmdResult {
                     if e.downcast_ref::<crate::hub::client::ApiError>()
                         .is_some_and(|api| api.status == 401) =>
                 {
-                    println!(
-                        "{}",
-                        ui::dim(&format!(
-                            "  {}: session already expired or revoked",
-                            safe_label(hub)
-                        ))
-                    );
+                    ui::info(ui::dim(&format!(
+                        "  {}: session already expired or revoked",
+                        safe_label(hub)
+                    )));
                 }
                 Err(e) => {
                     ui::warning(&format!(
@@ -122,9 +118,8 @@ fn run_all() -> CmdResult {
     }
     let n = credentials::remove_all()?;
     ui::success(&format!("removed credentials for {n} hubs"));
-    println!(
-        "{}",
-        ui::dim("  locally captured sessions are unaffected (in $AGIT_HOME/store)")
-    );
+    ui::info(ui::dim(
+        "  locally captured sessions are unaffected (in $AGIT_HOME/store)",
+    ));
     Ok(ExitCode::Ok)
 }

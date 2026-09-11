@@ -250,8 +250,7 @@ pub fn run(mut args: Args) -> CmdResult {
         Err(error) => return failed(error),
     };
 
-    let s = ui::theme::symbols();
-    println!("{} share created", ui::ok(s.check));
+    ui::success("share created");
 
     // When encrypted, the key is appended to the fragment — it is never sent to the server.
     let link = match &key {

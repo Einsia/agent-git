@@ -840,11 +840,16 @@ mod tests {
             .repo
             .git(&["update-ref", "refs/heads/unreadable", &unrelated])
             .unwrap();
-        let missing = fixture
-            .repo
-            .git_path(&format!("objects/{}/{}", &unrelated[..2], &unrelated[2..]))
-            .unwrap();
-        std::fs::remove_file(missing).unwrap();
+        let objects = fixture.repo.git_path("objects").unwrap();
+        let missing = objects.join(&unrelated[..2]).join(&unrelated[2..]);
+        assert_eq!(
+            fixture.repo.git(&["cat-file", "-t", &unrelated]).unwrap(),
+            "commit"
+        );
+        std::fs::remove_file(&missing).unwrap_or_else(|error| {
+            panic!("cannot remove unrelated fixture commit {missing:?}: {error}")
+        });
+        assert!(fixture.repo.git(&["cat-file", "-e", &unrelated]).is_err());
         let inspect = |native: &[u8]| {
             inspect_with_dictionary(
                 &fixture.repo,
@@ -866,11 +871,15 @@ mod tests {
                 .candidates
                 .is_empty()
         );
-        let object = fixture
-            .repo
-            .git_path(&format!("objects/{}/{}", &source[..2], &source[2..]))
-            .unwrap();
-        std::fs::remove_file(object).unwrap();
+        let object = objects.join(&source[..2]).join(&source[2..]);
+        assert_eq!(
+            fixture.repo.git(&["cat-file", "-t", &source]).unwrap(),
+            "commit"
+        );
+        std::fs::remove_file(&object).unwrap_or_else(|error| {
+            panic!("cannot remove selected fixture commit {object:?}: {error}")
+        });
+        assert!(fixture.repo.git(&["cat-file", "-e", &source]).is_err());
         assert!(inspect(raw.as_bytes()).is_err());
     }
 

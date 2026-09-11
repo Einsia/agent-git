@@ -50,7 +50,7 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
     let hub = hub.trim().trim_end_matches('/').to_string();
-    println!("hub: {}", ui::accent(&hub));
+    ui::info(format_args!("hub: {}", ui::accent(&hub)));
 
     let result = if args.with_token {
         login_with_token(&hub)
@@ -140,9 +140,9 @@ fn login_browser(hub: &str) -> crate::Result<Option<(HubCredential, String)>> {
     println!("  open this link to authorize the CLI:");
     println!("    {}", ui::accent(&session.url));
     if open_browser(&session.url) {
-        println!("  {}", ui::dim("(opened in your browser)"));
+        ui::info(format_args!("  {}", ui::dim("(opened in your browser)")));
     }
-    println!("  waiting for approval… (ctrl-c to cancel)");
+    ui::info("  waiting for approval… (ctrl-c to cancel)");
 
     poll(
         hub,
@@ -177,7 +177,7 @@ fn login_device(hub: &str) -> crate::Result<Option<(HubCredential, String)>> {
         "  and enter this code:  {}",
         ui::accent(&ui::bold(&dev.user_code))
     );
-    println!("  waiting… (ctrl-c to cancel)");
+    ui::info("  waiting… (ctrl-c to cancel)");
 
     poll(
         hub,
