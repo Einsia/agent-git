@@ -32,6 +32,7 @@ pub(super) fn harness_test_session_with_channels(
         },
         driver,
         tailer: None,
+        native_records: native_records::NativeRecords::default(),
         redactor: redact::Redactor::this_machine(),
         out,
         pending: Default::default(),
@@ -263,7 +264,7 @@ async fn a_pre_ready_retry_restores_the_initial_slot_and_ready_runs_it_once() {
 
     match &mut session.driver {
         AnyDriver::Codex(driver) => driver.set_test_thread_id("thread-1"),
-        AnyDriver::ClaudeCode(_) => unreachable!(),
+        AnyDriver::ClaudeCode(_) | AnyDriver::OpenCode(_) => unreachable!(),
     }
     session.flush_initial_turn_if_ready().await;
     assert!(session.queued_initial_turn.is_none());
@@ -1467,7 +1468,7 @@ fn unknown_without_a_mode_never_releases_a_still_unproven_harness() {
             );
             let failures = match &mut session.driver {
                 AnyDriver::Codex(driver) => driver.fail_test_shutdowns(usize::MAX),
-                AnyDriver::ClaudeCode(_) => unreachable!(),
+                AnyDriver::ClaudeCode(_) | AnyDriver::OpenCode(_) => unreachable!(),
             };
             let (ticket, mut receipt) = crate::rc::ticket::ticket();
             assert!(ticket.accept());

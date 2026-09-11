@@ -37,6 +37,8 @@
 //! advertised identity: keeping the original hash would hand the hub an offline
 //! oracle for guessing a low-entropy value. See [`projected_object_hash`].
 
+pub(crate) mod native_records;
+
 use crate::domain::{redact, transcript};
 use crate::protocol::{
     ApprovalResponse, CommitSettled, Delivery, Frame, ItemCompleted, ItemDelta, ItemStarted,
@@ -603,6 +605,7 @@ pub struct Session {
     pub info: SessionInfo,
     driver: AnyDriver,
     tailer: Option<Tailer>,
+    native_records: native_records::NativeRecords,
     redactor: redact::Redactor,
     /// Emitted upward; the daemon numbers these and ships them to the hub.
     out: mpsc::Sender<Frame>,
@@ -1107,6 +1110,7 @@ impl Session {
             info,
             driver,
             tailer: None,
+            native_records: native_records::NativeRecords::default(),
             redactor: redact::Redactor::with_registered(
                 redact::Persona::this_machine(),
                 secret_filter,
@@ -2488,9 +2492,10 @@ impl Session {
                 // which would deadlock a no-prompt recovery behind the daemon's
                 // Drive gate. Claude therefore uses the internal command-loop
                 // barrier above; Codex continues to require native evidence.
-                if self.info.runtime == "codex" {
+                if matches!(self.info.runtime.as_str(), "codex" | "opencode") {
                     self.sync_turn_guard(TurnGuardBarrier::Ready).await;
                 }
+                self.drain_transcript().await;
                 self.flush_initial_turn_if_ready().await;
             }
             HarnessEvent::TurnStartResolved(outcome) => {
@@ -3145,6 +3150,40 @@ impl Session {
     /// `Event::line` coordinate is a physical line number: a line's events do
     /// not depend on the lines before it.
     async fn drain_transcript(&mut self) {
+        if let Some(snapshot) = self.driver.take_native_snapshot() {
+            let projection = snapshot
+                .bytes
+                .map_err(anyhow::Error::msg)
+                .and_then(|bytes| {
+                    if snapshot.finalized {
+                        self.native_records
+                            .project_final(&bytes, self.resuming, &self.redactor)
+                    } else {
+                        self.native_records
+                            .project(&bytes, self.resuming, &self.redactor)
+                    }
+                });
+            match projection {
+                Ok((items, registered)) => {
+                    self.consumed_bytes = self.consumed_bytes.saturating_add(1);
+                    self.alert_registered(registered, "item_completed").await;
+                    for item in items {
+                        self.emit(method::ITEM_COMPLETED, item).await;
+                    }
+                }
+                Err(error) => {
+                    tracing_note(&format!("Native transcript projection failed: {error}"));
+                    self.emit(method::TURN_COMPLETED, TurnCompleted {
+                        turn_id: String::new(),
+                        outcome: PTurnOutcome::Error,
+                        error: Some("OpenCode's native history could not be displayed. Resume the session to recover its stored records.".into()),
+                        cost_usd: None,
+                        duration_ms: None,
+                    }).await;
+                }
+            }
+            return;
+        }
         let Some(tailer) = self.tailer.as_mut() else {
             return;
         };

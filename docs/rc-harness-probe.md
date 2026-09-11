@@ -6,6 +6,9 @@ sits at the end of each section.
 
 Environment: Ubuntu 24.04 / claude-code **2.1.233** / codex-cli **0.147.0**.
 
+OpenCode ACP results and remote support boundaries are recorded in
+[OpenCode remote control](rc-opencode.md).
+
 ## 0. The conclusion first: why not tmux / Zellij
 
 The easiest thing to reach for in the survey is a terminal multiplexer (tmux, Zellij, and the

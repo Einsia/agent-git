@@ -400,6 +400,18 @@ impl Daemon {
                 };
                 let (start_off, from_line, total_lines, absolute_lines) =
                     tail_window(&path, WATCH_BACKFILL_LINES);
+                let native_source = if runtime == "opencode" {
+                    use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};
+                    Some(
+                        OpenCode
+                            .lookup_native_readonly(&p.session_id, Limits::default())
+                            .map_err(|error| {
+                                RpcError::new(ErrorCode::SessionNotFound, error.to_string())
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 // The stream id comes from the thread id — several people watching the same
                 // session still share one stream and one run of seqs.
                 let watch_id = watch_stream_id(&caller.workspace_id, &p.session_id);
@@ -493,7 +505,41 @@ impl Daemon {
                             // the journal's ring, and a viewer replays them with a
                             // `session.subscribe`.
                             tokio::time::sleep(WATCH_RESPONSE_HEADSTART).await;
+                            let mut native_records =
+                                crate::rc::supervisor::native_records::NativeRecords::default();
                             loop {
+                                if let Some(source) = &native_source {
+                                    let Ok(bytes) =
+                                        crate::rc::supervisor::native_records::read_watch_snapshot(
+                                            source.clone(),
+                                            cwd.clone(),
+                                        )
+                                        .await
+                                    else {
+                                        break;
+                                    };
+                                    let Ok((items, _)) = native_records
+                                        .project_window(&bytes, false, &redactor, from_line)
+                                    else {
+                                        break;
+                                    };
+                                    if !items.is_empty() {
+                                        active.store(
+                                            crate::rc::daemon::now_secs(),
+                                            std::sync::atomic::Ordering::Release,
+                                        );
+                                    }
+                                    for item in items {
+                                        let mut frame =
+                                            Frame::notification(method::ITEM_COMPLETED, item);
+                                        frame.stream = Some(stream.clone());
+                                        if frames.send(frame).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    continue;
+                                }
                                 // Reap once the transcript is gone (the session was cleaned up,
                                 // the directory was deleted).
                                 if !path.exists() {

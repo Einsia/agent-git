@@ -670,6 +670,14 @@ async fn queue_line(
     .is_ok()
 }
 
+fn stdout_failure(strict: bool, message: String) -> Line {
+    if strict {
+        Line::Fatal("structured harness stdout is invalid or exceeds its limit".into())
+    } else {
+        Line::Notice(message)
+    }
+}
+
 impl Proc {
     /// Start a harness child process.
     ///
@@ -680,6 +688,26 @@ impl Proc {
         args: &[String],
         cwd: &PathBuf,
         env: &[(String, String)],
+    ) -> Result<Proc, LaunchError> {
+        Self::spawn_with_stdout_policy(program, args, cwd, env, false)
+    }
+
+    /// Losing structured stdout can lose an approval or terminal response.
+    pub fn spawn_strict_json(
+        program: &str,
+        args: &[String],
+        cwd: &PathBuf,
+        env: &[(String, String)],
+    ) -> Result<Proc, LaunchError> {
+        Self::spawn_with_stdout_policy(program, args, cwd, env, true)
+    }
+
+    fn spawn_with_stdout_policy(
+        program: &str,
+        args: &[String],
+        cwd: &PathBuf,
+        env: &[(String, String)],
+        strict_stdout: bool,
     ) -> Result<Proc, LaunchError> {
         #[cfg(test)]
         let stub = PROGRAM_OVERRIDE.with(|slot| slot.borrow().clone());
@@ -761,7 +789,14 @@ impl Proc {
                     Ok(Capped::Overlong(n)) => {
                         let notice = overlong_notice("output", n);
                         let bytes = notice.len();
-                        if !queue_line(&tx_out, &stdout_budget, Line::Notice(notice), bytes).await {
+                        if !queue_line(
+                            &tx_out,
+                            &stdout_budget,
+                            stdout_failure(strict_stdout, notice),
+                            bytes,
+                        )
+                        .await
+                        {
                             break;
                         }
                         continue;
@@ -772,8 +807,13 @@ impl Proc {
                             Err(n) => {
                                 let notice = overlong_notice("output", n);
                                 let bytes = notice.len();
-                                if !queue_line(&tx_out, &stdout_budget, Line::Notice(notice), bytes)
-                                    .await
+                                if !queue_line(
+                                    &tx_out,
+                                    &stdout_budget,
+                                    stdout_failure(strict_stdout, notice),
+                                    bytes,
+                                )
+                                .await
                                 {
                                     break;
                                 }
@@ -786,7 +826,7 @@ impl Proc {
                         }
                         let msg = match serde_json::from_str::<serde_json::Value>(s) {
                             Ok(v) => Line::Json(v),
-                            Err(_) => Line::Notice(s.to_string()),
+                            Err(_) => stdout_failure(strict_stdout, s.to_string()),
                         };
                         if !queue_line(&tx_out, &stdout_budget, msg, s.len()).await {
                             break;
@@ -1836,5 +1876,57 @@ mod tests {
             Capped::Line
         );
         assert_eq!(String::from_utf8_lossy(&buf), "{\"b\":2}");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_stdout_preserves_diagnostics_but_rejects_malformed_protocol() {
+        let mut proc = Proc::spawn_strict_json(
+            "sh",
+            &[
+                "-c".into(),
+                "printf 'ordinary diagnostic\\n' >&2; printf 'not-json\\n'; cat >/dev/null".into(),
+            ],
+            &PathBuf::from("/"),
+            &[],
+        )
+        .unwrap();
+        let mut fatal = false;
+        let mut diagnostic = false;
+        for _ in 0..2 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), proc.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_line()
+            {
+                Line::Fatal(message) => {
+                    fatal = true;
+                    assert!(!message.contains("not-json"));
+                }
+                Line::Notice(message) => {
+                    diagnostic = true;
+                    assert_eq!(message, "ordinary diagnostic");
+                }
+                other => panic!("unexpected output: {other:?}"),
+            }
+        }
+        assert!(fatal && diagnostic);
+        proc.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_stdout_cannot_discard_an_oversized_terminal_response() {
+        let script = format!("printf '%*s\\n' {} ''; cat >/dev/null", MAX_LINE_BYTES + 1);
+        let mut proc =
+            Proc::spawn_strict_json("sh", &["-c".into(), script], &PathBuf::from("/"), &[])
+                .unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), proc.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_line();
+        assert!(matches!(line, Line::Fatal(_)));
+        proc.shutdown().await.unwrap();
     }
 }

@@ -77,6 +77,34 @@ fn db_path() -> Option<PathBuf> {
     }
 }
 
+/// RC must not inherit session rules that override its agent's approval policy.
+pub(crate) fn validate_rc_session(database: &Path, id: &str, cwd: &Path) -> Result<()> {
+    let con = open(database).ok_or_else(|| anyhow::anyhow!("OpenCode database cannot be read"))?;
+    let (directory, permission): (String, Option<String>) = con
+        .query_row(
+            "SELECT directory, permission FROM session WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "OpenCode RC cannot verify the native session's directory and permission rules"
+            )
+        })?;
+    if std::fs::canonicalize(directory)? != std::fs::canonicalize(cwd)? {
+        bail!("OpenCode session belongs to another working directory");
+    }
+    if let Some(permission) = permission {
+        let rules: serde_json::Value = serde_json::from_str(&permission)?;
+        if !rules.is_null() && !rules.as_array().is_some_and(Vec::is_empty) {
+            bail!(
+                "OpenCode session has native permission overrides; start a new RC session to require remote approvals"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Cache directory for the materialized canonical jsonl.
 ///
 /// The backing store is not a file but a set of database rows (§9), while every other consumer

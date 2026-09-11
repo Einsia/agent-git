@@ -74,7 +74,7 @@ pub struct LandArgs {
     /// Session branch (allocated by the hub).
     #[arg(long, value_name = "branch")]
     pub branch: String,
-    /// Harness runtime (`claude-code` | `codex`).
+    /// Harness runtime (`claude-code` | `codex` | `opencode`).
     #[arg(long, value_name = "runtime")]
     pub runtime: String,
     /// The harness-native session/thread id.

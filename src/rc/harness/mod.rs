@@ -32,6 +32,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod opencode;
 pub mod proc;
 
 use crate::protocol::{
@@ -493,12 +494,11 @@ pub enum PermissionModeOutcome {
 
 /// A running harness process.
 ///
-/// An enum rather than `Box<dyn Driver>` + `async-trait`: there are exactly two
-/// variants, object-safe async traits still need a proc-macro crate, and this
-/// crate keeps its dependency list short on purpose. Dispatch is a `match`.
+/// Explicit variants keep protocol-specific capabilities attached to their drivers.
 pub enum AnyDriver {
     ClaudeCode(Box<claude_code::ClaudeCodeDriver>),
     Codex(Box<codex::CodexDriver>),
+    OpenCode(Box<opencode::OpenCodeDriver>),
 }
 
 macro_rules! dispatch {
@@ -506,6 +506,7 @@ macro_rules! dispatch {
         match $self {
             AnyDriver::ClaudeCode(d) => d.$m($($a),*).await,
             AnyDriver::Codex(d) => d.$m($($a),*).await,
+            AnyDriver::OpenCode(d) => d.$m($($a),*).await,
         }
     };
 }
@@ -524,10 +525,13 @@ impl AnyDriver {
             "codex" => Ok(AnyDriver::Codex(Box::new(
                 codex::CodexDriver::launch(spec).await?,
             ))),
+            "opencode" => Ok(AnyDriver::OpenCode(Box::new(
+                opencode::OpenCodeDriver::launch(spec).await?,
+            ))),
             // An unrecognized runtime never even built a command line, so
             // **provably** no process started.
             other => Err(proc::LaunchError::not_spawned(anyhow::anyhow!(
-                "{other} has no live control plane — agit can import its transcripts but not drive it remotely.\n  \u{2192} start this session with claude-code or codex"
+                "{other} has no live control plane — agit can import its transcripts but not drive it remotely.\n  \u{2192} start this session with claude-code, codex, or opencode"
             ))),
         }
     }
@@ -536,6 +540,7 @@ impl AnyDriver {
         match self {
             AnyDriver::ClaudeCode(_) => "claude-code",
             AnyDriver::Codex(_) => "codex",
+            AnyDriver::OpenCode(_) => "opencode",
         }
     }
 
@@ -553,6 +558,7 @@ impl AnyDriver {
         match self {
             AnyDriver::ClaudeCode(d) => d.runtime_thread_id().map(String::from),
             AnyDriver::Codex(d) => d.runtime_thread_id().map(String::from),
+            AnyDriver::OpenCode(d) => d.runtime_thread_id(),
         }
     }
 
@@ -560,6 +566,7 @@ impl AnyDriver {
         match self {
             AnyDriver::ClaudeCode(d) => d.transcript_path(),
             AnyDriver::Codex(d) => d.transcript_path(),
+            AnyDriver::OpenCode(d) => d.transcript_path(),
         }
     }
 
@@ -571,6 +578,7 @@ impl AnyDriver {
     ) -> TurnStartDispatch {
         match self {
             AnyDriver::ClaudeCode(d) => TurnStartDispatch::Resolved(d.start_turn(message).await),
+            AnyDriver::OpenCode(d) => d.start_turn(message).await,
             AnyDriver::Codex(d) => {
                 d.start_turn(message, consume_pending_mode, guard_attempt)
                     .await
@@ -600,6 +608,7 @@ impl AnyDriver {
         match self {
             AnyDriver::ClaudeCode(d) => d.abandon_pending_approvals(),
             AnyDriver::Codex(d) => d.abandon_pending_approvals(),
+            AnyDriver::OpenCode(d) => d.abandon_pending_approvals(),
         }
     }
 
@@ -616,11 +625,19 @@ impl AnyDriver {
         match self {
             AnyDriver::ClaudeCode(d) => d.permission_mode(),
             AnyDriver::Codex(d) => d.permission_mode(),
+            AnyDriver::OpenCode(d) => d.permission_mode(),
         }
     }
 
     pub async fn next_event(&mut self) -> Option<HarnessEvent> {
         dispatch!(self, next_event)
+    }
+
+    pub fn take_native_snapshot(&mut self) -> Option<opencode::NativeSnapshot> {
+        match self {
+            Self::OpenCode(driver) => driver.take_snapshot(),
+            _ => None,
+        }
     }
 
     pub async fn shutdown(&mut self) -> crate::Result<()> {
@@ -633,6 +650,7 @@ pub fn capability_of(runtime: &str) -> RuntimeCapability {
     match runtime {
         "claude-code" => claude_code::capability(),
         "codex" => codex::capability(),
+        "opencode" => opencode::capability(),
         other => RuntimeCapability {
             runtime: other.to_string(),
             available: false,
@@ -649,11 +667,14 @@ pub fn capability_of(runtime: &str) -> RuntimeCapability {
     }
 }
 
-/// Every runtime we can drive live. Note this is a *smaller* set than
-/// `adapter::all()`: adapters can import transcripts from five runtimes, but
-/// only two have a control plane we can drive.
+/// Every runtime with an implemented live control plane.
+/// Import support alone cannot advertise remote execution capabilities.
 pub fn drivable() -> Vec<RuntimeCapability> {
-    vec![claude_code::capability(), codex::capability()]
+    vec![
+        claude_code::capability(),
+        codex::capability(),
+        opencode::capability(),
+    ]
 }
 
 /// `<cli> --version`, best effort, used for the capability report.
@@ -809,12 +830,15 @@ mod tests {
     }
 
     #[test]
-    fn only_two_runtimes_are_drivable_even_though_five_are_importable() {
+    fn drivable_runtimes_advertise_their_control_planes() {
         let d = drivable();
-        assert_eq!(d.len(), 2);
+        assert_eq!(
+            d.iter().map(|c| c.runtime.as_str()).collect::<Vec<_>>(),
+            vec!["claude-code", "codex", "opencode"]
+        );
         assert!(
             d.iter().all(|c| c.interrupt),
-            "both drivable runtimes can be interrupted"
+            "drivable runtimes can be interrupted"
         );
         // cursor is importable but has no control plane.
         assert!(!capability_of("cursor").interrupt);
