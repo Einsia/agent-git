@@ -49,11 +49,19 @@ pub(in crate::commands::merge) fn start(
         cwd: &launch.cwd,
     })?;
     let binding = &prepared.binding;
-    let mut resumed = resume::prepared_archive_resume(
+    if binding.file_target.is_some() {
+        println!("exploration session: {slug}@{}", binding.role.branch);
+        crate::ui::hint(&format!(
+            "publish exploration explicitly with `agit push {slug} -b {}` or `--all`; pushing only {} keeps this exploration local",
+            binding.role.branch,
+            binding.target_branch(),
+        ));
+    }
+    let resumed = resume::prepared_archive_resume(
         launch,
         &binding.native.session_id,
         slug,
-        &tx.target,
+        &binding.role.branch,
         prompt,
     )?;
     let mut command = Command::new("sh");
@@ -80,7 +88,6 @@ pub(in crate::commands::merge) fn start(
         &mut command,
         || Ok(()),
     )?;
-    resumed.emit_launch_messages();
     if let Some(unresolved) = prepared.unresolved_placeholders.filter(|count| *count > 0) {
         crate::ui::warning(&format!(
             "archive VIEW retains {unresolved} unresolved secret placeholders"
@@ -117,7 +124,7 @@ fn spawn_verified(
             .context("archive launch transaction is missing")?
     };
     before_lock()?;
-    let _branch = link::lock_branch(store, &binding.role.slug, &binding.role.branch)?;
+    let _branches = super::lock_binding_branches(store, binding)?;
     let mut keys = observed
         .previous_claims
         .iter()
@@ -160,10 +167,17 @@ fn spawn_verified(
     merge_archive::checked_abort_transaction(&image.json, binding, false)?;
     resume::require_archive_launch_state(
         repo,
-        &binding.role.branch,
-        &binding.role.origin_head,
+        binding.target_branch(),
+        binding.target_head(),
         launch,
     )?;
+    if binding.file_target.is_some() {
+        super::file_agent::require_seed_binding(repo, binding)?;
+        ensure!(
+            super::current_head(repo, &binding.role.branch)? == binding.role.origin_head,
+            "file exploration evidence branch moved before launch"
+        );
+    }
     archive_history::verify_frozen_source(source, &binding.source.head)?;
     let actual = link::read_archive_link_snapshot(
         store,
@@ -212,6 +226,9 @@ fn spawn_verified(
         "archive installation changed before its first launch"
     );
     native_archive::capture(&bytes, binding.installed.bytes, &binding.installed.sha256)?;
+    if binding.file_target.is_some() && binding.native.runtime == "claude-code" {
+        super::file_agent::reserve_fresh_launch(repo, binding, &actual.link)?;
+    }
     // Only spawn is protected. Waiting under these guards would prevent the child from landing.
     command
         .spawn()
@@ -238,13 +255,22 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_file(false)
+        }
+
+        fn with_file(file: bool) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let cwd = directory.path().canonicalize().unwrap();
             let repo = Repo::init(&cwd.join("repo")).unwrap();
             repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
-            let mut metadata =
-                meta::Meta::new(SESSION.into(), "codex".into(), cwd.display().to_string());
-            metadata.turn = Some(1);
+            let mut metadata = if file {
+                meta::Meta::new_file_line()
+            } else {
+                meta::Meta::new(SESSION.into(), "codex".into(), cwd.display().to_string())
+            };
+            if !file {
+                metadata.turn = Some(1);
+            }
             meta::write(repo.root(), &metadata).unwrap();
             let view = transcript::wrap_lines(VISIBLE, "codex", SESSION);
             let log = format!(
@@ -255,15 +281,18 @@ mod tests {
                     SESSION
                 )
             );
-            storage::write_snapshot(repo.root(), &log, &view).unwrap();
+            if !file {
+                storage::write_snapshot(repo.root(), &log, &view).unwrap();
+            }
             repo.add_all().unwrap();
             repo.commit("synthetic launch target").unwrap();
             let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
-            for branch in ["work", "source"] {
+            let target = if file { "main" } else { "work" };
+            for branch in ["work", "source"].into_iter().chain(file.then_some("main")) {
                 repo.git(&["update-ref", &format!("refs/heads/{branch}"), &head])
                     .unwrap();
             }
-            repo.git(&["symbolic-ref", "HEAD", "refs/heads/work"])
+            repo.git(&["symbolic-ref", "HEAD", &format!("refs/heads/{target}")])
                 .unwrap();
             let store = Store::at(cwd.join("store"));
             let (installed, _) = install::install(VISIBLE, "codex", "codex", &cwd).unwrap();
@@ -283,10 +312,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let tx = mergetx::Tx {
-                mode: Some(mergetx::Mode::SessionAgent),
+                mode: Some(if file {
+                    mergetx::Mode::FileAgent
+                } else {
+                    mergetx::Mode::SessionAgent
+                }),
                 exploration: None,
                 generation: Some(uuid::Uuid::now_v7().to_string()),
-                target: "work".into(),
+                target: target.into(),
                 source: "alice/target@source".into(),
                 source_repo: Some("alice/target".into()),
                 source_branch: Some("source".into()),
@@ -300,7 +333,7 @@ mod tests {
             let launch = resume::archive_launch_context(
                 &repo,
                 "alice/target",
-                "work",
+                target,
                 &tx.target_head,
                 "codex".into(),
                 &cwd,
@@ -363,6 +396,117 @@ mod tests {
     fn spawn_probe_child() {
         if let Some(path) = std::env::var_os("AGIT_ARCHIVE_SPAWN_PROBE") {
             std::fs::write(path, b"started").unwrap();
+        }
+    }
+
+    #[test]
+    fn file_launch_checks_both_frozen_refs_and_keeps_failed_spawn_cancellable() {
+        const CHILD: &str = "AGIT_FILE_ARCHIVE_LAUNCH_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "commands::merge::archive::launch::tests::file_launch_checks_both_frozen_refs_and_keeps_failed_spawn_cancellable", "--nocapture"])
+                .env(CHILD, "1").env("HOME", home.path()).env("USERPROFILE", home.path())
+                .env("CODEX_HOME", home.path().join(".codex")).env("AGIT_HOME", home.path().join("agit"))
+                .env("AGIT_SECRETS_KEYSTORE", if cfg!(windows) { "os" } else { "file" });
+            for name in archive_history::GIT_ROUTING_ENV {
+                command.env_remove(name);
+            }
+            command
+                .env_remove(mergetx::ENV)
+                .env_remove(mergetx::GENERATION_ENV);
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        for change in ["none", "main", "evidence", "tracking", "spawn-failure"] {
+            let fixture = Fixture::with_file(true);
+            let installed = read_native(&fixture.native().link).unwrap();
+            let selected = fixture.native().json;
+            let journal = fixture.journal();
+            let checked_refs = std::cell::RefCell::new(None);
+            assert!(!String::from_utf8_lossy(&installed).contains("SYNTHETIC-ARCHIVE-VIEW"));
+            let marker = fixture.launch.cwd.join("file-spawn-marker");
+            let mut command = Command::new(if change == "spawn-failure" {
+                fixture.launch.cwd.join("missing-executable")
+            } else {
+                std::env::current_exe().unwrap()
+            });
+            command
+                .args([
+                    "--exact",
+                    "commands::merge::archive::launch::tests::spawn_probe_child",
+                ])
+                .env("AGIT_ARCHIVE_SPAWN_PROBE", &marker);
+            let result = spawn_verified(
+                &fixture.repo,
+                &fixture.repo,
+                &fixture.store,
+                &fixture.binding,
+                &fixture.launch,
+                &mut command,
+                || {
+                    if matches!(change, "main" | "evidence") {
+                        let (branch, head) = if change == "main" {
+                            (
+                                fixture.binding.target_branch(),
+                                fixture.binding.target_head(),
+                            )
+                        } else {
+                            (
+                                fixture.binding.role.branch.as_str(),
+                                fixture.binding.role.origin_head.as_str(),
+                            )
+                        };
+                        let tree = fixture
+                            .repo
+                            .git(&["rev-parse", &format!("{head}^{{tree}}")])?;
+                        let moved = crate::commands::plumbing::commit_tree(
+                            &fixture.repo,
+                            &tree,
+                            &[head],
+                            "competing ref fixture",
+                        )?;
+                        fixture.repo.git(&[
+                            "update-ref",
+                            &format!("refs/heads/{branch}"),
+                            &moved,
+                            head,
+                        ])?;
+                    } else if change == "tracking" {
+                        fixture.repo.git(&["config", "branch.main.remote", "."])?;
+                        fixture
+                            .repo
+                            .git(&["config", "branch.main.merge", "refs/heads/source"])?;
+                    }
+                    *checked_refs.borrow_mut() = Some(
+                        fixture
+                            .repo
+                            .git(&["for-each-ref", "--format=%(refname) %(objectname)"])?,
+                    );
+                    Ok(())
+                },
+            );
+            if change == "none" {
+                assert!(result.unwrap().wait().unwrap().success());
+                assert_eq!(std::fs::read(&marker).unwrap(), b"started");
+            } else {
+                assert!(result.is_err(), "{change}");
+                assert!(!marker.exists());
+            }
+            assert_eq!(read_native(&fixture.native().link).unwrap(), installed);
+            assert_eq!(fixture.native().json, selected);
+            assert_eq!(fixture.journal(), journal);
+            assert_eq!(
+                fixture
+                    .repo
+                    .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+                    .unwrap(),
+                checked_refs.borrow().as_deref().unwrap()
+            );
+            if matches!(change, "none" | "spawn-failure") {
+                fixture.cancel();
+            }
         }
     }
 

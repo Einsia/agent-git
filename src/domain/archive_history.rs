@@ -196,6 +196,171 @@ pub fn verify_frozen_source(repo: &Repo, head: &str) -> Result<()> {
     Ok(())
 }
 
+/// The public file result contains no session evidence and names only the original merge parents.
+/// Its retained tree fixes shared content independently of the session branch's native cursor.
+pub fn verify_file_merge_landing(
+    repo: &Repo,
+    target: &str,
+    source: &str,
+    candidate: &str,
+    expected_tree: &str,
+) -> Result<()> {
+    for oid in [source, candidate, expected_tree] {
+        validate_endpoints(target, oid)?;
+    }
+    let mut reader = ObjectReader::new(repo)?;
+    let commit = reader.read(candidate, "commit", MAX_COMMIT_BYTES)?;
+    let (tree, parents) = commit_headers(&commit, candidate.len())?;
+    ensure!(
+        tree == expected_tree && parents.as_slice() == [target, source],
+        "file merge candidate differs from its retained tree or ordered parents"
+    );
+    for parent in parents {
+        let bytes = reader.read(&parent, "commit", MAX_COMMIT_BYTES)?;
+        commit_headers(&bytes, parent.len())?;
+    }
+    let mut entries = BTreeMap::new();
+    read_tree(&mut reader, &tree, b"", 0, &mut entries)?;
+    let bytes = read_regular(&mut reader, &entries, meta::FILE, MAX_METADATA_BYTES)?;
+    let metadata = meta::parse_strict(std::str::from_utf8(&bytes)?, candidate)?;
+    ensure!(
+        metadata.is_file_line() && metadata.kind == meta::Kind::Merge,
+        "file merge candidate must retain its file-line declaration"
+    );
+    for (path, entry) in &entries {
+        let path = std::str::from_utf8(path).context("file merge path is not Unicode")?;
+        ensure!(
+            path == meta::FILE || !meta::is_storage_path(path),
+            "file merge candidate contains session evidence"
+        );
+        if !entry.is_tree()
+            && entry.mode != 0o160000
+            && reader.validated_blobs.insert(entry.oid.clone())
+        {
+            reader.read(&entry.oid, "blob", MAX_OBJECT_BYTES)?;
+        }
+    }
+    Ok(())
+}
+
+/// An exploration with no new records may acknowledge disposition without inventing an Archive.
+pub fn verify_empty_file_exploration(repo: &Repo, seed: &str, candidate: &str) -> Result<()> {
+    validate_endpoints(seed, candidate)?;
+    let mut reader = ObjectReader::new(repo)?;
+    let parent = reader.read(seed, "commit", MAX_COMMIT_BYTES)?;
+    let (expected_tree, _) = commit_headers(&parent, seed.len())?;
+    let child = reader.read(candidate, "commit", MAX_COMMIT_BYTES)?;
+    let (tree, parents) = commit_headers(&child, candidate.len())?;
+    ensure!(
+        tree == expected_tree && parents.as_slice() == [seed],
+        "empty file exploration must retain its exact seed tree and parent"
+    );
+    Snapshot::read(&mut reader, candidate)?;
+    Ok(())
+}
+
+/// A file merge's evidence branch starts empty and inherits only the frozen shared files.
+/// Raw parents keep the evidence branch out of the target's ancestry and publication closure.
+pub fn verify_file_evidence_seed(
+    repo: &Repo,
+    target: &str,
+    candidate: &str,
+    candidate_tree: &str,
+    metadata_text: &str,
+) -> Result<()> {
+    validate_endpoints(target, candidate)?;
+    validate_endpoints(target, candidate_tree)?;
+    let mut reader = ObjectReader::new(repo)?;
+    let commit = reader.read(candidate, "commit", MAX_COMMIT_BYTES)?;
+    let (tree, parents) = commit_headers(&commit, candidate.len())?;
+    ensure!(
+        tree == candidate_tree && parents.as_slice() == [target],
+        "file exploration seed has different parents or tree"
+    );
+    let seed = Snapshot::read(&mut reader, candidate)?;
+    let actual_meta = read_regular(&mut reader, &seed.entries, meta::FILE, MAX_METADATA_BYTES)?;
+    ensure!(
+        JsonFacts::parse(std::str::from_utf8(&actual_meta)?)? == JsonFacts::parse(metadata_text)?
+            && seed.metadata.kind == meta::Kind::File
+            && seed.metadata.turn.is_none()
+            && seed.log.is_empty(),
+        "file exploration seed changes its identity or contains conversation"
+    );
+    let target_commit = reader.read(target, "commit", MAX_COMMIT_BYTES)?;
+    let (target_tree, _) = commit_headers(&target_commit, target.len())?;
+    let mut old = BTreeMap::new();
+    read_tree(&mut reader, &target_tree, b"", 0, &mut old)?;
+    let bytes = read_regular(&mut reader, &old, meta::FILE, MAX_METADATA_BYTES)?;
+    let metadata = meta::parse_strict(std::str::from_utf8(&bytes)?, target)?;
+    ensure!(
+        metadata.is_file_line(),
+        "file exploration target is not a file line"
+    );
+    if metadata.layout == meta::LayoutVersion::V0 {
+        ensure!(
+            !old.keys().any(|path| {
+                path == meta::LOG_FILE.as_bytes()
+                    || path == meta::VIEW_FILE.as_bytes()
+                    || path == meta::EVENTS_DIR.as_bytes()
+                    || path.starts_with(b"events/")
+            }),
+            "file exploration seed collides with legacy shared paths"
+        );
+    }
+    let inherited = |path: &[u8], entry: &Entry| {
+        !entry.is_tree()
+            && path != meta::ATTRS_FILE.as_bytes()
+            && !std::str::from_utf8(path)
+                .is_ok_and(|path| meta::is_storage_path_for(metadata.layout, path))
+    };
+    let shared = old
+        .iter()
+        .filter(|(path, entry)| inherited(path, entry))
+        .collect::<BTreeMap<_, _>>();
+    let actual_shared = seed
+        .entries
+        .iter()
+        .filter(|(path, entry)| {
+            !entry.is_tree()
+                && ![
+                    meta::FILE,
+                    meta::LOG_FILE,
+                    meta::VIEW_FILE,
+                    meta::ATTRS_FILE,
+                ]
+                .iter()
+                .any(|allowed| path.as_slice() == allowed.as_bytes())
+        })
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        shared == actual_shared,
+        "file exploration seed changes shared files or adds evidence"
+    );
+    let attributes = if old.contains_key(meta::ATTRS_FILE.as_bytes()) {
+        Some(read_regular(
+            &mut reader,
+            &old,
+            meta::ATTRS_FILE,
+            MAX_OBJECT_BYTES,
+        )?)
+    } else {
+        None
+    };
+    let expected_attributes = storage::attributes_text_strict(
+        attributes.as_deref().map(std::str::from_utf8).transpose()?,
+    )?;
+    ensure!(
+        read_regular(
+            &mut reader,
+            &seed.entries,
+            meta::ATTRS_FILE,
+            MAX_OBJECT_BYTES
+        )? == expected_attributes.as_bytes(),
+        "file exploration seed changes shared Git attributes"
+    );
+    Ok(())
+}
+
 /// Turn coordinates and LOG bytes come from the same complete immutable first-parent chain.
 /// Native reads and later graph metadata changes cannot reinterpret a retained selection.
 pub(crate) struct FrozenSourceLog {

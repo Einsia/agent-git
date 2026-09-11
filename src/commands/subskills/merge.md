@@ -31,6 +31,7 @@ agit merge --continue | --abort
 | `--dry-run` | Reconnaissance only; no lock, launch, or history change |
 | `--status` | Show the open merge transaction |
 | `--continue` | Validate the summary and commit the merge |
+| `--resolved <path>` | With `--continue`, acknowledge the current contents of this conflicted file-line path; repeat for each path |
 | `--abort` | Cancel the transaction; a visible Archive landing is completed without rollback |
 | `pick <refs>` | Select source turns/events |
 | `drop <refs>` | Remove picks |
@@ -47,6 +48,14 @@ agit merge --into szh/p1@review pick szh/p1@other#3..#5
 agit merge --into szh/p1@review summary -m "Keep the new rate-limit policy and use uid on the target line"
 agit merge --into szh/p1@review --continue
 ```
+
+If a shared-file conflict is intentionally resolved by keeping the target text unchanged, use
+`agit merge --continue --resolved AGENTS.md` (with `--into` when needed). Paths are relative to
+the target checkout and are checked against the current transaction's frozen source and target.
+Only reported shared conflicts can be acknowledged. Other unresolved paths and conflict markers
+still prevent landing. This works for manual file-line merges and FileAgent transactions;
+session VIEW merges do not accept `--resolved`. An acknowledgement belongs to this invocation,
+not to a future transaction.
 
 If the intents cannot be reconciled, use `agit merge --abort`; do not rebase or force-push.
 
@@ -68,13 +77,26 @@ If a runtime writes while its replacement is being installed, the original claim
 
 For a transaction without Archive authority, cancellation and merge-agent launch share a transaction control guard. If cancellation completes before final publication, the prepared session stays unclaimed and no agent is spawned. Once spawning wins admission, the guard is released immediately; a later abort clears the transaction without waiting for or terminating that runtime. Transaction progress and landing hold the same guard from their state read through their update, so an aborted transaction cannot be revived by a delayed command.
 
+## File-line exploration
+
+When a merge agent reconciles a file line such as `main`, shared-file changes land on
+the selected target. The agent's recorded exploration belongs to a separate, visible
+session branch in the same Agent repository. The launch output prints that branch's
+full `owner/repo@branch` route; use it with `agit log` to inspect the recorded history.
+
+Publishing only `main` does not publish this exploration. Select its printed branch
+explicitly with `agit push owner/repo -b <exploration-branch>`, or include updated
+branches with `agit push owner/repo --all`. A manual merge does not launch an agent
+or create an exploration session.
+
 ## Retained Archive lifecycle
 
 A selected session transaction with retained Archive authority uses that generation for
 `--continue` and `--abort`. Continue reads the frozen source commit from its recorded local
 repository, even if the source branch moves or disappears. Once a candidate is retained,
 replay uses its imported objects without rereading native exploration or resolving the source
-branch. Pending publication, cancellation and completed generations reject `pick`, `drop`
+branch. Retry a retained candidate without `--resolved`: new acknowledgements cannot change
+its frozen result. Pending publication, cancellation and completed generations reject `pick`, `drop`
 and `summary` changes.
 
 Before landing, abort restores the exact prior claims and retains native exploration. If the

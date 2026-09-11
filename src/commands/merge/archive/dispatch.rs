@@ -59,7 +59,7 @@ pub(in crate::commands::merge) fn select(
         .context("the selected archive generation has no retained journal")?;
     let binding = journal.binding;
     ensure!(
-        binding.role.slug == slug && branch.is_some_and(|branch| branch == binding.role.branch),
+        binding.role.slug == slug && branch.is_some_and(|branch| branch == binding.target_branch()),
         "archive generation belongs to a different repository or branch"
     );
     if let Some(tx) = transaction {
@@ -127,23 +127,32 @@ pub(in crate::commands::merge) fn continue_selected(
     repo: &Repo,
     store: &Store,
     binding: &ExplorationBinding,
+    resolved: &[String],
 ) -> Result<landing::LandingOutcome> {
-    if let Some(outcome) = landing::replay(repo, store, binding)? {
+    ensure!(
+        resolved.is_empty() || binding.file_target.is_some(),
+        "--resolved requires a current file-line merge transaction"
+    );
+    if resolved.is_empty()
+        && let Some(outcome) = landing::replay(repo, store, binding)?
+    {
         return Ok(outcome);
     }
     let (owner, name) = super::super::super::parse_slug(&binding.source.slug)?;
     let source = Repo::open(crate::infra::config::repo_dir(&owner, &name)?)
         .context("the frozen merge source repository is unavailable")?;
     let global = VaultStore::open_default()?.matcher()?;
-    landing::land(
-        landing::LandingRequest {
-            repo,
-            source_repo: &source,
-            store,
-            binding,
-        },
-        &global,
-    )
+    let request = landing::LandingRequest {
+        repo,
+        source_repo: &source,
+        store,
+        binding,
+    };
+    if resolved.is_empty() {
+        landing::land(request, &global)
+    } else {
+        landing::land_resolved(request, &global, resolved)
+    }
 }
 
 pub(in crate::commands::merge) fn abort_selected(

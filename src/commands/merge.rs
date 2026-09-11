@@ -22,8 +22,10 @@
 //!    Failing validation makes it a proposal only, and the target ref never moved.
 //!
 //! B is left untouched.
+//! File targets keep shared-file history on their target and exploration on a visible session branch.
 
 pub mod archive;
+mod file_reconciliation;
 
 use super::CmdResult;
 use crate::domain::mergetx::{self, Tx};
@@ -64,6 +66,9 @@ pub struct Args {
     /// Validate and commit.
     #[arg(long)]
     pub continue_: bool,
+    /// Confirm the current contents of a conflicted shared path, including unchanged target text.
+    #[arg(long, value_name = "path", requires = "continue_", conflicts_with_all = ["source", "status", "abort", "manual", "dry_run", "as_runtime", "message"])]
+    pub resolved: Vec<String>,
     /// Cancel this merge; a visible archive landing is completed without rollback.
     #[arg(long)]
     pub abort: bool,
@@ -89,13 +94,17 @@ pub enum PickCmd {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    if !args.resolved.is_empty() && args.cmd.is_some() {
+        ui::error("--resolved is only valid with --continue, without a transaction subcommand");
+        return Ok(ExitCode::Usage);
+    }
     let cwd = std::env::current_dir()?;
     // The transaction subcommands run first (they need no source).
     if args.status {
         return status(&cwd, args.into.as_deref());
     }
     if args.continue_ {
-        return continue_tx(&cwd, args.into.as_deref());
+        return continue_tx(&cwd, args.into.as_deref(), &args.resolved);
     }
     if args.abort {
         return abort(&cwd, args.into.as_deref());
@@ -212,13 +221,8 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     let mut archive_runtime = None;
 
     if !args.dry_run {
-        // Starting the merge agent is the only part of this command that needs an interactive
-        // runtime.  Check that requirement before settling the target, checking out its worktree,
-        // or taking the transaction lock.  Otherwise a CI/agent-harness invocation reaches
-        // `resume_merge_agent`, which materializes the merge session and only then fails with
-        // "stdin is not a terminal", leaving the transaction open for somebody to recover by hand.
-        // `--manual` is intentionally exempt: it opens the same transaction for explicit plumbing
-        // commands and is designed to work without a terminal.
+        // Runtime interaction is checked before settling the target or opening its transaction.
+        // Manual reconciliation uses explicit plumbing and does not require a terminal.
         if should_refuse_noninteractive_merge(args.manual, args.dry_run, !merge_agent_can_launch())
         {
             ui::error("starting the merge agent requires an interactive terminal.");
@@ -228,7 +232,7 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
             return Ok(ExitCode::Interactive);
         }
 
-        if !args.manual && !meta::is_file_line_at(&repo, &target_head) {
+        if !args.manual {
             archive_runtime = Some(super::resume::archive_runtime(
                 &repo,
                 &target_head,
@@ -371,77 +375,18 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     }
 
     let instruction = merge_instruction(&slug, &target, src_ref, args.message.as_deref());
-    if let Some(launch) = archive_launch {
-        let mut launched = archive::launch::start(
-            &destination,
-            &base.repo,
-            &store,
-            &tx,
-            &slug,
-            &launch,
-            &instruction,
-        )?;
-        print_merge_instruction(&instruction);
-        return archive::completion::finish(
-            &destination,
-            &store,
-            &launched.binding,
-            &mut launched.child,
-        );
-    }
-
-    // resume merge agent: materialized from the target head (its instance carries the
-    // AGIT_MERGE_TX marker).
-    let rargs = super::resume::Args {
-        target: Some(target.clone()),
-        as_runtime: args.as_runtime.clone(),
-        cwd: None,
-        no_launch: false,
-        force: true, // the caller is usually the live session on the target branch itself
-    };
-    // The instruction goes in as the merge agent's **opening message**. Without it the agent
-    // comes up with no idea that it is the merge agent — that is what leaves it sitting there
-    // waiting after launch.
-    match super::resume::resume_merge_agent(&repo, &slug, &tx, &rargs, &instruction)? {
-        Some(mut res) => {
-            let child = res.cmd.as_ref().map(|cmd| {
-                std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(cmd)
-                    .env(mergetx::ENV, format!("{slug}@{target}"))
-                    .env(
-                        mergetx::GENERATION_ENV,
-                        tx.generation
-                            .as_deref()
-                            .expect("new transaction generation"),
-                    )
-                    .spawn()
-            });
-            drop(res.merge_launch_guard.take());
-            let child = child.transpose()?;
-            res.emit_launch_messages();
-            print_merge_instruction(&instruction);
-            match child {
-                Some(mut child) => {
-                    let status = child.wait()?;
-                    Ok(match status.code() {
-                        Some(0) | None => ExitCode::Ok,
-                        Some(_) => ExitCode::Precondition,
-                    })
-                }
-                None => Ok(ExitCode::Ok),
-            }
-        }
-        None => {
-            // The agent cannot come up (runtime unavailable, and so on) — the transaction
-            // stays open and the fallback to manual driving is stated.
-            ui::warning(
-                "the merge agent didn’t come up; the transaction stays open — drive it by hand:",
-            );
-            ui::hint("agit merge pick … → agit merge summary -m … → agit merge --continue");
-            Ok(ExitCode::Precondition)
-        }
-    }
+    let launch = archive_launch.context("agent merge has no retained launch selection")?;
+    let mut launched = archive::launch::start(
+        &destination,
+        &base.repo,
+        &store,
+        &tx,
+        &slug,
+        &launch,
+        &instruction,
+    )?;
+    print_merge_instruction(&instruction);
+    archive::completion::finish(&destination, &store, &launched.binding, &mut launched.child)
 }
 
 fn print_merge_instruction(instruction: &str) {
@@ -550,13 +495,12 @@ fn manual_commands(slug: &str, target: &str, src_ref: &str) -> String {
 /// agent's first act is to scout with `agit view` itself: what it wants, and how far down it
 /// drills, are its own call, on demand.
 ///
-/// It lands through the harness's native "resume carrying a prompt" (see
-/// [`super::resume::resume_branch_with_prompt`]), not by appending a forged user message to the
-/// transcript — that transcript is evidence going into history.
+/// The native launch receives the opening prompt as an argument. It is never appended to the
+/// installed transcript, whose bytes define the archive's inherited evidence frontier.
 fn merge_instruction(slug: &str, target: &str, src: &str, extra: Option<&str>) -> String {
     let mut s = format!(
-        "You were resumed by `agit merge` as the merge agent (AGIT_MERGE_TX={slug}@{target}).\n\
-         Reconcile branch `{src}` into the current branch `{target}`. Reconcile intent, don't stitch text.\n\
+        "You were started by `agit merge` as the merge agent (AGIT_MERGE_TX={slug}@{target}).\n\
+         Reconcile branch `{src}` into the target branch `{target}`. Reconcile intent, don't stitch text.\n\
          \n\
          1. `agit view {src} --json` — what that session actually sees\n\
          2. `agit show {src}#n.k` — drill into events outside its VIEW\n\
@@ -578,6 +522,18 @@ fn transaction_repo(
     cwd: &std::path::Path,
     into: Option<&str>,
 ) -> crate::Result<Option<(Repo, String, Option<String>)>> {
+    if into.is_none()
+        && let Some(marker) = std::env::var_os(mergetx::ENV)
+    {
+        let marker = marker.to_str().context("AGIT_MERGE_TX is not Unicode")?;
+        let (slug, branch) = super::context::decode_session_env(marker)
+            .context("AGIT_MERGE_TX must name an exact repository and target branch")?;
+        let (owner, name) = super::parse_slug(&slug)?;
+        crate::domain::repo::valid_branch_name(&branch)?;
+        let repo = Repo::open(crate::infra::config::repo_dir(&owner, &name)?)
+            .context("the marked merge repository is missing")?;
+        return Ok(Some((repo, slug, Some(branch))));
+    }
     let (repo, slug, selected_branch) = if let Some(into) = into {
         let Some((repo, slug, branch, _via)) = target_of(cwd, Some(into))? else {
             return Ok(None);
@@ -740,7 +696,7 @@ fn open_lifecycle(cwd: &std::path::Path, into: Option<&str>) -> crate::Result<Op
     if let Some(binding) =
         archive::dispatch::select(&repo, &slug, branch.as_deref(), observed.as_ref())?
     {
-        let repo = archive::dispatch::destination(&repo, &binding.role.branch)?;
+        let repo = archive::dispatch::destination(&repo, binding.target_branch())?;
         return Ok(Some(Lifecycle::Archive {
             repo,
             slug,
@@ -775,7 +731,7 @@ fn echo_archive(
         "merge",
         &[
             super::echo::Selection::new(
-                format!("{slug}@{}", binding.role.branch),
+                format!("{slug}@{}", binding.target_branch()),
                 target_selection_source(into),
             )
             .role("into"),
@@ -910,7 +866,7 @@ fn pick_drop_summary(cwd: &std::path::Path, into: Option<&str>, cmd: PickCmd) ->
     Ok(ExitCode::Ok)
 }
 
-fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
+fn continue_tx(cwd: &std::path::Path, into: Option<&str>, resolved: &[String]) -> CmdResult {
     let Some(selected) = open_lifecycle(cwd, into)? else {
         return Ok(ExitCode::Precondition);
     };
@@ -930,7 +886,7 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
             unreachable!()
         };
         let store = crate::domain::store::Store::at(crate::infra::config::store_root()?);
-        let outcome = archive::dispatch::continue_selected(&repo, &store, &binding)?;
+        let outcome = archive::dispatch::continue_selected(&repo, &store, &binding, resolved)?;
         echo_archive(&slug, &binding, into);
         ui::success(&format!(
             "merge commit landed: {} (archived records: {})",
@@ -965,6 +921,10 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
     // with no VIEW change. The test is `meta.line` — "meta cannot be read" is not a file line,
     // and such a checkout errors below in its own words.
     let target_is_file_line = meta::is_file_line_at(&repo, &tx.target_head);
+    if !resolved.is_empty() && (!target_is_file_line || tx.generation.is_none()) {
+        ui::error("--resolved requires a current file-line merge transaction with a generation");
+        return Ok(ExitCode::Precondition);
+    }
     let target_layout = super::plumbing::storage_layout_at(&repo, &tx.target_head)?;
     // Every successful merge writes a v1 snapshot. A v0 target may still use the new root names
     // as ordinary files, including ignored worktree data, so prove that namespace is free before
@@ -1013,6 +973,10 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
         None => vec![],
     };
     let on_target = checkout.is_some();
+    if !resolved.is_empty() && !on_target {
+        ui::error("--resolved requires the target branch checkout");
+        return Ok(ExitCode::Precondition);
+    }
     // Reading the worktree and refreshing the checkout below both target that worktree; with no
     // worktree only the ref moves.
     let repo = checkout.unwrap_or(repo);
@@ -1024,6 +988,7 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>) -> CmdResult {
         src_head,
         &shared,
         target_is_file_line,
+        resolved,
     )? {
         Some(v) => v,
         None => return Ok(ExitCode::Precondition),
@@ -1167,7 +1132,12 @@ fn merge_tree(
     src_head: &str,
     shared: &[String],
     target_is_file_line: bool,
+    resolved: &[String],
 ) -> crate::Result<Option<(String, String)>> {
+    anyhow::ensure!(
+        resolved.is_empty() || (target_is_file_line && tx.generation.is_some()),
+        "--resolved requires a generated file-line merge transaction"
+    );
     if !target_is_file_line {
         let Some(prepared) = prepare_session_merge(repo, source_repo, tx, src_head, None)? else {
             return Ok(None);
@@ -1176,17 +1146,16 @@ fn merge_tree(
         let base_tree = super::plumbing::tree_overlay_worktree(repo, &tx.target_head, shared)?;
         return land_session_merge(repo, tx, prepared, &base_tree).map(Some);
     }
+    super::plumbing::ensure_v1_namespace_available_at(source_repo, src_head)?;
     super::plumbing::import_commit_graph(repo, source_repo, src_head)?;
-    // File reconciliation: `merge-tree` does the mechanical three-way merge, and the session's
-    // own storage files are stripped out.
-    let tree = match repo.git(&["merge-tree", "--write-tree", &tx.target_head, src_head]) {
-        Ok(t) => t.trim().to_string(),
-        Err(e) => {
+    let tree = match file_reconciliation::tree(repo, &tx.target_head, src_head, shared, resolved) {
+        Ok(tree) => tree,
+        Err(error) => {
             ui::error(&format!(
-                "the shared files have conflicts the merge agent didn’t resolve: {e:#}"
+                "shared-file reconciliation is incomplete: {error:#}"
             ));
             ui::hint(
-                "edit the shared files in the target’s worktree (`cd $(agit repo path <owner/repo>@<target>)`), then `--continue` again",
+                "edit the conflicting shared paths in the target checkout, or confirm kept target text with --continue --resolved <path>",
             );
             return Ok(None);
         }
@@ -1200,10 +1169,6 @@ fn merge_tree(
         m.milestone = Some(format!("merge {}", tx.source));
         meta::to_text(&m)?
     };
-    // The mechanical three-way merge is only a draft; the merge agent's hand reconciliation in
-    // the worktree goes over it — on how a conflict is actually resolved, its conclusion beats
-    // `merge-tree`'s guess.
-    let tree = super::plumbing::tree_overlay_worktree(repo, &tree, shared)?;
     let existing_attributes = super::plumbing::regular_blob_text_at(repo, &tree, meta::ATTRS_FILE)?;
     let mut edits: std::collections::BTreeMap<String, Option<Vec<u8>>> = repo
         .ls_tree(&tree)
@@ -1909,9 +1874,17 @@ mod tests {
     fn picked_events_land_in_the_view_with_their_origin() {
         let mut f = two_branches();
         f.tx.picked = vec!["b#2".into()];
-        let (tree, _) = merge_tree(&f.repo, &f.repo, &f.tx, &f.src_head.clone(), &[], false)
-            .unwrap()
-            .unwrap();
+        let (tree, _) = merge_tree(
+            &f.repo,
+            &f.repo,
+            &f.tx,
+            &f.src_head.clone(),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         let view = view_of(&f, &tree);
 
         assert!(
@@ -1949,9 +1922,17 @@ mod tests {
     fn picks_merge_dedupe_and_keep_log_order() {
         let mut f = two_branches();
         f.tx.picked = vec!["b#1..#2".into(), "b#1.1".into()];
-        let (tree, _) = merge_tree(&f.repo, &f.repo, &f.tx, &f.src_head.clone(), &[], false)
-            .unwrap()
-            .unwrap();
+        let (tree, _) = merge_tree(
+            &f.repo,
+            &f.repo,
+            &f.tx,
+            &f.src_head.clone(),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         let view = view_of(&f, &tree);
         assert_eq!(
             view.matches("B's probe\"").count(),
@@ -1979,9 +1960,17 @@ mod tests {
         // Landing side: failing validation makes it a proposal only, producing neither tree nor
         // message.
         assert!(
-            merge_tree(&f.repo, &f.repo, &f.tx, &f.src_head.clone(), &[], false)
-                .unwrap()
-                .is_none()
+            merge_tree(
+                &f.repo,
+                &f.repo,
+                &f.tx,
+                &f.src_head.clone(),
+                &[],
+                false,
+                &[]
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -2024,9 +2013,17 @@ mod tests {
     #[test]
     fn a_merge_that_picks_nothing_still_lands_its_summary() {
         let f = two_branches();
-        let (tree, msg) = merge_tree(&f.repo, &f.repo, &f.tx, &f.src_head.clone(), &[], false)
-            .unwrap()
-            .unwrap();
+        let (tree, msg) = merge_tree(
+            &f.repo,
+            &f.repo,
+            &f.tx,
+            &f.src_head.clone(),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert!(msg.contains("B's conclusion comes in"));
         let view = view_of(&f, &tree);
         assert_eq!(
@@ -2041,9 +2038,17 @@ mod tests {
     fn the_log_takes_all_of_b_even_when_the_view_takes_one() {
         let mut f = two_branches();
         f.tx.picked = vec!["b#2".into()];
-        let (tree, _) = merge_tree(&f.repo, &f.repo, &f.tx, &f.src_head.clone(), &[], false)
-            .unwrap()
-            .unwrap();
+        let (tree, _) = merge_tree(
+            &f.repo,
+            &f.repo,
+            &f.tx,
+            &f.src_head.clone(),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         let c = crate::commands::plumbing::commit_tree(&f.repo, &tree, &[&f.tx.target_head], "t")
             .unwrap();
         let log = f.repo.show(&c, meta::LOG_FILE).unwrap();
@@ -2128,7 +2133,7 @@ mod tests {
             picked: vec!["source#1".into()],
             summary: Some("take the source conclusion".into()),
         };
-        let (tree, _) = merge_tree(&target, &source, &tx, &source_head, &[], false)
+        let (tree, _) = merge_tree(&target, &source, &tx, &source_head, &[], false, &[])
             .unwrap()
             .unwrap();
         crate::commands::plumbing::import_commit_graph(&target, &source, &source_head).unwrap();
@@ -2210,9 +2215,17 @@ mod tests {
             vec![meta::ATTRS_FILE, "AGENTS.md", "memory/team.md"]
         );
 
-        let (tree, _) = merge_tree(&f.repo, &f.repo, &f.tx, &f.src_head.clone(), &shared, false)
-            .unwrap()
-            .unwrap();
+        let (tree, _) = merge_tree(
+            &f.repo,
+            &f.repo,
+            &f.tx,
+            &f.src_head.clone(),
+            &shared,
+            false,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         let c = crate::commands::plumbing::commit_tree(&f.repo, &tree, &[&f.tx.target_head], "t")
             .unwrap();
         assert!(f.repo.show(&c, "AGENTS.md").unwrap().contains("uid"));

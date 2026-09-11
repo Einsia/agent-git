@@ -12,6 +12,7 @@ pub mod abort;
 pub mod activation;
 pub mod completion;
 pub(super) mod dispatch;
+pub mod file_agent;
 pub mod landing;
 pub(super) mod launch;
 pub mod preparation;
@@ -250,7 +251,14 @@ fn settle_tail_mode<K: KeyStore>(
     } = destination;
     role.validate(role.origin_head.len())?;
     native.validate()?;
-    let _branch = link::lock_branch(store, &role.slug, &role.branch)?;
+    let observed =
+        crate::domain::merge_archive::read_preparation_intent(repo.root(), &role.generation)?
+            .context("archive tail journal is missing")?;
+    ensure!(
+        observed.binding.role == *role && observed.binding.native == *native,
+        "archive tail differs from its selected role"
+    );
+    let _branches = lock_binding_branches(store, &observed.binding)?;
     let _link = link::lock(store, &native.runtime, &native.session_id)?;
     let guard = ArchiveJournalGuard::acquire(repo.root(), &role.generation)?;
     let control = mergetx::ControlGuard::acquire(repo.root())?;
@@ -258,7 +266,7 @@ fn settle_tail_mode<K: KeyStore>(
     guard.recover_pending()?;
     let mut journal = guard.read()?.context("archive journal is missing")?;
     ensure!(
-        journal.binding.role == *role && journal.binding.native == *native,
+        journal.binding == observed.binding,
         "archive journal does not match the selected runtime role"
     );
     ensure!(
@@ -270,7 +278,9 @@ fn settle_tail_mode<K: KeyStore>(
         "archive tail requires a landed, attached runtime"
     );
     ensure!(
-        !control.read()?.is_some_and(|tx| tx.target == role.branch),
+        !control.read()?.is_some_and(
+            |tx| tx.target == role.branch || tx.target == journal.binding.target_branch()
+        ),
         "archive target has an active merge transaction"
     );
     let selected = link::read_archive_link_snapshot(store, &native.runtime, &native.session_id)?
@@ -303,6 +313,7 @@ fn settle_tail_mode<K: KeyStore>(
         .as_deref()
         .context("archive has no accepted publication")?;
     archive_history::verify_archive_append_target(repo, accepted, &head)?;
+    file_agent::verify_fresh_launch_evidence(repo, &journal.binding, &selected.link)?;
     let snapshot = read_native(&selected.link)?;
     ensure!(
         snapshot.len() <= storage::MAX_MATERIALIZED_BYTES,
@@ -401,6 +412,19 @@ fn current_head(repo: &Repo, branch: &str) -> Result<String> {
         "--verify",
         &format!("refs/heads/{branch}^{{commit}}"),
     ])
+}
+
+pub(in crate::commands) fn lock_binding_branches(
+    store: &Store,
+    binding: &ExplorationBinding,
+) -> Result<Vec<link::BranchLock>> {
+    let mut names = vec![binding.role.branch.as_str(), binding.target_branch()];
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|branch| link::lock_branch(store, &binding.role.slug, branch))
+        .collect()
 }
 
 fn build_candidate(
@@ -689,6 +713,7 @@ mod tests {
             let mut preparing = ArchiveJournal {
                 version: crate::domain::merge_archive::VERSION,
                 binding: ExplorationBinding {
+                    file_target: None,
                     role: role.clone(),
                     native: native.clone(),
                     installed: installed.clone(),

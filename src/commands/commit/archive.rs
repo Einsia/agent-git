@@ -273,17 +273,6 @@ pub(super) fn settle(store: &Store, selected: &Link) -> Result<Option<ExitCode>>
                 &crate::infra::config::hub_url(),
             )?;
         }
-        let marker = std::env::var_os(mergetx::ENV);
-        let generation = std::env::var_os(mergetx::GENERATION_ENV);
-        if marker.is_some() || generation.is_some() {
-            ensure!(
-                marker.as_ref().and_then(|value| value.to_str())
-                    == Some(format!("{}@{}", role.slug, role.branch).as_str())
-                    && generation.as_ref().and_then(|value| value.to_str())
-                        == Some(role.generation.as_str()),
-                "archive settlement generation differs from the launched runtime"
-            );
-        }
         let landed = admit(&repo, store, selected, role, &native, None)?;
         if landed {
             let global = VaultStore::open_default()?.matcher()?;
@@ -376,7 +365,7 @@ fn admit(
         observed.binding.role == *role && observed.binding.native == *native,
         "archive settlement journal differs from its selected role"
     );
-    let _branch = link::lock_branch(store, &role.slug, &role.branch)?;
+    let _branches = core::lock_binding_branches(store, &observed.binding)?;
     let _link = link::lock(store, &native.runtime, &native.session_id)?;
     let journal = ArchiveJournalGuard::acquire(repo.root(), &role.generation)?;
     let control = mergetx::ControlGuard::acquire(repo.root())?;
@@ -385,13 +374,24 @@ fn admit(
         .read()?
         .context("archive settlement journal is missing")?;
     ensure!(
-        journal.binding.role == *role && journal.binding.native == *native,
+        journal.binding == observed.binding,
         "archive settlement journal differs from its selected role"
     );
     ensure!(
         expected.is_none_or(|binding| journal.binding == *binding),
         "archive settlement differs from its launched binding"
     );
+    let marker = std::env::var_os(mergetx::ENV);
+    let generation = std::env::var_os(mergetx::GENERATION_ENV);
+    if marker.is_some() || generation.is_some() {
+        ensure!(
+            marker.as_ref().and_then(|value| value.to_str())
+                == Some(format!("{}@{}", role.slug, journal.binding.target_branch()).as_str())
+                && generation.as_ref().and_then(|value| value.to_str())
+                    == Some(role.generation.as_str()),
+            "archive settlement generation differs from the launched runtime"
+        );
+    }
     let current = native_link(store, native)?.context("archive settlement Link disappeared")?;
     ensure!(
         current.to_json()? == selected.to_json()?,
@@ -424,11 +424,25 @@ fn admit(
                     == role.origin_head,
                 "archive exploration target moved"
             );
+            if let Some(target) = &journal.binding.file_target {
+                core::file_agent::require_seed_binding(repo, &journal.binding)?;
+                ensure!(
+                    repo.git(&[
+                        "rev-parse",
+                        "--verify",
+                        &format!("refs/heads/{}", target.branch)
+                    ])? == target.head,
+                    "file merge target moved during exploration"
+                );
+            }
             Ok(false)
         }
         ArchivePhase::Landed { .. } => {
             ensure!(
-                !control.read()?.is_some_and(|tx| tx.target == role.branch),
+                !control
+                    .read()?
+                    .is_some_and(|tx| tx.target == role.branch
+                        || tx.target == journal.binding.target_branch()),
                 "archive target has an active merge transaction"
             );
             Ok(true)

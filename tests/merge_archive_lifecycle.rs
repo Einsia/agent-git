@@ -148,6 +148,7 @@ impl Lab {
         );
         fs::write(&native, &baseline).unwrap();
         let binding = ExplorationBinding {
+            file_target: None,
             role: MergeArchiveRole {
                 generation: uuid::Uuid::now_v7().to_string(),
                 slug: "alice/target".into(),
@@ -432,6 +433,8 @@ impl Lab {
         let journal = self.journal();
         let mut pending = journal.clone();
         pending.landing = Some(RetainedMergeLanding {
+            file_commit: None,
+            file_evidence: None,
             transaction_json: fs::read_to_string(self.tx_path()).unwrap(),
             ordinary_tree: ordinary.clone(),
             worktree_tree: None,

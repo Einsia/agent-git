@@ -60,6 +60,16 @@ pub struct ExplorationBinding {
     pub native: RuntimeLinkKey,
     pub installed: Frontier,
     pub source: FrozenMergeSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_target: Option<FrozenFileTarget>,
+}
+
+/// File merges publish shared files on this ref and exploration only on the role's session ref.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenFileTarget {
+    pub branch: String,
+    pub head: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -123,6 +133,10 @@ pub struct RetainedMergeLanding {
     pub transaction_json: String,
     pub ordinary_tree: String,
     pub worktree_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_evidence: Option<String>,
 }
 
 /// Cancellation freezes the exact authority before restoring claims or retiring the transaction.
@@ -154,15 +168,17 @@ pub(crate) fn checked_abort_transaction(
     binding: &ExplorationBinding,
     allow_unbound: bool,
 ) -> Result<crate::domain::mergetx::Tx> {
-    use crate::domain::mergetx::{Mode, checked_activation_image};
+    use crate::domain::mergetx::checked_activation_image;
+    binding.role.validate(binding.role.origin_head.len())?;
+    binding.validate_file_target(binding.role.origin_head.len())?;
     let tx = checked_activation_image(json)?;
     ensure!(
-        tx.mode == Some(Mode::SessionAgent)
+        tx.mode == Some(binding.mode())
             && (tx.exploration.as_ref() == Some(binding)
                 || (allow_unbound && tx.exploration.is_none()))
             && tx.generation.as_ref() == Some(&binding.role.generation)
-            && tx.target == binding.role.branch
-            && tx.target_head == binding.role.origin_head
+            && tx.target == binding.target_branch()
+            && tx.target_head == binding.target_head()
             && tx.source == binding.source.reference
             && tx.source_repo.as_ref() == Some(&binding.source.slug)
             && tx.source_branch == binding.source.branch
@@ -187,27 +203,13 @@ pub struct PreparedActivation {
 
 impl PreparedActivation {
     pub(crate) fn validate(&self, binding: &ExplorationBinding) -> Result<()> {
-        use crate::domain::mergetx::{Mode, checked_activation_image};
+        use crate::domain::mergetx::checked_activation_image;
         use crate::domain::metadata_facts::JsonFacts;
 
-        let original = checked_activation_image(&self.transaction_original_json)?;
+        let original = checked_abort_transaction(&self.transaction_original_json, binding, true)?;
         let bound = checked_activation_image(&self.transaction_bound_json)?;
         ensure!(
-            original.mode == Some(Mode::SessionAgent)
-                && original.exploration.is_none()
-                && original.generation.as_ref() == Some(&binding.role.generation)
-                && original.target == binding.role.branch
-                && original.target_head == binding.role.origin_head
-                && original.source == binding.source.reference
-                && original.source_repo.as_ref() == Some(&binding.source.slug)
-                && original.source_branch == binding.source.branch
-                && original.source_head == binding.source.head
-                && (if original.base.is_empty() {
-                    binding.source.base.is_none()
-                } else {
-                    binding.source.base.as_ref() == Some(&original.base)
-                })
-                && bound.exploration.as_ref() == Some(binding),
+            original.exploration.is_none() && bound.exploration.as_ref() == Some(binding),
             "archive activation differs from the frozen merge transaction"
         );
         let JsonFacts::Object(mut before) = JsonFacts::parse(&self.transaction_original_json)?
@@ -384,6 +386,44 @@ impl MergeArchiveRole {
     }
 }
 
+impl ExplorationBinding {
+    pub fn target_branch(&self) -> &str {
+        self.file_target
+            .as_ref()
+            .map_or(&self.role.branch, |target| &target.branch)
+    }
+
+    pub fn target_head(&self) -> &str {
+        self.file_target
+            .as_ref()
+            .map_or(&self.role.origin_head, |target| &target.head)
+    }
+
+    pub fn mode(&self) -> crate::domain::mergetx::Mode {
+        if self.file_target.is_some() {
+            crate::domain::mergetx::Mode::FileAgent
+        } else {
+            crate::domain::mergetx::Mode::SessionAgent
+        }
+    }
+
+    fn validate_file_target(&self, width: usize) -> Result<()> {
+        if let Some(target) = &self.file_target {
+            if target.branch != "main" {
+                checked_branch(&target.branch)?;
+            }
+            checked_oid(&target.head, width)?;
+            ensure!(
+                target.branch != self.role.branch
+                    && target.head != self.role.origin_head
+                    && self.role.branch == format!("merge-exploration/{}", self.role.generation),
+                "file merge target and exploration session must have distinct frozen identities"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl FrozenMergeSource {
     pub(crate) fn validate(&self, object_id_width: usize) -> Result<()> {
         checked_slug(&self.slug)?;
@@ -453,6 +493,7 @@ impl ArchiveJournal {
             state.validate(&binding.native.session_id)?;
         }
         binding.source.validate(object_id_width)?;
+        binding.validate_file_target(object_id_width)?;
         if let Some(commit) = &self.accepted_commit {
             checked_oid(commit, object_id_width)?;
         }
@@ -481,6 +522,41 @@ impl ArchiveJournal {
         if let Some(landing) = &self.landing {
             checked_landing_transaction(&landing.transaction_json, binding)?;
             checked_oid(&landing.ordinary_tree, object_id_width)?;
+            ensure!(
+                landing.file_commit.is_some() == binding.file_target.is_some()
+                    && landing.file_evidence.is_some() == binding.file_target.is_some(),
+                "file merge landing must retain both publication candidates"
+            );
+            if let Some(commit) = &landing.file_commit {
+                checked_oid(commit, object_id_width)?;
+                let evidence = landing.file_evidence.as_ref().unwrap();
+                checked_oid(evidence, object_id_width)?;
+                ensure!(
+                    evidence != commit
+                        && evidence != &role.origin_head
+                        && self.publication.as_ref().is_none_or(|publication| {
+                            publication.kind == ArchivePublicationKind::Tail
+                                || &publication.candidate == evidence
+                        }),
+                    "file landing evidence differs from its retained candidate"
+                );
+                ensure!(
+                    commit != binding.target_head()
+                        && commit != &role.origin_head
+                        && self.accepted_commit.as_ref() != Some(commit)
+                        && self
+                            .publication
+                            .as_ref()
+                            .is_none_or(|publication| &publication.candidate != commit),
+                    "file merge result must remain separate from exploration history"
+                );
+                if let ArchivePhase::Landed { merge_commit } = &self.phase {
+                    ensure!(
+                        merge_commit == commit,
+                        "file merge disposition differs from its retained candidate"
+                    );
+                }
+            }
             if let Some(tree) = &landing.worktree_tree {
                 checked_oid(tree, object_id_width)?;
             }
@@ -517,6 +593,10 @@ impl ArchiveJournal {
                 ensure!(
                     self.accepted_commit.is_some(),
                     "landed archive has no accepted commit"
+                );
+                ensure!(
+                    binding.file_target.is_none() || self.landing.is_some(),
+                    "file merge disposition has no retained candidates"
                 );
             }
             ArchivePhase::Detached => {}
@@ -602,6 +682,10 @@ impl ArchiveJournal {
                         source_head == &binding.source.head
                             && publication.expected_old == role.origin_head,
                         "archive landing differs from its frozen merge selection"
+                    );
+                    ensure!(
+                        binding.file_target.is_none() || self.landing.is_some(),
+                        "file merge publication has no retained file result"
                     );
                 }
                 (ArchivePhase::Landed { .. }, ArchivePublicationKind::Tail) => {
@@ -870,7 +954,14 @@ fn checked_transition(previous: &ArchiveJournal, next: &ArchiveJournal) -> Resul
         (&previous.phase, &next.phase)
     {
         ensure!(
-            completed_publication.is_some_and(|publication| &publication.candidate == merge_commit),
+            completed_publication.is_some_and(|publication| {
+                previous
+                    .landing
+                    .as_ref()
+                    .and_then(|landing| landing.file_commit.as_ref())
+                    .unwrap_or(&publication.candidate)
+                    == merge_commit
+            }),
             "archive landing has no matching prepared candidate"
         );
     }
@@ -1060,6 +1151,11 @@ pub(crate) fn read_transition_bytes(path: &Path, budget: u64) -> Result<Option<V
 
 fn read_bytes(path: &Path, budget: u64) -> Result<Option<Vec<u8>>> {
     read_carrier_bytes(path, budget, true)
+}
+
+/// Retained private evidence must reject readable carriers before consuming their contents.
+pub(crate) fn read_private_bytes(path: &Path, budget: u64) -> Result<Option<Vec<u8>>> {
+    read_bytes(path, budget)
 }
 
 fn read_carrier_bytes(path: &Path, budget: u64, private: bool) -> Result<Option<Vec<u8>>> {
@@ -1728,15 +1824,15 @@ pub(crate) fn test_activation(
     successor_json: String,
 ) -> PreparedActivation {
     let mut tx = crate::domain::mergetx::Tx {
-        mode: Some(crate::domain::mergetx::Mode::SessionAgent),
+        mode: Some(binding.mode()),
         exploration: None,
         generation: Some(binding.role.generation.clone()),
-        target: binding.role.branch.clone(),
+        target: binding.target_branch().to_owned(),
         source: binding.source.reference.clone(),
         source_repo: Some(binding.source.slug.clone()),
         source_branch: binding.source.branch.clone(),
         base: binding.source.base.clone().unwrap_or_default(),
-        target_head: binding.role.origin_head.clone(),
+        target_head: binding.target_head().to_owned(),
         source_head: binding.source.head.clone(),
         picked: Vec::new(),
         summary: None,
@@ -2068,6 +2164,7 @@ mod tests {
         let mut journal = ArchiveJournal {
             version: VERSION,
             binding: ExplorationBinding {
+                file_target: None,
                 role: MergeArchiveRole {
                     generation: uuid::Uuid::now_v7().to_string(),
                     slug: "alice/photo".into(),
@@ -2101,6 +2198,231 @@ mod tests {
         };
         journal.activation = Some(test_activation(&journal.binding, "{}".into()));
         journal
+    }
+
+    fn file_preparing() -> ArchiveJournal {
+        let mut journal = preparing();
+        journal.binding.role.branch =
+            format!("merge-exploration/{}", journal.binding.role.generation);
+        journal.binding.file_target = Some(FrozenFileTarget {
+            branch: "main".into(),
+            head: "3".repeat(40),
+        });
+        journal.activation = Some(test_activation(&journal.binding, "{}".into()));
+        journal
+    }
+
+    #[test]
+    fn file_target_authority_is_separate_from_the_native_evidence_role() {
+        let journal = file_preparing();
+        journal.validate(40).unwrap();
+        let activation = journal.activation.as_ref().unwrap();
+        for (json, unbound) in [
+            (&activation.transaction_original_json, true),
+            (&activation.transaction_bound_json, false),
+        ] {
+            let tx = checked_abort_transaction(json, &journal.binding, unbound).unwrap();
+            assert_eq!(tx.mode, Some(crate::domain::mergetx::Mode::FileAgent));
+            assert_eq!(tx.target, "main");
+            assert_ne!(tx.target, journal.binding.role.branch);
+            assert_ne!(tx.target_head, journal.binding.role.origin_head);
+            for (key, value) in [
+                ("mode", serde_json::json!("session_agent")),
+                ("target", serde_json::json!(journal.binding.role.branch)),
+                (
+                    "target_head",
+                    serde_json::json!(journal.binding.role.origin_head),
+                ),
+                (
+                    "generation",
+                    serde_json::json!(uuid::Uuid::now_v7().to_string()),
+                ),
+                ("source_head", serde_json::json!("4".repeat(40))),
+            ] {
+                let mut changed: serde_json::Value = serde_json::from_str(json).unwrap();
+                changed[key] = value;
+                assert!(
+                    checked_abort_transaction(&changed.to_string(), &journal.binding, unbound)
+                        .is_err()
+                );
+            }
+        }
+        let ordinary = preparing();
+        let serialized = serde_json::to_string(&ordinary).unwrap();
+        assert!(!serialized.contains("file_target"));
+        assert_eq!(
+            serde_json::from_str::<ArchiveJournal>(&serialized).unwrap(),
+            ordinary
+        );
+        for branch in ["main", "work", "merge-exploration/wrong-generation"] {
+            let mut changed = journal.clone();
+            changed.binding.role.branch = branch.into();
+            assert!(changed.validate(40).is_err());
+        }
+        let mut changed = journal.clone();
+        changed.binding.file_target.as_mut().unwrap().head =
+            journal.binding.role.origin_head.clone();
+        assert!(changed.validate(40).is_err());
+    }
+
+    #[test]
+    fn file_landing_retains_both_candidates_before_consuming_native_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        let preparing = file_preparing();
+        let guard =
+            ArchiveJournalGuard::acquire(repo.root(), &preparing.binding.role.generation).unwrap();
+        guard.create(&preparing).unwrap();
+        let mut open = preparing.clone();
+        open.phase = ArchivePhase::Open;
+        open.activation = None;
+        guard.replace(&preparing, &open).unwrap();
+        let mut tx = crate::domain::mergetx::checked_activation_image(
+            &preparing
+                .activation
+                .as_ref()
+                .unwrap()
+                .transaction_bound_json,
+        )
+        .unwrap();
+        tx.set_summary("Keep shared instructions".into());
+        let file_commit = "c".repeat(40);
+        let evidence_commit = "d".repeat(40);
+        let publication = PreparedArchivePublication {
+            kind: ArchivePublicationKind::MergeLanding {
+                source_head: open.binding.source.head.clone(),
+            },
+            link_json: "{}".into(),
+            expected_old: open.binding.role.origin_head.clone(),
+            candidate: evidence_commit.clone(),
+            candidate_tree: "e".repeat(40),
+            prior_frontier: open.consumed.clone(),
+            next_frontier: Frontier {
+                bytes: 8,
+                sha256: "1".repeat(64),
+            },
+            next_opencode: None,
+            appended_records: 1,
+            protected_suffix_sha256: "2".repeat(64),
+        };
+        let mut pending = open.clone();
+        pending.publication = Some(publication.clone());
+        pending.landing = Some(RetainedMergeLanding {
+            transaction_json: serde_json::to_string(&tx).unwrap(),
+            ordinary_tree: "f".repeat(40),
+            worktree_tree: None,
+            file_commit: Some(file_commit.clone()),
+            file_evidence: Some(evidence_commit.clone()),
+        });
+        guard.replace(&open, &pending).unwrap();
+        for missing in [true, false] {
+            let mut invalid = pending.clone();
+            invalid.landing.as_mut().unwrap().file_commit = if missing {
+                None
+            } else {
+                Some(evidence_commit.clone())
+            };
+            assert_refused_without_write(&guard, &pending, &invalid);
+        }
+        for evidence in [None, Some(file_commit.clone()), Some("8".repeat(40))] {
+            let mut invalid = pending.clone();
+            invalid.landing.as_mut().unwrap().file_evidence = evidence;
+            assert_refused_without_write(&guard, &pending, &invalid);
+        }
+        let mut landed = pending.clone();
+        landed.phase = ArchivePhase::Landed {
+            merge_commit: file_commit.clone(),
+        };
+        landed.publication = None;
+        landed.accepted_commit = Some(evidence_commit.clone());
+        landed.consumed = publication.next_frontier.clone();
+        let mut wrong = landed.clone();
+        wrong.phase = ArchivePhase::Landed {
+            merge_commit: evidence_commit.clone(),
+        };
+        assert_refused_without_write(&guard, &pending, &wrong);
+        wrong = landed.clone();
+        wrong.accepted_commit = Some(file_commit.clone());
+        assert_refused_without_write(&guard, &pending, &wrong);
+        guard.replace(&pending, &landed).unwrap();
+        require_landed_transaction(
+            &common_git_dir(repo.root()),
+            &landed.binding,
+            &landed.landing.as_ref().unwrap().transaction_json,
+            &file_commit,
+        )
+        .unwrap();
+        assert!(
+            require_landed_transaction(
+                &common_git_dir(repo.root()),
+                &landed.binding,
+                &landed.landing.as_ref().unwrap().transaction_json,
+                &evidence_commit
+            )
+            .is_err()
+        );
+        let mut tail = landed.clone();
+        let mut next_publication = publication;
+        next_publication.kind = ArchivePublicationKind::Tail;
+        next_publication.expected_old = evidence_commit;
+        next_publication.candidate = "9".repeat(40);
+        next_publication.prior_frontier = landed.consumed.clone();
+        next_publication.next_frontier = Frontier {
+            bytes: 12,
+            sha256: "3".repeat(64),
+        };
+        tail.publication = Some(next_publication.clone());
+        guard.replace(&landed, &tail).unwrap();
+        let mut complete = tail.clone();
+        complete.publication = None;
+        complete.accepted_commit = Some(next_publication.candidate);
+        complete.consumed = next_publication.next_frontier;
+        guard.replace(&tail, &complete).unwrap();
+        assert_eq!(
+            complete.phase,
+            ArchivePhase::Landed {
+                merge_commit: file_commit
+            }
+        );
+    }
+
+    #[test]
+    fn preparing_file_cancellation_retains_the_main_transaction_and_evidence_role() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        let preparing = file_preparing();
+        let guard =
+            ArchiveJournalGuard::acquire(repo.root(), &preparing.binding.role.generation).unwrap();
+        guard.create(&preparing).unwrap();
+        let transaction_json = preparing
+            .activation
+            .as_ref()
+            .unwrap()
+            .transaction_original_json
+            .clone();
+        let mut cancelling = preparing.clone();
+        cancelling.phase = ArchivePhase::Aborting;
+        cancelling.abort = Some(RetainedAbort {
+            expected_head: preparing.binding.role.origin_head.clone(),
+            transaction_json: transaction_json.clone(),
+            successor_json: None,
+            activation: preparing.activation.clone(),
+            cancelled_publication: None,
+        });
+        guard.replace(&preparing, &cancelling).unwrap();
+        let mut completed = cancelling.clone();
+        completed.phase = ArchivePhase::Aborted;
+        completed.activation = None;
+        guard.replace(&cancelling, &completed).unwrap();
+        require_aborted_transaction(
+            &common_git_dir(repo.root()),
+            &completed.binding,
+            &transaction_json,
+        )
+        .unwrap();
+        let mut changed = completed.clone();
+        changed.binding.file_target.as_mut().unwrap().head = "5".repeat(40);
+        assert_refused_without_write(&guard, &completed, &changed);
     }
 
     fn assert_refused_without_write(

@@ -716,13 +716,34 @@ impl ArchiveTerminal {
     }
 
     fn start_with_runtime(lab: &Lab, exit: u8, available: bool) -> Self {
+        Self::start_selected(lab, exit, available, "work", "codex", None)
+    }
+
+    fn start_selected(
+        lab: &Lab,
+        exit: u8,
+        available: bool,
+        target: &str,
+        runtime: &str,
+        file_mode: Option<&str>,
+    ) -> Self {
         use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
         let bin = lab.home.join("bin");
         fs::create_dir_all(&bin).unwrap();
         if available {
-            let shim = bin.join("codex");
-            fs::write(&shim, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$AGIT_SESSION\" \"$AGIT_MERGE_TX\" \"$AGIT_MERGE_GENERATION\" \"$*\" > \"$ARCHIVE_LAUNCH_RECEIPT\"\nexit \"$ARCHIVE_EXIT_CODE\"\n").unwrap();
+            let shim = bin.join(if runtime == "claude-code" {
+                "claude"
+            } else {
+                runtime
+            });
+            let mut script = "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$AGIT_SESSION\" \"$AGIT_MERGE_TX\" \"$AGIT_MERGE_GENERATION\" \"$*\" > \"$ARCHIVE_LAUNCH_RECEIPT\"\n".to_owned();
+            if file_mode.is_some() {
+                script.push_str("exec \"$ARCHIVE_TEST_EXECUTABLE\" --exact file_merge_runtime_probe --nocapture\n");
+            } else {
+                script.push_str("exit \"$ARCHIVE_EXIT_CODE\"\n");
+            }
+            fs::write(&shim, script).unwrap();
             fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let mut path = vec![bin.clone()];
@@ -749,14 +770,20 @@ impl ArchiveTerminal {
         command.env("PATH", std::env::join_paths(path).unwrap());
         command.env("ARCHIVE_EXIT_CODE", exit.to_string());
         command.env("ARCHIVE_LAUNCH_RECEIPT", lab.home.join("launch-receipt"));
+        if let Some(mode) = file_mode {
+            command.env("ARCHIVE_TEST_EXECUTABLE", std::env::current_exe().unwrap());
+            command.env("ARCHIVE_FILE_MODE", mode);
+            command.env("ARCHIVE_REPO", lab.repo());
+            command.env("ARCHIVE_CWD", &lab.work);
+        }
         command.env("TERM", "xterm-256color");
         command.args([
             "merge",
             "me/qa@source",
             "--into",
-            "me/qa@work",
+            &format!("me/qa@{target}"),
             "--as",
-            "codex",
+            runtime,
         ]);
         command.cwd(&lab.work);
         let pty = portable_pty::native_pty_system()
@@ -1010,5 +1037,379 @@ fn archive_start_preflight_refusals_preserve_old_pending_authority() {
                 .count(),
             1
         );
+    }
+}
+
+/// The controlled child drives the public hooks and merge commands using its launched identities.
+#[test]
+#[cfg(unix)]
+fn file_merge_runtime_probe() {
+    use agit::domain::{link, merge_archive, mergetx, repo::Repo, store::Store};
+    use std::io::Write;
+    let Ok(mode) = std::env::var("ARCHIVE_FILE_MODE") else {
+        return;
+    };
+    let repo = Repo::open(std::env::var_os("ARCHIVE_REPO").unwrap()).unwrap();
+    let cwd = PathBuf::from(std::env::var_os("ARCHIVE_CWD").unwrap());
+    let tx = mergetx::read(repo.root()).unwrap().unwrap();
+    let binding = tx.exploration.as_ref().unwrap();
+    assert_eq!(tx.mode, Some(mergetx::Mode::FileAgent));
+    assert_eq!(std::env::var("AGIT_MERGE_TX").unwrap(), "me/qa@main");
+    assert_eq!(
+        std::env::var("AGIT_SESSION").unwrap(),
+        format!("me/qa@{}", binding.role.branch)
+    );
+    let native_key: merge_archive::RuntimeLinkKey =
+        serde_json::from_str(&std::env::var("AGIT_SETTLEMENT_NATIVE").unwrap()).unwrap();
+    assert_eq!(native_key, binding.native);
+    let store = Store::at(PathBuf::from(std::env::var_os("AGIT_HOME").unwrap()).join("store"));
+    let selected =
+        link::read_archive_link_snapshot(&store, &native_key.runtime, &native_key.session_id)
+            .unwrap()
+            .unwrap();
+    let native = if native_key.runtime == "claude-code" {
+        let path = PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(".claude/projects")
+            .join(agit::adapter::claude_code::slug_for(&cwd))
+            .join(format!("{}.jsonl", native_key.session_id));
+        assert!(
+            !path.exists(),
+            "fresh Claude UUID must not resolve to an existing empty session"
+        );
+        if mode != "abort-missing" {
+            fs::write(&path, b"").unwrap();
+        }
+        path
+    } else {
+        selected.link.resolve().unwrap()
+    };
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agit"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    if mode == "abort-missing" {
+        assert!(!native.exists());
+        let output = run(&["merge", "--abort"]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(!native.exists());
+        return;
+    }
+    let append = |bytes: &[u8]| {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&native)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    };
+    append(b"{\"type\":\"user\",\"text\":\"SYNTHETIC-FILE-EXPLORATION\"}\n");
+    let refs = repo
+        .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+        .unwrap();
+    let hook = |legacy: bool, fault: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        if legacy {
+            command.args(["commit", "--from-hook"]);
+        } else {
+            command.args(["hooks", "settle", "--runtime", native_key.runtime.as_str()]);
+        }
+        command.env("AGIT_SESSION", "me/qa@work");
+        if fault == "generation" {
+            command.env("AGIT_MERGE_GENERATION", uuid::Uuid::now_v7().to_string());
+        } else if fault == "route" {
+            command.env("AGIT_MERGE_TX", format!("me/qa@{}", binding.role.branch));
+        }
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let payload = serde_json::json!({"session_id":native_key.session_id,"transcript_path":native,"cwd":cwd});
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    for legacy in [false, true] {
+        let output = hook(legacy, "none");
+        assert!(output.status.success(), "{output:?}");
+        for fault in ["generation", "route"] {
+            let refused = hook(legacy, fault);
+            assert!(!refused.status.success(), "{fault}: {refused:?}");
+        }
+        assert_eq!(
+            link::read_archive_link_snapshot(&store, &native_key.runtime, &native_key.session_id)
+                .unwrap()
+                .unwrap()
+                .json,
+            selected.json
+        );
+        assert_eq!(
+            repo.git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+                .unwrap(),
+            refs
+        );
+        assert_eq!(
+            merge_archive::read(repo.root(), &binding.role.generation)
+                .unwrap()
+                .unwrap()
+                .consumed,
+            binding.installed
+        );
+    }
+    if mode == "open" {
+        return;
+    }
+    assert!(matches!(mode.as_str(), "land" | "keep-target"));
+    let output = run(&["merge", "summary", "-m", "Reconcile the file target"]);
+    assert!(output.status.success(), "{output:?}");
+    let output = run(&["repo", "path", "me/qa@main"]);
+    assert!(output.status.success(), "{output:?}");
+    let target_path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let continue_args = if mode == "keep-target" {
+        let target_text = fs::read(target_path.join("AGENTS.md")).unwrap();
+        let refs = repo.git(&["show-ref"]).unwrap();
+        let tx_path = agit::domain::repo::common_git_dir(repo.root()).join(mergetx::LOCK_FILE);
+        let tx_bytes = fs::read(&tx_path).unwrap();
+        for extra in [
+            vec![],
+            vec!["--resolved", "missing.md"],
+            vec!["--resolved", "AGENTS.md", "--resolved", "AGENTS.md"],
+        ] {
+            let output = run(&[&["merge", "--continue"][..], extra.as_slice()].concat());
+            assert!(!output.status.success(), "{extra:?}: {output:?}");
+            assert_eq!(repo.git(&["show-ref"]).unwrap(), refs);
+            assert_eq!(fs::read(&tx_path).unwrap(), tx_bytes);
+            assert_eq!(
+                fs::read(target_path.join("AGENTS.md")).unwrap(),
+                target_text
+            );
+        }
+        let markers = "<<<<<<< ours\nUnresolved\n=======\nOther\n>>>>>>> theirs\n";
+        fs::write(target_path.join("AGENTS.md"), markers).unwrap();
+        let output = run(&["merge", "--continue", "--resolved", "AGENTS.md"]);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("conflict-marker check"));
+        assert_eq!(repo.git(&["show-ref"]).unwrap(), refs);
+        assert_eq!(fs::read(&tx_path).unwrap(), tx_bytes);
+        assert_eq!(
+            fs::read_to_string(target_path.join("AGENTS.md")).unwrap(),
+            markers
+        );
+        fs::write(target_path.join("AGENTS.md"), &target_text).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_agit"))
+            .args(["merge", "--continue", "--resolved", "AGENTS.md"])
+            .env("AGIT_MERGE_GENERATION", uuid::Uuid::now_v7().to_string())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(repo.git(&["show-ref"]).unwrap(), refs);
+        assert_eq!(fs::read(&tx_path).unwrap(), tx_bytes);
+        vec!["merge", "--continue", "--resolved", "AGENTS.md"]
+    } else {
+        fs::write(
+            target_path.join("AGENTS.md"),
+            "Reconciled file instructions\n",
+        )
+        .unwrap();
+        vec!["merge", "--continue"]
+    };
+    let output = run(&continue_args);
+    assert!(output.status.success(), "{output:?}");
+    let main = repo.git(&["rev-parse", "refs/heads/main"]).unwrap();
+    append(b"{\"type\":\"assistant\",\"text\":\"SYNTHETIC-FILE-HOOK-TAIL\"}\n");
+    let output = hook(false, "none");
+    assert!(output.status.success(), "{output:?}");
+    let once = repo
+        .git(&["rev-parse", &format!("refs/heads/{}", binding.role.branch)])
+        .unwrap();
+    let output = hook(true, "none");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        repo.git(&["rev-parse", &format!("refs/heads/{}", binding.role.branch)])
+            .unwrap(),
+        once
+    );
+    assert_eq!(repo.git(&["rev-parse", "refs/heads/main"]).unwrap(), main);
+    append(b"{\"type\":\"assistant\",\"text\":\"SYNTHETIC-FILE-FINAL-TAIL\"}\n");
+}
+
+/// File targets retain their own ancestry while hooks and the exiting child publish only evidence.
+#[test]
+#[cfg(unix)]
+fn file_agent_public_launch_lands_and_captures_only_the_visible_session_branch() {
+    use agit::domain::{link, merge_archive, meta, repo::Repo, storage, store::Store};
+    for (runtime, mode) in [
+        ("codex", "land"),
+        ("claude-code", "land"),
+        ("codex", "keep-target"),
+        ("claude-code", "keep-target"),
+    ] {
+        let lab = Lab::new();
+        if mode == "keep-target" {
+            lab.git(&["checkout", "source"]);
+            fs::write(
+                lab.repo().join("AGENTS.md"),
+                "Source conflict instructions\n",
+            )
+            .unwrap();
+            lab.git(&["add", "AGENTS.md"]);
+            lab.git(&[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Synthetic source conflict",
+            ]);
+            lab.git(&["checkout", "main"]);
+            fs::write(
+                lab.repo().join("AGENTS.md"),
+                "Target conflict instructions\n",
+            )
+            .unwrap();
+            lab.git(&["add", "AGENTS.md"]);
+            lab.git(&[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Synthetic target conflict",
+            ]);
+        }
+        let old = lab.git(&["rev-parse", "refs/heads/main"]);
+        let source = lab.git(&["rev-parse", "refs/heads/source"]);
+        let existing = fs::read(lab.link()).unwrap();
+        let native = fs::read(&lab.native).unwrap();
+        let (status, output) =
+            ArchiveTerminal::start_selected(&lab, 0, true, "main", runtime, Some(mode)).finish();
+        assert_eq!(status, 0, "{runtime}: {output}");
+        let repo = Repo::open(lab.repo()).unwrap();
+        let main = lab.git(&["rev-parse", "refs/heads/main"]);
+        assert_ne!(main, old);
+        assert_eq!(
+            lab.git(&["show", "-s", "--format=%P", &main]),
+            format!("{old} {source}")
+        );
+        assert!(
+            meta::read_at_ref_result(&repo, &main)
+                .unwrap()
+                .unwrap()
+                .is_file_line()
+        );
+        let names = lab.git(&["ls-tree", "-r", "--name-only", &main]);
+        assert!(
+            !names
+                .lines()
+                .any(|name| name != meta::FILE && meta::is_storage_path(name))
+        );
+        assert_eq!(
+            lab.git(&["show", &format!("{main}:AGENTS.md")]),
+            if mode == "keep-target" {
+                "Target conflict instructions"
+            } else {
+                "Reconciled file instructions"
+            }
+        );
+        let evidence = lab.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/merge-exploration/",
+        ]);
+        assert_eq!(evidence.lines().count(), 1);
+        let branch = evidence.strip_prefix("refs/heads/").unwrap();
+        let generation = branch.strip_prefix("merge-exploration/").unwrap();
+        let journal = merge_archive::read(repo.root(), generation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            journal.phase,
+            merge_archive::ArchivePhase::Landed {
+                merge_commit: main.clone()
+            }
+        );
+        let tip = lab.git(&["rev-parse", &evidence]);
+        assert_eq!(journal.accepted_commit.as_deref(), Some(tip.as_str()));
+        let log = storage::materialize_at(repo.root(), &tip, meta::LOG_FILE).unwrap();
+        for marker in [
+            "SYNTHETIC-FILE-EXPLORATION",
+            "SYNTHETIC-FILE-HOOK-TAIL",
+            "SYNTHETIC-FILE-FINAL-TAIL",
+        ] {
+            assert_eq!(log.matches(marker).count(), 1, "{log}");
+        }
+        assert!(!log.contains("SYNTHETIC-SETTLED"));
+        assert_eq!(
+            storage::materialize_at(repo.root(), &tip, meta::VIEW_FILE).unwrap(),
+            ""
+        );
+        let store = Store::at(lab.store.join("store"));
+        let selected =
+            link::read_archive_link_snapshot(&store, runtime, &journal.binding.native.session_id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.link.branch.as_deref(), Some(branch));
+        assert_eq!(fs::read(lab.link()).unwrap(), existing);
+        assert_eq!(fs::read(&lab.native).unwrap(), native);
+        let receipt = fs::read_to_string(lab.home.join("launch-receipt")).unwrap();
+        assert!(receipt.starts_with(&format!("me/qa@{branch}\nme/qa@main\n{generation}\n")));
+        if runtime == "claude-code" {
+            assert!(receipt.contains(&format!(
+                "--session-id {}",
+                journal.binding.native.session_id
+            )));
+            assert!(!receipt.contains("--resume"));
+        }
+        let unreachable = Command::new("git")
+            .arg("-C")
+            .arg(lab.repo())
+            .args(["merge-base", "--is-ancestor", &tip, &main])
+            .output()
+            .unwrap();
+        assert_eq!(unreachable.status.code(), Some(1));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn file_agent_public_failed_launch_remains_abortable_without_a_native_file() {
+    use agit::domain::{merge_archive, mergetx, repo::Repo};
+    for mode in ["open", "abort-missing"] {
+        let lab = Lab::new();
+        let main = lab.git(&["rev-parse", "refs/heads/main"]);
+        let (status, output) =
+            ArchiveTerminal::start_selected(&lab, 0, true, "main", "claude-code", Some(mode))
+                .finish();
+        assert_eq!(status, 4, "{mode}: {output}");
+        assert_eq!(lab.git(&["rev-parse", "refs/heads/main"]), main);
+        let repo = Repo::open(lab.repo()).unwrap();
+        let evidence = lab.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/merge-exploration/",
+        ]);
+        let generation = evidence
+            .strip_prefix("refs/heads/merge-exploration/")
+            .unwrap();
+        let journal = merge_archive::read(repo.root(), generation)
+            .unwrap()
+            .unwrap();
+        if mode == "open" {
+            assert_eq!(journal.phase, merge_archive::ArchivePhase::Open);
+            lab.success(&["merge", "--into", "me/qa@main", "--abort"]);
+        }
+        assert_eq!(
+            merge_archive::read(repo.root(), generation)
+                .unwrap()
+                .unwrap()
+                .phase,
+            merge_archive::ArchivePhase::Aborted
+        );
+        assert!(mergetx::read(repo.root()).unwrap().is_none());
     }
 }

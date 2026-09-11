@@ -162,6 +162,19 @@ fn require_heads(request: &ActivationRequest<'_>) -> Result<()> {
         status == Some(0) && head.trim() == role.origin_head,
         "archive activation target is unavailable or moved from its frozen head"
     );
+    if let Some(target) = &request.binding.file_target {
+        require_destination_routing(request.repo, &target.branch)?;
+        ensure!(
+            super::current_head(request.repo, &target.branch)? == target.head,
+            "file merge target moved before archive activation"
+        );
+        let seed = super::file_agent::require_seed_binding(request.repo, request.binding)?
+            .context("file archive binding has no retained seed")?;
+        ensure!(
+            request.installed.cwd.as_deref() == Some(seed.cwd.as_str()),
+            "file archive installation cwd differs from the retained seed"
+        );
+    }
     Ok(())
 }
 
@@ -216,11 +229,36 @@ pub(super) fn activate_with(
     require_destination_routing(request.repo, &request.binding.role.branch)?;
     let preparing = prepare(&request)?;
     let role = &request.binding.role;
-    let branch = link::lock_branch(request.store, &role.slug, &role.branch)?;
+    let mut names = vec![
+        role.branch.clone(),
+        request.binding.target_branch().to_owned(),
+    ];
+    names.sort();
+    names.dedup();
+    let branches = names
+        .into_iter()
+        .map(|name| {
+            let guard = link::lock_branch(request.store, &role.slug, &name)?;
+            Ok((name, guard))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let branch = &branches
+        .iter()
+        .find(|(name, _)| name == &role.branch)
+        .unwrap()
+        .1;
+    let target = request.binding.file_target.as_ref().map(|target| {
+        &branches
+            .iter()
+            .find(|(name, _)| name == &target.branch)
+            .unwrap()
+            .1
+    });
     run_locked(
         request,
         preparing,
-        &branch,
+        branch,
+        target,
         read_native,
         || Ok(()),
         checkpoint,
@@ -230,6 +268,7 @@ pub(super) fn activate_with(
 pub(super) fn activate_under_branch_with(
     request: ActivationRequest<'_>,
     branch: &link::BranchLock,
+    target: Option<&link::BranchLock>,
     read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
     before_effects: impl FnMut() -> Result<()>,
     checkpoint: impl FnMut(Checkpoint) -> Result<()>,
@@ -239,6 +278,7 @@ pub(super) fn activate_under_branch_with(
         request,
         preparing,
         branch,
+        target,
         read_native,
         before_effects,
         checkpoint,
@@ -249,6 +289,7 @@ fn run_locked(
     request: ActivationRequest<'_>,
     preparing: ArchiveJournal,
     branch: &link::BranchLock,
+    target: Option<&link::BranchLock>,
     read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
     mut before_effects: impl FnMut() -> Result<()>,
     mut checkpoint: impl FnMut(Checkpoint) -> Result<()>,
@@ -256,6 +297,13 @@ fn run_locked(
     let role = &request.binding.role;
     let native = &request.binding.native;
     branch.require_route(request.store, &role.slug, &role.branch)?;
+    match (&request.binding.file_target, target) {
+        (Some(file), Some(guard)) => {
+            guard.require_route(request.store, &role.slug, &file.branch)?
+        }
+        (None, None) => {}
+        _ => anyhow::bail!("file archive activation requires both branch guards"),
+    }
     let mut keys: Vec<_> = preparing
         .previous_claims
         .iter()
@@ -466,6 +514,7 @@ mod tests {
                 logical_session: SESSION.into(),
             };
             let binding = ExplorationBinding {
+                file_target: None,
                 role,
                 native: RuntimeLinkKey {
                     runtime: "codex".into(),
@@ -630,6 +679,7 @@ mod tests {
             activate_under_branch_with(
                 fixture.request(),
                 &guard,
+                None,
                 |_| Ok(std::fs::read(&fixture.native)?),
                 || Ok(()),
                 |_| Ok(())

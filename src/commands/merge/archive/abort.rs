@@ -111,6 +111,7 @@ fn require_endpoints(
         .as_ref()
         .context("archive cancellation intent is missing")?;
     require_destination_routing(request.repo, &request.binding.role.branch)?;
+    require_unpublished_file_target(request)?;
     ensure!(
         current_head(request.repo, &request.binding.role.branch)? == retained.expected_head,
         "archive cancellation target changed from its retained expected head"
@@ -130,6 +131,18 @@ fn require_endpoints(
     Ok(())
 }
 
+fn require_unpublished_file_target(request: &AbortRequest<'_>) -> Result<()> {
+    if let Some(target) = &request.binding.file_target {
+        require_destination_routing(request.repo, &target.branch)?;
+        super::file_agent::require_seed_binding(request.repo, request.binding)?;
+        ensure!(
+            current_head(request.repo, &target.branch)? == target.head,
+            "file merge target moved outside its retained cancellation endpoint"
+        );
+    }
+    Ok(())
+}
+
 fn abort_with(
     request: AbortRequest<'_>,
     mut checkpoint: impl FnMut(Checkpoint) -> Result<()>,
@@ -139,7 +152,7 @@ fn abort_with(
     role.validate(role.origin_head.len())?;
     binding.native.validate()?;
     require_destination_routing(request.repo, &role.branch)?;
-    let _branch = link::lock_branch(request.store, &role.slug, &role.branch)?;
+    let _branches = super::lock_binding_branches(request.store, binding)?;
     let observed = merge_archive::read_preparation_intent(request.repo.root(), &role.generation)?
         .context("archive cancellation has no retained journal")?;
     ensure!(
@@ -190,6 +203,7 @@ fn abort_with(
         head == role.origin_head,
         "archive cancellation target moved outside its expected endpoint"
     );
+    require_unpublished_file_target(&request)?;
     if matches!(journal.phase, ArchivePhase::Preparing | ArchivePhase::Open) {
         let transaction = control
             .read_activation_snapshot()?
@@ -342,6 +356,7 @@ mod tests {
             let bytes = b"{\"type\":\"session_meta\",\"id\":\"INSTALLED\"}\n";
             std::fs::write(&native, bytes).unwrap();
             let binding = ExplorationBinding {
+                file_target: None,
                 role: MergeArchiveRole {
                     generation: uuid::Uuid::now_v7().to_string(),
                     slug: "alice/photo".into(),

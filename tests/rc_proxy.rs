@@ -9,6 +9,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::{Message, handshake::client::Request};
 
 const TEST_URL: &str = "AGIT_PROXY_TEST_URL";
+const REGISTERED: &str = "proxy.test.registered";
 
 fn registration() -> RcRegister {
     RcRegister {
@@ -32,12 +33,20 @@ fn rc_link_child() {
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let link = Link::new(&url, "rc-test-token");
-        let (_outbound_tx, mut outbound) = agit::rc::outbound::channel();
+        let (outbound_tx, mut outbound) = agit::rc::outbound::channel();
         for epoch in 1..=2 {
             let (events, mut receiver) = tokio::sync::mpsc::channel(4);
             let reason = tokio::time::timeout(
                 Duration::from_secs(10),
-                link.run_once(epoch, registration(), &mut outbound, events, |_| {}),
+                link.run_once(epoch, registration(), &mut outbound, events, |_| {
+                    assert_eq!(
+                        outbound_tx.send(Frame::notification(
+                            REGISTERED,
+                            serde_json::json!({ "epoch": epoch }),
+                        )),
+                        agit::rc::outbound::Sent::Queued
+                    );
+                }),
             )
             .await
             .expect("the connection attempt must complete");
@@ -106,7 +115,7 @@ async fn environment_proxy_selection_registers_and_reconnects() {
         };
         let url = format!("http://{host}");
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for epoch in 1_u64..=2 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 if !bypass {
                     let mut bytes = Vec::new();
@@ -150,6 +159,31 @@ async fn environment_proxy_selection_registers_and_reconnects() {
                     .send(Message::Text(reply.to_json().into()))
                     .await
                     .unwrap();
+                // Closing before acknowledgement can discard an in-flight registration response.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let message = socket
+                            .next()
+                            .await
+                            .expect("the registered client must keep the connection open")
+                            .expect("the registered client must send a valid frame");
+                        match message {
+                            Message::Text(text) => {
+                                let frame = Frame::from_json(&text).unwrap();
+                                assert!(frame.is_notification());
+                                if frame.method.as_deref() == Some(REGISTERED) {
+                                    assert_eq!(frame.params.unwrap()["epoch"], epoch);
+                                    break;
+                                }
+                                assert_eq!(frame.method.as_deref(), Some(method::RC_HEARTBEAT));
+                            }
+                            Message::Ping(_) | Message::Pong(_) => {}
+                            other => panic!("unexpected message before acknowledgement: {other:?}"),
+                        }
+                    }
+                })
+                .await
+                .expect("the client must acknowledge its registration");
                 socket.close(None).await.unwrap();
             }
         });
@@ -172,12 +206,12 @@ async fn environment_proxy_selection_registers_and_reconnects() {
             child.env_remove(name);
         }
         child.env(variable, format!("http://{address}"));
-        if variable == "HTTP_PROXY" {
+        if !cfg!(windows) && variable == "HTTP_PROXY" {
             child.env("http_proxy", "http://127.0.0.1:9");
         }
         if let Some((name, value)) = no_proxy {
             child.env(variable, "http://127.0.0.1:9").env(name, value);
-            if name == "NO_PROXY" {
+            if !cfg!(windows) && name == "NO_PROXY" {
                 child.env("no_proxy", "unrelated.test");
             }
         }

@@ -320,3 +320,163 @@ fn incomplete_or_ambiguous_graphs_refuse_before_a_transaction() {
         assert!(mergetx::read(repo.root()).unwrap().is_none());
     }
 }
+
+/// Keeping the target is an explicit conflict decision, not an inferred empty worktree diff.
+#[test]
+fn manual_file_merge_requires_exact_current_conflict_acknowledgement() {
+    let lab = Lab::new();
+    let repo = lab.repo("files");
+    fs::create_dir_all(repo.root().join("memory")).unwrap();
+    fs::write(repo.root().join("memory/common.md"), "Base memory\n").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("synthetic common memory").unwrap();
+    repo.git(&["checkout", "-b", "source"]).unwrap();
+    fs::write(repo.root().join("AGENTS.md"), "Source instructions\n").unwrap();
+    fs::create_dir_all(repo.root().join("memory")).unwrap();
+    fs::write(repo.root().join("memory/source.md"), "Source addition\n").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("synthetic source change").unwrap();
+    fs::write(repo.root().join("memory/common.md"), "Source memory\n").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("synthetic source memory").unwrap();
+    let source = repo.git(&["rev-parse", "HEAD"]).unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+    fs::write(repo.root().join("AGENTS.md"), "Target instructions\n").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("synthetic target change").unwrap();
+    fs::write(repo.root().join("memory/common.md"), "Target memory\n").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("synthetic target memory").unwrap();
+    let target = repo.git(&["rev-parse", "HEAD"]).unwrap();
+    success(lab.run(&[
+        "merge",
+        "alice/files@source",
+        "--into",
+        "alice/files@main",
+        "--manual",
+    ]));
+    success(lab.run(&[
+        "merge",
+        "--into",
+        "alice/files@main",
+        "summary",
+        "-m",
+        "Keep the target instructions",
+    ]));
+    let refs = repo.git(&["show-ref"]).unwrap();
+    let tx = serde_json::to_value(mergetx::read(repo.root()).unwrap().unwrap()).unwrap();
+    for extra in [
+        vec![],
+        vec!["--resolved", "AGENTS.md"],
+        vec!["--resolved", "missing.md"],
+        vec!["--resolved", "memory/source.md"],
+        vec!["--resolved", "../AGENTS.md"],
+        vec!["--resolved", meta::FILE],
+        vec!["--resolved", "AGENTS.md", "--resolved", "AGENTS.md"],
+    ] {
+        let args = [
+            &["merge", "--continue", "--into", "alice/files@main"][..],
+            extra.as_slice(),
+        ]
+        .concat();
+        let output = lab.run(&args);
+        assert_eq!(output.status.code(), Some(4), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("shared-file reconciliation is incomplete")
+        );
+        assert_eq!(repo.git(&["show-ref"]).unwrap(), refs);
+        assert_eq!(
+            serde_json::to_value(mergetx::read(repo.root()).unwrap().unwrap()).unwrap(),
+            tx
+        );
+        assert_eq!(
+            fs::read_to_string(repo.root().join("AGENTS.md")).unwrap(),
+            "Target instructions\n"
+        );
+    }
+    for flags in [
+        vec![],
+        vec!["--status"],
+        vec!["--abort"],
+        vec!["--continue", "--manual"],
+    ] {
+        let args = [
+            &[
+                "merge",
+                "--into",
+                "alice/files@main",
+                "--resolved",
+                "AGENTS.md",
+            ][..],
+            flags.as_slice(),
+        ]
+        .concat();
+        let output = lab.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert_eq!(repo.git(&["show-ref"]).unwrap(), refs);
+        assert_eq!(
+            serde_json::to_value(mergetx::read(repo.root()).unwrap().unwrap()).unwrap(),
+            tx
+        );
+    }
+    let markers = "<<<<<<< ours\nUnresolved\n=======\nOther\n>>>>>>> theirs\n";
+    fs::write(repo.root().join("AGENTS.md"), markers).unwrap();
+    let rejected = lab.run(&[
+        "merge",
+        "--continue",
+        "--into",
+        "alice/files@main",
+        "--resolved",
+        "AGENTS.md",
+        "--resolved",
+        "memory/common.md",
+    ]);
+    assert_eq!(rejected.status.code(), Some(4), "{rejected:?}");
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("conflict-marker check"));
+    assert_eq!(repo.git(&["show-ref"]).unwrap(), refs);
+    assert_eq!(
+        fs::read_to_string(repo.root().join("AGENTS.md")).unwrap(),
+        markers
+    );
+    fs::write(repo.root().join("AGENTS.md"), "Target instructions\n").unwrap();
+    assert_eq!(
+        repo.git(&["diff", "--name-only", &target, "--"]).unwrap(),
+        ""
+    );
+    success(lab.run(&[
+        "merge",
+        "--continue",
+        "--into",
+        "alice/files@main",
+        "--resolved",
+        "AGENTS.md",
+        "--resolved",
+        "memory/common.md",
+    ]));
+    let merged = repo.git(&["rev-parse", "HEAD"]).unwrap();
+    assert_eq!(
+        repo.git(&["show", "-s", "--format=%P", &merged]).unwrap(),
+        format!("{target} {source}")
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root().join("AGENTS.md")).unwrap(),
+        "Target instructions\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root().join("memory/source.md")).unwrap(),
+        "Source addition\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root().join("memory/common.md")).unwrap(),
+        "Target memory\n"
+    );
+    assert!(mergetx::read(repo.root()).unwrap().is_none());
+    assert!(
+        meta::read_at_ref_result(&repo, &merged)
+            .unwrap()
+            .unwrap()
+            .is_file_line()
+    );
+    assert_eq!(repo.git(&["status", "--porcelain"]).unwrap(), "");
+}

@@ -1,4 +1,4 @@
-//! Lands an already activated session merge without exposing a public lifecycle entry point.
+//! Lands an activated merge while retaining its exact publication and exploration endpoints.
 //!
 //! The retained ordinary tree fixes VIEW and shared content before native evidence extends LOG.
 //! Pending replay uses immutable receipt objects and exact transaction bytes, never new native
@@ -37,9 +37,24 @@ pub struct LandingOutcome {
 }
 
 pub fn land(request: LandingRequest<'_>, global: &Matcher) -> Result<LandingOutcome> {
+    land_resolved(request, global, &[])
+}
+
+pub(super) fn land_resolved(
+    request: LandingRequest<'_>,
+    global: &Matcher,
+    resolved: &[String],
+) -> Result<LandingOutcome> {
     require_destination_routing(request.repo, &request.binding.role.branch)?;
     let dictionary = RepositoryDictionary::open(request.repo.root())?;
-    land_with(request, &dictionary, global, read_native, |_| Ok(()))
+    land_with_resolved(
+        request,
+        &dictionary,
+        global,
+        read_native,
+        |_| Ok(()),
+        resolved,
+    )
 }
 
 /// Replay uses the retained candidate before opening a source repository or a secret vault.
@@ -50,7 +65,7 @@ pub(super) fn replay(
     binding: &ExplorationBinding,
 ) -> Result<Option<LandingOutcome>> {
     require_destination_routing(repo, &binding.role.branch)?;
-    let _branch = link::lock_branch(store, &binding.role.slug, &binding.role.branch)?;
+    let _branches = super::lock_binding_branches(store, binding)?;
     let _link = link::lock(store, &binding.native.runtime, &binding.native.session_id)?;
     let guard = ArchiveJournalGuard::acquire(repo.root(), &binding.role.generation)?;
     let control = mergetx::ControlGuard::acquire(repo.root())?;
@@ -152,7 +167,7 @@ fn require_retained_worktree(
     landing: &RetainedMergeLanding,
 ) -> Result<()> {
     ensure!(
-        target_is_checked_out(request.repo, &request.binding.role.branch)?
+        target_is_checked_out(request.repo, request.binding.target_branch())?
             == landing.worktree_tree.is_some(),
         "merge destination checkout changed after candidate preparation"
     );
@@ -303,19 +318,20 @@ fn require_transaction(control: &mergetx::ControlGuard, json: &str) -> Result<()
     Ok(())
 }
 
-fn land_with<K: KeyStore>(
+fn land_with_resolved<K: KeyStore>(
     request: LandingRequest<'_>,
     dictionary: &RepositoryDictionary<K>,
     global: &Matcher,
     read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
     mut checkpoint: impl FnMut(Checkpoint) -> Result<()>,
+    resolved: &[String],
 ) -> Result<LandingOutcome> {
     let binding = request.binding;
     let role = &binding.role;
     role.validate(role.origin_head.len())?;
     binding.native.validate()?;
     require_destination_routing(request.repo, &role.branch)?;
-    let _branch = link::lock_branch(request.store, &role.slug, &role.branch)?;
+    let _branches = super::lock_binding_branches(request.store, binding)?;
     let _link = link::lock(
         request.store,
         &binding.native.runtime,
@@ -331,6 +347,21 @@ fn land_with<K: KeyStore>(
         "merge landing differs from its attached activated journal"
     );
     let selected = selected_link(&request)?;
+    // A retained candidate owns its resolution; new acknowledgements cannot alter or replay it.
+    ensure!(
+        resolved.is_empty()
+            || (binding.file_target.is_some()
+                && journal.phase == ArchivePhase::Open
+                && journal.publication.is_none()
+                && journal.landing.is_none()),
+        "--resolved requires a fresh Open file merge; replay retained publication without --resolved"
+    );
+    if !resolved.is_empty() {
+        ensure!(
+            target_is_checked_out(request.repo, binding.target_branch())?,
+            "--resolved requires the target branch checkout"
+        );
+    }
     plumbing::recover_interrupted_checkout(request.repo)?;
     if matches!(journal.phase, ArchivePhase::Landed { .. }) {
         return complete(&request, &control, &journal, &mut checkpoint);
@@ -369,22 +400,48 @@ fn land_with<K: KeyStore>(
         &role.origin_head,
     )?;
     archive_history::verify_frozen_source(request.source_repo, &binding.source.head)?;
-    let source_log = archive_history::freeze_source_log(request.source_repo, &binding.source.head)?;
+    if let Some(target) = &binding.file_target {
+        require_destination_routing(request.repo, &target.branch)?;
+        super::file_agent::require_seed_binding(request.repo, binding)?;
+        ensure!(
+            current_head(request.repo, &target.branch)? == target.head,
+            "file merge target moved before landing"
+        );
+        ensure!(
+            !target_is_checked_out(request.repo, &role.branch)?,
+            "file exploration branch must not be checked out while the merge is open"
+        );
+    }
+    let source_log = if binding.file_target.is_none() {
+        Some(archive_history::freeze_source_log(
+            request.source_repo,
+            &binding.source.head,
+        )?)
+    } else {
+        None
+    };
 
+    super::file_agent::verify_fresh_launch_evidence(request.repo, binding, &selected.link)?;
     let native = read_native(&selected.link)?;
     ensure!(
         native.len() <= storage::MAX_MATERIALIZED_BYTES,
         "merge native snapshot exceeds its byte limit"
     );
     let capture = super::capture_selected(&native, &journal)?;
-    let prepared = merge::prepare_session_merge(
-        request.repo,
-        request.source_repo,
-        &tx,
-        &binding.source.head,
-        Some(&source_log),
-    )?
-    .context("ordinary merge selection cannot be landed")?;
+    let prepared = if binding.file_target.is_none() {
+        Some(
+            merge::prepare_session_merge(
+                request.repo,
+                request.source_repo,
+                &tx,
+                &binding.source.head,
+                source_log.as_ref(),
+            )?
+            .context("ordinary merge selection cannot be landed")?,
+        )
+    } else {
+        None
+    };
     let protected = if capture.record_count == 0 {
         String::new()
     } else {
@@ -403,23 +460,69 @@ fn land_with<K: KeyStore>(
     let envelopes =
         transcript::wrap_lines(&protected, &binding.native.runtime, &role.logical_session);
     plumbing::import_commit_graph(request.repo, request.source_repo, &binding.source.head)?;
-    let on_target = target_is_checked_out(request.repo, &role.branch)?;
+    let on_target = target_is_checked_out(request.repo, binding.target_branch())?;
     let shared = if on_target {
-        shared_paths(request.repo, &role.origin_head)?
+        shared_paths(request.repo, binding.target_head())?
     } else {
         Vec::new()
     };
-    let base = plumbing::tree_overlay_worktree(request.repo, &role.origin_head, &shared)?;
-    let (ordinary_tree, message) = merge::land_session_merge(request.repo, &tx, prepared, &base)?;
-    let tree = append_log(request.repo, &ordinary_tree, &envelopes)?;
-    let candidate = plumbing::commit_tree(
-        request.repo,
-        &tree,
-        &[&role.origin_head, &binding.source.head],
-        &message,
-    )?;
+    let base = plumbing::tree_overlay_worktree(request.repo, binding.target_head(), &shared)?;
+    let (ordinary_tree, file_commit, candidate, tree) = if binding.file_target.is_some() {
+        let (ordinary_tree, message) = merge::merge_tree(
+            request.repo,
+            request.source_repo,
+            &tx,
+            &binding.source.head,
+            &shared,
+            true,
+            resolved,
+        )?
+        .context("file merge selection cannot be landed")?;
+        let main = plumbing::commit_tree(
+            request.repo,
+            &ordinary_tree,
+            &[binding.target_head(), &binding.source.head],
+            &message,
+        )?;
+        let (evidence, tree) = if capture.record_count == 0 {
+            let tree = request.repo.git(&[
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{tree}}", role.origin_head),
+            ])?;
+            let commit = plumbing::commit_tree(
+                request.repo,
+                &tree,
+                &[&role.origin_head],
+                "Complete file merge without native evidence",
+            )?;
+            (commit, tree)
+        } else {
+            super::build_candidate(
+                request.repo,
+                &role.origin_head,
+                role,
+                &envelopes,
+                capture.record_count,
+            )?
+        };
+        (ordinary_tree, Some(main), evidence, tree)
+    } else {
+        let (ordinary_tree, message) =
+            merge::land_session_merge(request.repo, &tx, prepared.unwrap(), &base)?;
+        let tree = append_log(request.repo, &ordinary_tree, &envelopes)?;
+        let candidate = plumbing::commit_tree(
+            request.repo,
+            &tree,
+            &[&role.origin_head, &binding.source.head],
+            &message,
+        )?;
+        (ordinary_tree, None, candidate, tree)
+    };
     let mut pending = journal.clone();
     pending.landing = Some(RetainedMergeLanding {
+        file_evidence: file_commit.as_ref().map(|_| candidate.clone()),
+        file_commit,
         transaction_json: snapshot.json,
         ordinary_tree,
         worktree_tree: on_target.then_some(base),
@@ -500,14 +603,30 @@ fn verify_publication(repo: &Repo, journal: &ArchiveJournal) -> Result<usize> {
             }),
         "retained publication is not this merge landing"
     );
-    let suffix = archive_history::verify_merge_landing(
-        repo,
-        &publication.expected_old,
-        &journal.binding.source.head,
-        &landing.ordinary_tree,
-        &publication.candidate,
-        &publication.candidate_tree,
-    )?;
+    let suffix = if journal.binding.file_target.is_some() {
+        ensure!(
+            landing.file_evidence.as_ref() == Some(&publication.candidate),
+            "file evidence candidate changed"
+        );
+        ensure!(
+            repo.git(&[
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{tree}}", publication.candidate)
+            ])? == publication.candidate_tree,
+            "file evidence tree differs from its publication receipt"
+        );
+        verify_file_result(repo, journal)?
+    } else {
+        archive_history::verify_merge_landing(
+            repo,
+            &publication.expected_old,
+            &journal.binding.source.head,
+            &landing.ordinary_tree,
+            &publication.candidate,
+            &publication.candidate_tree,
+        )?
+    };
     ensure!(
         hex::encode(Sha256::digest(suffix.as_bytes())) == publication.protected_suffix_sha256,
         "merge landing evidence digest differs from its retained receipt"
@@ -518,6 +637,43 @@ fn verify_publication(repo: &Repo, journal: &ArchiveJournal) -> Result<usize> {
         "merge landing evidence count differs from its retained receipt"
     );
     Ok(count)
+}
+
+fn verify_file_result(repo: &Repo, journal: &ArchiveJournal) -> Result<String> {
+    let binding = &journal.binding;
+    let seed = super::file_agent::require_seed_binding(repo, binding)?
+        .context("file landing seed is missing")?;
+    let landing = journal
+        .landing
+        .as_ref()
+        .context("file landing result is missing")?;
+    let main = landing
+        .file_commit
+        .as_deref()
+        .context("file merge candidate is missing")?;
+    let evidence = landing
+        .file_evidence
+        .as_deref()
+        .context("file evidence candidate is missing")?;
+    archive_history::verify_file_merge_landing(
+        repo,
+        binding.target_head(),
+        &binding.source.head,
+        main,
+        &landing.ordinary_tree,
+    )?;
+    let log = storage::materialize_at(repo.root(), evidence, meta::LOG_FILE)?;
+    if log.is_empty() {
+        let tree = repo.git(&["rev-parse", "--verify", &format!("{evidence}^{{tree}}")])?;
+        ensure!(
+            tree == seed.tree,
+            "empty file evidence checkpoint changes its seed tree"
+        );
+        archive_history::verify_empty_file_exploration(repo, &seed.role.origin_head, evidence)?;
+    } else {
+        archive_history::verify_edge(repo, &seed.role.origin_head, evidence)?;
+    }
+    Ok(log)
 }
 
 fn verify_suffix(suffix: &str, binding: &ExplorationBinding) -> Result<usize> {
@@ -554,6 +710,10 @@ fn publish(
     );
     verify_publication(request.repo, journal)?;
     require_transaction(control, &landing.transaction_json)?;
+    if request.binding.file_target.is_some() {
+        publish_file_pair(request, control, journal, checkpoint)?;
+        return finish_visible(request, guard, control, journal, checkpoint);
+    }
     let head = current_head(request.repo, &request.binding.role.branch)?;
     if head == publication.expected_old {
         checkpoint(Checkpoint::BeforeCas)?;
@@ -581,6 +741,93 @@ fn publish(
     finish_visible(request, guard, control, journal, checkpoint)
 }
 
+fn publish_file_pair(
+    request: &LandingRequest<'_>,
+    control: &mergetx::ControlGuard,
+    journal: &ArchiveJournal,
+    checkpoint: &mut impl FnMut(Checkpoint) -> Result<()>,
+) -> Result<()> {
+    let binding = request.binding;
+    let target = binding
+        .file_target
+        .as_ref()
+        .context("file merge target is missing")?;
+    let publication = journal
+        .publication
+        .as_ref()
+        .context("file evidence publication is missing")?;
+    let landing = journal
+        .landing
+        .as_ref()
+        .context("file merge result is missing")?;
+    let main = landing
+        .file_commit
+        .as_deref()
+        .context("file merge candidate is missing")?;
+    require_destination_routing(request.repo, &target.branch)?;
+    require_destination_routing(request.repo, &binding.role.branch)?;
+    ensure!(
+        !target_is_checked_out(request.repo, &binding.role.branch)?,
+        "file exploration branch must not be checked out during dual publication"
+    );
+    let actual_main = current_head(request.repo, &target.branch)?;
+    let actual_evidence = current_head(request.repo, &binding.role.branch)?;
+    if actual_main == main && actual_evidence == publication.candidate {
+        return Ok(());
+    }
+    ensure!(
+        actual_main == target.head && actual_evidence == publication.expected_old,
+        "file merge refs are outside their retained atomic publication endpoints"
+    );
+    checkpoint(Checkpoint::BeforeCas)?;
+    require_destination_routing(request.repo, &target.branch)?;
+    require_destination_routing(request.repo, &binding.role.branch)?;
+    ensure!(
+        !target_is_checked_out(request.repo, &binding.role.branch)?,
+        "file exploration branch must not be checked out during dual publication"
+    );
+    require_retained_worktree(request, landing)?;
+    require_transaction(control, &landing.transaction_json)?;
+    ensure!(
+        selected_link(request)?.json == publication.link_json,
+        "file merge Link changed before publication"
+    );
+    super::file_agent::require_seed_binding(request.repo, binding)?;
+    let checkout = if landing.worktree_tree.is_some() {
+        Some(plumbing::prepare_checkout_transaction(
+            request.repo,
+            &target.branch,
+            &target.head,
+            main,
+            true,
+        )?)
+    } else {
+        None
+    };
+    let input = format!(
+        "start\noption no-deref\nupdate refs/heads/{} {} {}\noption no-deref\nupdate refs/heads/{} {} {}\nprepare\ncommit\n",
+        target.branch,
+        main,
+        target.head,
+        binding.role.branch,
+        publication.candidate,
+        publication.expected_old
+    );
+    plumbing::raw_git(request.repo, &["update-ref", "--stdin"], Some(&input)).context(
+        "file merge publication is uncertain; replay the retained candidates before continuing",
+    )?;
+    checkpoint(Checkpoint::AfterCas)?;
+    if let Some(checkout) = checkout {
+        plumbing::refresh_prepared_checkout(request.repo, &checkout)
+            .map_err(|failure| failure.error)
+            .context(
+                "file merge refs are published; the retained checkout journal must recover forward",
+            )?;
+        plumbing::finish_checkout_transaction(checkout)?;
+    }
+    Ok(())
+}
+
 fn finish_visible(
     request: &LandingRequest<'_>,
     guard: &ArchiveJournalGuard,
@@ -605,9 +852,18 @@ fn finish_visible(
         current_head(request.repo, &request.binding.role.branch)? == publication.candidate,
         "merge target moved before durable landing publication"
     );
+    if let Some(main) = &landing.file_commit {
+        ensure!(
+            current_head(request.repo, request.binding.target_branch())? == *main,
+            "file merge target moved before durable landing publication"
+        );
+    }
     let mut landed = journal.clone();
     landed.phase = ArchivePhase::Landed {
-        merge_commit: publication.candidate.clone(),
+        merge_commit: landing
+            .file_commit
+            .clone()
+            .unwrap_or_else(|| publication.candidate.clone()),
     };
     landed.consumed = publication.next_frontier.clone();
     landed.opencode = publication.next_opencode.clone();
@@ -635,22 +891,37 @@ fn complete(
     let tree = request
         .repo
         .git(&["rev-parse", "--verify", &format!("{merge_commit}^{{tree}}")])?;
-    let suffix = archive_history::verify_merge_landing(
-        request.repo,
-        &request.binding.role.origin_head,
-        &request.binding.source.head,
-        &landing.ordinary_tree,
-        merge_commit,
-        &tree,
-    )?;
+    let suffix = if request.binding.file_target.is_some() {
+        ensure!(
+            landing.file_commit.as_ref() == Some(merge_commit),
+            "file merge completion candidate changed"
+        );
+        verify_file_result(request.repo, journal)?
+    } else {
+        archive_history::verify_merge_landing(
+            request.repo,
+            &request.binding.role.origin_head,
+            &request.binding.source.head,
+            &landing.ordinary_tree,
+            merge_commit,
+            &tree,
+        )?
+    };
     let records = verify_suffix(&suffix, request.binding)?;
     archive_history::verify_archive_append_target(
         request.repo,
-        merge_commit,
+        landing.file_evidence.as_deref().unwrap_or(merge_commit),
         &current_head(request.repo, &request.binding.role.branch)?,
     )?;
     checkpoint(Checkpoint::BeforeRetire)?;
     require_destination_routing(request.repo, &request.binding.role.branch)?;
+    if request.binding.file_target.is_some() {
+        require_destination_routing(request.repo, request.binding.target_branch())?;
+        ensure!(
+            current_head(request.repo, request.binding.target_branch())? == *merge_commit,
+            "file merge target moved before exact transaction completion"
+        );
+    }
     selected_link(request)?;
     control.complete_archive_landing(request.binding, &landing.transaction_json, merge_commit)?;
     checkpoint(Checkpoint::Retired)?;
@@ -712,8 +983,20 @@ pub(super) fn complete_visible(
 
 #[cfg(test)]
 mod tests {
+    fn land_with<K: KeyStore>(
+        request: LandingRequest<'_>,
+        dictionary: &RepositoryDictionary<K>,
+        global: &Matcher,
+        read_native: impl FnOnce(&Link) -> Result<Vec<u8>>,
+        checkpoint: impl FnMut(Checkpoint) -> Result<()>,
+    ) -> Result<LandingOutcome> {
+        land_with_resolved(request, dictionary, global, read_native, checkpoint, &[])
+    }
+
     use super::*;
-    use crate::domain::merge_archive::{self, FrozenMergeSource, MergeArchiveRole, RuntimeLinkKey};
+    use crate::domain::merge_archive::{
+        self, FrozenFileTarget, FrozenMergeSource, MergeArchiveRole, RuntimeLinkKey,
+    };
     use crate::domain::native_archive::Frontier;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -765,42 +1048,99 @@ mod tests {
         }
 
         fn with_native(runtime: &str, baseline: &[u8]) -> Self {
+            Self::with_line_kind(runtime, baseline, false)
+        }
+
+        fn file() -> Self {
+            Self::with_line_kind("codex", BASELINE, true)
+        }
+
+        fn with_line_kind(runtime: &str, baseline: &[u8], file: bool) -> Self {
+            Self::with_file_conflict(runtime, baseline, file, false)
+        }
+
+        fn with_file_conflict(runtime: &str, baseline: &[u8], file: bool, conflict: bool) -> Self {
+            Self::with_file_history(runtime, baseline, file, conflict, false)
+        }
+
+        fn with_file_history(
+            runtime: &str,
+            baseline: &[u8],
+            file: bool,
+            conflict: bool,
+            target_only: bool,
+        ) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let repo = Repo::init(&directory.path().join("target")).unwrap();
             let source = Repo::init(&directory.path().join("source")).unwrap();
-            let mut metadata = meta::Meta::new(SESSION.into(), "codex".into(), "/work".into());
-            metadata.turn = Some(1);
+            let mut metadata = if file {
+                meta::Meta::new_file_line()
+            } else {
+                meta::Meta::new(SESSION.into(), "codex".into(), "/work".into())
+            };
+            if !file {
+                metadata.turn = Some(1);
+            }
             meta::write(repo.root(), &metadata).unwrap();
             let original_log = transcript::wrap_lines(
                 "{\"type\":\"user\",\"text\":\"inherited\"}\n",
                 "codex",
                 SESSION,
             );
-            storage::write_snapshot(repo.root(), &original_log, &original_log).unwrap();
+            if !file {
+                storage::write_snapshot(repo.root(), &original_log, &original_log).unwrap();
+            }
             std::fs::write(repo.root().join("AGENTS.md"), "Shared instructions\n").unwrap();
             repo.add_all().unwrap();
             repo.commit("landing target fixture").unwrap();
+            let fork = repo.git(&["rev-parse", "HEAD"]).unwrap();
+            if conflict || target_only {
+                std::fs::write(repo.root().join("AGENTS.md"), "Target shared rule\n").unwrap();
+                repo.add_all().unwrap();
+                repo.commit("target shared conflict").unwrap();
+            }
             let origin = repo.git(&["rev-parse", "HEAD"]).unwrap();
-            repo.git(&["update-ref", "refs/heads/work", &origin])
-                .unwrap();
-            repo.git(&["symbolic-ref", "HEAD", "refs/heads/work"])
-                .unwrap();
+            let target_branch = if file { "main" } else { "work" };
+            repo.git(&[
+                "update-ref",
+                &format!("refs/heads/{target_branch}"),
+                &origin,
+            ])
+            .unwrap();
+            repo.git(&[
+                "symbolic-ref",
+                "HEAD",
+                &format!("refs/heads/{target_branch}"),
+            ])
+            .unwrap();
             plumbing::import_commit_graph(&source, &repo, &origin).unwrap();
             let source_event = transcript::wrap_lines(
                 "{\"type\":\"user\",\"text\":\"selected source event\"}\n",
                 "codex",
                 SESSION,
             );
-            metadata.turn = Some(2);
+            if !file {
+                metadata.turn = Some(2);
+            }
             let log = format!("{original_log}{source_event}");
-            let mut files = storage::snapshot_files(&log, &log).unwrap();
+            let mut files = if file {
+                std::collections::BTreeMap::from([(
+                    "memory/source.md".into(),
+                    b"Source shared rule\n".to_vec(),
+                )])
+            } else {
+                storage::snapshot_files(&log, &log).unwrap()
+            };
             files.insert(
                 meta::FILE.into(),
                 meta::to_text(&metadata).unwrap().into_bytes(),
             );
+            if conflict {
+                files.insert("AGENTS.md".into(), b"Source shared rule\n".to_vec());
+            }
             let tree = plumbing::tree_apply_owned(
                 &source,
-                &origin,
+                &fork,
                 files
                     .into_iter()
                     .map(|(path, bytes)| (path, Some(bytes)))
@@ -808,14 +1148,17 @@ mod tests {
             )
             .unwrap();
             let source_head =
-                plumbing::commit_tree(&source, &tree, &[&origin], "landing source fixture")
-                    .unwrap();
+                plumbing::commit_tree(&source, &tree, &[&fork], "landing source fixture").unwrap();
             source
                 .git(&["update-ref", "refs/heads/source", &source_head])
                 .unwrap();
             let native = directory.path().join("native.jsonl");
             std::fs::write(&native, baseline).unwrap();
-            let binding = ExplorationBinding {
+            let mut binding = ExplorationBinding {
+                file_target: file.then(|| FrozenFileTarget {
+                    branch: "main".into(),
+                    head: origin.clone(),
+                }),
                 role: MergeArchiveRole {
                     generation: uuid::Uuid::now_v7().to_string(),
                     slug: "alice/target".into(),
@@ -836,7 +1179,7 @@ mod tests {
                     slug: "alice/source".into(),
                     branch: Some("source".into()),
                     head: source_head,
-                    base: Some(origin.clone()),
+                    base: Some(fork),
                 },
             };
             let mut installed = Link::new(runtime, "INSTALLED", Some(directory.path()));
@@ -851,7 +1194,9 @@ mod tests {
                 &merge_archive::test_activation(&binding, "{}".into()).transaction_original_json,
             )
             .unwrap();
-            tx.picked = vec![format!("{}#2.1", binding.source.reference)];
+            if !file {
+                tx.picked = vec![format!("{}#2.1", binding.source.reference)];
+            }
             tx.summary = Some("Retain the selected source decision".into());
             let json = format!(
                 "{},\"future\":9007199254740993.0000000000000001}}\n",
@@ -864,6 +1209,21 @@ mod tests {
             let tx_path = crate::domain::repo::common_git_dir(repo.root()).join(mergetx::LOCK_FILE);
             merge_archive::durable_publish_transition_bytes(&tx_path, json.as_bytes(), true)
                 .unwrap();
+            if file {
+                let seed =
+                    super::super::file_agent::prepare_seed(super::super::file_agent::SeedRequest {
+                        repo: &repo,
+                        store: &store,
+                        slug: "alice/target",
+                        transaction_json: &json,
+                        runtime,
+                        cwd: directory.path(),
+                    })
+                    .unwrap();
+                binding.role = seed.role;
+                installed.branch = Some(binding.role.branch.clone());
+                installed.materialized_from = Some(binding.role.origin_head.clone());
+            }
             super::super::activation::activate_with(
                 super::super::activation::ActivationRequest {
                     repo: &repo,
@@ -915,6 +1275,20 @@ mod tests {
                 checkpoint,
             )
         }
+        fn with_resolutions(
+            &self,
+            paths: &[String],
+            checkpoint: impl FnMut(Checkpoint) -> Result<()>,
+        ) -> Result<LandingOutcome> {
+            land_with_resolved(
+                self.request(),
+                &self.dictionary,
+                &Matcher::empty(),
+                |_| Ok(std::fs::read(&self.native)?),
+                checkpoint,
+                paths,
+            )
+        }
         fn append(&self, bytes: &[u8]) {
             use std::io::Write;
             std::fs::OpenOptions::new()
@@ -950,6 +1324,919 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn file_landing_publishes_distinct_main_and_evidence_history() {
+        for with_records in [false, true] {
+            let f = Fixture::file();
+            if with_records {
+                f.append(EXPLORATION);
+            }
+            let result = f.run().unwrap();
+            let journal = f.journal();
+            let landing = journal.landing.as_ref().unwrap();
+            let evidence = landing.file_evidence.as_deref().unwrap();
+            assert_eq!(landing.file_commit.as_deref(), Some(result.commit.as_str()));
+            assert_eq!(current_head(&f.repo, "main").unwrap(), result.commit);
+            assert_eq!(
+                current_head(&f.repo, &f.binding.role.branch).unwrap(),
+                evidence
+            );
+            assert_eq!(journal.accepted_commit.as_deref(), Some(evidence));
+            assert_ne!(result.commit, evidence);
+            assert_eq!(result.archived_records, usize::from(with_records));
+            assert!(!f.tx_path().exists());
+            assert_eq!(f.repo.git(&["status", "--porcelain"]).unwrap(), "");
+            let paths = f.repo.ls_tree_result(&result.commit).unwrap();
+            assert!(
+                !paths
+                    .iter()
+                    .any(|path| path != meta::FILE && meta::is_storage_path(path))
+            );
+            let metadata = meta::read_at_ref_result(&f.repo, &result.commit)
+                .unwrap()
+                .unwrap();
+            assert!(metadata.is_file_line());
+            assert_eq!(metadata.kind, meta::Kind::Merge);
+            let log = storage::materialize_at(f.repo.root(), evidence, meta::LOG_FILE).unwrap();
+            assert_eq!(log.contains("private exploration"), with_records);
+            assert_eq!(
+                storage::materialize_at(f.repo.root(), evidence, meta::VIEW_FILE).unwrap(),
+                ""
+            );
+            assert_eq!(
+                f.repo
+                    .git_status_local(&["merge-base", "--is-ancestor", evidence, &result.commit])
+                    .unwrap()
+                    .0,
+                Some(1)
+            );
+            assert_eq!(
+                f.repo
+                    .git(&["rev-list", "--parents", "-n", "1", &result.commit])
+                    .unwrap(),
+                format!(
+                    "{} {} {}",
+                    result.commit,
+                    f.binding.target_head(),
+                    f.binding.source.head
+                )
+            );
+            let replayed = replay(&f.repo, &f.store, &f.binding).unwrap().unwrap();
+            assert_eq!(replayed, result);
+        }
+    }
+
+    #[test]
+    fn file_native_capture_graph_changes_preserve_frozen_merge_content() {
+        for overlay in ["graft", "shallow", "replace"] {
+            let f = Fixture::with_file_history("codex", BASELINE, true, false, true);
+            f.append(EXPLORATION);
+            let target = f.binding.target_head();
+            let source = &f.binding.source.head;
+            plumbing::import_commit_graph(&f.repo, &f.source, source).unwrap();
+            let original_target = f
+                .repo
+                .git_bytes_result(&["cat-file", "commit", target])
+                .unwrap();
+            let original_source = f
+                .repo
+                .git_bytes_result(&["cat-file", "commit", source])
+                .unwrap();
+            let native = std::fs::read(&f.native).unwrap();
+            let link = selected_link(&f.request()).unwrap().json;
+            let transaction = std::fs::read(f.tx_path()).unwrap();
+            let before = f.repo.git(&["show-ref"]).unwrap();
+            let mut captured = false;
+            let outcome = land_with(
+                LandingRequest {
+                    source_repo: &f.repo,
+                    ..f.request()
+                },
+                &f.dictionary,
+                &Matcher::empty(),
+                |_| {
+                    captured = true;
+                    assert_eq!(f.repo.git(&["show-ref"])?, before);
+                    match overlay {
+                        "graft" => std::fs::write(
+                            f.repo.git_path("info/grafts")?,
+                            format!("{source} {target}\n"),
+                        )?,
+                        "shallow" => {
+                            std::fs::write(f.repo.git_path("shallow")?, format!("{source}\n"))?
+                        }
+                        "replace" => {
+                            let tree = f.repo.git(&["rev-parse", &format!("{source}^{{tree}}")])?;
+                            let replacement =
+                                plumbing::commit_tree(&f.repo, &tree, &[target], "replacement")?;
+                            f.repo.git(&[
+                                "update-ref",
+                                &format!("refs/replace/{source}"),
+                                &replacement,
+                            ])?;
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(current_head(&f.repo, f.binding.target_branch())?, target);
+                    assert_eq!(
+                        current_head(&f.repo, &f.binding.role.branch)?,
+                        f.binding.role.origin_head
+                    );
+                    Ok(native.clone())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert!(captured);
+            assert_eq!(
+                f.repo.show_raw(&outcome.commit, "AGENTS.md").as_deref(),
+                Some("Target shared rule\n")
+            );
+            assert_eq!(
+                f.repo
+                    .show_raw(&outcome.commit, "memory/source.md")
+                    .as_deref(),
+                Some("Source shared rule\n")
+            );
+            let raw = f
+                .repo
+                .git(&["cat-file", "commit", &outcome.commit])
+                .unwrap();
+            let parents: Vec<_> = raw
+                .lines()
+                .take_while(|line| !line.is_empty())
+                .filter_map(|line| line.strip_prefix("parent "))
+                .collect();
+            assert_eq!(parents, vec![target, source.as_str()]);
+            assert_eq!(
+                f.repo
+                    .git_bytes_result(&["cat-file", "commit", target])
+                    .unwrap(),
+                original_target
+            );
+            assert_eq!(
+                f.repo
+                    .git_bytes_result(&["cat-file", "commit", source])
+                    .unwrap(),
+                original_source
+            );
+            assert_eq!(std::fs::read(&f.native).unwrap(), native);
+            assert_eq!(selected_link(&f.request()).unwrap().json, link);
+            assert_eq!(std::fs::read(f.retired_path()).unwrap(), transaction);
+            assert_eq!(
+                current_head(&f.repo, f.binding.target_branch()).unwrap(),
+                outcome.commit
+            );
+            let journal = f.journal();
+            let evidence = current_head(&f.repo, &f.binding.role.branch).unwrap();
+            assert_eq!(journal.accepted_commit.as_deref(), Some(evidence.as_str()));
+            let log = storage::materialize_at(f.repo.root(), &evidence, meta::LOG_FILE).unwrap();
+            assert_eq!(log.matches("private exploration").count(), 1);
+            assert!(matches!(journal.phase, ArchivePhase::Landed { .. }));
+            assert!(!f.tx_path().exists());
+        }
+    }
+
+    #[test]
+    fn file_landing_uses_resolved_shared_conflicts_and_refuses_unresolved_drafts() {
+        for contents in [
+            None,
+            Some("<<<<<<< ours\nstill unresolved\n=======\nother side\n>>>>>>> theirs\n"),
+            Some("Reconciled shared rule\n"),
+        ] {
+            let f = Fixture::with_file_conflict("codex", BASELINE, true, true);
+            f.append(EXPLORATION);
+            if let Some(contents) = contents {
+                std::fs::write(f.repo.root().join("AGENTS.md"), contents).unwrap();
+            }
+            let refs = f.repo.git(&["show-ref"]).unwrap();
+            let tx = std::fs::read(f.tx_path()).unwrap();
+            let link = selected_link(&f.request()).unwrap().json;
+            let native = std::fs::read(&f.native).unwrap();
+            let result = f.run();
+            if contents == Some("Reconciled shared rule\n") {
+                let result = result.unwrap();
+                assert_eq!(
+                    f.repo.show_raw(&result.commit, "AGENTS.md").as_deref(),
+                    contents
+                );
+                assert!(!f.tx_path().exists());
+                assert_eq!(f.repo.git(&["status", "--porcelain"]).unwrap(), "");
+            } else {
+                assert!(result.is_err());
+                assert_eq!(f.repo.git(&["show-ref"]).unwrap(), refs);
+                assert_eq!(std::fs::read(f.tx_path()).unwrap(), tx);
+                assert_eq!(selected_link(&f.request()).unwrap().json, link);
+                assert_eq!(f.journal().phase, ArchivePhase::Open);
+                assert!(f.journal().publication.is_none());
+            }
+            assert_eq!(std::fs::read(&f.native).unwrap(), native);
+        }
+    }
+
+    /// Acknowledgements select only frozen conflicts and cannot grant another generation authority.
+    #[test]
+    fn file_landing_can_explicitly_keep_target_and_refuses_unrelated_acknowledgements() {
+        for (paths, contents, valid) in [
+            (vec![], None, false),
+            (vec!["AGENTS.md"], None, true),
+            (vec!["memory/source.md"], None, false),
+            (vec!["missing.md"], None, false),
+            (vec!["../AGENTS.md"], None, false),
+            (vec![meta::FILE], None, false),
+            (vec!["AGENTS.md", "AGENTS.md"], None, false),
+            (
+                vec!["AGENTS.md"],
+                Some("<<<<<<< ours\nUnresolved\n=======\nOther\n>>>>>>> theirs\n"),
+                false,
+            ),
+        ] {
+            let f = Fixture::with_file_conflict("codex", BASELINE, true, true);
+            f.append(EXPLORATION);
+            if let Some(contents) = contents {
+                std::fs::write(f.repo.root().join("AGENTS.md"), contents).unwrap();
+            }
+            let refs = f.repo.git(&["show-ref"]).unwrap();
+            let tx = std::fs::read(f.tx_path()).unwrap();
+            let link = selected_link(&f.request()).unwrap().json;
+            let native = std::fs::read(&f.native).unwrap();
+            let worktree = std::fs::read(f.repo.root().join("AGENTS.md")).unwrap();
+            let paths: Vec<_> = paths.into_iter().map(str::to_owned).collect();
+            let outcome = f.with_resolutions(&paths, |_| Ok(()));
+            if valid {
+                let outcome = outcome.unwrap();
+                assert_eq!(
+                    f.repo.show_raw(&outcome.commit, "AGENTS.md").as_deref(),
+                    Some("Target shared rule\n")
+                );
+                assert_eq!(
+                    f.repo
+                        .git(&["show", "-s", "--format=%P", &outcome.commit])
+                        .unwrap(),
+                    format!("{} {}", f.binding.target_head(), f.binding.source.head)
+                );
+                let evidence = current_head(&f.repo, &f.binding.role.branch).unwrap();
+                assert_eq!(
+                    storage::materialize_at(f.repo.root(), &evidence, meta::VIEW_FILE).unwrap(),
+                    ""
+                );
+                assert!(
+                    storage::materialize_at(f.repo.root(), &evidence, meta::LOG_FILE)
+                        .unwrap()
+                        .contains("private exploration")
+                );
+                assert_eq!(f.repo.git(&["status", "--porcelain"]).unwrap(), "");
+                assert_eq!(
+                    replay(&f.repo, &f.store, &f.binding).unwrap(),
+                    Some(outcome)
+                );
+            } else {
+                assert!(outcome.is_err(), "{paths:?}");
+                assert_eq!(f.repo.git(&["show-ref"]).unwrap(), refs);
+                assert_eq!(std::fs::read(f.tx_path()).unwrap(), tx);
+                assert_eq!(selected_link(&f.request()).unwrap().json, link);
+                assert_eq!(f.journal().phase, ArchivePhase::Open);
+                assert!(f.journal().publication.is_none());
+                assert_eq!(
+                    std::fs::read(f.repo.root().join("AGENTS.md")).unwrap(),
+                    worktree
+                );
+            }
+            assert_eq!(std::fs::read(&f.native).unwrap(), native);
+        }
+    }
+
+    #[test]
+    fn explicit_conflict_confirmation_requires_a_file_target_checkout() {
+        for file in [false, true] {
+            let f = Fixture::with_file_conflict("codex", BASELINE, file, file);
+            if file {
+                f.repo
+                    .git(&["checkout", "--detach", f.binding.target_head()])
+                    .unwrap();
+            }
+            let refs = f.repo.git(&["show-ref"]).unwrap();
+            let tx = std::fs::read(f.tx_path()).unwrap();
+            let link = selected_link(&f.request()).unwrap().json;
+            let error = f
+                .with_resolutions(&["AGENTS.md".into()], |_| Ok(()))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(if file {
+                "target branch checkout"
+            } else {
+                "fresh Open file merge"
+            }));
+            assert_eq!(f.repo.git(&["show-ref"]).unwrap(), refs);
+            assert_eq!(std::fs::read(f.tx_path()).unwrap(), tx);
+            assert_eq!(selected_link(&f.request()).unwrap().json, link);
+            assert!(f.journal().publication.is_none());
+        }
+    }
+
+    #[test]
+    fn confirmed_file_landing_replay_uses_only_its_retained_candidate() {
+        let f = Fixture::with_file_conflict("codex", BASELINE, true, true);
+        f.append(EXPLORATION);
+        let paths = vec!["AGENTS.md".into()];
+        assert!(
+            f.with_resolutions(&paths, |point| {
+                if point == Checkpoint::Prepared {
+                    anyhow::bail!("injected landing stop");
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        let before = f.journal();
+        let candidate = before
+            .landing
+            .as_ref()
+            .unwrap()
+            .file_commit
+            .clone()
+            .unwrap();
+        let refs = f.repo.git(&["show-ref"]).unwrap();
+        let tx = std::fs::read(f.tx_path()).unwrap();
+        let error = f.with_resolutions(&paths, |_| Ok(())).unwrap_err();
+        assert!(format!("{error:#}").contains("replay retained publication without --resolved"));
+        assert_eq!(f.repo.git(&["show-ref"]).unwrap(), refs);
+        assert_eq!(std::fs::read(f.tx_path()).unwrap(), tx);
+        assert_eq!(
+            serde_json::to_value(f.journal()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        std::fs::remove_file(&f.native).unwrap();
+        std::fs::rename(
+            f.source.root(),
+            f._directory.path().join("source-unavailable"),
+        )
+        .unwrap();
+        let result = replay(&f.repo, &f.store, &f.binding).unwrap().unwrap();
+        assert_eq!(result.commit, candidate);
+        assert_eq!(
+            f.repo.show_raw(&result.commit, "AGENTS.md").as_deref(),
+            Some("Target shared rule\n")
+        );
+    }
+
+    #[test]
+    fn explicit_file_resolution_does_not_bypass_generation_or_dual_ref_cas() {
+        for fault in ["generation", "target", "evidence"] {
+            let f = Fixture::with_file_conflict("codex", BASELINE, true, true);
+            f.append(EXPLORATION);
+            if fault == "generation" {
+                use crate::domain::metadata_facts::JsonFacts;
+                let _guard = mergetx::ControlGuard::acquire(f.repo.root()).unwrap();
+                let raw = std::fs::read_to_string(f.tx_path()).unwrap();
+                let JsonFacts::Object(mut fields) = JsonFacts::parse(&raw).unwrap() else {
+                    panic!("fixture transaction must be an object");
+                };
+                fields.insert(
+                    "generation".into(),
+                    JsonFacts::String(uuid::Uuid::now_v7().to_string()),
+                );
+                let mut changed = String::new();
+                JsonFacts::Object(fields).write_json(&mut changed).unwrap();
+                // Foreign mutation bypasses the ordinary writer, which refuses replacement authority.
+                std::fs::write(f.tx_path(), changed).unwrap();
+            }
+            let before = f.repo.git(&["show-ref"]).unwrap();
+            let tx = std::fs::read(f.tx_path()).unwrap();
+            let link = selected_link(&f.request()).unwrap().json;
+            let paths = vec!["AGENTS.md".into()];
+            let result = f.with_resolutions(&paths, |point| {
+                if point == Checkpoint::BeforeCas && fault != "generation" {
+                    let branch = if fault == "target" {
+                        f.binding.target_branch()
+                    } else {
+                        &f.binding.role.branch
+                    };
+                    let old = current_head(&f.repo, branch)?;
+                    let tree = f.repo.git(&["rev-parse", &format!("{old}^{{tree}}")])?;
+                    let moved = plumbing::commit_tree(
+                        &f.repo,
+                        &tree,
+                        &[&old],
+                        "Concurrent fixture change",
+                    )?;
+                    f.repo
+                        .git(&["update-ref", &format!("refs/heads/{branch}"), &moved, &old])?;
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "{fault}");
+            assert_eq!(std::fs::read(f.tx_path()).unwrap(), tx);
+            assert_eq!(selected_link(&f.request()).unwrap().json, link);
+            assert_eq!(f.journal().phase, ArchivePhase::Open);
+            if fault == "generation" {
+                assert_eq!(f.repo.git(&["show-ref"]).unwrap(), before);
+                assert!(f.journal().publication.is_none());
+            } else {
+                let untouched = if fault == "target" {
+                    &f.binding.role.branch
+                } else {
+                    f.binding.target_branch()
+                };
+                let expected = if fault == "target" {
+                    &f.binding.role.origin_head
+                } else {
+                    f.binding.target_head()
+                };
+                assert_eq!(current_head(&f.repo, untouched).unwrap(), expected);
+                assert!(f.journal().publication.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_file_evidence_requires_the_seed_tree_and_exact_parent() {
+        let f = Fixture::file();
+        let seed = &f.binding.role.origin_head;
+        let tree = f
+            .repo
+            .git(&["rev-parse", "--verify", &format!("{seed}^{{tree}}")])
+            .unwrap();
+        let valid =
+            plumbing::commit_tree(&f.repo, &tree, &[seed], "empty exploration checkpoint").unwrap();
+        archive_history::verify_empty_file_exploration(&f.repo, seed, &valid).unwrap();
+        for parents in [
+            vec![f.binding.target_head()],
+            vec![seed.as_str(), f.binding.target_head()],
+        ] {
+            let wrong = plumbing::commit_tree(&f.repo, &tree, &parents, "wrong exploration parent")
+                .unwrap();
+            assert!(archive_history::verify_empty_file_exploration(&f.repo, seed, &wrong).is_err());
+        }
+        let changed = plumbing::tree_apply_owned(
+            &f.repo,
+            &tree,
+            vec![(
+                "AGENTS.md".into(),
+                Some(b"changed shared content\n".to_vec()),
+            )],
+        )
+        .unwrap();
+        let wrong =
+            plumbing::commit_tree(&f.repo, &changed, &[seed], "changed empty exploration tree")
+                .unwrap();
+        assert!(archive_history::verify_empty_file_exploration(&f.repo, seed, &wrong).is_err());
+        assert_eq!(
+            current_head(&f.repo, "main").unwrap(),
+            f.binding.target_head()
+        );
+        assert_eq!(
+            current_head(&f.repo, &f.binding.role.branch).unwrap(),
+            *seed
+        );
+    }
+
+    #[test]
+    fn file_publication_replay_keeps_both_candidates_and_recovers_checkout_forward() {
+        for stop in [
+            Checkpoint::Prepared,
+            Checkpoint::AfterCas,
+            Checkpoint::Landed,
+            Checkpoint::Retired,
+        ] {
+            let f = Fixture::file();
+            f.append(EXPLORATION);
+            f.stop(stop);
+            let journal = f.journal();
+            let landing = journal.landing.as_ref().unwrap();
+            let main = landing.file_commit.clone().unwrap();
+            let evidence = landing.file_evidence.clone().unwrap();
+            f.append(b"{\"type\":\"assistant\",\"text\":\"later unconsumed evidence\"}\n");
+            std::fs::rename(
+                f.source.root(),
+                f._directory.path().join("source-unavailable"),
+            )
+            .unwrap();
+            let result = replay(&f.repo, &f.store, &f.binding).unwrap().unwrap();
+            assert_eq!(result.commit, main);
+            assert_eq!(current_head(&f.repo, "main").unwrap(), main);
+            assert_eq!(
+                current_head(&f.repo, &f.binding.role.branch).unwrap(),
+                evidence
+            );
+            assert_eq!(f.repo.git(&["status", "--porcelain"]).unwrap(), "");
+            assert!(
+                !storage::materialize_at(f.repo.root(), &evidence, meta::LOG_FILE)
+                    .unwrap()
+                    .contains("later unconsumed")
+            );
+            assert_eq!(
+                f.journal().consumed.bytes,
+                (BASELINE.len() + EXPLORATION.len()) as u64
+            );
+            assert!(!f.tx_path().exists());
+        }
+    }
+
+    #[test]
+    fn file_evidence_checkout_before_publication_preserves_refs_and_worktree() {
+        let f = Fixture::file();
+        f.append(EXPLORATION);
+        f.repo
+            .git(&["checkout", "--detach", f.binding.target_head()])
+            .unwrap();
+        let transaction = std::fs::read(f.tx_path()).unwrap();
+        let link = selected_link(&f.request()).unwrap().json;
+        let native = std::fs::read(&f.native).unwrap();
+        let mut checkout = None;
+        let error = f
+            .at(|step| {
+                if step == Checkpoint::BeforeCas {
+                    f.repo.git(&["checkout", &f.binding.role.branch])?;
+                    checkout = Some((
+                        std::fs::read(f.repo.git_path("index")?)?,
+                        std::fs::read(f.repo.root().join(meta::FILE))?,
+                        std::fs::read(f.repo.root().join("AGENTS.md"))?,
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "file exploration branch must not be checked out during dual publication"
+            )
+        );
+        let (index, metadata, shared) = checkout.expect("evidence checkout was not reached");
+        assert_eq!(
+            std::fs::read(f.repo.git_path("index").unwrap()).unwrap(),
+            index
+        );
+        assert_eq!(
+            std::fs::read(f.repo.root().join(meta::FILE)).unwrap(),
+            metadata
+        );
+        assert_eq!(
+            std::fs::read(f.repo.root().join("AGENTS.md")).unwrap(),
+            shared
+        );
+        assert_eq!(std::fs::read(f.tx_path()).unwrap(), transaction);
+        assert_eq!(selected_link(&f.request()).unwrap().json, link);
+        assert_eq!(std::fs::read(&f.native).unwrap(), native);
+        assert_eq!(
+            current_head(&f.repo, "main").unwrap(),
+            f.binding.target_head()
+        );
+        assert_eq!(
+            current_head(&f.repo, &f.binding.role.branch).unwrap(),
+            f.binding.role.origin_head
+        );
+        let pending = f.journal();
+        assert_eq!(pending.phase, ArchivePhase::Open);
+        assert_eq!(pending.consumed, f.binding.installed);
+        let landing = pending.landing.as_ref().unwrap();
+        assert!(landing.worktree_tree.is_none());
+        let main = landing.file_commit.as_ref().unwrap();
+        let evidence = landing.file_evidence.as_ref().unwrap();
+        assert_ne!(evidence, &f.binding.role.origin_head);
+        f.repo
+            .git(&["checkout", "--detach", f.binding.target_head()])
+            .unwrap();
+        let outcome = replay(&f.repo, &f.store, &f.binding).unwrap().unwrap();
+        assert_eq!(&outcome.commit, main);
+        assert_eq!(&current_head(&f.repo, "main").unwrap(), main);
+        assert_eq!(
+            &current_head(&f.repo, &f.binding.role.branch).unwrap(),
+            evidence
+        );
+        assert_eq!(
+            f.repo.git(&["rev-parse", "HEAD"]).unwrap(),
+            f.binding.target_head()
+        );
+        assert_eq!(f.repo.git(&["status", "--porcelain"]).unwrap(), "");
+        assert!(!f.tx_path().exists());
+    }
+
+    #[test]
+    fn a_file_main_cas_failure_cannot_publish_only_the_evidence_ref() {
+        let f = Fixture::file();
+        f.append(EXPLORATION);
+        let target = f.binding.target_head();
+        let tree = f
+            .repo
+            .git(&["rev-parse", "--verify", &format!("{target}^{{tree}}")])
+            .unwrap();
+        let moved =
+            plumbing::commit_tree(&f.repo, &tree, &[target], "independent main advance").unwrap();
+        assert!(
+            f.at(|step| {
+                if step == Checkpoint::BeforeCas {
+                    plumbing::update_ref_cas(&f.repo, "refs/heads/main", &moved, Some(target))?;
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        let pending = f.journal();
+        assert_eq!(pending.phase, ArchivePhase::Open);
+        assert_eq!(pending.consumed, f.binding.installed);
+        assert_eq!(
+            current_head(&f.repo, &f.binding.role.branch).unwrap(),
+            f.binding.role.origin_head
+        );
+        assert_eq!(current_head(&f.repo, "main").unwrap(), moved);
+        plumbing::update_ref_cas(&f.repo, "refs/heads/main", target, Some(&moved)).unwrap();
+        let result = replay(&f.repo, &f.store, &f.binding).unwrap().unwrap();
+        assert_eq!(
+            Some(result.commit),
+            pending.landing.as_ref().unwrap().file_commit
+        );
+    }
+
+    #[test]
+    fn a_file_evidence_cas_failure_cannot_publish_only_the_main_ref() {
+        let f = Fixture::file();
+        f.append(EXPLORATION);
+        let origin = &f.binding.role.origin_head;
+        let tree = f
+            .repo
+            .git(&["rev-parse", "--verify", &format!("{origin}^{{tree}}")])
+            .unwrap();
+        let moved =
+            plumbing::commit_tree(&f.repo, &tree, &[origin], "independent evidence advance")
+                .unwrap();
+        let evidence_ref = format!("refs/heads/{}", f.binding.role.branch);
+        assert!(
+            f.at(|step| {
+                if step == Checkpoint::BeforeCas {
+                    plumbing::update_ref_cas(&f.repo, &evidence_ref, &moved, Some(origin))?;
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(
+            current_head(&f.repo, "main").unwrap(),
+            f.binding.target_head()
+        );
+        assert_eq!(
+            current_head(&f.repo, &f.binding.role.branch).unwrap(),
+            moved
+        );
+        assert_eq!(f.journal().consumed, f.binding.installed);
+        plumbing::update_ref_cas(&f.repo, &evidence_ref, origin, Some(&moved)).unwrap();
+        let result = replay(&f.repo, &f.store, &f.binding).unwrap().unwrap();
+        assert_eq!(current_head(&f.repo, "main").unwrap(), result.commit);
+        assert_eq!(f.repo.git(&["status", "--porcelain"]).unwrap(), "");
+    }
+
+    #[test]
+    fn mixed_file_publication_endpoints_refuse_without_retiring_or_consuming() {
+        for main_only in [false, true] {
+            let f = Fixture::file();
+            f.append(EXPLORATION);
+            f.stop(Checkpoint::Prepared);
+            let pending = f.journal();
+            let landing = pending.landing.as_ref().unwrap();
+            let (branch, old, candidate) = if main_only {
+                (
+                    "main",
+                    f.binding.target_head(),
+                    landing.file_commit.as_deref().unwrap(),
+                )
+            } else {
+                (
+                    f.binding.role.branch.as_str(),
+                    f.binding.role.origin_head.as_str(),
+                    landing.file_evidence.as_deref().unwrap(),
+                )
+            };
+            let refname = format!("refs/heads/{branch}");
+            plumbing::update_ref_cas(&f.repo, &refname, candidate, Some(old)).unwrap();
+            let tx = std::fs::read(f.tx_path()).unwrap();
+            let link = selected_link(&f.request()).unwrap().json;
+            let refs = f.repo.git(&["show-ref"]).unwrap();
+            assert!(replay(&f.repo, &f.store, &f.binding).is_err());
+            assert_eq!(f.journal(), pending);
+            assert_eq!(std::fs::read(f.tx_path()).unwrap(), tx);
+            assert_eq!(selected_link(&f.request()).unwrap().json, link);
+            assert_eq!(f.repo.git(&["show-ref"]).unwrap(), refs);
+            plumbing::update_ref_cas(&f.repo, &refname, old, Some(candidate)).unwrap();
+            replay(&f.repo, &f.store, &f.binding).unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn file_completion_does_not_retire_a_main_rewound_after_publication() {
+        let f = Fixture::file();
+        f.append(EXPLORATION);
+        f.stop(Checkpoint::Landed);
+        let journal = f.journal();
+        let main = journal
+            .landing
+            .as_ref()
+            .unwrap()
+            .file_commit
+            .as_deref()
+            .unwrap();
+        plumbing::update_ref_cas(
+            &f.repo,
+            "refs/heads/main",
+            f.binding.target_head(),
+            Some(main),
+        )
+        .unwrap();
+        let tx = std::fs::read(f.tx_path()).unwrap();
+        assert!(replay(&f.repo, &f.store, &f.binding).is_err());
+        assert_eq!(std::fs::read(f.tx_path()).unwrap(), tx);
+        assert_eq!(f.journal(), journal);
+        plumbing::update_ref_cas(
+            &f.repo,
+            "refs/heads/main",
+            main,
+            Some(f.binding.target_head()),
+        )
+        .unwrap();
+        assert_eq!(
+            replay(&f.repo, &f.store, &f.binding)
+                .unwrap()
+                .unwrap()
+                .commit,
+            main
+        );
+    }
+
+    #[test]
+    fn file_cancellation_preserves_native_and_visible_evidence_without_publishing_main() {
+        for prepared in [false, true] {
+            let f = Fixture::file();
+            f.append(EXPLORATION);
+            if prepared {
+                f.stop(Checkpoint::Prepared);
+            }
+            let refs = f.repo.git(&["show-ref"]).unwrap();
+            let native = std::fs::read(&f.native).unwrap();
+            let link = selected_link(&f.request()).unwrap().json;
+            let cancel = || {
+                super::super::abort::abort(super::super::abort::AbortRequest {
+                    repo: &f.repo,
+                    store: &f.store,
+                    binding: &f.binding,
+                })
+            };
+            assert_eq!(
+                cancel().unwrap(),
+                super::super::abort::AbortOutcome::Aborted
+            );
+            assert_eq!(
+                cancel().unwrap(),
+                super::super::abort::AbortOutcome::Aborted
+            );
+            assert_eq!(f.journal().phase, ArchivePhase::Aborted);
+            assert_eq!(f.journal().consumed, f.binding.installed);
+            assert_eq!(f.repo.git(&["show-ref"]).unwrap(), refs);
+            assert_eq!(std::fs::read(&f.native).unwrap(), native);
+            assert_eq!(selected_link(&f.request()).unwrap().json, link);
+            assert!(!f.tx_path().exists());
+            assert!(replay(&f.repo, &f.store, &f.binding).is_err());
+        }
+    }
+
+    #[test]
+    fn file_cancellation_does_not_need_a_native_file_after_fresh_launch_retirement() {
+        let f = Fixture::with_line_kind("claude-code", b"", true);
+        merge_archive::durable_publish_transition_bytes(&f.native, b"", true).unwrap();
+        let selected = selected_link(&f.request()).unwrap();
+        let refs = f
+            .repo
+            .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .unwrap();
+        super::super::file_agent::reserve_fresh_launch_fixture(
+            &f.repo,
+            &f.binding,
+            &selected.link,
+            &f.native,
+        )
+        .unwrap();
+        assert!(!f.native.exists());
+        let request = || super::super::abort::AbortRequest {
+            repo: &f.repo,
+            store: &f.store,
+            binding: &f.binding,
+        };
+        assert_eq!(
+            super::super::abort::abort(request()).unwrap(),
+            super::super::abort::AbortOutcome::Aborted
+        );
+        assert_eq!(
+            super::super::abort::abort(request()).unwrap(),
+            super::super::abort::AbortOutcome::Aborted
+        );
+        assert!(!f.native.exists());
+        assert!(!f.tx_path().exists());
+        assert_eq!(f.journal().phase, ArchivePhase::Aborted);
+        assert_eq!(
+            f.repo
+                .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+                .unwrap(),
+            refs
+        );
+        assert_eq!(selected_link(&f.request()).unwrap().json, selected.json);
+    }
+
+    #[test]
+    fn file_cancellation_finishes_a_visible_pair_and_never_rolls_it_back() {
+        for checkpoint in [
+            Checkpoint::AfterCas,
+            Checkpoint::Landed,
+            Checkpoint::Retired,
+        ] {
+            let f = Fixture::file();
+            f.append(EXPLORATION);
+            f.stop(checkpoint);
+            let refs = f.repo.git(&["show-ref"]).unwrap();
+            let main = current_head(&f.repo, "main").unwrap();
+            let result = super::super::abort::abort(super::super::abort::AbortRequest {
+                repo: &f.repo,
+                store: &f.store,
+                binding: &f.binding,
+            })
+            .unwrap();
+            let super::super::abort::AbortOutcome::AlreadyLanded(outcome) = result else {
+                panic!("visible file merge was cancelled");
+            };
+            assert_eq!(outcome.commit, main);
+            assert_eq!(f.repo.git(&["show-ref"]).unwrap(), refs);
+            assert_eq!(f.repo.git(&["status", "--porcelain"]).unwrap(), "");
+            assert!(!f.tx_path().exists());
+        }
+    }
+
+    #[test]
+    fn file_cancellation_refuses_either_mixed_publication_without_mutation() {
+        for main_only in [false, true] {
+            let f = Fixture::file();
+            f.append(EXPLORATION);
+            f.stop(Checkpoint::Prepared);
+            let journal = f.journal();
+            let landing = journal.landing.as_ref().unwrap();
+            let (branch, old, new) = if main_only {
+                (
+                    "main",
+                    f.binding.target_head(),
+                    landing.file_commit.as_deref().unwrap(),
+                )
+            } else {
+                (
+                    f.binding.role.branch.as_str(),
+                    f.binding.role.origin_head.as_str(),
+                    landing.file_evidence.as_deref().unwrap(),
+                )
+            };
+            plumbing::update_ref_cas(&f.repo, &format!("refs/heads/{branch}"), new, Some(old))
+                .unwrap();
+            let refs = f.repo.git(&["show-ref"]).unwrap();
+            let tx = std::fs::read(f.tx_path()).unwrap();
+            let link = selected_link(&f.request()).unwrap().json;
+            assert!(
+                super::super::abort::abort(super::super::abort::AbortRequest {
+                    repo: &f.repo,
+                    store: &f.store,
+                    binding: &f.binding,
+                })
+                .is_err()
+            );
+            assert_eq!(f.journal(), journal);
+            assert_eq!(std::fs::read(f.tx_path()).unwrap(), tx);
+            assert_eq!(selected_link(&f.request()).unwrap().json, link);
+            assert_eq!(f.repo.git(&["show-ref"]).unwrap(), refs);
+        }
+    }
+
+    #[test]
+    fn file_dispatch_selects_the_main_transaction_not_the_evidence_branch() {
+        let f = Fixture::file();
+        let tx = mergetx::read(f.repo.root()).unwrap().unwrap();
+        assert_eq!(
+            super::super::dispatch::select(&f.repo, "alice/target", Some("main"), Some(&tx))
+                .unwrap(),
+            Some(f.binding.clone())
+        );
+        assert!(
+            super::super::dispatch::select(
+                &f.repo,
+                "alice/target",
+                Some(&f.binding.role.branch),
+                Some(&tx)
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::dispatch::select(&f.repo, "alice/foreign", Some("main"), Some(&tx))
+                .is_err()
+        );
+        assert_eq!(
+            super::super::dispatch::destination(&f.repo, "main")
+                .unwrap()
+                .root(),
+            f.repo.root().canonicalize().unwrap()
+        );
     }
 
     #[test]
