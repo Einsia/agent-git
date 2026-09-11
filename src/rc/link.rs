@@ -264,9 +264,9 @@ impl Link {
             Err(e) => return format!("bad hub url {url}: {e}"),
         };
 
-        let (stream, _resp) = match tokio_tungstenite::connect_async(req).await {
+        let stream = match super::transport::connect(req).await {
             Ok(x) => x,
-            Err(e) => return format!("cannot reach the hub at {url}: {e}"),
+            Err(e) => return format!("cannot reach the hub at {url}: {e:#}"),
         };
         let (mut sink, mut source) = stream.split();
 

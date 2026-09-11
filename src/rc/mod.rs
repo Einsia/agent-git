@@ -87,6 +87,7 @@ pub mod supervisor;
 pub mod tail;
 pub mod terminal;
 pub mod ticket;
+mod transport;
 #[cfg(windows)]
 pub(crate) mod windows_job;
 #[cfg(windows)]

@@ -34,3 +34,25 @@ agit rc stop
 ```
 
 With `AGIT_RC=1`, the daemon may commit/push at turn boundaries. That is supervisor behavior, not a normal CLI guarantee; shared-workspace approvals go to the workspace owner.
+
+## Proxy connections
+
+The daemon reads proxy settings when it connects or reconnects. `wss://` uses
+`https_proxy` / `HTTPS_PROXY`; `ws://` uses `http_proxy` / `HTTP_PROXY`.
+`all_proxy` / `ALL_PROXY` is the fallback. Uppercase variables take precedence.
+`no_proxy` / `NO_PROXY` bypasses the proxy for matching domains, IP addresses,
+IP subnets, or `*` (all hosts).
+
+Proxy URLs must use `http://` for an HTTP CONNECT proxy; optional URL credentials
+are sent only to the proxy. TLS still verifies the original hub hostname and
+certificate inside the tunnel. HTTPS and SOCKS proxy URLs produce an explicit
+unsupported-proxy error instead of silently falling back to a direct connection.
+
+```bash
+HTTPS_PROXY=http://proxy.example.com:8888 agit rc start --detach
+```
+
+DNS, TCP connection, CONNECT, TLS and WebSocket negotiation share a 30-second
+deadline. Connection errors identify whether the attempt was direct or through
+a proxy. Set the environment in the shell that starts the daemon; changing a
+different shell does not change the environment of an already running process.

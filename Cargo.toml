@@ -93,6 +93,9 @@ rc = [
     "dep:futures-util",
     "dep:portable-pty",
     "dep:base64",
+    "dep:hyper-util",
+    "dep:httparse",
+    "dep:tower-service",
 ]
 
 # The device-local vault for low-entropy secrets. A backend reusing domain with
@@ -222,6 +225,9 @@ libc = "0.2"
 # ── rc (agitd) ───────────────────────────────────────────────────────────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net", "fs", "signal"], optional = true }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
+hyper-util = { version = "0.1.20", default-features = false, features = ["client-legacy", "client-proxy", "tokio"], optional = true }
+httparse = { version = "1.10", optional = true }
+tower-service = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 # The terminal needs a real PTY: without one `vim`, `top` and anything that checks
 # isatty do not work, and the whole point of that bottom-right pane is "run real
