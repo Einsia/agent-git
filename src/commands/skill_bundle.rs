@@ -45,6 +45,7 @@ pub const SUBSKILLS: &[(&str, &str)] = subskills![
     "doctor",
     "export",
     "fetch",
+    "file",
     "fork",
     "hooks",
     "import",

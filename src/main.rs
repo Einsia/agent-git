@@ -304,6 +304,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Branch(a) => commands::branch::run(a),
 
         Commands::Commit(a) => commands::commit::run(a),
+        Commands::File(a) => commands::file::run(a),
         Commands::Tag(a) => commands::tag::run(a),
 
         Commands::Log(a) => commands::log::run(a),

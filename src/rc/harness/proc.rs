@@ -16,9 +16,12 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
+
+#[path = "pipe_input.rs"]
+mod pipe_input;
 
 /// When a harness launch fails, the one fact besides the reason that must travel upward:
 /// **whether this failure crossed the OS spawn**.
@@ -898,8 +901,7 @@ impl Proc {
         };
         let mut s = serde_json::to_string(v)?;
         s.push('\n');
-        stdin.write_all(s.as_bytes()).await?;
-        stdin.flush().await?;
+        pipe_input::write(stdin, s.as_bytes()).await?;
         #[cfg(test)]
         if self
             .write_outcome_failures
@@ -1057,6 +1059,47 @@ fn process_group_exists(pgid: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn closed_runtime_input_preserves_default_output_pipe_signals() {
+        const PROBE: &str = "AGIT_TEST_CLOSED_RUNTIME_INPUT";
+        if std::env::var_os(PROBE).is_some() {
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let directory = tempfile::tempdir().unwrap();
+                let mut proc = super::Proc::spawn(
+                    "sh",
+                    &["-c".into(), "exit 0".into()],
+                    &directory.path().to_path_buf(),
+                    &[],
+                )
+                .unwrap();
+                proc.child.wait().await.unwrap();
+                let error = proc
+                    .write_line(&serde_json::json!({"method":"initialize"}))
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::BrokenPipe
+                );
+                proc.shutdown().await.unwrap();
+            });
+            let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            assert_eq!(previous, libc::SIG_DFL);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rc::harness::proc::tests::closed_runtime_input_preserves_default_output_pipe_signals", "--nocapture"])
+            .env(PROBE, "1").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
     use super::*;
 
     /// **A paused clock must not shorten this budget.**

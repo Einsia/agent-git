@@ -51,6 +51,7 @@ pub mod worktree;
 
 // Recording
 pub mod commit;
+pub mod file;
 pub mod memory;
 pub mod tag;
 
@@ -1302,6 +1303,8 @@ pub enum Commands {
     // ── Recording ───────────────────────────────────────────────────
     /// Settle: new content since the last settlement becomes one turn commit per user turn
     Commit(commit::Args),
+    /// Manage ordinary session files: cwd / add / status / diff / commit / list / get / rm / mv
+    File(file::Args),
     /// Name milestones / release versions (pushed tags are immutable)
     Tag(tag::Args),
     /// Memory between the runtime directory, this session branch and main: status / diff / distill / sync
@@ -1392,6 +1395,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Status(_) => "status",
         Commands::Branch(_) => "branch",
         Commands::Commit(_) => "commit",
+        Commands::File(_) => "file",
         Commands::Tag(_) => "tag",
         Commands::Memory(_) => "memory",
         Commands::Distill(_) => "distill",

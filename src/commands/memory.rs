@@ -226,7 +226,7 @@ fn sha(bytes: &[u8]) -> String {
 ///
 /// It goes through plumbing plus an expected-old CAS and, like settlement, never through a real
 /// index; a worktree with this branch checked out is refreshed by
-/// [`super::plumbing::update_branch_cas_and_refresh`].
+/// [`super::plumbing::update_branch_cas_preserving_files`].
 fn commit_memory(
     primary: &Repo,
     branch: &str,
@@ -271,7 +271,7 @@ fn commit_memory_at(
     let tree = super::plumbing::tree_apply_owned(primary, &tip, all)?;
     let commit = super::plumbing::commit_tree(primary, &tree, &[&tip], message)?;
     let checkout = super::worktree::existing(primary, branch)?.unwrap_or_else(|| primary.clone());
-    super::plumbing::update_branch_cas_and_refresh(&checkout, branch, &commit, &tip, true)?;
+    super::plumbing::update_branch_cas_preserving_files(&checkout, branch, &commit, &tip)?;
     Ok(commit)
 }
 
@@ -1505,6 +1505,54 @@ mod tests {
 
     fn mirror(mem: &Path) -> PathBuf {
         mirror_dir(mem, SLUG, "s1")
+    }
+
+    #[test]
+    fn automatic_collection_preserves_explicit_artifact_staging() {
+        let (_d, primary, mem) = fixture();
+        let checkout = super::super::worktree::checkout(&primary, "s1").unwrap();
+        materialize_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        std::fs::create_dir_all(checkout.root().join("artifacts")).unwrap();
+        let artifact = checkout.root().join("artifacts/report.md");
+        std::fs::write(&artifact, "selected version").unwrap();
+        checkout.git(&["add", "artifacts/report.md"]).unwrap();
+        std::fs::write(&artifact, "later draft").unwrap();
+        std::fs::write(mirror(&mem).join("team.md"), "updated memory\n").unwrap();
+        let report = collect_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert!(report.commit.is_some());
+        assert_eq!(
+            file(&primary, "refs/heads/s1", "team.md").unwrap(),
+            "updated memory\n"
+        );
+        assert!(checkout.show("HEAD", "artifacts/report.md").is_none());
+        assert_eq!(
+            checkout
+                .git_bytes_result(&["show", ":artifacts/report.md"])
+                .unwrap(),
+            b"selected version"
+        );
+        assert_eq!(std::fs::read(artifact).unwrap(), b"later draft");
+    }
+
+    #[test]
+    fn automatic_collection_refuses_to_overwrite_staged_memory() {
+        let (_d, primary, mem) = fixture();
+        let checkout = super::super::worktree::checkout(&primary, "s1").unwrap();
+        materialize_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        let path = checkout.root().join("memory/team.md");
+        std::fs::write(&path, "manually selected").unwrap();
+        checkout.git(&["add", "memory/team.md"]).unwrap();
+        let old = checkout.git(&["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(mirror(&mem).join("team.md"), "runtime update\n").unwrap();
+        assert!(collect_with(&primary, "s1", SLUG, &mem, ON).is_err());
+        assert_eq!(checkout.git(&["rev-parse", "HEAD"]).unwrap(), old);
+        assert_eq!(
+            checkout
+                .git_bytes_result(&["show", ":memory/team.md"])
+                .unwrap(),
+            b"manually selected"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"manually selected");
     }
 
     /// Branch memory lands in the runtime directory's per-branch mirror subdirectory and

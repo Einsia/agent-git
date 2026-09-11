@@ -428,6 +428,8 @@ pub fn refresh_storage_checkout(repo: &Repo, old: &str, new: &str) -> Result<()>
 enum CheckoutScope {
     Storage,
     Full,
+    /// Refresh only changed paths, preserving unrelated staged files.
+    Changed,
     /// Publish the first commit of the checked-out branch. The pre-CAS checkout has no commit
     /// endpoint: recovery is therefore forward-only once the expected-absent CAS succeeds.
     Root,
@@ -732,6 +734,26 @@ pub(super) fn prepare_checkout_transaction(
     new: &str,
     refresh_full_index: bool,
 ) -> Result<CheckoutTransaction> {
+    prepare_scoped_checkout_transaction(
+        repo,
+        branch,
+        old,
+        new,
+        if refresh_full_index {
+            CheckoutScope::Full
+        } else {
+            CheckoutScope::Storage
+        },
+    )
+}
+
+fn prepare_scoped_checkout_transaction(
+    repo: &Repo,
+    branch: &str,
+    old: &str,
+    new: &str,
+    scope: CheckoutScope,
+) -> Result<CheckoutTransaction> {
     let lock = lock_checkout_transactions(repo)?;
     recover_interrupted_checkout_locked(repo, &lock)?;
 
@@ -750,11 +772,6 @@ pub(super) fn prepare_checkout_transaction(
         "refusing checkout transaction for {refname}: expected {old}, found {current}"
     );
 
-    let scope = if refresh_full_index {
-        CheckoutScope::Full
-    } else {
-        CheckoutScope::Storage
-    };
     let attributes_layers = prepare_attributes_upgrade(repo, &old, &new, scope)?;
     persist_checkout_transaction(
         repo,
@@ -2103,11 +2120,12 @@ fn prepare_checkout_refresh(
     let wanted: std::collections::BTreeSet<&str> = paths.iter().map(String::as_str).collect();
     let old_files = checkout_tree_entries(repo, old, &wanted, scope)?;
     let new_files = checkout_tree_entries(repo, new, &wanted, scope)?;
-    let index_files = if recovering || matches!(scope, CheckoutScope::Storage) {
-        Some(checkout_index_files(repo, &paths)?)
-    } else {
-        None
-    };
+    let index_files =
+        if recovering || matches!(scope, CheckoutScope::Storage | CheckoutScope::Changed) {
+            Some(checkout_index_files(repo, &paths)?)
+        } else {
+            None
+        };
     let mut snapshot = Vec::with_capacity(paths.len());
     let mut snapshot_bytes = 0usize;
     for path in &paths {
@@ -2227,7 +2245,7 @@ fn checkout_paths(repo: &Repo, old: &str, new: &str, scope: CheckoutScope) -> Re
     let mut paths = std::collections::BTreeSet::new();
     let changed = checkout_changed_paths(repo, old, new)?;
     match scope {
-        CheckoutScope::Full => {
+        CheckoutScope::Full | CheckoutScope::Changed => {
             paths.extend(changed);
         }
         CheckoutScope::Storage => {
@@ -3649,6 +3667,36 @@ pub fn update_branch_cas_and_refresh(
     old: &str,
     refresh_full_index: bool,
 ) -> Result<()> {
+    update_branch_cas_with_scope(
+        repo,
+        branch,
+        new,
+        old,
+        if refresh_full_index {
+            CheckoutScope::Full
+        } else {
+            CheckoutScope::Storage
+        },
+    )
+}
+
+/// Publish changed files while retaining unrelated worktree and index contents.
+pub(super) fn update_branch_cas_preserving_files(
+    repo: &Repo,
+    branch: &str,
+    new: &str,
+    old: &str,
+) -> Result<()> {
+    update_branch_cas_with_scope(repo, branch, new, old, CheckoutScope::Changed)
+}
+
+fn update_branch_cas_with_scope(
+    repo: &Repo,
+    branch: &str,
+    new: &str,
+    old: &str,
+    scope: CheckoutScope,
+) -> Result<()> {
     let refname = format!("refs/heads/{branch}");
     let active = checked_out_branch(repo)?.as_deref() == Some(branch);
     if !active {
@@ -3665,7 +3713,7 @@ pub fn update_branch_cas_and_refresh(
     {
         ensure_v1_upgrade_preflight(repo, old)?;
     }
-    let transaction = prepare_checkout_transaction(repo, branch, old, new, refresh_full_index)?;
+    let transaction = prepare_scoped_checkout_transaction(repo, branch, old, new, scope)?;
     maybe_crash_checkout_at("after_journal");
     if let Err(update_error) = update_ref_cas(repo, &refname, new, Some(old)) {
         return match finish_checkout_transaction(transaction) {

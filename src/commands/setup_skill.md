@@ -16,6 +16,7 @@ Agent repo           = ~/.agit/repos/<owner>/<name>, storing conversation histor
 workspace binding    = a directory's persistent route to one Agent repo
 session branch       = a branch in an Agent repo reserved by one session
 main file line       = AGENTS.md / memory/ / skills/ shared across sessions
+session files       = ordinary files in a branch worktree, including artifacts/
 ```
 
 Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also touches the project code repository; ordinary `agit commit` records the AgentGit conversation repository. Each directory has at most one persisted `bound repo`. Multiple session links may share the same cwd and belong to different repos. Every existing-session operation selects its target through explicit arguments or `AGIT_SESSION`; directory state and native runtime IDs never select a session.
@@ -101,6 +102,39 @@ session and records its claim; it is not a read-only preview.
 | Edit shared files on the file line (README.md, AGENTS.md, memory/, skills/) | `agit commit <owner/repo>@main -m "<msg>" [-- <path>...]` | Pure file commit on `main`; needs no session; publish with `agit push <owner/repo> -b main` |
 | Publish local history | `agit push <owner/repo>@<branch>` | Scans secrets, then publishes existing refs |
 
+## Deliver files at completed milestones
+
+When a milestone is ready, select the deliverables you intend to present to the
+user: documents, PDFs, slides, images, videos, or HTML. Put them in `artifacts/`,
+beside `memory/` and `skills/`, and explicitly stage and commit them:
+
+```bash
+agit file cwd
+agit file add /absolute/path/report.pdf
+agit file diff --staged
+agit file commit -m "Deliver the report"
+agit file link artifacts/report.pdf
+```
+
+`cwd` prints the selected branch's real file directory, where you can read and
+edit files directly. External inputs default to `artifacts/<name>`; `--to` chooses
+another relative path. Use `agit file --into owner/repo@branch` when `AGIT_SESSION`
+is absent. Read `references/commands/file.md` for the complete command set.
+
+Commit only material useful to the user; exclude scratch files, caches and build
+dependencies. Stage the exact version to deliver. A file commit consumes only
+that branch's index and never settles the conversation. Turn settlement and
+automatic memory collection preserve manually staged files. Memory continues to
+be collected automatically; other files require an explicit file commit.
+
+Present the commit-and-path permalink returned by `agit file link`. Publish the
+branch with `agit push` when the user has asked to share it or the workflow already
+authorizes publication; a local file commit alone does not upload anything.
+Keep large media local until the destination supports LFS. Do not commit an LFS
+pointer without uploading its object to a compatible server. For slides, include
+a PDF when browser preview is needed. HTML preview is a static document; use
+inline styles and embedded images, without scripts or external assets.
+
 ## Shared files on the file line
 
 `main` is the file line: it never carries a session, and it is where README.md, AGENTS.md, `memory/` and `skills/` live. Everything `agit new` inherits and everything teammates see when they `agit clone` comes from here. Updating it is a file commit — no `git add`, no session link:
@@ -153,6 +187,7 @@ agit push <owner/repo> -b main                         # publish the file line
 | Command | Meaning |
 |---|---|
 | `commit` | Record turn or shared-file changes in the Agent repo; `--code` also commits the code repo |
+| `file` | Read, stage and explicitly commit ordinary branch files, and generate immutable Hub links |
 | `memory` | Memory between the runtime directory, this session branch and `main`: `status` / `diff` / `distill` / `sync` |
 | `distill` | Promote selected memory files from a session branch into the shared `main` file line |
 | `tag` | Name a ref with a version tag |

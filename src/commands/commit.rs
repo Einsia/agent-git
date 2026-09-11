@@ -2490,6 +2490,60 @@ fn file_commit(
     paths: &[String],
     quiet: bool,
 ) -> CmdResult {
+    file_commit_with_staging(
+        repo,
+        slug,
+        branch,
+        expected_tip,
+        head_meta,
+        msg,
+        paths,
+        quiet,
+        true,
+    )
+}
+
+/// Commit the session worktree index without reading or settling its runtime transcript.
+pub(super) fn commit_staged_files(repo: &Repo, slug: &str, branch: &str, msg: &str) -> CmdResult {
+    anyhow::ensure!(
+        !msg.trim().is_empty(),
+        "a file commit requires a non-empty message"
+    );
+    let tip = repo.git(&[
+        "rev-parse",
+        "--verify",
+        &format!("refs/heads/{branch}^{{commit}}"),
+    ])?;
+    let head = meta::read_at_ref_result(repo, tip.trim())?;
+    anyhow::ensure!(
+        head.is_some(),
+        "the selected branch has no AgentGit metadata"
+    );
+    file_commit_with_staging(
+        repo,
+        slug,
+        branch,
+        Some(tip.trim()),
+        &head,
+        msg,
+        &[],
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn file_commit_with_staging(
+    repo: &Repo,
+    slug: &str,
+    branch: &str,
+    expected_tip: Option<&str>,
+    head_meta: &Option<Meta>,
+    msg: &str,
+    paths: &[String],
+    quiet: bool,
+    stage_worktree: bool,
+) -> CmdResult {
     // Validate literal pathspecs before any normalization or staging. Ancestor pathspecs are
     // allowed and are sanitized after `git add`, just as ordinary `git commit` would stage them.
     let layout = head_meta
@@ -2519,6 +2573,7 @@ fn file_commit(
         paths,
         quiet,
         layout,
+        stage_worktree,
     );
     match result {
         Ok(FileCommitOutcome::Published) => Ok(ExitCode::Ok),
@@ -3094,6 +3149,7 @@ fn file_commit_inner(
     paths: &[String],
     quiet: bool,
     layout: meta::LayoutVersion,
+    stage_worktree: bool,
 ) -> crate::Result<FileCommitOutcome> {
     // V1 owns only the marked AgentGit blocks, not the whole shared attributes file. Normalize
     // those blocks before any git add so user rules can be committed while malformed/symlinked
@@ -3101,9 +3157,9 @@ fn file_commit_inner(
     if layout == meta::LayoutVersion::V1 {
         storage::ensure_attributes(repo.root())?;
     }
-    if paths.is_empty() {
+    if stage_worktree && paths.is_empty() {
         repo.git(&["add", "-A", "--", "."])?;
-    } else {
+    } else if stage_worktree {
         for p in paths {
             repo.git(&["add", "--", p])?;
         }
@@ -3166,6 +3222,7 @@ fn file_commit_inner(
     let expected_meta = if let Some(tip) = head_meta {
         let mut m = tip.clone();
         m.kind = Kind::File;
+        m.milestone = None;
         let expected = meta::to_text(&m)?.into_bytes();
         meta::write(repo.root(), &m)?;
         repo.git(&["add", "--", meta::FILE])?;
@@ -3624,6 +3681,82 @@ mod tests {
             paths: vec![],
             quiet: false,
         }
+    }
+
+    #[test]
+    fn explicit_files_and_turn_settlement_preserve_each_others_pending_work() {
+        let (_d, store) = store();
+        let (_h, repo) = setup_repo();
+        let first = format!(
+            "{META}\n{}{}",
+            codex_user("make a report"),
+            codex_asst("ready")
+        );
+        settle_bytes(
+            &store,
+            &repo,
+            "alice/photo",
+            "main",
+            link(),
+            first.as_bytes(),
+            "alice",
+            opts(),
+            true,
+            false,
+        )
+        .unwrap();
+        let before = storage::materialize_pair_at(repo.root(), "HEAD").unwrap();
+        std::fs::write(repo.root().join("report.md"), "staged report\n").unwrap();
+        repo.git(&["add", "--", "report.md"]).unwrap();
+        std::fs::write(repo.root().join("report.md"), "later draft\n").unwrap();
+        std::fs::write(repo.root().join("untracked.md"), "not selected\n").unwrap();
+        commit_staged_files(&repo, "alice/photo", "main", "publish report").unwrap();
+        assert_eq!(repo.show("HEAD", "report.md").unwrap(), "staged report");
+        assert!(repo.show("HEAD", "untracked.md").is_none());
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("report.md")).unwrap(),
+            "later draft\n"
+        );
+        let after = storage::materialize_pair_at(repo.root(), "HEAD").unwrap();
+        assert_eq!(after, before);
+        let file_meta = meta::read_at_ref(&repo, "HEAD").unwrap();
+        assert_eq!(file_meta.kind, Kind::File);
+        assert_eq!(file_meta.turn, Some(1));
+        assert!(!file_meta.is_file_line());
+
+        repo.git(&["add", "--", "report.md"]).unwrap();
+        std::fs::write(repo.root().join("report.md"), "uncommitted final draft\n").unwrap();
+        let second = format!(
+            "{first}{}{}",
+            codex_user("revise it"),
+            codex_asst("revised")
+        );
+        settle_bytes(
+            &store,
+            &repo,
+            "alice/photo",
+            "main",
+            link(),
+            second.as_bytes(),
+            "alice",
+            opts(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(repo.show("HEAD", "report.md").unwrap(), "staged report");
+        assert_eq!(
+            repo.git_bytes_result(&["show", ":report.md"]).unwrap(),
+            b"later draft\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("report.md")).unwrap(),
+            "uncommitted final draft\n"
+        );
+        assert_eq!(meta::read_at_ref(&repo, "HEAD").unwrap().turn, Some(2));
+        commit_staged_files(&repo, "alice/photo", "main", "publish revision").unwrap();
+        assert_eq!(repo.show("HEAD", "report.md").unwrap(), "later draft");
+        assert_eq!(meta::read_at_ref(&repo, "HEAD").unwrap().turn, Some(2));
     }
 
     fn setup_repo() -> (tempfile::TempDir, Repo) {
