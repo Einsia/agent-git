@@ -1324,6 +1324,100 @@ mod unix {
         assert_eq!(hub.finish().len(), 2);
     }
 
+    /// A remote left behind by interrupted publication remains usable without local pin state.
+    #[test]
+    fn ordinary_push_retries_existing_remotes_without_adopting_cached_identity() {
+        for cached in [None, Some("stale"), Some("malformed")] {
+            let lab = Lab::new();
+            let bare = lab.home.join("remote.git");
+            fs::create_dir_all(&bare).unwrap();
+            lab.git(&bare, &["init", "--bare", "--quiet"]);
+            let hub = Hub::new(|_| {
+                (0..2)
+                    .map(|_| Step {
+                        method: "GET",
+                        target: "/api/agents/me/qa".into(),
+                        bearer: Some(OLD_ACCESS),
+                        status: 200,
+                        response: json!({"agent_id": AGENT_ID, "owner": "me", "name": "qa",
+                    "clone_url": bare.to_str().unwrap(), "visibility": "private"}),
+                        after_response: None,
+                    })
+                    .collect()
+            });
+            lab.seed_credentials(&hub.base, false);
+            let repo = lab.initialize_repo(&hub.base);
+            lab.git(
+                &repo,
+                &["config", "--local", "--unset", "agit.remoteIdentity"],
+            );
+            lab.git(&repo, &["remote", "remove", "origin"]);
+            if let Some(cached) = cached {
+                let pin = if cached == "malformed" {
+                    "invalid-json".into()
+                } else {
+                    json!({"hub":hub.base,"agent_id":"22222222-2222-4222-8222-222222222222"})
+                        .to_string()
+                };
+                lab.git(&repo, &["config", "--local", "agit.remoteIdentity", &pin]);
+                lab.git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+            }
+            let local_repo = agit::domain::repo::Repo::at(&repo);
+            let pin_before =
+                local_repo.git_opt(&["config", "--local", "--get", "agit.remoteIdentity"]);
+            let head = lab.git(&repo, &["rev-parse", "main"]);
+            for _ in 0..2 {
+                lab.json(&hub.base, &["--json", "push", "me/qa", "-b", "main"], 0);
+                assert_eq!(lab.git(&bare, &["rev-parse", "refs/heads/main"]), head);
+                assert_eq!(
+                    local_repo.git_opt(&["config", "--local", "--get", "agit.remoteIdentity"]),
+                    pin_before
+                );
+            }
+            assert_eq!(hub.finish().len(), 2);
+        }
+    }
+
+    #[test]
+    fn supervised_push_does_not_adopt_a_recreated_remote() {
+        for pinned in [false, true] {
+            let lab = Lab::new();
+            let hub = Hub::new(|_| {
+                if pinned {
+                    vec![Step {
+                        method: "GET",
+                        target: "/api/agents/me/qa".into(),
+                        bearer: Some(OLD_ACCESS),
+                        status: 200,
+                        response: json!({"agent_id":"22222222-2222-4222-8222-222222222222",
+                    "owner":"me", "name":"qa", "clone_url":"unused", "visibility":"private"}),
+                        after_response: None,
+                    }]
+                } else {
+                    vec![]
+                }
+            });
+            lab.seed_credentials(&hub.base, false);
+            let repo = lab.initialize_repo(&hub.base);
+            lab.git(&repo, &["remote", "remove", "origin"]);
+            if !pinned {
+                lab.git(
+                    &repo,
+                    &["config", "--local", "--unset", "agit.remoteIdentity"],
+                );
+            }
+            let refs = lab.git(&repo, &["show-ref"]);
+            let config = fs::read(repo.join(".git/config")).unwrap();
+            let mut command = lab.command(&hub.base, &["--json", "push", "me/qa", "-b", "main"]);
+            command.env("AGIT_EXPECTED_AGENT_ID", AGENT_ID);
+            let output = run_bounded(command);
+            assert!(!output.status.success(), "{output:?}");
+            assert_eq!(lab.git(&repo, &["show-ref"]), refs);
+            assert_eq!(fs::read(repo.join(".git/config")).unwrap(), config);
+            assert_eq!(hub.finish().len(), usize::from(pinned));
+        }
+    }
+
     #[test]
     fn pinned_push_keeps_the_terminal_error_source_through_its_context() {
         let lab = Lab::new();
@@ -1348,11 +1442,6 @@ mod unix {
         let value = lab.json(&hub.base, &["--json", "push", "me/qa", "-b", "main"], 5);
         lab.assert_login(&value, &hub.base);
         assert!(value.to_string().contains("synthetic terminal pinned push"));
-        assert!(
-            value
-                .to_string()
-                .contains("refusing to create a replacement")
-        );
         assert!(!value.to_string().contains("synthetic ignored push probe"));
         assert_eq!(lab.git(&repo, &["show-ref"]), refs_before);
         assert_eq!(fs::read(repo.join(".git/config")).unwrap(), config_before);

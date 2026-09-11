@@ -1071,7 +1071,13 @@ fn file_merge_runtime_probe() {
         return;
     };
     let repo = Repo::open(std::env::var_os("ARCHIVE_REPO").unwrap()).unwrap();
-    let cwd = PathBuf::from(std::env::var_os("ARCHIVE_CWD").unwrap());
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(
+        cwd,
+        PathBuf::from(std::env::var_os("ARCHIVE_CWD").unwrap())
+            .canonicalize()
+            .unwrap()
+    );
     let tx = mergetx::read(repo.root()).unwrap().unwrap();
     let binding = tx.exploration.as_ref().unwrap();
     assert_eq!(tx.mode, Some(mergetx::Mode::FileAgent));

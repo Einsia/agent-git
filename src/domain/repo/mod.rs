@@ -1424,7 +1424,7 @@ impl Repo {
         policy: ReadPolicy,
         mut on_object: impl FnMut(&str, &str, ObjectBody<'_>) -> Result<()>,
     ) -> Result<()> {
-        use std::io::{Read, Write};
+        use std::io::Read;
         if oids.is_empty() {
             return Ok(());
         }
@@ -1489,19 +1489,7 @@ impl Repo {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
-        let writer = std::thread::spawn(move || {
-            let mut w = std::io::BufWriter::new(stdin);
-            for oid in &eligible {
-                // A failed write only means the far side has gone (we killed it, or it exited
-                // on its own) — the reading side gives the real verdict, so this side just
-                // finishes quietly.
-                if w.write_all(oid.as_bytes()).is_err() || w.write_all(b"\n").is_err() {
-                    return;
-                }
-            }
-            let _ = w.flush();
-            // w is dropped here → stdin closes → git exits after reading EOF.
-        });
+        let writer = spawn_cat_file_writer(stdin, eligible);
 
         let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut chunk = [0u8; 64 * 1024];
@@ -1614,11 +1602,12 @@ impl Repo {
             let _ = child.kill();
         }
         // After the kill, the write in the writer thread gets EPIPE and returns; it does not hang.
-        let _ = writer.join();
+        let written = writer.join();
         let status = child.wait()?;
         if let Some(e) = fail {
             return Err(e);
         }
+        written.map_err(|_| anyhow::anyhow!("Git input writer panicked"))??;
         if !status.success() {
             anyhow::bail!("git cat-file --batch failed");
         }
@@ -1652,7 +1641,6 @@ impl Repo {
         policy: ReadPolicy,
         mut on_object: impl FnMut(&str, &str, u64) -> Result<()>,
     ) -> Result<()> {
-        use std::io::Write;
         if oids.is_empty() {
             return Ok(());
         }
@@ -1673,15 +1661,7 @@ impl Repo {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
-        let writer = std::thread::spawn(move || {
-            let mut w = std::io::BufWriter::new(stdin);
-            for oid in &oids {
-                if w.write_all(oid.as_bytes()).is_err() || w.write_all(b"\n").is_err() {
-                    return;
-                }
-            }
-            let _ = w.flush();
-        });
+        let writer = spawn_cat_file_writer(stdin, oids);
 
         // This path's output is only hex, type names and decimal digits, so splitting by line is
         // unambiguous — the reason the body path has to frame by length (a body may contain any
@@ -1710,11 +1690,12 @@ impl Repo {
         if fail.is_some() {
             let _ = child.kill();
         }
-        let _ = writer.join();
+        let written = writer.join();
         let status = child.wait()?;
         if let Some(e) = fail {
             return Err(e);
         }
+        written.map_err(|_| anyhow::anyhow!("Git input writer panicked"))??;
         if !status.success() {
             anyhow::bail!("git cat-file --batch-check failed");
         }
@@ -2411,8 +2392,91 @@ impl LocalWorktreeRecord {
     }
 }
 
+/// Bounded readers can close Git input early without changing the CLI output-pipe disposition.
+fn spawn_cat_file_writer(
+    stdin: std::process::ChildStdin,
+    oids: Vec<String>,
+) -> std::thread::JoinHandle<Result<()>> {
+    std::thread::spawn(move || {
+        use std::io::Write;
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::fd::AsRawFd;
+            const F_SETNOSIGPIPE: libc::c_int = 73;
+            // Darwin delivers pipe signals to the process, so suppression belongs to this pipe.
+            if unsafe { libc::fcntl(stdin.as_raw_fd(), F_SETNOSIGPIPE, 1) } == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("could not suppress the Git input pipe's signal");
+            }
+        }
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        {
+            // The mask belongs to this dedicated writer; pending pipe signals die with its thread.
+            let result = unsafe {
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut mask);
+                libc::sigaddset(&mut mask, libc::SIGPIPE);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut())
+            };
+            if result != 0 {
+                return Err(std::io::Error::from_raw_os_error(result))
+                    .context("could not block the Git input writer's pipe signal");
+            }
+        }
+        let mut writer = std::io::BufWriter::new(stdin);
+        for oid in &oids {
+            if writer.write_all(oid.as_bytes()).is_err() || writer.write_all(b"\n").is_err() {
+                return Ok(());
+            }
+        }
+        let _ = writer.flush();
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Cancelling a bounded Git read must return the reader error without terminating the CLI.
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_cat_file_reads_preserve_default_output_pipe_signals() {
+        const PROBE: &str = "AGIT_TEST_CAT_FILE_PIPE_STOP";
+        if let Ok(mode) = std::env::var(PROBE) {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = Repo::init(directory.path()).unwrap();
+            std::fs::write(directory.path().join("blob"), "bounded read fixture").unwrap();
+            let oid = repo.git(&["hash-object", "-w", "blob"]).unwrap();
+            let oids = vec![oid.trim().to_string(); 100_000];
+            // The isolated child uses the CLI signal disposition while its output is captured.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
+            let result = if mode == "body" {
+                repo.git_cat_file_batch(oids, usize::MAX, |_, _, _| {
+                    anyhow::bail!("controlled reader stop")
+                })
+            } else {
+                repo.git_cat_file_batch_check(oids, |_, _, _| {
+                    anyhow::bail!("controlled reader stop")
+                })
+            };
+            assert_eq!(result.unwrap_err().to_string(), "controlled reader stop");
+            let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            assert_eq!(
+                previous,
+                libc::SIG_DFL,
+                "Git input must not change output signal handling"
+            );
+            return;
+        }
+        for mode in ["body", "header"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "domain::repo::tests::cancelled_cat_file_reads_preserve_default_output_pipe_signals", "--nocapture"])
+                .env(PROBE, mode).output().unwrap();
+            assert!(output.status.success(), "{mode}: {output:?}");
+        }
+    }
 
     #[cfg(windows)]
     #[test]

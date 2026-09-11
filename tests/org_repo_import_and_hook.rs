@@ -22,8 +22,8 @@ const QA_AGENT_ID: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 
 /// A fake hub that answers the way the hub does: `einsia/qa` exists and is writable (once the
 /// `gate_closed` file appears the write gate answers 404 instead — simulating a revoked grant;
-/// whoever may write must still pass the identity fence: no Expected-Agent-Id is 428, a wrong one
-/// is 412); `einsia/locked` exists and its write gate answers 404 (the hub gives one answer for
+/// a supplied expected identity must match); `einsia/locked` exists and its write gate denies
+/// access (the hub gives one answer for
 /// both "exists but not writable" and "does not exist"); `einsia/fresh` does not exist and I am
 /// the owner of `einsia`; `acme/ghost` does not exist and I am only a plain member of `acme`.
 /// Serves until the process ends.
@@ -138,14 +138,10 @@ fn fake_hub(
                         .then(|| v.trim().to_string())
                 });
                 match expected.as_deref() {
-                    Some(QA_AGENT_ID) => ("200 OK", "0000".to_string()),
+                    Some(QA_AGENT_ID) | None => ("200 OK", "0000".to_string()),
                     Some(_) => (
                         "412 Precondition Failed",
                         r#"{"error":"this repository name now refers to a different Agent identity","kind":"identity_precondition_failed"}"#.to_string(),
-                    ),
-                    None => (
-                        "428 Precondition Required",
-                        r#"{"error":"pushes require an immutable Agent identity; upgrade agit and retry","kind":"identity_precondition_required"}"#.to_string(),
                     ),
                 }
             } else {

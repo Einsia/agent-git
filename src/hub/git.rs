@@ -22,8 +22,8 @@
 //! * `git -c http.extraHeader=...` puts the token in argv, where any user on the same machine
 //!   sees it with `ps`.
 //! * An environment variable is visible only to this one subprocess and is gone once the process
-//!   exits, leaving no credential on disk. The immutable `agent_id` itself persists separately as
-//!   a repo-local pin; it is not a secret.
+//!   exits, leaving no credential on disk. Supervised work can retain an immutable `agent_id`
+//!   in a repository-local pin; that identifier is not a secret.
 //!
 //! [`redact_url`] stays regardless: a user may have configured a URL with credentials by hand,
 //! and the credentials have to come off before we print it.
@@ -80,7 +80,7 @@ fn transport_command() -> Command {
 /// Inherited Git parameters retain their bytes and precedence; transport guards follow them.
 fn transport_env(
     token: Option<&str>,
-    expected_agent_id: &str,
+    expected_agent_id: Option<&str>,
     urls: &[String],
 ) -> Vec<(String, OsString)> {
     let inherited = std::env::var_os("GIT_CONFIG_PARAMETERS");
@@ -106,7 +106,7 @@ fn quote_git_parameter(value: &str) -> String {
 fn transport_env_after(
     inherited: Option<&OsStr>,
     token: Option<&str>,
-    expected_agent_id: &str,
+    expected_agent_id: Option<&str>,
     urls: &[String],
 ) -> Vec<(String, OsString)> {
     let mut settings = vec![("http.extraHeader".to_string(), String::new())];
@@ -116,13 +116,15 @@ fn transport_env_after(
         if let Some(token) = token {
             settings.push((key.clone(), format!("Authorization: Bearer {token}")));
         }
-        settings.push((
-            key,
-            format!(
-                "{}: {expected_agent_id}",
-                super::identity::EXPECTED_AGENT_ID_HEADER
-            ),
-        ));
+        if let Some(expected_agent_id) = expected_agent_id {
+            settings.push((
+                key,
+                format!(
+                    "{}: {expected_agent_id}",
+                    super::identity::EXPECTED_AGENT_ID_HEADER
+                ),
+            ));
+        }
         settings.push((format!("http.{url}.followRedirects"), "false".into()));
     }
     let mut parameters = inherited.unwrap_or_default().to_os_string();
@@ -141,7 +143,7 @@ fn transport_env_after(
 struct TransportIdentity {
     client: Option<super::Client>,
     urls: Vec<String>,
-    agent_id: String,
+    agent_id: Option<String>,
 }
 
 impl TransportIdentity {
@@ -149,6 +151,15 @@ impl TransportIdentity {
         dir: Option<&Path>,
         args: &[&str],
         identity: &super::identity::RemoteIdentity,
+    ) -> Result<Self> {
+        Self::for_hub(dir, args, &identity.hub, Some(&identity.agent_id))
+    }
+
+    fn for_hub(
+        dir: Option<&Path>,
+        args: &[&str],
+        hub: &str,
+        agent_id: Option<&str>,
     ) -> Result<Self> {
         let command_index = args
             .iter()
@@ -181,8 +192,8 @@ impl TransportIdentity {
             explicit_destination(&repo, requested)?
         };
         for (original, effective) in destinations {
-            let original_scope = require_transport_url(&original, identity)?;
-            let effective_scope = require_transport_url(&effective, identity)?;
+            let original_scope = require_transport_hub(&original, hub)?;
+            let effective_scope = require_transport_hub(&effective, hub)?;
             if original_scope.is_some()
                 && let Some(url) = effective_scope
             {
@@ -197,11 +208,11 @@ impl TransportIdentity {
             urls.is_empty() || !unauthenticated,
             "a Git remote cannot mix authenticated Hub URLs with other transports"
         );
-        let client = (!urls.is_empty()).then(|| super::Client::for_stored_hub(&identity.hub));
+        let client = (!urls.is_empty()).then(|| super::Client::for_stored_hub(hub));
         Ok(Self {
             client,
             urls,
-            agent_id: identity.agent_id.clone(),
+            agent_id: agent_id.map(str::to_string),
         })
     }
 
@@ -222,7 +233,7 @@ impl TransportIdentity {
     fn environment(&self) -> Result<Vec<(String, OsString)>> {
         Ok(transport_env(
             self.token()?.as_deref(),
-            &self.agent_id,
+            self.agent_id.as_deref(),
             &self.urls,
         ))
     }
@@ -303,12 +314,27 @@ impl Outcome {
 
 /// Run a git command that needs authentication.
 ///
-/// The identity is read from the repo-local pin, so a caller has no chance to forget the fencing
-/// id on some fetch/push.
+/// The current Hub scopes credentials; a supervised process also constrains the remote ID.
 pub fn run(repo: &Repo, args: &[&str]) -> Result<Outcome> {
-    let identity =
-        super::identity::require_current_expected(repo, &crate::infra::config::hub_url())?;
-    run_for_identity(Some(repo.root()), args, &identity)
+    let hub = crate::infra::config::hub_url();
+    let expected = super::identity::expected_for_transport(repo, &hub)?;
+    let transport = TransportIdentity::for_hub(
+        Some(repo.root()),
+        args,
+        &hub,
+        expected.as_ref().map(|identity| identity.agent_id.as_str()),
+    )?;
+    run_transport(Some(repo.root()), args, transport)
+}
+
+/// Keep the target selected for this operation fixed across branch and tag requests.
+pub fn run_for_remote(
+    repo: &Repo,
+    args: &[&str],
+    identity: &super::identity::RemoteIdentity,
+) -> Result<Outcome> {
+    super::identity::verify_transport_target(repo, identity)?;
+    run_for_identity(Some(repo.root()), args, identity)
 }
 
 fn run_for_identity(
@@ -317,6 +343,14 @@ fn run_for_identity(
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Outcome> {
     let transport = TransportIdentity::new(dir, args, identity)?;
+    run_transport(dir, args, transport)
+}
+
+fn run_transport(
+    dir: Option<&Path>,
+    args: &[&str],
+    transport: TransportIdentity,
+) -> Result<Outcome> {
     if transport
         .client
         .as_ref()
@@ -581,22 +615,26 @@ fn require_transport_url(
     url: &str,
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Option<String>> {
+    require_transport_hub(url, &identity.hub)
+}
+
+fn require_transport_hub(url: &str, hub: &str) -> Result<Option<String>> {
     let scheme = url.split(':').next().unwrap_or_default();
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return Ok(None);
     }
-    checked_transport_path(&identity.hub)?;
+    checked_transport_path(hub)?;
     checked_transport_path(url)?;
-    let authority = crate::infra::hub_authority::HubAuthority::parse(&identity.hub)?;
+    let authority = crate::infra::hub_authority::HubAuthority::parse(hub)?;
     anyhow::ensure!(
         authority.matches(url),
-        "the Git destination does not belong to the pinned Hub"
+        "the Git destination does not belong to the configured Hub"
     );
-    let hub = super::identity::normalize_hub(&identity.hub)?;
+    let hub = super::identity::normalize_hub(hub)?;
     let destination = super::identity::normalize_hub(url)?;
     anyhow::ensure!(
         destination.starts_with(&format!("{hub}/")),
-        "the Git destination does not belong to the pinned Hub"
+        "the Git destination does not belong to the configured Hub"
     );
     Ok(Some(destination))
 }
@@ -809,7 +847,7 @@ mod tests {
         let environment = transport_env_after(
             Some(inherited),
             Some("synthetic-token"),
-            "00000000-0000-0000-0000-000000000001",
+            Some("00000000-0000-0000-0000-000000000001"),
             &["https://hub.example.test/alice/notes.git".into()],
         );
         assert_eq!(environment.len(), 1);
@@ -944,7 +982,7 @@ mod tests {
         let e = transport_env_after(
             None,
             Some("s3cret"),
-            "00000000-0000-0000-0000-000000000001",
+            Some("00000000-0000-0000-0000-000000000001"),
             &["https://hub.example.test/alice/notes.git".into()],
         );
         assert!(
@@ -1238,6 +1276,7 @@ mod git_credential_lifecycle_tests {
             let empty_config = persistent_git_configuration();
             let mut settings: Vec<(String, Option<OsString>)> = [
                 "AGIT_HUB_URL",
+                "AGIT_EXPECTED_AGENT_ID",
                 "AGIT_QUIET",
                 "GIT_CONFIG",
                 "GIT_CONFIG_PARAMETERS",
@@ -1617,6 +1656,36 @@ mod git_credential_lifecycle_tests {
             identity.then_some(AGENT_ID)
         );
         assert!(request.body.is_empty());
+    }
+
+    #[test]
+    fn ordinary_transport_authenticates_without_a_persistent_pin() {
+        for stored in [None, Some("stale"), Some("malformed")] {
+            let home = IsolatedHome::new();
+            let hub = FakeHub::new(|_| advertisement());
+            config::set_global("hub.url", Some(&hub.base)).unwrap();
+            credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+            let repo = crate::domain::repo::Repo::init(home.workspace()).unwrap();
+            if let Some(stored) = stored {
+                let pin = if stored == "malformed" {
+                    "invalid-json".into()
+                } else {
+                    serde_json::to_string(
+                        &RemoteIdentity::new(&hub.base, "00000000-0000-0000-0000-000000000002")
+                            .unwrap(),
+                    )
+                    .unwrap()
+                };
+                repo.git(&["config", "--local", "agit.remoteIdentity", &pin])
+                    .unwrap();
+            }
+            let url = format!("{}/alice/example.git", hub.base);
+            let args = ["-c", "protocol.version=0", "ls-remote", &url];
+            assert!(super::run(&repo, &args).unwrap().ok());
+            let requests = hub.finish();
+            assert_eq!(requests.len(), 1);
+            assert_git_request(&requests[0], Some("fake-alice-access"), false);
+        }
     }
 
     #[test]
@@ -2079,7 +2148,7 @@ mod git_credential_lifecycle_tests {
             .envs(super::transport_env_after(
                 Some(inherited),
                 Some(token),
-                AGENT_ID,
+                Some(AGENT_ID),
                 &[url.into()],
             ))
             .output()
@@ -2143,7 +2212,7 @@ mod git_credential_lifecycle_tests {
         let environment = super::transport_env_after(
             Some(&inherited),
             Some("synthetic"),
-            AGENT_ID,
+            Some(AGENT_ID),
             &[url.into()],
         );
         assert!(

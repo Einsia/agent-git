@@ -343,7 +343,11 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         // Fast-forward only. Divergence does no text merge — that interleaves two sessions' lines
         // and breaks the message chain, producing a syntactically valid but semantically corrupt
         // transcript.
-        let out = match crate::hub::git::run(&store, &["fetch", "origin", "--tags"]) {
+        let out = match crate::hub::git::run_for_remote(
+            &store,
+            &["fetch", "origin", "--tags"],
+            &plan.identity,
+        ) {
             Ok(out) => out,
             Err(error) => return local_transport_failure(error),
         };
@@ -694,74 +698,21 @@ impl Plan {
         existed: bool,
         adopt_legacy_agent_id: Option<&str>,
     ) -> crate::Result<()> {
-        if existed {
-            // A GET on the current slug cannot vouch for a legacy checkout: a name can be
-            // deleted and reused. An existing repo must already carry a pin, and that pin must
-            // agree with this API answer.
-            match (identity::read(repo)?, adopt_legacy_agent_id) {
-                (Some(_), Some(_)) => anyhow::bail!(
-                    "this checkout already has an immutable remote identity; re-run without `--adopt-legacy-agent-id`"
-                ),
-                (Some(pinned), None) => {
-                    if pinned.hub != self.identity.hub {
-                        anyhow::bail!(
-                            "this checkout belongs to {}, but the current hub is {}; refusing to send it to a different hub",
-                            pinned.hub,
-                            self.identity.hub
-                        );
-                    }
-                    if pinned != self.identity {
-                        anyhow::bail!(
-                            "the remote name now identifies agent {}, but this checkout is pinned to {}; refusing to adopt a reused slug",
-                            self.identity.agent_id,
-                            pinned.agent_id
-                        );
-                    }
-                }
-                (None, None) => anyhow::bail!(
-                    "this legacy checkout has no immutable remote identity, so owner/name cannot prove what it belongs to.
-  verify the current agent ID, then explicitly preserve this checkout with:
-    agit clone {}/{} --adopt-legacy-agent-id {}",
+        identity::verify_transport_target(repo, &self.identity)?;
+        if let Some(supplied) = adopt_legacy_agent_id {
+            let explicit = RemoteIdentity::new(&self.identity.hub, supplied)
+                .context("invalid --adopt-legacy-agent-id")?;
+            if explicit != self.identity {
+                anyhow::bail!(
+                    "--adopt-legacy-agent-id names agent {}, but {}/{} currently identifies {}; refusing to adopt a same-name replacement",
+                    explicit.agent_id,
                     self.owner,
                     self.name,
                     self.identity.agent_id
-                ),
-                (None, Some(supplied)) => {
-                    let explicit = RemoteIdentity::new(&self.identity.hub, supplied)
-                        .context("invalid --adopt-legacy-agent-id")?;
-                    if explicit != self.identity {
-                        anyhow::bail!(
-                            "--adopt-legacy-agent-id names agent {}, but {}/{} currently identifies {}; refusing to adopt a same-name replacement",
-                            explicit.agent_id,
-                            self.owner,
-                            self.name,
-                            self.identity.agent_id
-                        );
-                    }
-                    let origin = repo.remote_url().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "this existing checkout has no origin, so it is not eligible for legacy adoption"
-                        )
-                    })?;
-                    if !super::same_hub(&origin, &self.identity.hub)
-                        || super::remote_slug(&origin)
-                            != Some((self.owner.clone(), self.name.clone()))
-                    {
-                        anyhow::bail!(
-                            "this checkout's origin ({}) is not {}/{} on {}; refusing to attach an unrelated repository",
-                            crate::hub::git::redact_url(&origin),
-                            self.owner,
-                            self.name,
-                            self.identity.hub
-                        );
-                    }
-                    identity::pin(repo, &explicit)?;
-                }
+                );
             }
-        } else {
-            // Pin before URL: a failure part-way leaves at most "pinned, no origin yet", which
-            // is safe to retry; the other order leaves a checkout that looks usable but has no
-            // fencing identity.
+            identity::pin(repo, &explicit)?;
+        } else if !existed {
             identity::pin(repo, &self.identity)?;
         }
         repo.set_remote(&self.origin)?;
@@ -1570,12 +1521,7 @@ mod tests {
             promoted_in_place: false,
         };
 
-        let ordinary = plan
-            .apply_remotes(&repo, true, None)
-            .unwrap_err()
-            .to_string();
-        assert!(ordinary.contains("--adopt-legacy-agent-id"), "{ordinary}");
-        assert!(ordinary.contains(&current.agent_id), "{ordinary}");
+        plan.apply_remotes(&repo, true, None).unwrap();
         assert_eq!(identity::read(&repo).unwrap(), None);
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), local_head);
 
@@ -1600,6 +1546,40 @@ mod tests {
             std::fs::read_to_string(repo.root().join("local-only.txt")).unwrap(),
             "not pushed\n"
         );
+    }
+
+    #[test]
+    fn an_explicit_clone_preserves_local_refs_and_retained_identity() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = Repo::init(d.path()).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(repo.root().join("local-only.txt"), "retained local work\n").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("retain local work").unwrap();
+        let old = RemoteIdentity::new(
+            "https://old-hub.test",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .unwrap();
+        identity::pin(&repo, &old).unwrap();
+        let plan = Plan {
+            owner: "me".into(),
+            name: "photo".into(),
+            origin: "https://hub.test/me/photo.git".into(),
+            identity: RemoteIdentity::new(
+                "https://hub.test",
+                "00000000-0000-0000-0000-000000000002",
+            )
+            .unwrap(),
+            upstream: None,
+            writable: true,
+            promoted_in_place: false,
+        };
+        let refs = repo.git(&["for-each-ref"]).unwrap();
+        plan.apply_remotes(&repo, true, None).unwrap();
+        assert_eq!(repo.remote_url().as_deref(), Some(plan.origin.as_str()));
+        assert_eq!(identity::read(&repo).unwrap(), Some(old));
+        assert_eq!(repo.git(&["for-each-ref"]).unwrap(), refs);
     }
 
     #[test]

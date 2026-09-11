@@ -83,12 +83,20 @@ pub fn run(args: Args) -> CmdResult {
 
     // 1. fetch.
     let client = crate::hub::Client::from_env();
-    if let Err(e) = crate::hub::identity::verify_slug(&repo, &client, &owner, &name) {
-        super::fix::register_terminal_api_error(&e);
-        ui::error(&format!("refusing to fetch: {e:#}"));
-        return Ok(super::terminal_error_code(&e, ExitCode::Precondition));
-    }
-    let out = crate::hub::git::run(&repo, &["fetch", "origin", "--prune", "--tags"])?;
+    let identity =
+        match crate::hub::identity::resolve_transport_target(&repo, &client, &owner, &name) {
+            Ok(identity) => identity,
+            Err(e) => {
+                super::fix::register_terminal_api_error(&e);
+                ui::error(&format!("refusing to fetch: {e:#}"));
+                return Ok(super::terminal_error_code(&e, ExitCode::Precondition));
+            }
+        };
+    let out = crate::hub::git::run_for_remote(
+        &repo,
+        &["fetch", "origin", "--prune", "--tags"],
+        &identity,
+    )?;
     if !out.ok() {
         ui::error(&format!("fetch failed: {}", out.stderr.trim()));
         ui::hint("network or auth. Check credentials with `agit whoami --check`");

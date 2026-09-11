@@ -554,6 +554,7 @@ pub fn publish_destination(
     let unknown = || PublishDestination {
         scan: secrets::Destination::Unknown,
         tags: Default::default(),
+        identity: None,
     };
     let Some(url) = repo.remote_url() else {
         return unknown();
@@ -567,9 +568,13 @@ pub fn publish_destination(
         return unknown();
     };
     let client = crate::hub::Client::from_env();
-    if crate::hub::identity::verify_slug(repo, &client, owner, agent).is_err() {
+    let Ok(remote) = crate::hub::identity::verify_slug(repo, &client, owner, agent) else {
         return unknown();
-    }
+    };
+    let Ok(identity) = crate::hub::identity::RemoteIdentity::new(client.base(), &remote.agent_id)
+    else {
+        return unknown();
+    };
     let Some(refs) = crate::hub::git::ls_remote_refs(repo.root(), &url, include_tags) else {
         return unknown();
     };
@@ -577,10 +582,12 @@ pub fn publish_destination(
         scan: secrets::Destination::advertised(repo, refs.heads)
             .unwrap_or(secrets::Destination::Unknown),
         tags: refs.tags,
+        identity: Some(identity),
     }
 }
 
 pub struct PublishDestination {
+    pub identity: Option<crate::hub::identity::RemoteIdentity>,
     pub scan: secrets::Destination,
     pub tags: std::collections::BTreeMap<String, String>,
 }

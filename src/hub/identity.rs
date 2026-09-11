@@ -1,14 +1,8 @@
-//! The repository-local immutable remote identity.
+//! Optional repository identity constraints for supervised work.
 //!
-//! `owner/name` is routing, not identity: once the remote is deleted, the same name can be
-//! recreated. Keeping only the URL in `origin` lets an old checkout silently write into the new
-//! repository on its next push. Every repository fetched or published through a hub therefore
-//! pins a `(hub, agent_id)` in `.git/config`.
-//!
-//! The two fields are stored as **one** JSON config value, not as two git config keys.
-//! `git config` updates a single value with `config.lock` + rename; whatever point a process
-//! dies at, a reader sees either the old pair or the new pair, never a torn "new hub + old id"
-//! state.
+//! Ordinary Git operations follow the selected remote. RC processes additionally retain a
+//! `(hub, agent_id)` pin and an expected identity so a running task cannot be redirected by
+//! replacing its checkout or reusing a remote name. The pair occupies an atomic Git config value.
 
 use crate::domain::repo::Repo;
 use anyhow::{Context, bail};
@@ -149,9 +143,8 @@ pub fn require_current(repo: &Repo, hub: &str) -> crate::Result<RemoteIdentity> 
 /// Read the repository pin and, when an RC lineage supplied an expected ID in
 /// the environment, require the two identities to be byte-for-byte the same.
 ///
-/// The environment value only narrows authority: ordinary CLI processes do
-/// not set it and keep using the repo pin, while RC land/hook/push cannot be
-/// redirected by swapping the checkout underneath a running session.
+/// The environment value only narrows authority; RC land, hooks and push must agree with
+/// the repository pin even if a checkout is replaced underneath the running session.
 pub fn require_current_expected(repo: &Repo, hub: &str) -> crate::Result<RemoteIdentity> {
     let pinned = require_current(repo, hub)?;
     constrain_expected(
@@ -162,6 +155,44 @@ pub fn require_current_expected(repo: &Repo, hub: &str) -> crate::Result<RemoteI
             .map(std::ffi::OsStr::to_string_lossy)
             .as_deref(),
     )
+}
+
+/// Ordinary transport does not infer an expected identity from cached checkout metadata.
+/// A supervised process must still prove its persisted identity before contacting a remote.
+pub fn expected_for_transport(repo: &Repo, hub: &str) -> crate::Result<Option<RemoteIdentity>> {
+    if std::env::var_os(EXPECTED_AGENT_ID_ENV).is_some() {
+        require_current_expected(repo, hub).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Resolve the selected name for this request and retain any supervised identity constraint.
+pub fn resolve_transport_target(
+    repo: &Repo,
+    client: &super::Client,
+    owner: &str,
+    name: &str,
+) -> crate::Result<RemoteIdentity> {
+    expected_for_transport(repo, client.base())?;
+    let remote = client.get_agent(owner, name)?;
+    let observed = RemoteIdentity::new(client.base(), &remote.agent_id)?;
+    verify_transport_target(repo, &observed)?;
+    Ok(observed)
+}
+
+/// A current API response selects this operation's target without replacing a retained pin.
+pub fn verify_transport_target(repo: &Repo, observed: &RemoteIdentity) -> crate::Result<()> {
+    if let Some(expected) = expected_for_transport(repo, &observed.hub)?
+        && expected != *observed
+    {
+        bail!(
+            "this RC session expects agent {}, but the remote identifies {}; refusing a reused remote name",
+            expected.agent_id,
+            observed.agent_id
+        );
+    }
+    Ok(())
 }
 
 fn constrain_expected(

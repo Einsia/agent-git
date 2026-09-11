@@ -329,6 +329,7 @@ pub fn run(mut args: Args) -> CmdResult {
     let super::PublishDestination {
         scan: dest,
         tags: mut advertised_tags,
+        identity: scanned_identity,
     } = super::publish_destination(&repo, &checkout.name, true);
     // Whether the destination narrowed the scan surface. Only a narrowed pass has to be redone
     // after the destination changes.
@@ -385,6 +386,7 @@ pub fn run(mut args: Args) -> CmdResult {
         push_url,
         visibility,
         created,
+        identity: remote_identity,
     } = remote;
 
     // `--private` / `--public` do nothing to an agent that already exists, and that has to be
@@ -423,7 +425,10 @@ pub fn run(mut args: Args) -> CmdResult {
     // about "the origin as it was then"; this step closes that gap. `narrowed` is the necessary
     // guard: when step 3 scanned in full anyway, a changed destination misses nothing and
     // rescanning only burns time.
-    let destination_changed = created || asked_url.as_deref() != Some(push_url.as_str());
+    // Advertised refs only narrow scanning while the selected remote identity stays the same.
+    let destination_changed = created
+        || asked_url.as_deref() != Some(push_url.as_str())
+        || scanned_identity.as_ref() != Some(&remote_identity);
     if destination_changed {
         advertised_tags.clear();
     }
@@ -449,7 +454,7 @@ pub fn run(mut args: Args) -> CmdResult {
     git_args.push("origin");
     let refs = refs_to_push(&branches, repo.has_ref("refs/heads/main"));
     git_args.extend(refs.iter().map(String::as_str));
-    let out = crate::hub::git::run(&repo, &git_args)?;
+    let out = crate::hub::git::run_for_remote(&repo, &git_args, &remote_identity)?;
     if !out.ok() {
         ui::error("pushing the branch failed.");
         for line in diagnose(&out, &owner, &name) {
@@ -472,7 +477,7 @@ pub fn run(mut args: Args) -> CmdResult {
     // idempotent operation.
     let tags = tags_to_push(&repo, &refs);
     let missing_tags = tags_missing_from_remote(&repo, &tags, &advertised_tags);
-    if let Err(out) = push_tags(&repo, &missing_tags) {
+    if let Err(out) = push_tags(&repo, &missing_tags, &remote_identity) {
         ui::warning("branches pushed, but version tags didn’t go up.");
         for line in diagnose(&out, &owner, &name) {
             ui::hint(&line);
@@ -928,6 +933,7 @@ struct Remote {
     owner: String,
     name: String,
     push_url: String,
+    identity: RemoteIdentity,
     /// Visibility as the server records it: `public` or `private`.
     visibility: String,
     /// Created by this call. The client decides visibility only at that moment, so "was it just
@@ -944,73 +950,30 @@ fn ensure_remote(
     snap: &meta::Meta,
     repo: &Repo,
 ) -> crate::Result<Remote> {
-    let pinned = identity::read(repo)?;
-    if pinned.is_some() {
-        // Refuse an `AGIT_HUB_URL` site swap first, then query by slug. An existing checkout's
-        // pin is the only trustworthy identity; the current slug proves only who it routed to,
-        // and cannot rewrite the pin the other way.
-        let pinned = identity::require_current_expected(repo, client.base())?;
-        let remote = client.get_agent(owner, agent).map_err(|e| {
-            e.context(format!(
-                "the checkout is pinned to agent {}, but {owner}/{agent} is unavailable; refusing to create a replacement at the same name",
-                pinned.agent_id
-            ))
-        })?;
-        let observed = RemoteIdentity::new(client.base(), &remote.agent_id)?;
-        if observed != pinned {
-            anyhow::bail!(
-                "{owner}/{agent} now identifies agent {}, but this checkout is pinned to {}; the name was reused, so nothing was pushed",
-                observed.agent_id,
-                pinned.agent_id
-            );
-        }
-        return Ok(Remote {
-            owner: remote.owner,
-            name: remote.name,
-            push_url: remote.clone_url,
-            visibility: remote.visibility,
-            created: false,
-        });
-    }
-
-    // A legacy checkout leaves only an origin URL. It cannot prove the URL still points at the
-    // object that was cloned then, so an `agent_id` is never adopted silently from one current
-    // GET.
-    if repo.remote_url().is_some() {
-        match client.get_agent(owner, agent) {
-            Ok(remote) => {
-                let observed = RemoteIdentity::new(client.base(), &remote.agent_id)?;
-                anyhow::bail!(
-                    "this legacy checkout has no immutable remote identity, so {owner}/{agent} cannot be adopted from its reusable name.
-  verify the current agent ID, then preserve every local branch and unpushed commit with:
-    agit clone {owner}/{agent} --adopt-legacy-agent-id {}",
-                    observed.agent_id
-                );
-            }
-            Err(e)
-                if e.downcast_ref::<crate::hub::client::ApiError>()
-                    .is_some_and(|api| api.status == 404) =>
-            {
-                anyhow::bail!(
-                    "this legacy checkout has no immutable remote identity and {owner}/{agent} no longer exists; refusing to create or adopt a same-name replacement"
-                );
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    // When a remote of the same name already exists, nothing local proves this repo belongs to
-    // it. Only an explicit 404 enters creation; a network error, a 5xx, a 401 all fail
-    // unchanged, and must never be read as "does not exist" and turned into a POST.
+    let expected = identity::expected_for_transport(repo, client.base())?;
     match client.get_agent(owner, agent) {
-        Ok(remote) => anyhow::bail!(
-            "{owner}/{agent} already exists as agent {}, but this local repo has no identity pin; clone that remote instead of silently adopting it.
-  an unpinned repo of this name usually means `agit init` ran against an already-created remote — move the local repo aside, then `agit clone {owner}/{agent}`",
-            remote.agent_id
-        ),
+        Ok(remote) => {
+            let observed = RemoteIdentity::new(client.base(), &remote.agent_id)?;
+            identity::verify_transport_target(repo, &observed)?;
+            return Ok(Remote {
+                owner: remote.owner,
+                name: remote.name,
+                push_url: remote.clone_url,
+                identity: observed,
+                visibility: remote.visibility,
+                created: false,
+            });
+        }
         Err(e)
             if e.downcast_ref::<crate::hub::client::ApiError>()
-                .is_some_and(|api| api.status == 404) => {}
+                .is_some_and(|api| api.status == 404) =>
+        {
+            if expected.is_some() {
+                return Err(
+                    e.context("the RC remote is unavailable; refusing to create a replacement")
+                );
+            }
+        }
         Err(e) => return Err(e),
     }
 
@@ -1047,11 +1010,15 @@ fn ensure_remote(
         repo_origins: origins,
     })?;
     let remote_identity = RemoteIdentity::new(client.base(), &resp.agent_id)?;
-    identity::pin(repo, &remote_identity)?;
+    // Retained pins belong to supervised work and cannot be rewritten by an ordinary push.
+    if matches!(identity::read(repo), Ok(None)) {
+        identity::pin(repo, &remote_identity)?;
+    }
     Ok(Remote {
         owner: resp.owner,
         name: resp.name,
         push_url: resp.push_url,
+        identity: remote_identity,
         visibility: if public { "public" } else { "private" }.to_string(),
         created: true,
     })
@@ -1258,12 +1225,16 @@ fn tags_missing_from_remote(
 
 /// Push tags. Batched because an agent gets a version ID every turn, and a command line has a
 /// length limit.
-fn push_tags(repo: &Repo, tags: &[String]) -> std::result::Result<(), crate::hub::git::Outcome> {
+fn push_tags(
+    repo: &Repo,
+    tags: &[String],
+    identity: &RemoteIdentity,
+) -> std::result::Result<(), crate::hub::git::Outcome> {
     for chunk in tags.chunks(100) {
         let specs: Vec<String> = chunk.iter().map(|t| format!("refs/tags/{t}")).collect();
         let mut args: Vec<&str> = vec!["push", "origin"];
         args.extend(specs.iter().map(String::as_str));
-        match crate::hub::git::run(repo, &args) {
+        match crate::hub::git::run_for_remote(repo, &args, identity) {
             Ok(out) if out.ok() => {}
             Ok(out) => return Err(out),
             Err(e) => {
