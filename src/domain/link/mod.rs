@@ -247,6 +247,7 @@ impl Link {
     /// root snapshot's session identity is computed from them too), and any encoding round trip
     /// can alter them.
     pub fn read_bytes(&self) -> Result<Vec<u8>> {
+        let adapter = adapter::get(&self.source)?;
         let p = self.resolve().ok_or_else(|| {
             anyhow::anyhow!(
                 "cannot find the transcript of session {} ({}).\n  \
@@ -255,7 +256,7 @@ impl Link {
                 self.source
             )
         })?;
-        std::fs::read(&p).with_context(|| format!("cannot read {}", p.display()))
+        adapter.read_native_bytes_at(&self.session_id, &p)
     }
 
     /// Read the transcript.

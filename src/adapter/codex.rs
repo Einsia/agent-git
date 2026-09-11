@@ -37,6 +37,7 @@ use super::{
 };
 use crate::Result;
 use anyhow::Context;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -144,6 +145,254 @@ fn all_rollouts(root: &Path) -> Vec<PathBuf> {
         .map(|e| e.into_path())
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .collect()
+}
+
+const MAX_FORK_DEPTH: usize = 64;
+
+#[derive(Debug)]
+struct RolloutParts {
+    header: Vec<u8>,
+    body: Vec<u8>,
+    header_ordinal: Option<u64>,
+}
+
+#[derive(Debug)]
+struct HistoryPoint {
+    source_id: String,
+    ordinal_exclusive: u64,
+    byte_offset: u64,
+}
+
+#[derive(Debug)]
+enum SplitFailure {
+    /// The leaf no longer has a trustworthy Codex header. Raw link reads still need its bytes so
+    /// doctor can classify a rewrite instead of turning it into an unreadable transcript.
+    Unrecognized,
+    /// A valid paginated header claims lineage but does not carry complete coordinates.
+    Incomplete,
+}
+
+fn recognized_rollout(bytes: &[u8], expected_thread_id: &str) -> bool {
+    let Some(header_end) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return false;
+    };
+    let Ok(header) = serde_json::from_slice::<serde_json::Value>(&bytes[..header_end]) else {
+        return false;
+    };
+    header.get("type").and_then(|value| value.as_str()) == Some("session_meta")
+        && header
+            .pointer("/payload/id")
+            .and_then(|value| value.as_str())
+            == Some(expected_thread_id)
+}
+
+fn split_rollout(
+    mut bytes: Vec<u8>,
+    expected_thread_id: Option<&str>,
+) -> std::result::Result<(RolloutParts, Option<HistoryPoint>), SplitFailure> {
+    let header_end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .ok_or(SplitFailure::Unrecognized)?;
+    let header_value: serde_json::Value =
+        serde_json::from_slice(&bytes[..header_end - 1]).map_err(|_| SplitFailure::Unrecognized)?;
+    if header_value.get("type").and_then(|value| value.as_str()) != Some("session_meta") {
+        return Err(SplitFailure::Unrecognized);
+    }
+    let payload = header_value
+        .get("payload")
+        .and_then(|value| value.as_object())
+        .ok_or(SplitFailure::Unrecognized)?;
+    let header_ordinal = header_value.get("ordinal").and_then(|value| value.as_u64());
+    if expected_thread_id.is_some_and(|expected| {
+        payload.get("id").and_then(|value| value.as_str()) != Some(expected)
+    }) {
+        return Err(SplitFailure::Unrecognized);
+    }
+    // AgentGit restores a captured paginated transcript as a self-contained legacy rollout while
+    // preserving unknown metadata. Its old pointer is documentary at that point, not a request to
+    // splice the parent into the already-complete copy again.
+    let history_base = (payload.get("history_mode").and_then(|value| value.as_str())
+        == Some("paginated"))
+    .then(|| payload.get("history_base"))
+    .flatten();
+    let history = if let Some(history_base) = history_base {
+        let history_base = history_base.as_object().ok_or(SplitFailure::Incomplete)?;
+        let source_id = history_base
+            .get("thread_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or(SplitFailure::Incomplete)?;
+        let ordinal_exclusive = history_base
+            .get("end_ordinal_exclusive")
+            .and_then(|value| value.as_u64())
+            .ok_or(SplitFailure::Incomplete)?;
+        let byte_offset = history_base
+            .get("end_byte_offset")
+            .and_then(|value| value.as_u64())
+            .ok_or(SplitFailure::Incomplete)?;
+        Some(HistoryPoint {
+            source_id: source_id.to_owned(),
+            ordinal_exclusive,
+            byte_offset,
+        })
+    } else {
+        None
+    };
+    let body = bytes.split_off(header_end);
+    Ok((
+        RolloutParts {
+            header: bytes,
+            body,
+            header_ordinal,
+        },
+        history,
+    ))
+}
+
+fn validated_prefix_end(
+    parts: &RolloutParts,
+    history: &HistoryPoint,
+) -> super::native_snapshot::Result<usize> {
+    use super::native_snapshot::Unavailable;
+
+    let byte_offset = usize::try_from(history.byte_offset).map_err(|_| Unavailable::Incomplete)?;
+    let prefix_end = byte_offset
+        .checked_sub(parts.header.len())
+        .filter(|end| *end <= parts.body.len())
+        .ok_or(Unavailable::Incomplete)?;
+    let prefix = &parts.body[..prefix_end];
+    if !prefix.is_empty() && prefix.last() != Some(&b'\n') {
+        return Err(Unavailable::Incomplete);
+    }
+    let mut previous = parts.header_ordinal.ok_or(Unavailable::Incomplete)?;
+    for line in prefix.split_inclusive(|byte| *byte == b'\n') {
+        if line == b"\n" {
+            continue;
+        }
+        let record: serde_json::Value =
+            serde_json::from_slice(&line[..line.len() - 1]).map_err(|_| Unavailable::Incomplete)?;
+        let ordinal = record
+            .get("ordinal")
+            .and_then(|value| value.as_u64())
+            .ok_or(Unavailable::Incomplete)?;
+        if ordinal <= previous {
+            return Err(Unavailable::Incomplete);
+        }
+        previous = ordinal;
+    }
+    if previous.checked_add(1) != Some(history.ordinal_exclusive) {
+        return Err(Unavailable::Incomplete);
+    }
+    Ok(prefix_end)
+}
+
+fn append_bounded(
+    target: &mut Vec<u8>,
+    bytes: &[u8],
+    limits: super::native_snapshot::Limits,
+) -> super::native_snapshot::Result<()> {
+    use super::native_snapshot::Unavailable;
+
+    let length = target
+        .len()
+        .checked_add(bytes.len())
+        .ok_or(Unavailable::BudgetExceeded)?;
+    if length > limits.bytes || length > limits.working_bytes {
+        return Err(Unavailable::BudgetExceeded);
+    }
+    target.extend_from_slice(bytes);
+    Ok(())
+}
+
+struct LineageNode {
+    parts: RolloutParts,
+    history: Option<HistoryPoint>,
+}
+
+fn lineage_bytes(
+    source: &super::native_snapshot::Source,
+    limits: super::native_snapshot::Limits,
+    allow_unrecognized_leaf: bool,
+) -> super::native_snapshot::Result<Vec<u8>> {
+    use super::native_snapshot::Unavailable;
+
+    let mut visited = HashSet::new();
+    let mut nodes = Vec::new();
+    let mut current = source.clone();
+    let mut retained = 0usize;
+    loop {
+        let rollout_id = id_from_filename(&current.path).ok_or(Unavailable::Incomplete)?;
+        if nodes.len() >= MAX_FORK_DEPTH || !visited.insert(rollout_id) {
+            return Err(Unavailable::Incomplete);
+        }
+        let bytes = super::native_snapshot::read_file_bytes(&current.path, limits)?;
+        retained = retained
+            .checked_add(bytes.len())
+            .ok_or(Unavailable::BudgetExceeded)?;
+        if retained > limits.working_bytes {
+            return Err(Unavailable::BudgetExceeded);
+        }
+        let expected_thread_id = nodes.is_empty().then_some(source.session_id.as_str());
+        if allow_unrecognized_leaf
+            && nodes.is_empty()
+            && !recognized_rollout(&bytes, source.session_id.as_str())
+        {
+            return Ok(bytes);
+        }
+        let (parts, history) =
+            split_rollout(bytes, expected_thread_id).map_err(|_| Unavailable::Incomplete)?;
+        if nodes.is_empty() && history.is_none() {
+            let mut bytes = parts.header;
+            bytes.extend_from_slice(&parts.body);
+            return Ok(bytes);
+        }
+        let next = history.as_ref().map(|point| point.source_id.clone());
+        nodes.push(LineageNode { parts, history });
+        let Some(next) = next else {
+            break;
+        };
+        current = super::native_snapshot::lookup_codex_rollout(
+            &next,
+            super::native_snapshot::Limits {
+                lookup_entries: limits.lookup_entries.saturating_sub(visited.len()),
+                ..limits
+            },
+        )?;
+    }
+
+    let output_limits = super::native_snapshot::Limits {
+        working_bytes: limits
+            .working_bytes
+            .checked_sub(retained)
+            .ok_or(Unavailable::BudgetExceeded)?,
+        ..limits
+    };
+    let mut bytes = Vec::new();
+    append_bounded(&mut bytes, &nodes[0].parts.header, output_limits)?;
+    for index in (1..nodes.len()).rev() {
+        let history = nodes[index - 1]
+            .history
+            .as_ref()
+            .ok_or(Unavailable::Incomplete)?;
+        let prefix_end = validated_prefix_end(&nodes[index].parts, history)?;
+        append_bounded(
+            &mut bytes,
+            &nodes[index].parts.body[..prefix_end],
+            output_limits,
+        )?;
+    }
+    append_bounded(&mut bytes, &nodes[0].parts.body, output_limits)?;
+    Ok(bytes)
+}
+
+fn lineage_snapshot(
+    source: &super::native_snapshot::Source,
+    limits: super::native_snapshot::Limits,
+) -> super::native_snapshot::Result<super::native_snapshot::Snapshot> {
+    let bytes = lineage_bytes(source, limits, false)?;
+    super::native_snapshot::finish(source.clone(), bytes, limits)
 }
 
 /// Inspection reads a unique rollout directly; opening a native index may create WAL sidecars.
@@ -269,6 +518,31 @@ impl Adapter for Codex {
         all_rollouts(&root)
             .into_iter()
             .find(|p| id_from_filename(p).as_deref() == Some(session_id))
+    }
+
+    fn snapshot_native_readonly(
+        &self,
+        source: &super::native_snapshot::Source,
+        limits: super::native_snapshot::Limits,
+    ) -> super::native_snapshot::Result<super::native_snapshot::Snapshot> {
+        if source.runtime != self.id() {
+            return Err(super::native_snapshot::Unavailable::Unsupported);
+        }
+        lineage_snapshot(source, limits)
+    }
+
+    fn read_native_bytes_at(&self, session_id: &str, path: &Path) -> Result<Vec<u8>> {
+        let source = super::native_snapshot::Source {
+            runtime: self.id(),
+            session_id: session_id.to_owned(),
+            path: path.to_owned(),
+            database: false,
+        };
+        Ok(lineage_bytes(
+            &source,
+            super::native_snapshot::Limits::default(),
+            true,
+        )?)
     }
 
     fn parse(&self, text: &str) -> Result<Session> {
@@ -1028,6 +1302,360 @@ fn extract_output_text(output: Option<&serde_json::Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CodexHomeGuard(Option<std::ffi::OsString>);
+
+    impl Drop for CodexHomeGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                // SAFETY: tests that mutate process configuration hold config::env_lock.
+                unsafe { std::env::set_var("CODEX_HOME", previous) };
+            } else {
+                // SAFETY: tests that mutate process configuration hold config::env_lock.
+                unsafe { std::env::remove_var("CODEX_HOME") };
+            }
+        }
+    }
+
+    fn rollout_path(root: &Path, id: &str) -> PathBuf {
+        root.join("sessions/2026/09/11")
+            .join(format!("rollout-2026-09-11T00-00-00-{id}.jsonl"))
+    }
+
+    fn record(ordinal: u64, role: &str, text: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ordinal": ordinal,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": role,
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            })
+        )
+    }
+
+    fn header(id: &str, ordinal: u64, history: Option<(&str, u64, usize)>) -> String {
+        let mut payload = serde_json::json!({"id": id, "cwd": "/repo"});
+        if let Some((parent, boundary, byte_offset)) = history {
+            payload["forked_from_id"] = serde_json::Value::String(parent.to_owned());
+            payload["forked_from_ordinal_exclusive"] = boundary.into();
+            payload["history_mode"] = serde_json::Value::String("paginated".to_owned());
+            payload["history_base"] = serde_json::json!({
+                "thread_id": parent,
+                "end_ordinal_exclusive": boundary,
+                "end_byte_offset": byte_offset,
+            });
+        }
+        format!(
+            "{}\n",
+            serde_json::json!({"ordinal": ordinal, "type": "session_meta", "payload": payload})
+        )
+    }
+
+    #[test]
+    fn fork_snapshot_places_the_fixed_parent_prefix_before_child_history() {
+        let _environment = crate::infra::config::env_lock();
+        let previous = std::env::var_os("CODEX_HOME");
+        let _restore = CodexHomeGuard(previous);
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: this test holds the process-wide configuration lock.
+        unsafe { std::env::set_var("CODEX_HOME", home.path()) };
+
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let child_id = "22222222-2222-4222-8222-222222222222";
+        let parent_path = rollout_path(home.path(), parent_id);
+        let child_path = rollout_path(home.path(), child_id);
+        std::fs::create_dir_all(parent_path.parent().unwrap()).unwrap();
+        let parent_prefix = format!(
+            "{}{}{}",
+            header(parent_id, 0, None),
+            record(1, "user", "parent question"),
+            record(2, "assistant", "parent answer"),
+        );
+        let parent = format!(
+            "{}{}",
+            parent_prefix,
+            record(3, "user", "parent continued elsewhere"),
+        );
+        let child = format!(
+            "{}{}{}",
+            header(child_id, 3, Some((parent_id, 3, parent_prefix.len()))),
+            record(4, "user", "child question"),
+            record(5, "assistant", "child answer"),
+        );
+        std::fs::write(&parent_path, parent).unwrap();
+        std::fs::write(&child_path, &child).unwrap();
+
+        let source = super::super::native_snapshot::Source {
+            runtime: "codex",
+            session_id: child_id.to_owned(),
+            path: child_path.clone(),
+            database: false,
+        };
+        let first = lineage_snapshot(&source, super::super::native_snapshot::Limits::default())
+            .unwrap()
+            .bytes;
+        let text = String::from_utf8(first.clone()).unwrap();
+        let history = Codex.parse(&text).unwrap();
+        assert_eq!(history.id, child_id);
+        assert_eq!(history.counts().prompts, 2);
+        assert_eq!(history.counts().replies, 2);
+        assert!(text.contains("parent question"));
+        assert!(!text.contains("parent continued elsewhere"));
+        assert!(text.find("parent answer") < text.find("child question"));
+
+        std::fs::write(
+            &child_path,
+            format!("{child}{}", record(6, "user", "later child turn")),
+        )
+        .unwrap();
+        let grown = lineage_snapshot(&source, super::super::native_snapshot::Limits::default())
+            .unwrap()
+            .bytes;
+        assert!(grown.starts_with(&first));
+    }
+
+    #[test]
+    fn history_base_resolves_a_physical_rollout_for_the_logical_parent() {
+        let _environment = crate::infra::config::env_lock();
+        let previous = std::env::var_os("CODEX_HOME");
+        let _restore = CodexHomeGuard(previous);
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: this test holds the process-wide configuration lock.
+        unsafe { std::env::set_var("CODEX_HOME", home.path()) };
+
+        let logical_parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let parent_rollout = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let child_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let active_parent_path = rollout_path(home.path(), logical_parent);
+        let parent_path = home.path().join("archived_sessions").join(format!(
+            "rollout-2026-09-10T00-00-00-{parent_rollout}.jsonl"
+        ));
+        let child_path = rollout_path(home.path(), child_id);
+        std::fs::create_dir_all(active_parent_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(parent_path.parent().unwrap()).unwrap();
+        let frozen_parent = format!(
+            "{}{}",
+            header(logical_parent, 0, None),
+            record(1, "user", "history through the archived physical rollout"),
+        );
+        std::fs::write(&parent_path, &frozen_parent).unwrap();
+        std::fs::write(
+            &active_parent_path,
+            format!(
+                "{}{}",
+                header(logical_parent, 0, None),
+                record(1, "user", "replacement rollout must not be selected"),
+            ),
+        )
+        .unwrap();
+        let database = home.path().join("state_1.sqlite");
+        let connection = rusqlite::Connection::open(database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE threads (id TEXT, rollout_path TEXT);")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads VALUES (?1, ?2)",
+                [parent_rollout, active_parent_path.to_str().unwrap()],
+            )
+            .unwrap();
+        let child_meta = serde_json::json!({
+            "ordinal": 2,
+            "type": "session_meta",
+            "payload": {
+                "id": child_id,
+                "cwd": "/repo",
+                "history_mode": "paginated",
+                "forked_from_id": logical_parent,
+                "forked_from_ordinal_exclusive": 2,
+                "history_base": {
+                    "thread_id": parent_rollout,
+                    "end_ordinal_exclusive": 2,
+                    "end_byte_offset": frozen_parent.len(),
+                },
+            },
+        });
+        std::fs::write(
+            &child_path,
+            format!(
+                "{child_meta}\n{}",
+                record(3, "assistant", "replacement history loaded"),
+            ),
+        )
+        .unwrap();
+
+        let source = super::super::native_snapshot::Source {
+            runtime: "codex",
+            session_id: child_id.to_owned(),
+            path: child_path,
+            database: false,
+        };
+        let bytes = lineage_snapshot(&source, super::super::native_snapshot::Limits::default())
+            .unwrap()
+            .bytes;
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("history through the archived physical rollout"));
+        assert!(!text.contains("replacement rollout must not be selected"));
+        assert!(text.find("physical rollout") < text.find("replacement history loaded"));
+    }
+
+    #[test]
+    fn rollback_leaf_and_original_rollout_use_distinct_physical_cycle_identities() {
+        let _environment = crate::infra::config::env_lock();
+        let previous = std::env::var_os("CODEX_HOME");
+        let _restore = CodexHomeGuard(previous);
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: this test holds the process-wide configuration lock.
+        unsafe { std::env::set_var("CODEX_HOME", home.path()) };
+
+        let logical_id = "abababab-abab-4aba-8aba-abababababab";
+        let replacement_rollout = "cdcdcdcd-cdcd-4cdc-8cdc-cdcdcdcdcdcd";
+        let original_path = home
+            .path()
+            .join("archived_sessions")
+            .join(format!("rollout-2026-09-10T00-00-00-{logical_id}.jsonl"));
+        let replacement_path = rollout_path(home.path(), replacement_rollout);
+        std::fs::create_dir_all(original_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(replacement_path.parent().unwrap()).unwrap();
+        let original = format!(
+            "{}{}",
+            header(logical_id, 0, None),
+            record(1, "user", "before rollback"),
+        );
+        std::fs::write(&original_path, &original).unwrap();
+        std::fs::write(
+            &replacement_path,
+            format!(
+                "{}{}",
+                header(logical_id, 2, Some((logical_id, 2, original.len()))),
+                record(3, "assistant", "after rollback"),
+            ),
+        )
+        .unwrap();
+        let source = super::super::native_snapshot::Source {
+            runtime: "codex",
+            session_id: logical_id.to_owned(),
+            path: replacement_path,
+            database: false,
+        };
+        let text = String::from_utf8(
+            lineage_snapshot(&source, super::super::native_snapshot::Limits::default())
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        assert!(text.find("before rollback") < text.find("after rollback"));
+    }
+
+    #[test]
+    fn legacy_restored_copy_is_self_contained_even_when_its_old_pointer_remains() {
+        let _environment = crate::infra::config::env_lock();
+        let previous = std::env::var_os("CODEX_HOME");
+        let _restore = CodexHomeGuard(previous);
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: this test holds the process-wide configuration lock.
+        unsafe { std::env::set_var("CODEX_HOME", home.path()) };
+
+        let id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let missing_parent = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        let path = rollout_path(home.path(), id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = format!(
+            "{}\n{}{}",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "cwd": "/repo",
+                    "history_mode": "legacy",
+                    "history_base": {
+                        "thread_id": missing_parent,
+                        "end_ordinal_exclusive": 2,
+                        "end_byte_offset": 999,
+                    },
+                },
+            }),
+            record(1, "user", "the restored copy already contains its parent"),
+            record(2, "assistant", "continue locally"),
+        );
+        std::fs::write(&path, &text).unwrap();
+        let source = super::super::native_snapshot::Source {
+            runtime: "codex",
+            session_id: id.to_owned(),
+            path,
+            database: false,
+        };
+        let snapshot =
+            lineage_snapshot(&source, super::super::native_snapshot::Limits::default()).unwrap();
+        assert_eq!(snapshot.bytes, text.as_bytes());
+    }
+
+    #[test]
+    fn truncated_parent_before_the_saved_byte_and_ordinal_boundary_is_rejected() {
+        let _environment = crate::infra::config::env_lock();
+        let previous = std::env::var_os("CODEX_HOME");
+        let _restore = CodexHomeGuard(previous);
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: this test holds the process-wide configuration lock.
+        unsafe { std::env::set_var("CODEX_HOME", home.path()) };
+
+        let parent_id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let child_id = "99999999-9999-4999-8999-999999999999";
+        let parent_path = rollout_path(home.path(), parent_id);
+        let child_path = rollout_path(home.path(), child_id);
+        std::fs::create_dir_all(parent_path.parent().unwrap()).unwrap();
+        let parent_header = header(parent_id, 0, None);
+        let first = record(1, "user", "still present");
+        let missing = record(2, "assistant", "was truncated cleanly");
+        let declared_offset = parent_header.len() + first.len() + missing.len();
+        std::fs::write(&parent_path, format!("{parent_header}{first}")).unwrap();
+        std::fs::write(
+            &child_path,
+            format!(
+                "{}{}",
+                header(child_id, 3, Some((parent_id, 3, declared_offset))),
+                record(3, "user", "child"),
+            ),
+        )
+        .unwrap();
+        let source = super::super::native_snapshot::Source {
+            runtime: "codex",
+            session_id: child_id.to_owned(),
+            path: child_path,
+            database: false,
+        };
+        assert_eq!(
+            lineage_snapshot(&source, super::super::native_snapshot::Limits::default())
+                .unwrap_err(),
+            super::super::native_snapshot::Unavailable::Incomplete
+        );
+    }
+
+    #[test]
+    fn a_parent_relation_without_a_fork_boundary_stays_standalone() {
+        let id = "33333333-3333-4333-8333-333333333333";
+        let mut payload = serde_json::json!({
+            "id": id,
+            "cwd": "/repo",
+            "forked_from_id": "44444444-4444-4444-8444-444444444444",
+            "thread_source": "subagent",
+        });
+        payload["subagent_history_start_ordinal"] = 7.into();
+        let text = format!(
+            "{}\n{}",
+            serde_json::json!({"ordinal": 0, "type": "session_meta", "payload": payload}),
+            record(1, "user", "bounded subtask"),
+        );
+        let (parts, history) = split_rollout(text.as_bytes().to_vec(), Some(id)).unwrap();
+        assert!(history.is_none());
+        let mut unchanged = parts.header;
+        unchanged.extend(parts.body);
+        assert_eq!(unchanged, text.as_bytes());
+    }
 
     #[test]
     fn configured_codex_home_controls_sessions_and_index_location() {

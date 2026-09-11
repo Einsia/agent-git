@@ -609,6 +609,13 @@ pub trait Adapter {
         native_snapshot::read_file(source, limits)
     }
 
+    /// Read the native carrier selected by [`Adapter::resolve`]. Runtimes whose visible history
+    /// spans more than one physical carrier can override this while keeping the link identity on
+    /// the leaf session.
+    fn read_native_bytes_at(&self, _session_id: &str, path: &Path) -> Result<Vec<u8>> {
+        std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))
+    }
+
     /// List **every** session of this runtime (not limited to one repo).
     ///
     /// For `doctor` to check for missed captures. More expensive than `sessions_for`.

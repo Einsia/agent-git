@@ -112,6 +112,44 @@ pub(crate) fn lookup_files(runtime: &'static str, id: &str, limits: Limits) -> R
     lookup_files_at(runtime, id, &root, limits)
 }
 
+/// Resolve a Codex history pointer by the immutable rollout id carried in its filename.
+///
+/// The state database is deliberately not consulted: after a rollback the logical thread row can
+/// point at a replacement rollout while existing children still reference the original physical
+/// carrier. Archived rollouts retain their filename and remain valid history bases.
+pub(crate) fn lookup_codex_rollout(id: &str, limits: Limits) -> Result<Source> {
+    validate_id(id, limits)?;
+    let home = super::codex::codex_home().map_err(|_| Unavailable::Read)?;
+    let mut selected = None;
+    let mut visited = 0usize;
+    for root in [home.join("sessions"), home.join("archived_sessions")] {
+        match std::fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            _ => return Err(Unavailable::Read),
+        }
+        for entry in walkdir::WalkDir::new(root) {
+            if visited >= limits.lookup_entries {
+                return Err(Unavailable::BudgetExceeded);
+            }
+            visited += 1;
+            let entry = entry.map_err(|_| Unavailable::Read)?;
+            let path = entry.path();
+            let matches = path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+                && super::codex::id_from_filename(path).as_deref() == Some(id);
+            if matches {
+                if selected.is_some() {
+                    return Err(Unavailable::Ambiguous);
+                }
+                selected = Some(file_source("codex", id, path.to_owned())?);
+            }
+        }
+    }
+    selected.ok_or(Unavailable::NotFound)
+}
+
 fn file_source(runtime: &'static str, id: &str, path: PathBuf) -> Result<Source> {
     let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
