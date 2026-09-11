@@ -20,7 +20,7 @@
 //! target for this run and writes it into the `hub.url` config, so the next command after
 //! signing in does not connect back to the default hub).
 
-use super::CmdResult;
+use super::{CmdResult, InteractionRequired, remote_request};
 use crate::infra::config;
 use crate::infra::credentials::{self, HubCredential};
 use crate::{ExitCode, ui};
@@ -62,7 +62,10 @@ pub fn run(args: Args) -> CmdResult {
 
     match result {
         Ok(Some((cred, who))) => {
-            credentials::save(&hub, &cred)?;
+            if let Err(error) = credentials::save(&hub, &cred) {
+                ui::error(&format!("cannot save the signed-in credentials: {error:#}"));
+                return Ok(ExitCode::Precondition);
+            }
             // A hub named explicitly with --hub is most likely the one the user keeps using,
             // so remember it.
             if args.hub.is_some() {
@@ -71,17 +74,19 @@ pub fn run(args: Args) -> CmdResult {
             ui::success(&format!("signed in as {}", ui::bold(&who)));
             Ok(ExitCode::Ok)
         }
-        Ok(None) if args.with_token => Ok(ExitCode::Interactive),
         Ok(None) => {
-            // Neither interactive flow asks for a password, so None can only come from a
-            // non-interactive environment.
+            // An unavailable or cancelled prompt cannot select a sign-in flow.
             ui::error("signing in needs an interactive terminal.");
             ui::hint(
                 "CI / agents use `agit login --with-token < token.txt` (reads a PAT from stdin)",
             );
             Ok(ExitCode::Interactive)
         }
-        Err(e) => Err(e),
+        Err(error) if error.is::<LocalInputFailure>() => {
+            ui::error(&format!("{error:#}"));
+            Ok(ExitCode::Precondition)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -107,7 +112,8 @@ fn login_interactive(hub: &str) -> crate::Result<Option<(HubCredential, String)>
         "    {} device code — we show a code, you enter it on the website (SSH, containers, no browser)",
         ui::accent("2.")
     );
-    let choice = ui::prompt::input("choice [1]", None)?;
+    let choice =
+        ui::prompt::input("choice [1]", None).map_err(|error| error.context(LocalInputFailure))?;
     let Some(choice) = choice else {
         return Ok(None);
     };
@@ -134,7 +140,8 @@ struct CliSession {
 
 fn login_browser(hub: &str) -> crate::Result<Option<(HubCredential, String)>> {
     let client = crate::hub::Client::for_hub(hub);
-    let session: CliSession = client.post_public("api/auth/cli/session", &serde_json::json!({}))?;
+    let session: CliSession =
+        remote_request(client.post_public("api/auth/cli/session", &serde_json::json!({})))?;
 
     println!();
     println!("  open this link to authorize the CLI:");
@@ -168,7 +175,8 @@ struct DeviceCode {
 
 fn login_device(hub: &str) -> crate::Result<Option<(HubCredential, String)>> {
     let client = crate::hub::Client::for_hub(hub);
-    let dev: DeviceCode = client.post_public("api/auth/device/code", &serde_json::json!({}))?;
+    let dev: DeviceCode =
+        remote_request(client.post_public("api/auth/device/code", &serde_json::json!({})))?;
 
     println!();
     println!("  on any device with a browser, open:");
@@ -206,40 +214,24 @@ fn poll(
     loop {
         std::thread::sleep(Duration::from_secs(interval));
         if Instant::now() > deadline {
-            ui::error("the sign-in request expired before it was approved.");
-            ui::hint("run `agit login` again — pending requests live 10 minutes");
-            return Ok(None);
+            return Err(anyhow::Error::new(InteractionRequired(
+                "the sign-in request expired before it was approved; run `agit login` again".into(),
+            )));
         }
-        let v: serde_json::Value = client.post_public(path, &serde_json::json!({ key: value }))?;
-        match v.get("status").and_then(|s| s.as_str()) {
-            Some("pending") | Some("authorization_pending") => continue,
-            _ => {
-                let username = v
-                    .get("username")
-                    .and_then(|s| s.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("the hub answered without a username: {v}"))?
-                    .to_string();
-                let email = v.get("email").and_then(|s| s.as_str()).map(String::from);
-                let get = |k: &str| {
-                    v.get(k)
-                        .and_then(|s| s.as_str())
-                        .map(String::from)
-                        .ok_or_else(|| anyhow::anyhow!("the hub answer is missing `{k}`"))
-                };
-                return Ok(Some((
-                    HubCredential {
-                        username: username.clone(),
-                        email,
-                        hub: None,
-                        access_token: get("access_token")?,
-                        access_expires_at: get("access_expires_at")?,
-                        refresh_token: get("refresh_token")?,
-                        refresh_expires_at: get("refresh_expires_at")?,
-                    },
-                    username,
-                )));
-            }
+        let response: serde_json::Value =
+            remote_request(client.post_public(path, &serde_json::json!({ key: value })))?;
+        if matches!(
+            response.get("status").and_then(|status| status.as_str()),
+            Some("pending" | "authorization_pending")
+        ) {
+            continue;
         }
+        // An invalid response can contain credentials; diagnostics expose its shape, not values.
+        let session = remote_request(
+            serde_json::from_value::<crate::hub::LoginResponse>(response)
+                .map_err(|_| anyhow::anyhow!("the Hub returned an invalid sign-in response")),
+        )?;
+        return Ok(Some(session_credential(session)));
     }
 }
 
@@ -267,38 +259,49 @@ fn open_browser(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Read a PAT from stdin. The token is persisted as-is — validity is settled by the 401 on
-/// first use; nothing local can (or should) pre-validate a credential we did not issue.
+#[derive(Debug)]
+struct LocalInputFailure;
+
+impl std::fmt::Display for LocalInputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cannot read sign-in input")
+    }
+}
+
+/// Read a PAT from stdin and exchange it for a session at the selected Hub.
 fn login_with_token(hub: &str) -> crate::Result<Option<(HubCredential, String)>> {
     let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf)?;
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|error| anyhow::Error::new(error).context(LocalInputFailure))?;
     let token = buf.trim().to_string();
     if token.is_empty() {
-        anyhow::bail!("stdin was empty. usage: `agit login --with-token < token.txt`");
+        return crate::input_argument(Err(anyhow::anyhow!(
+            "stdin was empty. usage: `agit login --with-token < token.txt`"
+        )));
     }
     let client = crate::hub::Client::for_hub_with_token(hub, &token);
-    // Trade the token for a real session (when the server knows the PAT); when it does not,
-    // say so plainly.
-    match client.login_with_pat(&token) {
-        Ok(resp) => Ok(Some((
-            HubCredential {
-                username: resp.username.clone(),
-                email: resp.email.clone(),
-                hub: None,
-                access_token: resp.access_token,
-                access_expires_at: resp.access_expires_at,
-                refresh_token: resp.refresh_token,
-                refresh_expires_at: resp.refresh_expires_at,
-            },
-            resp.username,
-        ))),
-        Err(e) => {
-            if super::terminal_error_code(&e, ExitCode::Usage) == ExitCode::Auth {
-                return Err(e.context("the PAT was not accepted"));
-            }
-            super::fix::register_terminal_api_error(&e);
-            ui::error(&format!("the PAT wasn’t accepted: {e:#}"));
-            Ok(None)
+    let response = remote_request(client.login_with_pat(&token)).map_err(|error| {
+        if super::terminal_error_code(&error, ExitCode::Usage) == ExitCode::Auth {
+            error.context("the PAT was not accepted")
+        } else {
+            error
         }
-    }
+    })?;
+    Ok(Some(session_credential(response)))
+}
+
+fn session_credential(response: crate::hub::LoginResponse) -> (HubCredential, String) {
+    (
+        HubCredential {
+            username: response.username.clone(),
+            email: response.email,
+            hub: None,
+            access_token: response.access_token,
+            access_expires_at: response.access_expires_at,
+            refresh_token: response.refresh_token,
+            refresh_expires_at: response.refresh_expires_at,
+        },
+        response.username,
+    )
 }

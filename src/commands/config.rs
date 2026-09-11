@@ -166,10 +166,10 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
         Some(v) => {
-            validate(&key, &v).map_err(|e| {
+            crate::input_argument(validate(&key, &v).map_err(|e| {
                 ui::error(&format!("{e:#}"));
                 e
-            })?;
+            }))?;
             config::set_global(&key, Some(&v))?;
             if super::json::requested() {
                 return structured_entry("set", &key);
@@ -240,10 +240,10 @@ fn entry_for(
 /// Apply one editor action through the same validation and storage path as the CLI.
 pub(crate) fn apply(key: &str, value: Option<&str>) -> crate::Result<()> {
     if !KEYS.iter().any(|(known, _)| *known == key) {
-        anyhow::bail!("unknown config key `{key}`");
+        return crate::input_argument(Err(anyhow::anyhow!("unknown config key `{key}`")));
     }
     if let Some(value) = value {
-        validate(key, value)?;
+        crate::input_argument(validate(key, value))?;
     }
     config::set_global(key, value)
 }

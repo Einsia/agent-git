@@ -211,7 +211,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
     };
 
     if let Some(n) = &args.name {
-        repo::valid_name(n)?;
+        crate::input_argument(repo::valid_name(n))?;
     }
 
     let store = match &accepted {
@@ -287,7 +287,7 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
             ui::error("a branch in `--into <owner/repo@branch>` cannot be combined with `-b`.");
             return Ok(ExitCode::Usage);
         }
-        let (dest_owner, dest_name) = super::parse_slug(repo)?;
+        let (dest_owner, dest_name) = crate::input_argument(super::parse_slug(repo))?;
         if let Err(e) = super::canonical_owner(&dest_owner) {
             ui::error(&format!("{e:#}"));
             return Ok(ExitCode::Usage);
@@ -752,7 +752,7 @@ fn prepare_target(
         args.onto.clone()
     } else if let Some(onto) = &args.onto {
         use crate::domain::refs::{Base, RepoSel, Tail};
-        let mut spec = crate::domain::refs::parse(onto)?;
+        let mut spec = crate::input_argument(crate::domain::refs::parse(onto))?;
         if matches!(
             spec.tail,
             Tail::Event { .. } | Tail::Range { .. } | Tail::Path(_)
@@ -1372,7 +1372,7 @@ pub(super) fn declare_session_line(
 /// Find a session by id or prefix. **Does not open the transcript file.**
 fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
     let runtimes: Vec<&'static str> = match from {
-        Some(r) => vec![adapter::normalize(r)?],
+        Some(r) => vec![crate::input_argument(adapter::normalize(r))?],
         None => adapter::RUNTIMES.to_vec(),
     };
 
@@ -1537,7 +1537,11 @@ fn pick_here_with_preview(store: &Store, args: &Args, legacy_preview: bool) -> c
 
     let sp = ui::spinner("looking for sessions under this directory…");
     let mut cands = Vec::new();
-    let selected_runtime = args.from.as_deref().map(adapter::normalize).transpose()?;
+    let selected_runtime = args
+        .from
+        .as_deref()
+        .map(|runtime| crate::input_argument(adapter::normalize(runtime)))
+        .transpose()?;
     for rt in adapter::RUNTIMES {
         if selected_runtime.is_some_and(|selected| selected != *rt) {
             continue;

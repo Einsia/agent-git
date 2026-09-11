@@ -900,7 +900,19 @@ fn session_agent_start_settles_old_content_then_activates_archive_before_spawn()
         }
         let native = fs::read(&lab.native).unwrap();
         let (status, output) = ArchiveTerminal::start(&lab, 0).finish();
-        assert_eq!(status.exit_code(), 4, "{status:?}: {output}");
+        assert_eq!(
+            status.exit_code(),
+            4,
+            "{status:?}: pending={pending}; launch_receipt_file_and_bytes={:?}; tx_mode_bound_summary={:?}; output={output}",
+            fs::symlink_metadata(lab.home.join("launch-receipt"))
+                .map(|metadata| (metadata.is_file(), metadata.len()))
+                .map_err(|error| error.kind()),
+            fs::read(lab.repo().join(".git").join(mergetx::LOCK_FILE))
+                .map_err(|error| error.kind())
+                .map(|bytes| serde_json::from_slice::<mergetx::Tx>(&bytes)
+                    .map(|tx| (tx.mode, tx.exploration.is_some(), tx.summary.is_some()))
+                    .map_err(|error| error.classify()))
+        );
         assert!(
             output.contains(
                 "archive merge child exited before the merge landed; the transaction remains open"

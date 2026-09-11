@@ -104,7 +104,7 @@ pub fn run(args: Args) -> CmdResult {
     let source = args
         .target
         .as_deref()
-        .map(refs::parse)
+        .map(super::target::parse_spec)
         .transpose()?
         .as_ref()
         .map(|spec| match (&spec.repo, &spec.base) {
@@ -136,7 +136,7 @@ enum Resolved {
 fn resolve_branch(args: &Args, cwd: &Path) -> crate::Result<Resolved> {
     // Explicit target: refs syntax (may be owner/repo@branch).
     if let Some(t) = &args.target {
-        let spec = super::target::resolve_local_repo(refs::parse(t)?)?;
+        let spec = super::target::resolve_local_repo(super::target::parse_spec(t)?)?;
         let (slug, base_name) = match &spec.repo {
             refs::RepoSel::Slug(o, n) => {
                 let name = match &spec.base {
@@ -663,7 +663,7 @@ pub(crate) fn archive_runtime(
     let snapshot = meta::read_at_ref_result(repo, head)?
         .ok_or_else(|| anyhow::anyhow!("the archive target has no session metadata"))?;
     let runtime = requested
-        .map(adapter::normalize)
+        .map(|runtime| crate::input_argument(adapter::normalize(runtime)))
         .transpose()?
         .or_else(|| {
             config::get_global("runtime.default")
@@ -899,7 +899,7 @@ fn resume_branch_for(
     let requested_runtime = args
         .as_runtime
         .as_deref()
-        .map(adapter::normalize)
+        .map(|runtime| crate::input_argument(adapter::normalize(runtime)))
         .transpose()?;
     let to_runtime = requested_runtime
         .or_else(|| {

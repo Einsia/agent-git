@@ -191,6 +191,10 @@ fn secret_commands_reload_live_matcher(home: &Path) {
 
 impl FakeHub {
     fn start() -> Self {
+        Self::with_pair_status("200 OK")
+    }
+
+    fn with_pair_status(pair_status: &'static str) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -244,10 +248,15 @@ impl FakeHub {
                     assert!(body["platform"].as_str().unwrap().starts_with("windows"));
                     assert!(!body["machine_fingerprint"].as_str().unwrap().is_empty());
                 }
-                let (status, body) = if paired {
+                let (status, body) = if paired && pair_status == "200 OK" {
                     (
-                        "200 OK",
+                        pair_status,
                         r#"{"connection_id":"windows-fixture","token":"synthetic-rc-fixture"}"#,
+                    )
+                } else if paired {
+                    (
+                        pair_status,
+                        r#"{"error":"synthetic HTTP 401 wording","kind":"unauthorized","fix":[{"kind":"authenticate"}]}"#,
                     )
                 } else {
                     ("503 Service Unavailable", "{}")
@@ -477,6 +486,74 @@ fn native_pipe_permissions_and_daemon_lifecycle() {
     );
 
     secret_commands_reload_live_matcher(&home);
+
+    let refused = FakeHub::with_pair_status("503 Service Unavailable");
+    agit::infra::credentials::save(
+        &refused.url,
+        &agit::infra::credentials::HubCredential {
+            username: "windows-fixture".into(),
+            email: None,
+            hub: Some(refused.url.clone()),
+            access_token: "synthetic-user-fixture".into(),
+            refresh_token: "synthetic-refresh-fixture".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let credential_path = agit::infra::config::credentials_path(&refused.url).unwrap();
+    let credential_before = std::fs::read(&credential_path).unwrap();
+    let fingerprint_before = agit::rc::identity::identity().unwrap().machine_fingerprint;
+    for flags in [
+        vec![],
+        vec!["--quiet"],
+        vec!["--json", "--json-version", "1"],
+        vec!["--json", "--json-version", "2"],
+    ] {
+        for operation in [vec!["rc", "pair"], vec!["rc", "start", "--detach"]] {
+            let mut args = flags.clone();
+            args.extend(operation);
+            let output = command(&home, &refused.url, &args);
+            assert_eq!(output.status.code(), Some(6), "{args:?}: {output:?}");
+            if flags.contains(&"--json") {
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["command"], "rc");
+                assert_eq!(value["exit_code"], 6);
+                assert_eq!(value["ok"], false);
+                assert_eq!(
+                    value["schema_version"],
+                    flags.last().unwrap().parse::<u32>().unwrap()
+                );
+                if flags.last() == Some(&"1") {
+                    assert!(value.get("fix").is_none());
+                } else {
+                    assert_eq!(value["fix"], serde_json::json!([]));
+                }
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("synthetic HTTP 401 wording")
+                );
+                assert!(output.stdout.is_empty(), "{output:?}");
+            }
+            assert_eq!(std::fs::read(&credential_path).unwrap(), credential_before);
+            assert_eq!(
+                agit::rc::identity::identity().unwrap().machine_fingerprint,
+                fingerprint_before
+            );
+            assert!(
+                agit::rc::identity::connection(&refused.url)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(control::presence(), control::Presence::Absent);
+            for secret in ["synthetic-user-fixture", "synthetic-refresh-fixture"] {
+                assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+                assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+            }
+        }
+    }
+    drop(refused);
 
     let hub = FakeHub::start();
     agit::infra::credentials::save(

@@ -866,9 +866,30 @@ hook and supervisor settlement; explicit `agit commit` remains available. Unsett
 restores the enabled default. The config list and editor show this effective default separately
 from the stored value.
 
-Common exit codes: `0` Ok · `2` Usage · `3` Ref / context does not resolve · `4` Precondition ·
-`5` Auth (not signed in) · `6` Network · `7` Policy (a secret is blocked) · `8` Interactive.
-The same failure is not necessarily the same code across commands; in scripts, read stderr too.
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success, including nothing to do |
+| `1` | Generic failure, or an aggregate result containing failed entries |
+| `2` | Invalid arguments or request configuration |
+| `3` | A reference does not resolve, or a terminal selection is ambiguous |
+| `4` | An execution precondition is not met |
+| `5` | Authentication is missing or no longer valid |
+| `6` | Network or Hub request failure |
+| `7` | Policy refusal, including publication and secret gates |
+| `8` | Interaction or explicit candidate selection is required |
+
+`1` is a supported generic result when the command cannot establish a more precise cause.
+Known failures use their specific category: a failed local store preparation is `4`, an
+expired credential is `5`, and a positively identified Hub failure is `6`. Unknown Git stderr
+does not establish any of those causes merely by containing similar words.
+
+Batch search uses `1` when at least one query fails and preserves each query's result or
+error. Scripts should inspect those entries instead of assuming a single cause for the batch.
+Human, quiet, and JSON output preserve the command's category; JSON also includes it in
+`exit_code`, with `ok` true only for success. Read the diagnostic and any structured recovery
+actions before deciding how to retry a failed operation.
 
 ## 9. Read on
 

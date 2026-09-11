@@ -50,6 +50,7 @@
 
 pub mod rules;
 
+use anyhow::Context as _;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 #[cfg(feature = "secret-vault")]
@@ -62,9 +63,32 @@ pub type RegisteredMatcher = crate::domain::secret_filter::Matcher;
 #[derive(Default)]
 pub struct RegisteredMatcher;
 
+/// Scan preparation preserves configuration errors separately from unavailable local state.
+#[derive(Debug)]
+pub(crate) enum ScanPreparationFailure {
+    #[cfg(feature = "secret-vault")]
+    Configuration,
+    LocalState,
+}
+
+impl std::fmt::Display for ScanPreparationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            #[cfg(feature = "secret-vault")]
+            Self::Configuration => "secret scan configuration is invalid",
+            Self::LocalState => "local secret scan state is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for ScanPreparationFailure {}
+
 #[cfg(feature = "secret-vault")]
 fn load_registered_matcher() -> crate::Result<RegisteredMatcher> {
-    crate::domain::secret_filter::VaultStore::open_default()?.matcher()
+    crate::domain::secret_filter::VaultStore::open_default()
+        .context(ScanPreparationFailure::Configuration)?
+        .matcher()
+        .context(ScanPreparationFailure::LocalState)
 }
 
 #[cfg(not(feature = "secret-vault"))]
@@ -2675,15 +2699,20 @@ pub fn scan_agent_repo(
     repo: &crate::domain::repo::Repo,
     plan: &ScanPlan,
 ) -> crate::Result<ScanReport> {
-    let home = crate::infra::config::agit_home()?;
+    let home = crate::infra::config::agit_home().context(ScanPreparationFailure::LocalState)?;
     let allowlist = load_allowlist(&home);
     // When a vault exists but cannot be unlocked or authenticated, return an error; degrading to
     // "there are no registered rules" is not allowed.
     let registered = load_registered_matcher()?;
     #[cfg(feature = "secret-vault")]
-    let registered = registered.merged(
-        &crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?.active_matcher()?,
-    )?;
+    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
+        .context(ScanPreparationFailure::Configuration)?
+        .active_matcher()
+        .context(ScanPreparationFailure::LocalState)?;
+    #[cfg(feature = "secret-vault")]
+    let registered = registered
+        .merged(&dictionary)
+        .context(ScanPreparationFailure::LocalState)?;
     // The working tree and the history objects have to use one provenance view. Source events
     // imported by a merge appear both in the current events/** and in a history blob; supplying
     // the identity to the second pass alone still leaves the working-tree pass false-positive.

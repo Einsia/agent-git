@@ -133,7 +133,7 @@ pub fn run(mut args: Args) -> CmdResult {
     if crate::rc::harness::settlement_is_delegated() {
         ui::error(crate::rc::harness::SUPERVISED_SETTLEMENT_MESSAGE);
         ui::hint("finish the turn and let agitd push it under the live identity lease");
-        return Ok(ExitCode::Failure);
+        return Ok(ExitCode::Precondition);
     }
     // The context resolves once: it answers both "which repo" and "which branch", and both
     // answers must come from the same resolution — otherwise "repo from the context, branch
@@ -157,7 +157,7 @@ pub fn run(mut args: Args) -> CmdResult {
     let Some(me) = credentials::current_user() else {
         ui::error("no account name in the stored credentials.");
         ui::hint("re-run `agit login`");
-        return Ok(ExitCode::Failure);
+        return Ok(ExitCode::Auth);
     };
     let ctx = super::context::resolve(&cwd).ok();
 
@@ -168,7 +168,7 @@ pub fn run(mut args: Args) -> CmdResult {
         Some(a) => match split_publish_target(a) {
             Ok(v) => v,
             Err(e) => {
-                ui::error(&format!("{e:#}"));
+                ui::error(&super::terminal_error_message(&e));
                 return Ok(ExitCode::Usage);
             }
         },
@@ -186,14 +186,21 @@ pub fn run(mut args: Args) -> CmdResult {
     };
 
     let Some(checkout) = pick_checkout(&me, want_owner.as_deref(), &agent)? else {
-        return Ok(ExitCode::Usage);
+        return Ok(if ui::prompt::interactive() {
+            ExitCode::Ref
+        } else {
+            ExitCode::Interactive
+        });
     };
     let Some(repo) = Repo::open(&checkout.path) else {
         ui::error(&format!("no local repo for {}.", checkout.slug()));
         ui::hint(&format!(
             "record a first version: `agit import <session-id> --from <runtime> --into <owner>/{agent}@<branch>`"
         ));
-        return Ok(ExitCode::Usage);
+        return Ok(match std::fs::symlink_metadata(&checkout.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ExitCode::Ref,
+            _ => ExitCode::Precondition,
+        });
     };
 
     let snap = match meta::resolve(repo.root()) {
@@ -204,7 +211,7 @@ pub fn run(mut args: Args) -> CmdResult {
                 checkout.slug()
             ));
             ui::hint(&format!("record one first: `agit commit {agent}`"));
-            return Ok(ExitCode::Failure);
+            return Ok(ExitCode::Precondition);
         }
     };
 
@@ -379,19 +386,26 @@ pub fn run(mut args: Args) -> CmdResult {
 
     // ── 6. Make sure the remote agent exists ──
     let wanted = wanted_visibility(&args, &repo).value();
-    let remote = ensure_remote(&client, &namespace, &agent, wanted, &snap, &repo)?;
+    let remote = match ensure_remote(&client, &namespace, &agent, wanted, &snap, &repo) {
+        Ok(remote) => remote,
+        Err(error) if error.is::<FirstPublicationRefusal>() => {
+            ui::error(&format!("{error:#}"));
+            return Ok(ExitCode::Precondition);
+        }
+        Err(error) => return Err(error),
+    };
     let Remote {
         owner,
         name,
         push_url,
         visibility,
-        created,
+        first_publish,
         identity: remote_identity,
     } = remote;
 
     // `--private` / `--public` do nothing to an agent that already exists, and that has to be
     // said: passing the flag means believing this push changed who can read it.
-    if !created
+    if !first_publish
         && let Some(want) = wanted
         && want != (visibility == "public")
     {
@@ -410,7 +424,7 @@ pub fn run(mut args: Args) -> CmdResult {
     //
     // Step 3 asked about the `origin` **as it was then**. Visibility settles only at
     // `ensure_remote`, and that step may create a brand-new empty repo along the way
-    // (`created`), or point `origin` somewhere else (`push_url` changed). In both cases what
+    // (`first_publish`), or point `origin` somewhere else (`push_url` changed). In both cases what
     // step 3 asked about is not this push's far side, and the difference that pass computed does
     // not count — what goes out this time is the **full history**, so it is rescanned in full.
     //
@@ -426,7 +440,7 @@ pub fn run(mut args: Args) -> CmdResult {
     // guard: when step 3 scanned in full anyway, a changed destination misses nothing and
     // rescanning only burns time.
     // Advertised refs only narrow scanning while the selected remote identity stays the same.
-    let destination_changed = created
+    let destination_changed = first_publish
         || asked_url.as_deref() != Some(push_url.as_str())
         || scanned_identity.as_ref() != Some(&remote_identity);
     if destination_changed {
@@ -435,8 +449,8 @@ pub fn run(mut args: Args) -> CmdResult {
     if narrowed && destination_changed {
         ui::warning(&format!(
             "the destination changed while preparing this push ({}) — re-checking the full history.",
-            if created {
-                "a new agent was created on the hub"
+            if first_publish {
+                "a first-publication destination was confirmed on the hub"
             } else {
                 "origin now points somewhere else"
             }
@@ -464,7 +478,7 @@ pub fn run(mut args: Args) -> CmdResult {
             "remote: {}",
             crate::hub::git::redact_url(&push_url)
         ));
-        return Ok(ExitCode::Failure);
+        return Ok(branch_failure_code(&out));
     }
 
     // Tags are pushed separately: `git push <branch>` carries no tags, and a tag is the version
@@ -517,9 +531,9 @@ pub fn run(mut args: Args) -> CmdResult {
     kv.push(("link", web));
     print!("{}", ui::table::key_values(&kv));
 
-    // Warn only on the push that created it. Shouting it on every push afterwards teaches the
+    // Warn only on the first publication. Shouting it on every push afterwards teaches the
     // reader to stop reading it.
-    if created && visibility == "public" {
+    if first_publish && visibility == "public" {
         ui::warning("this agent is public — anyone can read its full transcripts.");
         ui::hint(&format!(
             "back to private: agit repo visibility {owner}/{name} private"
@@ -701,30 +715,6 @@ fn first_visibility(want: Option<bool>, answer: Option<bool>) -> bool {
     }
 }
 
-/// Visibility for a first publish under an organization namespace.
-///
-/// Organization agents on the hub are always public. `--private`, and a private preference from
-/// the repo or the global config, are refused here rather than sent as a creation request bound
-/// to be rejected; saying nothing means public, with no question — asking a question that has
-/// only one answer wastes the user's time.
-fn org_first_visibility(owner: &str, agent: &str, want: Option<bool>) -> crate::Result<bool> {
-    match want {
-        Some(false) => anyhow::bail!(
-            "{owner}/{agent}: organization repos are public on the hub — drop `--private` (or the private preference) to publish it"
-        ),
-        Some(true) => Ok(true),
-        None => {
-            println!(
-                "{}",
-                ui::dim(&format!(
-                    "  {owner}/{agent} publishes public: organization repos are public on the hub"
-                ))
-            );
-            Ok(true)
-        }
-    }
-}
-
 /// Ask once at first publish. Off a tty this returns `None`.
 fn ask_visibility(agent: &str) -> crate::Result<Option<bool>> {
     println!(
@@ -790,6 +780,19 @@ fn diagnose(out: &crate::hub::git::Outcome, owner: &str, name: &str) -> Vec<Stri
             "git’s own words above are the best clue".into(),
             "`agit doctor --check-backend` checks connectivity".into(),
         ],
+    }
+}
+
+/// A known server rejection preserves its reason; an unclassified Git failure stays unclassified.
+pub(super) fn branch_failure_code(out: &crate::hub::git::Outcome) -> ExitCode {
+    match out.http_status() {
+        Some(401) => ExitCode::Auth,
+        Some(403 | 409 | 413 | 422) => ExitCode::Policy,
+        Some(412 | 428) => ExitCode::Precondition,
+        Some(404) => ExitCode::Ref,
+        Some(500..=599) => ExitCode::Network,
+        None if crate::hub::git::looks_like_auth_failure(&out.stderr) => ExitCode::Auth,
+        _ => ExitCode::Failure,
     }
 }
 
@@ -916,11 +919,11 @@ fn promote_if_read_only(
                 "agit clone {src} --mine   # make the copy, wire origin/upstream"
             ));
             ui::hint("then publish with `agit push`");
-            return Ok(Promotion::Refused(ExitCode::Usage));
+            return Ok(Promotion::Refused(ExitCode::Interactive));
         }
     }
 
-    let source = client.get_agent(&checkout.owner, &checkout.name)?;
+    let source = super::remote_request(client.get_agent(&checkout.owner, &checkout.name))?;
     let plan = super::clone::promote(client, &checkout.path, &source, None)?;
     Ok(Promotion::Promoted {
         repo: Repo::at(config::repo_dir(&plan.owner, &plan.name)?),
@@ -936,10 +939,20 @@ struct Remote {
     identity: RemoteIdentity,
     /// Visibility as the server records it: `public` or `private`.
     visibility: String,
-    /// Created by this call. The client decides visibility only at that moment, so "was it just
-    /// created" decides whether `--private` took effect and whether the public warning prints.
-    created: bool,
+    /// A first-publication target is verified against the requested visibility before pinning.
+    first_publish: bool,
 }
+
+#[derive(Debug)]
+struct FirstPublicationRefusal;
+
+impl std::fmt::Display for FirstPublicationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the first-publication destination could not be confirmed")
+    }
+}
+
+impl std::error::Error for FirstPublicationRefusal {}
 
 /// Make sure the remote has this agent.
 fn ensure_remote(
@@ -951,7 +964,7 @@ fn ensure_remote(
     repo: &Repo,
 ) -> crate::Result<Remote> {
     let expected = identity::expected_for_transport(repo, client.base())?;
-    match client.get_agent(owner, agent) {
+    match super::remote_request(client.get_agent(owner, agent)) {
         Ok(remote) => {
             let observed = RemoteIdentity::new(client.base(), &remote.agent_id)?;
             identity::verify_transport_target(repo, &observed)?;
@@ -961,7 +974,7 @@ fn ensure_remote(
                 push_url: remote.clone_url,
                 identity: observed,
                 visibility: remote.visibility,
-                created: false,
+                first_publish: false,
             });
         }
         Err(e)
@@ -977,16 +990,11 @@ fn ensure_remote(
         Err(e) => return Err(e),
     }
 
-    // Create it when it does not exist. Visibility settles at this moment, so this is the only
-    // moment it is asked. A repo under an organization is not asked: the hub makes them public.
+    // Visibility is chosen only for creation; the namespace cannot override a private choice.
     let mine = crate::infra::credentials::current_user().as_deref() == Some(owner);
-    let public = if mine {
-        match want {
-            Some(v) => v,
-            None => first_visibility(None, ask_visibility(agent)?),
-        }
-    } else {
-        org_first_visibility(owner, agent, want)?
+    let public = match want {
+        Some(value) => value,
+        None => first_visibility(None, ask_visibility(agent)?),
     };
     // The repo origin lets the server look up "which agents have worked in this repo".
     let origins: Vec<String> = snap
@@ -1003,24 +1011,46 @@ fn ensure_remote(
     ));
     // An organization repo names the organization to create it under; your own passes nothing,
     // and the server defaults to the caller.
-    let resp = client.publish(&PublishRequest {
+    let resp = super::remote_request(client.publish(&PublishRequest {
         name: agent.to_string(),
         owner: (!mine).then(|| owner.to_string()),
         public,
         repo_origins: origins,
-    })?;
+    }))?;
     let remote_identity = RemoteIdentity::new(client.base(), &resp.agent_id)?;
+    let observed = super::remote_request(client.get_agent(owner, agent))?;
+    // A creation response may name a concurrently created repository. Its current audience and
+    // immutable identity must agree with this publication before any identity pin or upload.
+    if resp.owner != owner
+        || resp.name != agent
+        || observed.owner != owner
+        || observed.name != agent
+        || observed.agent_id != remote_identity.agent_id
+    {
+        return Err(anyhow::anyhow!(
+            "{owner}/{agent} changed identity while preparing its first publication; nothing was uploaded"
+        )
+        .context(FirstPublicationRefusal));
+    }
+    if observed.visibility != visibility_word(public) {
+        return Err(anyhow::anyhow!(
+            "{owner}/{agent} is {} on the Hub, but this first publication requested {}; nothing was uploaded",
+            observed.visibility,
+            visibility_word(public)
+        )
+        .context(FirstPublicationRefusal));
+    }
     // Retained pins belong to supervised work and cannot be rewritten by an ordinary push.
     if matches!(identity::read(repo), Ok(None)) {
         identity::pin(repo, &remote_identity)?;
     }
     Ok(Remote {
-        owner: resp.owner,
-        name: resp.name,
-        push_url: resp.push_url,
+        owner: observed.owner,
+        name: observed.name,
+        push_url: observed.clone_url,
         identity: remote_identity,
-        visibility: if public { "public" } else { "private" }.to_string(),
-        created: true,
+        visibility: observed.visibility,
+        first_publish: true,
     })
 }
 
@@ -1308,8 +1338,23 @@ enum Gate {
 /// over-the-line object rather than skipping it, so the two sides agree.
 fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan) -> crate::Result<Gate> {
     let sp = ui::spinner("scanning for secrets…");
-    let scan = secrets::scan_agent_repo(repo, plan)?;
+    let scan = secrets::scan_agent_repo(repo, plan);
     sp.finish_and_clear();
+    let scan = match scan {
+        Ok(scan) => scan,
+        Err(error) => {
+            let code = match error.downcast_ref::<secrets::ScanPreparationFailure>() {
+                Some(secrets::ScanPreparationFailure::Configuration) => ExitCode::Usage,
+                Some(secrets::ScanPreparationFailure::LocalState) => ExitCode::Precondition,
+                None => ExitCode::Failure,
+            };
+            ui::error(&format!(
+                "cannot complete the secret scan: {}",
+                super::terminal_error_message(&error)
+            ));
+            return Ok(Gate::Blocked(code));
+        }
+    };
 
     let hits = scan.hits;
     let unscanned = scan.unscanned;
@@ -1579,17 +1624,6 @@ mod tests {
         assert!(split_publish_target("a/b/c").is_err());
     }
 
-    /// A first publish under an organization has one visibility: an explicit request for private
-    /// is refused (the hub refuses it; this says so first), and saying nothing means public, with
-    /// no question. An implementation carrying over the personal-repo "non-interactive defaults
-    /// to private" sends a creation bound to be rejected.
-    #[test]
-    fn an_org_first_publish_is_public_or_refused() {
-        assert!(org_first_visibility("einsia", "qa", Some(false)).is_err());
-        assert!(org_first_visibility("einsia", "qa", Some(true)).unwrap());
-        assert!(org_first_visibility("einsia", "qa", None).unwrap());
-    }
-
     /// What goes up is the context branch, not the one the checkout sits on.
     ///
     /// A rejected import leaves HEAD on `ghost` while the context says `refund-fix`; an
@@ -1794,5 +1828,51 @@ mod tests {
         assert!(advice.contains("identity"), "{advice}");
         assert!(advice.contains("deleted and reused"), "{advice}");
         assert!(!advice.contains("fetch first"), "{advice}");
+    }
+
+    #[test]
+    fn branch_failure_categories_require_known_status_or_existing_auth_evidence() {
+        for (status, expected) in [
+            (401, ExitCode::Auth),
+            (403, ExitCode::Policy),
+            (404, ExitCode::Ref),
+            (409, ExitCode::Policy),
+            (412, ExitCode::Precondition),
+            (413, ExitCode::Policy),
+            (422, ExitCode::Policy),
+            (428, ExitCode::Precondition),
+            (500, ExitCode::Network),
+            (503, ExitCode::Network),
+            (599, ExitCode::Network),
+            (418, ExitCode::Failure),
+        ] {
+            let out = crate::hub::git::Outcome {
+                code: 128,
+                stderr: format!("fatal: The requested URL returned error: {status}"),
+            };
+            assert_eq!(branch_failure_code(&out), expected);
+        }
+        for (stderr, expected) in [
+            ("fatal: Authentication failed", ExitCode::Auth),
+            (
+                "fatal: could not read Username: terminal prompts disabled",
+                ExitCode::Auth,
+            ),
+            ("fatal: repository 'unknown' not found", ExitCode::Failure),
+            ("fatal: could not read object", ExitCode::Failure),
+            (
+                "! [rejected] main -> main (non-fast-forward)",
+                ExitCode::Failure,
+            ),
+            ("unexpected protocol reply", ExitCode::Failure),
+        ] {
+            assert_eq!(
+                branch_failure_code(&crate::hub::git::Outcome {
+                    code: 128,
+                    stderr: stderr.into()
+                }),
+                expected
+            );
+        }
     }
 }

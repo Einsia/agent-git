@@ -48,7 +48,7 @@ pub fn run(args: Args) -> CmdResult {
         Some(raw) => match split_pull_target(raw) {
             Ok(v) => v,
             Err(e) => {
-                ui::error(&format!("{e:#}"));
+                ui::error(&super::terminal_error_message(&e));
                 return Ok(ExitCode::Usage);
             }
         },

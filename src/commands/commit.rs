@@ -186,6 +186,28 @@ enum Target {
     },
 }
 
+#[derive(Debug)]
+struct ImplicitClaimRefusal(String);
+
+impl std::fmt::Display for ImplicitClaimRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ImplicitClaimRefusal {}
+
+#[derive(Debug)]
+struct LocalStoreFailure;
+
+impl std::fmt::Display for LocalStoreFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("cannot open the local session store")
+    }
+}
+
+impl std::error::Error for LocalStoreFailure {}
+
 pub fn run(args: Args) -> CmdResult {
     let from_hook = args.from_hook;
     match run_inner(args) {
@@ -197,16 +219,28 @@ pub fn run(args: Args) -> CmdResult {
         // "the command succeeded and nothing happened". Quiet belongs to hooks alone.
         Err(e) => {
             super::fix::register_terminal_api_error(&e);
-            ui::error(&format!("{e:#}"));
-            Ok(super::terminal_error_code(&e, ExitCode::Failure))
+            ui::error(&super::terminal_error_message(&e));
+            let fallback = if e.is::<ImplicitClaimRefusal>() {
+                ExitCode::Policy
+            } else if e.is::<LocalStoreFailure>() {
+                ExitCode::Precondition
+            } else {
+                ExitCode::Failure
+            };
+            Ok(super::terminal_error_code(&e, fallback))
         }
     }
 }
 
 fn run_inner(args: Args) -> CmdResult {
     let quiet = args.from_hook;
-    if let Some(code) = delegated_settlement(args.from_hook)? {
-        return Ok(code);
+    match delegated_settlement(args.from_hook) {
+        Ok(Some(code)) => return Ok(code),
+        Ok(None) => {}
+        Err(error) => {
+            ui::error(&format!("{error:#}"));
+            return Ok(ExitCode::Precondition);
+        }
     }
     if (args.from_hook || args.from_supervisor)
         && super::config::get("commit.auto").as_deref() == Some("false")
@@ -220,13 +254,13 @@ fn run_inner(args: Args) -> CmdResult {
 
     let store = match archive::process_store()? {
         Some(store) => store,
-        None => match Store::open()? {
+        None => match Store::open().map_err(|error| error.context(LocalStoreFailure))? {
             Some(store) => store,
             None => {
                 if owner_for_recording(quiet)?.is_none() {
                     return Ok(if quiet { ExitCode::Ok } else { ExitCode::Auth });
                 }
-                Store::open_or_init()?
+                Store::open_or_init().map_err(|error| error.context(LocalStoreFailure))?
             }
         },
     };
@@ -704,13 +738,14 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
     if matches!(args.target.as_deref(), None | Some("@"))
         && let Some(lk) = superseded_harness_link(store)?
     {
-        anyhow::bail!(
+        return Err(ImplicitClaimRefusal(format!(
             "session {} was superseded by {} and cannot settle implicitly. Preserve later work with `agit import {} --from {} --into <owner>/<repo>@<new-branch>`, or name an explicit owner/repo@branch target to select its active writer.",
             link::short(&lk.session_id),
             lk.superseded_by.as_deref().unwrap_or("another runtime"),
             ui::session::shell_arg(&lk.session_id),
             ui::session::shell_arg(&lk.source),
-        );
+        ))
+        .into());
     }
 
     // Unified form: `owner/repo@branch`.  It is resolved independently of the
@@ -720,15 +755,7 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
         && raw.contains('@')
         && raw != "@"
     {
-        let parsed = match crate::commands::target::branch_only(raw) {
-            Ok(v) => v,
-            Err(e) => {
-                if !quiet {
-                    ui::error(&format!("{e:#}"));
-                }
-                return Ok(None);
-            }
-        };
+        let parsed = crate::commands::target::branch_only(raw)?;
         let slug = parsed
             .repo
             .clone()
@@ -737,7 +764,7 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
             .base
             .clone()
             .ok_or_else(|| anyhow::anyhow!("commit target has no branch"))?;
-        let (owner, name) = super::parse_slug(&slug)?;
+        let (owner, name) = crate::input_argument(super::parse_slug(&slug))?;
         let dir = crate::infra::config::repo_dir(&owner, &name)?;
         let Some(_repo) = Repo::open(&dir) else {
             if !quiet {
@@ -870,7 +897,7 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
                 let l = *l;
                 let agent = match (&args.name, &l.agent) {
                     (Some(n), _) => {
-                        repo::valid_name(n)?;
+                        crate::input_argument(repo::valid_name(n))?;
                         n.clone()
                     }
                     (None, Some(a)) => a.clone(),
@@ -952,9 +979,9 @@ fn superseded_harness_link(store: &Store) -> crate::Result<Option<Link>> {
     match candidates.as_slice() {
         [] => Ok(None),
         [link] => Ok(Some(link.clone())),
-        _ => anyhow::bail!(
-            "this process carries multiple superseded runtime identities; implicit settlement cannot select the active replacement. Resume the session before committing, or provide an explicit owner/repo@branch target."
-        ),
+        _ => Err(ImplicitClaimRefusal(
+            "this process carries multiple superseded runtime identities; implicit settlement cannot select the active replacement. Resume the session before committing, or provide an explicit owner/repo@branch target.".into(),
+        ).into()),
     }
 }
 

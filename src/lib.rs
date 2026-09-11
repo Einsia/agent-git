@@ -166,6 +166,53 @@ pub mod infra {
 
 pub type Result<T> = anyhow::Result<T>;
 
+/// Only a caller that owns an input boundary may attach this category; stored evidence uses
+/// the same parsers without acquiring a command-line usage classification.
+#[derive(Debug)]
+pub(crate) struct InputValidation {
+    message: String,
+    #[cfg(any(feature = "cli", feature = "secret-vault"))]
+    cause_depth: usize,
+}
+
+impl std::fmt::Display for InputValidation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// Retain the original diagnostic and typed causes when classifying a pure input check.
+pub(crate) fn input_argument<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if error.is::<InputValidation>() {
+            return error;
+        }
+        let marker = InputValidation {
+            message: error.to_string(),
+            #[cfg(any(feature = "cli", feature = "secret-vault"))]
+            cause_depth: error.chain().count(),
+        };
+        error.context(marker)
+    })
+}
+
+/// Render the original chain without repeating the transparent input classification context.
+#[cfg(any(feature = "cli", feature = "secret-vault"))]
+pub(crate) fn input_diagnostic(error: &anyhow::Error) -> String {
+    let Some(marker) = error.downcast_ref::<InputValidation>() else {
+        return format!("{error:#}");
+    };
+    let causes: Vec<_> = error.chain().collect();
+    let marker_index = causes.len().checked_sub(marker.cause_depth + 1);
+    causes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != marker_index)
+        .map(|(_, cause)| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
 /// The return shape of a command. `commands::CmdResult` is the same thing, but it sits behind
 /// the `cli` feature and `tui` needs it too, so the alias lives at the crate root.
 pub type CmdResultAlias = Result<ExitCode>;
@@ -182,26 +229,13 @@ pub fn warn(msg: &str) {
     eprintln!("note {msg}");
 }
 
-/// Exit codes. Uniform across the CLI (the PRD's "contract for scripts and agents"):
-///
-/// | Code | Meaning |
-/// |------|---------|
-/// | 0    | success (including nothing to do) |
-/// | 2    | usage error |
-/// | 3    | a reference does not resolve, or is ambiguous at an interactive terminal |
-/// | 4    | a precondition is not met |
-/// | 5    | not signed in, or the credentials are no longer valid |
-/// | 6    | network / hub error |
-/// | 7    | policy refusal (secret scan, gate) |
-/// | 8    | interaction or an explicit candidate selection is required in a non-interactive run |
-///
-/// `Failure(1)` is kept only while the legacy call sites migrate; new code must use one of the
-/// kinds above. A named type rather than a bare i32 makes every command's signature
-/// self-explanatory.
+/// Process exit categories preserve the cause established by a command across output formats.
+/// Known failures use their specific category; unclassified failures and aggregate results
+/// without a shared category use `Failure`. Diagnostic wording alone does not establish a cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
     Ok = 0,
-    /// Migration leftover; new code uses a more precise kind.
+    /// No precise category is established for the failed operation or aggregate result.
     Failure = 1,
     Usage = 2,
     /// A reference does not resolve, or is ambiguous at an interactive terminal.

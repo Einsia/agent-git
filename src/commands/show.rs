@@ -117,13 +117,13 @@ pub fn run(args: Args) -> CmdResult {
     // resolves back to the original in the runtime's directory).
     let repo = match (&args.agent, args.target.is_none()) {
         (Some(slug), _) => {
-            let (o, n) = super::parse_slug(slug)?;
+            let (o, n) = crate::input_argument(super::parse_slug(slug))?;
             match super::clone::local_store(&o, &n)? {
                 Some(r) => Some(r),
                 None => {
                     ui::error(&format!("nothing local named {o}/{n}."));
                     ui::hint(&format!("fetch it first: `agit clone {o}/{n}`"));
-                    return Ok(ExitCode::Failure);
+                    return Ok(ExitCode::Ref);
                 }
             }
         }
@@ -232,16 +232,36 @@ pub fn run(args: Args) -> CmdResult {
         }
     };
 
-    let content = read_session(repo.as_ref(), &target, args.log_only, args.raw)?;
+    let content = match read_session(repo.as_ref(), &target, args.log_only, args.raw) {
+        Ok(content) => content,
+        Err(error) => {
+            ui::error(&format!("cannot read selected session content: {error:#}"));
+            let fallback = if error.is::<LocalContentFailure>() {
+                ExitCode::Precondition
+            } else {
+                ExitCode::Failure
+            };
+            return Ok(super::terminal_error_code(&error, fallback));
+        }
+    };
     if args.raw {
         print!("{}", content.text);
         return Ok(ExitCode::Ok);
     }
     let parsed = if content.from_repo {
-        transcript::display::parse(&content.text)?
+        transcript::display::parse(&content.text)
     } else {
         let rt = adapter::infer_runtime(&content.text).unwrap_or(target.runtime.as_str());
-        adapter::get(rt)?.parse(&content.text)?
+        adapter::get(rt)?.parse(&content.text)
+    };
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            ui::error(&format!(
+                "cannot decode selected session content: {error:#}"
+            ));
+            return Ok(super::terminal_error_code(&error, ExitCode::Precondition));
+        }
     };
 
     let selection = match (&selected_context, &args.agent, &target.branch) {
@@ -333,7 +353,7 @@ fn tui_verdict(explicit: bool, mut signals: crate::tui::Signals) -> Option<crate
 fn session_index(sessions: &[session::Stored], selector: &str) -> crate::Result<usize> {
     let selector = selector.trim();
     if selector.is_empty() {
-        anyhow::bail!("session selector must not be empty");
+        return crate::input_argument(Err(anyhow::anyhow!("session selector must not be empty")));
     }
     if let Some(index) = sessions
         .iter()
@@ -367,6 +387,15 @@ struct SessionRead {
     from_repo: bool,
 }
 
+#[derive(Debug)]
+struct LocalContentFailure;
+
+impl std::fmt::Display for LocalContentFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("local session content is unavailable")
+    }
+}
+
 /// Repository sessions expose the explicitly selected sequence; native selectors expose the live file.
 /// A branch's content and header share a frozen commit even if its tip advances during the read.
 fn read_session(
@@ -397,11 +426,15 @@ fn read_session(
                 crate::domain::storage::materialize_worktree(repo.root(), sequence_file(log_only))?;
             (view, Some((meta::resolve(repo.root())?, None)))
         }
-        (None, _) => (std::fs::read_to_string(&target.path)?, None),
+        (None, _) => (
+            std::fs::read_to_string(&target.path)
+                .map_err(|error| anyhow::Error::new(error).context(LocalContentFailure))?,
+            None,
+        ),
     };
     Ok(SessionRead {
         text: if from_repo && raw_output {
-            transcript::unwrap_strict(&raw)?
+            transcript::unwrap_strict(&raw).map_err(|error| error.context(LocalContentFailure))?
         } else {
             raw
         },
@@ -668,7 +701,7 @@ fn show_ref(t: &str, args: &Args, use_tui: bool) -> Option<ExitCode> {
             };
             let Ok(env) = serde_json::from_str::<transcript::Envelope>(l) else {
                 ui::error("that line is not a valid envelope.");
-                return Some(ExitCode::Failure);
+                return Some(ExitCode::Precondition);
             };
             println!("{}", env.content);
             return Some(ExitCode::Ok);
@@ -823,7 +856,7 @@ fn browse_ref_text(target: &str, text: String, source: &str) -> ExitCode {
         Ok(code) => code,
         Err(error) => {
             ui::error(&format!("cannot open this transcript: {error:#}"));
-            ExitCode::Failure
+            ExitCode::Precondition
         }
     }
 }
@@ -952,6 +985,18 @@ fn render_envelopes(envelopes: &str, max_chars: usize) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unreadable_snapshot_refuses_before_entering_the_terminal() {
+        assert_eq!(
+            super::browse_ref_text(
+                "synthetic/session@branch",
+                "not saved JSONL\n".to_owned(),
+                "repository VIEW"
+            ),
+            crate::ExitCode::Precondition
+        );
+    }
+
     /// The header follows the body: with the main checkout sitting on main (the file line),
     /// `show` of a session branch takes the meta and version ID from that branch's tip, not from
     /// the main checkout's.
@@ -1075,8 +1120,21 @@ mod tests {
         let mut sessions = [stored("abc-one"), stored("abc-two")];
         sessions[1].branch = Some("work".into());
         assert_eq!(super::session_index(&sessions, "work").unwrap(), 1);
-        assert!(super::session_index(&sessions, "missing").is_err());
-        assert!(super::session_index(&sessions, "abc").is_err());
+        for selector in ["", " "] {
+            let error = super::session_index(&sessions, selector).unwrap_err();
+            assert_eq!(
+                crate::commands::terminal_error_code(&error, crate::ExitCode::Failure),
+                crate::ExitCode::Usage
+            );
+            assert_eq!(
+                crate::commands::terminal_error_message(&error),
+                "session selector must not be empty"
+            );
+        }
+        for selector in ["missing", "abc"] {
+            let error = super::session_index(&sessions, selector).unwrap_err();
+            assert!(!error.is::<crate::InputValidation>());
+        }
         assert_eq!(super::session_index(&sessions, "abc-t").unwrap(), 1);
     }
 

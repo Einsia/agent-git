@@ -574,7 +574,7 @@ fn name_it(slug: &str, row: Option<&Row>) -> Option<String> {
             continue;
         }
         if let Err(error) = crate::commands::target::branch_only(&format!("{slug}@{branch}")) {
-            crate::ui::error(&format!("{error:#}"));
+            crate::ui::error(&crate::commands::terminal_error_message(&error));
             continue;
         }
         match std::process::Command::new("git")

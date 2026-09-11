@@ -173,7 +173,7 @@ pub fn run(mut args: Args) -> CmdResult {
     };
     let readable = ui::transcript::render_transcript(&parsed, 20000);
 
-    let expire_secs = parse_expire(&args.expire)?;
+    let expire_secs = crate::input_argument(parse_expire(&args.expire))?;
 
     // Passphrase: hashed locally; the plaintext is never uploaded.
     let password_hash = if args.password {

@@ -7,8 +7,7 @@
 use super::{
     CURRENT_PROJECTION_VERSION, CURRENT_SCHEMA_VERSION, DecryptedRecord, KeyStore,
     MAX_REPOSITORY_SECRET_BYTES, Matcher, PlainRecord, RECORD_VERSION, RecordOrigin, SealedRecord,
-    SelectedKeyStore, Unlocked, VaultStore, encode_padded, record_aad, seal, validate_name,
-    validate_secret, write_vault,
+    SelectedKeyStore, Unlocked, VaultStore, encode_padded, record_aad, seal, write_vault,
 };
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{Context as _, bail};
@@ -389,8 +388,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         secret: Zeroizing<String>,
         allow_short: bool,
     ) -> crate::Result<RepositoryRecordSummary> {
-        validate_name(name)?;
-        validate_secret(&secret, allow_short)?;
+        super::validate_registration(name, &secret, allow_short)?;
         self.store.with_lock(|| {
             let created = !self.store.path.exists();
             let mut unlocked = if created {

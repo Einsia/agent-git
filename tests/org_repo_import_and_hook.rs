@@ -1103,7 +1103,7 @@ fn check_superseded_harness_refusal(ownerless: bool) {
         String::from_utf8_lossy(&from_old_runtime.stderr)
     );
     assert!(
-        !from_old_runtime.status.success(),
+        from_old_runtime.status.code() == Some(7),
         "{from_old_runtime_text}"
     );
     assert!(
@@ -1161,7 +1161,7 @@ fn check_superseded_harness_refusal(ownerless: bool) {
             String::from_utf8_lossy(&refused.stdout),
             String::from_utf8_lossy(&refused.stderr)
         );
-        assert!(!refused.status.success(), "{args:?}: {output}");
+        assert_eq!(refused.status.code(), Some(7), "{args:?}: {output}");
         assert!(output.contains("superseded"), "{output}");
         assert_eq!(
             repo.git(&["rev-parse", "refs/heads/work"]).unwrap(),

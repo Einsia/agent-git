@@ -62,7 +62,9 @@ pub fn edit() -> crate::Result<()> {
                             editing = false;
                             notice = Some(format!("saved {key}"));
                         }
-                        Err(error) => notice = Some(format!("{error:#}")),
+                        Err(error) => {
+                            notice = Some(crate::commands::terminal_error_message(&error))
+                        }
                     }
                 }
                 KeyCode::Char(ch)
@@ -99,7 +101,7 @@ pub fn edit() -> crate::Result<()> {
                         entries = config::collect()?;
                         notice = Some(format!("unset {key}"));
                     }
-                    Err(error) => notice = Some(format!("{error:#}")),
+                    Err(error) => notice = Some(crate::commands::terminal_error_message(&error)),
                 }
             }
             _ => {}

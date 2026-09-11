@@ -43,7 +43,7 @@ pub fn run(args: Args) -> CmdResult {
         let parsed = match crate::commands::target::branch_only(raw) {
             Ok(v) => v,
             Err(e) => {
-                ui::error(&format!("{e:#}"));
+                ui::error(&super::terminal_error_message(&e));
                 return Ok(ExitCode::Usage);
             }
         };
@@ -53,7 +53,7 @@ pub fn run(args: Args) -> CmdResult {
         let branch = parsed
             .base
             .ok_or_else(|| anyhow::anyhow!("target has no branch"))?;
-        let (o, n) = super::parse_slug(&slug)?;
+        let (o, n) = crate::input_argument(super::parse_slug(&slug))?;
         let Some(repo) = Repo::open(crate::infra::config::repo_dir(&o, &n)?) else {
             ui::error(&format!("{slug} doesn’t exist locally."));
             return Ok(ExitCode::Precondition);
@@ -168,7 +168,7 @@ fn expand_one(
     target_source: Source,
     p: &str,
 ) -> crate::Result<Option<(Vec<String>, Selection)>> {
-    let spec = super::target::resolve_local_repo(refs::parse(p)?)?;
+    let spec = super::target::resolve_local_repo(crate::input_argument(refs::parse(p))?)?;
     // Source repo: with an explicit owner/repo@..., it may be a different local repo.
     let (repo, head, slug, source) = match &spec.repo {
         refs::RepoSel::Slug(o, n) => {

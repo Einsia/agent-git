@@ -220,14 +220,14 @@ impl SecretKeystore {
 pub fn secret_keystore() -> Result<SecretKeystore> {
     match get_global(SecretKeystore::KEY)? {
         None => Ok(SecretKeystore::Os),
-        Some(v) => SecretKeystore::parse(&v).with_context(|| {
+        Some(v) => crate::input_argument(SecretKeystore::parse(&v).with_context(|| {
             format!(
                 "`{}` takes `os` or `file`, not `{v}` (from ${} or `agit config {}`)",
                 SecretKeystore::KEY,
                 SecretKeystore::ENV,
                 SecretKeystore::KEY
             )
-        }),
+        })),
     }
 }
 

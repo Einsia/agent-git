@@ -29,6 +29,7 @@
 //! "what the workspace is". A grant is not the hub's truth, and a reconnect must not erase it.
 //! So: a file of its own.
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,6 +46,24 @@ const FILE: &str = "grants.json";
 impl Grants {
     pub fn load() -> Grants {
         super::load_json(FILE)
+    }
+
+    /// Explicit changes require readable prior state; a bad carrier is not an empty grant set.
+    pub fn load_for_update() -> crate::Result<Grants> {
+        let path = super::rc_dir()?.join(FILE);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(error).context("cannot inspect the local grant file"),
+        };
+        anyhow::ensure!(
+            metadata.is_file(),
+            "the local grant file is not a regular file"
+        );
+        let bytes = std::fs::read(&path).context("cannot read the local grant file")?;
+        serde_json::from_slice(&bytes).context("the local grant file is not valid grant data")
     }
 
     pub fn save(&self) -> crate::Result<()> {

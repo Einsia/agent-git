@@ -19,8 +19,16 @@ pub struct Target {
 }
 
 pub fn parse(input: &str) -> Result<Target> {
-    let spec = refs::parse(input)?;
-    Ok(from_spec(spec))
+    Ok(from_spec(parse_spec(input)?))
+}
+
+/// Validate the literal repository qualifier before context or stored checkout resolution.
+pub(crate) fn parse_spec(input: &str) -> Result<RefSpec> {
+    let spec = crate::input_argument(refs::parse(input))?;
+    if let RepoSel::Slug(owner, name) = &spec.repo {
+        crate::input_argument(super::parse_slug(&format!("{owner}/{name}")))?;
+    }
+    Ok(spec)
 }
 
 #[derive(Debug)]
@@ -56,7 +64,7 @@ pub(crate) fn resolve_local_repo(mut spec: RefSpec) -> Result<RefSpec> {
 /// branch name; the sentinel is removed before the caller resolves the ref.
 pub fn parse_local(input: &str) -> Result<RefSpec> {
     let qualified = format!("__agit_target__/__agit_ref@{input}");
-    let parsed = refs::parse(&qualified)?;
+    let parsed = crate::input_argument(refs::parse(&qualified))?;
     Ok(RefSpec {
         repo: RepoSel::Context,
         base: parsed.base,
@@ -102,7 +110,7 @@ fn parse_spec_with_local(repo: Option<&crate::domain::repo::Repo>, input: &str) 
     {
         return Ok(local);
     }
-    refs::parse(input)
+    parse_spec(input)
 }
 
 pub fn from_spec(spec: RefSpec) -> Target {
@@ -153,17 +161,19 @@ pub fn to_spec(target: Target) -> RefSpec {
 pub fn branch_only(input: &str) -> Result<Target> {
     let t = parse(input)?;
     if t.base.is_none() {
-        anyhow::bail!("`{input}` does not name a branch; use `<owner>/<repo>@<branch>`");
+        return crate::input_argument(Err(anyhow::anyhow!(
+            "`{input}` does not name a branch; use `<owner>/<repo>@<branch>`"
+        )));
     }
     if t.base.as_deref() == Some("@") {
-        anyhow::bail!(
+        return crate::input_argument(Err(anyhow::anyhow!(
             "`{input}` is the current-session shorthand; write the branch explicitly when naming a repository"
-        );
+        )));
     }
     if t.tail != Tail::None {
-        anyhow::bail!(
+        return crate::input_argument(Err(anyhow::anyhow!(
             "`{input}` names a historic point, not a branch; remove the trailing selector"
-        );
+        )));
     }
     Ok(t)
 }
@@ -224,9 +234,42 @@ mod tests {
 
     #[test]
     fn branch_only_rejects_points() {
-        assert!(branch_only("alice/payments@refund-fix#3").is_err());
-        assert!(branch_only("alice/payments").is_err());
+        for input in [
+            "alice/payments@refund-fix#3",
+            "alice/payments",
+            "alice/payments@@",
+        ] {
+            let error = branch_only(input).unwrap_err();
+            assert_eq!(
+                crate::commands::terminal_error_code(&error, crate::ExitCode::Failure),
+                crate::ExitCode::Usage
+            );
+        }
         assert!(branch_only("alice/payments@refund-fix").is_ok());
+    }
+
+    #[test]
+    fn argument_syntax_does_not_reclassify_the_shared_reference_parser() {
+        let input = "alice/payments@refund-fix#0";
+        let shared_error = refs::parse(input).unwrap_err();
+        assert_eq!(
+            crate::commands::terminal_error_code(&shared_error, crate::ExitCode::Failure),
+            crate::ExitCode::Failure
+        );
+        for error in [
+            parse(input).unwrap_err(),
+            parse_local("refund-fix#0").unwrap_err(),
+            parse_spec_with_local(None, input).unwrap_err(),
+        ] {
+            assert_eq!(
+                error.root_cause().to_string(),
+                shared_error.root_cause().to_string()
+            );
+            assert_eq!(
+                crate::commands::terminal_error_code(&error, crate::ExitCode::Failure),
+                crate::ExitCode::Usage
+            );
+        }
     }
 
     #[test]

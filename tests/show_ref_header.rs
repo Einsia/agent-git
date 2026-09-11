@@ -4,6 +4,9 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/publication_process.rs"]
+mod publication_process;
+
 const SESSION: &str = "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const HUB: &str = "https://published.example.test/mount";
 
@@ -94,6 +97,10 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
             .args(args)
@@ -124,7 +131,7 @@ impl Fixture {
                 command.env(name, value);
             }
         }
-        command.output().unwrap()
+        command
     }
 
     fn success(&self, args: &[&str]) -> String {
@@ -132,6 +139,226 @@ impl Fixture {
         assert!(output.status.success(), "{args:?}: {output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
         String::from_utf8(output.stdout).unwrap()
+    }
+}
+
+#[test]
+fn selected_repository_read_failure_stays_unclassified_when_git_can_fetch() {
+    fn state(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(!entry.file_type().is_symlink());
+                (
+                    entry.path().strip_prefix(root).unwrap().to_owned(),
+                    entry
+                        .file_type()
+                        .is_file()
+                        .then(|| std::fs::read(entry.path()).unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    let fixture = Fixture::new();
+    fixture.success(&["show", SESSION, "--agent", "alice/headers", "--raw"]);
+    let blob = fixture
+        .repo
+        .git(&["rev-parse", &format!("{}:{}", fixture.sha, meta::VIEW_FILE)])
+        .unwrap();
+    let path = fixture
+        .repo
+        .root()
+        .join(".git/objects")
+        .join(&blob[..2])
+        .join(&blob[2..]);
+    let bytes = std::fs::read(&path).unwrap();
+    let remote = fixture._root.path().join("empty-promisor.git");
+    fixture
+        .repo
+        .git(&["init", "--bare", remote.to_str().unwrap()])
+        .unwrap();
+    fixture
+        .repo
+        .git(&["remote", "set-url", "origin", remote.to_str().unwrap()])
+        .unwrap();
+    fixture
+        .repo
+        .git(&["config", "extensions.partialClone", "origin"])
+        .unwrap();
+    fixture
+        .repo
+        .git(&["config", "remote.origin.promisor", "true"])
+        .unwrap();
+    fixture
+        .repo
+        .git(&["config", "remote.origin.partialclonefilter", "blob:none"])
+        .unwrap();
+    std::fs::write(fixture.repo.root().join(".git/FETCH_HEAD"), b"").unwrap();
+    #[cfg(windows)]
+    {
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+    std::fs::remove_file(&path).unwrap();
+    let before = state(fixture._root.path());
+    let refs = fixture.repo.git(&["show-ref"]).unwrap();
+
+    for (flags, mode, version) in [
+        (vec![], "human", None),
+        (vec!["--quiet"], "quiet", None),
+        (vec!["--json", "--json-version", "1"], "json1", Some(1)),
+        (vec!["--json", "--json-version", "2"], "json2", Some(2)),
+    ] {
+        for raw in [false, true] {
+            let mut args = flags.clone();
+            args.extend(["show", SESSION, "--agent", "alice/headers"]);
+            if raw {
+                args.push("--raw");
+            }
+            let mut command = fixture.command(&args);
+            command
+                .env_remove("GIT_NO_LAZY_FETCH")
+                .env("GIT_ALLOW_PROTOCOL", "file")
+                .env("LC_ALL", "C")
+                .env("LANGUAGE", "C");
+            let output = publication_process::output(
+                command,
+                mode,
+                "missing-promisor-view",
+                std::time::Instant::now() + publication_process::MODE_LIMIT,
+            )
+            .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            let diagnostics = if let Some(version) = version {
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(envelope["schema_version"], version);
+                assert_eq!(envelope["command"], "show");
+                assert_eq!(envelope["exit_code"], 1);
+                assert_eq!(envelope["ok"], false);
+                assert_eq!(envelope["result"]["format"], "empty");
+                envelope["diagnostics"].to_string()
+            } else {
+                assert!(output.stdout.is_empty(), "{output:?}");
+                String::from_utf8(output.stderr).unwrap()
+            };
+            assert!(
+                diagnostics.contains("cannot read selected session content"),
+                "{diagnostics}"
+            );
+            assert!(
+                diagnostics.contains("upload-pack") && diagnostics.contains(&blob),
+                "{diagnostics}"
+            );
+            assert!(
+                !diagnostics.contains("FROZEN-PROMPT") && !diagnostics.contains("HIDDEN-PROMPT")
+            );
+            assert_eq!(state(fixture._root.path()), before);
+            assert_eq!(fixture.repo.git(&["show-ref"]).unwrap(), refs);
+            assert!(!path.exists());
+        }
+    }
+    std::fs::write(path, bytes).unwrap();
+    let before = state(fixture._root.path());
+    let restored = fixture.success(&["show", SESSION, "--agent", "alice/headers", "--raw"]);
+    assert!(restored.contains("FROZEN-PROMPT"));
+    assert!(!restored.contains("HIDDEN-PROMPT"));
+    assert_eq!(state(fixture._root.path()), before);
+}
+
+#[test]
+fn explicit_agent_absence_is_a_reference_failure_without_changing_saved_evidence() {
+    fn state(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(!entry.file_type().is_symlink());
+                (
+                    entry.path().strip_prefix(root).unwrap().to_owned(),
+                    entry
+                        .file_type()
+                        .is_file()
+                        .then(|| std::fs::read(entry.path()).unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    let fixture = Fixture::new();
+    fixture.success(&["show", "alice/headers@selected", "--raw"]);
+    let before = state(fixture._root.path());
+    let refs = fixture
+        .repo
+        .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+        .unwrap();
+    for (flags, version) in [
+        (vec![], None),
+        (vec!["--quiet"], None),
+        (vec!["--json", "--json-version", "1"], Some(1)),
+        (vec!["--json", "--json-version", "2"], Some(2)),
+    ] {
+        for (agent, code, diagnostic) in [
+            ("alice/missing", 3, "nothing local named alice/missing"),
+            ("alice/headers/extra", 2, "use the <owner>/<agent> form"),
+        ] {
+            let mut args = flags.clone();
+            args.extend(["show", SESSION, "--agent", agent]);
+            let output = fixture.run(&args);
+            assert_eq!(output.status.code(), Some(code), "{args:?}: {output:?}");
+            let diagnostics = if let Some(version) = version {
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(envelope["command"], "show");
+                assert_eq!(envelope["schema_version"], version);
+                assert_eq!(envelope["exit_code"], code);
+                assert_eq!(envelope["ok"], false);
+                assert_eq!(envelope["result"]["format"], "empty");
+                if version == 1 {
+                    assert!(envelope.get("fix").is_none());
+                } else {
+                    assert_eq!(envelope["fix"], json!([]));
+                }
+                envelope["diagnostics"].to_string()
+            } else {
+                assert!(output.stdout.is_empty(), "{output:?}");
+                String::from_utf8(output.stderr).unwrap()
+            };
+            assert!(diagnostics.contains(diagnostic), "{diagnostics}");
+            assert_eq!(state(fixture._root.path()), before);
+        }
+
+        let mut args = flags;
+        args.extend(["show", SESSION, "--agent", "alice/headers", "--raw"]);
+        let output = fixture.run(&args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let values = if let Some(version) = version {
+            let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(envelope["schema_version"], version);
+            assert_eq!(envelope["ok"], true);
+            assert_eq!(envelope["result"]["format"], "json_lines");
+            envelope["result"]["values"].as_array().unwrap().clone()
+        } else {
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        assert_eq!(values, fixture.view);
+        assert_eq!(fixture.repo.current_branch().as_deref(), Some("main"));
+        assert_eq!(
+            fixture
+                .repo
+                .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+                .unwrap(),
+            refs
+        );
+        assert_eq!(state(fixture._root.path()), before);
     }
 }
 

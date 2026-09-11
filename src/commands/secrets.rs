@@ -123,6 +123,11 @@ pub fn run(args: Args) -> CmdResult {
                 }
                 Zeroizing::new(first)
             };
+            crate::input_argument(crate::domain::secret_filter::validate_registration(
+                &name,
+                &secret,
+                allow_short,
+            ))?;
             let added = store.add(&name, secret, allow_short)?;
             reload_daemon()?;
             ui::success_result(&format!("registered {} ({})", added.name, added.id));
@@ -209,6 +214,11 @@ pub fn run(args: Args) -> CmdResult {
                 repo,
             } => {
                 let secret = read_new_secret(stdin)?;
+                crate::input_argument(crate::domain::secret_filter::validate_registration(
+                    &name,
+                    &secret,
+                    allow_short,
+                ))?;
                 let added = repository_dictionary(repo)?.block_add(&name, secret, allow_short)?;
                 ui::success_result(&format!(
                     "repository block rule {} ({})",
@@ -230,13 +240,18 @@ fn read_new_secret(stdin: bool) -> crate::Result<Zeroizing<String>> {
         return read_secret_stdin();
     }
     let Some(first) = ui::prompt::password("Secret")? else {
-        anyhow::bail!("an interactive terminal is required; automation must use `--stdin`");
+        return Err(super::InteractionRequired(
+            "an interactive terminal is required; automation must use `--stdin`".into(),
+        )
+        .into());
     };
     let Some(second) = ui::prompt::password("Secret again")? else {
-        anyhow::bail!("could not read the confirmation");
+        return Err(super::InteractionRequired("could not read the confirmation".into()).into());
     };
     if first != second {
-        anyhow::bail!("the two secret values did not match; nothing was saved");
+        return crate::input_argument(Err(anyhow::anyhow!(
+            "the two secret values did not match; nothing was saved"
+        )));
     }
     Ok(Zeroizing::new(first))
 }

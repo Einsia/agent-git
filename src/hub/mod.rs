@@ -190,11 +190,7 @@ pub struct PublishRequest {
     /// org name, and the server decides from membership whether it may be created.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
-    /// Whether it is public. **Public by default**; private is what `agit push --private` asks
-    /// for explicitly.
-    ///
-    /// Always sent explicitly, never left to the server's default — once the two ends drift apart
-    /// on "what the default is", what drifts is visibility, and that is irreversible.
+    /// Visibility is sent explicitly so server defaults cannot widen the audience chosen locally.
     pub public: bool,
     /// The code repo origins these sessions touch, for the server to build its reverse-lookup
     /// index on.

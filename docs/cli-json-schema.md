@@ -19,7 +19,8 @@ Every supported command uses the same top-level fields:
   negotiate versions they do not understand.
 - `command`: the canonical top-level command name.
 - `ok`: `true` exactly when `exit_code` is zero.
-- `exit_code`: the normal CLI exit code.
+- `exit_code`: the normal [CLI exit code](00_usage.md#exit-codes), including the supported
+  generic failure code when a more precise cause is not established.
 - `result`: command output, represented as `json`, `json_lines`, `text`, or
   `empty`.
 - `diagnostics`: captured stderr diagnostics as `{level, message}` objects.

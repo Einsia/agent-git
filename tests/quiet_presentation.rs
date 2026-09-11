@@ -301,7 +301,7 @@ fn setup_config_command(lab: &Lab, args: &[&str], mode: &str) -> Command {
 }
 
 fn setup_config_refusal(output: Output, diagnostic: &str, mode: &str) {
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
     let rendered = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -314,6 +314,7 @@ fn setup_config_refusal(output: Output, diagnostic: &str, mode: &str) {
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["schema_version"], mode.parse::<u32>().unwrap());
         assert_eq!(value["command"], "setup");
+        assert_eq!(value["exit_code"], 4);
         assert_eq!(value["ok"], false);
     } else {
         assert!(output.stdout.is_empty(), "{output:?}");
@@ -556,7 +557,7 @@ fn quiet_setup_retains_refusals_completion_data_and_json_results() {
             .quiet_command(&["setup", "--hooks", "--runtime", "claude-code"], mode)
             .output()
             .unwrap();
-        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
         assert!(output.stdout.is_empty(), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("must contain a JSON object"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("Setup incomplete"));

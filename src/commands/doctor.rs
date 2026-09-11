@@ -467,7 +467,7 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     Ok(if fatal {
-        ExitCode::Failure
+        ExitCode::Precondition
     } else {
         ExitCode::Ok
     })

@@ -160,7 +160,7 @@ fn validate(
     crate::domain::repo::valid_branch_name(branch).map_err(|error| format!("{error:#}"))?;
     let slug = repo.slug();
     crate::commands::target::branch_only(&format!("{slug}@{branch}"))
-        .map_err(|error| format!("{error:#}"))?;
+        .map_err(|error| crate::commands::terminal_error_message(&error))?;
     if repo.branches.iter().any(|existing| existing == branch) {
         return Err(format!(
             "`{branch}` already exists in {} — choose a new session branch.",

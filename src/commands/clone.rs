@@ -263,6 +263,11 @@ impl ProgressOutput {
 }
 
 fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
+    if let Some(supplied) = &args.adopt_legacy_agent_id {
+        crate::input_argument(
+            uuid::Uuid::parse_str(supplied.trim()).context("invalid --adopt-legacy-agent-id"),
+        )?;
+    }
     let client = crate::hub::Client::from_env();
     let s = ui::theme::symbols();
 
@@ -286,7 +291,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     let (src_owner, src_name, want) = match &args.target {
         Some(t) => {
             let (slug, r) = split_ref(t);
-            let (o, n) = parse_slug(slug)?;
+            let (o, n) = crate::input_argument(parse_slug(slug))?;
             (o, n, r)
         }
         None => match resolve_from_repo(&client)? {

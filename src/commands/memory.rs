@@ -981,7 +981,9 @@ fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
         Some(raw) => {
             let t = super::target::branch_only(raw)?;
             let Some(slug) = t.repo else {
-                anyhow::bail!("`--into` needs the full `<owner/repo>@<branch>` form");
+                return crate::input_argument(Err(anyhow::anyhow!(
+                    "`--into` needs the full `<owner/repo>@<branch>` form"
+                )));
             };
             (slug, t.base.expect("branch_only guarantees a branch"))
         }
@@ -990,7 +992,12 @@ fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
             (super::context::qualify(&ctx.repo), ctx.branch)
         }
     };
-    let (owner, name) = super::parse_slug(&slug)?;
+    let parts = super::parse_slug(&slug);
+    let (owner, name) = if into.is_some() {
+        crate::input_argument(parts)?
+    } else {
+        parts?
+    };
     let dir = crate::infra::config::repo_dir(&owner, &name)?;
     let Some(primary) = Repo::open(&dir) else {
         ui::error(&format!("{slug} doesn’t exist locally."));

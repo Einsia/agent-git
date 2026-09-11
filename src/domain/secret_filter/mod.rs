@@ -500,7 +500,7 @@ pub fn keystore_health() -> KeystoreHealth {
             return KeystoreHealth::Problem {
                 keystore: None,
                 dir: None,
-                why: format!("{e:#}"),
+                why: crate::input_diagnostic(&e),
             };
         }
     };
@@ -702,8 +702,7 @@ impl<K: KeyStore> VaultStore<K> {
         secret: Zeroizing<String>,
         allow_short: bool,
     ) -> crate::Result<RecordSummary> {
-        validate_name(name)?;
-        validate_secret(&secret, allow_short)?;
+        validate_registration(name, &secret, allow_short)?;
         self.with_lock(|| {
             let created = !self.path.exists();
             let mut unlocked = if created {
@@ -1262,6 +1261,16 @@ impl MatcherHandle {
         self.replace(matcher);
         Ok(status)
     }
+}
+
+/// Registration input validation is independent of stored records and keystore access.
+pub(crate) fn validate_registration(
+    name: &str,
+    secret: &str,
+    allow_short: bool,
+) -> crate::Result<()> {
+    validate_name(name)?;
+    validate_secret(secret, allow_short)
 }
 
 fn validate_name(name: &str) -> crate::Result<()> {

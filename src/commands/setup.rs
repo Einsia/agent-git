@@ -48,7 +48,7 @@ pub struct Args {
     pub mcp: bool,
     #[arg(long = "agents-md")]
     pub agents_md: bool,
-    #[arg(long, value_name = "shell")]
+    #[arg(long, value_name = "shell", value_parser = ["bash", "zsh", "fish"])]
     pub completions: Option<String>,
 }
 
@@ -143,7 +143,7 @@ pub fn run(args: Args) -> CmdResult {
             "Setup incomplete: {} item(s) failed; run `agit doctor` to inspect the installation.",
             report.failures
         ));
-        return Ok(ExitCode::Failure);
+        return Ok(ExitCode::Precondition);
     }
     if report.items > 0 {
         ui::success(&format!(

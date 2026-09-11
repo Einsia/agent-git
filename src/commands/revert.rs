@@ -92,7 +92,7 @@ pub fn run(args: Args) -> CmdResult {
     let specs = args
         .refs_
         .iter()
-        .map(|raw| super::target::resolve_local_repo(refs::parse(raw)?))
+        .map(|raw| super::target::resolve_local_repo(super::target::parse_spec(raw)?))
         .collect::<crate::Result<Vec<_>>>()?;
     let cwd = std::env::current_dir()?;
     let (repo, slug, target, target_source) = if let Some(raw) = args.into.as_deref()
@@ -102,7 +102,7 @@ pub fn run(args: Args) -> CmdResult {
         let parsed = match crate::commands::target::branch_only(raw) {
             Ok(v) => v,
             Err(e) => {
-                ui::error(&format!("{e:#}"));
+                ui::error(&super::terminal_error_message(&e));
                 return Ok(ExitCode::Usage);
             }
         };
@@ -112,7 +112,7 @@ pub fn run(args: Args) -> CmdResult {
         let branch = parsed
             .base
             .ok_or_else(|| anyhow::anyhow!("target has no branch"))?;
-        let (o, n) = super::parse_slug(&slug)?;
+        let (o, n) = crate::input_argument(super::parse_slug(&slug))?;
         let Some(repo) = Repo::open(crate::infra::config::repo_dir(&o, &n)?) else {
             ui::error(&format!("{slug} doesn’t exist locally."));
             return Ok(ExitCode::Precondition);

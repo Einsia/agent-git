@@ -4,7 +4,7 @@
 mod unix {
     use agit::infra::credentials::{HubCredential, save_at};
     use serde_json::{Value, json};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -59,6 +59,10 @@ mod unix {
 
     impl Hub {
         fn new(build: impl FnOnce(&str) -> Vec<Step>) -> Self {
+            Self::new_with_disconnect(build, false)
+        }
+
+        fn new_with_disconnect(build: impl FnOnce(&str) -> Vec<Step>, disconnect: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
@@ -98,16 +102,18 @@ mod unix {
                         request.authorization,
                         step.bearer.map(|token| format!("Bearer {token}"))
                     );
-                    let body = serde_json::to_vec(&step.response).unwrap();
-                    write!(
-                        stream,
-                        "HTTP/1.1 {} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        step.status,
-                        body.len()
-                    )
-                    .unwrap();
-                    stream.write_all(&body).unwrap();
-                    stream.flush().unwrap();
+                    if !disconnect {
+                        let body = serde_json::to_vec(&step.response).unwrap();
+                        write!(
+                            stream,
+                            "HTTP/1.1 {} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            step.status,
+                            body.len()
+                        )
+                        .unwrap();
+                        stream.write_all(&body).unwrap();
+                        stream.flush().unwrap();
+                    }
                     drop(stream);
                     if let Some(after_response) = step.after_response.take() {
                         after_response();
@@ -239,6 +245,27 @@ mod unix {
                 &credential(base, refresh_valid),
             )
             .unwrap();
+        }
+
+        fn state(&self) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+            walkdir::WalkDir::new(self._root.path())
+                .into_iter()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    assert!(!entry.file_type().is_symlink());
+                    (
+                        entry
+                            .path()
+                            .strip_prefix(self._root.path())
+                            .unwrap()
+                            .to_owned(),
+                        entry
+                            .file_type()
+                            .is_file()
+                            .then(|| fs::read(entry.path()).unwrap()),
+                    )
+                })
+                .collect()
         }
 
         fn json(&self, base: &str, args: &[&str], code: i32) -> Value {
@@ -1114,7 +1141,7 @@ mod unix {
             let mut command = lab.command(&hub.base, &["--json", "login", "--with-token"]);
             command.stdin(fs::File::open(input).unwrap());
             let output = run_bounded(command);
-            assert_eq!(output.status.code(), Some(8), "{output:?}");
+            assert_eq!(output.status.code(), Some(6), "{output:?}");
             assert!(output.stderr.is_empty());
             let value: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(value["fix"], json!([]));
@@ -1129,6 +1156,232 @@ mod unix {
             assert!(!value.to_string().contains(OLD_ACCESS));
             assert_eq!(fs::read(lab.credential_path(&hub.base)).unwrap(), before);
             assert_eq!(hub.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn pairing_and_first_start_keep_remote_failure_categories_without_saving_a_connection() {
+        for flags in [
+            vec![],
+            vec!["--quiet"],
+            vec!["--json", "--json-version", "1"],
+            vec!["--json", "--json-version", "2"],
+        ] {
+            for operation in [vec!["rc", "pair"], vec!["rc", "start", "--detach"]] {
+                for (status, code) in [(401, 5), (503, 6), (500, 6), (200, 6)] {
+                    let lab = Lab::new();
+                    let hub = Hub::new(|_| {
+                        let mut step = Step::error(
+                            "POST",
+                            "/api/rc/connections",
+                            authentication_error("synthetic HTTP 401 wording"),
+                        );
+                        step.status = status;
+                        vec![step]
+                    });
+                    assert!(
+                        run_bounded(lab.command(&hub.base, &["config", "--list"]))
+                            .status
+                            .success()
+                    );
+                    lab.seed_credentials(&hub.base, false);
+                    let identity = lab.store.join("rc/identity.json");
+                    fs::create_dir_all(identity.parent().unwrap()).unwrap();
+                    let identity_bytes = br#"{"machine_fingerprint":"synthetic-machine","display_name":"synthetic-machine","created_at":"2026-01-01T00:00:00Z"}"#;
+                    fs::write(&identity, identity_bytes).unwrap();
+                    let credentials = fs::read(lab.credential_path(&hub.base)).unwrap();
+                    let mut args = flags.clone();
+                    args.extend(operation.iter().copied());
+                    let output = run_bounded(lab.command(&hub.base, &args));
+                    assert_eq!(output.status.code(), Some(code), "{args:?}: {output:?}");
+                    if flags.contains(&"--json") {
+                        assert!(output.stderr.is_empty(), "{output:?}");
+                        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(value["command"], "rc");
+                        assert_eq!(value["exit_code"], code);
+                        assert_eq!(value["ok"], false);
+                        assert_eq!(
+                            value["schema_version"],
+                            flags.last().unwrap().parse::<u32>().unwrap()
+                        );
+                        if flags.last() == Some(&"1") {
+                            assert!(value.get("fix").is_none());
+                        } else if code == 5 {
+                            lab.assert_login(&value, &hub.base);
+                        } else {
+                            assert_eq!(value["fix"], json!([]));
+                        }
+                    } else {
+                        assert!(!output.stderr.is_empty());
+                        assert!(output.stdout.is_empty(), "{output:?}");
+                    }
+                    for token in [OLD_ACCESS, OLD_REFRESH] {
+                        assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
+                        assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
+                    }
+                    assert_eq!(fs::read(&identity).unwrap(), identity_bytes);
+                    assert_eq!(
+                        fs::read(lab.credential_path(&hub.base)).unwrap(),
+                        credentials
+                    );
+                    assert!(
+                        !lab.store
+                            .join("rc/connections")
+                            .join(format!(
+                                "{}.json",
+                                agit::infra::config::hub_host_key(&hub.base).unwrap()
+                            ))
+                            .exists()
+                    );
+                    assert!(!lab.store.join("rc/agitd.pid").exists());
+                    let requests = hub.finish();
+                    assert_eq!(requests.len(), 1);
+                    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+                    assert_eq!(body["machine_fingerprint"], "synthetic-machine");
+                    assert_eq!(body["display_name"], "synthetic-machine");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rc_land_remote_refusals_preserve_lineage_and_native_evidence() {
+        for flags in [
+            vec![],
+            vec!["--quiet"],
+            vec!["--json", "--json-version", "1"],
+            vec!["--json", "--json-version", "2"],
+        ] {
+            for case in [
+                "unauthorized",
+                "unavailable",
+                "disconnect",
+                "configuration",
+                "lineage",
+            ] {
+                let existing_repos: &[bool] = if case == "unavailable" {
+                    &[false, true]
+                } else {
+                    &[false]
+                };
+                for &existing_repo in existing_repos {
+                    let lab = Lab::new();
+                    let sends_request = !matches!(case, "configuration" | "lineage");
+                    let code = match case {
+                        "unauthorized" => 5,
+                        "configuration" | "lineage" => 2,
+                        _ => 6,
+                    };
+                    let hub = Hub::new_with_disconnect(
+                        |_| {
+                            if !sends_request {
+                                return vec![];
+                            }
+                            let mut step = Step::error(
+                                "GET",
+                                "/api/agents/me/qa",
+                                authentication_error("synthetic HTTP 401 wording"),
+                            );
+                            if case != "unauthorized" {
+                                step.status = 503;
+                            }
+                            vec![step]
+                        },
+                        case == "disconnect",
+                    );
+                    assert!(
+                        run_bounded(lab.command(&hub.base, &["config", "--list"]))
+                            .status
+                            .success()
+                    );
+                    lab.seed_credentials(&hub.base, false);
+                    if existing_repo {
+                        lab.initialize_repo(&hub.base);
+                        assert!(
+                            run_bounded(lab.command(&hub.base, &["config", "--list"]))
+                                .status
+                                .success()
+                        );
+                    }
+                    if case == "configuration" {
+                        fs::write(
+                            lab.credential_path(&hub.base),
+                            format!("{{\"token\":\"{OLD_ACCESS}\", invalid"),
+                        )
+                        .unwrap();
+                    }
+                    let native = lab.home.join(".codex/sessions/native-canary.jsonl");
+                    fs::create_dir_all(native.parent().unwrap()).unwrap();
+                    fs::write(&native, b"retained native transcript evidence\n").unwrap();
+                    let before = lab.state();
+                    let args = agit::commands::rc::land_argv(
+                        if case == "lineage" { "../qa" } else { "me/qa" },
+                        AGENT_ID,
+                        "rc-http",
+                        "codex",
+                        "synthetic-rc-land",
+                        lab.work.to_str().unwrap(),
+                    );
+                    let mut command = lab.command(&hub.base, &flags);
+                    command.args(args);
+                    let output = run_bounded(command);
+                    assert_eq!(
+                        output.status.code(),
+                        Some(code),
+                        "{case}/{flags:?}: {output:?}"
+                    );
+                    let text = if flags.contains(&"--json") {
+                        assert!(output.stderr.is_empty(), "{output:?}");
+                        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(value["command"], "rc");
+                        assert_eq!(value["exit_code"], code);
+                        assert_eq!(value["ok"], false);
+                        assert_eq!(
+                            value["schema_version"],
+                            flags.last().unwrap().parse::<u32>().unwrap()
+                        );
+                        if flags.last() == Some(&"1") {
+                            assert!(value.get("fix").is_none());
+                        } else if code == 5 {
+                            lab.assert_login(&value, &hub.base);
+                        } else {
+                            assert_eq!(value["fix"], json!([]));
+                        }
+                        value.to_string()
+                    } else {
+                        assert!(output.stdout.is_empty(), "{output:?}");
+                        assert!(!output.stderr.is_empty());
+                        String::from_utf8_lossy(&output.stderr).into_owned()
+                    };
+                    if case == "configuration" {
+                        assert!(text.contains("credentials do not belong"), "{text}");
+                    } else if case == "lineage" {
+                        assert!(text.contains("hub sent an unusable lineage"), "{text}");
+                    }
+                    for token in [OLD_ACCESS, OLD_REFRESH, NEW_ACCESS, NEW_REFRESH] {
+                        assert!(!text.contains(token), "credential in output");
+                    }
+                    assert_eq!(lab.state(), before, "{case}/{flags:?}");
+                    assert_eq!(lab.store.join("repos/me/qa").exists(), existing_repo);
+                    assert!(
+                        !lab.store
+                            .join("store/codex/synthetic-rc-land.json")
+                            .exists()
+                    );
+                    assert!(!lab.store.join("rc/agitd.pid").exists());
+                    let requests = hub.finish();
+                    assert_eq!(requests.len(), usize::from(sends_request));
+                    if sends_request {
+                        assert_eq!(requests[0].method, "GET");
+                        assert_eq!(requests[0].target, "/api/agents/me/qa");
+                        assert_eq!(
+                            requests[0].authorization,
+                            Some(format!("Bearer {OLD_ACCESS}"))
+                        );
+                        assert!(requests[0].body.is_empty());
+                    }
+                }
+            }
         }
     }
 

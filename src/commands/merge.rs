@@ -118,6 +118,7 @@ pub fn run(args: Args) -> CmdResult {
         ui::hint("use `agit merge <src-ref>`, or `agit merge --status|--continue|--abort`");
         return Ok(ExitCode::Usage);
     };
+    crate::input_argument(refs::parse(&source))?;
     start(&cwd, &source, &args)
 }
 
@@ -130,20 +131,14 @@ fn target_of(
         && raw.contains('@')
         && raw != "@"
     {
-        let parsed = match crate::commands::target::branch_only(raw) {
-            Ok(v) => v,
-            Err(e) => {
-                ui::error(&format!("{e:#}"));
-                return Ok(None);
-            }
-        };
+        let parsed = crate::commands::target::branch_only(raw)?;
         let slug = parsed
             .repo
             .ok_or_else(|| anyhow::anyhow!("merge target has no repository"))?;
         let branch = parsed
             .base
             .ok_or_else(|| anyhow::anyhow!("merge target has no branch"))?;
-        let (o, n) = super::parse_slug(&slug)?;
+        let (o, n) = crate::input_argument(super::parse_slug(&slug))?;
         let Some(repo) = Repo::open(crate::infra::config::repo_dir(&o, &n)?) else {
             ui::error(&format!("{slug} doesn’t exist locally."));
             ui::hint(&format!("fetch it first: `agit clone {slug}`"));
@@ -525,11 +520,14 @@ fn transaction_repo(
     if into.is_none()
         && let Some(marker) = std::env::var_os(mergetx::ENV)
     {
-        let marker = marker.to_str().context("AGIT_MERGE_TX is not Unicode")?;
-        let (slug, branch) = super::context::decode_session_env(marker)
-            .context("AGIT_MERGE_TX must name an exact repository and target branch")?;
-        let (owner, name) = super::parse_slug(&slug)?;
-        crate::domain::repo::valid_branch_name(&branch)?;
+        let marker =
+            crate::input_argument(marker.to_str().context("AGIT_MERGE_TX is not Unicode"))?;
+        let (slug, branch) = crate::input_argument(
+            super::context::decode_session_env(marker)
+                .context("AGIT_MERGE_TX must name an exact repository and target branch"),
+        )?;
+        let (owner, name) = crate::input_argument(super::parse_slug(&slug))?;
+        crate::input_argument(crate::domain::repo::valid_branch_name(&branch))?;
         let repo = Repo::open(crate::infra::config::repo_dir(&owner, &name)?)
             .context("the marked merge repository is missing")?;
         return Ok(Some((repo, slug, Some(branch))));

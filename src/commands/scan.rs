@@ -73,7 +73,7 @@ pub fn run(args: Args) -> CmdResult {
             |raw| match crate::commands::target::parse_spec_preferring_local(&cwd, raw) {
                 Ok(spec) => Ok(spec),
                 Err(e) => {
-                    ui::error(&format!("{e:#}"));
+                    ui::error(&super::terminal_error_message(&e));
                     Err(ExitCode::Usage)
                 }
             },

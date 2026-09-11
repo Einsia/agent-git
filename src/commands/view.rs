@@ -44,7 +44,7 @@ pub fn run(args: Args) -> CmdResult {
         Some(raw) => match crate::commands::target::parse(raw) {
             Ok(parsed) => Some(parsed),
             Err(e) => {
-                ui::error(&format!("{e:#}"));
+                ui::error(&super::terminal_error_message(&e));
                 return Ok(ExitCode::Usage);
             }
         },
@@ -52,7 +52,7 @@ pub fn run(args: Args) -> CmdResult {
     };
     let (repo, slug, default_ref) = if let Some(target) = &parsed_target {
         if let Some(slug) = &target.repo {
-            let (o, n) = super::parse_slug(slug)?;
+            let (o, n) = crate::input_argument(super::parse_slug(slug))?;
             let Some(repo) = Repo::open(crate::infra::config::repo_dir(&o, &n)?) else {
                 ui::error(&format!("{slug} doesn’t exist locally."));
                 return Ok(ExitCode::Precondition);

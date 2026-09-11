@@ -63,7 +63,7 @@ pub fn run(args: Args) -> CmdResult {
     let endpoints = match args.range.as_deref().map(parse_endpoints).transpose() {
         Ok(endpoints) => endpoints,
         Err(error) => {
-            ui::error(&format!("{error:#}"));
+            ui::error(&super::terminal_error_message(&error));
             return Ok(ExitCode::Usage);
         }
     };
@@ -258,7 +258,7 @@ pub fn run(args: Args) -> CmdResult {
 
 fn parse_endpoints(raw: &str) -> crate::Result<(refs::RefSpec, Option<refs::RefSpec>, bool)> {
     let (left, right, three_dot) = split_range(raw);
-    let left = refs::parse(&left)?;
+    let left = super::target::parse_spec(&left)?;
     let right = right.as_deref().map(parse_right).transpose()?;
     whole_point(&left)?;
     if let Some(right) = &right {
@@ -272,7 +272,7 @@ fn parse_right(raw: &str) -> crate::Result<refs::RefSpec> {
         .split_once('@')
         .is_some_and(|(repo, _)| repo.contains('/'))
     {
-        refs::parse(raw)
+        super::target::parse_spec(raw)
     } else {
         crate::commands::target::parse_local(raw)
     }

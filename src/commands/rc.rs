@@ -140,7 +140,7 @@ pub struct RevokeArgs {
 }
 
 pub fn run(args: Args) -> CmdResult {
-    match args.action {
+    let result = match args.action {
         Action::Start(a) => start(a),
         Action::Status => status(),
         Action::Stop => stop(),
@@ -151,6 +151,13 @@ pub fn run(args: Args) -> CmdResult {
         Action::Grant(a) => grant(a),
         Action::Ungrant(a) => revoke_grant(a),
         Action::Grants(a) => grants(a),
+    };
+    match result {
+        Err(error) if error.is::<LocalStateFailure>() => {
+            ui::error(&format!("{error:#}"));
+            Ok(ExitCode::Precondition)
+        }
+        result => result,
     }
 }
 
@@ -172,13 +179,26 @@ pub fn run(args: Args) -> CmdResult {
 /// second authorization scheme for "is this request really from the owner", which is exactly the
 /// problem this feature avoids.
 fn grant(args: GrantArgs) -> CmdResult {
-    let mut g = crate::rc::grants::Grants::load();
-    if let Err(e) = g.grant(&args.workspace, &args.command) {
-        ui::error(&e.to_string());
+    if !crate::rc::grants::is_bare_command_name(&args.command) {
+        ui::error(&format!(
+            "`{}` is not a bare command name — grant `git`, not a path or a command line",
+            args.command
+        ));
         ui::hint(
             "grant a bare command name like `cargo` — a path or a command line would hand over arbitrary code",
         );
         return Ok(ExitCode::Usage);
+    }
+    let mut g = match crate::rc::grants::Grants::load_for_update() {
+        Ok(grants) => grants,
+        Err(error) => {
+            ui::error(&format!("cannot read the local command grants: {error:#}"));
+            return Ok(ExitCode::Precondition);
+        }
+    };
+    if let Err(error) = g.grant(&args.workspace, &args.command) {
+        ui::error(&format!("cannot save the local command grant: {error:#}"));
+        return Ok(ExitCode::Precondition);
     }
     ui::success(&format!(
         "operators of {} can now answer `{}` themselves",
@@ -189,7 +209,13 @@ fn grant(args: GrantArgs) -> CmdResult {
 }
 
 fn revoke_grant(args: GrantArgs) -> CmdResult {
-    let mut g = crate::rc::grants::Grants::load();
+    let mut g = match crate::rc::grants::Grants::load_for_update() {
+        Ok(grants) => grants,
+        Err(error) => {
+            ui::error(&format!("cannot read the local command grants: {error:#}"));
+            return Ok(ExitCode::Precondition);
+        }
+    };
     match g.revoke(&args.workspace, &args.command) {
         Ok(true) => {
             ui::success(&format!(
@@ -269,27 +295,30 @@ fn land(args: LandArgs) -> CmdResult {
                 return Ok(ExitCode::Usage);
             }
         };
+    let runtime = crate::input_argument(crate::adapter::normalize(&args.runtime))?;
     let (owner, name) = (lineage.owner(), lineage.name());
     let dest = lineage.repo_dir()?;
     let client = crate::hub::Client::from_env();
-    let expected = crate::hub::identity::RemoteIdentity::new(client.base(), lineage.agent_id())?;
+    let expected = crate::input_argument(crate::hub::identity::RemoteIdentity::new(
+        client.base(),
+        lineage.agent_id(),
+    ))?;
     // Resolve the slug on every invocation, including an already-landed
     // checkout. A deleted-and-recreated name must stop before any local commit;
     // relying only on the later push fence would leave an unauthorized local
     // settlement behind.
-    let agent = client.get_agent(owner, name)?;
+    let agent = super::remote_request(client.get_agent(owner, name))?;
     let observed = crate::hub::identity::RemoteIdentity::new(client.base(), &agent.agent_id)?;
     if observed != expected {
-        anyhow::bail!(
+        ui::error(&format!(
             "{} now identifies agent {}, but this RC session expects {}; refusing a reused name",
-            args.slug,
-            observed.agent_id,
-            expected.agent_id
-        );
+            args.slug, observed.agent_id, expected.agent_id
+        ));
+        return Ok(ExitCode::Precondition);
     }
 
     let native = crate::domain::merge_archive::RuntimeLinkKey {
-        runtime: crate::adapter::normalize(&args.runtime)?.into(),
+        runtime: runtime.into(),
         session_id: args.session.clone(),
     };
     let expected_archive = super::commit::archive::expected_rc_handoff()?;
@@ -338,7 +367,13 @@ fn land(args: LandArgs) -> CmdResult {
     );
 
     let history_update =
-        super::migration::begin_startup_recovery_for_path(&dest, "rc-land-history")?;
+        match super::migration::begin_startup_recovery_for_path(&dest, "rc-land-history") {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                ui::error(&format!("cannot prepare RC history recovery: {error:#}"));
+                return Ok(super::terminal_error_code(&error, ExitCode::Precondition));
+            }
+        };
 
     // Fetch the hub's copy when we don't have one — a rebind of a folder that
     // already has history elsewhere must build on that history, not fork it.
@@ -348,11 +383,12 @@ fn land(args: LandArgs) -> CmdResult {
     if !dest.join(".git").exists() {
         let cloned = crate::hub::git::clone(&agent.clone_url, &dest, &expected)?;
         if !cloned.ok() {
-            anyhow::bail!(
+            ui::error(&format!(
                 "could not clone {} for RC settlement: {}",
                 args.slug,
                 cloned.stderr.trim()
-            );
+            ));
+            return Ok(super::push::branch_failure_code(&cloned));
         }
     }
 
@@ -461,12 +497,17 @@ fn start(args: StartArgs) -> CmdResult {
         ui::hint("`agit rc status` to see it, `agit rc stop` to replace it");
         return Ok(ExitCode::Precondition);
     }
+    let hub = config::hub_url();
+    crate::input_argument(crate::infra::hub_authority::HubAuthority::parse(&hub))?;
     if let Some(n) = &args.name {
-        identity::set_display_name(n)?;
+        identity::set_display_name(n).map_err(|error| {
+            error.context(LocalStateFailure("cannot save the local RC machine name"))
+        })?;
     }
 
-    let hub = config::hub_url();
-    let conn = match identity::connection(&hub)? {
+    let conn = match identity::connection(&hub)
+        .map_err(|error| error.context(LocalStateFailure("cannot read the local RC connection")))?
+    {
         Some(c) => c,
         None => {
             // First run: pair through the existing device-code flow rather than
@@ -479,7 +520,11 @@ fn start(args: StartArgs) -> CmdResult {
     };
     let opts = daemon_options(&hub, conn)?;
 
-    let id = identity::identity()?;
+    let id = identity::identity().map_err(|error| {
+        error.context(LocalStateFailure(
+            "cannot prepare the local RC machine identity",
+        ))
+    })?;
     ui::section("agit rc");
     println!("  machine   {}", ui::accent(&id.display_name));
     println!("  hub       {hub}");
@@ -529,7 +574,7 @@ fn start(args: StartArgs) -> CmdResult {
         Ok(()) => Ok(ExitCode::Ok),
         Err(e) => {
             ui::error(&format!("{e:#}"));
-            Ok(ExitCode::Failure)
+            Ok(ExitCode::Precondition)
         }
     }
 }
@@ -538,7 +583,7 @@ fn daemon_options(
     hub: &str,
     connection: identity::Connection,
 ) -> crate::Result<crate::rc::daemon::Options> {
-    let authority = crate::infra::hub_authority::HubAuthority::parse(hub)?;
+    let authority = crate::input_argument(crate::infra::hub_authority::HubAuthority::parse(hub))?;
     anyhow::ensure!(
         authority.matches(&connection.hub),
         "the saved RC connection belongs to a different Hub"
@@ -596,7 +641,8 @@ fn status() -> CmdResult {
         }
         Ok(control::Reply::Error { message }) => {
             ui::error(&message);
-            Ok(ExitCode::Failure)
+            // A local control error cannot provide the requested daemon status snapshot.
+            Ok(ExitCode::Precondition)
         }
         Ok(_) => Ok(ExitCode::Ok),
         Err(_) => {
@@ -782,8 +828,10 @@ fn pair() -> CmdResult {
 /// a connection token bound to this machine's fingerprint. The RC token is
 /// separate from the API token so it can be revoked on its own.
 fn pair_interactive(hub: &str) -> crate::Result<Option<identity::Connection>> {
-    crate::infra::hub_authority::HubAuthority::parse(hub)?;
-    let c = match crate::infra::credentials::load_checked(hub)? {
+    crate::input_argument(crate::infra::hub_authority::HubAuthority::parse(hub))?;
+    let c = match crate::infra::credentials::load_checked(hub).map_err(|error| {
+        error.context(LocalStateFailure("cannot read the saved Hub credentials"))
+    })? {
         Some(credential) => crate::hub::Client::for_credential(hub, &credential),
         None => crate::hub::Client::for_hub(hub),
     };
@@ -794,26 +842,24 @@ fn pair_interactive(hub: &str) -> crate::Result<Option<identity::Connection>> {
         ui::hint("`agit login`");
         return Ok(None);
     }
-    let id = identity::identity()?;
-    let res = match c.rc_pair(
+    let id = identity::identity().map_err(|error| {
+        error.context(LocalStateFailure(
+            "cannot prepare the local RC machine identity",
+        ))
+    })?;
+    let res = super::remote_request(c.rc_pair(
         &id.machine_fingerprint,
         &id.display_name,
         &crate::rc::platform(),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            super::fix::register_terminal_api_error(&e);
-            ui::error(&format!("{e}"));
-            return Ok(None);
-        }
-    };
+    ))?;
     let conn = identity::Connection {
         connection_id: res.connection_id,
         token: res.token,
         hub: hub.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    identity::save_connection(&conn)?;
+    identity::save_connection(&conn)
+        .map_err(|error| error.context(LocalStateFailure("cannot save the local RC connection")))?;
     println!(
         "  {} paired as {}",
         ui::ok("✓"),
@@ -821,6 +867,17 @@ fn pair_interactive(hub: &str) -> crate::Result<Option<identity::Connection>> {
     );
     Ok(Some(conn))
 }
+
+#[derive(Debug)]
+struct LocalStateFailure(&'static str);
+
+impl std::fmt::Display for LocalStateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for LocalStateFailure {}
 
 fn runtimes_line() -> String {
     crate::rc::harness::drivable()

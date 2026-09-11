@@ -170,6 +170,8 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
                 .is_some_and(|api| api.status == 401)
     }) {
         ExitCode::Auth
+    } else if error.is::<crate::hub::client::RequestConfiguration>() {
+        ExitCode::Usage
     } else if error.is::<RemoteRequest>() {
         ExitCode::Network
     } else if error.is::<InteractionRequired>() {
@@ -182,9 +184,16 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
         } else {
             ExitCode::Interactive
         }
+    } else if error.is::<crate::InputValidation>() {
+        ExitCode::Usage
     } else {
         fallback
     }
+}
+
+/// Render diagnostics without exposing a transparent input classification twice.
+pub fn terminal_error_message(error: &anyhow::Error) -> String {
+    crate::input_diagnostic(error)
 }
 
 /// Parse the `<owner>/<name>` form.
@@ -239,14 +248,16 @@ pub fn writability(me: &str, owner: &str, name: &str) -> Result<Writability> {
             "{owner}/{name} is not your namespace — sign in (`agit login`) so the hub can say whether you may write to it"
         );
     }
-    match client.get_agent(owner, name) {
-        Ok(agent) => Ok(match client.push_access(owner, name, &agent.agent_id)? {
-            crate::hub::PushAccess::Writable => Writability::Granted,
-            crate::hub::PushAccess::ReadOnly | crate::hub::PushAccess::Missing => {
-                Writability::ReadOnly
-            }
-        }),
-        Err(e) if is_not_found(&e) => match client.get_org(owner) {
+    match remote_request(client.get_agent(owner, name)) {
+        Ok(agent) => Ok(
+            match remote_request(client.push_access(owner, name, &agent.agent_id))? {
+                crate::hub::PushAccess::Writable => Writability::Granted,
+                crate::hub::PushAccess::ReadOnly | crate::hub::PushAccess::Missing => {
+                    Writability::ReadOnly
+                }
+            },
+        ),
+        Err(e) if is_not_found(&e) => match remote_request(client.get_org(owner)) {
             Ok(org) if org.role == "owner" => Ok(Writability::Creatable),
             Ok(_) => Ok(Writability::Missing),
             Err(e) if is_not_found(&e) => Ok(Writability::Missing),
@@ -1536,6 +1547,110 @@ mod terminal_error_tests {
     use super::{LoginRequired, terminal_error_code};
     use crate::ExitCode;
     use crate::domain::refs::NotFound;
+
+    #[test]
+    fn input_classification_retains_diagnostics_and_neutral_parsers() {
+        for raw in [
+            "",
+            "alice/qa@main~bad",
+            "alice/qa@main#0",
+            "alice/qa@main#1.bad",
+        ] {
+            let neutral = crate::domain::refs::parse(raw).unwrap_err();
+            let message = neutral.to_string();
+            let chain = format!("{neutral:#}");
+            assert_eq!(
+                terminal_error_code(&neutral, ExitCode::Failure),
+                ExitCode::Failure
+            );
+            let typed = crate::input_argument::<()>(Err(neutral)).unwrap_err();
+            assert_eq!(typed.to_string(), message);
+            assert_eq!(super::terminal_error_message(&typed), chain);
+            let typed = crate::input_argument::<()>(Err(typed))
+                .unwrap_err()
+                .context("selected argument");
+            assert_eq!(
+                super::terminal_error_message(&typed),
+                format!("selected argument: {chain}")
+            );
+            assert_eq!(
+                terminal_error_code(&typed, ExitCode::Failure),
+                ExitCode::Usage
+            );
+        }
+        let error = crate::domain::repo::valid_name("not/a/name").unwrap_err();
+        assert_eq!(
+            terminal_error_code(&error, ExitCode::Precondition),
+            ExitCode::Precondition
+        );
+        let error = crate::adapter::normalize("not-a-runtime").unwrap_err();
+        assert_eq!(
+            terminal_error_code(&error, ExitCode::Failure),
+            ExitCode::Failure
+        );
+        let error = super::parse_slug("bad-slug").unwrap_err();
+        assert_eq!(
+            terminal_error_code(&error, ExitCode::Precondition),
+            ExitCode::Precondition
+        );
+    }
+
+    #[test]
+    fn explicit_input_keeps_stronger_causes_and_request_configuration_keeps_usage() {
+        for (error, code) in [
+            (
+                anyhow::Error::new(LoginRequired {
+                    hub: "https://hub.example.test".into(),
+                }),
+                ExitCode::Auth,
+            ),
+            (anyhow::Error::new(NotFound("absent".into())), ExitCode::Ref),
+            (
+                anyhow::Error::new(super::InteractionRequired("select a candidate".into())),
+                ExitCode::Interactive,
+            ),
+        ] {
+            let error = crate::input_argument::<()>(Err(error))
+                .unwrap_err()
+                .context("input context");
+            assert_eq!(terminal_error_code(&error, ExitCode::Failure), code);
+        }
+        let io = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "owned local I/O failure",
+        );
+        let error = crate::input_argument::<()>(Err(anyhow::Error::new(io))).unwrap_err();
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        let configuration = anyhow::anyhow!("invalid owned Hub configuration")
+            .context(crate::hub::client::RequestConfiguration);
+        let configuration = super::remote_request::<()>(Err(configuration)).unwrap_err();
+        assert_eq!(
+            terminal_error_code(&configuration, ExitCode::Failure),
+            ExitCode::Usage
+        );
+        assert!(!configuration.is::<super::RemoteRequest>());
+        let auth = anyhow::Error::new(LoginRequired {
+            hub: "https://hub.example.test".into(),
+        })
+        .context(crate::hub::client::RequestConfiguration);
+        assert_eq!(
+            terminal_error_code(&auth, ExitCode::Failure),
+            ExitCode::Auth
+        );
+        for message in [
+            "invalid argument",
+            "HTTP 401",
+            "cannot open file",
+            "ref is missing",
+        ] {
+            let error = anyhow::anyhow!(message).context("operation failed");
+            assert_eq!(
+                terminal_error_code(&error, ExitCode::Failure),
+                ExitCode::Failure
+            );
+            assert_eq!(super::terminal_error_message(&error), format!("{error:#}"));
+        }
+    }
 
     #[test]
     fn remote_request_context_preserves_authentication_and_does_not_classify_by_words() {

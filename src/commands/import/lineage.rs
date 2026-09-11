@@ -61,7 +61,7 @@ struct Destination {
 }
 
 impl Destination {
-    fn parse(args: &Args) -> crate::Result<Self> {
+    fn arguments(args: &Args) -> crate::Result<(String, String, String, String)> {
         let target = crate::commands::target::parse(
             args.repo
                 .as_deref()
@@ -91,14 +91,25 @@ impl Destination {
             branch != "@" && branch != "main",
             "the destination must name an explicit session branch"
         );
+        Ok((slug, owner, name, branch))
+    }
+
+    fn parse(args: &Args) -> crate::Result<Self> {
+        let (slug, owner, name, branch) = crate::input_argument(Self::arguments(args))?;
         let directory = std::env::current_dir()?.join(config::repo_dir(&owner, &name)?);
         let probe = repo::Repo::at(std::env::current_dir()?);
         let (status, _, _) =
             probe.git_status_local(&["check-ref-format", &format!("refs/heads/{branch}")])?;
-        ensure!(
-            status == Some(0),
-            "the destination session branch is not a valid Git ref"
-        );
+        if status != Some(0) {
+            let failure = Err(anyhow::anyhow!(
+                "the destination session branch is not a valid Git ref"
+            ));
+            return if status == Some(1) {
+                crate::input_argument(failure)
+            } else {
+                failure
+            };
+        }
         Ok(Self {
             slug,
             branch,
@@ -215,20 +226,24 @@ pub(super) fn preview(args: &Args, json: bool) -> crate::commands::CmdResult {
 
 fn selected_args(args: &Args) -> crate::Result<(Destination, &str, Box<dyn adapter::Adapter>)> {
     let destination = Destination::parse(args)?;
-    let id = args
-        .session
-        .as_deref()
-        .context("lineage inspection requires an explicit native session ID")?;
-    ensure!(
-        id != "@",
-        "lineage inspection requires a native session ID, not current-session inference"
-    );
-    native_snapshot::validate_id(id, native_snapshot::Limits::default())?;
-    let adapter = adapter::get(
-        args.from
+    let (id, runtime) = crate::input_argument((|| {
+        let id = args
+            .session
             .as_deref()
-            .context("lineage inspection requires --from <runtime>")?,
-    )?;
+            .context("lineage inspection requires an explicit native session ID")?;
+        ensure!(
+            id != "@",
+            "lineage inspection requires a native session ID, not current-session inference"
+        );
+        native_snapshot::validate_id(id, native_snapshot::Limits::default())?;
+        let runtime = adapter::normalize(
+            args.from
+                .as_deref()
+                .context("lineage inspection requires --from <runtime>")?,
+        )?;
+        Ok((id, runtime))
+    })())?;
+    let adapter = adapter::get(runtime)?;
     Ok((destination, id, adapter))
 }
 
@@ -319,8 +334,11 @@ pub(super) fn choose(args: &mut Args, json: bool) -> crate::Result<Decision> {
     let (destination, id, adapter) = match selected_args(args) {
         Ok(selected) => selected,
         Err(error) => {
-            ui::error(&format!("{error:#}"));
-            return Ok(Decision::Stop(ExitCode::Usage));
+            ui::error(&crate::commands::terminal_error_message(&error));
+            return Ok(Decision::Stop(crate::commands::terminal_error_code(
+                &error,
+                ExitCode::Failure,
+            )));
         }
     };
     let store = Store::at(std::env::current_dir()?.join(config::store_root()?));

@@ -210,13 +210,13 @@ pub fn fork_branch(
 
 pub fn run(args: Args) -> CmdResult {
     let cwd = std::env::current_dir()?;
+    let spec = crate::input_argument(refs::parse(&args.source))?;
     let Some(base) = resolve_base(&args.source, &cwd)? else {
         return Ok(ExitCode::Ref);
     };
     let Some(commit) = fork_branch(&base, &args.source, &args.branch)? else {
         return Ok(ExitCode::Policy);
     };
-    let spec = refs::parse(&args.source)?;
     let target = if matches!(spec.tail, refs::Tail::None) {
         base.resolved.branch.as_ref().unwrap_or(&base.resolved.sha)
     } else {
@@ -264,6 +264,17 @@ pub fn run(args: Args) -> CmdResult {
 mod tests {
     use super::*;
     use crate::domain::transcript::{self, Envelope};
+
+    #[test]
+    fn shared_fork_resolution_does_not_classify_stored_sources_as_arguments() {
+        let error = resolve_base("alice/payments@refund-fix#0", std::path::Path::new("."))
+            .err()
+            .expect("invalid reference syntax must fail before repository resolution");
+        assert_eq!(
+            crate::commands::terminal_error_code(&error, ExitCode::Failure),
+            ExitCode::Failure
+        );
+    }
 
     #[test]
     fn forking_a_v0_history_point_writes_a_v1_tip_without_losing_context() {

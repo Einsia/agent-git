@@ -341,9 +341,8 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Ok(code) => code.as_i32(),
         Err(e) => {
             commands::fix::register_terminal_error(&e);
-            // `{e:#}` prints the whole anyhow error chain, which is what diagnostics need.
-            agit::ui::error(&format!("{e:#}"));
-            commands::terminal_error_code(&e, agit::ExitCode::Usage).as_i32()
+            agit::ui::error(&commands::terminal_error_message(&e));
+            commands::terminal_error_code(&e, agit::ExitCode::Failure).as_i32()
         }
     }
 }

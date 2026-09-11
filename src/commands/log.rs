@@ -96,7 +96,7 @@ pub fn run(args: Args) -> CmdResult {
             match parsed {
                 Ok(parsed) => Some(parsed),
                 Err(e) => {
-                    ui::error(&format!("{e:#}"));
+                    ui::error(&super::terminal_error_message(&e));
                     return Ok(ExitCode::Usage);
                 }
             }

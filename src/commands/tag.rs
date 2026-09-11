@@ -34,7 +34,7 @@ pub fn run(args: Args) -> CmdResult {
         Some(raw) => match crate::commands::target::parse(raw) {
             Ok(parsed) => Some(parsed),
             Err(e) => {
-                ui::error(&format!("{e:#}"));
+                ui::error(&super::terminal_error_message(&e));
                 return Ok(ExitCode::Usage);
             }
         },
@@ -58,7 +58,11 @@ pub fn run(args: Args) -> CmdResult {
         };
         (ctx.repo, Some(ctx.branch))
     };
-    let (owner, name) = super::parse_slug(&slug)?;
+    let (owner, name) = if repo_source == super::echo::Source::Explicit {
+        crate::input_argument(super::parse_slug(&slug))?
+    } else {
+        super::parse_slug(&slug)?
+    };
     let Some(repo) = Repo::open(crate::infra::config::repo_dir(&owner, &name)?) else {
         ui::error(&format!("{slug} doesn’t exist locally."));
         ui::hint(&format!("fetch it first: `agit clone {slug}`"));
@@ -157,8 +161,10 @@ fn create(
 
     // Resolve the target: an explicit ref goes through the reference syntax; the default pins
     // the head of the current branch.
-    let spec = ref_.unwrap_or(ctx_branch);
-    let spec = refs::parse(spec)?;
+    let spec = match ref_ {
+        Some(explicit) => crate::input_argument(refs::parse(explicit))?,
+        None => refs::parse(ctx_branch)?,
+    };
     let source = if ref_.is_some() {
         super::echo::Source::for_spec(&spec)
     } else {
