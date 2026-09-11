@@ -22,6 +22,7 @@ characters, matching the Hub request budget.
 
 | Option | Meaning |
 |---|---|
+| `--scope <mine\|public\|owner/repo>` | Restrict sessions or agents before ranking, counts and pagination |
 | `--repo <owner/name>` | One Agent repo; equivalent to `repo:` / `agent:` |
 | `--owner <name>` | Repo owner, including an organization; not the conversation author |
 | `--author <name/email>` | Exact Git author name or email of the selected saved version, case insensitive |
@@ -75,3 +76,23 @@ the normalized predicates; an older Hub that omits them causes an explicit error
 instead of an unfiltered answer. Metadata is checked before blob deduplication,
 ranking, counts and pagination, under the same repository permissions as content.
 Missing metadata produces `incomplete: true` and never relaxes the filters.
+
+## Repository scope
+
+Every remote search requires login, including public search. `--scope mine` selects
+repositories in the current authenticated account's personal namespace; it does not
+include repositories shared through collaboration or organization membership.
+`--scope public` selects public repositories; `--scope owner/repo` selects that exact
+repository. These scopes apply to sessions and agents, and cannot be combined with
+`--counts`. Other repository scopes, `--here`, and `--local` are not supported here.
+
+Scope is applied to every effective query, including shared `--repo` and `--owner`
+filters, before any search request. A contradictory qualifier rejects the entire
+batch. `mine` obtains the current identity once for the batch. Each structured result
+reports its scoped query; saved-author/time filters and pagination remain independent.
+
+```bash
+agit search "rate limit" --scope mine
+agit search --query "cache" --query "deploy" --scope public
+agit search "rate limit" --scope einsia/payments --author "Alice"
+```

@@ -4,12 +4,85 @@
 //! or an unsupported filter cannot establish that no relevant prior work exists.
 
 use super::{CmdResult, require_login};
+use crate::domain::query::Query;
 use crate::hub::{AgentHit, PersonHit, PrHit, SearchFilters, SearchHit, SearchPage};
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
 /// The allowed types. Matches the hub's `SearchType`.
 const KINDS: &[&str] = &["sessions", "agents", "prs", "people"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CorpusScope {
+    Mine,
+    Public,
+    Repository(String),
+}
+
+impl std::str::FromStr for CorpusScope {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "mine" => Ok(Self::Mine),
+            "public" => Ok(Self::Public),
+            _ => {
+                let (owner, name) = super::parse_slug(value).map_err(|_| {
+                    "scope must be mine, public, or an explicit owner/repo".to_owned()
+                })?;
+                if value.trim() != value {
+                    return Err("scope must not contain surrounding whitespace".into());
+                }
+                for component in [&owner, &name] {
+                    if component.trim() != component {
+                        return Err("scope components must not contain whitespace".into());
+                    }
+                    crate::domain::repo::valid_name(component).map_err(|e| e.to_string())?;
+                }
+                Ok(Self::Repository(value.to_ascii_lowercase()))
+            }
+        }
+    }
+}
+
+impl CorpusScope {
+    fn apply(&self, query: &str, account: Option<&str>) -> anyhow::Result<String> {
+        let mut expected = Query::parse(query);
+        let (key, value, existing) = match self {
+            Self::Mine => {
+                let account = account.ok_or_else(|| anyhow::anyhow!("missing Hub identity"))?;
+                if account.trim() != account {
+                    anyhow::bail!("Hub returned an invalid account name");
+                }
+                crate::domain::repo::valid_name(account)?;
+                let value = account.to_ascii_lowercase();
+                ("owner", value.clone(), expected.owner.replace(value))
+            }
+            Self::Public => (
+                "is",
+                "public".to_owned(),
+                expected.visibility.replace("public".into()),
+            ),
+            Self::Repository(slug) => ("agent", slug.clone(), expected.agent.replace(slug.clone())),
+        };
+        if existing.is_some_and(|existing| existing != value) {
+            anyhow::bail!(
+                "--scope conflicts with the query's {key}: qualifier; remove that qualifier or choose a matching scope"
+            );
+        }
+        // A prefix stays outside an unfinished quoted phrase in the original query. The parsed
+        // query must retain every original condition and the requested corpus restriction.
+        let scoped = if query.is_empty() {
+            format!("{key}:{value}")
+        } else {
+            format!("{key}:{value} {query}")
+        };
+        if Query::parse(&scoped) != expected {
+            anyhow::bail!("query cannot preserve the requested scope; check its qualifiers");
+        }
+        Ok(scoped)
+    }
+}
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -73,6 +146,10 @@ pub struct Args {
     )]
     pub kind: String,
 
+    /// Restrict sessions or agents to your own repos, public repos, or one explicit repo
+    #[arg(long, value_name = "mine|public|owner/repo")]
+    pub scope: Option<CorpusScope>,
+
     /// Max hits to return
     #[arg(short = 'n', long, default_value = "10", value_name = "count")]
     pub limit: usize,
@@ -115,7 +192,7 @@ const BATCH_CONCURRENCY: usize = 4;
 const MAX_QUERY_CHARS: usize = 256;
 
 pub fn run(mut args: Args) -> CmdResult {
-    let queries = match effective_queries(&args) {
+    let mut queries = match effective_queries(&args) {
         Ok(queries) => queries,
         Err(message) => {
             ui::error(&message);
@@ -123,6 +200,23 @@ pub fn run(mut args: Args) -> CmdResult {
         }
     };
     let client = require_login()?;
+    if let Some(scope) = &args.scope {
+        let account = if *scope == CorpusScope::Mine {
+            match client.me() {
+                Ok(me) => Some(me.username),
+                Err(error) => return failed(error),
+            }
+        } else {
+            None
+        };
+        queries = match scoped_queries(scope, &queries, account.as_deref()) {
+            Ok(queries) => queries,
+            Err(error) => {
+                ui::error(&error.to_string());
+                return Ok(ExitCode::Usage);
+            }
+        };
+    }
     if queries.len() > 1 {
         let (value, failed) = batch(&client, &args, &queries);
         println!("{}", serde_json::to_string(&value)?);
@@ -156,7 +250,31 @@ pub fn run(mut args: Args) -> CmdResult {
     }
 }
 
+fn scoped_queries(
+    scope: &CorpusScope,
+    queries: &[String],
+    account: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    queries
+        .iter()
+        .map(|query| {
+            let query = scope.apply(query, account)?;
+            anyhow::ensure!(
+                query.chars().count() <= MAX_QUERY_CHARS,
+                "each scoped query must be at most {MAX_QUERY_CHARS} characters"
+            );
+            Ok(query)
+        })
+        .collect()
+}
+
 fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
+    if args.scope.is_some() && (args.counts || !matches!(args.kind.as_str(), "sessions" | "agents"))
+    {
+        return Err(
+            "--scope supports --type sessions or agents and cannot be used with --counts.".into(),
+        );
+    }
     let saved_filters = args.saved_filters()?;
     if !(1..=100).contains(&args.limit) {
         return Err("--limit must be between 1 and 100".into());
@@ -189,7 +307,8 @@ fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
         vec![args.query.clone()]
     };
     queries.extend(args.queries.clone());
-    if queries.is_empty() && (!filters.is_empty() || saved_filters.active()) {
+    let has_filters = args.scope.is_some() || !filters.is_empty() || saved_filters.active();
+    if queries.is_empty() && has_filters {
         queries.push(String::new());
     }
     if queries.is_empty() {
@@ -202,9 +321,7 @@ fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
     }
     let explicit_queries = !args.query.is_empty() || !args.queries.is_empty();
     for query in &mut queries {
-        if query.trim().is_empty()
-            && ((filters.is_empty() && !saved_filters.active()) || explicit_queries)
-        {
+        if query.trim().is_empty() && (!has_filters || explicit_queries) {
             return Err("queries must not be empty".into());
         }
         if !filters.is_empty() {
@@ -657,6 +774,8 @@ fn nothing<T>(query: &str, p: &SearchPage<T>) -> CmdResult {
 ///
 #[cfg(test)]
 mod tests {
+    use super::CorpusScope;
+    use crate::domain::query::Query;
     use clap::Parser;
 
     #[derive(Parser)]
@@ -906,5 +1025,174 @@ mod tests {
                 assert_eq!(result["result"]["unknown"][0], "runtim:codex");
             }
         }
+    }
+    #[test]
+    fn scopes_require_exact_repository_names() {
+        let w = W::try_parse_from(["x", "cache", "--scope", "Alice/My-Repo"]).unwrap();
+        assert_eq!(
+            w.a.scope,
+            Some(CorpusScope::Repository("alice/my-repo".into()))
+        );
+        for value in [
+            "org",
+            "alice",
+            "/repo",
+            "alice/",
+            "alice/repo/child",
+            "alice/repo is:private",
+            "alice/ repo",
+            " alice/repo",
+            "alice/repo ",
+            "alice/repo\"",
+        ] {
+            assert!(W::try_parse_from(["x", "cache", "--scope", value]).is_err());
+        }
+    }
+
+    #[test]
+    fn scope_only_queries_are_filters_without_admitting_explicit_empty_queries() {
+        for (scope, expected) in [
+            ("public", "is:public"),
+            ("mine", "owner:alice"),
+            ("Alice/My-Repo", "agent:alice/my-repo"),
+        ] {
+            for kind in ["sessions", "agents"] {
+                let args = W::parse_from(["x", "--scope", scope, "--type", kind]).a;
+                let queries = super::effective_queries(&args).unwrap();
+                assert_eq!(queries, [""]);
+                assert_eq!(
+                    super::scoped_queries(args.scope.as_ref().unwrap(), &queries, Some("alice"))
+                        .unwrap(),
+                    [expected]
+                );
+                for empty in ["", " \t "] {
+                    for argv in [
+                        vec!["x", "--scope", scope, "--type", kind, "-Q", empty],
+                        vec!["x", "needle", "--scope", scope, "--type", kind, "-Q", empty],
+                    ] {
+                        assert!(super::effective_queries(&W::parse_from(argv).a).is_err());
+                    }
+                }
+            }
+        }
+        assert!(super::effective_queries(&W::parse_from(["x"]).a).is_err());
+    }
+
+    #[test]
+    fn scoped_queries_preserve_terms_and_other_qualifiers() {
+        for query in [
+            "cache in:tool -deprecated runtime:codex",
+            "\"cache phrase\" -\"old phrase\"",
+            "\"unfinished phrase",
+            "path:\"a directory/file\" turns:>20",
+            "https://example.test/cache runtime:codex",
+            "runtim:codex",
+        ] {
+            for (scope, account) in [
+                (CorpusScope::Mine, Some("Alice")),
+                (CorpusScope::Public, None),
+                (CorpusScope::Repository("alice/my-repo".into()), None),
+            ] {
+                let original = Query::parse(query);
+                let mut scoped = Query::parse(&scope.apply(query, account).unwrap());
+                match scope {
+                    CorpusScope::Mine => assert_eq!(scoped.owner.take().as_deref(), Some("alice")),
+                    CorpusScope::Public => {
+                        assert_eq!(scoped.visibility.take().as_deref(), Some("public"));
+                    }
+                    CorpusScope::Repository(_) => {
+                        assert_eq!(scoped.agent.take().as_deref(), Some("alice/my-repo"));
+                    }
+                }
+                assert_eq!(scoped, original, "scope changed the query {query:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn scope_cannot_override_an_existing_contradictory_filter() {
+        for (scope, account, query) in [
+            (CorpusScope::Mine, Some("alice"), "cache owner:bob"),
+            (CorpusScope::Mine, Some("alice"), "cache org:bob"),
+            (CorpusScope::Public, None, "cache -is:public"),
+            (CorpusScope::Public, None, "cache is:private"),
+            (
+                CorpusScope::Repository("alice/my-repo".into()),
+                None,
+                "cache repo:bob/my-repo",
+            ),
+        ] {
+            assert!(scope.apply(query, account).is_err(), "{query}");
+        }
+        for query in ["cache owner:alice", "cache user:ALICE"] {
+            assert!(CorpusScope::Mine.apply(query, Some("alice")).is_ok());
+        }
+        for query in ["cache is:public", "cache -is:private"] {
+            assert!(CorpusScope::Public.apply(query, None).is_ok());
+        }
+        assert!(
+            CorpusScope::Repository("alice/my-repo".into())
+                .apply("cache agent:Alice/My-Repo", None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn mine_requires_a_valid_authenticated_identity() {
+        for account in [None, Some(""), Some("alice is:private"), Some(" alice ")] {
+            assert!(CorpusScope::Mine.apply("cache", account).is_err());
+        }
+    }
+    #[test]
+    fn scope_applies_to_every_effective_batch_query_without_widening_shared_filters() {
+        let args = W::parse_from([
+            "x",
+            "cache",
+            "--query",
+            "deploy",
+            "--repo",
+            "alice/demo",
+            "--scope",
+            "public",
+        ])
+        .a;
+        let effective = super::effective_queries(&args).unwrap();
+        let scoped = super::scoped_queries(args.scope.as_ref().unwrap(), &effective, None).unwrap();
+        assert_eq!(
+            scoped,
+            [
+                "is:public cache repo:\"alice/demo\"",
+                "is:public deploy repo:\"alice/demo\""
+            ]
+        );
+        for query in scoped {
+            let parsed = Query::parse(&query);
+            assert_eq!(parsed.agent.as_deref(), Some("alice/demo"));
+            assert_eq!(parsed.visibility.as_deref(), Some("public"));
+        }
+        for argv in [
+            vec![
+                "x",
+                "cache",
+                "--query",
+                "deploy is:private",
+                "--scope",
+                "public",
+            ],
+            vec!["x", "cache", "--repo", "bob/demo", "--scope", "alice/demo"],
+            vec!["x", "cache", "--owner", "bob", "--scope", "mine"],
+        ] {
+            let args = W::parse_from(argv).a;
+            assert!(
+                super::scoped_queries(
+                    args.scope.as_ref().unwrap(),
+                    &super::effective_queries(&args).unwrap(),
+                    Some("alice")
+                )
+                .is_err()
+            );
+        }
+        let long = "x".repeat(super::MAX_QUERY_CHARS);
+        assert!(super::scoped_queries(&CorpusScope::Public, &[long], None).is_err());
     }
 }

@@ -304,12 +304,22 @@ mod unix {
         }
     }
 
-    fn run_bounded(mut command: Command) -> Output {
+    fn run_bounded(command: Command) -> Output {
+        run_with_input_bounded(command, None)
+    }
+
+    fn run_with_input_bounded(mut command: Command, input: Option<&[u8]>) -> Output {
+        if input.is_some() {
+            command.stdin(Stdio::piped());
+        }
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        if let Some(input) = input {
+            child.stdin.take().unwrap().write_all(input).unwrap();
+        }
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if child.try_wait().unwrap().is_some() {
@@ -343,6 +353,307 @@ mod unix {
 
     fn authentication_error(marker: &str) -> Value {
         json!({"error":marker,"kind":"unauthorized","fix":[{"kind":"authenticate"}]})
+    }
+
+    fn search_scope_step(target: &str, response: Value) -> Step {
+        Step {
+            method: "GET",
+            target: target.into(),
+            bearer: Some(OLD_ACCESS),
+            status: 200,
+            response,
+            after_response: None,
+        }
+    }
+
+    #[test]
+    fn search_scope_reaches_the_hub_before_results_are_counted_or_paged() {
+        for (scope, prefix, encoded_prefix) in [
+            ("public", "is:public", "is%3Apublic"),
+            ("mine", "owner:alice", "owner%3Aalice"),
+            (
+                "Alice/My-Repo",
+                "agent:alice/my-repo",
+                "agent%3Aalice%2Fmy-repo",
+            ),
+        ] {
+            for kind in ["sessions", "agents"] {
+                for version in ["1", "2"] {
+                    for term in [None, Some("needle")] {
+                        let query = term
+                            .map_or_else(|| prefix.to_owned(), |term| format!("{prefix} {term}"));
+                        let encoded = term.map_or_else(
+                            || encoded_prefix.to_owned(),
+                            |term| format!("{encoded_prefix}%20{term}"),
+                        );
+                        let lab = Lab::new();
+                        let hub = Hub::new(|_| {
+                            let mut steps = Vec::new();
+                            if scope == "mine" {
+                                steps.push(search_scope_step(
+                                    "/api/auth/me",
+                                    json!({"username":"alice"}),
+                                ));
+                            }
+                            steps.push(search_scope_step(
+                                &format!("/api/search/{kind}?q={encoded}&sort=recent&page=2&per=3"),
+                                json!({"type":kind,"total":8,"page":2,"per":3,
+                                    "items":[],"incomplete":true,"unknown":[]}),
+                            ));
+                            steps
+                        });
+                        lab.seed_credentials(&hub.base, false);
+                        let mut argv = vec!["--json", "--json-version", version, "search"];
+                        if let Some(term) = term {
+                            argv.push(term);
+                        }
+                        argv.extend([
+                            "--scope", scope, "--type", kind, "--mcp", "--sort", "recent",
+                            "--page", "2", "-n", "3",
+                        ]);
+                        let value = lab.json(&hub.base, &argv, 0);
+                        assert_eq!(value["schema_version"], version.parse::<u32>().unwrap());
+                        assert_eq!(value["result"]["value"]["query"], query);
+                        assert_eq!(value["result"]["value"]["total"], 8);
+                        assert_eq!(value["result"]["value"]["incomplete"], true);
+                        assert_eq!(value.get("fix").is_some(), version == "2");
+                        assert_eq!(hub.finish().len(), if scope == "mine" { 2 } else { 1 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mine_uses_the_authenticated_identity_instead_of_the_saved_display_name() {
+        let lab = Lab::new();
+        let hub = Hub::new(|_| {
+            vec![
+                search_scope_step("/api/auth/me", json!({"username":"alice"})),
+                search_scope_step(
+                    "/api/search/sessions?q=owner%3Aalice%20needle&per=10",
+                    json!({"type":"sessions","total":0,"items":[]}),
+                ),
+            ]
+        });
+        lab.seed_credentials(&hub.base, false);
+        let value = lab.json(
+            &hub.base,
+            &["--json", "search", "needle", "--scope", "mine", "--mcp"],
+            0,
+        );
+        assert_eq!(value["result"]["value"]["query"], "owner:alice needle");
+        assert_eq!(hub.finish().len(), 2);
+    }
+
+    #[test]
+    fn batch_scope_resolves_identity_once_before_every_search_and_rejects_all_on_conflict() {
+        for version in ["1", "2"] {
+            let lab = Lab::new();
+            let hub = Hub::new(|_| {
+                vec![
+                    search_scope_step("/api/auth/me", json!({"username":"alice"})),
+                    search_scope_step(
+                        "/api/search/sessions?q=owner%3Aalice%20needle&per=10",
+                        json!({"type":"sessions","total":0,"items":[]}),
+                    ),
+                    search_scope_step(
+                        "/api/search/sessions?q=owner%3Aalice%20needle&per=10",
+                        json!({"type":"sessions","total":0,"items":[]}),
+                    ),
+                ]
+            });
+            lab.seed_credentials(&hub.base, false);
+            let value = lab.json(
+                &hub.base,
+                &[
+                    "--json",
+                    "--json-version",
+                    version,
+                    "search",
+                    "needle",
+                    "--query",
+                    "needle",
+                    "--scope",
+                    "mine",
+                ],
+                0,
+            );
+            let result = &value["result"]["value"];
+            assert_eq!(result["batch"], true);
+            assert_eq!(result["results"].as_array().unwrap().len(), 2);
+            for row in result["results"].as_array().unwrap() {
+                assert_eq!(row["ok"], true);
+                assert_eq!(row["query"], "owner:alice needle");
+                assert_eq!(row["result"]["query"], "owner:alice needle");
+            }
+            assert_eq!(hub.finish().len(), 3);
+
+            let hub = Hub::new(|_| Vec::new());
+            lab.seed_credentials(&hub.base, false);
+            for argv in [
+                vec![
+                    "--json",
+                    "--json-version",
+                    version,
+                    "search",
+                    "needle",
+                    "--query",
+                    "other is:private",
+                    "--scope",
+                    "public",
+                ],
+                vec![
+                    "--json",
+                    "--json-version",
+                    version,
+                    "search",
+                    "needle",
+                    "--repo",
+                    "bob/demo",
+                    "--scope",
+                    "alice/demo",
+                ],
+            ] {
+                let value = lab.json(&hub.base, &argv, 2);
+                assert_eq!(value["result"]["format"], "empty");
+            }
+            assert!(hub.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn mcp_search_forwards_scope_to_the_authenticated_command() {
+        for term in [None, Some("needle")] {
+            let lab = Lab::new();
+            let encoded = if term.is_some() {
+                "agent%3Aalice%2Fmy-repo%20needle"
+            } else {
+                "agent%3Aalice%2Fmy-repo"
+            };
+            let hub = Hub::new(|_| {
+                vec![search_scope_step(
+                    &format!("/api/search/sessions?q={encoded}&per=10"),
+                    json!({"type":"sessions","total":0,"items":[]}),
+                )]
+            });
+            lab.seed_credentials(&hub.base, false);
+            let mut arguments = json!({"scope":"alice/my-repo"});
+            if let Some(term) = term {
+                arguments["query"] = json!(term);
+            }
+            let input = format!(
+                "{}\n{}\n",
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-03-26","capabilities":{},
+                    "clientInfo":{"name":"synthetic-scope-client","version":"test"}}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"search","arguments":arguments}}),
+            );
+            let output =
+                run_with_input_bounded(lab.command(&hub.base, &["mcp"]), Some(input.as_bytes()));
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let replies: Vec<Value> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(replies.len(), 2);
+            assert_eq!(replies[0]["result"]["protocolVersion"], "2025-03-26");
+            let search: Value =
+                serde_json::from_str(replies[1]["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(
+                search["query"],
+                if term.is_some() {
+                    "agent:alice/my-repo needle"
+                } else {
+                    "agent:alice/my-repo"
+                }
+            );
+            assert_eq!(search["total"], 0);
+            assert_eq!(hub.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn malformed_mcp_scope_never_falls_back_to_unscoped_search() {
+        let lab = Lab::new();
+        let hub = Hub::new(|_| Vec::new());
+        lab.seed_credentials(&hub.base, false);
+        for scope in [
+            json!(null),
+            json!(["public"]),
+            json!({}),
+            json!(7),
+            json!(true),
+        ] {
+            let input = format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"search","arguments":{"query":"needle","scope":scope}}}),
+            );
+            let output =
+                run_with_input_bounded(lab.command(&hub.base, &["mcp"]), Some(input.as_bytes()));
+            assert!(output.status.success(), "{output:?}");
+            let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let diagnostic = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(diagnostic.starts_with("invalid search arguments: invalid search scope:"));
+            assert_eq!(reply["result"]["isError"], true);
+        }
+        assert!(hub.finish().is_empty());
+    }
+
+    #[test]
+    fn unsupported_or_conflicting_scopes_do_not_send_an_unscoped_search() {
+        let lab = Lab::new();
+        let hub = Hub::new(|_| Vec::new());
+        lab.seed_credentials(&hub.base, false);
+        for args in [
+            vec![
+                "--json", "search", "needle", "--scope", "public", "--counts",
+            ],
+            vec![
+                "--json", "search", "needle", "--scope", "public", "--type", "prs",
+            ],
+            vec![
+                "--json", "search", "needle", "--scope", "mine", "--type", "people",
+            ],
+            vec!["--json", "search", "--scope", "public", "-Q", ""],
+            vec!["--json", "search", "--scope", "public", "-Q", " \t "],
+            vec!["--json", "search", "needle", "--scope", "public", "-Q", ""],
+            vec!["--json", "search", "needle is:private", "--scope", "public"],
+            vec![
+                "--json",
+                "search",
+                "needle agent:bob/repo",
+                "--scope",
+                "alice/repo",
+            ],
+        ] {
+            let value = lab.json(&hub.base, &args, 2);
+            assert_eq!(value["result"]["format"], "empty");
+        }
+        assert!(hub.finish().is_empty());
+    }
+
+    #[test]
+    fn scope_does_not_allow_anonymous_search() {
+        let lab = Lab::new();
+        let hub = Hub::new(|_| Vec::new());
+        for scope in ["mine", "public", "alice/repo"] {
+            for term in [None, Some("needle")] {
+                let mut argv = vec!["--json", "search", "--scope", scope];
+                if let Some(term) = term {
+                    argv.push(term);
+                }
+                let value = lab.json(&hub.base, &argv, 5);
+                assert_eq!(value["ok"], false);
+                lab.assert_login(&value, &hub.base);
+            }
+        }
+        assert!(hub.finish().is_empty());
     }
 
     #[test]

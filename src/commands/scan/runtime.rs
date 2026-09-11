@@ -627,6 +627,14 @@ async fn execute(
     .await
 }
 
+fn spawn_failure(error: std::io::Error) -> anyhow::Error {
+    anyhow!(
+        "cannot start the configured review runtime; verify its installation (kind: {:?}; OS code: {:?})",
+        error.kind(),
+        error.raw_os_error()
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_cancellable(
     program: &str,
@@ -659,9 +667,7 @@ async fn execute_cancellable(
         .map_err(|_| anyhow!("cannot supervise the review runtime"))?;
     #[cfg(windows)]
     crate::rc::windows_job::Job::configure(&mut command);
-    let child = command.spawn().map_err(|_| {
-        anyhow!("cannot start the configured review runtime; verify its installation")
-    })?;
+    let child = command.spawn().map_err(spawn_failure)?;
     #[cfg(unix)]
     let pgid = child.id().map(|id| id as i32);
     let mut tree = ReviewProcess {
@@ -771,6 +777,21 @@ async fn collect_output(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn spawn_diagnostics_preserve_error_categories_without_private_error_payloads() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private-executable-path private-argument private-transcript",
+        );
+        let diagnostic = format!("{:#}", spawn_failure(error));
+        assert!(diagnostic.contains("PermissionDenied"));
+        assert!(!diagnostic.contains("private-"));
+        let error = std::io::Error::from_raw_os_error(13);
+        let diagnostic = format!("{:#}", spawn_failure(error));
+        assert!(diagnostic.contains("OS code: Some(13)"));
+        assert!(!diagnostic.contains("private-"));
+    }
 
     #[cfg(windows)]
     const WINDOWS_JOB_PROBE: &str =
@@ -1388,7 +1409,11 @@ printf '%s\n' "$!" > "$CLAUDE_CONFIG_DIR/ready"
         )
         .await
         .unwrap_err();
-        assert!(cancelled.get(), "the cancellation future must become ready");
+        assert!(
+            cancelled.get(),
+            "the cancellation future must become ready (execution error: {error:#}; ready marker exists: {})",
+            fixtures.path().join("ready").exists()
+        );
         assert!(matches!(
             error.to_string().as_str(),
             "review was cancelled" | "review runtime process termination could not be verified"

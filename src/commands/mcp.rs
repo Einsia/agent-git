@@ -57,7 +57,7 @@ fn handle(req: &serde_json::Value) -> Option<String> {
             id,
             serde_json::json!({
                 "tools": [
-                    {"name": "search", "description": "Search readable AgentGit history. Use query for one search, or queries for an ordered batch (up to 16, four in flight). Shared filters: repo (owner/name), owner, author (saved Git author name/email), since (inclusive UTC saved time), before (exclusive UTC saved time), runtime, scopes (prompt/reply/tool/output/edit/summary), tool, path. Queries also accept quoted phrases, -exclude and qualifiers such as turns:>20. Inspect incomplete and unknown before concluding no work exists. Scope identifies the evidence; secondhand means a compact summary. Outcome/confidence are heuristics: open a hit before relying on it. Pagination includes page, per and has_more.", "inputSchema": {"type":"object","properties":{"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},"type":{"type":"string","enum":["sessions","agents","prs","people"]},"sort":{"type":"string","enum":["best","recent","turns"]},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1},"repo":{"type":"string"},"owner":{"type":"string"},"author":{"type":"string"},"since":{"type":"string"},"before":{"type":"string"},"runtime":{"type":"string"},"scopes":{"type":"array","items":{"type":"string","enum":["prompt","reply","tool","output","edit","summary"]}},"tool":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}},
+                    {"name": "search", "description": "Search readable AgentGit history. Use query for one search, or queries for an ordered batch (up to 16, four in flight). Shared filters: repo (owner/name), owner, author (saved Git author name/email), since (inclusive UTC saved time), before (exclusive UTC saved time), runtime, scopes (prompt/reply/tool/output/edit/summary), tool, path. Queries also accept quoted phrases, -exclude and qualifiers such as turns:>20. Inspect incomplete and unknown before concluding no work exists. Scope identifies the evidence; secondhand means a compact summary. Outcome/confidence are heuristics: open a hit before relying on it. Pagination includes page, per and has_more. scope restricts sessions or agents to mine (personally owned repositories), public, or one owner/repo; every remote search requires login.", "inputSchema": {"type":"object","properties":{"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},"type":{"type":"string","enum":["sessions","agents","prs","people"]},"sort":{"type":"string","enum":["best","recent","turns"]},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1},"scope":{"type":"string","description":"mine, public, or owner/repo; sessions and agents only"},"repo":{"type":"string"},"owner":{"type":"string"},"author":{"type":"string"},"since":{"type":"string"},"before":{"type":"string"},"runtime":{"type":"string"},"scopes":{"type":"array","items":{"type":"string","enum":["prompt","reply","tool","output","edit","summary"]}},"tool":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}},
                     {"name": "show", "description": "Read part of a session (ref, ref#n, ref#n.k)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "view", "description": "the ordered composition of a VIEW (plumbing)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "status", "description": "who am I + sync status", "inputSchema": {"type":"object","properties":{}}},
@@ -115,6 +115,7 @@ struct SearchArgs {
     sort: Option<String>,
     limit: Option<usize>,
     page: Option<usize>,
+    scope: Option<String>,
     repo: Option<String>,
     owner: Option<String>,
     author: Option<String>,
@@ -128,6 +129,11 @@ struct SearchArgs {
 }
 
 fn search_arguments(args: &serde_json::Value) -> Result<Vec<String>, String> {
+    if let Some(scope) = args.get("scope")
+        && !scope.is_string()
+    {
+        return Err("invalid search scope: expected mine, public, or an owner/repo string".into());
+    }
     let args: SearchArgs = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
     let mut out = vec!["search".to_owned(), "--mcp".to_owned()];
     for query in args.query.into_iter().chain(args.queries) {
@@ -136,6 +142,7 @@ fn search_arguments(args: &serde_json::Value) -> Result<Vec<String>, String> {
     for (flag, value) in [
         ("--type", args.kind),
         ("--sort", args.sort),
+        ("--scope", args.scope),
         ("--repo", args.repo),
         ("--owner", args.owner),
         ("--author", args.author),
@@ -272,7 +279,7 @@ mod workspace_tool_tests {
     fn search_batch_arguments_are_literal_and_typed() {
         let arguments = super::search_arguments(&serde_json::json!({
             "queries": ["--counts", "cache"], "repo":"alice/demo", "author":"Bob", "since":"2026-09-01", "page":2,
-            "scopes":["tool", "output"], "limit":5,
+            "scopes":["tool", "output"], "scope":"public", "limit":5,
         }))
         .unwrap();
         assert_eq!(
@@ -290,6 +297,7 @@ mod workspace_tool_tests {
         assert!(!args.counts);
         assert_eq!(args.queries, ["--counts", "cache"]);
         assert_eq!(args.repo.as_deref(), Some("alice/demo"));
+        assert_eq!(args.scope, Some(super::super::search::CorpusScope::Public));
         assert!(super::search_arguments(&serde_json::json!({"limit":-1})).is_err());
         assert!(super::search_arguments(&serde_json::json!({"queries":[false]})).is_err());
         assert!(super::search_arguments(&serde_json::json!({"author_typo":"alice"})).is_err());
