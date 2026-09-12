@@ -370,6 +370,8 @@ pub struct SearchPage<T> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
@@ -379,10 +381,17 @@ pub struct SearchFilters {
 
 impl SearchFilters {
     pub fn active(&self) -> bool {
-        self.author.is_some() || self.since.is_some() || self.before.is_some()
+        self.code_origin.is_some()
+            || self.author.is_some()
+            || self.since.is_some()
+            || self.before.is_some()
     }
 
     pub fn normalized(&self) -> crate::Result<Self> {
+        anyhow::ensure!(
+            self.code_origin.as_deref().is_none_or(valid_code_origin),
+            "code origin must be credential-free with an explicit host and path"
+        );
         use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
         let time = |raw: &str| -> crate::Result<DateTime<Utc>> {
             DateTime::parse_from_rfc3339(raw)
@@ -411,6 +420,7 @@ impl SearchFilters {
             "--since must be earlier than --before"
         );
         Ok(Self {
+            code_origin: self.code_origin.clone(),
             author,
             since: since.map(|t| t.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
             before: before.map(|t| t.to_rfc3339_opts(SecondsFormat::AutoSi, true)),
@@ -585,4 +595,98 @@ mod tests {
             Some("00000000-0000-0000-0000-000000000001")
         );
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the Hub did not confirm --here; search results were withheld. Upgrade the Hub before relying on code-origin search"
+)]
+pub(crate) struct CodeOriginNotConfirmed;
+
+pub(crate) fn valid_code_origin(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 4096
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b"?#%\\".contains(&b))
+    {
+        return false;
+    }
+    let (authority, path, ssh, uri) = if let Some((scheme, rest)) = value.split_once("://") {
+        if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+            return false;
+        }
+        let Some((authority, path)) = rest.split_once('/') else {
+            return false;
+        };
+        (authority, path, scheme == "ssh", true)
+    } else {
+        let Some((authority, path)) = value.split_once(':') else {
+            return false;
+        };
+        if authority.len() == 1 {
+            return false;
+        }
+        (authority, path, true, false)
+    };
+    if path.is_empty()
+        || path.split('/').any(|part| matches!(part, "." | ".."))
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-~@".contains(&b))
+    {
+        return false;
+    }
+    let host = if let Some((user, host)) = authority.split_once('@') {
+        if !ssh
+            || user.is_empty()
+            || user.len() > 64
+            || !user
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    let (hostname, port) = if let Some(bracketed) = host.strip_prefix('[').filter(|_| uri) {
+        let Some((ip, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if ip.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            let Some(port) = suffix.strip_prefix(':') else {
+                return false;
+            };
+            Some(port)
+        };
+        (ip, port)
+    } else {
+        let (name, port) = if uri {
+            host.split_once(':')
+                .map_or((host, None), |(name, port)| (name, Some(port)))
+        } else {
+            (host, None)
+        };
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+        {
+            return false;
+        }
+        (name, port)
+    };
+    !hostname.is_empty()
+        && port.is_none_or(|port| {
+            !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port > 0)
+        })
 }

@@ -1028,7 +1028,11 @@ impl Client {
         filters: &SearchFilters,
         scope: Option<&str>,
     ) -> Result<SearchPage<T>> {
+        let filters = filters.normalized()?;
         let mut path = format!("api/search/{kind}?q={}", urlencode(query));
+        if let Some(origin) = &filters.code_origin {
+            path.push_str(&format!("&code_origin={}", urlencode(origin)));
+        }
         if let Some(scope) = scope {
             path.push_str(&format!("&scope={}", urlencode(scope)));
         }
@@ -1041,7 +1045,6 @@ impl Client {
         if per > 0 {
             path.push_str(&format!("&per={per}"));
         }
-        let filters = filters.normalized()?;
         for (key, value) in [
             ("author", &filters.author),
             ("since", &filters.since),
@@ -1052,6 +1055,11 @@ impl Client {
             }
         }
         let response: SearchPage<T> = self.get(&path)?;
+        if filters.code_origin.is_some()
+            && response.applied_filters.code_origin != filters.code_origin
+        {
+            return Err(super::CodeOriginNotConfirmed.into());
+        }
         anyhow::ensure!(
             response.applied_filters == filters,
             "the Hub did not acknowledge the requested author/time filters; upgrade the Hub before relying on these results"

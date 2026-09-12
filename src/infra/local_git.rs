@@ -206,8 +206,12 @@ async fn read(mut stream: impl AsyncRead + Unpin, limit: usize) -> Result<Vec<u8
     Ok(bytes)
 }
 
-#[cfg(test)]
-async fn execute(command: Command, limit: usize, deadline: Instant) -> Result<Output> {
+/// Callers share one absolute deadline across reads without resetting it between commands.
+pub(crate) async fn output_until(
+    command: Command,
+    limit: usize,
+    deadline: Instant,
+) -> Result<Output> {
     execute_with_input(command, None, limit, deadline).await
 }
 
@@ -303,6 +307,14 @@ async fn execute_with_input(
             .wait()
             .await
             .context("code-origin Git could not be reaped")?;
+        #[cfg(windows)]
+        {
+            let drained = match &process.job {
+                Some(job) => job.wait_empty_within(CLEANUP_TIMEOUT).await.is_ok(),
+                None => false,
+            };
+            ensure!(drained, "code-origin Git left subprocesses running");
+        }
         ensure!(process.gone(), "code-origin Git left subprocesses running");
         Ok(Output {
             status,
@@ -497,7 +509,7 @@ mod tests {
         for mode in ["wait", "stdout", "stderr", "complete"] {
             let pid = root.path().join(mode);
             let started = Instant::now();
-            let result = runtime.block_on(execute(
+            let result = runtime.block_on(output_until(
                 child(mode, &pid),
                 if mode == "stdout" { 256 } else { 4096 },
                 started + ORIGIN_TIMEOUT,
@@ -621,6 +633,25 @@ mod tests {
                     .contains("blocking caller")
             );
         });
+        assert!(!pid.exists());
+    }
+
+    #[test]
+    fn explicit_deadline_refuses_expired_queries_before_spawning() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = root.path().join("unstarted-explicit");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(output_until(
+                child("complete", &pid),
+                4096,
+                Instant::now() - Duration::from_secs(1),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline expired"), "{error:#}");
         assert!(!pid.exists());
     }
 

@@ -194,6 +194,14 @@ async fn execute(command: Command, limit: usize, timeout: Duration) -> Result<Ou
             .wait()
             .await
             .context("shared-file Git could not be reaped")?;
+        #[cfg(windows)]
+        {
+            let drained = match &process.job {
+                Some(job) => job.wait_empty_within(CLEANUP_TIMEOUT).await.is_ok(),
+                None => false,
+            };
+            ensure!(drained, "shared-file Git left subprocesses running");
+        }
         ensure!(process.gone(), "shared-file Git left subprocesses running");
         Ok(Output {
             status,

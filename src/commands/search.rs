@@ -6,8 +6,11 @@
 use super::{CmdResult, require_login};
 use crate::domain::query::Query;
 use crate::hub::{AgentHit, PersonHit, PrHit, SearchFilters, SearchHit, SearchPage};
+use crate::hub::{CodeOriginNotConfirmed, valid_code_origin};
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
+
+mod local_git;
 
 /// The allowed types. Matches the hub's `SearchType`.
 const KINDS: &[&str] = &["sessions", "agents", "prs", "people"];
@@ -156,6 +159,13 @@ pub struct Args {
     #[arg(long, value_name = "mine|org|public|owner/repo")]
     pub scope: Option<CorpusScope>,
 
+    /// Restrict sessions to this code Git repository exact origin (requires Hub support)
+    #[arg(long)]
+    pub here: bool,
+
+    #[arg(skip)]
+    code_origin: Option<String>,
+
     /// Max hits to return
     #[arg(short = 'n', long, default_value = "10", value_name = "count")]
     pub limit: usize,
@@ -180,6 +190,7 @@ pub struct Args {
 impl Args {
     fn saved_filters(&self) -> Result<SearchFilters, String> {
         let filters = SearchFilters {
+            code_origin: self.code_origin.clone(),
             author: self.author.clone(),
             since: self.since.clone(),
             before: self.before.clone(),
@@ -206,6 +217,18 @@ pub fn run(mut args: Args) -> CmdResult {
         }
     };
     let client = require_login()?;
+    if args.here {
+        args.code_origin = match current_code_origin() {
+            Ok(origin) => Some(origin),
+            Err(()) => {
+                ui::error("--here requires a code Git repository with one credential-free origin.");
+                ui::hint(
+                    "set one explicit origin; remove passwords, HTTP userinfo, query and fragment data from the origin and URL rewrites; SSH usernames are allowed",
+                );
+                return Ok(ExitCode::Precondition);
+            }
+        };
+    }
     if let Some(scope) = &args.scope {
         let account = if *scope == CorpusScope::Mine {
             match client.me() {
@@ -275,6 +298,11 @@ fn scoped_queries(
 }
 
 fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
+    if args.here && (args.counts || args.kind != "sessions") {
+        return Err(
+            "--here supports only --type sessions and cannot be used with --counts.".into(),
+        );
+    }
     if args.scope.is_some() && (args.counts || !matches!(args.kind.as_str(), "sessions" | "agents"))
     {
         return Err(
@@ -313,7 +341,8 @@ fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
         vec![args.query.clone()]
     };
     queries.extend(args.queries.clone());
-    let has_filters = args.scope.is_some() || !filters.is_empty() || saved_filters.active();
+    let has_filters =
+        args.scope.is_some() || args.here || !filters.is_empty() || saved_filters.active();
     if queries.is_empty() && has_filters {
         queries.push(String::new());
     }
@@ -362,7 +391,8 @@ fn scoped_page<T: serde::de::DeserializeOwned>(
     query: &str,
 ) -> anyhow::Result<SearchPage<T>> {
     let filters = args.saved_filters().map_err(anyhow::Error::msg)?;
-    if args.scope != Some(CorpusScope::Org) {
+    let org = args.scope == Some(CorpusScope::Org);
+    if !org && !args.here {
         return client.search_page_filtered_with_scope(
             &args.kind,
             query,
@@ -380,9 +410,12 @@ fn scoped_page<T: serde::de::DeserializeOwned>(
         args.page,
         args.limit,
         &filters,
-        Some("org"),
+        org.then_some("org"),
     )?;
-    if page.applied_scope.as_deref() != Some("org") || page.kind != args.kind {
+    if args.here && page.kind != args.kind {
+        return Err(CodeOriginNotConfirmed.into());
+    }
+    if org && (page.applied_scope.as_deref() != Some("org") || page.kind != args.kind) {
         return Err(ScopeNotConfirmed.into());
     }
     Ok(SearchPage {
@@ -404,6 +437,9 @@ fn scoped_page<T: serde::de::DeserializeOwned>(
 }
 
 fn scope_label<T>(page: &SearchPage<T>) {
+    if page.applied_filters.code_origin.is_some() {
+        println!("scope: exact code Git origin");
+    }
     if page.applied_scope.as_deref() == Some("org") {
         println!("scope: readable repositories in your membership organizations");
     }
@@ -492,11 +528,13 @@ fn failed(e: anyhow::Error) -> CmdResult {
     super::fix::register_terminal_api_error(&e);
     ui::error(&format!("search failed: {e:#}"));
     ui::hint("if this hub is self-hosted, it may be older than this CLI");
-    Ok(if e.is::<ScopeNotConfirmed>() {
-        ExitCode::Precondition
-    } else {
-        super::terminal_error_code(&e, ExitCode::Network)
-    })
+    Ok(
+        if e.is::<ScopeNotConfirmed>() || e.is::<CodeOriginNotConfirmed>() {
+            ExitCode::Precondition
+        } else {
+            super::terminal_error_code(&e, ExitCode::Network)
+        },
+    )
 }
 
 fn counts(client: &crate::hub::Client, args: &Args) -> CmdResult {
@@ -573,6 +611,52 @@ fn footer<T>(p: &SearchPage<T>) {
             p.page + 1
         ));
     }
+}
+
+fn current_code_origin() -> Result<String, ()> {
+    let cwd = std::env::current_dir().map_err(|_| ())?;
+    let repo = crate::domain::repo::Repo::at(cwd).local_objects_only();
+    let git = local_git::Git::new().map_err(|_| ())?;
+    let inside = git
+        .output(&repo, &["rev-parse", "--is-inside-work-tree"], 32)
+        .map_err(|_| ())?;
+    if !inside.status.success() || !inside.stderr.is_empty() || inside.stdout != b"true\n" {
+        return Err(());
+    }
+    let config = git
+        .output(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "--no-includes",
+                "--null",
+                "--get-all",
+                "remote.origin.url",
+            ],
+            4097,
+        )
+        .map_err(|_| ())?;
+    if !config.status.success() || !config.stderr.is_empty() {
+        return Err(());
+    }
+    let raw = config.stdout.strip_suffix(b"\0").ok_or(())?;
+    let origin = std::str::from_utf8(raw).map_err(|_| ())?;
+    if !valid_code_origin(origin) {
+        return Err(());
+    }
+    // Saved code provenance uses Git's effective URL. Validate both spellings so a rewrite
+    // cannot introduce credentials or make an unsafe configured origin eligible for search.
+    let effective = git.effective_origin(&repo).map_err(|_| ())?;
+    if !effective.status.success() || !effective.stderr.is_empty() {
+        return Err(());
+    }
+    let raw = effective.stdout.strip_suffix(b"\n").ok_or(())?;
+    let origin = std::str::from_utf8(raw).map_err(|_| ())?;
+    if !valid_code_origin(origin) {
+        return Err(());
+    }
+    Ok(origin.to_owned())
 }
 
 fn sessions(client: &crate::hub::Client, args: &Args) -> CmdResult {
@@ -839,6 +923,40 @@ mod tests {
     }
 
     #[test]
+    fn exact_origin_preserves_ssh_identity_and_rejects_credentials_and_ambiguous_forms() {
+        for origin in [
+            "https://Example.test:114/team/Repo.git",
+            "ssh://git@example.test:2222/team/repo.git",
+            "git@example.test:team/repo.git",
+            "example.test:/team/repo",
+            "ssh://git@[::1]:2222/repo",
+        ] {
+            assert!(super::valid_code_origin(origin), "{origin}");
+        }
+        for origin in [
+            "https://token@example.test/repo",
+            "ssh://git:password@example.test/repo",
+            "https://example.test/repo?token=secret",
+            "https://example.test/repo#secret",
+            "ext::anything",
+            "file:///tmp/repo",
+            "/tmp/repo",
+            "C:/repo",
+            "https://example.test",
+            "https://example.test/a/../repo",
+            "https://example.test/%40secret",
+            "git@example.test:repo\n",
+            "https://example.test:0/repo",
+            "https://example.test:65536/repo",
+        ] {
+            assert!(
+                !super::valid_code_origin(origin),
+                "unsafe identity was accepted"
+            );
+        }
+    }
+
+    #[test]
     fn raw_json_flag_is_optional() {
         let w = W::parse_from(["x", "query term"]);
         assert!(
@@ -1009,6 +1127,8 @@ mod tests {
         }
     }
 
+    const HERE_ORIGIN: &str = "https://example.test/team/repo.git";
+
     fn scoped_response<T: serde::de::DeserializeOwned>(
         args: &super::Args,
         body: serde_json::Value,
@@ -1016,10 +1136,15 @@ mod tests {
         use std::io::{Read, Write};
         use std::time::{Duration, Instant};
 
+        args.saved_filters().expect("the fixture query is valid");
+        if args.here {
+            assert_eq!(args.code_origin.as_deref(), Some(HERE_ORIGIN));
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let org = args.scope == Some(CorpusScope::Org);
+        let here = args.here;
         let kind = args.kind.clone();
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -1051,6 +1176,12 @@ mod tests {
             let request = String::from_utf8(bytes).unwrap();
             assert!(request.starts_with(&format!("GET /api/search/{kind}?q=cache&")));
             assert_eq!(request.contains("&scope=org&"), org);
+            assert_eq!(request.contains("&code_origin="), here);
+            if here {
+                assert!(
+                    request.contains("&code_origin=https%3A%2F%2Fexample.test%2Fteam%2Frepo.git&")
+                );
+            }
             let body = body.to_string();
             write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         });
@@ -1090,26 +1221,31 @@ mod tests {
         use crate::hub::{AgentHit, SearchHit};
         use serde_json::json;
 
-        let args = W::parse_from([
-            "x", "cache", "--type", "sessions", "--scope", "org", "--author", "Bob",
-        ])
-        .a;
-        let body = json!({
-            "type":"sessions", "applied_scope":"org", "applied_filters":{"author":"bob"},
-            "total":19, "page":3, "per":4, "incomplete":true,
-            "unknown":["runtim:codex"], "terms":["cache"],
-            "items":[{"agent":"acme/demo", "session_id":"selected-session", "excerpt":"selected hit"}]
-        });
-        let page = scoped_response::<SearchHit>(&args, body).unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].session_id, "selected-session");
-        assert_eq!(page.applied_scope.as_deref(), Some("org"));
-        assert_eq!(page.kind, "sessions");
-        assert_eq!(page.applied_filters, args.saved_filters().unwrap());
-        assert_eq!((page.total, page.page, page.per), (19, 3, 4));
-        assert!(page.incomplete);
-        assert_eq!(page.unknown, ["runtim:codex"]);
-        assert_eq!(page.terms, ["cache"]);
+        for here in [false, true] {
+            let mut args = W::parse_from([
+                "x", "cache", "--type", "sessions", "--scope", "org", "--author", "Bob",
+            ])
+            .a;
+            args.here = here;
+            args.code_origin = here.then(|| HERE_ORIGIN.to_owned());
+            let body = json!({
+                "type":"sessions", "applied_scope":"org",
+                "applied_filters":{"author":"bob", "code_origin":args.code_origin},
+                "total":19, "page":3, "per":4, "incomplete":true,
+                "unknown":["runtim:codex"], "terms":["cache"],
+                "items":[{"agent":"acme/demo", "session_id":"selected-session", "excerpt":"selected hit"}]
+            });
+            let page = scoped_response::<SearchHit>(&args, body).unwrap();
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].session_id, "selected-session");
+            assert_eq!(page.applied_scope.as_deref(), Some("org"));
+            assert_eq!(page.kind, "sessions");
+            assert_eq!(page.applied_filters, args.saved_filters().unwrap());
+            assert_eq!((page.total, page.page, page.per), (19, 3, 4));
+            assert!(page.incomplete);
+            assert_eq!(page.unknown, ["runtim:codex"]);
+            assert_eq!(page.terms, ["cache"]);
+        }
 
         for scope in [Some("org"), None] {
             let mut argv = vec!["x", "cache", "--type", "agents"];
@@ -1122,6 +1258,94 @@ mod tests {
             assert!(!error.is::<super::ScopeNotConfirmed>(), "{error:#}");
             assert!(format!("{error:#}").contains("missing field"));
         }
+    }
+
+    #[test]
+    fn here_confirmation_precedes_typed_items_and_org_confirmation() {
+        use crate::hub::{AgentHit, CodeOriginNotConfirmed, SearchHit};
+        use serde_json::{Value, json};
+
+        let agent =
+            json!({"owner":"acme", "name":"demo", "slug":"acme/demo", "visibility":"public"});
+        assert!(serde_json::from_value::<AgentHit>(agent.clone()).is_ok());
+        assert!(serde_json::from_value::<SearchHit>(agent.clone()).is_err());
+        for (org, origin, kind, org_error) in [
+            (false, Some(HERE_ORIGIN), "agents", false),
+            (false, None, "sessions", false),
+            (
+                false,
+                Some("https://example.test/other/repo.git"),
+                "sessions",
+                false,
+            ),
+            (true, None, "agents", false),
+            (true, Some(HERE_ORIGIN), "agents", false),
+            (true, Some(HERE_ORIGIN), "sessions", true),
+        ] {
+            let mut args = W::parse_from(["x", "cache", "--here"]).a;
+            args.code_origin = Some(HERE_ORIGIN.to_owned());
+            args.scope = org.then_some(CorpusScope::Org);
+            let body = json!({
+                "type":kind, "total":1, "applied_filters":{"code_origin":origin},
+                "items":[agent.clone()]
+            });
+            for result in [
+                scoped_response::<SearchHit>(&args, body.clone()).map(|_| ()),
+                scoped_response::<Value>(&args, body).map(|_| ()),
+            ] {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.is::<super::ScopeNotConfirmed>(),
+                    org_error,
+                    "{error:#}"
+                );
+                assert_eq!(
+                    error.is::<CodeOriginNotConfirmed>(),
+                    !org_error,
+                    "{error:#}"
+                );
+                assert!(!format!("{error:#}").contains("acme/demo"));
+            }
+        }
+    }
+
+    #[test]
+    fn here_saved_filters_keep_priority_and_here_only_needs_no_org_acknowledgement() {
+        use crate::hub::{CodeOriginNotConfirmed, SearchHit};
+        use serde_json::{Value, json};
+
+        let mut args =
+            W::parse_from(["x", "cache", "--here", "--scope", "org", "--author", "Bob"]).a;
+        args.code_origin = Some(HERE_ORIGIN.to_owned());
+        let body = json!({
+            "type":"agents", "total":1,
+            "applied_filters":{"code_origin":HERE_ORIGIN, "author":"alice"}, "items":[{}]
+        });
+        for result in [
+            scoped_response::<SearchHit>(&args, body.clone()).map(|_| ()),
+            scoped_response::<Value>(&args, body).map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(!error.is::<CodeOriginNotConfirmed>());
+            assert!(!error.is::<super::ScopeNotConfirmed>());
+            assert!(format!("{error:#}").contains("did not acknowledge"));
+        }
+
+        args.scope = None;
+        let mut body = json!({
+            "type":"sessions", "total":1,
+            "applied_filters":{"code_origin":HERE_ORIGIN, "author":"bob"},
+            "items":[{"agent":"acme/demo", "session_id":"selected-session", "excerpt":"selected hit"}]
+        });
+        let page = scoped_response::<SearchHit>(&args, body.clone()).unwrap();
+        assert_eq!(page.items[0].session_id, "selected-session");
+        assert!(page.applied_scope.is_none());
+        assert_eq!(page.applied_filters, args.saved_filters().unwrap());
+        body["items"] = json!([{}]);
+        let error = scoped_response::<SearchHit>(&args, body).unwrap_err();
+        assert!(!error.is::<CodeOriginNotConfirmed>());
+        assert!(!error.is::<super::ScopeNotConfirmed>());
+        assert!(format!("{error:#}").contains("missing field"));
     }
 
     #[test]

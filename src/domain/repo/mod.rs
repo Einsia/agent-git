@@ -676,6 +676,14 @@ impl Repo {
         deadline.output(command, None, limit)
     }
 
+    /// Code provenance retains user and local URL rewrites but excludes system configuration.
+    #[cfg(feature = "cli")]
+    pub(crate) fn inspection_code_origin_command(&self) -> Command {
+        let mut command = self.inspection_command(&["remote", "get-url", "origin"]);
+        command.env("GIT_CONFIG_NOSYSTEM", "1");
+        command
+    }
+
     fn inspection_path(&self, args: &[&str]) -> Result<PathBuf> {
         self.inspection_path_using(args, &mut bounded_inspection_output)
     }

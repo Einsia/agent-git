@@ -84,7 +84,7 @@ repositories in the current authenticated account's personal namespace; it does 
 include repositories shared through collaboration or organization membership.
 `--scope public` selects public repositories; `--scope owner/repo` selects that exact
 repository. These scopes apply to sessions and agents, and cannot be combined with
-`--counts`. `--here` and `--local` are not supported here.
+`--counts`. `--here` intersects these scopes for sessions; `--local` is not supported here.
 
 Scope is applied to every effective query, including shared `--repo` and `--owner`
 filters, before any search request. A contradictory qualifier rejects the entire
@@ -110,3 +110,38 @@ a single query exits with precondition code 4, and a batch marks that query as a
 error. The CLI never retries without the scope. Structured results preserve the
 acknowledgement, filters, pagination and uncertainty. The local MCP search tool
 forwards `scope: "org"` through the same command.
+
+## Search this code repository
+
+Use `agit search "query" --here` to restrict session results to the current code Git
+repository after `-C`. This requires one explicit `remote.origin.url` from local Git
+configuration, without includes. It then reads Git's effective `remote get-url origin`,
+including user and local URL rewrite rules, to match the origin used when recording
+code provenance. System Git configuration is excluded, as it is when recording.
+Both the configured origin and the effective URL must be safe. It does not use
+`AGIT_SESSION`, an Agent repo binding, another remote, or a local-search fallback.
+
+The Hub compares that exact origin with the original `code` field in each saved
+version's `session/meta.json`, before collapsing sessions, counting or paging.
+Transport, SSH username, hostname spelling, port, path and `.git` suffix all remain
+part of the identity. Equivalent-looking transport URLs do not match automatically.
+The recorded code commit suffix can be Git's abbreviated or full hexadecimal ID;
+absent or malformed provenance does not match. Failed or budget-limited reads produce incomplete results.
+
+This option supports `--type sessions` only and rejects `--counts` before a request.
+It can intersect `--scope org`, `mine`, `public`, or `owner/repo`; all repository ACLs
+still apply. A Hub that cannot echo the exact `applied_filters.code_origin` causes
+a single-query exit 4 before hits or counts are shown; a batch marks each unconfirmed query as an error. Authentication remains required.
+
+HTTPS/HTTP/git/SSH URLs and SCP-style origins with explicit hosts and paths are
+accepted conservatively. SSH usernames such as `git@host:team/repo.git` are retained.
+Passwords, HTTP userinfo, query/fragment data, percent-escaped forms, local paths,
+whitespace and ambiguous origins are refused without printing or sending the value.
+Set a single credential-free origin explicitly and keep any URL rewrites credential-free.
+The CLI uses the effective URL exactly; it does not normalize URLs or guess aliases.
+
+`agit search --here` also supports a filter-only query without text; it still requires
+login and a validated code origin. Explicit empty `--query` values are refused.
+
+The origin is resolved once before dispatching a batch. Saved-author and time filters
+intersect it, and every structured result includes the acknowledged `applied_filters`.

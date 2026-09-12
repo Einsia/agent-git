@@ -1349,7 +1349,7 @@ pub enum Commands {
 
     // ── Discovery and sharing ───────────────────────────────────────
     /// Find matching sessions, repositories, pull requests, or people
-    Search(search::Args),
+    Search(Box<search::Args>),
     /// Create a read-only link to a conversation
     Share(share::Args),
     /// Pull requests: create / list / show / fetch / merge

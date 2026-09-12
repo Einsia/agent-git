@@ -453,7 +453,7 @@ fn startup_nudge_allowed(command: &str, json: bool, quiet: bool, ci: bool, tty: 
         && !ci
         && !matches!(
             command,
-            "upgrade" | "hooks" | "mcp" | "status" | "doctor" | "whoami" | "diff"
+            "upgrade" | "hooks" | "mcp" | "status" | "doctor" | "whoami" | "diff" | "search"
         )
 }
 
@@ -524,7 +524,7 @@ mod tests {
         assert!(startup_nudge_allowed("push", false, false, false, true));
         assert!(!startup_nudge_allowed("search", false, false, false, false));
         for command in [
-            "upgrade", "hooks", "mcp", "status", "doctor", "whoami", "diff",
+            "upgrade", "hooks", "mcp", "status", "doctor", "whoami", "diff", "search",
         ] {
             assert!(!startup_nudge_allowed(command, false, false, false, true));
         }

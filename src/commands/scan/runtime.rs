@@ -714,6 +714,14 @@ async fn execute_cancellable(
             .await
             .map_err(|_| anyhow!("cannot verify review runtime exit status"))?;
         verify_exit(status)?;
+        #[cfg(windows)]
+        {
+            let drained = match &tree.job {
+                Some(job) => job.wait_empty_within(CLEANUP_TIMEOUT).await.is_ok(),
+                None => false,
+            };
+            ensure!(drained, "review runtime left subprocesses running");
+        }
         ensure!(tree.gone(), "review runtime left subprocesses running");
         Ok(output)
         }) => result

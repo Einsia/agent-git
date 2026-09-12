@@ -141,7 +141,10 @@ fn main() {
     // path because stdout there is a strict machine-readable envelope.
     if !matches!(
         startup,
-        Startup::ScopedDoctor | Startup::ScopedImport | Startup::ScopedReview
+        Startup::ScopedDoctor
+            | Startup::ScopedImport
+            | Startup::ScopedReview
+            | Startup::RemoteSearch
     ) {
         commands::upgrade::maybe_startup_nudge(command_name, json);
     }
@@ -220,7 +223,7 @@ enum Startup {
     ScopedImport,
     /// Review and guarded edits inspect recovery only after selecting their repository.
     ScopedReview,
-    /// Search queries the Hub without inspecting or migrating local repositories.
+    /// Search validates its own local scope before requesting the Hub.
     RemoteSearch,
 }
 
@@ -327,7 +330,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Fetch(a) => commands::fetch::run(a),
         Commands::Pull(a) => commands::pull::run(a),
 
-        Commands::Search(a) => commands::search::run(a),
+        Commands::Search(a) => commands::search::run(*a),
         Commands::Share(a) => commands::share::run(a),
         Commands::Pr(a) => commands::pr::run(a),
 

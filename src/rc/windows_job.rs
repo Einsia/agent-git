@@ -46,6 +46,10 @@ pub(crate) struct Job {
     drain_on_drop: bool,
     #[cfg(test)]
     nonempty_accounting: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pending_nonempty_queries: std::sync::atomic::AtomicU32,
+    #[cfg(test)]
+    termination_requests: std::sync::atomic::AtomicU32,
 }
 
 impl Job {
@@ -59,6 +63,10 @@ impl Job {
             drain_on_drop: true,
             #[cfg(test)]
             nonempty_accounting: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            pending_nonempty_queries: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            termination_requests: std::sync::atomic::AtomicU32::new(0),
         };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -104,6 +112,18 @@ impl Job {
         {
             return Ok(1);
         }
+        #[cfg(test)]
+        if self
+            .pending_nonempty_queries
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |pending| pending.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Ok(1);
+        }
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         let queried = unsafe {
             QueryInformationJobObject(
@@ -121,6 +141,9 @@ impl Job {
     }
 
     pub(crate) fn terminate(&self) -> io::Result<()> {
+        #[cfg(test)]
+        self.termination_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let terminated = unsafe { TerminateJobObject(self.handle.0, 1) };
         if terminated == 0 {
             return Err(io::Error::last_os_error());
@@ -150,6 +173,18 @@ impl Job {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// Natural exit accounting must become empty without terminating the owned processes.
+    pub(crate) async fn wait_empty_within(&self, within: std::time::Duration) -> io::Result<()> {
+        tokio::time::timeout(within, self.wait_empty())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "process tree exit was not verified",
+                )
+            })?
     }
 }
 
@@ -209,5 +244,105 @@ fn resume_primary_thread(process_id: u32) -> io::Result<()> {
                 "child primary thread was not present in the system snapshot",
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Job;
+    use std::future::{Future, poll_fn};
+    use std::io;
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    fn bounded_job_fixture() -> Job {
+        let mut job = Job::new().unwrap();
+        job.drain_on_drop = false;
+        job
+    }
+
+    #[tokio::test]
+    async fn natural_job_wait_yields_until_empty_without_termination() {
+        let job = bounded_job_fixture();
+        assert_eq!(job.active_processes().unwrap(), 0);
+        job.pending_nonempty_queries.store(1, Ordering::Relaxed);
+        let waiting = job.wait_empty_within(Duration::from_secs(2));
+        tokio::pin!(waiting);
+        poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("natural Job wait exceeded its watchdog")
+            .unwrap();
+        assert_eq!(job.pending_nonempty_queries.load(Ordering::Relaxed), 0);
+        assert_eq!(job.active_processes().unwrap(), 0);
+        assert_eq!(job.termination_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn natural_job_wait_refuses_persistent_accounting_without_termination() {
+        let job = bounded_job_fixture();
+        job.force_nonempty_accounting();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            job.wait_empty_within(Duration::from_millis(50)),
+        )
+        .await
+        .expect("natural Job wait exceeded its watchdog")
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(job.termination_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn enclosing_deadline_withholds_output_while_job_accounting_is_nonempty() {
+        let job = bounded_job_fixture();
+        job.force_nonempty_accounting();
+        let operation = tokio::time::timeout(Duration::from_millis(50), async {
+            job.wait_empty_within(Duration::from_secs(30)).await?;
+            Ok::<_, io::Error>(b"accepted-output")
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .expect("enclosing deadline exceeded its watchdog");
+        assert!(result.is_err(), "nonempty Job accounting admitted output");
+        assert_eq!(job.termination_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_withholds_output_while_job_accounting_is_nonempty() {
+        let job = bounded_job_fixture();
+        job.force_nonempty_accounting();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let operation = async {
+            tokio::select! {
+                biased;
+                signal = cancelled => {
+                    signal.expect("cancellation sender disappeared");
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+                }
+                result = async {
+                    job.wait_empty_within(Duration::from_secs(30)).await?;
+                    Ok::<_, io::Error>(b"accepted-output")
+                } => result,
+            }
+        };
+        tokio::pin!(operation);
+        poll_fn(|cx| {
+            assert!(operation.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        cancel.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .expect("cancellation exceeded its watchdog")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(job.termination_requests.load(Ordering::Relaxed), 0);
     }
 }

@@ -57,7 +57,7 @@ fn handle(req: &serde_json::Value) -> Option<String> {
             id,
             serde_json::json!({
                 "tools": [
-                    {"name": "search", "description": "Search readable AgentGit history. Use query for one search, or queries for an ordered batch (up to 16, four in flight). Shared filters: repo (owner/name), owner, author (saved Git author name/email), since (inclusive UTC saved time), before (exclusive UTC saved time), runtime, scopes (prompt/reply/tool/output/edit/summary), tool, path. Queries also accept quoted phrases, -exclude and qualifiers such as turns:>20. Inspect incomplete and unknown before concluding no work exists. Scope identifies the evidence; secondhand means a compact summary. Outcome/confidence are heuristics: open a hit before relying on it. Pagination includes page, per and has_more. scope restricts sessions or agents to mine (personally owned repositories), org (readable repositories in current membership organizations), public, or one owner/repo; every remote search requires login.", "inputSchema": {"type":"object","properties":{"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},"type":{"type":"string","enum":["sessions","agents","prs","people"]},"sort":{"type":"string","enum":["best","recent","turns"]},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1},"scope":{"type":"string","description":"mine, org, public, or owner/repo; sessions and agents only"},"repo":{"type":"string"},"owner":{"type":"string"},"author":{"type":"string"},"since":{"type":"string"},"before":{"type":"string"},"runtime":{"type":"string"},"scopes":{"type":"array","items":{"type":"string","enum":["prompt","reply","tool","output","edit","summary"]}},"tool":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}},
+                    {"name": "search", "description": "Search readable AgentGit history. Use query for one search, or queries for an ordered batch (up to 16, four in flight). Shared filters: repo (owner/name), owner, author (saved Git author name/email), since (inclusive UTC saved time), before (exclusive UTC saved time), runtime, scopes (prompt/reply/tool/output/edit/summary), tool, path. Queries also accept quoted phrases, -exclude and qualifiers such as turns:>20. Inspect incomplete and unknown before concluding no work exists. Scope identifies the evidence; secondhand means a compact summary. Outcome/confidence are heuristics: open a hit before relying on it. Pagination includes page, per and has_more. scope restricts sessions or agents to mine (personally owned repositories), org (readable repositories in current membership organizations), public, or one owner/repo; every remote search requires login.", "inputSchema": {"type":"object","properties":{"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},"type":{"type":"string","enum":["sessions","agents","prs","people"]},"sort":{"type":"string","enum":["best","recent","turns"]},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1},"scope":{"type":"string","description":"mine, org, public, or owner/repo; sessions and agents only"},"here":{"type":"boolean","description":"Restrict sessions to the current code Git repository exact origin; requires a supporting Hub."},"repo":{"type":"string"},"owner":{"type":"string"},"author":{"type":"string"},"since":{"type":"string"},"before":{"type":"string"},"runtime":{"type":"string"},"scopes":{"type":"array","items":{"type":"string","enum":["prompt","reply","tool","output","edit","summary"]}},"tool":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}},
                     {"name": "show", "description": "Read part of a session (ref, ref#n, ref#n.k)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "view", "description": "the ordered composition of a VIEW (plumbing)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "status", "description": "who am I + sync status", "inputSchema": {"type":"object","properties":{}}},
@@ -116,6 +116,8 @@ struct SearchArgs {
     limit: Option<usize>,
     page: Option<usize>,
     scope: Option<String>,
+    #[serde(default)]
+    here: bool,
     repo: Option<String>,
     owner: Option<String>,
     author: Option<String>,
@@ -138,6 +140,9 @@ fn search_arguments(args: &serde_json::Value) -> Result<Vec<String>, String> {
     }
     let args: SearchArgs = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
     let mut out = vec!["search".to_owned(), "--mcp".to_owned()];
+    if args.here {
+        out.push("--here".into());
+    }
     for query in args.query.into_iter().chain(args.queries) {
         out.extend(["--query".to_owned(), query]);
     }
@@ -342,5 +347,35 @@ mod workspace_tool_tests {
             );
         }
         assert!(src.contains("\"rc_status\"") && src.contains("\"rc_list\""));
+    }
+}
+
+#[cfg(test)]
+mod here_tests {
+    #[test]
+    fn here_is_a_typed_flag_on_the_shared_query_dispatcher() {
+        for here in [true, false] {
+            let args = super::search_arguments(&serde_json::json!({"queries":["first","second"], "here":here, "scope":"org", "author":"Alice"})).unwrap();
+            assert_eq!(
+                args.iter().filter(|arg| arg.as_str() == "--here").count(),
+                usize::from(here)
+            );
+            assert_eq!(
+                args.iter().filter(|arg| arg.as_str() == "--query").count(),
+                2
+            );
+            assert!(args.windows(2).any(|pair| pair == ["--scope", "org"]));
+            assert!(args.windows(2).any(|pair| pair == ["--author", "Alice"]));
+        }
+        for here in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
+            assert!(
+                super::search_arguments(&serde_json::json!({"query":"first", "here":here}))
+                    .is_err()
+            );
+        }
     }
 }
