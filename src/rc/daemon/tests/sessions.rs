@@ -2486,3 +2486,74 @@ async fn delayed_publication_covers_only_its_captured_turn_boundary() {
     assert_eq!(commit.params.unwrap()["through_seq"], 1);
     assert_eq!(commit.seq, Some(3));
 }
+
+#[tokio::test]
+async fn discovery_snapshot_revalidates_scope_after_folder_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+    let mut state = daemon.lock().await;
+    state.mirror.bind("ws-a", "project", root.path()).unwrap();
+    let frame = frame_with(
+        Some(claim("viewer", "ws-a")),
+        serde_json::json!({"workspace_id":"ws-a", "include_local":true}),
+    );
+    let snapshot = state.prepare_session_list(&frame).unwrap();
+    assert!(
+        state
+            .finish_session_list(&frame, &snapshot.roots, vec![])
+            .is_ok()
+    );
+    state.mirror.bind("ws-a", "project", other.path()).unwrap();
+    assert!(
+        state
+            .finish_session_list(&frame, &snapshot.roots, vec![])
+            .is_err()
+    );
+    let foreign = frame_with(
+        Some(claim("owner", "ws-b")),
+        serde_json::json!({"workspace_id":"ws-a"}),
+    );
+    assert!(state.prepare_session_list(&foreign).is_err());
+    assert!(
+        state
+            .finish_session_list(&foreign, &snapshot.roots, vec![])
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn discovery_reply_refreshes_supervision_after_the_scan() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+    let mut state = daemon.lock().await;
+    state.mirror.bind("ws-a", "project", root.path()).unwrap();
+    let frame = frame_with(
+        Some(claim("viewer", "ws-a")),
+        serde_json::json!({"workspace_id":"ws-a", "include_local":true}),
+    );
+    let snapshot = state.prepare_session_list(&frame).unwrap();
+    let local = LocalSession {
+        runtime_session_id: "native-new".into(),
+        runtime: "codex".into(),
+        cwd: root.path().to_string_lossy().into(),
+        modified_at: "now".into(),
+        gist: None,
+        adopted: false,
+        agent: None,
+        likely_active: false,
+    };
+    let (tx, _rx) = mpsc::channel(1);
+    let mut live = rpc_test_live("live-new", 1, tx, crate::protocol::PermissionMode::Default);
+    live.runtime_thread_id = Some("native-new".into());
+    state.sessions.insert("live-new".into(), live);
+    let result: SessionListResult = serde_json::from_value(
+        state
+            .finish_session_list(&frame, &snapshot.roots, vec![local])
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(result.local.is_empty());
+    assert_eq!(result.sessions.len(), 1);
+    assert_eq!(result.sessions[0].session_id, "live-new");
+}

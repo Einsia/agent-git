@@ -330,6 +330,7 @@ pub struct ClaudeCodeDriver {
     /// attributed to the wrong place. Echoes come back in the order they were written to
     /// stdin, so only the head of the queue is compared against.
     awaiting_echoes: std::collections::VecDeque<String>,
+    pub(super) next_prompt_id: Option<String>,
 }
 
 /// The exact command line `launch` runs, minus the spawn.
@@ -415,6 +416,7 @@ impl ClaudeCodeDriver {
             commands: vec![],
             pushback: Default::default(),
             awaiting_echoes: Default::default(),
+            next_prompt_id: None,
         })
     }
 
@@ -472,9 +474,13 @@ impl ClaudeCodeDriver {
         let turn = uuid::Uuid::new_v4().to_string();
         self.current_turn = Some(turn.clone());
         self.awaiting_echoes.push_back(message.to_string());
+        let prompt_id = self
+            .next_prompt_id
+            .take()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         match self
             .proc
-            .write_line(&json!({"type":"user","message":{"role":"user","content":message}}))
+            .write_line(&json!({"type":"user","uuid":prompt_id,"message":{"role":"user","content":message}}))
             .await
         {
             Ok(()) => super::TurnStartOutcome::Accepted {
@@ -501,9 +507,13 @@ impl ClaudeCodeDriver {
             anyhow::bail!("no turn is running — send a message instead of steering");
         }
         self.awaiting_echoes.push_back(message.to_string());
+        let prompt_id = self
+            .next_prompt_id
+            .take()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         if let Err(error) = self
             .proc
-            .write_line(&json!({"type":"user","message":{"role":"user","content":message}}))
+            .write_line(&json!({"type":"user","uuid":prompt_id,"message":{"role":"user","content":message}}))
             .await
         {
             // A write that did not succeed withdraws its echo. The queue compares against
@@ -1013,6 +1023,7 @@ impl ClaudeCodeDriver {
             commands: vec![],
             pushback: Default::default(),
             awaiting_echoes: Default::default(),
+            next_prompt_id: None,
         }
     }
 
@@ -1209,6 +1220,7 @@ mod tests {
             commands: vec![],
             pushback: Default::default(),
             awaiting_echoes: Default::default(),
+            next_prompt_id: None,
         }
     }
 
@@ -1494,6 +1506,42 @@ mod tests {
             Line::Json(value) if value["type"] == "control_response"
         ));
         d.shutdown().await.expect("stop test process");
+    }
+
+    #[tokio::test]
+    async fn remote_prompt_identity_reaches_native_input_for_start_and_steer() {
+        for start in [true, false] {
+            let mut driver = probe();
+            driver.current_turn = if start { None } else { Some("turn".into()) };
+            let mut driver = crate::rc::harness::AnyDriver::ClaudeCode(Box::new(driver));
+            let identity = driver.reserve_prompt_identity().expect("native identity");
+            assert!(uuid::Uuid::parse_str(&identity).is_ok());
+            if start {
+                assert!(matches!(
+                    driver.start_turn("continue", false, None).await,
+                    crate::rc::harness::TurnStartDispatch::Resolved(
+                        crate::rc::harness::TurnStartOutcome::Accepted { .. }
+                    )
+                ));
+            } else {
+                driver.steer("continue").await.unwrap();
+            }
+            let crate::rc::harness::AnyDriver::ClaudeCode(ref mut native) = driver else {
+                unreachable!()
+            };
+            let line = tokio::time::timeout(std::time::Duration::from_secs(1), native.proc.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .into_line();
+            let Line::Json(record) = line else {
+                panic!("expected native prompt")
+            };
+            assert_eq!(record["uuid"], identity);
+            assert_eq!(record["message"]["content"], "continue");
+            assert!(native.next_prompt_id.is_none());
+            driver.shutdown().await.unwrap();
+        }
     }
 
     /// `--replay-user-messages` is required (other viewers must see what the

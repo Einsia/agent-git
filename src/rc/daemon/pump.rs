@@ -426,6 +426,44 @@ impl Daemon {
                 Some(ev) = link_ev_rx.recv() => {
                     if !stopping { match ev {
                         link::LinkEvent::Frame { epoch, frame }
+                            if frame.method() == method::SESSION_LIST =>
+                        {
+                            if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
+                            let Some(id) = frame.id.clone() else { continue };
+                            if session_rpc_tasks.len() >= 32 {
+                                let _ = out_tx.send(Frame::error_response(id, RpcError::new(ErrorCode::SessionBusy, "session discovery is busy; retry shortly")));
+                                continue;
+                            }
+                            let prepared = {
+                                let g = d.lock().await;
+                                if !connection_epoch_is_current(&g.settlement, epoch) { continue; }
+                                g.prepare_session_list(&frame)
+                            };
+                            match prepared {
+                                Ok(snapshot) => {
+                                    let d = d.clone();
+                                    let out = out_tx.clone();
+                                    let roots = snapshot.roots.clone();
+                                    let include_local = frame.params_as::<SessionList>().is_ok_and(|params| params.include_local);
+                                    session_rpc_tasks.spawn(async move {
+                                        let scanned = tokio::task::spawn_blocking(move || {
+                                            if include_local { snapshot.scan(LocalSessionScan::Listing) } else { vec![] }
+                                        }).await;
+                                        let g = d.lock().await;
+                                        if !connection_epoch_is_current(&g.settlement, epoch) { return; }
+                                        let result = scanned.map_err(|_| RpcError::new(ErrorCode::Internal, "session discovery worker failed"))
+                                            .and_then(|local| g.finish_session_list(&frame, &roots, local));
+                                        let response = match result {
+                                            Ok(value) => Frame::response(id, value),
+                                            Err(error) => Frame::error_response(id, error),
+                                        };
+                                        let _ = out.send(response);
+                                    });
+                                }
+                                Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
+                            }
+                        }
+                        link::LinkEvent::Frame { epoch, frame }
                             if frame.method() == method::SESSION_ENQUEUE =>
                         {
                             if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }

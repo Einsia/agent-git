@@ -565,6 +565,7 @@ pub struct MessageAttribution {
     pub by: Option<String>,
     pub sender: Option<crate::protocol::MessageSender>,
     pub client_msg_id: Option<String>,
+    pub native_prompt_id: Option<String>,
 }
 
 impl MessageAttribution {
@@ -598,6 +599,7 @@ impl MessageAttribution {
             by: caller.username.clone().or(legacy_by),
             sender,
             client_msg_id,
+            native_prompt_id: None,
         }
     }
 }
@@ -1681,7 +1683,7 @@ impl Session {
         }
     }
 
-    async fn begin_turn_start(&mut self, pending: PendingTurnCommand) {
+    async fn begin_turn_start(&mut self, mut pending: PendingTurnCommand) {
         if self.pending_turn_command.is_some() {
             self.resolve_turn_start(
                 pending,
@@ -1692,6 +1694,7 @@ impl Session {
             .await;
             return;
         }
+        pending.attribution.native_prompt_id = self.driver.reserve_prompt_identity();
         let dispatch = self
             .driver
             .start_turn(
@@ -1901,6 +1904,7 @@ impl Session {
                 by: attribution.by,
                 sender: attribution.sender,
                 client_msg_id: attribution.client_msg_id,
+                native_prompt_id: attribution.native_prompt_id,
                 prompt,
             },
             mark_running,
@@ -2145,6 +2149,7 @@ impl Session {
                             // steer is redacted **silently** when the harness repeats it.
                             let report = self.redactor.scrub(&message);
                             self.alert_registered(report.registered_ids, "turn_steer").await;
+                            let native_prompt_id = self.driver.reserve_prompt_identity();
                             let result = self.driver.steer(&message).await;
                             if let Some(message) = result
                                 .as_ref()
@@ -2167,6 +2172,7 @@ impl Session {
                                         by: attribution.by,
                                         sender: attribution.sender,
                                         client_msg_id: attribution.client_msg_id,
+                                        native_prompt_id,
                                     },
                                 )
                                 .await;

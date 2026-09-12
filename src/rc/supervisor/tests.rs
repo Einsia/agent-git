@@ -887,6 +887,7 @@ async fn an_exact_response_synthesizes_one_remote_head_with_full_attribution() {
                     username: "operator".into(),
                 }),
                 client_msg_id: Some("submitted-message".into()),
+                native_prompt_id: None,
             },
             reply: Some(ticket),
             initial: false,
@@ -2411,6 +2412,7 @@ async fn steering_publishes_attributed_redacted_history_only_after_native_accept
                     by: Some("alice".into()),
                     sender: Some(sender.clone()),
                     client_msg_id: Some("steer-a".into()),
+                    native_prompt_id: None,
                 },
                 reply: ticket,
             })
@@ -2455,6 +2457,7 @@ fn authenticated_attribution(account_id: &str, username: &str) -> MessageAttribu
             username: username.into(),
         }),
         client_msg_id: None,
+        native_prompt_id: None,
     }
 }
 
@@ -2642,5 +2645,37 @@ async fn native_failure_reaches_viewers_after_persona_and_secret_redaction() {
             .unwrap()
             .contains("confidential-fixture")
     );
+    session.driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn accepted_claude_prompt_publishes_its_machine_generated_native_identity() {
+    let mut driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver();
+    driver.clear_test_current_turn();
+    let (mut session, mut out, _notes) = harness_test_session_with_channels(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::Idle,
+    );
+    let (ticket, _receipt) = crate::rc::ticket::ticket();
+    assert!(ticket.accept());
+    session
+        .begin_turn_start(PendingTurnCommand {
+            message: "Inspect the latency".into(),
+            attribution: authenticated_attribution("account-alice", "alice"),
+            reply: Some(ticket),
+            initial: false,
+            guard_attempt: None,
+        })
+        .await;
+    let frame = std::iter::from_fn(|| out.try_recv().ok())
+        .find(|frame| frame.method() == method::TURN_STARTED)
+        .expect("accepted prompt frame");
+    let prompt: TurnStarted = frame.params_as().unwrap();
+    assert!(
+        uuid::Uuid::parse_str(prompt.native_prompt_id.as_deref().expect("native identity")).is_ok()
+    );
+    assert_eq!(prompt.sender.unwrap().account_id, "account-alice");
+    assert_eq!(prompt.prompt.as_deref(), Some("Inspect the latency"));
     session.driver.shutdown().await.unwrap();
 }

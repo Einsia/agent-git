@@ -570,6 +570,18 @@ impl AnyDriver {
         }
     }
 
+    /// A machine-minted native identity binds the accepted prompt to its transcript echo.
+    pub fn reserve_prompt_identity(&mut self) -> Option<String> {
+        match self {
+            AnyDriver::ClaudeCode(driver) => {
+                let id = uuid::Uuid::new_v4().to_string();
+                driver.next_prompt_id = Some(id.clone());
+                Some(id)
+            }
+            AnyDriver::Codex(_) | AnyDriver::OpenCode(_) => None,
+        }
+    }
+
     pub async fn start_turn(
         &mut self,
         message: &str,

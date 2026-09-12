@@ -968,6 +968,9 @@ pub struct TurnStarted {
     /// The user text that opened the turn (for the timeline header).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Native user-record identity supplied by the machine, independent of caller-chosen ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_prompt_id: Option<String>,
 }
 
 /// A steering message accepted by the native driver, replayable with the session stream.
@@ -981,6 +984,9 @@ pub struct TurnSteered {
     pub sender: Option<MessageSender>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_msg_id: Option<String>,
+    /// Native user-record identity supplied by the machine, independent of caller-chosen ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_prompt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

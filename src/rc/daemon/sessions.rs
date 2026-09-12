@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Read;
 
 impl Daemon {
     /// Local sessions on this machine that can be taken over.
@@ -16,73 +17,63 @@ impl Daemon {
         workspace_id: &str,
         purpose: LocalSessionScan,
     ) -> Vec<LocalSession> {
-        let roots = self.mirror.roots(workspace_id);
-        if roots.is_empty() {
-            return vec![];
-        }
-        let store = crate::domain::store::Store::open().ok().flatten();
-        let mut out: Vec<LocalSession> = vec![];
+        self.local_session_scan(workspace_id).scan(purpose)
+    }
 
-        for adapter in crate::adapter::all() {
-            if !adapter.installable() || !adapter.available() {
-                continue;
-            }
-            for root in &roots {
-                // Every adapter filters by **this project directory** rather than scanning the
-                // whole store: codex uses the `threads` table's
-                // `(archived, cwd, updated_at_ms DESC)` index, Claude Code is one readdir of
-                // `projects/<cwd-slug>/`. So the cost follows "how many sessions this project
-                // has", not how many rollouts piled up on disk.
-                let Ok(mut refs) = adapter.sessions_for(root) else {
-                    continue;
-                };
-                // The index is already in reverse time order, but the file fallback path is
-                // not — sort once and then truncate, so "the most recently talked to" always
-                // sits within the first PER_PROJECT_LIMIT.
-                refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
-                refs.truncate(PER_PROJECT_LIMIT);
-                for r in refs {
-                    // A session already under supervision is no longer listed as "takeable".
-                    if self
-                        .sessions
-                        .values()
-                        .any(|l| l.runtime_thread_id.as_deref() == Some(r.id.as_str()))
-                    {
-                        continue;
-                    }
-                    let link = store
-                        .as_ref()
-                        .and_then(|s| crate::domain::link::get(s, r.runtime, &r.id));
-                    if link.as_ref().is_some_and(|link| !link.is_active()) {
-                        continue;
-                    }
-                    out.push(LocalSession {
-                        runtime_session_id: r.id.clone(),
-                        runtime: r.runtime.to_string(),
-                        cwd: r
-                            .cwd
-                            .clone()
-                            .unwrap_or_else(|| root.to_string_lossy().to_string()),
-                        modified_at: rfc3339(r.mtime),
-                        // The codex index gives an opening prompt for free; Claude Code has
-                        // no index, so leave None and fill it in below within the budget.
-                        gist: r.gist.clone(),
-                        adopted: link.is_some(),
-                        agent: link.and_then(|l| l.agent),
-                        likely_active: recently_written(r.mtime),
-                    });
-                }
-            }
+    pub(super) fn local_session_scan(&self, workspace_id: &str) -> LocalSessionSnapshot {
+        LocalSessionSnapshot {
+            roots: self.mirror.roots(workspace_id),
+            supervised: self
+                .sessions
+                .values()
+                .filter_map(|session| session.runtime_thread_id.clone())
+                .collect(),
         }
+    }
 
-        finish_local_sessions(out, purpose, |item| {
-            let adapter = crate::adapter::get(&item.runtime).ok()?;
-            let path = adapter.resolve(
-                &item.runtime_session_id,
-                Some(std::path::Path::new(&item.cwd)),
-            )?;
-            adapter.parse_at(&path).ok()?.gist(80)
-        })
+    pub(super) fn prepare_session_list(
+        &self,
+        frame: &Frame,
+    ) -> Result<LocalSessionSnapshot, RpcError> {
+        let caller = caller_scope(frame)?;
+        require_role(&caller, frame.method())?;
+        if !self.mirror.has_workspace(&caller.workspace_id) {
+            return Err(RpcError::new(
+                ErrorCode::WorkspaceNotFound,
+                "workspace is not bound on this machine",
+            ));
+        }
+        Ok(self.local_session_scan(&caller.workspace_id))
+    }
+
+    pub(super) fn finish_session_list(
+        &self,
+        frame: &Frame,
+        roots: &policy::CanonicalRoots,
+        local: Vec<LocalSession>,
+    ) -> Result<serde_json::Value, RpcError> {
+        let caller = caller_scope(frame)?;
+        require_role(&caller, frame.method())?;
+        if !self.mirror.has_workspace(&caller.workspace_id)
+            || self.mirror.roots(&caller.workspace_id) != *roots
+        {
+            return Err(RpcError::new(
+                ErrorCode::WorkspaceNotFound,
+                "workspace folders changed during discovery; refresh the list",
+            ));
+        }
+        let snapshot = self.local_session_scan(&caller.workspace_id);
+        let local = local
+            .into_iter()
+            .filter(|item| !snapshot.supervised.contains(&item.runtime_session_id))
+            .collect();
+        let sessions = self
+            .sessions
+            .values()
+            .filter(|session| session.info.workspace_id == caller.workspace_id)
+            .map(|session| self.stamped(session.info.clone()))
+            .collect();
+        Ok(serde_json::to_value(SessionListResult { sessions, local }).unwrap())
     }
 
     /// Take over a local session.
@@ -1149,5 +1140,250 @@ mod claim_tests {
             crate::protocol::ErrorCode::SessionNotFound as i32
         );
         assert!(error.message.contains("superseded"));
+    }
+}
+
+/// A discovery worker carries only authorized roots and native identities, never daemon state.
+#[derive(Clone)]
+pub(super) struct LocalSessionSnapshot {
+    pub(super) roots: policy::CanonicalRoots,
+    supervised: std::collections::HashSet<String>,
+}
+
+impl LocalSessionSnapshot {
+    pub(super) fn scan(self, purpose: LocalSessionScan) -> Vec<LocalSession> {
+        let roots = self.roots;
+        if roots.is_empty() {
+            return vec![];
+        }
+        let store = crate::domain::store::Store::open().ok().flatten();
+        let mut out: Vec<LocalSession> = vec![];
+
+        for adapter in crate::adapter::all() {
+            if !adapter.installable() || !adapter.available() {
+                continue;
+            }
+            for root in &roots {
+                // Every adapter filters by **this project directory** rather than scanning the
+                // whole store: codex uses the `threads` table's
+                // `(archived, cwd, updated_at_ms DESC)` index, Claude Code is one readdir of
+                // `projects/<cwd-slug>/`. So the cost follows "how many sessions this project
+                // has", not how many rollouts piled up on disk.
+                let Ok(mut refs) = adapter.sessions_for(root) else {
+                    continue;
+                };
+                // The index is already in reverse time order, but the file fallback path is
+                // not — sort once and then truncate, so "the most recently talked to" always
+                // sits within the first PER_PROJECT_LIMIT.
+                refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
+                refs.truncate(PER_PROJECT_LIMIT);
+                for r in refs {
+                    // A session already under supervision is no longer listed as "takeable".
+                    if self.supervised.contains(&r.id) {
+                        continue;
+                    }
+                    let link = store
+                        .as_ref()
+                        .and_then(|s| crate::domain::link::get(s, r.runtime, &r.id));
+                    if link.as_ref().is_some_and(|link| !link.is_active()) {
+                        continue;
+                    }
+                    out.push(LocalSession {
+                        runtime_session_id: r.id.clone(),
+                        runtime: r.runtime.to_string(),
+                        cwd: r
+                            .cwd
+                            .clone()
+                            .unwrap_or_else(|| root.to_string_lossy().to_string()),
+                        modified_at: rfc3339(r.mtime),
+                        // The codex index gives an opening prompt for free; Claude Code has
+                        // no index, so leave None and fill it in below within the budget.
+                        gist: r.gist.as_deref().map(local_gist_text),
+                        adopted: link.is_some(),
+                        agent: link.and_then(|l| l.agent),
+                        likely_active: recently_written(r.mtime),
+                    });
+                }
+            }
+        }
+
+        finish_local_sessions(out, purpose, local_gist_preview)
+    }
+}
+
+const LOCAL_GIST_BYTES: u64 = 256 * 1024;
+const LOCAL_GIST_CHARS: usize = 80;
+
+fn local_gist_preview(item: &LocalSession) -> Option<String> {
+    // Path resolution can materialize database histories, so discovery only opens native files.
+    if !matches!(item.runtime.as_str(), "claude-code" | "codex") {
+        return None;
+    }
+    let adapter = crate::adapter::get(&item.runtime).ok()?;
+    let path = adapter.resolve(
+        &item.runtime_session_id,
+        Some(std::path::Path::new(&item.cwd)),
+    )?;
+    let file = std::fs::File::open(path).ok()?;
+    bounded_local_gist(file, adapter.as_ref())
+}
+
+fn local_gist_text(text: &str) -> String {
+    let mut characters = text
+        .split_whitespace()
+        .enumerate()
+        .flat_map(|(index, word)| (index > 0).then_some(' ').into_iter().chain(word.chars()));
+    let mut gist: String = characters.by_ref().take(LOCAL_GIST_CHARS).collect();
+    if characters.next().is_some() {
+        gist.push('…');
+    }
+    gist
+}
+
+/// Discovery previews have a byte budget independent of the transcript's total length.
+fn bounded_local_gist(
+    reader: impl std::io::Read,
+    adapter: &dyn crate::adapter::Adapter,
+) -> Option<String> {
+    let mut prefix = Vec::new();
+    reader
+        .take(LOCAL_GIST_BYTES)
+        .read_to_end(&mut prefix)
+        .ok()?;
+    if prefix.len() == LOCAL_GIST_BYTES as usize {
+        let end = prefix.iter().rposition(|byte| *byte == b'\n')?;
+        prefix.truncate(end + 1);
+    }
+    let parsed = adapter.parse(std::str::from_utf8(&prefix).ok()?).ok()?;
+    parsed
+        .events
+        .iter()
+        .find(|event| event.kind == crate::adapter::EventKind::UserPrompt)
+        .and_then(|event| event.text.as_deref())
+        .map(local_gist_text)
+}
+
+#[cfg(test)]
+mod discovery_preview_tests {
+    use super::*;
+    use std::io::{Cursor, Read};
+
+    #[test]
+    fn database_preview_does_not_materialize_native_history() {
+        const CHILD: &str = "AGIT_RC_PREVIEW_TEST_CHILD";
+        let Some(root) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rc::daemon::sessions::discovery_preview_tests::database_preview_does_not_materialize_native_history",
+                    "--nocapture",
+                ])
+                .env(CHILD, directory.path())
+                .env("AGIT_HOME", directory.path().join("agit"))
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(directory.path().join("completed").exists());
+            return;
+        };
+        let native = root.join("data/opencode");
+        std::fs::create_dir_all(&native).unwrap();
+        let database = rusqlite::Connection::open(native.join("opencode.db")).unwrap();
+        database.execute_batch(
+            r#"CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT,
+                 directory TEXT, time_created INTEGER, time_updated INTEGER, version TEXT);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+             INSERT INTO project VALUES ('project', '/preview');
+             INSERT INTO session VALUES ('ses_preview', 'project', NULL, '/preview', 1, 2, 'fixture');
+             INSERT INTO message VALUES ('message', 'ses_preview', 1, '{"role":"user"}');"#,
+        ).unwrap();
+        let content =
+            serde_json::json!({"type":"text", "text":"prompt".repeat(LOCAL_GIST_BYTES as usize)})
+                .to_string();
+        database
+            .execute(
+                "INSERT INTO part VALUES ('part', 'message', 'ses_preview', 2, ?1)",
+                [&content],
+            )
+            .unwrap();
+        drop(database);
+        let adapter = crate::adapter::get("opencode").unwrap();
+        let refs = adapter
+            .sessions_for(std::path::Path::new("/preview"))
+            .unwrap();
+        assert_eq!(refs.len(), 1);
+        let item = LocalSession {
+            runtime_session_id: refs[0].id.clone(),
+            runtime: refs[0].runtime.to_owned(),
+            cwd: refs[0].cwd.clone().unwrap(),
+            modified_at: rfc3339(refs[0].mtime),
+            gist: refs[0].gist.clone(),
+            adopted: false,
+            agent: None,
+            likely_active: false,
+        };
+        let discovered = finish_local_sessions(
+            vec![item.clone()],
+            LocalSessionScan::Listing,
+            local_gist_preview,
+        );
+        assert_eq!(discovered.len(), 1);
+        assert!(discovered[0].gist.is_none());
+        let cache = &refs[0].path;
+        assert!(!cache.exists());
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(cache, "saved export").unwrap();
+        assert!(local_gist_preview(&item).is_none());
+        assert_eq!(std::fs::read_to_string(cache).unwrap(), "saved export");
+        assert_eq!(
+            adapter.resolve(&item.runtime_session_id, None).as_ref(),
+            Some(cache)
+        );
+        assert!(std::fs::metadata(cache).unwrap().len() > LOCAL_GIST_BYTES);
+        std::fs::write(root.join("completed"), []).unwrap();
+    }
+
+    #[test]
+    fn preview_reads_a_bounded_prefix_of_large_histories() {
+        let prompt = serde_json::json!({"type":"user", "message":{"role":"user", "content":"Investigate the latency"}}).to_string();
+        let history = format!("{prompt}\n{}", " ".repeat(LOCAL_GIST_BYTES as usize * 4));
+        let mut input = Cursor::new(history.into_bytes());
+        let adapter = crate::adapter::get("claude-code").unwrap();
+        assert_eq!(
+            bounded_local_gist(&mut input, adapter.as_ref()).as_deref(),
+            Some("Investigate the latency")
+        );
+        assert_eq!(input.position(), LOCAL_GIST_BYTES);
+        assert!(input.bytes().next().is_some());
+    }
+
+    #[test]
+    fn oversized_first_record_does_not_expand_the_preview_budget() {
+        let mut input = Cursor::new(vec![b'x'; LOCAL_GIST_BYTES as usize * 2]);
+        let adapter = crate::adapter::get("claude-code").unwrap();
+        assert!(bounded_local_gist(&mut input, adapter.as_ref()).is_none());
+        assert_eq!(input.position(), LOCAL_GIST_BYTES);
+    }
+
+    #[test]
+    fn indexed_previews_normalize_whitespace_and_truncate_unicode_safely() {
+        assert_eq!(
+            local_gist_text("  Inspect\n  the latency  "),
+            "Inspect the latency"
+        );
+        // CJK fixture pins character-based preview boundaries.
+        let text = "界".repeat(LOCAL_GIST_CHARS + 1);
+        assert_eq!(
+            local_gist_text(&text),
+            format!("{}…", "界".repeat(LOCAL_GIST_CHARS))
+        );
+        assert_eq!(
+            local_gist_text(&"a".repeat(LOCAL_GIST_CHARS)),
+            "a".repeat(LOCAL_GIST_CHARS)
+        );
     }
 }
