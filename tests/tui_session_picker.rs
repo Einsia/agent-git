@@ -256,7 +256,7 @@ fn bare_init_creates_only_the_named_repo_with_binding_disabled() {
     let home = tmp.path().join("agit");
     let mut terminal = Terminal::start(&home, tmp.path(), "init", 60);
     terminal.wait_for("agit init");
-    terminal.type_keys("\rtui-created\r \t\t\r");
+    terminal.type_keys("\rtui-created\r \t\t\t\r");
     terminal.wait_for("local/tui-created");
     assert!(terminal.child.wait().unwrap().success());
     let repo = Repo::open(home.join("repos/local/tui-created")).unwrap();

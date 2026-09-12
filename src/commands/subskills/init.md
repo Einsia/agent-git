@@ -52,3 +52,9 @@ agit init p1 --no-bind
 ```
 
 If `szh/p1` already exists, do not run `init` again. Use `new` for a new session in that repo and `import` for an existing runtime conversation.
+
+## Automatic publishing preference
+
+An interactive repository creation asks whether to inherit the user preference, enable automatic pushing, or disable it for this repository. Use `--auto-push` or `--auto-push=false` to choose explicitly in scripts; omission inherits the user setting. Change or clear the override later with `agit config --repo <owner/repo> push.auto <true|false>` or `agit config --repo <owner/repo> --unset push.auto`.
+
+Enabling automatic pushing while signed out enters the login flow before creating the repository. Creating the repo itself does not upload a session; automatic publication follows successful session settlement.

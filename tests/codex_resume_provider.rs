@@ -46,6 +46,11 @@ fn main() {
             registered_provider_is_preserved,
         ),
         ("unknown registry", unknown_registry_is_not_reinterpreted),
+        #[cfg(unix)]
+        (
+            "closed probe input",
+            closed_probe_input_preserves_native_state,
+        ),
         ("opaque provider identity", other_provider_names_are_opaque),
         ("unknown native index", unknown_index_is_not_reinterpreted),
         (
@@ -96,6 +101,16 @@ fn fake_app_server() {
         let request: Value = serde_json::from_str(&line).unwrap();
         writeln!(log, "{}", json!({"pid":pid,"request":request})).unwrap();
         log.flush().unwrap();
+        #[cfg(unix)]
+        if request["method"] == "initialize"
+            && fs::read_to_string(&response_path).unwrap() == "CLOSED_INPUT"
+        {
+            // The reply makes the parent write again only after its input pipe has no reader.
+            assert_eq!(unsafe { libc::close(libc::STDIN_FILENO) }, 0);
+            writeln!(stdout, "{}", json!({"id":request["id"],"result":{}})).unwrap();
+            stdout.flush().unwrap();
+            return;
+        }
         let reply = match request["method"].as_str() {
             Some("initialize") => json!({"id":request["id"],"result":{}}),
             Some("initialized") => continue,
@@ -1044,6 +1059,43 @@ fn unknown_registry_is_not_reinterpreted() {
         assert_eq!(fs::read(index).unwrap(), index_bytes);
         lab.assert_rpc(true);
     }
+}
+
+#[cfg(unix)]
+fn closed_probe_input_preserves_native_state() {
+    let lab = Lab::new("OpenAI", absent_registry());
+    fs::write(&lab.response, "CLOSED_INPUT").unwrap();
+    let index = lab.seed_index(Some("OpenAI"));
+    let index_bytes = fs::read(&index).unwrap();
+    let before = snapshot(&lab.codex_home);
+    let resumed = lab.success(&["resume", "me/qa@work", "--no-launch"]);
+    assert!(!output_text(&resumed).contains("model_provider="));
+    assert_eq!(snapshot(&lab.codex_home), before);
+    let forked = lab.success(&[
+        "fork",
+        "me/qa@work",
+        "-b",
+        "portable",
+        "--resume",
+        "--no-launch",
+    ]);
+    assert!(!output_text(&forked).contains("model_provider="));
+    let (id, _) = lab.claim("portable");
+    assert_eq!(
+        records(&lab.rollout(&id))[0]["payload"]["model_provider"],
+        "OpenAI"
+    );
+    assert_eq!(fs::read(index).unwrap(), index_bytes);
+    let requests: Vec<_> = records(&lab.rpc_log)
+        .into_iter()
+        .filter_map(|row| row.get("request").cloned())
+        .collect();
+    assert!(!requests.is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["method"] == "initialize")
+    );
 }
 
 fn other_provider_names_are_opaque() {

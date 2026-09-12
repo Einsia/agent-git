@@ -125,6 +125,9 @@ pub struct Args {
     /// Bind this directory even if it is already bound to another repo
     #[arg(long, conflicts_with = "no_bind")]
     pub rebind: bool,
+    /// Override automatic publishing for this repository; omission inherits user preferences.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub auto_push: Option<bool>,
 
     /// Explicitly pin an existing legacy checkout to this verified immutable agent ID
     ///
@@ -162,6 +165,9 @@ pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<Repo> {
     let repo = Repo::at(&dest);
     repo.set_remote(&a.clone_url)?;
     super::migration::finish_external_history_update(&repo, history_update)?;
+    if let Some(value) = super::config::choose_repo_auto_push()? {
+        repo.set_auto_push(Some(value))?;
+    }
     Ok(repo)
 }
 
@@ -229,6 +235,7 @@ pub(super) fn acquire_mine(slug: &str) -> CmdResult {
             name: None,
             no_bind: true,
             rebind: false,
+            auto_push: None,
             adopt_legacy_agent_id: None,
             as_runtime: None,
             no_launch: true,
@@ -312,6 +319,13 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     // pair of session links under the same agent, and `agit commit photo` then has to pick among
     // four candidates — an ambiguity created out of nowhere.
     if plan.promoted_in_place {
+        let preference = match args.auto_push {
+            Some(value) => Some(value),
+            None => super::config::choose_repo_auto_push()?,
+        };
+        if let Some(value) = preference {
+            Repo::at(config::repo_dir(&owner, &name)?).set_auto_push(Some(value))?;
+        }
         progress.line(format_args!(
             "{}",
             ui::dim(&format!(
@@ -406,6 +420,12 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
 
     let store = Repo::at(&dest);
     plan.report(&src_owner, &src_name, progress);
+
+    if let Some(value) = args.auto_push {
+        store.set_auto_push(Some(value))?;
+    } else if !existed && let Some(value) = super::config::choose_repo_auto_push()? {
+        store.set_auto_push(Some(value))?;
+    }
 
     // ── 4. Local branches ──
     //

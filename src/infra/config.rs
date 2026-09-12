@@ -157,7 +157,7 @@ pub(crate) fn hub_record_key_matches(path: &std::path::Path, key: &str) -> bool 
         && same_file::is_same_file(path, &expected_path).unwrap_or(false)
 }
 
-/// The global config file: a few keys, no repo-level config (the PRD's `agit config` section).
+/// User preferences supply defaults for repositories without a local override.
 pub fn global_config_path() -> Result<PathBuf> {
     Ok(agit_home()?.join("config.json"))
 }
@@ -304,6 +304,17 @@ pub fn set_global(key: &str, value: Option<&str>) -> Result<()> {
     }
     std::fs::write(&path, serde_json::to_string_pretty(&map)?)?;
     Ok(())
+}
+
+/// Automatic publishing is opt-in; malformed preferences cannot enable it.
+pub fn auto_push_default() -> Result<bool> {
+    match get_global("push.auto")?.as_deref() {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => anyhow::bail!(
+            "invalid user push.auto preference; set it to true or false with agit config"
+        ),
+    }
 }
 
 /// List every global config key and value.

@@ -3922,3 +3922,149 @@ fn resume_tracking_recovery_hint_resolves_the_frozen_graph() {
         assert_eq!(lab.hub_requests.load(Ordering::SeqCst), requests_before);
     }
 }
+
+#[test]
+fn automatic_push_publishes_the_selected_session_and_keeps_failed_turns_local() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "prepare automatic publication", "ready");
+    let imported = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let bare = lab._tmp.path().join("automatic-remote.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&bare)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(&lab.clone_url, bare.to_string_lossy().as_bytes()).unwrap();
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    repo.set_remote(bare.to_str().unwrap()).unwrap();
+    let identity = agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap();
+    agit::hub::identity::pin(&repo, &identity).unwrap();
+    repo.git(&["branch", "unpublished", "work"]).unwrap();
+    repo.set_auto_push(Some(true)).unwrap();
+    lab.append_turn(SID, 2, "publish this saved turn", "saved");
+    let pushed = lab.hook(
+        "settle",
+        SID,
+        &[],
+        &[("AGIT_SESSION", "me/unrelated@other")],
+    );
+    assert!(
+        pushed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    let remote_tip = || {
+        let output = Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["rev-parse", "refs/heads/work"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&pushed.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let published = remote_tip();
+    assert_eq!(published, repo.git(&["rev-parse", "work"]).unwrap().trim());
+    let refs = Command::new("git")
+        .arg("--git-dir")
+        .arg(&bare)
+        .args(["for-each-ref", "--format=%(refname)", "refs/heads/"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(refs.stdout).unwrap().trim(),
+        "refs/heads/main\nrefs/heads/work"
+    );
+
+    let requests = lab.hub_requests.load(Ordering::SeqCst);
+    let unchanged = lab.hook("settle", SID, &[], &[]);
+    assert!(unchanged.status.success());
+    assert_eq!(requests, lab.hub_requests.load(Ordering::SeqCst));
+
+    fs::write(&lab.gate_closed, "revoked").unwrap();
+    lab.append_turn(
+        SID,
+        3,
+        "retain this turn after access is revoked",
+        "saved offline",
+    );
+    let failed = lab.hook("settle", SID, &[], &[]);
+    assert!(failed.status.success());
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("saved locally; automatic push failed")
+    );
+    assert_ne!(published, repo.git(&["rev-parse", "work"]).unwrap().trim());
+    assert_eq!(published, remote_tip());
+
+    repo.set_auto_push(Some(false)).unwrap();
+    let requests = lab.hub_requests.load(Ordering::SeqCst);
+    lab.append_turn(SID, 4, "keep the disabled repository local", "saved");
+    assert!(lab.hook("settle", SID, &[], &[]).status.success());
+    assert_eq!(requests, lab.hub_requests.load(Ordering::SeqCst));
+    assert_eq!(published, remote_tip());
+
+    fs::remove_file(&lab.gate_closed).unwrap();
+    let configured = lab.agit(&["config", "push.auto", "true"]).output().unwrap();
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    repo.set_auto_push(None).unwrap();
+    lab.append_turn(SID, 5, "inherit the user publishing choice", "saved");
+    assert!(lab.hook("settle", SID, &[], &[]).status.success());
+    assert_eq!(
+        remote_tip(),
+        repo.git(&["rev-parse", "work"]).unwrap().trim()
+    );
+
+    let published = remote_tip();
+    let secret = format!("aws_access_key_id = AKIA{}", "4X7QZ2M5RT6VW3JH");
+    let main = repo.git(&["rev-parse", "main"]).unwrap();
+    let tree = repo.git(&["rev-parse", "main^{tree}"]).unwrap();
+    let unsafe_commit = repo
+        .git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit-tree",
+            &tree,
+            "-p",
+            &main,
+            "-m",
+            &secret,
+        ])
+        .unwrap();
+    repo.git(&["update-ref", "refs/heads/main", &unsafe_commit, &main])
+        .unwrap();
+    lab.append_turn(
+        SID,
+        6,
+        "keep this turn local while shared history contains a secret",
+        "synthetic scanner fixture",
+    );
+    let refused = lab.hook("settle", SID, &[], &[]);
+    assert!(refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("automatic push failed"),
+        "{refused:?}"
+    );
+    assert_eq!(remote_tip(), published);
+    assert_ne!(published, repo.git(&["rev-parse", "work"]).unwrap().trim());
+}

@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 pub struct Picked {
     pub name: String,
     pub bind: bool,
+    pub auto_push: Option<bool>,
     /// `None` means seed was not requested. `Some` is the exact set confirmed in the asset screen.
     pub seed_assets: Option<Vec<(PathBuf, PathBuf)>>,
 }
@@ -29,6 +30,8 @@ struct Form {
     name: String,
     bind: bool,
     seed: bool,
+    auto_push: Option<bool>,
+    user_auto_push: bool,
     field: Field,
     editing: bool,
     notice: Option<String>,
@@ -40,6 +43,8 @@ impl Default for Form {
             name: String::new(),
             bind: true,
             seed: false,
+            auto_push: None,
+            user_auto_push: false,
             field: Field::Name,
             editing: false,
             notice: None,
@@ -52,6 +57,7 @@ enum Field {
     Name,
     Bind,
     Seed,
+    AutoPush,
     Create,
 }
 
@@ -60,7 +66,8 @@ impl Field {
         match self {
             Field::Name => Field::Bind,
             Field::Bind => Field::Seed,
-            Field::Seed => Field::Create,
+            Field::Seed => Field::AutoPush,
+            Field::AutoPush => Field::Create,
             Field::Create => Field::Name,
         }
     }
@@ -70,7 +77,8 @@ impl Field {
             Field::Name => Field::Create,
             Field::Bind => Field::Name,
             Field::Seed => Field::Bind,
-            Field::Create => Field::Seed,
+            Field::Create => Field::AutoPush,
+            Field::AutoPush => Field::Seed,
         }
     }
 
@@ -79,7 +87,8 @@ impl Field {
             Field::Name => 0,
             Field::Bind => 1,
             Field::Seed => 2,
-            Field::Create => 3,
+            Field::AutoPush => 3,
+            Field::Create => 4,
         }
     }
 }
@@ -103,7 +112,10 @@ pub fn pick(cwd: &Path) -> crate::Result<Option<Picked>> {
         .unwrap_or_default();
     let owner = crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
     let assets = crate::commands::init::find_seed_assets(cwd);
-    let mut form = Form::default();
+    let mut form = Form {
+        user_auto_push: crate::infra::config::auto_push_default()?,
+        ..Default::default()
+    };
     let mut selected = vec![false; assets.len()];
 
     widgets::refresh_rc_status();
@@ -126,6 +138,7 @@ pub fn pick(cwd: &Path) -> crate::Result<Option<Picked>> {
                             break Some(Picked {
                                 name: form.name.trim().to_string(),
                                 bind: form.bind,
+                                auto_push: form.auto_push,
                                 seed_assets: Some(picked),
                             });
                         }
@@ -137,6 +150,7 @@ pub fn pick(cwd: &Path) -> crate::Result<Option<Picked>> {
                     break Some(Picked {
                         name: form.name.trim().to_string(),
                         bind: form.bind,
+                        auto_push: form.auto_push,
                         seed_assets: form.seed.then(Vec::new),
                     });
                 }
@@ -203,12 +217,14 @@ fn form_loop(
             KeyCode::Char(' ') => match form.field {
                 Field::Bind => form.bind = !form.bind,
                 Field::Seed => form.seed = !form.seed,
+                Field::AutoPush => form.auto_push = cycle_auto_push(form.auto_push),
                 _ => {}
             },
             KeyCode::Enter => match form.field {
                 Field::Name => form.editing = true,
                 Field::Bind => form.bind = !form.bind,
                 Field::Seed => form.seed = !form.seed,
+                Field::AutoPush => form.auto_push = cycle_auto_push(form.auto_push),
                 Field::Create => match validate_name(&form.name) {
                     Ok(()) => return Ok(FormOutcome::Submit),
                     Err(error) => {
@@ -219,6 +235,14 @@ fn form_loop(
             },
             _ => {}
         }
+    }
+}
+
+fn cycle_auto_push(choice: Option<bool>) -> Option<bool> {
+    match choice {
+        None => Some(true),
+        Some(true) => Some(false),
+        Some(false) => None,
     }
 }
 
@@ -316,7 +340,22 @@ fn draw_form(
             "seed    {}  inspect {asset_count} adoptable assets",
             checkbox(form.seed)
         )),
-        ListItem::new("create  continue"),
+        ListItem::new(format!(
+            "push    {}",
+            match form.auto_push {
+                Some(true) => "[x] automatically push settled turns",
+                Some(false) => "[ ] keep settled turns local",
+                None if form.user_auto_push => "[-] inherit user preference: on",
+                None => "[-] inherit user preference: off",
+            }
+        )),
+        ListItem::new(
+            if owner == "local" && form.auto_push.unwrap_or(form.user_auto_push) {
+                "create  sign in, then create"
+            } else {
+                "create  continue"
+            },
+        ),
     ];
     let mut state = ListState::default();
     state.select(Some(form.field.index()));

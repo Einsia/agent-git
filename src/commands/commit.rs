@@ -1338,6 +1338,24 @@ fn settle(
     repo_dir: &Path,
     slug: &str,
     branch: &str,
+    lk: Link,
+    owner: &str,
+    opts: SettleOpts,
+) -> CmdResult {
+    let before = super::auto_push::branch_tip(repo_dir, branch);
+    let quiet = opts.quiet;
+    let result = settle_local(store, repo_dir, slug, branch, lk, owner, opts);
+    if matches!(result, Ok(ExitCode::Ok)) {
+        super::auto_push::after_settlement(repo_dir, slug, branch, before.as_deref(), quiet);
+    }
+    result
+}
+
+fn settle_local(
+    store: &Store,
+    repo_dir: &Path,
+    slug: &str,
+    branch: &str,
     mut lk: Link,
     owner: &str,
     opts: SettleOpts,
@@ -1424,7 +1442,15 @@ fn settle(
         return Ok(ExitCode::Policy);
     }
     let fresh = !repo_dir.join(".git").exists();
+    let preference = if fresh && !quiet {
+        super::config::choose_repo_auto_push()?
+    } else {
+        None
+    };
     let primary = Repo::open_or_init(repo_dir)?;
+    if let Some(value) = preference {
+        primary.set_auto_push(Some(value))?;
+    }
     let repo = match checkout_for_settlement(&primary, slug, branch)? {
         Ok(repo) => repo,
         Err(code) => return Ok(code),

@@ -50,6 +50,9 @@ pub struct Args {
     pub agents_md: bool,
     #[arg(long, value_name = "shell", value_parser = ["bash", "zsh", "fish"])]
     pub completions: Option<String>,
+    /// Set the user default for automatically publishing settled turns.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub auto_push: Option<bool>,
 }
 
 /// The observable result of one setup run.
@@ -119,6 +122,18 @@ pub fn run(args: Args) -> CmdResult {
         args.mcp || all,
         args.agents_md || all,
     );
+
+    if let Some(value) = args.auto_push {
+        super::config::apply("push.auto", Some(if value { "true" } else { "false" }))?;
+    } else if all && !super::json::requested() && ui::prompt::interactive() {
+        let current = crate::infra::config::auto_push_default()?;
+        if let Some(value) = ui::prompt::confirm(
+            "Automatically push settled turns by default? Each repository can override this",
+            current,
+        )? {
+            super::config::apply("push.auto", Some(if value { "true" } else { "false" }))?;
+        }
+    }
 
     let rt = args.runtime.as_deref();
     let mut report = SetupReport::default();

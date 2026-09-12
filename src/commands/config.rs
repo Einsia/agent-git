@@ -1,13 +1,5 @@
-//! `agit config` — reading and writing the small set of global config keys.
-//!
-//! Only these keys exist (PRD, the `agit config` section): `hub.url`, `runtime.default`,
-//! `push.visibility`, `commit.auto`, `memory.track`, `secrets.keystore`. **There is no repo-level
-//! config file** — the smaller the configuration surface, the easier "why does it behave this
-//! way" is to answer.
-//!
-//! `ask` for `push.visibility` counts as `private` in a non-interactive environment (publishing
-//! memory always errs conservative); that rule lives where the value is read (push), not in the
-//! storage layer.
+//! Configuration at user scope and explicit repository scope.
+//! Repository overrides remain local to this device; unset values inherit user preferences.
 
 use super::CmdResult;
 use crate::infra::config;
@@ -16,7 +8,7 @@ use clap::Args as ClapArgs;
 
 /// The full set of valid keys. Adding a key means editing here; an unknown key is always rejected
 /// and this table printed.
-pub const KEYS: [(&str, &str); 6] = [
+pub const KEYS: [(&str, &str); 7] = [
     (
         "hub.url",
         "default hub address (AGIT_HUB_URL takes priority)",
@@ -28,6 +20,10 @@ pub const KEYS: [(&str, &str); 6] = [
     (
         "push.visibility",
         "first-publish visibility: ask | private | public (non-interactive ask = private)",
+    ),
+    (
+        "push.auto",
+        "automatically publish settled turns: true | false (default false)",
     ),
     ("commit.auto", "hooks auto-settlement switch: true | false"),
     (
@@ -52,6 +48,12 @@ pub struct Args {
     /// List everything.
     #[arg(long, conflicts_with_all = ["key", "unset"])]
     pub list: bool,
+    /// Configure a local Agent repository instead of user preferences.
+    #[arg(long, value_name = "OWNER/REPO", conflicts_with = "global")]
+    pub repo: Option<String>,
+    /// Configure user preferences, inherited by repositories without an override.
+    #[arg(long)]
+    pub global: bool,
 }
 
 /// Where the effective value shown by the editor comes from.
@@ -83,6 +85,9 @@ pub fn get(key: &str) -> Option<String> {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    if let Some(slug) = args.repo.as_deref() {
+        return run_repo(&args, slug);
+    }
     if wants_tui(&args) {
         match crate::tui::should_enter() {
             crate::tui::Verdict::Enter => {
@@ -180,6 +185,95 @@ pub fn run(args: Args) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
+fn run_repo(args: &Args, slug: &str) -> CmdResult {
+    use crate::domain::{refs, repo::Repo};
+    let spec = crate::input_argument(refs::parse(slug))?;
+    let (refs::RepoSel::Slug(owner, name), refs::Base::Default, refs::Tail::None) =
+        (spec.repo, spec.base, spec.tail)
+    else {
+        return crate::input_argument(Err(anyhow::anyhow!(
+            "--repo requires an explicit owner/repo without a branch or turn selector"
+        )));
+    };
+    crate::input_argument(crate::domain::repo::valid_name(&owner))?;
+    crate::input_argument(crate::domain::repo::valid_name(&name))?;
+    if args.key.as_deref().is_some_and(|key| key != "push.auto") {
+        return crate::input_argument(Err(anyhow::anyhow!(
+            "only push.auto supports a repository override"
+        )));
+    }
+    if args.unset && args.key.is_none() {
+        return crate::input_argument(Err(anyhow::anyhow!("--unset requires a key")));
+    }
+    if let Some(value) = args.value.as_deref() {
+        crate::input_argument(validate("push.auto", value))?;
+    }
+    let repo = Repo::open(config::repo_dir(&owner, &name)?).ok_or_else(|| {
+        anyhow::anyhow!("{owner}/{name} is not a local Agent repository; clone it first")
+    })?;
+    let operation = if args.unset {
+        repo.set_auto_push(None)?;
+        "unset"
+    } else if let Some(value) = args.value.as_deref() {
+        repo.set_auto_push(Some(value == "true"))?;
+        "set"
+    } else if args.list || args.key.is_none() {
+        "list"
+    } else {
+        "get"
+    };
+    let stored = repo.auto_push_override()?;
+    let effective = repo.auto_push_enabled()?;
+    let entry = serde_json::json!({
+        "key": "push.auto", "description": "Automatically publish settled turns",
+        "effective": effective.to_string(), "stored": stored.map(|value| value.to_string()),
+        "source": if stored.is_some() { "repository" } else { "inherited" },
+    });
+    if super::json::requested() {
+        let mut response = serde_json::json!({"schema_version": 1, "operation": operation, "repository": format!("{owner}/{name}")});
+        if operation == "list" {
+            response["settings"] = serde_json::json!([entry]);
+        } else {
+            response["setting"] = entry;
+        }
+        println!("{response}");
+    } else if operation == "get" {
+        println!("{effective}");
+    } else {
+        println!(
+            "push.auto = {effective} ({})",
+            if stored.is_some() {
+                "repository"
+            } else {
+                "inherited from user preferences"
+            }
+        );
+    }
+    Ok(ExitCode::Ok)
+}
+
+/// Ask only at an interactive repository creation boundary; unattended commands inherit.
+pub(super) fn choose_repo_auto_push() -> crate::Result<Option<bool>> {
+    if super::json::requested() || !ui::prompt::interactive() {
+        return Ok(None);
+    }
+    let inherited = config::auto_push_default()?;
+    let label = format!(
+        "Inherit user preference ({})",
+        if inherited { "on" } else { "off" }
+    );
+    Ok(
+        match ui::prompt::select(
+            "Automatically push settled turns from this repository?",
+            &[&label, "On", "Off"],
+        )? {
+            Some(1) => Some(true),
+            Some(2) => Some(false),
+            _ => None,
+        },
+    )
+}
+
 fn structured_entry(operation: &str, key: &str) -> CmdResult {
     let entry = collect()?
         .into_iter()
@@ -253,6 +347,7 @@ fn default_value(key: &str) -> Option<&'static str> {
         "hub.url" => Some(config::DEFAULT_HUB_URL),
         "push.visibility" => Some("ask"),
         "commit.auto" => Some("true"),
+        "push.auto" => Some("false"),
         "memory.track" => Some("session"),
         config::SecretKeystore::KEY => Some(config::SecretKeystore::Os.as_str()),
         _ => None,
@@ -267,7 +362,7 @@ fn wants_tui(args: &Args) -> bool {
 pub(crate) fn validate(key: &str, v: &str) -> crate::Result<()> {
     let ok = match key {
         "push.visibility" => matches!(v, "ask" | "private" | "public"),
-        "commit.auto" => matches!(v, "true" | "false"),
+        "commit.auto" | "push.auto" => matches!(v, "true" | "false"),
         "memory.track" => matches!(v, "session" | "off"),
         "runtime.default" => crate::adapter::normalize(v).is_ok(),
         "hub.url" => v.starts_with("http://") || v.starts_with("https://"),

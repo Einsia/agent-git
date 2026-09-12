@@ -463,9 +463,12 @@ fn selecting_a_hub_repository_clones_it_and_creates_the_named_session() {
     terminal.type_keys("\r");
     terminal.wait_for("branch name for the new session");
     terminal.type_keys("from-hub\r");
+    terminal.wait_for("Automatically push settled turns from this repository?");
+    terminal.type_keys("\x1b[B\x1b[B\r");
     terminal.finish(Duration::from_secs(10));
     terminal.assert_restored();
     let repo = Repo::open(lab.home.join("repos/me/remote-only")).unwrap();
+    assert_eq!(repo.auto_push_override().unwrap(), Some(false));
     assert_eq!(
         meta::line_at_ref(&repo, "from-hub"),
         Some(meta::Line::Session)
@@ -496,6 +499,8 @@ fn selecting_a_hub_repository_preserves_the_requested_file_ref() {
     terminal.type_keys("\r");
     terminal.wait_for("branch name for the new session");
     terminal.type_keys("release-session\r");
+    terminal.wait_for("Automatically push settled turns from this repository?");
+    terminal.type_keys("\r");
     terminal.finish(Duration::from_secs(10));
     let repo = Repo::open(lab.home.join("repos/me/remote-only")).unwrap();
     assert_eq!(

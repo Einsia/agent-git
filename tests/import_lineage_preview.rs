@@ -1254,8 +1254,11 @@ fn explicit_independent_selection_creates_a_real_line_after_the_choice() {
     let mut dialogue = choice(&lab);
     assert_eq!(lab.state(), before);
     dialogue.send(b"\x1b[B\r");
+    dialogue.wait_text("Automatically push settled turns from this repository?");
+    dialogue.send(b"\x1b[B\x1b[B\r");
     assert_eq!(dialogue.finish(), 0, "{}", dialogue.text());
     let repo = Repo::open(lab.agit.join("repos/me/repo")).unwrap();
+    assert_eq!(repo.auto_push_override().unwrap(), Some(false));
     assert!(repo.has_ref("refs/heads/main"));
     assert!(repo.has_ref("refs/heads/imported"));
     let store = agit::domain::store::Store::at(lab.agit.join("store"));
@@ -1334,6 +1337,8 @@ fn first_independent_import_confirms_assets_from_the_frozen_native_directory() {
         dialogue.prompt();
         assert_eq!(lab.state(), before);
         dialogue.send(b"\x1b[B\r");
+        dialogue.wait_text("Automatically push settled turns from this repository?");
+        dialogue.send(b"\r");
         dialogue.wait_text("adopt AGENTS.md");
         assert!(
             dialogue

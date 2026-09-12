@@ -43,3 +43,9 @@ agit clone alice/notes --no-bind
 ```
 
 `clone` fetches and optionally binds. Use `run` or `resume` to run a ref.
+
+## Automatic publishing preference
+
+An interactive repository creation asks whether to inherit the user preference, enable automatic pushing, or disable it for this repository. Use `--auto-push` or `--auto-push=false` to choose explicitly in scripts; omission inherits the user setting. Change or clear the override later with `agit config --repo <owner/repo> push.auto <true|false>` or `agit config --repo <owner/repo> --unset push.auto`.
+
+Fetching an existing clone preserves its preference unless an explicit override is supplied. Making a local copy with `--mine` also offers the preference.

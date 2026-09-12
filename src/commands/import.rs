@@ -926,7 +926,15 @@ pub(super) fn place_legacy_commit_branch(
         ui::hint("choose a session branch with `-b <branch>`; sessions must never land on main");
         return Ok(Placed::Refused(ExitCode::Precondition));
     }
+    let preference = if !repo_dir.join(".git").exists() {
+        super::config::choose_repo_auto_push()?
+    } else {
+        None
+    };
     let repo = Repo::open_or_init(repo_dir)?;
+    if let Some(value) = preference {
+        repo.set_auto_push(Some(value))?;
+    }
     place_resolved_branch(
         lk,
         store,
@@ -1075,7 +1083,16 @@ fn birth_session_branch(
         }
     }
     let repo = if accepted.is_some() || prepared.is_some() {
-        Repo::open_or_init(&repo_dir)?
+        let preference = if !repo_dir.join(".git").exists() {
+            super::config::choose_repo_auto_push()?
+        } else {
+            None
+        };
+        let created = Repo::open_or_init(&repo_dir)?;
+        if let Some(value) = preference {
+            created.set_auto_push(Some(value))?;
+        }
+        created
     } else {
         repo
     };

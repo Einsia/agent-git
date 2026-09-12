@@ -37,6 +37,9 @@ pub struct Args {
     /// Bind this directory even if it is already bound to another repo.
     #[arg(long, conflicts_with = "no_bind")]
     pub rebind: bool,
+    /// Override automatic publishing for this repository; omission inherits user preferences.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub auto_push: Option<bool>,
 
     /// Asset choices made by the TUI. `None` means use the ordinary `--seed` policy; `Some`
     /// carries the exact item-by-item confirmation and must not ask a second time.
@@ -47,6 +50,7 @@ pub struct Args {
 pub fn run(args: Args) -> CmdResult {
     let mut args = args;
     let cwd = std::env::current_dir()?;
+    let mut preference_chosen = args.auto_push.is_some();
 
     if wants_tui(&args) {
         match crate::tui::should_enter() {
@@ -58,6 +62,8 @@ pub fn run(args: Args) -> CmdResult {
                 args.no_bind = !picked.bind;
                 args.seed = picked.seed_assets.is_some();
                 args.seed_assets = picked.seed_assets;
+                args.auto_push = picked.auto_push;
+                preference_chosen = true;
             }
             crate::tui::Verdict::Explain(note) => crate::tui::warn_skipped(&note),
             crate::tui::Verdict::NoTerminal => return Ok(ExitCode::Interactive),
@@ -90,6 +96,30 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
     };
+
+    if !preference_chosen {
+        args.auto_push = super::config::choose_repo_auto_push()?;
+    }
+    let existing_owner =
+        crate::infra::credentials::current_user().unwrap_or_else(|| "local".into());
+    let auto_push = match args.auto_push {
+        Some(value) => value,
+        None => match Repo::open(crate::infra::config::repo_dir(&existing_owner, &name)?) {
+            Some(repo) => repo.auto_push_enabled()?,
+            None => crate::infra::config::auto_push_default()?,
+        },
+    };
+    if auto_push && crate::infra::credentials::current_user().is_none() {
+        ui::info("Sign in to enable automatic pushing for this repository.");
+        let result = super::login::run(super::login::Args {
+            hub: None,
+            with_token: false,
+            device: false,
+        })?;
+        if result != ExitCode::Ok {
+            return Ok(result);
+        }
+    }
 
     let owner = crate::infra::credentials::current_user().unwrap_or_else(|| "local".to_string());
     // A binding conflict is refused before anything touches disk: refusing after the repo is
@@ -144,6 +174,9 @@ pub fn run(args: Args) -> CmdResult {
         }
         None => Repo::init(&dir)?,
     };
+    if let Some(preference) = args.auto_push {
+        repo.set_auto_push(Some(preference))?;
+    }
     scaffold(repo.root())?;
 
     let seeded = if let Some(picked) = args.seed_assets.as_deref() {
@@ -193,6 +226,7 @@ fn wants_tui(args: &Args) -> bool {
         && !args.private
         && !args.no_bind
         && !args.rebind
+        && args.auto_push.is_none()
         && args.seed_assets.is_none()
 }
 

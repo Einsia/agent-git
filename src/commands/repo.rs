@@ -108,6 +108,7 @@ fn create(name: &str, private: bool) -> CmdResult {
         ui::hint("nothing was created on the hub");
         return Ok(ExitCode::Precondition);
     }
+    let auto_push = super::config::choose_repo_auto_push()?;
     match client.publish(&crate::hub::PublishRequest {
         name: name.to_string(),
         owner: None,
@@ -140,6 +141,9 @@ fn create(name: &str, private: bool) -> CmdResult {
                     resp.owner, resp.name
                 ));
                 return Ok(ExitCode::Precondition);
+            }
+            if let Some(value) = auto_push {
+                Repo::at(&dir).set_auto_push(Some(value))?;
             }
             println!("  next:");
             println!(

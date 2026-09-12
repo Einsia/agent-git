@@ -32,7 +32,7 @@ agit setup --runtime claude-code --hooks
 agit setup --completions zsh
 ```
 
-Run `agit doctor` after installation. Hooks may commit at Stop/turn boundaries, but ordinary CLI use still needs an explicit `push`.
+Run `agit doctor` after installation. Hooks may commit at Stop/turn boundaries. Full interactive setup also asks whether to push settled turns automatically; the default is off. Use `--auto-push` or `--auto-push=false` to set that user preference explicitly. Repositories without a local override inherit it.
 
 Claude hooks are merged into `~/.claude/settings.json`. Codex hooks are merged into
 `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) only when `codex features list` reports the

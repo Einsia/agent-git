@@ -69,3 +69,36 @@ fn overridden_settings_report_both_the_saved_request_and_active_environment() {
         "AGIT_SECRETS_KEYSTORE"
     );
 }
+
+#[test]
+fn repository_auto_push_overrides_are_private_and_inherit_user_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("agit/repos/alice/demo");
+    std::fs::create_dir_all(&path).unwrap();
+    let repo = agit::domain::repo::Repo::init(&path).unwrap();
+    let read = || run(root.path(), &["--repo", "alice/demo", "push.auto"], &[]);
+    assert_eq!(read()["setting"]["effective"], "false");
+    assert_eq!(read()["setting"]["source"], "inherited");
+    run(root.path(), &["--global", "push.auto", "true"], &[]);
+    assert_eq!(read()["setting"]["effective"], "true");
+    run(
+        root.path(),
+        &["--repo", "alice/demo", "push.auto", "false"],
+        &[],
+    );
+    assert_eq!(read()["setting"]["effective"], "false");
+    assert_eq!(read()["setting"]["source"], "repository");
+    assert_eq!(
+        run(root.path(), &["push.auto"], &[])["setting"]["effective"],
+        "true"
+    );
+    assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
+    run(
+        root.path(),
+        &["--repo", "alice/demo", "--unset", "push.auto"],
+        &[],
+    );
+    assert_eq!(read()["setting"]["effective"], "true");
+    run(root.path(), &["push.auto", "false"], &[]);
+    assert_eq!(read()["setting"]["effective"], "false");
+}

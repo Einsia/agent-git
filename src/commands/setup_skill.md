@@ -277,7 +277,7 @@ agit commit = write to the local Agent repo
 agit push   = separately publish existing local refs
 ```
 
-Claude hooks may run `agit hooks settle` at Stop (older installs wrote `agit commit --from-hook`; `agit setup` retires it). In `AGIT_RC=1` supervisor mode, `agitd` may settle and push at turn boundaries; that is integration behavior, not a general CLI guarantee. When offline, the local Agent repo remains authoritative.
+Claude hooks may run `agit hooks settle` at Stop (older installs wrote `agit commit --from-hook`; `agit setup` retires it). In `AGIT_RC=1` supervisor mode, `agitd` may settle and push at turn boundaries; that is integration behavior, not a general CLI guarantee. When offline, the local Agent repo remains authoritative. Automatic publication is opt-in: `agit config --global push.auto true` enables it for repositories without overrides, while `agit config --repo <owner/repo> push.auto false` keeps one repository local. `init`, `clone`, and full `setup` offer this choice. Successful session settlement then pushes only that branch through the normal access and secret gates; upload failure never discards the local commit.
 
 ## Skill installation layout
 

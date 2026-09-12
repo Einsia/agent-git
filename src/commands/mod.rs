@@ -50,6 +50,7 @@ pub mod rc;
 pub mod worktree;
 
 // Recording
+mod auto_push;
 pub mod commit;
 pub mod file;
 pub mod memory;

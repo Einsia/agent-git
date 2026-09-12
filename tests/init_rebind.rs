@@ -63,3 +63,36 @@ fn init_refuses_before_creating_anything_when_the_directory_is_bound_elsewhere()
     let text = fs::read_to_string(ws.path()).unwrap();
     assert!(text.contains("local/qa"), "{text}");
 }
+
+#[test]
+fn automatic_init_requires_login_before_creation_and_explicit_off_stays_local() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let out = agit(&home, &work, &["init", "automatic", "--auto-push"]);
+    assert!(!out.status.success());
+    assert!(!home.join("repos/local/automatic").exists());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        output.contains("Sign in to enable automatic pushing"),
+        "{output}"
+    );
+    assert!(
+        agit(&home, &work, &["config", "push.auto", "true"])
+            .status
+            .success()
+    );
+    let out = agit(&home, &work, &["init", "manual", "--auto-push=false"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let repo = agit::domain::repo::Repo::open(home.join("repos/local/manual")).unwrap();
+    assert_eq!(repo.auto_push_override().unwrap(), Some(false));
+}

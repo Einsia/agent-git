@@ -55,6 +55,8 @@
 //! Authenticated git operations (`clone` / `fetch` / `push`) do not live here; they live in
 //! [`crate::hub::git`] — authentication is the hub's business.
 
+mod preferences;
+
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
