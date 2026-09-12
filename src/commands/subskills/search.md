@@ -22,7 +22,7 @@ characters, matching the Hub request budget.
 
 | Option | Meaning |
 |---|---|
-| `--scope <mine\|public\|owner/repo>` | Restrict sessions or agents before ranking, counts and pagination |
+| `--scope <mine\|org\|public\|owner/repo>` | Restrict sessions or agents before ranking, counts and pagination |
 | `--repo <owner/name>` | One Agent repo; equivalent to `repo:` / `agent:` |
 | `--owner <name>` | Repo owner, including an organization; not the conversation author |
 | `--author <name/email>` | Exact Git author name or email of the selected saved version, case insensitive |
@@ -84,7 +84,7 @@ repositories in the current authenticated account's personal namespace; it does 
 include repositories shared through collaboration or organization membership.
 `--scope public` selects public repositories; `--scope owner/repo` selects that exact
 repository. These scopes apply to sessions and agents, and cannot be combined with
-`--counts`. Other repository scopes, `--here`, and `--local` are not supported here.
+`--counts`. `--here` and `--local` are not supported here.
 
 Scope is applied to every effective query, including shared `--repo` and `--owner`
 filters, before any search request. A contradictory qualifier rejects the entire
@@ -93,6 +93,20 @@ reports its scoped query; saved-author/time filters and pagination remain indepe
 
 ```bash
 agit search "rate limit" --scope mine
+agit search "rate limit" --scope org
 agit search --query "cache" --query "deploy" --scope public
 agit search "rate limit" --scope einsia/payments --author "Alice"
 ```
+
+`--scope org` searches readable repositories owned by organizations you currently
+belong to. Membership narrows the corpus; it does not grant private-repository
+access. Existing query qualifiers and saved-author/time filters further intersect
+this scope. Personal repositories and organizations you have not joined remain
+outside it even when you can read them.
+
+Every organization-scoped response must confirm `applied_scope: "org"` and the
+requested result type. Missing or mismatched confirmation withholds the result;
+a single query exits with precondition code 4, and a batch marks that query as an
+error. The CLI never retries without the scope. Structured results preserve the
+acknowledgement, filters, pagination and uncertainty. The local MCP search tool
+forwards `scope: "org"` through the same command.

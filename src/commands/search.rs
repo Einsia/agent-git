@@ -15,6 +15,7 @@ const KINDS: &[&str] = &["sessions", "agents", "prs", "people"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CorpusScope {
     Mine,
+    Org,
     Public,
     Repository(String),
 }
@@ -25,10 +26,11 @@ impl std::str::FromStr for CorpusScope {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "mine" => Ok(Self::Mine),
+            "org" => Ok(Self::Org),
             "public" => Ok(Self::Public),
             _ => {
                 let (owner, name) = super::parse_slug(value).map_err(|_| {
-                    "scope must be mine, public, or an explicit owner/repo".to_owned()
+                    "scope must be mine, org, public, or an explicit owner/repo".to_owned()
                 })?;
                 if value.trim() != value {
                     return Err("scope must not contain surrounding whitespace".into());
@@ -47,6 +49,9 @@ impl std::str::FromStr for CorpusScope {
 
 impl CorpusScope {
     fn apply(&self, query: &str, account: Option<&str>) -> anyhow::Result<String> {
+        if *self == Self::Org {
+            return Ok(query.to_owned());
+        }
         let mut expected = Query::parse(query);
         let (key, value, existing) = match self {
             Self::Mine => {
@@ -58,6 +63,7 @@ impl CorpusScope {
                 let value = account.to_ascii_lowercase();
                 ("owner", value.clone(), expected.owner.replace(value))
             }
+            Self::Org => unreachable!("organization scope is a server-side corpus predicate"),
             Self::Public => (
                 "is",
                 "public".to_owned(),
@@ -146,8 +152,8 @@ pub struct Args {
     )]
     pub kind: String,
 
-    /// Restrict sessions or agents to your own repos, public repos, or one explicit repo
-    #[arg(long, value_name = "mine|public|owner/repo")]
+    /// Restrict sessions or agents to your repos, membership organizations, public, or one repo
+    #[arg(long, value_name = "mine|org|public|owner/repo")]
     pub scope: Option<CorpusScope>,
 
     /// Max hits to return
@@ -344,6 +350,65 @@ fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
     Ok(queries)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the Hub did not confirm --scope org; search results were withheld. Upgrade the Hub before relying on organization-scoped search"
+)]
+struct ScopeNotConfirmed;
+
+fn scoped_page<T: serde::de::DeserializeOwned>(
+    client: &crate::hub::Client,
+    args: &Args,
+    query: &str,
+) -> anyhow::Result<SearchPage<T>> {
+    let filters = args.saved_filters().map_err(anyhow::Error::msg)?;
+    if args.scope != Some(CorpusScope::Org) {
+        return client.search_page_filtered_with_scope(
+            &args.kind,
+            query,
+            args.sort.as_deref(),
+            args.page,
+            args.limit,
+            &filters,
+            None,
+        );
+    }
+    let page: SearchPage<serde_json::Value> = client.search_page_filtered_with_scope(
+        &args.kind,
+        query,
+        args.sort.as_deref(),
+        args.page,
+        args.limit,
+        &filters,
+        Some("org"),
+    )?;
+    if page.applied_scope.as_deref() != Some("org") || page.kind != args.kind {
+        return Err(ScopeNotConfirmed.into());
+    }
+    Ok(SearchPage {
+        applied_scope: page.applied_scope,
+        kind: page.kind,
+        applied_filters: page.applied_filters,
+        total: page.total,
+        page: page.page,
+        per: page.per,
+        items: page
+            .items
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()?,
+        incomplete: page.incomplete,
+        unknown: page.unknown,
+        terms: page.terms,
+    })
+}
+
+fn scope_label<T>(page: &SearchPage<T>) {
+    if page.applied_scope.as_deref() == Some("org") {
+        println!("scope: readable repositories in your membership organizations");
+    }
+}
+
 fn structured(
     client: &crate::hub::Client,
     args: &Args,
@@ -360,21 +425,18 @@ fn structured(
             },
         }));
     }
-    let page: SearchPage<serde_json::Value> = client.search_page_filtered(
-        &args.kind,
-        query,
-        args.sort.as_deref(),
-        args.page,
-        args.limit,
-        &args.saved_filters().map_err(anyhow::Error::msg)?,
-    )?;
-    Ok(serde_json::json!({
+    let page: SearchPage<serde_json::Value> = scoped_page(client, args, query)?;
+    let mut value = serde_json::json!({
         "query": query, "type": args.kind, "total": page.total,
         "page": page.page, "per": page.per,
         "has_more": page.per > 0 && page.page.saturating_mul(page.per) < page.total,
         "incomplete": page.incomplete, "unknown": page.unknown,
         "terms": page.terms, "hits": page.items, "applied_filters": page.applied_filters,
-    }))
+    });
+    if let Some(scope) = page.applied_scope {
+        value["applied_scope"] = serde_json::json!(scope);
+    }
+    Ok(value)
 }
 
 fn batch(
@@ -430,7 +492,11 @@ fn failed(e: anyhow::Error) -> CmdResult {
     super::fix::register_terminal_api_error(&e);
     ui::error(&format!("search failed: {e:#}"));
     ui::hint("if this hub is self-hosted, it may be older than this CLI");
-    Ok(super::terminal_error_code(&e, ExitCode::Network))
+    Ok(if e.is::<ScopeNotConfirmed>() {
+        ExitCode::Precondition
+    } else {
+        super::terminal_error_code(&e, ExitCode::Network)
+    })
 }
 
 fn counts(client: &crate::hub::Client, args: &Args) -> CmdResult {
@@ -462,6 +528,7 @@ fn counts(client: &crate::hub::Client, args: &Args) -> CmdResult {
 /// The line carrying the query string and the total, plus the notices that qualify it. Shared by
 /// every type.
 fn header<T>(p: &SearchPage<T>, query: &str) {
+    scope_label(p);
     for (key, value) in [
         ("author", &p.applied_filters.author),
         ("since", &p.applied_filters.since),
@@ -509,14 +576,7 @@ fn footer<T>(p: &SearchPage<T>) {
 }
 
 fn sessions(client: &crate::hub::Client, args: &Args) -> CmdResult {
-    let p: SearchPage<SearchHit> = match client.search_page_filtered(
-        "sessions",
-        &args.query,
-        args.sort.as_deref(),
-        args.page,
-        args.limit,
-        &args.saved_filters().map_err(anyhow::Error::msg)?,
-    ) {
+    let p: SearchPage<SearchHit> = match scoped_page(client, args, &args.query) {
         Ok(p) => p,
         Err(e) => return failed(e),
     };
@@ -636,14 +696,7 @@ fn verdict_label(outcome: Option<&str>) -> Option<String> {
 }
 
 fn agents(client: &crate::hub::Client, args: &Args) -> CmdResult {
-    let p: SearchPage<AgentHit> = match client.search_page_filtered(
-        "agents",
-        &args.query,
-        args.sort.as_deref(),
-        args.page,
-        args.limit,
-        &args.saved_filters().map_err(anyhow::Error::msg)?,
-    ) {
+    let p: SearchPage<AgentHit> = match scoped_page(client, args, &args.query) {
         Ok(p) => p,
         Err(e) => return failed(e),
     };
@@ -756,6 +809,7 @@ fn people(client: &crate::hub::Client, args: &Args) -> CmdResult {
 /// The hint "the corpus only covers what you can read" is necessary: private content appears
 /// neither in the results nor in the counts, so what "nothing" means depends on who is asking.
 fn nothing<T>(query: &str, p: &SearchPage<T>) -> CmdResult {
+    scope_label(p);
     println!("nothing found for “{query}”.");
     if !p.unknown.is_empty() {
         ui::warning(&format!(
@@ -955,6 +1009,121 @@ mod tests {
         }
     }
 
+    fn scoped_response<T: serde::de::DeserializeOwned>(
+        args: &super::Args,
+        body: serde_json::Value,
+    ) -> anyhow::Result<crate::hub::SearchPage<T>> {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let org = args.scope == Some(CorpusScope::Org);
+        let kind = args.kind.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut connection = loop {
+                match listener.accept() {
+                    Ok((connection, _)) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "search request did not arrive");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("search connection failed: {error}"),
+                }
+            };
+            connection.set_nonblocking(false).unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            connection
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut buffer = [0; 1024];
+                let count = connection.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "search request was truncated");
+                bytes.extend_from_slice(&buffer[..count]);
+                assert!(bytes.len() <= 16384, "search request exceeded its bound");
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            assert!(request.starts_with(&format!("GET /api/search/{kind}?q=cache&")));
+            assert_eq!(request.contains("&scope=org&"), org);
+            let body = body.to_string();
+            write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let result = super::scoped_page(&crate::hub::Client::for_hub(&base), args, "cache");
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn org_confirmation_precedes_typed_items_for_nonempty_pages() {
+        use crate::hub::{AgentHit, SearchHit};
+        use serde_json::{Value, json};
+
+        let args = W::parse_from(["x", "cache", "--type", "agents", "--scope", "org"]).a;
+        let session = json!({
+            "agent":"acme/demo", "session_id":"selected-session", "excerpt":"withheld hit"
+        });
+        assert!(serde_json::from_value::<SearchHit>(session.clone()).is_ok());
+        assert!(serde_json::from_value::<AgentHit>(session.clone()).is_err());
+        for body in [
+            json!({"type":"sessions", "applied_scope":"org", "total":1, "items":[session]}),
+            json!({"type":"agents", "total":1, "items":[{"invalid":"withheld hit"}]}),
+        ] {
+            for result in [
+                scoped_response::<AgentHit>(&args, body.clone()).map(|_| ()),
+                scoped_response::<Value>(&args, body).map(|_| ()),
+            ] {
+                let error = result.unwrap_err();
+                assert!(error.is::<super::ScopeNotConfirmed>(), "{error:#}");
+                assert!(!format!("{error:#}").contains("withheld hit"));
+            }
+        }
+    }
+
+    #[test]
+    fn confirmed_org_page_decodes_items_and_retains_metadata() {
+        use crate::hub::{AgentHit, SearchHit};
+        use serde_json::json;
+
+        let args = W::parse_from([
+            "x", "cache", "--type", "sessions", "--scope", "org", "--author", "Bob",
+        ])
+        .a;
+        let body = json!({
+            "type":"sessions", "applied_scope":"org", "applied_filters":{"author":"bob"},
+            "total":19, "page":3, "per":4, "incomplete":true,
+            "unknown":["runtim:codex"], "terms":["cache"],
+            "items":[{"agent":"acme/demo", "session_id":"selected-session", "excerpt":"selected hit"}]
+        });
+        let page = scoped_response::<SearchHit>(&args, body).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].session_id, "selected-session");
+        assert_eq!(page.applied_scope.as_deref(), Some("org"));
+        assert_eq!(page.kind, "sessions");
+        assert_eq!(page.applied_filters, args.saved_filters().unwrap());
+        assert_eq!((page.total, page.page, page.per), (19, 3, 4));
+        assert!(page.incomplete);
+        assert_eq!(page.unknown, ["runtim:codex"]);
+        assert_eq!(page.terms, ["cache"]);
+
+        for scope in [Some("org"), None] {
+            let mut argv = vec!["x", "cache", "--type", "agents"];
+            if let Some(scope) = scope {
+                argv.extend(["--scope", scope]);
+            }
+            let args = W::parse_from(argv).a;
+            let body = json!({"type":"agents", "applied_scope":"org", "total":1, "items":[{}]});
+            let error = scoped_response::<AgentHit>(&args, body).unwrap_err();
+            assert!(!error.is::<super::ScopeNotConfirmed>(), "{error:#}");
+            assert!(format!("{error:#}").contains("missing field"));
+        }
+    }
+
     #[test]
     fn batch_preserves_wire_metadata_order_and_partial_failure() {
         use std::io::{Read, Write};
@@ -1034,7 +1203,6 @@ mod tests {
             Some(CorpusScope::Repository("alice/my-repo".into()))
         );
         for value in [
-            "org",
             "alice",
             "/repo",
             "alice/",
@@ -1090,6 +1258,7 @@ mod tests {
         ] {
             for (scope, account) in [
                 (CorpusScope::Mine, Some("Alice")),
+                (CorpusScope::Org, None),
                 (CorpusScope::Public, None),
                 (CorpusScope::Repository("alice/my-repo".into()), None),
             ] {
@@ -1097,6 +1266,7 @@ mod tests {
                 let mut scoped = Query::parse(&scope.apply(query, account).unwrap());
                 match scope {
                     CorpusScope::Mine => assert_eq!(scoped.owner.take().as_deref(), Some("alice")),
+                    CorpusScope::Org => {}
                     CorpusScope::Public => {
                         assert_eq!(scoped.visibility.take().as_deref(), Some("public"));
                     }

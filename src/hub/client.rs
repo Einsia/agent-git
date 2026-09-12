@@ -1014,7 +1014,24 @@ impl Client {
         per: usize,
         filters: &SearchFilters,
     ) -> Result<SearchPage<T>> {
+        self.search_page_filtered_with_scope(kind, query, sort, page, per, filters, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_page_filtered_with_scope<T: serde::de::DeserializeOwned>(
+        &self,
+        kind: &str,
+        query: &str,
+        sort: Option<&str>,
+        page: usize,
+        per: usize,
+        filters: &SearchFilters,
+        scope: Option<&str>,
+    ) -> Result<SearchPage<T>> {
         let mut path = format!("api/search/{kind}?q={}", urlencode(query));
+        if let Some(scope) = scope {
+            path.push_str(&format!("&scope={}", urlencode(scope)));
+        }
         if let Some(s) = sort {
             path.push_str(&format!("&sort={}", urlencode(s)));
         }

@@ -322,6 +322,9 @@ pub struct SearchHit {
 // This hard-codes the bound to the one actually needed.
 #[serde(bound(deserialize = "T: serde::de::DeserializeOwned"))]
 pub struct SearchPage<T> {
+    /// A server-confirmed corpus predicate; absence cannot acknowledge a requested restriction.
+    #[serde(default)]
+    pub applied_scope: Option<String>,
     /// The category in effect. From it the client confirms that the word it asked for was
     /// recognized.
     #[serde(rename = "type", default)]
