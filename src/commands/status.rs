@@ -23,7 +23,10 @@ use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
 mod branches;
+mod merges;
+mod project;
 mod sessions;
+mod shared;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -121,7 +124,8 @@ pub fn run(args: Args) -> CmdResult {
                     "branch",
                     "last commit",
                     "pending activity",
-                    "local instance"
+                    "local instance",
+                    "project"
                 ],
                 &page.rows
             )
@@ -200,6 +204,35 @@ pub fn run(args: Args) -> CmdResult {
             );
             ui::hint(
                 "inspect a repository with `agit branch --repo <owner/repo> --all` for its remaining branches",
+            );
+        }
+        let shared = shared::inspect(&agents);
+        if !shared.items.is_empty() {
+            ui::section("shared-file changes");
+            println!(
+                "{}",
+                ui::table::render(&["target", "path", "staged", "local bytes"], &shared.rows())
+            );
+        }
+        ui::hint(
+            "local bytes are compared without Git clean filters or line-ending conversion; content is not displayed",
+        );
+        if shared.incomplete {
+            ui::warning(
+                "shared-file inspection is incomplete; unavailable evidence does not mean unchanged",
+            );
+        }
+        let merges = merges::page(&agents);
+        if !merges.items.is_empty() {
+            ui::section("merge transactions");
+            println!(
+                "{}",
+                ui::table::render(&["target", "source", "progress"], &merges.rows())
+            );
+        }
+        if merges.incomplete {
+            ui::warning(
+                "merge transaction inspection is incomplete; unavailable evidence does not mean no transaction",
             );
         }
     }
@@ -317,6 +350,7 @@ fn structured(args: &Args) -> CmdResult {
                 "superseded_by": link.superseded_by,
                 "last_commit": (detail[4] != "—").then_some(&detail[4]),
                 "pending_activity": detail[5], "local_instance": detail[6],
+                "project": detail[7],
             })
         })
         .collect();
@@ -346,6 +380,8 @@ fn structured(args: &Args) -> CmdResult {
             "repo": format!("{owner}/{name}"), "path": path, "branches": branch_sync,
         }));
     }
+    let shared_files = shared::inspect(&agents);
+    let merge_transactions = merges::page(&agents);
     let missing = if args.check_missing {
         let discovery = uncaptured(&links, inventory_complete);
         Some((discovery.sessions.into_iter().map(|(runtime, session_id)| {
@@ -372,6 +408,7 @@ fn structured(args: &Args) -> CmdResult {
             "limit": limit, "next_offset": (next < links.len()).then_some(next),
              "incomplete": !inventory_complete},
         "repositories": repositories, "repositories_omitted": repositories_omitted,
+        "shared_files": shared_files, "merge_transactions": merge_transactions,
         "code_repository": {"path": code_repo, "adopted_sessions": adopted_here},
         "unadopted": {"checked": args.check_missing,
             "sessions": missing.as_ref().map(|(sessions, _)| sessions),

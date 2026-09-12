@@ -655,9 +655,13 @@ impl Repo {
         args: &[&str],
         limit: usize,
     ) -> Result<std::process::Output> {
+        bounded_inspection_output(self.inspection_command(args), limit)
+    }
+
+    pub(crate) fn inspection_command(&self, args: &[&str]) -> Command {
         let mut command = self.clone().local_objects_only().cmd();
         command.args(args);
-        bounded_inspection_output(command, limit)
+        command
     }
 
     #[cfg(feature = "cli")]
@@ -673,7 +677,15 @@ impl Repo {
     }
 
     fn inspection_path(&self, args: &[&str]) -> Result<PathBuf> {
-        let output = self.inspection_output(args, MAX_INSPECTION_OUTPUT_BYTES)?;
+        self.inspection_path_using(args, &mut bounded_inspection_output)
+    }
+
+    fn inspection_path_using(
+        &self,
+        args: &[&str],
+        run: &mut impl FnMut(Command, usize) -> Result<std::process::Output>,
+    ) -> Result<PathBuf> {
+        let output = run(self.inspection_command(args), MAX_INSPECTION_OUTPUT_BYTES)?;
         anyhow::ensure!(
             output.status.success() && output.stderr.is_empty(),
             "local Git inspection could not identify its storage path"
@@ -792,6 +804,25 @@ impl Repo {
         self.common_dir_with_policy(ReadPolicy::AllowTransport)
     }
 
+    #[cfg(feature = "cli")]
+    pub(crate) fn inspection_common_dir_using(
+        &self,
+        run: &mut impl FnMut(Command, usize) -> Result<std::process::Output>,
+    ) -> Result<PathBuf> {
+        self.inspection_path_using(&["rev-parse", "--git-common-dir"], run)
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn inspection_checkout_paths_using(
+        &self,
+        run: &mut impl FnMut(Command, usize) -> Result<std::process::Output>,
+    ) -> Result<(PathBuf, PathBuf)> {
+        Ok((
+            self.inspection_path_using(&["rev-parse", "--show-toplevel"], run)?,
+            self.inspection_path_using(&["rev-parse", "--absolute-git-dir"], run)?,
+        ))
+    }
+
     pub(crate) fn common_dir_with_policy(&self, policy: ReadPolicy) -> Result<PathBuf> {
         if self.local_objects_only {
             return self.inspection_path(&["rev-parse", "--git-common-dir"]);
@@ -866,9 +897,17 @@ impl Repo {
     /// Inspection keeps every registration or reports that enumeration is incomplete.
     #[cfg(any(feature = "cli", test))]
     pub(crate) fn inspection_worktrees(&self) -> Result<Vec<Worktree>> {
-        let output = self.inspection_worktree_output(true)?;
+        self.inspection_worktrees_using(&mut bounded_inspection_output)
+    }
+
+    #[cfg(any(feature = "cli", test))]
+    pub(crate) fn inspection_worktrees_using(
+        &self,
+        run: &mut impl FnMut(Command, usize) -> Result<std::process::Output>,
+    ) -> Result<Vec<Worktree>> {
+        let output = self.inspection_worktree_output(true, run)?;
         if worktree_nul_option_unsupported(&output) {
-            return self.inspection_worktrees_legacy();
+            return self.inspection_worktrees_legacy(run);
         }
         anyhow::ensure!(
             output.status.success() && output.stderr.is_empty(),
@@ -878,26 +917,33 @@ impl Repo {
     }
 
     #[cfg(any(feature = "cli", test))]
-    fn inspection_worktree_output(&self, nul: bool) -> Result<std::process::Output> {
-        let mut command = self.clone().local_objects_only().cmd();
+    fn inspection_worktree_output(
+        &self,
+        nul: bool,
+        run: &mut impl FnMut(Command, usize) -> Result<std::process::Output>,
+    ) -> Result<std::process::Output> {
+        let mut command = self.inspection_command(&[]);
         command
             .env("LC_ALL", "C")
             .args(["worktree", "list", "--porcelain"]);
         if nul {
             command.arg("-z");
         }
-        bounded_inspection_output(command, MAX_INSPECTION_OUTPUT_BYTES)
+        run(command, MAX_INSPECTION_OUTPUT_BYTES)
     }
 
     #[cfg(any(feature = "cli", test))]
-    fn inspection_worktrees_legacy(&self) -> Result<Vec<Worktree>> {
-        let before = self.legacy_inspection_registration_paths()?;
-        let output = self.inspection_worktree_output(false)?;
+    fn inspection_worktrees_legacy(
+        &self,
+        run: &mut impl FnMut(Command, usize) -> Result<std::process::Output>,
+    ) -> Result<Vec<Worktree>> {
+        let before = self.legacy_inspection_registration_paths_using(run)?;
+        let output = self.inspection_worktree_output(false, run)?;
         anyhow::ensure!(
             output.status.success() && output.stderr.is_empty(),
             "legacy worktree inspection did not complete"
         );
-        let after = self.legacy_inspection_registration_paths()?;
+        let after = self.legacy_inspection_registration_paths_using(run)?;
         anyhow::ensure!(
             before == after,
             "worktree registrations changed during inspection"
@@ -919,12 +965,15 @@ impl Repo {
 
     /// Line-delimited output is usable only after native registration paths prove its framing.
     #[cfg(any(feature = "cli", test))]
-    fn legacy_inspection_registration_paths(&self) -> Result<Vec<PathBuf>> {
+    fn legacy_inspection_registration_paths_using(
+        &self,
+        run: &mut impl FnMut(Command, usize) -> Result<std::process::Output>,
+    ) -> Result<Vec<PathBuf>> {
         anyhow::ensure!(
             legacy_worktree_path_is_representable(self.root()),
             "legacy worktree inspection cannot represent a line-break-containing path"
         );
-        let common = self.clone().local_objects_only().common_dir()?;
+        let common = self.inspection_path_using(&["rev-parse", "--git-common-dir"], run)?;
         anyhow::ensure!(
             legacy_worktree_path_is_representable(&common),
             "legacy worktree inspection cannot represent a line-break-containing common directory"
@@ -944,7 +993,10 @@ impl Repo {
                 .context("legacy worktree common directory has no parent")?
                 .to_path_buf()
         } else {
-            let bare = self.inspection_output(&["rev-parse", "--is-bare-repository"], 64)?;
+            let bare = run(
+                self.inspection_command(&["rev-parse", "--is-bare-repository"]),
+                64,
+            )?;
             anyhow::ensure!(
                 bare.status.success() && bare.stderr.is_empty() && bare.stdout == b"true\n",
                 "legacy worktree inspection cannot establish this common-directory layout"
@@ -2545,7 +2597,9 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let entries = repo.inspection_worktrees_legacy().unwrap();
+        let entries = repo
+            .inspection_worktrees_legacy(&mut bounded_inspection_output)
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(
             entries[0].path.canonicalize().unwrap(),

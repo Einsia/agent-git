@@ -44,7 +44,7 @@ fn pending_failure(error: &anyhow::Error) -> &'static str {
     }
 }
 
-fn branch_head(repo: &Repo, branch: &str, deadline: Deadline) -> crate::Result<String> {
+pub(super) fn branch_head(repo: &Repo, branch: &str, deadline: Deadline) -> crate::Result<String> {
     let reference = format!("refs/heads/{branch}");
     let checked =
         repo.inspection_output_with_deadline(&["check-ref-format", &reference], 1024, deadline)?;
@@ -82,6 +82,7 @@ fn initial_row(claim: &link::Link) -> Vec<String> {
         "—".into(),
         "unavailable: incomplete claim".into(),
         "incomplete claim; process unverified".into(),
+        super::project::UNAVAILABLE.into(),
     ]
 }
 
@@ -217,22 +218,26 @@ pub(super) fn rows(
     let before = identity(links);
     let mut budget = Budget::new(256 * 1024 * 1024);
     let deadline = Deadline::new();
-    let rows = links
+    let mut project = super::project::Observation::new();
+    let mut rows = links
         .iter()
         .skip(offset)
         .take(limit)
         .enumerate()
         .map(|(index, claim)| {
-            if index < 8 {
+            let mut row = if index < 8 {
                 inspect(store, claim, links, complete, &mut budget, deadline)
             } else {
                 let mut row = initial_row(claim);
                 row[5] = "unavailable: per-page inspection limit".into();
                 row[6] = "not inspected; process unverified".into();
                 row
-            }
+            };
+            row[7] = project.relation(claim, index < 8, deadline).into();
+            row
         })
         .collect::<Vec<_>>();
+    project.recheck(&mut rows, deadline);
     finish_rows(store, before, complete, rows)
 }
 
@@ -251,6 +256,7 @@ fn finish_rows(
             row[4] = "—".into();
             row[5] = "unavailable: claim inventory changed or incomplete".into();
             row[6] = "claim unverified; process unverified".into();
+            row[7] = super::project::UNAVAILABLE.into();
         }
     }
     Page {
@@ -317,6 +323,7 @@ mod tests {
         row[4] = "agit-01234567".into();
         row[5] = "0 unsettled user turns".into();
         row[6] = "current claim; process unverified".into();
+        row[7] = "here".into();
         row
     }
 
@@ -355,6 +362,7 @@ mod tests {
                     assert_eq!(row[4], "—");
                     assert_eq!(row[5], "unavailable: claim inventory changed or incomplete");
                     assert_eq!(row[6], "claim unverified; process unverified");
+                    assert_eq!(row[7], super::super::project::UNAVAILABLE);
                 }
                 let discovery = super::super::uncaptured(&before, page.inventory_complete);
                 assert!(discovery.sessions.is_empty());

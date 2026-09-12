@@ -184,8 +184,13 @@ fn status_diagnostics(status: &serde_json::Value) -> String {
         out.push("incomplete inventory".into());
     }
     for row in status["sessions"]["items"].as_array().unwrap() {
-        out.push(row["pending_activity"].as_str().unwrap().into());
-        out.push(row["local_instance"].as_str().unwrap().into());
+        out.push(format!(
+            "{}\t{}\t{}\t{}",
+            row["session_id"].as_str().unwrap(),
+            row["runtime"].as_str().unwrap(),
+            row["pending_activity"].as_str().unwrap(),
+            row["local_instance"].as_str().unwrap(),
+        ));
     }
     let missing = &status["unadopted"];
     if missing["checked"] == true {
@@ -212,6 +217,16 @@ fn status_diagnostics(status: &serde_json::Value) -> String {
         );
     }
     out.join("\n")
+}
+
+fn native_session_row<'a>(text: &'a str, runtime: &str, session: &str) -> &'a str {
+    let prefix = format!("{session}\t{runtime}\t");
+    let mut rows = text.lines().filter(|line| line.starts_with(&prefix));
+    let row = rows
+        .next()
+        .unwrap_or_else(|| panic!("session row missing: {text}"));
+    assert!(rows.next().is_none(), "session row repeated: {text}");
+    row
 }
 
 struct Lab {
@@ -531,7 +546,7 @@ impl Lab {
             if let Some(text) = text {
                 assert!(
                 text.contains(
-                    "session\truntime\trepo\tbranch\tlast commit\tpending activity\tlocal instance"
+                    "session\truntime\trepo\tbranch\tlast commit\tpending activity\tlocal instance\tproject"
                 ),
                 "{text}"
             );
@@ -540,7 +555,7 @@ impl Lab {
                     .find(|line| line.starts_with(&format!("{SID}\tcodex\t")))
                     .expect("selected session row missing");
                 let fields = selected.split('\t').collect::<Vec<_>>();
-                assert_eq!(fields.len(), 7, "{text}");
+                assert_eq!(fields.len(), 8, "{text}");
                 assert_eq!(fields[2], "alice/notes");
                 assert_eq!(fields[3], "topic");
                 if badge.starts_with("current")
@@ -565,6 +580,59 @@ impl Lab {
             assert_eq!(
                 self.git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
                 refs
+            );
+            assert_eq!(
+                self.hub.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    fn expect_project(&self, expected: &str) {
+        for version in [None, Some("default"), Some("1"), Some("2")] {
+            let before = inventory(self.root.path());
+            let mut command = self.command(env!("CARGO_BIN_EXE_agit"));
+            if let Some(version) = version {
+                command.arg("--json");
+                if version != "default" {
+                    command.args(["--json-version", version]);
+                }
+            }
+            let output = status_output(command.arg("status"));
+            assert!(output.status.success(), "{output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(!text.contains("PASSWORD_SENTINEL"));
+            assert!(!text.contains("QUERY_SENTINEL"));
+            assert!(!text.contains("PRIVATE_"));
+            if version.is_some() {
+                assert!(output.stderr.is_empty());
+                let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(envelope["ok"], true);
+                let value = &envelope["result"]["value"];
+                assert!(value["selection"]["repo"].is_null());
+                assert!(value["selection"]["branch"].is_null());
+                let row = value["sessions"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["runtime"] == "codex" && row["session_id"] == SID)
+                    .unwrap();
+                assert_eq!(row["project"], expected);
+                assert_eq!(row["target"], "alice/notes@topic");
+            } else {
+                let row = text
+                    .lines()
+                    .find(|line| line.starts_with(&format!("{SID}\tcodex\t")))
+                    .unwrap();
+                let fields = row.split('\t').collect::<Vec<_>>();
+                assert_eq!(fields.len(), 8, "{text}");
+                assert_eq!(fields[7], expected, "{text}");
+                assert!(text.contains("no session target supplied through AGIT_SESSION"));
+            }
+            assert_eq!(
+                inventory(self.root.path()),
+                before,
+                "status changed owned evidence"
             );
             assert_eq!(
                 self.hub.accept().unwrap_err().kind(),
@@ -1141,16 +1209,17 @@ fn status_observes_codex_fork_history_without_opening_indexes_or_changing_carrie
     let check = |expected: &str| {
         lab.check_status(&[], &[("AGIT_SESSION", "alice/notes@topic")], |text| {
             assert!(text.contains("alice/notes @ topic"), "{text}");
-            assert!(text.contains(expected), "{text}");
-            assert!(text.contains("current claim; process unverified"), "{text}");
+            let row = native_session_row(text, "codex", SID);
+            assert!(row.contains(expected), "{text}");
+            assert!(row.contains("current claim; process unverified"), "{text}");
             if expected.starts_with("unavailable:") || expected.contains("budget") {
-                assert!(!text.contains(pending), "{text}");
+                assert!(!row.contains(pending), "{text}");
                 assert!(
-                    !text.contains("no unsettled content in the verified native snapshot"),
+                    !row.contains("no unsettled content in the verified native snapshot"),
                     "{text}"
                 );
             } else {
-                assert!(!text.contains("unavailable:"), "{text}");
+                assert!(!row.contains("unavailable:"), "{text}");
             }
         });
     };
@@ -1509,8 +1578,14 @@ fn pagination_preserves_identity_rows_and_bounds_native_detail_inspection() {
                 );
             } else {
                 assert_eq!(
-                    std::str::from_utf8(&output.stderr).unwrap().trim(),
-                    "→ --check-missing lists this repo’s unadopted sessions"
+                    std::str::from_utf8(&output.stderr)
+                        .unwrap()
+                        .lines()
+                        .collect::<Vec<_>>(),
+                    [
+                        "  → local bytes are compared without Git clean filters or line-ending conversion; content is not displayed",
+                        "  → --check-missing lists this repo’s unadopted sessions",
+                    ]
                 );
                 let text = std::str::from_utf8(&output.stdout).unwrap();
                 let row = text
@@ -1531,6 +1606,133 @@ fn pagination_preserves_identity_rows_and_bounds_native_detail_inspection() {
             );
         }
     }
+}
+
+#[test]
+fn status_project_badges_match_code_origins_without_selecting_or_mutating_sessions() {
+    let mut lab = Lab::new();
+    lab.expect_project("other");
+    let code = lab.cwd();
+    success(
+        lab.command("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .output()
+            .unwrap(),
+    );
+    lab.claim.cwd = Some(code.to_str().unwrap().into());
+    lab.save();
+    lab.expect_project("here");
+
+    let origin = "https://user:PASSWORD_SENTINEL@github.com/team/code.git?token=QUERY_SENTINEL";
+    success(
+        lab.command("git")
+            .args(["remote", "add", "origin", origin])
+            .output()
+            .unwrap(),
+    );
+    let mut snapshot = meta::read(lab.repo.root()).unwrap();
+    snapshot.code = Some("git@github.com:team/code.git@abcdef01".into());
+    let save_code = |lab: &mut Lab, snapshot: &meta::Meta| {
+        meta::write(lab.repo.root(), snapshot).unwrap();
+        lab.git(&["add", meta::FILE]);
+        lab.git(&["commit", "-m", "record code project"]);
+        lab.head = lab.git(&["rev-parse", "HEAD"]);
+        lab.git(&["branch", "-f", "topic", "HEAD"]);
+    };
+    save_code(&mut lab, &snapshot);
+    lab.expect_project("here");
+    lab.claim.cwd = Some(
+        lab.root
+            .path()
+            .join("another-clone")
+            .to_str()
+            .unwrap()
+            .into(),
+    );
+    lab.save();
+    lab.expect_project("same-repo");
+
+    let previous_cwd = lab.claim.cwd.clone();
+    lab.claim.superseded_by = Some("codex/replacement".into());
+    lab.save();
+    lab.expect_project("unavailable: project evidence");
+    lab.claim.cwd = Some(code.to_str().unwrap().into());
+    lab.save();
+    lab.expect_project("here");
+    lab.claim.cwd = previous_cwd.clone();
+    lab.claim.superseded_by = None;
+    lab.claim.merge_archive = Some(agit::domain::merge_archive::MergeArchiveRole {
+        generation: uuid::Uuid::now_v7().to_string(),
+        slug: "alice/notes".into(),
+        branch: "topic".into(),
+        origin_head: lab.head.clone(),
+        logical_session: format!("agit-{}", "a".repeat(40)),
+    });
+    lab.claim
+        .merge_archive
+        .as_ref()
+        .unwrap()
+        .validate(lab.head.len())
+        .unwrap();
+    lab.save();
+    lab.expect_project("unavailable: project evidence");
+    lab.claim.cwd = Some(code.to_str().unwrap().into());
+    lab.save();
+    lab.expect_project("here");
+    lab.claim.cwd = previous_cwd;
+    lab.claim.merge_archive = None;
+    lab.save();
+
+    let expected_git = lab.repo.root().join(".git");
+    let ancestor_git = lab.repo.root().parent().unwrap().join(".git");
+    fs::rename(&expected_git, &ancestor_git).unwrap();
+    lab.expect_project("unavailable: project evidence");
+    fs::create_dir(&expected_git).unwrap();
+    lab.expect_project("unavailable: project evidence");
+    fs::remove_dir(&expected_git).unwrap();
+    fs::rename(&ancestor_git, &expected_git).unwrap();
+    lab.expect_project("same-repo");
+
+    let separate_git = lab.root.path().join("separate-agent.git");
+    fs::rename(&expected_git, &separate_git).unwrap();
+    fs::write(
+        &expected_git,
+        format!("gitdir: {}\n", separate_git.display()),
+    )
+    .unwrap();
+    lab.expect_project("same-repo");
+    fs::remove_file(&expected_git).unwrap();
+    fs::rename(&separate_git, &expected_git).unwrap();
+
+    snapshot.milestone = Some("x".repeat(1024 * 1024));
+    save_code(&mut lab, &snapshot);
+    lab.expect_project("unavailable: project evidence");
+    snapshot.milestone = None;
+    save_code(&mut lab, &snapshot);
+    lab.expect_project("same-repo");
+
+    snapshot.code = Some("git@github.com:team/code-other.git@abcdef01".into());
+    save_code(&mut lab, &snapshot);
+    lab.expect_project("other");
+    snapshot.code = None;
+    save_code(&mut lab, &snapshot);
+    lab.expect_project("other");
+    snapshot.code = Some("git@github.com:team/code.git@HEAD".into());
+    save_code(&mut lab, &snapshot);
+    lab.expect_project("unavailable: project evidence");
+
+    success(
+        lab.command("git")
+            .args(["remote", "remove", "origin"])
+            .output()
+            .unwrap(),
+    );
+    lab.expect_project("other");
+    fs::write(code.join(".git/config"), b"[invalid configuration").unwrap();
+    lab.expect_project("unavailable: project evidence");
+    lab.claim.cwd = Some(code.to_str().unwrap().into());
+    lab.save();
+    lab.expect_project("here");
 }
 
 // The writer stays in the test process; status must coordinate from its isolated child.
@@ -1777,11 +1979,12 @@ mod opencode_status {
                 |_| self.isolated_inventory(),
                 |text| {
                     assert!(text.contains("alice/notes @ topic"), "{text}");
+                    let row = native_session_row(text, "opencode", SESSION);
                     for expected in expected {
-                        assert!(text.contains(expected), "{text}");
+                        assert!(row.contains(expected), "{text}");
                     }
                     for forbidden in forbidden {
-                        assert!(!text.contains(forbidden), "{text}");
+                        assert!(!row.contains(forbidden), "{text}");
                     }
                 },
             );

@@ -156,3 +156,31 @@ identifies the selected local branch evidence, and `local_instance` describes
 local claim evidence. A current local claim does not prove that a native process
 is alive. Status does not choose a session identity from the first row; process
 identity still requires an explicit command target or `AGIT_SESSION`.
+
+The appended `project` field is `here` for an exact recorded cwd match, `same-repo`
+for a recorded code-origin match, or `other` when no match is recorded. It refers
+to the code repository, not the Agent repository. Missing, malformed, changed,
+or over-budget evidence is `unavailable: project evidence`. An absent configured
+origin is ordinary absence. These labels do not select a session or prove a live
+process. Project inspection shares the page deadline, reads at most eight branch
+metadata blobs capped at 1 MiB each, and caps origin output at 16 KiB. Final claim
+inventory changes invalidate project labels alongside the other observed details.
+Superseded and merge-exploration rows may report their recorded cwd match, but
+their code-origin relationship remains unavailable.
+
+## Shared files and merge transactions in status
+
+`shared_files` contains `items` and `incomplete`. Each item separates `repo`, nullable `branch`,
+nullable `checkout`, nullable relative `path`, `staged` and `local_bytes`. A null branch with a
+checkout denotes detached HEAD; a null checkout denotes unavailable repository inspection.
+An unavailable file path is null, rather than an empty-string file. State strings describe
+observed staged changes and raw local-byte comparisons without Git filters or line conversion.
+
+`merge_transactions` contains `items`, `incomplete` and `repositories_omitted`. Successful items
+include `repo`, `target`, `source`, full `target_head` and `source_head`, numeric `picked_count`,
+boolean `summary_ready`, and null `error`. Unavailable items retain only the repository and a
+fixed error; all transaction facts are null. Status reads retained intent without completing,
+repairing or removing it. Summary text and picked-event lists are never returned.
+
+Both output versions preserve exact identity and path strings in these fields instead of
+escaped or truncated terminal cells. Empty arrays with `incomplete: true` do not prove absence.

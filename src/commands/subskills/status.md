@@ -57,10 +57,20 @@ Missing, changing, unsafe, or over-budget evidence remains unavailable without r
 Each page inspects native details for at most its first eight session rows. Additional
 rows preserve their identities and say `unavailable: per-page inspection limit`; use
 `--offset` to inspect another page. Text and JSON share this bound. JSON session rows
-include `last_commit` (null when unavailable), `pending_activity`, and `local_instance`.
+include `last_commit` (null when unavailable), `pending_activity`, `local_instance`, and `project`.
 `sessions.incomplete=true` means the total is only the number of claims observed, not a verified
 current count or a guaranteed lower bound. A failed final inventory recheck also prevents
 unadopted-session classification.
+
+The `project` column labels `here` when the recorded cwd equals the current directory. Otherwise,
+`same-repo` matches the recorded branch's code-origin anchor to the current code repository's origin;
+matching Agent repository names is not sufficient. `other` means no recorded match, including a
+code repository without a configured origin. Missing or invalid inspection evidence is
+`unavailable: project evidence`. The comparison uses only displayed rows, rechecks the branch and
+origin, and never chooses a session target. A cwd match takes precedence and needs no Git lookup.
+Rows beyond the page's detail allowance can still show `here`; other relations remain unavailable.
+Superseded and merge-exploration instances retain their recorded cwd relationship but do not borrow
+the current branch's code origin from a replacement or ordinary session.
 
 The session inventory and displayed-row inspections share command budgets. Status does not read
 undisplayed native transcripts, and it warns when the local claim inventory is incomplete. Only a
@@ -108,6 +118,34 @@ Status bounds the displayed rows and ancestry inspection. An incomplete display 
 use `agit branch --repo <owner/repo> --all` to inspect another repository's refs. A missing tracking
 ref does not establish whether the branch has ever been published. Shallow or grafted history
 produces counts only when the immutable parent graph can be reconstructed completely.
+
+The merge transaction table shows the retained target, source, pick count and whether a summary
+is ready. It does not print the summary itself, infer that a merge agent is running, or complete
+an interrupted operation. Missing, malformed, changing or oversized transaction evidence is
+reported as unavailable; status never repairs or removes that evidence.
+
+The shared-file table covers registered checkouts of local Agent repositories, including session
+worktrees. It does not inspect shared-looking files in the current code repository. Eligible paths
+are `AGENTS.md`, `memory/` and `skills/`; ignored untracked files are excluded. The `staged` column
+compares the index with HEAD, including conflicts and deletions. The `local bytes` column compares
+regular files with their index blobs without executing Git filters, hooks or fsmonitor. It does
+not apply clean filters or line-ending conversion: a raw byte difference can remain even when
+Git would normalize the file to its index content. This view never claims Git-clean status.
+Only relative paths and states are printed, never file contents. Unsupported carriers, symlinks,
+changing metadata and exceeded budgets remain unavailable; known staged facts are retained when
+only the local file cannot be read. Checkouts, path records, displayed rows and file reads have
+command-wide limits. Incomplete inspection includes a warning and does not imply no changes.
+
+JSON v1 and v2 include the same bounded observations under `shared_files` and
+`merge_transactions`. Each page has `items` and an `incomplete` flag. Shared-file entries keep
+separate repository, branch, checkout path, relative file path, staged state and local-byte
+state fields. JSON preserves complete identity strings; terminal cells may be escaped or
+shortened. An unreadable checkout uses a null file path instead of pretending it has no changes.
+Merge entries retain the target/source refs and full frozen endpoint OIDs, numeric pick count
+and boolean summary readiness. Unavailable transaction fields are null with an explicit error.
+No summary or picked-event content is returned. `merge_transactions.repositories_omitted`
+counts repositories outside that inspection budget. An empty incomplete page proves neither
+unchanged shared files nor absence of a merge transaction.
 
 ## Examples
 
