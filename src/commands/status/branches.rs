@@ -33,7 +33,7 @@ pub(super) struct Page {
 }
 
 pub(super) fn inspect(repo: &Repo, limit: usize) -> crate::Result<Page> {
-    let repo = repo.clone().local_objects_only();
+    let repo = repo.clone().exact_root_inspection();
     let before = refs(&repo, limit)?;
     let mut selected = Vec::new();
     let mut tracked = BTreeSet::new();

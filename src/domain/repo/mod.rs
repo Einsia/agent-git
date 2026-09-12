@@ -206,11 +206,14 @@ impl std::error::Error for GitWorktreeFormatUnavailable {}
 pub(crate) enum ReadPolicy {
     AllowTransport,
     LocalOnly,
+    /// One inspection retains its deadline through nested immutable storage reads.
+    #[cfg(feature = "cli")]
+    LocalInspection(crate::infra::local_git::Deadline),
 }
 
 impl ReadPolicy {
     pub(crate) fn apply(self, command: &mut Command) {
-        if matches!(self, Self::LocalOnly) {
+        if !matches!(self, Self::AllowTransport) {
             command
                 .env("GIT_NO_LAZY_FETCH", "1")
                 .env("GIT_ALLOW_PROTOCOL", "")
@@ -617,6 +620,7 @@ pub fn common_git_dir(root: &Path) -> PathBuf {
 pub struct Repo {
     root: PathBuf,
     local_objects_only: bool,
+    exact_root: bool,
 }
 
 impl Repo {
@@ -624,12 +628,21 @@ impl Repo {
         Repo {
             root: root.into(),
             local_objects_only: false,
+            exact_root: false,
         }
     }
 
     /// Missing objects remain unavailable to inspection instead of being fetched into the store.
     pub(crate) fn local_objects_only(mut self) -> Self {
         self.local_objects_only = true;
+        self
+    }
+
+    /// Recorded repositories cannot borrow evidence from an enclosing Git repository.
+    #[cfg(feature = "cli")]
+    pub(crate) fn exact_root_inspection(mut self) -> Self {
+        self.local_objects_only = true;
+        self.exact_root = true;
         self
     }
 
@@ -645,6 +658,18 @@ impl Repo {
         let mut command = self.clone().local_objects_only().cmd();
         command.args(args);
         bounded_inspection_output(command, limit)
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn inspection_output_with_deadline(
+        &self,
+        args: &[&str],
+        limit: usize,
+        deadline: crate::infra::local_git::Deadline,
+    ) -> Result<std::process::Output> {
+        let mut command = self.clone().local_objects_only().cmd();
+        command.args(args);
+        deadline.output(command, None, limit)
     }
 
     fn inspection_path(&self, args: &[&str]) -> Result<PathBuf> {
@@ -1134,6 +1159,9 @@ impl Repo {
             ] {
                 cmd.env_remove(name);
             }
+        }
+        if self.exact_root {
+            cmd.args(["--git-dir", ".git", "--work-tree", "."]);
         }
         cmd
     }

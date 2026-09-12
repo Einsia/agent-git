@@ -270,6 +270,8 @@ fn to_ref(l: Listed, cache_root: &Path) -> SessionRef {
 // key order drawn above is only illustrative.
 
 mod native_snapshot;
+#[cfg(feature = "cli")]
+pub(crate) mod status_snapshot;
 
 pub(super) enum CanonicalRecord<'a> {
     Meta {

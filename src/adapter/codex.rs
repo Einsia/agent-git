@@ -254,6 +254,7 @@ fn split_rollout(
 fn validated_prefix_end(
     parts: &RolloutParts,
     history: &HistoryPoint,
+    parent_records_left: &mut Option<usize>,
 ) -> super::native_snapshot::Result<usize> {
     use super::native_snapshot::Unavailable;
 
@@ -270,6 +271,11 @@ fn validated_prefix_end(
     for line in prefix.split_inclusive(|byte| *byte == b'\n') {
         if line == b"\n" {
             continue;
+        }
+        if let Some(remaining) = parent_records_left {
+            *remaining = remaining
+                .checked_sub(1)
+                .ok_or(Unavailable::BudgetExceeded)?;
         }
         let record: serde_json::Value =
             serde_json::from_slice(&line[..line.len() - 1]).map_err(|_| Unavailable::Incomplete)?;
@@ -315,6 +321,7 @@ fn lineage_bytes(
     source: &super::native_snapshot::Source,
     limits: super::native_snapshot::Limits,
     allow_unrecognized_leaf: bool,
+    mut parent_records_left: Option<usize>,
 ) -> super::native_snapshot::Result<Vec<u8>> {
     use super::native_snapshot::Unavailable;
 
@@ -376,7 +383,8 @@ fn lineage_bytes(
             .history
             .as_ref()
             .ok_or(Unavailable::Incomplete)?;
-        let prefix_end = validated_prefix_end(&nodes[index].parts, history)?;
+        let prefix_end =
+            validated_prefix_end(&nodes[index].parts, history, &mut parent_records_left)?;
         append_bounded(
             &mut bytes,
             &nodes[index].parts.body[..prefix_end],
@@ -387,11 +395,26 @@ fn lineage_bytes(
     Ok(bytes)
 }
 
+/// Pending observation uses the captured history while retaining an incomplete leaf tail for
+/// the caller to distinguish active writes from settled-prefix damage.
+/// Parent-prefix validation shares an admission allowance across ancestors; the caller separately
+/// admits the reconstructed records before comparing their content.
+#[cfg(feature = "cli")]
+pub(crate) fn read_pending_bytes(
+    source: &super::native_snapshot::Source,
+    limits: super::native_snapshot::Limits,
+) -> super::native_snapshot::Result<Vec<u8>> {
+    if source.runtime != "codex" || source.database {
+        return Err(super::native_snapshot::Unavailable::Unsupported);
+    }
+    lineage_bytes(source, limits, false, Some(limits.records))
+}
+
 fn lineage_snapshot(
     source: &super::native_snapshot::Source,
     limits: super::native_snapshot::Limits,
 ) -> super::native_snapshot::Result<super::native_snapshot::Snapshot> {
-    let bytes = lineage_bytes(source, limits, false)?;
+    let bytes = lineage_bytes(source, limits, false, None)?;
     super::native_snapshot::finish(source.clone(), bytes, limits)
 }
 
@@ -542,6 +565,7 @@ impl Adapter for Codex {
             &source,
             super::native_snapshot::Limits::default(),
             true,
+            None,
         )?)
     }
 
@@ -1353,6 +1377,152 @@ mod tests {
             "{}\n",
             serde_json::json!({"ordinal": ordinal, "type": "session_meta", "payload": payload})
         )
+    }
+
+    #[test]
+    fn parent_prefix_admission_precedes_decoding_and_preserves_validation() {
+        use super::super::native_snapshot::Unavailable;
+
+        let mut parts = RolloutParts {
+            header: header("parent", 0, None).into_bytes(),
+            body: format!(
+                "\n{}\n{}\n",
+                record(1, "user", "first"),
+                record(2, "assistant", "second")
+            )
+            .into_bytes(),
+            header_ordinal: Some(0),
+        };
+        let point = |parts: &RolloutParts, ordinal_exclusive| HistoryPoint {
+            source_id: "parent".into(),
+            ordinal_exclusive,
+            byte_offset: (parts.header.len() + parts.body.len()) as u64,
+        };
+        let mut remaining = Some(2);
+        assert_eq!(
+            validated_prefix_end(&parts, &point(&parts, 3), &mut remaining).unwrap(),
+            parts.body.len()
+        );
+        assert_eq!(remaining, Some(0));
+
+        parts.body.extend_from_slice(b"malformed\n");
+        for (allowance, expected) in [
+            (Some(2), Unavailable::BudgetExceeded),
+            (Some(3), Unavailable::Incomplete),
+            (None, Unavailable::Incomplete),
+        ] {
+            let mut remaining = allowance;
+            assert_eq!(
+                validated_prefix_end(&parts, &point(&parts, 4), &mut remaining).unwrap_err(),
+                expected
+            );
+        }
+        parts.body = b"malformed\n".to_vec();
+        assert_eq!(
+            validated_prefix_end(&parts, &point(&parts, 1), &mut Some(0)).unwrap_err(),
+            Unavailable::BudgetExceeded
+        );
+        parts.body = b" \n".to_vec();
+        assert_eq!(
+            validated_prefix_end(&parts, &point(&parts, 1), &mut Some(1)).unwrap_err(),
+            Unavailable::Incomplete
+        );
+    }
+
+    /// Ancestor validation shares admission while the reconstructed leaf retains its unfinished tail.
+    #[test]
+    #[cfg(feature = "cli")]
+    fn pending_parent_admission_is_shared_without_changing_ordinary_capture() {
+        use super::super::native_snapshot::{Limits, Source, Unavailable};
+
+        let _environment = crate::infra::config::env_lock();
+        let previous = std::env::var_os("CODEX_HOME");
+        let _restore = CodexHomeGuard(previous);
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: this test holds the process-wide configuration lock.
+        unsafe { std::env::set_var("CODEX_HOME", home.path()) };
+
+        let grand_id = "10101010-1010-4010-8010-101010101010";
+        let parent_id = "20202020-2020-4020-8020-202020202020";
+        let leaf_id = "30303030-3030-4030-8030-303030303030";
+        let grand_path = rollout_path(home.path(), grand_id);
+        let parent_path = rollout_path(home.path(), parent_id);
+        let leaf_path = rollout_path(home.path(), leaf_id);
+        std::fs::create_dir_all(grand_path.parent().unwrap()).unwrap();
+        let grand_body = record(1, "user", "selected grandparent");
+        let grand_prefix = format!("{}{grand_body}", header(grand_id, 0, None));
+        std::fs::write(&grand_path, format!("{grand_prefix}unselected suffix\n")).unwrap();
+        let parent_header = header(parent_id, 2, Some((grand_id, 2, grand_prefix.len())));
+        let first = record(3, "assistant", "selected parent");
+        let second = record(4, "user", "selected later parent");
+        let incomplete_leaf = "{\"type\":";
+        let source = Source {
+            runtime: "codex",
+            session_id: leaf_id.into(),
+            path: leaf_path.clone(),
+            database: false,
+        };
+        let limits = |records| Limits {
+            records,
+            ..Limits::default()
+        };
+
+        let malformed_parent = format!("{parent_header}{first}malformed\n");
+        std::fs::write(&parent_path, &malformed_parent).unwrap();
+        std::fs::write(
+            &leaf_path,
+            format!(
+                "{}{incomplete_leaf}",
+                header(leaf_id, 5, Some((parent_id, 5, malformed_parent.len())))
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_pending_bytes(&source, limits(2)).unwrap_err(),
+            Unavailable::BudgetExceeded
+        );
+        assert_eq!(
+            read_pending_bytes(&source, limits(3)).unwrap_err(),
+            Unavailable::Incomplete
+        );
+        assert_eq!(
+            lineage_snapshot(&source, limits(2)).unwrap_err(),
+            Unavailable::Incomplete
+        );
+
+        let parent_prefix = format!("{parent_header}{first}{second}");
+        std::fs::write(&parent_path, format!("{parent_prefix}unselected suffix\n")).unwrap();
+        let leaf_header = header(leaf_id, 5, Some((parent_id, 5, parent_prefix.len())));
+        std::fs::write(&leaf_path, format!("{leaf_header}{incomplete_leaf}")).unwrap();
+        let expected = format!("{leaf_header}{grand_body}{first}{second}{incomplete_leaf}");
+        assert_eq!(
+            read_pending_bytes(&source, limits(3)).unwrap(),
+            expected.as_bytes()
+        );
+        assert_eq!(
+            read_pending_bytes(&source, limits(2)).unwrap_err(),
+            Unavailable::BudgetExceeded
+        );
+        assert_eq!(
+            Codex.read_native_bytes_at(leaf_id, &leaf_path).unwrap(),
+            expected.as_bytes()
+        );
+        assert_eq!(
+            lineage_snapshot(&source, Limits::default()).unwrap_err(),
+            Unavailable::Incomplete
+        );
+
+        let complete_leaf = record(6, "assistant", "healthy leaf");
+        std::fs::write(&leaf_path, format!("{leaf_header}{complete_leaf}")).unwrap();
+        let expected = format!("{leaf_header}{grand_body}{first}{second}{complete_leaf}");
+        assert_eq!(
+            lineage_snapshot(&source, Limits::default()).unwrap().bytes,
+            expected.as_bytes()
+        );
+        assert_eq!(
+            lineage_snapshot(&source, limits(3)).unwrap_err(),
+            Unavailable::BudgetExceeded
+        );
     }
 
     #[test]

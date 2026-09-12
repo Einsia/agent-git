@@ -31,6 +31,9 @@ fn main() {
     }
 
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = commands::status::native_observation_worker(&raw_args) {
+        exit(code);
+    }
     let json_hint = raw_args.iter().any(|arg| arg == "--json");
     let json_version_hint = commands::json::Version::from_argv(&raw_args);
     let cli = match <Cli as clap::Parser>::try_parse_from(raw_args.clone()) {

@@ -64,9 +64,9 @@ fn stable_occurrence(left: &Row, right: &Row) -> bool {
 }
 
 impl Rows {
-    fn read(text: &str, session: &str, envelopes: bool) -> crate::Result<Self> {
+    fn read(text: &str, session: &str, envelopes: bool, limits: Limits) -> crate::Result<Self> {
         ensure!(
-            text.len() <= Limits::default().bytes,
+            text.len() <= limits.bytes,
             "OpenCode comparison exceeds its byte limit"
         );
         let mut result = Self {
@@ -75,17 +75,18 @@ impl Rows {
             text: String::new(),
         };
         let mut meta_seen = false;
+        let mut nodes = limits.working_bytes / 128;
         for (line, raw) in text.lines().enumerate() {
             ensure!(
-                line < Limits::default().records && raw.len() <= storage::MAX_EVENT_BYTES,
+                line < limits.records && raw.len() <= storage::MAX_EVENT_BYTES,
                 "OpenCode comparison exceeds its record limit"
             );
             ensure!(
                 !raw.trim().is_empty(),
                 "OpenCode evidence contains an empty record"
             );
-            let mut facts =
-                JsonFacts::parse(raw).context("OpenCode evidence contains ambiguous JSON")?;
+            let mut facts = JsonFacts::parse_with_node_budget(raw, &mut nodes)
+                .context("OpenCode evidence contains ambiguous or over-budget JSON")?;
             let mut value: serde_json::Value = serde_json::from_str(raw)?;
             if envelopes {
                 ensure!(
@@ -170,25 +171,47 @@ impl Rows {
 }
 
 pub(super) fn inspect(repo: &Repo, claim: &Link, tip: &str, log: &str) -> crate::Result<String> {
+    inspect_with_limits(repo, claim, tip, log, Limits::default())
+}
+
+pub(super) fn inspect_with_limits(
+    repo: &Repo,
+    claim: &Link,
+    tip: &str,
+    log: &str,
+    limits: Limits,
+) -> crate::Result<String> {
     let adapter = crate::adapter::get("opencode")?;
-    let limits = Limits::default();
     let source = adapter.lookup_native_readonly(&claim.session_id, limits)?;
     let snapshot = adapter.snapshot_native_readonly(&source, limits)?;
-    let live = std::str::from_utf8(&snapshot.bytes).context("OpenCode snapshot is not UTF-8")?;
+    compare_snapshot(repo, claim, tip, log, &snapshot.bytes, limits, false)
+}
+
+/// Snapshot acquisition is separate from native identity and revision comparison.
+pub(super) fn compare_snapshot(
+    repo: &Repo,
+    claim: &Link,
+    tip: &str,
+    log: &str,
+    bytes: &[u8],
+    limits: Limits,
+    status: bool,
+) -> crate::Result<String> {
+    let live = std::str::from_utf8(bytes).context("OpenCode snapshot is not UTF-8")?;
     let materialized = claim.baseline_bytes.is_some()
         || claim.baseline_hash.is_some()
         || claim.materialized_from.is_some();
     if materialized {
-        let boundary = super::materialized_boundary(claim, tip, &snapshot.bytes)
+        let boundary = super::materialized_boundary(claim, tip, bytes)
             .context("the reminted OpenCode baseline cannot be reconstructed from changed bytes")?;
         return compare(
-            &Rows::read(&live[..boundary], &claim.session_id, false)?,
-            &Rows::read(live, &claim.session_id, false)?,
+            &Rows::read(&live[..boundary], &claim.session_id, false, limits)?,
+            &Rows::read(live, &claim.session_id, false, limits)?,
             None,
         );
     }
-    let old = Rows::read(log, &claim.session_id, true)?;
-    let current = Rows::read(live, &claim.session_id, false)?;
+    let old = Rows::read(log, &claim.session_id, true, limits)?;
+    let current = Rows::read(live, &claim.session_id, false, limits)?;
     // Hydration supplies only string comparisons. Original numeric tokens remain authoritative.
     let projection = if current.entries.iter().any(|(key, row)| {
         old.entries
@@ -196,7 +219,11 @@ pub(super) fn inspect(repo: &Repo, claim: &Link, tip: &str, log: &str) -> crate:
             .is_some_and(|prior| prior.facts != row.facts)
     }) {
         let reports = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-            .hydrate_batch_readonly_bounded(&[log, live], Limits::default().working_bytes)?;
+            .hydrate_batch_readonly_with_limits(
+                &[log, live],
+                limits.working_bytes,
+                status.then_some(crate::domain::secret_filter::ReadonlyDictionaryLimits::STATUS),
+            )?;
         let mut reports = reports.into_iter();
         let left = reports.next().context("missing saved hydration result")??;
         let right = reports
@@ -207,8 +234,8 @@ pub(super) fn inspect(repo: &Repo, claim: &Link, tip: &str, log: &str) -> crate:
             "OpenCode comparison requires unavailable repository secret mappings"
         );
         Some((
-            Rows::read(&left.text, &claim.session_id, true)?,
-            Rows::read(&right.text, &claim.session_id, false)?,
+            Rows::read(&left.text, &claim.session_id, true, limits)?,
+            Rows::read(&right.text, &claim.session_id, false, limits)?,
         ))
     } else {
         None

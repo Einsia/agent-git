@@ -817,6 +817,25 @@ pub(crate) fn materialize_pair_local(
     )
 }
 
+/// Status keeps all metadata, sequence and event reads inside its page's Git deadline.
+#[cfg(feature = "cli")]
+pub(crate) fn materialize_pair_status(
+    repo_root: &Path,
+    commit: &str,
+    max_sequence_bytes: usize,
+    max_unique_event_bytes: usize,
+    deadline: crate::infra::local_git::Deadline,
+) -> Result<(String, String)> {
+    immutable_local_oid(commit)?;
+    materialize_pair_with_policy(
+        repo_root,
+        commit,
+        max_sequence_bytes,
+        max_unique_event_bytes,
+        ReadPolicy::LocalInspection(deadline),
+    )
+}
+
 fn materialize_pair_with_policy(
     repo_root: &Path,
     git_ref: &str,
@@ -832,7 +851,7 @@ fn materialize_pair_with_policy(
         anyhow::bail!("git ref must be a bounded non-option string without newlines");
     }
     let commit = resolve_commit_with_policy(repo_root, git_ref, policy)?;
-    let local = matches!(policy, ReadPolicy::LocalOnly);
+    let local = !matches!(policy, ReadPolicy::AllowTransport);
     let meta_limit = if local { 1024 * 1024 } else { MAX_EVENT_BYTES };
     let sequence_limit = if local {
         max_sequence_bytes.min(MAX_MATERIALIZED_BYTES)
@@ -957,7 +976,7 @@ fn visit_v0_pair(
     policy: ReadPolicy,
     mut visit: impl FnMut(usize, &str) -> Result<()>,
 ) -> Result<()> {
-    let local = matches!(policy, ReadPolicy::LocalOnly);
+    let local = !matches!(policy, ReadPolicy::AllowTransport);
     visit_v0_pair_with_policy(
         repo_root,
         commit,
@@ -1025,7 +1044,7 @@ fn visit_v0_pair_with_policy(
         (SequenceKind::Log, meta::LEGACY_LOG_FILE),
         (SequenceKind::View, meta::LEGACY_VIEW_FILE),
     ];
-    with_legacy_pair_batch(repo_root, commit, policy, |reader| {
+    with_legacy_pair_batch(repo_root, commit, policy, max_blob_bytes, |reader| {
         for (sequence, path) in PATHS {
             let spec = format!("{commit}:{path}");
             let header = read_batch_header(reader)?;
@@ -1067,13 +1086,35 @@ fn with_legacy_pair_batch<T>(
     repo_root: &Path,
     commit: &str,
     policy: ReadPolicy,
-    consume: impl FnOnce(&mut BufReader<std::process::ChildStdout>) -> Result<T>,
+    _max_blob_bytes: usize,
+    consume: impl FnOnce(&mut dyn BufRead) -> Result<T>,
 ) -> Result<T> {
     let specs = [
         format!("{commit}:{}", meta::LEGACY_LOG_FILE),
         format!("{commit}:{}", meta::LEGACY_VIEW_FILE),
     ];
     let mut command = read_command(repo_root, policy);
+    #[cfg(feature = "cli")]
+    if let ReadPolicy::LocalInspection(deadline) = policy {
+        let limit = _max_blob_bytes
+            .checked_add(MAX_BATCH_HEADER_BYTES + 1)
+            .and_then(|limit| limit.checked_mul(specs.len()))
+            .context("legacy pair response budget overflow")?;
+        let input = format!("{}\n", specs.join("\n"));
+        command.args(["cat-file", "--batch"]);
+        let output = deadline.output(command, Some(input.as_bytes()), limit)?;
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "legacy pair inspection is unavailable"
+        );
+        let mut reader = std::io::Cursor::new(output.stdout);
+        let value = consume(&mut reader)?;
+        anyhow::ensure!(
+            reader.position() == reader.get_ref().len() as u64,
+            "legacy pair inspection has trailing bytes"
+        );
+        return Ok(value);
+    }
     let mut child = command
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
@@ -1148,7 +1189,7 @@ fn legacy_blob_size_from_header(spec: &str, header: &str, max_blob_bytes: usize)
     usize::try_from(size).context("v0 blob size does not fit memory")
 }
 
-fn read_bounded_blob_line<R: BufRead>(
+fn read_bounded_blob_line<R: BufRead + ?Sized>(
     reader: &mut R,
     remaining: &mut usize,
     max_line_bytes: usize,
@@ -1193,6 +1234,10 @@ fn read_command(repo_root: &Path, policy: ReadPolicy) -> Command {
     let mut command = Command::new("git");
     command.arg("--no-replace-objects").arg("-C").arg(repo_root);
     policy.apply(&mut command);
+    #[cfg(feature = "cli")]
+    if matches!(policy, ReadPolicy::LocalInspection(_)) {
+        command.args(["--git-dir", ".git", "--work-tree", "."]);
+    }
     command
 }
 
@@ -1202,10 +1247,13 @@ fn resolve_commit_with_policy(
     policy: ReadPolicy,
 ) -> Result<String> {
     let expression = format!("{git_ref}^{{commit}}");
-    let output = read_command(repo_root, policy)
-        .args(["rev-parse", "--verify", &expression])
-        .output()
-        .with_context(|| format!("cannot resolve {git_ref}"))?;
+    let output = read_output(
+        repo_root,
+        policy,
+        &["rev-parse", "--verify", &expression],
+        128,
+    )
+    .with_context(|| format!("cannot resolve {git_ref}"))?;
     if !output.status.success() {
         anyhow::bail!(
             "cannot resolve {git_ref}: {}",
@@ -1905,6 +1953,21 @@ pub(crate) fn metadata_local(repo_root: &Path, commit: &str) -> Result<meta::Met
     )
 }
 
+fn read_output(
+    repo_root: &Path,
+    policy: ReadPolicy,
+    args: &[&str],
+    _limit: usize,
+) -> Result<std::process::Output> {
+    let mut command = read_command(repo_root, policy);
+    command.args(args);
+    #[cfg(feature = "cli")]
+    if let ReadPolicy::LocalInspection(deadline) = policy {
+        return deadline.output(command, None, _limit);
+    }
+    Ok(command.output()?)
+}
+
 fn git_blob_with_policy(
     repo_root: &Path,
     git_ref: &str,
@@ -1913,9 +1976,7 @@ fn git_blob_with_policy(
     policy: ReadPolicy,
 ) -> Result<Vec<u8>> {
     let spec = format!("{git_ref}:{path}");
-    let size = read_command(repo_root, policy)
-        .args(["cat-file", "-s", &spec])
-        .output()
+    let size = read_output(repo_root, policy, &["cat-file", "-s", &spec], 64)
         .with_context(|| format!("cannot inspect {spec}"))?;
     if !size.status.success() {
         anyhow::bail!(
@@ -1935,9 +1996,7 @@ fn git_blob_with_policy(
         .into());
     }
 
-    let output = read_command(repo_root, policy)
-        .args(["cat-file", "blob", &spec])
-        .output()
+    let output = read_output(repo_root, policy, &["cat-file", "blob", &spec], size)
         .with_context(|| format!("cannot read {spec}"))?;
     if !output.status.success() {
         anyhow::bail!(
@@ -1968,14 +2027,70 @@ fn materialize_ids_at(repo_root: &Path, git_ref: &str, ids: &[String]) -> Result
 
 const MAX_BATCH_HEADER_BYTES: usize = 1024;
 
+#[cfg(feature = "cli")]
+const MAX_STATUS_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
 fn with_event_batch<T>(
     repo_root: &Path,
     git_ref: &str,
     ids: &[&str],
     mode: &str,
     policy: ReadPolicy,
-    consume: impl FnOnce(&mut BufReader<std::process::ChildStdout>) -> Result<T>,
+    _sizes: Option<&[usize]>,
+    consume: impl FnOnce(&mut dyn BufRead) -> Result<T>,
 ) -> Result<T> {
+    #[cfg(feature = "cli")]
+    if let ReadPolicy::LocalInspection(deadline) = policy {
+        // Response buffering is limited by validated body sizes and bounded header framing.
+        // Concurrent pipe I/O must finish before synchronous parsing can observe any bytes.
+        let mut limit = ids
+            .len()
+            .checked_mul(MAX_BATCH_HEADER_BYTES + 1)
+            .context("saved batch header budget overflow")?;
+        if let Some(sizes) = _sizes {
+            anyhow::ensure!(
+                sizes.len() == ids.len(),
+                "saved batch sizes differ from requests"
+            );
+            for size in sizes {
+                limit = limit
+                    .checked_add(*size)
+                    .context("saved batch body budget overflow")?;
+            }
+        }
+        // Framing cannot expand a small saved sequence into an unbounded response buffer.
+        let limit = limit.min(MAX_STATUS_BATCH_BYTES);
+        use std::fmt::Write as _;
+        let mut input = String::new();
+        for id in ids {
+            let path = meta::event_path(id)?;
+            let length = git_ref
+                .len()
+                .checked_add(path.len())
+                .and_then(|length| length.checked_add(2))
+                .and_then(|length| length.checked_add(input.len()))
+                .context("saved batch input budget overflow")?;
+            anyhow::ensure!(
+                length <= MAX_STATUS_BATCH_BYTES,
+                "saved batch input budget exceeded"
+            );
+            writeln!(input, "{git_ref}:{path}")?;
+        }
+        let mut command = read_command(repo_root, policy);
+        command.args(["cat-file", mode]);
+        let output = deadline.output(command, Some(input.as_bytes()), limit)?;
+        anyhow::ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "saved event batch is unavailable"
+        );
+        let mut reader = std::io::Cursor::new(output.stdout);
+        let value = consume(&mut reader)?;
+        anyhow::ensure!(
+            reader.position() == reader.get_ref().len() as u64,
+            "saved event batch has trailing bytes"
+        );
+        return Ok(value);
+    }
     let mut child = read_command(repo_root, policy)
         .args(["cat-file", mode])
         .stdin(Stdio::piped())
@@ -2036,17 +2151,25 @@ fn inspect_git_event_sizes_with_policy(
     ids: &[&str],
     policy: ReadPolicy,
 ) -> Result<Vec<usize>> {
-    with_event_batch(repo_root, git_ref, ids, "--batch-check", policy, |reader| {
-        let mut sizes = Vec::new();
-        sizes
-            .try_reserve_exact(ids.len())
-            .context("cannot allocate git event sizes")?;
-        for id in ids {
-            let header = read_batch_header(reader)?;
-            sizes.push(event_size_from_header(git_ref, id, &header)?);
-        }
-        Ok(sizes)
-    })
+    with_event_batch(
+        repo_root,
+        git_ref,
+        ids,
+        "--batch-check",
+        policy,
+        None,
+        |reader| {
+            let mut sizes = Vec::new();
+            sizes
+                .try_reserve_exact(ids.len())
+                .context("cannot allocate git event sizes")?;
+            for id in ids {
+                let header = read_batch_header(reader)?;
+                sizes.push(event_size_from_header(git_ref, id, &header)?);
+            }
+            Ok(sizes)
+        },
+    )
 }
 
 fn read_git_events_into_output(
@@ -2077,34 +2200,42 @@ fn read_git_events_into_output_with_policy(
     output: &mut [u8],
     policy: ReadPolicy,
 ) -> Result<()> {
-    with_event_batch(repo_root, git_ref, ids, "--batch", policy, |reader| {
-        for (index, id) in ids.iter().enumerate() {
-            let header = read_batch_header(reader)?;
-            let actual = event_size_from_header(git_ref, id, &header)?;
-            let expected = sizes[index];
-            anyhow::ensure!(
-                actual == expected,
-                "event {id} changed size between git batch passes: expected {expected}, found {actual}"
-            );
-            let start = first_offsets[index];
-            let end = start
-                .checked_add(expected)
-                .context("event output range overflow")?;
-            let destination = output
-                .get_mut(start..end)
-                .with_context(|| format!("event {id} output range is out of bounds"))?;
-            reader
-                .read_exact(destination)
-                .with_context(|| format!("cannot read event {id} from git cat-file"))?;
-            let mut separator = [0u8; 1];
-            reader.read_exact(&mut separator)?;
-            anyhow::ensure!(
-                separator == *b"\n",
-                "git cat-file --batch omitted the separator after event {id}"
-            );
-        }
-        Ok(())
-    })
+    with_event_batch(
+        repo_root,
+        git_ref,
+        ids,
+        "--batch",
+        policy,
+        Some(sizes),
+        |reader| {
+            for (index, id) in ids.iter().enumerate() {
+                let header = read_batch_header(reader)?;
+                let actual = event_size_from_header(git_ref, id, &header)?;
+                let expected = sizes[index];
+                anyhow::ensure!(
+                    actual == expected,
+                    "event {id} changed size between git batch passes: expected {expected}, found {actual}"
+                );
+                let start = first_offsets[index];
+                let end = start
+                    .checked_add(expected)
+                    .context("event output range overflow")?;
+                let destination = output
+                    .get_mut(start..end)
+                    .with_context(|| format!("event {id} output range is out of bounds"))?;
+                reader
+                    .read_exact(destination)
+                    .with_context(|| format!("cannot read event {id} from git cat-file"))?;
+                let mut separator = [0u8; 1];
+                reader.read_exact(&mut separator)?;
+                anyhow::ensure!(
+                    separator == *b"\n",
+                    "git cat-file --batch omitted the separator after event {id}"
+                );
+            }
+            Ok(())
+        },
+    )
 }
 
 fn event_size_from_header(git_ref: &str, id: &str, header: &str) -> Result<usize> {
@@ -2133,7 +2264,7 @@ fn event_size_from_header(git_ref: &str, id: &str, header: &str) -> Result<usize
     Ok(size)
 }
 
-fn read_batch_header<R: BufRead>(reader: &mut R) -> Result<String> {
+fn read_batch_header<R: BufRead + ?Sized>(reader: &mut R) -> Result<String> {
     let mut header = Vec::with_capacity(96);
     loop {
         let available = reader.fill_buf()?;

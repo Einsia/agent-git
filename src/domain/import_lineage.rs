@@ -929,6 +929,74 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_dictionary_records_do_not_remove_import_candidates() {
+        let fixture = Fixture::new();
+        let path = fixture.directory.path().join("known-dictionary/vault.json");
+        let keys = CountingKeys::default();
+        let dictionary = RepositoryDictionary::new(path.clone(), keys.clone());
+        let secrets = (0..129)
+            .map(|index| format!("UNRELATED_SYNTHETIC_VALUE_{index:03}"))
+            .collect::<Vec<_>>();
+        let patterns = secrets
+            .iter()
+            .map(|value| (value.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let unrelated = format!("{}\n", serde_json::json!({"values":secrets}));
+        dictionary
+            .protect_jsonl(
+                &unrelated,
+                &crate::domain::secret_filter::Matcher::for_test(&patterns),
+            )
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let vault: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(vault["records"].as_array().unwrap().len(), 129);
+        let raw = turn("a small session without dictionary placeholders");
+        let source = fixture.commit(&raw);
+        let refs = fixture.repo.git(&["show-ref"]).unwrap();
+        let index = std::fs::read(fixture.repo.git_path("index").unwrap()).unwrap();
+        let lock = path.parent().unwrap().join("vault.lock");
+        std::fs::remove_file(&lock).unwrap();
+        let key_values = keys.values.lock().unwrap().clone();
+        let report = discover_with_dictionary(
+            &fixture.repo,
+            "alice/repo",
+            &fixture.selected,
+            raw.as_bytes(),
+            Limits::default(),
+            &dictionary,
+        )
+        .unwrap();
+        assert!(report.unavailable.is_empty());
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].commit, source);
+        assert_eq!(report.candidates[0].evidence, Evidence::ExactNativeRecords);
+        let ordinary = dictionary
+            .hydrate_batch_readonly_bounded(&[&raw], 8 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(ordinary[0].as_ref().unwrap().text, raw);
+        assert!(
+            dictionary
+                .hydrate_batch_readonly_with_limits(
+                    &[&raw],
+                    8 * 1024 * 1024,
+                    Some(crate::domain::secret_filter::ReadonlyDictionaryLimits::STATUS),
+                )
+                .unwrap_err()
+                .downcast_ref::<HydrationBudgetExceeded>()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(*keys.values.lock().unwrap(), key_values);
+        assert!(!lock.exists());
+        assert_eq!(fixture.repo.git(&["show-ref"]).unwrap(), refs);
+        assert_eq!(
+            std::fs::read(fixture.repo.git_path("index").unwrap()).unwrap(),
+            index
+        );
+    }
+
+    #[test]
     fn proposals_share_one_dictionary_snapshot_without_losing_candidate_boundaries() {
         use std::sync::atomic::Ordering;
         let fixture = Fixture::new();

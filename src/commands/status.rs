@@ -4,8 +4,14 @@
 //! which version; whether anything is committed but not pushed; which sessions in this repo are
 //! still unadopted.
 //!
-//! **Opens no transcript.** Every number comes from the store links and from git, so the command
-//! stays fast with thousands of sessions.
+//! Displayed session rows use bounded, read-only native snapshots. Incomplete evidence remains
+//! unavailable instead of being reported as no unsettled work.
+
+/// Internal memory-only observation runs before ordinary command startup.
+#[doc(hidden)]
+pub fn native_observation_worker(args: &[std::ffi::OsString]) -> Option<i32> {
+    super::diff::pending::status_native_worker(args)
+}
 
 use super::CmdResult;
 use crate::domain::link;
@@ -17,6 +23,7 @@ use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
 mod branches;
+mod sessions;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -37,21 +44,37 @@ pub fn run(args: Args) -> CmdResult {
     }
     let limit = args.limit.unwrap_or(8) as usize;
     let s = ui::theme::symbols();
+    let ClaimInventory {
+        store,
+        mut links,
+        issues: link_issues,
+    } = claim_inventory(config::store_root()?);
+    // Active claims remain ahead of recovery history without using filesystem timestamps.
+    links.sort_by_key(|link| !link.is_active());
+    let page = observe_page(
+        store.as_ref(),
+        &links,
+        link_issues.is_empty(),
+        args.offset,
+        limit,
+    );
+    let inventory_complete = page.inventory_complete;
 
     // ── Who am I (PRD status, first block: the context resolution result and its route) ──
     ui::section("who am I");
     let cwd = std::env::current_dir()?;
-    match super::context::resolve(&cwd) {
-        Ok(c) => {
+    match super::context::from_env_with_claims(&links, inventory_complete) {
+        Ok(Some(c)) => {
             println!("  {} @ {}", c.repo, c.branch);
             println!("  {}", ui::dim(&format!("via: {}", c.via)));
         }
-        Err(_) => {
+        Ok(None) => {
             println!(
                 "  {}",
                 ui::dim("no session target supplied through AGIT_SESSION")
             );
         }
+        Err(error) => println!("  session target unavailable: {error}"),
     }
     if let Some(ws) = crate::domain::workspace::read(&cwd) {
         println!("  {}", ui::dim(&format!("bound repo: {}", ws.repo)));
@@ -59,7 +82,6 @@ pub fn run(args: Args) -> CmdResult {
 
     // ── Local store ──
     ui::section("local");
-    let store = Store::open()?;
     if store.is_none() {
         println!("  no sessions adopted yet.");
         ui::hint(
@@ -67,11 +89,6 @@ pub fn run(args: Args) -> CmdResult {
         );
     }
 
-    let mut links = store.as_ref().map(link::list).unwrap_or_default();
-    // Historical links remain visible for recovery, but they must not push the branch's current
-    // writer below the display limit. The stable sort keeps `link::list`'s deterministic order
-    // inside each group and avoids a filesystem metadata read in every comparator call.
-    links.sort_by_key(|link| !link.is_active());
     let committed = links.iter().filter(|l| l.agent.is_some()).count();
 
     print!(
@@ -80,35 +97,34 @@ pub fn run(args: Args) -> CmdResult {
             ("store", ui::tilde(&config::store_root()?)),
             (
                 "adopted sessions",
-                format!("{} ({committed} versioned)", links.len())
+                if inventory_complete {
+                    format!("{} ({committed} with a recorded repository)", links.len())
+                } else {
+                    format!(
+                        "{} observed ({committed} with a recorded repository; incomplete inventory)",
+                        links.len()
+                    )
+                }
             ),
         ])
     );
 
     // ── Adopted sessions ──
     if !links.is_empty() {
-        let rows: Vec<Vec<String>> = links
-            .iter()
-            .skip(args.offset)
-            .take(limit)
-            .map(|l| {
-                vec![
-                    link::short(&l.session_id),
-                    l.source.clone(),
-                    l.agent
-                        .clone()
-                        .unwrap_or_else(|| ui::dim("unversioned").to_string()),
-                    if l.is_active() {
-                        "active".to_string()
-                    } else {
-                        ui::dim("superseded").to_string()
-                    },
-                ]
-            })
-            .collect();
         println!(
             "{}",
-            ui::table::render(&["session", "runtime", "AGENT", "state"], &rows)
+            ui::table::render(
+                &[
+                    "session",
+                    "runtime",
+                    "repo",
+                    "branch",
+                    "last commit",
+                    "pending activity",
+                    "local instance"
+                ],
+                &page.rows
+            )
         );
         let remaining = links
             .len()
@@ -116,6 +132,10 @@ pub fn run(args: Args) -> CmdResult {
         if remaining > 0 {
             println!("{}", ui::dim(&format!("… {remaining} more")));
         }
+    }
+
+    if !inventory_complete {
+        ui::warning("status is incomplete: some local session claims cannot be inspected");
     }
 
     // ── Agent repos on this machine ──
@@ -196,7 +216,14 @@ pub fn run(args: Args) -> CmdResult {
             "{}",
             ui::table::key_values(&[
                 ("path", ui::tilde(&repo)),
-                ("adopted from this repo", here.to_string()),
+                (
+                    "adopted from this repo",
+                    if inventory_complete {
+                        here.to_string()
+                    } else {
+                        format!("{here} observed (incomplete inventory)")
+                    },
+                ),
             ])
         );
     }
@@ -205,7 +232,7 @@ pub fn run(args: Args) -> CmdResult {
     if args.check_missing {
         ui::section("unadopted sessions");
         let sp = ui::spinner("checking runtime indexes…");
-        let discovery = uncaptured(&links);
+        let discovery = uncaptured(&links, inventory_complete);
         let missing = &discovery.sessions;
         sp.finish_and_clear();
         if missing.is_empty() && discovery.errors.is_empty() {
@@ -249,23 +276,36 @@ pub fn run(args: Args) -> CmdResult {
 
 fn structured(args: &Args) -> CmdResult {
     let cwd = std::env::current_dir()?;
-    let selection = match super::context::resolve(&cwd) {
-        Ok(context) => serde_json::json!({
-            "repo": context.repo, "branch": context.branch, "source": context.via,
-        }),
-        Err(error) => {
-            serde_json::json!({"repo": null, "branch": null, "reason": error.to_string()})
-        }
-    };
-    let store = Store::open()?;
-    let mut links = store.as_ref().map(link::list).unwrap_or_default();
+    let ClaimInventory {
+        store,
+        mut links,
+        issues: link_issues,
+    } = claim_inventory(config::store_root()?);
+
     links.sort_by_key(|link| !link.is_active());
     let limit = args.limit.unwrap_or(100) as usize;
+    let page = observe_page(
+        store.as_ref(),
+        &links,
+        link_issues.is_empty(),
+        args.offset,
+        limit,
+    );
+    let inventory_complete = page.inventory_complete;
+    let selection = match super::context::from_env_with_claims(&links, inventory_complete) {
+        Ok(Some(context)) => serde_json::json!({
+            "repo": context.repo, "branch": context.branch, "source": context.via,
+        }),
+        Ok(None) => serde_json::json!({"repo":null, "branch":null,
+            "reason":"no session target supplied through AGIT_SESSION"}),
+        Err(error) => serde_json::json!({"repo":null, "branch":null, "reason":error.to_string()}),
+    };
     let items: Vec<_> = links
         .iter()
         .skip(args.offset)
         .take(limit)
-        .map(|link| {
+        .zip(page.rows)
+        .map(|(link, detail)| {
             let target = match (&link.owner, &link.agent, &link.branch) {
                 (Some(owner), Some(repo), Some(branch)) => Some(format!("{owner}/{repo}@{branch}")),
                 _ => None,
@@ -275,6 +315,8 @@ fn structured(args: &Args) -> CmdResult {
                 "owner": link.owner, "repository_name": link.agent, "branch": link.branch,
                 "target": target, "cwd": link.cwd, "active": link.is_active(),
                 "superseded_by": link.superseded_by,
+                "last_commit": (detail[4] != "—").then_some(&detail[4]),
+                "pending_activity": detail[5], "local_instance": detail[6],
             })
         })
         .collect();
@@ -305,7 +347,7 @@ fn structured(args: &Args) -> CmdResult {
         }));
     }
     let missing = if args.check_missing {
-        let discovery = uncaptured(&links);
+        let discovery = uncaptured(&links, inventory_complete);
         Some((discovery.sessions.into_iter().map(|(runtime, session_id)| {
             serde_json::json!({"runtime": runtime, "session_id": session_id})
         }).collect::<Vec<_>>(), discovery.errors))
@@ -313,18 +355,22 @@ fn structured(args: &Args) -> CmdResult {
         None
     };
     let code_repo = config::repo_root();
-    let adopted_here = code_repo.as_ref().map(|root| {
-        links
-            .iter()
-            .filter(|link| link.cwd.as_deref() == root.to_str())
-            .count()
-    });
+    let adopted_here = code_repo
+        .as_ref()
+        .filter(|_| inventory_complete)
+        .map(|root| {
+            links
+                .iter()
+                .filter(|link| link.cwd.as_deref() == root.to_str())
+                .count()
+        });
     let result = serde_json::json!({
         "schema_version": 1, "cwd": cwd, "selection": selection,
         "bound_repo": crate::domain::workspace::read(&cwd).map(|workspace| workspace.repo),
         "store_path": store.as_ref().map(|store| store.root()),
         "sessions": {"items": items, "total": links.len(), "offset": args.offset,
-            "limit": limit, "next_offset": (next < links.len()).then_some(next)},
+            "limit": limit, "next_offset": (next < links.len()).then_some(next),
+             "incomplete": !inventory_complete},
         "repositories": repositories, "repositories_omitted": repositories_omitted,
         "code_repository": {"path": code_repo, "adopted_sessions": adopted_here},
         "unadopted": {"checked": args.check_missing,
@@ -334,6 +380,62 @@ fn structured(args: &Args) -> CmdResult {
     });
     println!("{}", serde_json::to_string(&result)?);
     Ok(ExitCode::Ok)
+}
+
+fn observe_page(
+    store: Option<&Store>,
+    links: &[link::Link],
+    complete: bool,
+    offset: usize,
+    limit: usize,
+) -> sessions::Page {
+    store
+        .map(|store| sessions::rows(store, links, complete, offset, limit))
+        .unwrap_or_else(|| sessions::Page {
+            rows: Vec::new(),
+            inventory_complete: complete && links.is_empty(),
+        })
+}
+
+struct ClaimInventory {
+    store: Option<Store>,
+    links: Vec<link::Link>,
+    issues: Vec<link::LinkIssue>,
+}
+
+/// Only a missing carrier proves an empty inventory; inspection failures retain unknown claims.
+fn claim_inventory(root: std::path::PathBuf) -> ClaimInventory {
+    let store = Store::at(root);
+    let (links, mut issues) =
+        link::list_checked_with_limits(&store, sessions::MAX_LINKS, sessions::MAX_LINK_BYTES);
+    let carrier_issue = match std::fs::symlink_metadata(store.root()) {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && links.is_empty()
+                && issues.is_empty() =>
+        {
+            return ClaimInventory {
+                store: None,
+                links,
+                issues,
+            };
+        }
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => None,
+        Ok(_) => Some(link::LinkIssueKind::InvalidPath),
+        Err(_) => Some(link::LinkIssueKind::UnreadableDirectory),
+    };
+    if let Some(kind) = carrier_issue {
+        issues.push(link::LinkIssue {
+            path: store.root().to_owned(),
+            kind,
+            repository: None,
+        });
+    }
+    ClaimInventory {
+        store: Some(store),
+        links,
+        issues,
+    }
 }
 
 #[derive(Default)]
@@ -349,7 +451,17 @@ struct IndexError {
 }
 
 /// Runtime indexes define discovery; an unreadable index is not evidence of an empty one.
-fn uncaptured(links: &[link::Link]) -> Discovery {
+fn uncaptured(links: &[link::Link], complete: bool) -> Discovery {
+    if !complete {
+        return Discovery {
+            sessions: Vec::new(),
+            errors: vec![IndexError {
+                runtime: "claims",
+                message: "unavailable: claim inventory incomplete; adoption cannot be determined"
+                    .into(),
+            }],
+        };
+    }
     let Some(repo) = config::repo_root().or_else(|| std::env::current_dir().ok()) else {
         return Discovery::default();
     };
@@ -391,6 +503,16 @@ fn uncaptured(links: &[link::Link]) -> Discovery {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_store_only_proves_a_complete_empty_observation() {
+        let empty = super::observe_page(None, &[], true, 0, 8);
+        assert!(empty.inventory_complete);
+        assert!(empty.rows.is_empty());
+        assert!(!super::observe_page(None, &[], false, 0, 8).inventory_complete);
+        let claim = crate::domain::link::Link::new("codex", "unverified", None);
+        assert!(!super::observe_page(None, &[claim], true, 0, 8).inventory_complete);
+    }
+
     #[test]
     fn expensive_scan_is_opt_in() {
         // CC has to read a directory and Codex has to query a database; neither belongs in the

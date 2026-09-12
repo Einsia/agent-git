@@ -28,6 +28,8 @@ mod os_keychain;
 mod repository;
 
 pub(crate) use repository::HydrationBudgetExceeded;
+#[cfg(any(feature = "cli", test))]
+pub(crate) use repository::ReadonlyDictionaryLimits;
 pub use repository::{
     HydrationReport, ProtectionReport, RepositoryDictionary, RepositoryRecordSummary,
 };
@@ -165,6 +167,10 @@ pub struct FilterReport {
 /// configured; the vault logic is not written twice.
 pub trait KeyStore: Send + Sync {
     fn get(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>>;
+    /// File-backed inspection caps the carrier before decoding; platform stores supply a key.
+    fn get_bounded(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
+        self.get(vault_id)
+    }
     fn set(&self, vault_id: &str, key: &[u8]) -> crate::Result<()>;
     fn delete(&self, vault_id: &str) -> crate::Result<()>;
 }
@@ -342,6 +348,28 @@ impl KeyStore for FileKeyStore {
         Ok(key)
     }
 
+    fn get_bounded(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
+        use std::io::Read as _;
+        let path = self.key_path(vault_id)?;
+        let file = open_owner_only_with_flags(&path, libc::O_NONBLOCK)?;
+        const MAX_KEY_FILE_BYTES: u64 = 64;
+        let mut text = Zeroizing::new(Vec::new());
+        (&file)
+            .take(MAX_KEY_FILE_BYTES + 1)
+            .read_to_end(&mut text)?;
+        if text.len() as u64 > MAX_KEY_FILE_BYTES {
+            return Err(repository::HydrationBudgetExceeded.into());
+        }
+        let text = std::str::from_utf8(&text).context("the secret-filter key file is not UTF-8")?;
+        let key = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(text.trim())
+                .context("the secret-filter key file is malformed")?,
+        );
+        validate_key(&key, "KEK")?;
+        Ok(key)
+    }
+
     fn set(&self, vault_id: &str, key: &[u8]) -> crate::Result<()> {
         validate_key(key, "KEK")?;
         let path = self.key_path(vault_id)?;
@@ -450,6 +478,13 @@ impl KeyStore for SelectedKeyStore {
         match self {
             Self::Os(store) => store.get(vault_id),
             Self::File(store) => store.get(vault_id),
+        }
+    }
+
+    fn get_bounded(&self, vault_id: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
+        match self {
+            Self::Os(store) => store.get_bounded(vault_id),
+            Self::File(store) => store.get_bounded(vault_id),
         }
     }
 
@@ -627,10 +662,15 @@ fn probe_file_store(store: &FileKeyStore) -> crate::Result<()> {
 /// run on the opened handle, so what is checked is what is read.
 #[cfg(unix)]
 fn open_owner_only(path: &Path) -> crate::Result<std::fs::File> {
+    open_owner_only_with_flags(path, 0)
+}
+
+#[cfg(unix)]
+fn open_owner_only_with_flags(path: &Path, flags: i32) -> crate::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | flags)
         .open(path)
     {
         Ok(file) => file,
@@ -867,6 +907,10 @@ impl<K: KeyStore> VaultStore<K> {
 
     fn unlock_existing(&self) -> crate::Result<Unlocked> {
         let file = read_vault(&self.path)?;
+        self.unlock_file(file, false)
+    }
+
+    fn unlock_file(&self, file: VaultFile, bounded: bool) -> crate::Result<Unlocked> {
         if file.version != VAULT_VERSION {
             bail!(
                 "unsupported secret-filter vault version {} (this build supports {VAULT_VERSION})",
@@ -891,7 +935,11 @@ impl<K: KeyStore> VaultStore<K> {
                 file.projection_version
             );
         }
-        let kek = self.keys.get(&file.vault_id)?;
+        let kek = if bounded {
+            self.keys.get_bounded(&file.vault_id)?
+        } else {
+            self.keys.get(&file.vault_id)?
+        };
         let dek = open(
             &kek,
             &file.wrapped_dek,
@@ -1721,6 +1769,50 @@ mod tests {
         write_vault(&path, &file).unwrap();
         assert!(store.status().is_err());
         assert!(store.matcher().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_key_refuses_oversized_and_special_carriers_without_mutation() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = FileKeyStore::new(dir.path().join("keys"));
+        let id = uuid::Uuid::new_v4().to_string();
+        let key = [7; 32];
+        keys.set(&id, &key).unwrap();
+        let path = keys.key_path(&id).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(keys.get_bounded(&id).unwrap().as_slice(), key);
+        let mut padded = original.clone();
+        padded.resize(65, b' ');
+        std::fs::write(&path, &padded).unwrap();
+        assert!(
+            keys.get_bounded(&id)
+                .unwrap_err()
+                .downcast_ref::<HydrationBudgetExceeded>()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), padded);
+        assert_eq!(keys.get(&id).unwrap().as_slice(), key);
+        std::fs::remove_file(&path).unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, &original).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(keys.get_bounded(&id).is_err());
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: name is a live NUL-terminated path inside the owned fixture.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(keys.get_bounded(&id).is_err());
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert_eq!(std::fs::read_dir(keys.dir()).unwrap().count(), 1);
     }
 
     #[test]

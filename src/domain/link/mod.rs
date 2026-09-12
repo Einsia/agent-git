@@ -639,6 +639,15 @@ pub struct LinkIssue {
 
 /// Diagnostic enumeration retains unreadable adoption evidence without changing lenient readers.
 pub fn list_checked(store: &Store) -> (Vec<Link>, Vec<LinkIssue>) {
+    list_checked_with_limits(store, usize::MAX, u64::MAX)
+}
+
+/// A bounded listing reports incomplete evidence rather than authorizing a partial claim set.
+pub(crate) fn list_checked_with_limits(
+    store: &Store,
+    max_entries: usize,
+    mut remaining_bytes: u64,
+) -> (Vec<Link>, Vec<LinkIssue>) {
     let root = store.root();
     let root_issue = match std::fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => None,
@@ -660,7 +669,20 @@ pub fn list_checked(store: &Store) -> (Vec<Link>, Vec<LinkIssue>) {
     }
     let mut links = Vec::new();
     let mut issues = Vec::new();
-    for entry in walkdir::WalkDir::new(root).min_depth(1).max_depth(2) {
+    for (visited, entry) in walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .max_depth(2)
+        .into_iter()
+        .enumerate()
+    {
+        if visited >= max_entries {
+            issues.push(LinkIssue {
+                path: root.to_owned(),
+                kind: LinkIssueKind::InspectionLimit,
+                repository: None,
+            });
+            break;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -702,8 +724,13 @@ pub fn list_checked(store: &Store) -> (Vec<Link>, Vec<LinkIssue>) {
             });
             continue;
         }
-        let bytes = match read_checked_record(path) {
-            Ok(bytes) => bytes,
+        let allowance = remaining_bytes.min(MAX_CHECKED_LINK_BYTES);
+        remaining_bytes = remaining_bytes.saturating_sub(allowance);
+        let bytes = match read_checked_record_with_limit(path, allowance) {
+            Ok(bytes) => {
+                remaining_bytes += allowance - bytes.len() as u64;
+                bytes
+            }
             Err(kind) => {
                 issues.push(LinkIssue {
                     path: path.to_owned(),
@@ -713,6 +740,14 @@ pub fn list_checked(store: &Store) -> (Vec<Link>, Vec<LinkIssue>) {
                 continue;
             }
         };
+        if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+            issues.push(LinkIssue {
+                path: path.to_owned(),
+                kind: LinkIssueKind::InvalidData,
+                repository: None,
+            });
+            continue;
+        }
         match serde_json::from_slice::<Body>(&bytes) {
             Ok(body) => match link_from_body(path, body) {
                 Some(link) => links.push(link),
@@ -737,9 +772,28 @@ pub fn list_checked(store: &Store) -> (Vec<Link>, Vec<LinkIssue>) {
 const MAX_CHECKED_LINK_BYTES: u64 = 1024 * 1024;
 
 /// Enumeration metadata cannot authorize a read after a record is replaced.
+#[cfg(test)]
 fn read_checked_record(path: &Path) -> std::result::Result<Vec<u8>, LinkIssueKind> {
-    use std::io::Read as _;
+    read_checked_record_with_limit(path, MAX_CHECKED_LINK_BYTES)
+}
 
+fn read_checked_record_with_limit(
+    path: &Path,
+    limit: u64,
+) -> std::result::Result<Vec<u8>, LinkIssueKind> {
+    use std::io::Read as _;
+    let file = open_checked_file(path)?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| LinkIssueKind::UnreadableFile)?;
+    if bytes.len() as u64 > limit {
+        return Err(LinkIssueKind::InspectionLimit);
+    }
+    Ok(bytes)
+}
+
+fn open_checked_file(path: &Path) -> std::result::Result<std::fs::File, LinkIssueKind> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -773,14 +827,33 @@ fn read_checked_record(path: &Path) -> std::result::Result<Vec<u8>, LinkIssueKin
             return Err(LinkIssueKind::InvalidPath);
         }
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_CHECKED_LINK_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| LinkIssueKind::UnreadableFile)?;
-    if bytes.len() as u64 > MAX_CHECKED_LINK_BYTES {
-        return Err(LinkIssueKind::InspectionLimit);
+    Ok(file)
+}
+
+/// A contended existing claim lock proves a writer, not a running native process.
+/// Observation never creates a lock file or waits for its owner.
+#[cfg(feature = "cli")]
+pub(crate) fn claim_update_busy(
+    store: &Store,
+    claim: &Link,
+) -> std::result::Result<bool, LinkIssueKind> {
+    let path = link_path(store, &claim.source, &claim.session_id).with_extension("json.lock");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(LinkIssueKind::UnreadableFile),
+        Ok(_) => {}
     }
-    Ok(bytes)
+    let file = open_checked_file(&path)?;
+    match fs2::FileExt::try_lock_shared(&file) {
+        Ok(()) => {
+            fs2::FileExt::unlock(&file).map_err(|_| LinkIssueKind::UnreadableFile)?;
+            Ok(false)
+        }
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(true)
+        }
+        Err(_) => Err(LinkIssueKind::UnreadableFile),
+    }
 }
 
 fn registered_runtime(path: &Path) -> bool {

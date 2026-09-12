@@ -6,6 +6,8 @@ use anyhow::{Context, ensure};
 use sha2::{Digest, Sha256};
 
 mod opencode;
+mod status_opencode;
+pub(crate) use status_opencode::worker as status_native_worker;
 
 pub(super) fn check_readonly_repository(repo: &Repo) -> crate::Result<()> {
     for name in [
@@ -120,6 +122,52 @@ pub(super) fn inspect(repo: &Repo, slug: &str, branch: &str) -> crate::Result<St
     Ok(summary)
 }
 
+/// Status reserves one bounded evidence allowance before inspecting a displayed claim.
+/// The caller rechecks the exact link inventory and branch head before publishing the row.
+pub(crate) fn inspect_status(
+    repo: &Repo,
+    claim: &link::Link,
+    tip: &str,
+    budget: &mut crate::adapter::native_snapshot::Budget,
+    deadline: crate::infra::local_git::Deadline,
+) -> crate::Result<String> {
+    budget.reserve(32 * 1024 * 1024)?;
+    if claim.source == "opencode" {
+        budget.reserve(status_opencode::RESERVATION - 32 * 1024 * 1024)?;
+    }
+    let limits = status_opencode::limits();
+    let output = repo.inspection_output_with_deadline(
+        &["show", &format!("{tip}:{}", meta::FILE)],
+        1024 * 1024,
+        deadline,
+    )?;
+    ensure!(
+        output.status.success() && output.stderr.is_empty(),
+        "the committed session metadata is unavailable"
+    );
+    let snapshot = meta::parse_strict(std::str::from_utf8(&output.stdout)?, tip)?;
+    ensure!(
+        snapshot.is_session_line(),
+        "the claimed branch is not a session line"
+    );
+    let (log, _view) = if snapshot.session.is_empty() {
+        (String::new(), String::new())
+    } else {
+        storage::materialize_pair_status(repo.root(), tip, limits.bytes, limits.bytes, deadline)?
+    };
+    ensure!(
+        snapshot.runtime.is_empty()
+            || snapshot.runtime == claim.source
+            || claim.baseline_bytes.is_some(),
+        "the native runtime differs from the committed session runtime"
+    );
+    if claim.source == "opencode" {
+        status_opencode::inspect(repo, claim, tip, &log, deadline)
+    } else {
+        inspect_append_only_with_limits(repo, claim, tip, &log, &snapshot.runtime, Some(limits))
+    }
+}
+
 fn inspect_append_only(
     repo: &Repo,
     claim: &link::Link,
@@ -127,9 +175,43 @@ fn inspect_append_only(
     log: &str,
     runtime: &str,
 ) -> crate::Result<String> {
-    let bytes = read_native(claim)?;
+    inspect_append_only_with_limits(repo, claim, tip, log, runtime, None)
+}
+
+fn inspect_append_only_with_limits(
+    repo: &Repo,
+    claim: &link::Link,
+    tip: &str,
+    log: &str,
+    runtime: &str,
+    limits: Option<crate::adapter::native_snapshot::Limits>,
+) -> crate::Result<String> {
+    let bytes = if let Some(limits) = limits {
+        let runtime = if claim.source == "claude-desktop" {
+            "claude-code"
+        } else {
+            &claim.source
+        };
+        let runtime = crate::adapter::get(runtime)?.id();
+        let source = crate::adapter::native_snapshot::lookup_files_without_database(
+            runtime,
+            &claim.session_id,
+            limits,
+        )?;
+        if runtime == "codex" {
+            crate::adapter::codex::read_pending_bytes(&source, limits)?
+        } else {
+            crate::adapter::native_snapshot::read_file_bytes(&source.path, limits)?
+        }
+    } else {
+        read_native(claim)?
+    };
     let text = std::str::from_utf8(&bytes).context("the native transcript is not valid UTF-8")?;
-    let records = records(text, claim)?;
+    let records = if let Some(limits) = limits {
+        records_with_limit(text, claim, limits.records)?
+    } else {
+        records(text, claim)?
+    };
     let materialized = claim.baseline_bytes.is_some()
         || claim.baseline_hash.is_some()
         || claim.materialized_from.is_some();
@@ -140,7 +222,14 @@ fn inspect_append_only(
             runtime.is_empty() || runtime == claim.source,
             "the native runtime differs from the committed session runtime"
         );
-        native_boundary(repo, claim, log, text, &records)?
+        native_boundary(
+            repo,
+            claim,
+            log,
+            text,
+            &records,
+            limits.map(|limits| limits.working_bytes),
+        )?
     };
     summarize(claim, text, boundary, &records)
 }
@@ -223,15 +312,23 @@ struct Records {
 }
 
 fn records(text: &str, claim: &link::Link) -> crate::Result<Records> {
+    records_with_limit(text, claim, storage::MAX_SEQUENCE_EVENTS)
+}
+
+fn records_with_limit(text: &str, claim: &link::Link, limit: usize) -> crate::Result<Records> {
+    let limit = limit.min(storage::MAX_SEQUENCE_EVENTS);
     let mut records = Vec::new();
     let mut start = 0;
     let mut incomplete_tail = false;
     for (line, value) in text.split_inclusive('\n').enumerate() {
         let end = start + value.len();
         if !value.trim().is_empty() {
+            // Admit the record before parsing or hashing any of its native content.
+            if records.len() >= limit {
+                return Err(crate::adapter::native_snapshot::Unavailable::BudgetExceeded.into());
+            }
             ensure!(
-                value.len() <= storage::MAX_EVENT_BYTES
-                    && records.len() < storage::MAX_SEQUENCE_EVENTS,
+                value.len() <= storage::MAX_EVENT_BYTES,
                 "the native transcript exceeds the record inspection limit"
             );
             match serde_json::from_str::<serde_json::Value>(value) {
@@ -308,6 +405,7 @@ fn native_boundary(
     log: &str,
     live: &str,
     records: &Records,
+    hydration_limit: Option<usize>,
 ) -> crate::Result<usize> {
     let committed = storage::parse_envelopes(log)?;
     ensure!(
@@ -325,10 +423,27 @@ fn native_boundary(
         .zip(&records.records)
         .all(|(a, b)| a.object_hash == b.hash);
     if !direct {
-        let (committed_plain, live_plain) =
-            crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
+        let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
+        let (committed_plain, live_plain) = if let Some(limit) = hydration_limit {
+            let mut reports = dictionary
+                .hydrate_batch_readonly_with_limits(
+                    &[log, live],
+                    limit,
+                    Some(crate::domain::secret_filter::ReadonlyDictionaryLimits::STATUS),
+                )?
+                .into_iter();
+            let committed = reports
+                .next()
+                .context("missing committed hydration result")??;
+            let live = reports
+                .next()
+                .context("missing native hydration result")??;
+            (committed, live)
+        } else {
+            dictionary
                 .hydrate_pair_readonly(log, live)
-                .context("the existing repository secret mappings cannot be read")?;
+                .context("the existing repository secret mappings cannot be read")?
+        };
         ensure!(
             committed_plain.unresolved == 0 && live_plain.unresolved == 0,
             "the repository secret mappings needed to verify the settled prefix are unavailable"
@@ -579,6 +694,57 @@ mod tests {
     }
 
     #[test]
+    fn record_budget_is_admitted_before_json_parsing() {
+        use crate::adapter::native_snapshot::Unavailable;
+        let prefix = "{}\n{}\n{}\n";
+        assert_eq!(
+            records_with_limit(&format!("{prefix}\n  \n"), &claim(), 3)
+                .unwrap()
+                .records
+                .len(),
+            3
+        );
+        for next in [
+            "malformed\n",
+            "[]\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"foreign\"}}\n",
+            "{\"type\":",
+        ] {
+            let error = records_with_limit(&format!("{prefix}{next}"), &claim(), 3).unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<Unavailable>(),
+                    Some(Unavailable::BudgetExceeded)
+                ),
+                "content beyond the admitted record boundary was inspected: {error:#}"
+            );
+        }
+        let error = records_with_limit("malformed\n", &claim(), 0).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<Unavailable>(),
+            Some(Unavailable::BudgetExceeded)
+        ));
+        assert!(
+            records_with_limit("malformed\n", &claim(), 1)
+                .unwrap_err()
+                .to_string()
+                .contains("malformed record")
+        );
+        assert!(
+            records_with_limit(&format!("{prefix}{{\"type\":"), &claim(), 4)
+                .unwrap()
+                .incomplete_tail
+        );
+        assert_eq!(
+            records(&format!("{prefix}{{}}\n"), &claim())
+                .unwrap()
+                .records
+                .len(),
+            4
+        );
+    }
+
+    #[test]
     fn foreign_identity_is_refused_even_inside_an_otherwise_matching_prefix() {
         let first = line(json!({"type":"session_meta","payload":{"id":"native-session"}}));
         let foreign = line(json!({"type":"session_meta","payload":{"id":"someone-else"}}));
@@ -648,7 +814,7 @@ mod tests {
         let text = format!("\n{prefix}\n{}", message("assistant", "appended"));
         let records = records(&text, &claim()).unwrap();
         assert_eq!(
-            native_boundary(&repo, &claim(), &log, &text, &records).unwrap(),
+            native_boundary(&repo, &claim(), &log, &text, &records, None).unwrap(),
             prefix.len() + 1
         );
         let rewritten = text.replace("same size", "evil size");
@@ -658,6 +824,7 @@ mod tests {
             &log,
             &rewritten,
             &super::records(&rewritten, &claim()).unwrap(),
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("rewritten"), "{error:#}");
@@ -669,7 +836,8 @@ mod tests {
                 &claim(),
                 &extra_log,
                 truncated,
-                &super::records(truncated, &claim()).unwrap()
+                &super::records(truncated, &claim()).unwrap(),
+                None,
             )
             .unwrap_err()
             .to_string()

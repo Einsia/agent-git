@@ -235,7 +235,7 @@ impl Records {
     }
 }
 
-fn materialize(connection: &Connection, id: &str, limits: Limits) -> Result<Vec<u8>> {
+pub(super) fn materialize(connection: &Connection, id: &str, limits: Limits) -> Result<Vec<u8>> {
     let mut output = Records::new(limits);
     {
         let mut statement = connection.prepare("SELECT id, project_id, parent_id, directory, time_created, version FROM session WHERE id = ?1")

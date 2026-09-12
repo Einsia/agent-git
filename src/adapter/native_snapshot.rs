@@ -29,7 +29,9 @@ impl Default for Limits {
 }
 
 /// Missing or incomplete evidence never establishes an empty native history.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, thiserror::Error, serde::Serialize, serde::Deserialize,
+)]
 pub enum Unavailable {
     #[error("the explicit native session was not found")]
     NotFound,
@@ -98,14 +100,24 @@ pub(crate) fn validate_id(id: &str, limits: Limits) -> Result<()> {
 /// Lookup accepts a full native identity, never a prefix or a current-session inference.
 pub(crate) fn lookup_files(runtime: &'static str, id: &str, limits: Limits) -> Result<Source> {
     validate_id(id, limits)?;
+    if runtime == "codex"
+        && let Some(path) = super::codex_index::native_path_readonly(id, limits)?
+    {
+        return file_source(runtime, id, path);
+    }
+    lookup_files_without_database(runtime, id, limits)
+}
+
+/// Strict observation never opens a runtime database, whose read locks may create sidecars.
+pub(crate) fn lookup_files_without_database(
+    runtime: &'static str,
+    id: &str,
+    limits: Limits,
+) -> Result<Source> {
+    validate_id(id, limits)?;
     let root = match runtime {
         "claude-code" => super::claude_code::projects_dir(),
-        "codex" => {
-            if let Some(path) = super::codex_index::native_path_readonly(id, limits)? {
-                return file_source(runtime, id, path);
-            }
-            super::codex::sessions_root()
-        }
+        "codex" => super::codex::sessions_root(),
         _ => return Err(Unavailable::Unsupported),
     }
     .map_err(|_| Unavailable::Read)?;

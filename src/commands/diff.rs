@@ -19,7 +19,7 @@ use crate::domain::storage;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
-mod pending;
+pub(super) mod pending;
 
 #[derive(ClapArgs)]
 pub struct Args {

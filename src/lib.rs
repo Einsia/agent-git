@@ -156,6 +156,8 @@ pub mod infra {
     pub mod credentials;
     /// Canonical host-and-port binding shared by API and RC credentials.
     pub mod hub_authority;
+    #[cfg(feature = "cli")]
+    pub(crate) mod local_git;
     /// Where each runtime's project memory directory is.
     pub mod runtime_memory;
     /// Discovery of the runtime session the current process belongs to (no CLI output here).

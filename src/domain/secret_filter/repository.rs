@@ -9,7 +9,7 @@ use super::{
     MAX_REPOSITORY_SECRET_BYTES, Matcher, PlainRecord, RECORD_VERSION, RecordOrigin, SealedRecord,
     SelectedKeyStore, Unlocked, VaultStore, encode_padded, record_aad, seal, write_vault,
 };
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use anyhow::{Context as _, bail};
 use serde::Serialize;
 use serde_json::Value;
@@ -23,6 +23,21 @@ const TOKEN_PREFIX: &str = "{{AGIT_SECRET_V1:";
 const TOKEN_SUFFIX: &str = "}}";
 const CANONICAL_TOKEN_LEN: usize = TOKEN_PREFIX.len() + 36 + 1 + 4 + 32 + TOKEN_SUFFIX.len();
 const MAX_NEW_HEURISTIC_RECORDS: usize = 1_024;
+#[derive(Clone, Copy)]
+pub(crate) struct ReadonlyDictionaryLimits {
+    pub vault_bytes: usize,
+    pub records: usize,
+    pub pattern_bytes: usize,
+}
+
+impl ReadonlyDictionaryLimits {
+    #[cfg(any(feature = "cli", test))]
+    pub const STATUS: Self = Self {
+        vault_bytes: 256 * 1024,
+        records: 128,
+        pattern_bytes: 16 * 1024,
+    };
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectionReport {
@@ -37,7 +52,7 @@ pub struct ProtectionReport {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("read-only hydration exceeds its output byte budget")]
+#[error("read-only hydration exceeds its inspection budget")]
 pub(crate) struct HydrationBudgetExceeded;
 
 struct HydrationBudget {
@@ -218,27 +233,42 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         committed: &str,
         live: &str,
     ) -> crate::Result<(HydrationReport, HydrationReport)> {
-        self.with_readonly_hydrator(&[committed, live], None, |hydrate| {
+        self.with_readonly_hydrator(&[committed, live], None, None, |hydrate| {
             Ok((hydrate(committed)?, hydrate(live)?))
         })
     }
 
     /// Each input retains its own record boundaries and unresolved-token result.
     /// The expansion budget is shared before any replacement string is allocated.
+    /// Dictionary admission requires a separate, explicit caller policy.
     pub(crate) fn hydrate_batch_readonly_bounded(
         &self,
         inputs: &[&str],
         max_output_bytes: usize,
     ) -> crate::Result<Vec<crate::Result<HydrationReport>>> {
-        self.with_readonly_hydrator(inputs, Some(max_output_bytes), |hydrate| {
-            Ok(inputs.iter().copied().map(hydrate).collect())
-        })
+        self.hydrate_batch_readonly_with_limits(inputs, max_output_bytes, None)
+    }
+
+    /// Dictionary admission is an explicit caller policy, separate from output expansion.
+    pub(crate) fn hydrate_batch_readonly_with_limits(
+        &self,
+        inputs: &[&str],
+        max_output_bytes: usize,
+        dictionary_limits: Option<ReadonlyDictionaryLimits>,
+    ) -> crate::Result<Vec<crate::Result<HydrationReport>>> {
+        self.with_readonly_hydrator(
+            inputs,
+            Some(max_output_bytes),
+            dictionary_limits,
+            |hydrate| Ok(inputs.iter().copied().map(hydrate).collect()),
+        )
     }
 
     fn with_readonly_hydrator<T>(
         &self,
         inputs: &[&str],
         max_output_bytes: Option<usize>,
+        dictionary_limits: Option<ReadonlyDictionaryLimits>,
         consume: impl FnOnce(&mut dyn FnMut(&str) -> crate::Result<HydrationReport>) -> crate::Result<T>,
     ) -> crate::Result<T> {
         let mut budget = max_output_bytes.map(HydrationBudget::new);
@@ -249,7 +279,11 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         }
         let (unlocked, records) = match std::fs::symlink_metadata(&self.store.path) {
             Ok(_) => {
-                let unlocked = self.store.unlock_existing()?;
+                let unlocked = if let Some(limits) = dictionary_limits {
+                    self.unlock_readonly_bounded(limits)?
+                } else {
+                    self.store.unlock_existing()?
+                };
                 let records = super::decrypt_records(&unlocked.file, &unlocked.dek)?;
                 (Some(unlocked), records)
             }
@@ -273,9 +307,15 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         let matcher = if patterns.is_empty() {
             None
         } else {
+            let mut builder = AhoCorasickBuilder::new();
+            builder.match_kind(MatchKind::LeftmostLongest);
+            if dictionary_limits.is_some() {
+                builder
+                    .kind(Some(AhoCorasickKind::NoncontiguousNFA))
+                    .dense_depth(0);
+            }
             Some(
-                AhoCorasickBuilder::new()
-                    .match_kind(MatchKind::LeftmostLongest)
+                builder
                     .build(patterns.iter().map(String::as_bytes))
                     .context("cannot build the repository secret hydrator")?,
             )
@@ -306,6 +346,60 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             })
         };
         consume(&mut hydrate)
+    }
+
+    fn unlock_readonly_bounded(&self, limits: ReadonlyDictionaryLimits) -> crate::Result<Unlocked> {
+        use crate::adapter::native_snapshot::{self, Limits, Unavailable};
+        let cap = limits.vault_bytes;
+        // The pinned reader bounds growth after stat and rejects special or substituted carriers.
+        let bytes = native_snapshot::read_file_bytes(
+            &self.store.path,
+            Limits {
+                bytes: cap,
+                working_bytes: cap.checked_add(1).ok_or(HydrationBudgetExceeded)?,
+                ..Limits::default()
+            },
+        )
+        .map_err(|error| match error {
+            Unavailable::BudgetExceeded => anyhow::Error::from(HydrationBudgetExceeded),
+            other => anyhow::Error::from(other),
+        })?;
+        let file: super::VaultFile = serde_json::from_slice(&bytes)
+            .context("the repository secret dictionary is malformed")?;
+        if file.records.len() > limits.records {
+            return Err(HydrationBudgetExceeded.into());
+        }
+        // Canonical identifiers bound AAD and matcher states before decryption or key lookup.
+        anyhow::ensure!(
+            file.vault_id.len() == 36 && uuid::Uuid::parse_str(&file.vault_id).is_ok(),
+            "the repository secret dictionary has an invalid vault identity"
+        );
+        let mut encrypted = file.wrapped_dek.ciphertext.len();
+        let mut patterns = 0usize;
+        anyhow::ensure!(
+            file.wrapped_dek.nonce.len() == 16 && encrypted == 64,
+            "the repository secret dictionary has an invalid wrapped key"
+        );
+        for record in &file.records {
+            anyhow::ensure!(
+                record.id.strip_prefix("sec_").is_some_and(|id| {
+                    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }) && record.sealed.nonce.len() == 16,
+                "the repository secret dictionary has an invalid record identity or nonce"
+            );
+            encrypted = encrypted
+                .checked_add(record.sealed.ciphertext.len())
+                .ok_or(HydrationBudgetExceeded)?;
+            patterns = patterns
+                .checked_add(CANONICAL_TOKEN_LEN)
+                .ok_or(HydrationBudgetExceeded)?;
+        }
+        if encrypted > cap || patterns > limits.pattern_bytes {
+            return Err(HydrationBudgetExceeded.into());
+        }
+        // Base64 ciphertext bounds the aggregate padded plaintext; the sparse NFA cannot
+        // select a dense DFA whose states multiply the dictionary's pattern footprint.
+        self.store.unlock_file(file, true)
     }
 
     /// Project only records that came from explicit/global registration (plus
@@ -1247,7 +1341,10 @@ mod tests {
         let path = dir.path().join("dictionary/vault.json");
         let dictionary = RepositoryDictionary::new(path.clone(), MemoryKeys::default());
         let secret = format!("{}\n\"suffix", "private payload ".repeat(128));
-        let raw = format!("{}\n", serde_json::json!({"message": secret}));
+        let raw = format!(
+            "{}\n",
+            serde_json::json!({"message": secret, "context": "public ".repeat(128)})
+        );
         let protected = dictionary
             .protect_jsonl(&raw, &Matcher::for_test(&[("explicit", &secret)]))
             .unwrap();
@@ -1302,6 +1399,130 @@ mod tests {
                 .text,
             raw
         );
+    }
+
+    #[test]
+    fn bounded_readonly_vault_admission_precedes_key_lookup_and_decryption() {
+        struct NoKeyReads;
+        impl KeyStore for NoKeyReads {
+            fn get(&self, _: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
+                panic!("oversized dictionary admission must precede key access")
+            }
+            fn set(&self, _: &str, _: &[u8]) -> crate::Result<()> {
+                panic!("read-only inspection cannot create keys")
+            }
+            fn delete(&self, _: &str) -> crate::Result<()> {
+                panic!("read-only inspection cannot delete keys")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dictionary/vault.json");
+        let dictionary = RepositoryDictionary::new(path.clone(), MemoryKeys::default());
+        let raw = "{\"message\":\"stored-secret\"}\n";
+        let protected = dictionary
+            .protect_jsonl(raw, &Matcher::for_test(&[("explicit", "stored-secret")]))
+            .unwrap()
+            .text;
+        let original = std::fs::read(&path).unwrap();
+        let keys = dictionary.store.keys.0.lock().unwrap().clone();
+        let lock = path.parent().unwrap().join("vault.lock");
+        std::fs::remove_file(&lock).unwrap();
+        let denied = RepositoryDictionary::new(path.clone(), NoKeyReads);
+        let mut oversized = original.clone();
+        oversized.resize(ReadonlyDictionaryLimits::STATUS.vault_bytes + 1, b' ');
+        let mut crowded: super::super::VaultFile = serde_json::from_slice(&original).unwrap();
+        crowded.records.resize(
+            ReadonlyDictionaryLimits::STATUS.records + 1,
+            crowded.records[0].clone(),
+        );
+        let crowded = serde_json::to_vec(&crowded).unwrap();
+        assert!(crowded.len() < ReadonlyDictionaryLimits::STATUS.vault_bytes);
+        for bytes in [&oversized, &crowded] {
+            std::fs::write(&path, bytes).unwrap();
+            let error = denied
+                .hydrate_batch_readonly_with_limits(
+                    &[&protected, raw],
+                    8 * 1024 * 1024,
+                    Some(ReadonlyDictionaryLimits::STATUS),
+                )
+                .unwrap_err();
+            assert!(error.downcast_ref::<HydrationBudgetExceeded>().is_some());
+            assert_eq!(std::fs::read(&path).unwrap(), *bytes);
+            assert!(!lock.exists());
+        }
+        // Whitespace padding is valid vault syntax for the unrestricted diff reader.
+        std::fs::write(&path, &oversized).unwrap();
+        assert_eq!(
+            dictionary
+                .hydrate_pair_readonly(&protected, raw)
+                .unwrap()
+                .0
+                .text,
+            raw
+        );
+        std::fs::write(&path, &original).unwrap();
+        let reports = dictionary
+            .hydrate_batch_readonly_with_limits(
+                &[&protected, raw],
+                8 * 1024 * 1024,
+                Some(ReadonlyDictionaryLimits::STATUS),
+            )
+            .unwrap()
+            .into_iter()
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(reports[0].text, raw);
+        assert_eq!(reports[1].text, raw);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(*dictionary.store.keys.0.lock().unwrap(), keys);
+        assert!(!lock.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_readonly_dictionary_refuses_symlinks_and_pipes_without_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("vault.json");
+        std::fs::write(&target, "private sentinel").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let dictionary = RepositoryDictionary::new(path.clone(), MemoryKeys::default());
+        assert!(
+            dictionary
+                .hydrate_batch_readonly_with_limits(
+                    &["{}\n"],
+                    1024,
+                    Some(ReadonlyDictionaryLimits::STATUS),
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: name is a live NUL-terminated path inside the owned fixture.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(
+            dictionary
+                .hydrate_batch_readonly_with_limits(
+                    &["{}\n"],
+                    1024,
+                    Some(ReadonlyDictionaryLimits::STATUS),
+                )
+                .is_err()
+        );
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "private sentinel"
+        );
+        assert!(!dir.path().join("vault.lock").exists());
+        assert!(dictionary.store.keys.0.lock().unwrap().is_empty());
     }
 
     #[test]

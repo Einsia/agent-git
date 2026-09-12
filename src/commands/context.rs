@@ -57,6 +57,52 @@ pub fn from_env() -> Option<Context> {
     pick_env_context(Some(injected), from_harness_env())
 }
 
+/// Descriptive callers supply their admitted claim snapshot instead of enumerating the store.
+/// A partial snapshot cannot rule out a runtime veto, but never replaces an explicit target.
+pub(super) fn from_env_with_claims(
+    claims: &[link::Link],
+    complete: bool,
+) -> Result<Option<Context>> {
+    let Some(injected) = from_session_env() else {
+        return Ok(None);
+    };
+    let mut harness = None;
+    for (var, runtime) in crate::infra::runtime_session::ENV_SESSIONS {
+        let Ok(sid) = std::env::var(var) else {
+            continue;
+        };
+        if sid.is_empty() {
+            continue;
+        }
+        anyhow::ensure!(complete, "runtime claim inventory is incomplete");
+        let mut hits = claims
+            .iter()
+            .filter(|claim| claim.source == *runtime && claim.session_id == sid);
+        let Some(claim) = hits.next() else {
+            continue;
+        };
+        anyhow::ensure!(hits.next().is_none(), "runtime claim identity is ambiguous");
+        let (Some(agent), Some(branch)) = (&claim.agent, &claim.branch) else {
+            anyhow::bail!("runtime claim identity is incomplete");
+        };
+        let repo = claim
+            .owner
+            .as_ref()
+            .map(|owner| format!("{owner}/{agent}"))
+            .unwrap_or_else(|| agent.clone());
+        harness = Some((
+            Context {
+                repo,
+                branch: branch.clone(),
+                via: "harness session env",
+            },
+            claim.owner.is_some(),
+        ));
+        break;
+    }
+    Ok(pick_env_context(Some(injected), harness))
+}
+
 /// Runtime evidence is a veto, never a source of an implicit command target.
 fn pick_env_context(
     injected: Option<(String, String)>,

@@ -16,6 +16,11 @@ test -n "$base_version"
 short_sha="${AGIT_BUILD_SHA:0:12}"
 export AGIT_BUILD_VERSION="${base_version}-${AGIT_RELEASE_CHANNEL}+${short_sha}"
 
+if [ "$AGIT_ARTIFACT_TARGET" = aarch64-apple-darwin ]; then
+  cargo test --locked --release --lib infra::local_git::tests:: -- --test-threads=1
+  cargo test --locked --release --lib domain::repo::tests::cancelled_cat_file_reads_preserve_default_output_pipe_signals -- --exact
+fi
+
 cargo build --locked --release --bin agit
 
 binary="target/release/agit"

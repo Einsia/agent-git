@@ -115,3 +115,44 @@ Unknown or unavailable comparisons use null counts. A failed inspection uses
 `omitted` counts undisplayed branches, while top-level `repositories_omitted`
 counts repositories outside the shared display budget. Status neither fetches
 missing objects nor treats the primary checkout's HEAD as every branch's sync state.
+
+## Pending native activity in status
+
+Default status inspects bounded native evidence for displayed, uniquely claimed
+session rows. It performs no network requests and does not create or modify
+native transcripts, databases, WAL/SHM files, export caches, or temporary
+snapshots. This is a bounded observation, not an unconditional instant lookup.
+`--check-missing` separately requests unadopted-session index discovery.
+
+For OpenCode, status reads pinned database and sidecar handles under SQLite's
+cooperating read locks, validates the committed WAL frontier, and reconstructs
+an owned in-memory database. SQLite receives only that memory image. A supervised
+worker limits acquisition and query time; it returns the pending summary without
+returning native message contents. Missing, malformed, changing, unsafe, or
+over-budget evidence produces `unavailable`, never an inferred zero count.
+A hot rollback journal or an orphaned WAL index is refused without recovery.
+
+OpenCode counts use canonical native message/part identities. In-place revisions
+can change an existing turn without starting another turn; tool updates do not
+create another call merely because their state changed. Missing or unclassified
+records make semantic counts lower bounds. Compaction evidence is reported
+separately. A materialized session must still match its recorded byte prefix and
+branch-tip baseline. Status rechecks the local claim inventory and branch head
+before publishing a successful observation.
+
+The current session-detail page shares a 30-second deadline and a 256-MiB work
+allowance, inspecting at most eight displayed claims. Each supervised operation
+has at most five seconds plus a separate two-second process cleanup allowance.
+An OpenCode observation reserves 128 MiB from the page allowance, including
+failures. It accepts at most 16 MiB of combined database/WAL bytes, uses a
+32-MiB SQLite heap cap, and bounds native output to 2 MiB and 16,384 records.
+SQLite VM work, JSON structure, and secret hydration have additional limits.
+Rows outside the remaining allowance stay explicitly unavailable. These limits
+apply to session-detail inspection, not to every other status section.
+
+Both JSON envelope versions retain the same status fields:
+`pending_activity` contains the verified summary or refusal, `last_commit`
+identifies the selected local branch evidence, and `local_instance` describes
+local claim evidence. A current local claim does not prove that a native process
+is alive. Status does not choose a session identity from the first row; process
+identity still requires an explicit command target or `AGIT_SESSION`.
