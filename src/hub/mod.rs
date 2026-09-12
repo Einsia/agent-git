@@ -137,6 +137,14 @@ pub struct PublicationFindings {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SecretFindingLocation {
+    pub rule: String,
+    pub file: String,
+    pub line: usize,
+    pub redacted: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PublicationSnapshot {
     pub refs_digest: String,
     pub ruleset_digest: String,
@@ -149,6 +157,8 @@ pub struct PreparePublicResponse {
     pub confirmation_phrase: String,
     pub snapshot: PublicationSnapshot,
     pub findings: PublicationFindings,
+    #[serde(default)]
+    pub finding_locations: Vec<SecretFindingLocation>,
     pub warning: String,
 }
 

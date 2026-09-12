@@ -386,6 +386,22 @@ fn set_visibility(repo: &str, v: &str) -> CmdResult {
     }
 }
 
+fn finding_display(value: &str) -> String {
+    value
+        .chars()
+        .take(512)
+        .map(|character| {
+            if character.is_control()
+                || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// `expected_agent_id` is carried the whole way: the scan and the publication that follows must
 /// land on the **same** immutable identity. A server-side scan and a human confirmation sit in
 /// between, and `owner/name` can be deleted and rebuilt under the same name in that window; a
@@ -425,6 +441,15 @@ fn set_public_visibility(
         ));
         for rule in &prepared.findings.rules {
             println!("  {}: {}", rule.id, rule.count);
+        }
+        for finding in prepared.finding_locations.iter().take(10) {
+            println!(
+                "  {} line {} [{}] {}",
+                finding_display(&finding.file),
+                finding.line,
+                finding_display(&finding.rule),
+                finding_display(&finding.redacted)
+            );
         }
         ui::hint(
             "findings are warnings for this owner-confirmed transition; incomplete scans still cannot be overridden",
@@ -743,6 +768,31 @@ fn path(repo: Option<String>) -> CmdResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finding_locations_cannot_inject_terminal_controls_or_unbounded_text() {
+        assert_eq!(
+            finding_display("file\n\u{1b}[31m\u{202e}txt"),
+            "file  [31m txt"
+        );
+        assert_eq!(finding_display(&"界".repeat(600)).chars().count(), 512);
+    }
+
+    #[test]
+    fn publication_location_details_are_optional_for_older_servers() {
+        let response = serde_json::json!({
+            "intent_id": "intent", "expires_at": "2099-01-01", "confirmation_phrase": "alice/notes",
+            "snapshot": {"refs_digest": "refs", "ruleset_digest": "rules"},
+            "findings": {"suspected_secrets": 0, "complete": true}, "warning": "Public history"
+        });
+        let parsed: crate::hub::PreparePublicResponse =
+            serde_json::from_value(response.clone()).unwrap();
+        assert!(parsed.finding_locations.is_empty());
+        let mut located = response;
+        located["finding_locations"] = serde_json::json!([{"rule": "example-rule", "file": "session.jsonl", "line": 7, "redacted": "redacted"}]);
+        let parsed: crate::hub::PreparePublicResponse = serde_json::from_value(located).unwrap();
+        assert_eq!(parsed.finding_locations[0].line, 7);
+    }
+
     use super::*;
 
     #[test]

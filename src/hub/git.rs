@@ -82,9 +82,16 @@ fn transport_env(
     token: Option<&str>,
     expected_agent_id: Option<&str>,
     urls: &[String],
+    accept_secret_findings: bool,
 ) -> Vec<(String, OsString)> {
     let inherited = std::env::var_os("GIT_CONFIG_PARAMETERS");
-    transport_env_after(inherited.as_deref(), token, expected_agent_id, urls)
+    transport_env_after(
+        inherited.as_deref(),
+        token,
+        expected_agent_id,
+        urls,
+        accept_secret_findings,
+    )
 }
 
 fn quote_git_parameter(value: &str) -> String {
@@ -108,6 +115,7 @@ fn transport_env_after(
     token: Option<&str>,
     expected_agent_id: Option<&str>,
     urls: &[String],
+    accept_secret_findings: bool,
 ) -> Vec<(String, OsString)> {
     let mut settings = vec![("http.extraHeader".to_string(), String::new())];
     for url in urls {
@@ -118,12 +126,15 @@ fn transport_env_after(
         }
         if let Some(expected_agent_id) = expected_agent_id {
             settings.push((
-                key,
+                key.clone(),
                 format!(
                     "{}: {expected_agent_id}",
                     super::identity::EXPECTED_AGENT_ID_HEADER
                 ),
             ));
+        }
+        if accept_secret_findings {
+            settings.push((key, "X-AgentGit-Accept-Secret-Findings: true".into()));
         }
         settings.push((format!("http.{url}.followRedirects"), "false".into()));
     }
@@ -144,6 +155,7 @@ struct TransportIdentity {
     client: Option<super::Client>,
     urls: Vec<String>,
     agent_id: Option<String>,
+    accept_secret_findings: bool,
 }
 
 impl TransportIdentity {
@@ -213,6 +225,7 @@ impl TransportIdentity {
             client,
             urls,
             agent_id: agent_id.map(str::to_string),
+            accept_secret_findings: false,
         })
     }
 
@@ -235,6 +248,7 @@ impl TransportIdentity {
             self.token()?.as_deref(),
             self.agent_id.as_deref(),
             &self.urls,
+            self.accept_secret_findings,
         ))
     }
 }
@@ -335,6 +349,23 @@ pub fn run_for_remote(
 ) -> Result<Outcome> {
     super::identity::verify_transport_target(repo, identity)?;
     run_for_identity(Some(repo.root()), args, identity)
+}
+
+/// Explicit acceptance belongs only to this push and its validated immutable destination.
+pub fn push_for_remote(
+    repo: &Repo,
+    args: &[&str],
+    identity: &super::identity::RemoteIdentity,
+    accept_secret_findings: bool,
+) -> Result<Outcome> {
+    anyhow::ensure!(
+        args.first() == Some(&"push"),
+        "secret acceptance requires a Git push"
+    );
+    super::identity::verify_transport_target(repo, identity)?;
+    let mut transport = TransportIdentity::new(Some(repo.root()), args, identity)?;
+    transport.accept_secret_findings = accept_secret_findings;
+    run_transport(Some(repo.root()), args, transport)
 }
 
 fn run_for_identity(
@@ -849,6 +880,7 @@ mod tests {
             Some("synthetic-token"),
             Some("00000000-0000-0000-0000-000000000001"),
             &["https://hub.example.test/alice/notes.git".into()],
+            false,
         );
         assert_eq!(environment.len(), 1);
         assert_eq!(environment[0].0, "GIT_CONFIG_PARAMETERS");
@@ -984,6 +1016,7 @@ mod tests {
             Some("s3cret"),
             Some("00000000-0000-0000-0000-000000000001"),
             &["https://hub.example.test/alice/notes.git".into()],
+            false,
         );
         assert!(
             e.iter().all(|(k, _)| k.starts_with("GIT_CONFIG_")),
@@ -2047,6 +2080,69 @@ mod git_credential_lifecycle_tests {
     }
 
     #[test]
+    fn secret_acceptance_is_explicit_and_does_not_persist_to_later_requests() {
+        let home = IsolatedHome::new();
+        let hub = FakeHub::new(|_| Reply {
+            status: 400,
+            content_type: "text/plain",
+            headers: Vec::new(),
+            body: b"synthetic transport response".to_vec(),
+        });
+        let repo = pinned_repo(&home, &hub.base);
+        repo.git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "transport fixture",
+        ])
+        .unwrap();
+        let url = format!("{}/alice/example.git", hub.base);
+        repo.git(&[
+            "config",
+            "--local",
+            &format!("http.{url}.extraHeader"),
+            "X-AgentGit-Accept-Secret-Findings: true",
+        ])
+        .unwrap();
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        for accepted in [false, true, false] {
+            let result = super::push_for_remote(
+                &repo,
+                &["push", "origin", "HEAD:main"],
+                &identity,
+                accepted,
+            )
+            .unwrap();
+            assert!(!result.ok());
+        }
+        assert!(super::push_for_remote(&repo, &["fetch", "origin"], &identity, true).is_err());
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 3);
+        for (request, accepted) in requests.iter().zip([false, true, false]) {
+            assert_eq!(
+                request.header("X-AgentGit-Accept-Secret-Findings"),
+                accepted.then_some("true")
+            );
+            assert_eq!(
+                request.path,
+                "/alice/example.git/info/refs?service=git-receive-pack"
+            );
+            assert_eq!(
+                request.header("Authorization"),
+                Some("Bearer fake-alice-access")
+            );
+            assert_eq!(
+                request.header("X-AgentGit-Expected-Agent-Id"),
+                Some(AGENT_ID)
+            );
+        }
+    }
+
+    #[test]
     fn repository_scoped_headers_override_inherited_headers_without_duplicates() {
         let home = IsolatedHome::new();
         let hub = FakeHub::new(|_| advertisement());
@@ -2150,6 +2246,7 @@ mod git_credential_lifecycle_tests {
                 Some(token),
                 Some(AGENT_ID),
                 &[url.into()],
+                false,
             ))
             .output()
             .unwrap()
@@ -2214,6 +2311,7 @@ mod git_credential_lifecycle_tests {
             Some("synthetic"),
             Some(AGENT_ID),
             &[url.into()],
+            false,
         );
         assert!(
             environment[0]

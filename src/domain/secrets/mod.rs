@@ -6,21 +6,13 @@
 //! `export TOKEN=...` and an API key pasted into the conversation are all in it. `push` is the
 //! moment **content first leaves this machine**, so the gate sits here.
 //!
-//! The client-side gate can be bypassed (edit the code, or run git push directly), so whatever
-//! the server truly guarantees the server has to scan and refuse for itself. But the sentence the
-//! server guarantees is **narrow**:
+//! The client warns before content leaves the machine. Public pushes and private-to-public
+//! transitions also receive a strict server scan. An authenticated caller can explicitly
+//! accept credential findings with the publication workflow; incomplete server scans still
+//! prevent publication. Private pushes remain subject to the local check.
 //!
-//! > the hub is not a distribution channel for leaked credentials
-//!
-//! not "the hub keeps your secrets for you". So it scans only at the moment content becomes
-//! readable by a third party — a push to a public agent, and a private-to-public transition — and
-//! not a push to a private agent. That is your own storage, nothing is distributed, the server
-//! has no standing there, and it must not wedge your own work with a false positive.
-//!
-//! The client-side gate is therefore worth more than "learn early that the server will refuse":
-//! **a private push has only this one**. It cannot stop you (`AGIT_ALLOW_SECRETS=1` is yours),
-//! but it is the only thing that warns you before a secret enters history. Once in, it does not
-//! go away — it blocks you the day you want to make this agent public.
+//! `AGIT_ALLOW_SECRETS` affects local checking only. The push command's `--allow-secrets` option
+//! also communicates explicit acceptance to a supporting server for that operation.
 //!
 //! Not at `agit commit`: a commit is a purely local action, a secret staying on this machine is
 //! not a leak, and a commit that refuses to record a version because of a secret only teaches

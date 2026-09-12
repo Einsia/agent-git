@@ -124,6 +124,11 @@ pub struct Args {
     #[arg(long)]
     pub public: bool,
 
+    /// Explicitly accept credential findings for this push, including its version tags.
+    /// Incomplete server scans and repository authorization checks still apply.
+    #[arg(long)]
+    pub allow_secrets: bool,
+
     /// Run every local check (secret scan included) and print what would go up. Sends nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -341,7 +346,9 @@ pub fn run(mut args: Args) -> CmdResult {
     // Whether the destination narrowed the scan surface. Only a narrowed pass has to be redone
     // after the destination changes.
     let narrowed = dest.narrows();
-    if let Gate::Blocked(code) = secret_gate(&repo, &secrets::ScanPlan::to(dest))? {
+    if let Gate::Blocked(code) =
+        secret_gate(&repo, &secrets::ScanPlan::to(dest), args.allow_secrets)?
+    {
         return Ok(code);
     }
 
@@ -455,7 +462,9 @@ pub fn run(mut args: Args) -> CmdResult {
                 "origin now points somewhere else"
             }
         ));
-        if let Gate::Blocked(code) = secret_gate(&repo, &secrets::ScanPlan::full())? {
+        if let Gate::Blocked(code) =
+            secret_gate(&repo, &secrets::ScanPlan::full(), args.allow_secrets)?
+        {
             return Ok(code);
         }
     }
@@ -468,7 +477,13 @@ pub fn run(mut args: Args) -> CmdResult {
     git_args.push("origin");
     let refs = refs_to_push(&branches, repo.has_ref("refs/heads/main"));
     git_args.extend(refs.iter().map(String::as_str));
-    let out = crate::hub::git::run_for_remote(&repo, &git_args, &remote_identity)?;
+    if args.allow_secrets {
+        ui::warning(
+            "--allow-secrets explicitly accepts credential findings for this push and its version tags; public history can be copied by anyone.",
+        );
+    }
+    let out =
+        crate::hub::git::push_for_remote(&repo, &git_args, &remote_identity, args.allow_secrets)?;
     if !out.ok() {
         ui::error("pushing the branch failed.");
         for line in diagnose(&out, &owner, &name) {
@@ -491,7 +506,7 @@ pub fn run(mut args: Args) -> CmdResult {
     // idempotent operation.
     let tags = tags_to_push(&repo, &refs);
     let missing_tags = tags_missing_from_remote(&repo, &tags, &advertised_tags);
-    if let Err(out) = push_tags(&repo, &missing_tags, &remote_identity) {
+    if let Err(out) = push_tags(&repo, &missing_tags, &remote_identity, args.allow_secrets) {
         ui::warning("branches pushed, but version tags didn’t go up.");
         for line in diagnose(&out, &owner, &name) {
             ui::hint(&line);
@@ -739,11 +754,30 @@ fn ask_visibility(agent: &str) -> crate::Result<Option<bool>> {
 fn diagnose(out: &crate::hub::git::Outcome, owner: &str, name: &str) -> Vec<String> {
     let err = &out.stderr;
 
+    if err.contains("HTTP 422 secrets_rejected:") {
+        return vec![
+            "the server found credentials; review the rule, file and line locations above".into(),
+            format!("remove unintended credentials, or explicitly accept them: agit push {owner}/{name}@<branch> --allow-secrets"),
+            "use the same branch or --all selection as the rejected push; acceptance applies to its version tags too".into(),
+        ];
+    }
+    if err.contains("HTTP 422 secret_scan_incomplete:") {
+        return vec![
+            "the server could not complete the scan; --allow-secrets cannot accept unread content"
+                .into(),
+            "follow the scan budget or object-read guidance above, then retry".into(),
+        ];
+    }
+    if err.contains("HTTP 422 provenance_rejected:") {
+        return vec!["the server rejected session provenance; credential acceptance cannot override this check".into(),
+            "inspect the provenance error above and repair the affected session before retrying".into()];
+    }
+
     match out.http_status() {
         // Content rejection includes secret scanning, provenance, and branch identity changes.
         Some(422) => vec![
             "the server rejected the content (HTTP 422: secret scan or provenance check)".into(),
-            "the server-side gate has no bypass — what it stopped would be irreversible inside shared history".into(),
+            "this server did not provide a specific rejection category; update the server to receive finding locations and explicit credential acceptance".into(),
             "ask the hub admin to check the agent.push.rejected audit entries for what matched".into(),
         ],
         // 413 = over quota. git cannot reach the "used this much, the cap is this" line in the
@@ -1259,12 +1293,13 @@ fn push_tags(
     repo: &Repo,
     tags: &[String],
     identity: &RemoteIdentity,
+    allow_secrets: bool,
 ) -> std::result::Result<(), crate::hub::git::Outcome> {
     for chunk in tags.chunks(100) {
         let specs: Vec<String> = chunk.iter().map(|t| format!("refs/tags/{t}")).collect();
         let mut args: Vec<&str> = vec!["push", "origin"];
         args.extend(specs.iter().map(String::as_str));
-        match crate::hub::git::run_for_remote(repo, &args, identity) {
+        match crate::hub::git::push_for_remote(repo, &args, identity, allow_secrets) {
             Ok(out) if out.ok() => {}
             Ok(out) => return Err(out),
             Err(e) => {
@@ -1336,7 +1371,7 @@ enum Gate {
 /// budget, a single object over the line). A verdict given off an empty hit list is fail open: a
 /// gate allowing the input it could not reach, and saying nothing. The server refuses an
 /// over-the-line object rather than skipping it, so the two sides agree.
-fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan) -> crate::Result<Gate> {
+fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan, allow_secrets: bool) -> crate::Result<Gate> {
     let sp = ui::spinner("scanning for secrets…");
     let scan = secrets::scan_agent_repo(repo, plan);
     sp.finish_and_clear();
@@ -1368,6 +1403,11 @@ fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan) -> crate::Result<Gate> {
         super::report_unscanned(&unscanned);
     }
 
+    if allow_secrets && unscanned.is_empty() {
+        ui::warning("--allow-secrets is set — accepting the credential findings shown above.");
+        return Ok(Gate::Pass);
+    }
+
     if config::allow_secrets() {
         // An allow must be visible. A silent bypass is the same as no gate.
         if !hits.is_empty() {
@@ -1381,16 +1421,8 @@ fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan) -> crate::Result<Gate> {
                 "AGIT_ALLOW_SECRETS is set — proceeding past content that was not scanned.",
             );
         }
-        // The wording has to hold **on both sides of a hub deployment**.
-        //
-        // "Scan only at exposure" is what a newer hub does, and this CLI can ship ahead of it —
-        // until then the server still scans every push, and "pushing private will not be
-        // refused" is false. So the first half says "may still refuse" (true in both worlds),
-        // and the second says the thing that holds either way and that the user actually needs
-        // to know: a secret that entered history does not go away, and it blocks you on the day
-        // you make this public.
         ui::warning(
-            "note: the server may still refuse this, and it will block making this agent public later.",
+            "AGIT_ALLOW_SECRETS affects only the local check; the server may still refuse this push. Use --allow-secrets to explicitly accept server credential findings.",
         );
         return Ok(Gate::Pass);
     }
@@ -1414,7 +1446,9 @@ fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan) -> crate::Result<Gate> {
             ));
         }
     }
-    ui::hint("· to proceed anyway: AGIT_ALLOW_SECRETS=1 agit push");
+    if unscanned.is_empty() {
+        ui::hint("to accept these findings explicitly, repeat the push with --allow-secrets");
+    }
     // The remedies that branch by carrier go through the **shared** implementation
     // (`agit scan --secrets` calls the same one). An unconditional promise of "annotate that
     // line with agit:allow-secret" is wrong for a hit inside a blob / commit / tag object: that
@@ -1515,6 +1549,7 @@ mod tests {
             all: false,
             private: false,
             public: false,
+            allow_secrets: false,
             dry_run: false,
         };
         let (_d, repo) = {
@@ -1797,6 +1832,26 @@ mod tests {
         // upstream configured — either it was promoted, or the user wired the remote up
         // themselves, and in neither case does push create another one for them.
         assert!(!is_read_only("me", "alice", Some("http://h/bob/photo.git")));
+    }
+
+    #[test]
+    fn credential_acceptance_is_offered_only_for_server_findings() {
+        for (kind, offers_acceptance) in [
+            ("secrets_rejected", true),
+            ("secret_scan_incomplete", false),
+            ("provenance_rejected", false),
+        ] {
+            let out = crate::hub::git::Outcome {
+                code: 128,
+                stderr: format!("fatal: remote error: HTTP 422 {kind}: synthetic finding"),
+            };
+            let advice = diagnose(&out, "alice", "notes").join("\n");
+            assert_eq!(
+                advice.contains("agit push alice/notes@<branch> --allow-secrets"),
+                offers_acceptance
+            );
+            assert_eq!(branch_failure_code(&out), ExitCode::Policy);
+        }
     }
 
     /// Every 422 hint says "the server refused it" first, or the user goes looking locally.
