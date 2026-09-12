@@ -6,6 +6,48 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.1.2] - 2026-09-12
+
+### Added
+
+- **Session files with explicit staging.** Use `agit file` to add, inspect, commit,
+  retrieve and link deliverables in a selected branch without changing its conversation
+  VIEW. File staging remains separate from automatic turn settlement.
+- **Windows x64 distribution.** Install the native Windows CLI through npm or
+  download the executable from the GitHub Release, including remote-control support.
+- **More remote-control workflows.** Connect existing Codex conversations through
+  the native inbox, use OpenCode remote control and transcript snapshots, and navigate
+  between connected machines and their workspaces.
+- **Richer history inspection.** Inspect saved VIEWs and LOGs, raw native JSONL and
+  archived evidence; compare semantic prefixes and unsettled native turns with `diff`.
+- **Scoped search and integrity checks.** Search authenticated repository scopes,
+  inspect incomplete-result diagnostics, and run bounded, read-only `doctor` checks.
+- **Safer import and review.** Choose native-session lineage explicitly, preview and
+  name sessions interactively, and review committed VIEWs with guarded scan remedies.
+
+### Changed
+
+- **Explicit session targeting.** Use `owner/repo@branch` or `AGIT_SESSION` for
+  automation. Interactive commands offer target selection; `agit switch` and implicit
+  workspace targeting are removed. Update scripts that depended on those defaults.
+- **Structured agent output.** JSON output includes typed recovery actions, while
+  human output identifies verified targets and quiet mode suppresses progress output.
+- Merge-agent exploration remains available as archived evidence and visible session
+  history without adding that exploration to the merged VIEW.
+
+### Fixed
+
+- Preserve Codex fork history, portable provider metadata, mixed-runtime sharing and
+  paired tool evidence during capture, resume and export.
+- Preserve reference, network, authentication, policy and cancellation error categories;
+  bind credentials to the selected Hub and validate setup before applying changes.
+- Keep failed remote API turns responsive, preserve shared-message authors and native
+  execution feedback, and support HTTP CONNECT proxies between `agitd` and the Hub.
+- Validate imports before adoption, prevent duplicate runtime claims, guard resume
+  against tracking divergence, and preserve private-publication checks.
+- Avoid repository-wide migration scans on clean stores and skip tags already present
+  on a verified remote during push.
+
 ## [0.1.1] - 2026-09-04
 
 ### Added
@@ -65,5 +107,6 @@ First public release.
   per-platform packages for Linux and macOS on x64 and arm64, and GitHub Release
   artifacts with `SHA256SUMS`.
 
+[0.1.2]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.1.2
 [0.1.1]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.1.1
 [0.1.0]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.1.0
