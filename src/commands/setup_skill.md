@@ -130,10 +130,19 @@ be collected automatically; other files require an explicit file commit.
 Present the commit-and-path permalink returned by `agit file link`. Publish the
 branch with `agit push` when the user has asked to share it or the workflow already
 authorizes publication; a local file commit alone does not upload anything.
-Keep large media local until the destination supports LFS. Do not commit an LFS
-pointer without uploading its object to a compatible server. For slides, include
-a PDF when browser preview is needed. HTML preview is a static document; use
-inline styles and embedded images, without scripts or external assets.
+Use `agit file add --lfs /absolute/path/video.mp4` for videos and large binary
+deliverables. This stages standard Git LFS pointers and their attributes; finish
+with the same explicit file commit. `agit push` uploads selected history's objects
+before publishing its Git refs and refuses missing or unsafe payloads. Git LFS
+must be installed. Hub PPTX preview keeps the editable original; include a PDF
+when exact presentation fidelity matters. HTML preview is a static document;
+use inline styles and embedded images, without scripts or external assets.
+
+After cloning or switching a branch, an LFS worktree entry can still contain its
+pointer. Use `agit file get artifacts/video.mp4 --output /absolute/path/video.mp4`
+to extract verified payload bytes. A cold object is downloaded through that
+repository's authenticated Hub connection. Automatic checkout never follows a
+repository-supplied LFS endpoint.
 
 ## Shared files on the file line
 

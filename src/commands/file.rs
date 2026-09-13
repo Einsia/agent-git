@@ -29,6 +29,9 @@ pub enum Cmd {
         /// Destination relative to the file worktree (requires one source).
         #[arg(long, value_name = "path")]
         to: Option<String>,
+        /// Store payloads with standard Git LFS and stage their tracking attributes.
+        #[arg(long)]
+        lfs: bool,
     },
     /// Show staged and unstaged file changes.
     Status,
@@ -182,7 +185,12 @@ fn plan_copy(
     Ok(())
 }
 
-fn add(repo: &Repo, sources: &[PathBuf], destination: Option<&str>) -> crate::Result<()> {
+fn add(
+    repo: &Repo,
+    sources: &[PathBuf],
+    destination: Option<&str>,
+    lfs: bool,
+) -> crate::Result<()> {
     anyhow::ensure!(
         destination.is_none() || sources.len() == 1,
         "--to requires exactly one source"
@@ -262,6 +270,13 @@ fn add(repo: &Repo, sources: &[PathBuf], destination: Option<&str>) -> crate::Re
             "multiple sources target {dest}; use separate --to paths"
         );
         stage.insert(dest.clone());
+    }
+    if lfs && !stage.is_empty() {
+        crate::domain::lfs::local::prepare_tracking(
+            repo,
+            &stage.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        stage.insert(".gitattributes".into());
     }
     for (source, dest) in &files {
         let target = root.join(dest);
@@ -406,7 +421,7 @@ pub fn run(args: Args) -> CmdResult {
     }
     match args.cmd {
         Cmd::Cwd => println!("{}", repo.root().display()),
-        Cmd::Add { paths, to } => add(repo, &paths, to.as_deref())?,
+        Cmd::Add { paths, to, lfs } => add(repo, &paths, to.as_deref(), lfs)?,
         Cmd::Status => {
             let output = repo.git(&["status", "--short", "--untracked-files=all"])?;
             if !output.is_empty() {
@@ -461,7 +476,21 @@ pub fn run(args: Args) -> CmdResult {
                 std::env::current_dir()?.canonicalize()?.join(output)
             };
             safe_parents(&output)?;
-            std::fs::write(&output, bytes)?;
+            if let Some(pointer) = crate::domain::lfs::Pointer::parse(&bytes)? {
+                if crate::domain::lfs::local::object_path(repo, &pointer)?.try_exists()? {
+                    crate::domain::lfs::local::extract_cached(repo, &pointer, &output)?;
+                } else {
+                    let (owner, name) = super::parse_slug(&target.slug)?;
+                    let hub = permalink_hub(repo, &owner, &name)?;
+                    let client = crate::hub::Client::for_stored_hub(&hub);
+                    let identity = crate::hub::identity::resolve_transport_target(
+                        repo, &client, &owner, &name,
+                    )?;
+                    crate::hub::git::download_lfs_file(repo, &path, &bytes, &output, &identity)?;
+                }
+            } else {
+                std::fs::write(&output, bytes)?;
+            }
             println!("{}", output.display());
         }
         Cmd::Rm { paths, cached } => {
@@ -485,6 +514,30 @@ pub fn run(args: Args) -> CmdResult {
             ordinary(&destination)?;
             safe_parents(&repo.root().join(&source))?;
             safe_parents(&repo.root().join(&destination))?;
+            let entries =
+                repo.git_bytes_result(&["--literal-pathspecs", "ls-files", "-z", "--", &source])?;
+            let destination_root = if repo.root().join(&destination).is_dir() {
+                format!(
+                    "{destination}/{}",
+                    source.rsplit('/').next().unwrap_or(&source)
+                )
+            } else {
+                destination.clone()
+            };
+            let mut tracked = Vec::new();
+            for entry in entries
+                .split(|byte| *byte == 0)
+                .filter(|entry| !entry.is_empty())
+            {
+                let entry = std::str::from_utf8(entry)?;
+                if crate::domain::lfs::local::is_tracked(repo, entry)? {
+                    tracked.push(format!("{destination_root}{}", &entry[source.len()..]));
+                }
+            }
+            if !tracked.is_empty() {
+                crate::domain::lfs::local::prepare_tracking(repo, &tracked)?;
+                repo.git(&["add", "--", ".gitattributes"])?;
+            }
             repo.git(&["--literal-pathspecs", "mv", "--", &source, &destination])?;
         }
         Cmd::Restore { paths, .. } => {

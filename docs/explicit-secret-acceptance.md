@@ -13,7 +13,9 @@ agit push alice/notes@experiment --allow-secrets
 ```
 
 Keep the same target and branch selection as the rejected command. The option
-covers the branch requests and version tags sent by this command. It is not
+covers the branch requests and version tags sent by this command, including
+credential findings in verified LFS payloads. Missing, corrupt or incompletely
+scanned LFS payloads remain errors. It is not
 saved in repository configuration and does not apply to later pushes. The CLI
 prints a warning; it never retries a rejection with acceptance automatically.
 `--dry-run` still sends no writes. `AGIT_ALLOW_SECRETS=1` affects only the local

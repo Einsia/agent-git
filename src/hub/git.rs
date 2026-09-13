@@ -74,6 +74,7 @@ pub(crate) fn looks_like_auth_failure(stderr: &str) -> bool {
 fn transport_command() -> Command {
     let mut command = Command::new("git");
     command.env("LC_ALL", "C").env("LANGUAGE", "C");
+    command.env("GIT_LFS_SKIP_SMUDGE", "1");
     command
 }
 
@@ -155,6 +156,7 @@ struct TransportIdentity {
     client: Option<super::Client>,
     urls: Vec<String>,
     agent_id: Option<String>,
+    lfs: Option<(String, String)>,
     accept_secret_findings: bool,
 }
 
@@ -220,11 +222,24 @@ impl TransportIdentity {
             urls.is_empty() || !unauthenticated,
             "a Git remote cannot mix authenticated Hub URLs with other transports"
         );
+        let lfs = if args[..command_index].contains(&"lfs") {
+            anyhow::ensure!(
+                matches!(command, "push" | "fetch") && urls.len() == 1 && !unauthenticated,
+                "LFS requires one validated HTTP Hub remote"
+            );
+            Some((
+                requested.to_owned(),
+                format!("{}/info/lfs", urls[0].trim_end_matches('/')),
+            ))
+        } else {
+            None
+        };
         let client = (!urls.is_empty()).then(|| super::Client::for_stored_hub(hub));
         Ok(Self {
             client,
             urls,
             agent_id: agent_id.map(str::to_string),
+            lfs,
             accept_secret_findings: false,
         })
     }
@@ -244,13 +259,226 @@ impl TransportIdentity {
     }
 
     fn environment(&self) -> Result<Vec<(String, OsString)>> {
-        Ok(transport_env(
+        let mut environment = transport_env(
             self.token()?.as_deref(),
             self.agent_id.as_deref(),
             &self.urls,
             self.accept_secret_findings,
-        ))
+        );
+        if let Some((remote, endpoint)) = &self.lfs {
+            constrain_lfs_environment(&mut environment, remote, endpoint);
+        }
+        Ok(environment)
     }
+}
+
+/// Tracked LFS configuration cannot redirect a transport selected by repository identity.
+fn constrain_lfs_environment(environment: &mut [(String, OsString)], remote: &str, endpoint: &str) {
+    let parameters = &mut environment
+        .iter_mut()
+        .find(|(key, _)| key == "GIT_CONFIG_PARAMETERS")
+        .expect("transport parameters are present")
+        .1;
+    for (key, value) in [
+        ("lfs.url".to_owned(), endpoint),
+        ("lfs.pushurl".to_owned(), endpoint),
+        (format!("remote.{remote}.lfsurl"), endpoint),
+        (format!("remote.{remote}.lfspushurl"), endpoint),
+        ("lfs.basictransfersonly".to_owned(), "true"),
+        ("lfs.standalonetransferagent".to_owned(), ""),
+        ("lfs.remote.autodetect".to_owned(), "false"),
+        ("lfs.remote.searchall".to_owned(), "false"),
+        ("lfs.transfer.enablehrefrewrite".to_owned(), "false"),
+        ("lfs.allowincompletepush".to_owned(), "false"),
+        ("lfs.skipdownloaderrors".to_owned(), "false"),
+        ("lfs.fetchrecentalways".to_owned(), "false"),
+        ("lfs.fetchinclude".to_owned(), ""),
+        ("lfs.fetchexclude".to_owned(), ""),
+    ] {
+        parameters.push(" ");
+        parameters.push(quote_git_parameter(&key));
+        parameters.push("=");
+        parameters.push(quote_git_parameter(value));
+    }
+}
+
+/// Large-object transfers retain the selected Hub identity and its scoped authentication.
+pub fn missing_lfs_uploads(
+    repo: &Repo,
+    pointers: &[crate::domain::lfs::Pointer],
+    identity: &super::identity::RemoteIdentity,
+) -> Result<Vec<crate::domain::lfs::Pointer>> {
+    use std::collections::HashMap;
+    if pointers.is_empty() {
+        return Ok(Vec::new());
+    }
+    super::identity::verify_transport_target(repo, identity)?;
+    let transport =
+        TransportIdentity::new(Some(repo.root()), &["lfs", "push", "origin"], identity)?;
+    let endpoint = &transport.lfs.as_ref().context("LFS endpoint is missing")?.1;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut missing = Vec::new();
+    for batch in pointers.chunks(100) {
+        let mut expected: HashMap<_, _> = batch.iter().map(|p| (p.oid.as_str(), p)).collect();
+        anyhow::ensure!(
+            expected.len() == batch.len(),
+            "duplicate LFS object identity"
+        );
+        for pointer in batch {
+            pointer.validate()?;
+        }
+        let send = || -> Result<_> {
+            let mut request = agent
+                .post(format!("{endpoint}/objects/batch"))
+                .header("Accept", "application/vnd.git-lfs+json")
+                .header("Content-Type", "application/vnd.git-lfs+json")
+                .header(
+                    super::identity::EXPECTED_AGENT_ID_HEADER,
+                    &identity.agent_id,
+                );
+            if let Some(token) = transport.token()? {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            Ok(request.send_json(serde_json::json!({
+                "operation": "upload", "transfers": ["basic"], "objects": batch,
+                "hash_algo": "sha256"
+            }))?)
+        };
+        let mut response = send()?;
+        if response.status() == 401 && transport.refresh() {
+            response = send()?;
+        }
+        anyhow::ensure!(
+            response.status().is_success(),
+            "LFS availability check failed with HTTP {}",
+            response.status()
+        );
+        let body: serde_json::Value = response
+            .body_mut()
+            .with_config()
+            .limit(1024 * 1024)
+            .read_json()?;
+        anyhow::ensure!(
+            body.get("transfer").is_none_or(|value| value == "basic")
+                && body.get("hash_algo").is_none_or(|value| value == "sha256"),
+            "unsupported LFS batch transfer"
+        );
+        let objects = body["objects"]
+            .as_array()
+            .context("LFS batch objects are missing")?;
+        for object in objects {
+            let oid = object["oid"]
+                .as_str()
+                .context("LFS batch object identity is missing")?;
+            let pointer = expected
+                .remove(oid)
+                .context("unexpected or duplicate LFS batch object")?;
+            anyhow::ensure!(
+                object["size"].as_u64() == Some(pointer.size),
+                "LFS batch object size mismatch"
+            );
+            anyhow::ensure!(
+                object.get("error").is_none(),
+                "the Hub rejected LFS object {oid}"
+            );
+            if let Some(actions) = object.get("actions") {
+                let actions = actions.as_object().context("invalid LFS batch actions")?;
+                anyhow::ensure!(
+                    actions.is_empty() || actions.contains_key("upload"),
+                    "LFS upload action is missing"
+                );
+                if actions.contains_key("upload") {
+                    missing.push(pointer.clone());
+                }
+            }
+        }
+        anyhow::ensure!(
+            expected.is_empty(),
+            "LFS batch response omitted requested objects"
+        );
+    }
+    Ok(missing)
+}
+
+/// Native transfer receives only explicit object identities selected by the caller.
+pub fn run_lfs_for_remote(
+    repo: &Repo,
+    args: &[&str],
+    identity: &super::identity::RemoteIdentity,
+) -> Result<Outcome> {
+    crate::domain::lfs::local::require_client(repo)?;
+    anyhow::ensure!(
+        matches!(args.first(), Some(&"push" | &"fetch")),
+        "unsupported LFS transport operation"
+    );
+    let mut command = vec!["lfs"];
+    command.extend_from_slice(args);
+    run_for_remote(repo, &command, identity)
+}
+
+/// A cold file read hydrates only its pointer and publishes the output after integrity verification.
+pub fn download_lfs_file(
+    repo: &Repo,
+    path: &str,
+    pointer_bytes: &[u8],
+    output: &Path,
+    identity: &super::identity::RemoteIdentity,
+) -> Result<()> {
+    let pointer = crate::domain::lfs::Pointer::parse(pointer_bytes)?
+        .context("the requested file is not an LFS pointer")?;
+    crate::domain::lfs::local::require_client(repo)?;
+    super::identity::verify_transport_target(repo, identity)?;
+    let transport =
+        TransportIdentity::new(Some(repo.root()), &["lfs", "fetch", "origin"], identity)?;
+    if transport
+        .client
+        .as_ref()
+        .is_some_and(super::Client::access_expired)
+    {
+        transport.refresh();
+    }
+    let parent = output.parent().context("the output path has no parent")?;
+    for attempt in 0..2 {
+        let temporary = tempfile::NamedTempFile::new_in(parent)?;
+        let mut child = transport_command()
+            .arg("-C")
+            .arg(repo.root())
+            .args(["lfs", "smudge", "--", path])
+            .envs(transport.environment()?)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_LFS_SKIP_SMUDGE", "0")
+            .stdin(Stdio::piped())
+            .stdout(temporary.reopen()?)
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start the LFS download")?;
+        let written = child
+            .stdin
+            .take()
+            .context("LFS input is unavailable")?
+            .write_all(pointer_bytes);
+        let result = child
+            .wait_with_output()
+            .context("failed to wait for the LFS download")?;
+        written?;
+        if !result.status.success() {
+            let error = String::from_utf8_lossy(&result.stderr);
+            if attempt == 0 && looks_like_auth_failure(&error) && transport.refresh() {
+                continue;
+            }
+            anyhow::bail!("LFS download failed: {}", error.trim());
+        }
+        pointer.verify(temporary.reopen()?)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(output).map_err(|error| error.error)?;
+        return Ok(());
+    }
+    anyhow::bail!("LFS authentication could not be renewed")
 }
 
 fn explicit_destination(repo: &Repo, requested: &str) -> Result<Vec<(String, String)>> {
@@ -873,6 +1101,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lfs_transport_overrides_redirects_and_custom_transfer_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        let url = "https://lfs.example.test/mount/alice/notes.git";
+        let endpoint = format!("{url}/info/lfs");
+        repo.set_remote(url).unwrap();
+        repo.git(&["config", "lfs.url", "https://foreign.example.test/objects"])
+            .unwrap();
+        repo.git(&[
+            "config",
+            "remote.origin.lfspushurl",
+            "https://foreign.example.test/push",
+        ])
+        .unwrap();
+        repo.git(&["config", "lfs.standalonetransferagent", "foreign"])
+            .unwrap();
+        repo.git(&["config", "lfs.allowincompletepush", "true"])
+            .unwrap();
+        let transport = TransportIdentity::for_hub(
+            Some(repo.root()),
+            &["lfs", "push", "origin", "main"],
+            "https://lfs.example.test/mount",
+            None,
+        )
+        .unwrap();
+        assert_eq!(transport.lfs, Some(("origin".into(), endpoint.clone())));
+        let mut environment = transport_env_after(None, None, None, &transport.urls, false);
+        constrain_lfs_environment(&mut environment, "origin", &endpoint);
+        for (key, expected) in [
+            ("lfs.url", endpoint.as_str()),
+            ("lfs.pushurl", endpoint.as_str()),
+            ("remote.origin.lfspushurl", endpoint.as_str()),
+            ("lfs.standalonetransferagent", ""),
+            ("lfs.basictransfersonly", "true"),
+            ("lfs.remote.searchall", "false"),
+            ("lfs.allowincompletepush", "false"),
+            ("lfs.transfer.enablehrefrewrite", "false"),
+        ] {
+            let output = Command::new("git")
+                .current_dir(repo.root())
+                .args(["config", "--get", key])
+                .envs(environment.iter().cloned())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+        }
+        repo.git(&["config", "--add", "remote.origin.pushurl", url])
+            .unwrap();
+        repo.git(&[
+            "config",
+            "--add",
+            "remote.origin.pushurl",
+            "https://foreign.example.test/notes.git",
+        ])
+        .unwrap();
+        assert!(
+            TransportIdentity::for_hub(
+                Some(repo.root()),
+                &["lfs", "push", "origin", "main"],
+                "https://lfs.example.test/mount",
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn transport_guards_follow_the_unmodified_inherited_parameters() {
         let inherited = OsStr::new("'fixture.keep'='unchanged' 'http.extraHeader'='inherited'");
         let environment = transport_env_after(
@@ -1350,6 +1646,8 @@ mod git_credential_lifecycle_tests {
                 ("NO_PROXY".into(), Some("*".into())),
                 ("no_proxy".into(), Some("*".into())),
             ]);
+            #[cfg(unix)]
+            settings.push(("AGIT_SECRETS_KEYSTORE".into(), Some("file".into())));
             settings.extend(std::env::vars_os().filter_map(|(name, _)| {
                 name.to_str()
                     .filter(|name| name.starts_with("GIT_TRACE"))
@@ -1640,6 +1938,508 @@ mod git_credential_lifecycle_tests {
             refresh_token: format!("fake-{username}-refresh"),
             refresh_expires_at: "2099-02-01T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn cold_lfs_reads_use_the_selected_hub_and_leave_existing_output_on_corruption() {
+        use sha2::{Digest, Sha256};
+        let home = IsolatedHome::new();
+        let repo = crate::domain::repo::Repo::init(&home.workspace().join("lfs-read")).unwrap();
+        if let Err(error) = crate::domain::lfs::local::require_client(&repo) {
+            assert!(
+                std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+                "{error:#}"
+            );
+            eprintln!("Git LFS integration requires a current client: {error:#}");
+            return;
+        }
+        let payload = b"a large artifact\0\xff";
+        let oid = hex::encode(Sha256::digest(payload));
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n",
+            payload.len()
+        );
+        let foreign = FakeHub::new(|_| denied());
+        for corrupt in [false, true] {
+            let expected_oid = oid.clone();
+            let hub = FakeHub::new(move |request| {
+                assert_eq!(
+                    request.header("Authorization"),
+                    Some("Bearer fake-alice-access")
+                );
+                assert_eq!(
+                    request.header("X-AgentGit-Expected-Agent-Id"),
+                    Some(AGENT_ID)
+                );
+                if request.path.ends_with("/objects/batch") {
+                    assert_eq!(request.method, "POST");
+                    let batch: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(batch["objects"][0]["oid"], expected_oid);
+                    let href = format!(
+                        "http://{}/alice/example.git/info/lfs/objects/{expected_oid}",
+                        request.header("Host").unwrap()
+                    );
+                    Reply {
+                        status: 200, content_type: "application/vnd.git-lfs+json", headers: vec![],
+                        body: serde_json::to_vec(&serde_json::json!({"transfer":"basic", "objects":[{
+                            "oid":expected_oid, "size":payload.len(), "authenticated":true,
+                            "actions":{"download":{"href":href, "header":{"X-Agit-Lfs-Grant":"synthetic-file-grant"}}}
+                        }]})).unwrap(),
+                    }
+                } else {
+                    assert_eq!(request.method, "GET");
+                    assert_eq!(
+                        request.header("X-Agit-Lfs-Grant"),
+                        Some("synthetic-file-grant")
+                    );
+                    Reply {
+                        status: 200,
+                        content_type: "application/octet-stream",
+                        headers: vec![],
+                        body: if corrupt {
+                            vec![b'x'; payload.len()]
+                        } else {
+                            payload.to_vec()
+                        },
+                    }
+                }
+            });
+            credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+            repo.set_remote(&format!("{}/alice/example.git", hub.base))
+                .unwrap();
+            repo.git(&["config", "lfs.url", &foreign.base]).unwrap();
+            repo.git(&["config", "lfs.fetchinclude", "unrequested/**"])
+                .unwrap();
+            repo.git(&["config", "lfs.fetchexclude", "*"]).unwrap();
+            repo.git(&["config", "lfs.transfer.maxretries", "1"])
+                .unwrap();
+            repo.git(&[
+                "config",
+                "lfs.storage",
+                if corrupt { "bad-cache" } else { "good-cache" },
+            ])
+            .unwrap();
+            let output = home.workspace().join("report.mp4");
+            std::fs::write(&output, b"existing output").unwrap();
+            let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+            let result = super::download_lfs_file(
+                &repo,
+                "report, [one].mp4",
+                pointer.as_bytes(),
+                &output,
+                &identity,
+            );
+            assert_eq!(result.is_err(), corrupt, "{result:?}");
+            assert_eq!(
+                std::fs::read(&output).unwrap(),
+                if corrupt {
+                    b"existing output".as_slice()
+                } else {
+                    payload.as_slice()
+                }
+            );
+            let requests = hub.finish();
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.path.ends_with("/objects/batch"))
+            );
+        }
+        assert!(foreign.finish().is_empty());
+    }
+
+    #[test]
+    fn lfs_uploads_cover_raw_selected_history_despite_a_foreign_replacement() {
+        use crate::domain::{lfs::local, repo::Repo};
+        use sha2::{Digest, Sha256};
+        let oversized_bytes = crate::domain::secrets::ScanLimits::default().max_object_bytes + 1;
+        for (payload, accept_findings, oversized) in [
+            (b"selected artifact\0\xff".to_vec(), false, false),
+            (
+                concat!("access = AKIA", "2E7YQXK4NMZ5VJ3T")
+                    .as_bytes()
+                    .to_vec(),
+                true,
+                false,
+            ),
+            (vec![b'a'; oversized_bytes as usize], true, true),
+        ] {
+            let home = IsolatedHome::new();
+            let repo = Repo::init(&home.workspace().join("lfs-push")).unwrap();
+            if let Err(error) = local::require_client(&repo) {
+                assert!(
+                    std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+                    "{error:#}"
+                );
+                eprintln!("Git LFS integration requires a current client: {error:#}");
+                return;
+            }
+            std::fs::write(repo.root().join("README.md"), b"fixture\n").unwrap();
+            repo.add_all().unwrap();
+            repo.commit("base").unwrap();
+            repo.git(&["branch", "empty"]).unwrap();
+            let oid = hex::encode(Sha256::digest(&payload));
+            std::fs::write(repo.root().join("video.mp4"), &payload).unwrap();
+            local::prepare_tracking(&repo, &["video.mp4".into()]).unwrap();
+            repo.add_all().unwrap();
+            repo.commit("selected artifact").unwrap();
+            repo.git(&["rm", "video.mp4"]).unwrap();
+            repo.commit("remove from current tip").unwrap();
+            repo.git(&["checkout", "-b", "unselected"]).unwrap();
+            std::fs::write(repo.root().join("private.mp4"), b"private artifact\0\xff").unwrap();
+            local::prepare_tracking(&repo, &["private.mp4".into()]).unwrap();
+            repo.add_all().unwrap();
+            repo.commit("unselected artifact").unwrap();
+            repo.git(&["replace", "main", "unselected"]).unwrap();
+            let selected = vec!["refs/heads/main".into()];
+            let pointers = local::reachable(&repo, &selected).unwrap();
+            assert_eq!(pointers.len(), 1);
+            assert_eq!(pointers[0].oid, oid);
+            assert!(
+                local::reachable(&repo, &["refs/heads/empty".into()])
+                    .unwrap()
+                    .is_empty()
+            );
+            let expected = oid.clone();
+            let expected_payload = payload.clone();
+            let hub = FakeHub::new(move |request| {
+                assert_eq!(request.header("X-AgentGit-Accept-Secret-Findings"), None);
+                assert_eq!(
+                    request.header("Authorization"),
+                    Some("Bearer fake-alice-access")
+                );
+                assert_eq!(
+                    request.header("X-AgentGit-Expected-Agent-Id"),
+                    Some(AGENT_ID)
+                );
+                let base = format!(
+                    "http://{}/alice/example.git/info/lfs/objects/{expected}",
+                    request.header("Host").unwrap()
+                );
+                if request.path == GIT_PATH {
+                    return advertisement();
+                }
+                if request.path.ends_with("/locks/verify") {
+                    return Reply {
+                        status: 404,
+                        content_type: "application/vnd.git-lfs+json",
+                        body: b"{\"message\":\"locking is not supported\"}".to_vec(),
+                        headers: vec![],
+                    };
+                }
+                let body = if request.path.ends_with("/objects/batch") {
+                    let batch: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(batch["operation"], "upload");
+                    assert_eq!(batch["objects"].as_array().unwrap().len(), 1);
+                    assert_eq!(batch["objects"][0]["oid"], expected);
+                    serde_json::to_vec(&serde_json::json!({"transfer":"basic", "objects":[{
+                        "oid":expected,"size":expected_payload.len(),"authenticated":true,
+                        "actions":{"upload":{"href":base},"verify":{"href":format!("{base}/verify")}}
+                    }]}))
+                    .unwrap()
+                } else if request.method == "PUT" {
+                    assert_eq!(request.body, expected_payload);
+                    vec![]
+                } else {
+                    assert!(
+                        request.path.ends_with("/verify"),
+                        "unexpected LFS request: {} {}",
+                        request.method,
+                        request.path
+                    );
+                    let verify: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(verify["oid"], expected);
+                    b"{}".to_vec()
+                };
+                Reply {
+                    status: 200,
+                    content_type: "application/vnd.git-lfs+json",
+                    body,
+                    headers: vec![],
+                }
+            });
+            credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+            repo.set_remote(&format!("{}/alice/example.git", hub.base))
+                .unwrap();
+            let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+            if accept_findings && !oversized {
+                assert!(
+                    local::upload_selected(&repo, &selected, &identity, false)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("suspected secrets")
+                );
+            }
+            let outcome = local::upload_selected(&repo, &selected, &identity, accept_findings);
+            if oversized {
+                assert!(
+                    outcome
+                        .unwrap_err()
+                        .to_string()
+                        .contains("cannot be completely scanned")
+                );
+                assert!(hub.finish().iter().all(|request| request.method != "PUT"));
+                continue;
+            }
+            outcome.unwrap();
+            let requests = hub.finish();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.method == "PUT")
+                    .count(),
+                1
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.path.ends_with("/verify"))
+            );
+        }
+    }
+
+    #[test]
+    fn cold_lfs_history_requires_local_payloads_only_when_the_destination_needs_them() {
+        use crate::domain::{lfs::local, repo::Repo};
+        let home = IsolatedHome::new();
+        let source = Repo::init(&home.workspace().join("lfs-cold-source")).unwrap();
+        if let Err(error) = local::require_client(&source) {
+            assert!(
+                std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+                "{error:#}"
+            );
+            return;
+        }
+        std::fs::write(source.root().join("video.mp4"), b"historical media\0\xff").unwrap();
+        local::prepare_tracking(&source, &["video.mp4".into()]).unwrap();
+        source.add_all().unwrap();
+        source.commit("historical artifact").unwrap();
+        source.git(&["rm", "video.mp4"]).unwrap();
+        source.commit("remove artifact from tip").unwrap();
+        let clone = home.workspace().join("lfs-cold-clone");
+        source
+            .git(&[
+                "clone",
+                source.root().to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ])
+            .unwrap();
+        let repo = Repo::at(&clone);
+        std::fs::write(repo.root().join("README.md"), b"ordinary text update\n").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("update text after cold clone").unwrap();
+        let selected = vec!["refs/heads/main".into()];
+        let pointers = local::reachable(&repo, &selected).unwrap();
+        assert_eq!(pointers.len(), 1);
+        assert!(!local::object_path(&repo, &pointers[0]).unwrap().exists());
+        for mode in [
+            "present",
+            "missing",
+            "wrong-size",
+            "omitted",
+            "duplicate",
+            "error",
+        ] {
+            let pointer = pointers[0].clone();
+            let hub = FakeHub::new(move |request| {
+                assert_eq!(request.method, "POST");
+                assert!(request.path.ends_with("/objects/batch"));
+                assert_eq!(
+                    request.header("Authorization"),
+                    Some("Bearer fake-alice-access")
+                );
+                assert_eq!(
+                    request.header("X-AgentGit-Expected-Agent-Id"),
+                    Some(AGENT_ID)
+                );
+                let batch: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(batch["objects"], serde_json::json!([pointer]));
+                let mut object = serde_json::json!(pointer);
+                match mode {
+                    "missing" => {
+                        object["actions"] =
+                            serde_json::json!({"upload":{"href":"https://unused.invalid/object"}})
+                    }
+                    "wrong-size" => object["size"] = serde_json::json!(pointer.size + 1),
+                    "error" => {
+                        object["error"] = serde_json::json!({"code":404,"message":"missing"})
+                    }
+                    _ => {}
+                }
+                let objects = match mode {
+                    "omitted" => vec![],
+                    "duplicate" => vec![object.clone(), object],
+                    _ => vec![object],
+                };
+                Reply {
+                    status: 200,
+                    content_type: "application/vnd.git-lfs+json",
+                    headers: vec![],
+                    body: serde_json::to_vec(
+                        &serde_json::json!({"transfer":"basic","objects":objects}),
+                    )
+                    .unwrap(),
+                }
+            });
+            credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+            repo.set_remote(&format!("{}/alice/example.git", hub.base))
+                .unwrap();
+            let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+            let result = local::upload_selected(&repo, &selected, &identity, false);
+            assert_eq!(result.is_ok(), mode == "present", "{mode}: {result:?}");
+            assert_eq!(hub.finish().len(), 1);
+        }
+    }
+
+    #[cfg(feature = "secret-vault")]
+    #[test]
+    fn missing_historical_lfs_payloads_apply_repository_rules_before_native_transfer() {
+        use crate::domain::{lfs, repo::Repo, secret_filter::RepositoryDictionary, secrets};
+        use sha2::{Digest, Sha256};
+        let home = IsolatedHome::new();
+        let repo = Repo::init(&home.workspace().join("lfs-upload-scan")).unwrap();
+        if let Err(error) = lfs::local::require_client(&repo) {
+            assert!(
+                std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+                "{error:#}"
+            );
+            return;
+        }
+        let secret = "fixture-only-blocked-value";
+        let payload = secret.as_bytes();
+        assert!(
+            secrets::scan_text_registered(secret, &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        RepositoryDictionary::open(repo.root())
+            .unwrap()
+            .block_add(
+                "repository-fixture",
+                zeroize::Zeroizing::new(secret.to_owned()),
+                false,
+            )
+            .unwrap();
+        let pointer = lfs::Pointer {
+            oid: hex::encode(Sha256::digest(payload)),
+            size: payload.len() as u64,
+        };
+        let cache = lfs::local::object_path(&repo, &pointer).unwrap();
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(
+            repo.root().join("report.txt"),
+            format!(
+                "version {}\noid sha256:{}\nsize {}\n",
+                lfs::VERSION,
+                pointer.oid,
+                pointer.size
+            ),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("record historical pointer").unwrap();
+        repo.git(&["rm", "report.txt"]).unwrap();
+        repo.commit("remove historical pointer from tip").unwrap();
+        let hub = FakeHub::new(move |request| {
+            assert!(request.path.ends_with("/objects/batch"));
+            Reply {
+                status: 200,
+                content_type: "application/vnd.git-lfs+json",
+                headers: vec![],
+                body: serde_json::to_vec(&serde_json::json!({"objects":[{
+                    "oid":pointer.oid,"size":pointer.size,
+                    "actions":{"upload":{"href":"https://unused.invalid/object"}}
+                }]}))
+                .unwrap(),
+            }
+        });
+        credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+        repo.set_remote(&format!("{}/alice/example.git", hub.base))
+            .unwrap();
+        let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+        std::fs::write(&cache, payload).unwrap();
+        let full = secrets::scan_agent_repo(&repo, &secrets::ScanPlan::full()).unwrap();
+        assert!(full.hits.iter().any(|hit| hit.rule == "registered-secret"));
+        let incremental = secrets::ScanPlan::to(secrets::Destination::Advertised(vec![
+            repo.git(&["rev-parse", "HEAD"]).unwrap(),
+        ]));
+        assert!(
+            secrets::scan_agent_repo(&repo, &incremental)
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        let result =
+            lfs::local::upload_selected(&repo, &["refs/heads/main".into()], &identity, false);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("suspected secrets")
+        );
+        std::fs::write(&cache, vec![0xff; payload.len()]).unwrap();
+        let result =
+            lfs::local::upload_selected(&repo, &["refs/heads/main".into()], &identity, true);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("hash does not match")
+        );
+        assert_eq!(hub.finish().len(), 2);
+    }
+
+    #[test]
+    fn lfs_checkout_keeps_pointers_without_contacting_repository_controlled_endpoints() {
+        use crate::domain::{lfs::local, repo::Repo};
+        let home = IsolatedHome::new();
+        let repo = Repo::init(&home.workspace().join("lfs-source")).unwrap();
+        if let Err(error) = local::require_client(&repo) {
+            assert!(
+                std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+                "{error:#}"
+            );
+            return;
+        }
+        let foreign = FakeHub::new(|_| denied());
+        std::fs::write(repo.root().join("video.mp4"), b"artifact\0\xff").unwrap();
+        local::prepare_tracking(&repo, &["video.mp4".into()]).unwrap();
+        std::fs::write(
+            repo.root().join(".lfsconfig"),
+            format!("[lfs]\nurl = {}\n", foreign.base),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("record artifact").unwrap();
+        let clone = home.workspace().join("lfs-clone");
+        let output = super::transport_command()
+            .args([
+                "-c",
+                "filter.lfs.process=git-lfs filter-process",
+                "-c",
+                "filter.lfs.required=true",
+                "clone",
+                "--",
+                repo.root().to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = repo.git_bytes_result(&["show", "HEAD:video.mp4"]).unwrap();
+        assert_eq!(std::fs::read(clone.join("video.mp4")).unwrap(), expected);
+        let cloned = Repo::at(&clone);
+        cloned
+            .git(&["config", "filter.lfs.process", "git-lfs filter-process"])
+            .unwrap();
+        std::fs::remove_file(clone.join("video.mp4")).unwrap();
+        cloned.git(&["checkout", "--", "video.mp4"]).unwrap();
+        assert_eq!(std::fs::read(clone.join("video.mp4")).unwrap(), expected);
+        assert!(foreign.finish().is_empty());
     }
 
     #[derive(Clone, Copy)]

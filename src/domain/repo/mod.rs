@@ -154,6 +154,9 @@ fn git_command() -> Command {
     let mut cmd = Command::new("git");
     // Global option slot — must come **before** the subcommand; git rejects it after.
     cmd.arg("--no-replace-objects");
+    // Checkout preserves pointers; explicit LFS reads choose and authenticate their remote.
+    cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
+
     // Signing is turned off explicitly: an agent repo is agit's own internal record, authorship
     // comes from the sign-in credentials, and it carries none of the gpg policy of the user's code
     // repo. hooks and agitd both commit in an environment with **no tty** — on a machine with a

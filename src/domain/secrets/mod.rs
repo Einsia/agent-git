@@ -88,6 +88,28 @@ fn load_registered_matcher() -> crate::Result<RegisteredMatcher> {
     Ok(RegisteredMatcher)
 }
 
+/// Repository publication combines local dictionary rules with the global vault before reading payloads.
+pub(crate) fn registered_matcher_for_repo(
+    repo: &crate::domain::repo::Repo,
+) -> crate::Result<RegisteredMatcher> {
+    let registered = load_registered_matcher()?;
+    #[cfg(feature = "secret-vault")]
+    {
+        let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
+            .context(ScanPreparationFailure::Configuration)?
+            .active_matcher()
+            .context(ScanPreparationFailure::LocalState)?;
+        registered
+            .merged(&dictionary)
+            .context(ScanPreparationFailure::LocalState)
+    }
+    #[cfg(not(feature = "secret-vault"))]
+    {
+        let _ = repo;
+        Ok(registered)
+    }
+}
+
 /// The allowlist file, under `$AGIT_HOME`.
 ///
 /// Not inside the repo: that repo gets pushed, and publishing the allowlist along with it is both
@@ -2695,16 +2717,7 @@ pub fn scan_agent_repo(
     let allowlist = load_allowlist(&home);
     // When a vault exists but cannot be unlocked or authenticated, return an error; degrading to
     // "there are no registered rules" is not allowed.
-    let registered = load_registered_matcher()?;
-    #[cfg(feature = "secret-vault")]
-    let dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
-        .context(ScanPreparationFailure::Configuration)?
-        .active_matcher()
-        .context(ScanPreparationFailure::LocalState)?;
-    #[cfg(feature = "secret-vault")]
-    let registered = registered
-        .merged(&dictionary)
-        .context(ScanPreparationFailure::LocalState)?;
+    let registered = registered_matcher_for_repo(repo)?;
     // The working tree and the history objects have to use one provenance view. Source events
     // imported by a merge appear both in the current events/** and in a history blob; supplying
     // the identity to the second pass alone still leaves the working-tree pass false-positive.
@@ -2760,6 +2773,20 @@ pub fn scan_agent_repo(
         let Ok(size) = entry.metadata().map(|m| m.len()) else {
             continue;
         };
+        if size > plan.limits.max_object_bytes && is_lfs_worktree_file(repo, &rel)? {
+            let mut remaining = plan.limits.budget_bytes.saturating_sub(spent);
+            let inspected = crate::domain::lfs::inspection::read(
+                std::fs::File::open(entry.path())?,
+                size,
+                None,
+                plan.limits.max_object_bytes,
+                &mut remaining,
+            )?;
+            spent = plan.limits.budget_bytes - remaining;
+            if inspected == crate::domain::lfs::inspection::Payload::Binary {
+                continue;
+            }
+        }
         if size > plan.limits.max_object_bytes {
             // Booked in **the working tree's own ledger**: the handle here is a path, not an
             // oid (see [`Unscanned`]). A file over the line is not read at all, so not one of
@@ -2795,27 +2822,46 @@ pub fn scan_agent_repo(
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        // The bound is **how much the collector can still take**: a large file matching on every
-        // line materializes `Hit`s on the order of its line count before `extend` takes over, and
-        // capping the final list does not stop that stretch. See [`scan_text_capped`].
-        let cap = out.remaining();
-        let scanned = scan_repository_payload_capped(
-            &text,
-            &allowlist,
-            &worktree_identities,
-            Policy::CLIENT,
-            cap,
-            &registered,
-        );
-        // This file's own budget ran out: it holds hits that were never scanned. Completeness is
-        // stated by the side that knows.
-        if scanned.truncated {
-            out.mark_truncated();
+        let mut remaining = plan.limits.budget_bytes.saturating_sub(spent);
+        let payload = inspect_lfs_text(
+            repo,
+            text.as_bytes(),
+            plan.limits.max_object_bytes,
+            &mut remaining,
+        )?;
+        spent = plan.limits.budget_bytes - remaining;
+        if let Some(crate::domain::lfs::inspection::Payload::TooLarge) = payload {
+            let pointer = crate::domain::lfs::Pointer::parse(text.as_bytes())?.unwrap();
+            unscanned.oversized_files.push((rel, pointer.size));
+            continue;
         }
-        out.extend(scanned.hits.into_iter().map(|mut h| {
-            h.file = Some(rel.clone());
-            h
-        }));
+        let decoded = match &payload {
+            Some(crate::domain::lfs::inspection::Payload::Text(text)) => Some(text.as_str()),
+            _ => None,
+        };
+        for text in std::iter::once(text.as_str()).chain(decoded) {
+            // The bound is **how much the collector can still take**: a large file matching on every
+            // line materializes `Hit`s on the order of its line count before `extend` takes over, and
+            // capping the final list does not stop that stretch. See [`scan_text_capped`].
+            let cap = out.remaining();
+            let scanned = scan_repository_payload_capped(
+                text,
+                &allowlist,
+                &worktree_identities,
+                Policy::CLIENT,
+                cap,
+                &registered,
+            );
+            // This file's own budget ran out: it holds hits that were never scanned. Completeness is
+            // stated by the side that knows.
+            if scanned.truncated {
+                out.mark_truncated();
+            }
+            out.extend(scanned.hits.into_iter().map(|mut h| {
+                h.file = Some(rel.clone());
+                h
+            }));
+        }
     }
     // The working-tree pass already spent the budget: the object pass does not even
     // **estimate**. Its first act would be to ask git for the object list starting from the same
@@ -2838,6 +2884,24 @@ pub fn scan_agent_repo(
         hits: out.into_hits(),
         unscanned,
     })
+}
+
+fn is_lfs_worktree_file(repo: &crate::domain::repo::Repo, path: &str) -> crate::Result<bool> {
+    let output = repo.git_bytes_result(&["check-attr", "-z", "filter", "--", path])?;
+    Ok(output.split(|byte| *byte == 0).nth(2) == Some(b"lfs".as_slice()))
+}
+
+fn inspect_lfs_text(
+    repo: &crate::domain::repo::Repo,
+    bytes: &[u8],
+    text_limit: u64,
+    remaining: &mut u64,
+) -> crate::Result<Option<crate::domain::lfs::inspection::Payload>> {
+    crate::domain::lfs::Pointer::parse(bytes)?
+        .map(|pointer| {
+            crate::domain::lfs::inspection::cached(repo, &pointer, text_limit, remaining)
+        })
+        .transpose()
 }
 
 /// The whole block of the scan surface that **does not vary with the working tree**: reachable
@@ -2903,6 +2967,7 @@ fn scan_publish_objects(
         allowlist,
         registered,
         trusted_identities,
+        lfs_remaining: std::cell::Cell::new(plan.limits.budget_bytes - estimate),
     };
     scan_publish_blobs(&blobs, &sel, out, unscanned)?;
     scan_commit_messages(
@@ -3302,6 +3367,7 @@ struct BlobScanContext<'a> {
     allowlist: &'a HashSet<String>,
     registered: &'a RegisteredMatcher,
     trusted_identities: &'a TrustedEnvelopeIdentities,
+    lfs_remaining: std::cell::Cell<u64>,
 }
 
 /// Read a batch of objects and scan the blobs among them. `batch` and `label` are cleared once
@@ -3350,38 +3416,59 @@ fn scan_blob_batch(
             if kind != "blob" {
                 return Ok(());
             }
+            let mut remaining = context.lfs_remaining.get();
+            let inspected = inspect_lfs_text(
+                context.repo,
+                payload,
+                context.limits.max_object_bytes,
+                &mut remaining,
+            )?;
+            context.lfs_remaining.set(remaining);
+            if let Some(crate::domain::lfs::inspection::Payload::TooLarge) = inspected {
+                let pointer = crate::domain::lfs::Pointer::parse(payload)?.unwrap();
+                unscanned
+                    .oversized
+                    .push((format!("lfs:{}", pointer.oid), pointer.size));
+                return Ok(());
+            }
+            let decoded = match &inspected {
+                Some(crate::domain::lfs::inspection::Payload::Text(text)) => Some(text.as_str()),
+                _ => None,
+            };
             // Non-UTF-8 (binary) is skipped, the same test as `read_to_string` on the
             // working-tree path.
             let Ok(text) = std::str::from_utf8(payload) else {
                 return Ok(());
             };
-            // The bound is **how much the collector can still take**, for the same reason as the
-            // working-tree path.
-            let cap = out.remaining();
-            let scanned = scan_repository_payload_capped(
-                text,
-                context.allowlist,
-                context.trusted_identities,
-                Policy::CLIENT,
-                cap,
-                context.registered,
-            );
-            // This blob's own budget ran out: it holds hits that were never scanned.
-            if scanned.truncated {
-                out.mark_truncated();
+            for text in std::iter::once(text).chain(decoded) {
+                // The bound is **how much the collector can still take**, for the same reason as the
+                // working-tree path.
+                let cap = out.remaining();
+                let scanned = scan_repository_payload_capped(
+                    text,
+                    context.allowlist,
+                    context.trusted_identities,
+                    Policy::CLIENT,
+                    cap,
+                    context.registered,
+                );
+                // This blob's own budget ran out: it holds hits that were never scanned.
+                if scanned.truncated {
+                    out.mark_truncated();
+                }
+                // The label has the same shape as the commit and tag paths: `<kind> object <sha8>`,
+                // followed by the path this blob was referenced at. Both parts are needed — the sha8
+                // is the user's only handle for `git cat-file blob` / `git log --all --find-object=`,
+                // and only the path says what leaked.
+                let file = label
+                    .get(oid)
+                    .map(|p| format!("blob object {}/{p}", &oid[..oid.len().min(8)]));
+                out.extend(scanned.hits.into_iter().map(|mut h| {
+                    h.file.clone_from(&file);
+                    h.source = Source::BlobObject;
+                    h
+                }));
             }
-            // The label has the same shape as the commit and tag paths: `<kind> object <sha8>`,
-            // followed by the path this blob was referenced at. Both parts are needed — the sha8
-            // is the user's only handle for `git cat-file blob` / `git log --all --find-object=`,
-            // and only the path says what leaked.
-            let file = label
-                .get(oid)
-                .map(|p| format!("blob object {}/{p}", &oid[..oid.len().min(8)]));
-            out.extend(scanned.hits.into_iter().map(|mut h| {
-                h.file.clone_from(&file);
-                h.source = Source::BlobObject;
-                h
-            }));
             Ok(())
         });
     label.clear();
@@ -4129,6 +4216,142 @@ mod tests {
     const AGIT: &str = "agit_at_9f3ca71e04b8d25f6e103a4c7b9d82f051ae6cb37d40928ef15b6a3c8d072e94";
     const INTERNAL_HEX: &str = "9f3ca71e04b8d25f6e103a4c7b9d82f051ae6cb3";
     const UNTRUSTED_HEX: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn lfs_scanning_reads_historical_payloads_and_refuses_missing_or_corrupt_content() {
+        use crate::domain::{lfs, repo::Repo};
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        if let Err(error) = lfs::local::require_client(&repo) {
+            assert!(
+                std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+                "{error:#}"
+            );
+            return;
+        }
+        let payload = format!("access_token = {GHP}\n");
+        let pointer = lfs::Pointer {
+            oid: hex::encode(Sha256::digest(payload.as_bytes())),
+            size: payload.len() as u64,
+        };
+        let cache = lfs::cached_object_path(&repo, &pointer).unwrap();
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, &payload).unwrap();
+        let encoded = format!(
+            "version {}\noid sha256:{}\nsize {}\n",
+            lfs::VERSION,
+            pointer.oid,
+            pointer.size
+        );
+        std::fs::write(repo.root().join("report.txt"), &encoded).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("record artifact").unwrap();
+        std::fs::write(repo.root().join("report.txt"), b"safe working content\n").unwrap();
+        let report = scan_agent_repo(&repo, &ScanPlan::full()).unwrap();
+        assert!(
+            report
+                .hits
+                .iter()
+                .any(|hit| hit.source == Source::BlobObject
+                    && hit
+                        .file
+                        .as_deref()
+                        .is_some_and(|path| path.ends_with("/report.txt"))),
+            "hits: {:?}, unread: {:?}",
+            report.hits,
+            report.unscanned
+        );
+        std::fs::remove_file(&cache).unwrap();
+        assert!(scan_agent_repo(&repo, &ScanPlan::full()).is_err());
+        std::fs::write(&cache, vec![0xff; payload.len()]).unwrap();
+        assert!(scan_agent_repo(&repo, &ScanPlan::full()).is_err());
+        std::fs::write(&cache, &payload).unwrap();
+        std::fs::write(repo.root().join("report.txt"), encoded).unwrap();
+        let report = scan_agent_repo(&repo, &ScanPlan::full()).unwrap();
+        assert!(
+            report
+                .hits
+                .iter()
+                .any(|hit| hit.file.as_deref() == Some("report.txt")),
+            "hits: {:?}, unread: {:?}",
+            report.hits,
+            report.unscanned
+        );
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn lfs_binary_scans_remain_bounded_and_oversized_text_remains_unscanned() {
+        use crate::domain::{lfs, repo::Repo};
+        use sha2::{Digest, Sha256};
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        if let Err(error) = lfs::local::require_client(&repo) {
+            assert!(
+                std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+                "{error:#}"
+            );
+            return;
+        }
+        let mut plan = ScanPlan::full();
+        plan.limits.max_object_bytes = 8192;
+        for (name, bytes) in [
+            ("video.bin", vec![0xff; 128 * 1024]),
+            ("report.txt", vec![b'x'; 128 * 1024]),
+        ] {
+            let pointer = lfs::Pointer {
+                oid: hex::encode(Sha256::digest(&bytes)),
+                size: bytes.len() as u64,
+            };
+            let cache = lfs::cached_object_path(&repo, &pointer).unwrap();
+            std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+            std::fs::write(&cache, &bytes).unwrap();
+            let encoded = format!(
+                "version {}\noid sha256:{}\nsize {}\n",
+                lfs::VERSION,
+                pointer.oid,
+                pointer.size
+            );
+            std::fs::write(repo.root().join(name), encoded).unwrap();
+            repo.add_all().unwrap();
+            repo.commit("record artifact").unwrap();
+            std::fs::write(
+                repo.root().join(".gitattributes"),
+                format!("{name} filter=lfs\n"),
+            )
+            .unwrap();
+            std::fs::write(repo.root().join(name), bytes).unwrap();
+            let report = scan_agent_repo(&repo, &plan).unwrap();
+            if name == "video.bin" {
+                assert!(
+                    report.unscanned.is_empty(),
+                    "hits: {:?}, unread: {:?}",
+                    report.hits,
+                    report.unscanned
+                );
+                let mut tight = plan.clone();
+                tight.limits.budget_bytes = pointer.size - 1;
+                assert!(scan_agent_repo(&repo, &tight).is_err());
+            } else {
+                assert!(
+                    !report.unscanned.oversized.is_empty(),
+                    "hits: {:?}, unread: {:?}",
+                    report.hits,
+                    report.unscanned
+                );
+                assert!(
+                    !report.unscanned.oversized_files.is_empty(),
+                    "hits: {:?}, unread: {:?}",
+                    report.hits,
+                    report.unscanned
+                );
+            }
+            std::fs::remove_file(repo.root().join(name)).unwrap();
+            std::fs::remove_file(repo.root().join(".gitattributes")).unwrap();
+        }
+    }
 
     fn agent_envelope(content: serde_json::Value) -> crate::domain::transcript::Envelope {
         crate::domain::transcript::Envelope {
@@ -7350,6 +7573,14 @@ mod tests {
         assert!(in_publish_surface("skills/x/SKILL.md"));
         assert!(!in_publish_surface(crate::domain::meta::FILE));
         assert!(!in_publish_surface(".git/config"));
+    }
+
+    #[test]
+    fn artifact_download_grants_are_credentials_on_the_publication_surface() {
+        let grant = AGIT.replacen("agit_at_", "agit_lfs_", 1);
+        let hits = scan_text(&grant, &none());
+        assert!(hits.iter().any(|hit| hit.rule == "agit-token"));
+        assert!(scan_text("agit_lfs_invalid", &none()).is_empty());
     }
 
     #[test]

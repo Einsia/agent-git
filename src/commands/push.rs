@@ -476,6 +476,16 @@ pub fn run(mut args: Args) -> CmdResult {
     }
     git_args.push("origin");
     let refs = refs_to_push(&branches, repo.has_ref("refs/heads/main"));
+    let lfs_refs: Vec<String> = refs
+        .iter()
+        .map(|branch| format!("refs/heads/{branch}"))
+        .collect();
+    crate::domain::lfs::local::upload_selected(
+        &repo,
+        &lfs_refs,
+        &remote_identity,
+        args.allow_secrets,
+    )?;
     git_args.extend(refs.iter().map(String::as_str));
     if args.allow_secrets {
         ui::warning(

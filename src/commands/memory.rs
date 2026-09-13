@@ -1535,6 +1535,66 @@ mod tests {
     }
 
     #[test]
+    fn automatic_memory_commits_preserve_staged_lfs_pointers_and_tracking_attributes() {
+        let (_d, primary, mem) = fixture();
+        let checkout = super::super::worktree::checkout(&primary, "s1").unwrap();
+        if let Err(error) = crate::domain::lfs::local::require_client(&checkout) {
+            assert!(
+                std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+                "{error:#}"
+            );
+            return;
+        }
+        materialize_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        let path = "artifacts/video.mp4";
+        std::fs::create_dir_all(checkout.root().join("artifacts")).unwrap();
+        std::fs::write(checkout.root().join(path), b"selected video\0payload").unwrap();
+        crate::domain::lfs::local::prepare_tracking(&checkout, &[path.into()]).unwrap();
+        checkout.git(&["add", path, ".gitattributes"]).unwrap();
+        let staged = checkout
+            .git_bytes_result(&["show", &format!(":{path}")])
+            .unwrap();
+        assert!(
+            crate::domain::lfs::Pointer::parse(&staged)
+                .unwrap()
+                .is_some()
+        );
+        let attributes = checkout
+            .git_bytes_result(&["show", ":.gitattributes"])
+            .unwrap();
+        let previous_attributes = checkout.git_bytes(&["show", "HEAD:.gitattributes"]);
+        std::fs::write(checkout.root().join(path), b"later draft").unwrap();
+        std::fs::write(mirror(&mem).join("team.md"), "updated automatic memory\n").unwrap();
+        let report = collect_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert!(report.commit.is_some());
+        assert_eq!(
+            file(&primary, "refs/heads/s1", "team.md").unwrap(),
+            "updated automatic memory\n"
+        );
+        assert!(checkout.show("HEAD", path).is_none());
+        assert_eq!(
+            checkout
+                .git_bytes_result(&["show", &format!(":{path}")])
+                .unwrap(),
+            staged
+        );
+        assert_eq!(
+            checkout
+                .git_bytes_result(&["show", ":.gitattributes"])
+                .unwrap(),
+            attributes
+        );
+        assert_eq!(
+            checkout.git_bytes(&["show", "HEAD:.gitattributes"]),
+            previous_attributes
+        );
+        assert_eq!(
+            std::fs::read(checkout.root().join(path)).unwrap(),
+            b"later draft"
+        );
+    }
+
+    #[test]
     fn automatic_collection_refuses_to_overwrite_staged_memory() {
         let (_d, primary, mem) = fixture();
         let checkout = super::super::worktree::checkout(&primary, "s1").unwrap();

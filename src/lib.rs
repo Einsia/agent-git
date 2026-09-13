@@ -97,6 +97,7 @@ pub mod domain {
     /// Install a session into a runtime (the native format is rewritten byte by byte;
     /// cross-runtime goes through the IR).
     pub mod install;
+    pub mod lfs;
     /// Links: what stands for a session in the store (not a copy).
     pub mod link;
     pub mod merge_archive;

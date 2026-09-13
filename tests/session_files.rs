@@ -73,6 +73,119 @@ impl Lab {
 }
 
 #[test]
+fn lfs_files_stage_pointers_and_preserve_payloads_across_file_operations() {
+    let lab = Lab::new();
+    let repo = lab.checkout("first");
+    if let Err(error) = agit::domain::lfs::local::require_client(&repo) {
+        assert!(
+            std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+            "{error:#}"
+        );
+        eprintln!("Git LFS integration requires a current Git LFS client: {error:#}");
+        return;
+    }
+    let workspace = lab.workspace.canonicalize().unwrap();
+    let cache = workspace.join("custom-lfs-cache");
+    repo.git(&["config", "lfs.storage", cache.to_str().unwrap()])
+        .unwrap();
+    let source = workspace.join("sample [one].mp4");
+    let payload = b"a video payload\0with binary bytes\n";
+    fs::write(&source, payload).unwrap();
+    lab.ok("first", &["file", "add", "--lfs", source.to_str().unwrap()]);
+    let selected = "artifacts/sample [one].mp4";
+    let staged = repo
+        .git_bytes_result(&["show", &format!(":{selected}")])
+        .unwrap();
+    let pointer = agit::domain::lfs::Pointer::parse(&staged).unwrap().unwrap();
+    assert!(
+        agit::domain::lfs::local::object_path(&repo, &pointer)
+            .unwrap()
+            .starts_with(&cache)
+    );
+    assert_eq!(pointer.size, payload.len() as u64);
+    pointer.verify(&payload[..]).unwrap();
+    assert_eq!(fs::read(repo.root().join(selected)).unwrap(), payload);
+    assert!(agit::domain::lfs::local::is_tracked(&repo, selected).unwrap());
+    assert!(!agit::domain::lfs::local::is_tracked(&repo, "artifacts/sample o.mp4").unwrap());
+    assert!(
+        lab.checkout("second")
+            .git(&["status", "--porcelain"])
+            .unwrap()
+            .is_empty()
+    );
+    lab.ok("first", &["file", "commit", "-m", "save large artifact"]);
+    let first = repo.git(&["rev-parse", "HEAD"]).unwrap();
+    assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
+    let output = workspace.join("download.mp4");
+    lab.ok(
+        "first",
+        &[
+            "file",
+            "get",
+            selected,
+            "--output",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(fs::read(&output).unwrap(), payload);
+    lab.ok("first", &["file", "mv", selected, "artifacts/renamed.mp4"]);
+    lab.ok("first", &["file", "commit", "-m", "rename large artifact"]);
+    assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
+    assert!(agit::domain::lfs::local::is_tracked(&repo, "artifacts/renamed.mp4").unwrap());
+    lab.ok(
+        "first",
+        &[
+            "file",
+            "get",
+            selected,
+            "--ref",
+            &first,
+            "--output",
+            output.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(fs::read(&output).unwrap(), payload);
+    let attrs = repo.root().join(".gitattributes");
+    let untouched = fs::read(&attrs).unwrap();
+    fs::write(&attrs, [untouched.as_slice(), b"\n*.txt text\n"].concat()).unwrap();
+    let rejected = lab.call(
+        "first",
+        &[
+            "file",
+            "add",
+            "--lfs",
+            source.to_str().unwrap(),
+            "--to",
+            "artifacts/other.mp4",
+        ],
+    );
+    assert!(!rejected.status.success());
+    assert!(!repo.root().join("artifacts/other.mp4").exists());
+    assert_eq!(
+        repo.git_bytes_result(&["show", ":.gitattributes"]).unwrap(),
+        untouched
+    );
+    fs::write(&attrs, &untouched).unwrap();
+    let nested = repo.root().join("artifacts/.gitattributes");
+    fs::write(&nested, b"*.mp4 -filter\n").unwrap();
+    lab.ok("first", &["file", "add", nested.to_str().unwrap()]);
+    let rejected = lab.call(
+        "first",
+        &[
+            "file",
+            "add",
+            "--lfs",
+            source.to_str().unwrap(),
+            "--to",
+            "artifacts/overridden.mp4",
+        ],
+    );
+    assert!(!rejected.status.success());
+    assert!(!repo.root().join("artifacts/overridden.mp4").exists());
+    assert_eq!(fs::read(&attrs).unwrap(), untouched);
+}
+
+#[test]
 fn file_diffs_preserve_patch_bytes_and_apply_with_trailing_whitespace() {
     let lab = Lab::new();
     let repo = lab.checkout("first");

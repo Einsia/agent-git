@@ -291,6 +291,64 @@ fn assert_output(output: &Output, mode: &str, code: i32, diagnostic: &str) {
 }
 
 #[test]
+fn noncanonical_lfs_history_blocks_publication_before_any_payload_leaves() {
+    use sha2::{Digest, Sha256};
+
+    let lab = Lab::new();
+    let repo = lab.seed("alice", "qa", true);
+    if let Err(error) =
+        agit::domain::lfs::local::require_client(&agit::domain::repo::Repo::at(&repo))
+    {
+        assert!(
+            std::env::var_os("AGIT_TEST_REQUIRE_LFS").is_none(),
+            "{error:#}"
+        );
+        return;
+    }
+    let mut encoded = Vec::new();
+    for payload in [
+        "a safe artifact\n",
+        "access_token = agit_at_9f3ca71e04b8d25f6e103a4c7b9d82f051ae6cb37d40928ef15b6a3c8d072e94\n",
+    ] {
+        let oid = hex::encode(Sha256::digest(payload.as_bytes()));
+        let cache = repo
+            .join(".git/lfs/objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(&oid);
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(cache, payload).unwrap();
+        encoded.push(format!(
+            "version {}\noid sha256:{oid}\nsize {}\n",
+            agit::domain::lfs::VERSION,
+            payload.len()
+        ));
+    }
+    fs::write(repo.join("safe.txt"), &encoded[0]).unwrap();
+    fs::write(repo.join("sensitive.txt"), format!("\n{}", encoded[1])).unwrap();
+    lab.git(
+        &repo,
+        &["lfs", "pointer", "--check", "--file=sensitive.txt"],
+    );
+    lab.git(&repo, &["add", "."]);
+    lab.git(&repo, &["commit", "-m", "Record mixed pointer forms"]);
+    lab.git(&repo, &["rm", "sensitive.txt"]);
+    lab.git(
+        &repo,
+        &["commit", "-m", "Remove sensitive pointer from tip"],
+    );
+    let refs = lab.git(&repo, &["show-ref"]);
+    let output = lab
+        .command(env!("CARGO_BIN_EXE_agit"))
+        .args(["push", "alice/qa", "--all"])
+        .output()
+        .unwrap();
+    assert_output(&output, "human", 1, "cannot complete the secret scan");
+    assert_eq!(lab.git(&repo, &["show-ref"]), refs);
+    lab.no_requests();
+}
+
+#[test]
 fn local_push_refusals_keep_identity_credentials_and_repository_bytes() {
     for mode in ["human", "quiet", "json1", "json2"] {
         let lab = Lab::new();

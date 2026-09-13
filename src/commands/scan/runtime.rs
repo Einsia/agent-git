@@ -1336,8 +1336,8 @@ touch "$CLAUDE_CONFIG_DIR/model-called"
         ] {
             let program = script(&fixtures, body);
             let error = execute(
-                &program,
-                &[],
+                "/bin/sh",
+                &[program],
                 fixtures.path(),
                 &[],
                 b"",
@@ -1367,8 +1367,8 @@ touch "$CLAUDE_CONFIG_DIR/model-called"
         )];
         let input = vec![b'x'; MAX_PROMPT_BYTES];
         let error = execute(
-            &program,
-            &[],
+            "/bin/sh",
+            &[program],
             fixtures.path(),
             &environment,
             &input,
@@ -1405,9 +1405,14 @@ printf '%s\n' "$!" > "$CLAUDE_CONFIG_DIR/ready"
             }
             cancelled.set(true);
         };
+        // An interpreter can read the fixture even while another fork retains its writer.
+        let _retained_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .unwrap();
         let error = execute_cancellable(
-            &program,
-            &[],
+            "/bin/sh",
+            &[program],
             fixtures.path(),
             &environment,
             b"",
