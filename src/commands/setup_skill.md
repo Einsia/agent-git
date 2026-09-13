@@ -23,6 +23,12 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
 
 ## Working from an agent or script
 
+- When login is needed, run `agit login --json`, show its `authorization_url` to
+  the human, and ask them to sign in and approve CLI access. It returns exit `8`
+  while human action is needed. After approval, run the returned `complete_command`
+  argument array with the same `AGIT_HOME` and explicit Hub. Continue only after
+  it succeeds; do not ask for passwords or tokens. Read `references/commands/login.md`
+  for pending and expired requests.
 - Start with `agit status --json` in the intended project directory. Existing
   sessions require an explicit `<owner/repo>@<branch>` or `AGIT_SESSION`.
   Workspace bindings and discovered runtime sessions do not supply that target.

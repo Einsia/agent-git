@@ -490,7 +490,7 @@ fn input_and_interactive_admission_fail_without_a_request_or_credential_change()
         lab.seed(&hub.base);
         let before = lab.state();
         for (args, input, code) in [
-            (vec!["login"], None, 8),
+            (vec!["login", "--complete", " "], None, 2),
             (vec!["login", "--with-token"], Some(b"   ".as_slice()), 2),
             (vec!["login", "--with-token"], Some(b"\xff".as_slice()), 4),
             (
@@ -511,6 +511,91 @@ fn input_and_interactive_admission_fail_without_a_request_or_credential_change()
             assert_eq!(lab.state(), before);
         }
         assert!(hub.finish().is_empty());
+    }
+}
+
+#[test]
+fn noninteractive_login_returns_a_human_link_and_completion_checks_once() {
+    for flags in modes() {
+        let url = "https://hub.example.test/auth/cli?state=SYNTHETIC-state";
+        let hub = Hub::new(vec![
+            Reply::Json(json!({"state":"SYNTHETIC-state", "url":url, "expires_in":600})),
+            Reply::Json(json!({"status":"pending"})),
+            Reply::Json(session()),
+        ]);
+        let lab = Lab::new(&hub.base);
+        lab.seed(&hub.base);
+        let before = lab.state();
+        let output = lab.run(&hub.base, &flags, &["login"], None);
+        let document = assert_output(&output, &flags, 8);
+        assert_eq!(lab.state(), before);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains(url));
+        assert!(text.contains("Ask the human"));
+        assert!(!text.contains("how do you want to sign in"));
+        let command = [
+            "agit",
+            "login",
+            "--hub",
+            &hub.base,
+            "--complete",
+            "SYNTHETIC-state",
+        ];
+        if let Some(document) = document {
+            let result = &document["result"]["value"];
+            assert_eq!(result["status"], "authorization_required");
+            assert_eq!(result["authorization_url"], url);
+            assert_eq!(result["expires_in"], 600);
+            assert_eq!(result["complete_command"], json!(command));
+        }
+        let pending = lab.run("http://127.0.0.1:1", &flags, &command[1..], None);
+        assert_output(&pending, &flags, 8);
+        assert_eq!(lab.state(), before);
+        let output = lab.run("http://127.0.0.1:1", &flags, &command[1..], None);
+        assert_output(&output, &flags, 0);
+        let saved: Value =
+            serde_json::from_slice(&fs::read(lab.credential_path(&hub.base)).unwrap()).unwrap();
+        assert_eq!(saved["username"], "new-owner");
+        assert_eq!(saved["hub"], hub.base);
+        assert_eq!(saved["access_token"], ACCESS);
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 3);
+        assert_request(&requests[0], "/api/auth/cli/session", json!({}));
+        for request in &requests[1..] {
+            assert_request(
+                request,
+                "/api/auth/cli/poll",
+                json!({"state":"SYNTHETIC-state"}),
+            );
+        }
+    }
+}
+
+#[test]
+fn browser_handoff_and_completion_preserve_remote_failure_categories() {
+    for flags in modes() {
+        for args in [
+            vec!["login"],
+            vec!["login", "--complete", "SYNTHETIC-state"],
+        ] {
+            for (reply, code) in [
+                (Reply::Status(503), 6),
+                (Reply::Status(401), 5),
+                (Reply::TruncatedHeaders, 6),
+            ] {
+                let hub = Hub::new(vec![reply]);
+                let lab = Lab::new(&hub.base);
+                lab.seed(&hub.base);
+                let before = lab.state();
+                assert_output(&lab.run(&hub.base, &flags, &args, None), &flags, code);
+                assert_eq!(lab.state(), before);
+                assert_eq!(hub.finish().len(), 1);
+            }
+        }
     }
 }
 

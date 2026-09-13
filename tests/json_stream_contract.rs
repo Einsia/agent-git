@@ -157,7 +157,7 @@ fn launch_and_parse_rejections_precede_storage_preparation() {
     let lab = Lab::new();
     for args in [
         vec!["--json", "resume", "local/demo@work"],
-        vec!["--json", "login"],
+        vec!["--json", "login", "--device"],
         vec!["--json", "rc", "start"],
         vec!["--json", "status", "--unknown-option"],
     ] {

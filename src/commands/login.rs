@@ -2,11 +2,12 @@
 //!
 //! Three paths:
 //!
-//! * **Browser authorization (default, 1)**: the CLI opens a pending authorization request and
+//! * **Browser authorization (default)**: the CLI opens a pending authorization request and
 //!   opens the web interface; the user confirms there with GitHub (or an existing web session),
 //!   and the CLI polls until it holds the session. The terminal touches no credential — this is
-//!   the default path.
-//! * **device code (2)**: the CLI prints a short code and the user types and confirms it in a
+//!   the default path. Without a terminal it returns the link for a human to authorize,
+//!   and `--complete` retrieves the approved session in a separate invocation.
+//! * **device code**: the CLI prints a short code and the user types and confirms it in a
 //!   browser on **any device**. SSH, containers and machines with no browser take this one.
 //! * `--with-token`: read a PAT from stdin, for CI and agent environments (non-interactive).
 //!
@@ -33,12 +34,15 @@ pub struct Args {
     /// Hub to sign in to (default: AGIT_HUB_URL → config hub.url → the built-in public hub).
     #[arg(long, value_name = "url")]
     pub hub: Option<String>,
-    /// Read a PAT from stdin and sign in (CI / agent environments).
-    #[arg(long)]
+    /// Read an explicitly supplied PAT from stdin and sign in.
+    #[arg(long, conflicts_with_all = ["device", "complete"])]
     pub with_token: bool,
     /// Skip the menu and use the device-code flow directly.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "complete")]
     pub device: bool,
+    /// Check a browser authorization request and save credentials if the human approved it.
+    #[arg(long, value_name = "state")]
+    pub complete: Option<String>,
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -50,10 +54,19 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
     let hub = hub.trim().trim_end_matches('/').to_string();
+    if !args.with_token
+        && args.complete.is_none()
+        && !args.device
+        && (super::json::is_capturing() || !ui::prompt::interactive())
+    {
+        return start_browser_handoff(&hub);
+    }
     ui::info(format_args!("hub: {}", ui::accent(&hub)));
 
     let result = if args.with_token {
         login_with_token(&hub)
+    } else if let Some(state) = &args.complete {
+        complete_browser(&hub, state)
     } else if args.device {
         login_device(&hub)
     } else {
@@ -138,6 +151,54 @@ struct CliSession {
     expires_in: u64,
 }
 
+fn start_browser_handoff(hub: &str) -> CmdResult {
+    let client = crate::hub::Client::for_hub(hub);
+    let session: CliSession =
+        remote_request(client.post_public("api/auth/cli/session", &serde_json::json!({})))?;
+    let message = "Ask the human to open the login link, sign in, and approve CLI access.";
+    let complete = ["agit", "login", "--hub", hub, "--complete", &session.state];
+    if super::json::is_capturing() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "authorization_required",
+                "authorization_url": session.url,
+                "expires_in": session.expires_in,
+                "message": message,
+                "complete_command": complete,
+            })
+        );
+    } else {
+        println!("{}", session.url);
+        #[cfg(windows)]
+        let quote = ui::quote_powershell_argument;
+        #[cfg(not(windows))]
+        let quote = ui::quote_posix_argument;
+        println!(
+            "After the human approves, run: agit login --hub {} --complete {}",
+            quote(hub),
+            quote(&session.state)
+        );
+        println!("The login link expires in {} seconds.", session.expires_in);
+    }
+    ui::hint(message);
+    Ok(ExitCode::Interactive)
+}
+
+fn complete_browser(hub: &str, state: &str) -> crate::Result<Option<(HubCredential, String)>> {
+    if state.trim().is_empty() {
+        return crate::input_argument(Err(anyhow::anyhow!("the sign-in state must not be empty")));
+    }
+    let client = crate::hub::Client::for_hub(hub);
+    let response = authorization_response(&client, "api/auth/cli/poll", "state", state)?;
+    match response {
+        Some(session) => Ok(Some(session_credential(session))),
+        None => Err(anyhow::Error::new(InteractionRequired(
+            "Ask the human to finish approving the login link, then retry the same `agit login --complete` command. If the link expired, run `agit login` again to request a new link.".into(),
+        ))),
+    }
+}
+
 fn login_browser(hub: &str) -> crate::Result<Option<(HubCredential, String)>> {
     let client = crate::hub::Client::for_hub(hub);
     let session: CliSession =
@@ -218,21 +279,32 @@ fn poll(
                 "the sign-in request expired before it was approved; run `agit login` again".into(),
             )));
         }
-        let response: serde_json::Value =
-            remote_request(client.post_public(path, &serde_json::json!({ key: value })))?;
-        if matches!(
-            response.get("status").and_then(|status| status.as_str()),
-            Some("pending" | "authorization_pending")
-        ) {
-            continue;
+        if let Some(session) = authorization_response(client, path, key, value)? {
+            return Ok(Some(session_credential(session)));
         }
-        // An invalid response can contain credentials; diagnostics expose its shape, not values.
-        let session = remote_request(
-            serde_json::from_value::<crate::hub::LoginResponse>(response)
-                .map_err(|_| anyhow::anyhow!("the Hub returned an invalid sign-in response")),
-        )?;
-        return Ok(Some(session_credential(session)));
     }
+}
+
+fn authorization_response(
+    client: &crate::hub::Client,
+    path: &str,
+    key: &str,
+    value: &str,
+) -> crate::Result<Option<crate::hub::LoginResponse>> {
+    let response: serde_json::Value =
+        remote_request(client.post_public(path, &serde_json::json!({ key: value })))?;
+    if matches!(
+        response.get("status").and_then(|status| status.as_str()),
+        Some("pending" | "authorization_pending")
+    ) {
+        return Ok(None);
+    }
+    // An invalid response can contain credentials; diagnostics expose its shape, not values.
+    remote_request(
+        serde_json::from_value(response)
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("the Hub returned an invalid sign-in response")),
+    )
 }
 
 /// Open a browser where possible; failing is not fatal (the link is already on screen).

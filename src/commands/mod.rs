@@ -1507,7 +1507,10 @@ mod json_cli_tests {
     #[test]
     fn json_rejects_lifecycles_that_cannot_return_one_document() {
         for (argv, expected) in [
-            (vec!["agit", "--json", "login"], "interactive login flow"),
+            (
+                vec!["agit", "--json", "login", "--device"],
+                "waiting device-code flow",
+            ),
             (
                 vec!["agit", "--json", "rc", "start"],
                 "foreground RC daemon",
@@ -1523,6 +1526,8 @@ mod json_cli_tests {
     #[test]
     fn json_allows_preparation_only_lifecycles() {
         for argv in [
+            vec!["agit", "--json", "login"],
+            vec!["agit", "--json", "login", "--complete", "SYNTHETIC-state"],
             vec!["agit", "--json", "rc", "start", "--detach"],
             vec!["agit", "--json", "run", "main", "--no-launch"],
             vec!["agit", "--json", "new", "--no-launch"],

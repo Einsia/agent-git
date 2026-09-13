@@ -115,6 +115,7 @@ pub fn run(args: Args) -> CmdResult {
             hub: None,
             with_token: false,
             device: false,
+            complete: None,
         })?;
         if result != ExitCode::Ok {
             return Ok(result);

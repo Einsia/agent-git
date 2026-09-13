@@ -364,7 +364,7 @@ fn parse_and_interactive_rejections_leave_local_state_untouched() {
             (vec![], 2),
             (vec!["resume"], 8),
             (vec!["resume", "me/qa@work"], 8),
-            (vec!["login"], 8),
+            (vec!["login", "--device"], 8),
         ] {
             let mut args = vec!["--json", "--json-version", version];
             args.extend(tail);

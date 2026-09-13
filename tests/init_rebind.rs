@@ -23,6 +23,7 @@ fn agit(home: &Path, work: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .current_dir(work)
         .env("AGIT_HOME", home)
+        .env("AGIT_HUB_URL", "http://127.0.0.1:1")
         .env_remove("AGIT_SESSION")
         .output()
         .unwrap()

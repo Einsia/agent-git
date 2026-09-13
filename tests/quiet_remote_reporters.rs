@@ -361,10 +361,17 @@ fn quiet_auth_preserves_revoke_failure_and_interactive_recovery() {
             "{error}"
         );
         assert!(!lab.credential_path(&hub.base).exists());
-        let refused = lab.command(&hub.base, &["login"], mode).output().unwrap();
+        let refused = lab
+            .command(&hub.base, &["login", "--json", "--device"], mode)
+            .output()
+            .unwrap();
         assert_eq!(refused.status.code(), Some(8), "{refused:?}");
-        assert!(refused.stdout.is_empty(), "{refused:?}");
-        assert!(String::from_utf8_lossy(&refused.stderr).contains("--with-token"));
+        let document: Value = serde_json::from_slice(&refused.stdout).unwrap();
+        assert!(
+            document["diagnostics"]["stderr"]
+                .to_string()
+                .contains("human authorization link")
+        );
         assert_eq!(hub.finish().len(), 1);
     }
 }

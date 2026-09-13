@@ -228,8 +228,8 @@ pub fn incompatible(command: &super::Commands) -> Option<&'static str> {
     use super::Commands;
 
     match command {
-        Commands::Login(args) if !args.with_token => Some(
-            "--json cannot wrap the interactive login flow; use `agit login --with-token < token.txt>` or omit --json",
+        Commands::Login(args) if args.device => Some(
+            "--json cannot wrap the waiting device-code flow; use `agit login --json` for a human authorization link or omit --json",
         ),
         Commands::Rc(args) => match &args.action {
             super::rc::Action::Start(start) if !start.detach => Some(
