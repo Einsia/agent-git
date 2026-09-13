@@ -3803,6 +3803,7 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
+    #[cfg(unix)]
     fn captured_index_bytes(state: &FileCommitState) -> Vec<u8> {
         match &state.index.body {
             FileSnapshotBody::Regular { bytes, .. } => bytes.clone(),
@@ -3810,6 +3811,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn captured_index_bytes_or_missing(state: &FileCommitState) -> Option<Vec<u8>> {
         match &state.index.body {
             FileSnapshotBody::Missing => None,
@@ -3818,6 +3820,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn raw_commit_message(repo: &Repo, commit: &str) -> Vec<u8> {
         let object = repo
             .git_bytes_result(&["cat-file", "commit", commit])

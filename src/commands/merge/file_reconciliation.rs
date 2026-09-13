@@ -323,6 +323,10 @@ mod tests {
                         #[cfg(windows)]
                         {
                             let mut writable = permissions.clone();
+                            #[expect(
+                                clippy::permissions_set_readonly_false,
+                                reason = "This Windows-only fixture clears the read-only attribute on a Git object."
+                            )]
                             writable.set_readonly(false);
                             std::fs::set_permissions(&object, writable).unwrap();
                         }

@@ -107,15 +107,18 @@ thread_local! {
 /// installed" and then "installed" — and a panic unwind never leaves the stand-in behind for the
 /// next test.
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) fn override_harness_program(program: impl Into<String>) -> HarnessProgramOverride {
     let previous = PROGRAM_OVERRIDE.with(|slot| slot.borrow_mut().replace(program.into()));
     HarnessProgramOverride(previous)
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) struct HarnessProgramOverride(Option<String>);
 
 #[cfg(test)]
+#[cfg(unix)]
 impl Drop for HarnessProgramOverride {
     fn drop(&mut self) {
         let previous = self.0.take();
@@ -148,6 +151,7 @@ thread_local! {
 /// ambiguous-write case — the child may well have consumed the line while the caller receives no
 /// success proof.
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) fn fail_next_launch_writes(count: usize) {
     LAUNCH_WRITE_FAILURES.with(|slot| slot.set(count));
 }
@@ -444,6 +448,7 @@ impl Pushback {
     /// arrives at once while stdout is empty), which the scheduler decides; asserting on it
     /// yields a test that is green locally and red on CI.
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn held_len(&self) -> usize {
         self.items
             .iter()

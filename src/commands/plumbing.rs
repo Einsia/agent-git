@@ -1298,7 +1298,7 @@ fn capture_attributes_layers(repo: &Repo) -> Result<AttributesLayers> {
             storage::attributes_text_strict(Some(text))?;
             Some(text.to_owned())
         }
-        CheckoutFile::Symlink(_) | CheckoutFile::Directory => anyhow::bail!(
+        _ => anyhow::bail!(
             "refusing non-regular worktree {} during storage upgrade",
             meta::ATTRS_FILE
         ),
@@ -1996,6 +1996,8 @@ fn remove_checkout_journal(path: &std::path::Path) -> Result<()> {
 }
 
 fn sync_directory(path: &std::path::Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         std::fs::File::open(path)
@@ -2009,7 +2011,11 @@ fn sync_directory(path: &std::path::Path) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CheckoutFile {
     Absent,
-    Regular { bytes: Vec<u8>, executable: bool },
+    Regular {
+        bytes: Vec<u8>,
+        executable: bool,
+    },
+    #[cfg(unix)]
     Symlink(Vec<u8>),
     Directory,
 }
@@ -2632,6 +2638,7 @@ fn checkout_mode_matches_tree(local: &CheckoutFile, tree: &TreeEntry) -> bool {
             matches!(tree.mode.as_str(), "100644" | "100755")
                 && *executable == (tree.mode == "100755")
         }
+        #[cfg(unix)]
         CheckoutFile::Symlink(_) => tree.mode == "120000",
         CheckoutFile::Absent | CheckoutFile::Directory => false,
     }
@@ -2639,7 +2646,9 @@ fn checkout_mode_matches_tree(local: &CheckoutFile, tree: &TreeEntry) -> bool {
 
 fn checkout_file_payload(file: &CheckoutFile) -> Option<&[u8]> {
     match file {
-        CheckoutFile::Regular { bytes, .. } | CheckoutFile::Symlink(bytes) => Some(bytes),
+        CheckoutFile::Regular { bytes, .. } => Some(bytes),
+        #[cfg(unix)]
+        CheckoutFile::Symlink(bytes) => Some(bytes),
         CheckoutFile::Absent | CheckoutFile::Directory => None,
     }
 }
@@ -2903,6 +2912,7 @@ fn checkout_file_bytes(file: &CheckoutFile) -> usize {
 fn checkout_matches_tree(local: &CheckoutFile, tree: Option<&TreeFile>) -> bool {
     match (local, tree) {
         (CheckoutFile::Absent, None) => true,
+        #[cfg(unix)]
         (CheckoutFile::Symlink(local), Some(tree)) => tree.mode == "120000" && *local == tree.bytes,
         (
             CheckoutFile::Regular { bytes, executable },
@@ -3265,7 +3275,10 @@ fn restore_checkout(
         let absolute = repo.root().join(path);
         match state {
             CheckoutFile::Absent => {}
-            CheckoutFile::Regular { bytes, executable } => {
+            CheckoutFile::Regular {
+                bytes,
+                executable: _executable,
+            } => {
                 if let Some(parent) = absolute.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -3273,10 +3286,11 @@ fn restore_checkout(
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt as _;
-                    let mode = if *executable { 0o755 } else { 0o644 };
+                    let mode = if *_executable { 0o755 } else { 0o644 };
                     std::fs::set_permissions(&absolute, std::fs::Permissions::from_mode(mode))?;
                 }
             }
+            #[cfg(unix)]
             CheckoutFile::Symlink(target) => {
                 #[cfg(unix)]
                 {
@@ -3287,8 +3301,6 @@ fn restore_checkout(
                     }
                     symlink(std::ffi::OsStr::from_bytes(target), &absolute)?;
                 }
-                #[cfg(not(unix))]
-                anyhow::bail!("cannot restore symlink on this platform");
             }
             CheckoutFile::Directory => {
                 std::fs::create_dir_all(&absolute)?;

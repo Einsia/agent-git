@@ -20,9 +20,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_READ_ATTRIBUTES, GetFileInformationByHandle, READ_CONTROL,
 };
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub(crate) struct Handle(pub HANDLE);
 
@@ -113,7 +111,9 @@ pub(crate) fn current_sid() -> io::Result<String> {
     process_sid(unsafe { GetCurrentProcess() })
 }
 
+#[cfg(feature = "rc")]
 pub(crate) fn require_process_user(pid: u32, expected: &str) -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     let process = Handle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
     if process_sid(process.0)? != expected {
         return Err(denied("the local RC peer belongs to another Windows user"));
@@ -151,6 +151,7 @@ pub(crate) fn denied(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
+#[cfg(feature = "rc")]
 pub(crate) fn directory_identity(path: &Path) -> io::Result<[u8; 12]> {
     validate_path(path, true, true)?;
     let file = std::fs::OpenOptions::new()

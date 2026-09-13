@@ -1154,6 +1154,7 @@ fn read_bytes(path: &Path, budget: u64) -> Result<Option<Vec<u8>>> {
 }
 
 /// Retained private evidence must reject readable carriers before consuming their contents.
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn read_private_bytes(path: &Path, budget: u64) -> Result<Option<Vec<u8>>> {
     read_bytes(path, budget)
 }
@@ -1480,6 +1481,7 @@ fn finish_retirement_unix(
 }
 
 /// Preparation selects retained participants without publishing journal recovery out of lock order.
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn read_preparation_intent(
     repo_root: &Path,
     generation: &str,

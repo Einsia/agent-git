@@ -1104,6 +1104,7 @@ fn visit_v0_pair(
 /// Every raw line is bounded before JSON parsing and only its canonical v1 wire form is passed to
 /// the visitor. Migration uses the limit-aware entry point to spool a complete v1 snapshot without
 /// ever materializing either legacy sequence in memory.
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn visit_v0_pair_at_with_limits(
     repo_root: &Path,
     commit: &str,

@@ -6,7 +6,9 @@
 
 use crate::Result;
 use crate::domain::metadata_facts::JsonFacts;
-use crate::domain::{meta, refs, repo::Repo, storage};
+#[cfg(any(feature = "cli", test))]
+use crate::domain::refs;
+use crate::domain::{meta, repo::Repo, storage};
 use anyhow::{Context, ensure};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -363,12 +365,14 @@ pub fn verify_file_evidence_seed(
 
 /// Turn coordinates and LOG bytes come from the same complete immutable first-parent chain.
 /// Native reads and later graph metadata changes cannot reinterpret a retained selection.
+#[cfg(any(feature = "cli", test))]
 pub(crate) struct FrozenSourceLog {
     head: String,
     chain: refs::Chain,
     logs: BTreeMap<String, String>,
 }
 
+#[cfg(any(feature = "cli", test))]
 impl FrozenSourceLog {
     pub fn log_at(&self, head: &str) -> Result<&str> {
         ensure!(
@@ -422,10 +426,12 @@ impl FrozenSourceLog {
 }
 
 /// Walk stored parent headers to a real root; traversal flags never establish ancestry.
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn freeze_source_log(repo: &Repo, head: &str) -> Result<FrozenSourceLog> {
     freeze_source_log_with_limit(repo, head, MAX_CHAIN_EDGES)
 }
 
+#[cfg(any(feature = "cli", test))]
 fn freeze_source_log_with_limit(
     repo: &Repo,
     head: &str,

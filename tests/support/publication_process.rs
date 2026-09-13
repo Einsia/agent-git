@@ -330,6 +330,10 @@ fn diagnostic_child() {
         }
         #[cfg(windows)]
         Ok("hold-writer") => {
+            #[expect(
+                clippy::zombie_processes,
+                reason = "The outer observer owns the Windows job; this child must exit while its descendant holds the pipes."
+            )]
             let _child = diagnostic_command("hold")
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())

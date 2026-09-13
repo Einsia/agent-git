@@ -4118,6 +4118,7 @@ mod tests {
 
     /// The run of directories [`ControlSurfaceScope`] hands out under an ample budget,
     /// flattened.
+    #[cfg(unix)]
     fn scope_dirs(target: &Path, cwd: &Path, roots: &CanonicalRoots) -> Vec<PathBuf> {
         let mut ample = AliasBudget::new();
         let mut walk = ControlSurfaceScope::new(target, cwd, roots);
@@ -5307,6 +5308,7 @@ mod tests {
     /// `<root>/etc/passwd` — inside the allowlist — while the kernel resolves `vendor` to what
     /// it points at, goes up one level, and finally opens the real `/etc/passwd`.
     #[test]
+    #[cfg(unix)]
     fn a_dotdot_after_a_symlinked_component_does_not_fold_its_way_back_inside() {
         let (_d, roots, cwd) = workspace();
         #[cfg(unix)]
@@ -5736,6 +5738,7 @@ mod tests {
     /// `<root>/link -> /etc/cron.d/x` (target not yet created) as `<root>/link` — inside the
     /// allowlist, while one write writes straight into /etc.
     #[test]
+    #[cfg(unix)]
     fn a_dangling_symlink_out_of_the_workspace_is_not_judged_to_be_inside_it() {
         let (_d, roots, cwd) = workspace();
         #[cfg(unix)]

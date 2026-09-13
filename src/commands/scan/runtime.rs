@@ -604,6 +604,7 @@ impl Cancellation {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 async fn execute(
     program: &str,
     args: &[String],

@@ -78,6 +78,7 @@ fn db_path() -> Option<PathBuf> {
 }
 
 /// RC must not inherit session rules that override its agent's approval policy.
+#[cfg(any(feature = "rc", test))]
 pub(crate) fn validate_rc_session(database: &Path, id: &str, cwd: &Path) -> Result<()> {
     let con = open(database).ok_or_else(|| anyhow::anyhow!("OpenCode database cannot be read"))?;
     let (directory, permission): (String, Option<String>) = con
@@ -1691,6 +1692,7 @@ impl Adapter for OpenCode {
 /// The trait's `install` only wires this up to `which("opencode")` and [`receipt_dir`] — tests
 /// do not call that one, so they never depend on a binary that may not exist in CI.
 #[cfg(test)]
+#[cfg(unix)]
 fn install_via(
     content: &str,
     new_id: &str,

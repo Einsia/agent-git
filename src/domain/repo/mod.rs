@@ -1871,6 +1871,7 @@ impl Repo {
     }
 
     /// Probe local objects without allowing a transport to supply missing history.
+    #[cfg(any(feature = "secret-vault", test))]
     pub(crate) fn git_status_local(&self, args: &[&str]) -> Result<(Option<i32>, String, String)> {
         self.git_status_with_transport(args, false)
     }

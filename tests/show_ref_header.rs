@@ -199,6 +199,10 @@ fn selected_repository_read_failure_stays_unclassified_when_git_can_fetch() {
     #[cfg(windows)]
     {
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "This Windows-only fixture clears the read-only attribute on a Git object."
+        )]
         permissions.set_readonly(false);
         std::fs::set_permissions(&path, permissions).unwrap();
     }

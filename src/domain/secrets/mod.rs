@@ -1145,7 +1145,7 @@ fn scan_text_capped_registered(
     #[cfg(not(feature = "secret-vault"))]
     {
         let _ = registered;
-        return scan_text_capped(text, allowlist, policy, cap);
+        scan_text_capped(text, allowlist, policy, cap)
     }
 
     #[cfg(feature = "secret-vault")]

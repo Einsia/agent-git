@@ -300,6 +300,10 @@ fn incomplete_or_ambiguous_graphs_refuse_before_a_transaction() {
                 {
                     // The corruption fixture must remove its object even if Git marks it read-only.
                     let mut permissions = fs::metadata(&object).unwrap().permissions();
+                    #[expect(
+                        clippy::permissions_set_readonly_false,
+                        reason = "This Windows-only fixture clears the read-only attribute on a Git object."
+                    )]
                     permissions.set_readonly(false);
                     fs::set_permissions(&object, permissions).unwrap();
                 }

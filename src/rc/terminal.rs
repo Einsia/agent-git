@@ -26,6 +26,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::path::Path;
 #[cfg(test)]
+#[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -65,7 +66,9 @@ enum ChildPhase {
     Reaped(Option<i32>),
 }
 
+#[cfg(unix)]
 const REAP_POLL_INITIAL: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(unix)]
 const REAP_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How many bytes one read from the pty takes.
@@ -78,6 +81,7 @@ const READ_CHUNK_BYTES: usize = 8192;
 struct ChildLifecycle {
     state: Arc<(Mutex<ChildPhase>, Condvar)>,
     #[cfg(test)]
+    #[cfg(unix)]
     waiter_waitid_calls: Arc<AtomicUsize>,
 }
 
@@ -86,6 +90,7 @@ impl ChildLifecycle {
         Self {
             state: Arc::new((Mutex::new(ChildPhase::Running), Condvar::new())),
             #[cfg(test)]
+            #[cfg(unix)]
             waiter_waitid_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -136,6 +141,7 @@ impl ChildLifecycle {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     fn waiter_waitid_calls(&self) -> usize {
         self.waiter_waitid_calls.load(Ordering::Relaxed)
     }
@@ -619,6 +625,7 @@ impl Drop for Terminal {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     async fn wait_for_output(rx: &mut mpsc::Receiver<TerminalEvent>, needle: &str) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut seen = String::new();
@@ -640,6 +647,7 @@ mod tests {
         panic!("terminal never printed {needle:?}: {seen:?}");
     }
 
+    #[cfg(unix)]
     async fn wait_for_exit(rx: &mut mpsc::Receiver<TerminalEvent>) -> Option<i32> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {

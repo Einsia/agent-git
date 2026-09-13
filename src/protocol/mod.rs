@@ -65,7 +65,9 @@ pub use types::*;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "rc")]
 use std::sync::Arc;
+#[cfg(feature = "rc")]
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Protocol version. Sent in `rc.register`; the hub rejects a mismatch with
@@ -98,11 +100,13 @@ pub const DEAD_AFTER_SECS: u64 = 45;
 /// (`is_request()`, `method()`) then dispatch. Constructors below keep the three
 /// forms well-formed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "rc")]
 pub(crate) enum ConnectionFeature {
     AgentIdentityV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "rc")]
 pub(crate) enum DeliveryStatus {
     Pending,
     Delivered,
@@ -115,12 +119,14 @@ pub(crate) enum DeliveryStatus {
 /// registration ACK, while the supervisor observes the same atomic state before
 /// declaring the notification delivered.
 #[derive(Debug)]
+#[cfg(feature = "rc")]
 pub(crate) struct ConnectionDelivery {
     epoch: u64,
     feature: ConnectionFeature,
     state: AtomicU8,
 }
 
+#[cfg(feature = "rc")]
 impl ConnectionDelivery {
     const PENDING: u8 = 0;
     const DELIVERED: u8 = 1;
@@ -199,6 +205,7 @@ pub struct Frame {
     /// and deserialization always yields `None`. A hub/client therefore cannot
     /// forge a current local generation through JSON.
     #[serde(skip)]
+    #[cfg(feature = "rc")]
     pub(crate) source_generation: Option<u64>,
     /// This frame **must not be dropped for backpressure**.
     ///
@@ -213,10 +220,12 @@ pub struct Frame {
     /// Local connection-epoch fence for feature-sensitive notifications.
     /// Clones in the journal/outbound queues share the same delivery state.
     #[serde(skip)]
+    #[cfg(feature = "rc")]
     pub(crate) connection_delivery: Option<Arc<ConnectionDelivery>>,
     /// Local journal boundary shared by a completed turn and its later publication.
     /// Wire deserialization cannot supply a trusted settlement coordinate.
     #[serde(skip)]
+    #[cfg(feature = "rc")]
     pub(crate) settlement_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Who the hub says is asking, and with what standing.
     ///
@@ -421,10 +430,13 @@ impl Frame {
             error: None,
             seq: None,
             stream: None,
+            #[cfg(feature = "rc")]
             source_generation: None,
             caller: None,
             reliable: false,
+            #[cfg(feature = "rc")]
             connection_delivery: None,
+            #[cfg(feature = "rc")]
             settlement_boundary: None,
         }
     }
@@ -447,10 +459,13 @@ impl Frame {
             error: None,
             seq: None,
             stream: None,
+            #[cfg(feature = "rc")]
             source_generation: None,
             caller: None,
             reliable: false,
+            #[cfg(feature = "rc")]
             connection_delivery: None,
+            #[cfg(feature = "rc")]
             settlement_boundary: None,
         }
     }
@@ -476,10 +491,13 @@ impl Frame {
             error: None,
             seq: None,
             stream: None,
+            #[cfg(feature = "rc")]
             source_generation: None,
             caller: None,
             reliable: false,
+            #[cfg(feature = "rc")]
             connection_delivery: None,
+            #[cfg(feature = "rc")]
             settlement_boundary: None,
         }
     }
@@ -493,10 +511,13 @@ impl Frame {
             error: Some(err),
             seq: None,
             stream: None,
+            #[cfg(feature = "rc")]
             source_generation: None,
             caller: None,
             reliable: false,
+            #[cfg(feature = "rc")]
             connection_delivery: None,
+            #[cfg(feature = "rc")]
             settlement_boundary: None,
         }
     }
@@ -621,6 +642,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "rc")]
     fn settlement_boundary_is_local_unforgeable_metadata() {
         let mut frame = Frame::notification("turn.completed", serde_json::json!({}));
         frame.settlement_boundary = Some(Arc::new(std::sync::atomic::AtomicU64::new(17)));
@@ -675,6 +697,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rc")]
     fn source_generation_is_local_unforgeable_metadata() {
         let mut local = Frame::notification(method::ITEM_DELTA, serde_json::json!({"text":"x"}));
         assert_eq!(local.source_generation, None);

@@ -550,6 +550,7 @@ pub fn list(store: &Store) -> Vec<Link> {
 
 /// Archive preparation cannot treat unreadable Link metadata as an absent branch claim.
 /// Every registered runtime directory is inspected before selecting the requested route.
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn archive_claims_for_branch(
     store: &Store,
     owner: &str,
@@ -906,9 +907,11 @@ pub fn touched_at(store: &Store, link: &Link) -> std::time::SystemTime {
 pub struct BranchLock {
     _branch: std::fs::File,
     _repository: std::fs::File,
+    #[cfg(any(feature = "cli", test))]
     route: (PathBuf, String, String),
 }
 
+#[cfg(any(feature = "cli", test))]
 impl BranchLock {
     pub(crate) fn require_route(&self, store: &Store, slug: &str, branch: &str) -> Result<()> {
         anyhow::ensure!(
@@ -943,6 +946,7 @@ pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock
     Ok(BranchLock {
         _branch: file,
         _repository: repository,
+        #[cfg(any(feature = "cli", test))]
         route: (store.root().to_owned(), slug.to_owned(), branch.to_owned()),
     })
 }
