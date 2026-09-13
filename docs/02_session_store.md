@@ -12,13 +12,13 @@ version — `agit import` and `agit commit` both count.
 agit login
 ```
 
-It puts a token pair in `~/.agit/credentials.json` (0600): access lasts an hour,
+It puts a token pair in `~/.agit/credentials/<authority-key>.json` (0600): access lasts an hour,
 refresh lasts thirty days. Once access expires the client swaps in a new one and
 retries, so one sign-in lasts a month.
 
 Recording a version requires signing in first, because a commit records **who
 recorded it** (git's `user.name` / `user.email`, taken from the sign-in
-credentials), and the agent repo path is `~/.agit/agents/<owner>/<name>/` — both
+credentials), and the agent repo path is `~/.agit/repos/<owner>/<name>/` — both
 need the account name, and neither can be filled in afterwards.
 
 `agit import` records the first version by default, so it needs a sign-in too.
@@ -37,11 +37,16 @@ version control by itself; `agit import` has to name it.
 
 ## 2. Disk layout
 
+The default storage root is `~/.agit`; `AGIT_HOME` can select another root.
+Credential filenames are derived from the normalized Hub authority. They are
+opaque keys, and each credential record is bound to that Hub. Use `agit login`
+and `agit logout` to manage them rather than copying a token file between Hubs.
+
 ```text
 ~/.agit/
-  credentials.json              token + account name/email 0600
-  store/<runtime>/<session-id>.json    the link (two fields)
-  agents/<owner>/<name>/               a git repo, the only copy of the content
+  credentials/<authority-key>.json     token pair and account identity, per Hub (0600)
+  store/<runtime>/<session-id>.json    the local session link
+  repos/<owner>/<name>/               the Agent repository
 ```
 
 Two levels, not three. A middle level `drafts/<agent>/` — `agit commit`
@@ -61,8 +66,8 @@ One session corresponds to one concrete rollout entry in the runtime:
 | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<uuid>.jsonl` | the `threads` table of `~/.codex/state_<N>.sqlite`, 0.40 ms |
 | Claude Code | `~/.claude/projects/<cwd-slug>/<uuid>.jsonl` | one glob level, `projects/*/<id>.jsonl`, 2.2 ms |
 
-`agit import <session-id> -n <agent>` records one link in the store (and then
-records the first version):
+`agit import <session-id> --from claude-code --into nana/opd@topic` adopts the
+native session and records its initial version. Its local link lives at:
 
 ```text
 ~/.agit/store/claude-code/db57fdab-….json
@@ -71,22 +76,30 @@ records the first version):
 ```json
 {
   "cwd": "/Users/nana/Projects/OpenPad",
-  "agent": "opd"
+  "agent": "opd",
+  "owner": "nana",
+  "branch": "topic"
 }
 ```
 
-**Two fields; `runtime` and `session_id` live in the path** — recording one
-thing in two places drifts apart sooner or later, and the path is the one the
-reverse lookup reaches first.
+This example shows the local route. The runtime and session id come from the
+path and are not repeated in the JSON body; absent optional fields are omitted.
 
-* `cwd` is the source of truth for "which project this belongs to" (the
-  `agit log --here` filter and a snapshot's `code` field both rely on it).
-  Partition slugs collide; a cwd does not.
-* `agent` is which agent it belongs to, written by `agit import -n <agent>` (or
-  `agit clone`). It is also the **reverse index**: `agit commit <agent>` uses it
-  to find the session back from the name, so the session id never has to be
-  given again. A session adopted with `--link-only` has no such field yet.
-  Lineage is not recorded here — that is the git commit chain's own business.
+* `cwd` records the native session's project directory.
+* `owner`, `agent` and `branch` identify its local repository claim. A session
+  adopted with `--link-only` can remain unclaimed. Ordinary commands select an
+  existing session through explicit arguments or `AGIT_SESSION`; a saved link
+  does not authorize guessing a command target.
+* Materialization and settlement can also persist `baseline_bytes`,
+  `baseline_hash` and `materialized_from` to distinguish saved context from
+  later native work. Supersession, merge-archive roles and naming state have
+  separate optional fields; superseded or archive links are not active claims.
+
+Import adopts an existing runtime session; resume/run and a resumed fork can
+record a newly materialized instance, and commit updates its settlement state.
+Clone only fetches repository history and optionally binds the workspace. It
+does not create a runtime session link. These instance records remain local;
+the repository's Git history carries the shared lineage.
 
 The store keeps no copy of the transcript. Transcript files do not disappear
 (observed over the 18779 `rollout_path` rows of the `threads` table, with the
@@ -147,7 +160,7 @@ agit commit opd                 # after more work, record another
   session  agit-a1b2c3d4… (this branch's first snapshot claimed it)
   turns    3
   code     git@github.com:nana/OpenPad.git@1839e61
-  repo     ~/.agit/agents/nana/pad
+  repo     ~/.agit/repos/nana/pad
   created the local repo for nana/pad; `agit push` creates it on the hub
 
   `agit push opd` publishes
@@ -313,31 +326,37 @@ at — this is how the server-side gate ④·layout judges it (see
 SHA is itself the content address, so doctor needs no machine tag to prove it
 (§8, check 1).
 
-## 4. Envelopes: session/log.jsonl and session/VIEW
+## 4. Envelopes and the v1 LOG / VIEW sequences
 
-With one session per branch, a directory level split by runtime carries no
-meaning. The current branch's session content is these three files under
-`session/` (the constants live in `domain::meta`, and the paths are recorded in
-no metadata):
+Current snapshots declare `"layout": "v1"` in `session/meta.json`. The physical
+paths are defined by `domain::meta`; `domain::storage` materializes their logical
+envelope streams for readers:
 
 ```text
-session/meta.json   session metadata (branch form, session identity, runtime, cwd)
-session/log.jsonl   the full history, one envelope per line, append-only
-session/VIEW        the resume VIEW, a derivative rewritten whole at every commit
+session/meta.json          session metadata and the storage layout declaration
+LOG                        full ordered sequence of event ids, one id per line
+VIEW                       ordered resume selection of event ids, one id per line
+events/a/b/c/d/<event-id>   one canonical envelope and its trailing LF
 ```
 
-The triplet is gathered in one directory instead of spread over the repo root:
-the root also holds shared files (memory / skills / AGENTS.md and the like), and
-once session artifacts are mixed in with them, "which bytes belong to this
-session" has no path-level answer — while the gate, doctor and the read paths
-all judge by that boundary.
+An event id is a lowercase hex content address of the complete envelope,
+including its source, session identity and trailing LF. Its first characters
+select the shard directories; the complete id remains the filename. It is
+distinct from `_object_hash`, which addresses only the envelope's `content`.
+The managed `.gitattributes` rules preserve the bytes of `LOG`, `VIEW` and
+`events/**`. Shared `AGENTS.md`, `memory/` and `skills/` remain separate content.
 
-`VIEW` deliberately has no extension: it is an **ordered table of event
-references**, not a second transcript; sharing a name and a shape with
-`log.jsonl` would tempt tools to treat it as a second log, and the same content
-would be counted twice.
+Historical **v0** snapshots instead store complete envelope JSONL in
+`session/log.jsonl` and `session/VIEW`. A missing `layout` field means v0;
+readers use the metadata declaration rather than guessing from filenames.
+Those paths remain compatibility inputs for history and migration, not the
+physical layout written by current snapshots.
 
-### Every line is an envelope
+`VIEW` has no extension because it is an ordered selection, not a second
+transcript. The capture discussion below describes the logical envelope
+streams after materialization, independently of their v0 or v1 storage.
+
+### Event objects materialize into envelope lines
 
 ```json
 {"_source":"claude-code","_session_id":"agit-…","_object_hash":"…","content":{…the original line…}}
@@ -381,15 +400,14 @@ serialized** — key order is rearranged by BTreeMap, the semantics are equal to
 the letter, and the bytes do not follow the source file; downstream comparison
 always goes through Value/hash, never raw bytes.
 
-### session/VIEW = the resume VIEW
+### VIEW = the resume selection
 
-The full history is in session/log.jsonl (the one people read, the one
-`agit show` reads); **what is installed into the runtime is always
-session/VIEW** — packed from the slice running from the **last compact boundary
-(inclusive) to the end of the file**; for a session that never compacted, the
-VIEW is the whole text. Pushing compacted-away context back into the runtime
-both wastes the window and fails to match what this runtime's own resume looks
-like.
+The full saved event sequence is `LOG`; the selected resume sequence is `VIEW`.
+Repository-backed `agit show` reads `VIEW` by default and `LOG` with
+`--log-only`. Resume materializes `VIEW` into envelopes and unwraps the native
+records before installation. For ordinary capture, the selection runs from the
+last compact boundary (inclusive) to the end; without compaction it contains
+the whole captured transcript.
 
 Both forms of compact boundary count (`EventKind::is_compact`): in Claude Code a
 user line carrying `"isCompactSummary":true`, in Codex a
@@ -397,23 +415,16 @@ user line carrying `"isCompactSummary":true`, in Codex a
 physical line (`view_of_live`), and only then packed into envelopes by
 `wrap_lines`.
 
-session/VIEW is a **stateless derivative**: computed from live at every commit
-and rewritten whole — git takes care of its own history, and when the sessions
-in an agent are enumerated it never counts as a second copy of the content
-(`session::list_in` recognizes only `session/log.jsonl`).
+The logical VIEW is rebuilt from live content when a turn is captured; v1
+persists the resulting event-id sequence rather than a second envelope file.
+Session enumeration does not count `VIEW` as another session: `session::list_in`
+recognizes root `LOG` or the legacy v0 log together with claimed metadata.
 
-**The self-consistency invariant**: every real event in the VIEW must be
-reachable in the log (compared by `_object_hash`), and the paired merge /
-cherry-pick markers must be closed. This is the one thing doctor and the
-server-side gate judge.
-
-The test is not "the VIEW is an ordered suffix of the log": that holds for a
-pure compact slice, but `agit merge` / `agit cherry-pick` put **synthetic
-lines** into the VIEW (the paired `agit:__merge_start__` / `__merge_end__`
-markers and one `merge_summary`), which by design are not in the log — judging
-by suffix would call every merge corrupt. Synthetic lines are therefore exempt
-from the reachability check (recognized by a shape allowlist; a shape that does
-not match is not exempt), and no real event may appear out of nowhere.
+**Current v1 self-consistency:** every event id in `VIEW` must resolve to its
+canonical object and occur in `LOG`, including synthetic merge/cherry-pick
+events. Paired operation markers must also be valid. Historical v0 handling
+has compatibility rules for synthetic VIEW records; that exception must not be
+used to admit an orphan event into a v1 sequence.
 
 ### The write path: commit / import -n
 
@@ -437,13 +448,13 @@ one version:
        → record it elsewhere: agit commit 019fb2… -n <another agent name>
      ```
 
-     What `agit clone` installs into the runtime is minted with a new session id
-     (§7); its content is nearly line-for-line the same and is still judged
-     diverged here — only a content-level continuity test sees through it.
-2. Persist two files: all of live is packed into session/log.jsonl (the envelope
-   sequence grows only by Append, while the file body is rewritten whole each
-   time to stay aligned with live); session/VIEW is sliced from live, packed and
-   rewritten whole.
+     Native installation is a separate resume/run step (§7); clone itself
+     does not create a native session. The storage layout does not replace the
+     continuation checks for an installed instance.
+2. Pass the logical LOG and VIEW envelope streams to `storage::write_snapshot`.
+   It writes canonical event objects under `events/`, reuses identical existing
+   objects, and writes the root `LOG` / `VIEW` event-id sequences. A conflicting
+   body under an existing event id is refused.
 3. Overwrite session/meta.json: `session` is inherited from the tip, and only a
    branch's first snapshot claims it by content.
 4. git commit (message shaped `agit: 3 turns`; the author comes from the account
@@ -453,48 +464,32 @@ one version:
 
 ### The read path: show / clone / resume
 
-| Command | Which one it reads | How |
+| Command | Which content it reads | How |
 |---|---|---|
-| `agit show` (`--agent` or a repo session) | session/log.jsonl | `unwrap_lossy` unwraps the original lines, which then enter the parse / render pipeline — reading history tolerates faults line by line, and one corrupt line does not drag down the whole file |
-| `agit clone` / `agit resume --agent` | session/VIEW | `view_text_for_install`: the original lines unwrapped by `unwrap_lossy` are installed into the runtime |
-| `agit show` / `agit resume` given a file path directly, or reached through a store link | the live transcript in the runtime directory | read as is, with no envelope unwrapping — envelope discipline governs only files inside the repo |
+| Repository-backed `agit show` | selected `VIEW` | Materializes the selected point's sequence into envelopes for parsing/rendering; `--raw` strictly unwraps native records |
+| Repository-backed `agit show --log-only` | full `LOG` | Uses the same layout-aware materializer for the complete saved sequence |
+| `agit clone` | Git history and repository metadata | Fetches, creates the local checkout/branches and optionally binds the workspace; it does not install or launch a runtime |
+| Repository-backed `agit resume` | selected branch head's `VIEW` | The slow path materializes and unwraps the VIEW, restores required native bootstrap metadata when available, then installs it; an eligible existing native instance can use the fast path |
+| `agit show` selecting a native transcript or store link | the runtime's live transcript | Reads native content directly, with no repository envelope unwrapping |
 
-A missing session/VIEW, or one that cannot be unwrapped at all, is an
-**incomplete checkout** (deleted by hand, a half-finished fetch): installation
-is refused and points at rerunning `agit clone` to restore it, never silently
-degrading into installing the full history.
+A missing or unreadable required `VIEW` or event object is an incomplete
+checkout. Materialization refuses instead of substituting the full `LOG`.
+Recover the saved content with clone/fetch before retrying the selected session.
+The selected branch/ref determines the saved VIEW, not an unrelated checked-out
+branch.
 
-The path that installs a cloned session back into the runtime (`agit resume`)
-installs the same thing, the session/VIEW of that branch in the repo — whichever
-branch is checked out, its resume VIEW is what gets installed.
+### Historical layouts
 
-### The legacy layouts (retired)
-
-Two layout generations come before today's `session/` triplet, each leaving one
-feature recognizable at a glance:
-
-| Generation | Feature | Its shape |
+| Generation | Physical shape | Current distinction |
 |---|---|---|
-| Earliest | a `sessions/` directory is still there | transcripts spread over `sessions/<runtime>/<id>.jsonl`, several sessions under one main; the snapshot has no `runtime`, and `session` records the transcript's path inside the repo |
-| Preceding | `snapshot.json` or `transcript.jsonl` at the repo root | the triplet (`snapshot.json` / `transcript.jsonl` / `view.jsonl`) spread directly over the repo root |
+| v0 | `session/meta.json`, `session/log.jsonl`, `session/VIEW` | Layout-aware readers retain historical compatibility; migration writes v1 without changing old commits |
+| Earlier multi-session design | `sessions/<runtime>/<id>.jsonl` | Historical design, not the current v0/v1 session layout |
+| Earlier root triplet | `snapshot.json`, `transcript.jsonl`, `view.jsonl` | Historical design, not the current root `LOG` / `VIEW` event-id format |
 
-Both are **retired, with no in-place migration**. The test is written as
-"recognize the feature" and not "recognize a version number": nowhere in the
-repo is it recorded which generation built it, while these two filesystem
-features are ones that generation necessarily left behind and today's never
-produces — `the_session_triplet_lands_under_session_dir` pins the second half
-(after a settlement, no legacy-layout file name may appear at the root again).
-
-* The client does not recognize them: `session::list_in` counts "there is
-  session content" only when `session/log.jsonl` is there and meta reads out
-  with a claimed identity, so to `agit commit` / `agit resume` a legacy-layout
-  repo has no session to choose, and half a copy of the content is never parsed
-  out of it as if it were the new layout.
-* `agit doctor` aggregates them into one warning (§8) with the single way out:
-  **clear those directories, then adopt again with `agit import` and record the
-  first version**.
-* The server likewise refuses a legacy-layout push, and its read path no longer
-  parses it either (see `docs/03_branch_model.md` §7).
+The earlier layouts must not be confused with v0 merely because their files
+contain transcripts. Current v0/v1 interpretation is selected by
+`session/meta.json`; valid v0 history remains readable and has a dedicated
+storage migration path.
 
 ## 5. Turns
 
@@ -545,8 +540,9 @@ The cost is that "saying the same sentence twice gets the same hash". That is
 not a problem: where uniqueness is needed, the snapshot id is what is used.
 
 Normalization takes only the part the IR models, leaving out uuid, parentUuid,
-sessionId and file paths — those necessarily differ after `agit clone` (new
-UUIDs minted + re-rendering). `EventKind::Other` (encrypted reasoning,
+sessionId and file paths, which can differ when saved history is materialized
+into another native instance. Clone itself preserves the saved history.
+`EventKind::Other` (encrypted reasoning,
 vendor-proprietary encodings) and `TurnEnd` do not take part, and how much was
 dropped is recorded in `Turn::dropped`. The integrity of those excluded bytes is
 carried by the envelopes in the repo (every line's full original text goes into
@@ -568,15 +564,20 @@ agit log db57fdab
 
 ## 6. The agent repo
 
-One agent tracks one session lineage; locally it is a plain git repo:
+An Agent repo can hold multiple session branches alongside the shared `main` file
+line. The following paths describe a session-branch checkout; `main` does not
+require session LOG or VIEW files:
 
 ```text
-~/.agit/agents/nana/pad/
+~/.agit/repos/nana/pad/
   .git/
   session/
-    meta.json                          session metadata for the current commit
-    log.jsonl                          the full history, one envelope per line (§4)
-    VIEW                               the resume VIEW, rewritten whole at every commit
+    meta.json                          metadata, including layout: v1
+  LOG                                  full ordered event-id sequence (§4)
+  VIEW                                 selected resume event-id sequence (§4)
+  events/a/b/c/d/<event-id>              canonical envelope object
+  .gitattributes                       byte-preservation rules for storage
+  AGENTS.md / memory/ / skills/         shared content
 ```
 
 ```text
@@ -702,19 +703,11 @@ agit clone alice/photo:agit-21fc4fdc…      # one snapshot
 agit clone alice/photo --mine              # make a copy under your name
 ```
 
-**Read-only by default**: nothing is created under your name, `origin` points at
-alice's copy (you cannot push into it), and installing it into the runtime is
-enough to carry on. Recording the work that follows as versions takes knowing
-one thing: the installed session is minted with a **new session id** (without
-that it would overwrite the one already in the runtime), and by content it is
-not the same chain as the committed transcript — `agit commit`'s continuity
-check judges it Diverged and refuses (the write path, §4). To keep the
-continuation, `agit commit <session> -n <another agent name>` starts another
-lineage under your name, where the root snapshot claims by content again.
-Folding this tier away — as merging `use` and `fork` into `clone` does — means
-"taking a look" also adds an agent under your name next to someone else's
-namespace, while "look first, then decide whether to take it over" is by far the
-more common intent.
+**Read-only by default**: nothing is created under your name and `origin`
+points at alice's copy. Clone fetches the repository and optionally binds the
+workspace; it stops before native installation or launch. Use an explicit
+`agit run` / `agit resume` selection to continue afterward. Materialization and
+session identity belong to that separate operation, not to fetching a copy.
 
 The two remotes are configured the way git itself means them:
 
@@ -748,61 +741,32 @@ source** — copied from a public one it is public, copied from a private one
 
 Running `--mine` on an existing read-only checkout is an **in-place promotion**:
 make the copy, change `origin`, record `upstream`, move the directory from
-`agents/alice/photo` to `agents/<you>/photo`. Nothing already committed locally
-is lost. The directory has to move because `agents/<owner>/<name>` records
+`repos/alice/photo` to `repos/<you>/photo`. Nothing already committed locally
+is lost. The directory has to move because `repos/<owner>/<name>` records
 "which agent on the hub this is a checkout of", and after the promotion that
 agent is yours.
 
 When the source is already under your own name both steps are skipped: there is
 nothing to copy, and that path is "carry on from another machine".
 
-Then it is fetched locally:
+The local fetch prepares repository branches and reads `session/meta.json`.
+By default clone binds the current workspace to the repository (unless
+`--no-bind` is requested); that routing does not create or select a native
+session. It prints next-step guidance and stops.
 
-1. Read `session/meta.json` — if it does not read out, this agent was pushed up
-   by a plain git push, and the next commit treats this branch as the start of a
-   new chain and claims the session identity under the new layout (said out
-   loud, not silently)
-2. Write the name into the link's `agent`; `agit commit <agent>` /
-   `agit push <agent>` both rely on it afterwards
-3. Install into the runtime
+When a later resume needs installation, it materializes the selected branch's
+root `VIEW` sequence through the event objects and unwraps the native records.
+Historical v0 points use `session/VIEW` through the same layout-aware boundary.
+It does not install full `LOG` history in place of a missing VIEW. Required
+bootstrap records may be restored separately from LOG; this does not restore
+compacted-away context wholesale.
 
-What is installed is **the original lines unwrapped from session/VIEW** (the
-resume VIEW of §4), not the full history in session/log.jsonl; a session/VIEW
-that does not read out is an incomplete checkout, and installation is refused
-and points at rerunning clone. The version id is integrity in itself: checking
-out `refs/tags/agit-<sha>` yields that content itself, git's content addressing
-guarantees the tag name and the content are the same thing, and picking it up
-recomputes nothing.
-
+```text
+agit clone alice/photo
+  fetch repository history and prepare local branches
+  bind the current workspace unless --no-bind is set
+  print next-step guidance; no runtime is launched
 ```
-fetching alice/photo from https://hub.example.com…
-  ● read-only: origin is alice/photo — you can't push to it
-  ✓ 1 session  ~/.agit/agents/alice/photo
-
-  codex resume 019fb2…        (native, complete)
-  claude --resume 7d3a1e…     (converted, encrypted reasoning dropped)
-  done: agit commit photo (records a version locally)
-  publishing needs a copy of your own first: agit clone alice/photo --mine
-```
-
-The native-runtime copy is rewritten byte-wise, changing only the session id and
-the cwd and keeping every other field unchanged; the cross-runtime copy goes
-through the IR and loses encrypted reasoning and vendor-proprietary tool
-encodings.
-
-One copy is installed per runtime, so one agent name holds two sessions — that
-is the normal state, not an anomaly. `agit commit photo` has to choose between
-them, and the test is **which transcript has moved since installation**
-(comparing two mtimes, opening no file): you carry on in exactly one of them
-while the other stays at the moment of installation. If both have moved (or
-neither has) it does not guess; it lists the two session ids for you to say.
-
-After "choose one" there is still the continuity check: both copies were minted
-with new session ids when installed and by content are not the same chain as the
-committed transcript, so committing onto the taken `photo` branch is judged
-Diverged and refused — the "done: agit commit photo" line in the output above
-stops right here. To keep the continued work, record it into a new lineage under
-your name with `agit commit <session> -n <another agent name>`.
 
 A cloned history is the complete git history — every snapshot the original
 author recorded and every commit's author field hold unchanged in your checkout.
@@ -850,7 +814,7 @@ gathered into one line instead of flooding the screen one by one):
 === session metadata integrity ===
   ✓ session metadata is self-consistent for 2 agents
   ✓ checked against 2 live transcripts: both continue the committed content, 1 of them has 12 new lines since its latest version — `agit commit` records the next one
-  ✓ session/VIEW is self-consistent in 2 repos
+  ✓ VIEW is self-consistent in 2 repos
 ```
 
 1. **Metadata self-consistency**: `session/meta.json` reads out and this branch
@@ -867,8 +831,8 @@ gathered into one line instead of flooding the screen one by one):
    never misjudged as a divergence. What is compared is the content hash of each
    line's parse result, not the raw bytes — changed content necessarily changes
    the hash, while touching only key order or whitespace is not a change.
-3. **VIEW self-consistency**: the real events session/VIEW references must be
-   reachable in session/log.jsonl, and merge / cherry-pick markers must close in
+3. **VIEW self-consistency**: the current v1 `VIEW` event ids must be
+   reachable in `LOG`, and merge / cherry-pick markers must close in
    pairs (the self-consistency invariant, §4); a log present with no VIEW is an
    error too (the VIEW is a required file). doctor only reports — the next
    version (`agit commit`) rebuilds the VIEW whole.
@@ -913,9 +877,9 @@ agit push <agent>                         publish (it is git push)
 agit log                                  the adopted sessions
 agit log <session>                        each of its turns (computed on the spot)
 agit log <owner>/<agent>                  the snapshots of one agent
-agit show <session>                       read a session (the repo copy is unwrapped from session/log.jsonl)
-agit resume <session>                     continue a session (from the repo it installs the session/VIEW slice)
-agit clone <owner>/<agent>[:<version|branch>]  a read-only pickup, installed into the runtime
+agit show <session>                       read a session (saved VIEW by default; --log-only selects LOG)
+agit resume <session>                     continue a session (materialize saved VIEW when installation is needed)
+agit clone <owner>/<agent>                fetch a read-only checkout; no runtime installation or launch
 agit clone <owner>/<agent> --mine         make a copy under your name (origin yours, upstream the source)
 agit doctor                               session metadata integrity, live transcript check, VIEW check, runtimes, backend
 ```

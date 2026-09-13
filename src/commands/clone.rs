@@ -92,7 +92,7 @@ use crate::domain::transcript;
 use crate::domain::workspace;
 use crate::hub::RemoteAgent;
 use crate::hub::identity::{self, RemoteIdentity};
-use crate::infra::{config, credentials};
+use crate::infra::config;
 use crate::{ExitCode, ui};
 use anyhow::Context;
 use clap::Args as ClapArgs;
@@ -298,8 +298,21 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     let (src_owner, src_name, want) = match &args.target {
         Some(t) => {
             let (slug, r) = split_ref(t);
-            let (o, n) = crate::input_argument(parse_slug(slug))?;
-            (o, n, r)
+            let (owner, name) = crate::input_argument(parse_slug(slug))?;
+            let owner = if owner == "me" {
+                let Some(username) = client.credential_username() else {
+                    ui::error(&format!(
+                        "`me/` requires a signed-in identity for {}.",
+                        client.base()
+                    ));
+                    ui::hint(&ui::login_hint(client.base()));
+                    return Ok(ExitCode::Auth);
+                };
+                username
+            } else {
+                owner
+            };
+            (owner, name, r)
         }
         None => match resolve_from_repo(&client)? {
             Selection::Chosen(o, n) => (o, n, None),
@@ -551,30 +564,51 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         ui::hint("`--as` moved to `agit run --as <runtime>` — clone only fetches");
     }
     progress.line(format_args!(""));
-    let head = store.current_branch();
+    let head = match &want {
+        Some(Ref::Branch(branch)) => Some(branch.clone()),
+        Some(Ref::Version(_)) => None,
+        None => store.current_branch(),
+    };
     let on_file_line = head
         .as_deref()
         .is_some_and(|b| meta::is_file_line_at(&store, &format!("refs/heads/{b}")));
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
     match (&head, plan.writable, on_file_line) {
         // Your own session line: carry straight on.
         (Some(b), true, false) => progress.line(format_args!(
             "  {}",
-            ui::accent(&format!("agit resume {b}"))
+            ui::accent(&format!(
+                "agit resume {}",
+                quote_arg(&format!("{slug}@{b}"))
+            ))
         )),
         // main is the file line and is never resumed — start a new session off it, inheriting
         // memory/skills.
-        (Some(_), true, true) => {
-            progress.line(format_args!("  {}", ui::accent("agit new -b <name>")))
-        }
+        (Some(_), true, true) => progress.line(format_args!(
+            "  {}",
+            ui::accent(&format!("agit new {} -b <name>", quote_arg(&slug)))
+        )),
         // Someone else's: running it necessarily forks off a line you can write to.
         (Some(b), false, _) => progress.line(format_args!(
             "  {}",
-            ui::accent(&format!("agit run {slug}@{b} -b <name>"))
+            ui::accent(&format!(
+                "agit run {} -b <name>",
+                quote_arg(&format!("{slug}@{b}"))
+            ))
         )),
-        (None, _, _) => progress.line(format_args!(
-            "  {}",
-            ui::accent(&format!("agit run {slug}@{} -b <name>", heads[0]))
-        )),
+        (None, _, _) => {
+            let selected = store.git(&["rev-parse", "--verify", "HEAD"])?;
+            progress.line(format_args!(
+                "  {}",
+                ui::accent(&format!(
+                    "agit run {} -b <name>",
+                    quote_arg(&format!("{slug}@{}", selected.trim()))
+                ))
+            ));
+        }
     }
     progress.line(format_args!(
         "{}",
@@ -813,7 +847,7 @@ fn plan(
     args: &Args,
     progress: ProgressOutput,
 ) -> crate::Result<Option<Plan>> {
-    let me = credentials::current_user();
+    let me = client.credential_username();
     let mode = mode_of(me.as_deref(), src_owner, args.mine);
 
     // ── Your own agent: carry on from another machine ──

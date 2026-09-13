@@ -9,6 +9,8 @@ description: Fetch a local checkout of an Agent repo.
 
 Fetch an Agent repo from the Hub into `~/.agit/repos/<owner>/<name>`, including local branches and remote-tracking refs. The checkout is read-only by default, does not start a runtime, and normally binds the current directory.
 
+`me/<repo>` uses the signed-in username for the selected Hub. It requires a saved login; an explicit owner remains literal.
+
 Without a target, the current directory must be a code Git repo with an `origin`; the CLI asks the Hub to reverse-map that code remote to an Agent repo.
 
 ## Synopsis
@@ -37,6 +39,7 @@ agit clone [<owner/repo[@version-or-branch]>]
 
 ```bash
 agit clone alice/notes
+agit clone me/notes
 agit clone alice/notes@refund-fix
 agit clone alice/notes --mine --name notes
 agit clone alice/notes --no-bind

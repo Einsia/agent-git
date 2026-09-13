@@ -22,6 +22,7 @@ struct Hub {
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<(usize, usize)>>,
     git_status: Option<u16>,
+    authenticated: Arc<AtomicBool>,
 }
 
 impl Hub {
@@ -47,6 +48,8 @@ impl Hub {
         .to_string();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let expected_auth = Arc::clone(&authenticated);
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut count = 0;
@@ -82,7 +85,10 @@ impl Hub {
                     headers.push(byte[0]);
                 }
                 let headers = String::from_utf8(headers).unwrap();
-                assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+                assert_eq!(
+                    headers.to_ascii_lowercase().contains("authorization:"),
+                    expected_auth.load(Ordering::Acquire)
+                );
                 if headers.starts_with("GET /api/agents/alice/paper HTTP/1.1\r\n") {
                     count += 1;
                     assert_eq!(count, 1, "the metadata request was replayed");
@@ -116,6 +122,7 @@ impl Hub {
             stop,
             worker: Some(worker),
             git_status,
+            authenticated,
         }
     }
 
@@ -245,6 +252,10 @@ impl Lab {
     }
 
     fn clone_command(&self, selected: &str, mode: &str) -> Command {
+        self.clone_target_command(&format!("alice/paper@{selected}"), mode)
+    }
+
+    fn clone_target_command(&self, target: &str, mode: &str) -> Command {
         let mut cmd = self.command(env!("CARGO_BIN_EXE_agit"));
         if mode == "quiet" {
             cmd.arg("--quiet");
@@ -252,8 +263,27 @@ impl Lab {
         if let Some(version) = mode.strip_prefix("json") {
             cmd.args(["--json", "--json-version", version]);
         }
-        cmd.args(["clone", &format!("alice/paper@{selected}"), "--no-bind"]);
+        cmd.args(["clone", target, "--no-bind"]);
         cmd
+    }
+
+    fn sign_in(&self, username: &str) {
+        let credential = agit::infra::credentials::HubCredential {
+            username: username.into(),
+            email: None,
+            hub: Some(self.hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_token: "synthetic-expired-refresh".into(),
+            refresh_expires_at: "2000-01-01T00:00:00Z".into(),
+        };
+        let key = agit::infra::config::hub_host_key(&self.hub.base).unwrap();
+        agit::infra::credentials::save_at(
+            &self.home.join("credentials").join(format!("{key}.json")),
+            &credential,
+        )
+        .unwrap();
+        self.hub.authenticated.store(true, Ordering::Release);
     }
 
     fn destination(&self) -> PathBuf {
@@ -503,5 +533,124 @@ fn occupied_clone_destinations_are_preconditions_without_git_requests() {
             assert!(!lab.home.join("workspaces").exists());
             assert!(!lab.home.join("store").exists());
         }
+    }
+}
+
+#[test]
+fn me_alias_requires_identity_without_reading_a_literal_me_namespace() {
+    for mode in ["human", "quiet", "json1", "json2"] {
+        let mut lab = Lab::new(200);
+        let output = lab
+            .clone_target_command("me/paper@main", mode)
+            .output()
+            .unwrap();
+        assert_output(&output, mode, 5, Some("requires a signed-in identity"));
+        lab.hub.finish_counts((0, 0));
+        assert!(!lab.home.join("repos").exists());
+        assert!(!lab.home.join("workspaces").exists());
+        assert!(!lab.home.join("store").exists());
+    }
+}
+
+#[test]
+fn me_alias_clones_the_logged_in_namespace_and_explicit_owners_stay_literal() {
+    for mode in ["human", "quiet", "json1", "json2"] {
+        for (user, target) in [("alice", "me/paper@main"), ("bob", "alice/paper@main")] {
+            let mut lab = Lab::new(200);
+            lab.sign_in(user);
+            let source = inventory(&lab.source);
+            let output = lab.clone_target_command(target, mode).output().unwrap();
+            assert_output(&output, mode, 0, None);
+            if mode == "human" {
+                let expected = if user == "alice" {
+                    "agit new alice/paper -b <name>"
+                } else {
+                    "agit run alice/paper@main -b <name>"
+                };
+                assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+            }
+            lab.hub.finish();
+            assert_eq!(
+                lab.git(&lab.destination(), &["rev-parse", "HEAD"]),
+                lab.head
+            );
+            assert_eq!(
+                identity::read(&Repo::at(lab.destination())).unwrap(),
+                Some(RemoteIdentity::new(&lab.hub.base, AGENT_ID).unwrap())
+            );
+            assert_eq!(inventory(&lab.source), source);
+            assert!(!lab.home.join("repos/me").exists());
+            assert!(!lab.home.join("repos/bob").exists());
+            assert!(!lab.home.join("workspaces").exists());
+            assert!(!lab.home.join("store").exists());
+        }
+    }
+}
+
+#[test]
+fn me_alias_preserves_authenticated_remote_failures_without_anonymous_fallback() {
+    for mode in ["human", "quiet", "json1", "json2"] {
+        for (status, code) in [(401, 5), (503, 6)] {
+            let mut lab = Lab::new(status);
+            lab.sign_in("alice");
+            let output = lab
+                .clone_target_command("me/paper@main", mode)
+                .output()
+                .unwrap();
+            assert_output(&output, mode, code, None);
+            lab.hub.finish();
+            assert!(!lab.home.join("repos").exists());
+            assert!(!lab.home.join("workspaces").exists());
+            assert!(!lab.home.join("store").exists());
+        }
+    }
+}
+
+#[test]
+fn own_clone_hints_retain_the_selected_session_or_frozen_commit() {
+    for frozen in [false, true] {
+        let mut lab = Lab::new(200);
+        lab.sign_in("alice");
+        lab.git(&lab.source, &["checkout", "-qb", "topic"]);
+        meta::write(
+            &lab.source,
+            &meta::Meta::new(
+                "agit-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                "codex".into(),
+                lab.work.to_string_lossy().into_owned(),
+            ),
+        )
+        .unwrap();
+        fs::write(lab.source.join(meta::LOG_FILE), "").unwrap();
+        fs::write(lab.source.join(meta::VIEW_FILE), "").unwrap();
+        lab.git(&lab.source, &["add", "-A"]);
+        lab.git(&lab.source, &["commit", "-qm", "session line"]);
+        let session_sha = lab.git(&lab.source, &["rev-parse", "HEAD"]);
+        let version = meta::id_from_sha(&session_sha);
+        lab.git(&lab.source, &["tag", &version]);
+        let target = if frozen { &version } else { "topic" };
+        let output = lab
+            .clone_target_command(&format!("me/paper@{target}"), "human")
+            .output()
+            .unwrap();
+        assert_output(&output, "human", 0, None);
+        let expected = if frozen {
+            format!("agit run alice/paper@{session_sha} -b <name>")
+        } else {
+            "agit resume alice/paper@topic".to_owned()
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&expected), "{stdout}");
+        assert_eq!(
+            lab.git(&lab.destination(), &["rev-parse", "refs/heads/topic"]),
+            session_sha
+        );
+        assert_eq!(
+            lab.git(&lab.destination(), &["rev-parse", "HEAD"]),
+            if frozen { &session_sha } else { &lab.head }.as_str()
+        );
+        lab.hub.finish();
+        assert!(!lab.home.join("store").exists());
+        assert!(!lab.home.join("workspaces").exists());
     }
 }

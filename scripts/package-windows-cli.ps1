@@ -52,6 +52,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows local precondition category tests fail
 if ($LASTEXITCODE -ne 0) { throw 'Windows unreadable transcript category test failed' }
 & cargo test --locked --release --target $target --test clone_ref_categories -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows clone reference category tests failed' }
+& cargo test --locked --release --target $target --test pull_recovery -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows pull recovery tests failed' }
 & cargo test --locked --release --target $target --test export_output_categories -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows export output category tests failed' }
 & cargo test --locked --release --target $target --lib commands::export::tests::output_flush_failure_is_not_a_successful_delivery -- --nocapture

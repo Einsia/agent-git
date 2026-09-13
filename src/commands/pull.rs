@@ -191,7 +191,7 @@ pub fn run(args: Args) -> CmdResult {
                         match remote_point(&repo, b) {
                             Some(sha) => {
                                 eprintln!("  two ways out (origin/{b} is at {sha}):");
-                                for line in ways_out(b, &sha) {
+                                for line in ways_out(&slug, b, &sha) {
                                     eprintln!("    {line}");
                                 }
                             }
@@ -265,10 +265,18 @@ fn remote_point(repo: &Repo, branch: &str) -> Option<String> {
 ///
 /// A separate function so a test can take the command text and resolve it — "the printed command
 /// runs" is proven only by joining both ends.
-fn ways_out(branch: &str, sha: &str) -> Vec<String> {
+fn ways_out(slug: &str, branch: &str, sha: &str) -> Vec<String> {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+
+    let source = quote_arg(&format!("{slug}@{sha}"));
+    let target = quote_arg(&format!("{slug}@{branch}"));
+    let fork = quote_arg(&format!("{branch}-remote"));
     vec![
-        format!("reconcile: `agit merge {sha} --into {branch}` (the merge agent)"),
-        format!("keep both: `agit fork {sha} -b {branch}-remote --resume`"),
+        format!("reconcile: `agit merge {source} --into {target}` (the merge agent)"),
+        format!("keep both: `agit fork {source} -b {fork} --resume`"),
     ]
 }
 
@@ -377,18 +385,24 @@ mod tests {
         repo.git(&["commit", "-m", "local turn"]).unwrap();
 
         let sha = remote_point(&repo, "refund-fix").expect("the remote point must be readable");
-        let lines = ways_out("refund-fix", &sha);
+        let lines = ways_out("alice/notes", "refund-fix", &sha);
         assert!(
-            lines[0].contains(&format!("agit merge {sha} --into refund-fix")),
+            lines[0].contains(&format!(
+                "agit merge alice/notes@{sha} --into alice/notes@refund-fix"
+            )),
             "{lines:?}"
         );
         assert!(
-            lines[1].contains(&format!("agit fork {sha} -b refund-fix-remote")),
+            lines[1].contains(&format!("agit fork alice/notes@{sha} -b refund-fix-remote")),
             "{lines:?}"
         );
 
         // The ref inside the command resolves, and it resolves to the commit on the remote side.
-        let spec = refs::parse(&sha).unwrap();
+        let spec = refs::parse(&format!("alice/notes@{sha}")).unwrap();
+        assert_eq!(
+            spec.repo,
+            refs::RepoSel::Slug("alice".into(), "notes".into())
+        );
         let got = refs::resolve(&repo, &spec).expect("a printed ref must resolve");
         assert_eq!(got.sha, remote_sha.trim());
 

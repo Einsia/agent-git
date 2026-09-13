@@ -268,6 +268,14 @@ impl Client {
         self.token.borrow().is_some()
     }
 
+    /// Namespace shortcuts and request tokens must use the same loaded credential identity.
+    pub(crate) fn credential_username(&self) -> Option<String> {
+        self.cred
+            .borrow()
+            .as_ref()
+            .map(|cred| cred.username.clone())
+    }
+
     pub(crate) fn checked_access_token(&self) -> Result<Option<String>> {
         self.ensure_destination()?;
         Ok(self.token.borrow().clone())
