@@ -65,6 +65,7 @@ pub struct Args {
 struct SetupReport {
     items: usize,
     failures: usize,
+    changed: usize,
 }
 
 impl SetupReport {
@@ -72,6 +73,14 @@ impl SetupReport {
         Self {
             items: 1,
             failures: 0,
+            changed: 0,
+        }
+    }
+
+    fn changed_item() -> Self {
+        Self {
+            changed: 1,
+            ..Self::item()
         }
     }
 
@@ -79,12 +88,14 @@ impl SetupReport {
         Self {
             items: 0,
             failures: 1,
+            changed: 0,
         }
     }
 
     fn merge(&mut self, other: Self) {
         self.items += other.items;
         self.failures += other.failures;
+        self.changed += other.changed;
     }
 
     fn succeeded(self) -> bool {
@@ -619,12 +630,7 @@ fn install_skill_dir(dir: &Path, runtime: &str) -> SetupReport {
                 }
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
-                        ui::info(format_args!(
-                            "  {} stale skill reference removed → {}",
-                            ui::ok(ui::theme::symbols().check),
-                            ui::tilde(&path)
-                        ));
-                        report.merge(SetupReport::item());
+                        report.merge(SetupReport::changed_item());
                     }
                     Err(error) => {
                         ui::warning(&format!(
@@ -650,6 +656,18 @@ fn install_skill_dir(dir: &Path, runtime: &str) -> SetupReport {
             dir.display()
         ));
         report.merge(SetupReport::failure());
+    }
+    if report.succeeded() {
+        let status = if report.changed == 0 {
+            "is up to date"
+        } else {
+            "updated"
+        };
+        ui::info(format_args!(
+            "  {} skill {runtime} {status} → {}",
+            ui::ok(ui::theme::symbols().check),
+            ui::tilde(dir)
+        ));
     }
     report
 }
@@ -1036,11 +1054,9 @@ fn exe_str() -> String {
         .unwrap_or_else(|| "agit".into())
 }
 
-/// Write only when the content differs (what idempotent means here: already current skips
-/// quietly).
+/// Bundle writes report failures individually; successful files contribute to the runtime summary.
 fn write_if_changed(path: &Path, body: &str, label: &str) -> SetupReport {
     if std::fs::read_to_string(path).ok().as_deref() == Some(body) {
-        ui::info(format_args!("  {} {label} is up to date", ui::dim("·")));
         return SetupReport::item();
     }
     let ok = path
@@ -1051,12 +1067,7 @@ fn write_if_changed(path: &Path, body: &str, label: &str) -> SetupReport {
         ui::warning(&format!("{label} write failed: {}", path.display()));
         return SetupReport::failure();
     }
-    ui::info(format_args!(
-        "  {} {label} → {}",
-        ui::ok(ui::theme::symbols().check),
-        ui::tilde(&PathBuf::from(path))
-    ));
-    SetupReport::item()
+    SetupReport::changed_item()
 }
 
 /// Upsert a section marked with `<!-- agit:begin/end -->`: an existing marked section is replaced
