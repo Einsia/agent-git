@@ -847,3 +847,89 @@ fn run_bounded(mut command: Command) -> Output {
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn terminal_enter_uses_browser_default_and_explicit_choices_select_their_flow() {
+    for (input, target) in [
+        ("\r", "/api/auth/cli/session"),
+        ("1\r", "/api/auth/cli/session"),
+        ("2\r", "/api/auth/device/code"),
+    ] {
+        let hub = Hub::new(vec![Reply::Status(503)]);
+        let lab = Lab::new(&hub.base);
+        lab.seed(&hub.base);
+        let before = lab.state();
+        let (status, output) = terminal_login(&lab, &hub.base, input);
+        assert_eq!(status.exit_code(), 6, "{output}");
+        assert!(output.contains("press Enter"), "{output}");
+        assert!(
+            !output.contains("needs an interactive terminal"),
+            "{output}"
+        );
+        assert_eq!(lab.state(), before);
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1, "{output}");
+        assert_request(&requests[0], target, json!({}));
+    }
+}
+
+#[cfg(unix)]
+fn terminal_login(lab: &Lab, base: &str, input: &str) -> (portable_pty::ExitStatus, String) {
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize::default())
+        .unwrap();
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+    command.arg("login");
+    command.env_clear();
+    command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    command.env("HOME", &lab.home);
+    command.env("AGIT_HOME", &lab.store);
+    command.env("AGIT_HUB_URL", base);
+    command.env("AGIT_SECRETS_KEYSTORE", "file");
+    command.env("GIT_CONFIG_GLOBAL", lab.home.join("absent-gitconfig"));
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env("NO_COLOR", "1");
+    command.env("CI", "1");
+    command.env("TERM", "xterm-256color");
+    command.cwd(&lab.work);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _master = pair.master;
+        let mut buffer = [0; 4096];
+        while let Ok(size) = reader.read(&mut buffer) {
+            if size == 0 || sender.send(buffer[..size].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut captured = Vec::new();
+    let mut sent = false;
+    loop {
+        if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(10)) {
+            captured.extend_from_slice(&bytes);
+        }
+        let output = String::from_utf8_lossy(&captured);
+        if !sent && output.contains("choice") && output.contains(": ") {
+            writer.write_all(input.as_bytes()).unwrap();
+            writer.flush().unwrap();
+            sent = true;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            while let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(20)) {
+                captured.extend_from_slice(&bytes);
+            }
+            return (status, String::from_utf8(captured).unwrap());
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("login did not respond to {input:?}: {output}");
+        }
+    }
+}

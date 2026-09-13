@@ -118,7 +118,7 @@ fn login_interactive(hub: &str) -> crate::Result<Option<(HubCredential, String)>
     println!();
     println!("  how do you want to sign in?");
     println!(
-        "    {} browser — open the hub in your browser (nothing to type here)",
+        "    {} browser — press Enter to sign in through your browser",
         ui::accent("1.")
     );
     println!(
@@ -126,7 +126,7 @@ fn login_interactive(hub: &str) -> crate::Result<Option<(HubCredential, String)>
         ui::accent("2.")
     );
     let choice =
-        ui::prompt::input("choice [1]", None).map_err(|error| error.context(LocalInputFailure))?;
+        ui::prompt::input("choice", Some("1")).map_err(|error| error.context(LocalInputFailure))?;
     let Some(choice) = choice else {
         return Ok(None);
     };
