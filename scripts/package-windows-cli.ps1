@@ -23,6 +23,14 @@ $binary = "target/$target/release/agit.exe"
 if ($LASTEXITCODE -ne 0) { throw 'Windows library without RC failed to compile' }
 & cargo test --locked --release --target $target --lib rc::windows_job::tests -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows process-tree exit tests failed' }
+& cargo test --locked --release --target $target --lib commands::search::local::tests -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows saved-history repository admission tests failed' }
+foreach ($test in @('commands::migration::tests::spooled_git_paths_bind_the_canonical_repository_and_private_index', 'commands::migration::tests::pending_work_is_migrated_before_the_completion_marker_is_written')) {
+    & cargo test --locked --release --target $target --lib $test -- --exact --nocapture
+    if ($LASTEXITCODE -ne 0) { throw "Windows storage migration path test failed: $test" }
+}
+& cargo test --locked --release --target $target --test search_local -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows offline saved-history search tests failed' }
 & cargo test --locked --release --target $target --test session_files -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows session file tests failed' }
 # Status fixtures run serially so parallel test load cannot exhaust their Git deadlines.
@@ -30,6 +38,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows session file tests failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Windows branch, shared-file, and session status tests failed' }
 & cargo test --locked --release --target $target --test windows_rc --test rc_proxy --test import_noninteractive_selection --test show_ref_header --test diff_pending --test diff_pending_opencode --test import_lineage_preview --test ref_selection --test merge_recon --test merge_settlement --test hub_credential_binding --test whoami_identity_snapshot --test codex_resume_provider --test windows_json_capture --test quiet_presentation --test quiet_remote_reporters --test doctor_deep --test doctor_link_integrity --test doctor_local_health --test doctor_repo_scope --test context_echo --test context_echo_run_mine --test semantic_turn_prefix --test merge_archive_lifecycle --test sensitive_review --test terminal_failure_categories --test search_org_scope --test search_here -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows native CLI integration tests failed' }
+& cargo test --locked --release --target $target --bin agit startup_tests -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows offline startup policy tests failed' }
 & cargo test --locked --release --target $target --test push_confirmation_category --test setup_completion_category -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows confirmation and setup category tests failed' }
 & cargo test --locked --release --target $target --test share_search_categories --test login_terminal_categories -- --nocapture
@@ -56,7 +66,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows native JSON capture lifecycle tests fa
 if ($LASTEXITCODE -ne 0) { throw 'Windows archive Link privacy transition test failed' }
 & cargo test --locked --release --target $target --lib hub::git:: -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows Git transport tests failed' }
-foreach ($suite in @('native_snapshot', 'adapter::opencode::status_snapshot::tests', 'domain::metadata_facts::tests::structural_budget_', 'domain::native_archive::', 'adapter::opencode::tests::archive_frontier_', 'adapter::codex_index::tests', 'domain::import_lineage::tests', 'domain::repo::tests::local_', 'domain::repo::tests::inspection_', 'domain::repo::tests::legacy_inspection_', 'commands::fix::tests', 'commands::import::tests::prepared_target_', 'commands::merge::archive::', 'commands::merge::file_reconciliation::tests', 'commands::commit::archive::tests', 'domain::merge_archive::tests', 'domain::archive_history::tests', 'domain::mergetx::tests', 'commands::terminal_error_tests', 'adapter::cursor::tests::windows_cwd_', 'tui::screens::selector::tests', 'tui::screens::sessions::tests', 'tui::screens::adopt::tests', 'tui::screens::naming::tests', 'tui::widgets::tests', 'commands::push::tests::branch_failure_categories', 'infra::local_git::tests', 'domain::secret_filter::repository::tests::bounded_', 'commands::status::shared::git::tests', 'commands::status::shared::tests', 'commands::status::', 'commands::search::tests', 'rc::transport::tests', 'commands::search::local_git::tests', 'commands::upgrade::tests::startup_nudge_is_only_for_interactive_user_commands')) {
+foreach ($suite in @('native_snapshot', 'adapter::opencode::status_snapshot::tests', 'domain::metadata_facts::tests::structural_budget_', 'domain::native_archive::', 'adapter::opencode::tests::archive_frontier_', 'adapter::codex_index::tests', 'domain::import_lineage::tests', 'domain::repo::tests::local_', 'domain::repo::tests::inspection_', 'domain::repo::tests::legacy_inspection_', 'commands::fix::tests', 'commands::import::tests::prepared_target_', 'commands::merge::archive::', 'commands::merge::file_reconciliation::tests', 'commands::commit::archive::tests', 'domain::merge_archive::tests', 'domain::archive_history::tests', 'domain::mergetx::tests', 'commands::terminal_error_tests', 'adapter::cursor::tests::windows_cwd_', 'tui::screens::selector::tests', 'tui::screens::sessions::tests', 'tui::screens::adopt::tests', 'tui::screens::naming::tests', 'tui::widgets::tests', 'commands::push::tests::branch_failure_categories', 'infra::local_git::tests', 'domain::secret_filter::repository::tests::bounded_', 'commands::status::shared::git::tests', 'commands::status::shared::tests', 'commands::status::', 'commands::search::tests', 'rc::transport::tests', 'commands::upgrade::tests::startup_nudge_is_only_for_interactive_user_commands', 'commands::mcp::workspace_tool_tests', 'domain::storage::tests::local_', 'domain::storage::local_read::tests', 'adapter::enrich::tests::input_projection_')) {
     & cargo test --locked --release --target $target --lib $suite -- --nocapture
     if ($LASTEXITCODE -ne 0) { throw "Windows import lineage suite failed: $suite" }
 }

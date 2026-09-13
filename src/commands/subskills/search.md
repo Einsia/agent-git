@@ -77,6 +77,59 @@ instead of an unfiltered answer. Metadata is checked before blob deduplication,
 ranking, counts and pagination, under the same repository permissions as content.
 Missing metadata produces `incomplete: true` and never relaxes the filters.
 
+## Offline saved history
+
+`agit search --local "cache failure" --repo alice/service` searches saved session
+history already present in local AgentGit repositories. Sign-in remains required;
+the command checks existing credentials locally and never refreshes or verifies them
+online. It makes no Hub requests, performs no automatic fetch, opens no native
+runtime transcript, and creates no Store, index database or migration state.
+
+Git inspection shares a 30-second command deadline, including final ref verification.
+Each Git operation is limited to 5 seconds, followed by a separate 2-second cleanup
+budget. A stalled read makes coverage incomplete. A repository whose final snapshot
+cannot be verified contributes no hits; previously verified repositories remain in
+the partial result.
+
+The corpus is the immutable commit history reachable through local `refs/heads/`
+and `refs/remotes/`. It uses raw parent identities, so shallow or graft views do
+not hide parent objects that are already local. Missing objects remain incomplete.
+A saved LOG is searched in its declared storage layout; VIEW is derived context
+and does not limit the history search. Repeated saved events retain their occurrence
+count. Identical LOGs of one session collapse after supported version filters;
+each matching saved version supplies one excerpt and an `other_hits` count.
+
+Content coverage and turn-count reliability are separate. A normal Codex
+`session_meta` record has no searchable body and does not make either incomplete.
+Known non-user records, such as reasoning or an unreadable tool result, can make
+content coverage incomplete while an exact `turns:` filter remains usable.
+Unknown records or unprojected user messages make `turns_incomplete: true`, so
+versions with uncertain user-turn counts cannot satisfy a `turns:` filter.
+
+Local mode supports the default session category, text/phrase/exclusion queries,
+repo/agent, owner, runtime, in, tool, path and turns filters, sorting and pagination.
+It rejects other categories, `--counts`, author/time filters, Hub visibility,
+category, state, fork and unknown qualifiers before scanning. `--scope` (including
+`org`, `mine`, `public` and an exact repository) and `--here` cannot be combined
+with `--local`: these scopes require remote confirmation. Use `--repo` or `--owner`
+for local saved-history filtering. Unsupported combinations
+never fall back to the Hub. A batch validates every query before scanning any corpus.
+
+The result labels `corpus: local_saved_history` and `total_unit: saved_versions`.
+`best` prefers direct evidence over summaries and then newer saved versions; it is
+not a claim to reproduce the Hub's index ranking. Output keeps JSON, MCP and ordered
+batch envelopes. Limits are shared across the command's repository entries, refs,
+raw commits, source bytes, record/JSON-structure work and hits. Structural work is
+charged before value allocation, hashing and native event expansion; failed reads,
+filtered versions and repeated passes retain their spent quota. Ref rechecks share
+the observation quota; a full read limit without room to prove exhaustion is
+reported as incomplete. Dense single-record
+block arrays can exhaust this conservative work budget. Unreadable objects, concurrent
+ref changes, unrepresented native record content or exhausted limits produce
+`incomplete: true` with bounded reason codes. Totals are then lower bounds, not a
+complete absence claim. These are local cached bytes, not a fresh Hub permission
+check; a local clone can retain history whose remote permissions have changed.
+
 ## Repository scope
 
 Every remote search requires login, including public search. `--scope mine` selects
@@ -84,7 +137,8 @@ repositories in the current authenticated account's personal namespace; it does 
 include repositories shared through collaboration or organization membership.
 `--scope public` selects public repositories; `--scope owner/repo` selects that exact
 repository. These scopes apply to sessions and agents, and cannot be combined with
-`--counts`. `--here` intersects these scopes for sessions; `--local` is not supported here.
+`--counts`. `--here` intersects these scopes for sessions. Combining any `--scope`
+with `--local` is rejected before Git origin inspection, login or corpus scanning.
 
 Scope is applied to every effective query, including shared `--repo` and `--owner`
 filters, before any search request. A contradictory qualifier rejects the entire

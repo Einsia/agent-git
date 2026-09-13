@@ -10,7 +10,8 @@ use crate::hub::{CodeOriginNotConfirmed, valid_code_origin};
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 
-mod local_git;
+mod local;
+use crate::infra::local_git;
 
 /// The allowed types. Matches the hub's `SearchType`.
 const KINDS: &[&str] = &["sessions", "agents", "prs", "people"];
@@ -182,6 +183,10 @@ pub struct Args {
     #[arg(long)]
     pub counts: bool,
 
+    /// Search saved local session history without contacting the Hub or native runtimes
+    #[arg(long)]
+    pub local: bool,
+
     /// Emit raw structured JSON (also the default when stdout is not a terminal)
     #[arg(long)]
     pub mcp: bool,
@@ -216,7 +221,53 @@ pub fn run(mut args: Args) -> CmdResult {
             return Ok(ExitCode::Usage);
         }
     };
+    let local_queries = if args.local {
+        match local::validate(&args, &queries) {
+            Ok(parsed) => Some(parsed),
+            Err(message) => {
+                ui::error(&message);
+                return Ok(ExitCode::Usage);
+            }
+        }
+    } else {
+        None
+    };
     let client = require_login()?;
+    if let Some(parsed) = local_queries {
+        let results = local::execute(&args, &queries, &parsed)?;
+        if results.len() > 1 {
+            let results: Vec<_> = results
+                .into_iter()
+                .zip(&queries)
+                .map(|(result, query)| serde_json::json!({"query":query,"ok":true,"result":result}))
+                .collect();
+            println!("{}", serde_json::json!({"batch":true,"results":results}));
+        } else {
+            let result = results.into_iter().next().expect("a local query exists");
+            if args.mcp || !ui::is_tty() {
+                println!("{}", result);
+            } else {
+                println!("{} matches in local saved history", result["total"]);
+                if let Some(hits) = result["hits"].as_array() {
+                    for hit in hits {
+                        println!(
+                            "{} @{}:{}  {}",
+                            hit["agent"].as_str().unwrap_or_default(),
+                            hit["commit"].as_str().unwrap_or_default(),
+                            hit["line"],
+                            hit["excerpt"].as_str().unwrap_or_default()
+                        );
+                    }
+                }
+                if result["incomplete"] == true {
+                    ui::warning(
+                        "local history search is incomplete; missing or bounded evidence may contain additional matches",
+                    );
+                }
+            }
+        }
+        return Ok(ExitCode::Ok);
+    }
     if args.here {
         args.code_origin = match current_code_origin() {
             Ok(origin) => Some(origin),
@@ -298,6 +349,9 @@ fn scoped_queries(
 }
 
 fn effective_queries(args: &Args) -> Result<Vec<String>, String> {
+    if args.local && (args.scope.is_some() || args.here || args.code_origin.is_some()) {
+        return Err("--local cannot be combined with --scope or --here; use --repo or --owner to filter saved local history".into());
+    }
     if args.here && (args.counts || args.kind != "sessions") {
         return Err(
             "--here supports only --type sessions and cannot be used with --counts.".into(),

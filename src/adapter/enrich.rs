@@ -33,12 +33,22 @@ use std::collections::HashMap;
 /// same text that was fed to parse — line-number coordinates only mean anything against the same
 /// text.
 pub fn tool_details(format: &str, raw: &str, session: &Session) -> ToolDetails {
+    details(format, raw, session, true)
+}
+
+/// Search needs call arguments, not a copy of every output paired to each occurrence.
+#[cfg(feature = "cli")]
+pub(crate) fn tool_inputs(format: &str, raw: &str, session: &Session) -> ToolDetails {
+    details(format, raw, session, false)
+}
+
+fn details(format: &str, raw: &str, session: &Session, include_output: bool) -> ToolDetails {
     let lines: Vec<&str> = raw.lines().collect();
     let mut out = ToolDetails::default();
     match format {
-        "claude-code" => claude(&lines, session, &mut out),
-        "codex" => codex(&lines, session, &mut out),
-        "opencode" => opencode(&lines, session, &mut out),
+        "claude-code" => claude(&lines, session, &mut out, include_output),
+        "codex" => codex(&lines, session, &mut out, include_output),
+        "opencode" => opencode(&lines, session, &mut out, include_output),
         // Unknown format family: better an empty table than reading against a guessed shape.
         _ => {}
     }
@@ -92,7 +102,7 @@ fn claude_result_text(content: Option<&serde_json::Value>) -> Option<String> {
     })
 }
 
-fn claude(lines: &[&str], session: &Session, out: &mut ToolDetails) {
+fn claude(lines: &[&str], session: &Session, out: &mut ToolDetails, include_output: bool) {
     // One pass collects calls (by line, in block order), one collects outputs (by tool_use_id).
     let mut calls_at: HashMap<usize, Vec<(String, serde_json::Value)>> = HashMap::new();
     let mut outputs: HashMap<String, (String, bool)> = HashMap::new();
@@ -112,7 +122,7 @@ fn claude(lines: &[&str], session: &Session, out: &mut ToolDetails) {
                     let input = b.get("input").cloned().unwrap_or(serde_json::json!({}));
                     calls_at.entry(ln).or_default().push((id, input));
                 }
-                Some("tool_result") => {
+                Some("tool_result") if include_output => {
                     if let (Some(id), Some(text)) = (
                         b.get("tool_use_id").and_then(|x| x.as_str()),
                         claude_result_text(b.get("content")),
@@ -139,7 +149,7 @@ fn claude(lines: &[&str], session: &Session, out: &mut ToolDetails) {
     });
 }
 
-fn codex(lines: &[&str], session: &Session, out: &mut ToolDetails) {
+fn codex(lines: &[&str], session: &Session, out: &mut ToolDetails, include_output: bool) {
     // Codex records one call per line; the three families use different argument keys, while
     // outputs uniformly pair by call_id.
     let mut calls_at: HashMap<usize, (String, serde_json::Value)> = HashMap::new();
@@ -180,7 +190,7 @@ fn codex(lines: &[&str], session: &Session, out: &mut ToolDetails) {
             }
             Some(
                 "function_call_output" | "custom_tool_call_output" | "local_shell_call_output",
-            ) => {
+            ) if include_output => {
                 // output is either plain text or {"output": ..., "metadata": ...}.
                 let text = match p.get("output") {
                     Some(serde_json::Value::String(s)) => Some(s.clone()),
@@ -219,7 +229,7 @@ fn codex(lines: &[&str], session: &Session, out: &mut ToolDetails) {
     }
 }
 
-fn opencode(lines: &[&str], session: &Session, out: &mut ToolDetails) {
+fn opencode(lines: &[&str], session: &Session, out: &mut ToolDetails, include_output: bool) {
     // In the canonical line set a tool part is one per line and its input and output sit in the
     // state on that same line, so nothing pairs across lines. The export form is not
     // line-per-JSON, so reaching here yields an empty table.
@@ -230,7 +240,9 @@ fn opencode(lines: &[&str], session: &Session, out: &mut ToolDetails) {
         let error = state.get("status").and_then(|x| x.as_str()) == Some("error");
         // A failed call's body is in `state.error`; an empty-string output is still carried
         // faithfully (see claude_result_text).
-        let output = if error {
+        let output = if !include_output {
+            None
+        } else if error {
             state
                 .get("error")
                 .and_then(|x| x.as_str())
@@ -600,5 +612,35 @@ mod tests {
         };
         let details = tool_details("opencode", "{\n  \"info\": {}\n}", &session);
         assert!(details.is_empty());
+    }
+    #[cfg(feature = "cli")]
+    #[test]
+    fn input_projection_never_duplicates_paired_output_for_repeated_calls() {
+        let call = serde_json::json!({"type":"tool_use", "id":"same", "name":"Bash", "input":{"command":"needle"}});
+        let raw = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"assistant","message":{"content":vec![call; 100]}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"same","content":"output".repeat(10_000)}]}})
+        );
+        let session = crate::adapter::get("claude-code")
+            .unwrap()
+            .parse(&raw)
+            .unwrap();
+        let inputs = tool_inputs("claude-code", &raw, &session);
+        assert_eq!(
+            session
+                .events
+                .iter()
+                .filter(|event| event.kind == EventKind::ToolUse)
+                .count(),
+            100
+        );
+        for (index, event) in session.events.iter().enumerate() {
+            if event.kind == EventKind::ToolUse {
+                let detail = inputs.get(index).unwrap();
+                assert_eq!(detail.input.as_ref().unwrap()["command"], "needle");
+                assert!(detail.output.is_none());
+            }
+        }
     }
 }

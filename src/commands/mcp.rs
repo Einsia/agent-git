@@ -57,7 +57,7 @@ fn handle(req: &serde_json::Value) -> Option<String> {
             id,
             serde_json::json!({
                 "tools": [
-                    {"name": "search", "description": "Search readable AgentGit history. Use query for one search, or queries for an ordered batch (up to 16, four in flight). Shared filters: repo (owner/name), owner, author (saved Git author name/email), since (inclusive UTC saved time), before (exclusive UTC saved time), runtime, scopes (prompt/reply/tool/output/edit/summary), tool, path. Queries also accept quoted phrases, -exclude and qualifiers such as turns:>20. Inspect incomplete and unknown before concluding no work exists. Scope identifies the evidence; secondhand means a compact summary. Outcome/confidence are heuristics: open a hit before relying on it. Pagination includes page, per and has_more. scope restricts sessions or agents to mine (personally owned repositories), org (readable repositories in current membership organizations), public, or one owner/repo; every remote search requires login.", "inputSchema": {"type":"object","properties":{"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},"type":{"type":"string","enum":["sessions","agents","prs","people"]},"sort":{"type":"string","enum":["best","recent","turns"]},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1},"scope":{"type":"string","description":"mine, org, public, or owner/repo; sessions and agents only"},"here":{"type":"boolean","description":"Restrict sessions to the current code Git repository exact origin; requires a supporting Hub."},"repo":{"type":"string"},"owner":{"type":"string"},"author":{"type":"string"},"since":{"type":"string"},"before":{"type":"string"},"runtime":{"type":"string"},"scopes":{"type":"array","items":{"type":"string","enum":["prompt","reply","tool","output","edit","summary"]}},"tool":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}},
+                    {"name": "search", "description": "Search readable AgentGit history. Use query for one search, or queries for an ordered batch (up to 16, four in flight). Shared filters: repo (owner/name), owner, author (saved Git author name/email), since (inclusive UTC saved time), before (exclusive UTC saved time), runtime, scopes (prompt/reply/tool/output/edit/summary), tool, path. Queries also accept quoted phrases, -exclude and qualifiers such as turns:>20. Inspect incomplete and unknown before concluding no work exists. Scope identifies the evidence; secondhand means a compact summary. Outcome/confidence are heuristics: open a hit before relying on it. Pagination includes page, per and has_more. scope restricts sessions or agents to mine (personally owned repositories), org (readable repositories in current membership organizations), public, or one owner/repo; every remote search requires login. local=true searches saved local session history without HTTP or native transcript access; it keeps the login precondition and refuses scope, here and unsupported Hub-only filters/types before scanning.", "inputSchema": {"type":"object","properties":{"local":{"type":"boolean"},"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":16},"type":{"type":"string","enum":["sessions","agents","prs","people"]},"sort":{"type":"string","enum":["best","recent","turns"]},"limit":{"type":"integer","minimum":1,"maximum":100},"page":{"type":"integer","minimum":1},"scope":{"type":"string","description":"mine, org, public, or owner/repo; sessions and agents only"},"here":{"type":"boolean","description":"Restrict sessions to the current code Git repository exact origin; requires a supporting Hub."},"repo":{"type":"string"},"owner":{"type":"string"},"author":{"type":"string"},"since":{"type":"string"},"before":{"type":"string"},"runtime":{"type":"string"},"scopes":{"type":"array","items":{"type":"string","enum":["prompt","reply","tool","output","edit","summary"]}},"tool":{"type":"string"},"path":{"type":"string"}},"additionalProperties":false}},
                     {"name": "show", "description": "Read part of a session (ref, ref#n, ref#n.k)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "view", "description": "the ordered composition of a VIEW (plumbing)", "inputSchema": {"type":"object","properties":{"ref":{"type":"string"}}}},
                     {"name": "status", "description": "who am I + sync status", "inputSchema": {"type":"object","properties":{}}},
@@ -107,6 +107,8 @@ impl ToolOutput {
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchArgs {
+    #[serde(default)]
+    local: bool,
     query: Option<String>,
     #[serde(default)]
     queries: Vec<String>,
@@ -140,6 +142,9 @@ fn search_arguments(args: &serde_json::Value) -> Result<Vec<String>, String> {
     }
     let args: SearchArgs = serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
     let mut out = vec!["search".to_owned(), "--mcp".to_owned()];
+    if args.local {
+        out.push("--local".to_owned());
+    }
     if args.here {
         out.push("--here".into());
     }
@@ -308,6 +313,32 @@ mod workspace_tool_tests {
         assert!(super::search_arguments(&serde_json::json!({"limit":-1})).is_err());
         assert!(super::search_arguments(&serde_json::json!({"queries":[false]})).is_err());
         assert!(super::search_arguments(&serde_json::json!({"author_typo":"alice"})).is_err());
+    }
+
+    #[test]
+    fn local_search_is_explicit_and_preserves_literal_query_arguments() {
+        use clap::Parser;
+        for local in [false, true] {
+            let arguments = super::search_arguments(&serde_json::json!({
+                "local": local, "query": "--counts", "repo": "alice/demo",
+                "scope": "org", "here": true,
+            }))
+            .unwrap();
+            let command = super::super::Cli::try_parse_from(
+                std::iter::once("agit").chain(arguments.iter().map(String::as_str)),
+            )
+            .unwrap();
+            let Some(super::super::Commands::Search(args)) = command.command else {
+                panic!("search command expected")
+            };
+            assert_eq!(args.local, local);
+            assert_eq!(args.scope, Some(super::super::search::CorpusScope::Org));
+            assert!(args.here);
+            assert!(!args.counts);
+            assert_eq!(args.queries, ["--counts"]);
+            assert_eq!(args.repo.as_deref(), Some("alice/demo"));
+        }
+        assert!(super::search_arguments(&serde_json::json!({"local":"true"})).is_err());
     }
 
     #[test]

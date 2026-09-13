@@ -209,12 +209,24 @@ impl std::error::Error for GitWorktreeFormatUnavailable {}
 pub(crate) enum ReadPolicy {
     AllowTransport,
     LocalOnly,
+    /// The selected checkout owns its Git carrier; ancestor discovery is forbidden.
+    #[cfg(feature = "cli")]
+    LocalRepository(crate::infra::local_git::Deadline),
     /// One inspection retains its deadline through nested immutable storage reads.
     #[cfg(feature = "cli")]
     LocalInspection(crate::infra::local_git::Deadline),
 }
 
 impl ReadPolicy {
+    pub(crate) fn apply_at_root(self, command: &mut Command) {
+        self.apply(command);
+        #[cfg(feature = "cli")]
+        if matches!(self, Self::LocalRepository(_)) {
+            // The command's explicit checkout change anchors this carrier without discovery.
+            command.env("GIT_DIR", ".git");
+        }
+    }
+
     pub(crate) fn apply(self, command: &mut Command) {
         if !matches!(self, Self::AllowTransport) {
             command
@@ -675,6 +687,20 @@ impl Repo {
         deadline: crate::infra::local_git::Deadline,
     ) -> Result<std::process::Output> {
         let mut command = self.clone().local_objects_only().cmd();
+        command.args(args);
+        deadline.output(command, None, limit)
+    }
+
+    /// Every subprocess names this checkout's carrier even if it disappears between reads.
+    #[cfg(feature = "cli")]
+    pub(crate) fn inspection_output_in_repository(
+        &self,
+        args: &[&str],
+        limit: usize,
+        deadline: crate::infra::local_git::Deadline,
+    ) -> Result<std::process::Output> {
+        let mut command = self.clone().local_objects_only().cmd();
+        ReadPolicy::LocalRepository(deadline).apply_at_root(&mut command);
         command.args(args);
         deadline.output(command, None, limit)
     }

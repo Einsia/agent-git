@@ -123,29 +123,11 @@ fn main() {
     // warnings are part of this output too, and left outside the envelope they become bare text
     // ahead of the JSON that the consumer cannot parse.
     let command_name = commands::command_name(&command);
-    let startup = match &command {
-        Commands::Status(_) => Startup::Inspect,
-        Commands::Search(_) => Startup::RemoteSearch,
-        Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
-        Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
-        Commands::Doctor(_) => Startup::Inspect,
-        Commands::Scan(args) if args.sensitive => Startup::ScopedReview,
-        Commands::Revert(args) if args.expected_head.is_some() => Startup::ScopedReview,
-        Commands::Import(args) if commands::import::needs_readonly_startup(args) => {
-            Startup::ScopedImport
-        }
-        _ => Startup::Migrate,
-    };
+    let startup = startup_for(&command);
     // A best-effort, once-a-day update hint belongs to the process startup path so it also
     // appears for ordinary commands, not only after a successful push. The helper skips the JSON
     // path because stdout there is a strict machine-readable envelope.
-    if !matches!(
-        startup,
-        Startup::ScopedDoctor
-            | Startup::ScopedImport
-            | Startup::ScopedReview
-            | Startup::RemoteSearch
-    ) {
+    if startup.allows_nudge() {
         commands::upgrade::maybe_startup_nudge(command_name, json);
     }
     if json {
@@ -203,7 +185,9 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
         | Startup::ScopedDiff
         | Startup::ScopedImport
         | Startup::ScopedReview
-        | Startup::RemoteSearch => Ok(()),
+        | Startup::RemoteSearch
+        | Startup::LocalSearch
+        | Startup::ToolDispatcher => Ok(()),
     };
     if let Err(e) = prepared {
         agit::ui::error(&format!("local storage preparation failed: {e:#}"));
@@ -212,7 +196,7 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
     None
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Startup {
     Migrate,
     Inspect,
@@ -223,8 +207,44 @@ enum Startup {
     ScopedImport,
     /// Review and guarded edits inspect recovery only after selecting their repository.
     ScopedReview,
-    /// Search validates its own local scope before requesting the Hub.
+    /// Search queries the Hub without inspecting or migrating local repositories.
     RemoteSearch,
+    /// Offline search must not run update checks or create migration/cache state.
+    LocalSearch,
+    /// Each dispatched tool prepares its own storage; the protocol parent has no local scope.
+    ToolDispatcher,
+}
+
+impl Startup {
+    fn allows_nudge(self) -> bool {
+        !matches!(
+            self,
+            Self::ScopedDoctor
+                | Self::ScopedImport
+                | Self::ScopedReview
+                | Self::RemoteSearch
+                | Self::LocalSearch
+                | Self::ToolDispatcher
+        )
+    }
+}
+
+fn startup_for(command: &Commands) -> Startup {
+    match command {
+        Commands::Status(_) => Startup::Inspect,
+        Commands::Search(args) if args.local => Startup::LocalSearch,
+        Commands::Search(_) => Startup::RemoteSearch,
+        Commands::Mcp(_) => Startup::ToolDispatcher,
+        Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
+        Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
+        Commands::Doctor(_) => Startup::Inspect,
+        Commands::Scan(args) if args.sensitive => Startup::ScopedReview,
+        Commands::Revert(args) if args.expected_head.is_some() => Startup::ScopedReview,
+        Commands::Import(args) if commands::import::needs_readonly_startup(args) => {
+            Startup::ScopedImport
+        }
+        _ => Startup::Migrate,
+    }
 }
 
 /// What to do when no subcommand is given and the interface is **not** entered.
@@ -351,5 +371,47 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
             agit::ui::error(&commands::terminal_error_message(&e));
             commands::terminal_error_code(&e, agit::ExitCode::Failure).as_i32()
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn mcp_defers_storage_and_nudges_to_each_tool() {
+        let cli = Cli::try_parse_from(["agit", "mcp"]).unwrap();
+        let startup = startup_for(&cli.command.unwrap());
+        assert_eq!(startup, Startup::ToolDispatcher);
+        assert!(!startup.allows_nudge());
+        let commit = Cli::try_parse_from(["agit", "commit"]).unwrap();
+        assert_eq!(startup_for(&commit.command.unwrap()), Startup::Migrate);
+    }
+
+    #[test]
+    fn local_search_never_admits_a_startup_nudge_before_validation_or_login() {
+        for arguments in [
+            vec!["agit", "search", "--local", "needle"],
+            vec!["agit", "search", "--local", "--counts", "needle"],
+            vec!["agit", "search", "--local", "--query", "\"\""],
+            vec!["agit", "--quiet", "search", "--local", "needle"],
+            vec!["agit", "--json", "search", "--local", "needle"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let startup = startup_for(&cli.command.unwrap());
+            assert_eq!(startup, Startup::LocalSearch);
+            assert!(
+                !startup.allows_nudge(),
+                "TTY and production mode cannot admit a local update request"
+            );
+        }
+        let remote = Cli::try_parse_from(["agit", "search", "needle"]).unwrap();
+        let startup = startup_for(&remote.command.unwrap());
+        assert_eq!(startup, Startup::RemoteSearch);
+        assert!(
+            !startup.allows_nudge(),
+            "remote search leaves update checks outside its request path"
+        );
     }
 }

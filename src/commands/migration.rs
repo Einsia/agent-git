@@ -1659,6 +1659,23 @@ impl LegacySnapshotSpool {
         self.root.path()
     }
 
+    fn verified_name(&self, repo: &Repo) -> Result<&OsStr> {
+        let git_dir = migration_git_dir(repo)?;
+        let name = self
+            .root()
+            .file_name()
+            .context("migration spool has no directory name")?;
+        let metadata = std::fs::symlink_metadata(self.root())?;
+        anyhow::ensure!(
+            self.root().parent() == Some(git_dir.as_path())
+                && is_owned_spool_name(name)?
+                && metadata.file_type().is_dir()
+                && !metadata.file_type().is_symlink(),
+            "migration spool does not belong to the selected repository"
+        );
+        Ok(name)
+    }
+
     fn record_log(
         &mut self,
         canonical: &str,
@@ -1874,8 +1891,7 @@ fn apply_streamed_tree_edits(
     spool: &LegacySnapshotSpool,
     metrics: &mut MigrationMetrics,
 ) -> Result<String> {
-    let index = spool.root().join("migration.index");
-    run_index_git(repo, &index, &["read-tree", old], None)?;
+    run_index_git(repo, spool, &["read-tree", old], None)?;
 
     let index_info_path = spool.root().join("index-info");
     let mut index_info = BufWriter::new(File::create(&index_info_path)?);
@@ -1894,11 +1910,11 @@ fn apply_streamed_tree_edits(
     let input = File::open(index_info_path)?;
     run_index_git(
         repo,
-        &index,
+        spool,
         &["update-index", "-z", "--index-info"],
         Some(input),
     )?;
-    let tree = run_index_git(repo, &index, &["write-tree"], None)?;
+    let tree = run_index_git(repo, spool, &["write-tree"], None)?;
     let tree = String::from_utf8(tree)?.trim().to_owned();
     anyhow::ensure!(
         matches!(tree.len(), 40 | 64) && tree.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -1963,12 +1979,14 @@ fn hash_spooled_blobs_with_command(
     metrics: &mut MigrationMetrics,
     command: &mut Command,
 ) -> Result<()> {
+    spool.verified_name(repo)?;
     let sources = File::open(spool.root().join("hash-sources"))?;
     let mut targets = BufReader::new(File::open(spool.root().join("hash-targets"))?);
-    let git_dir = std::fs::canonicalize(repo.root().join(".git"))?;
     metrics.object_hash_processes += 1;
+    // The verified spool is directly inside the selected Git directory. Relative Git inputs
+    // avoid OS-only canonical path spellings without changing which repository owns the objects.
     let mut child = command
-        .env("GIT_DIR", git_dir)
+        .env("GIT_DIR", "..")
         .current_dir(spool.root())
         .stdin(Stdio::from(sources))
         .stdout(Stdio::piped())
@@ -2047,11 +2065,20 @@ fn hash_spooled_blobs_with_command(
     Ok(())
 }
 
-fn run_index_git(repo: &Repo, index: &Path, args: &[&str], input: Option<File>) -> Result<Vec<u8>> {
+fn run_index_git(
+    repo: &Repo,
+    spool: &LegacySnapshotSpool,
+    args: &[&str],
+    input: Option<File>,
+) -> Result<Vec<u8>> {
+    let index = Path::new(".git")
+        .join(spool.verified_name(repo)?)
+        .join("migration.index");
     let output = Command::new("git")
         .arg("--no-replace-objects")
         .args(args)
         .current_dir(repo.root())
+        .env("GIT_DIR", ".git")
         .env("GIT_INDEX_FILE", index)
         .stdin(input.map_or_else(Stdio::null, Stdio::from))
         .stdout(Stdio::piped())
@@ -2460,11 +2487,13 @@ mod tests {
     #[test]
     fn pending_work_is_migrated_before_the_completion_marker_is_written() {
         let home = tempfile::tempdir().unwrap();
-        let repos = home.path().join("repos");
+        let canonical_home = home.path().canonicalize().unwrap();
+        let repos = canonical_home.join("repos");
         let repo = local_repo_with_layout(&repos, "owner", "legacy", LayoutVersion::V0);
+        let old = repo.git(&["rev-parse", "HEAD"]).unwrap();
 
         assert_eq!(
-            migrate_startup_at(home.path(), &repos).unwrap(),
+            migrate_startup_at(&canonical_home, &repos).unwrap(),
             Report {
                 repos: 1,
                 branches: 1,
@@ -2477,6 +2506,10 @@ mod tests {
             STARTUP_MIGRATION_VERSION
         );
         assert_eq!(meta::read(repo.root()).unwrap().layout, LayoutVersion::V1);
+        assert_eq!(
+            read_meta_at(&repo, &old).unwrap().unwrap().layout,
+            LayoutVersion::V0
+        );
     }
 
     #[test]
@@ -3118,6 +3151,71 @@ mod tests {
         assert!(format!("{error:#}").contains("non-directory"), "{error:#}");
         assert_eq!(std::fs::read_to_string(&hostile).unwrap(), "user file\n");
         assert!(lookalike.is_dir());
+    }
+
+    #[test]
+    fn spooled_git_paths_bind_the_canonical_repository_and_private_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let selected = Repo::init(&directory.path().join("selected repo")).unwrap();
+        let repo = Repo::open(selected.root().canonicalize().unwrap()).unwrap();
+        let other = Repo::init(&directory.path().join("other repo")).unwrap();
+        let session = format!("agit-{}", "d".repeat(40));
+        let log = envelope(
+            serde_json::json!({"type":"event","text":"saved content"}),
+            &session,
+        );
+        let old = legacy_session_tip(&repo, &session, &log, &log);
+        let index_before = std::fs::read(repo.root().join(".git/index")).unwrap();
+        let mut metrics = MigrationMetrics::default();
+
+        let new = migrate_tip_with_limits(&repo, &old, MIGRATION_LIMITS, &mut metrics).unwrap();
+
+        assert_eq!(
+            storage::materialize_pair_at(repo.root(), &new).unwrap(),
+            (log.clone(), log)
+        );
+        assert_eq!(
+            read_meta_at(&repo, &new).unwrap().unwrap().layout,
+            LayoutVersion::V1
+        );
+        assert_eq!(
+            read_meta_at(&repo, &old).unwrap().unwrap().layout,
+            LayoutVersion::V0
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), old);
+        assert_eq!(
+            std::fs::read(repo.root().join(".git/index")).unwrap(),
+            index_before
+        );
+        assert_eq!(metrics.object_hash_processes, 1);
+
+        let mut spool = LegacySnapshotSpool::create(&repo).unwrap();
+        spool.finish_payloads(b"", b"").unwrap();
+        let error = run_index_git(&other, &spool, &["read-tree", "--empty"], None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to the selected repository"),
+            "{error:#}"
+        );
+        let mut index_info = Vec::new();
+        let mut refused_metrics = MigrationMetrics::default();
+        let error =
+            hash_spooled_blobs(&other, &spool, &mut index_info, &mut refused_metrics).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to the selected repository"),
+            "{error:#}"
+        );
+        assert!(index_info.is_empty());
+        assert_eq!(refused_metrics.object_hash_processes, 0);
+        assert!(!spool.root().join("migration.index").exists());
+        assert!(!other.root().join(".git/index").exists());
+        assert_eq!(
+            std::fs::read(repo.root().join(".git/index")).unwrap(),
+            index_before
+        );
     }
 
     #[test]

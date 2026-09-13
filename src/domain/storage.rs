@@ -17,6 +17,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(feature = "cli")]
+mod local_read;
+#[cfg(feature = "cli")]
+pub(crate) use local_read::LocalReadBudget;
+
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub(crate) struct ReadLimitExceeded(String);
@@ -717,6 +722,94 @@ pub fn materialize_at(repo_root: &Path, git_ref: &str, seq_file: &str) -> Result
     }
 }
 
+/// Read saved history from a validated immutable snapshot without consulting VIEW or fetching.
+/// The limit covers both unique object bytes and the expanded LOG, including repeated events.
+#[cfg(feature = "cli")]
+pub(crate) fn materialize_log_local(
+    repo_root: &Path,
+    commit: &str,
+    layout: LayoutVersion,
+    maximum: usize,
+    maximum_events: usize,
+    work: &mut LocalReadBudget,
+) -> Result<String> {
+    immutable_local_oid(commit)?;
+    let maximum = maximum.min(MAX_MATERIALIZED_BYTES);
+    let policy = ReadPolicy::LocalRepository(work.deadline());
+    let bytes = git_blob_with_policy(
+        repo_root,
+        commit,
+        SequenceKind::Log.path(layout),
+        maximum,
+        policy,
+    )?;
+    work.record_read(bytes.len())?;
+    let text = String::from_utf8(bytes).context("saved LOG is not UTF-8")?;
+    match layout {
+        LayoutVersion::V0 => {
+            let mut output = String::new();
+            for (position, line) in text.split_inclusive('\n').enumerate() {
+                read_limit(position < maximum_events, || {
+                    "saved LOG exceeds the event budget".into()
+                })?;
+                work.json(line)?;
+                let envelope = parse_legacy_envelope_line(line)?;
+                let canonical = envelope_line(&envelope);
+                read_limit(
+                    canonical.len() <= maximum.saturating_sub(output.len()),
+                    || "canonical saved LOG exceeds the read budget".into(),
+                )?;
+                output.push_str(&canonical);
+            }
+            Ok(output)
+        }
+        LayoutVersion::V1 => {
+            let mut ids = Vec::new();
+            if !text.is_empty() {
+                let body = text
+                    .strip_suffix('\n')
+                    .context("saved LOG must end with LF")?;
+                for id in body.split('\n') {
+                    work.spend(1)?;
+                    read_limit(ids.len() < maximum_events, || {
+                        "saved LOG exceeds the event budget".into()
+                    })?;
+                    anyhow::ensure!(
+                        meta::is_event_id(id),
+                        "saved LOG contains an invalid event id"
+                    );
+                    ids.push(id.to_owned());
+                }
+            }
+            let (log, _) = materialize_pair_ids_with_limits(
+                &ids,
+                &[],
+                maximum.min(MAX_EVENT_BYTES),
+                maximum,
+                maximum,
+                |unique| inspect_git_event_sizes_with_policy(repo_root, commit, unique, policy),
+                |unique, sizes, offsets, output| {
+                    read_git_events_into_output_with_policy(
+                        repo_root, commit, unique, sizes, offsets, output, policy,
+                    )?;
+                    for size in sizes {
+                        work.record_read(*size)?;
+                    }
+                    // Validate structure before canonical envelope hashing allocates JSON values.
+                    for (&offset, &size) in offsets.iter().zip(sizes) {
+                        let body = output
+                            .get(offset..offset + size)
+                            .context("saved event bounds are invalid")?;
+                        work.json(std::str::from_utf8(body).context("saved event is not UTF-8")?)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok(log)
+        }
+    }
+}
+
 /// Materialize only the **first event** of the sequence (v1 reads only the hash list and the
 /// first object; v0 streams to the first newline and canonicalizes only the first envelope).
 /// Picking up the Codex bootstrap needs just this line, and materializing the whole LOG for it
@@ -1095,7 +1188,7 @@ fn with_legacy_pair_batch<T>(
     ];
     let mut command = read_command(repo_root, policy);
     #[cfg(feature = "cli")]
-    if let ReadPolicy::LocalInspection(deadline) = policy {
+    if let ReadPolicy::LocalInspection(deadline) | ReadPolicy::LocalRepository(deadline) = policy {
         let limit = _max_blob_bytes
             .checked_add(MAX_BATCH_HEADER_BYTES + 1)
             .and_then(|limit| limit.checked_mul(specs.len()))
@@ -1233,7 +1326,7 @@ fn resolve_commit(repo_root: &Path, git_ref: &str) -> Result<String> {
 fn read_command(repo_root: &Path, policy: ReadPolicy) -> Command {
     let mut command = Command::new("git");
     command.arg("--no-replace-objects").arg("-C").arg(repo_root);
-    policy.apply(&mut command);
+    policy.apply_at_root(&mut command);
     #[cfg(feature = "cli")]
     if matches!(policy, ReadPolicy::LocalInspection(_)) {
         command.args(["--git-dir", ".git", "--work-tree", "."]);
@@ -1962,7 +2055,7 @@ fn read_output(
     let mut command = read_command(repo_root, policy);
     command.args(args);
     #[cfg(feature = "cli")]
-    if let ReadPolicy::LocalInspection(deadline) = policy {
+    if let ReadPolicy::LocalInspection(deadline) | ReadPolicy::LocalRepository(deadline) = policy {
         return deadline.output(command, None, _limit);
     }
     Ok(command.output()?)
@@ -2040,7 +2133,7 @@ fn with_event_batch<T>(
     consume: impl FnOnce(&mut dyn BufRead) -> Result<T>,
 ) -> Result<T> {
     #[cfg(feature = "cli")]
-    if let ReadPolicy::LocalInspection(deadline) = policy {
+    if let ReadPolicy::LocalInspection(deadline) | ReadPolicy::LocalRepository(deadline) = policy {
         // Response buffering is limited by validated body sizes and bounded header framing.
         // Concurrent pipe I/O must finish before synchronous parsing can observe any bytes.
         let mut limit = ids
@@ -2059,7 +2152,11 @@ fn with_event_batch<T>(
             }
         }
         // Framing cannot expand a small saved sequence into an unbounded response buffer.
-        let limit = limit.min(MAX_STATUS_BATCH_BYTES);
+        let limit = if matches!(policy, ReadPolicy::LocalInspection(_)) {
+            limit.min(MAX_STATUS_BATCH_BYTES)
+        } else {
+            limit
+        };
         use std::fmt::Write as _;
         let mut input = String::new();
         for id in ids {
@@ -2071,7 +2168,8 @@ fn with_event_batch<T>(
                 .and_then(|length| length.checked_add(input.len()))
                 .context("saved batch input budget overflow")?;
             anyhow::ensure!(
-                length <= MAX_STATUS_BATCH_BYTES,
+                !matches!(policy, ReadPolicy::LocalInspection(_))
+                    || length <= MAX_STATUS_BATCH_BYTES,
                 "saved batch input budget exceeded"
             );
             writeln!(input, "{git_ref}:{path}")?;
@@ -3272,6 +3370,218 @@ mod tests {
         assert_eq!(
             materialize_at(dir.path(), "HEAD", meta::LOG_FILE).unwrap(),
             new_line
+        );
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn local_log_reads_immutable_history_without_view_and_bounds_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+        let event = line(SID_A, 1);
+        let log = event.repeat(4);
+        write_snapshot(dir.path(), &log, &event).unwrap();
+        std::fs::write(dir.path().join(meta::VIEW_FILE), "unreadable view").unwrap();
+        meta::write(
+            dir.path(),
+            &meta::Meta::new(SID_A.into(), "codex".into(), "/r".into()),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("saved history").unwrap();
+        let commit = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let mut work = LocalReadBudget::new(20_000);
+        assert_eq!(
+            materialize_log_local(
+                dir.path(),
+                &commit,
+                LayoutVersion::V1,
+                log.len(),
+                MAX_SEQUENCE_EVENTS,
+                &mut work
+            )
+            .unwrap(),
+            log
+        );
+        assert_eq!(
+            work.read_bytes(),
+            std::fs::read(dir.path().join(meta::LOG_FILE))
+                .unwrap()
+                .len()
+                + event.len()
+        );
+        assert!(
+            materialize_log_local(
+                dir.path(),
+                "HEAD",
+                LayoutVersion::V1,
+                log.len(),
+                MAX_SEQUENCE_EVENTS,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .is_err()
+        );
+        assert!(
+            materialize_log_local(
+                dir.path(),
+                &commit,
+                LayoutVersion::V1,
+                log.len(),
+                3,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            materialize_log_local(
+                dir.path(),
+                &commit,
+                LayoutVersion::V1,
+                log.len(),
+                4,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .unwrap(),
+            log
+        );
+        assert!(
+            materialize_log_local(
+                dir.path(),
+                &commit,
+                LayoutVersion::V1,
+                log.len() - 1,
+                MAX_SEQUENCE_EVENTS,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .is_err()
+        );
+        std::fs::write(dir.path().join(meta::LOG_FILE), "not the saved history").unwrap();
+        assert_eq!(
+            materialize_log_local(
+                dir.path(),
+                &commit,
+                LayoutVersion::V1,
+                log.len(),
+                MAX_SEQUENCE_EVENTS,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .unwrap(),
+            log
+        );
+        let event_path = meta::event_path(&event_id(&event).unwrap()).unwrap();
+        std::fs::remove_file(dir.path().join(event_path)).unwrap();
+        std::fs::write(
+            dir.path().join(meta::LOG_FILE),
+            sequence_text(&[event_id(&event).unwrap()]).unwrap(),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("missing saved event").unwrap();
+        let broken = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        assert!(
+            materialize_log_local(
+                dir.path(),
+                &broken,
+                LayoutVersion::V1,
+                log.len(),
+                MAX_SEQUENCE_EVENTS,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn local_legacy_log_keeps_occurrences_and_refuses_malformed_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+        let event = line(SID_A, 2);
+        std::fs::create_dir_all(dir.path().join("session")).unwrap();
+        std::fs::write(dir.path().join(meta::LEGACY_LOG_FILE), event.repeat(2)).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("legacy history").unwrap();
+        let commit = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            materialize_log_local(
+                dir.path(),
+                &commit,
+                LayoutVersion::V0,
+                event.len() * 2,
+                MAX_SEQUENCE_EVENTS,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .unwrap(),
+            event.repeat(2)
+        );
+        assert!(
+            materialize_log_local(
+                dir.path(),
+                &commit,
+                LayoutVersion::V0,
+                event.len(),
+                MAX_SEQUENCE_EVENTS,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .is_err()
+        );
+        assert!(
+            materialize_log_local(
+                dir.path(),
+                &commit,
+                LayoutVersion::V0,
+                event.len() * 2,
+                1,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .is_err()
+        );
+        std::fs::write(dir.path().join(meta::LEGACY_LOG_FILE), "{}\n").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("invalid legacy history").unwrap();
+        let broken = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        assert!(
+            materialize_log_local(
+                dir.path(),
+                &broken,
+                LayoutVersion::V0,
+                1024,
+                MAX_SEQUENCE_EVENTS,
+                &mut LocalReadBudget::new(20_000)
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn local_failed_materialization_retains_work_across_saved_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("session")).unwrap();
+        let valid = line(SID_A, 1);
+        std::fs::write(
+            dir.path().join(meta::LEGACY_LOG_FILE),
+            format!("{valid}{{]\n"),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("owned malformed saved tail").unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let mut work = LocalReadBudget::new(2_000);
+        assert!(
+            materialize_log_local(dir.path(), &head, LayoutVersion::V0, 4096, 100, &mut work)
+                .is_err()
+        );
+        let after_failure = work.remaining();
+        assert!(after_failure < 2_000 && after_failure > 0);
+        assert!(
+            materialize_log_local(dir.path(), &head, LayoutVersion::V0, 4096, 100, &mut work)
+                .is_err()
+        );
+        assert!(
+            work.remaining() < after_failure,
+            "failed versions cannot refund input work"
         );
     }
 
