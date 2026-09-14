@@ -578,7 +578,12 @@ impl AnyDriver {
                 driver.next_prompt_id = Some(id.clone());
                 Some(id)
             }
-            AnyDriver::Codex(_) | AnyDriver::OpenCode(_) => None,
+            AnyDriver::Codex(driver) => {
+                let id = uuid::Uuid::new_v4().to_string();
+                driver.next_prompt_id = Some(id.clone());
+                Some(id)
+            }
+            AnyDriver::OpenCode(_) => None,
         }
     }
 

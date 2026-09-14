@@ -604,208 +604,12 @@ impl Adapter for Codex {
     }
 
     fn parse(&self, text: &str) -> Result<Session> {
-        let mut id = String::new();
-        let mut cwd = None;
-        let mut events = vec![];
-        // Whether any message has been seen before this point: it decides whether a compacted
-        // record's replacement_history is "a duplicate" or "the only carrier" (see the
-        // compacted arm).
-        let mut saw_message = false;
-
-        // The line number goes into every event ([`Event::line`]); the web transcript uses it to
-        // go back to the source for tool arguments and reasoning. Blank and malformed lines take
-        // a number too, so the coordinate addresses that exact line in the file.
-        for (lineno, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue; // As in Claude Code: skip a malformed line
-            };
-            let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            let payload = v.get("payload");
-            let ts = v
-                .get("timestamp")
-                .and_then(|x| x.as_str())
-                .map(String::from);
-
-            match ty {
-                // ── compact: a **top-level** record type, not an event_msg subtype ──
-                //
-                // A probe that filters on `payload.type` misses the whole mechanism: a
-                // `compacted` record carries its type at the top level and its payload has no
-                // type field, so the only thing that shows up is the `event_msg/context_compacted`
-                // notice for the UI that follows it (payload carries only a type, no body) — read
-                // as "there is no summary".
-                //
-                // One compact appends five records:
-                //   compacted                    ← the real payload, it is here
-                //   world_state                  ← environment snapshot
-                //   turn_context                 ← new turn
-                //   event_msg/token_count
-                //   event_msg/context_compacted  ← only a UI notice
-                //
-                // `replacement_history` is a **structured message array** and user input is kept
-                // verbatim (every sampled message matches exactly), so this is CompactFiltered
-                // and not Summary.
-                "compacted" => {
-                    let p = payload;
-                    let rh = p
-                        .and_then(|p| p.get("replacement_history"))
-                        .and_then(|x| x.as_array());
-                    let kept = rh.map(|a| a.len()).unwrap_or(0);
-                    let window = p
-                        .and_then(|p| p.get("window_number"))
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
-                    events.push(
-                        Event::text(
-                            EventKind::CompactFiltered,
-                            format!("context window #{window}, {kept} messages kept"),
-                            ts.clone(),
-                        )
-                        .at_line(lineno),
-                    );
-                    // In a complete transcript the body of replacement_history already appeared
-                    // verbatim before this record, so only the boundary description is kept and
-                    // nothing is duplicated into the IR. But in a text that opens at a boundary
-                    // (a branch VIEW's resume view) it is the only carrier of the retained
-                    // context — without expanding it, the resumed session has not even an
-                    // opening prompt.
-                    if !saw_message && let Some(rh) = rh {
-                        for m in rh {
-                            if m.get("type").and_then(|x| x.as_str()) != Some("message") {
-                                continue;
-                            }
-                            let role = m.get("role").and_then(|x| x.as_str()).unwrap_or("");
-                            if let Some(t) = extract_content_text(m.get("content")) {
-                                let (kind, text) = classify_message(role, t);
-                                events.push(Event::text(kind, text, ts.clone()).at_line(lineno));
-                            }
-                        }
-                        saw_message = kept > 0;
-                    }
-                }
-                "session_meta" => {
-                    if let Some(p) = payload {
-                        if id.is_empty()
-                            && let Some(s) = p.get("id").and_then(|x| x.as_str())
-                        {
-                            id = s.to_string();
-                        }
-                        if cwd.is_none()
-                            && let Some(c) = p
-                                .get("cwd")
-                                .and_then(|x| x.as_str())
-                                .filter(|c| !c.is_empty())
-                        {
-                            cwd = Some(c.to_string());
-                        }
-                    }
-                }
-                "response_item" => {
-                    let Some(p) = payload else { continue };
-                    match p.get("type").and_then(|x| x.as_str()).unwrap_or("") {
-                        "message" => {
-                            saw_message = true;
-                            let role = p.get("role").and_then(|x| x.as_str()).unwrap_or("");
-                            if let Some(t) = extract_content_text(p.get("content")) {
-                                let (kind, text) = classify_message(role, t);
-                                events.push(Event::text(kind, text, ts).at_line(lineno));
-                            }
-                        }
-                        "function_call" | "local_shell_call" | "custom_tool_call" => {
-                            let name = p
-                                .get("name")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("shell")
-                                .to_string();
-                            events.push(Event {
-                                kind: EventKind::ToolUse,
-                                text: Some(name.clone()),
-                                timestamp: ts,
-                                paths: vec![],
-                                tool: Some(name),
-                                line: Some(lineno),
-                            });
-                        }
-                        "function_call_output"
-                        | "local_shell_call_output"
-                        | "custom_tool_call_output" => {
-                            // Codex writes tool results as a separate response item.  They
-                            // are evidence, not user prompts; dropping them makes
-                            // `in:output` disagree with the Claude adapter.
-                            if let Some(text) = extract_output_text(p.get("output")) {
-                                events.push(
-                                    Event::text(EventKind::ToolResult, text, ts).at_line(lineno),
-                                );
-                            } else {
-                                // Keep an untextual/unknown output visible in loss accounting
-                                // instead of silently treating it as if it never existed.
-                                events.push(other_event(ts).at_line(lineno));
-                            }
-                        }
-                        // reasoning is encrypted and vendor-proprietary; the IR cannot express
-                        // it. Recorded as Other so the loss can be reported.
-                        "reasoning" => events.push(Event {
-                            kind: EventKind::Other,
-                            text: None,
-                            timestamp: ts,
-                            paths: vec![],
-                            tool: None,
-                            line: Some(lineno),
-                        }),
-                        // An unknown payload type (a custom tool call, or any form added
-                        // later) counts toward the dropped total too, never silently.
-                        _ => events.push(other_event(ts).at_line(lineno)),
-                    }
-                }
-                "event_msg" => {
-                    let Some(p) = payload else { continue };
-                    // This turn is done. There is one per human turn (a turn still running has
-                    // none), so it is a reliable close signal.
-                    if p.get("type").and_then(|x| x.as_str()) == Some("task_complete") {
-                        events.push(Event {
-                            kind: EventKind::TurnEnd,
-                            text: None,
-                            timestamp: ts.clone(),
-                            paths: vec![],
-                            tool: None,
-                            line: Some(lineno),
-                        });
-                        continue;
-                    }
-                    if p.get("type").and_then(|x| x.as_str()) == Some("patch_apply_end") {
-                        let paths: Vec<String> = p
-                            .get("changes")
-                            .and_then(|c| c.as_object())
-                            .map(|o| o.keys().cloned().collect())
-                            .unwrap_or_default();
-                        if !paths.is_empty() {
-                            events.push(Event {
-                                kind: EventKind::FileEdit,
-                                text: Some(format!("edited {} files", paths.len())),
-                                timestamp: ts,
-                                paths,
-                                tool: Some("apply_patch".into()),
-                                line: Some(lineno),
-                            });
-                        }
-                    }
-                }
-                // An unknown top-level record type (world_state, turn_context, anything added
-                // later) counts toward the dropped total too, never silently.
-                _ => events.push(other_event(ts).at_line(lineno)),
-            }
-        }
-
-        Ok(Session {
-            id,
-            runtime: "codex".into(),
-            cwd,
-            events,
-        })
+        let records = text.lines().enumerate().filter_map(|(line, text)| {
+            serde_json::from_str::<serde_json::Value>(text.trim())
+                .ok()
+                .map(|record| (line, record))
+        });
+        Ok(parse_records(records))
     }
 
     fn open_tool_calls(&self, text: &str) -> Vec<OpenCall> {
@@ -1104,34 +908,193 @@ impl Adapter for Codex {
     }
 }
 
-/// What a `response_item/message` is recorded as, and which span of it is the body.
-///
-/// Returns `(kind, text)` rather than kind alone, because Codex's attachment wrapper (see
-/// [`wrapped_human_request`]) needs the span the human actually typed peeled out of the wrapper.
-///
-/// # The role test: only `assistant` is the model speaking
-///
-/// Classifying by `if role != "user" { AssistantReply }` renders a `role=developer` record onto
-/// the page as a model reply — that is the runtime instructing the model, not the model speaking,
-/// and printing it as the agent's prose misreports what happened in this conversation.
-///
-/// Across 108 transcripts on this machine, 4855 messages: `assistant` 3654, `user` 977,
-/// `developer` 224. **Not one** of the 224 `developer` messages is a human or the model speaking:
-///
-/// | count | content |
-/// |---|---|
-/// | 92 | `<permissions instructions>` sandbox description |
-/// | 56 | `You are ..., the primary agent in a team of agents...` multi-agent formation orders |
-/// | 48 | `<multi_agent_mode>` delegation switch |
-/// | 11 | `<app-context>` desktop environment |
-/// | 9 | `<skills_instructions>` skill description |
-/// | 6 | `<turn_aborted>` interruption notice |
-/// | 2 | `<collaboration_mode>` collaboration mode |
-///
-/// So the test is an allowlist and not a denylist: **an unknown role is always `Other`**. With a
-/// denylist, the next role Codex introduces gets printed as the agent's words all over again;
-/// with an allowlist, the worst outcome is that it lands in `dropped` (the count runs high, but
-/// nobody is accused of saying something they never said).
+/// Project parsed native records without reparsing their JSON or changing source coordinates.
+pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
+    records: impl IntoIterator<Item = (usize, T)>,
+) -> Session {
+    let mut id = String::new();
+    let mut cwd = None;
+    let mut events = vec![];
+    // Whether any message has been seen before this point: it decides whether a compacted
+    // record's replacement_history is "a duplicate" or "the only carrier" (see the
+    // compacted arm).
+    let mut saw_message = false;
+
+    // The line number goes into every event ([`Event::line`]); the web transcript uses it to
+    // go back to the source for tool arguments and reasoning. Blank and malformed lines take
+    // a number too, so the coordinate addresses that exact line in the file.
+    for (lineno, record) in records {
+        let v = record.borrow();
+        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        let payload = v.get("payload");
+        let ts = v
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+
+        match ty {
+            // Compaction metadata is top-level; replacement history carries retained messages.
+            // Treating the bodyless UI notice as the payload would lose the retained context.
+            "compacted" => {
+                let p = payload;
+                let rh = p
+                    .and_then(|p| p.get("replacement_history"))
+                    .and_then(|x| x.as_array());
+                let kept = rh.map(|a| a.len()).unwrap_or(0);
+                let window = p
+                    .and_then(|p| p.get("window_number"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                events.push(
+                    Event::text(
+                        EventKind::CompactFiltered,
+                        format!("context window #{window}, {kept} messages kept"),
+                        ts.clone(),
+                    )
+                    .at_line(lineno),
+                );
+                // In a complete transcript the body of replacement_history already appeared
+                // verbatim before this record, so only the boundary description is kept and
+                // nothing is duplicated into the IR. But in a text that opens at a boundary
+                // (a branch VIEW's resume view) it is the only carrier of the retained
+                // context — without expanding it, the resumed session has not even an
+                // opening prompt.
+                if !saw_message && let Some(rh) = rh {
+                    for m in rh {
+                        if m.get("type").and_then(|x| x.as_str()) != Some("message") {
+                            continue;
+                        }
+                        let role = m.get("role").and_then(|x| x.as_str()).unwrap_or("");
+                        if let Some(t) = extract_content_text(m.get("content")) {
+                            let (kind, text) = classify_message(role, t);
+                            events.push(Event::text(kind, text, ts.clone()).at_line(lineno));
+                        }
+                    }
+                    saw_message = kept > 0;
+                }
+            }
+            "session_meta" => {
+                if let Some(p) = payload {
+                    if id.is_empty()
+                        && let Some(s) = p.get("id").and_then(|x| x.as_str())
+                    {
+                        id = s.to_string();
+                    }
+                    if cwd.is_none()
+                        && let Some(c) = p
+                            .get("cwd")
+                            .and_then(|x| x.as_str())
+                            .filter(|c| !c.is_empty())
+                    {
+                        cwd = Some(c.to_string());
+                    }
+                }
+            }
+            "response_item" => {
+                let Some(p) = payload else { continue };
+                match p.get("type").and_then(|x| x.as_str()).unwrap_or("") {
+                    "message" => {
+                        saw_message = true;
+                        let role = p.get("role").and_then(|x| x.as_str()).unwrap_or("");
+                        if let Some(t) = extract_content_text(p.get("content")) {
+                            let (kind, text) = classify_message(role, t);
+                            events.push(Event::text(kind, text, ts).at_line(lineno));
+                        }
+                    }
+                    "function_call" | "local_shell_call" | "custom_tool_call" => {
+                        let name = p
+                            .get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("shell")
+                            .to_string();
+                        events.push(Event {
+                            kind: EventKind::ToolUse,
+                            text: Some(name.clone()),
+                            timestamp: ts,
+                            paths: vec![],
+                            tool: Some(name),
+                            line: Some(lineno),
+                        });
+                    }
+                    "function_call_output"
+                    | "local_shell_call_output"
+                    | "custom_tool_call_output" => {
+                        // Codex writes tool results as a separate response item.  They
+                        // are evidence, not user prompts; dropping them makes
+                        // `in:output` disagree with the Claude adapter.
+                        if let Some(text) = extract_output_text(p.get("output")) {
+                            events
+                                .push(Event::text(EventKind::ToolResult, text, ts).at_line(lineno));
+                        } else {
+                            // Keep an untextual/unknown output visible in loss accounting
+                            // instead of silently treating it as if it never existed.
+                            events.push(other_event(ts).at_line(lineno));
+                        }
+                    }
+                    // reasoning is encrypted and vendor-proprietary; the IR cannot express
+                    // it. Recorded as Other so the loss can be reported.
+                    "reasoning" => events.push(Event {
+                        kind: EventKind::Other,
+                        text: None,
+                        timestamp: ts,
+                        paths: vec![],
+                        tool: None,
+                        line: Some(lineno),
+                    }),
+                    // An unknown payload type (a custom tool call, or any form added
+                    // later) counts toward the dropped total too, never silently.
+                    _ => events.push(other_event(ts).at_line(lineno)),
+                }
+            }
+            "event_msg" => {
+                let Some(p) = payload else { continue };
+                // This turn is done. There is one per human turn (a turn still running has
+                // none), so it is a reliable close signal.
+                if p.get("type").and_then(|x| x.as_str()) == Some("task_complete") {
+                    events.push(Event {
+                        kind: EventKind::TurnEnd,
+                        text: None,
+                        timestamp: ts.clone(),
+                        paths: vec![],
+                        tool: None,
+                        line: Some(lineno),
+                    });
+                    continue;
+                }
+                if p.get("type").and_then(|x| x.as_str()) == Some("patch_apply_end") {
+                    let paths: Vec<String> = p
+                        .get("changes")
+                        .and_then(|c| c.as_object())
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    if !paths.is_empty() {
+                        events.push(Event {
+                            kind: EventKind::FileEdit,
+                            text: Some(format!("edited {} files", paths.len())),
+                            timestamp: ts,
+                            paths,
+                            tool: Some("apply_patch".into()),
+                            line: Some(lineno),
+                        });
+                    }
+                }
+            }
+            // An unknown top-level record type (world_state, turn_context, anything added
+            // later) counts toward the dropped total too, never silently.
+            _ => events.push(other_event(ts).at_line(lineno)),
+        }
+    }
+
+    Session {
+        id,
+        runtime: "codex".into(),
+        cwd,
+        events,
+    }
+}
+
+/// Only known conversational roles may appear as human or assistant speech.
+/// Wrapped model input retains the human-authored span when its boundaries are explicit.
 pub(crate) fn classify_message(role: &str, text: String) -> (EventKind, String) {
     if role == "assistant" {
         return (EventKind::AssistantReply, text);

@@ -135,6 +135,7 @@ impl NativeRecords {
             items.push(ItemCompleted {
                 item_id,
                 turn_id: String::new(),
+                native_prompt_id: None,
                 event,
                 line: line as u64,
                 object_hash: hash,

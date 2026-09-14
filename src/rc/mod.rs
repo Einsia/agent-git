@@ -65,6 +65,7 @@
 //! end-to-end hole-detection contract — a dropped frame at any hop is
 //! *detected*, not silently lost. The hub's only job is to reject holes.
 
+pub(crate) mod codex_history;
 #[cfg(unix)]
 pub mod control;
 #[cfg(windows)]

@@ -35,12 +35,19 @@ pub struct Tailer {
     pending: String,
     /// A watched source restarts from a bounded replay window when its coordinates expire.
     replay_window: Option<u64>,
+    codex_header: Option<super::codex_history::Header>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TailedLine {
     pub lineno: u64,
     pub text: String,
+}
+
+#[derive(Default)]
+pub(crate) struct CodexBatch {
+    pub mode: super::codex_history::HistoryMode,
+    pub lines: Vec<TailedLine>,
 }
 
 impl Tailer {
@@ -73,6 +80,7 @@ impl Tailer {
             lineno,
             pending: String::new(),
             replay_window: None,
+            codex_header: None,
         }
     }
 
@@ -112,6 +120,7 @@ impl Tailer {
             lineno,
             pending: String::new(),
             replay_window: Some(replay_lines),
+            codex_header: None,
         }
     }
 
@@ -138,6 +147,29 @@ impl Tailer {
     /// Follow the file to a different path (slow-path resume mints a new file).
     pub fn retarget(&mut self, path: impl Into<PathBuf>, from_start: bool) {
         *self = Tailer::new(path, from_start);
+    }
+
+    /// History mode and records are read through the same retained file handle.
+    pub(crate) fn poll_codex(&mut self) -> std::io::Result<CodexBatch> {
+        let lines = self.poll()?;
+        if self.codex_header.is_none()
+            || matches!(
+                self.codex_header,
+                Some(super::codex_history::Header::Pending)
+            )
+        {
+            self.codex_header = self
+                .source
+                .as_mut()
+                .map(|source| super::codex_history::read_header(source.as_file_mut()));
+        }
+        Ok(CodexBatch {
+            mode: self
+                .codex_header
+                .map(super::codex_history::Header::mode)
+                .unwrap_or_default(),
+            lines,
+        })
     }
 
     /// Read whatever has been appended since the last call.
@@ -179,6 +211,7 @@ impl Tailer {
             self.offset = offset;
             self.lineno = line;
             self.pending.clear();
+            self.codex_header = None;
         }
         let source = self.source.insert(source);
         if len == self.offset {

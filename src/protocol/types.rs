@@ -921,6 +921,9 @@ pub struct ItemDelta {
 pub struct ItemCompleted {
     pub item_id: String,
     pub turn_id: String,
+    /// Correlation from a canonical native user record, after the local secret filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_prompt_id: Option<String>,
     pub event: IrEvent,
     /// 0-based line in the transcript file (`event.line` mirrors it).
     pub line: u64,
@@ -1270,6 +1273,7 @@ mod tests {
         let ic = ItemCompleted {
             item_id: "i1".into(),
             turn_id: "t1".into(),
+            native_prompt_id: None,
             event: ev.clone(),
             line: 12,
             object_hash: hash.clone(),
@@ -1278,6 +1282,8 @@ mod tests {
         };
         let s = serde_json::to_string(&ic).unwrap();
         let back: ItemCompleted = serde_json::from_str(&s).unwrap();
+        assert!(!s.contains("native_prompt_id"));
+        assert!(back.native_prompt_id.is_none());
         assert_eq!(back.event.kind, IrEventKind::ToolUse);
         assert_eq!(back.event.line, Some(12));
         assert_eq!(back.object_hash, hash);

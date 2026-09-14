@@ -300,6 +300,8 @@ pub struct CodexDriver {
     current_turn: Option<String>,
     /// Our own JSON-RPC id counter for client→server requests.
     next_id: Option<i64>,
+    /// The next native user message carries this machine-issued correlation identity.
+    pub(super) next_prompt_id: Option<String>,
     /// approval_id → what is needed to answer that approval.
     pending_approvals: HashMap<String, PendingApproval>,
     cwd: PathBuf,
@@ -375,6 +377,7 @@ impl CodexDriver {
             thread_id: None,
             current_turn: None,
             next_id: Some(1),
+            next_prompt_id: None,
             pending_approvals: Default::default(),
             cwd: spec.cwd.clone(),
             resume_from: spec.resume_from.clone(),
@@ -484,6 +487,7 @@ impl CodexDriver {
         consume_pending_mode: bool,
         guard_attempt: Option<TurnGuardAttempt>,
     ) -> TurnStartDispatch {
+        let prompt_id = self.next_prompt_id.take();
         if self.pending_turn_start.is_some() {
             return TurnStartDispatch::Resolved(TurnStartOutcome::RetryableNotAccepted {
                 message: "another Codex turn is still awaiting native acceptance".into(),
@@ -534,6 +538,9 @@ impl CodexDriver {
             "threadId": tid,
             "input": [{"type":"text","text": message, "text_elements": []}]
         });
+        if let Some(prompt_id) = prompt_id {
+            params["clientUserMessageId"] = json!(prompt_id);
+        }
         // A queued mode change lands here, because this is the only place codex
         // lets it land. The override is sticky ("this turn and subsequent
         // turns"), so it is sent once and then becomes the session's mode.
@@ -722,20 +729,21 @@ impl CodexDriver {
     }
 
     pub async fn steer(&mut self, message: &str) -> crate::Result<Delivery> {
+        let prompt_id = self.next_prompt_id.take();
         let (Some(tid), Some(turn)) = (self.thread_id.clone(), self.current_turn.clone()) else {
             anyhow::bail!("no turn is running — send a message instead of steering");
         };
         let id = self.alloc_id()?;
-        self.send(&json!({
-            "id": id,
-            "method": "turn/steer",
-            "params": {
-                "threadId": tid,
-                "expectedTurnId": turn,
-                "input": [{"type":"text","text": message, "text_elements": []}]
-            }
-        }))
-        .await?;
+        let mut params = json!({
+            "threadId": tid,
+            "expectedTurnId": turn,
+            "input": [{"type":"text","text": message, "text_elements": []}]
+        });
+        if let Some(prompt_id) = prompt_id {
+            params["clientUserMessageId"] = json!(prompt_id);
+        }
+        self.send(&json!({"id": id, "method": "turn/steer", "params": params}))
+            .await?;
         // **Wait for codex to answer before saying "delivered".**
         //
         // `turn/steer` does get refused outright by the native side (an expectedTurnId that
@@ -1500,6 +1508,7 @@ impl CodexDriver {
             thread_id: thread_id.map(String::from),
             current_turn: None,
             next_id: Some(1),
+            next_prompt_id: None,
             pending_approvals: Default::default(),
             cwd,
             resume_from: None,
@@ -1576,6 +1585,7 @@ mod tests {
             thread_id: None,
             current_turn: None,
             next_id: Some(1),
+            next_prompt_id: None,
             pending_approvals: Default::default(),
             cwd,
             resume_from: None,
@@ -1642,6 +1652,123 @@ mod tests {
                 assert_eq!(request["params"]["threadId"].as_str(), resume);
                 driver.shutdown().await.unwrap();
             }
+        }
+    }
+
+    async fn prompt_probe(capture: &std::path::Path, start: bool) -> CodexDriver {
+        let mut driver = probe();
+        driver.shutdown().await.unwrap();
+        let response = if start {
+            json!({"id":1,"result":{"turn":{"id":"native-turn"}}})
+        } else {
+            json!({"id":1,"result":{}})
+        };
+        driver.proc = Proc::spawn(
+            "sh",
+            &[
+                "-c".into(),
+                concat!(
+                    "IFS= read -r request\n",
+                    "printf '%s\\n' \"$request\" > \"$AGIT_CODEX_PROMPT_CAPTURE\"\n",
+                    "printf '%s\\n' \"$AGIT_CODEX_PROMPT_RESPONSE\"\n",
+                    "while IFS= read -r rest; do :; done"
+                )
+                .into(),
+            ],
+            &driver.cwd,
+            &[
+                (
+                    "AGIT_CODEX_PROMPT_CAPTURE".into(),
+                    capture.to_string_lossy().into_owned(),
+                ),
+                ("AGIT_CODEX_PROMPT_RESPONSE".into(), response.to_string()),
+            ],
+        )
+        .unwrap();
+        driver.thread_id = Some("thread".into());
+        driver.current_turn = (!start).then(|| "native-turn".into());
+        driver
+    }
+
+    #[tokio::test]
+    async fn codex_remote_prompt_identity_reaches_start_and_steer_requests() {
+        let mut identities = std::collections::HashSet::new();
+        for start in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let capture = directory.path().join("request.json");
+            let native = prompt_probe(&capture, start).await;
+            let mut driver = crate::rc::harness::AnyDriver::Codex(Box::new(native));
+            let identity = driver.reserve_prompt_identity().unwrap();
+            assert!(uuid::Uuid::parse_str(&identity).is_ok());
+            assert!(identities.insert(identity.clone()));
+            if start {
+                assert_eq!(
+                    driver.start_turn("same user message", false, None).await,
+                    TurnStartDispatch::Awaiting
+                );
+            } else {
+                assert_eq!(
+                    driver.steer("same user message").await.unwrap(),
+                    Delivery::Immediate
+                );
+            }
+            let crate::rc::harness::AnyDriver::Codex(ref mut native) = driver else {
+                unreachable!()
+            };
+            if start {
+                let line =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), native.proc.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .into_line();
+                assert!(matches!(line, Line::Json(value) if value["id"] == 1));
+            }
+            let request: Value = serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+            assert_eq!(
+                request["method"],
+                if start { "turn/start" } else { "turn/steer" }
+            );
+            assert_eq!(request["params"]["clientUserMessageId"], identity);
+            assert_eq!(request["params"]["input"][0]["text"], "same user message");
+            native.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_codex_prompt_cannot_relabel_a_later_native_request() {
+        for start in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let capture = directory.path().join("request.json");
+            let mut driver = prompt_probe(&capture, start).await;
+            driver.thread_id = None;
+            driver.next_prompt_id = Some(uuid::Uuid::new_v4().to_string());
+            if start {
+                assert!(matches!(
+                    driver.start_turn("rejected", false, None).await,
+                    TurnStartDispatch::Resolved(TurnStartOutcome::RetryableNotAccepted { .. })
+                ));
+            } else {
+                assert!(driver.steer("rejected").await.is_err());
+            }
+            assert!(!capture.exists());
+            driver.thread_id = Some("thread".into());
+            if start {
+                assert_eq!(
+                    driver.start_turn("unattributed", false, None).await,
+                    TurnStartDispatch::Awaiting
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(5), driver.proc.next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            } else {
+                driver.steer("unattributed").await.unwrap();
+            }
+            let request: Value = serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+            assert_eq!(request["params"]["input"][0]["text"], "unattributed");
+            assert!(request["params"].get("clientUserMessageId").is_none());
+            driver.shutdown().await.unwrap();
         }
     }
 

@@ -359,7 +359,15 @@ impl Daemon {
                         if !tailer.path().exists() {
                             break;
                         }
-                        let lines = tailer.poll().unwrap_or_default();
+                        let (mode, lines) = if rt == "codex" {
+                            let batch = tailer.poll_codex().unwrap_or_default();
+                            (batch.mode, batch.lines)
+                        } else {
+                            (
+                                crate::rc::codex_history::HistoryMode::Model,
+                                tailer.poll().unwrap_or_default(),
+                            )
+                        };
                         if lines.is_empty() {
                             // Quiet decides nothing here: reaping is judged by the
                             // daemon (`reap_idle_watches`) because it has to sit
@@ -376,7 +384,9 @@ impl Daemon {
                             // `secret.detected` is a session-level alert: this only
                             // guarantees the content is redacted.
                             let (items, _registered_ids) =
-                                crate::rc::supervisor::items_from_lines(&rt, &redactor, &lines);
+                                crate::rc::supervisor::items_from_lines_with_mode(
+                                    &rt, &redactor, &lines, mode,
+                                );
                             for item in items {
                                 let mut fr = Frame::notification(method::ITEM_COMPLETED, item);
                                 fr.stream = Some(stream.clone());

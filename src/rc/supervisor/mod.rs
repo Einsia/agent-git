@@ -3307,7 +3307,16 @@ impl Session {
         let Some(tailer) = self.tailer.as_mut() else {
             return;
         };
-        let lines = poll_and_mark(tailer, &mut self.consumed_bytes);
+        let (mode, lines) = if self.info.runtime == "codex" {
+            let batch = tailer.poll_codex().unwrap_or_default();
+            self.consumed_bytes = tailer.consumed();
+            (batch.mode, batch.lines)
+        } else {
+            (
+                super::codex_history::HistoryMode::Model,
+                poll_and_mark(tailer, &mut self.consumed_bytes),
+            )
+        };
         if lines.is_empty() {
             return;
         }
@@ -3316,7 +3325,8 @@ impl Session {
         // so it must not be alive across an `.await` — keeping the parse in its
         // own scope (inside `items_from_lines`) is what lets this whole session
         // run as a spawned task.
-        let (items, registered_ids) = items_from_lines(&self.info.runtime, &self.redactor, &lines);
+        let (items, registered_ids) =
+            items_from_lines_with_mode(&self.info.runtime, &self.redactor, &lines, mode);
         self.alert_registered(registered_ids, "item_completed")
             .await;
         for item in items {
@@ -3334,6 +3344,20 @@ pub fn items_from_lines(
     redactor: &redact::Redactor,
     lines: &[crate::rc::tail::TailedLine],
 ) -> (Vec<ItemCompleted>, Vec<String>) {
+    items_from_lines_with_mode(
+        runtime,
+        redactor,
+        lines,
+        super::codex_history::HistoryMode::Model,
+    )
+}
+
+pub(crate) fn items_from_lines_with_mode(
+    runtime: &str,
+    redactor: &redact::Redactor,
+    lines: &[crate::rc::tail::TailedLine],
+    mode: super::codex_history::HistoryMode,
+) -> (Vec<ItemCompleted>, Vec<String>) {
     let Ok(adapter) = crate::adapter::get(runtime) else {
         return (vec![], vec![]);
     };
@@ -3343,20 +3367,27 @@ pub fn items_from_lines(
         if line.text.trim().is_empty() {
             continue;
         }
-        // Ask the adapter first: most lines in a transcript (summary, meta) produce no event,
-        // and those lines are not worth parsing as JSON a second time.
-        let Ok(parsed) = adapter.parse(&line.text) else {
-            continue;
+        let (raw, events) = if runtime == "codex" {
+            let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line.text) else {
+                continue;
+            };
+            let events = super::codex_history::events(&raw, mode);
+            (raw, events)
+        } else {
+            let Ok(parsed) = adapter.parse(&line.text) else {
+                continue;
+            };
+            if parsed.events.is_empty() {
+                continue;
+            }
+            let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line.text) else {
+                continue;
+            };
+            (raw, parsed.events)
         };
-        if parsed.events.is_empty() {
+        if events.is_empty() {
             continue;
         }
-
-        let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line.text) else {
-            // A half-written or corrupt line. `transcript::wrap_lines`
-            // skips these too, so skipping matches what gets committed.
-            continue;
-        };
 
         // Scrub the **decoded strings**, not the wire bytes. Matching bytes misses every
         // registered literal containing `"`, `\` or a newline; rewriting in place also removes
@@ -3366,6 +3397,9 @@ pub fn items_from_lines(
         let registered_projection = !scrubbed.registered_ids.is_empty();
         registered.extend(scrubbed.registered_ids);
         let scrubbed_raw = scrubbed.value;
+        let native_prompt_id = (runtime == "codex")
+            .then(|| super::codex_history::prompt_identity(&scrubbed_raw, mode))
+            .flatten();
         // Once a registered low-entropy value was removed, sending the hash of
         // the original JSON would give the hub an offline dictionary oracle.
         // Only that case switches identity: ordinary path/persona redaction must
@@ -3374,7 +3408,7 @@ pub fn items_from_lines(
         let object_hash = projected_object_hash(&raw, &scrubbed_raw, registered_projection);
         let (raw_out, truncated) = cap_raw(scrubbed_raw);
 
-        for (i, mut event) in parsed.events.into_iter().enumerate() {
+        for (i, mut event) in events.into_iter().enumerate() {
             if let Some(t) = event.text.take() {
                 let r = redactor.scrub(&t);
                 registered.extend(r.registered_ids);
@@ -3406,6 +3440,7 @@ pub fn items_from_lines(
             out.push(ItemCompleted {
                 item_id: format!("{}#{i}", line.lineno),
                 turn_id: String::new(),
+                native_prompt_id: native_prompt_id.clone(),
                 event,
                 line: line.lineno,
                 object_hash: object_hash.clone(),
