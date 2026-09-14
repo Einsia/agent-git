@@ -628,7 +628,7 @@ fn skill_installation_checks() -> Vec<(String, Check)> {
             checks.push((format!("skill {runtime}"), check_skill_dir(&path, runtime)));
         }
         if let Some(path) = super::setup::legacy_inline_skill_path(runtime)
-            && legacy_inline_skill_exists(&path, runtime)
+            && super::setup::legacy_inline_skill_exists(&path, runtime)
         {
             checks.push((
                 format!("skill {runtime} legacy"),
@@ -639,29 +639,18 @@ fn skill_installation_checks() -> Vec<(String, Check)> {
             ));
         }
     }
+    if super::setup::legacy_home_skill_exists()
+        && let Some(path) = super::setup::legacy_home_skill_path()
+    {
+        checks.push((
+            "skill home legacy".to_owned(),
+            Check::Warn(format!(
+                "the legacy inline manual is still at {}; run `agit setup --skill --installed-only`",
+                path.display()
+            )),
+        ));
+    }
     checks
-}
-
-fn legacy_inline_skill_exists(path: &Path, runtime: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let (begin, end) = if runtime == "cursor" {
-        (
-            skill_bundle::CURSOR_BEGIN_MARKER,
-            skill_bundle::CURSOR_END_MARKER,
-        )
-    } else {
-        (skill_bundle::BEGIN_MARKER, skill_bundle::END_MARKER)
-    };
-    let Some(start) = text.find(begin) else {
-        return false;
-    };
-    let body_start = start + begin.len();
-    let Some(relative_end) = text[body_start..].find(end) else {
-        return false;
-    };
-    text[body_start..body_start + relative_end].contains("<!-- agit:skill-version:")
 }
 
 fn check_skill_dir(dir: &Path, runtime: &str) -> Check {

@@ -1,9 +1,20 @@
 ---
 name: agit
-description: "Use AgentGit to adopt native conversations, select explicit session targets, save completed turns, inspect or resume saved context, and publish session history. Read command references only when needed."
+description: "Use AgentGit when the user requests AgentGit operations or the current session has an explicit AgentGit identity. Save, resume, inspect, or publish session history. Unrelated tasks do not need AgentGit checks."
 ---
 
 # AgentGit overview
+
+## When to use
+
+Use this workflow when the user requests an AgentGit operation, or when
+`AGIT_SESSION` or `AGIT_MERGE_TX` explicitly identifies the current managed session.
+An installed skill, a workspace binding, or a generic instruction in an ancestor
+`AGENTS.md` does not by itself make an unrelated task an AgentGit operation.
+For ordinary questions, device troubleshooting, browsing, or unmanaged project
+work, continue the user's task without running agit. Do not run `agit status` or
+scan transcripts merely to decide whether this skill applies. Reading this skill
+for review or editing does not activate its session-management workflow.
 
 AgentGit (`agit`) is a version-control layer for agent conversations. It is not a replacement for the project code repository: it stores conversation context, VIEWs, events, shared memory, and skills in a real Git repository.
 
@@ -29,7 +40,8 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   argument array with the same `AGIT_HOME` and explicit Hub. Continue only after
   it succeeds; do not ask for passwords or tokens. Read `references/commands/login.md`
   for pending and expired requests.
-- Start with `agit status --json` in the intended project directory. Existing
+- Once this workflow applies, use `agit status --json` when session or workspace
+  state is needed for the requested operation. Existing
   sessions require an explicit `<owner/repo>@<branch>` or `AGIT_SESSION`.
   Workspace bindings and discovered runtime sessions do not supply that target.
 - `@` means the session supplied through `AGIT_SESSION`. A known conflicting
@@ -74,7 +86,7 @@ Name constraint: a **branch** name must not begin with `agit-`. That prefix is r
 
 ## Adopt the current session when it is not managed yet
 
-If `AGIT_SESSION` is absent, do not assume the current transcript is already managed, and do not use `agit new` to upload it. First find the session:
+When the user asks to upload, save, or adopt the current conversation and its native session ID is needed, find the session below. An absent `AGIT_SESSION` alone is not a reason to scan or adopt transcripts. Do not use `agit new` to upload the running conversation:
 
 ```bash
 agit status --check-missing

@@ -108,10 +108,15 @@ pub fn run(args: Args) -> CmdResult {
                     ui::ok(ui::theme::symbols().check)
                 );
             }
-            return Ok(ExitCode::Ok);
+            return if args.check {
+                Ok(ExitCode::Ok)
+            } else {
+                refresh_installed_skills(&std::env::current_exe()?)
+            };
         }
     }
 
+    let exe = std::env::current_exe()?;
     if let Err(e) = download_and_replace(&latest) {
         ui::error(&format!("upgrade failed: {e:#}"));
         ui::hint(
@@ -120,6 +125,37 @@ pub fn run(args: Args) -> CmdResult {
         return Ok(ExitCode::Network);
     }
     ui::success(&format!("upgraded to {}", latest.version));
+    refresh_installed_skills(&exe)
+}
+
+/// Run the replacement executable so its bundled instructions match the installed CLI.
+fn refresh_installed_skills(exe: &Path) -> CmdResult {
+    let output = std::process::Command::new(exe)
+        .args([
+            "--no-tui",
+            "--quiet",
+            "setup",
+            "--skill",
+            "--installed-only",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            ui::info(format_args!("Installed AgentGit skills refreshed."));
+        }
+        result => {
+            let detail = match result {
+                Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                Err(error) => error.to_string(),
+            };
+            ui::warning(&format!(
+                "CLI is installed, but skill refresh failed: {detail}"
+            ));
+            ui::hint("run `agit setup --skill --installed-only` to retry.");
+            return Ok(ExitCode::Precondition);
+        }
+    }
     Ok(ExitCode::Ok)
 }
 
@@ -494,6 +530,43 @@ fn nudge_with(latest: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_runs_the_supplied_executable_and_propagates_failure() {
+        // A child owns fixture writes so concurrent test forks cannot inherit writable handles.
+        fn write_executable(exe: &Path, body: &str) {
+            let status = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"",
+                    "fixture-writer",
+                ])
+                .arg(exe)
+                .arg(body)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("new agit");
+        write_executable(&exe, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n");
+        assert_eq!(refresh_installed_skills(&exe).unwrap(), ExitCode::Ok);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("new agit.args")).unwrap(),
+            "--no-tui\n--quiet\nsetup\n--skill\n--installed-only\n"
+        );
+        write_executable(&exe, "#!/bin/sh\nexit 4\n");
+        assert_eq!(
+            refresh_installed_skills(&exe).unwrap(),
+            ExitCode::Precondition
+        );
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(
+            refresh_installed_skills(&exe).unwrap(),
+            ExitCode::Precondition
+        );
+    }
 
     #[test]
     fn semver_compare_matrix() {

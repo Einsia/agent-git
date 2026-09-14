@@ -26,6 +26,7 @@
 use super::CmdResult;
 use super::skill_bundle;
 use crate::{ExitCode, ui};
+mod legacy;
 mod native;
 
 use clap::Args as ClapArgs;
@@ -40,6 +41,9 @@ pub struct Args {
     pub hooks: bool,
     #[arg(long)]
     pub skill: bool,
+    /// Refresh only existing native or legacy Skill installations.
+    #[arg(long, requires = "skill", conflicts_with_all = ["hooks", "mcp", "agents_md", "completions", "auto_push"])]
+    pub installed_only: bool,
     #[arg(long)]
     pub mcp: bool,
     #[arg(long = "agents-md")]
@@ -161,7 +165,7 @@ fn run_setup(mut args: Args) -> CmdResult {
         report.merge(install_hooks(rt));
     }
     if skill {
-        report.merge(install_skill(rt));
+        report.merge(install_skill(rt, args.installed_only));
     }
     if mcp {
         report.merge(register_mcp(rt));
@@ -536,7 +540,7 @@ fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str) -> usize {
 
 /// The agit skill lands in each runtime's native Skill directory. Beyond how many files were
 /// written, this also reports whether the install is complete.
-fn install_skill(runtime: Option<&str>) -> SetupReport {
+fn install_skill(runtime: Option<&str>, installed_only: bool) -> SetupReport {
     let mut report = SetupReport::default();
     for name in crate::adapter::setup_runtimes() {
         if !wants(runtime, name) {
@@ -547,6 +551,9 @@ fn install_skill(runtime: Option<&str>) -> SetupReport {
             report.merge(SetupReport::failure());
             continue;
         };
+        if installed_only && !dir.exists() && !legacy_skill_installed(name) {
+            continue;
+        }
         let skill_report = install_skill_dir(&dir, name);
         report.merge(skill_report);
         // Older releases placed the full entrypoint in an AGENTS.md marker. Remove
@@ -555,9 +562,63 @@ fn install_skill(runtime: Option<&str>) -> SetupReport {
         // deliberately gated on a complete bundle result so a failed install cannot
         // destroy the only working copy of the Skill.
         merge_legacy_cleanup(&mut report, skill_report, || {
-            remove_legacy_inline_skill(name)
+            let mut cleanup = remove_legacy_inline_skill(name);
+            // The home manual is a Cursor entrypoint; another runtime's bundle cannot replace it.
+            if name == "cursor" {
+                cleanup.merge(remove_legacy_home_skill());
+            }
+            cleanup
         });
     }
+    report
+}
+
+fn legacy_skill_installed(runtime: &str) -> bool {
+    legacy_inline_skill_path(runtime).is_some_and(|path| legacy_inline_skill_exists(&path, runtime))
+        || (runtime == "cursor" && legacy_home_skill_exists())
+}
+
+pub(crate) fn legacy_home_skill_path() -> Option<PathBuf> {
+    home().map(|home| home.join("AGENTS.md"))
+}
+
+pub(crate) fn legacy_home_skill_exists() -> bool {
+    legacy_home_skill_path().is_some_and(|path| {
+        legacy_inline_skill_exists(&path, "codex") || legacy_inline_skill_exists(&path, "cursor")
+    })
+}
+
+pub(crate) fn legacy_inline_skill_exists(path: &Path, runtime: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let (begin, end) = if runtime == "cursor" {
+        (
+            skill_bundle::CURSOR_BEGIN_MARKER,
+            skill_bundle::CURSOR_END_MARKER,
+        )
+    } else {
+        (skill_bundle::BEGIN_MARKER, skill_bundle::END_MARKER)
+    };
+    legacy::without_versioned_blocks(&text, begin, end).is_some()
+}
+
+fn remove_legacy_home_skill() -> SetupReport {
+    let Some(path) = legacy_home_skill_path() else {
+        return SetupReport::default();
+    };
+    let mut report = remove_marked_block_if_versioned(
+        &path,
+        skill_bundle::BEGIN_MARKER,
+        skill_bundle::END_MARKER,
+        "legacy home AGENTS.md skill",
+    );
+    report.merge(remove_marked_block_if_versioned(
+        &path,
+        skill_bundle::CURSOR_BEGIN_MARKER,
+        skill_bundle::CURSOR_END_MARKER,
+        "legacy home AGENTS.md skill",
+    ));
     report
 }
 
@@ -805,40 +866,25 @@ fn remove_marked_block_if_versioned(
     end_marker: &str,
     label: &str,
 ) -> SetupReport {
-    let Ok(existing) = std::fs::read_to_string(path) else {
-        return SetupReport::default();
-    };
-    let Some(begin) = existing.find(begin_marker) else {
-        return SetupReport::default();
-    };
-    let body_start = begin + begin_marker.len();
-    let Some(relative_end) = existing[body_start..].find(end_marker) else {
-        return SetupReport::default();
-    };
-    let mut end = body_start + relative_end + end_marker.len();
-    // Markers are line-oriented. Consume the newline immediately following the
-    // owned block so removing it does not leave a blank line in user content.
-    if existing[end..].starts_with('\n') {
-        end += 1;
+    match legacy::remove(path, begin_marker, end_marker) {
+        Ok(Some(backup)) => {
+            ui::info(format_args!(
+                "  {} {label} removed → {} (backup: {})",
+                ui::ok(ui::theme::symbols().check),
+                ui::tilde(path),
+                ui::tilde(&backup)
+            ));
+            SetupReport::changed_item()
+        }
+        Ok(None) => SetupReport::default(),
+        Err(error) => {
+            ui::warning(&format!(
+                "{label} removal failed: {}: {error}",
+                path.display()
+            ));
+            SetupReport::failure()
+        }
     }
-    let body = &existing[body_start..body_start + relative_end];
-    if !body.contains("<!-- agit:skill-version:") {
-        return SetupReport::default();
-    }
-
-    let mut new = String::with_capacity(existing.len() - (end - begin));
-    new.push_str(&existing[..begin]);
-    new.push_str(&existing[end..]);
-    if write_append_overwrite(path, &new).is_err() {
-        ui::warning(&format!("{label} removal failed: {}", path.display()));
-        return SetupReport::failure();
-    }
-    ui::info(format_args!(
-        "  {} {label} removed → {}",
-        ui::ok(ui::theme::symbols().check),
-        ui::tilde(&PathBuf::from(path))
-    ));
-    SetupReport::item()
 }
 
 // ── MCP registration ──────────────────────────────────────────────────

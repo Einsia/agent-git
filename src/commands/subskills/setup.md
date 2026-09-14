@@ -18,6 +18,7 @@ agit setup [options]
 | `--runtime <all\|claude-code\|codex\|cursor\|opencode>` | Runtime to integrate |
 | `--hooks` | Install or update runtime hooks |
 | `--skill` | Install the progressive-disclosure AgentGit Skill bundle (`SKILL.md`, `VERSION`, and command references) in the selected runtime's native global Skill directory; does not expand the full guide into `AGENTS.md` |
+| `--installed-only` | With `--skill`, refresh only existing native or legacy Skill installations; does not change hooks, MCP, project integration, or auto-push preferences |
 | `--mcp` | Configure the MCP server |
 | `--agents-md` | Write/update the AGENTS.md integration block |
 | `--completions <shell>` | Generate completion for a shell |
@@ -47,3 +48,12 @@ The native Skill targets are:
 - Cursor: `~/.cursor/skills/agit/`
 
 Use `--agents-md` separately when you want the short, marked project integration block.
+
+After verifying the native bundle, Skill setup removes complete, version-marked
+legacy manuals from known runtime instruction paths and `~/AGENTS.md`, even when
+setup runs in another directory. It preserves user text and unversioned project
+rules, and saves the original beside the file as `AGENTS.md.agit-backup-<hash>`
+before replacing it. The home manual is a Cursor entrypoint: a runtime-filtered
+refresh preserves it until the Cursor bundle is verified. Incomplete markers and
+fenced examples are left alone.
+Run `agit setup --skill --installed-only` to repair an existing installation.

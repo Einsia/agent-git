@@ -31,3 +31,15 @@ internal `hooks`/`mcp` commands skip the check so machine-readable and integrati
 unchanged.
 
 Upgrading the CLI does not migrate or delete `~/.agit/repos`. Run `agit doctor` afterwards to verify runtime integrations.
+
+After installing the CLI, `upgrade` runs the new executable's
+`setup --skill --installed-only` to refresh existing Skills and remove versioned
+legacy manuals, including `~/AGENTS.md`. This also runs when the CLI is already
+current; `--check` never refreshes files. Native bundles are verified before
+cleanup, and original instruction files are backed up beside the originals.
+Hooks, MCP settings, project rules, and auto-push preferences are not refreshed.
+
+An older CLI whose upgrade command only replaces the binary cannot run this
+refresh automatically. After that upgrade, run
+`agit setup --skill --installed-only` once with the new CLI. npm installation
+already runs setup unless `AGIT_SKIP_SETUP=1` is set.
