@@ -398,7 +398,7 @@ impl Daemon {
                         )
                     })?
                 };
-                let (start_off, from_line, total_lines, absolute_lines) =
+                let (start_off, from_line, total_lines, absolute_lines, tail_source) =
                     tail_window(&path, WATCH_BACKFILL_LINES);
                 let native_source = if runtime == "opencode" {
                     use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};
@@ -496,8 +496,13 @@ impl Daemon {
                             // Read from the start of the window instead of reading from the
                             // beginning and discarding — the latter costs memory the size of
                             // the whole transcript.
-                            let mut tailer =
-                                crate::rc::tail::Tailer::at(&path, start_off, from_line);
+                            let mut tailer = crate::rc::tail::Tailer::at(
+                                &path,
+                                start_off,
+                                from_line,
+                                tail_source,
+                                WATCH_BACKFILL_LINES,
+                            );
                             // Let the `session.watch` **response** out first: the hub registers
                             // "which workspace this stream belongs to" only on that response,
                             // and replay frames that arrive before the registration fan out to

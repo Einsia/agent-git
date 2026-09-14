@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 
 pub struct Tailer {
     path: PathBuf,
+    /// Coordinates and buffered fragments belong to the open source, not its pathname.
+    source: Option<same_file::Handle>,
+    #[cfg(unix)]
+    source_identity: Option<(u64, u64)>,
     /// Byte offset we've consumed up to.
     offset: u64,
     /// Physical line number of the next line (0-based).
@@ -29,6 +33,8 @@ pub struct Tailer {
     /// A trailing partial line (the harness writes a line in more than one
     /// syscall); held back until the newline arrives.
     pending: String,
+    /// A watched source restarts from a bounded replay window when its coordinates expire.
+    replay_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,16 +47,32 @@ impl Tailer {
     /// Start at the end of the file (only new content) or the beginning.
     pub fn new(path: impl Into<PathBuf>, from_start: bool) -> Tailer {
         let path = path.into();
+        let mut source = std::fs::File::open(&path)
+            .and_then(same_file::Handle::from_file)
+            .ok();
         let (offset, lineno) = if from_start {
             (0, 0)
         } else {
-            count_to_end(&path).unwrap_or_default()
+            source
+                .as_mut()
+                .and_then(|handle| count_to_end(handle.as_file_mut()).ok())
+                .unwrap_or_default()
         };
         Tailer {
             path,
+            #[cfg(unix)]
+            source_identity: source.as_ref().and_then(|handle| {
+                handle
+                    .as_file()
+                    .metadata()
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+            }),
+            source,
             offset,
             lineno,
             pending: String::new(),
+            replay_window: None,
         }
     }
 
@@ -61,14 +83,35 @@ impl Tailer {
     /// to throw the front away, which costs memory proportional to the whole
     /// file. Seeking straight to the window keeps that bounded.
     ///
-    /// `offset` must be the first byte of line `lineno`, or the line numbers
-    /// this tailer reports will not match the file.
-    pub fn at(path: impl Into<PathBuf>, offset: u64, lineno: u64) -> Tailer {
+    /// The open source must be the file used to calculate the coordinates; reopening
+    /// its pathname can bind the window to a replacement file.
+    pub fn at(
+        path: impl Into<PathBuf>,
+        offset: u64,
+        lineno: u64,
+        source: Option<same_file::Handle>,
+        replay_lines: u64,
+    ) -> Tailer {
+        let (offset, lineno) = if source.is_some() {
+            (offset, lineno)
+        } else {
+            (0, 0)
+        };
         Tailer {
             path: path.into(),
+            #[cfg(unix)]
+            source_identity: source.as_ref().and_then(|handle| {
+                handle
+                    .as_file()
+                    .metadata()
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+            }),
+            source,
             offset,
             lineno,
             pending: String::new(),
+            replay_window: Some(replay_lines),
         }
     }
 
@@ -99,23 +142,49 @@ impl Tailer {
 
     /// Read whatever has been appended since the last call.
     ///
-    /// Truncation (file shrank — replaced or rotated) resets to the start, since
-    /// the old coordinates no longer mean anything.
+    /// Replacement or truncation resets the coordinates and pending fragment together.
+    /// A replacement can be longer than the source whose coordinates were consumed.
     pub fn poll(&mut self) -> std::io::Result<Vec<TailedLine>> {
-        let meta = match std::fs::metadata(&self.path) {
-            Ok(m) => m,
-            Err(_) => return Ok(vec![]), // not created yet; try again next tick
+        // The held source keeps its identity valid while an unchanged path skips reopening.
+        // Changed paths are opened and identified before their bytes are consumed.
+        #[cfg(unix)]
+        if let Some(identity) = self.source_identity
+            && std::fs::metadata(&self.path).is_ok_and(|metadata| {
+                metadata.len() == self.offset && file_identity(&metadata) == identity
+            })
+        {
+            return Ok(vec![]);
+        }
+        let file = match std::fs::File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) => return Err(error),
         };
-        let len = meta.len();
-        if len < self.offset {
-            self.offset = 0;
-            self.lineno = 0;
+        let mut source = same_file::Handle::from_file(file)?;
+        let metadata = source.as_file().metadata()?;
+        let len = metadata.len();
+        #[cfg(unix)]
+        {
+            self.source_identity = Some(file_identity(&metadata));
+        }
+        let replaced = self
+            .source
+            .as_ref()
+            .is_some_and(|previous| previous != &source);
+        if replaced || len < self.offset || self.source.is_none() {
+            let (offset, line) = self.replay_window.map_or((0, 0), |want| {
+                let (offset, line, _, _) = window_start(source.as_file_mut(), want);
+                (offset, line)
+            });
+            self.offset = offset;
+            self.lineno = line;
             self.pending.clear();
         }
+        let source = self.source.insert(source);
         if len == self.offset {
             return Ok(vec![]);
         }
-        let mut f = std::fs::File::open(&self.path)?;
+        let f = source.as_file_mut();
         f.seek(SeekFrom::Start(self.offset))?;
         let mut reader = BufReader::new(f);
         let mut out = vec![];
@@ -147,16 +216,142 @@ impl Tailer {
     }
 }
 
+/// Select a bounded replay window on the same open file the tailer will consume.
+pub(super) fn window_start(f: &mut std::fs::File, want: u64) -> (u64, u64, u64, bool) {
+    let want = want.max(1) as usize;
+
+    // A bounded scan prevents large transcripts from monopolizing the daemon.
+    const SCAN_CAP: u64 = 32 * 1024 * 1024;
+    let mut base_off: u64 = 0;
+    if let Ok(meta) = f.metadata()
+        && meta.len() > SCAN_CAP
+    {
+        base_off = meta.len() - SCAN_CAP;
+        if f.seek(SeekFrom::Start(base_off)).is_ok() {
+            // Align to the next newline; never start in the middle of a line.
+            let mut skip = Vec::with_capacity(8192);
+            let mut r = BufReader::new(&mut *f);
+            if let Ok(n) = r.read_until(b'\n', &mut skip) {
+                base_off += n as u64;
+            }
+            let _ = f.seek(SeekFrom::Start(base_off));
+        } else {
+            base_off = 0;
+        }
+    }
+    let mut starts: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+    let mut reader = BufReader::new(f);
+    let mut offset: u64 = base_off;
+    let mut lineno: u64 = 0;
+    let mut buf = Vec::with_capacity(8192);
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if starts.len() == want {
+                    starts.pop_front();
+                }
+                starts.push_back((offset, lineno));
+                offset += n as u64;
+                lineno += 1;
+            }
+        }
+    }
+    // An empty capped window must stay at the aligned boundary, never rewind to the head.
+    let (start_off, start_line) = starts.front().copied().unwrap_or((base_off, 0));
+    (start_off, start_line, lineno, base_off == 0)
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
 /// (byte length, line count) of an existing file.
-fn count_to_end(path: &Path) -> Option<(u64, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    let f = std::fs::File::open(path).ok()?;
-    let lines = BufReader::new(f).lines().count() as u64;
-    Some((meta.len(), lines))
+fn count_to_end(file: &mut std::fs::File) -> std::io::Result<(u64, u64)> {
+    let mut reader = BufReader::new(file);
+    let mut bytes = 0;
+    let mut lines = 0;
+    let mut unterminated = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok((bytes, lines + u64::from(unterminated)));
+        }
+        bytes += buffer.len() as u64;
+        lines += buffer.iter().filter(|&&byte| byte == b'\n').count() as u64;
+        unterminated = buffer.last() != Some(&b'\n');
+        let consumed = buffer.len();
+        reader.consume(consumed);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn replacement_restarts_coordinates_even_when_the_source_does_not_shrink() {
+        for contents in ["new\n", "new\nmore\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.jsonl");
+            let replacement = dir.path().join("replacement.jsonl");
+            std::fs::write(&path, "old\n").unwrap();
+            let mut tailer = Tailer::new(&path, true);
+            assert_eq!(tailer.poll().unwrap()[0].text, "old");
+            std::fs::write(&replacement, contents).unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+
+            let expected: Vec<_> = contents
+                .lines()
+                .enumerate()
+                .map(|(line, text)| TailedLine {
+                    lineno: line as u64,
+                    text: text.into(),
+                })
+                .collect();
+            assert_eq!(tailer.poll().unwrap(), expected);
+            assert!(tailer.poll().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn replacement_discards_the_previous_sources_partial_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.jsonl");
+        let replacement = dir.path().join("replacement.jsonl");
+        std::fs::write(&path, "old-part").unwrap();
+        let mut tailer = Tailer::new(&path, true);
+        assert!(tailer.poll().unwrap().is_empty());
+        std::fs::write(&replacement, "replacement-complete\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(
+            tailer.poll().unwrap(),
+            vec![TailedLine {
+                lineno: 0,
+                text: "replacement-complete".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn replacement_after_seeking_to_end_does_not_reuse_the_old_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.jsonl");
+        let replacement = dir.path().join("replacement.jsonl");
+        std::fs::write(&path, "old\n").unwrap();
+        let mut tailer = Tailer::new(&path, false);
+        std::fs::write(&replacement, "replacement\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(
+            tailer.poll().unwrap(),
+            vec![TailedLine {
+                lineno: 0,
+                text: "replacement".into(),
+            }]
+        );
+    }
 
     /// A record being written in pieces: the bytes grow, but not one whole line can be handed
     /// back yet.

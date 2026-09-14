@@ -2096,89 +2096,16 @@ fn transcript_recently_written(runtime: &str, thread_id: &str, cwd: &std::path::
         .unwrap_or(false)
 }
 
-/// The transcript's total line count, and the byte offset the "last `want` lines" start at.
-///
-/// # Why one scan plus a ring buffer
-///
-/// watch replays only the tail, but has to report **absolute** line numbers
-/// (`item.completed.line` is the physical line number in the file, the same coordinate
-/// `agit show` uses; making it relative makes it a different thing). An absolute line number
-/// needs the total line count, and the total line count needs reading the whole file.
-///
-/// So scan once, and remember where the recent lines start in a ring buffer holding only `want`
-/// offsets. Time O(file), memory O(want). `Tailer::new(.., from_start)` cannot do this: it reads
-/// **every line** into a `Vec` and then drops the front, taking as much memory as the whole
-/// transcript.
-fn tail_window(path: &std::path::Path, want: u64) -> (u64, u64, u64, bool) {
-    use std::io::{BufRead as _, BufReader, Seek as _, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return (0, 0, 0, true);
+/// Select replay coordinates and retain the source those coordinates describe.
+fn tail_window(
+    path: &std::path::Path,
+    want: u64,
+) -> (u64, u64, u64, bool, Option<same_file::Handle>) {
+    let Ok(mut source) = std::fs::File::open(path).and_then(same_file::Handle::from_file) else {
+        return (0, 0, 0, true, None);
     };
-    let want = want.max(1) as usize;
-
-    // **Never scan more bytes than this.**
-    //
-    // An exact line number counts from the head of the file, and this function runs synchronously
-    // inside `dispatch` while holding the daemon's global mutex: the cost grows linearly with the
-    // size of the transcript and has no bound of its own — one pathologically large transcript
-    // stalls every RPC on this machine, event pump included.
-    //
-    // So cap it. Over the cap only the last stretch is scanned: line numbers become **relative to
-    // the truncation point**, and their only uses are numbering this watch stream's items (a
-    // stream is created fresh for each watch, so the numbering only has to be unique and
-    // monotonic within it) and the "showing the last N lines" line in the interface — neither
-    // depends on absolute line numbers. Below `SCAN_CAP` everything stays exact, and that covers
-    // the vast majority of transcripts.
-    const SCAN_CAP: u64 = 32 * 1024 * 1024;
-    let mut base_off: u64 = 0;
-    if let Ok(meta) = f.metadata()
-        && meta.len() > SCAN_CAP
-    {
-        base_off = meta.len() - SCAN_CAP;
-        if f.seek(SeekFrom::Start(base_off)).is_ok() {
-            // Align to the next newline; never start in the middle of a line.
-            let mut skip = Vec::with_capacity(8192);
-            let mut r = BufReader::new(&mut f);
-            if let Ok(n) = r.read_until(b'\n', &mut skip) {
-                base_off += n as u64;
-            }
-            let _ = f.seek(SeekFrom::Start(base_off));
-        } else {
-            base_off = 0;
-        }
-    }
-    let mut starts: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
-    let mut reader = BufReader::new(f);
-    let mut offset: u64 = base_off;
-    let mut lineno: u64 = 0;
-    let mut buf = Vec::with_capacity(8192);
-    loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if starts.len() == want {
-                    starts.pop_front();
-                }
-                starts.push_back((offset, lineno));
-                offset += n as u64;
-                lineno += 1;
-            }
-        }
-    }
-    // **An empty window must not fall back to the head of the file.**
-    //
-    // After capping, the offset aligns to the next newline; if the last JSONL record runs from
-    // the truncation point all the way to EOF, that alignment pushes `base_off` to EOF and
-    // `starts` is empty — and `(0, 0)` makes the tailer re-read from the **head of the file**,
-    // going straight around the `SCAN_CAP` guardrail and pulling the whole transcript into
-    // memory. The right answer for an empty window is "there is nothing after this point", not
-    // "start over from the beginning".
-    let (start_off, start_line) = starts.front().copied().unwrap_or((base_off, 0));
-    // The fourth value: whether the two line numbers above are **physical** ones. After capping
-    // they are relative to the truncation point, while every other line number in the protocol is
-    // physical — that has to be said out loud, see `SessionWatchResult`.
-    (start_off, start_line, lineno, base_off == 0)
+    let (offset, line, total, absolute) = crate::rc::tail::window_start(source.as_file_mut(), want);
+    (offset, line, total, absolute, Some(source))
 }
 
 /// Fill "at most `want` bytes" for real, instead of taking whatever one `read()` hands back.
