@@ -1595,37 +1595,9 @@ fn native_resume_cmd(
     prompt: Option<&str>,
     system_prompt: Option<&str>,
 ) -> Option<String> {
-    let mut inner = match runtime {
-        "claude-code" => format!("claude --resume {sid}"),
-        "codex" => adapter::codex::resume_command(sid, cwd),
-        "opencode" if prompt.is_none() && system_prompt.is_none() => {
-            format!("opencode --session {sid}")
-        }
-        _ => return None,
-    };
-    if runtime == "codex"
-        && let Some(provider) = adapter::codex_provider::resume_override(sid, cwd)
-    {
-        let value = serde_json::to_string(&provider).ok()?;
-        inner.push_str(" -c ");
-        inner.push_str(&shell_quote(&format!("model_provider={value}")));
-    }
-    if let Some(system) = system_prompt {
-        match runtime {
-            "claude-code" => {
-                inner.push_str(" --append-system-prompt ");
-                inner.push_str(&shell_quote(system));
-            }
-            // Codex's config flag replaces the user's instructions. Its trusted SessionStart
-            // hook adds saved environment context without changing configuration or user input.
-            "codex" => {}
-            _ => return None,
-        }
-    }
-    if let Some(p) = prompt {
-        inner.push(' ');
-        inner.push_str(&shell_quote(p));
-    }
+    let inner = adapter::get(runtime)
+        .ok()?
+        .resume_command(sid, cwd, prompt, system_prompt)?;
     Some(wrap_launch(&inner, cwd, slug, branch))
 }
 
@@ -1746,7 +1718,7 @@ fn materialize_and_resume(
     slug: &str,
     branch: &str,
     head: &str,
-    _snap: &meta::Meta,
+    snap: &meta::Meta,
     from: &str,
     to: &str,
     args: &Args,
@@ -1789,6 +1761,11 @@ fn materialize_and_resume(
             )
         })?;
     let (text, skipped) = transcript::unwrap_lossy(&view_env);
+    let raw_bytes = text.len();
+    let mut saved: String = view_env
+        .split_inclusive('\n')
+        .filter(|line| crate::domain::storage::parse_envelope_line(line).is_ok())
+        .collect();
     // A compact-anchored VIEW carries no leading `session_meta` line, and that line is more than
     // bootstrap: `history_mode` / `model_provider` / `base_instructions` all sit in it, and a
     // synthesized fallback cannot supply them. The original lies on the LOG's first line — ask
@@ -1816,8 +1793,12 @@ fn materialize_and_resume(
         ui::hint("a fresh session goes through `agit new`");
         anyhow::bail!("empty VIEW");
     }
+    if text.len() > raw_bytes {
+        let bootstrap = &text[..text.len() - raw_bytes];
+        saved.insert_str(0, &transcript::wrap_lines(bootstrap, from, &snap.session));
+    }
     let hydrated = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
-        .hydrate_jsonl(&text)?;
+        .hydrate_envelopes(&saved)?;
     if hydrated.unresolved > 0 {
         ui::warning(&format!(
             "{} repository secret placeholder(s) have no local dictionary entry and were left unchanged.",
@@ -1827,9 +1808,7 @@ fn materialize_and_resume(
             "repository secret dictionaries are device-local and are never fetched from the hub",
         );
     }
-    let text = hydrated.text;
-
-    let lossy = adapter::is_lossy_conversion(from, to);
+    let saved = hydrated.text;
 
     let mut locked_supersede = Vec::with_capacity(supersede.len());
     for previous in &supersede {
@@ -1837,7 +1816,7 @@ fn materialize_and_resume(
             locked_supersede.push((guard, current));
         }
     }
-    let (installed, _) = crate::domain::install::install(&text, from, to, cwd)?;
+    let (installed, lossy) = crate::domain::install::install_saved(&saved, to, cwd)?;
 
     // Registration: the new instance's baseline = the byte count and hash of the materialized
     // file at this moment; the identity is injected as `AGIT_SESSION`.

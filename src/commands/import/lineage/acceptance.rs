@@ -243,7 +243,16 @@ fn native_cwd(source: &native_snapshot::Source, bytes: &[u8]) -> crate::Result<O
                 let fields: OpenCode<'_> = serde_json::from_str(line)?;
                 (fields.id, fields.directory)
             }
-            _ => return Ok(None),
+            _ => {
+                let mut nodes = 65_536;
+                crate::domain::metadata_facts::JsonFacts::parse_with_node_budget(line, &mut nodes)?;
+                let value = serde_json::from_str::<serde_json::Value>(line)?;
+                let Some((id, cwd)) = crate::adapter::get(source.runtime)?.record_identity(&value)
+                else {
+                    continue;
+                };
+                (Some(Cow::Owned(id)), cwd.map(Cow::Owned))
+            }
         };
         let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
             continue;

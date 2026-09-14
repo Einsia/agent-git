@@ -560,6 +560,34 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         })
     }
 
+    /// Hydration changes only native content; provenance stays intact and hashes describe the new content.
+    pub fn hydrate_envelopes(&self, saved: &str) -> crate::Result<HydrationReport> {
+        use crate::domain::{storage, transcript};
+        let envelopes = saved
+            .split_inclusive('\n')
+            .map(storage::parse_envelope_line)
+            .collect::<crate::Result<Vec<_>>>()?;
+        let raw = transcript::unwrap_strict(saved)?;
+        let mut report = self.hydrate_jsonl(&raw)?;
+        let contents = report
+            .text
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            contents.len() == envelopes.len(),
+            "hydration changed the native record count"
+        );
+        let mut text = String::new();
+        for (mut envelope, content) in envelopes.into_iter().zip(contents) {
+            envelope.content = content;
+            envelope.object_hash = transcript::object_hash(&envelope.content);
+            text.push_str(&storage::envelope_line(&envelope));
+        }
+        report.text = text;
+        Ok(report)
+    }
+
     /// Restore known placeholders only while materializing a session into a
     /// local runtime. Unknown/foreign tokens remain visible and are counted.
     pub fn hydrate_jsonl(&self, text: &str) -> crate::Result<HydrationReport> {
@@ -1680,6 +1708,30 @@ mod tests {
         assert!(!target.exists());
         assert!(!dir.path().join("vault.lock").exists());
         assert!(dictionary.store.keys.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn saved_hydration_preserves_provenance_and_recomputes_content_hashes() {
+        use crate::domain::{storage, transcript};
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary =
+            RepositoryDictionary::new(dir.path().join("vault.json"), MemoryKeys::default());
+        let secret = "synthetic hydration marker";
+        let matcher = Matcher::for_test(&[("sec_global", secret)]);
+        let raw = format!("{}\n", serde_json::json!({"message":secret}));
+        let protected = dictionary.protect_jsonl(&raw, &matcher).unwrap();
+        let claim = format!("agit-{}", "a".repeat(40));
+        let saved = transcript::wrap_lines(&protected.text, "hermes", &claim);
+        let hydrated = dictionary.hydrate_envelopes(&saved).unwrap();
+        let envelope = storage::parse_envelope_line(&hydrated.text).unwrap();
+        assert_eq!(envelope.source, "hermes");
+        assert_eq!(envelope.session_id, claim);
+        assert_eq!(envelope.content["message"], secret);
+        assert_ne!(
+            envelope.object_hash,
+            storage::parse_envelope_line(&saved).unwrap().object_hash
+        );
+        assert_eq!(hydrated.replacements, 1);
     }
 
     #[test]

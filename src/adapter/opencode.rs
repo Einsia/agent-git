@@ -1526,6 +1526,18 @@ fn run_import(cmd: &mut std::process::Command, file: &Path, cwd: &Path) -> Resul
 }
 
 impl Adapter for OpenCode {
+    fn record_group(&self, value: &serde_json::Value) -> Option<String> {
+        let field = if value["kind"] == "opencode.meta" {
+            "id"
+        } else {
+            "session_id"
+        };
+        value[field]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+    }
+
     fn id(&self) -> &'static str {
         "opencode"
     }
@@ -1536,6 +1548,21 @@ impl Adapter for OpenCode {
 
     /// §8.3: it installs to disk (import writes to the database), it yields a resume command
     /// certain to run, and its last step goes through no private index — Resumable.
+    fn start_command(&self, _cwd: &Path) -> Option<String> {
+        Some("opencode".into())
+    }
+
+    fn resume_command(
+        &self,
+        id: &str,
+        _cwd: &Path,
+        prompt: Option<&str>,
+        system: Option<&str>,
+    ) -> Option<String> {
+        (prompt.is_none() && system.is_none())
+            .then(|| format!("opencode --session {}", super::shell_id(id)))
+    }
+
     fn capability(&self) -> Capability {
         Capability::Resumable
     }

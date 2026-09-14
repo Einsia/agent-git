@@ -33,16 +33,25 @@ use std::collections::HashMap;
 /// same text that was fed to parse — line-number coordinates only mean anything against the same
 /// text.
 pub fn tool_details(format: &str, raw: &str, session: &Session) -> ToolDetails {
-    details(format, raw, session, true)
+    super::get(format)
+        .map(|adapter| adapter.tool_details(raw, session, true))
+        .unwrap_or_default()
 }
 
 /// Search needs call arguments, not a copy of every output paired to each occurrence.
 #[cfg(feature = "cli")]
 pub(crate) fn tool_inputs(format: &str, raw: &str, session: &Session) -> ToolDetails {
-    details(format, raw, session, false)
+    super::get(format)
+        .map(|adapter| adapter.tool_details(raw, session, false))
+        .unwrap_or_default()
 }
 
-fn details(format: &str, raw: &str, session: &Session, include_output: bool) -> ToolDetails {
+pub(crate) fn legacy_details(
+    format: &str,
+    raw: &str,
+    session: &Session,
+    include_output: bool,
+) -> ToolDetails {
     let lines: Vec<&str> = raw.lines().collect();
     let mut out = ToolDetails::default();
     match format {

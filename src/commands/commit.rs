@@ -1061,6 +1061,10 @@ fn in_flight_tail(ir: &Session, open: &[OpenCall]) -> Option<InFlight> {
     if !answered {
         return Some(InFlight::Unanswered);
     }
+    let events: Vec<_> = last_g.iter().map(|&index| &ir.events[index]).collect();
+    if crate::adapter::get(&ir.runtime).is_ok_and(|adapter| !adapter.tail_is_complete(&events)) {
+        return Some(InFlight::Unanswered);
+    }
     let first_line = last_g.iter().filter_map(|&j| ir.events[j].line).min()?;
     open.iter()
         .find(|c| c.line >= first_line)

@@ -283,7 +283,12 @@ fn read_native(claim: &link::Link) -> crate::Result<Vec<u8>> {
             crate::adapter::claude_code::resolve_readonly(&claim.session_id)?
         }
         "cursor" => crate::adapter::cursor::resolve_readonly(&claim.session_id)?,
-        _ => anyhow::bail!("the selected runtime has no read-only transcript reader"),
+        _ => {
+            let adapter = crate::adapter::get(&claim.source)?;
+            let limits = crate::adapter::native_snapshot::Limits::default();
+            let source = adapter.lookup_native_readonly(&claim.session_id, limits)?;
+            return Ok(adapter.snapshot_native_readonly(&source, limits)?.bytes);
+        }
     };
     crate::adapter::native_snapshot::read_file_bytes(
         &path,
@@ -340,6 +345,10 @@ fn records_with_limit(text: &str, claim: &link::Link, limit: usize) -> crate::Re
                         "claude-code" | "claude-desktop" => value["sessionId"].as_str(),
                         _ => None,
                     };
+                    let adapter_identity =
+                        crate::adapter::get(&claim.source)?.record_identity(&value);
+                    let declared =
+                        declared.or_else(|| adapter_identity.as_ref().map(|(id, _)| id.as_str()));
                     ensure!(
                         declared.is_none_or(|id| id == claim.session_id),
                         "the native transcript identity differs from the selected claim"

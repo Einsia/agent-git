@@ -99,6 +99,10 @@ impl Adapter for Cursor {
 
     /// Cursor is import-only: the transcript is a projection and cannot be installed back
     /// (module docs, "Why it is not writable").
+    fn requires_turn_end(&self) -> bool {
+        true
+    }
+
     fn capability(&self) -> Capability {
         Capability::ImportOnly
     }

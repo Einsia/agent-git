@@ -61,6 +61,34 @@ impl Adapter for ClaudeCode {
         "claude"
     }
 
+    fn native_files_root(&self) -> Result<PathBuf> {
+        projects_dir()
+    }
+
+    fn start_command(&self, _cwd: &Path) -> Option<String> {
+        Some("claude".into())
+    }
+
+    fn resume_command(
+        &self,
+        id: &str,
+        _cwd: &Path,
+        prompt: Option<&str>,
+        system: Option<&str>,
+    ) -> Option<String> {
+        let mut command = format!("claude --resume {}", super::shell_id(id));
+        if let Some(system) = system {
+            command.push_str(&format!(
+                " --append-system-prompt {}",
+                super::shell_arg(system)
+            ));
+        }
+        if let Some(prompt) = prompt {
+            command.push_str(&format!(" {}", super::shell_arg(prompt)));
+        }
+        Some(command)
+    }
+
     fn capability(&self) -> Capability {
         Capability::Resumable
     }

@@ -98,7 +98,7 @@ pub fn completed_count(session: &Session) -> usize {
 }
 
 fn supports_turn_end(runtime: &str) -> bool {
-    matches!(runtime, "codex" | "cursor")
+    crate::adapter::get(runtime).is_ok_and(|adapter| adapter.requires_turn_end())
 }
 
 /// Hex length of a hash.

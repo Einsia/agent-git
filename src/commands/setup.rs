@@ -26,19 +26,15 @@
 use super::CmdResult;
 use super::skill_bundle;
 use crate::{ExitCode, ui};
+mod native;
+
 use clap::Args as ClapArgs;
 use std::path::{Path, PathBuf};
-
-/// Valid values for `--runtime`. Separate from the adapter list: setup installs "where an
-/// integration lands", the adapter answers "how a transcript is read and written". claude-desktop
-/// has no integration site of its own (it reuses everything claude-code has), so it is not
-/// listed here.
-const RUNTIMES: &[&str] = &["all", "claude-code", "codex", "cursor", "opencode"];
 
 #[derive(ClapArgs)]
 pub struct Args {
     /// Install for one runtime only (default: every runtime noticed).
-    #[arg(long, value_name = "all|claude-code|codex|cursor|opencode")]
+    #[arg(long, value_name = "runtime")]
     pub runtime: Option<String>,
     #[arg(long)]
     pub hooks: bool,
@@ -110,16 +106,25 @@ fn wants(filter: Option<&str>, runtime: &str) -> bool {
     matches!(filter, None | Some("all")) || filter == Some(runtime)
 }
 
-pub fn run(args: Args) -> CmdResult {
+pub fn run(mut args: Args) -> CmdResult {
+    if let Some(runtime) = args.runtime.as_deref()
+        && let Ok(runtime) = crate::adapter::normalize(runtime)
+    {
+        args.runtime = Some(runtime.into());
+    }
     // Reject an unknown runtime on the spot: silently installing nothing is the most expensive
     // class of configuration bug — the user believes the integration is in place and finds out
     // only at the next session.
     if let Some(rt) = args.runtime.as_deref()
-        && !RUNTIMES.contains(&rt)
+        && rt != "all"
+        && !crate::adapter::setup_runtimes().any(|id| id == rt)
     {
         ui::error(&format!(
             "unknown runtime `{rt}` (expected one of: {})",
-            RUNTIMES.join(" / ")
+            std::iter::once("all")
+                .chain(crate::adapter::setup_runtimes())
+                .collect::<Vec<_>>()
+                .join(" / ")
         ));
         return Ok(ExitCode::Usage);
     }
@@ -263,6 +268,30 @@ fn install_hooks(runtime: Option<&str>) -> SetupReport {
                 "  {} Codex hooks unavailable; skipping",
                 ui::dim("·")
             )),
+        }
+    }
+
+    if wants(runtime, "workbuddy") {
+        match crate::adapter::workbuddy::home() {
+            Ok(root) => report.merge(install_hook_file(
+                &root.join("settings.json"),
+                "WorkBuddy",
+                &exe,
+                Some("workbuddy"),
+            )),
+            Err(_) => report.merge(SetupReport::failure()),
+        }
+    }
+    for id in ["hermes", "openclaw"] {
+        if wants(runtime, id)
+            && (runtime == Some(id)
+                || crate::adapter::get(id).is_ok_and(|adapter| adapter.available()))
+        {
+            report.merge(if id == "hermes" {
+                native::hermes(&exe, "hooks")
+            } else {
+                native::openclaw(&exe)
+            });
         }
     }
 
@@ -505,7 +534,7 @@ fn upsert_hook(hooks: &mut serde_json::Value, event: &str, cmd: &str) -> usize {
 /// written, this also reports whether the install is complete.
 fn install_skill(runtime: Option<&str>) -> SetupReport {
     let mut report = SetupReport::default();
-    for name in ["claude-code", "codex", "opencode", "cursor"] {
+    for name in crate::adapter::setup_runtimes() {
         if !wants(runtime, name) {
             continue;
         }
@@ -530,13 +559,10 @@ fn install_skill(runtime: Option<&str>) -> SetupReport {
 
 /// Resolve the native global Skill directory for a runtime.
 pub(crate) fn skill_path(runtime: &str) -> Option<PathBuf> {
-    match runtime {
-        "codex" => codex_home_path().map(|h| h.join("skills/agit")),
-        "claude-code" | "opencode" | "cursor" => home().map(|h| skill_path_for_home(&h, runtime)),
-        _ => None,
-    }
+    (crate::adapter::registration(runtime)?.skill_dir?)().ok()
 }
 
+#[cfg(test)]
 fn skill_path_for_home(home: &Path, runtime: &str) -> PathBuf {
     match runtime {
         "claude-code" => home.join(".claude/skills/agit"),
@@ -877,6 +903,21 @@ fn register_mcp(runtime: Option<&str>) -> SetupReport {
             ui::warning("cannot install Cursor MCP: HOME is not set");
             report.merge(SetupReport::failure());
         }
+    }
+
+    if wants(runtime, "workbuddy") {
+        report.merge(native::workbuddy_mcp(&exe));
+    }
+    if wants(runtime, "hermes")
+        && (runtime == Some("hermes")
+            || crate::adapter::get("hermes").is_ok_and(|adapter| adapter.available()))
+    {
+        report.merge(native::hermes(&exe, "mcp"));
+    }
+    if runtime == Some("openclaw") {
+        ui::info(format_args!(
+            "  OpenClaw uses the native lifecycle plugin and Skill; a stdio MCP registration is not required."
+        ));
     }
 
     report

@@ -48,21 +48,25 @@ pub fn prepare(request: PreparationRequest<'_>) -> Result<PreparedExploration> {
     prepare_with(
         request,
         |text, from, to, cwd| {
-            if file && to == "claude-code" {
+            if !file {
+                install::install_saved(text, to, cwd)
+            } else if to == "claude-code" {
                 ensure!(
                     text.is_empty(),
                     "fresh file exploration contains prior context"
                 );
-                file_agent::install_fresh_claude(cwd)
-            } else if file && to == "opencode" {
+                file_agent::install_fresh_claude(cwd).map(|installed| (installed, false))
+            } else if to == "opencode" {
                 ensure!(
                     text.is_empty(),
                     "fresh file exploration contains prior context"
                 );
                 let (id, payload) = empty_opencode_bootstrap(cwd)?;
-                adapter::get(to)?.install(&payload, &id, cwd)
+                adapter::get(to)?
+                    .install(&payload, &id, cwd)
+                    .map(|installed| (installed, false))
             } else {
-                install::install(text, from, to, cwd).map(|(installed, _)| installed)
+                install::install(text, from, to, cwd)
             }
         },
         read_native,
@@ -142,7 +146,7 @@ fn require_claims(
 
 fn prepare_with(
     request: PreparationRequest<'_>,
-    install: impl FnOnce(&str, &str, &str, &Path) -> Result<Installed>,
+    install: impl FnOnce(&str, &str, &str, &Path) -> Result<(Installed, bool)>,
     read: impl Fn(&Link) -> Result<Vec<u8>>,
     mut checkpoint: impl FnMut(Checkpoint) -> Result<()>,
 ) -> Result<PreparedExploration> {
@@ -280,7 +284,7 @@ fn prepare_with(
         .context("archive target metadata is missing")?;
     let committed =
         storage::materialize_at(request.repo.root(), &role.origin_head, meta::LOG_FILE)?;
-    let lossy = adapter::is_lossy_conversion(&metadata.runtime, runtime);
+    let mut lossy = adapter::is_lossy_conversion(&metadata.runtime, runtime);
     let (binding, installed, previous_claims, original_json, unresolved) = if let Some(journal) =
         previous
     {
@@ -390,7 +394,19 @@ fn prepare_with(
         let view =
             storage::materialize_at(request.repo.root(), &role.origin_head, meta::VIEW_FILE)?;
         let text = transcript::unwrap_strict(&view)?;
+        let raw_bytes = text.len();
         let text = transcript::restore_bootstrap(&text, &committed, &metadata.runtime);
+        let mut saved = view;
+        if text.len() > raw_bytes {
+            saved.insert_str(
+                0,
+                &transcript::wrap_lines(
+                    &text[..text.len() - raw_bytes],
+                    &metadata.runtime,
+                    &metadata.session,
+                ),
+            );
+        }
         ensure!(
             file_target.is_some() || !text.trim().is_empty(),
             "archive merge VIEW is empty"
@@ -404,7 +420,7 @@ fn prepare_with(
         } else {
             let hydrated =
                 crate::domain::secret_filter::RepositoryDictionary::open(request.repo.root())?
-                    .hydrate_jsonl(&text)?;
+                    .hydrate_envelopes(&saved)?;
             (hydrated.text, hydrated.unresolved)
         };
         ensure!(
@@ -413,7 +429,8 @@ fn prepare_with(
         );
         require_destination_routing(request.repo, &role.branch)?;
         require_transaction(&request, request.transaction_json)?;
-        let receipt = install(&install_text, &metadata.runtime, runtime, request.cwd)?;
+        let (receipt, converted) = install(&install_text, &metadata.runtime, runtime, request.cwd)?;
+        lossy |= converted;
         let id = receipt
             .path
             .file_stem()
@@ -518,7 +535,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const SESSION: &str = "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const VISIBLE: &str = "{\"type\":\"user\",\"text\":\"visible installation context\"}\n";
+    const VISIBLE: &str = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"visible installation context\"}]}}\n";
 
     struct FileFixture {
         directory: tempfile::TempDir,
@@ -628,10 +645,13 @@ mod tests {
                         "{\"type\":\"session_meta\",\"payload\":{\"id\":\"FILE_1\"}}\n"
                     };
                     std::fs::write(&path, baseline)?;
-                    Ok(Installed {
-                        path,
-                        next: adapter::Next::Resume("not executed".into()),
-                    })
+                    Ok((
+                        Installed {
+                            path,
+                            next: adapter::Next::Resume("not executed".into()),
+                        },
+                        false,
+                    ))
                 },
                 |link| {
                     Ok(std::fs::read(
@@ -1001,13 +1021,20 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_suffix("")
+        }
+
+        fn with_suffix(suffix: &str) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let repo = Repo::init(&directory.path().join("repo")).unwrap();
             repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
             let mut metadata = meta::Meta::new(SESSION.into(), "codex".into(), "/work".into());
             metadata.turn = Some(1);
             meta::write(repo.root(), &metadata).unwrap();
-            let view = transcript::wrap_lines(VISIBLE, "codex", SESSION);
+            let view = format!(
+                "{}{suffix}",
+                transcript::wrap_lines(VISIBLE, "codex", SESSION)
+            );
             let log = format!(
                 "{view}{}",
                 transcript::wrap_lines(
@@ -1098,7 +1125,14 @@ mod tests {
             )?)
         }
 
-        fn install(&self, text: &str, from: &str, to: &str, cwd: &Path) -> Result<Installed> {
+        fn install(
+            &self,
+            text: &str,
+            from: &str,
+            to: &str,
+            cwd: &Path,
+        ) -> Result<(Installed, bool)> {
+            let (text, converted) = transcript::display::render_native(text, to, "synthetic", cwd)?;
             assert_eq!(from, "codex");
             assert_eq!(to, "codex");
             assert_eq!(cwd, self.directory.path());
@@ -1125,10 +1159,13 @@ mod tests {
                 self.installs.load(Ordering::Relaxed)
             ));
             std::fs::write(&path, text)?;
-            Ok(Installed {
-                path,
-                next: adapter::Next::Resume("unused launcher".into()),
-            })
+            Ok((
+                Installed {
+                    path,
+                    next: adapter::Next::Resume("unused launcher".into()),
+                },
+                converted,
+            ))
         }
 
         fn run(
@@ -1154,6 +1191,41 @@ mod tests {
                 std::fs::read(self.tx_path()).unwrap(),
                 std::fs::read(link::link_path(&self.store, "codex", "OLD")).unwrap(),
             )
+        }
+    }
+
+    #[test]
+    fn merge_exploration_restores_each_selected_native_source() {
+        for (runtime, message) in [
+            (
+                "hermes",
+                serde_json::json!({"type":"hermes_message", "data":{"session_id":"native", "role":"user", "content":"INHERITED_MARKER"}}),
+            ),
+            (
+                "workbuddy",
+                serde_json::json!({"type":"message", "sessionId":"native", "role":"user", "content":"INHERITED_MARKER"}),
+            ),
+            (
+                "openclaw",
+                serde_json::json!({"type":"message", "id":"native-message", "parentId":null, "message":{"role":"user", "content":[{"type":"text", "text":"INHERITED_MARKER"}]}}),
+            ),
+        ] {
+            let suffix = transcript::wrap_lines(&format!("{message}\n"), runtime, SESSION);
+            let fixture = Fixture::with_suffix(&suffix);
+            let result = fixture.run(&fixture.transaction_json, |_| Ok(())).unwrap();
+            assert!(result.lossy);
+            let native =
+                std::fs::read_to_string(fixture.directory.path().join("NEW_1.jsonl")).unwrap();
+            let parsed = adapter::get("codex").unwrap().parse(&native).unwrap();
+            assert!(
+                parsed
+                    .events
+                    .iter()
+                    .any(|event| event.text.as_deref() == Some("INHERITED_MARKER")),
+                "{runtime}: {native}"
+            );
+            assert!(native.contains("visible installation context"));
+            assert!(!native.contains("excluded log evidence"));
         }
     }
 

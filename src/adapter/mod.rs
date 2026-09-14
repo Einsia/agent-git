@@ -31,22 +31,25 @@ pub mod codex_index;
 #[cfg(feature = "cli")]
 pub(crate) mod codex_provider;
 pub mod cursor;
+pub mod detail;
 pub mod enrich;
+pub mod hermes;
+mod native_message;
 pub mod native_snapshot;
+pub mod openclaw;
 pub mod opencode;
+mod sqlite_native;
+pub mod workbuddy;
 
 use crate::Result;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const RUNTIMES: &[&str] = &[
-    "claude-code",
-    "codex",
-    "cursor",
-    "claude-desktop",
-    "opencode",
-];
+mod registry;
+pub use registry::{
+    REGISTRY, RUNTIMES, RuntimeRegistration, registration, runtime_label, setup_runtimes,
+};
 
 /// Inspection requires a unique physical carrier; discovery order and modification time
 /// cannot establish which copy belongs to an active native session.
@@ -82,32 +85,19 @@ fn unique_native_file(
 /// Normalize a runtime name typed by the user. Common short forms are accepted because users
 /// type both.
 ///
-/// This can normalize to a name with **no registered adapter** (see [`KNOWN_BUT_UNREGISTERED`]) —
-/// `get` reports that case as "not supported yet" instead of the catch-all bug message.
+/// Names and aliases resolve through the same registry used to construct adapters.
 pub fn normalize(s: &str) -> Result<&'static str> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "claude-code" | "claude" | "cc" => Ok("claude-code"),
-        "codex" | "cx" => Ok("codex"),
-        // No `cs`-style short form: one letter away from `cc`, so a typo silently goes looking
-        // for another runtime's session. `cursor` is short enough not to be worth abbreviating.
-        "cursor" => Ok("cursor"),
-        // ChatGPT Desktop (com.openai.codex) embeds the Codex engine and reads and writes the
-        // same `CODEX_HOME` — it is not another runtime, it is another interface onto the same
-        // one, so it normalizes to `codex` instead of getting its own adapter (research in
-        // docs/mechanism-probing/desktop-apps.md §3.1).
-        "chatgpt-desktop" | "chatgpt" | "chatgpt-app" | "codex-app" => Ok("codex"),
-        // Claude Desktop's Code tab writes Claude Code's own jsonl, but its write side hands
-        // the file to the desktop app to pick up rather than being directly resumable, so it
-        // needs a name of its own (§3.2/§4).
-        "claude-desktop" | "claude-app" => Ok("claude-desktop"),
-        // No `oc`-style short form: one letter away from `cc` / `cx`, so a typo silently goes
-        // looking for another runtime's session (same reason as cursor).
-        "opencode" => Ok("opencode"),
-        other => anyhow::bail!(
-            "unknown runtime `{other}`. Registered: {}",
-            RUNTIMES.join(", ")
-        ),
-    }
+    let name = s.trim().to_ascii_lowercase();
+    REGISTRY
+        .iter()
+        .find(|r| r.id == name || r.aliases.contains(&name.as_str()))
+        .map(|r| r.id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown runtime `{name}`. Registered: {}",
+                RUNTIMES.join(", ")
+            )
+        })
 }
 
 /// Intermediate representation (IR) of a session.
@@ -552,6 +542,71 @@ pub trait Adapter {
     /// The executable's name.
     fn cli(&self) -> &'static str;
 
+    /// A missing command refuses launch before a session branch is created.
+    fn start_command(&self, _cwd: &Path) -> Option<String> {
+        None
+    }
+
+    /// Return a shell-safe native command; the caller adds cwd and AgentGit identity.
+    fn resume_command(
+        &self,
+        _id: &str,
+        _cwd: &Path,
+        _prompt: Option<&str>,
+        _system: Option<&str>,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Explicit native completion events keep a trailing user turn pending.
+    fn requires_turn_end(&self) -> bool {
+        false
+    }
+
+    /// Some native streams distinguish terminal replies from intermediate assistant messages.
+    fn tail_is_complete(&self, events: &[&Event]) -> bool {
+        let _ = events;
+        true
+    }
+
+    /// Format-specific detail is decoded against the same raw coordinates as the IR.
+    fn tool_details(&self, raw: &str, session: &Session, include_output: bool) -> ToolDetails {
+        enrich::legacy_details(self.format(), raw, session, include_output)
+    }
+
+    /// Raw presentation details follow the adapter's event ordering.
+    fn line_details(&self, value: &serde_json::Value) -> detail::LineDetails {
+        detail::legacy_line(self.format(), value)
+    }
+
+    /// Session context determines which native records belong to the projected history.
+    fn event_details(&self, raw: &str, session: &Session) -> Vec<Option<detail::EventDetail>> {
+        detail::project(self, raw, session, |_| true)
+    }
+
+    /// Preserve native fields while localizing the history into a new session identity.
+    fn localize(&self, content: &str, id: &str, cwd: &Path) -> Result<String> {
+        crate::domain::install::localize_same_format(content, self.format(), id, cwd)
+    }
+
+    /// An identity is declared by a native record, never inferred from modification time.
+    fn record_identity(&self, _value: &serde_json::Value) -> Option<(String, Option<String>)> {
+        None
+    }
+
+    /// A per-record native session key isolates reused identifiers after materialization.
+    /// Header-only identities cannot partition body records and must return None here.
+    fn record_group(&self, _value: &serde_json::Value) -> Option<String> {
+        None
+    }
+
+    fn native_files_root(&self) -> Result<PathBuf> {
+        anyhow::bail!(
+            "{} does not store its native sessions as individual files",
+            self.id()
+        )
+    }
+
     /// Which level this target reaches.
     ///
     /// **Deliberately no default implementation.** With a `Resumable` default, an adapter whose
@@ -718,42 +773,17 @@ pub enum Next {
     HandOff { trigger: String, fallback: String },
 }
 
-/// Canonical names normalize knows but for which no adapter is registered.
-///
-/// The table exists for one reason: to keep "not supported yet" apart from "bug". Without it,
-/// `get`'s catch-all branch reports a runtime that is **planned but unwritten** as "no adapter
-/// (bug)" — and the user concludes the install is broken rather than the feature unbuilt.
-///
-/// Empty: `claude-desktop` ships with the capability model (S10, desktop-apps.md §4). The next
-/// runtime that normalize knows but has no adapter goes back into this table.
-const KNOWN_BUT_UNREGISTERED: &[&str] = &[];
-
 pub fn get(runtime: &str) -> Result<Box<dyn Adapter>> {
-    match normalize(runtime)? {
-        "claude-code" => Ok(Box::new(claude_code::ClaudeCode)),
-        "codex" => Ok(Box::new(codex::Codex)),
-        "cursor" => Ok(Box::new(cursor::Cursor)),
-        "claude-desktop" => Ok(Box::new(claude_desktop::ClaudeDesktop)),
-        "opencode" => Ok(Box::new(opencode::OpenCode)),
-        other if KNOWN_BUT_UNREGISTERED.contains(&other) => {
-            anyhow::bail!(
-                "runtime `{other}` is not supported yet: normalize knows it, but no adapter implements it"
-            )
-        }
-        other => anyhow::bail!("runtime `{other}` has no adapter (bug)"),
-    }
+    let id = normalize(runtime)?;
+    REGISTRY
+        .iter()
+        .find(|r| r.id == id)
+        .map(|r| (r.create)())
+        .ok_or_else(|| anyhow::anyhow!("runtime `{id}` has no registered adapter"))
 }
 
 pub fn all() -> Vec<Box<dyn Adapter>> {
-    vec![
-        Box::new(claude_code::ClaudeCode),
-        Box::new(codex::Codex),
-        Box::new(cursor::Cursor),
-        // Export-only: the capability model keeps it out of the default resume list, and only
-        // an explicit `--as` reaches it.
-        Box::new(claude_desktop::ClaudeDesktop),
-        Box::new(opencode::OpenCode),
-    ]
+    REGISTRY.iter().map(|r| (r.create)()).collect()
 }
 
 /// Which runtimes `clone` installs into by default when no `--as` is given.
@@ -846,9 +876,26 @@ pub fn infer_runtime(text: &str) -> Option<&'static str> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if matches!(
+            v["type"].as_str(),
+            Some("hermes_session" | "hermes_message")
+        ) {
+            return Some("hermes");
+        }
+        if v["type"] == "session" && v.get("version").is_some() && v.get("cwd").is_some() {
+            return Some("openclaw");
+        }
         // A Codex line is {type, payload}
         if v.get("payload").is_some() && v.get("type").is_some() {
             return Some("codex");
+        }
+        if v.get("sessionId").is_some()
+            && matches!(
+                v["type"].as_str(),
+                Some("message" | "function_call" | "function_call_result")
+            )
+        {
+            return Some("workbuddy");
         }
         // A Claude Code line has sessionId / parentUuid
         if v.get("sessionId").is_some() || v.get("parentUuid").is_some() {
@@ -862,6 +909,23 @@ pub fn infer_runtime(text: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Every dynamic shell argument is quoted, including embedded apostrophes and newlines.
+pub(crate) fn shell_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+pub(crate) fn shell_id(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-.:".contains(&c))
+    {
+        value.to_owned()
+    } else {
+        shell_arg(value)
+    }
 }
 
 #[cfg(test)]
@@ -976,6 +1040,9 @@ mod tests {
             // place — the install lands in the source-of-truth store itself, not through a
             // private index nobody can observe.
             ("opencode", Capability::Resumable, "opencode"),
+            ("hermes", Capability::Resumable, "hermes"),
+            ("openclaw", Capability::Resumable, "openclaw"),
+            ("workbuddy", Capability::Resumable, "workbuddy"),
         ];
         let got: Vec<_> = all()
             .iter()
@@ -999,7 +1066,17 @@ mod tests {
     #[test]
     fn default_targets_are_exactly_the_resumable_ones() {
         let defaults = default_targets();
-        assert_eq!(defaults, ["claude-code", "codex", "opencode"]);
+        assert_eq!(
+            defaults,
+            [
+                "claude-code",
+                "codex",
+                "hermes",
+                "openclaw",
+                "opencode",
+                "workbuddy"
+            ]
+        );
         let mut rest: Vec<_> = non_default_targets().iter().map(|(id, _)| *id).collect();
         rest.sort();
         assert_eq!(rest, ["claude-desktop", "cursor"]);

@@ -28,6 +28,9 @@ pub struct Current {
 /// carried only by child processes agit starts itself. Both support unmanaged-session safety
 /// checks and stale AGIT_SESSION rejection; neither selects an ordinary command target.
 pub const ENV_SESSIONS: &[(&str, &str)] = &[
+    ("CODEBUDDY_SESSION_ID", "workbuddy"),
+    ("HERMES_SESSION_ID", "hermes"),
+    ("OPENCLAW_SESSION_ID", "openclaw"),
     ("CLAUDE_CODE_SESSION_ID", "claude-code"),
     ("CLAUDE_SESSION_ID", "claude-code"),
     ("CODEX_SESSION_ID", "codex"),

@@ -46,7 +46,7 @@ pub struct Codex;
 /// The selected workspace overrides the native session's persisted directory.
 pub(crate) fn resume_command(sid: &str, cwd: &Path) -> String {
     let cwd = cwd.to_string_lossy().replace('\'', "'\\''");
-    format!("codex resume {sid} --cd '{cwd}'")
+    format!("codex resume {} --cd '{cwd}'", super::shell_id(sid))
 }
 
 /// The output body paired to a tool call replayed from another runtime.
@@ -483,6 +483,40 @@ impl Adapter for Codex {
 
     fn cli(&self) -> &'static str {
         "codex"
+    }
+
+    fn native_files_root(&self) -> Result<PathBuf> {
+        sessions_root()
+    }
+
+    fn start_command(&self, _cwd: &Path) -> Option<String> {
+        Some("codex".into())
+    }
+
+    fn requires_turn_end(&self) -> bool {
+        true
+    }
+
+    fn resume_command(
+        &self,
+        id: &str,
+        cwd: &Path,
+        prompt: Option<&str>,
+        _system: Option<&str>,
+    ) -> Option<String> {
+        let mut command = resume_command(id, cwd);
+        #[cfg(feature = "cli")]
+        if let Some(provider) = super::codex_provider::resume_override(id, cwd) {
+            let value = serde_json::to_string(&provider).ok()?;
+            command.push_str(&format!(
+                " -c {}",
+                super::shell_arg(&format!("model_provider={value}"))
+            ));
+        }
+        if let Some(prompt) = prompt {
+            command.push_str(&format!(" {}", super::shell_arg(prompt)));
+        }
+        Some(command)
     }
 
     fn capability(&self) -> Capability {

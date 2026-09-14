@@ -90,6 +90,15 @@ pub fn run(args: Args) -> CmdResult {
     }
     let cwd_now = std::env::current_dir()?;
     let work_dir = args.cwd.clone().unwrap_or(cwd_now.clone());
+    let runtime = crate::adapter::get(&runtime_of(&args))?;
+    args.as_runtime = Some(runtime.id().to_owned());
+    let Some(launch) = runtime.start_command(&work_dir) else {
+        ui::error(&format!(
+            "{} has no native session launch command",
+            runtime.id()
+        ));
+        return Ok(ExitCode::Precondition);
+    };
 
     // Unified target form: `owner/repo@<inheritance-ref>`.  Keep `--from`
     // as a compatibility spelling for scripts that already use it.
@@ -298,7 +307,7 @@ pub fn run(args: Args) -> CmdResult {
         "(export AGIT_SESSION={}; cd {} && {})",
         shell_q(&super::context::encode_session_env(&slug, &branch)),
         shell_q(&work_dir.to_string_lossy()),
-        runtime_cli_of(&args)
+        launch
     );
     if args.no_launch {
         println!("\n  {}", ui::accent(&cmd));
@@ -357,14 +366,6 @@ fn runtime_of(args: &Args) -> String {
         .clone()
         .or_else(|| super::config::get("runtime.default"))
         .unwrap_or_else(|| "claude-code".into())
-}
-
-fn runtime_cli_of(args: &Args) -> String {
-    match runtime_of(args).as_str() {
-        "codex" => "codex".into(),
-        "opencode" => "opencode".into(),
-        _ => "claude".into(),
-    }
 }
 
 /// Materialize the shared instructions: AGENTS.md → cwd/AGENTS.md (an existing file is never

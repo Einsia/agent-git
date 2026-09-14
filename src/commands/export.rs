@@ -5,7 +5,7 @@
 //!   the entry point of a data pipeline: downstream formats (training data, eval sets) are the
 //!   pipeline's own to work up from ir, and agit makes no format decision for them;
 //! * `markdown`: for a human to read;
-//! * `claude-code` / `codex`: the target harness's native format — a file only, no runtime
+//! * a registered runtime name: its native format — a file only, no runtime
 //!   installed.
 //!
 //! `--view-only` exports only what the VIEW covers; the default exports the full log — detours
@@ -30,7 +30,7 @@ pub struct Args {
     /// Output format.
     #[arg(
         long,
-        value_name = "jsonl|ir|markdown|claude-code|codex",
+        value_name = "jsonl|ir|markdown|RUNTIME",
         default_value = "jsonl"
     )]
     pub format: String,
@@ -120,31 +120,30 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Precondition);
         }
     };
-    let (raw, _skipped) = transcript::unwrap_lossy(&env_text);
-
-    // Range cropping (#a..#b): cut on turn byte boundaries.
-    let raw = if let Some((a, b)) = spec_turn_range(&spec) {
-        crop_to_turns(
-            &raw,
-            &meta::read_at_ref(&repo, &sha)
-                .map(|s| s.runtime)
-                .unwrap_or_else(|| "codex".into()),
-            a,
-            b,
-        )
+    let selected = if let Some((a, b)) = spec_turn_range(&spec) {
+        crop_to_turns(&env_text, a, b)?
     } else {
-        raw
+        env_text
     };
-
-    let mut out = match args.format.as_str() {
-        "jsonl" => raw.clone(),
-        "ir" => to_ir(&raw, &repo, &sha),
-        "markdown" => to_markdown(&raw, &repo, &sha),
-        "claude-code" | "codex" => to_native(&raw, &repo, &sha, &args),
+    let result = match args.format.as_str() {
+        "jsonl" => Ok(transcript::unwrap_lossy(&selected).0),
+        "ir" => to_ir(&selected),
+        "markdown" => to_markdown(&selected),
+        runtime if adapter::get(runtime).is_ok() => to_native(&selected, runtime),
         other => {
             ui::error(&format!("unknown format `{other}`."));
-            ui::hint("jsonl | ir | markdown | claude-code | codex");
+            ui::hint(&format!(
+                "jsonl | ir | markdown | {}",
+                adapter::RUNTIMES.join(" | ")
+            ));
             return Ok(ExitCode::Usage);
+        }
+    };
+    let mut out = match result {
+        Ok(content) => content,
+        Err(error) => {
+            ui::error(&format!("cannot export to {}: {error:#}", args.format));
+            return Ok(ExitCode::Precondition);
         }
     };
 
@@ -201,6 +200,12 @@ fn write_output(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Resu
     writer.flush()
 }
 
+fn to_native(envelopes: &str, runtime: &str) -> crate::Result<String> {
+    // Native exports form replayable call/result pairs; jsonl preserves the raw native records.
+    let (session, details) = transcript::display::parse_with_details(envelopes)?;
+    adapter::get(runtime)?.render_with(&session, "export", std::path::Path::new("."), &details)
+}
+
 fn required_sequence(repo: &Repo, sha: &str, which: &str) -> crate::Result<String> {
     repo.show_result(sha, which)?
         .ok_or_else(|| anyhow::anyhow!("this point has no {which}"))
@@ -215,17 +220,10 @@ fn spec_turn_range(spec: &refs::RefSpec) -> Option<(u32, u32)> {
 }
 
 /// Crop to a turn range: parse into IR → rebuild the bytes segment by segment.
-fn crop_to_turns(raw: &str, runtime: &str, a: u32, b: u32) -> String {
-    // The line number of each event in a turn is recorded at parse time; take the raw text of
-    // every line inside the range.
-    let Ok(ad) = adapter::get(runtime) else {
-        return raw.to_string();
-    };
-    let Ok(ir) = ad.parse(raw) else {
-        return raw.to_string();
-    };
+fn crop_to_turns(envelopes: &str, a: u32, b: u32) -> crate::Result<String> {
+    let ir = transcript::display::parse(envelopes)?;
     let groups = crate::domain::turn::groups_of(&ir);
-    let lines: Vec<&str> = raw.lines().collect();
+    let lines: Vec<&str> = envelopes.lines().collect();
     let mut take: Vec<usize> = vec![];
     for (i, g) in groups.iter().enumerate() {
         let n = (i + 1) as u32;
@@ -247,28 +245,12 @@ fn crop_to_turns(raw: &str, runtime: &str, a: u32, b: u32) -> String {
             out.push('\n');
         }
     }
-    out
-}
-
-fn runtime_of(repo: &Repo, sha: &str) -> String {
-    meta::read_at_ref(repo, sha)
-        .map(|s| s.runtime)
-        .unwrap_or_else(|| {
-            crate::adapter::infer_runtime("")
-                .unwrap_or("codex")
-                .to_string()
-        })
+    Ok(out)
 }
 
 /// The ir form: one `{agit-ir, kind, text, timestamp, tool, paths}` per line.
-fn to_ir(raw: &str, repo: &Repo, sha: &str) -> String {
-    let rt = runtime_of(repo, sha);
-    let Ok(ad) = adapter::get(&rt) else {
-        return raw.to_string();
-    };
-    let Ok(ir) = ad.parse(raw) else {
-        return raw.to_string();
-    };
+fn to_ir(envelopes: &str) -> crate::Result<String> {
+    let ir = transcript::display::parse(envelopes)?;
     let mut out = String::new();
     for e in &ir.events {
         let line = serde_json::json!({
@@ -282,7 +264,7 @@ fn to_ir(raw: &str, repo: &Repo, sha: &str) -> String {
         out.push_str(&line.to_string());
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
 /// An interjection renders as one whole blockquote, every line carrying `> `. Otherwise only the
@@ -298,14 +280,8 @@ fn interjection_block(text: &str) -> String {
     out
 }
 
-fn to_markdown(raw: &str, repo: &Repo, sha: &str) -> String {
-    let rt = runtime_of(repo, sha);
-    let Ok(ad) = adapter::get(&rt) else {
-        return raw.to_string();
-    };
-    let Ok(ir) = ad.parse(raw) else {
-        return raw.to_string();
-    };
+fn to_markdown(envelopes: &str) -> crate::Result<String> {
+    let ir = transcript::display::parse(envelopes)?;
     let mut out = String::from("# session export\n\n");
     for e in &ir.events {
         match e.kind {
@@ -334,32 +310,48 @@ fn to_markdown(raw: &str, repo: &Repo, sha: &str) -> String {
             _ => {}
         }
     }
-    out
-}
-
-fn to_native(raw: &str, repo: &Repo, sha: &str, args: &Args) -> String {
-    let from = runtime_of(repo, sha);
-    let target = args.format.as_str();
-    // Re-render through IR into the target harness format (a file only, no runtime installed).
-    let dst = adapter::get(target);
-    let src = adapter::get(&from);
-    match (src, dst) {
-        (Ok(s), Ok(d)) => match s.parse(raw) {
-            Ok(ir) => {
-                let details = adapter::enrich::tool_details(s.format(), raw, &ir);
-                match d.render_with(&ir, "export", std::path::Path::new("."), &details) {
-                    Ok(t) => t,
-                    Err(_) => raw.to_string(),
-                }
-            }
-            Err(_) => raw.to_string(),
-        },
-        _ => raw.to_string(),
-    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
+    fn render_native(raw: &str, from: &str, target: &str) -> crate::Result<String> {
+        let saved =
+            crate::domain::transcript::wrap_lines(raw, from, &format!("agit-{}", "a".repeat(40)));
+        crate::domain::transcript::display::render_native(
+            &saved,
+            target,
+            "export",
+            std::path::Path::new("."),
+        )
+        .map(|(content, _)| content)
+    }
+    #[test]
+    fn registered_native_exports_preserve_tool_history_and_report_invalid_sources() {
+        let raw = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"source\",\"message\":{\"role\":\"user\",\"content\":\"Read the file\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call\",\"name\":\"Read\",\"input\":{\"file_path\":\"probe.txt\"}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call\",\"content\":\"TOOL_OUTPUT\"}]}}\n"
+        );
+        for runtime in ["openclaw", "hermes", "workbuddy"] {
+            let exported = render_native(raw, "claude-code", runtime).unwrap();
+            let adapter = crate::adapter::get(runtime).unwrap();
+            let parsed = adapter.parse(&exported).unwrap();
+            assert!(
+                parsed
+                    .events
+                    .iter()
+                    .any(|event| event.text.as_deref() == Some("TOOL_OUTPUT"))
+            );
+            assert!(exported.contains("probe.txt"));
+            assert_eq!(
+                render_native(&exported, runtime, runtime).unwrap(),
+                exported
+            );
+            assert!(render_native("invalid", "hermes", runtime).is_err());
+        }
+    }
+
     #[test]
     fn output_flush_failure_is_not_a_successful_delivery() {
         #[derive(Default)]

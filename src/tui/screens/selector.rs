@@ -187,9 +187,6 @@ pub(crate) fn preview(runtime: &str, path: &std::path::Path) -> Preview {
         let end = bytes.iter().rposition(|byte| *byte == b'\n')? + 1;
         String::from_utf8(bytes[..end].to_vec()).ok()
     };
-    if !matches!(runtime, "claude-code" | "codex" | "cursor") {
-        return Preview::default();
-    }
     let Some(text) = read() else {
         return Preview::default();
     };
@@ -217,6 +214,7 @@ pub(crate) fn preview(runtime: &str, path: &std::path::Path) -> Preview {
         && let Ok(session) = adapter.parse(&text)
     {
         result.gist = session.gist(60);
+        result.cwd = session.cwd.or(result.cwd);
     }
     result
 }

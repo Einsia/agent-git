@@ -115,12 +115,10 @@ pub(crate) fn lookup_files_without_database(
     limits: Limits,
 ) -> Result<Source> {
     validate_id(id, limits)?;
-    let root = match runtime {
-        "claude-code" => super::claude_code::projects_dir(),
-        "codex" => super::codex::sessions_root(),
-        _ => return Err(Unavailable::Unsupported),
-    }
-    .map_err(|_| Unavailable::Read)?;
+    let root = super::get(runtime)
+        .map_err(|_| Unavailable::Unsupported)?
+        .native_files_root()
+        .map_err(|_| Unavailable::Unsupported)?;
     lookup_files_at(runtime, id, &root, limits)
 }
 
@@ -200,9 +198,8 @@ fn lookup_files_at(runtime: &'static str, id: &str, root: &Path, limits: Limits)
             .extension()
             .is_some_and(|extension| extension == "jsonl")
             && match runtime {
-                "claude-code" => path.file_stem().is_some_and(|stem| stem == id),
                 "codex" => super::codex::id_from_filename(path).as_deref() == Some(id),
-                _ => false,
+                _ => path.file_stem().is_some_and(|stem| stem == id),
             };
         if matches {
             if selected.is_some() {

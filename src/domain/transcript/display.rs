@@ -1,7 +1,7 @@
 //! Renderable IR from a saved envelope sequence without guessing its native format.
 
 use crate::Result;
-use crate::adapter::{self, Event, EventKind, Session};
+use crate::adapter::{self, Event, EventKind, Session, ToolDetails};
 use crate::domain::{storage, transcript::Envelope};
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -22,19 +22,9 @@ pub(crate) struct SourceKey {
 pub(crate) fn source_key(envelope: &Envelope) -> SourceKey {
     // A logical AgentGit session can contain copies of distinct native database sessions.
     // Reused native message identifiers cannot correlate across those source identities.
-    let native_session = if envelope.source == "opencode" {
-        let field = if envelope.content["kind"] == "opencode.meta" {
-            "id"
-        } else {
-            "session_id"
-        };
-        envelope.content[field]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned)
-    } else {
-        None
-    };
+    let native_session = adapter::get(&envelope.source)
+        .ok()
+        .and_then(|parser| parser.record_group(&envelope.content));
     SourceKey {
         source: envelope.source.clone(),
         session: envelope.session_id.clone(),
@@ -46,6 +36,15 @@ pub(crate) fn source_key(envelope: &Envelope) -> SourceKey {
 /// Their line coordinates are mapped back to the selected sequence before rendering, so grouping
 /// cannot reorder interleaved history or fetch context excluded from that sequence.
 pub fn parse(envelopes: &str) -> Result<Session> {
+    Ok(parse_selected(envelopes, false)?.0)
+}
+
+/// Enrichment stays inside each native source group before event coordinates are remapped.
+pub fn parse_with_details(envelopes: &str) -> Result<(Session, ToolDetails)> {
+    parse_selected(envelopes, true)
+}
+
+fn parse_selected(envelopes: &str, enrich: bool) -> Result<(Session, ToolDetails)> {
     let mut groups: BTreeMap<SourceKey, NativeSession> = BTreeMap::new();
     let mut events = Vec::new();
     for (position, line) in envelopes.split_inclusive('\n').enumerate() {
@@ -64,7 +63,11 @@ pub fn parse(envelopes: &str) -> Result<Session> {
             })?;
             // AgentGit summaries retain their own message schema even when their envelope names
             // a native runtime; native parser dispatch must not discard that selected content.
-            events.push(Event::text(EventKind::UserPrompt, text, None).at_line(position));
+            events.push((
+                Event::text(EventKind::UserPrompt, text, None).at_line(position),
+                None,
+                false,
+            ));
             continue;
         }
         let group = groups.entry(source_key(&envelope)).or_default();
@@ -76,10 +79,15 @@ pub fn parse(envelopes: &str) -> Result<Session> {
     }
 
     for (key, group) in groups {
-        let parsed = adapter::get(&key.source)
-            .with_context(|| format!("cannot render saved transcript source `{}`", key.source))?
-            .parse(&group.raw)?;
-        for mut event in parsed.events {
+        let parser = adapter::get(&key.source)
+            .with_context(|| format!("cannot render saved transcript source `{}`", key.source))?;
+        let parsed = parser.parse(&group.raw)?;
+        let details = if enrich {
+            parser.tool_details(&group.raw, &parsed, true)
+        } else {
+            ToolDetails::default()
+        };
+        for (index, mut event) in parsed.events.into_iter().enumerate() {
             let line = event
                 .line
                 .context("saved transcript event has no source coordinate")?;
@@ -88,16 +96,67 @@ pub fn parse(envelopes: &str) -> Result<Session> {
                 .get(line)
                 .context("saved transcript event has an invalid source coordinate")?;
             event.line = Some(*position);
-            events.push(event);
+            events.push((
+                event,
+                details.get(index).cloned(),
+                details.is_receipt(index),
+            ));
         }
     }
-    events.sort_by_key(|event| event.line);
-    Ok(Session {
-        id: String::new(),
-        runtime: "agentgit-view".into(),
-        cwd: None,
-        events,
-    })
+    events.sort_by_key(|(event, _, _)| event.line);
+    let mut details = ToolDetails::default();
+    let events = events
+        .into_iter()
+        .enumerate()
+        .map(|(index, (event, detail, receipt))| {
+            if let Some(detail) = detail {
+                details.insert(index, detail);
+            }
+            if receipt {
+                details.mark_receipt(index);
+            }
+            event
+        })
+        .collect();
+    Ok((
+        Session {
+            id: String::new(),
+            runtime: "agentgit-view".into(),
+            cwd: None,
+            events,
+        },
+        details,
+    ))
+}
+
+/// A single native source can retain its proprietary fields; mixed sources require conversion.
+pub fn render_native(
+    envelopes: &str,
+    target: &str,
+    id: &str,
+    cwd: &std::path::Path,
+) -> Result<(String, bool)> {
+    let dst = adapter::get(target)?;
+    let mut keys = std::collections::BTreeSet::new();
+    let mut raw = String::new();
+    let mut synthetic = false;
+    for line in envelopes.split_inclusive('\n') {
+        let envelope = storage::parse_envelope_line(line)?;
+        synthetic |= envelope.content["agit"] == "merge_summary";
+        keys.insert(source_key(&envelope));
+        raw.push_str(&serde_json::to_string(&envelope.content)?);
+        raw.push('\n');
+    }
+    anyhow::ensure!(!keys.is_empty(), "empty saved transcript");
+    if !synthetic && keys.len() == 1 {
+        let src = adapter::get(&keys.first().unwrap().source)?;
+        if src.format() == dst.format() {
+            src.parse(&raw)?;
+            return Ok((raw, false));
+        }
+    }
+    let (session, details) = parse_with_details(envelopes)?;
+    Ok((dst.render_with(&session, id, cwd, &details)?, true))
 }
 
 #[cfg(test)]
@@ -112,6 +171,68 @@ mod tests {
             source,
             &format!("agit-{}", claim.to_string().repeat(40)),
         )
+    }
+
+    #[test]
+    fn mixed_materializations_preserve_history_and_isolate_reused_tool_ids() {
+        let cwd = std::path::Path::new("/workspace");
+        for runtime in ["hermes", "workbuddy"] {
+            let mut saved = wrap(
+                "claude-code",
+                'a',
+                json!({"type":"user", "message":{"role":"user", "content":"ORIGINAL_MARKER"}}),
+            );
+            for (id, marker) in [("first", "FIRST_TOOL"), ("second", "SECOND_TOOL")] {
+                let raw = [
+                    json!({"type":"assistant", "message":{"role":"assistant", "content":[{"type":"tool_use", "id":"reused", "name":"Read", "input":{"file_path":marker}}]}}),
+                    json!({"type":"user", "message":{"role":"user", "content":[{"type":"tool_result", "tool_use_id":"reused", "content":marker}]}}),
+                    json!({"type":"assistant", "message":{"role":"assistant", "content":marker}}),
+                ].into_iter().map(|row| format!("{row}\n")).collect::<String>();
+                let source = transcript::wrap_lines(
+                    &raw,
+                    "claude-code",
+                    &format!("agit-{}", "b".repeat(40)),
+                );
+                let native = render_native(&source, runtime, id, cwd).unwrap().0;
+                saved.push_str(&transcript::wrap_lines(
+                    &native,
+                    runtime,
+                    &format!("agit-{}", "a".repeat(40)),
+                ));
+            }
+            let (session, details) = parse_with_details(&saved).unwrap();
+            let calls = session
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.kind == EventKind::ToolUse)
+                .map(|(index, _)| details.get(index).unwrap().output.as_deref().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(calls, ["FIRST_TOOL", "SECOND_TOOL"]);
+            for target in ["hermes", "workbuddy", "openclaw"] {
+                let (restored, lossy) = render_native(&saved, target, "restored", cwd).unwrap();
+                assert!(lossy);
+                let parser = adapter::get(target).unwrap();
+                let ir = parser.parse(&restored).unwrap();
+                for marker in ["ORIGINAL_MARKER", "FIRST_TOOL", "SECOND_TOOL"] {
+                    assert!(ir.events.iter().any(|event| {
+                        event
+                            .text
+                            .as_deref()
+                            .is_some_and(|text| text.contains(marker))
+                    }));
+                }
+                let enriched = parser.tool_details(&restored, &ir, true);
+                let outputs = ir
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.kind == EventKind::ToolUse)
+                    .map(|(index, _)| enriched.get(index).unwrap().output.as_deref().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(outputs, calls);
+            }
+        }
     }
 
     #[test]

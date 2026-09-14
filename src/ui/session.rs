@@ -4,13 +4,7 @@ use crate::infra::runtime_session::Current;
 
 /// The human-facing name of a runtime.
 pub fn runtime_label(runtime: &str) -> &'static str {
-    match runtime {
-        "claude-code" => "Claude Code",
-        "codex" => "Codex",
-        "opencode" => "OpenCode",
-        "cursor" => "Cursor",
-        _ => "agent",
-    }
+    crate::adapter::runtime_label(runtime)
 }
 
 /// Print the guard notice for `agit new`; the caller then refuses to continue.

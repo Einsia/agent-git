@@ -623,7 +623,7 @@ fn runtime_row(ad: &dyn adapter::Adapter) -> (String, Check) {
 
 fn skill_installation_checks() -> Vec<(String, Check)> {
     let mut checks = Vec::new();
-    for runtime in ["claude-code", "codex", "opencode", "cursor"] {
+    for runtime in crate::adapter::setup_runtimes() {
         if let Some(path) = super::setup::skill_path(runtime) {
             checks.push((format!("skill {runtime}"), check_skill_dir(&path, runtime)));
         }

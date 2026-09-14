@@ -60,8 +60,7 @@ pub fn install(
         // Same format family: byte rewrite plus bounded Codex localization, no IR. Which set of
         // identity keys is rewritten follows the format family, not the runtime name — several
         // runtimes can share one format (§4.3).
-        let format = adapter::get(source_rt)?.format();
-        let localized = localize_same_format(content, format, &new_id, cwd)?;
+        let localized = dst.localize(content, &new_id, cwd)?;
         return Ok((dst.install(&localized, &new_id, cwd)?, false));
     }
 
@@ -74,6 +73,24 @@ pub fn install(
     let details = adapter::enrich::tool_details(src.format(), content, &ir);
     let rendered = dst.render_with(&ir, &new_id, cwd, &details)?;
     Ok((dst.install(&rendered, &new_id, cwd)?, true))
+}
+
+/// Restore an archived VIEW using each envelope's source instead of the latest writer's format.
+pub fn install_saved(envelopes: &str, target: &str, cwd: &Path) -> Result<(Installed, bool)> {
+    let dst = adapter::get(target)?;
+    if !dst.installable() {
+        dst.install("", "", cwd)?;
+        anyhow::bail!("{target} does not support installing sessions");
+    }
+    let id = dst.mint_id();
+    let (content, lossy) =
+        crate::domain::transcript::display::render_native(envelopes, target, &id, cwd)?;
+    let content = if lossy {
+        content
+    } else {
+        dst.localize(&content, &id, cwd)?
+    };
+    Ok((dst.install(&content, &id, cwd)?, lossy))
 }
 
 /// Codex bootstraps from a first-line `session_meta`, and only accepts one whose
@@ -313,7 +330,12 @@ fn ensure_codex_visible_history(content: &str, format: &str) -> Result<String> {
 /// unchanged** — lines are rewritten through canonical serialization, key order and whitespace
 /// are not preserved (the same stance as the envelope hash normalization);
 /// `only_the_closed_set_of_localizations_applies` pins this closed set.
-fn localize_same_format(content: &str, format: &str, new_id: &str, cwd: &Path) -> Result<String> {
+pub(crate) fn localize_same_format(
+    content: &str,
+    format: &str,
+    new_id: &str,
+    cwd: &Path,
+) -> Result<String> {
     let rewritten = rewrite_identity(content, format, new_id, cwd)?;
     let closed = close_open_calls(&rewritten, format, new_id, cwd)?;
     let bootstrapped = ensure_codex_bootstrap(&closed, format, new_id, cwd)?;

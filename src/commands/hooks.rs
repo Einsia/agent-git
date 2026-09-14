@@ -143,10 +143,25 @@ fn parse_event(buf: &str) -> Option<Event> {
     })
 }
 
-fn read_event() -> Option<Event> {
+fn read_event(runtime: Option<&str>) -> Option<Event> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).ok()?;
-    parse_event(&buf)
+    let mut event = parse_event(&buf)?;
+    match runtime.and_then(|runtime| crate::adapter::normalize(runtime).ok()) {
+        Some("workbuddy") if event.cwd.is_none() => {
+            event.cwd = std::env::var("CODEBUDDY_PROJECT_DIR")
+                .ok()
+                .filter(|cwd| !cwd.is_empty());
+        }
+        Some("hermes") => {
+            let value: serde_json::Value = serde_json::from_str(&buf).ok()?;
+            if value["hook_event_name"] == "on_session_start" {
+                event.source = Source::Startup;
+            }
+        }
+        _ => {}
+    }
+    Some(event)
 }
 
 /// Which runtime is calling us.
@@ -253,7 +268,7 @@ fn ingest(runtime: Option<&str>) -> CmdResult {
 }
 
 fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
-    let ev = read_event()?;
+    let ev = read_event(runtime)?;
     let env_session = super::context::from_session_env();
 
     let dir = ev.cwd.as_deref().map(std::path::Path::new);
@@ -378,6 +393,9 @@ fn session_annotation(
             sh_quote(session_id)
         ),
     };
+    if runtime == "openclaw" {
+        return Some(serde_json::json!({"context":additional_context}));
+    }
     if !matches!(runtime, "claude-code" | "codex") {
         return None;
     }
@@ -511,7 +529,7 @@ fn settle_inner(runtime: Option<&str>) -> crate::Result<()> {
     if super::config::get("commit.auto").as_deref() == Some("false") {
         return Ok(());
     }
-    let Some(ev) = read_event() else {
+    let Some(ev) = read_event(runtime) else {
         super::commit::archive::require_hook_identity(false)?;
         return Ok(());
     };
