@@ -127,6 +127,22 @@ impl Adapter for ClaudeCode {
         Ok(out)
     }
 
+    fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
+        Ok(self
+            .sessions_for(repo)?
+            .into_iter()
+            .filter(|session| {
+                // Nested subagents are outside collect_dir; legacy agent files can be siblings.
+                !session.id.starts_with("agent-")
+                    && !super::session_visibility::has_internal_metadata(&session.path, |record| {
+                        record
+                            .get("isSidechain")
+                            .and_then(serde_json::Value::as_bool)
+                    })
+            })
+            .collect())
+    }
+
     /// Reverse lookup: with a cwd, go straight there (0.14 ms); without one, or on a miss, glob
     /// one level (2.2 ms).
     ///

@@ -39,6 +39,7 @@ pub mod native_snapshot;
 pub mod openclaw;
 pub mod opencode;
 pub(crate) mod preview;
+mod session_visibility;
 mod sqlite_native;
 pub mod workbuddy;
 

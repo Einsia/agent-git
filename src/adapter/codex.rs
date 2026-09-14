@@ -454,6 +454,20 @@ fn thread_to_ref(t: super::codex_index::Thread) -> SessionRef {
     }
 }
 
+fn is_user_thread(thread: &super::codex_index::Thread) -> bool {
+    use super::session_visibility::{internal_codex_file, internal_codex_source};
+    let source = thread.source.as_deref().map(|source| {
+        serde_json::from_str(source)
+            .unwrap_or_else(|_| serde_json::Value::String(source.to_owned()))
+    });
+    if internal_codex_source(thread.thread_source.as_deref(), source.as_ref()) {
+        return false;
+    }
+    // An index without complete origin metadata cannot override the native session header.
+    (thread.thread_source.is_some() && thread.source.is_some())
+        || !internal_codex_file(&thread.rollout_path)
+}
+
 /// List every session by scanning files — the fallback when the index database is unusable.
 ///
 /// **Cost warning**: linear in the total number of sessions, each costing an 8 KB header read. On
@@ -567,11 +581,16 @@ impl Adapter for Codex {
     fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
         let want = repo.to_string_lossy();
         if let Some(threads) = super::codex_index::session_choices_for_cwd(&want) {
-            return Ok(threads.into_iter().map(thread_to_ref).collect());
+            return Ok(threads
+                .into_iter()
+                .filter(is_user_thread)
+                .map(thread_to_ref)
+                .collect());
         }
         Ok(scan_all_sessions(true)?
             .into_iter()
             .filter(|session| session.cwd.as_deref() == Some(want.as_ref()))
+            .filter(|session| !super::session_visibility::internal_codex_file(&session.path))
             .collect())
     }
 

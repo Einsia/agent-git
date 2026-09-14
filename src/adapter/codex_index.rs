@@ -46,8 +46,9 @@ pub struct Thread {
     pub cwd: Option<String>,
     /// A bounded opening preview; callers must open the transcript to read the prompt.
     pub gist: Option<String>,
-    /// `user` / `subagent`. Filters out subagent sessions (345 of them on this machine).
+    /// Native origin metadata is retained for user-facing discovery filters.
     pub thread_source: Option<String>,
+    pub source: Option<String>,
     pub updated_at_ms: Option<i64>,
 }
 
@@ -107,11 +108,17 @@ fn schema_ok(con: &Connection) -> bool {
 
 const GIST_SOURCE_CHARS: usize = 4096;
 
-fn select() -> String {
+fn select(con: &Connection) -> String {
+    // Older indexes can omit source; native metadata remains the classification fallback.
+    let source = if con.prepare("SELECT source FROM threads LIMIT 0").is_ok() {
+        "source"
+    } else {
+        "NULL"
+    };
     format!(
         "SELECT id, rollout_path, cwd, \
          CASE WHEN typeof(first_user_message) = 'text' THEN substr(first_user_message, 1, {}) END, thread_source, \
-         updated_at_ms FROM threads",
+         updated_at_ms, {source} FROM threads",
         GIST_SOURCE_CHARS + 1
     )
 }
@@ -134,6 +141,7 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         gist: r.get(3).ok().map(opening_preview),
         thread_source: r.get(4).ok(),
         updated_at_ms: r.get(5).ok(),
+        source: r.get(6).ok(),
     })
 }
 
@@ -177,7 +185,7 @@ fn threads_for_cwd_at(con: &Connection, cwd: &str, choices_only: bool) -> Option
     let sql = format!(
         "{} WHERE archived = 0 AND cwd = ?1 AND rollout_path IS NOT NULL \
          {source_filter} ORDER BY updated_at_ms DESC",
-        select()
+        select(con)
     );
     let mut st = con.prepare(&sql).ok()?;
     let rows = st.query_map([cwd], row_to_thread).ok()?;
@@ -195,7 +203,7 @@ pub fn all_threads() -> Option<Vec<Thread>> {
     }
     let sql = format!(
         "{} WHERE archived = 0 AND rollout_path IS NOT NULL ORDER BY updated_at_ms DESC",
-        select()
+        select(&con)
     );
     let mut st = con.prepare(&sql).ok()?;
     let rows = st.query_map([], row_to_thread).ok()?;
@@ -214,7 +222,7 @@ pub fn thread_by_id(id: &str) -> Option<Thread> {
     }
     let sql = format!(
         "{} WHERE id = ?1 AND rollout_path IS NOT NULL LIMIT 1",
-        select()
+        select(&con)
     );
     let mut st = con.prepare(&sql).ok()?;
     let mut rows = st.query_map([id], row_to_thread).ok()?;
@@ -536,7 +544,7 @@ mod tests {
                 [&prompt],
             )
             .unwrap();
-        let sql = format!("{} WHERE id = 'id-a'", select());
+        let sql = format!("{} WHERE id = 'id-a'", select(&connection));
         let projected: String = connection.query_row(&sql, [], |row| row.get(3)).unwrap();
         assert_eq!(projected.chars().count(), GIST_SOURCE_CHARS + 1);
         let listed = q_cwd(&path, "/repo/one");

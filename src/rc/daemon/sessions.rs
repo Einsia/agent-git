@@ -1290,6 +1290,7 @@ mod discovery_preview_tests {
         let cwd = root.join("project");
         let native = root.join("codex/sessions");
         std::fs::create_dir(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
         std::fs::create_dir_all(&native).unwrap();
         let index = root.join("codex/state_1.sqlite");
         let database = rusqlite::Connection::open(&index).unwrap();
@@ -1477,3 +1478,7 @@ mod discovery_preview_tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "discovery_visibility_tests.rs"]
+mod discovery_visibility_tests;

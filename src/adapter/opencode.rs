@@ -188,6 +188,7 @@ struct Listed {
     directory: Option<String>,
     time_created: i64,
     time_updated: i64,
+    parent_id: Option<String>,
 }
 
 fn row_to_listed(r: &rusqlite::Row<'_>) -> rusqlite::Result<Listed> {
@@ -196,10 +197,11 @@ fn row_to_listed(r: &rusqlite::Row<'_>) -> rusqlite::Result<Listed> {
         directory: r.get(1)?,
         time_created: r.get(2)?,
         time_updated: r.get(3)?,
+        parent_id: r.get(4)?,
     })
 }
 
-const LIST_COLS: &str = "SELECT id, directory, time_created, time_updated FROM session";
+const LIST_COLS: &str = "SELECT id, directory, time_created, time_updated, parent_id FROM session";
 
 /// §5: "belongs to a repo" = an exact `directory = repo` match, merged with a
 /// `project.worktree = repo` fallback (which covers sessions started from a subdirectory — the
@@ -214,7 +216,7 @@ fn list_for_repo(con: &Connection, repo: &str) -> Option<Vec<Listed>> {
         rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
     };
     let by_worktree = {
-        let sql = "SELECT s.id, s.directory, s.time_created, s.time_updated \
+        let sql = "SELECT s.id, s.directory, s.time_created, s.time_updated, s.parent_id \
                    FROM session s JOIN project p ON p.id = s.project_id WHERE p.worktree = ?1";
         let mut st = con.prepare(sql).ok()?;
         let rows = st.query_map([repo], row_to_listed).ok()?;
@@ -250,6 +252,27 @@ fn to_ref(l: Listed, cache_root: &Path) -> SessionRef {
         mtime: ms_to_systime(l.time_updated),
         gist: None,
     }
+}
+
+fn session_refs_for_repo(repo: &Path, user_only: bool) -> Result<Vec<SessionRef>> {
+    let Some(db) = db_path() else {
+        // OpenCode not installed = no sessions; a normal state, not an error.
+        return Ok(vec![]);
+    };
+    let want = repo.to_string_lossy().to_string();
+    let cache = cache_dir()?;
+    let Some(con) = open(&db) else {
+        return Ok(vec![]);
+    };
+    if !schema_ok(&con) {
+        return Ok(vec![]);
+    }
+    Ok(list_for_repo(&con, &want)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|session| !user_only || session.parent_id.as_deref().is_none_or(str::is_empty))
+        .map(|l| to_ref(l, &cache))
+        .collect())
 }
 
 // ── Canonical materialization (§4) ───────────────────────────────────────────
@@ -1575,23 +1598,11 @@ impl Adapter for OpenCode {
     }
 
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
-        let Some(db) = db_path() else {
-            // OpenCode not installed = no sessions; a normal state, not an error.
-            return Ok(vec![]);
-        };
-        let want = repo.to_string_lossy().to_string();
-        let cache = cache_dir()?;
-        let Some(con) = open(&db) else {
-            return Ok(vec![]);
-        };
-        if !schema_ok(&con) {
-            return Ok(vec![]);
-        }
-        Ok(list_for_repo(&con, &want)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|l| to_ref(l, &cache))
-            .collect())
+        session_refs_for_repo(repo, false)
+    }
+
+    fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
+        session_refs_for_repo(repo, true)
     }
 
     fn all_sessions(&self) -> Result<Vec<SessionRef>> {
