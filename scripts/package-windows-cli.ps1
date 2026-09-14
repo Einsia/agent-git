@@ -21,6 +21,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows CLI build failed' }
 $binary = "target/$target/release/agit.exe"
 & cargo check --locked --release --no-default-features --target $target --lib
 if ($LASTEXITCODE -ne 0) { throw 'Windows library without RC failed to compile' }
+$lfsBin = Join-Path $PWD '.cache/test-bin'
+& (Join-Path $PSScriptRoot 'install-test-lfs.ps1') -Destination $lfsBin -CacheDirectory (Join-Path $PWD '.cache/test-lfs')
+$env:PATH = "$lfsBin;$env:PATH"
+$env:AGIT_TEST_REQUIRE_LFS = '1'
 & cargo test --locked --release --target $target --lib rc::windows_job::tests -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows process-tree exit tests failed' }
 & cargo test --locked --release --target $target --lib commands::search::local::tests -- --nocapture
@@ -62,6 +66,20 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows export flush failure test failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Windows resume cwd selection tests failed' }
 & cargo test --locked --release --target $target --lib commands::scan:: -- --nocapture --test-threads=1
 if ($LASTEXITCODE -ne 0) { throw 'Windows sensitive review library tests failed' }
+& cargo test --locked --release --target $target --lib domain::secrets::tests::frozen_publication_ -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows frozen publication secret scans failed' }
+& cargo test --locked --release --target $target --lib domain::secrets::publication::tests:: -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows prepared publication inspection tests failed' }
+& cargo test --locked --release --target $target --lib domain::repo::publication::tests:: -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows frozen publication planner tests failed' }
+& cargo test --locked --release --target $target --lib domain::lfs::history:: -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows LFS history enumeration tests failed' }
+& cargo test --locked --release --target $target --test publication_plan -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows publication planner scanner integration failed' }
+& cargo test --locked --release --target $target --lib commands::push::publication_tests:: -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw 'Windows publication receiver scope tests failed' }
+& cargo test --locked --release --target $target --lib commands::push::audit -- --nocapture --test-threads=1
+if ($LASTEXITCODE -ne 0) { throw 'Windows interactive publication audit tests failed' }
 & cargo test --locked --release --target $target --lib commands::json::windows::tests -- --nocapture
 if ($LASTEXITCODE -ne 0) { throw 'Windows native JSON capture lifecycle tests failed' }
 & cargo test --locked --release --target $target --lib domain::link::tests::archive_transition_replaces_inherited_public_reads_with_private_acl -- --exact --nocapture

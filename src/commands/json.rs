@@ -228,6 +228,9 @@ pub fn incompatible(command: &super::Commands) -> Option<&'static str> {
     use super::Commands;
 
     match command {
+        Commands::Push(args) if args.audit => {
+            Some("--json cannot wrap push --audit; omit --json and use an interactive terminal")
+        }
         Commands::Login(args) if args.device => Some(
             "--json cannot wrap the waiting device-code flow; use `agit login --json` for a human authorization link or omit --json",
         ),

@@ -21,8 +21,12 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Deadline {
     pub(crate) fn new() -> Self {
+        Self::with_timeout(SEARCH_TIMEOUT)
+    }
+
+    pub(crate) fn with_timeout(timeout: Duration) -> Self {
         Self {
-            expires: Instant::now() + SEARCH_TIMEOUT,
+            expires: Instant::now() + timeout,
         }
     }
 
@@ -648,6 +652,20 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert_reaped(std::fs::read_to_string(pid).unwrap().parse().unwrap());
+    }
+
+    #[test]
+    fn caller_timeout_is_finite_without_changing_the_search_default() {
+        let before = Instant::now();
+        let timeout = Duration::from_secs(300);
+        let explicit = Deadline::with_timeout(timeout);
+        let search = Deadline::new();
+        let after = Instant::now();
+        assert!(explicit.expires >= before + timeout);
+        assert!(explicit.expires <= after + timeout);
+        assert!(search.expires >= before + SEARCH_TIMEOUT);
+        assert!(search.expires <= after + SEARCH_TIMEOUT);
+        assert!(Deadline::with_timeout(Duration::ZERO).expired());
     }
 
     #[test]

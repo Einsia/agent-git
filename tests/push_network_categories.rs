@@ -4,6 +4,10 @@
 mod publication_http;
 #[path = "support/publication_process.rs"]
 mod publication_process;
+#[cfg(windows)]
+#[allow(dead_code)]
+#[path = "../src/rc/windows_job.rs"]
+mod publication_windows_job;
 
 use agit::domain::{meta, repo::Repo};
 use agit::hub::identity::{self, RemoteIdentity};

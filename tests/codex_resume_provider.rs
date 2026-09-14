@@ -25,6 +25,7 @@ fn main() {
         "the fake runtime was invoked with an unexpected command"
     );
     let cases: &[(&str, fn())] = &[
+        ("reused process identity", rpc_invocations_survive_pid_reuse),
         (
             "materialized provider and immutable source",
             materialized_provider_is_local,
@@ -87,10 +88,11 @@ fn fake_app_server() {
         .open(log_path)
         .unwrap();
     let pid = std::process::id();
+    let invocation = uuid::Uuid::new_v4().to_string();
     writeln!(
         log,
         "{}",
-        json!({"pid":pid,"event":"spawn","args":std::env::args().skip(1).collect::<Vec<_>>(),
+        json!({"pid":pid,"invocation":invocation,"event":"spawn","args":std::env::args().skip(1).collect::<Vec<_>>(),
             "cwd":std::env::current_dir().unwrap()})
     )
     .unwrap();
@@ -99,7 +101,12 @@ fn fake_app_server() {
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
         let request: Value = serde_json::from_str(&line).unwrap();
-        writeln!(log, "{}", json!({"pid":pid,"request":request})).unwrap();
+        writeln!(
+            log,
+            "{}",
+            json!({"pid":pid,"invocation":invocation,"request":request})
+        )
+        .unwrap();
         log.flush().unwrap();
         #[cfg(unix)]
         if request["method"] == "initialize"
@@ -120,7 +127,7 @@ fn fake_app_server() {
                 writeln!(
                     log,
                     "{}",
-                    json!({"pid":pid,"event":"thread/read-result","response":value})
+                    json!({"pid":pid,"invocation":invocation,"event":"thread/read-result","response":value})
                 )
                 .unwrap();
                 log.flush().unwrap();
@@ -136,7 +143,7 @@ fn fake_app_server() {
                 writeln!(
                     log,
                     "{}",
-                    json!({"pid":pid,"event":"config/read-result",
+                    json!({"pid":pid,"invocation":invocation,"event":"config/read-result",
                         "config":value.pointer("/result/config"),
                         "sqlite_home_env":std::env::var_os("CODEX_SQLITE_HOME").map(PathBuf::from)})
                 )
@@ -149,6 +156,59 @@ fn fake_app_server() {
         writeln!(stdout, "{reply}").unwrap();
         stdout.flush().unwrap();
     }
+}
+
+type InvocationMethods = BTreeMap<String, (u64, Vec<String>)>;
+
+fn invocation_methods<'a>(
+    methods: &'a mut InvocationMethods,
+    value: &Value,
+) -> &'a mut Vec<String> {
+    let pid = value["pid"].as_u64().unwrap();
+    let invocation = value["invocation"].as_str().unwrap();
+    assert!(!invocation.is_empty(), "an RPC invocation has no identity");
+    if value["event"] == "spawn" {
+        assert!(
+            methods
+                .insert(invocation.to_owned(), (pid, Vec::new()))
+                .is_none(),
+            "an RPC invocation has duplicate spawn records"
+        );
+    }
+    let (spawn_pid, sequence) = methods
+        .get_mut(invocation)
+        .expect("RPC event precedes its spawn");
+    assert_eq!(
+        *spawn_pid, pid,
+        "an RPC invocation changed its process identity"
+    );
+    sequence
+}
+
+fn rpc_invocations_survive_pid_reuse() {
+    let mut methods = InvocationMethods::new();
+    for (invocation, method) in [("first", "config/read"), ("second", "thread/read")] {
+        invocation_methods(
+            &mut methods,
+            &json!({"pid":42,"invocation":invocation,"event":"spawn"}),
+        );
+        for method in ["initialize", "initialized", method] {
+            invocation_methods(
+                &mut methods,
+                &json!({"pid":42,"invocation":invocation,"request":{"method":method}}),
+            )
+            .push(method.into());
+        }
+    }
+    assert_eq!(methods.len(), 2);
+    assert_eq!(
+        methods["first"].1,
+        ["initialize", "initialized", "config/read"]
+    );
+    assert_eq!(
+        methods["second"].1,
+        ["initialize", "initialized", "thread/read"]
+    );
 }
 
 fn fake_thread_metadata(request: &Value, response_path: &Path) -> Value {
@@ -550,15 +610,14 @@ impl Lab {
             return;
         }
         let log = fs::read_to_string(&self.rpc_log).expect("configuration lookup did not execute");
-        let mut methods: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        let mut methods = InvocationMethods::new();
         let mut metadata_reads = 0;
         for line in log.lines() {
             let value: Value = serde_json::from_str(line).unwrap();
-            let pid = value["pid"].as_u64().unwrap();
+            let sequence = invocation_methods(&mut methods, &value);
             if value["event"] == "spawn" {
                 assert_eq!(value["args"], json!(["app-server"]));
                 assert_eq!(value["cwd"], json!(expected_cwd));
-                assert!(methods.insert(pid, Vec::new()).is_none());
                 continue;
             }
             if value["event"] == "config/read-result" {
@@ -596,14 +655,14 @@ impl Lab {
                 assert_eq!(request["params"]["cwd"], json!(expected_cwd));
                 assert_eq!(request["params"]["includeLayers"], false);
             }
-            methods.get_mut(&pid).unwrap().push(method.to_owned());
+            sequence.push(method.to_owned());
         }
         assert!(!methods.is_empty());
         assert!(
             metadata_reads > 0,
             "native provider metadata was never read"
         );
-        for sequence in methods.values() {
+        for (_, sequence) in methods.values() {
             let sequence = sequence.iter().map(String::as_str).collect::<Vec<_>>();
             assert!(
                 sequence == ["initialize", "initialized", "config/read"]

@@ -308,22 +308,35 @@ fn full_output_device_refuses_export_and_the_final_json_envelope() {
 #[cfg(unix)]
 #[test]
 fn closed_output_pipe_keeps_the_unix_sigpipe_contract() {
-    use std::os::fd::{FromRawFd, OwnedFd};
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     for mode in ["human", "quiet", "json1", "json2"] {
         let lab = Lab::new();
         let before = lab.state();
-        let mut descriptors = [-1; 2];
-        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
-        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
-        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
-        drop(reader);
-        let output = lab
-            .export_command(mode, "jsonl", Path::new("-"))
-            .stdout(Stdio::from(writer))
-            .stderr(Stdio::piped())
-            .output()
-            .unwrap();
+        let mut command = lab.export_command(mode, "jsonl", Path::new("-"));
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+        // Child-local pipe creation prevents concurrent test children from retaining its reader.
+        // The pre-exec callback uses only async-signal-safe descriptor operations.
+        unsafe {
+            command.pre_exec(|| {
+                let mut descriptors = [-1; 2];
+                if libc::pipe(descriptors.as_mut_ptr()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::close(descriptors[0]) == -1 {
+                    let error = std::io::Error::last_os_error();
+                    libc::close(descriptors[1]);
+                    return Err(error);
+                }
+                let result = libc::dup2(descriptors[1], libc::STDOUT_FILENO);
+                let error = (result == -1).then(std::io::Error::last_os_error);
+                libc::close(descriptors[1]);
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
         assert_eq!(
             output.status.signal(),
             Some(libc::SIGPIPE),

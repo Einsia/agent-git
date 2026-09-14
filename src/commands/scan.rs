@@ -40,6 +40,7 @@ use clap::Args as ClapArgs;
 mod json;
 mod review;
 mod runtime;
+pub(in crate::commands) use runtime::foreground::{ForegroundExit, ForegroundReview};
 mod scope;
 
 pub(super) use scope::freeze_review_log;
@@ -294,47 +295,149 @@ pub fn run(args: Args) -> CmdResult {
 }
 
 fn run_sensitive(repo: &Repo, slug: &str, targets: &[refs::RefSpec], json: bool) -> CmdResult {
-    let selected = match scope::collect(repo, targets) {
-        Ok(selected) => selected,
-        Err(error) => {
-            if let Some(ambiguity) = error.downcast_ref::<refs::Ambiguous>() {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "check": "sensitive", "status": "incomplete", "complete": false,
-                            "reason": "selected reference requires an explicit choice",
-                            "findings": [], "scopes": []
-                        })
-                    );
-                }
-                ui::error(&ambiguity.to_string());
-                return Ok(super::terminal_error_code(&error, ExitCode::Precondition));
-            }
-            let exit = if refs::is_not_found(&error) {
-                ExitCode::Ref
-            } else {
-                ExitCode::Precondition
-            };
-            if json {
+    match sensitive_report(repo, slug, targets) {
+        Ok(report) => {
+            report.print(json)?;
+            Ok(report.exit_code())
+        }
+        Err(failure) => {
+            failure.print(json);
+            Ok(failure.code)
+        }
+    }
+}
+
+/// A completed report describes immutable evidence; the caller decides whether to publish it.
+pub(super) struct SensitiveReport {
+    scopes: Vec<serde_json::Value>,
+    findings: Vec<review::Finding>,
+    count: usize,
+    complete: bool,
+    historical: bool,
+}
+
+impl SensitiveReport {
+    pub(super) fn complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(super) fn value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "check": "sensitive", "status": if self.complete() { "reviewed" } else { "incomplete" },
+            "complete": self.complete(), "scopes": self.scopes, "findings": self.findings,
+            "evidence_log_unchanged": true,
+            "runtime": if self.count > 0 { Some("claude-code") } else { None },
+            "runtime_boundary": "model tools and user/project customizations are disabled; native authentication housekeeping and administrator policies remain active",
+        })
+    }
+
+    pub(super) fn print(&self, json: bool) -> crate::Result<()> {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&self.value())?);
+        } else {
+            for finding in &self.findings {
                 println!(
-                    "{}",
-                    serde_json::json!({
-                        "check": "sensitive", "status": "incomplete", "complete": false,
-                        "reason": "selected VIEW/LOG could not be read within the review limits",
-                        "findings": [], "scopes": []
-                    })
+                    "  {} {}: {}",
+                    &finding.snapshot[..12],
+                    finding.locator,
+                    finding.explanation
+                );
+                for remedy in &finding.remedies {
+                    println!("    {}", remedy.command);
+                }
+            }
+            if self.count == 0 {
+                println!("no located events to review in the selected VIEW");
+            } else if self.findings.is_empty() && self.complete() {
+                println!(
+                    "no sensitive findings reported in {} selected VIEW events",
+                    self.count
                 );
             }
-            ui::error(
-                "sensitive review is incomplete: the selected committed VIEW/LOG is unavailable, invalid, or exceeds the review limits.",
-            );
-            ui::hint(
-                "select a valid session ref or a smaller turn range; `agit scan --secrets` remains a separate check",
-            );
-            return Ok(exit);
         }
-    };
+        if !self.complete() {
+            ui::error(
+                "sensitive review is incomplete: some selected VIEW events have no safe turn/event location.",
+            );
+        }
+        if !self.findings.is_empty() {
+            ui::hint(
+                "review each suspicion before removing it from the VIEW; revert preserves the evidence LOG",
+            );
+            if self.historical {
+                ui::hint(
+                    "historical snapshots have inspection remedies only; fork explicitly before changing their VIEW",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn exit_code(&self) -> ExitCode {
+        if !self.complete() {
+            ExitCode::Precondition
+        } else if self.findings.is_empty() {
+            ExitCode::Ok
+        } else {
+            ExitCode::Policy
+        }
+    }
+}
+
+pub(super) struct SensitiveFailure {
+    pub(super) code: ExitCode,
+    reason: String,
+    message: String,
+    hint: Option<&'static str>,
+    scopes: Vec<serde_json::Value>,
+}
+
+impl SensitiveFailure {
+    pub(super) fn print(&self, json: bool) {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "check": "sensitive", "status": "incomplete", "complete": false,
+                    "reason": self.reason, "findings": [], "scopes": self.scopes,
+                })
+            );
+        }
+        ui::error(&self.message);
+        if let Some(hint) = self.hint {
+            ui::hint(hint);
+        }
+    }
+}
+
+pub(super) fn sensitive_report(
+    repo: &Repo,
+    slug: &str,
+    targets: &[refs::RefSpec],
+) -> std::result::Result<SensitiveReport, SensitiveFailure> {
+    let selected = scope::collect(repo, targets).map_err(|error| {
+        if let Some(ambiguity) = error.downcast_ref::<refs::Ambiguous>() {
+            SensitiveFailure {
+                code: super::terminal_error_code(&error, ExitCode::Precondition),
+                reason: "selected reference requires an explicit choice".into(),
+                message: ambiguity.to_string(),
+                hint: None,
+                scopes: Vec::new(),
+            }
+        } else {
+            SensitiveFailure {
+                code: if refs::is_not_found(&error) {
+                    ExitCode::Ref
+                } else {
+                    ExitCode::Precondition
+                },
+                reason: "selected VIEW/LOG could not be read within the review limits".into(),
+                message: "sensitive review is incomplete: the selected committed VIEW/LOG is unavailable, invalid, or exceeds the review limits.".into(),
+                hint: Some("select a valid session ref or a smaller turn range; `agit scan --secrets` remains a separate check"),
+                scopes: Vec::new(),
+            }
+        }
+    })?;
     let count: usize = selected.iter().map(|scope| scope.events.len()).sum();
     let complete = selected
         .iter()
@@ -354,25 +457,15 @@ fn run_sensitive(repo: &Repo, slug: &str, targets: &[refs::RefSpec], json: bool)
             .and_then(|prompt| runtime::review(&prompt, &review::schema()))
             .and_then(|response| review::validate(&response, &selected, slug))
     };
-    let mut findings = match reviewed {
-        Ok(findings) => findings,
-        Err(error) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "check": "sensitive", "status": "incomplete", "complete": false,
-                        "reason": error.to_string(), "findings": [], "scopes": scopes,
-                    })
-                );
-            }
-            ui::error(&format!("sensitive review is incomplete: {error}"));
-            ui::hint(
-                "check the configured local runtime; `agit scan --secrets` remains a separate deterministic check",
-            );
-            return Ok(ExitCode::Precondition);
-        }
-    };
+    let mut findings = reviewed.map_err(|error| SensitiveFailure {
+        code: ExitCode::Precondition,
+        reason: error.to_string(),
+        message: format!("sensitive review is incomplete: {error}"),
+        hint: Some(
+            "check the configured local runtime; `agit scan --secrets` remains a separate deterministic check",
+        ),
+        scopes: scopes.clone(),
+    })?;
     for (report, scope) in scopes.iter_mut().zip(&selected) {
         report["events_reviewed"] = serde_json::json!(scope.events.len());
     }
@@ -385,56 +478,12 @@ fn run_sensitive(repo: &Repo, slug: &str, targets: &[refs::RefSpec], json: bool)
             finding.remedies.retain(|remedy| remedy.action == "inspect");
         }
     }
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "check": "sensitive", "status": if complete { "reviewed" } else { "incomplete" },
-                "complete": complete, "scopes": scopes, "findings": findings,
-                "evidence_log_unchanged": true,
-                "runtime": if count > 0 { Some("claude-code") } else { None },
-                "runtime_boundary": "model tools and user/project customizations are disabled; native authentication housekeeping and administrator policies remain active",
-            }))?
-        );
-    } else {
-        for finding in &findings {
-            println!(
-                "  {} {}: {}",
-                &finding.snapshot[..12],
-                finding.locator,
-                finding.explanation
-            );
-            for remedy in &finding.remedies {
-                println!("    {}", remedy.command);
-            }
-        }
-        if count == 0 {
-            println!("no located events to review in the selected VIEW");
-        } else if findings.is_empty() && complete {
-            println!("no sensitive findings reported in {count} selected VIEW events");
-        }
-    }
-    if !complete {
-        ui::error(
-            "sensitive review is incomplete: some selected VIEW events have no safe turn/event location.",
-        );
-    }
-    if !findings.is_empty() {
-        ui::hint(
-            "review each suspicion before removing it from the VIEW; revert preserves the evidence LOG",
-        );
-        if selected.iter().any(|scope| scope.branch.is_none()) {
-            ui::hint(
-                "historical snapshots have inspection remedies only; fork explicitly before changing their VIEW",
-            );
-        }
-    }
-    Ok(if !complete {
-        ExitCode::Precondition
-    } else if findings.is_empty() {
-        ExitCode::Ok
-    } else {
-        ExitCode::Policy
+    Ok(SensitiveReport {
+        scopes,
+        findings,
+        count,
+        complete,
+        historical: selected.iter().any(|scope| scope.branch.is_none()),
     })
 }
 

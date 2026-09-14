@@ -56,6 +56,8 @@
 //! [`crate::hub::git`] — authentication is the hub's business.
 
 mod preferences;
+#[cfg(feature = "cli")]
+pub mod publication;
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -493,8 +495,7 @@ fn legacy_worktree_path_is_representable(path: &Path) -> bool {
         .any(|byte| matches!(*byte, b'\n' | b'\r' | 0))
 }
 
-#[cfg(any(feature = "cli", test))]
-fn inspection_git_path_spelling(path: PathBuf) -> PathBuf {
+pub(crate) fn inspection_git_path_spelling(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         use std::ffi::OsString;
@@ -524,7 +525,10 @@ fn inspection_git_path_spelling(path: PathBuf) -> PathBuf {
     path
 }
 
-fn bounded_inspection_output(mut command: Command, limit: usize) -> Result<std::process::Output> {
+pub(crate) fn bounded_inspection_output(
+    mut command: Command,
+    limit: usize,
+) -> Result<std::process::Output> {
     use std::io::Read as _;
     use std::process::Stdio;
 
@@ -635,7 +639,7 @@ pub fn common_git_dir(root: &Path) -> PathBuf {
 pub struct Repo {
     root: PathBuf,
     local_objects_only: bool,
-    exact_root: bool,
+    exact_root: Option<&'static str>,
 }
 
 impl Repo {
@@ -643,7 +647,7 @@ impl Repo {
         Repo {
             root: root.into(),
             local_objects_only: false,
-            exact_root: false,
+            exact_root: None,
         }
     }
 
@@ -657,7 +661,15 @@ impl Repo {
     #[cfg(feature = "cli")]
     pub(crate) fn exact_root_inspection(mut self) -> Self {
         self.local_objects_only = true;
-        self.exact_root = true;
+        self.exact_root = Some(".git");
+        self
+    }
+
+    /// The caller validates a bare carrier before selecting its root for object inspection.
+    #[cfg(feature = "cli")]
+    pub(crate) fn exact_bare_root_inspection(mut self) -> Self {
+        self.local_objects_only = true;
+        self.exact_root = Some(".");
         self
     }
 
@@ -1249,8 +1261,11 @@ impl Repo {
                 cmd.env_remove(name);
             }
         }
-        if self.exact_root {
-            cmd.args(["--git-dir", ".git", "--work-tree", "."]);
+        if let Some(gitdir) = self.exact_root {
+            cmd.args(["--git-dir", gitdir]);
+            if gitdir == ".git" {
+                cmd.args(["--work-tree", "."]);
+            }
         }
         cmd
     }
@@ -1347,6 +1362,24 @@ impl Repo {
         self.git_stream_split_with_policy(args, sep, ReadPolicy::AllowTransport, on_record)
     }
 
+    /// Stream output with captured input, retaining the same callback abort and child cleanup.
+    pub(crate) fn git_stream_split_stdin_file(
+        &self,
+        args: &[&str],
+        input: std::fs::File,
+        sep: u8,
+        on_record: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.git_stream_split_with_input(
+            args,
+            sep,
+            ReadPolicy::AllowTransport,
+            usize::MAX,
+            Some(input),
+            on_record,
+        )
+    }
+
     #[cfg(feature = "secret-vault")]
     pub(crate) fn git_stream_split_local(
         &self,
@@ -1390,11 +1423,26 @@ impl Repo {
         sep: u8,
         policy: ReadPolicy,
         max_record_bytes: usize,
+        on_record: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.git_stream_split_with_input(args, sep, policy, max_record_bytes, None, on_record)
+    }
+
+    fn git_stream_split_with_input(
+        &self,
+        args: &[&str],
+        sep: u8,
+        policy: ReadPolicy,
+        max_record_bytes: usize,
+        input: Option<std::fs::File>,
         mut on_record: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
         use std::io::Read;
         let mut command = self.cmd();
         policy.apply(&mut command);
+        if let Some(input) = input {
+            command.stdin(input);
+        }
         let mut child = command
             .args(args)
             .stdout(std::process::Stdio::piped())

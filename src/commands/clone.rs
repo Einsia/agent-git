@@ -1025,49 +1025,15 @@ fn promote_with_progress(
     ))?;
     let copy_identity = validate_copy_response(client.base(), &resp, &source_identity)?;
 
-    let store = Store::open_or_init()?;
-    let source_slug = source.slug();
-    let destination_slug = format!("{}/{}", resp.owner, resp.name);
-    let _repository_guards = crate::domain::link::lock_repositories_exclusive(
-        &store,
-        &[&source_slug, &destination_slug],
+    relocate_promoted_checkout(
+        &repo,
+        source,
+        &source_identity,
+        &copy_identity,
+        &resp.owner,
+        &resp.name,
+        &resp.push_url,
     )?;
-    let dest = config::repo_dir(&resp.owner, &resp.name)?;
-    if dest != checkout && dest.join(".git").exists() {
-        anyhow::bail!(
-            "a checkout of {}/{} already exists locally ({}) — can’t move this one there.
-  \
-             name the copy differently: agit clone {} --mine --name <other-name>",
-            resp.owner,
-            resp.name,
-            ui::tilde(&dest),
-            source.slug()
-        );
-    }
-    if source_slug != destination_slug
-        && crate::domain::link::list(&store).iter().any(|claim| {
-            claim.is_active()
-                && claim.owner.as_deref() == Some(resp.owner.as_str())
-                && claim.agent.as_deref() == Some(resp.name.as_str())
-        })
-    {
-        anyhow::bail!(
-            "{destination_slug} already has an active runtime claim; inspect it before promoting this checkout"
-        );
-    }
-
-    identity::rebind(&repo, &source_identity, &copy_identity)?;
-    repo.set_remote(&resp.push_url)?;
-    repo.set_upstream(&source.clone_url)?;
-
-    if dest != checkout {
-        if let Some(p) = dest.parent() {
-            std::fs::create_dir_all(p)?;
-        }
-        std::fs::rename(checkout, &dest)
-            .with_context(|| format!("can’t move {} to {}", checkout.display(), dest.display()))?;
-    }
-    rename_links(&source.owner, &source.name, &resp.owner, &resp.name)?;
 
     progress.line(format_args!(
         "{} {} is now yours: {}",
@@ -1093,6 +1059,107 @@ fn promote_with_progress(
         writable: true,
         promoted_in_place: true,
     })
+}
+
+/// Attach a selected local checkout to an already validated destination without copying remote refs.
+/// The caller obtains publication consent and verifies the target identity and audience first.
+pub(crate) fn promote_to_prepared_destination(
+    checkout: &Path,
+    source: &RemoteAgent,
+    destination: &RemoteAgent,
+    hub: &str,
+) -> crate::Result<Plan> {
+    let source_identity = RemoteIdentity::new(hub, &source.agent_id)?;
+    let copy_identity = RemoteIdentity::new(hub, &destination.agent_id)?;
+    anyhow::ensure!(
+        source_identity != copy_identity,
+        "the prepared destination is the source repository"
+    );
+    let repo = Repo::at(checkout).exact_root_inspection();
+    identity::verify_transport_target(&repo, &source_identity)?;
+    match identity::read(&repo)? {
+        Some(pinned) => anyhow::ensure!(
+            pinned == source_identity,
+            "the selected copy source identity changed"
+        ),
+        None => identity::pin(&repo, &source_identity)?,
+    }
+    relocate_promoted_checkout(
+        &repo,
+        source,
+        &source_identity,
+        &copy_identity,
+        &destination.owner,
+        &destination.name,
+        &destination.clone_url,
+    )?;
+    Ok(Plan {
+        owner: destination.owner.clone(),
+        name: destination.name.clone(),
+        origin: destination.clone_url.clone(),
+        identity: copy_identity,
+        upstream: Some(source.clone_url.clone()),
+        writable: true,
+        promoted_in_place: true,
+    })
+}
+
+/// Local promotion retains repository and claim locks regardless of how the remote was prepared.
+fn relocate_promoted_checkout(
+    repo: &Repo,
+    source: &RemoteAgent,
+    source_identity: &RemoteIdentity,
+    copy_identity: &RemoteIdentity,
+    owner: &str,
+    name: &str,
+    push_url: &str,
+) -> crate::Result<()> {
+    let checkout = repo.root();
+    let store = Store::open_or_init()?;
+    let source_slug = source.slug();
+    let destination_slug = format!("{}/{}", owner, name);
+    let _repository_guards = crate::domain::link::lock_repositories_exclusive(
+        &store,
+        &[&source_slug, &destination_slug],
+    )?;
+    let dest = config::repo_dir(owner, name)?;
+    if dest != checkout && dest.join(".git").exists() {
+        anyhow::bail!(
+            "a checkout of {}/{} already exists locally ({}) — can’t move this one there.
+  \
+             name the copy differently: agit clone {} --mine --name <other-name>",
+            owner,
+            name,
+            ui::tilde(&dest),
+            source.slug()
+        );
+    }
+    if source_slug != destination_slug
+        && crate::domain::link::list(&store).iter().any(|claim| {
+            claim.is_active()
+                && claim.owner.as_deref() == Some(owner)
+                && claim.agent.as_deref() == Some(name)
+        })
+    {
+        anyhow::bail!(
+            "{destination_slug} already has an active runtime claim; inspect it before promoting this checkout"
+        );
+    }
+
+    identity::rebind(repo, source_identity, copy_identity)?;
+    repo.set_remote(push_url)?;
+    repo.set_upstream(&source.clone_url)?;
+
+    if dest != checkout {
+        if let Some(p) = dest.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::rename(checkout, &dest)
+            .with_context(|| format!("can’t move {} to {}", checkout.display(), dest.display()))?;
+    }
+    rename_links(&source.owner, &source.name, owner, name)?;
+
+    Ok(())
 }
 
 /// Only claims whose recorded namespace matches the promoted source can move to its copy.

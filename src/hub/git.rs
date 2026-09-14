@@ -48,11 +48,25 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// What an authentication failure looks like in git's stderr.
-///
-/// Covers three shapes: smart-http answering 401/403 directly, git translating that into
-/// "Authentication failed", and git turning to the terminal for a username (which means it never
-/// got usable credentials).
+mod frozen;
+pub mod inspection_summary;
+pub use crate::domain::secrets::publication::InspectionFailure;
+pub use frozen::{
+    BlockedContentInspection, BlockedInspection, CapturedPublication, CompleteContentInspection,
+    CompleteInspection, ContentInspection, FrozenPublication, InspectionReport,
+    PreparedPayloadAvailability, PreparedPublication, PublicationInspection,
+};
+mod frozen_lfs_stage;
+pub use frozen_lfs_stage::{LfsStagingError, LfsStagingFailure, StagedLfsPayloads};
+mod publication_report;
+pub use publication_report::{
+    LfsAttemptKind, LfsPublicationAttempt, LfsPublicationPhase, PublicationAttempt,
+    PublicationPhase, PublicationReport, PublicationStatus, PublishedRef, SecretFindingsAcceptance,
+};
+mod publication_output;
+
+/// Git and Git LFS authentication diagnostics identify when a credential retry is appropriate.
+/// Other transport failures must not consume a credential refresh.
 const AUTH_MARKERS: &[&str] = &[
     "error: 401",
     "error: 403",
@@ -61,7 +75,9 @@ const AUTH_MARKERS: &[&str] = &[
     "returned error: 401",
     "returned error: 403",
     "Authentication failed",
+    "Authentication required",
     "could not read Username",
+    "unable to get password from user",
     "terminal prompts disabled",
 ];
 
@@ -156,6 +172,7 @@ struct TransportIdentity {
     client: Option<super::Client>,
     urls: Vec<String>,
     agent_id: Option<String>,
+    execution: Option<frozen::Execution>,
     lfs: Option<(String, String)>,
     accept_secret_findings: bool,
 }
@@ -239,6 +256,7 @@ impl TransportIdentity {
             client,
             urls,
             agent_id: agent_id.map(str::to_string),
+            execution: None,
             lfs,
             accept_secret_findings: false,
         })
@@ -259,6 +277,24 @@ impl TransportIdentity {
     }
 
     fn environment(&self) -> Result<Vec<(String, OsString)>> {
+        self.environment_in(self.execution.as_ref())
+    }
+
+    fn environment_in(
+        &self,
+        execution: Option<&frozen::Execution>,
+    ) -> Result<Vec<(String, OsString)>> {
+        if let Some(execution) = execution {
+            let environment = transport_env_after(
+                Some(&execution.parameters),
+                self.token()?.as_deref(),
+                self.agent_id.as_deref(),
+                &self.urls,
+                self.accept_secret_findings,
+            );
+            execution.validate_parameters(&environment[0].1)?;
+            return Ok(environment);
+        }
         let mut environment = transport_env(
             self.token()?.as_deref(),
             self.agent_id.as_deref(),
@@ -270,6 +306,21 @@ impl TransportIdentity {
         }
         Ok(environment)
     }
+
+    fn command(&self, dir: Option<&Path>) -> Command {
+        self.command_in(dir, self.execution.as_ref())
+    }
+
+    fn command_in(&self, dir: Option<&Path>, execution: Option<&frozen::Execution>) -> Command {
+        if let Some(execution) = execution {
+            return execution.command();
+        }
+        let mut command = transport_command();
+        if let Some(dir) = dir {
+            command.arg("-C").arg(dir);
+        }
+        command
+    }
 }
 
 /// Tracked LFS configuration cannot redirect a transport selected by repository identity.
@@ -279,6 +330,10 @@ fn constrain_lfs_environment(environment: &mut [(String, OsString)], remote: &st
         .find(|(key, _)| key == "GIT_CONFIG_PARAMETERS")
         .expect("transport parameters are present")
         .1;
+    constrain_lfs_parameters(parameters, remote, endpoint);
+}
+
+fn constrain_lfs_parameters(parameters: &mut OsString, remote: &str, endpoint: &str) {
     for (key, value) in [
         ("lfs.url".to_owned(), endpoint),
         ("lfs.pushurl".to_owned(), endpoint),
@@ -308,14 +363,12 @@ pub fn missing_lfs_uploads(
     pointers: &[crate::domain::lfs::Pointer],
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Vec<crate::domain::lfs::Pointer>> {
-    use std::collections::HashMap;
     if pointers.is_empty() {
         return Ok(Vec::new());
     }
     super::identity::verify_transport_target(repo, identity)?;
     let transport =
         TransportIdentity::new(Some(repo.root()), &["lfs", "push", "origin"], identity)?;
-    let endpoint = &transport.lfs.as_ref().context("LFS endpoint is missing")?.1;
     let agent = crate::hub::transport::agent(
         ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(30)))
@@ -323,6 +376,24 @@ pub fn missing_lfs_uploads(
             .http_status_as_error(false)
             .build(),
     );
+    missing_lfs_uploads_with_transport(pointers, &transport, &agent)
+}
+
+/// Availability checks reuse the caller's selected endpoint, account and HTTP execution context.
+fn missing_lfs_uploads_with_transport(
+    pointers: &[crate::domain::lfs::Pointer],
+    transport: &TransportIdentity,
+    agent: &ureq::Agent,
+) -> Result<Vec<crate::domain::lfs::Pointer>> {
+    use std::collections::HashMap;
+    if pointers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let endpoint = &transport.lfs.as_ref().context("LFS endpoint is missing")?.1;
+    let agent_id = transport
+        .agent_id
+        .as_deref()
+        .context("LFS repository identity is missing")?;
     let mut missing = Vec::new();
     for batch in pointers.chunks(100) {
         let mut expected: HashMap<_, _> = batch.iter().map(|p| (p.oid.as_str(), p)).collect();
@@ -338,10 +409,7 @@ pub fn missing_lfs_uploads(
                 .post(format!("{endpoint}/objects/batch"))
                 .header("Accept", "application/vnd.git-lfs+json")
                 .header("Content-Type", "application/vnd.git-lfs+json")
-                .header(
-                    super::identity::EXPECTED_AGENT_ID_HEADER,
-                    &identity.agent_id,
-                );
+                .header(super::identity::EXPECTED_AGENT_ID_HEADER, agent_id);
             if let Some(token) = transport.token()? {
                 request = request.header("Authorization", format!("Bearer {token}"));
             }
@@ -532,6 +600,7 @@ fn named_destinations(repo: &Repo, requested: &str, push: bool) -> Result<Vec<(S
 /// changed, and the two have nothing to do with each other. A caller that cannot see stderr can
 /// only collapse every failure into one sentence — a 422 arriving as "the remote has moved ahead
 /// / an authentication problem".
+#[derive(Debug)]
 pub struct Outcome {
     pub code: i32,
     pub stderr: String,
@@ -567,7 +636,7 @@ pub fn run(repo: &Repo, args: &[&str]) -> Result<Outcome> {
         &hub,
         expected.as_ref().map(|identity| identity.agent_id.as_str()),
     )?;
-    run_transport(Some(repo.root()), args, transport)
+    run_transport(Some(repo.root()), args, &transport)
 }
 
 /// Keep the target selected for this operation fixed across branch and tag requests.
@@ -594,7 +663,7 @@ pub fn push_for_remote(
     super::identity::verify_transport_target(repo, identity)?;
     let mut transport = TransportIdentity::new(Some(repo.root()), args, identity)?;
     transport.accept_secret_findings = accept_secret_findings;
-    run_transport(Some(repo.root()), args, transport)
+    run_transport(Some(repo.root()), args, &transport)
 }
 
 fn run_for_identity(
@@ -603,14 +672,67 @@ fn run_for_identity(
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Outcome> {
     let transport = TransportIdentity::new(dir, args, identity)?;
-    run_transport(dir, args, transport)
+    run_transport(dir, args, &transport)
 }
 
 fn run_transport(
     dir: Option<&Path>,
     args: &[&str],
-    transport: TransportIdentity,
+    transport: &TransportIdentity,
 ) -> Result<Outcome> {
+    let run = execute_transport(dir, args, transport, OutputMode::Ordinary);
+    if let Some(error) = run.error {
+        return Err(error);
+    }
+    Ok(run
+        .attempts
+        .into_iter()
+        .last()
+        .expect("transport has an attempt")
+        .outcome)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Ordinary,
+    Captured,
+}
+
+struct ProcessOutput {
+    outcome: Outcome,
+    stdout: Vec<u8>,
+    complete: bool,
+    error: Option<String>,
+}
+
+struct TransportRun {
+    attempts: Vec<ProcessOutput>,
+    error: Option<anyhow::Error>,
+}
+
+fn execute_transport(
+    dir: Option<&Path>,
+    args: &[&str],
+    transport: &TransportIdentity,
+    mode: OutputMode,
+) -> TransportRun {
+    execute_transport_in(dir, args, transport, mode, None)
+}
+
+/// A borrowed execution controls both process setup and configuration across credential retries.
+/// The transport retains account state; replacing execution never constructs another client.
+fn execute_transport_in(
+    dir: Option<&Path>,
+    args: &[&str],
+    transport: &TransportIdentity,
+    mode: OutputMode,
+    execution: Option<&frozen::Execution>,
+) -> TransportRun {
+    let execution = execution.or(transport.execution.as_ref());
+    let mut run = TransportRun {
+        attempts: Vec::new(),
+        error: None,
+    };
     if transport
         .client
         .as_ref()
@@ -619,19 +741,24 @@ fn run_transport(
         transport.refresh();
     }
 
-    let (code, stderr) = spawn(dir, args, &transport)?;
-    if code == 0 || !looks_like_auth_failure(&stderr) {
-        return Ok(Outcome { code, stderr });
+    for retry in [false, true] {
+        match spawn(dir, args, transport, mode, execution) {
+            Ok(attempt) => {
+                let refresh = !retry
+                    && attempt.outcome.code != 0
+                    && looks_like_auth_failure(&attempt.outcome.stderr);
+                run.attempts.push(attempt);
+                if !refresh || !transport.refresh() {
+                    break;
+                }
+            }
+            Err(error) => {
+                run.error = Some(error);
+                break;
+            }
+        }
     }
-
-    // Authentication failed: exchange the token once and try again. When the exchange fails,
-    // hand this result back — the caller's hint (`agit login`) is more useful than reporting it
-    // again ourselves.
-    if !transport.refresh() {
-        return Ok(Outcome { code, stderr });
-    }
-    let (code, stderr) = spawn(dir, args, &transport)?;
-    Ok(Outcome { code, stderr })
+    run
 }
 
 /// Advertised branches and unpeeled tags from an identity-fenced remote probe.
@@ -746,12 +873,26 @@ fn capture(
         .map(|identity| TransportIdentity::new(Some(dir), args, identity))
         .transpose()
         .ok()?;
+    capture_transport(dir, args, transport.as_ref())
+}
+
+fn capture_transport(
+    dir: &Path,
+    args: &[&str],
+    transport: Option<&TransportIdentity>,
+) -> Option<String> {
     let once = || -> Option<(bool, String, String)> {
-        let mut cmd = transport_command();
-        cmd.arg("-C").arg(dir);
+        let mut cmd = match transport {
+            Some(transport) => transport.command(Some(dir)),
+            None => {
+                let mut command = transport_command();
+                command.arg("-C").arg(dir);
+                command
+            }
+        };
         cmd.args(args);
         cmd.env("GIT_TERMINAL_PROMPT", "0");
-        if let Some(transport) = &transport {
+        if let Some(transport) = transport {
             for (k, v) in transport.environment().ok()? {
                 cmd.env(k, v);
             }
@@ -807,7 +948,7 @@ fn capture(
     if ok {
         return Some(stdout);
     }
-    let transport = transport.as_ref()?;
+    let transport = transport?;
     if !looks_like_auth_failure(&stderr) || !transport.refresh() {
         return None;
     }
@@ -960,23 +1101,34 @@ fn spawn(
     dir: Option<&Path>,
     args: &[&str],
     transport: &TransportIdentity,
-) -> Result<(i32, String)> {
-    let mut cmd = transport_command();
-    if let Some(d) = dir {
-        cmd.arg("-C").arg(d);
-    }
-    let full = with_progress(
-        args,
-        std::io::IsTerminal::is_terminal(&std::io::stderr()),
-        crate::ui::quiet(),
-    );
+    mode: OutputMode,
+    execution: Option<&frozen::Execution>,
+) -> Result<ProcessOutput> {
+    let mut cmd = transport.command_in(dir, execution);
+    let full = match mode {
+        OutputMode::Ordinary => with_progress(
+            args,
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+            crate::ui::quiet(),
+        ),
+        OutputMode::Captured => args.to_vec(),
+    };
     cmd.args(&full);
     // Give git no chance to ask for a password interactively: with no usable token it must fail
     // immediately and let us see the authentication marker, instead of hanging on input in a
     // non-interactive environment.
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    for (k, v) in transport.environment()? {
+    for (k, v) in transport.environment_in(execution)? {
         cmd.env(k, v);
+    }
+
+    if mode == OutputMode::Captured {
+        cmd.stdout(Stdio::piped());
+        let child = cmd
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+        return Ok(publication_output::capture(child));
     }
 
     let mut child = cmd
@@ -1004,10 +1156,15 @@ fn spawn(
     }
 
     let status = child.wait().context("failed to wait for git to exit")?;
-    Ok((
-        status.code().unwrap_or(1),
-        String::from_utf8_lossy(&captured).into_owned(),
-    ))
+    Ok(ProcessOutput {
+        outcome: Outcome {
+            code: status.code().unwrap_or(1),
+            stderr: String::from_utf8_lossy(&captured).into_owned(),
+        },
+        stdout: Vec::new(),
+        complete: true,
+        error: None,
+    })
 }
 
 /// Strip the credentials out of a URL.
@@ -1332,7 +1489,9 @@ mod tests {
             "fatal: unable to access 'http://h/a.git/': The requested URL returned error: 403",
             "remote: HTTP 401 Unauthorized",
             "fatal: Authentication failed for 'http://h/a.git/'",
+            "batch response: Authentication required: Authorization error: http://h/a.git/info/lfs/objects/batch",
             "fatal: could not read Username for 'http://h': terminal prompts disabled",
+            "fatal: unable to get password from user",
         ] {
             assert!(
                 looks_like_auth_failure(line),
@@ -1563,6 +1722,11 @@ mod probe_timeout_tests {
 
 #[cfg(test)]
 mod git_credential_lifecycle_tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/hub/git/frozen_http_tests.rs"
+    ));
+
     use super::{capture, run_for_identity};
     use crate::hub::identity::RemoteIdentity;
     use crate::infra::{config, credentials};
@@ -1858,14 +2022,21 @@ mod git_credential_lifecycle_tests {
     }
 
     impl FakeHub {
-        fn new(mut respond: impl FnMut(&WireRequest) -> Reply + Send + 'static) -> Self {
+        fn new(respond: impl FnMut(&WireRequest) -> Reply + Send + 'static) -> Self {
+            Self::with_timeout(Duration::from_secs(20), respond)
+        }
+
+        fn with_timeout(
+            timeout: Duration,
+            mut respond: impl FnMut(&WireRequest) -> Reply + Send + 'static,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let stop = Arc::new(AtomicBool::new(false));
             let stopped = stop.clone();
             let thread = std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(20);
+                let deadline = Instant::now() + timeout;
                 let mut requests = Vec::new();
                 while !stopped.load(Ordering::SeqCst) && Instant::now() < deadline {
                     match listener.accept() {
@@ -2489,6 +2660,7 @@ mod git_credential_lifecycle_tests {
             request.header("X-AgentGit-Expected-Agent-Id"),
             identity.then_some(AGENT_ID)
         );
+        assert_eq!(request.header("X-AgentGit-Accept-Secret-Findings"), None);
         assert!(request.body.is_empty());
     }
 
@@ -2878,6 +3050,103 @@ mod git_credential_lifecycle_tests {
         assert!(super::clone(&url, &home.workspace().join("clone"), &identity).is_err());
         assert!(hub.finish().is_empty());
         assert!(other.finish().is_empty());
+    }
+
+    /// Credential refresh preserves an explicit push decision through branch and tag consumers.
+    #[test]
+    fn explicit_branch_and_tag_acceptance_survives_refresh_without_persisting() {
+        const PUSH_PATH: &str = "/alice/example.git/info/refs?service=git-receive-pack";
+        for tags in [false, true] {
+            let home = IsolatedHome::new();
+            let mut git_requests = 0;
+            let hub = FakeHub::new(move |request| {
+                if request.path == "/api/auth/refresh" {
+                    return refreshed();
+                }
+                assert_eq!(request.path, PUSH_PATH);
+                git_requests += 1;
+                if git_requests == 1 {
+                    return denied();
+                }
+                Reply {
+                    status: 400,
+                    content_type: "text/plain",
+                    headers: Vec::new(),
+                    body: b"synthetic transport response".to_vec(),
+                }
+            });
+            let repo = pinned_repo(&home, &hub.base);
+            repo.git(&[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "transport fixture",
+            ])
+            .unwrap();
+            repo.git(&["tag", "selected"]).unwrap();
+            let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+            for accepted in [true, false] {
+                let outcome = if tags {
+                    crate::commands::push::push_tags_for_test(
+                        &repo,
+                        &["selected".into()],
+                        &identity,
+                        accepted,
+                    )
+                    .unwrap_err()
+                } else {
+                    super::push_for_remote(
+                        &repo,
+                        &["push", "origin", "HEAD:main"],
+                        &identity,
+                        accepted,
+                    )
+                    .unwrap()
+                };
+                assert!(!outcome.ok());
+            }
+            let saved = credentials::load_checked(&hub.base).unwrap().unwrap();
+            assert_eq!(saved.access_token, "fake-alice-fresh-access");
+            let requests = hub.finish();
+            assert_eq!(requests.len(), 4);
+            let refresh = &requests[1];
+            assert_eq!(refresh.method, "POST");
+            assert_eq!(refresh.path, "/api/auth/refresh");
+            assert_eq!(refresh.header("Authorization"), None);
+            assert_eq!(refresh.header("X-AgentGit-Accept-Secret-Findings"), None);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&refresh.body).unwrap(),
+                serde_json::json!({"refresh_token": "fake-alice-refresh"}),
+            );
+            for (index, token, accepted) in [
+                (0, "fake-alice-access", true),
+                (2, "fake-alice-fresh-access", true),
+                (3, "fake-alice-fresh-access", false),
+            ] {
+                let request = &requests[index];
+                assert_eq!(request.method, "GET");
+                assert_eq!(request.path, PUSH_PATH);
+                assert_eq!(
+                    request.header("Authorization"),
+                    Some(format!("Bearer {token}").as_str())
+                );
+                assert_eq!(
+                    request.header("X-AgentGit-Expected-Agent-Id"),
+                    Some(AGENT_ID)
+                );
+                assert_eq!(
+                    request.header("X-AgentGit-Accept-Secret-Findings"),
+                    accepted.then_some("true")
+                );
+                assert!(request.body.is_empty());
+            }
+        }
     }
 
     #[test]

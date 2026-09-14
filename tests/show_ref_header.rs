@@ -6,6 +6,10 @@ use std::process::{Command, Output};
 
 #[path = "support/publication_process.rs"]
 mod publication_process;
+#[cfg(windows)]
+#[allow(dead_code)]
+#[path = "../src/rc/windows_job.rs"]
+mod publication_windows_job;
 
 const SESSION: &str = "agit-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const HUB: &str = "https://published.example.test/mount";
@@ -664,5 +668,55 @@ fn published_birth_points_without_a_session_identity_have_no_web_link() {
     assert!(
         !text.contains("web:") && !text.contains("/s/?ref="),
         "{text}"
+    );
+}
+
+#[test]
+fn full_raw_log_at_an_explicit_commit_does_not_prepare_global_storage() {
+    let fixture = Fixture::new();
+    let state = || {
+        walkdir::WalkDir::new(&fixture.home)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(!entry.file_type().is_symlink());
+                (
+                    entry.path().strip_prefix(&fixture.home).unwrap().to_owned(),
+                    entry
+                        .file_type()
+                        .is_file()
+                        .then(|| std::fs::read(entry.path()).unwrap()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = state();
+    assert!(!fixture.home.join("layout-v1.complete").exists());
+    assert!(!fixture.home.join("store").exists());
+    let target = format!("alice/headers@{}", fixture.sha);
+    let output = publication_process::output(
+        fixture.command(&["show", &target, "--log-only", "--raw", "--no-tui"]),
+        "audit-show",
+        "full-raw-log",
+        std::time::Instant::now() + publication_process::MODE_LIMIT,
+    )
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let actual: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut expected = fixture.view.clone();
+    expected.push(json!({"type":"user", "message":{"role":"user", "content":"HIDDEN-PROMPT"}}));
+    assert_eq!(
+        actual, expected,
+        "raw LOG must retain records outside the selected VIEW"
+    );
+    assert_eq!(
+        state(),
+        before,
+        "explicit raw LOG inspection must not change any source or startup entry"
     );
 }

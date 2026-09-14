@@ -26,6 +26,7 @@ pub fn home() -> Result<PathBuf> {
 
 pub fn slug_for(cwd: &Path) -> String {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd = crate::domain::repo::inspection_git_path_spelling(cwd);
     cwd.to_string_lossy()
         .split(['/', '\\', ':', '-'])
         .filter(|part| !part.is_empty())

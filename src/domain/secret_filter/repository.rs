@@ -103,6 +103,15 @@ pub struct RepositoryDictionary<K: KeyStore = SelectedKeyStore> {
 }
 
 impl RepositoryDictionary<SelectedKeyStore> {
+    /// A validated Git carrier selects its dictionary without rediscovering a worktree.
+    #[cfg(feature = "cli")]
+    pub(crate) fn open_at_git_dir(git_dir: &Path) -> crate::Result<Self> {
+        Ok(Self::new(
+            git_dir.join(Path::new(DICTIONARY_RELATIVE_PATH)),
+            SelectedKeyStore::from_config()?,
+        ))
+    }
+
     /// Fails only on a keystore setting outside its domain; the key itself is touched lazily.
     pub fn open(repo_root: &Path) -> crate::Result<Self> {
         // One dictionary per repository: session-branch worktrees and the main checkout share it.

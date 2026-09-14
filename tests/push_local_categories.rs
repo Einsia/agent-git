@@ -222,10 +222,16 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
 
         fs::write(&vault_path, b"{").unwrap();
         let blocked = lab.state();
-        for allow_secrets in [false, true] {
+        for acceptance in ["none", "environment", "explicit"] {
             let mut command = lab.push_command("alice/qa", mode, false);
-            if allow_secrets {
-                command.env("AGIT_ALLOW_SECRETS", "1");
+            match acceptance {
+                "environment" => {
+                    command.env("AGIT_ALLOW_SECRETS", "1");
+                }
+                "explicit" => {
+                    command.arg("--allow-secrets");
+                }
+                _ => {}
             }
             let output = command.output().unwrap();
             assert_output(&output, mode, 4, "is malformed");
@@ -233,14 +239,17 @@ fn secret_scan_preparation_keeps_configuration_policy_and_repair_categories() {
             assert_eq!(lab.git(&repo, &["show-ref"]), refs);
             lab.no_requests();
         }
-        let invalid_config = lab
-            .push_command("alice/qa", mode, false)
-            .env("AGIT_SECRETS_KEYSTORE", "invalid-keystore")
-            .output()
-            .unwrap();
-        assert_output(&invalid_config, mode, 2, "takes `os` or `file`");
-        assert_eq!(lab.state(), blocked);
-        lab.no_requests();
+        for accepted in [false, true] {
+            let mut command = lab.push_command("alice/qa", mode, false);
+            command.env("AGIT_SECRETS_KEYSTORE", "invalid-keystore");
+            if accepted {
+                command.arg("--allow-secrets");
+            }
+            let invalid_config = command.output().unwrap();
+            assert_output(&invalid_config, mode, 2, "takes `os` or `file`");
+            assert_eq!(lab.state(), blocked);
+            lab.no_requests();
+        }
 
         fs::write(&vault_path, &vault_bytes).unwrap();
         let repaired = lab.push("alice/qa", mode, false);

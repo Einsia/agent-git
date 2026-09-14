@@ -696,11 +696,40 @@ too). The exit code is 7 when it finds something.
 
 - **False positive**: add that string to `$AGIT_HOME/.agit-allow-secrets`, or put an
   `agit:allow-secret` note on that line of the original.
-- **A real secret**: `agit revert @#n.k` takes it out of the VIEW.
+- **A real secret**: inspect the reported carrier before publishing. `agit revert @#n.k`
+  removes context from the VIEW; it preserves the LOG and Git history that publishing carries.
 
-`--sensitive` is designed to start a separate local review agent that looks at sensitive content
-rather than structure, but 0.9.0 ships no usable local review agent: running it reports an unmet
-precondition (exit code 4). What works today is the default `--secrets` structured scan.
+`--sensitive` reviews selected committed VIEW events for suspected disclosure risks:
+
+```sh
+agit config runtime.default claude-code
+agit scan alice/payments@session-1 --sensitive
+```
+
+The review adapter supports installed Claude Code versions with the required isolation controls.
+The configured provider may be remote, and the native runtime's authentication housekeeping may
+perform its own I/O. Unsettled turns and working files are outside this selected VIEW review.
+Reports are advisory: AgentGit never applies model-supplied remedies automatically.
+
+A completed review returns exit 0 without findings or exit 7 with findings. Failure to run or
+complete the model review returns exit 4. The deterministic secret scan remains the publishing
+gate. See the [scan command manual](../src/commands/subskills/scan.md) for runtime requirements,
+scope selection, review limits, and report fields.
+
+To review the complete outgoing publication interactively, use:
+
+```sh
+agit push alice/payments@session-1 --audit
+```
+
+This opens the reviewer in the current terminal, where it shows progress and asks
+questions. Its workflow reads full historical LOG through immutable `agit show`
+targets and reviews the remaining published text, including shared-file history
+and readable LFS payloads. After it finishes, push validates the report and asks
+separately before publishing. Ordinary push does not launch a model. An incomplete
+or interrupted audit stops this push; `--audit --dry-run` reviews without publishing.
+See the [push command manual](../src/commands/subskills/push.md) for runtime, terminal,
+and report requirements.
 
 ## 6. Detach a session from the terminal (remote control)
 

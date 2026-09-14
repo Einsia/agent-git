@@ -122,6 +122,19 @@ fn main() {
     // The JSON path moves the cd and the startup migration inside the envelope: migration
     // warnings are part of this output too, and left outside the envelope they become bare text
     // ahead of the JSON that the consumer cannot parse.
+    if !json && matches!(&command, Commands::Push(args) if args.audit) {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            agit::ui::error(
+                "push --audit requires an interactive terminal for review and final confirmation",
+            );
+            exit(agit::ExitCode::Interactive.as_i32());
+        }
+        if let Err(error) = commands::push::check_audit_environment() {
+            agit::ui::error(&error.to_string());
+            exit(agit::ExitCode::Usage.as_i32());
+        }
+    }
     let command_name = commands::command_name(&command);
     let startup = startup_for(&command);
     // A best-effort, once-a-day update hint belongs to the process startup path so it also
@@ -238,7 +251,18 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
         Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
         Commands::Doctor(_) => Startup::Inspect,
+        Commands::Show(args)
+            if args.raw
+                && args.log_only
+                && args
+                    .target
+                    .as_deref()
+                    .is_some_and(|target| target.contains('@')) =>
+        {
+            Startup::ScopedReview
+        }
         Commands::Scan(args) if args.sensitive => Startup::ScopedReview,
+        Commands::Push(args) if args.audit => Startup::ScopedReview,
         Commands::Revert(args) if args.expected_head.is_some() => Startup::ScopedReview,
         Commands::Import(args) if commands::import::needs_readonly_startup(args) => {
             Startup::ScopedImport
@@ -378,6 +402,46 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
 mod startup_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn audited_push_defers_storage_and_never_admits_an_update_nudge() {
+        for arguments in [
+            vec!["agit", "push", "me/repo@work", "--audit"],
+            vec!["agit", "push", "me/repo@work", "--audit", "--dry-run"],
+            vec!["agit", "--yes", "push", "me/repo@work", "--audit"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let startup = startup_for(&cli.command.unwrap());
+            assert_eq!(startup, Startup::ScopedReview);
+            assert!(!startup.allows_nudge());
+        }
+        let ordinary = Cli::try_parse_from(["agit", "push", "me/repo@work"]).unwrap();
+        assert_eq!(startup_for(&ordinary.command.unwrap()), Startup::Migrate);
+    }
+
+    #[test]
+    fn explicit_raw_log_review_skips_global_migration_and_nudges() {
+        let cli = Cli::try_parse_from([
+            "agit",
+            "show",
+            "audit/source@0123456789012345678901234567890123456789",
+            "--log-only",
+            "--raw",
+            "--no-tui",
+        ])
+        .unwrap();
+        let startup = startup_for(&cli.command.unwrap());
+        assert_eq!(startup, Startup::ScopedReview);
+        assert!(!startup.allows_nudge());
+        for args in [
+            vec!["agit", "show", "audit/source@main", "--raw"],
+            vec!["agit", "show", "audit/source@main", "--log-only"],
+            vec!["agit", "show", "--raw", "--log-only"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(startup_for(&cli.command.unwrap()), Startup::Migrate);
+        }
+    }
 
     #[test]
     fn mcp_defers_storage_and_nudges_to_each_tool() {

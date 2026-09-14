@@ -424,7 +424,7 @@ impl RunNotes {
 }
 
 enum ForkResolution {
-    Selected(String, super::fork::ForkBase),
+    Selected(String, Box<super::fork::ForkBase>),
     Refused(ExitCode),
 }
 
@@ -453,7 +453,7 @@ fn resolve_fork(
     let Some(fork_base) = super::fork::resolve_base(&full_ref, cwd)? else {
         return Ok(ForkResolution::Refused(ExitCode::Ref));
     };
-    Ok(ForkResolution::Selected(full_ref, fork_base))
+    Ok(ForkResolution::Selected(full_ref, Box::new(fork_base)))
 }
 
 fn turn_display(n: u32) -> String {

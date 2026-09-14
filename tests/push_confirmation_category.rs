@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 mod publication_http;
 #[path = "support/publication_process.rs"]
 mod publication_process;
+#[cfg(windows)]
+#[allow(dead_code)]
+#[path = "../src/rc/windows_job.rs"]
+mod publication_windows_job;
 
 struct Lab {
     mode: &'static str,
@@ -418,5 +422,65 @@ fn noninteractive_copy_confirmation_preserves_the_foreign_checkout() {
         assert!(!lab.home.join("repos/alice/qa").exists());
         lab.no_requests();
         eprintln!("publication mode={mode} stage=postconditions done");
+    }
+}
+
+#[test]
+fn audited_push_refuses_captured_stdio_before_startup_or_hub_activity() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("not-created");
+    let hub = TcpListener::bind("127.0.0.1:0").unwrap();
+    hub.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", hub.local_addr().unwrap());
+    for tail in [
+        vec![],
+        vec!["--dry-run", "--yes", "--allow-secrets"],
+        vec!["--json", "--json-version", "1"],
+        vec!["--json", "--json-version", "2", "--dry-run", "--yes"],
+    ] {
+        let json = tail.contains(&"--json");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear();
+        for name in ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .args(["push", "me/qa@work", "--audit"])
+            .args(tail)
+            .current_dir(root.path())
+            .env("HOME", root.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &base)
+            .env("AGIT_YES", "1")
+            .env("AGIT_ALLOW_SECRETS", "1");
+        let output = publication_process::output(
+            command,
+            "audit-noninteractive",
+            "entry-refusal",
+            Instant::now() + publication_process::MODE_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(agit::ExitCode::Interactive.as_i32()),
+            "{output:?}"
+        );
+        if json {
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["ok"], false);
+            assert_eq!(value["exit_code"], agit::ExitCode::Interactive.as_i32());
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal"));
+        }
+        assert!(
+            !home.exists(),
+            "a refused audit must not initialize or migrate storage"
+        );
+        match hub.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("a refused audit contacted the Hub: {other:?}"),
+        }
     }
 }

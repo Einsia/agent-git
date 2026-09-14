@@ -79,6 +79,11 @@
 //! Hub sessions and repository grants authorize publication. Git object hashes establish
 //! content integrity; they do not prove a signing identity.
 
+mod audit;
+mod audit_report;
+mod audit_workspace;
+mod audited_push;
+
 use super::{CmdResult, require_login};
 use crate::domain::meta;
 use crate::domain::repo::{self, Repo};
@@ -129,12 +134,33 @@ pub struct Args {
     #[arg(long)]
     pub allow_secrets: bool,
 
-    /// Run every local check (secret scan included) and print what would go up. Sends nothing.
+    /// Review all outgoing readable content in an interactive agent before a separate confirmation.
+    #[arg(long)]
+    pub audit: bool,
+
+    /// Check without publishing. With --audit, the model review still runs and receives content.
     #[arg(long)]
     pub dry_run: bool,
 }
 
+/// Audit startup rejects inherited Git routing before storage preparation or native review.
+pub fn check_audit_environment() -> crate::Result<()> {
+    audited_push::check_environment(std::env::vars_os())
+}
+
 pub fn run(mut args: Args) -> CmdResult {
+    if args.audit && !ui::prompt::interactive() {
+        ui::error(
+            "push --audit requires an interactive terminal for review and final confirmation",
+        );
+        return Ok(ExitCode::Interactive);
+    }
+    if args.audit
+        && let Err(error) = check_audit_environment()
+    {
+        ui::error(&error.to_string());
+        return Ok(ExitCode::Usage);
+    }
     if crate::rc::harness::settlement_is_delegated() {
         ui::error(crate::rc::harness::SUPERVISED_SETTLEMENT_MESSAGE);
         ui::hint("finish the turn and let agitd push it under the live identity lease");
@@ -207,6 +233,16 @@ pub fn run(mut args: Args) -> CmdResult {
             _ => ExitCode::Precondition,
         });
     };
+
+    if args.audit
+        && let Err(error) =
+            super::migration::check_readonly_repo_startup_local(&repo.clone().local_objects_only())
+    {
+        ui::error(&format!(
+            "audited push requires settled local storage: {error:#}"
+        ));
+        return Ok(ExitCode::Precondition);
+    }
 
     let snap = match meta::resolve(repo.root()) {
         Ok(v) => v,
@@ -318,6 +354,10 @@ pub fn run(mut args: Args) -> CmdResult {
             ui::hint("`agit commit` records the conversation so far, then push");
         }
         return Ok(ExitCode::Ok);
+    }
+
+    if args.audit {
+        return audited_push::run(&args, client, &me, checkout, repo, &branches);
     }
 
     // ── 3. Secret scan ──
@@ -470,11 +510,6 @@ pub fn run(mut args: Args) -> CmdResult {
     }
 
     // ── 7. Push branches and tags ──
-    let mut git_args = vec!["push"];
-    if repo.ahead_behind().is_none() {
-        git_args.push("-u");
-    }
-    git_args.push("origin");
     let refs = refs_to_push(&branches, repo.has_ref("refs/heads/main"));
     let lfs_refs: Vec<String> = refs
         .iter()
@@ -486,7 +521,7 @@ pub fn run(mut args: Args) -> CmdResult {
         &remote_identity,
         args.allow_secrets,
     )?;
-    git_args.extend(refs.iter().map(String::as_str));
+    let git_args = publication_push_args(&refs, repo.ahead_behind().is_none());
     if args.allow_secrets {
         ui::warning(
             "--allow-secrets explicitly accepts credential findings for this push and its version tags; public history can be copied by anyone.",
@@ -1007,6 +1042,34 @@ fn ensure_remote(
     snap: &meta::Meta,
     repo: &Repo,
 ) -> crate::Result<Remote> {
+    ensure_remote_with_options(
+        client,
+        owner,
+        agent,
+        want,
+        snap,
+        repo,
+        RemotePreparation {
+            pin_identity: true,
+            own_namespace: None,
+        },
+    )
+}
+
+struct RemotePreparation {
+    pin_identity: bool,
+    own_namespace: Option<bool>,
+}
+
+fn ensure_remote_with_options(
+    client: &crate::hub::Client,
+    owner: &str,
+    agent: &str,
+    want: Option<bool>,
+    snap: &meta::Meta,
+    repo: &Repo,
+    preparation: RemotePreparation,
+) -> crate::Result<Remote> {
     let expected = identity::expected_for_transport(repo, client.base())?;
     match super::remote_request(client.get_agent(owner, agent)) {
         Ok(remote) => {
@@ -1035,7 +1098,9 @@ fn ensure_remote(
     }
 
     // Visibility is chosen only for creation; the namespace cannot override a private choice.
-    let mine = crate::infra::credentials::current_user().as_deref() == Some(owner);
+    let mine = preparation
+        .own_namespace
+        .unwrap_or_else(|| crate::infra::credentials::current_user().as_deref() == Some(owner));
     let public = match want {
         Some(value) => value,
         None => first_visibility(None, ask_visibility(agent)?),
@@ -1085,7 +1150,7 @@ fn ensure_remote(
         .context(FirstPublicationRefusal));
     }
     // Retained pins belong to supervised work and cannot be rewritten by an ordinary push.
-    if matches!(identity::read(repo), Ok(None)) {
+    if preparation.pin_identity && matches!(identity::read(repo), Ok(None)) {
         identity::pin(repo, &remote_identity)?;
     }
     Ok(Remote {
@@ -1297,6 +1362,17 @@ fn tags_missing_from_remote(
         .collect()
 }
 
+/// Local configuration cannot add tag refs or publish a nested repository implicitly.
+fn publication_push_args(refs: &[String], set_upstream: bool) -> Vec<&str> {
+    let mut args = vec!["push", "--no-follow-tags", "--recurse-submodules=no"];
+    if set_upstream {
+        args.push("-u");
+    }
+    args.push("origin");
+    args.extend(refs.iter().map(String::as_str));
+    args
+}
+
 /// Push tags. Batched because an agent gets a version ID every turn, and a command line has a
 /// length limit.
 fn push_tags(
@@ -1307,8 +1383,7 @@ fn push_tags(
 ) -> std::result::Result<(), crate::hub::git::Outcome> {
     for chunk in tags.chunks(100) {
         let specs: Vec<String> = chunk.iter().map(|t| format!("refs/tags/{t}")).collect();
-        let mut args: Vec<&str> = vec!["push", "origin"];
-        args.extend(specs.iter().map(String::as_str));
+        let args = publication_push_args(&specs, false);
         match crate::hub::git::push_for_remote(repo, &args, identity, allow_secrets) {
             Ok(out) if out.ok() => {}
             Ok(out) => return Err(out),
@@ -1321,6 +1396,16 @@ fn push_tags(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn push_tags_for_test(
+    repo: &Repo,
+    tags: &[String],
+    identity: &RemoteIdentity,
+    allow_secrets: bool,
+) -> std::result::Result<(), crate::hub::git::Outcome> {
+    push_tags(repo, tags, identity, allow_secrets)
 }
 
 /// Recover the origin from `<origin>@<short-sha>`.
@@ -1355,36 +1440,27 @@ fn where_column(h: &secrets::Hit) -> String {
     }
 }
 
-/// `truncated`: the scan filled its cap, and hits beyond it went unreported.
-///
-/// Left unsaid, this report looks exactly like "that is all of it": the user fixes the rows one
-/// by one, pushes again, and is stopped again — a loop with no way out.
-/// One gate's verdict.
+/// The diagnostics and exit category describe the same publication decision.
 enum Gate {
-    /// Nothing to stop (or the user allowed it explicitly).
+    /// The scan is clean or its reported content risk was explicitly allowed.
     Pass,
-    /// The reason has already been said; exit with this code.
+    /// Diagnostics have identified the refusal and its exit category.
     Blocked(ExitCode),
 }
 
-/// Scan once, say what came out, and give the verdict.
-///
-/// # Why this is one function
-///
-/// This command uses it **twice** (step 3, and step 6b after the destination changed), and both
-/// times the wording, the allow switch and the exit code must be identical. The cost of a second
-/// copy is "one repo judged by two sets of rules inside one push".
-///
-/// # "Not scanned" is stopped exactly like "found"
-///
-/// [`secrets::Unscanned`] records the part that was **never read at all** (a whole history over
-/// budget, a single object over the line). A verdict given off an empty hit list is fail open: a
-/// gate allowing the input it could not reach, and saying nothing. The server refuses an
-/// over-the-line object rather than skipping it, so the two sides agree.
+/// Collection finishes and the spinner clears before result diagnostics are emitted.
 fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan, allow_secrets: bool) -> crate::Result<Gate> {
     let sp = ui::spinner("scanning for secrets…");
     let scan = secrets::scan_agent_repo(repo, plan);
     sp.finish_and_clear();
+    finish_secret_scan(scan, allow_secrets)
+}
+
+/// Preparation errors cannot be waived; incomplete coverage is reported alongside findings.
+fn finish_secret_scan(
+    scan: crate::Result<secrets::ScanReport>,
+    allow_secrets: bool,
+) -> crate::Result<Gate> {
     let scan = match scan {
         Ok(scan) => scan,
         Err(error) => {
@@ -1419,7 +1495,7 @@ fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan, allow_secrets: bool) -> cr
     }
 
     if config::allow_secrets() {
-        // An allow must be visible. A silent bypass is the same as no gate.
+        // A content override must announce which risks the local gate is allowing.
         if !hits.is_empty() {
             ui::warning(&format!(
                 "AGIT_ALLOW_SECRETS is set — proceeding past {} suspected secrets.",
@@ -1431,6 +1507,7 @@ fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan, allow_secrets: bool) -> cr
                 "AGIT_ALLOW_SECRETS is set — proceeding past content that was not scanned.",
             );
         }
+        // A local override cannot promise server acceptance or permission to publish history publicly.
         ui::warning(
             "AGIT_ALLOW_SECRETS affects only the local check; the server may still refuse this push. Use --allow-secrets to explicitly accept server credential findings.",
         );
@@ -1438,9 +1515,7 @@ fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan, allow_secrets: bool) -> cr
     }
 
     if hits.is_empty() {
-        // With nothing scanned there is no saying "N secrets found" — that is false, and the
-        // action it points at is wrong (there is no hit to fix). `report_unscanned` has already
-        // said the reason and the next step.
+        // Missing coverage requires a coverage diagnosis even when the scan found no secrets.
         ui::error("publish blocked: part of what would be sent was not scanned.");
     } else {
         ui::error(&format!(
@@ -1459,15 +1534,12 @@ fn secret_gate(repo: &Repo, plan: &secrets::ScanPlan, allow_secrets: bool) -> cr
     if unscanned.is_empty() {
         ui::hint("to accept these findings explicitly, repeat the push with --allow-secrets");
     }
-    // The remedies that branch by carrier go through the **shared** implementation
-    // (`agit scan --secrets` calls the same one). An unconditional promise of "annotate that
-    // line with agit:allow-secret" is wrong for a hit inside a blob / commit / tag object: that
-    // line is not in the workspace, there is nowhere to write it, and the one way out that works
-    // goes unmentioned — same repo, scan right, push wrong.
+    // Object findings need remedies for retained history, not only workspace lines.
     super::hint_secret_hit_remedies(hits.iter());
     Ok(Gate::Blocked(ExitCode::Policy))
 }
 
+/// Truncated results remain visibly incomplete so omitted findings are not mistaken for clean data.
 fn report_hits(hits: &[secrets::Hit], truncated: bool) {
     ui::section("suspected secrets");
     let rows: Vec<Vec<String>> = hits
@@ -1497,6 +1569,9 @@ fn report_hits(hits: &[secrets::Hit], truncated: bool) {
         ));
     }
 }
+
+#[cfg(test)]
+mod publication_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1560,6 +1635,7 @@ mod tests {
             private: false,
             public: false,
             allow_secrets: false,
+            audit: false,
             dry_run: false,
         };
         let (_d, repo) = {

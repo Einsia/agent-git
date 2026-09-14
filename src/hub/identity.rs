@@ -97,8 +97,8 @@ pub fn pin(repo: &Repo, identity: &RemoteIdentity) -> crate::Result<()> {
     write(repo, identity)
 }
 
-/// Explicit identity migration (only for the promotion flow where the server has just created a
-/// copy and returned a new id).
+/// Promotion replaces the expected source pin with a separately validated destination identity.
+/// A changed source pin prevents rebinding the checkout to another repository.
 pub fn rebind(
     repo: &Repo,
     expected: &RemoteIdentity,
@@ -183,8 +183,18 @@ pub fn resolve_transport_target(
 
 /// A current API response selects this operation's target without replacing a retained pin.
 pub fn verify_transport_target(repo: &Repo, observed: &RemoteIdentity) -> crate::Result<()> {
-    if let Some(expected) = expected_for_transport(repo, &observed.hub)?
-        && expected != *observed
+    verify_expected_target(
+        expected_for_transport(repo, &observed.hub)?.as_ref(),
+        observed,
+    )
+}
+
+pub(crate) fn verify_expected_target(
+    expected: Option<&RemoteIdentity>,
+    observed: &RemoteIdentity,
+) -> crate::Result<()> {
+    if let Some(expected) = expected
+        && expected != observed
     {
         bail!(
             "this RC session expects agent {}, but the remote identifies {}; refusing a reused remote name",
@@ -195,7 +205,7 @@ pub fn verify_transport_target(repo: &Repo, observed: &RemoteIdentity) -> crate:
     Ok(())
 }
 
-fn constrain_expected(
+pub(crate) fn constrain_expected(
     pinned: RemoteIdentity,
     hub: &str,
     expected_agent_id: Option<&str>,

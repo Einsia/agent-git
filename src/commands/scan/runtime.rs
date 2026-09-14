@@ -1,5 +1,7 @@
 //! Run a native reviewer with no project context and a bounded, private output channel.
 
+pub(in crate::commands) mod foreground;
+
 use anyhow::{Result, anyhow, bail, ensure};
 use serde::Deserialize;
 use serde_json::Value;
@@ -22,6 +24,17 @@ pub(super) fn review(prompt: &str, schema: &Value) -> Result<Vec<u8>> {
         prompt.len() <= MAX_PROMPT_BYTES,
         "sensitive review input exceeds its byte limit"
     );
+    require_configured_claude()?;
+    let environment = review_environment(std::env::vars_os());
+    let program = resolve_claude(&environment)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| anyhow!("cannot initialize the review runtime"))?
+        .block_on(review_claude(&program, &environment, prompt, schema))
+}
+
+fn require_configured_claude() -> Result<()> {
     let configured = crate::infra::config::get_global("runtime.default")
         .map_err(|_| anyhow!("cannot read the configured review runtime"))?
         .unwrap_or_else(|| "claude-code".to_owned());
@@ -31,13 +44,7 @@ pub(super) fn review(prompt: &str, schema: &Value) -> Result<Vec<u8>> {
         selected == "claude-code",
         "the configured runtime does not provide an isolated sensitive review"
     );
-    let environment = review_environment(std::env::vars_os());
-    let program = resolve_claude(&environment)?;
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| anyhow!("cannot initialize the review runtime"))?
-        .block_on(review_claude(&program, &environment, prompt, schema))
+    Ok(())
 }
 
 fn resolve_claude(environment: &[(OsString, OsString)]) -> Result<String> {
@@ -1236,8 +1243,21 @@ mod tests {
     fn script(directory: &tempfile::TempDir, body: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path = directory.path().join("reviewer");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let contents = format!("#!/bin/sh\n{body}\n");
+        // Only the producer child owns a writer, so parallel test children cannot retain it.
+        let output = std::process::Command::new("/bin/sh")
+            .env_clear()
+            .args(["-c", "printf '%s' \"$1\" > \"$2\"", "write-review-fixture"])
+            .arg(&contents)
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), contents.as_bytes());
         path.to_str().unwrap().to_owned()
     }
 

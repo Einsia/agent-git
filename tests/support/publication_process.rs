@@ -6,9 +6,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
-#[allow(dead_code)]
-#[path = "../../src/rc/windows_job.rs"]
-mod windows_job;
+use crate::publication_windows_job as windows_job;
 
 pub const CHILD_LIMIT: Duration = Duration::from_secs(30);
 pub const MODE_LIMIT: Duration = Duration::from_secs(120);
@@ -345,6 +343,10 @@ fn diagnostic_child() {
 }
 
 fn diagnostic_command(kind: &str) -> Command {
+    let module = module_path!().split_once("::").map(|(_, module)| module);
+    let test = module
+        .map(|module| format!("{module}::diagnostic_child"))
+        .unwrap_or_else(|| "diagnostic_child".into());
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.env_clear();
     for name in ["SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
@@ -353,11 +355,7 @@ fn diagnostic_command(kind: &str) -> Command {
         }
     }
     command
-        .args([
-            "--exact",
-            "publication_process::diagnostic_child",
-            "--nocapture",
-        ])
+        .args(["--exact", &test, "--nocapture"])
         .env("AGIT_PUBLICATION_DIAGNOSTIC_CHILD", kind)
         .stdin(Stdio::null());
     command

@@ -8,6 +8,10 @@ pub fn require_client(repo: &Repo) -> Result<()> {
     let output = repo
         .git(&["lfs", "version"])
         .context("install Git LFS from https://git-lfs.com/ to manage large files")?;
+    validate_client_version(&output)
+}
+
+pub(crate) fn validate_client_version(output: &str) -> Result<()> {
     let version = output
         .strip_prefix("git-lfs/")
         .and_then(|rest| rest.split_whitespace().next())

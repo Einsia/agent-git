@@ -40,6 +40,8 @@
 //! at the top of the file and update the version, then run `cargo test --lib domain::secrets` —
 //! `every_rule_compiles` tells you whether there is a new rule Rust's `regex` cannot compile.
 
+#[cfg(feature = "cli")]
+pub(crate) mod publication;
 pub mod rules;
 
 use anyhow::Context as _;
@@ -1544,13 +1546,34 @@ fn branch_trusted_envelope_identities(
     repo: &crate::domain::repo::Repo,
     branches: &[String],
 ) -> TrustedEnvelopeIdentities {
-    let mut trusted = TrustedEnvelopeIdentities::new();
-    let mut budget = ProvenanceReadBudget::new();
-    let tip_specs: Vec<String> = branches
+    let tips: Vec<String> = branches
         .iter()
-        .map(|branch| format!("refs/heads/{branch}:{}", crate::domain::meta::FILE))
+        .map(|branch| format!("refs/heads/{branch}"))
         .collect();
-    for meta in read_trusted_meta_batch(repo, &tip_specs, &mut budget)
+    trusted_envelope_identities_at(repo, &tips, HistorySelection::Revisions(&["--branches"]))
+}
+
+fn trusted_envelope_identities_at(
+    repo: &crate::domain::repo::Repo,
+    tips: &[String],
+    history: HistorySelection<'_>,
+) -> TrustedEnvelopeIdentities {
+    let mut budget = ProvenanceReadBudget::new();
+    trusted_envelope_identities_with_budget(repo, tips, history, &mut budget)
+}
+
+fn trusted_envelope_identities_with_budget(
+    repo: &crate::domain::repo::Repo,
+    tips: &[String],
+    history: HistorySelection<'_>,
+    budget: &mut ProvenanceReadBudget,
+) -> TrustedEnvelopeIdentities {
+    let mut trusted = TrustedEnvelopeIdentities::new();
+    let tip_specs: Vec<String> = tips
+        .iter()
+        .map(|tip| format!("{tip}:{}", crate::domain::meta::FILE))
+        .collect();
+    for meta in read_trusted_meta_batch(repo, &tip_specs, budget)
         .into_iter()
         .flatten()
     {
@@ -1561,7 +1584,7 @@ fn branch_trusted_envelope_identities(
             trust_meta_identity(&mut trusted, &meta);
         }
     }
-    trust_merge_source_identities(repo, &mut trusted, &mut budget);
+    trust_merge_source_identities(repo, &mut trusted, budget, history);
     trusted
 }
 
@@ -1586,19 +1609,19 @@ fn trust_merge_source_identities(
     repo: &crate::domain::repo::Repo,
     trusted: &mut TrustedEnvelopeIdentities,
     budget: &mut ProvenanceReadBudget,
+    history: HistorySelection<'_>,
 ) {
     let before = trusted.clone();
     let mut batch = Vec::with_capacity(MERGE_META_BATCH);
     note_trusted_provenance_git_process();
-    let read = repo.git_stream_split(
+    let read = history.stream(
+        repo,
         &[
             "rev-list",
             "--parents",
             "--min-parents=2",
             "--max-parents=2",
-            "--branches",
         ],
-        b'\n',
         |record| {
             let Ok(line) = std::str::from_utf8(record) else {
                 return Ok(());
@@ -2713,6 +2736,54 @@ pub fn scan_agent_repo(
     repo: &crate::domain::repo::Repo,
     plan: &ScanPlan,
 ) -> crate::Result<ScanReport> {
+    scan_agent_repo_selected(repo, plan, None)
+}
+
+/// Scan immutable publication roots without resolving live branches or tags during the scan.
+/// The caller supplies every selected commit and every annotated tag object in its tag chains.
+/// Workspace checks and repository payload exemptions retain the ordinary scanner's rules.
+pub fn scan_agent_repo_frozen(
+    repo: &crate::domain::repo::Repo,
+    commits: &[String],
+    tag_objects: &[String],
+) -> crate::Result<ScanReport> {
+    anyhow::ensure!(
+        !commits.is_empty() && commits.len() <= 4096 && tag_objects.len() <= 4096,
+        "frozen secret scan exceeds its publication root limit"
+    );
+    anyhow::ensure!(
+        commits.iter().chain(tag_objects).all(|oid| {
+            matches!(oid.len(), 40 | 64)
+                && oid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }),
+        "frozen secret scan requires full immutable object ids"
+    );
+    let local = repo.clone().local_objects_only();
+    for (objects, expected) in [(commits, "commit"), (tag_objects, "tag")] {
+        let mut count = 0;
+        local.git_cat_file_batch_check(objects.to_vec(), |oid, kind, _| {
+            anyhow::ensure!(
+                objects.get(count).is_some_and(|wanted| wanted == oid) && kind == expected,
+                "frozen secret scan contains an unavailable or mistyped object"
+            );
+            count += 1;
+            Ok(())
+        })?;
+        anyhow::ensure!(
+            count == objects.len(),
+            "frozen secret scan object check is incomplete"
+        );
+    }
+    scan_agent_repo_selected(&local, &ScanPlan::full(), Some((commits, tag_objects)))
+}
+
+fn scan_agent_repo_selected(
+    repo: &crate::domain::repo::Repo,
+    plan: &ScanPlan,
+    frozen: Option<(&[String], &[String])>,
+) -> crate::Result<ScanReport> {
     let home = crate::infra::config::agit_home().context(ScanPreparationFailure::LocalState)?;
     let allowlist = load_allowlist(&home);
     // When a vault exists but cannot be unlocked or authenticated, return an error; degrading to
@@ -2721,8 +2792,24 @@ pub fn scan_agent_repo(
     // The working tree and the history objects have to use one provenance view. Source events
     // imported by a merge appear both in the current events/** and in a history blob; supplying
     // the identity to the second pass alone still leaves the working-tree pass false-positive.
-    let tag_branches = tag_scan_branches(repo)?;
-    let branch_identities = branch_trusted_envelope_identities(repo, &tag_branches);
+    let tag_branches = match frozen {
+        Some(_) => Vec::new(),
+        None => tag_scan_branches(repo)?,
+    };
+    let revisions = plan.dest.revs();
+    let revision_args: Vec<&str> = revisions.iter().map(String::as_str).collect();
+    let (history, tags, branch_identities) = match frozen {
+        Some((commits, tag_objects)) => (
+            HistorySelection::Frozen(commits),
+            TagSelection::Objects(tag_objects),
+            trusted_envelope_identities_at(repo, commits, HistorySelection::Frozen(commits)),
+        ),
+        None => (
+            HistorySelection::Revisions(&revision_args),
+            TagSelection::Branches(&tag_branches),
+            branch_trusted_envelope_identities(repo, &tag_branches),
+        ),
+    };
     let worktree_identities = worktree_trusted_envelope_identities(repo, &branch_identities);
     let mut out = HitCollector::new();
     let mut unscanned = Unscanned::default();
@@ -2874,7 +2961,8 @@ pub fn scan_agent_repo(
             plan,
             allowlist: &allowlist,
             registered: &registered,
-            tag_branches: &tag_branches,
+            history,
+            tags,
             trusted_identities: &branch_identities,
         };
         scan_publish_objects(&context, spent, &mut out, &mut unscanned)?;
@@ -2932,7 +3020,8 @@ struct PublishScanContext<'a> {
     plan: &'a ScanPlan,
     allowlist: &'a HashSet<String>,
     registered: &'a RegisteredMatcher,
-    tag_branches: &'a [String],
+    history: HistorySelection<'a>,
+    tags: TagSelection<'a>,
     trusted_identities: &'a TrustedEnvelopeIdentities,
 }
 
@@ -2947,13 +3036,11 @@ fn scan_publish_objects(
         plan,
         allowlist,
         registered,
-        tag_branches,
+        history,
+        tags,
         trusted_identities,
     } = *context;
-    let revs = plan.dest.revs();
-    let sel: Vec<&str> = revs.iter().map(String::as_str).collect();
-
-    let estimate = estimate_object_bytes(repo, &sel, tag_branches, &plan.limits, spent)?;
+    let estimate = estimate_object_bytes(repo, history, tags, &plan.limits, spent)?;
     if estimate > plan.limits.budget_bytes {
         // **Do not scan**, and say so. Returning Ok silently is the failure this gate must not
         // have: a history that was never read reported as clean.
@@ -2968,11 +3055,14 @@ fn scan_publish_objects(
         registered,
         trusted_identities,
         lfs_remaining: std::cell::Cell::new(plan.limits.budget_bytes - estimate),
+        prepared_binary: None,
+        #[cfg(feature = "cli")]
+        prepared_remaining: None,
     };
-    scan_publish_blobs(&blobs, &sel, out, unscanned)?;
+    scan_publish_blobs(&blobs, history, out, unscanned)?;
     scan_commit_messages(
         repo,
-        &sel,
+        history,
         &plan.limits,
         allowlist,
         registered,
@@ -2984,7 +3074,7 @@ fn scan_publish_objects(
         &plan.limits,
         allowlist,
         registered,
-        tag_branches,
+        tags,
         out,
         unscanned,
     )?;
@@ -3045,14 +3135,11 @@ fn scan_publish_objects(
 /// it errors instead of allowing silently.
 fn estimate_object_bytes(
     repo: &crate::domain::repo::Repo,
-    sel: &[&str],
-    tag_branches: &[String],
+    history: HistorySelection<'_>,
+    tags: TagSelection<'_>,
     limits: &ScanLimits,
     spent: u64,
 ) -> crate::Result<u64> {
-    let mut args = vec!["rev-list", "--objects"];
-    args.extend_from_slice(sel);
-
     let mut total: u64 = spent;
     // Each entry is `(oid, did the enumeration line carry a non-empty path)`. The second half is
     // the test [`scan_publish_blobs`] uses to decide whether to read a body, so it travels with
@@ -3071,7 +3158,15 @@ fn estimate_object_bytes(
         // [`crate::domain::repo::Repo::git_cat_file_batch_check`]), so the index is "which
         // enumeration record this answer belongs to".
         let mut at = 0usize;
-        repo.git_cat_file_batch_check(oids, |_, kind, size| {
+        let expected = history.is_snapshot().then(|| oids.clone());
+        repo.git_cat_file_batch_check(oids, |oid, kind, size| {
+            if let Some(expected) = &expected {
+                anyhow::ensure!(
+                    expected.get(at).is_some_and(|item| item == oid)
+                        && matches!(kind, "blob" | "tree" | "commit" | "tag"),
+                    "prepared object estimate contains an invalid response"
+                );
+            }
             let payload = has_path.get(at).copied().unwrap_or(false);
             at += 1;
             // The ones whose bodies get read: commits ([`scan_messages`]), tags
@@ -3082,10 +3177,17 @@ fn estimate_object_bytes(
                 *total = total.saturating_add(size);
             }
             Ok(())
-        })
+        })?;
+        if let Some(expected) = &expected {
+            anyhow::ensure!(
+                at == expected.len(),
+                "prepared object estimate is incomplete"
+            );
+        }
+        Ok(())
     };
 
-    let read = repo.git_stream_split(&args, b'\n', |rec| {
+    let read = history.stream(repo, &["rev-list", "--objects"], |rec| {
         if total > limits.budget_bytes {
             over = true;
             return Err(anyhow::Error::new(BudgetSpent));
@@ -3122,7 +3224,7 @@ fn estimate_object_bytes(
     weigh(repo, &mut batch, &mut total)?;
 
     // The tag side: unreachable from a branch, so the pass above cannot see it.
-    let read = stream_tag_object_oids(repo, tag_branches, |oid| {
+    let read = stream_tag_object_oids(repo, tags, |oid| {
         if total > limits.budget_bytes {
             over = true;
             return Err(anyhow::Error::new(BudgetSpent));
@@ -3294,7 +3396,7 @@ impl std::error::Error for BudgetSpent {}
 /// order of the history.
 fn scan_publish_blobs(
     context: &BlobScanContext<'_>,
-    sel: &[&str],
+    history: HistorySelection<'_>,
     out: &mut HitCollector,
     unscanned: &mut Unscanned,
 ) -> crate::Result<()> {
@@ -3304,16 +3406,13 @@ fn scan_publish_blobs(
     if out.is_full() {
         return Ok(());
     }
-    let mut args = vec!["rev-list", "--objects"];
-    args.extend_from_slice(sel);
-    let sel = &args[..];
 
     let mut batch: Vec<String> = Vec::with_capacity(OBJECT_BATCH);
     // OID → the path shown in the report, covering **the current batch only** and cleared with
     // it.
     let mut label: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-    let read = repo.git_stream_split(sel, b'\n', |rec| {
+    let read = history.stream(repo, &["rev-list", "--objects"], |rec| {
         if out.is_full() {
             return Err(anyhow::Error::new(EnoughHits));
         }
@@ -3368,6 +3467,9 @@ struct BlobScanContext<'a> {
     registered: &'a RegisteredMatcher,
     trusted_identities: &'a TrustedEnvelopeIdentities,
     lfs_remaining: std::cell::Cell<u64>,
+    prepared_binary: Option<&'a std::cell::Cell<u64>>,
+    #[cfg(feature = "cli")]
+    prepared_remaining: Option<&'a std::cell::Cell<u64>>,
 }
 
 /// Read a batch of objects and scan the blobs among them. `batch` and `label` are cleared once
@@ -3384,10 +3486,26 @@ fn scan_blob_batch(
         return Ok(());
     }
     let oids = std::mem::take(batch);
+    #[cfg(feature = "cli")]
+    let expected = context
+        .prepared_binary
+        .map(|_| publication::checked_objects(context.repo, &oids, None))
+        .transpose()?;
+    #[cfg(feature = "cli")]
+    if let (Some(expected), Some(remaining)) = (&expected, context.prepared_remaining) {
+        publication::reserve_objects(expected, context.limits.max_object_bytes, remaining)?;
+    }
+    #[cfg(feature = "cli")]
+    let mut checked = 0;
     let cap_bytes = usize::try_from(context.limits.max_object_bytes).unwrap_or(usize::MAX);
     let read = context
         .repo
         .git_cat_file_batch(oids, cap_bytes, |oid, kind, body| {
+            #[cfg(feature = "cli")]
+            if let Some(expected) = &expected {
+                publication::check_body(expected, checked, oid, kind, &body)?;
+                checked += 1;
+            }
             // Once full, **do not even scan**: what is skipped is `scan_text_capped`, not just
             // one push.
             if out.is_full() {
@@ -3399,7 +3517,7 @@ fn scan_blob_batch(
                 // effectively removed from the scan surface, and the report calls something it
                 // never looked at clean.
                 crate::domain::repo::ObjectBody::TooLarge(n) => {
-                    if kind == "blob" || kind == "commit" {
+                    if kind == "blob" || kind == "commit" || context.prepared_binary.is_some() {
                         unscanned
                             .oversized
                             .push((oid[..oid.len().min(8)].to_string(), n as u64));
@@ -3414,6 +3532,11 @@ fn scan_blob_batch(
             // [`estimate_object_bytes`] has to count them into the budget (sharing the test:
             // the ones whose enumeration line carried a non-empty path).
             if kind != "blob" {
+                return Ok(());
+            }
+            #[cfg(feature = "cli")]
+            if let Some(binary) = context.prepared_binary {
+                publication::scan_blob_payload(context, oid, payload, label, binary, out)?;
                 return Ok(());
             }
             let mut remaining = context.lfs_remaining.get();
@@ -3472,6 +3595,15 @@ fn scan_blob_batch(
             Ok(())
         });
     label.clear();
+    #[cfg(feature = "cli")]
+    if read.is_ok()
+        && let Some(expected) = &expected
+    {
+        anyhow::ensure!(
+            checked == expected.len(),
+            "prepared object body response is incomplete"
+        );
+    }
     read.map_err(|e| {
         anyhow::anyhow!(
             "git cannot read the content of the objects to publish, so they cannot be confirmed clean: {e}"
@@ -3566,7 +3698,7 @@ fn scan_tag_objects(
     limits: &ScanLimits,
     allowlist: &HashSet<String>,
     registered: &RegisteredMatcher,
-    branches: &[String],
+    tags: TagSelection<'_>,
     out: &mut HitCollector,
     unscanned: &mut Unscanned,
 ) -> crate::Result<()> {
@@ -3577,7 +3709,7 @@ fn scan_tag_objects(
     }
 
     let mut batch: Vec<String> = Vec::with_capacity(OBJECT_BATCH);
-    let read = stream_tag_object_oids(repo, branches, |oid| {
+    let read = stream_tag_object_oids(repo, tags, |oid| {
         // Stop when full: what is skipped is the body of every tag behind this one, not just one
         // push.
         if out.is_full() {
@@ -3678,6 +3810,68 @@ fn scan_tag_batch(
     })
 }
 
+#[derive(Clone, Copy)]
+enum HistorySelection<'a> {
+    Revisions(&'a [&'a str]),
+    // Frozen roots are validated full object ids, so stdin cannot introduce revision options.
+    Frozen(&'a [String]),
+    #[cfg(feature = "cli")]
+    Snapshots(&'a [String]),
+}
+
+impl HistorySelection<'_> {
+    fn is_snapshot(self) -> bool {
+        #[cfg(feature = "cli")]
+        if matches!(self, Self::Snapshots(_)) {
+            return true;
+        }
+        false
+    }
+
+    fn stream(
+        self,
+        repo: &crate::domain::repo::Repo,
+        arguments: &[&str],
+        on_record: impl FnMut(&[u8]) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let mut arguments = arguments.to_vec();
+        #[cfg(feature = "cli")]
+        let selection = if let Self::Snapshots(roots) = self {
+            arguments.push("--no-walk");
+            Self::Frozen(roots)
+        } else {
+            self
+        };
+        #[cfg(not(feature = "cli"))]
+        let selection = self;
+        match selection {
+            Self::Revisions(revisions) => {
+                arguments.extend_from_slice(revisions);
+                repo.git_stream_split(&arguments, b'\n', on_record)
+            }
+            #[cfg(feature = "cli")]
+            Self::Snapshots(_) => unreachable!("snapshots are normalized before streaming"),
+            Self::Frozen(roots) => {
+                use std::io::{Seek, Write};
+
+                let mut input = tempfile::tempfile()?;
+                for root in roots {
+                    writeln!(input, "{root}")?;
+                }
+                input.rewind()?;
+                arguments.push("--stdin");
+                repo.git_stream_split_stdin_file(&arguments, input, b'\n', on_record)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TagSelection<'a> {
+    Branches(&'a [String]),
+    Objects(&'a [String]),
+}
+
 /// List, **as a stream**, the OIDs of the annotated tag objects reachable from these branches.
 ///
 /// The scan ([`scan_tag_objects`]) and the estimate ([`estimate_object_bytes`]) use **one**
@@ -3702,9 +3896,18 @@ fn scan_tag_batch(
 /// already enough.
 fn stream_tag_object_oids(
     repo: &crate::domain::repo::Repo,
-    branches: &[String],
+    selection: TagSelection<'_>,
     mut on_oid: impl FnMut(&str) -> crate::Result<()>,
 ) -> crate::Result<()> {
+    let branches = match selection {
+        TagSelection::Branches(branches) => branches,
+        TagSelection::Objects(objects) => {
+            for oid in objects {
+                on_oid(oid)?;
+            }
+            return Ok(());
+        }
+    };
     if branches.is_empty() {
         return Ok(());
     }
@@ -3814,7 +4017,7 @@ fn local_branches(repo: &crate::domain::repo::Repo) -> crate::Result<Vec<String>
 /// crossing a limit is said out loud ([`Unscanned`]) instead of quietly scanning a few fewer.
 fn scan_commit_messages(
     repo: &crate::domain::repo::Repo,
-    sel: &[&str],
+    history: HistorySelection<'_>,
     limits: &ScanLimits,
     allowlist: &HashSet<String>,
     registered: &RegisteredMatcher,
@@ -3825,7 +4028,7 @@ fn scan_commit_messages(
     // — the selector is `--branches` and never touches HEAD. After `git checkout --orphan`,
     // unpushed commits on other branches are pushed all the same.
     assert_repo_readable(repo)?;
-    scan_messages(repo, sel, limits, allowlist, registered, out, unscanned)
+    scan_messages(repo, history, limits, allowlist, registered, out, unscanned)
 }
 
 /// `git rev-list <sel>` for the OIDs, `git cat-file --batch` to read each **raw body** and scan
@@ -3847,7 +4050,7 @@ fn scan_commit_messages(
 /// test.
 fn scan_messages(
     repo: &crate::domain::repo::Repo,
-    sel: &[&str],
+    history: HistorySelection<'_>,
     limits: &ScanLimits,
     allowlist: &HashSet<String>,
     registered: &RegisteredMatcher,
@@ -3860,8 +4063,6 @@ fn scan_messages(
     if out.is_full() {
         return Ok(());
     }
-    let mut args = vec!["rev-list"];
-    args.extend_from_slice(sel);
     // Read the OIDs **as a stream**, keeping the whole stdout out of memory: without a "scan only
     // the most recent few hundred" cap, `rev-list`'s output grows linearly with the history.
     //
@@ -3871,20 +4072,26 @@ fn scan_messages(
     // argument errors outright, and swallowing that would take the whole commit scan out
     // silently.
     let mut oids: Vec<String> = Vec::new();
-    repo.git_stream_split(&args, b'\n', |rec| {
-        let oid = String::from_utf8_lossy(rec);
-        let oid = oid.trim();
-        if !oid.is_empty() {
-            oids.push(oid.to_string());
-        }
-        Ok(())
-    })
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "git rev-list {} cannot be read, so the history cannot be confirmed clean: {e}",
-            sel.join(" ")
-        )
-    })?;
+    history
+        .stream(repo, &["rev-list"], |rec| {
+            let oid = String::from_utf8_lossy(rec);
+            let oid = oid.trim();
+            if !oid.is_empty() {
+                oids.push(oid.to_string());
+            }
+            Ok(())
+        })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "git rev-list {} cannot be read, so the history cannot be confirmed clean: {e}",
+                match history {
+                    HistorySelection::Revisions(revisions) => revisions.join(" "),
+                    HistorySelection::Frozen(_) => "frozen publication roots".into(),
+                    #[cfg(feature = "cli")]
+                    HistorySelection::Snapshots(_) => "captured publication snapshots".into(),
+                }
+            )
+        })?;
 
     // Read the **raw commit body** (every header line + the blank line + the message), not a
     // projection of a few chosen fields.
@@ -3956,7 +4163,12 @@ fn scan_messages(
     .map_err(|e| {
         anyhow::anyhow!(
             "git cat-file cannot read the commit bodies on {}, so the history cannot be confirmed clean: {e}",
-            sel.join(" ")
+            match history {
+                HistorySelection::Revisions(revisions) => revisions.join(" "),
+                HistorySelection::Frozen(_) => "frozen publication roots".into(),
+                    #[cfg(feature = "cli")]
+                    HistorySelection::Snapshots(_) => "captured publication snapshots".into(),
+            }
         )
     })
 }
@@ -4127,7 +4339,7 @@ mod tests {
             &ScanLimits::DEFAULT,
             allowlist,
             &RegisteredMatcher::default(),
-            branches,
+            TagSelection::Branches(branches),
             &mut out,
             &mut unscanned,
         )?;
@@ -4144,7 +4356,7 @@ mod tests {
         let sel: Vec<&str> = revs.iter().map(String::as_str).collect();
         scan_commit_messages(
             repo,
-            &sel,
+            HistorySelection::Revisions(&sel),
             &ScanLimits::DEFAULT,
             allowlist,
             &RegisteredMatcher::default(),
@@ -4163,7 +4375,7 @@ mod tests {
         let mut unscanned = Unscanned::default();
         scan_messages(
             repo,
-            sel,
+            HistorySelection::Revisions(sel),
             &ScanLimits::DEFAULT,
             allowlist,
             &RegisteredMatcher::default(),
@@ -7896,6 +8108,168 @@ mod tests {
         }
     }
 
+    /// Moving live refs away from a disclosure cannot change the frozen scan's input.
+    #[test]
+    fn frozen_publication_scans_retained_commit_blob_and_tag_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let run = git_in(directory.path());
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "Audit fixture"]);
+        run(&["config", "user.email", "audit@example.invalid"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "tag.gpgsign", "false"]);
+        run(&["commit", "--allow-empty", "-qm", "clean base"]);
+        let base = run(&["rev-parse", "HEAD"]);
+        std::fs::write(
+            directory.path().join("payload.txt"),
+            format!("key = {AWS}\n"),
+        )
+        .unwrap();
+        run(&["add", "payload.txt"]);
+        run(&["commit", "-qm", &format!("disclosure {AWS}")]);
+        let reviewed = run(&["rev-parse", "HEAD"]);
+        run(&[
+            "tag",
+            "-a",
+            "version",
+            "-m",
+            &format!("tag disclosure {AWS}"),
+        ]);
+        let tag = run(&["rev-parse", "refs/tags/version"]);
+        run(&["reset", "--hard", &base]);
+        run(&["update-ref", "refs/tags/version", &base, &tag]);
+        let repo = crate::domain::repo::Repo::at(directory.path());
+        assert!(
+            scan_agent_repo(&repo, &ScanPlan::full())
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+
+        let report = scan_agent_repo_frozen(&repo, &[reviewed], &[tag]).unwrap();
+        assert!(report.unscanned.is_empty());
+        for carrier in [Source::CommitObject, Source::BlobObject, Source::TagObject] {
+            assert!(
+                report.hits.iter().any(|hit| hit.source == carrier),
+                "every immutable carrier must reach the scanner: {carrier:?}"
+            );
+        }
+        assert_eq!(run(&["rev-parse", "HEAD"]), base);
+        assert_eq!(run(&["rev-parse", "refs/tags/version"]), base);
+        assert!(run(&["status", "--porcelain"]).is_empty());
+    }
+
+    /// Root validation must not turn missing or mistyped immutable objects into an empty scan.
+    #[test]
+    fn frozen_publication_rejects_unavailable_and_mistyped_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let run = git_in(directory.path());
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "Audit fixture"]);
+        run(&["config", "user.email", "audit@example.invalid"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["commit", "--allow-empty", "-qm", "clean base"]);
+        let head = run(&["rev-parse", "HEAD"]);
+        let tree = run(&["rev-parse", "HEAD^{tree}"]);
+        let repo = crate::domain::repo::Repo::at(directory.path());
+        assert!(scan_agent_repo_frozen(&repo, &[], &[]).is_err());
+        for invalid in [
+            "--all".into(),
+            "--not".into(),
+            format!("^{head}"),
+            format!("{head}\n--all"),
+            format!("{head} payload.txt"),
+        ] {
+            assert!(scan_agent_repo_frozen(&repo, &[invalid], &[]).is_err());
+        }
+        assert!(scan_agent_repo_frozen(&repo, &["0".repeat(40)], &[]).is_err());
+        assert!(scan_agent_repo_frozen(&repo, &[tree], &[]).is_err());
+        assert!(
+            scan_agent_repo_frozen(
+                &repo,
+                std::slice::from_ref(&head),
+                std::slice::from_ref(&head)
+            )
+            .is_err()
+        );
+        let report = scan_agent_repo_frozen(&repo, &[head], &[]).unwrap();
+        assert!(report.hits.is_empty() && report.unscanned.is_empty());
+    }
+
+    /// Every captured root must reach the scan even when argv cannot hold the publication set.
+    #[test]
+    fn frozen_publication_streams_roots_beyond_windows_argument_limit() {
+        use std::io::{Seek, Write};
+
+        let directory = tempfile::tempdir().unwrap();
+        let run = git_in(directory.path());
+        run(&["init", "-q", "--object-format=sha1", "-b", "main"]);
+        run(&["config", "user.name", "Audit fixture"]);
+        run(&["config", "user.email", "audit@example.invalid"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["commit", "--allow-empty", "-qm", "clean base"]);
+        let base = run(&["rev-parse", "HEAD"]);
+        let tree = run(&["rev-parse", "HEAD^{tree}"]);
+        let repo = crate::domain::repo::Repo::at(directory.path());
+        let mut paths = tempfile::tempfile().unwrap();
+        for index in 0..1000 {
+            let path = format!(".git/frozen-root-{index}");
+            let message = if matches!(index, 699 | 999) {
+                format!("disclosure {index} {AWS}")
+            } else {
+                format!("clean root {index}")
+            };
+            std::fs::write(
+                directory.path().join(&path),
+                format!(
+                    "tree {tree}\nparent {base}\nauthor Audit fixture <audit@example.invalid> 1700000000 +0000\ncommitter Audit fixture <audit@example.invalid> 1700000000 +0000\n\n{message}\n"
+                ),
+            )
+            .unwrap();
+            writeln!(paths, "{path}").unwrap();
+        }
+        paths.rewind().unwrap();
+        let stored = repo
+            .git_with_stdin_file(
+                &[
+                    "hash-object",
+                    "-w",
+                    "-t",
+                    "commit",
+                    "--stdin-paths",
+                    "--no-filters",
+                ],
+                paths,
+            )
+            .unwrap();
+        let mut roots = vec![base.clone()];
+        roots.extend(stored.lines().map(str::to_owned));
+        assert_eq!(roots.len(), 1001);
+
+        let mut enumerated = HashSet::new();
+        HistorySelection::Frozen(&roots)
+            .stream(&repo, &["rev-list", "--no-walk"], |record| {
+                enumerated.insert(std::str::from_utf8(record)?.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(enumerated, roots.iter().cloned().collect());
+
+        for (count, exceeds_argument_limit) in [(701, false), (1001, true)] {
+            let selected = &roots[..count];
+            let argument_units: usize = selected.iter().map(|oid| oid.len() + 1).sum();
+            assert_eq!(argument_units > 32767, exceeds_argument_limit);
+            let report = scan_agent_repo_frozen(&repo, selected, &[]).unwrap();
+            assert!(report.unscanned.is_empty());
+            let last = format!("commit object {}", &selected.last().unwrap()[..8]);
+            assert!(report.hits.iter().any(|hit| {
+                hit.source == Source::CommitObject && hit.file.as_deref() == Some(last.as_str())
+            }));
+        }
+        assert_eq!(run(&["rev-parse", "HEAD"]), base);
+        assert!(run(&["status", "--porcelain"]).is_empty());
+    }
+
     /// The branch tips the destination itself reports — in production from
     /// `git ls-remote --heads`, and here the same question asked of a local bare repo.
     fn ask(hub: &std::path::Path) -> Vec<String> {
@@ -8119,8 +8493,14 @@ mod tests {
         let revs = Destination::Unknown.revs();
         let sel: Vec<&str> = revs.iter().map(String::as_str).collect();
         let branches = local_branches(&repo).expect("the repo is healthy");
-        let total = estimate_object_bytes(&repo, &sel, &branches, &ScanLimits::DEFAULT, 0)
-            .expect("the repo is healthy");
+        let total = estimate_object_bytes(
+            &repo,
+            HistorySelection::Revisions(&sel),
+            TagSelection::Branches(&branches),
+            &ScanLimits::DEFAULT,
+            0,
+        )
+        .expect("the repo is healthy");
         assert!(
             total > 0 && total < ScanLimits::DEFAULT.budget_bytes,
             "precondition: this history is inside the default budget (estimated {total} bytes)"
@@ -8220,8 +8600,14 @@ mod tests {
         let revs = Destination::Unknown.revs();
         let sel: Vec<&str> = revs.iter().map(String::as_str).collect();
         let branches = local_branches(&repo).expect("the repo is healthy");
-        let estimate = estimate_object_bytes(&repo, &sel, &branches, &ScanLimits::DEFAULT, 0)
-            .expect("the repo is healthy");
+        let estimate = estimate_object_bytes(
+            &repo,
+            HistorySelection::Revisions(&sel),
+            TagSelection::Branches(&branches),
+            &ScanLimits::DEFAULT,
+            0,
+        )
+        .expect("the repo is healthy");
         assert!(
             estimate >= wide_bytes,
             "that tree's {wide_bytes} bytes stream through cat-file in full while the estimate is only {estimate}"
@@ -8295,8 +8681,14 @@ mod tests {
         let revs = Destination::Unknown.revs();
         let sel: Vec<&str> = revs.iter().map(String::as_str).collect();
         let branches = local_branches(&repo).expect("the repo is healthy");
-        let estimate = estimate_object_bytes(&repo, &sel, &branches, &ScanLimits::DEFAULT, 0)
-            .expect("the repo is healthy");
+        let estimate = estimate_object_bytes(
+            &repo,
+            HistorySelection::Revisions(&sel),
+            TagSelection::Branches(&branches),
+            &ScanLimits::DEFAULT,
+            0,
+        )
+        .expect("the repo is healthy");
         assert!(
             estimate < root_bytes,
             "nobody reads the root tree ({root_bytes} bytes), so it does not go into the budget; estimate {estimate}"

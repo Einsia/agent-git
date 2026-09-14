@@ -73,6 +73,11 @@ pub mod hub;
 /// RC wire protocol shared with the hub and viewers. Not feature-gated: the
 /// backend compiles against it with `default-features = false`.
 pub mod protocol;
+#[cfg(all(test, feature = "cli"))]
+#[path = "../tests/support/publication_process.rs"]
+mod publication_test_process;
+#[cfg(all(test, feature = "cli", windows))]
+use crate::rc::windows_job as publication_windows_job;
 /// `agit rc` — the resident daemon (`agitd`). Behind the `rc` feature so the
 /// backend's `default-features = false` import stays free of tokio and TLS.
 #[cfg(feature = "rc")]
