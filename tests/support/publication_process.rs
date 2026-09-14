@@ -1,7 +1,6 @@
 //! A publication fixture owns its child tree until both output pipes close and cleanup is verified.
 
-use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, PipeReader, Read};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -113,7 +112,7 @@ impl Drop for Process {
 }
 
 #[cfg(unix)]
-fn read_ready(file: &mut File, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+fn read_ready(file: &mut PipeReader, buffer: &mut [u8]) -> io::Result<Option<usize>> {
     use std::os::fd::AsRawFd;
     let mut fd = libc::pollfd {
         fd: file.as_raw_fd(),
@@ -132,7 +131,7 @@ fn read_ready(file: &mut File, buffer: &mut [u8]) -> io::Result<Option<usize>> {
 }
 
 #[cfg(windows)]
-fn read_ready(file: &mut File, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+fn read_ready(file: &mut PipeReader, buffer: &mut [u8]) -> io::Result<Option<usize>> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
@@ -160,7 +159,9 @@ fn read_ready(file: &mut File, buffer: &mut [u8]) -> io::Result<Option<usize>> {
     }
     // Peek and read share a sole reader, so this read cannot wait for additional bytes.
     let count = buffer.len().min(available as usize);
-    file.read(&mut buffer[..count]).map(Some)
+    // An empty Windows pipe write can complete a read without closing the writer.
+    file.read(&mut buffer[..count])
+        .map(|count| (count != 0).then_some(count))
 }
 
 #[derive(Default)]
@@ -172,7 +173,7 @@ struct Streams {
 }
 
 fn drain_one(
-    file: &mut File,
+    file: &mut PipeReader,
     bytes: &mut Vec<u8>,
     closed: &mut bool,
     remaining: usize,
@@ -207,10 +208,13 @@ fn capture(command: Command, mode: &str, stage: &str, deadline: Instant) -> io::
             "mode deadline elapsed before spawn",
         ));
     }
+    // Readiness polling requires synchronous handles with no outstanding asynchronous reads.
+    let (mut stdout, stdout_writer) = io::pipe()?;
+    let (mut stderr, stderr_writer) = io::pipe()?;
     let mut command = tokio::process::Command::from(command);
     command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(stdout_writer)
+        .stderr(stderr_writer)
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
@@ -219,6 +223,8 @@ fn capture(command: Command, mode: &str, stage: &str, deadline: Instant) -> io::
     #[cfg(windows)]
     windows_job::Job::configure(&mut command);
     let child = command.spawn()?;
+    // The observer must not retain writers after spawn or EOF cannot prove child closure.
+    drop(command);
     let pid = child.id().expect("a newly spawned child has a process ID");
     let mut tree = Process {
         child,
@@ -232,18 +238,6 @@ fn capture(command: Command, mode: &str, stage: &str, deadline: Instant) -> io::
     let result = (|| {
         #[cfg(windows)]
         tree.job.as_ref().unwrap().attach_and_resume(&tree.child)?;
-        let stdout = tree.child.stdout.take().expect("stdout is piped");
-        let stderr = tree.child.stderr.take().expect("stderr is piped");
-        #[cfg(unix)]
-        let (mut stdout, mut stderr) = (
-            File::from(stdout.into_owned_fd()?),
-            File::from(stderr.into_owned_fd()?),
-        );
-        #[cfg(windows)]
-        let (mut stdout, mut stderr) = (
-            File::from(stdout.into_owned_handle()?),
-            File::from(stderr.into_owned_handle()?),
-        );
         loop {
             // Check time even when the child continually supplies ready output.
             if Instant::now() >= deadline {
@@ -359,6 +353,49 @@ fn diagnostic_command(kind: &str) -> Command {
         .env("AGIT_PUBLICATION_DIAGNOSTIC_CHILD", kind)
         .stdin(Stdio::null());
     command
+}
+
+#[cfg(windows)]
+#[test]
+fn empty_pipe_writes_do_not_end_capture_while_a_writer_remains() {
+    use std::io::Write;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+    let (mut reader, mut writer) = io::pipe().unwrap();
+    writer.write_all(b"before").unwrap();
+    let mut written = 0;
+    assert_ne!(
+        unsafe {
+            WriteFile(
+                writer.as_raw_handle(),
+                b"".as_ptr(),
+                0,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    writer.write_all(b"after").unwrap();
+    let deadline = Instant::now() + CHILD_LIMIT;
+    let mut captured = Vec::new();
+    let mut buffer = [0; 3];
+    while captured.len() < b"beforeafter".len() {
+        assert!(
+            Instant::now() < deadline,
+            "pipe data did not become readable"
+        );
+        match read_ready(&mut reader, &mut buffer).unwrap() {
+            Some(0) => panic!("an open writer was reported as EOF"),
+            Some(count) => captured.extend_from_slice(&buffer[..count]),
+            None => std::thread::yield_now(),
+        }
+    }
+    assert_eq!(captured, b"beforeafter");
+    assert_eq!(read_ready(&mut reader, &mut buffer).unwrap(), None);
+    drop(writer);
+    assert_eq!(read_ready(&mut reader, &mut buffer).unwrap(), Some(0));
 }
 
 #[test]
