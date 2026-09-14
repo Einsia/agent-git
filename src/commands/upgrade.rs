@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn startup_nudge_is_only_for_interactive_user_commands() {
-        assert!(startup_nudge_allowed("open", false, false, false, true));
+        assert!(startup_nudge_allowed("run", false, false, false, true));
         assert!(startup_nudge_allowed("resume", false, false, false, true));
         assert!(startup_nudge_allowed("push", false, false, false, true));
         assert!(!startup_nudge_allowed("search", false, false, false, false));
@@ -529,8 +529,8 @@ mod tests {
         ] {
             assert!(!startup_nudge_allowed(command, false, false, false, true));
         }
-        assert!(!startup_nudge_allowed("open", true, false, false, true));
-        assert!(!startup_nudge_allowed("open", false, true, false, true));
-        assert!(!startup_nudge_allowed("open", false, false, true, true));
+        assert!(!startup_nudge_allowed("run", true, false, false, true));
+        assert!(!startup_nudge_allowed("run", false, true, false, true));
+        assert!(!startup_nudge_allowed("run", false, false, true, true));
     }
 }

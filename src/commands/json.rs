@@ -376,11 +376,7 @@ pub fn command_from_argv(args: &[std::ffi::OsString]) -> String {
         if arg.starts_with('-') {
             continue;
         }
-        return if arg == "run" {
-            "open".to_owned()
-        } else {
-            arg.into_owned()
-        };
+        return arg.into_owned();
     }
     "cli".to_string()
 }

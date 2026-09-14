@@ -103,7 +103,7 @@ session and records its claim; it is not a read-only preview.
 | Import an existing Codex/Claude conversation | `agit import <runtime-id> --from <runtime> --repo <owner/repo> -b <branch>` | Chooses lineage, then adopts and settles the transcript |
 | Open a line from an old point | `agit fork <source> -b <branch>` | Creates a branch; add `--resume` to start it |
 | Continue an existing session | `agit resume <owner/repo>@<branch>` | Restores that session's VIEW and starts it; never forks |
-| Open a branch or saved point | `agit open <owner/repo>@<ref>` | Continues a writable branch head; forks other saved points (`run` is an alias) |
+| Open a branch or saved point | `agit run <owner/repo>@<ref>` | Continues a writable branch head; forks other saved points |
 | Save completed turns | `agit commit <owner/repo>@<branch>` | Records completed pending turns; an in-progress turn waits for settlement after it ends |
 | Edit shared files on the file line (README.md, AGENTS.md, memory/, skills/) | `agit commit <owner/repo>@main -m "<msg>" [-- <path>...]` | Pure file commit on `main`; needs no session; publish with `agit push <owner/repo> -b main` |
 | Publish local history | `agit push <owner/repo>@<branch>` | Scans secrets, then publishes existing refs |
@@ -186,7 +186,7 @@ agit push <owner/repo> -b main                         # publish the file line
 | `clone` | Fetch an existing Agent repo; read-only by default, `--mine` makes a copy in your namespace |
 | `repo` | Manage repo create/list/info/visibility/collaborators/rename/delete/path |
 | `new` | Create an empty session branch in a selected repo |
-| `open` | Open a branch or saved point, continuing a writable head or forking; `run` is a compatibility alias |
+| `run` | Open a branch or saved point, continuing a writable head or forking |
 | `resume` | Strictly continue an existing writable session branch |
 
 ### Adoption, context, and sessions

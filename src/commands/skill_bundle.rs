@@ -57,7 +57,7 @@ pub const SUBSKILLS: &[(&str, &str)] = subskills![
     "memory",
     "merge",
     "new",
-    "open",
+    "run",
     "pr",
     "pull",
     "push",
@@ -147,7 +147,7 @@ mod tests {
             }
         }
         for command in [
-            "import", "commit", "search", "new", "resume", "open", "merge",
+            "import", "commit", "search", "new", "resume", "run", "merge",
         ] {
             assert!(
                 commands.contains(command),

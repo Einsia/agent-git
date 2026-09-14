@@ -315,7 +315,7 @@ fn list(repo: &Repo, slug: &str, verbose: bool, all: bool) -> CmdResult {
     let local: Vec<_> = rows.iter().filter(|row| row.local).collect();
     if local.is_empty() {
         println!("{slug} has no branches yet.");
-        ui::hint("branches are born via `agit import` / `fork` / `new` / `open`");
+        ui::hint("branches are born via `agit import` / `fork` / `new` / `run`");
     }
     for row in local {
         let star = if row.current { "*" } else { " " };

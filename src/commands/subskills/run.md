@@ -1,19 +1,19 @@
 ---
-name: agit-open
+name: agit-run
 description: Fetch any frozen ref, decide whether to resume or fork, and start a runtime.
 ---
 
-# agit open
+# agit run
 
 ## Purpose
 
-Open a branch, tag, historical commit, or turn ref. The command fetches or locates the ref, resumes only a writable unsealed session-branch head, and forks all other refs. `agit run` remains a compatibility alias.
+Open a branch, tag, historical commit, or turn ref. The command fetches or locates the ref, resumes only a writable unsealed session-branch head, and forks all other refs.
 
 ## Synopsis
 
 ```bash
-agit open <owner/repo>@<ref> [options]
-agit open <local-ref> [options]
+agit run <owner/repo>@<ref> [options]
+agit run <local-ref> [options]
 ```
 
 ## Options
@@ -36,13 +36,13 @@ agit open <local-ref> [options]
 ## Examples
 
 ```bash
-agit open szh/p1@version0 -b experiment --no-launch
-agit open szh/p1@feature-x
-agit open alice/notes@v2 --mine -b my-v2 --as codex
+agit run szh/p1@version0 -b experiment --no-launch
+agit run szh/p1@feature-x
+agit run alice/notes@v2 --mine -b my-v2 --as codex
 ```
 
 Use `resume` when you know the session should continue, and `fork` when you know an old point should start a new line.
 
-Both spellings report the canonical command name `open` in `--json` output. The new local session is writable; the source checkpoint remains unchanged. Opening another author's source does not create a repository in your Hub namespace unless `--mine` is explicit.
+The command reports `run` in `--json` output. The new local session is writable; the source checkpoint remains unchanged. Opening another author's source does not create a repository in your Hub namespace unless `--mine` is explicit.
 
 `--no-launch` performs the preparation; it is not a dry run. Repeating the same preparation reuses its runtime session. If the branch advances, an untouched prepared session is retained as superseded history and replaced; a session with unsettled content must be committed or forked before another materialization can take its claim.

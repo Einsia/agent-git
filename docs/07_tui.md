@@ -108,9 +108,9 @@ result both leave a trace.
 ### 3.1 Bare `agit` / `agit resume` — which one to continue
 
 `resume` continues an existing local session and never creates a fork. To start
-from a tag, historical point or another author's source, use `agit open <ref>`;
+from a tag, historical point or another author's source, use `agit run <ref>`;
 it continues a writable session head when possible and otherwise creates a new
-writable session. `agit run` remains a hidden compatibility alias for `open`.
+writable session.
 
 ```text
 ┌ agit ── nana @ agent-git.com ── rc: online ── ⚠ 2 unnamed ───────────┐

@@ -18,13 +18,12 @@ agit import                       choose an existing runtime conversation to ado
 agit log                          choose a session and browse its history
 agit push                         choose a saved session to publish
 agit share                        choose a session and review link settings
-agit open owner/repo@ref           open a saved source, forking when needed
+agit run owner/repo@ref           open a saved source, forking when needed
 ```
 
 These bare commands open their interfaces in a human terminal. `agit resume`
-continues the same session and never forks; `agit open` can start a new writable
-session from a tag, historical point or another author's source. `agit run`
-remains a compatibility alias for `open`.
+continues the same session and never forks; `agit run` can start a new writable
+session from a tag, historical point or another author's source.
 
 Inside an adopted agent session, `agit commit` saves completed turns and
 `agit push` publishes that session. For scripts, pass the target explicitly,
@@ -47,7 +46,7 @@ Inspecting lineage in an existing repository requires NUL-framed Git worktree ou
 normally available in Git 2.36 or newer. An unsupported Git reports `git_worktree_format`;
 explicit `--onto`, `--independent`, and `--link-only` imports retain their ordinary checks.
 
-`agit clone` fetches repository history locally. Use `agit open` or `agit resume`
+`agit clone` fetches repository history locally. Use `agit run` or `agit resume`
 to start a runtime. A clone is **read-only by default** on the Hub: nothing is
 created in your name and `origin` points at the source. `agit clone --mine`
 creates your copy, repoints `origin` and remembers the source as `upstream`.

@@ -7,7 +7,7 @@ description: Strictly resume a writable session branch.
 
 ## Purpose
 
-Continue the current head of an existing branch. It does not turn a tag, historical commit, sealed branch, or someone else's branch into a new line; use `fork` or `open` for those cases.
+Continue the current head of an existing branch. It does not turn a tag, historical commit, sealed branch, or someone else's branch into a new line; use `fork` or `run` for those cases.
 
 ## Synopsis
 

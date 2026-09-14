@@ -7,7 +7,7 @@ to verify it; it is not a list of proposed future changes.
 | Requirement | Current behavior | Evidence |
 | --- | --- | --- |
 | Basic human commands and intuitive omitted targets | `agit` chooses a session; push/log/share use transient selection; explicit flags remain available | `tests/tui_session_picker.rs`, `tests/mutation_context.rs`, `tests/explicit_push_target.rs` |
-| Distinguish opening a source from continuation | `open` is canonical, `run` is a compatible alias, `resume` continues without creating a fork | `commands::json_cli_tests`, CLI help, bundled open/resume references |
+| Distinguish opening a source from continuation | `run` starts from a saved source, `resume` continues without creating a fork | `commands::json_cli_tests`, CLI help, bundled run/resume references |
 | Remove shared implicit branch selection | `switch` is removed; workspace/native discovery does not select an existing-session target | `tests/at_ref_session_context.rs`, `tests/explicit_session_reads.rs`, `commands::context` tests |
 | Agent-readable Skill and prompt injection | Valid YAML, executable command examples, explicit follow-up targets, current project injection | `commands::skill_bundle` contract tests, `tests/skill_agent_flow.rs`, independent YAML parsing |
 | Noninteractive output and JSON option | Stable envelope; typed status/config/history/ref/search data; partial failures remain observable | `tests/status_json_fields.rs`, `tests/config_json_fields.rs`, `tests/history_json.rs`, `tests/search_json.rs`, `tests/json_stream_contract.rs` |

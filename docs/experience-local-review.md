@@ -14,13 +14,12 @@ implementation below.
 | --- | --- |
 | Choose a conversation to continue | `agit` or `agit resume` |
 | Start a fresh conversation | `agit new` |
-| Open a saved source, continuing or forking as appropriate | `agit open <owner/repo>@<ref>` |
+| Open a saved source, continuing or forking as appropriate | `agit run <owner/repo>@<ref>` |
 | Continue the exact local session lineage | `agit resume <owner/repo>@<branch>` |
 | Inspect or publish a selected session from a terminal | `agit log`, `agit push`, `agit share` |
 | Address the agent's own session explicitly | `agit commit <owner/repo>@<branch>` |
 
-`run` remains a hidden compatibility alias for `open`. `switch` and directory
-branch pins are removed. Existing-session commands require an explicit target
+`switch` and directory branch pins are removed. Existing-session commands require an explicit target
 or a valid `AGIT_SESSION`; a workspace binding, a discovered runtime ID, or the
 only repo on a machine does not silently choose the target. A runtime ID checks
 whether an inherited environment is stale. Its store link is read directly

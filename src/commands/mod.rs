@@ -1222,7 +1222,7 @@ use clap::{Parser, Subcommand};
     long_about = "agit is git for agent sessions: a repo holds one agent's sessions plus shared \
                   memory/skills, a branch is one session, a commit is one user turn.\n\n\
                   Start with `agit` to choose a session. Use `new` for a fresh conversation, \
-                  `resume` to continue one, and `open <ref>` to start from a saved source.\n\n\
+                  `resume` to continue one, and `run <ref>` to start from a saved source.\n\n\
                   Daily commands: import, log, commit, push, share.",
     propagate_version = true
 )]
@@ -1285,10 +1285,10 @@ pub enum Commands {
     // ── Repositories ────────────────────────────────────────────────
     /// Create an agent repo: the main file line + scaffolding (memory/ skills/ AGENTS.md), bound to this directory
     Init(init::Args),
-    /// Fetch a repo locally; use open or resume to start a session
+    /// Fetch a repo locally; use run or resume to start a session
     Clone(clone::Args),
     /// Open a saved source: continue a writable session or fork a new one when needed
-    #[command(name = "open", alias = "run")]
+    #[command(name = "run")]
     Run(run::Args),
     /// Repo administration: create/list/info/visibility/collab/rename/delete/path
     Repo(repo::Args),
@@ -1390,7 +1390,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Config(_) => "config",
         Commands::Init(_) => "init",
         Commands::Clone(_) => "clone",
-        Commands::Run(_) => "open",
+        Commands::Run(_) => "run",
         Commands::Repo(_) => "repo",
         Commands::Import(_) => "import",
         Commands::Status(_) => "status",
@@ -1478,23 +1478,22 @@ mod json_cli_tests {
     }
 
     #[test]
-    fn open_is_canonical_and_run_remains_a_compatible_alias() {
-        for spelling in ["open", "run"] {
-            let command = command_of(vec!["agit", spelling, "me/repo@v1", "--no-launch"]);
-            assert!(matches!(command, Commands::Run(_)));
-            assert_eq!(command_name(&command), "open");
-            assert_eq!(
-                json::command_from_argv(&["agit".into(), spelling.into()]),
-                "open"
-            );
-        }
+    fn run_is_the_only_saved_source_command() {
+        let command = command_of(vec!["agit", "run", "me/repo@v1", "--no-launch"]);
+        assert!(matches!(command, Commands::Run(_)));
+        assert_eq!(command_name(&command), "run");
+        assert_eq!(
+            json::command_from_argv(&["agit".into(), "run".into()]),
+            "run"
+        );
+        assert!(Cli::try_parse_from(["agit", "open", "me/repo@v1"]).is_err());
         let names: Vec<_> = cli_def()
             .get_subcommands()
             .filter(|command| !command.is_hide_set())
             .map(|command| command.get_name().to_string())
             .collect();
-        assert!(names.iter().any(|name| name == "open"));
-        assert!(!names.iter().any(|name| name == "run" || name == "switch"));
+        assert!(names.iter().any(|name| name == "run"));
+        assert!(!names.iter().any(|name| name == "open" || name == "switch"));
     }
 
     #[test]

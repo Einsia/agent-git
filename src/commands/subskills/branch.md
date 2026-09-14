@@ -43,7 +43,7 @@ agit branch --repo alice/payments seal handoff
 agit branch --repo alice/payments rm --force scratch
 ```
 
-Before removing or sealing a branch, save any needed ref with `agit log`/`agit show`. After sealing, `agit open` takes the fork path instead of treating it as writable.
+Before removing or sealing a branch, save any needed ref with `agit log`/`agit show`. After sealing, `agit run` takes the fork path instead of treating it as writable.
 
 ## Structured listing
 
