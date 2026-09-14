@@ -39,4 +39,7 @@ if ($Suite -eq 'integration') {
         & cargo test --locked --target $target --test $test
         if ($LASTEXITCODE -ne 0) { throw "Windows custom harness failed: $test" }
     }
+    $env:AGIT_NPM_SMOKE_BINARY = (Resolve-Path "target/$target/debug/agit.exe").Path
+    & node npm/smoke.mjs
+    if ($LASTEXITCODE -ne 0) { throw 'Windows npm installation smoke test failed' }
 }

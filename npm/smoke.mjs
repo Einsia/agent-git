@@ -26,6 +26,7 @@ import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { protectWindowsSmokeHome } from '../scripts/windows-smoke-home.mjs'
 
 const require = createRequire(import.meta.url)
 const platform = require('./lib/platform.js')
@@ -52,6 +53,7 @@ if (!key) {
 const work = mkdtempSync(join(tmpdir(), 'agit-npm-smoke-'))
 const nm = join(work, 'node_modules', '@einsia')
 const home = join(work, 'home')
+protectWindowsSmokeHome(work)
 mkdirSync(home, { recursive: true })
 const env = { ...process.env, HOME: home, USERPROFILE: home, AGIT_HOME: join(home, '.agit'),
   CODEX_HOME: join(home, '.codex'), CLAUDE_CONFIG_DIR: join(home, '.claude'),
@@ -128,11 +130,14 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
       existsSync(join(home, '.claude', 'skills', 'agit', 'SKILL.md')) ||
       existsSync(join(home, '.claude', 'agents.md')) ||
       existsSync(join(home, 'AGENTS.md')))
-    const saved = JSON.parse(readFileSync(preferences, 'utf8'))
-    check('npm yes enables statistics after a visible notice', saved.preference === 'enabled' && saved.decision_source === 'create_agit_yes' && r.stderr.includes('agit telemetry disable'), r.stderr)
-    spawnSync(installed, ['telemetry', 'disable'], { env, encoding: 'utf8' })
-    const again = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env, encoding: 'utf8', cwd: home })
-    check('reinstallation with npm yes preserves an opt-out', again.status === 0 && JSON.parse(readFileSync(preferences, 'utf8')).preference === 'disabled', again.stderr)
+    check('setup persists usage-statistics preferences', existsSync(preferences), r.stderr)
+    if (existsSync(preferences)) {
+      const saved = JSON.parse(readFileSync(preferences, 'utf8'))
+      check('npm yes enables statistics after a visible notice', saved.preference === 'enabled' && saved.decision_source === 'create_agit_yes' && r.stderr.includes('agit telemetry disable'), r.stderr)
+      spawnSync(installed, ['telemetry', 'disable'], { env, encoding: 'utf8' })
+      const again = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env, encoding: 'utf8', cwd: home })
+      check('reinstallation with npm yes preserves an opt-out', again.status === 0 && JSON.parse(readFileSync(preferences, 'utf8')).preference === 'disabled', again.stderr)
+    }
   }
 }
 

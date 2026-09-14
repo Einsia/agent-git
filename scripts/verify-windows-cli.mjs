@@ -4,6 +4,7 @@ import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { protectWindowsSmokeHome } from './windows-smoke-home.mjs'
 
 const binary = resolve(process.argv[2])
 const bytes = readFileSync(binary)
@@ -16,17 +17,7 @@ assert.equal(bytes.readUInt16LE(pe + 4), 0x8664, 'Windows artifact must target x
 assert.equal(process.platform, 'win32', 'Windows smoke tests require a native Windows host')
 const home = mkdtempSync(join(tmpdir(), 'agit-windows-smoke-'))
 try {
-  const protect = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `
-    $ErrorActionPreference = 'Stop'
-    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-    $acl = New-Object System.Security.AccessControl.DirectorySecurity
-    $acl.SetOwner($sid)
-    $acl.SetAccessRuleProtection($true, $false)
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-    $acl.AddAccessRule($rule)
-    [System.IO.Directory]::SetAccessControl($env:AGIT_WINDOWS_SMOKE_HOME, $acl)
-  `], { encoding: 'utf8', env: { ...process.env, AGIT_WINDOWS_SMOKE_HOME: home }, timeout: 10000 })
-  assert.equal(protect.status, 0, `owned Windows smoke home needs a private ACL: ${protect.error || protect.stderr}`)
+  protectWindowsSmokeHome(home)
   const env = { ...process.env, USERPROFILE: home, CI: '1' }
   for (const key of Object.keys(env)) {
     if (['HOME', 'AGIT_HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME'].includes(key.toUpperCase())) delete env[key]
