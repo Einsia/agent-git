@@ -3,7 +3,7 @@ mod sessions;
 mod stopping;
 mod turns;
 
-fn rpc_test_live(
+pub(super) fn rpc_test_live(
     session_id: &str,
     generation: u64,
     tx: mpsc::Sender<Command>,
@@ -42,7 +42,10 @@ fn rpc_test_live(
     }
 }
 
-fn rpc_test_daemon(sessions: HashMap<String, Live>, roster: Roster) -> Arc<Mutex<Daemon>> {
+pub(super) fn rpc_test_daemon(
+    sessions: HashMap<String, Live>,
+    roster: Roster,
+) -> Arc<Mutex<Daemon>> {
     let (notes, _notes_rx) = mpsc::channel(1);
     let (settlement, _) = tokio::sync::watch::channel(SettlementState::default());
     Arc::new(Mutex::new(Daemon {

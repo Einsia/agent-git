@@ -67,6 +67,7 @@ mod projection;
 mod pump;
 mod session_rpc;
 mod sessions;
+mod watch_rpc;
 
 /// How many adoptable local sessions to list per project at most.
 ///

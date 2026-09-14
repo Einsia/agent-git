@@ -276,6 +276,7 @@ impl Daemon {
         // worker may outlive the state coordinator it needs for finalization.
         let mut session_rpc_tasks = tokio::task::JoinSet::new();
         let (session_rpc_stop_tx, _) = tokio::sync::watch::channel(false);
+        let mut watch_rpc_queue = watch_rpc::WatchRpcQueue::default();
         let mut stopping = false;
         let mut shutdown_projection_tail: Option<ShutdownProjectionTail> = None;
         let shutdown_deadline = tokio::time::sleep(SESSION_RPC_SHUTDOWN_GRACE);
@@ -425,6 +426,24 @@ impl Daemon {
                 }
                 Some(ev) = link_ev_rx.recv() => {
                     if !stopping { match ev {
+                        link::LinkEvent::Frame { epoch, frame }
+                            if matches!(frame.method(), method::SESSION_WATCH | method::SESSION_UNWATCH) =>
+                        {
+                            if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
+                            let Some(id) = frame.id.clone() else { continue };
+                            if session_rpc_tasks.len() >= 32 {
+                                let _ = out_tx.send(Frame::error_response(id, RpcError::new(
+                                    ErrorCode::SessionBusy, "session opening is busy; retry shortly")));
+                                continue;
+                            }
+                            match watch_rpc_queue.reserve(&frame) {
+                                Ok(ticket) => {
+                                    session_rpc_tasks.spawn(ticket.serve(d.clone(), out_tx.clone(),
+                                        frames_tx.clone(), *frame, epoch, session_rpc_stop_tx.subscribe()));
+                                }
+                                Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
+                            }
+                        }
                         link::LinkEvent::Frame { epoch, frame }
                             if frame.method() == method::SESSION_LIST =>
                         {

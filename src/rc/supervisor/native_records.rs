@@ -152,34 +152,36 @@ pub(crate) async fn read_watch_snapshot(
     source: crate::adapter::native_snapshot::Source,
     cwd: std::path::PathBuf,
 ) -> crate::Result<Vec<u8>> {
-    tokio::task::spawn_blocking(move || {
-        let snapshot = OpenCode.snapshot_native_readonly(
-            &source,
-            crate::adapter::native_snapshot::Limits::default(),
-        )?;
-        let mut found = false;
-        for line in std::str::from_utf8(&snapshot.bytes)?.lines() {
-            let row: Value = serde_json::from_str(line)?;
-            if row["kind"] != "opencode.meta" {
-                continue;
-            }
-            if found || row["id"].as_str() != Some(source.session_id.as_str()) {
-                anyhow::bail!("native watch metadata is ambiguous");
-            }
-            let directory = row["directory"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("native watch directory is missing"))?;
-            if std::fs::canonicalize(directory)? != std::fs::canonicalize(&cwd)? {
-                anyhow::bail!("native watch session moved outside its workspace");
-            }
-            found = true;
+    tokio::task::spawn_blocking(move || read_watch_snapshot_blocking(&source, &cwd)).await?
+}
+
+pub(crate) fn read_watch_snapshot_blocking(
+    source: &crate::adapter::native_snapshot::Source,
+    cwd: &std::path::Path,
+) -> crate::Result<Vec<u8>> {
+    let snapshot = OpenCode
+        .snapshot_native_readonly(source, crate::adapter::native_snapshot::Limits::default())?;
+    let mut found = false;
+    for line in std::str::from_utf8(&snapshot.bytes)?.lines() {
+        let row: Value = serde_json::from_str(line)?;
+        if row["kind"] != "opencode.meta" {
+            continue;
         }
-        if !found {
-            anyhow::bail!("native watch metadata is missing");
+        if found || row["id"].as_str() != Some(source.session_id.as_str()) {
+            anyhow::bail!("native watch metadata is ambiguous");
         }
-        Ok(snapshot.bytes)
-    })
-    .await?
+        let directory = row["directory"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("native watch directory is missing"))?;
+        if std::fs::canonicalize(directory)? != std::fs::canonicalize(cwd)? {
+            anyhow::bail!("native watch session moved outside its workspace");
+        }
+        found = true;
+    }
+    if !found {
+        anyhow::bail!("native watch metadata is missing");
+    }
+    Ok(snapshot.bytes)
 }
 
 #[cfg(test)]
