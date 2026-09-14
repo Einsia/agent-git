@@ -202,10 +202,11 @@ fn asset_name(version: &str) -> Result<String> {
 }
 
 fn download(url: &str) -> Result<Vec<u8>> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .user_agent(concat!("agit/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into();
+    let agent = crate::hub::transport::agent(
+        ureq::Agent::config_builder()
+            .user_agent(concat!("agit/", env!("CARGO_PKG_VERSION")))
+            .build(),
+    );
     let mut resp = agent
         .get(url)
         .call()

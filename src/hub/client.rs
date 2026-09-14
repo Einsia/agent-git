@@ -221,7 +221,7 @@ impl Client {
             credential_binding_valid,
             token: std::cell::RefCell::new(cred.as_ref().map(|c| c.access_token.clone())),
             cred: std::cell::RefCell::new(cred),
-            agent: cfg.into(),
+            agent: super::transport::agent(cfg),
         }
     }
 

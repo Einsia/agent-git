@@ -316,12 +316,13 @@ pub fn missing_lfs_uploads(
     let transport =
         TransportIdentity::new(Some(repo.root()), &["lfs", "push", "origin"], identity)?;
     let endpoint = &transport.lfs.as_ref().context("LFS endpoint is missing")?.1;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(30)))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build()
-        .into();
+    let agent = crate::hub::transport::agent(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .build(),
+    );
     let mut missing = Vec::new();
     for batch in pointers.chunks(100) {
         let mut expected: HashMap<_, _> = batch.iter().map(|p| (p.oid.as_str(), p)).collect();

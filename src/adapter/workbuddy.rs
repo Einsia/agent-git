@@ -8,7 +8,7 @@ use super::{
 use crate::Result;
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub struct WorkBuddy;
@@ -218,42 +218,12 @@ fn list_at(root: &Path, cwd: Option<&Path>) -> Result<Vec<SessionRef>> {
         if validate_id(id).is_err() {
             continue;
         }
-        let mut bytes = Vec::new();
-        std::fs::File::open(entry.path())?
-            .take(32 * 1024)
-            .read_to_end(&mut bytes)?;
-        let mut recorded_cwd = None;
-        for line in bytes.split(|byte| *byte == b'\n') {
-            if let Ok(value) = serde_json::from_slice::<Value>(line)
-                && let Some((recorded_id, directory)) = WorkBuddy.record_identity(&value)
-            {
-                ensure!(
-                    recorded_id == id,
-                    "WorkBuddy filename and native identity differ"
-                );
-                recorded_cwd = directory;
-                break;
-            }
-        }
-        if let Some(wanted) = cwd {
-            let Some(recorded) = recorded_cwd.as_deref() else {
-                continue;
-            };
-            let wanted = wanted
-                .canonicalize()
-                .unwrap_or_else(|_| wanted.to_path_buf());
-            let recorded = Path::new(recorded)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(recorded));
-            if wanted != recorded {
-                continue;
-            }
-        }
         sessions.push(SessionRef {
             id: id.into(),
             path: entry.path().into(),
             runtime: "workbuddy",
-            cwd: recorded_cwd,
+            // A lossy project slug cannot establish the transcript's recorded directory.
+            cwd: None,
             mtime: entry.metadata()?.modified()?,
             gist: None,
         });
@@ -614,6 +584,65 @@ mod tests {
                         .unwrap()
                 )
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn candidate_enumeration_defers_transcript_fields_and_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let directory = root.path().join("projects").join(slug_for(cwd.path()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("filename-hint.jsonl");
+        std::fs::write(&path, RAW).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        }
+        let scoped = list_at(root.path(), Some(cwd.path()));
+        let all = list_at(root.path(), None);
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, metadata.permissions()).unwrap();
+        for sessions in [scoped.unwrap(), all.unwrap()] {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].id, "filename-hint");
+            assert_eq!(sessions[0].path, path);
+            assert_eq!(sessions[0].runtime, "workbuddy");
+            assert_eq!(sessions[0].mtime, metadata.modified().unwrap());
+            assert!(sessions[0].cwd.is_none());
+            assert!(sessions[0].gist.is_none());
+        }
+        let selected = WorkBuddy.parse_at(&path).unwrap();
+        assert_eq!(selected.id, "session-1");
+        assert_eq!(selected.cwd.as_deref(), Some("/workspace"));
+    }
+
+    #[test]
+    fn colliding_project_slugs_do_not_establish_recorded_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("a-b");
+        let other = root.path().join("a").join("b");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(slug_for(&cwd), slug_for(&other));
+        let path = install_at(root.path(), RAW, "shared-slug", &cwd).unwrap();
+        let directory = path.parent().unwrap();
+        let subagents = directory.join("shared-slug").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-child.jsonl"), RAW).unwrap();
+        std::fs::write(directory.join("invalid.id.jsonl"), RAW).unwrap();
+        std::fs::create_dir(directory.join("directory.jsonl")).unwrap();
+        for wanted in [Some(cwd.as_path()), Some(other.as_path()), None] {
+            let sessions = list_at(root.path(), wanted).unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].path, path);
+            assert!(sessions[0].cwd.is_none());
+        }
+        assert_eq!(
+            WorkBuddy.parse_at(&path).unwrap().cwd.as_deref(),
+            cwd.canonicalize().unwrap().to_str()
         );
     }
 

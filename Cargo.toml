@@ -204,7 +204,8 @@ zeroize = { version = "1", optional = true }
 # ── HTTP ────────────────────────────────────────────────────────────────
 # Blocking is enough: the CLI has no concurrent-request path. rustls keeps the
 # build free of system dependencies.
-ureq = { version = "3", default-features = false, features = ["rustls", "json"], optional = true }
+# The Hub transport implements ureq's unversioned connector API.
+ureq = { version = "=3.3.0", default-features = false, features = ["rustls", "json"], optional = true }
 
 # ── Miscellaneous ───────────────────────────────────────────────────────
 regex = "1"

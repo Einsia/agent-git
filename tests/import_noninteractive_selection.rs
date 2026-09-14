@@ -343,6 +343,72 @@ fn all_noninteractive_candidates_are_actionable_without_adoption() {
 }
 
 #[test]
+fn workbuddy_candidates_defer_content_until_selected_identity_validation() {
+    let mut lab = Lab::new(0);
+    let id = "filename-candidate";
+    let project = lab
+        .home
+        .join(".workbuddy-ai/projects")
+        .join(agit::adapter::workbuddy::slug_for(&lab.work));
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join(format!("{id}.jsonl"));
+    let mut record = serde_json::json!({
+        "type":"message", "role":"user", "sessionId":"recorded-identity", "cwd":lab.work,
+        "id":"message-id", "content":[{"type":"input_text", "text":"SYNTHETIC-UNREAD-CONTENT"}]
+    });
+    fs::write(&path, format!("{record}\n")).unwrap();
+    lab.sources.push((id.into(), path.clone()));
+    let before = lab.state();
+
+    let listed = lab
+        .command()
+        .args(["import", "--from", "workbuddy", "--into", "me/qa@work"])
+        .output()
+        .unwrap();
+    assert_eq!(listed.status.code(), Some(8), "{listed:?}");
+    assert!(listed.stdout.is_empty(), "{listed:?}");
+    let stderr = String::from_utf8(listed.stderr).unwrap();
+    assert!(stderr.contains(id), "{stderr}");
+    assert!(!stderr.contains("SYNTHETIC-UNREAD-CONTENT"), "{stderr}");
+    assert_eq!(lab.state(), before);
+
+    let selected = lab
+        .command()
+        .args(["import", id, "--from", "workbuddy", "--into", "me/qa@work"])
+        .output()
+        .unwrap();
+    assert!(!selected.status.success(), "{selected:?}");
+    let stderr = String::from_utf8(selected.stderr).unwrap();
+    assert!(stderr.contains("unavailable: stored_evidence"), "{stderr}");
+    assert_eq!(lab.state(), before);
+
+    record["sessionId"] = id.into();
+    fs::write(&path, format!("{record}\n")).unwrap();
+    let before = lab.state();
+    let matching = lab
+        .command()
+        .args([
+            "import",
+            id,
+            "--from",
+            "workbuddy",
+            "--into",
+            "me/qa@work",
+            "--propose-lineage",
+        ])
+        .output()
+        .unwrap();
+    assert!(matching.status.success(), "{matching:?}");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&matching.stdout),
+        String::from_utf8_lossy(&matching.stderr)
+    );
+    assert!(!text.contains("stored_evidence"), "{text}");
+    assert_eq!(lab.state(), before);
+}
+
+#[test]
 fn an_ambiguous_explicit_prefix_requires_selection_without_stdout_or_adoption() {
     let lab = Lab::new(2);
     let before = lab.state();
