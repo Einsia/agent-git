@@ -3,8 +3,6 @@ $ErrorActionPreference = 'Stop'
 foreach ($tool in @('cargo', 'node', 'git', 'tar')) {
     Get-Command $tool -ErrorAction Stop | Out-Null
 }
-& node scripts/verify-windows-powershell.mjs
-if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell host verification failed' }
 if ($env:AGIT_RELEASE_CHANNEL -notin @('dev', 'staging')) { throw 'Internal packages require dev or staging' }
 if (-not $env:AGIT_DEFAULT_HUB_URL) { throw 'AGIT_DEFAULT_HUB_URL is required' }
 if (-not $env:AGIT_BUILD_SHA) { throw 'AGIT_BUILD_SHA is required' }
@@ -19,77 +17,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Rust target installation failed' }
 & cargo build --locked --release --target $target --bin agit
 if ($LASTEXITCODE -ne 0) { throw 'Windows CLI build failed' }
 $binary = "target/$target/release/agit.exe"
-& cargo check --locked --release --no-default-features --target $target --lib
-if ($LASTEXITCODE -ne 0) { throw 'Windows library without RC failed to compile' }
-$lfsBin = Join-Path $PWD '.cache/test-bin'
-& (Join-Path $PSScriptRoot 'install-test-lfs.ps1') -Destination $lfsBin -CacheDirectory (Join-Path $PWD '.cache/test-lfs')
-$env:PATH = "$lfsBin;$env:PATH"
-$env:AGIT_TEST_REQUIRE_LFS = '1'
-& cargo test --locked --release --target $target --lib rc::windows_job::tests -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows process-tree exit tests failed' }
-& cargo test --locked --release --target $target --lib commands::search::local::tests -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows saved-history repository admission tests failed' }
-foreach ($test in @('commands::migration::tests::spooled_git_paths_bind_the_canonical_repository_and_private_index', 'commands::migration::tests::pending_work_is_migrated_before_the_completion_marker_is_written')) {
-    & cargo test --locked --release --target $target --lib $test -- --exact --nocapture
-    if ($LASTEXITCODE -ne 0) { throw "Windows storage migration path test failed: $test" }
-}
-& cargo test --locked --release --target $target --test search_local -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows offline saved-history search tests failed' }
-& cargo test --locked --release --target $target --test session_files -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows session file tests failed' }
-# Status fixtures run serially so parallel test load cannot exhaust their Git deadlines.
-& cargo test --locked --release --target $target --test status_branch_sync --test status_session_details -- --nocapture --test-threads=1
-if ($LASTEXITCODE -ne 0) { throw 'Windows branch, shared-file, and session status tests failed' }
-& cargo test --locked --release --target $target --test windows_rc --test rc_proxy --test import_noninteractive_selection --test show_ref_header --test diff_pending --test diff_pending_opencode --test import_lineage_preview --test ref_selection --test merge_recon --test merge_settlement --test hub_credential_binding --test hub_socks_proxy --test whoami_identity_snapshot --test codex_resume_provider --test windows_json_capture --test quiet_presentation --test quiet_remote_reporters --test doctor_deep --test doctor_link_integrity --test doctor_local_health --test doctor_repo_scope --test context_echo --test context_echo_run_mine --test semantic_turn_prefix --test merge_archive_lifecycle --test sensitive_review --test terminal_failure_categories --test search_org_scope --test search_here -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows native CLI integration tests failed' }
-& cargo test --locked --release --target $target --bin agit startup_tests -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows offline startup policy tests failed' }
-& cargo test --locked --release --target $target --test push_confirmation_category --test setup_completion_category -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows confirmation and setup category tests failed' }
-& cargo test --locked --release --target $target --test share_search_categories --test login_terminal_categories -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows share, search, and login terminal category tests failed' }
-& cargo test --locked --release --target $target --test push_local_categories --test push_network_categories -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows local publication category tests failed' }
-& cargo test --locked --release --target $target --test local_precondition_categories -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows local precondition category tests failed' }
-& cargo test --locked --release --target $target --lib commands::show::tests::unreadable_snapshot_refuses_before_entering_the_terminal -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows unreadable transcript category test failed' }
-& cargo test --locked --release --target $target --test clone_ref_categories -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows clone reference category tests failed' }
-& cargo test --locked --release --target $target --test pull_recovery -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows pull recovery tests failed' }
-& cargo test --locked --release --target $target --test export_output_categories -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows export output category tests failed' }
-& cargo test --locked --release --target $target --lib commands::export::tests::output_flush_failure_is_not_a_successful_delivery -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows export flush failure test failed' }
-& cargo test --locked --release --target $target --test resume_cwd_selection -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows resume cwd selection tests failed' }
-& cargo test --locked --release --target $target --lib commands::scan:: -- --nocapture --test-threads=1
-if ($LASTEXITCODE -ne 0) { throw 'Windows sensitive review library tests failed' }
-& cargo test --locked --release --target $target --lib domain::secrets::tests::frozen_publication_ -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows frozen publication secret scans failed' }
-& cargo test --locked --release --target $target --lib domain::secrets::publication::tests:: -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows prepared publication inspection tests failed' }
-& cargo test --locked --release --target $target --lib domain::repo::publication::tests:: -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows frozen publication planner tests failed' }
-& cargo test --locked --release --target $target --lib domain::lfs::history:: -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows LFS history enumeration tests failed' }
-& cargo test --locked --release --target $target --test publication_plan -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows publication planner scanner integration failed' }
-& cargo test --locked --release --target $target --lib commands::push::publication_tests:: -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows publication receiver scope tests failed' }
-& cargo test --locked --release --target $target --lib commands::push::audit -- --nocapture --test-threads=1
-if ($LASTEXITCODE -ne 0) { throw 'Windows interactive publication audit tests failed' }
-& cargo test --locked --release --target $target --lib commands::json::windows::tests -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows native JSON capture lifecycle tests failed' }
-& cargo test --locked --release --target $target --lib domain::link::tests::archive_transition_replaces_inherited_public_reads_with_private_acl -- --exact --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows archive Link privacy transition test failed' }
-& cargo test --locked --release --target $target --lib hub::git:: -- --nocapture
-if ($LASTEXITCODE -ne 0) { throw 'Windows Git transport tests failed' }
-foreach ($suite in @('native_snapshot', 'adapter::opencode::status_snapshot::tests', 'domain::metadata_facts::tests::structural_budget_', 'domain::native_archive::', 'adapter::opencode::tests::archive_frontier_', 'adapter::codex_index::tests', 'domain::import_lineage::tests', 'domain::repo::tests::local_', 'domain::repo::tests::inspection_', 'domain::repo::tests::legacy_inspection_', 'commands::fix::tests', 'commands::import::tests::prepared_target_', 'commands::merge::archive::', 'commands::merge::file_reconciliation::tests', 'commands::commit::archive::tests', 'domain::merge_archive::tests', 'domain::archive_history::tests', 'domain::mergetx::tests', 'commands::terminal_error_tests', 'adapter::cursor::tests::windows_cwd_', 'tui::screens::selector::tests', 'tui::screens::sessions::tests', 'tui::screens::adopt::tests', 'tui::screens::naming::tests', 'tui::widgets::tests', 'commands::push::tests::branch_failure_categories', 'infra::local_git::tests', 'domain::secret_filter::repository::tests::bounded_', 'commands::status::shared::git::tests', 'commands::status::shared::tests', 'commands::status::', 'commands::search::tests', 'rc::transport::tests', 'commands::upgrade::tests::startup_nudge_is_only_for_interactive_user_commands', 'commands::mcp::workspace_tool_tests', 'domain::storage::tests::local_', 'domain::storage::local_read::tests', 'adapter::enrich::tests::input_projection_')) {
-    & cargo test --locked --release --target $target --lib $suite -- --nocapture
-    if ($LASTEXITCODE -ne 0) { throw "Windows import lineage suite failed: $suite" }
-}
 & node scripts/verify-windows-cli.mjs $binary
 if ($LASTEXITCODE -ne 0) { throw 'Windows executable verification failed' }
 $actualVersion = & $binary --version

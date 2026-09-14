@@ -400,19 +400,26 @@ fn hub_credentials_are_private_under_inherited_public_read(home: &Path) {
         credential.username = username.into();
         agit::infra::credentials::save_at(&path, &credential).unwrap();
         assert!(agit::infra::credentials::load_at(&path).unwrap().username == username);
-        security::validate_path(&path, false, true).unwrap();
-        assert_eq!(
-            restricted_open(&path, GENERIC_READ)
-                .err()
-                .unwrap()
-                .raw_os_error(),
-            Some(ERROR_ACCESS_DENIED as i32)
-        );
+        for private in [&path, &path.with_extension("identity")] {
+            security::validate_path(private, false, true).unwrap();
+            assert_eq!(
+                restricted_open(private, GENERIC_READ)
+                    .err()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(ERROR_ACCESS_DENIED as i32)
+            );
+        }
     }
     assert!(agit::infra::credentials::save_at(&legacy, &credential).is_err());
     assert!(std::fs::read(&legacy).unwrap() == b"synthetic legacy credential");
     assert!(restricted_open(&legacy, GENERIC_READ).is_ok());
-    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+    let mut entries: Vec<_> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["legacy.json", "private.identity", "private.json"]);
 }
 
 #[test]

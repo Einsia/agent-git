@@ -1,0 +1,16 @@
+{
+  "lfs": {
+    "version": "3.8.0",
+    "archive": "git-lfs-windows-amd64-v3.8.0.zip",
+    "sha256": "b62e7b8ceddee635f691233d77de8eaa4b213e9209e0173811d8cfa77f7882c1",
+    "url": "https://github.com/git-lfs/git-lfs/releases/download/v3.8.0/git-lfs-windows-amd64-v3.8.0.zip",
+    "cacheDirectory": ".cache/test-lfs"
+  },
+  "nextest": {
+    "version": "0.9.140",
+    "archive": "nextest-0.9.140.zip",
+    "sha256": "ec39698dfe5bcfffb7d5da037f226bc1670584ba247123f4e684a0f224fe828d",
+    "url": "https://get.nexte.st/0.9.140/x86_64-pc-windows-msvc.zip",
+    "cacheDirectory": ".cache/test-nextest"
+  }
+}

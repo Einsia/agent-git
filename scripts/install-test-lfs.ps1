@@ -1,12 +1,14 @@
 param(
     [Parameter(Mandatory = $true)][string]$Destination,
-    [Parameter(Mandatory = $true)][string]$CacheDirectory
+    [Parameter(Mandatory = $true)][string]$CacheDirectory,
+    [switch]$RequireCachedArchive
 )
 
 $ErrorActionPreference = 'Stop'
-$version = '3.8.0'
-$checksum = 'b62e7b8ceddee635f691233d77de8eaa4b213e9209e0173811d8cfa77f7882c1'
-$asset = "git-lfs-windows-amd64-v$version.zip"
+$tool = (Get-Content (Join-Path $PSScriptRoot 'windows-test-tools.json') -Raw | ConvertFrom-Json).lfs
+$version = $tool.version
+$checksum = $tool.sha256
+$asset = $tool.archive
 $temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("agit-test-lfs-" + [Guid]::NewGuid().ToString('N'))
 $archive = Join-Path $temporary $asset
 $cached = Join-Path $CacheDirectory "$checksum-$asset"
@@ -22,9 +24,10 @@ try {
         Copy-Item -LiteralPath $cached -Destination $archive
     }
     if (-not (Test-ReleaseArchive $archive)) {
+        if ($RequireCachedArchive) { throw 'The prepared Git LFS archive is missing or corrupt' }
         for ($attempt = 0; $attempt -lt 3; $attempt++) {
             try {
-                Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/git-lfs/git-lfs/releases/download/v$version/$asset" -OutFile $archive -TimeoutSec 180
+                Invoke-WebRequest -UseBasicParsing -Uri $tool.url -OutFile $archive -TimeoutSec 180
                 break
             } catch {
                 if ($attempt -eq 2) { throw 'Unable to download the pinned Git LFS release' }
@@ -43,7 +46,7 @@ try {
     $binary = Join-Path $Destination 'git-lfs.exe'
     Copy-Item -LiteralPath (Join-Path $unpacked "git-lfs-$version/git-lfs.exe") -Destination $binary -Force
     $actualVersion = & $binary version
-    if ($LASTEXITCODE -ne 0 -or $actualVersion -notmatch '^git-lfs/3\.8\.0\s') {
+    if ($LASTEXITCODE -ne 0 -or $actualVersion -notmatch ('^git-lfs/' + [regex]::Escape($version) + '\s')) {
         throw 'Job-local Git LFS version verification failed'
     }
     Write-Output $actualVersion
