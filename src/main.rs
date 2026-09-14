@@ -34,11 +34,24 @@ fn main() {
     if let Some(code) = commands::status::native_observation_worker(&raw_args) {
         exit(code);
     }
+    if raw_args.len() == 2 && raw_args[1] == "--internal-telemetry-flush" {
+        let _ = agit::telemetry::transport::flush();
+        return;
+    }
+    agit::telemetry::begin(&raw_args);
+    let code = run(raw_args);
+    agit::telemetry::finish(code);
+    exit(code);
+}
+
+fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
     let json_hint = raw_args.iter().any(|arg| arg == "--json");
     let json_version_hint = commands::json::Version::from_argv(&raw_args);
     let cli = match <Cli as clap::Parser>::try_parse_from(raw_args.clone()) {
         Ok(cli) => cli,
         Err(error) => {
+            agit::telemetry::observe(agit::telemetry::Observation::Stage("parse"));
+            agit::telemetry::observe(agit::telemetry::Observation::Parse(error.kind()));
             use clap::error::ErrorKind;
             if json_hint
                 && !matches!(
@@ -46,14 +59,16 @@ fn main() {
                     ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
                 )
             {
-                exit(commands::json::emit_parse_error_version(
+                return commands::json::emit_parse_error_version(
                     commands::json::command_from_argv(&raw_args),
                     json_version_hint,
                     error.exit_code(),
                     &error.to_string(),
-                ));
+                );
             }
-            error.exit();
+            let code = error.exit_code();
+            let _ = error.print();
+            return code;
         }
     };
     let json_version = cli.json_version.unwrap_or_default();
@@ -61,12 +76,14 @@ fn main() {
         commands::json_requested(cli.json, command)
     });
     if cli.json_version.is_some() && !json {
-        <Cli as clap::CommandFactory>::command()
-            .error(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "--json-version requires --json",
-            )
-            .exit();
+        let error = <Cli as clap::CommandFactory>::command().error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--json-version requires --json",
+        );
+        agit::telemetry::observe(agit::telemetry::Observation::Stage("parse"));
+        let code = error.exit_code();
+        let _ = error.print();
+        return code;
     }
     if cli.no_color {
         unsafe { std::env::set_var("NO_COLOR", "1") };
@@ -111,11 +128,11 @@ fn main() {
             agit::tui::Verdict::Enter => {
                 commands::upgrade::maybe_startup_nudge("resume", cli.json);
                 if let Some(code) = prepare_startup(cli.directory.as_deref(), Startup::Migrate) {
-                    exit(code);
+                    return code;
                 }
-                exit(dispatch(Commands::Resume(Default::default()), false));
+                return dispatch(Commands::Resume(Default::default()), false);
             }
-            verdict => exit(bare_help(verdict, cli.json, json_version)),
+            verdict => return bare_help(verdict, cli.json, json_version),
         }
     };
 
@@ -145,7 +162,8 @@ fn main() {
     }
     if json {
         if let Some(reason) = commands::json::incompatible(&command) {
-            exit(commands::json::emit_rejection_version(
+            agit::telemetry::observe(agit::telemetry::Observation::Stage("json_admission"));
+            return commands::json::emit_rejection_version(
                 command_name,
                 json_version,
                 agit::ExitCode::Interactive.as_i32(),
@@ -164,7 +182,7 @@ fn main() {
                 } else {
                     Vec::new()
                 },
-            ));
+            );
         }
         let directory = cli.directory.clone();
         let code = commands::json::capture_version(command_name, json_version, || {
@@ -173,18 +191,19 @@ fn main() {
             }
             dispatch(command, true)
         });
-        exit(code);
+        return code;
     }
 
     if let Some(code) = prepare_startup(cli.directory.as_deref(), startup) {
-        exit(code);
+        return code;
     }
-    exit(dispatch(command, false));
+    dispatch(command, false)
 }
 
 /// Apply the working directory before inspecting storage. Read-only inspection must refuse
 /// pending recovery without performing it; JSON callers keep failures inside their envelope.
 fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Option<i32> {
+    agit::telemetry::observe(agit::telemetry::Observation::Stage("startup"));
     if let Some(d) = directory
         && let Err(e) = std::env::set_current_dir(d)
     {
@@ -247,7 +266,7 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Status(_) => Startup::Inspect,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
-        Commands::Mcp(_) => Startup::ToolDispatcher,
+        Commands::Mcp(_) | Commands::Telemetry(_) => Startup::ToolDispatcher,
         Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
         Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
         Commands::Doctor(_) => Startup::Inspect,
@@ -334,6 +353,7 @@ fn bare_help(verdict: agit::tui::Verdict, json: bool, version: commands::json::V
 /// The dispatch table. Deliberately too boring to get wrong — every change lives in the file
 /// being called.
 fn dispatch(cmd: Commands, json: bool) -> i32 {
+    agit::telemetry::observe(agit::telemetry::Observation::Stage("dispatch"));
     let _echo = commands::echo::Invocation::enter(&cmd, json);
     let result = match cmd {
         Commands::Login(a) => commands::login::run(a),
@@ -341,6 +361,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Logout(a) => commands::logout::run(a),
         Commands::Whoami(a) => commands::whoami::run(a, json),
         Commands::Config(a) => commands::config::run(a),
+        Commands::Telemetry(a) => commands::telemetry::run(a),
 
         Commands::Init(a) => commands::init::run(a),
         Commands::Clone(a) => commands::clone::run(a),

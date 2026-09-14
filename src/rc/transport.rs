@@ -24,7 +24,19 @@ pub(super) async fn connect(request: Request) -> crate::Result<Socket> {
     } else {
         Matcher::from_env()
     };
-    connect_with(request, &proxies, CONNECT_TIMEOUT).await
+    #[cfg(feature = "cli")]
+    crate::telemetry::allow_uploads();
+    #[cfg(feature = "cli")]
+    let started = std::time::Instant::now();
+    let result = connect_with(request, &proxies, CONNECT_TIMEOUT).await;
+    #[cfg(feature = "cli")]
+    crate::telemetry::operation(
+        crate::telemetry::Operation::RcConnect,
+        result.is_ok(),
+        started.elapsed(),
+        None,
+    );
+    result
 }
 
 fn proxy_destination(uri: &Uri) -> crate::Result<Uri> {

@@ -64,6 +64,7 @@ impl Lab {
             .env("USERPROFILE", &self.home)
             .env("AGIT_HOME", &self.agit)
             .env("AGIT_HUB_URL", HUB)
+            .env("AGIT_TELEMETRY_DISABLED", "1")
             .env("AGIT_SESSION", "ignored/unselected@branch")
             .env("GIT_CONFIG_GLOBAL", self.home.join("absent-gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -93,6 +94,7 @@ impl Lab {
                 agit::infra::config::hub_host_key(HUB).unwrap()
             )),
             &agit::infra::credentials::HubCredential {
+                account_id: None,
                 username: "me".into(),
                 email: None,
                 hub: Some(HUB.into()),

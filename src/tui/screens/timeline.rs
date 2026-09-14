@@ -278,6 +278,12 @@ struct Screen {
 
 /// Open the Timeline. Returns only once the user presses q.
 pub fn run(repo: &Repo, slug: &str, branch: &str, head: &str) -> crate::CmdResultAlias {
+    crate::telemetry::measure_command(crate::telemetry::Operation::TuiTimeline, || {
+        run_telemetry_inner(repo, slug, branch, head)
+    })
+}
+
+fn run_telemetry_inner(repo: &Repo, slug: &str, branch: &str, head: &str) -> crate::CmdResultAlias {
     // Failing to read the history is an error and is reported at the command boundary — flattened
     // into an empty list, this screen says "no turns yet" and exits normally, and one corrupt spot
     // makes the whole history vanish with no symptom.

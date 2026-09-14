@@ -31,6 +31,7 @@ impl Lab {
             .env("USERPROFILE", &self.home)
             .env("AGIT_HOME", &self.store)
             .env("AGIT_HUB_URL", HUB)
+            .env("AGIT_TELEMETRY_DISABLED", "1")
             .env(
                 "AGIT_SECRETS_KEYSTORE",
                 if cfg!(windows) { "os" } else { "file" },
@@ -76,6 +77,7 @@ impl Lab {
                 agit::infra::config::hub_host_key(HUB).unwrap()
             )),
             &agit::infra::credentials::HubCredential {
+                account_id: None,
                 username: "me".into(),
                 email: None,
                 hub: Some(HUB.into()),

@@ -117,6 +117,17 @@ pub fn upload_selected(
     identity: &crate::hub::identity::RemoteIdentity,
     allow_secrets: bool,
 ) -> Result<()> {
+    crate::telemetry::measure(crate::telemetry::Operation::ArtifactUpload, || {
+        upload_selected_inner(repo, references, identity, allow_secrets)
+    })
+}
+
+fn upload_selected_inner(
+    repo: &Repo,
+    references: &[String],
+    identity: &crate::hub::identity::RemoteIdentity,
+    allow_secrets: bool,
+) -> Result<()> {
     let pointers = reachable(repo, references)?;
     let pointers = crate::hub::git::missing_lfs_uploads(repo, &pointers, identity)?;
     if pointers.is_empty() {

@@ -25,6 +25,7 @@
 pub mod config;
 pub mod login;
 pub mod logout;
+pub mod telemetry;
 pub mod whoami;
 
 // Repositories
@@ -1281,6 +1282,8 @@ pub enum Commands {
     Whoami(whoami::Args),
     /// Global config: hub.url / runtime.default / push.visibility / commit.auto
     Config(config::Args),
+    /// Usage statistics: status / enable / disable / schema / preview
+    Telemetry(telemetry::Args),
 
     // ── Repositories ────────────────────────────────────────────────
     /// Create an agent repo: the main file line + scaffolding (memory/ skills/ AGENTS.md), bound to this directory
@@ -1388,6 +1391,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Logout(_) => "logout",
         Commands::Whoami(_) => "whoami",
         Commands::Config(_) => "config",
+        Commands::Telemetry(_) => "telemetry",
         Commands::Init(_) => "init",
         Commands::Clone(_) => "clone",
         Commands::Run(_) => "run",

@@ -181,6 +181,7 @@ fn promotion(name: &str) {
         }
     });
     let credential = agit::infra::credentials::HubCredential {
+        account_id: None,
         username: "me".into(),
         email: None,
         hub: Some(hub.clone()),

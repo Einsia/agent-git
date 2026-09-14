@@ -251,6 +251,12 @@ fn candidates_from_rows(
 
 /// Open the picker, returning only after the normal screen owns the terminal again.
 pub fn pick(cwd: &Path) -> crate::Result<Option<Picked>> {
+    crate::telemetry::measure_pick(crate::telemetry::Operation::TuiAdopt, || {
+        pick_telemetry_inner(cwd)
+    })
+}
+
+fn pick_telemetry_inner(cwd: &Path) -> crate::Result<Option<Picked>> {
     let candidates = collect(cwd);
     if candidates.is_empty() {
         println!(

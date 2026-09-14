@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 /// One hub's credentials. The whole file is this single object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubCredential {
+    #[serde(default)]
+    pub account_id: Option<String>,
     pub username: String,
     #[serde(default)]
     pub email: Option<String>,
@@ -116,6 +118,10 @@ fn bound_to(cred: &HubCredential, authority: &HubAuthority) -> bool {
 }
 
 fn same_identity(left: &HubCredential, right: &HubCredential) -> bool {
+    left.account_id == right.account_id && same_token_identity(left, right)
+}
+
+fn same_token_identity(left: &HubCredential, right: &HubCredential) -> bool {
     left.username == right.username
         && left.email == right.email
         && left.access_token == right.access_token
@@ -185,11 +191,16 @@ pub fn save(hub: &str, cred: &HubCredential) -> Result<()> {
 }
 
 /// Refresh results cannot replace a concurrent login or resurrect a signed-out credential.
-pub fn save_refreshed(hub: &str, expected: &HubCredential, fresh: &HubCredential) -> Result<bool> {
+pub fn save_refreshed(
+    hub: &str,
+    expected: &HubCredential,
+    fresh: &HubCredential,
+) -> Result<Option<HubCredential>> {
     let authority = HubAuthority::parse(hub)?;
     ensure!(
         bound_to(expected, &authority)
             && bound_to(fresh, &authority)
+            && expected.account_id == fresh.account_id
             && expected.username == fresh.username,
         "refreshed credential identity does not match"
     );
@@ -201,24 +212,69 @@ pub fn save_refreshed(hub: &str, expected: &HubCredential, fresh: &HubCredential
     )
 }
 
+/// Verified account metadata cannot replace a concurrent sign-in or revive a signed-out slot.
+pub fn save_verified_account(
+    hub: &str,
+    expected: &HubCredential,
+    account_id: &str,
+) -> Result<bool> {
+    let authority = HubAuthority::parse(hub)?;
+    ensure!(
+        bound_to(expected, &authority),
+        "credential authority does not match"
+    );
+    ensure!(
+        !account_id.is_empty()
+            && expected
+                .account_id
+                .as_deref()
+                .is_none_or(|saved| saved == account_id),
+        "verified account does not match saved identity"
+    );
+    let mut verified = expected.clone();
+    verified.account_id = Some(account_id.to_owned());
+    save_refreshed_at(
+        &crate::infra::config::credentials_dir()?,
+        &authority,
+        expected,
+        &verified,
+    )
+    .map(|saved| saved.is_some())
+}
+
 fn save_refreshed_at(
     dir: &Path,
     authority: &HubAuthority,
     expected: &HubCredential,
     fresh: &HubCredential,
-) -> Result<bool> {
+) -> Result<Option<HubCredential>> {
     let _guard = mutation_guard(dir)?;
     let Some(current) = load_from(dir, authority)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    if !same_identity(&current, expected) {
-        return Ok(false);
+    // Verified metadata may enrich an unchanged token pair, but cannot replace a known identity.
+    if !same_token_identity(&current, expected)
+        || expected
+            .account_id
+            .as_ref()
+            .is_some_and(|account| current.account_id.as_ref() != Some(account))
+        || current
+            .account_id
+            .as_ref()
+            .zip(fresh.account_id.as_ref())
+            .is_some_and(|(current, fresh)| current != fresh)
+    {
+        return Ok(None);
     }
+    let fresh = HubCredential {
+        account_id: current.account_id.or_else(|| fresh.account_id.clone()),
+        ..fresh.clone()
+    };
     save_at(
         &dir.join(format!("{}.json", authority.storage_key())),
-        fresh,
+        &fresh,
     )?;
-    Ok(true)
+    Ok(Some(fresh))
 }
 
 fn mutation_guard(dir: &Path) -> Result<std::fs::File> {
@@ -257,7 +313,84 @@ pub fn save_at(path: &Path, cred: &HubCredential) -> Result<()> {
             .persist(path)
             .map_err(|_| anyhow!("cannot persist saved Hub credentials"))?;
     }
+    // File metadata invalidates the tokenless sidecar if another writer replaces the credential.
+    #[cfg(feature = "cli")]
+    let _ = save_account_cache(path, cred.account_id.as_deref());
     Ok(())
+}
+
+#[cfg(feature = "cli")]
+#[derive(Serialize, Deserialize)]
+struct AccountCache {
+    account_id: Option<String>,
+    length: u64,
+    modified: u128,
+}
+
+#[cfg(feature = "cli")]
+fn credential_stamp(path: &Path) -> Option<(u64, u128)> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some((
+        metadata.len(),
+        metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    ))
+}
+
+#[cfg(feature = "cli")]
+fn save_account_cache(path: &Path, account_id: Option<&str>) -> Result<()> {
+    let Some((length, modified)) = credential_stamp(path) else {
+        return Ok(());
+    };
+    let cache = AccountCache {
+        account_id: account_id.map(str::to_owned),
+        length,
+        modified,
+    };
+    crate::telemetry::state::write_json(&path.with_extension("identity"), &cache)
+}
+
+/// No token-bearing file or network request is needed to describe the selected analytics identity.
+#[cfg(feature = "cli")]
+pub fn analytics_account(hub: &str) -> (Option<String>, &'static str) {
+    let Ok(path) = crate::infra::config::credentials_path(hub) else {
+        return (None, "unavailable");
+    };
+    analytics_account_at(&path)
+}
+
+#[cfg(feature = "cli")]
+fn analytics_account_at(path: &Path) -> (Option<String>, &'static str) {
+    let Some(stamp) = credential_stamp(path) else {
+        return (None, "signed_out");
+    };
+    let cache =
+        crate::telemetry::state::read_json::<AccountCache>(&path.with_extension("identity"), 2048)
+            .ok()
+            .flatten();
+    let Some(cache) = cache.filter(|c| (c.length, c.modified) == stamp) else {
+        return (None, "signed_in_id_missing");
+    };
+    let account_id = cache.account_id.filter(|id| {
+        !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    });
+    let state = if account_id.is_some() {
+        "identified"
+    } else {
+        "signed_in_id_missing"
+    };
+    (account_id, state)
 }
 
 /// Signing out clears the selected slot and all positively bound compatibility records.
@@ -271,6 +404,7 @@ pub fn remove(hub: &str) -> Result<bool> {
 fn remove_from(dir: &Path, authority: &HubAuthority) -> Result<bool> {
     let canonical = dir.join(format!("{}.json", authority.storage_key()));
     let paths = record_paths(dir)?;
+    let _ = std::fs::remove_file(canonical.with_extension("identity"));
     let mut removed = match std::fs::remove_file(&canonical) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -280,6 +414,7 @@ fn remove_from(dir: &Path, authority: &HubAuthority) -> Result<bool> {
         if !recognized_record(&path, true).is_some_and(|cred| bound_to(&cred, authority)) {
             continue;
         }
+        let _ = std::fs::remove_file(path.with_extension("identity"));
         match std::fs::remove_file(&path) {
             Ok(()) => removed = true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -327,6 +462,7 @@ pub fn remove_all() -> Result<usize> {
     let _guard = mutation_guard(&dir)?;
     let mut removed = 0;
     for path in record_paths(&dir)? {
+        let _ = std::fs::remove_file(path.with_extension("identity"));
         std::fs::remove_file(&path).map_err(|_| anyhow!("cannot remove saved Hub credentials"))?;
         removed += 1;
     }
@@ -376,6 +512,7 @@ mod tests {
 
     fn cred(access_exp: &str, refresh_exp: &str) -> HubCredential {
         HubCredential {
+            account_id: None,
             username: "alice".into(),
             email: Some("alice@example.com".into()),
             hub: None,
@@ -413,6 +550,45 @@ mod tests {
         assert!(load_at(&corp).is_some());
         assert_ne!(local, corp, "each hub isolates into its own file");
         assert!(load_at(&d.path().join("unknown.json")).is_none());
+    }
+
+    #[test]
+    fn account_identity_roundtrips_and_legacy_credentials_remain_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credential.json");
+        let mut value = cred(&future(), &future());
+        value.account_id = Some("account-alice".into());
+        save_at(&path, &value).unwrap();
+        assert_eq!(
+            load_at(&path).unwrap().account_id.as_deref(),
+            Some("account-alice")
+        );
+        let mut legacy = serde_json::to_value(value).unwrap();
+        legacy.as_object_mut().unwrap().remove("account_id");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(load_at(&path).unwrap().account_id.is_none());
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn analytics_identity_cache_excludes_tokens_and_rejects_stale_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credential.json");
+        let mut credential = cred(&future(), &future());
+        credential.account_id = Some("account-alice".into());
+        save_at(&path, &credential).unwrap();
+        assert_eq!(
+            analytics_account_at(&path),
+            (Some("account-alice".into()), "identified")
+        );
+        let body = std::fs::read_to_string(path.with_extension("identity")).unwrap();
+        assert!(!body.contains("token"));
+        assert!(!body.contains("email"));
+        assert!(!body.contains("username"));
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(analytics_account_at(&path), (None, "signed_in_id_missing"));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(analytics_account_at(&path), (None, "signed_out"));
     }
 
     /// A trailing slash, the scheme and the path must not change where it lands — otherwise
@@ -548,7 +724,10 @@ mod tests {
     #[test]
     fn refresh_compare_and_swap_preserves_login_logout_and_rotated_pairs() {
         let dir = tempfile::tempdir().unwrap();
-        let value = bound("http://node.test:8177");
+        let value = HubCredential {
+            account_id: Some("alice-account".into()),
+            ..bound("http://node.test:8177")
+        };
         let authority = HubAuthority::parse(value.hub.as_deref().unwrap()).unwrap();
         let canonical = dir.path().join(format!("{}.json", authority.storage_key()));
         let refreshed = HubCredential {
@@ -556,19 +735,40 @@ mod tests {
             refresh_token: "fresh-refresh".into(),
             ..value.clone()
         };
-        assert!(!save_refreshed_at(dir.path(), &authority, &value, &refreshed).unwrap());
+        assert!(
+            save_refreshed_at(dir.path(), &authority, &value, &refreshed)
+                .unwrap()
+                .is_none()
+        );
         save_at(&canonical, &value).unwrap();
-        assert!(save_refreshed_at(dir.path(), &authority, &value, &refreshed).unwrap());
+        assert!(
+            save_refreshed_at(dir.path(), &authority, &value, &refreshed)
+                .unwrap()
+                .is_some()
+        );
         for replacement in [
             HubCredential {
+                account_id: None,
                 username: "bob".into(),
                 ..value.clone()
             },
             refreshed.clone(),
+            HubCredential {
+                account_id: Some("another-account".into()),
+                ..value.clone()
+            },
+            HubCredential {
+                account_id: None,
+                ..value.clone()
+            },
         ] {
             save_at(&canonical, &replacement).unwrap();
             let before = std::fs::read(&canonical).unwrap();
-            assert!(!save_refreshed_at(dir.path(), &authority, &value, &refreshed).unwrap());
+            assert!(
+                save_refreshed_at(dir.path(), &authority, &value, &refreshed)
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(std::fs::read(&canonical).unwrap(), before);
         }
         std::fs::write(&canonical, b"invalid").unwrap();

@@ -167,6 +167,7 @@ impl Lab {
                     agit::infra::config::hub_host_key(base).unwrap()
                 )),
                 &HubCredential {
+                    account_id: None,
                     username: "saved-display".into(),
                     email: None,
                     hub: Some(base.into()),
@@ -193,6 +194,7 @@ impl Lab {
             .env("AGIT_HOME", &self.store)
             .env("AGIT_SESSION", "unselected/agent@branch")
             .env("AGIT_HUB_URL", base)
+            .env("AGIT_TELEMETRY_DISABLED", "1")
             .env("CI", "1")
             .env("NO_COLOR", "1")
             .env(

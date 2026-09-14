@@ -37,7 +37,10 @@ function run() {
     process.exit(127);
   }
 
-  const r = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });
+  const r = spawnSync(bin, process.argv.slice(2), {
+    stdio: 'inherit',
+    env: { ...process.env, AGIT_INSTALL_CHANNEL: 'npm_global' },
+  });
   if (r.error) {
     log.error(`failed to start ${bin}: ${r.error.message}`);
     process.exit(1);

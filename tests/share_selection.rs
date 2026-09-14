@@ -130,6 +130,7 @@ impl Fixture {
         let home = temporary.path();
         let hub = Hub::start();
         let credential = agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "me".into(),
             email: None,
             hub: Some(hub.url.clone()),

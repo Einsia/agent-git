@@ -31,6 +31,7 @@ impl Lab {
         // `agit commit` fills its author field from the credentials; the hub points at an
         // unreachable address, and commit itself never goes over the network.
         let cred = agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "me".into(),
             email: None,
             hub: Some(HUB.into()),

@@ -54,7 +54,9 @@ pub fn from_session_env() -> Option<(String, String)> {
 /// Resolve the supplied environment target while refusing a conflicting live claim.
 pub fn from_env() -> Option<Context> {
     let injected = from_session_env()?;
-    pick_env_context(Some(injected), from_harness_env())
+    let context = pick_env_context(Some(injected), from_harness_env());
+    crate::telemetry::observe(crate::telemetry::Observation::Managed(context.is_some()));
+    context
 }
 
 /// Descriptive callers supply their admitted claim snapshot instead of enumerating the store.

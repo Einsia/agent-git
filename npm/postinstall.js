@@ -42,7 +42,8 @@ function main() {
   }
   if (!bin) return; // unsupported platform: the shim gives full instructions on the next command.
 
-  const check = spawnSync(bin, ['--version'], { encoding: 'utf8' });
+  const env = { ...process.env, AGIT_TELEMETRY_DEFER: '1', AGIT_INSTALL_CHANNEL: 'npm_global' };
+  const check = spawnSync(bin, ['--version'], { encoding: 'utf8', env });
   if (check.error || check.status !== 0) {
     log.warn(`installed binary does not run: ${bin}`);
     log.warn((check.stderr || check.error?.message || `exit ${check.status}`).trim());
@@ -50,7 +51,7 @@ function main() {
   }
 
   if (truthy(process.env.AGIT_SKIP_SETUP)) return;
-  const setup = spawnSync(bin, ['setup'], { stdio: 'inherit' });
+  const setup = spawnSync(bin, ['setup'], { stdio: 'inherit', env });
   if (setup.status !== 0) {
     log.warn('`agit setup` did not fully succeed — re-run it any time; the CLI itself is installed.');
   }

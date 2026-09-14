@@ -188,6 +188,7 @@ impl Lab {
         save_at(
             &lab.credential_path(base),
             &HubCredential {
+                account_id: None,
                 username: "me".into(),
                 email: None,
                 hub: Some(base.into()),

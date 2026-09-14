@@ -77,6 +77,7 @@ impl Lab {
                 agit::infra::config::hub_host_key(HUB).unwrap()
             )),
             &agit::infra::credentials::HubCredential {
+                account_id: None,
                 username: "me".into(),
                 email: None,
                 hub: Some(HUB.into()),

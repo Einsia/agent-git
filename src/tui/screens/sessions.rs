@@ -690,6 +690,12 @@ pub enum Outcome {
 /// the runtime exits → take the terminal back → rescan → back to the list (`docs/07_tui.md` §2).
 /// So this function does not return until the user presses q.
 pub fn run(cwd: &Path) -> crate::CmdResultAlias {
+    crate::telemetry::measure_command(crate::telemetry::Operation::TuiSessions, || {
+        run_telemetry_inner(cwd)
+    })
+}
+
+fn run_telemetry_inner(cwd: &Path) -> crate::CmdResultAlias {
     let rows = collect_all(cwd);
     if rows.is_empty() {
         // No candidate means no empty shell: making the user press q at an empty list wastes

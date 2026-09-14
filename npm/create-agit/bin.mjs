@@ -54,7 +54,7 @@ function main() {
   copyFileSync(bin, target)
   chmodSync(target, 0o755)
 
-  const check = spawnSync(target, ['--version'], { encoding: 'utf8' })
+  const check = spawnSync(target, ['--version'], { encoding: 'utf8', env: { ...process.env, AGIT_TELEMETRY_DEFER: '1' } })
   if (check.error || check.status !== 0) {
     fail(`the binary did not run: ${(check.stderr || check.error?.message || `exit ${check.status}`).trim()}`)
     process.exit(1)
@@ -68,7 +68,16 @@ function main() {
   // "installed by default at download time": hooks + skill + MCP + AGENTS.md in one pass. A
   // failure does not block the install itself — the binary is already there, and setup can be
   // re-run by hand later.
-  const setup = spawnSync(target, ['setup'], { stdio: 'inherit' })
+  const yes = ['1', 'true'].includes(process.env.npm_config_yes?.toLowerCase()) || process.argv.slice(2).some(a => a === '--yes' || a === '-y')
+  const skipSetup = process.env.AGIT_SKIP_SETUP && !['0', 'false'].includes(process.env.AGIT_SKIP_SETUP.toLowerCase())
+  if (skipSetup) {
+    dim('Setup skipped by AGIT_SKIP_SETUP. Run `agit setup` when ready.')
+    return
+  }
+  const setup = spawnSync(target, yes ? ['setup', '--yes'] : ['setup'], {
+    stdio: 'inherit',
+    env: { ...process.env, AGIT_INSTALL_CHANNEL: 'create_agit', AGIT_INSTALLER_YES: yes ? '1' : '0' },
+  })
   if (setup.status === 0) {
     ok('integrations installed (skills · hooks · MCP · AGENTS.md)')
   } else {

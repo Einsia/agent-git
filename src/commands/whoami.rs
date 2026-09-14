@@ -260,6 +260,7 @@ mod tests {
     #[test]
     fn json_report_uses_named_fields_instead_of_aligned_text() {
         let cred = credentials::HubCredential {
+            account_id: None,
             username: "alice".into(),
             email: Some("alice@example.test".into()),
             hub: None,
@@ -285,6 +286,7 @@ mod tests {
     #[test]
     fn json_report_separates_reachability_from_acceptance() {
         let cred = credentials::HubCredential {
+            account_id: None,
             username: "alice".into(),
             email: None,
             hub: None,
@@ -305,6 +307,7 @@ mod tests {
     #[test]
     fn json_report_keeps_server_reachability_unknown_without_a_check() {
         let cred = credentials::HubCredential {
+            account_id: None,
             username: "alice".into(),
             email: None,
             hub: None,

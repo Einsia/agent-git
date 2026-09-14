@@ -167,6 +167,7 @@ impl Lab {
         let work = work.canonicalize().unwrap();
         let hub = Hub::new();
         let credential = agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "me".into(),
             email: None,
             hub: Some(hub.url.clone()),

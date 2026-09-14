@@ -274,6 +274,8 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     let dir = ev.cwd.as_deref().map(std::path::Path::new);
     let bound = dir.map(|d| workspace::read(d).is_some()).unwrap_or(false);
     let rt = runtime_of(runtime, ev.transcript_path.as_deref());
+    crate::telemetry::runtime(rt);
+    crate::telemetry::observe(crate::telemetry::Observation::WorkspaceBound(bound));
     let existing = Store::open()
         .ok()
         .flatten()

@@ -1360,6 +1360,20 @@ fn settle_local(
     repo_dir: &Path,
     slug: &str,
     branch: &str,
+    lk: Link,
+    owner: &str,
+    opts: SettleOpts,
+) -> CmdResult {
+    crate::telemetry::measure_command(crate::telemetry::Operation::Settlement, || {
+        settle_local_telemetry_inner(store, repo_dir, slug, branch, lk, owner, opts)
+    })
+}
+
+fn settle_local_telemetry_inner(
+    store: &Store,
+    repo_dir: &Path,
+    slug: &str,
+    branch: &str,
     mut lk: Link,
     owner: &str,
     opts: SettleOpts,
@@ -2242,6 +2256,7 @@ fn settle_bytes(
 
     let cwd = lk.cwd.clone().unwrap_or_else(|| ".".into());
     let total = new_chunks.len();
+    crate::telemetry::runtime(&lk.source);
     let mut last_sha = String::new();
     // Every branch, including an unborn one, is settled without touching the real index/worktree:
     // build every turn as an unreachable object chain first, then move the ref once with the
@@ -2424,6 +2439,7 @@ fn settle_bytes(
         }
     }
 
+    crate::telemetry::observe(crate::telemetry::Observation::SettledTurns(total as u64));
     // Settling advances the link's baseline.
     lk.agent = Some(slug.split('/').nth(1).unwrap_or(slug).to_string());
     lk.branch = Some(branch.to_string());
@@ -4046,6 +4062,7 @@ mod tests {
                 crate::infra::config::hub_host_key(hub).unwrap()
             )),
             &credentials::HubCredential {
+                account_id: None,
                 username: "alice".into(),
                 email: None,
                 hub: Some(hub.into()),

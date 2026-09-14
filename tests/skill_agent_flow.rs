@@ -96,6 +96,7 @@ fn installed_skill_supports_explicit_adopt_commit_search_and_prepare() {
             agit::infra::config::hub_host_key(&lab.hub).unwrap()
         )),
         &agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "me".into(),
             email: None,
             hub: Some(lab.hub.clone()),

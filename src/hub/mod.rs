@@ -173,6 +173,8 @@ pub struct LoginRequest {
 /// The sign-in response: a token pair plus the account.
 #[derive(Debug, Deserialize)]
 pub struct LoginResponse {
+    #[serde(default)]
+    pub account_id: Option<String>,
     pub username: String,
     #[serde(default)]
     pub email: Option<String>,
@@ -500,6 +502,8 @@ pub struct SearchCounts {
 /// `GET /api/auth/me`: the current account as the server sees it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Me {
+    #[serde(default)]
+    pub account_id: Option<String>,
     pub username: String,
     #[serde(default)]
     pub email: Option<String>,

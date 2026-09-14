@@ -647,6 +647,7 @@ fn grant_mutations_preserve_unusable_data_and_unrelated_authorizations() {
 fn seed_login(lab: &Lab) {
     let hub = format!("http://{}", lab.hub.local_addr().unwrap());
     let credential = agit::infra::credentials::HubCredential {
+        account_id: None,
         username: "alice".into(),
         email: None,
         hub: Some(hub.clone()),

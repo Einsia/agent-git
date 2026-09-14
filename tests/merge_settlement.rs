@@ -57,6 +57,7 @@ impl Lab {
         agit::infra::credentials::save_at(
             &lab.credential(),
             &agit::infra::credentials::HubCredential {
+                account_id: None,
                 username: "me".into(),
                 email: None,
                 hub: Some(HUB.into()),

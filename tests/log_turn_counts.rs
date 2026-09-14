@@ -244,6 +244,7 @@ fn native_opencode_import_counts_a_late_part_on_an_earlier_turns_host() {
                 .join("agit/credentials")
                 .join(format!("{key}.json")),
             &agit::infra::credentials::HubCredential {
+                account_id: None,
                 username: "me".into(),
                 email: None,
                 hub: Some(hub.into()),

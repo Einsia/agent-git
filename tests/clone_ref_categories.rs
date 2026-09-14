@@ -269,6 +269,7 @@ impl Lab {
 
     fn sign_in(&self, username: &str) {
         let credential = agit::infra::credentials::HubCredential {
+            account_id: None,
             username: username.into(),
             email: None,
             hub: Some(self.hub.base.clone()),

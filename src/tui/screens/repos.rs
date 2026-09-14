@@ -500,6 +500,12 @@ pub struct Picked {
 
 /// One pass of "pick a repo → name it". `None` = the user gave up, or there is nothing to pick.
 pub fn pick(from: &str) -> crate::Result<Option<Picked>> {
+    crate::telemetry::measure_pick(crate::telemetry::Operation::TuiRepositories, || {
+        pick_telemetry_inner(from)
+    })
+}
+
+fn pick_telemetry_inner(from: &str) -> crate::Result<Option<Picked>> {
     let mut rows = collect(from);
     let mut hub = HubDiscovery::new();
     widgets::refresh_rc_status();

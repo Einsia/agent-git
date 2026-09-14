@@ -201,6 +201,7 @@ impl Lab {
         save_at(
             &self.credential_path(base),
             &HubCredential {
+                account_id: None,
                 username: "old-owner".into(),
                 email: None,
                 hub: Some(base.into()),
@@ -473,6 +474,12 @@ fn pat_success_persists_only_the_selected_hub_and_local_save_failure_is_not_netw
                     .unwrap()
                     .to_owned();
                 after.insert(changed.clone(), before[&changed].clone());
+                let identity = changed.with_extension("identity");
+                let cache: Value =
+                    serde_json::from_slice(after[&identity].as_ref().unwrap()).unwrap();
+                assert_eq!(cache["account_id"], saved["account_id"]);
+                assert_eq!(cache.as_object().unwrap().len(), 3);
+                after.insert(identity.clone(), before[&identity].clone());
                 assert_eq!(after, before);
             }
             let requests = hub.finish();
@@ -673,6 +680,11 @@ fn pending_device_authorization_can_complete_without_exposing_the_token_pair() {
             .unwrap()
             .to_owned();
         after.insert(changed.clone(), before[&changed].clone());
+        let identity = changed.with_extension("identity");
+        let cache: Value = serde_json::from_slice(after[&identity].as_ref().unwrap()).unwrap();
+        assert_eq!(cache["account_id"], saved["account_id"]);
+        assert_eq!(cache.as_object().unwrap().len(), 3);
+        after.insert(identity.clone(), before[&identity].clone());
         assert_eq!(after, before);
         let requests = hub.finish();
         assert_eq!(requests.len(), 3);

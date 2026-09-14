@@ -28,6 +28,7 @@ impl Lab {
         // The author field comes from the credentials; the hub points at an unreachable address,
         // so import/log/show never go to the network.
         let cred = agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "me".into(),
             email: None,
             hub: Some(HUB.into()),

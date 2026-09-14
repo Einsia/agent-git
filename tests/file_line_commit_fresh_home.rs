@@ -29,6 +29,7 @@ impl Lab {
         // Signed in: the commit's author fields come from the credentials. The rest of the home
         // directory is empty — no store.
         let cred = agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "me".into(),
             email: None,
             hub: Some(HUB.into()),

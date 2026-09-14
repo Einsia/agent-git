@@ -106,6 +106,12 @@ enum AssetOutcome {
 
 /// Run the form and optional asset checklist, returning after the normal screen is restored.
 pub fn pick(cwd: &Path) -> crate::Result<Option<Picked>> {
+    crate::telemetry::measure_pick(crate::telemetry::Operation::TuiInitialize, || {
+        pick_telemetry_inner(cwd)
+    })
+}
+
+fn pick_telemetry_inner(cwd: &Path) -> crate::Result<Option<Picked>> {
     let suggestion = cwd
         .file_name()
         .map(|name| name.to_string_lossy().to_string())

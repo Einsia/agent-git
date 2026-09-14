@@ -73,7 +73,9 @@ fn handle(req: &serde_json::Value) -> Option<String> {
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_default();
+            let started = std::time::Instant::now();
             let out = call_tool(&name, &args);
+            crate::telemetry::mcp_finished(&name, !out.is_error, started.elapsed());
             Some(result(
                 id,
                 serde_json::json!({
@@ -186,6 +188,12 @@ fn call_tool(name: &str, args: &serde_json::Value) -> ToolOutput {
     }
     // A tool's stdout is its result payload, independent of human presentation.
     cmd.env("AGIT_PROTOCOL_CHILD", "1").env_remove("AGIT_QUIET");
+    if crate::telemetry::MCP_TOOLS.contains(&name) {
+        cmd.env("AGIT_MCP_TOOL", name);
+    }
+    if let Some(parent) = crate::telemetry::parent_invocation_id() {
+        cmd.env("AGIT_TELEMETRY_PARENT_ID", parent);
+    }
     match name {
         "search" => match search_arguments(args) {
             Ok(arguments) => {
@@ -271,6 +279,15 @@ fn mcp_result(name: &str, stdout: &str) -> String {
 #[cfg(test)]
 mod workspace_tool_tests {
     use super::mcp_result;
+
+    #[test]
+    fn every_tool_and_input_has_a_telemetry_policy() {
+        let response = super::handle(&serde_json::json!({"id":1,"method":"tools/list"})).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(crate::telemetry::schema::validate_mcp_tools(
+            &response["result"]["tools"]
+        ));
+    }
 
     #[test]
     fn view_tool_unwraps_the_cli_envelope() {

@@ -56,6 +56,7 @@ impl Lab {
         let output = lab.output(command, "config-warmup");
         assert!(output.status.success(), "{output:?}");
         let credential = agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "alice".into(),
             email: None,
             hub: Some(lab.base.clone()),

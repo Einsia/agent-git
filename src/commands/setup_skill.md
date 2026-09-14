@@ -189,6 +189,7 @@ agit push <owner/repo> -b main                         # publish the file line
 | `logout` | Sign out and remove local credentials; store/repos remain |
 | `whoami` | Show the current Hub identity; `--check` verifies online |
 | `config` | Read/set/unset `hub.url`, default runtime, push visibility, and related settings |
+| `telemetry` | Inspect usage statistics, preview their fields, or enable/disable collection |
 
 ### Repositories and runtime entry points
 

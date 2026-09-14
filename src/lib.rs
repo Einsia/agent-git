@@ -82,6 +82,8 @@ use crate::rc::windows_job as publication_windows_job;
 /// backend's `default-features = false` import stays free of tokio and TLS.
 #[cfg(feature = "rc")]
 pub mod rc;
+#[cfg(feature = "cli")]
+pub mod telemetry;
 /// The human-facing side: the terminal interface a bare command enters when "someone is sitting
 /// at the terminal". The split with `ui`: `ui` is line rendering and inline questions, `tui` is
 /// full-screen browsing and selection.

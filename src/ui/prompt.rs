@@ -22,6 +22,7 @@ pub fn select(prompt: &str, options: &[&str]) -> Result<Option<usize>> {
     if !interactive() || options.is_empty() {
         return Ok(None);
     }
+    crate::telemetry::observe(crate::telemetry::Observation::Prompt);
     Ok(Select::new()
         .with_prompt(prompt)
         .items(options)
@@ -37,6 +38,7 @@ pub fn confirm(prompt: &str, default: bool) -> Result<Option<bool>> {
     if !interactive() {
         return Ok(None);
     }
+    crate::telemetry::observe(crate::telemetry::Observation::Prompt);
     Ok(Confirm::new()
         .with_prompt(prompt)
         .default(default)
@@ -49,6 +51,7 @@ pub fn input(prompt: &str, default: Option<&str>) -> Result<Option<String>> {
     }
     // The builder methods take self by value, so this rebinds instead of calling on a mutable
     // binding.
+    crate::telemetry::observe(crate::telemetry::Observation::Prompt);
     let mut i = Input::<String>::new().with_prompt(prompt);
     if let Some(d) = default {
         i = i.default(d.to_string());
@@ -61,6 +64,7 @@ pub fn password(prompt: &str) -> Result<Option<String>> {
     if !interactive() {
         return Ok(None);
     }
+    crate::telemetry::observe(crate::telemetry::Observation::Prompt);
     Ok(Some(Password::new().with_prompt(prompt).interact()?))
 }
 

@@ -184,6 +184,7 @@ impl Lab {
                 agit::infra::config::hub_host_key(&hub.url).unwrap()
             )),
             &agit::infra::credentials::HubCredential {
+                account_id: None,
                 username: "me".into(),
                 email: Some("me@example.test".into()),
                 hub: Some(hub.url.clone()),

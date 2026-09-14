@@ -121,6 +121,7 @@ fn share_payload(home: &Path, work: &Path) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let hub = format!("http://{}", listener.local_addr().unwrap());
     let credential = agit::infra::credentials::HubCredential {
+        account_id: None,
         username: "me".into(),
         email: None,
         hub: Some(hub.clone()),

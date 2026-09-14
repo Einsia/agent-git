@@ -138,6 +138,7 @@ fn refresh_installed_skills(exe: &Path) -> CmdResult {
             "--skill",
             "--installed-only",
         ])
+        .env("AGIT_TELEMETRY_DEFER", "1")
         .stdin(std::process::Stdio::null())
         .output();
     match output {
@@ -550,11 +551,18 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let exe = root.path().join("new agit");
-        write_executable(&exe, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n");
+        write_executable(
+            &exe,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nprintf '%s' \"$AGIT_TELEMETRY_DEFER\" > \"$0.telemetry\"\n",
+        );
         assert_eq!(refresh_installed_skills(&exe).unwrap(), ExitCode::Ok);
         assert_eq!(
             std::fs::read_to_string(root.path().join("new agit.args")).unwrap(),
             "--no-tui\n--quiet\nsetup\n--skill\n--installed-only\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("new agit.telemetry")).unwrap(),
+            "1"
         );
         write_executable(&exe, "#!/bin/sh\nexit 4\n");
         assert_eq!(

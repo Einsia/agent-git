@@ -85,6 +85,8 @@ pub fn run(args: Args) -> CmdResult {
                 let _ = config::set_global("hub.url", Some(&hub));
             }
             ui::success(&format!("signed in as {}", ui::bold(&who)));
+            crate::telemetry::observe(crate::telemetry::Observation::Authentication(true));
+            crate::telemetry::account_saved(&hub, cred.account_id.as_deref());
             Ok(ExitCode::Ok)
         }
         Ok(None) => {
@@ -154,6 +156,7 @@ fn start_browser_handoff(hub: &str) -> CmdResult {
     let client = crate::hub::Client::for_hub(hub);
     let session: CliSession =
         remote_request(client.post_public("api/auth/cli/session", &serde_json::json!({})))?;
+    crate::telemetry::observe(crate::telemetry::Observation::Authentication(false));
     let message = "Ask the human to open the login link, sign in, and approve CLI access.";
     let complete = ["agit", "login", "--hub", hub, "--complete", &session.state];
     if super::json::is_capturing() {
@@ -365,6 +368,7 @@ fn login_with_token(hub: &str) -> crate::Result<Option<(HubCredential, String)>>
 fn session_credential(response: crate::hub::LoginResponse) -> (HubCredential, String) {
     (
         HubCredential {
+            account_id: response.account_id,
             username: response.username.clone(),
             email: response.email,
             hub: None,
@@ -375,4 +379,25 @@ fn session_credential(response: crate::hub::LoginResponse) -> (HubCredential, St
         },
         response.username,
     )
+}
+
+#[cfg(test)]
+mod identity_tests {
+    #[test]
+    fn login_keeps_authoritative_account_identity_without_a_username_fallback() {
+        for account in [None, Some("account-authoritative")] {
+            let response = serde_json::from_value(serde_json::json!({
+                "account_id": account,
+                "username": "mutable-name",
+                "access_token": "synthetic-access",
+                "access_expires_at": "2030-01-01T00:00:00Z",
+                "refresh_token": "synthetic-refresh",
+                "refresh_expires_at": "2030-02-01T00:00:00Z"
+            }))
+            .unwrap();
+            let (credential, username) = super::session_credential(response);
+            assert_eq!(credential.account_id.as_deref(), account);
+            assert_eq!(username, "mutable-name");
+        }
+    }
 }

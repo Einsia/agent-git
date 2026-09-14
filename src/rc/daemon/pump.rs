@@ -425,6 +425,11 @@ impl Daemon {
                     ordered_tail.acknowledge(&stream);
                 }
                 Some(ev) = link_ev_rx.recv() => {
+                    #[cfg(feature = "cli")]
+                    if let link::LinkEvent::Frame { epoch, frame } = &ev
+                        && frame.is_request() && connection_epoch_is_current(&settlement_tx, *epoch) {
+                        crate::telemetry::rc_request(frame.method());
+                    }
                     if !stopping { match ev {
                         link::LinkEvent::Frame { epoch, frame }
                             if matches!(frame.method(), method::SESSION_WATCH | method::SESSION_UNWATCH) =>

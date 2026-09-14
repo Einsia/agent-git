@@ -387,6 +387,7 @@ fn hub_credentials_are_private_under_inherited_public_read(home: &Path) {
     );
     let path = directory.join("private.json");
     let mut credential = agit::infra::credentials::HubCredential {
+        account_id: None,
         username: "windows-fixture".into(),
         email: None,
         hub: Some("http://127.0.0.1:9".into()),
@@ -491,6 +492,7 @@ fn native_pipe_permissions_and_daemon_lifecycle() {
     agit::infra::credentials::save(
         &refused.url,
         &agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "windows-fixture".into(),
             email: None,
             hub: Some(refused.url.clone()),
@@ -559,6 +561,7 @@ fn native_pipe_permissions_and_daemon_lifecycle() {
     agit::infra::credentials::save(
         &hub.url,
         &agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "windows-fixture".into(),
             email: None,
             hub: Some(hub.url.clone()),

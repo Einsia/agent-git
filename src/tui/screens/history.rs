@@ -64,6 +64,12 @@ fn rank(rows: &mut [Row], preferred: Option<&str>) {
 }
 
 pub fn pick(cwd: &Path, title: &str) -> crate::Result<Option<Row>> {
+    crate::telemetry::measure_pick(crate::telemetry::Operation::TuiHistory, || {
+        pick_telemetry_inner(cwd, title)
+    })
+}
+
+fn pick_telemetry_inner(cwd: &Path, title: &str) -> crate::Result<Option<Row>> {
     let rows = collect(cwd)?;
     if rows.is_empty() {
         println!("no settled sessions on this machine yet.");

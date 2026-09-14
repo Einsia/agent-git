@@ -137,6 +137,13 @@ fn run_setup(mut args: Args) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
 
+    if args.completions.is_none() && !args.installed_only {
+        if crate::telemetry::state::onboarding().is_err() {
+            eprintln!("Usage statistics remain off because their settings could not be saved.");
+        }
+        crate::telemetry::activate(true);
+    }
+
     // No flag = install everything (except completions — that one takes a shell argument).
     let all =
         !args.hooks && !args.skill && !args.mcp && !args.agents_md && args.completions.is_none();
@@ -149,7 +156,11 @@ fn run_setup(mut args: Args) -> CmdResult {
 
     if let Some(value) = args.auto_push {
         super::config::apply("push.auto", Some(if value { "true" } else { "false" }))?;
-    } else if all && !super::json::requested() && ui::prompt::interactive() {
+    } else if all
+        && !super::json::requested()
+        && ui::prompt::interactive()
+        && !crate::telemetry::state::positive("AGIT_YES")
+    {
         let current = crate::infra::config::auto_push_default()?;
         if let Some(value) = ui::prompt::confirm(
             "Automatically push settled turns by default? Each repository can override this",

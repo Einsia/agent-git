@@ -102,6 +102,7 @@ impl Guard {
     /// Take the terminal over.
     pub fn enter() -> Result<Guard> {
         apply_effect(Effect::Take)?;
+        crate::telemetry::observe(crate::telemetry::Observation::Tui);
         Ok(Guard {
             state: State::Owned,
         })

@@ -2784,6 +2784,24 @@ fn scan_agent_repo_selected(
     plan: &ScanPlan,
     frozen: Option<(&[String], &[String])>,
 ) -> crate::Result<ScanReport> {
+    #[cfg(feature = "cli")]
+    let started = std::time::Instant::now();
+    let result = scan_agent_repo_selected_inner(repo, plan, frozen);
+    #[cfg(feature = "cli")]
+    crate::telemetry::operation(
+        crate::telemetry::Operation::SecretScan,
+        result.is_ok(),
+        started.elapsed(),
+        result.as_ref().ok().map(|report| report.hits.len() as u64),
+    );
+    result
+}
+
+fn scan_agent_repo_selected_inner(
+    repo: &crate::domain::repo::Repo,
+    plan: &ScanPlan,
+    frozen: Option<(&[String], &[String])>,
+) -> crate::Result<ScanReport> {
     let home = crate::infra::config::agit_home().context(ScanPreparationFailure::LocalState)?;
     let allowlist = load_allowlist(&home);
     // When a vault exists but cannot be unlocked or authenticated, return an error; degrading to

@@ -23,6 +23,7 @@ fn singleton_publish_state_cannot_replace_missing_or_rejected_identity() {
     listener.set_nonblocking(true).unwrap();
     let hub = format!("http://{}", listener.local_addr().unwrap());
     let credential = agit::infra::credentials::HubCredential {
+        account_id: None,
         username: "me".into(),
         email: None,
         hub: Some(hub.clone()),

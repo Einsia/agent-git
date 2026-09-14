@@ -91,6 +91,17 @@ pub fn run(
     deferred: &mut HashSet<Identity>,
     focus: Option<&Identity>,
 ) -> crate::Result<Outcome> {
+    crate::telemetry::measure(crate::telemetry::Operation::TuiNaming, || {
+        run_telemetry_inner(rows, cwd, deferred, focus)
+    })
+}
+
+fn run_telemetry_inner(
+    rows: &[sessions::Row],
+    cwd: &Path,
+    deferred: &mut HashSet<Identity>,
+    focus: Option<&Identity>,
+) -> crate::Result<Outcome> {
     let repos = repos::collect(crate::commands::new::DEFAULT_FROM);
     let preferred = crate::commands::context::repo_for(cwd).ok();
     let repo_index = preferred

@@ -67,6 +67,14 @@ impl Draft {
 }
 
 pub fn pick(cwd: &std::path::Path) -> crate::Result<Option<crate::commands::share::Args>> {
+    crate::telemetry::measure_pick(crate::telemetry::Operation::TuiSharing, || {
+        pick_telemetry_inner(cwd)
+    })
+}
+
+fn pick_telemetry_inner(
+    cwd: &std::path::Path,
+) -> crate::Result<Option<crate::commands::share::Args>> {
     let Some(session) = super::history::pick(cwd, "agit share")? else {
         return Ok(None);
     };

@@ -157,6 +157,7 @@ impl Lab {
                     agit::infra::config::hub_host_key(base).unwrap()
                 )),
                 &HubCredential {
+                    account_id: None,
                     username: "saved-display".into(),
                     email: None,
                     hub: Some(base.into()),

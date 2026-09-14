@@ -908,6 +908,7 @@ impl Lab {
                 agit::infra::config::hub_host_key(hub).unwrap()
             )),
             &agit::infra::credentials::HubCredential {
+                account_id: None,
                 username: "alice".into(),
                 email: None,
                 hub: Some(hub.into()),
@@ -1781,6 +1782,7 @@ fn rc_land_to_strict_archive_settlement_retains_native_authority() {
                 agit::infra::config::hub_host_key(&hub).unwrap()
             )),
             &agit::infra::credentials::HubCredential {
+                account_id: None,
                 username: "alice".into(),
                 email: None,
                 hub: Some(hub.clone()),

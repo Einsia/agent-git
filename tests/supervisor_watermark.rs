@@ -30,6 +30,7 @@ impl Lab {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&work).unwrap();
         let cred = agit::infra::credentials::HubCredential {
+            account_id: None,
             username: "me".into(),
             email: None,
             hub: Some(HUB.into()),

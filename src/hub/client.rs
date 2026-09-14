@@ -342,6 +342,17 @@ impl Client {
         T: serde::de::DeserializeOwned,
         F: Fn(Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     {
+        crate::telemetry::allow_uploads();
+        crate::telemetry::measure(crate::telemetry::Operation::HubRequest, || {
+            self.with_retry_telemetry_inner(path, send)
+        })
+    }
+
+    fn with_retry_telemetry_inner<T, F>(&self, path: &str, send: F) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn(Option<&str>) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    {
         self.ensure_destination()?;
         let mut resp = {
             let t = self.token.borrow();
@@ -455,6 +466,7 @@ impl Client {
         };
 
         let fresh = credentials::HubCredential {
+            account_id: cred.account_id.clone(),
             username: cred.username.clone(),
             email: cred.email.clone(),
             hub: cred.hub.clone(),
@@ -463,13 +475,13 @@ impl Client {
             refresh_token: pair.refresh_token,
             refresh_expires_at: pair.refresh_expires_at,
         };
-        match credentials::save_refreshed(&self.base, &cred, &fresh) {
-            Ok(true) => {}
-            Ok(false) => return self.adopt_newer_from_disk(&cred).unwrap_or(false),
+        let saved = match credentials::save_refreshed(&self.base, &cred, &fresh) {
+            Ok(Some(saved)) => saved,
+            Ok(None) => return self.adopt_newer_from_disk(&cred).unwrap_or(false),
             Err(_) => return false,
-        }
-        *self.token.borrow_mut() = Some(pair.access_token);
-        *self.cred.borrow_mut() = Some(fresh);
+        };
+        *self.token.borrow_mut() = Some(saved.access_token.clone());
+        *self.cred.borrow_mut() = Some(saved);
         true
     }
 
@@ -489,7 +501,9 @@ impl Client {
         let disk = credentials::load_checked(&self.base)?
             .ok_or_else(|| anyhow::anyhow!("the saved Hub credentials are no longer available"))?;
         anyhow::ensure!(
-            credential_matches_hub(&self.base, &disk) && disk.username == ours.username,
+            credential_matches_hub(&self.base, &disk)
+                && disk.username == ours.username
+                && (ours.account_id.is_none() || disk.account_id == ours.account_id),
             "the saved Hub identity changed"
         );
         if disk.access_token == ours.access_token || disk.refresh_expired() {
@@ -566,6 +580,17 @@ impl Client {
         path: &str,
         body: &B,
     ) -> Result<T> {
+        crate::telemetry::allow_uploads();
+        crate::telemetry::measure(crate::telemetry::Operation::HubRequest, || {
+            self.post_public_telemetry_inner(path, body)
+        })
+    }
+
+    fn post_public_telemetry_inner<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
         self.ensure_destination()?;
         let resp = self
             .agent
@@ -584,6 +609,17 @@ impl Client {
     }
 
     fn delete_inner(&self, path: &str, expected_agent_id: Option<&str>) -> Result<()> {
+        crate::telemetry::allow_uploads();
+        crate::telemetry::measure(crate::telemetry::Operation::HubRequest, || {
+            self.delete_inner_telemetry_inner(path, expected_agent_id)
+        })
+    }
+
+    fn delete_inner_telemetry_inner(
+        &self,
+        path: &str,
+        expected_agent_id: Option<&str>,
+    ) -> Result<()> {
         self.ensure_destination()?;
         let send = |token: Option<&str>| {
             let mut req = self.agent.delete(self.url(path));
@@ -842,7 +878,18 @@ impl Client {
     /// an endpoint that requires authentication can answer whether the credentials are still
     /// valid.
     pub fn me(&self) -> Result<super::Me> {
-        self.get("api/auth/me")
+        let me: super::Me = self.get("api/auth/me")?;
+        let expected = self.cred.borrow().clone();
+        if let (Some(expected), Some(account_id)) = (expected, me.account_id.as_deref())
+            && credentials::save_verified_account(&self.base, &expected, account_id)
+                .unwrap_or(false)
+        {
+            let mut verified = expected;
+            verified.account_id = Some(account_id.to_owned());
+            *self.cred.borrow_mut() = Some(verified);
+            crate::telemetry::account_saved(&self.base, Some(account_id));
+        }
+        Ok(me)
     }
 
     /// Whether `<owner>/<name>` can be pushed to.
@@ -1232,6 +1279,7 @@ mod tests {
             std::env::set_var("AGIT_HOME", home.path());
         }
         let cred = credentials::HubCredential {
+            account_id: None,
             username: "alice".into(),
             email: None,
             hub: Some(base.clone()),
@@ -1294,6 +1342,7 @@ mod tests {
             std::env::set_var("AGIT_HOME", home.path());
         }
         let cred = credentials::HubCredential {
+            account_id: None,
             username: "alice".into(),
             email: None,
             hub: Some(base.clone()),
@@ -1341,6 +1390,7 @@ mod tests {
 
     fn old_pair(base: &str, username: &str) -> credentials::HubCredential {
         credentials::HubCredential {
+            account_id: None,
             username: username.into(),
             email: None,
             hub: Some(base.to_string()),
@@ -1353,6 +1403,7 @@ mod tests {
 
     fn new_pair(base: &str, username: &str) -> credentials::HubCredential {
         credentials::HubCredential {
+            account_id: None,
             username: username.into(),
             email: None,
             hub: Some(base.to_string()),
@@ -1523,6 +1574,54 @@ mod tests {
             .map(|(_, value)| value.trim())
             .unwrap();
         format!("http://{host}")
+    }
+
+    fn refresh_with_verified_account(verify_during_exchange: bool) {
+        let _home = CredentialTestHome::new();
+        let (base, hub) = fake_hub(1, move |request| {
+            assert!(request.starts_with("POST /api/auth/refresh "));
+            assert!(request.contains("rt-old"));
+            let base = request_hub(request);
+            if verify_during_exchange {
+                let expected = credentials::load(&base).unwrap();
+                assert!(
+                    credentials::save_verified_account(&base, &expected, "alice-account").unwrap()
+                );
+            }
+            (
+                200,
+                serde_json::to_string(&new_pair(&base, "alice")).unwrap(),
+            )
+        });
+        let cred = old_pair(&base, "alice");
+        credentials::save(&base, &cred).unwrap();
+        let client = Client::for_credential(&base, &cred);
+        if !verify_during_exchange {
+            assert!(credentials::save_verified_account(&base, &cred, "alice-account").unwrap());
+        }
+        let refreshed = client.refresh_access();
+        assert_eq!(hub.join().unwrap().len(), 1);
+        assert!(
+            refreshed,
+            "verified metadata must not discard the exchanged pair"
+        );
+        let saved = credentials::load(&base).unwrap();
+        for value in [&saved, client.cred.borrow().as_ref().unwrap()] {
+            assert_eq!(value.access_token, "at-new");
+            assert_eq!(value.refresh_token, "rt-new");
+            assert_eq!(value.account_id.as_deref(), Some("alice-account"));
+        }
+        assert_eq!(client.token.borrow().as_deref(), Some("at-new"));
+    }
+
+    #[test]
+    fn account_verification_before_refresh_preserves_the_exchanged_pair() {
+        refresh_with_verified_account(false);
+    }
+
+    #[test]
+    fn account_verification_during_refresh_preserves_the_exchanged_pair() {
+        refresh_with_verified_account(true);
     }
 
     #[test]

@@ -498,6 +498,18 @@ pub fn download_lfs_file(
     output: &Path,
     identity: &super::identity::RemoteIdentity,
 ) -> Result<()> {
+    crate::telemetry::measure(crate::telemetry::Operation::ArtifactDownload, || {
+        download_lfs_file_telemetry_inner(repo, path, pointer_bytes, output, identity)
+    })
+}
+
+fn download_lfs_file_telemetry_inner(
+    repo: &Repo,
+    path: &str,
+    pointer_bytes: &[u8],
+    output: &Path,
+    identity: &super::identity::RemoteIdentity,
+) -> Result<()> {
     let pointer = crate::domain::lfs::Pointer::parse(pointer_bytes)?
         .context("the requested file is not an LFS pointer")?;
     crate::domain::lfs::local::require_client(repo)?;
@@ -722,6 +734,29 @@ fn execute_transport(
 /// A borrowed execution controls both process setup and configuration across credential retries.
 /// The transport retains account state; replacing execution never constructs another client.
 fn execute_transport_in(
+    dir: Option<&Path>,
+    args: &[&str],
+    transport: &TransportIdentity,
+    mode: OutputMode,
+    execution: Option<&frozen::Execution>,
+) -> TransportRun {
+    crate::telemetry::allow_uploads();
+    let started = std::time::Instant::now();
+    let result = execute_transport_inner(dir, args, transport, mode, execution);
+    crate::telemetry::operation(
+        crate::telemetry::Operation::GitTransport,
+        result.error.is_none()
+            && result
+                .attempts
+                .last()
+                .is_some_and(|attempt| attempt.outcome.code == 0),
+        started.elapsed(),
+        None,
+    );
+    result
+}
+
+fn execute_transport_inner(
     dir: Option<&Path>,
     args: &[&str],
     transport: &TransportIdentity,
@@ -2102,6 +2137,7 @@ mod git_credential_lifecycle_tests {
 
     fn pair(hub: &str, username: &str) -> credentials::HubCredential {
         credentials::HubCredential {
+            account_id: None,
             username: username.into(),
             email: None,
             hub: Some(hub.into()),

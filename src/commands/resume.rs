@@ -2012,11 +2012,18 @@ pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
                 println!("\n  {}", ui::accent(&cmd));
                 return Ok(ExitCode::Ok);
             }
+            let started = std::time::Instant::now();
             let status = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&cmd)
-                .status()
-                .map_err(|e| anyhow::anyhow!("couldn’t launch: {e}"))?;
+                .status();
+            crate::telemetry::operation(
+                crate::telemetry::Operation::RuntimeLaunch,
+                status.as_ref().is_ok_and(std::process::ExitStatus::success),
+                started.elapsed(),
+                None,
+            );
+            let status = status.map_err(|e| anyhow::anyhow!("couldn’t launch: {e}"))?;
             Ok(match status.code() {
                 Some(0) | None => ExitCode::Ok,
                 Some(_) => ExitCode::Precondition,

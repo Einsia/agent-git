@@ -52,6 +52,16 @@ if (!key) {
 const work = mkdtempSync(join(tmpdir(), 'agit-npm-smoke-'))
 const nm = join(work, 'node_modules', '@einsia')
 const home = join(work, 'home')
+mkdirSync(home, { recursive: true })
+const env = { ...process.env, HOME: home, USERPROFILE: home, AGIT_HOME: join(home, '.agit'),
+  CODEX_HOME: join(home, '.codex'), CLAUDE_CONFIG_DIR: join(home, '.claude'),
+  XDG_DATA_HOME: join(home, '.local', 'share'), XDG_CONFIG_HOME: join(home, '.config'),
+  AGIT_HUB_URL: 'http://127.0.0.1:9', npm_config_yes: 'true' }
+for (const key of ['AGIT_TELEMETRY_DISABLED', 'DO_NOT_TRACK', 'AGIT_TELEMETRY_DEFER', 'AGIT_SKIP_SETUP', 'AGIT_SESSION', 'AGIT_TELEMETRY_HOST', 'AGIT_TELEMETRY_KEY']) delete env[key]
+if (process.platform === 'win32') {
+  delete env.HOME
+  delete env.AGIT_HOME
+}
 let failed = 0
 const check = (label, ok, detail = '') => {
   console.log(`${ok ? '✓' : '✗ FAIL'} ${label}${ok ? '' : ` :: ${detail}`}`)
@@ -90,26 +100,19 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
 
 // 1. main package shim forwarding
 {
-  const r = spawnSync('node', [mainShim, '--version'], { encoding: 'utf8' })
+  const r = spawnSync('node', [mainShim, '--version'], { encoding: 'utf8', env })
   check('shim resolves the platform binary and forwards --version', r.status === 0 && (r.stdout || '').trim() === `agit ${version}`, `${r.status} ${r.stdout} ${r.stderr}`)
 }
 {
-  const r = spawnSync('node', [mainShim, 'definitely-not-a-command'], { encoding: 'utf8' })
+  const r = spawnSync('node', [mainShim, 'definitely-not-a-command'], { encoding: 'utf8', env })
   check('shim forwards a failing exit code', r.status === 2 || r.status === 1, `exit ${r.status}`)
 }
 
 // 2. sandboxed install through the npx wrapper
 {
-  mkdirSync(home, { recursive: true })
-  const env = { ...process.env, USERPROFILE: home }
-  if (process.platform === 'win32') {
-    for (const key of Object.keys(env)) {
-      if (['HOME', 'AGIT_HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME'].includes(key.toUpperCase())) delete env[key]
-    }
-  } else {
-    env.HOME = home
-    env.AGIT_HOME = join(home, '.agit')
-  }
+  const preferences = join(home, '.agit', 'telemetry', 'preferences.json')
+  const postinstall = spawnSync('node', [join(mainPkg, 'npm', 'postinstall.js')], { encoding: 'utf8', env, cwd: home })
+  check('dependency postinstall defers usage-statistics onboarding', postinstall.status === 0 && !existsSync(preferences), postinstall.stderr)
   const r = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], {
     encoding: 'utf8',
     env,
@@ -118,19 +121,24 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
   const installed = join(home, '.local', 'bin', platform.binaryName())
   check(`npx wrapper installs ${platform.binaryName()} to the user bin directory`, r.status === 0 && existsSync(installed), `${r.status} ${r.stderr}`)
   if (existsSync(installed)) {
-    const v = spawnSync(installed, ['--version'], { encoding: 'utf8' })
+    const v = spawnSync(installed, ['--version'], { encoding: 'utf8', env })
     check('installed binary runs', v.status === 0, `${v.status} ${v.stderr}`)
     // at least one of what setup persists (the skill, the AGENTS.md marker block) must be there
     check('agit setup ran (skills marker exists)',
       existsSync(join(home, '.claude', 'skills', 'agit', 'SKILL.md')) ||
       existsSync(join(home, '.claude', 'agents.md')) ||
       existsSync(join(home, 'AGENTS.md')))
+    const saved = JSON.parse(readFileSync(preferences, 'utf8'))
+    check('npm yes enables statistics after a visible notice', saved.preference === 'enabled' && saved.decision_source === 'create_agit_yes' && r.stderr.includes('agit telemetry disable'), r.stderr)
+    spawnSync(installed, ['telemetry', 'disable'], { env, encoding: 'utf8' })
+    const again = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env, encoding: 'utf8', cwd: home })
+    check('reinstallation with npm yes preserves an opt-out', again.status === 0 && JSON.parse(readFileSync(preferences, 'utf8')).preference === 'disabled', again.stderr)
   }
 }
 
 // 3. source checkout: postinstall must skip itself on this path
 {
-  const r = spawnSync('node', [join(root, 'npm', 'postinstall.js')], { encoding: 'utf8' })
+  const r = spawnSync('node', [join(root, 'npm', 'postinstall.js')], { encoding: 'utf8', env })
   check('postinstall in a source checkout stays silent', r.status === 0, `${r.status} ${r.stderr}`)
 }
 

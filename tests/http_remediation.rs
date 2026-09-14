@@ -363,6 +363,7 @@ mod unix {
 
     fn credential(base: &str, refresh_valid: bool) -> HubCredential {
         HubCredential {
+            account_id: None,
             username: "me".into(),
             email: None,
             hub: Some(base.into()),
