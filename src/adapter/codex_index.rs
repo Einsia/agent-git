@@ -44,9 +44,8 @@ pub struct Thread {
     pub id: String,
     pub rollout_path: PathBuf,
     pub cwd: Option<String>,
-    /// The opening prompt. `agit log` uses it so the user recognizes "which one was the
-    /// payments-module session".
-    pub first_user_message: Option<String>,
+    /// A bounded opening preview; callers must open the transcript to read the prompt.
+    pub gist: Option<String>,
     /// `user` / `subagent`. Filters out subagent sessions (345 of them on this machine).
     pub thread_source: Option<String>,
     pub updated_at_ms: Option<i64>,
@@ -106,8 +105,25 @@ fn schema_ok(con: &Connection) -> bool {
     .is_ok()
 }
 
-const SELECT: &str = "SELECT id, rollout_path, cwd, first_user_message, thread_source, \
-                      updated_at_ms FROM threads";
+const GIST_SOURCE_CHARS: usize = 4096;
+
+fn select() -> String {
+    format!(
+        "SELECT id, rollout_path, cwd, \
+         CASE WHEN typeof(first_user_message) = 'text' THEN substr(first_user_message, 1, {}) END, thread_source, \
+         updated_at_ms FROM threads",
+        GIST_SOURCE_CHARS + 1
+    )
+}
+
+fn opening_preview(text: String) -> String {
+    let mut preview = super::preview::shorten(&text, super::preview::SESSION_PREVIEW_CHARS);
+    // A clipped whitespace prefix cannot establish that the complete prompt is empty.
+    if text.chars().count() > GIST_SOURCE_CHARS && !preview.ends_with('…') {
+        preview.push('…');
+    }
+    preview
+}
 
 fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     let path: String = r.get(1)?;
@@ -115,7 +131,7 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         id: r.get(0)?,
         rollout_path: PathBuf::from(path),
         cwd: r.get(2).ok(),
-        first_user_message: r.get(3).ok(),
+        gist: r.get(3).ok().map(opening_preview),
         thread_source: r.get(4).ok(),
         updated_at_ms: r.get(5).ok(),
     })
@@ -140,8 +156,9 @@ pub fn threads_for_cwd(cwd: &str) -> Option<Vec<Thread>> {
         return None;
     }
     let sql = format!(
-        "{SELECT} WHERE archived = 0 AND cwd = ?1 AND rollout_path IS NOT NULL \
-         ORDER BY updated_at_ms DESC"
+        "{} WHERE archived = 0 AND cwd = ?1 AND rollout_path IS NOT NULL \
+         ORDER BY updated_at_ms DESC",
+        select()
     );
     let mut st = con.prepare(&sql).ok()?;
     let rows = st.query_map([cwd], row_to_thread).ok()?;
@@ -158,7 +175,8 @@ pub fn all_threads() -> Option<Vec<Thread>> {
         return None;
     }
     let sql = format!(
-        "{SELECT} WHERE archived = 0 AND rollout_path IS NOT NULL ORDER BY updated_at_ms DESC"
+        "{} WHERE archived = 0 AND rollout_path IS NOT NULL ORDER BY updated_at_ms DESC",
+        select()
     );
     let mut st = con.prepare(&sql).ok()?;
     let rows = st.query_map([], row_to_thread).ok()?;
@@ -175,7 +193,10 @@ pub fn thread_by_id(id: &str) -> Option<Thread> {
     if !schema_ok(&con) {
         return None;
     }
-    let sql = format!("{SELECT} WHERE id = ?1 AND rollout_path IS NOT NULL LIMIT 1");
+    let sql = format!(
+        "{} WHERE id = ?1 AND rollout_path IS NOT NULL LIMIT 1",
+        select()
+    );
     let mut st = con.prepare(&sql).ok()?;
     let mut rows = st.query_map([id], row_to_thread).ok()?;
     rows.next()?.ok()
@@ -398,14 +419,80 @@ mod tests {
         let con = open(p).unwrap();
         assert!(schema_ok(&con));
         let sql = format!(
-            "{SELECT} WHERE archived = 0 AND cwd = ?1 AND rollout_path IS NOT NULL \
-             ORDER BY updated_at_ms DESC"
+            "{} WHERE archived = 0 AND cwd = ?1 AND rollout_path IS NOT NULL \
+             ORDER BY updated_at_ms DESC",
+            select()
         );
         let mut st = con.prepare(&sql).unwrap();
         st.query_map([cwd], row_to_thread)
             .unwrap()
             .filter_map(|r| r.ok())
             .collect()
+    }
+
+    #[test]
+    fn indexed_previews_bound_query_results_without_changing_native_prompts() {
+        let (_directory, path) = fixture();
+        let connection = Connection::open(&path).unwrap();
+        // Unicode fixture pins scalar boundaries through SQLite and Rust preview extraction.
+        let prompt = format!(
+            "{}SENTINEL_AFTER_PREVIEW",
+            "\u{4f60}\u{597d}\n".repeat(1 << 17)
+        );
+        connection
+            .execute(
+                "UPDATE threads SET first_user_message = ?1 WHERE id = 'id-a'",
+                [&prompt],
+            )
+            .unwrap();
+        let sql = format!("{} WHERE id = 'id-a'", select());
+        let projected: String = connection.query_row(&sql, [], |row| row.get(3)).unwrap();
+        assert_eq!(projected.chars().count(), GIST_SOURCE_CHARS + 1);
+        let listed = q_cwd(&path, "/repo/one");
+        let preview = listed[0].gist.as_ref().unwrap();
+        assert_eq!(
+            preview.chars().count(),
+            super::super::preview::SESSION_PREVIEW_CHARS + 1
+        );
+        assert!(preview.ends_with('…'));
+        assert!(!preview.contains("SENTINEL_AFTER_PREVIEW"));
+        assert_eq!(listed[1].gist.as_deref(), Some("add test"));
+        let stored: String = connection
+            .query_row(
+                "SELECT first_user_message FROM threads WHERE id = 'id-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, prompt);
+    }
+
+    #[test]
+    fn non_text_index_values_do_not_become_prompt_previews() {
+        let (_directory, path) = fixture();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE threads SET first_user_message = zeroblob(65536) WHERE id = 'id-a'",
+                [],
+            )
+            .unwrap();
+        assert!(q_cwd(&path, "/repo/one")[0].gist.is_none());
+    }
+
+    #[test]
+    fn an_incomplete_whitespace_prefix_does_not_hide_a_real_session() {
+        let (_directory, path) = fixture();
+        let connection = Connection::open(&path).unwrap();
+        let prompt = format!("{}real request", " ".repeat(GIST_SOURCE_CHARS * 2));
+        connection
+            .execute(
+                "UPDATE threads SET first_user_message = ?1 WHERE id = 'id-a'",
+                [&prompt],
+            )
+            .unwrap();
+        let listed = q_cwd(&path, "/repo/one");
+        assert_eq!(listed[0].gist.as_deref(), Some("…"));
     }
 
     #[test]

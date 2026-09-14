@@ -1457,6 +1457,47 @@ fn a_lineage_that_cannot_become_a_path_is_refused_at_the_wire_not_downgraded() {
 }
 
 #[test]
+fn local_session_wire_previews_bound_indexed_and_parsed_prompts() {
+    let prompt = format!("{}SENTINEL_AFTER_PREVIEW", "long prompt ".repeat(1 << 16));
+    let rows = [Some(prompt.clone()), None]
+        .into_iter()
+        .enumerate()
+        .map(|(index, gist)| LocalSession {
+            runtime_session_id: format!("native-{index}"),
+            runtime: "codex".into(),
+            cwd: "/fixture".into(),
+            modified_at: "2026-09-14T00:00:00Z".into(),
+            gist,
+            adopted: false,
+            agent: None,
+            likely_active: false,
+        })
+        .collect();
+    let mut parses = 0;
+    let listed = finish_local_sessions(rows, LocalSessionScan::Listing, |_| {
+        parses += 1;
+        Some(prompt.clone())
+    });
+    assert_eq!(parses, 1);
+    assert_eq!(listed.len(), 2);
+    for row in &listed {
+        let preview = row.gist.as_ref().unwrap();
+        assert_eq!(
+            preview.chars().count(),
+            crate::adapter::preview::SESSION_PREVIEW_CHARS + 1
+        );
+        assert!(preview.ends_with('…'));
+    }
+    let wire = serde_json::to_vec(&listed).unwrap();
+    assert!(wire.len() < 2048);
+    assert!(
+        !String::from_utf8(wire)
+            .unwrap()
+            .contains("SENTINEL_AFTER_PREVIEW")
+    );
+}
+
+#[test]
 fn resume_location_consumes_one_scan_and_opens_no_transcript_for_gist() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();

@@ -2369,6 +2369,14 @@ fn finish_local_sessions(
             item.gist = gist_for(item);
         }
     }
+    for item in &mut sessions {
+        if let Some(gist) = &mut item.gist {
+            *gist = crate::adapter::preview::shorten(
+                gist,
+                crate::adapter::preview::SESSION_PREVIEW_CHARS,
+            );
+        }
+    }
     sessions
 }
 

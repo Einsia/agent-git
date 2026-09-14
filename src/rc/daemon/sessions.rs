@@ -1198,7 +1198,7 @@ impl LocalSessionSnapshot {
                         modified_at: rfc3339(r.mtime),
                         // The codex index gives an opening prompt for free; Claude Code has
                         // no index, so leave None and fill it in below within the budget.
-                        gist: r.gist.as_deref().map(local_gist_text),
+                        gist: r.gist,
                         adopted: link.is_some(),
                         agent: link.and_then(|l| l.agent),
                         likely_active: recently_written(r.mtime),
@@ -1212,7 +1212,6 @@ impl LocalSessionSnapshot {
 }
 
 const LOCAL_GIST_BYTES: u64 = 256 * 1024;
-const LOCAL_GIST_CHARS: usize = 80;
 
 fn local_gist_preview(item: &LocalSession) -> Option<String> {
     // Path resolution can materialize database histories, so discovery only opens native files.
@@ -1226,18 +1225,6 @@ fn local_gist_preview(item: &LocalSession) -> Option<String> {
     )?;
     let file = std::fs::File::open(path).ok()?;
     bounded_local_gist(file, adapter.as_ref())
-}
-
-fn local_gist_text(text: &str) -> String {
-    let mut characters = text
-        .split_whitespace()
-        .enumerate()
-        .flat_map(|(index, word)| (index > 0).then_some(' ').into_iter().chain(word.chars()));
-    let mut gist: String = characters.by_ref().take(LOCAL_GIST_CHARS).collect();
-    if characters.next().is_some() {
-        gist.push('…');
-    }
-    gist
 }
 
 /// Discovery previews have a byte budget independent of the transcript's total length.
@@ -1257,10 +1244,9 @@ fn bounded_local_gist(
     let parsed = adapter.parse(std::str::from_utf8(&prefix).ok()?).ok()?;
     parsed
         .events
-        .iter()
+        .into_iter()
         .find(|event| event.kind == crate::adapter::EventKind::UserPrompt)
-        .and_then(|event| event.text.as_deref())
-        .map(local_gist_text)
+        .and_then(|event| event.text)
 }
 
 #[cfg(test)]
@@ -1370,20 +1356,40 @@ mod discovery_preview_tests {
     }
 
     #[test]
-    fn indexed_previews_normalize_whitespace_and_truncate_unicode_safely() {
-        assert_eq!(
-            local_gist_text("  Inspect\n  the latency  "),
-            "Inspect the latency"
-        );
+    fn discovery_previews_share_normalized_unicode_boundaries() {
+        use crate::adapter::preview::SESSION_PREVIEW_CHARS;
+
         // CJK fixture pins character-based preview boundaries.
-        let text = "界".repeat(LOCAL_GIST_CHARS + 1);
-        assert_eq!(
-            local_gist_text(&text),
-            format!("{}…", "界".repeat(LOCAL_GIST_CHARS))
-        );
-        assert_eq!(
-            local_gist_text(&"a".repeat(LOCAL_GIST_CHARS)),
-            "a".repeat(LOCAL_GIST_CHARS)
-        );
+        let inputs = [
+            "  Inspect\n  the latency  ".to_owned(),
+            "界".repeat(SESSION_PREVIEW_CHARS + 1),
+            "a".repeat(SESSION_PREVIEW_CHARS),
+        ];
+        let rows = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, gist)| LocalSession {
+                runtime_session_id: format!("native-{index}"),
+                runtime: "codex".into(),
+                cwd: "/fixture".into(),
+                modified_at: "2026-09-14T00:00:00Z".into(),
+                gist: Some(gist),
+                adopted: false,
+                agent: None,
+                likely_active: false,
+            })
+            .collect();
+        let listed = finish_local_sessions(rows, LocalSessionScan::Listing, |_| {
+            panic!("Indexed previews must not reopen native transcripts")
+        });
+        let expected = [
+            "Inspect the latency".to_owned(),
+            format!("{}…", "界".repeat(SESSION_PREVIEW_CHARS)),
+            "a".repeat(SESSION_PREVIEW_CHARS),
+        ];
+        assert_eq!(listed.len(), expected.len());
+        for (row, expected) in listed.iter().zip(expected) {
+            assert_eq!(row.gist.as_deref(), Some(expected.as_str()));
+        }
     }
 }

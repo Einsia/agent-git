@@ -38,6 +38,7 @@ mod native_message;
 pub mod native_snapshot;
 pub mod openclaw;
 pub mod opencode;
+pub(crate) mod preview;
 mod sqlite_native;
 pub mod workbuddy;
 
@@ -129,12 +130,7 @@ impl Session {
             .iter()
             .find(|e| e.kind == EventKind::UserPrompt)
             .and_then(|e| e.text.as_deref())?;
-        let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let mut s: String = one_line.chars().take(max).collect();
-        if one_line.chars().count() > max {
-            s.push('…');
-        }
-        Some(s)
+        Some(preview::shorten(text, max))
     }
 
     pub fn counts(&self) -> Counts {

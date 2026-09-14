@@ -445,7 +445,7 @@ fn thread_to_ref(t: super::codex_index::Thread) -> SessionRef {
         mtime,
         // Already in the index, so it is free — without it the caller reparses the whole
         // transcript.
-        gist: t.first_user_message,
+        gist: t.gist,
     }
 }
 
