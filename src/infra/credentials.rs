@@ -1,8 +1,7 @@
 //! Credential storage: an access token + refresh token pair.
 //!
-//! The access token is short-lived (one hour) and rides on every request; the refresh token is
-//! long-lived (thirty days) and only buys a new access token. On a 401 the client refreshes once
-//! and retries, so one sign-in lasts a month.
+//! The Hub supplies the expiry of each token. Access tokens authenticate requests, while
+//! refresh tokens exchange for a new pair whose expiry starts at the successful renewal.
 //!
 //! # One file per hub
 //!
@@ -291,6 +290,41 @@ fn mutation_guard(dir: &Path) -> Result<std::fs::File> {
         .context("cannot open credential mutation lock")?;
     fs2::FileExt::lock_exclusive(&file).context("cannot lock credential mutations")?;
     Ok(file)
+}
+
+/// Serialize renewal through persistence without preventing a concurrent login or logout.
+/// The separate mutation lock still fences the final write against an identity change.
+#[cfg(feature = "cli")]
+pub(crate) fn refresh_guard(hub: &str) -> Result<std::fs::File> {
+    use std::time::{Duration, Instant};
+
+    let authority = HubAuthority::parse(hub)?;
+    let dir = crate::infra::config::credentials_dir()?;
+    std::fs::create_dir_all(&dir).context("cannot create credential directory")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(dir.join(format!("{}.refresh.lock", authority.storage_key())))
+        .context("cannot open Hub credential refresh lock")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(file),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                ensure!(
+                    Instant::now() < deadline,
+                    "another process is still refreshing Hub credentials; retry this command"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error).context("cannot lock Hub credential refresh"),
+        }
+    }
 }
 
 pub fn save_at(path: &Path, cred: &HubCredential) -> Result<()> {

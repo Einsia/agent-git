@@ -1023,38 +1023,63 @@ mod unix {
     }
 
     #[test]
-    fn whoami_preserves_its_check_payload_and_uses_the_terminal_response() {
-        let lab = Lab::new();
-        let hub = Hub::new(|_| {
-            let mut refresh = Step::error(
-                "POST",
-                "/api/auth/refresh",
-                authentication_error("synthetic incidental refresh"),
+    fn whoami_preserves_its_check_payload_and_uses_the_refresh_failure() {
+        for status in [401, 503] {
+            let lab = Lab::new();
+            let hub = Hub::new(|_| {
+                let mut refresh = Step::error(
+                    "POST",
+                    "/api/auth/refresh",
+                    if status == 401 {
+                        authentication_error("synthetic terminal refresh")
+                    } else {
+                        json!({"error":"synthetic terminal refresh", "kind":"unavailable"})
+                    },
+                );
+                refresh.status = status;
+                refresh.bearer = None;
+                vec![
+                    Step::error(
+                        "GET",
+                        "/api/auth/me",
+                        authentication_error("synthetic expired access"),
+                    ),
+                    refresh,
+                ]
+            });
+            lab.seed_credentials(&hub.base, true);
+            let before = fs::read(lab.credential_path(&hub.base)).unwrap();
+            let value = lab.json(
+                &hub.base,
+                &["--json", "whoami", "--check"],
+                if status == 401 { 5 } else { 6 },
             );
-            refresh.bearer = None;
-            vec![
-                Step::error(
-                    "GET",
-                    "/api/auth/me",
-                    authentication_error("synthetic terminal identity"),
-                ),
-                refresh,
-            ]
-        });
-        lab.seed_credentials(&hub.base, true);
-        let value = lab.json(&hub.base, &["--json", "whoami", "--check"], 5);
-        lab.assert_login(&value, &hub.base);
-        assert_eq!(value["result"]["value"]["account"], "me");
-        assert_eq!(value["result"]["value"]["check"]["server_reachable"], true);
-        assert_eq!(value["result"]["value"]["check"]["authenticated"], false);
-        assert!(value.to_string().contains("synthetic terminal identity"));
-        assert!(!value.to_string().contains("synthetic incidental refresh"));
-        let requests = hub.finish();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&requests[1].body).unwrap(),
-            json!({"refresh_token":OLD_REFRESH})
-        );
+            if status == 401 {
+                lab.assert_login(&value, &hub.base);
+            } else {
+                assert_eq!(value["fix"], json!([]));
+                assert!(!value.to_string().contains("agit login"));
+            }
+            assert_eq!(value["result"]["value"]["account"], "me");
+            assert_eq!(value["result"]["value"]["check"]["server_reachable"], true);
+            assert_eq!(
+                value["result"]["value"]["check"]["authenticated"],
+                if status == 401 {
+                    json!(false)
+                } else {
+                    Value::Null
+                }
+            );
+            assert!(value.to_string().contains("synthetic terminal refresh"));
+            assert!(!value.to_string().contains("synthetic expired access"));
+            assert_eq!(fs::read(lab.credential_path(&hub.base)).unwrap(), before);
+            let requests = hub.finish();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&requests[1].body).unwrap(),
+                json!({"refresh_token":OLD_REFRESH})
+            );
+        }
     }
 
     #[test]
@@ -1075,15 +1100,19 @@ mod unix {
                     if recipe {
                         body["fix"] = json!([{"kind":"authenticate"}]);
                     }
-                    let mut step = Step::error("GET", "/api/auth/me", body);
+                    let mut step = Step::error(
+                        "GET",
+                        "/api/auth/me",
+                        if status == 401 {
+                            authentication_error("synthetic expired access")
+                        } else {
+                            body.clone()
+                        },
+                    );
                     step.status = status;
                     steps.push(step);
                     if status == 401 {
-                        let mut refresh = Step::error(
-                            "POST",
-                            "/api/auth/refresh",
-                            authentication_error("synthetic discarded refresh"),
-                        );
+                        let mut refresh = Step::error("POST", "/api/auth/refresh", body);
                         refresh.bearer = None;
                         steps.push(refresh);
                     }
@@ -1095,7 +1124,7 @@ mod unix {
             let code = if matches!(status, 401 | 403) { 5 } else { 6 };
             let value = lab.json(&hub.base, &["--json", "whoami", "--check"], code);
             assert!(value.to_string().contains("synthetic identity refusal"));
-            assert!(!value.to_string().contains("synthetic discarded refresh"));
+            assert!(!value.to_string().contains("synthetic expired access"));
             assert_eq!(value["result"]["value"]["check"]["server_reachable"], true);
             assert_eq!(
                 value.to_string().contains("log in with `agit login --hub"),
@@ -1111,7 +1140,7 @@ mod unix {
             assert_eq!(output.status.code(), Some(code));
             let stderr = String::from_utf8(output.stderr).unwrap();
             assert!(stderr.contains("synthetic identity refusal"));
-            assert!(!stderr.contains("synthetic discarded refresh"));
+            assert!(!stderr.contains("synthetic expired access"));
             assert_eq!(stderr.contains("log in with `agit login --hub"), login);
             if !login {
                 assert!(!stderr.contains("sign in again"));

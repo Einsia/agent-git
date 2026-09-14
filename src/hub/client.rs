@@ -328,15 +328,9 @@ impl Client {
         })
     }
 
-    /// Send the request; on a 401, exchange the refresh token for a new access token and retry
-    /// once.
-    ///
-    /// Exactly **one** retry: a 401 after the exchange means the refresh token is expired too,
-    /// and retrying past that only fills the server log. The error surfaces there and the user
-    /// signs in again.
-    ///
-    /// An access token is valid for one hour, so this path is walked constantly — it is where
-    /// "one sign-in lasts a month" is implemented.
+    /// Retry an unauthorized request after renewing or adopting saved credentials.
+    /// Renewal failures retain their own cause, and a rejected retry is returned to the
+    /// caller without another exchange.
     fn with_retry<T, F>(&self, path: &str, send: F) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
@@ -362,7 +356,7 @@ impl Client {
 
         // A status code is no longer a transport error (see why `from_env` turns
         // `http_status_as_error` off), so the 401 is tested here and not in the `Err` arm.
-        if resp.status() == 401 && self.try_refresh() {
+        if resp.status() == 401 && self.try_refresh()? {
             let t = self.token.borrow();
             resp = send(t.as_deref()).map_err(|e| self.explain(e, path))?;
         }
@@ -423,37 +417,48 @@ impl Client {
     /// For [`super::git`]: a git subprocess that hits a 401 cannot go through `with_retry`
     /// itself (it sends no HTTP request, it only gets a header injected), so it needs an
     /// explicit entry point.
-    pub fn refresh_access(&self) -> bool {
+    pub fn refresh_access(&self) -> Result<bool> {
         self.try_refresh()
     }
 
     /// Exchange the refresh token for a new pair and persist it. Returns whether it worked.
     ///
-    /// A refresh token is **single-use** (the server replaces the whole row), and one credential
-    /// may be read into memory by more than one client: once another client (or another process)
-    /// has exchanged first, the refresh token we hold is void and using it again only yields a
-    /// 401. So look at the newest credentials on disk for this hub first: different from the
-    /// in-memory pair means adopt them and retry; only while disk still holds the same pair do
-    /// we exchange ourselves, and after a failed exchange look at disk once more — if someone
-    /// rotated it exactly between those two steps, the pair that landed is the answer.
-    fn try_refresh(&self) -> bool {
-        let Some(cred) = self.cred.borrow().clone() else {
-            return false;
+    /// Refresh credentials are single-use. Processes hold the authority's renewal lock until
+    /// persistence completes, then adopt the saved successor before spending a token.
+    /// An adopted access token may itself be expired and still require renewal.
+    fn try_refresh(&self) -> Result<bool> {
+        let Some(mut cred) = self.cred.borrow().clone() else {
+            return Ok(false);
         };
         if self.ensure_destination().is_err() || !credential_matches_hub(&self.base, &cred) {
-            return false;
+            return Ok(false);
         }
         // One client renews at a time in-process: latecomers wait outside the gate, and by the
         // time they get in the one that went first has persisted the new pair, so they adopt
         // it — two clients never spend the same single-use refresh token.
         let _gate = refresh_gate().lock().unwrap_or_else(|e| e.into_inner());
+        if cred.refresh_expired() {
+            if !self.adopt_newer_from_disk(&cred).unwrap_or(false) {
+                return Ok(false);
+            }
+            cred = self.cred.borrow().clone().expect("adopted credential");
+            if !cred.access_expired() {
+                return Ok(true);
+            }
+        }
+        let _process_gate = credentials::refresh_guard(&self.base)?;
         match self.adopt_newer_from_disk(&cred) {
-            Ok(true) => return true,
+            Ok(true) => {
+                cred = self.cred.borrow().clone().expect("adopted credential");
+                if !cred.access_expired() {
+                    return Ok(true);
+                }
+            }
             Ok(false) => {}
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         }
         if cred.refresh_expired() {
-            return false;
+            return Ok(false);
         }
 
         // The refresh endpoint carries no auth header — the access token is the expired one.
@@ -462,7 +467,12 @@ impl Client {
             &serde_json::json!({ "refresh_token": cred.refresh_token }),
         ) {
             Ok(p) => p,
-            Err(_) => return self.wait_for_a_sibling_to_land(&cred),
+            Err(error) => {
+                if self.wait_for_a_sibling_to_land(&cred) {
+                    return Ok(true);
+                }
+                return Err(error);
+            }
         };
 
         let fresh = credentials::HubCredential {
@@ -477,12 +487,12 @@ impl Client {
         };
         let saved = match credentials::save_refreshed(&self.base, &cred, &fresh) {
             Ok(Some(saved)) => saved,
-            Ok(None) => return self.adopt_newer_from_disk(&cred).unwrap_or(false),
-            Err(_) => return false,
+            Ok(None) => return Ok(self.adopt_newer_from_disk(&cred).unwrap_or(false)),
+            Err(error) => return Err(error.context("cannot save renewed Hub credentials")),
         };
         *self.token.borrow_mut() = Some(saved.access_token.clone());
         *self.cred.borrow_mut() = Some(saved);
-        true
+        Ok(true)
     }
 
     /// If the credentials on disk for this hub are newer than `ours` (a different access token,
@@ -636,7 +646,7 @@ impl Client {
             send(token.as_deref())
         }
         .map_err(|e| self.explain(e, path))?;
-        if resp.status() == 401 && self.try_refresh() {
+        if resp.status() == 401 && self.try_refresh()? {
             let token = self.token.borrow();
             resp = send(token.as_deref()).map_err(|e| self.explain(e, path))?;
         }
@@ -945,7 +955,7 @@ impl Client {
             send(t.as_deref())
         }
         .map_err(|e| self.explain(e, path))?;
-        if resp.status() == 401 && self.try_refresh() {
+        if resp.status() == 401 && self.try_refresh()? {
             let t = self.token.borrow();
             resp = send(t.as_deref()).map_err(|e| self.explain(e, path))?;
         }
@@ -1401,6 +1411,222 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_newer_expired_access_pair_is_refreshed_before_retry() {
+        let _home = CredentialTestHome::new();
+        let (base, hub) = fake_hub(3, |request| {
+            if request.starts_with("POST /api/auth/refresh ") {
+                assert!(request.contains("rt-sibling"));
+                return (
+                    200,
+                    serde_json::to_string(&new_pair(&request_hub(request), "alice")).unwrap(),
+                );
+            }
+            if request.contains("Bearer at-new") {
+                (200, "{}".into())
+            } else {
+                (401, r#"{"error":"expired","kind":"unauthorized"}"#.into())
+            }
+        });
+        let cred = old_pair(&base, "alice");
+        let sibling = credentials::HubCredential {
+            access_token: "at-sibling".into(),
+            refresh_token: "rt-sibling".into(),
+            ..cred.clone()
+        };
+        credentials::save(&base, &sibling).unwrap();
+        let result = Client::for_credential(&base, &cred).logout();
+        result.unwrap();
+        assert_eq!(credentials::load(&base).unwrap().access_token, "at-new");
+        assert_eq!(hub.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn refresh_service_failure_is_not_reported_as_expired_login() {
+        let _home = CredentialTestHome::new();
+        let (base, hub) = fake_hub(2, |request| {
+            if request.starts_with("POST /api/auth/refresh ") {
+                (
+                    503,
+                    r#"{"error":"temporarily unavailable","kind":"unavailable"}"#.into(),
+                )
+            } else {
+                (
+                    401,
+                    r#"{"error":"expired","kind":"unauthorized","fix":[{"kind":"authenticate"}]}"#
+                        .into(),
+                )
+            }
+        });
+        let cred = old_pair(&base, "alice");
+        credentials::save(&base, &cred).unwrap();
+        let error = Client::for_credential(&base, &cred).logout().unwrap_err();
+        let api = error.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.status, 503);
+        assert!(api.remedies().is_empty());
+        assert_eq!(
+            credentials::load(&base).unwrap().refresh_token,
+            cred.refresh_token
+        );
+        assert_eq!(hub.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[ignore = "subprocess entry point for concurrent refresh verification"]
+    fn refresh_child_process() {
+        assert_eq!(std::env::var("AGIT_REFRESH_CHILD").as_deref(), Ok("1"));
+        Client::from_env().logout().unwrap();
+    }
+
+    #[test]
+    fn processes_share_a_slow_refresh_without_spending_it_twice() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        fn reply(socket: &mut std::net::TcpStream, status: u16, body: &str) {
+            write!(socket, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+
+        let _home = CredentialTestHome::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        credentials::save(&base, &old_pair(&base, "alice")).unwrap();
+        let body = serde_json::to_string(&new_pair(&base, "alice")).unwrap();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let hub = std::thread::spawn(move || {
+            let mut pending = None;
+            let mut exchanges = 0;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "synthetic Hub exceeded its deadline"
+                );
+                if release_rx.try_recv().is_ok() {
+                    reply(pending.as_mut().unwrap(), 200, &body);
+                    pending = None;
+                }
+                let (mut socket, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("synthetic Hub accept failed: {error}"),
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut byte = [0];
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    bytes.push(byte[0]);
+                    assert!(bytes.len() < 16384);
+                }
+                let header = String::from_utf8(bytes).unwrap();
+                let length = header
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                assert!(length < 16384);
+                socket.read_exact(&mut vec![0; length]).unwrap();
+                if header.starts_with("POST /api/auth/refresh ") {
+                    exchanges += 1;
+                    if exchanges == 1 {
+                        pending = Some(socket);
+                        event_tx.send("refresh").unwrap();
+                    } else {
+                        reply(
+                            &mut socket,
+                            401,
+                            r#"{"error":"spent","kind":"unauthorized"}"#,
+                        );
+                    }
+                } else if header.contains("Bearer at-new") {
+                    reply(&mut socket, 200, "{}");
+                } else {
+                    reply(
+                        &mut socket,
+                        401,
+                        r#"{"error":"expired","kind":"unauthorized"}"#,
+                    );
+                    event_tx.send("expired").unwrap();
+                }
+            }
+            exchanges
+        });
+        let child = || {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hub::client::tests::refresh_child_process",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("AGIT_REFRESH_CHILD", "1")
+                .env("AGIT_HUB_URL", &base)
+                .env("NO_PROXY", "*")
+                .env("no_proxy", "*")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let first = child();
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "expired"
+        );
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "refresh"
+        );
+        let second = child();
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "expired"
+        );
+        std::thread::sleep(REFRESH_SETTLE_STEP * (REFRESH_SETTLE_POLLS as u32 + 5));
+        release_tx.send(()).unwrap();
+        let mut outputs = Vec::new();
+        for mut child in [first, second] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outputs.push(child.wait_with_output().unwrap());
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let exchanges = hub.join().unwrap();
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(
+            exchanges, 1,
+            "processes must share the successor credential"
+        );
+    }
+
     fn new_pair(base: &str, username: &str) -> credentials::HubCredential {
         credentials::HubCredential {
             account_id: None,
@@ -1492,7 +1718,7 @@ mod tests {
             assert!(!client.has_token());
             let error = client.logout().unwrap_err().to_string();
             assert!(!error.contains("private-sentinel"));
-            assert!(!client.refresh_access());
+            assert!(!client.refresh_access().unwrap());
         }
         assert_eq!(
             listener.accept().unwrap_err().kind(),
@@ -1549,16 +1775,16 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let client = Client::for_credential(&base, &old_pair(&base, "alice"));
-        assert!(!client.refresh_access());
+        assert!(!client.refresh_access().unwrap());
         let path = config::credentials_path(&base).unwrap();
         assert!(!path.exists());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"invalid credential").unwrap();
-        assert!(!client.refresh_access());
+        assert!(!client.refresh_access().unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), b"invalid credential");
         credentials::save_at(&path, &new_pair("http://elsewhere.test", "alice")).unwrap();
         let before = std::fs::read(&path).unwrap();
-        assert!(!client.refresh_access());
+        assert!(!client.refresh_access().unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(
             listener.accept().unwrap_err().kind(),
@@ -1599,7 +1825,7 @@ mod tests {
         if !verify_during_exchange {
             assert!(credentials::save_verified_account(&base, &cred, "alice-account").unwrap());
         }
-        let refreshed = client.refresh_access();
+        let refreshed = client.refresh_access().unwrap();
         assert_eq!(hub.join().unwrap().len(), 1);
         assert!(
             refreshed,

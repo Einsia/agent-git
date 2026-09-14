@@ -270,10 +270,12 @@ impl TransportIdentity {
             .map(Option::flatten)
     }
 
-    fn refresh(&self) -> bool {
+    fn refresh(&self) -> Result<bool> {
         self.client
             .as_ref()
-            .is_some_and(super::Client::refresh_access)
+            .map(super::Client::refresh_access)
+            .transpose()
+            .map(|result| result.unwrap_or(false))
     }
 
     fn environment(&self) -> Result<Vec<(String, OsString)>> {
@@ -419,7 +421,7 @@ fn missing_lfs_uploads_with_transport(
             }))?)
         };
         let mut response = send()?;
-        if response.status() == 401 && transport.refresh() {
+        if response.status() == 401 && transport.refresh()? {
             response = send()?;
         }
         anyhow::ensure!(
@@ -521,7 +523,7 @@ fn download_lfs_file_telemetry_inner(
         .as_ref()
         .is_some_and(super::Client::access_expired)
     {
-        transport.refresh();
+        transport.refresh()?;
     }
     let parent = output.parent().context("the output path has no parent")?;
     for attempt in 0..2 {
@@ -549,7 +551,7 @@ fn download_lfs_file_telemetry_inner(
         written?;
         if !result.status.success() {
             let error = String::from_utf8_lossy(&result.stderr);
-            if attempt == 0 && looks_like_auth_failure(&error) && transport.refresh() {
+            if attempt == 0 && looks_like_auth_failure(&error) && transport.refresh()? {
                 continue;
             }
             anyhow::bail!("LFS download failed: {}", error.trim());
@@ -772,8 +774,10 @@ fn execute_transport_inner(
         .client
         .as_ref()
         .is_some_and(super::Client::access_expired)
+        && let Err(error) = transport.refresh()
     {
-        transport.refresh();
+        run.error = Some(error);
+        return run;
     }
 
     for retry in [false, true] {
@@ -783,8 +787,16 @@ fn execute_transport_inner(
                     && attempt.outcome.code != 0
                     && looks_like_auth_failure(&attempt.outcome.stderr);
                 run.attempts.push(attempt);
-                if !refresh || !transport.refresh() {
+                if !refresh {
                     break;
+                }
+                match transport.refresh() {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        run.error = Some(error);
+                        break;
+                    }
                 }
             }
             Err(error) => {
@@ -984,7 +996,7 @@ fn capture_transport(
         return Some(stdout);
     }
     let transport = transport?;
-    if !looks_like_auth_failure(&stderr) || !transport.refresh() {
+    if !looks_like_auth_failure(&stderr) || !transport.refresh().ok()? {
         return None;
     }
     let (ok, stdout, _) = once()?;
