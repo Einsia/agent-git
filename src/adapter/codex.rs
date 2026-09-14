@@ -96,7 +96,7 @@ fn read_head(path: &Path, bytes: usize) -> Option<String> {
 }
 
 /// Parse (id, cwd) out of the file header.
-fn primary_meta(path: &Path) -> Option<(String, String)> {
+fn primary_meta(path: &Path, choices_only: bool) -> Option<(String, String)> {
     let head = read_head(path, 8192)?;
     for line in head.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -108,6 +108,11 @@ fn primary_meta(path: &Path) -> Option<(String, String)> {
             continue;
         }
         let p = v.get("payload")?;
+        if choices_only
+            && p.pointer("/source/subagent/other").and_then(|v| v.as_str()) == Some("guardian")
+        {
+            return None;
+        }
         let cwd = p.get("cwd").and_then(|x| x.as_str()).unwrap_or("");
         if cwd.is_empty() {
             return None;
@@ -454,11 +459,11 @@ fn thread_to_ref(t: super::codex_index::Thread) -> SessionRef {
 /// **Cost warning**: linear in the total number of sessions, each costing an 8 KB header read. On
 /// this machine, 18745 files on NFS takes minutes. It stays because the index database may not
 /// exist (Codex not installed, database not built yet) or its schema may have changed.
-fn scan_all_sessions() -> Result<Vec<SessionRef>> {
+fn scan_all_sessions(choices_only: bool) -> Result<Vec<SessionRef>> {
     let root = sessions_root()?;
     let mut out = vec![];
     for p in all_rollouts(&root) {
-        let Some((id, cwd)) = primary_meta(&p) else {
+        let Some((id, cwd)) = primary_meta(&p, choices_only) else {
             continue;
         };
         let mtime = std::fs::metadata(&p)
@@ -556,7 +561,18 @@ impl Adapter for Codex {
         if let Some(threads) = super::codex_index::all_threads() {
             return Ok(threads.into_iter().map(thread_to_ref).collect());
         }
-        scan_all_sessions()
+        scan_all_sessions(false)
+    }
+
+    fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
+        let want = repo.to_string_lossy();
+        if let Some(threads) = super::codex_index::session_choices_for_cwd(&want) {
+            return Ok(threads.into_iter().map(thread_to_ref).collect());
+        }
+        Ok(scan_all_sessions(true)?
+            .into_iter()
+            .filter(|session| session.cwd.as_deref() == Some(want.as_ref()))
+            .collect())
     }
 
     /// Reverse lookup: the index database first (0.40 ms), then a glob by id (39 ms).
@@ -1322,6 +1338,47 @@ fn extract_output_text(output: Option<&serde_json::Value>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_choice_headers_preserve_explicit_internal_session_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("session.jsonl");
+        let cases = [
+            (
+                serde_json::json!({"subagent": {"other": "guardian"}}),
+                false,
+            ),
+            (
+                serde_json::json!({"subagent": {"thread_spawn": {"agent_role": "guardian"}}}),
+                true,
+            ),
+            (serde_json::json!({"subagent": "review"}), true),
+            (serde_json::json!({"subagent": {"other": "unknown"}}), true),
+            (serde_json::json!("guardian"), true),
+            (serde_json::Value::Null, true),
+        ];
+        for (source, visible) in cases {
+            let header = serde_json::json!({
+                "type": "session_meta",
+                "payload": {"id": "native-id", "cwd": "/project", "source": source}
+            });
+            let content = format!(
+                "{header}\n{}\n",
+                "guardian approval transcript".repeat(1 << 16)
+            );
+            std::fs::write(&file, &content).unwrap();
+            assert_eq!(
+                super::primary_meta(&file, true).is_some(),
+                visible,
+                "{source}"
+            );
+            assert_eq!(
+                super::primary_meta(&file, false),
+                Some(("native-id".to_owned(), "/project".to_owned()))
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        }
+    }
+
     use super::*;
 
     struct CodexHomeGuard(Option<std::ffi::OsString>);

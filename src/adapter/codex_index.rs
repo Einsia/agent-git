@@ -152,12 +152,31 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
 /// Any anomaly returns None and the caller falls back to scanning files.
 pub fn threads_for_cwd(cwd: &str) -> Option<Vec<Thread>> {
     let con = open(&index_path()?)?;
-    if !schema_ok(&con) {
+    threads_for_cwd_at(&con, cwd, false)
+}
+
+/// Internal approval runtimes cannot displace human conversations from session choices.
+pub fn session_choices_for_cwd(cwd: &str) -> Option<Vec<Thread>> {
+    let con = open(&index_path()?)?;
+    threads_for_cwd_at(&con, cwd, true)
+}
+
+fn threads_for_cwd_at(con: &Connection, cwd: &str, choices_only: bool) -> Option<Vec<Thread>> {
+    if !schema_ok(con) {
         return None;
     }
+    // Unknown provenance stays visible; prompt text and broad subagent labels do not identify
+    // internal approval runtimes. Filtering before projection avoids reading their previews.
+    let source_filter = if choices_only && con.prepare("SELECT source FROM threads LIMIT 0").is_ok()
+    {
+        "AND CASE WHEN typeof(source) = 'text' AND length(source) <= 4096 AND json_valid(source) \
+         THEN COALESCE(json_extract(source, '$.subagent.other') != 'guardian', 1) ELSE 1 END"
+    } else {
+        ""
+    };
     let sql = format!(
         "{} WHERE archived = 0 AND cwd = ?1 AND rollout_path IS NOT NULL \
-         ORDER BY updated_at_ms DESC",
+         {source_filter} ORDER BY updated_at_ms DESC",
         select()
     );
     let mut st = con.prepare(&sql).ok()?;
@@ -417,17 +436,89 @@ mod tests {
     /// The SQL stays identical to `threads_for_cwd`.
     fn q_cwd(p: &Path, cwd: &str) -> Vec<Thread> {
         let con = open(p).unwrap();
-        assert!(schema_ok(&con));
-        let sql = format!(
-            "{} WHERE archived = 0 AND cwd = ?1 AND rollout_path IS NOT NULL \
-             ORDER BY updated_at_ms DESC",
-            select()
+        threads_for_cwd_at(&con, cwd, false).unwrap()
+    }
+
+    #[test]
+    fn session_choices_filter_native_approval_provenance_without_hiding_other_work() {
+        let (_directory, path) = fixture();
+        let con = Connection::open(&path).unwrap();
+        con.execute_batch("ALTER TABLE threads ADD COLUMN source TEXT;")
+            .unwrap();
+        let cases = [
+            (
+                "approval-null",
+                Some(r#"{"subagent":{"other":"guardian"}}"#),
+                None,
+                false,
+            ),
+            (
+                "approval-user",
+                Some(r#"{"subagent":{"other":"guardian"}}"#),
+                Some("user"),
+                false,
+            ),
+            (
+                "worker",
+                Some(r#"{"subagent":{"thread_spawn":{"agent_role":"guardian"}}}"#),
+                Some("subagent"),
+                true,
+            ),
+            (
+                "review",
+                Some(r#"{"subagent":"review"}"#),
+                Some("subagent"),
+                true,
+            ),
+            (
+                "unknown",
+                Some(r#"{"subagent":{"other":"unknown"}}"#),
+                Some("subagent"),
+                true,
+            ),
+            ("malformed", Some("{invalid"), None, true),
+            ("plain", Some("guardian"), Some("user"), true),
+            ("missing", None, Some("subagent"), true),
+        ];
+        for (id, source, thread_source, _) in cases {
+            con.execute(
+                "INSERT INTO threads (id, rollout_path, cwd, first_user_message, thread_source, updated_at_ms, archived, source) \
+                 VALUES (?1, '/missing.jsonl', '/repo/one', 'guardian approval transcript', ?2, 500, 0, ?3)",
+                rusqlite::params![id, thread_source, source],
+            ).unwrap();
+        }
+        drop(con);
+        let con = open(&path).unwrap();
+        let choices = threads_for_cwd_at(&con, "/repo/one", true).unwrap();
+        let all = threads_for_cwd_at(&con, "/repo/one", false).unwrap();
+        for (id, _, _, visible) in cases {
+            assert_eq!(
+                choices.iter().any(|thread| thread.id == id),
+                visible,
+                "{id}"
+            );
+            assert!(all.iter().any(|thread| thread.id == id), "{id}");
+        }
+        assert!(choices.iter().any(|thread| thread.id == "id-a"));
+        assert!(
+            !choices
+                .iter()
+                .any(|thread| thread.id == "id-c" || thread.id == "id-e")
         );
-        let mut st = con.prepare(&sql).unwrap();
-        st.query_map([cwd], row_to_thread)
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
+    }
+
+    #[test]
+    fn indexes_without_native_source_keep_their_session_choices() {
+        let (_directory, path) = fixture();
+        let con = open(&path).unwrap();
+        let choices = threads_for_cwd_at(&con, "/repo/one", true).unwrap();
+        assert_eq!(
+            choices
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            ["id-a", "id-b"]
+        );
     }
 
     #[test]

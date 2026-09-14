@@ -626,6 +626,12 @@ pub trait Adapter {
     /// in — Codex splits directories by date and the path carries no project information.
     fn sessions_for(&self, repo: &Path) -> Result<Vec<SessionRef>>;
 
+    /// Human-facing choices omit runtime bookkeeping when its native provenance is known.
+    /// Explicit discovery remains available for inspecting and importing those records.
+    fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
+        self.sessions_for(repo)
+    }
+
     /// Look a transcript file up by session id.
     ///
     /// **This is the foundation of the session-link design.** The store records only

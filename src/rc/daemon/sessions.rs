@@ -1169,7 +1169,11 @@ impl LocalSessionSnapshot {
                 // `(archived, cwd, updated_at_ms DESC)` index, Claude Code is one readdir of
                 // `projects/<cwd-slug>/`. So the cost follows "how many sessions this project
                 // has", not how many rollouts piled up on disk.
-                let Ok(mut refs) = adapter.sessions_for(root) else {
+                let refs = match purpose {
+                    LocalSessionScan::Listing => adapter.session_choices_for(root),
+                    LocalSessionScan::Locate => adapter.sessions_for(root),
+                };
+                let Ok(mut refs) = refs else {
                     continue;
                 };
                 // The index is already in reverse time order, but the file fallback path is
@@ -1253,6 +1257,86 @@ fn bounded_local_gist(
 mod discovery_preview_tests {
     use super::*;
     use std::io::{Cursor, Read};
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_sessions_cannot_displace_human_choices_but_remain_addressable() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AGIT_RC_INTERNAL_DISCOVERY_TEST_CHILD";
+        let Some(root) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let directory = tempfile::tempdir().unwrap();
+            let bin = directory.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let executable = bin.join("codex");
+            std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rc::daemon::sessions::discovery_preview_tests::approval_sessions_cannot_displace_human_choices_but_remain_addressable",
+                    "--nocapture",
+                ])
+                .env(CHILD, directory.path())
+                .env("CODEX_HOME", directory.path().join("codex"))
+                .env("AGIT_HOME", directory.path().join("agit"))
+                .env("HOME", directory.path().join("home"))
+                .env("PATH", bin)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(directory.path().join("completed").exists());
+            return;
+        };
+        let cwd = root.join("project");
+        let native = root.join("codex/sessions");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir_all(&native).unwrap();
+        let index = root.join("codex/state_1.sqlite");
+        let database = rusqlite::Connection::open(&index).unwrap();
+        database.execute_batch(
+            "CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, first_user_message TEXT, \
+             thread_source TEXT, updated_at_ms INTEGER, archived INTEGER, source TEXT);",
+        ).unwrap();
+        for position in 0..PER_PROJECT_LIMIT + 2 {
+            let id = format!("00000000-0000-4000-8000-{position:012}");
+            let source = if position == 0 {
+                serde_json::json!("cli")
+            } else {
+                serde_json::json!({"subagent": {"other": "guardian"}})
+            };
+            let file = native.join(format!("rollout-{id}.jsonl"));
+            let header = serde_json::json!({"type": "session_meta", "payload": {"id": id, "cwd": cwd, "source": source}});
+            std::fs::write(&file, format!("{header}\n")).unwrap();
+            database.execute(
+                "INSERT INTO threads VALUES (?1, ?2, ?3, 'guardian approval transcript', NULL, ?4, 0, ?5)",
+                rusqlite::params![id, file.to_str().unwrap(), cwd.to_str().unwrap(), position, source.to_string()],
+            ).unwrap();
+        }
+        drop(database);
+        let snapshot = LocalSessionSnapshot {
+            roots: policy::CanonicalRoots::from_untrusted([cwd.clone()]),
+            supervised: Default::default(),
+        };
+        let human = "00000000-0000-4000-8000-000000000000";
+        let internal = "00000000-0000-4000-8000-000000000001";
+        for indexed in [true, false] {
+            if !indexed {
+                std::fs::rename(&index, index.with_extension("disabled")).unwrap();
+            }
+            let choices = snapshot.clone().scan(LocalSessionScan::Listing);
+            assert_eq!(choices.len(), 1, "indexed={indexed}");
+            assert_eq!(choices[0].runtime_session_id, human);
+            let located = snapshot.clone().scan(LocalSessionScan::Locate);
+            assert!(located.iter().any(|item| item.runtime_session_id != human));
+            let adapter = crate::adapter::get("codex").unwrap();
+            assert_eq!(
+                adapter.sessions_for(&cwd).unwrap().len(),
+                PER_PROJECT_LIMIT + 2
+            );
+            assert!(adapter.resolve(internal, Some(&cwd)).is_some());
+        }
+        std::fs::write(root.join("completed"), "verified").unwrap();
+    }
 
     #[test]
     fn database_preview_does_not_materialize_native_history() {
