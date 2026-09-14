@@ -141,10 +141,34 @@ pub(crate) fn quiet() -> bool {
     std::env::var_os("AGIT_QUIET").is_some() && !crate::commands::json::is_capturing()
 }
 
+thread_local! {
+    static INFO_ON_STDERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn info_uses_stderr() -> bool {
+    INFO_ON_STDERR.get()
+}
+
+/// Artifact-producing commands keep routine notices off the data stream, including nested calls.
+pub(crate) fn with_info_on_stderr<T>(enabled: bool, action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INFO_ON_STDERR.set(self.0);
+        }
+    }
+    let _restore = Restore(INFO_ON_STDERR.replace(enabled || info_uses_stderr()));
+    action()
+}
+
 /// Routine notices are optional; requested data and recovery diagnostics use their own writers.
 pub(crate) fn info(message: impl std::fmt::Display) {
     if !quiet() {
-        println!("{message}");
+        if info_uses_stderr() {
+            eprintln!("{message}");
+        } else {
+            println!("{message}");
+        }
     }
 }
 

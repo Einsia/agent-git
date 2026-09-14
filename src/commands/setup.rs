@@ -106,7 +106,11 @@ fn wants(filter: Option<&str>, runtime: &str) -> bool {
     matches!(filter, None | Some("all")) || filter == Some(runtime)
 }
 
-pub fn run(mut args: Args) -> CmdResult {
+pub fn run(args: Args) -> CmdResult {
+    ui::with_info_on_stderr(args.completions.is_some(), || run_setup(args))
+}
+
+fn run_setup(mut args: Args) -> CmdResult {
     if let Some(runtime) = args.runtime.as_deref()
         && let Ok(runtime) = crate::adapter::normalize(runtime)
     {
@@ -848,6 +852,11 @@ fn register_mcp(runtime: Option<&str>) -> SetupReport {
     if wants(runtime, "claude-code") {
         let ok = std::process::Command::new("claude")
             .args(["mcp", "add", "agit", "--", &exe, "mcp"])
+            .stdout(if ui::info_uses_stderr() {
+                std::process::Stdio::from(std::io::stderr())
+            } else {
+                std::process::Stdio::inherit()
+            })
             .status()
             .map(|s| s.success())
             .unwrap_or(false);

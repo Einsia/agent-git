@@ -125,17 +125,16 @@ fn login_interactive(hub: &str) -> crate::Result<Option<(HubCredential, String)>
         "    {} device code — we show a code, you enter it on the website (SSH, containers, no browser)",
         ui::accent("2.")
     );
-    let choice =
-        ui::prompt::input("choice", Some("1")).map_err(|error| error.context(LocalInputFailure))?;
-    let Some(choice) = choice else {
-        return Ok(None);
-    };
-    match choice.trim() {
-        "" | "1" => login_browser(hub),
-        "2" => login_device(hub),
-        other => {
-            ui::error(&format!("`{other}` isn’t 1 or 2."));
-            Ok(None)
+    loop {
+        let choice = ui::prompt::input("choice", Some("1"))
+            .map_err(|error| error.context(LocalInputFailure))?;
+        let Some(choice) = choice else {
+            return Ok(None);
+        };
+        match choice.trim() {
+            "" | "1" => return login_browser(hub),
+            "2" => return login_device(hub),
+            _ => ui::error("choose 1 for browser sign-in or 2 for a device code."),
         }
     }
 }

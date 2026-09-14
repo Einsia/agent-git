@@ -875,6 +875,34 @@ fn terminal_enter_uses_browser_default_and_explicit_choices_select_their_flow() 
 }
 
 #[cfg(unix)]
+#[test]
+fn invalid_terminal_choice_can_be_corrected_without_restarting_login() {
+    for (input, target) in [
+        ("invalid\r\r", "/api/auth/cli/session"),
+        ("invalid\r2\r", "/api/auth/device/code"),
+    ] {
+        let hub = Hub::new(vec![Reply::Status(503)]);
+        let lab = Lab::new(&hub.base);
+        lab.seed(&hub.base);
+        let before = lab.state();
+        let (status, output) = terminal_login(&lab, &hub.base, input);
+        assert_eq!(status.exit_code(), 6, "{output}");
+        assert!(
+            output.contains("choose 1 for browser sign-in or 2 for a device code"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("needs an interactive terminal"),
+            "{output}"
+        );
+        assert_eq!(lab.state(), before);
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1, "{output}");
+        assert_request(&requests[0], target, json!({}));
+    }
+}
+
+#[cfg(unix)]
 fn terminal_login(lab: &Lab, base: &str, input: &str) -> (portable_pty::ExitStatus, String) {
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize::default())
