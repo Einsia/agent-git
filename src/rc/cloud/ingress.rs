@@ -98,7 +98,7 @@ impl Registry {
     pub fn client(&self, principal: Principal, expires_at_ms: i64) -> Client {
         Client {
             principal,
-            lease: Lease::new(expires_at_ms),
+            lease: Lease(Arc::new(RwLock::new(LeaseState::new(expires_at_ms)))),
             state: self.state.clone(),
             permits: Default::default(),
             live: Arc::new(RwLock::new(true)),
@@ -108,12 +108,14 @@ impl Registry {
 }
 
 #[derive(Clone)]
-struct Lease {
+pub(crate) struct Lease(Arc<RwLock<LeaseState>>);
+
+struct LeaseState {
     expires_at_ms: i64,
     deadline: tokio::time::Instant,
 }
 
-impl Lease {
+impl LeaseState {
     fn new(expires_at_ms: i64) -> Self {
         let remaining = expires_at_ms
             .saturating_sub(chrono::Utc::now().timestamp_millis())
@@ -131,6 +133,43 @@ impl Lease {
     fn current(&self) -> bool {
         tokio::time::Instant::now() < self.deadline
             && chrono::Utc::now().timestamp_millis() < self.expires_at_ms
+    }
+}
+
+impl Lease {
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .deadline
+    }
+
+    pub fn expires_at_ms(&self) -> i64 {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expires_at_ms
+    }
+
+    fn current(&self) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .current()
+    }
+
+    pub fn renew(&self, expires_at_ms: i64) -> anyhow::Result<()> {
+        let mut lease = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        anyhow::ensure!(lease.current(), "expired cloud authority cannot be renewed");
+        anyhow::ensure!(
+            expires_at_ms > lease.expires_at_ms,
+            "cloud lease must advance"
+        );
+        *lease = LeaseState::new(expires_at_ms);
+        Ok(())
     }
 }
 
@@ -183,7 +222,7 @@ impl crate::rc::authority::Authority for ExecutionAuthority {
                 &self.role,
             );
         if !allowed && let Some(log) = &self.log {
-            log.record("cloud.execution_rejected", serde_json::json!({"principal":self.principal,"request_id":self.request,"method":self.permit.method,"policy_revision":state.policy.revision(),"connected":*live,"grant_expires_at_ms":self.lease.expires_at_ms}));
+            log.record("cloud.execution_rejected", serde_json::json!({"principal":self.principal,"request_id":self.request,"method":self.permit.method,"policy_revision":state.policy.revision(),"connected":*live,"grant_expires_at_ms":self.lease.expires_at_ms()}));
         }
         allowed && accept()
     }
@@ -196,8 +235,8 @@ pub enum Rejection {
 }
 
 impl Client {
-    pub fn deadline(&self) -> tokio::time::Instant {
-        self.lease.deadline
+    pub(crate) fn lease(&self) -> Lease {
+        self.lease.clone()
     }
 
     pub fn authorize(&self, frame: Frame) -> Result<Frame, Rejection> {
@@ -334,6 +373,33 @@ mod tests {
         drop(client);
         assert!(!queued.accept());
         assert_eq!(receipt.abandon(), Abandon::NeverRan);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewed_authority_reaches_queued_work_but_cannot_resurrect_an_expired_lease() {
+        use crate::rc::ticket::ticket_authorized;
+        let registry = Registry::fixed(policy());
+        registry.state.write().unwrap().resources.observe(
+            "session.list",
+            &json!({"local":[{"runtime_session_id":"visible","runtime":"codex","cwd":"/trusted"}]}),
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        let client = registry.client(principal(), now + 60_000);
+        let frame = client
+            .authorize(Frame::request(
+                "session.history",
+                json!({"session_id":"visible"}),
+            ))
+            .unwrap();
+        let (ticket, _) = ticket_authorized::<()>(frame.authority.clone());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        client.lease().renew(now + 120_000).unwrap();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(ticket.accept());
+        tokio::time::advance(Duration::from_secs(90)).await;
+        assert!(client.lease().renew(now + 240_000).is_err());
+        let (ticket, _) = ticket_authorized::<()>(frame.authority.clone());
+        assert!(!ticket.accept());
     }
 
     #[tokio::test(start_paused = true)]

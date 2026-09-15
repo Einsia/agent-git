@@ -4,7 +4,7 @@ use super::store;
 use agit_controller::{Authority, Connector, Opening, Worker};
 use agit_peer::{
     client::{Client, Presence, join_data},
-    cloud::{ConnectionGrant, Device, PresenceEvent},
+    cloud::{ConnectionGrant, Device, DeviceCredential, PresenceEvent, Secret},
     transport::{Role, authenticate},
 };
 use anyhow::{Context, ensure};
@@ -15,6 +15,13 @@ pub struct Authenticated {
     pub connection: agit_tunnel::Connection,
     pub grant: ConnectionGrant,
     pub stopped: watch::Receiver<()>,
+    pub renewal: Option<Renewal>,
+}
+
+pub struct Renewal {
+    pub api: Client,
+    pub credential: DeviceCredential,
+    pub token: Secret,
 }
 
 pub struct Service {
@@ -125,7 +132,8 @@ async fn run_executor(
                                 let raw = join_data(raw, &link_id, ticket).await?;
                                 let connection = authenticate(raw, &enrollment.identity, &grant.source.certificate, Role::Executor).await?;
                                 record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid}));
-                                incoming.try_send(Authenticated { connection, grant, stopped })
+                                let renewal = Some(Renewal { api, credential: enrollment.credential, token: grant_token });
+                                incoming.try_send(Authenticated { connection, grant, stopped, renewal })
                                     .map_err(|_| anyhow::anyhow!("executor ingress is full or stopped"))?;
                                 Ok::<_, anyhow::Error>(())
                             }.await;

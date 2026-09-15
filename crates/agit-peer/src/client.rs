@@ -228,6 +228,33 @@ impl Client {
         Ok(grant)
     }
 
+    pub async fn renew(
+        &self,
+        executor: &DeviceCredential,
+        token: &Secret,
+        previous: &ConnectionGrant,
+    ) -> anyhow::Result<ConnectionGrant> {
+        let grant: ConnectionGrant = self
+            .request(
+                Method::POST,
+                "/api/peer/grants/renew",
+                &executor.token,
+                Some(serde_json::json!({"token":token})),
+            )
+            .await?;
+        self.validate_grant(&grant)?;
+        ensure!(
+            grant.id == previous.id
+                && grant.caller == previous.caller
+                && same_device(&grant.source, &previous.source)
+                && same_device(&grant.target, &previous.target)
+                && same_device(&grant.target, &executor.device)
+                && grant.expires_at_ms > previous.expires_at_ms,
+            "cloud renewal must preserve connection identity and advance its lease"
+        );
+        Ok(grant)
+    }
+
     fn validate_grant(&self, grant: &ConnectionGrant) -> anyhow::Result<()> {
         ensure!(
             grant.caller.issuer == self.origin

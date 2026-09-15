@@ -85,7 +85,8 @@ async fn encrypted_cloud_ingress_filters_fanout_and_cannot_break_owner_rpc() {
             .send(host::Authenticated {
                 connection: framed(0, target.unwrap()),
                 grant,
-                stopped
+                stopped,
+                renewal: None,
             })
             .await
             .is_ok()

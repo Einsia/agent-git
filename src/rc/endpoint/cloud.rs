@@ -63,7 +63,9 @@ pub(super) fn attach(
         stop: Some(stop),
     };
     let projection = guard.clone();
-    let deadline = guard.deadline();
+    let lease = guard.lease();
+    let renewal = accepted.renewal;
+    let grant = accepted.grant.clone();
     let task = tokio::spawn(async move {
         let read = async {
             loop {
@@ -89,7 +91,12 @@ pub(super) fn attach(
             Ok::<_, anyhow::Error>(())
         };
         let reason = tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => "authorization_expired",
+            result = renew_authority(renewal, grant, lease.clone(), log.as_ref()) => {
+                if let (Some(log), Err(error)) = (&log, result) {
+                    log.record("cloud.authorization_renewal_failed", serde_json::json!({"grant_id":accepted.grant.id,"reason":error.to_string()}));
+                }
+                "authorization_expired"
+            },
             _ = read => "reader_closed",
             _ = write => "writer_closed",
             _ = stopped.changed() => "output_capacity",
@@ -98,7 +105,7 @@ pub(super) fn attach(
         if let Some(log) = log {
             log.record(
                 "cloud.client_closed",
-                serde_json::json!({"client_id":client,"reason":reason,"grant_id":accepted.grant.id,"grant_expires_at_ms":accepted.grant.expires_at_ms}),
+                serde_json::json!({"client_id":client,"reason":reason,"grant_id":accepted.grant.id,"grant_expires_at_ms":lease.expires_at_ms()}),
             );
         }
         let _ = input.send(Incoming::Closed(client)).await;
@@ -109,5 +116,34 @@ pub(super) fn attach(
         peers: Default::default(),
         peer_slots: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING)),
         cloud: Some(guard),
+    }
+}
+
+async fn renew_authority(
+    renewal: Option<host::Renewal>,
+    mut grant: agit_peer::cloud::ConnectionGrant,
+    lease: ingress::Lease,
+    log: Option<&Log>,
+) -> anyhow::Result<()> {
+    let Some(renewal) = renewal else {
+        tokio::time::sleep_until(lease.deadline()).await;
+        anyhow::bail!("cloud grant expired without a renewal authority");
+    };
+    loop {
+        let deadline = lease.deadline();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(remaining / 2).await;
+        let renewed = tokio::time::timeout_at(
+            deadline,
+            renewal
+                .api
+                .renew(&renewal.credential, &renewal.token, &grant),
+        )
+        .await??;
+        lease.renew(renewed.expires_at_ms)?;
+        if let Some(log) = log {
+            log.record("cloud.authorization_renewed", serde_json::json!({"grant_id":renewed.id,"grant_expires_at_ms":renewed.expires_at_ms}));
+        }
+        grant = renewed;
     }
 }
