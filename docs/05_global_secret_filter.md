@@ -107,10 +107,14 @@ on every other day. With the OS store selected and no usable keyring, initializa
 unlocking fail explicitly rather than degrade to a plaintext key file in the same directory;
 the error names the setting, and `agit doctor` reports the keystore's state.
 
+This setting applies to manually registered global secrets. Repository dictionaries keep their
+own key material in local files and do not use this backend after migration; see
+[the repository dictionary design](06_repository_secret_dictionary.md#4-storage-and-placeholders).
+
 On macOS, credential operations allow Keychain authorization dialogs only when both stdin
 and stdout are terminals. Piped commands, JSON capture, runtime hooks, and other headless
 callers fail promptly when Keychain needs approval. Run the affected command from a terminal
-in the macOS login session and approve access before retrying automation. An authorization
+in the macOS login session and choose "Always Allow" to retain access for that signed executable before retrying automation. "Allow" grants a single access; an ad-hoc rebuild or signing-identity change can require authorization again. An authorization
 failure does not mean the store is unavailable: keep the selected keystore and its existing
 vault key. This policy also covers the OS-store probe in `agit doctor`.
 

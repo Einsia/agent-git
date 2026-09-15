@@ -52,8 +52,19 @@ agit secrets remove ci-token --yes
 
 `remove` is irreversible: placeholders written under that record can no longer be hydrated anywhere. Unregister a value only when it is no longer a secret.
 
-Both vaults keep their key in the keystore `agit config secrets.keystore` selects: `os` (the default) is the system credential store — macOS Keychain, Windows Credential Manager, the Secret Service on other Unix systems; `file` is a private file under `AGIT_HOME/keystore/`, for a machine with no desktop session (an SSH login, a CI runner) where no Secret Service answers — Unix only, protected by its file mode alone. With `file`, a backup of `AGIT_HOME` carries the global vault together with every key; the repository dictionary lives in the checkout's `.git`, so decrypting it takes a backup that holds both the repository and `AGIT_HOME`. The choice is per machine and nothing falls through from one store to the other; `agit doctor` reports whether the chosen store answers. When it does not, `add` and any commit that finds a secret fail closed rather than write an unprotected vault.
+Only the global registration vault uses `agit config secrets.keystore`: `os` (default)
+selects the system credential store; `file` selects a private file under
+`AGIT_HOME/keystore/` (Unix only). Repository dictionaries automatically keep their key
+under their common Git directory at `agit/secret-dictionary/keys/`, alongside the encrypted
+mapping. They do not depend on the global setting or create system credential entries.
+Back up the entire repository dictionary directory to preserve local hydration, and treat
+that backup as sensitive. Git push never uploads it.
 
-On macOS, a noninteractive command cannot open a Keychain authorization dialog. If Keychain requires authorization, have the user rerun the command from a terminal in their macOS login session and approve access, then retry automation. Keep the current keystore and vault key; changing stores does not repair an authorization failure.
+An existing dictionary may need its previously selected keystore once. After authenticating
+all records, a locked operation installs a local key and atomically records the new storage
+route without changing placeholders. Strict read-only inspection does not migrate. A missing
+local key after migration is an error, not permission to fall back to a system credential.
+
+On macOS, a noninteractive command cannot open a Keychain authorization dialog. If Keychain requires authorization, have the user rerun the command from a terminal in their macOS login session and approve access, then retry automation. For global secrets or a dictionary awaiting migration, keep the previous keystore available. Choose "Always Allow" to retain access for the same signed executable; "Allow" grants one access. A rebuilt ad-hoc-signed binary may need authorization again. Migrated dictionaries do not use Keychain.
 
 Projection happens at `agit commit`, not during transport — rewriting bytes at `git push` would change object ids and make local and remote history disagree. `agit push` stays a repository-wide fail-closed residue check: it refuses to publish when a protected literal survives in any object it would send.

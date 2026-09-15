@@ -99,13 +99,13 @@ enum BlockAction {
 }
 
 pub fn run(args: Args) -> CmdResult {
-    let store = VaultStore::open_default()?;
     match args.command {
         Action::Add {
             name,
             stdin,
             allow_short,
         } => {
+            let store = VaultStore::open_default()?;
             let secret = if stdin {
                 read_secret_stdin()?
             } else {
@@ -134,6 +134,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Action::List { json } => {
+            let store = VaultStore::open_default()?;
             let records = store.list()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&records)?);
@@ -147,6 +148,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Action::Remove { id_or_name, yes } => {
+            let store = VaultStore::open_default()?;
             if !yes {
                 match ui::prompt::confirm(
                     &format!("Permanently remove registered secret `{id_or_name}`?"),
@@ -166,6 +168,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Action::Status { json } => {
+            let store = VaultStore::open_default()?;
             let status = store.status()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
@@ -325,6 +328,60 @@ fn reload_daemon() -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
+
+    #[test]
+    fn repository_management_does_not_require_global_keystore_configuration() {
+        const CHILD: &str = "AGIT_TEST_REPOSITORY_LOCAL_KEYS";
+        let Some(root) = std::env::var_os(CHILD) else {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::secret_vault::tests::repository_management_does_not_require_global_keystore_configuration",
+                    "--nocapture",
+                ])
+                .env(CHILD, dir.path())
+                .env("AGIT_HOME", dir.path().join("home"))
+                .env("AGIT_SECRETS_KEYSTORE", "invalid-global-setting")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+            return;
+        };
+        let path = std::path::PathBuf::from(root).join("repository");
+        crate::domain::repo::Repo::init(&path).unwrap();
+        let dictionary = super::repository_dictionary(Some(path.clone())).unwrap();
+        dictionary
+            .protect_jsonl(
+                "{\"text\":\"fixture-registered-value\"}\n",
+                &crate::domain::secret_filter::Matcher::for_test(&[(
+                    "fixture",
+                    "fixture-registered-value",
+                )]),
+            )
+            .unwrap();
+        assert_eq!(
+            super::run(super::Args {
+                command: super::Action::Review {
+                    repo: Some(path),
+                    json: true
+                },
+            })
+            .unwrap(),
+            crate::ExitCode::Ok
+        );
+        assert!(
+            super::run(super::Args {
+                command: super::Action::Status { json: true }
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn cli_accepts_management_commands_but_never_a_positional_secret() {

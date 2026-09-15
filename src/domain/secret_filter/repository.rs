@@ -6,8 +6,9 @@
 
 use super::{
     CURRENT_PROJECTION_VERSION, CURRENT_SCHEMA_VERSION, DecryptedRecord, KeyStore,
-    MAX_REPOSITORY_SECRET_BYTES, Matcher, PlainRecord, RECORD_VERSION, RecordOrigin, SealedRecord,
-    SelectedKeyStore, Unlocked, VaultStore, encode_padded, record_aad, seal, write_vault,
+    MAX_REPOSITORY_SECRET_BYTES, Matcher, PlainRecord, RECORD_VERSION, RecordOrigin,
+    RepositoryKeyStore, SealedRecord, Unlocked, VaultStore, encode_padded, record_aad, seal,
+    write_vault,
 };
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use anyhow::{Context as _, bail};
@@ -98,27 +99,27 @@ pub struct RepositoryRecordSummary {
 
 /// One encrypted dictionary per checkout. The path is beneath `.git`, so no
 /// normal add/push/export path can accidentally publish it.
-pub struct RepositoryDictionary<K: KeyStore = SelectedKeyStore> {
+pub struct RepositoryDictionary<K: KeyStore = RepositoryKeyStore> {
     store: VaultStore<K>,
 }
 
-impl RepositoryDictionary<SelectedKeyStore> {
+impl RepositoryDictionary<RepositoryKeyStore> {
     /// A validated Git carrier selects its dictionary without rediscovering a worktree.
     #[cfg(feature = "cli")]
     pub(crate) fn open_at_git_dir(git_dir: &Path) -> crate::Result<Self> {
         Ok(Self::new(
             git_dir.join(Path::new(DICTIONARY_RELATIVE_PATH)),
-            SelectedKeyStore::from_config()?,
+            RepositoryKeyStore::new(git_dir.join("agit/secret-dictionary/keys")),
         ))
     }
 
-    /// Fails only on a keystore setting outside its domain; the key itself is touched lazily.
+    /// Repository keys use local files independently of the global registration keystore.
     pub fn open(repo_root: &Path) -> crate::Result<Self> {
         // One dictionary per repository: session-branch worktrees and the main checkout share it.
+        let git_dir = crate::domain::repo::common_git_dir(repo_root);
         Ok(Self::new(
-            crate::domain::repo::common_git_dir(repo_root)
-                .join(Path::new(DICTIONARY_RELATIVE_PATH)),
-            SelectedKeyStore::from_config()?,
+            git_dir.join(Path::new(DICTIONARY_RELATIVE_PATH)),
+            RepositoryKeyStore::new(git_dir.join("agit/secret-dictionary/keys")),
         ))
     }
 }
@@ -291,7 +292,8 @@ impl<K: KeyStore> RepositoryDictionary<K> {
                 let unlocked = if let Some(limits) = dictionary_limits {
                     self.unlock_readonly_bounded(limits)?
                 } else {
-                    self.store.unlock_existing()?
+                    self.store
+                        .unlock_file(super::read_vault(&self.store.path)?, true)?
                 };
                 let records = super::decrypt_records(&unlocked.file, &unlocked.dek)?;
                 (Some(unlocked), records)
@@ -1370,6 +1372,37 @@ mod tests {
             self.0.lock().unwrap().remove(vault_id);
             Ok(())
         }
+    }
+
+    #[test]
+    fn short_heuristic_records_remain_reversible_after_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary =
+            RepositoryDictionary::new(dir.path().join("vault.json"), MemoryKeys::default());
+        let input = "{\"message\":\"fixture: abc\"}\n";
+        let protected = dictionary
+            .store
+            .with_lock(|| {
+                let mut state = ProtectionState::load(
+                    &dictionary.store,
+                    &Matcher::empty(),
+                    &[Zeroizing::new("abc".into())],
+                )?;
+                let (text, count) = transform_jsonl(input, |text| state.protect_string(text))?;
+                assert_eq!(count, 1);
+                state.persist()?;
+                Ok(text)
+            })
+            .unwrap();
+        assert!(!protected.contains("abc"));
+        assert_eq!(dictionary.hydrate_jsonl(&protected).unwrap().text, input);
+        assert_eq!(
+            dictionary
+                .protect_jsonl(input, &Matcher::empty())
+                .unwrap()
+                .text,
+            protected
+        );
     }
 
     #[test]
