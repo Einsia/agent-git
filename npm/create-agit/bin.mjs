@@ -28,6 +28,13 @@ function fail(m) { console.error(`\x1b[31m✗ ${m}\x1b[0m`) }
 const { packageKey, binaryName } = require('@einsia/agent-git/npm/lib/platform.js')
 
 function main() {
+  const args = process.argv.slice(2)
+  const attributionIndex = args.indexOf('--acquisition-id')
+  const acquisitionId = attributionIndex >= 0 ? args[attributionIndex + 1] : undefined
+  if (attributionIndex >= 0 && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(acquisitionId ?? '')) {
+    fail('--acquisition-id requires a random UUID.')
+    process.exit(1)
+  }
   const t = packageKey()
   if (!t) {
     fail(`no prebuilt binary for ${platform()}/${arch()}.`)
@@ -69,6 +76,11 @@ function main() {
   // failure does not block the install itself — the binary is already there, and setup can be
   // re-run by hand later.
   const yes = ['1', 'true'].includes(process.env.npm_config_yes?.toLowerCase()) || process.argv.slice(2).some(a => a === '--yes' || a === '-y')
+  spawnSync(target, ['--internal-install-completed'], {
+    stdio: ['ignore', 'inherit', 'inherit'],
+    env: { ...process.env, AGIT_INSTALL_CHANNEL: 'create_agit', AGIT_INSTALLER_YES: yes ? '1' : '0',
+      ...(acquisitionId ? { AGIT_ACQUISITION_ID: acquisitionId } : {}) },
+  })
   const skipSetup = process.env.AGIT_SKIP_SETUP && !['0', 'false'].includes(process.env.AGIT_SKIP_SETUP.toLowerCase())
   if (skipSetup) {
     dim('Setup skipped by AGIT_SKIP_SETUP. Run `agit setup` when ready.')

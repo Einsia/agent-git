@@ -23,7 +23,7 @@
 
 use super::{CmdResult, InteractionRequired, remote_request};
 use crate::infra::config;
-use crate::infra::credentials::{self, HubCredential};
+use crate::infra::credentials::HubCredential;
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
 use std::io::Read as _;
@@ -75,7 +75,7 @@ pub fn run(args: Args) -> CmdResult {
 
     match result {
         Ok(Some((cred, who))) => {
-            if let Err(error) = credentials::save(&hub, &cred) {
+            if let Err(error) = crate::telemetry::acquisition::save_login(&hub, &cred) {
                 ui::error(&format!("cannot save the signed-in credentials: {error:#}"));
                 return Ok(ExitCode::Precondition);
             }
@@ -156,6 +156,7 @@ fn start_browser_handoff(hub: &str) -> CmdResult {
     let client = crate::hub::Client::for_hub(hub);
     let session: CliSession =
         remote_request(client.post_public("api/auth/cli/session", &serde_json::json!({})))?;
+    let url = crate::telemetry::acquisition::authorization_url(&session.url, hub);
     crate::telemetry::observe(crate::telemetry::Observation::Authentication(false));
     let message = "Ask the human to open the login link, sign in, and approve CLI access.";
     let complete = ["agit", "login", "--hub", hub, "--complete", &session.state];
@@ -164,14 +165,14 @@ fn start_browser_handoff(hub: &str) -> CmdResult {
             "{}",
             serde_json::json!({
                 "status": "authorization_required",
-                "authorization_url": session.url,
+                "authorization_url": url,
                 "expires_in": session.expires_in,
                 "message": message,
                 "complete_command": complete,
             })
         );
     } else {
-        println!("{}", session.url);
+        println!("{}", url);
         #[cfg(windows)]
         let quote = ui::quote_powershell_argument;
         #[cfg(not(windows))]
@@ -207,9 +208,10 @@ fn login_browser(hub: &str) -> crate::Result<Option<(HubCredential, String)>> {
         remote_request(client.post_public("api/auth/cli/session", &serde_json::json!({})))?;
 
     println!();
+    let url = crate::telemetry::acquisition::authorization_url(&session.url, hub);
     println!("  open this link to authorize the CLI:");
-    println!("    {}", ui::accent(&session.url));
-    if open_browser(&session.url) {
+    println!("    {}", ui::accent(&url));
+    if open_browser(&url) {
         ui::info(format_args!("  {}", ui::dim("(opened in your browser)")));
     }
     ui::info("  waiting for approval… (ctrl-c to cancel)");
@@ -243,7 +245,13 @@ fn login_device(hub: &str) -> crate::Result<Option<(HubCredential, String)>> {
 
     println!();
     println!("  on any device with a browser, open:");
-    println!("    {}", ui::accent(&dev.verification_uri));
+    println!(
+        "    {}",
+        ui::accent(&crate::telemetry::acquisition::authorization_url(
+            &dev.verification_uri,
+            hub
+        ))
+    );
     println!(
         "  and enter this code:  {}",
         ui::accent(&ui::bold(&dev.user_code))
@@ -309,23 +317,54 @@ fn authorization_response(
     )
 }
 
-/// Open a browser where possible; failing is not fatal (the link is already on screen).
+#[cfg(any(windows, test))]
+fn browser_url_wide(url: &str) -> Option<Vec<u16>> {
+    (!url.contains('\0')).then(|| url.encode_utf16().chain([0]).collect())
+}
+
+/// Pass URLs directly to the system association API so query separators never reach a shell.
+#[cfg(windows)]
 fn open_browser(url: &str) -> bool {
-    let (cmd, arg) = if cfg!(target_os = "macos") {
-        ("open", url)
-    } else if cfg!(target_os = "windows") {
-        return std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+    use windows_sys::Win32::{
+        System::Com::{
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+        },
+        UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+    };
+    let Some(wide) = browser_url_wide(url) else {
+        return false;
+    };
+    let verb: Vec<u16> = "open".encode_utf16().chain([0]).collect();
+    unsafe {
+        let initialized = CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        );
+        let result = ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+        if initialized >= 0 {
+            CoUninitialize();
+        }
+        result as isize > 32
+    }
+}
+
+/// Open a browser where possible; failing is not fatal because the link is already on screen.
+#[cfg(not(windows))]
+fn open_browser(url: &str) -> bool {
+    let cmd = if cfg!(target_os = "macos") {
+        "open"
     } else {
-        ("xdg-open", url)
+        "xdg-open"
     };
     std::process::Command::new(cmd)
-        .arg(arg)
+        .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -383,6 +422,15 @@ fn session_credential(response: crate::hub::LoginResponse) -> (HubCredential, St
 
 #[cfg(test)]
 mod identity_tests {
+    #[test]
+    fn windows_url_buffer_keeps_query_and_fragment_as_one_system_argument() {
+        let url = "https://agent-git.com/auth/cli?state=synthetic&installation_id=opaque#fragment";
+        let wide = super::browser_url_wide(url).unwrap();
+        assert_eq!(wide.last(), Some(&0));
+        assert_eq!(String::from_utf16(&wide[..wide.len() - 1]).unwrap(), url);
+        assert!(super::browser_url_wide("https://agent-git.com/\0truncated").is_none());
+    }
+
     #[test]
     fn login_keeps_authoritative_account_identity_without_a_username_fallback() {
         for account in [None, Some("account-authoritative")] {

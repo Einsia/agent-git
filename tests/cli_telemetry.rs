@@ -49,6 +49,7 @@ impl Fixture {
             "AGIT_MCP_TOOL",
             "AGIT_TELEMETRY_PARENT_ID",
             "AGIT_INSTALL_CHANNEL",
+            "AGIT_ACQUISITION_ID",
             "AGIT_YES",
         ] {
             command.env_remove(name);
@@ -600,4 +601,389 @@ fn disable_waits_for_the_upload_gate_and_prevents_any_followup_request() {
     let listener = server.join().unwrap();
     f.run(&["--internal-telemetry-flush"]);
     assert!(matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn verified_install_is_observable_without_setup_or_login_and_is_deduplicated() {
+    let f = Fixture::new();
+    let acquisition = uuid::Uuid::new_v4().to_string();
+    for _ in 0..2 {
+        let output = f
+            .command()
+            .arg("--internal-install-completed")
+            .env("AGIT_ACQUISITION_ID", &acquisition)
+            .env("AGIT_INSTALL_CHANNEL", "create_agit")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+    let events = f.events();
+    let installs: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "cli_install_succeeded")
+        .collect();
+    assert_eq!(installs.len(), 1);
+    let install = installs[0];
+    assert_eq!(install["properties"]["acquisition_id"], acquisition);
+    assert_eq!(install["properties"]["channel"], "create_agit");
+    assert_eq!(install["properties"]["installation_verified"], true);
+    assert_eq!(install["properties"]["ci"], true);
+    assert!(install["properties"]["user_id"].is_null());
+    assert!(
+        events
+            .iter()
+            .all(|e| e["event"] != "cli_acquisition_linked")
+    );
+    let prefs: Value =
+        serde_json::from_slice(&std::fs::read(f.path("preferences.json")).unwrap()).unwrap();
+    assert_eq!(install["properties"]["installation_id"], prefs["device_id"]);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["event"] == "cli_install_attributed")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn installation_obeys_opt_out_and_reenable_cannot_restore_the_old_acquisition() {
+    for optout in [
+        "DO_NOT_TRACK",
+        "AGIT_TELEMETRY_DISABLED",
+        "AGIT_TELEMETRY_DEFER",
+    ] {
+        let f = Fixture::new();
+        f.command()
+            .arg("--internal-install-completed")
+            .env(optout, "1")
+            .output()
+            .unwrap();
+        assert!(f.events().is_empty());
+        assert!(!f.path("preferences.json").exists());
+    }
+    let f = Fixture::new();
+    f.command()
+        .arg("--internal-install-completed")
+        .env("AGIT_ACQUISITION_ID", uuid::Uuid::new_v4().to_string())
+        .output()
+        .unwrap();
+    assert!(f.run(&["telemetry", "disable"]).status.success());
+    f.run(&["--internal-install-completed"]);
+    assert!(f.events().is_empty());
+    f.enable();
+    f.run(&["--internal-install-completed"]);
+    assert!(
+        f.events()
+            .iter()
+            .all(|e| e["properties"]["acquisition_id"].is_null())
+    );
+}
+
+#[test]
+fn a_tagged_reinstall_attributes_an_existing_install_without_counting_it_twice() {
+    let f = Fixture::new();
+    f.run(&["--internal-install-completed"]);
+    let id = uuid::Uuid::new_v4().to_string();
+    f.command()
+        .arg("--internal-install-completed")
+        .env("AGIT_ACQUISITION_ID", &id)
+        .output()
+        .unwrap();
+    let events = f.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["event"] == "cli_install_succeeded")
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "cli_install_attributed"
+                && e["properties"]["acquisition_id"] == id)
+    );
+}
+
+fn reply_to_login(listener: &TcpListener, child: &mut std::process::Child, body: Value) {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "login did not reach the Hub");
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "login exited before its request"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut header = Vec::new();
+    let mut byte = [0];
+    while !header.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).unwrap();
+        header.push(byte[0]);
+    }
+    let length = String::from_utf8_lossy(&header)
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .and_then(|s| s.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    stream.read_exact(&mut vec![0; length]).unwrap();
+    let body = body.to_string();
+    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+}
+
+#[test]
+fn first_browser_handoff_and_completed_login_join_the_install_without_linking_another_account() {
+    let hub = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut f = Fixture::new();
+    f.hub = format!("http://{}", hub.local_addr().unwrap());
+    let acquisition = uuid::Uuid::new_v4().to_string();
+    f.command()
+        .arg("--internal-install-completed")
+        .env("AGIT_ACQUISITION_ID", &acquisition)
+        .output()
+        .unwrap();
+    let install = f
+        .events()
+        .into_iter()
+        .find(|e| e["event"] == "cli_install_succeeded")
+        .unwrap();
+    let installation = install["properties"]["installation_id"].as_str().unwrap();
+    let mut child = f
+        .command()
+        .args(["login", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    reply_to_login(
+        &hub,
+        &mut child,
+        json!({"state":"private-state-canary", "url":format!("{}/auth/cli?state=private-state-canary", f.hub), "expires_in":300}),
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(8));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("installation_id={installation}"))
+    );
+    assert!(
+        !f.events()
+            .iter()
+            .any(|e| e["event"] == "cli_acquisition_linked")
+    );
+    for account in ["account-alice", "account-bob"] {
+        let mut child = f
+            .command()
+            .args(["login", "--complete", "private-state-canary"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        reply_to_login(
+            &hub,
+            &mut child,
+            json!({"account_id":account, "username":"private-name-canary", "access_token":"private-access-canary", "refresh_token":"private-refresh-canary", "access_expires_at":"2099-01-01T00:00:00Z", "refresh_expires_at":"2099-02-01T00:00:00Z"}),
+        );
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let events = f.events();
+    let links: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "cli_acquisition_linked")
+        .collect();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0]["properties"]["installation_id"], installation);
+    assert_eq!(links[0]["properties"]["acquisition_id"], acquisition);
+    assert_eq!(links[0]["properties"]["user_id"], "account-alice");
+    assert!(
+        events
+            .iter()
+            .filter(|e| e["properties"]["user_id"] == "account-bob")
+            .all(|e| e["properties"]["installation_id"].is_null())
+    );
+    assert!(!serde_json::to_string(&events).unwrap().contains("canary"));
+}
+
+#[test]
+fn official_installation_keys_do_not_cross_into_another_hubs_authorization_url() {
+    for configured in [false, true] {
+        let mut f = Fixture::new();
+        f.hub = "https://agent-git.com".into();
+        f.run(&["--internal-install-completed"]);
+        let hub = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = format!("http://{}", hub.local_addr().unwrap());
+        let mut command = f.command();
+        if !configured {
+            command
+                .env_remove("AGIT_TELEMETRY_HOST")
+                .env_remove("AGIT_TELEMETRY_KEY");
+        }
+        let mut child = command
+            .args(["login", "--hub", &other, "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        reply_to_login(
+            &hub,
+            &mut child,
+            json!({"state":"synthetic-other-hub", "url":format!("{other}/auth/cli?state=synthetic-other-hub"), "expires_in":300}),
+        );
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(8));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("installation_id="));
+    }
+}
+
+#[test]
+fn the_first_saved_account_survives_a_busy_collector_and_a_broken_queue() {
+    let hub = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut f = Fixture::new();
+    f.hub = format!("http://{}", hub.local_addr().unwrap());
+    f.run(&["--internal-install-completed"]);
+    let gate = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.path("gate.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&gate).unwrap();
+    std::fs::write(f.path("queue.json"), b"invalid queue").unwrap();
+    let mut first = None;
+    for account in ["account-alice", "account-bob"] {
+        let mut child = f
+            .command()
+            .args(["login", "--complete", "private-state-canary"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        reply_to_login(
+            &hub,
+            &mut child,
+            json!({"account_id":account, "username":"private-name-canary", "access_token":"private-access-canary", "refresh_token":"private-refresh-canary", "access_expires_at":"2099-01-01T00:00:00Z", "refresh_expires_at":"2099-02-01T00:00:00Z"}),
+        );
+        if first.is_none() {
+            assert!(child.try_wait().unwrap().is_none());
+            fs2::FileExt::unlock(&gate).unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let preferences: Value =
+            serde_json::from_slice(&std::fs::read(f.path("preferences.json")).unwrap()).unwrap();
+        let owner = preferences["first_acquisition_account"].clone();
+        assert_eq!(owner["account_id"], "account-alice");
+        if let Some(first) = &first {
+            assert_eq!(&owner, first);
+        } else {
+            first = Some(owner);
+        }
+        assert_eq!(preferences["acquisition_completed"], false);
+    }
+    std::fs::remove_file(f.path("queue.json")).unwrap();
+    f.run(&["--internal-telemetry-flush"]);
+    let linked: Vec<_> = f
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "cli_acquisition_linked")
+        .collect();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0]["properties"]["user_id"], "account-alice");
+    assert_eq!(linked[0]["uuid"], first.as_ref().unwrap()["event_id"]);
+    assert_eq!(linked[0]["timestamp"], first.as_ref().unwrap()["saved_at"]);
+}
+
+#[test]
+fn hidden_install_defers_ids_until_visible_consent_and_preserves_its_occurrence_time() {
+    let f = Fixture::new();
+    let output = f
+        .command()
+        .args(["--internal-install-completed", "--defer-notice"])
+        .env("AGIT_INSTALL_CHANNEL", "npm_global")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    assert!(!f.path("preferences.json").exists());
+    assert!(f.events().is_empty());
+    let fact: Value =
+        serde_json::from_slice(&std::fs::read(f.path("pending-install.json")).unwrap()).unwrap();
+    assert!(fact.get("device_id").is_none());
+    f.run(&["--version"]);
+    assert!(!f.path("preferences.json").exists());
+    let enabled = f.run(&["telemetry", "enable"]);
+    assert!(String::from_utf8_lossy(&enabled.stderr).contains("agit telemetry disable"));
+    let installs: Vec<_> = f
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "cli_install_succeeded")
+        .collect();
+    assert_eq!(installs.len(), 1);
+    assert_eq!(installs[0]["timestamp"], fact["verified_at"]);
+    assert_eq!(installs[0]["properties"]["channel"], "npm_global");
+    assert!(!f.path("pending-install.json").exists());
+}
+
+#[test]
+fn declining_statistics_purges_the_hidden_install_fact_before_reenable() {
+    let f = Fixture::new();
+    f.run(&["--internal-install-completed", "--defer-notice"]);
+    assert!(f.path("pending-install.json").exists());
+    f.run(&["telemetry", "disable"]);
+    assert!(!f.path("pending-install.json").exists());
+    f.run(&["--internal-install-completed", "--defer-notice"]);
+    assert!(!f.path("pending-install.json").exists());
+    f.enable();
+    assert!(f.events().is_empty());
+}
+
+#[test]
+fn manual_installations_bind_their_key_before_the_first_authorization_handoff() {
+    let mut f = Fixture::new();
+    f.enable();
+    let mut first_installation = None;
+    for first in [true, false] {
+        let hub = TcpListener::bind("127.0.0.1:0").unwrap();
+        f.hub = format!("http://{}", hub.local_addr().unwrap());
+        let mut child = f
+            .command()
+            .args(["login", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        reply_to_login(
+            &hub,
+            &mut child,
+            json!({"state":"private-state-canary", "url":format!("{}/auth/cli?state=private-state-canary", f.hub), "expires_in":300}),
+        );
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(8));
+        let prefs: Value =
+            serde_json::from_slice(&std::fs::read(f.path("preferences.json")).unwrap()).unwrap();
+        assert_eq!(prefs["install_reported"], false);
+        if first {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("installation_id="));
+            assert!(prefs["acquisition_route"].is_string());
+            first_installation = Some(prefs["acquisition_route"].clone());
+        } else {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("installation_id="));
+            assert_eq!(Some(prefs["acquisition_route"].clone()), first_installation);
+        }
+    }
 }

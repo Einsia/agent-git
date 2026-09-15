@@ -38,6 +38,14 @@ fn main() {
         let _ = agit::telemetry::transport::flush();
         return;
     }
+    if raw_args
+        .get(1)
+        .is_some_and(|arg| arg == "--internal-install-completed")
+        && (raw_args.len() == 2 || (raw_args.len() == 3 && raw_args[2] == "--defer-notice"))
+    {
+        let _ = agit::telemetry::acquisition::installed(raw_args.len() == 3);
+        return;
+    }
     agit::telemetry::begin(&raw_args);
     let code = run(raw_args);
     agit::telemetry::finish(code);

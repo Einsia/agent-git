@@ -100,6 +100,12 @@ pub(crate) enum EventName {
     Onboarding,
     #[serde(rename = "cli_session_started")]
     Session,
+    #[serde(rename = "cli_install_succeeded")]
+    InstallSucceeded,
+    #[serde(rename = "cli_acquisition_linked")]
+    AcquisitionLinked,
+    #[serde(rename = "cli_install_attributed")]
+    InstallAttributed,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -150,9 +156,21 @@ pub(crate) fn enqueue(event: Event, generation: u64, destination: &Destination) 
         "telemetry event exceeds its limit"
     );
     let dir = state::directory()?;
-    let _guard = state::gate(&dir, false)?;
-    let preferences = state::read_at(&dir)?;
+    let _guard = state::gate(
+        &dir,
+        matches!(
+            event.event,
+            EventName::InstallSucceeded | EventName::InstallAttributed
+        ),
+    )?;
+    let mut preferences = state::read_at(&dir)?;
     if !state::enabled(&preferences) || preferences.generation != generation {
+        return Ok(());
+    }
+    if (event.event == EventName::InstallSucceeded && preferences.install_reported)
+        || (event.event == EventName::AcquisitionLinked && preferences.acquisition_completed)
+        || (event.event == EventName::InstallAttributed && preferences.acquisition_reported)
+    {
         return Ok(());
     }
     let mut queue = load(&dir)?;
@@ -198,13 +216,22 @@ pub(crate) fn enqueue(event: Event, generation: u64, destination: &Destination) 
             return state::write_json(&dir.join("queue.json"), &queue);
         }
     }
+    let event_name = event.event;
+    queue.entries.retain(|entry| entry.event.uuid != event.uuid);
     queue.entries.push(Entry {
         route: destination.route.clone(),
         generation,
         event,
     });
     prune(&mut queue, generation, now);
-    state::write_json(&dir.join("queue.json"), &queue)
+    state::write_json(&dir.join("queue.json"), &queue)?;
+    match event_name {
+        EventName::InstallSucceeded => preferences.install_reported = true,
+        EventName::AcquisitionLinked => preferences.acquisition_completed = true,
+        EventName::InstallAttributed => preferences.acquisition_reported = true,
+        _ => return Ok(()),
+    }
+    state::write_json(&dir.join("preferences.json"), &preferences)
 }
 
 pub fn queue_status() -> (usize, u64) {
@@ -251,6 +278,7 @@ pub fn flush() -> Result<()> {
         return Ok(());
     }
     let hub = crate::infra::config::hub_url();
+    let _ = super::acquisition::enqueue_pending_link(&hub);
     let Some(destination) = Destination::for_hub(&hub) else {
         return Ok(());
     };

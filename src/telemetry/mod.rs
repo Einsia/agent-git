@@ -1,5 +1,6 @@
 //! Product analytics accepts only properties constructed by the reviewed field registry.
 
+pub mod acquisition;
 mod rc;
 pub mod schema;
 pub mod state;
@@ -194,7 +195,7 @@ fn seed(argv: &[OsString]) -> Seed {
 }
 
 fn context(seed: &Seed) -> anyhow::Result<Option<(Context, bool)>> {
-    let preferences = state::read()?;
+    let mut preferences = state::read()?;
     if !state::enabled(&preferences) {
         return Ok(None);
     }
@@ -224,6 +225,7 @@ fn context(seed: &Seed) -> anyhow::Result<Option<(Context, bool)>> {
         {
             return Ok(None);
         }
+        preferences = current;
     }
     let old = if debug {
         None
@@ -280,6 +282,16 @@ fn context(seed: &Seed) -> anyhow::Result<Option<(Context, bool)>> {
     }).as_object().unwrap().clone());
     if let Some(account) = &account {
         properties.insert("user_id".into(), json!(account));
+    }
+    if seed.properties.get("command") == Some(&json!("login"))
+        && preferences.first_acquisition_account.is_none()
+        && if debug {
+            preferences.acquisition_route.as_ref() == Some(&destination.route)
+        } else {
+            acquisition::bind_route(&mut preferences, &dir, &destination)?
+        }
+    {
+        acquisition::extend_properties(&preferences, &mut properties);
     }
     Ok(Some((
         Context {
@@ -390,6 +402,7 @@ pub fn activate(onboarding: bool) {
     let Some(seed) = seed else {
         return;
     };
+    let _ = acquisition::resume_pending(&seed.hub);
     let Some((context, new_session)) = context(&seed).ok().flatten() else {
         return;
     };

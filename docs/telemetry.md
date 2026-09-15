@@ -32,8 +32,9 @@ An existing installation with an unset preference receives the disclosure and
 sets the default on its first ordinary foreground invocation with a visible
 terminal. Fresh CI, hooks, MCP parents and children, RC daemons, help, version,
 invalid invocations, and completion generation do not establish a preference.
-The npm dependency postinstall defers onboarding to a visible setup or foreground
-invocation. Automatic Skill refresh during upgrades also defers collection in its
+Verified installers establish the default-on preference with the collection notice,
+including when integration setup is skipped. A dependency installed by npm exec
+defers this to create-agit after its durable binary copy passes the self-check. Automatic Skill refresh during upgrades also defers collection in its
 hidden setup child. `setup --skill --installed-only` never establishes a telemetry
 preference, including when invoked by an older upgrader. `AGIT_SKIP_SETUP` also
 skips create-agit's setup.
@@ -117,6 +118,9 @@ been persisted when the daemon exits may be lost.
 | `cli_integration_summary` | Aggregated hook completions or received RC requests |
 | `cli_onboarding_completed` | Setup established an enabled preference |
 | `cli_session_started` | Foreground telemetry activity started a new session |
+| `cli_install_succeeded` | An installer copied the binary and verified it runs; once per consent generation |
+| `cli_install_attributed` | A tagged installer associates an installation with an anonymous website acquisition |
+| `cli_acquisition_linked` | The first successful CLI login saved an authoritative account ID |
 
 Use `cli_command_finished` and `invocation_id` for command counts. Operation events
 are detail within an invocation, not additional commands. MCP child commands carry
@@ -175,3 +179,53 @@ retention. The API envelope follows PostHog's
 
 The module is gated by the Cargo `cli` feature. Backend consumers using
 `default-features = false` do not link or execute this telemetry system.
+
+
+## Acquisition funnel contract
+
+Website `page_view` and anonymous `product_intent` events carry a random
+`acquisition_id`. Copying a create-agit install command adds the opaque
+`--acquisition-id <UUID>` option. The installer passes it to the verified binary
+as `AGIT_ACQUISITION_ID`; only random UUIDs are accepted, never command text.
+The install receipt carries `installation_id` and the optional acquisition key.
+A tagged reinstall can emit `cli_install_attributed` to associate an existing
+receipt without counting another installation. These events are independently
+sent even when setup is skipped or fails and no login ever follows, once the
+usage-statistics notice is visible and statistics are enabled. The visible
+create-agit wrapper and npm `--foreground-scripts` can do this at installation.
+Default npm lifecycle output is hidden: without an existing choice, postinstall
+keeps only a local verified fact and its original timestamp, with no new tracking
+ID, preference or upload. A visible foreground invocation, setup, or explicit
+`agit telemetry enable` can subsequently queue that receipt. Local-only commands
+do not start a sender. Pending receipts expire after a day and are deleted on
+opt-out. A hidden npm installation that never reaches visible consent remains
+unobservable in PostHog.
+
+The first `agit login` handoff URL also carries `installation_id`. The browser
+stores it through registration, so a direct npm installation can be associated
+with a website visit when the browser authorization page is opened. The CLI emits
+`cli_acquisition_linked` only after credentials containing the authoritative
+account ID are saved, and only for the first completed acquisition. The first
+account is persisted under the installation gate at credential save, independently
+of event buffering. Queue failures retry that same account, event ID and timestamp;
+a later login cannot claim the installation. Existing
+account login is not registration; use website `signup_success` for that stage.
+The ordinary started/finished command events continue to describe pending,
+failed, and completed login attempts.
+
+Build the funnel by joining website acquisition keys to installation receipts
+and the first account link, then counting distinct resolved people at each stage.
+Exclude installer events with `ci=true` from human acquisition cohorts.
+Deduplicate multiple intent events as one person. Never sum clicks or equate a
+copied command, a download, setup completion, or a pending authorization with an
+installation or registration. Multiple devices require the authoritative account
+link to deduplicate as people; unregistered devices remain anonymous installations,
+not a provable count of natural persons. These keys do not alias all anonymous CLI
+activity or merge subsequent accounts sharing a machine.
+
+Untagged installs that never open browser authorization cannot be connected to an
+earlier website visit. Where the installation receipt was eligible for delivery, they still appear in
+the installation-without-observed-registration cohort. Manual archive copies, builds outside the installers, `--no-verify`, npm
+`--ignore-scripts`, opt-outs, offline delivery expiry, and older CLI releases have
+no verified install receipt. Exclude those from claims of complete coverage. Data
+is prospective; deploying the website and releasing the CLI are both required.

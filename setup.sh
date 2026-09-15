@@ -215,8 +215,9 @@ ok "installed ${C_BOLD}${DEST}${C_RESET}"
 if [ "$VERIFY" -eq 1 ]; then
 	# --version rather than a bare run: clap sets arg_required_else_help, so no arguments
 	# prints help and exits non-zero, which set -e misreads as a failure.
-	if VERSION_OUT="$("$DEST" --version 2>&1)"; then
+	if VERSION_OUT="$(AGIT_TELEMETRY_DEFER=1 "$DEST" --version 2>&1)"; then
 		ok "self-check passed: ${VERSION_OUT}"
+		AGIT_INSTALL_CHANNEL=source "$DEST" --internal-install-completed </dev/null || true
 	else
 		die "the installed binary does not run: ${VERSION_OUT}" \
 			"architecture mismatch or a missing dependency; rebuild with --debug for the full error"

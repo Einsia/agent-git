@@ -21,7 +21,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, chmodSync, copyFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, chmodSync, copyFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
@@ -113,11 +113,12 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
 // 2. sandboxed install through the npx wrapper
 {
   const preferences = join(home, '.agit', 'telemetry', 'preferences.json')
-  const postinstall = spawnSync('node', [join(mainPkg, 'npm', 'postinstall.js')], { encoding: 'utf8', env, cwd: home })
+  const postinstall = spawnSync('node', [join(mainPkg, 'npm', 'postinstall.js')], { encoding: 'utf8', env: { ...env, npm_command: 'exec' }, cwd: home })
   check('dependency postinstall defers usage-statistics onboarding', postinstall.status === 0 && !existsSync(preferences), postinstall.stderr)
-  const r = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], {
+  const acquisitionId = 'f2ec57cb-12f0-4387-bd56-7739bde158bf'
+  const r = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs'), '--acquisition-id', acquisitionId], {
     encoding: 'utf8',
-    env,
+    env: { ...env, AGIT_TELEMETRY_HOST: 'http://127.0.0.1:9', AGIT_TELEMETRY_KEY: 'synthetic' },
     cwd: home,
   })
   const installed = join(home, '.local', 'bin', platform.binaryName())
@@ -133,10 +134,51 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
     check('setup persists usage-statistics preferences', existsSync(preferences), r.stderr)
     if (existsSync(preferences)) {
       const saved = JSON.parse(readFileSync(preferences, 'utf8'))
+      check('verified install retains the browser acquisition key', saved.install_reported === true && saved.acquisition_id === acquisitionId)
       check('npm yes enables statistics after a visible notice', saved.preference === 'enabled' && saved.decision_source === 'create_agit_yes' && r.stderr.includes('agit telemetry disable'), r.stderr)
       spawnSync(installed, ['telemetry', 'disable'], { env, encoding: 'utf8' })
       const again = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env, encoding: 'utf8', cwd: home })
       check('reinstallation with npm yes preserves an opt-out', again.status === 0 && JSON.parse(readFileSync(preferences, 'utf8')).preference === 'disabled', again.stderr)
+    }
+  }
+}
+
+// npm controls lifecycle visibility; running postinstall directly cannot exercise that boundary.
+if (process.platform !== 'win32') {
+  for (const foreground of [false, true]) {
+    const lifecycleHome = join(work, foreground ? 'foreground-home' : 'hidden-home')
+    const consumer = join(lifecycleHome, 'consumer')
+    const fixture = join(lifecycleHome, 'fixture')
+    mkdirSync(consumer, { recursive: true })
+    mkdirSync(fixture, { recursive: true })
+    writeFileSync(join(consumer, 'package.json'), JSON.stringify({ name: 'smoke-consumer', version: '1.0.0', private: true }))
+    writeFileSync(join(fixture, 'package.json'), JSON.stringify({ name: 'verified-install-fixture', version: '1.0.0', scripts: { postinstall: 'node postinstall.cjs' } }))
+    writeFileSync(join(fixture, 'postinstall.cjs'), `require(${JSON.stringify(join(mainPkg, 'npm', 'postinstall.js'))})`)
+    const lifecycleEnv = { ...env, HOME: lifecycleHome, USERPROFILE: lifecycleHome,
+      AGIT_HOME: join(lifecycleHome, '.agit'), AGIT_SKIP_SETUP: '1',
+      AGIT_TELEMETRY_HOST: 'http://127.0.0.1:9', AGIT_TELEMETRY_KEY: 'synthetic',
+      npm_config_cache: join(work, 'npm-cache'), npm_config_userconfig: join(work, 'empty-npmrc') }
+    delete lifecycleEnv.npm_config_foreground_scripts
+    const result = spawnSync('npm', ['install', '--offline', '--no-audit', '--no-fund', '--install-links', '--ignore-scripts=false', `--foreground-scripts=${foreground}`, fixture], {
+      encoding: 'utf8', env: lifecycleEnv, cwd: consumer, timeout: 30000,
+    })
+    check(`real npm lifecycle succeeds (foreground=${foreground})`, result.status === 0, `${result.status} ${result.stderr}`)
+    const dir = join(lifecycleHome, '.agit', 'telemetry')
+    const prefs = join(dir, 'preferences.json')
+    if (foreground) {
+      check('foreground npm discloses before enabling statistics', existsSync(prefs) && (result.stdout + result.stderr).includes('agit telemetry disable'), result.stdout + result.stderr)
+      check('foreground npm records a verified install without setup or registration', existsSync(prefs) && JSON.parse(readFileSync(prefs, 'utf8')).install_reported === true)
+    } else {
+      check('hidden npm output cannot enable statistics or allocate an installation ID', !existsSync(prefs) && !existsSync(join(dir, 'queue.json')) && !(result.stdout + result.stderr).includes('agit telemetry disable'))
+      const pending = join(dir, 'pending-install.json')
+      check('hidden npm retains the verified installation fact', existsSync(pending))
+      if (existsSync(pending)) {
+        const fact = JSON.parse(readFileSync(pending, 'utf8'))
+        const consent = spawnSync(bin, ['telemetry', 'enable'], { encoding: 'utf8', env: lifecycleEnv, cwd: consumer })
+        const queuePath = join(dir, 'queue.json')
+        const receipt = existsSync(queuePath) && JSON.parse(readFileSync(queuePath, 'utf8')).entries.find(entry => entry.event.event === 'cli_install_succeeded')?.event
+        check('visible consent records the original installation without registration', consent.status === 0 && consent.stderr.includes('agit telemetry disable') && receipt?.timestamp === fact.verified_at, consent.stderr)
+      }
     }
   }
 }

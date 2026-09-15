@@ -50,6 +50,15 @@ function main() {
     return;
   }
 
+  // npx create-agit owns its durable-copy receipt and passes the browser acquisition key.
+  if (process.env.npm_command !== 'exec') {
+    const receiptArgs = ['--internal-install-completed'];
+    if (!truthy(process.env.npm_config_foreground_scripts)) receiptArgs.push('--defer-notice');
+    spawnSync(bin, receiptArgs, {
+      stdio: ['ignore', 'inherit', 'inherit'],
+      env: { ...process.env, AGIT_INSTALL_CHANNEL: 'npm_global' },
+    });
+  }
   if (truthy(process.env.AGIT_SKIP_SETUP)) return;
   const setup = spawnSync(bin, ['setup'], { stdio: 'inherit', env });
   if (setup.status !== 0) {

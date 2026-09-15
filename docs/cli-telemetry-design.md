@@ -100,7 +100,10 @@ its own preference database or event schema.
 The dependency postinstall path must pass a telemetry-defer marker: no onboarding,
 notice, ID allocation, or analytics there. The visible create-agit wrapper owns the
 installation notice and invokes setup once for telemetry. A standalone global npm
-installation defers onboarding to the first visible setup or ordinary invocation.
+installation with hidden lifecycle output retains a local verified fact without
+a preference, ID allocation or upload. Visible foreground consent can queue its
+original timestamp later; an existing enabled choice permits immediate reporting.
+See `docs/telemetry.md` for the scoped acquisition receipt and correlation contract.
 This avoids hidden npm lifecycle output establishing a preference before disclosure.
 
 The wrapper explicitly translates npm's supported `yes` configuration into a

@@ -33,6 +33,14 @@ pub enum DecisionSource {
     ExplicitDisable,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcquisitionAccount {
+    pub account_id: Option<String>,
+    pub event_id: uuid::Uuid,
+    pub saved_at: chrono::DateTime<chrono::Utc>,
+    pub ci: bool,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
@@ -43,6 +51,12 @@ pub struct Preferences {
     pub decision_at: Option<String>,
     pub device_id: Option<uuid::Uuid>,
     pub channel: String,
+    pub acquisition_id: Option<uuid::Uuid>,
+    pub acquisition_route: Option<String>,
+    pub install_reported: bool,
+    pub acquisition_completed: bool,
+    pub first_acquisition_account: Option<AcquisitionAccount>,
+    pub acquisition_reported: bool,
 }
 
 pub fn directory() -> Result<PathBuf> {
@@ -164,6 +178,8 @@ fn choose_at(
     {
         return Ok(current);
     }
+    let preserve_pending =
+        current.preference == Preference::Unset && preference == Preference::Enabled;
     // The barrier covers both persistence and queue removal, so a worker cannot admit a stale batch.
     current.generation = current
         .generation
@@ -174,6 +190,12 @@ fn choose_at(
     current.decision_source = Some(source);
     current.decision_at = Some(chrono::Utc::now().to_rfc3339());
     current.device_id = (preference == Preference::Enabled).then(uuid::Uuid::new_v4);
+    current.acquisition_id = None;
+    current.acquisition_route = None;
+    current.install_reported = false;
+    current.acquisition_completed = false;
+    current.first_acquisition_account = None;
+    current.acquisition_reported = false;
     current.channel = match std::env::var("AGIT_INSTALL_CHANNEL").as_deref() {
         Ok("create_agit") => "create_agit",
         Ok("npm_global") => "npm_global",
@@ -183,7 +205,10 @@ fn choose_at(
     }
     .into();
     write_json(&dir.join("preferences.json"), &current)?;
-    for name in ["queue.json", "activity.json"] {
+    for name in ["queue.json", "activity.json", "pending-install.json"] {
+        if name == "pending-install.json" && preserve_pending {
+            continue;
+        }
         match std::fs::remove_file(dir.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

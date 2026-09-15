@@ -49,6 +49,8 @@ pub fn run(args: Args) -> super::CmdResult {
             )?;
             if state::enabled(&saved) {
                 eprintln!("{}", state::ENABLED_NOTICE);
+                let _ =
+                    crate::telemetry::acquisition::resume_pending(&crate::infra::config::hub_url());
             } else {
                 eprintln!(
                     "Usage statistics are saved as enabled, but an environment override keeps this process off."
