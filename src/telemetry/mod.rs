@@ -1,6 +1,7 @@
 //! Product analytics accepts only properties constructed by the reviewed field registry.
 
 pub mod acquisition;
+mod campaign;
 mod rc;
 pub mod schema;
 pub mod state;

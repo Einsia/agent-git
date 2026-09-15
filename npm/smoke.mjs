@@ -116,7 +116,7 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
   const postinstall = spawnSync('node', [join(mainPkg, 'npm', 'postinstall.js')], { encoding: 'utf8', env: { ...env, npm_command: 'exec' }, cwd: home })
   check('dependency postinstall defers usage-statistics onboarding', postinstall.status === 0 && !existsSync(preferences), postinstall.stderr)
   const acquisitionId = 'f2ec57cb-12f0-4387-bd56-7739bde158bf'
-  const r = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs'), '--acquisition-id', acquisitionId], {
+  const r = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs'), '--acquisition-id', acquisitionId, '--campaign-url', 'https://example.test/?utm_source=docs&utm_campaign=launch&utm_creative_format=video&gclid=click&token=private-campaign-canary'], {
     encoding: 'utf8',
     env: { ...env, AGIT_TELEMETRY_HOST: 'http://127.0.0.1:9', AGIT_TELEMETRY_KEY: 'synthetic' },
     cwd: home,
@@ -135,6 +135,7 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
     if (existsSync(preferences)) {
       const saved = JSON.parse(readFileSync(preferences, 'utf8'))
       check('verified install retains the browser acquisition key', saved.install_reported === true && saved.acquisition_id === acquisitionId)
+      check('installer retains URL campaign context locally', saved.campaign_first?.parameters.utm_creative_format?.[0] === 'video' && saved.campaign_latest?.parameters.gclid?.[0] === 'click' && !JSON.stringify(saved).includes('private-campaign-canary'))
       check('npm yes enables statistics after a visible notice', saved.preference === 'enabled' && saved.decision_source === 'create_agit_yes' && r.stderr.includes('agit telemetry disable'), r.stderr)
       spawnSync(installed, ['telemetry', 'disable'], { env, encoding: 'utf8' })
       const again = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env, encoding: 'utf8', cwd: home })

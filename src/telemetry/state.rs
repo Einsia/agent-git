@@ -52,6 +52,8 @@ pub struct Preferences {
     pub device_id: Option<uuid::Uuid>,
     pub channel: String,
     pub acquisition_id: Option<uuid::Uuid>,
+    pub campaign_first: Option<super::campaign::Campaign>,
+    pub campaign_latest: Option<super::campaign::Campaign>,
     pub acquisition_route: Option<String>,
     pub install_reported: bool,
     pub acquisition_completed: bool,
@@ -129,7 +131,7 @@ pub(crate) fn gate(dir: &Path, wait: bool) -> Result<File> {
 }
 
 pub(crate) fn read_at(dir: &Path) -> Result<Preferences> {
-    Ok(read_json(&dir.join("preferences.json"), 8192)?.unwrap_or_default())
+    Ok(read_json(&dir.join("preferences.json"), 65536)?.unwrap_or_default())
 }
 
 pub fn read() -> Result<Preferences> {
@@ -191,6 +193,8 @@ fn choose_at(
     current.decision_at = Some(chrono::Utc::now().to_rfc3339());
     current.device_id = (preference == Preference::Enabled).then(uuid::Uuid::new_v4);
     current.acquisition_id = None;
+    current.campaign_first = None;
+    current.campaign_latest = None;
     current.acquisition_route = None;
     current.install_reported = false;
     current.acquisition_completed = false;

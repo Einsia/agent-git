@@ -17,6 +17,8 @@ struct VerifiedInstall {
     verified_at: chrono::DateTime<chrono::Utc>,
     route: String,
     acquisition_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    campaign: Option<super::campaign::Campaign>,
     channel: String,
     version: String,
     ci: bool,
@@ -25,6 +27,9 @@ struct VerifiedInstall {
 impl VerifiedInstall {
     fn current(destination: &Destination) -> Self {
         Self {
+            campaign: std::env::var("AGIT_CAMPAIGN_URL")
+                .ok()
+                .and_then(|raw| super::campaign::Campaign::from_url(&raw)),
             verified_at: chrono::Utc::now(),
             route: destination.route.clone(),
             acquisition_id: std::env::var("AGIT_ACQUISITION_ID")
@@ -65,7 +70,7 @@ pub fn installed(defer_notice: bool) -> anyhow::Result<()> {
             state::Preference::Disabled => return Ok(()),
             state::Preference::Unset => {
                 let path = dir.join("pending-install.json");
-                if state::read_json::<VerifiedInstall>(&path, 8192)?.is_none() {
+                if state::read_json::<VerifiedInstall>(&path, 32768)?.is_none() {
                     state::write_json(&path, &fact)?;
                 }
                 return Ok(());
@@ -91,7 +96,7 @@ pub(crate) fn resume_pending(hub: &str) -> anyhow::Result<()> {
         return Ok(());
     };
     let dir = state::directory()?;
-    let Some(fact) = state::read_json::<VerifiedInstall>(&dir.join("pending-install.json"), 8192)?
+    let Some(fact) = state::read_json::<VerifiedInstall>(&dir.join("pending-install.json"), 32768)?
     else {
         return Ok(());
     };
@@ -139,6 +144,12 @@ fn record_install(
         preferences.acquisition_route = Some(destination.route.clone());
         if preferences.acquisition_id.is_none() && preferences.first_acquisition_account.is_none() {
             preferences.acquisition_id = fact.acquisition_id;
+        }
+        if let Some(campaign) = &fact.campaign {
+            if preferences.campaign_first.is_none() {
+                preferences.campaign_first = Some(campaign.clone());
+            }
+            preferences.campaign_latest = Some(campaign.clone());
         }
         if !preferences.install_reported {
             preferences.channel = fact.channel.clone();

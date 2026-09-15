@@ -50,6 +50,7 @@ impl Fixture {
             "AGIT_TELEMETRY_PARENT_ID",
             "AGIT_INSTALL_CHANNEL",
             "AGIT_ACQUISITION_ID",
+            "AGIT_CAMPAIGN_URL",
             "AGIT_YES",
         ] {
             command.env_remove(name);
@@ -986,4 +987,88 @@ fn manual_installations_bind_their_key_before_the_first_authorization_handoff() 
             assert_eq!(Some(prefs["acquisition_route"].clone()), first_installation);
         }
     }
+}
+
+#[test]
+fn installer_retains_first_and_latest_campaigns_locally_and_opt_out_erases_them() {
+    let fixture = Fixture::new();
+    fixture.enable();
+    for source in ["first", "latest"] {
+        let output = fixture.command()
+            .args(["--internal-install-completed"])
+            .env("AGIT_CAMPAIGN_URL", format!("https://example.test/?utm_source={source}&utm_id=launch&code=private-campaign-canary"))
+            .output().unwrap();
+        assert!(output.status.success());
+    }
+    let preferences: Value =
+        serde_json::from_slice(&std::fs::read(fixture.path("preferences.json")).unwrap()).unwrap();
+    assert_eq!(
+        preferences["campaign_first"]["parameters"]["utm_source"][0],
+        "first"
+    );
+    assert_eq!(
+        preferences["campaign_latest"]["parameters"]["utm_source"][0],
+        "latest"
+    );
+    assert!(!preferences.to_string().contains("private-campaign-canary"));
+    assert!(!fixture.queue().to_string().contains("utm_source"));
+    assert!(fixture.run(&["telemetry", "disable"]).status.success());
+    let preferences: Value =
+        serde_json::from_slice(&std::fs::read(fixture.path("preferences.json")).unwrap()).unwrap();
+    assert!(preferences["campaign_first"].is_null());
+    assert!(preferences["campaign_latest"].is_null());
+}
+
+#[test]
+fn maximum_escaped_campaign_round_trips_pending_and_active_preferences() {
+    let mut raw = "https://example.test/?".to_owned();
+    for index in 0..8 {
+        if index > 0 {
+            raw.push('&');
+        }
+        raw.push_str(&format!("utm_{index}={}", "\\".repeat(1024)));
+    }
+    raw.truncate(8192);
+    let fixture = Fixture::new();
+    assert!(
+        fixture
+            .command()
+            .args(["--internal-install-completed", "--defer-notice"])
+            .env("AGIT_CAMPAIGN_URL", &raw)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let pending: Value =
+        serde_json::from_slice(&std::fs::read(fixture.path("pending-install.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        pending["campaign"]["parameters"].as_object().unwrap().len(),
+        8
+    );
+    fixture.enable();
+    assert!(fixture.run(&["--version"]).status.success());
+    let preferences: Value =
+        serde_json::from_slice(&std::fs::read(fixture.path("preferences.json")).unwrap()).unwrap();
+    assert_eq!(
+        preferences["campaign_first"]["parameters"],
+        pending["campaign"]["parameters"]
+    );
+    assert_eq!(
+        preferences["campaign_latest"]["parameters"],
+        pending["campaign"]["parameters"]
+    );
+    assert!(fixture.run(&["telemetry", "status"]).status.success());
+    assert!(
+        fixture
+            .command()
+            .args(["--internal-install-completed"])
+            .env("AGIT_CAMPAIGN_URL", &raw)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(fixture.run(&["telemetry", "status"]).status.success());
 }

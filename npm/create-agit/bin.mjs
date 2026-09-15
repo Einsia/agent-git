@@ -35,6 +35,16 @@ function main() {
     fail('--acquisition-id requires a random UUID.')
     process.exit(1)
   }
+  const campaignIndex = args.indexOf('--campaign-url')
+  const campaignUrl = campaignIndex >= 0 ? args[campaignIndex + 1] : undefined
+  if (campaignIndex >= 0) {
+    try {
+      if (!campaignUrl || campaignUrl.length > 8192 || !['http:', 'https:'].includes(new URL(campaignUrl).protocol)) throw new Error()
+    } catch {
+      fail('--campaign-url requires an HTTP or HTTPS URL of at most 8192 characters.')
+      process.exit(1)
+    }
+  }
   const t = packageKey()
   if (!t) {
     fail(`no prebuilt binary for ${platform()}/${arch()}.`)
@@ -79,7 +89,8 @@ function main() {
   spawnSync(target, ['--internal-install-completed'], {
     stdio: ['ignore', 'inherit', 'inherit'],
     env: { ...process.env, AGIT_INSTALL_CHANNEL: 'create_agit', AGIT_INSTALLER_YES: yes ? '1' : '0',
-      ...(acquisitionId ? { AGIT_ACQUISITION_ID: acquisitionId } : {}) },
+      ...(acquisitionId ? { AGIT_ACQUISITION_ID: acquisitionId } : {}),
+      ...(campaignUrl ? { AGIT_CAMPAIGN_URL: campaignUrl } : {}) },
   })
   const skipSetup = process.env.AGIT_SKIP_SETUP && !['0', 'false'].includes(process.env.AGIT_SKIP_SETUP.toLowerCase())
   if (skipSetup) {

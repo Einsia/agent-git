@@ -229,3 +229,21 @@ the installation-without-observed-registration cohort. Manual archive copies, bu
 `--ignore-scripts`, opt-outs, offline delivery expiry, and older CLI releases have
 no verified install receipt. Exclude those from claims of complete coverage. Data
 is prospective; deploying the website and releasing the CLI are both required.
+
+## Local campaign attribution
+
+`npx -y create-agit --campaign-url <url>` passes campaign context to the verified
+installation receipt. Native/global installers can use `AGIT_CAMPAIGN_URL`.
+The CLI stores `campaign_first` and `campaign_latest` in its private telemetry
+preferences, including capture time and decoded query values. Repeated values
+are preserved. These fields are local context for later account attribution;
+they are not added to outbound CLI events or used to merge PostHog people.
+
+Accepted fields are lowercase `utm_*`, `campaign`, `gclid`, `dclid`, `gbraid`,
+`wbraid`, `fbclid`, `msclkid`, `ttclid`, `twclid`, and `li_fat_id`. Paths,
+fragments, credentials and unrelated query fields are not stored. Input is
+bounded to 8192 URL bytes, 32 keys, 8 distinct values per key and 1024 bytes
+per value; invalid or excess fields are ignored without blocking installation.
+The first context is retained across reinstalls, while the latest is updated.
+Existing consent and Hub/destination boundaries apply. Hidden npm installation
+can defer the receipt until consent; opting out deletes campaign context.
