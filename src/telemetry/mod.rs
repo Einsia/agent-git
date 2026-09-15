@@ -16,13 +16,24 @@ use std::{
         Mutex,
         atomic::{AtomicBool, AtomicI64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use transport::{Destination, Event, EventName};
 
 static RUN: Mutex<Option<Run>> = Mutex::new(None);
 static ONLINE: AtomicBool = AtomicBool::new(false);
 static LAST_WORKER: AtomicI64 = AtomicI64::new(0);
+
+pub const RESTART_ENV: &str = "AGIT_INTERNAL_TELEMETRY_RESTART";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Restart {
+    invocation_id: uuid::Uuid,
+    prompt_shown: bool,
+    started_event: bool,
+    elapsed_ms: u64,
+}
 
 #[derive(Clone)]
 struct Seed {
@@ -50,6 +61,7 @@ struct Run {
     context: Option<Context>,
     identity_update: Option<(Option<String>, &'static str)>,
     started: Instant,
+    started_event: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -351,8 +363,17 @@ fn emit(context: &Context, event: EventName, extra: Map<String, Value>) {
     }
 }
 
-pub fn begin(argv: &[OsString]) {
-    let seed = seed(argv);
+pub fn begin(argv: &[OsString], restart: Option<&str>) {
+    let restart = restart
+        .filter(|value| value.len() <= 512)
+        .and_then(|value| serde_json::from_str::<Restart>(value).ok());
+    let mut seed = seed(argv);
+    if let Some(restart) = &restart {
+        seed.properties
+            .insert("invocation_id".into(), json!(restart.invocation_id));
+        seed.properties
+            .insert("prompt_shown".into(), json!(restart.prompt_shown));
+    }
     if seed.properties.get("command") == Some(&json!("telemetry")) {
         return;
     }
@@ -385,7 +406,13 @@ pub fn begin(argv: &[OsString]) {
             seed,
             context: None,
             identity_update: None,
-            started: Instant::now(),
+            started: restart
+                .as_ref()
+                .and_then(|restart| {
+                    Instant::now().checked_sub(Duration::from_millis(restart.elapsed_ms))
+                })
+                .unwrap_or_else(Instant::now),
+            started_event: restart.is_some_and(|restart| restart.started_event),
         });
     }
     activate(false);
@@ -398,29 +425,50 @@ pub fn activate(onboarding: bool) {
     let seed = RUN.lock().ok().and_then(|run| {
         run.as_ref()
             .filter(|run| run.context.is_none())
-            .map(|run| run.seed.clone())
+            .map(|run| (run.seed.clone(), run.started_event))
     });
-    let Some(seed) = seed else {
+    let Some((seed, started_event)) = seed else {
         return;
     };
     let _ = acquisition::resume_pending(&seed.hub);
     let Some((context, new_session)) = context(&seed).ok().flatten() else {
         return;
     };
-    if new_session {
+    if new_session && !started_event {
         emit(&context, EventName::Session, Map::new());
     }
     if onboarding {
         emit(&context, EventName::Onboarding, Map::new());
         ONLINE.store(true, Ordering::Relaxed);
     }
-    if !seed.hook {
+    if !seed.hook && !started_event {
         emit(&context, EventName::Started, Map::new());
     }
     if let Ok(mut run) = RUN.lock()
         && let Some(run) = run.as_mut()
     {
         run.context = Some(context);
+        run.started_event = !seed.hook;
+    }
+}
+
+/// A replacement process continues the invocation; it must not emit another start or lose prompts.
+pub fn configure_restart(command: &mut std::process::Command) {
+    command.env_remove(RESTART_ENV);
+    let restart = RUN.lock().ok().and_then(|run| {
+        let run = run.as_ref()?;
+        Some(Restart {
+            invocation_id: uuid::Uuid::parse_str(
+                run.seed.properties.get("invocation_id")?.as_str()?,
+            )
+            .ok()?,
+            prompt_shown: run.seed.properties.get("prompt_shown") == Some(&json!(true)),
+            started_event: run.started_event,
+            elapsed_ms: run.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        })
+    });
+    if let Some(restart) = restart.and_then(|restart| serde_json::to_string(&restart).ok()) {
+        command.env(RESTART_ENV, restart);
     }
 }
 

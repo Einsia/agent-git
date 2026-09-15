@@ -1,5 +1,8 @@
 //! A valid export with an unavailable output path is a local precondition failure.
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 use agit::domain::{meta, storage, transcript};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -34,6 +37,7 @@ impl Lab {
         }
         let hub = TcpListener::bind("127.0.0.1:0").unwrap();
         hub.set_nonblocking(true).unwrap();
+        startup_cache::seed(&home);
         let raw = format!(
             "{}\n",
             json!({"type":"response_item","payload":{

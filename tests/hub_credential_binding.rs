@@ -373,7 +373,9 @@ fn logout_all_never_routes_a_legacy_token_by_the_current_filename() {
     let output = lab.run(&destination.uppercase(), &["logout", "--all"]);
     let foreign = destination.requests();
     assert!(
-        foreign.is_empty(),
+        foreign
+            .iter()
+            .all(|request| request.target == "/api/cli/version" && request.authorization.is_none()),
         "logout sent a foreign token: {foreign:?}"
     );
     assert!(output.status.success(), "{output:?}");
@@ -404,7 +406,10 @@ fn logout_all_clears_unbound_legacy_files_without_sending_their_tokens() {
         let output = lab.run(&hub.uppercase(), &["logout", "--all"]);
         let requests = hub.requests();
         assert!(
-            requests.is_empty(),
+            requests
+                .iter()
+                .all(|request| request.target == "/api/cli/version"
+                    && request.authorization.is_none()),
             "an unbound token was sent: {requests:?}"
         );
         assert!(output.status.success(), "{output:?}");
@@ -525,8 +530,15 @@ fn canonical_case_aliases_are_revoked_and_removed_consistently() {
         assert!(output.status.success(), "{output:?}");
         assert!(!path.exists());
         let requests = hub.requests();
-        assert_eq!(requests.len(), 1, "{requests:?}");
-        assert_eq!(requests[0].target, "/api/auth/logout");
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_eq!(requests[0].target, "/api/cli/version");
+        assert_eq!(requests[1].target, "/api/auth/logout");
+        for request in &requests {
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some(format!("Bearer {TOKEN}").as_str())
+            );
+        }
         assert_eq!(lab.run(&hub.base, &["whoami"]).status.code(), Some(5));
     }
 }
@@ -541,10 +553,10 @@ fn whoami_only_contacts_the_hub_for_explicit_identity_verification() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    assert!(
-        hub.requests().is_empty(),
-        "redirected config must stay offline"
-    );
+    let requests = hub.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].target, "/api/cli/version");
+    assert!(requests[0].authorization.is_none());
     hub.requests.lock().unwrap().clear();
 
     let lab = Lab::new();

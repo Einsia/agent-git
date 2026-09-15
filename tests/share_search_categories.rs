@@ -162,6 +162,9 @@ fn read_request(stream: &mut TcpStream) -> Request {
     }
 }
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 struct Lab {
     root: tempfile::TempDir,
     home: PathBuf,
@@ -175,6 +178,7 @@ impl Lab {
         let root_path = root.path().canonicalize().unwrap();
         let home = root_path.join("home");
         let store = root_path.join("agit");
+        startup_cache::seed(&store);
         let work = root_path.join("work");
         for directory in [&home, &work, &root_path.join("git-template")] {
             fs::create_dir_all(directory).unwrap();

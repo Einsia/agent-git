@@ -710,41 +710,52 @@ fn a_tagged_reinstall_attributes_an_existing_install_without_counting_it_twice()
 fn reply_to_login(listener: &TcpListener, child: &mut std::process::Child, body: Value) {
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "login did not reach the Hub");
-                assert!(
-                    child.try_wait().unwrap().is_none(),
-                    "login exited before its request"
-                );
-                std::thread::sleep(Duration::from_millis(5));
+    loop {
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "login did not reach the Hub");
+                    assert!(
+                        child.try_wait().unwrap().is_none(),
+                        "login exited before its request"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
             }
-            Err(error) => panic!("{error}"),
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut header = Vec::new();
+        let mut byte = [0];
+        while !header.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            header.push(byte[0]);
         }
-    };
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let mut header = Vec::new();
-    let mut byte = [0];
-    while !header.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte).unwrap();
-        header.push(byte[0]);
+        if header.starts_with(b"GET /api/cli/version ") {
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            continue;
+        }
+        let length = String::from_utf8_lossy(&header)
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        stream.read_exact(&mut vec![0; length]).unwrap();
+        let body = body.to_string();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        return;
     }
-    let length = String::from_utf8_lossy(&header)
-        .lines()
-        .find_map(|line| {
-            line.to_ascii_lowercase()
-                .strip_prefix("content-length:")
-                .and_then(|s| s.trim().parse::<usize>().ok())
-        })
-        .unwrap_or(0);
-    stream.read_exact(&mut vec![0; length]).unwrap();
-    let body = body.to_string();
-    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
 }
 
 #[test]

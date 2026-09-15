@@ -31,6 +31,9 @@ fn main() {
     }
 
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let telemetry_restart = std::env::var(agit::telemetry::RESTART_ENV).ok();
+    // Consume invocation state before helpers or the requested command can inherit it.
+    unsafe { std::env::remove_var(agit::telemetry::RESTART_ENV) };
     if let Some(code) = commands::status::native_observation_worker(&raw_args) {
         exit(code);
     }
@@ -46,13 +49,16 @@ fn main() {
         let _ = agit::telemetry::acquisition::installed(raw_args.len() == 3);
         return;
     }
-    agit::telemetry::begin(&raw_args);
+    agit::telemetry::begin(&raw_args, telemetry_restart.as_deref());
     let code = run(raw_args);
     agit::telemetry::finish(code);
     exit(code);
 }
 
 fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
+    let skip_update = std::env::var_os(commands::upgrade::RESTART_ENV).is_some();
+    // Consume the restart marker before any command can pass its environment to another CLI.
+    unsafe { std::env::remove_var(commands::upgrade::RESTART_ENV) };
     let json_hint = raw_args.iter().any(|arg| arg == "--json");
     let json_version_hint = commands::json::Version::from_argv(&raw_args);
     let cli = match <Cli as clap::Parser>::try_parse_from(raw_args.clone()) {
@@ -134,7 +140,11 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
         // nothing.
         match agit::tui::should_enter() {
             agit::tui::Verdict::Enter => {
-                commands::upgrade::maybe_startup_nudge("resume", cli.json);
+                if !skip_update
+                    && let Some(exe) = commands::upgrade::maybe_startup_nudge("resume", cli.json)
+                {
+                    return commands::upgrade::restart_after_upgrade(&exe, &raw_args);
+                }
                 if let Some(code) = prepare_startup(cli.directory.as_deref(), Startup::Migrate) {
                     return code;
                 }
@@ -162,36 +172,37 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
     }
     let command_name = commands::command_name(&command);
     let startup = startup_for(&command);
-    // A best-effort, once-a-day update hint belongs to the process startup path so it also
-    // appears for ordinary commands, not only after a successful push. The helper skips the JSON
-    // path because stdout there is a strict machine-readable envelope.
-    if startup.allows_nudge() {
-        commands::upgrade::maybe_startup_nudge(command_name, json);
+    if json && let Some(reason) = commands::json::incompatible(&command) {
+        agit::telemetry::observe(agit::telemetry::Observation::Stage("json_admission"));
+        return commands::json::emit_rejection_version(
+            command_name,
+            json_version,
+            agit::ExitCode::Interactive.as_i32(),
+            reason,
+            if json_version == commands::json::Version::V2 {
+                commands::json::incompatible_fixes(
+                    &command,
+                    cli.directory.as_deref(),
+                    &[
+                        ("--yes", cli.yes),
+                        ("--quiet", cli.quiet),
+                        ("--no-color", cli.no_color),
+                        ("--no-tui", cli.no_tui),
+                    ],
+                )
+            } else {
+                Vec::new()
+            },
+        );
+    }
+    // Admitted commands report updates outside JSON capture, keeping notices on process stderr.
+    if !skip_update
+        && startup.allows_nudge()
+        && let Some(exe) = commands::upgrade::maybe_startup_nudge(command_name, json)
+    {
+        return commands::upgrade::restart_after_upgrade(&exe, &raw_args);
     }
     if json {
-        if let Some(reason) = commands::json::incompatible(&command) {
-            agit::telemetry::observe(agit::telemetry::Observation::Stage("json_admission"));
-            return commands::json::emit_rejection_version(
-                command_name,
-                json_version,
-                agit::ExitCode::Interactive.as_i32(),
-                reason,
-                if json_version == commands::json::Version::V2 {
-                    commands::json::incompatible_fixes(
-                        &command,
-                        cli.directory.as_deref(),
-                        &[
-                            ("--yes", cli.yes),
-                            ("--quiet", cli.quiet),
-                            ("--no-color", cli.no_color),
-                            ("--no-tui", cli.no_tui),
-                        ],
-                    )
-                } else {
-                    Vec::new()
-                },
-            );
-        }
         let directory = cli.directory.clone();
         let code = commands::json::capture_version(command_name, json_version, || {
             if let Some(code) = prepare_startup(directory.as_deref(), startup) {

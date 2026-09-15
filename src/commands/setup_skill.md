@@ -49,7 +49,10 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   reported by the runtime hook or correct the environment before continuing.
 - Use `--json` for a stable envelope: check `ok` and `exit_code`, then inspect
   `result.format`. Structured data is in `result.value`; text-only commands
-  expose `result.lines`. Errors and hints are in `diagnostics.stderr`.
+  expose `result.lines`. Command errors and hints are in `diagnostics.stderr`.
+  Startup update notices can also appear on process stderr, outside the JSON envelope.
+  When a startup notice reports a newer version, run `agit upgrade` before continuing.
+  `--quiet` suppresses these startup notices.
 - Machine output disables terminal pickers. Supply required targets and options;
   runtime-launching commands require `--no-launch` with `--json`. `--yes` only
   answers confirmation prompts and never selects a session identity.

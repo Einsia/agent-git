@@ -25,10 +25,24 @@ agit upgrade --check
 agit upgrade
 ```
 
-On user-facing CLI startup, agit also performs the same once-a-day best-effort check and prints a
-new-version notice to stderr. It never installs automatically. JSON/quiet/CI invocations and the
-internal `hooks`/`mcp` commands skip the check so machine-readable and integration output stays
-unchanged.
+On eligible user-facing CLI startup, production builds check for updates with a daily cache and
+a short request timeout. A newer version prints a notice to stderr, including in pipes, CI, and
+JSON mode. JSON stdout remains one complete envelope; the startup notice is separate from
+`diagnostics.stderr` inside that envelope. The CLI never installs an incidental update without
+an explicit terminal confirmation.
+
+A human terminal waits at `Update agit now? [y/N]`. Enter or `n` skips installation; `y` runs
+the existing upgrade and skill-refresh flow before restarting the requested command. Upgrade
+output also goes to stderr. An unavailable update or failed installation does not prevent the
+original command from running. After an accepted update attempt, the CLI restarts with the
+original arguments through the installation path and skips the repeated startup check. This
+uses the installed version even if installation succeeded but skill refresh failed.
+
+JSON, CI, agent sessions, `--yes`, `--no-tui`, or redirected standard streams only receive the
+notice and never wait for input. `--tui` can explicitly opt an agent terminal into the prompt;
+JSON, CI, and redirected streams still prevent prompting. `--quiet` / `AGIT_QUIET` suppress both
+the check and notice. Local inspection, search, scoped review, and internal `hooks`/`mcp` paths
+retain their startup exclusions.
 
 Upgrading the CLI does not migrate or delete `~/.agit/repos`. Run `agit doctor` afterwards to verify runtime integrations.
 

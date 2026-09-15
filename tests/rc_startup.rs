@@ -8,6 +8,9 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 #[cfg(windows)]
 #[path = "../src/infra/windows_security.rs"]
 #[allow(dead_code)]
@@ -36,6 +39,7 @@ fn pair(home: &Path, hub: &str) {
         security::private_directory(&directory).unwrap();
     }
     std::fs::create_dir_all(&directory).unwrap();
+    startup_cache::seed(home);
     let key = agit::infra::config::hub_host_key(hub).unwrap();
     let path = directory.join(format!("{key}.json"));
     let body = serde_json::to_vec(&serde_json::json!({

@@ -54,7 +54,9 @@ impl Hub {
                         break;
                     }
                 }
-                seen.lock().unwrap().push(path.clone());
+                if path != "/api/cli/version" {
+                    seen.lock().unwrap().push(path.clone());
+                }
                 let agent = |owner: &str| json!({"agent_id":AGENT_ID,"owner":owner,"name":"paper","visibility":"public","clone_url":format!("{url}/{owner}/paper.git")});
                 let (status, body) = if path.starts_with("/api/agents/for-repo?") {
                     let body = if lookup_status == 200 {

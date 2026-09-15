@@ -19,6 +19,9 @@ struct Lab {
     server: Option<std::thread::JoinHandle<()>>,
 }
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 impl Lab {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -355,6 +358,7 @@ fn mcp_commit_migrates_v0_and_settles_the_selected_claim() {
         store::Store,
     };
     let lab = Lab::new();
+    startup_cache::seed(&lab.temp.path().join("agit"));
     let cwd = lab.temp.path().join("work");
     let native_id = "aaaaaaaa-0000-4000-8000-000000000091";
     let events: Vec<Value> = (1..=2).flat_map(|turn| [

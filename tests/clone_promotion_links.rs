@@ -162,6 +162,14 @@ fn promotion(name: &str) {
                 .unwrap();
             let (request, body) =
                 read_request(&mut stream).expect("local hub request is incomplete or invalid");
+            if request.starts_with("GET /api/cli/version ") {
+                write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
             let response = if request.starts_with("POST /api/agents/alice/qa/clone ") {
                 let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(

@@ -52,6 +52,14 @@ impl Hub {
                     request.push(byte[0]);
                 }
                 let request = String::from_utf8(request).unwrap();
+                if request.starts_with("GET /api/cli/version ") {
+                    write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
                 assert!(request.starts_with("GET /api/agents/alice/notes HTTP/1.1\r\n"));
                 requests += 1;
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();

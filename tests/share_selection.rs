@@ -124,10 +124,14 @@ fn envelope(text: &str) -> String {
     transcript::wrap_lines(&raw, "claude-code", &format!("agit-{}", "b".repeat(40)))
 }
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 impl Fixture {
     fn new(excluded: &str) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let home = temporary.path();
+        startup_cache::seed(home);
         let hub = Hub::start();
         let credential = agit::infra::credentials::HubCredential {
             account_id: None,

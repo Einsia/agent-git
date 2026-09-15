@@ -90,6 +90,10 @@ mod unix {
                         .set_write_timeout(Some(Duration::from_secs(3)))
                         .unwrap();
                     let request = read_request(&mut stream);
+                    if request.method == "GET" && request.target.ends_with("/api/cli/version") {
+                        write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        continue;
+                    }
                     let mut step = steps.pop_front().unwrap_or_else(|| {
                         panic!(
                             "unexpected synthetic request: {} {}",

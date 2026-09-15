@@ -175,55 +175,62 @@ fn stdin_reaches_token_login_without_secret_output() {
     let hub = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "login never reached the hub"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+        'requests: loop {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "login never reached the hub"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
                 }
-                Err(error) => panic!("accept failed: {error}"),
-            }
-        };
-        stream.set_nonblocking(false).unwrap();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-        let mut input = Vec::new();
-        loop {
-            let mut chunk = [0; 4096];
-            let count = stream.read(&mut chunk).unwrap();
-            assert_ne!(count, 0);
-            input.extend_from_slice(&chunk[..count]);
-            if let Some(end) = input.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&input[..end]);
-                let length: usize = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length: ")
-                            .map(|n| n.parse().unwrap())
-                    })
-                    .unwrap();
-                if input.len() >= end + 4 + length {
-                    let body: Value =
-                        serde_json::from_slice(&input[end + 4..end + 4 + length]).unwrap();
-                    assert_eq!(body["token"], "fake-pat-for-capture-test");
-                    break;
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut input = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0);
+                input.extend_from_slice(&chunk[..count]);
+                if let Some(end) = input.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&input[..end]);
+                    if headers.starts_with("GET /api/cli/version ") {
+                        write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        continue 'requests;
+                    }
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(|n| n.parse().unwrap())
+                        })
+                        .unwrap();
+                    if input.len() >= end + 4 + length {
+                        let body: Value =
+                            serde_json::from_slice(&input[end + 4..end + 4 + length]).unwrap();
+                        assert_eq!(body["token"], "fake-pat-for-capture-test");
+                        break;
+                    }
                 }
             }
+            let body = serde_json::json!({
+                "username": "alice", "email": null,
+                "access_token": "fake-access", "refresh_token": "fake-refresh",
+                "access_expires_at": "2099-01-01T00:00:00Z",
+                "refresh_expires_at": "2099-01-01T00:00:00Z"
+            })
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            break;
         }
-        let body = serde_json::json!({
-            "username": "alice", "email": null,
-            "access_token": "fake-access", "refresh_token": "fake-refresh",
-            "access_expires_at": "2099-01-01T00:00:00Z",
-            "refresh_expires_at": "2099-01-01T00:00:00Z"
-        })
-        .to_string();
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     });
     let mut child = lab
         .command(&["--json", "login", "--with-token"])

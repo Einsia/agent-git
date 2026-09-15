@@ -13,6 +13,9 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 const HUB: &str = "http://127.0.0.1:1";
 const SID: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 
@@ -381,6 +384,7 @@ fn parse_and_interactive_rejections_leave_local_state_untouched() {
 #[test]
 fn startup_directory_failure_is_enveloped_before_config_mutation() {
     let lab = Lab::new();
+    startup_cache::seed(&lab.store);
     let before = lab.state();
     let missing = lab.work.join("missing-directory");
     let (output, document) = lab.json(&[

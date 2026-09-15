@@ -68,10 +68,19 @@ impl Hub {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
+                let request = read_request(&mut stream);
+                if request.method == "GET" && request.target == "/api/cli/version" {
+                    write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
                 let reply = replies
                     .get(requests.len())
                     .expect("unexpected request replay");
-                requests.push(read_request(&mut stream));
+                requests.push(request);
                 let (status, body) = match reply {
                     Reply::Status(status) => (
                         *status,

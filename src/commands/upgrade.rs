@@ -20,19 +20,18 @@
 //!
 //! ## The passing nudge (the passive path)
 //!
-//! User-facing command startup calls the nudge path: the local cache is consulted once a day,
-//! only an expired one sends a short-timeout request, and a newer version
-//! prints one unobtrusive line. A slow network, an old hub, or GitHub being down are all just "no
-//! nudge today", not an error. JSON, quiet, CI, and internal hook/MCP paths never get extra
-//! output or a network request. Startup notices go to stderr so a piped command's stdout remains
-//! usable by a caller that is not expecting a notice.
+//! User-facing command startup consults the shared cache and refreshes expired entries with a
+//! short-timeout request. Update notices use stderr, including outside JSON capture, so stdout
+//! remains command data. Human terminals ask before installing; unattended calls only report
+//! the available version. Quiet, local inspection, and internal hook/MCP paths skip the check.
+//! An unavailable version endpoint never prevents the requested command from running.
 
 use super::CmdResult;
 use crate::hub::client::Client;
 use crate::{ExitCode, ui};
 use anyhow::{Context as _, Result, bail};
 use clap::Args as ClapArgs;
-use std::io::Read as _;
+use std::io::{IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,6 +48,8 @@ const NUDGE_INTERVAL_SECS: u64 = 24 * 3600;
 /// Incidental checks must fail quickly. The explicit `agit upgrade` command keeps the normal
 /// 30-second hub timeout; a startup hint is best-effort and must not make a command feel stuck.
 const NUDGE_TIMEOUT_SECS: u64 = 2;
+
+pub const RESTART_ENV: &str = "AGIT_INTERNAL_UPDATE_RESTART";
 
 pub fn run(args: Args) -> CmdResult {
     if !crate::infra::config::is_production_release() {
@@ -474,30 +475,34 @@ fn save_cache(latest: &str) {
 
 /// Check for an update at a user-facing CLI startup.
 ///
-/// Machine-readable output, quiet mode, CI, local inspection, and internal commands skip both
-/// the network request and the notice. Eligible user-facing invocations share the daily cache.
-pub fn maybe_startup_nudge(command: &str, json: bool) {
+/// Notices precede JSON capture so they remain on stderr instead of entering the envelope.
+/// Only a human terminal may block for an update decision; unattended calls only print a hint.
+pub fn maybe_startup_nudge(command: &str, json: bool) -> Option<PathBuf> {
     let quiet = std::env::var_os("AGIT_QUIET").is_some();
-    let ci = std::env::var_os("CI").is_some();
-    if !startup_nudge_allowed(command, json, quiet, ci, ui::is_tty()) {
-        return;
+    if !startup_nudge_allowed(command, quiet) {
+        return None;
     }
-    maybe_nudge_with_timeout(std::time::Duration::from_secs(NUDGE_TIMEOUT_SECS));
+    let interactive = !json
+        && std::env::var_os("CI").is_none()
+        && std::io::stderr().is_terminal()
+        && matches!(crate::tui::should_enter(), crate::tui::Verdict::Enter);
+    maybe_nudge_with_timeout(
+        std::time::Duration::from_secs(NUDGE_TIMEOUT_SECS),
+        interactive,
+    )
 }
 
-fn startup_nudge_allowed(command: &str, json: bool, quiet: bool, ci: bool, tty: bool) -> bool {
-    tty && !json
-        && !quiet
-        && !ci
+fn startup_nudge_allowed(command: &str, quiet: bool) -> bool {
+    !quiet
         && !matches!(
             command,
             "upgrade" | "hooks" | "mcp" | "status" | "doctor" | "whoami" | "diff" | "search"
         )
 }
 
-fn maybe_nudge_with_timeout(timeout: std::time::Duration) {
+fn maybe_nudge_with_timeout(timeout: std::time::Duration, interactive: bool) -> Option<PathBuf> {
     if !crate::infra::config::is_production_release() {
-        return;
+        return None;
     }
 
     let now = SystemTime::now()
@@ -508,24 +513,82 @@ fn maybe_nudge_with_timeout(timeout: std::time::Duration) {
     if let Some(c) = &cached
         && now.saturating_sub(c.checked_at) < NUDGE_INTERVAL_SECS
     {
-        return nudge_with(&c.latest);
+        return nudge_with(&c.latest, interactive);
     }
     // A failed ask (old hub, upstream down) still stamps the time: otherwise every eligible
     // startup sends another request, and "one failure costs a day" must not become "one failure
     // costs every invocation".
     let Ok(latest) = Client::from_env_with_timeout(timeout).cli_version() else {
         save_cache("");
-        return;
+        return None;
     };
     save_cache(&latest.version);
-    nudge_with(&latest.version);
+    nudge_with(&latest.version, interactive)
 }
 
-fn nudge_with(latest: &str) {
+fn nudge_with(latest: &str, interactive: bool) -> Option<PathBuf> {
     if !latest.is_empty() && compare(env!("CARGO_PKG_VERSION"), latest) == Ordering::Less {
         let message = ui::dim(&format!("agit {latest} is available — use `agit upgrade`"));
         eprintln!("{message}");
+        if interactive
+            && ui::prompt::confirm("Update agit now?", false)
+                .ok()
+                .flatten()
+                == Some(true)
+        {
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(error) => {
+                    ui::warning(&format!("cannot locate the running CLI: {error}"));
+                    return None;
+                }
+            };
+            if let Err(error) = startup_upgrade(&exe) {
+                ui::warning(&format!("{error:#}"));
+                ui::hint("run `agit upgrade` to retry; continuing the requested command.");
+            }
+            // Even a failed skill refresh can follow binary replacement. Continuing the loaded
+            // image would expose a deleted executable path or overwrite the installed skill bundle.
+            return Some(exe);
+        }
     }
+    None
+}
+
+/// Re-enter through the saved installation path before the original command touches storage.
+/// The restart marker suppresses only the repeated startup check, preserving arguments and streams.
+pub fn restart_after_upgrade(exe: &Path, argv: &[std::ffi::OsString]) -> i32 {
+    let mut command = std::process::Command::new(exe);
+    command.args(argv.iter().skip(1)).env(RESTART_ENV, "1");
+    crate::telemetry::configure_restart(&mut command);
+    #[cfg(unix)]
+    let error = {
+        use std::os::unix::process::CommandExt as _;
+        command.exec()
+    };
+    #[cfg(not(unix))]
+    let error = match command.status() {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(error) => error,
+    };
+    ui::error(&format!("cannot continue with the installed CLI: {error}"));
+    ui::hint("run the original command again.");
+    ExitCode::Precondition.as_i32()
+}
+
+/// The upgrade child owns replacement and skill refresh; its output must stay off command stdout.
+fn startup_upgrade(exe: &Path) -> Result<()> {
+    let status = std::process::Command::new(exe)
+        .args(["--no-tui", "upgrade"])
+        .env("AGIT_TELEMETRY_DEFER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::io::stderr())
+        .status()
+        .context("could not start `agit upgrade`")?;
+    if !status.success() {
+        bail!("`agit upgrade` did not complete successfully");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -600,18 +663,15 @@ mod tests {
     }
 
     #[test]
-    fn startup_nudge_is_only_for_interactive_user_commands() {
-        assert!(startup_nudge_allowed("run", false, false, false, true));
-        assert!(startup_nudge_allowed("resume", false, false, false, true));
-        assert!(startup_nudge_allowed("push", false, false, false, true));
-        assert!(!startup_nudge_allowed("search", false, false, false, false));
+    fn startup_nudge_excludes_quiet_and_local_or_internal_commands() {
+        assert!(startup_nudge_allowed("run", false));
+        assert!(startup_nudge_allowed("resume", false));
+        assert!(startup_nudge_allowed("push", false));
         for command in [
             "upgrade", "hooks", "mcp", "status", "doctor", "whoami", "diff", "search",
         ] {
-            assert!(!startup_nudge_allowed(command, false, false, false, true));
+            assert!(!startup_nudge_allowed(command, false));
         }
-        assert!(!startup_nudge_allowed("run", true, false, false, true));
-        assert!(!startup_nudge_allowed("run", false, true, false, true));
-        assert!(!startup_nudge_allowed("run", false, false, true, true));
+        assert!(!startup_nudge_allowed("run", true));
     }
 }

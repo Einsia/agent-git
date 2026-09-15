@@ -51,7 +51,6 @@ fn fake_hub(
                     break;
                 }
             }
-            hub_requests.fetch_add(1, Ordering::SeqCst);
             let req = String::from_utf8_lossy(&buf).into_owned();
             let line = req.lines().next().unwrap_or_default().to_string();
             let authed = req.to_ascii_lowercase().contains("authorization: bearer ");
@@ -60,6 +59,10 @@ fn fake_hub(
                 .nth(1)
                 .unwrap_or_default()
                 .to_string();
+            // Version probes have their own counter; repository traffic remains independently observable.
+            if path != "/api/cli/version" {
+                hub_requests.fetch_add(1, Ordering::SeqCst);
+            }
             let not_found = (
                 "404 Not Found",
                 r#"{"error":"agent not found","kind":"not_found"}"#.to_string(),
@@ -394,9 +397,9 @@ fn update_notice_count(output: &std::process::Output) -> usize {
 
 /// The update check has one owner: binary startup. This deliberately drives a successful push
 /// all the way through Git so a second call reintroduced at the tail would print the cached
-/// notice twice. Suppressed modes start without a cache, making any bypass visible as a request.
+/// notice twice. Each mode starts without a cache so its request policy is observable.
 #[test]
-fn redirected_push_never_dispatches_startup_update_checks() {
+fn redirected_push_reports_startup_updates_once_on_stderr() {
     let lab = Lab::new();
     lab.append_turn(SID, 1, "publish this turn", "done");
     let imported = lab
@@ -436,14 +439,15 @@ fn redirected_push_never_dispatches_startup_update_checks() {
         String::from_utf8_lossy(&ordinary.stderr)
     );
     assert_eq!(
-        requests, 0,
-        "redirected push must not request an incidental update"
+        requests, 1,
+        "redirected push checks for an update at startup"
     );
     assert_eq!(
         update_notice_count(&ordinary),
-        0,
-        "redirected push must not print an update notice"
+        1,
+        "startup owns the update notice"
     );
+    assert!(!String::from_utf8_lossy(&ordinary.stdout).contains("is available"));
 
     for (label, args, env) in [
         (
@@ -465,12 +469,18 @@ fn redirected_push_never_dispatches_startup_update_checks() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(requests, 0, "{label} push must not check for an update");
+        let expected = usize::from(label != "quiet");
+        assert_eq!(requests, expected, "{label} update request policy");
         assert_eq!(
             update_notice_count(&output),
-            0,
-            "{label} push must not print an update notice"
+            expected,
+            "{label} update notice policy"
         );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("is available"));
+        if label == "JSON" {
+            let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(envelope["ok"], true);
+        }
     }
 }
 

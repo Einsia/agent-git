@@ -22,6 +22,9 @@ mod publication_process;
 #[path = "../src/rc/windows_job.rs"]
 mod publication_windows_job;
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 struct Lab {
     mode: &'static str,
     deadline: Instant,
@@ -37,6 +40,7 @@ impl Lab {
         let deadline = Instant::now() + publication_process::MODE_LIMIT;
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("agit");
+        startup_cache::seed(&home);
         for name in ["work", "tmp", "templates"] {
             fs::create_dir(root.path().join(name)).unwrap();
         }

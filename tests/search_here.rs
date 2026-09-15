@@ -179,7 +179,7 @@ impl Lab {
             )
             .unwrap();
         }
-        let warm = lab.run(base, &["config", "hub.url"]);
+        let warm = lab.run(base, &["--quiet", "config", "hub.url"]);
         assert!(warm.status.success(), "{warm:?}");
         lab
     }

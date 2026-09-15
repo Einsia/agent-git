@@ -1,5 +1,8 @@
 //! Local precondition failures preserve command categories and owned state.
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,6 +20,7 @@ impl Lab {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("agit");
+        startup_cache::seed(&home);
         for name in ["work", "tmp", "bin"] {
             fs::create_dir(root.path().join(name)).unwrap();
         }

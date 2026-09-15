@@ -1,5 +1,8 @@
 //! Local publication refusals preserve their category without reaching the Hub or moving refs.
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 use agit::domain::meta;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -20,6 +23,7 @@ impl Lab {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("agit");
+        startup_cache::seed(&home);
         for name in ["work", "tmp", "templates"] {
             fs::create_dir(root.path().join(name)).unwrap();
         }

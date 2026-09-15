@@ -59,6 +59,9 @@ fn document(output: Output) -> serde_json::Value {
     document
 }
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 fn native_turn(path: &Path, marker: &str) {
     let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     for record in [
@@ -84,6 +87,7 @@ fn installed_skill_supports_explicit_adopt_commit_search_and_prepare() {
         hub,
     };
     std::fs::create_dir_all(&lab.home).unwrap();
+    startup_cache::seed(&lab.agit_home);
     std::fs::create_dir_all(&lab.work).unwrap();
     let repo = Repo::init(&lab.agit_home.join("repos/me/guide")).unwrap();
     repo.git(&["config", "commit.gpgsign", "false"]).unwrap();

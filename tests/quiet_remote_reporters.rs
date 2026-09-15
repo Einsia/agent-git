@@ -77,6 +77,19 @@ impl Hub {
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
                 let request = read_request(&mut socket);
+                if request.method == "GET"
+                    && request.path == "/api/cli/version"
+                    && replies
+                        .front()
+                        .is_none_or(|reply| reply.path != "/api/cli/version")
+                {
+                    write!(
+                        socket,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
                 let reply = replies.pop_front().expect("unexpected request or replay");
                 assert_eq!(request.method, reply.method);
                 assert_eq!(request.path, reply.path);

@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 const AGENT_ID: &str = "9f2c3b53-7fe0-412f-b62a-bf68a6845ce7";
 const OTHER_ID: &str = "070fd8ab-ef31-4f1e-843f-728e2496f6eb";
 
+#[path = "support/startup_cache.rs"]
+mod startup_cache;
+
 struct Lab {
     root: tempfile::TempDir,
     home: PathBuf,
@@ -37,6 +40,7 @@ impl Lab {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("agit");
+        startup_cache::seed(&home);
         for name in ["work", "tmp", "templates"] {
             fs::create_dir(root.path().join(name)).unwrap();
         }

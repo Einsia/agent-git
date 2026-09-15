@@ -1,4 +1,4 @@
-//! Publish targets require explicit repository and branch selection before any outbound request.
+//! Publish targets require explicit repository and branch selection before publication requests.
 
 use agit::domain::{link, meta, repo::Repo, store::Store};
 use std::io::{Read, Write};
@@ -57,9 +57,16 @@ fn singleton_publish_state_cannot_replace_missing_or_rejected_identity() {
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                         .unwrap();
-                    let mut buffer = [0; 4096];
-                    let _ = stream.read(&mut buffer);
-                    seen.fetch_add(1, Ordering::SeqCst);
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        assert!(headers.len() < 8192, "fixture headers exceed budget");
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        headers.push(byte[0]);
+                    }
+                    if !headers.starts_with(b"GET /api/cli/version ") {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    }
                     let body = r#"{"error":"synthetic route refused","kind":"not_found"}"#;
                     let _ = write!(
                         stream,
@@ -127,7 +134,7 @@ fn singleton_publish_state_cannot_replace_missing_or_rejected_identity() {
     server.join().unwrap();
     assert_eq!(
         unpublished, 0,
-        "missing or rejected identity must not reach the Hub"
+        "missing or rejected identity must not send publication requests"
     );
     for output in refused {
         assert!(!output.status.success());
