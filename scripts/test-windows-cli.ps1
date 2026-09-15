@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('unit', 'integration')][string]$Suite,
+    [ValidateSet('all', 'unit', 'integration')][string]$Suite = 'all',
     [switch]$RequireCachedTools
 )
 
@@ -21,24 +21,40 @@ $env:PATH = "$testBin;$env:PATH"
 $env:AGIT_TEST_REQUIRE_LFS = '1'
 $suites = Get-Content (Join-Path $PSScriptRoot 'windows-test-suites.json') -Raw | ConvertFrom-Json
 $cargoArgs = @('nextest', 'run', '--locked', '--target', $target, '--profile', 'windows')
-if ($Suite -eq 'unit') {
-    & cargo check --locked --no-default-features --target $target --lib
-    if ($LASTEXITCODE -ne 0) { throw 'Windows library without RC failed to compile' }
-    $filters = ($suites.unit | ForEach-Object { "test(~$_)" }) -join ' | '
-    $cargoArgs += @('--lib', '--bin', 'agit', '-E', "(kind(lib) & ($filters)) | (kind(bin) & test(~startup_tests))")
-} else {
+$filters = @()
+if ($Suite -ne 'integration') {
+    $unitFilters = ($suites.unit | ForEach-Object { "test(~$_)" }) -join ' | '
+    $tunnelFilter = ($suites.tunnel_unit | ForEach-Object { "test(=$_)" }) -join ' | '
+    $cargoArgs += @('--package', 'agit', '--package', 'agit-tunnel', '--lib', '--bin', 'agit')
+    $filters += "(package(=agit) & ((kind(lib) & ($unitFilters)) | (kind(bin) & test(~startup_tests)))) | (package(=agit-tunnel) & kind(lib) & ($tunnelFilter))"
+}
+if ($Suite -ne 'unit') {
     foreach ($test in $suites.integration) {
         $cargoArgs += @('--test', $test)
+    }
+    $filters += 'kind(test)'
+}
+$cargoArgs += @('-E', ($filters -join ' | '))
+if ($Suite -ne 'integration') {
+    $tunnelFilter = ($suites.tunnel_unit | ForEach-Object { "test(=$_)" }) -join ' | '
+    $tunnelArgs = @('--locked', '--target', $target, '--package', 'agit-tunnel', '--lib', '-E', $tunnelFilter)
+    $inventory = (& cargo nextest list @tunnelArgs --message-format json) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw 'Tunnel test enumeration failed' }
+    $selected = @()
+    $listed = $inventory | ConvertFrom-Json
+    foreach ($binary in $listed.'rust-suites'.PSObject.Properties) {
+        foreach ($test in $binary.Value.testcases.PSObject.Properties) {
+            if ($test.Value.'filter-match'.status -eq 'matches') { $selected += $test.Name }
+        }
+    }
+    foreach ($test in $suites.tunnel_unit) {
+        if ($selected -notcontains $test) { throw "Required tunnel test was not selected: $test" }
+        Write-Output "Selected tunnel regression: $test"
     }
 }
 & cargo @cargoArgs
 if ($LASTEXITCODE -ne 0) { throw "Windows $Suite tests failed" }
-if ($Suite -eq 'integration') {
-    # Standalone harnesses do not implement nextest's test-listing protocol.
-    foreach ($test in $suites.custom) {
-        & cargo test --locked --target $target --test $test
-        if ($LASTEXITCODE -ne 0) { throw "Windows custom harness failed: $test" }
-    }
+if ($Suite -ne 'unit') {
     $env:AGIT_NPM_SMOKE_BINARY = (Resolve-Path "target/$target/debug/agit.exe").Path
     & node npm/smoke.mjs
     if ($LASTEXITCODE -ne 0) { throw 'Windows npm installation smoke test failed' }

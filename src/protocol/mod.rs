@@ -177,6 +177,10 @@ impl ConnectionDelivery {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
+    /// A local admission lease follows queued work; deserialization cannot create it.
+    #[serde(skip)]
+    #[cfg(feature = "rc")]
+    pub(crate) authority: crate::rc::authority::Guard,
     pub jsonrpc: JsonRpcVersion,
     /// Request id. Present on requests and responses, absent on notifications.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,6 +442,8 @@ impl Frame {
             connection_delivery: None,
             #[cfg(feature = "rc")]
             settlement_boundary: None,
+            #[cfg(feature = "rc")]
+            authority: Default::default(),
         }
     }
     pub fn request_with_id(
@@ -467,6 +473,8 @@ impl Frame {
             connection_delivery: None,
             #[cfg(feature = "rc")]
             settlement_boundary: None,
+            #[cfg(feature = "rc")]
+            authority: Default::default(),
         }
     }
     /// An event notification: a notification that also carries `seq` + `stream`.
@@ -499,6 +507,8 @@ impl Frame {
             connection_delivery: None,
             #[cfg(feature = "rc")]
             settlement_boundary: None,
+            #[cfg(feature = "rc")]
+            authority: Default::default(),
         }
     }
     pub fn error_response(id: RequestId, err: RpcError) -> Frame {
@@ -519,6 +529,8 @@ impl Frame {
             connection_delivery: None,
             #[cfg(feature = "rc")]
             settlement_boundary: None,
+            #[cfg(feature = "rc")]
+            authority: Default::default(),
         }
     }
 
@@ -613,6 +625,10 @@ pub mod method {
     /// leaves — without it, every session someone has watched leaves a permanent file poll
     /// behind on that machine.
     pub const SESSION_UNWATCH: &str = "session.unwatch";
+    pub const SESSION_COMMANDS: &str = "session.commands";
+    pub const SESSION_COMMAND: &str = "session.command";
+    pub const SESSION_MODEL: &str = "session.model";
+    pub const SESSION_SET_MODEL: &str = "session.setModel";
     pub const SESSION_SET_PERMISSION_MODE: &str = "session.setPermissionMode";
     pub const APPROVAL_DECIDE: &str = "approval.decide";
     /// Event: the mode changed (broadcast to every viewer of the session).

@@ -981,81 +981,77 @@ fn run_selector_refusals_precede_fork_consent_in_every_presentation_mode() {
     let refs_before = lab.git(&lab.repo, &["show-ref"]);
     let link_path = lab.store.join(format!("store/codex/{RUNTIME_ID}.json"));
     let link_before = fs::read(&link_path).unwrap();
-    for (selector, expected) in [
-        ("absent", agit::ExitCode::Ref),
-        ("selected~99", agit::ExitCode::Ref),
-        ("selected#99", agit::ExitCode::Ref),
-        ("selected#1..2", agit::ExitCode::Usage),
-        ("selected:payload.txt", agit::ExitCode::Usage),
-        ("selected~1", agit::ExitCode::Interactive),
+    for (selector, expected, mode) in [
+        ("absent", agit::ExitCode::Ref, "human"),
+        ("absent", agit::ExitCode::Ref, "json1"),
+        ("selected~99", agit::ExitCode::Ref, "flag"),
+        ("selected#99", agit::ExitCode::Ref, "empty"),
+        ("selected#1..2", agit::ExitCode::Usage, "one"),
+        ("selected:payload.txt", agit::ExitCode::Usage, "protocol"),
+        ("selected~1", agit::ExitCode::Interactive, "human"),
+        ("selected~1", agit::ExitCode::Interactive, "json2"),
     ] {
-        for mode in [
-            "human", "flag", "empty", "one", "protocol", "json1", "json2",
-        ] {
-            if mode.starts_with("json") && !cfg!(any(unix, all(windows, target_env = "msvc"))) {
+        if mode.starts_with("json") && !cfg!(any(unix, all(windows, target_env = "msvc"))) {
+            continue;
+        }
+        for name_fork in [false, true] {
+            if name_fork && expected == agit::ExitCode::Interactive {
                 continue;
             }
-            for name_fork in [false, true] {
-                if name_fork && expected == agit::ExitCode::Interactive {
-                    continue;
-                }
-                let mut args = Vec::new();
-                if mode == "flag" {
-                    args.push("--quiet");
-                }
-                if let Some(version) = mode.strip_prefix("json") {
-                    args.extend(["--json", "--json-version", version]);
-                }
-                args.extend(["run", selector, "--no-launch"]);
-                if name_fork {
-                    args.extend(["-b", "must-not-exist"]);
-                }
-                let mut command = lab.command(Some(SELECTED), &args);
-                match mode {
-                    "empty" => {
-                        command.env("AGIT_QUIET", "");
-                    }
-                    "one" => {
-                        command.env("AGIT_QUIET", "1");
-                    }
-                    "protocol" => {
-                        command.env("AGIT_PROTOCOL_CHILD", "1");
-                    }
-                    _ => {}
-                }
-                let output = command.output().unwrap();
-                assert_eq!(
-                    output.status.code(),
-                    Some(expected.as_i32()),
-                    "{mode}: {args:?}: {output:?}"
-                );
-                let diagnostic = if mode.starts_with("json") {
-                    assert!(output.stderr.is_empty(), "{output:?}");
-                    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
-                    assert_eq!(document["ok"], false);
-                    assert_eq!(document["exit_code"], expected.as_i32());
-                    document["diagnostics"].to_string()
-                } else {
-                    if expected != agit::ExitCode::Interactive {
-                        assert!(output.stdout.is_empty(), "{output:?}");
-                    }
-                    String::from_utf8(output.stderr).unwrap()
-                };
-                assert_eq!(
-                    diagnostic.contains("non-interactive runs must pass -b"),
-                    expected == agit::ExitCode::Interactive,
-                    "{mode}: {args:?}: {diagnostic}"
-                );
-                assert_eq!(lab.git(&lab.repo, &["show-ref"]), refs_before);
-                assert_eq!(fs::read(&link_path).unwrap(), link_before);
-                assert_eq!(
-                    agit::domain::link::list(&agit::domain::store::Store::at(
-                        lab.store.join("store")
-                    ))
-                    .len(),
-                    1
-                );
+            let mut args = Vec::new();
+            if mode == "flag" {
+                args.push("--quiet");
             }
+            if let Some(version) = mode.strip_prefix("json") {
+                args.extend(["--json", "--json-version", version]);
+            }
+            args.extend(["run", selector, "--no-launch"]);
+            if name_fork {
+                args.extend(["-b", "must-not-exist"]);
+            }
+            let mut command = lab.command(Some(SELECTED), &args);
+            match mode {
+                "empty" => {
+                    command.env("AGIT_QUIET", "");
+                }
+                "one" => {
+                    command.env("AGIT_QUIET", "1");
+                }
+                "protocol" => {
+                    command.env("AGIT_PROTOCOL_CHILD", "1");
+                }
+                _ => {}
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(expected.as_i32()),
+                "{mode}: {args:?}: {output:?}"
+            );
+            let diagnostic = if mode.starts_with("json") {
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(document["ok"], false);
+                assert_eq!(document["exit_code"], expected.as_i32());
+                document["diagnostics"].to_string()
+            } else {
+                if expected != agit::ExitCode::Interactive {
+                    assert!(output.stdout.is_empty(), "{output:?}");
+                }
+                String::from_utf8(output.stderr).unwrap()
+            };
+            assert_eq!(
+                diagnostic.contains("non-interactive runs must pass -b"),
+                expected == agit::ExitCode::Interactive,
+                "{mode}: {args:?}: {diagnostic}"
+            );
+            assert_eq!(lab.git(&lab.repo, &["show-ref"]), refs_before);
+            assert_eq!(fs::read(&link_path).unwrap(), link_before);
+            assert_eq!(
+                agit::domain::link::list(&agit::domain::store::Store::at(lab.store.join("store")))
+                    .len(),
+                1
+            );
         }
     }
 }

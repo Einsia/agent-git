@@ -14,7 +14,18 @@ impl Daemon {
         let (notes_tx, mut notes_rx) = mpsc::channel::<SessionNote>(256);
         let terminal_delivery_blockers =
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (settlement_tx, _) = tokio::sync::watch::channel(SettlementState::default());
+        let local_owner = opts.local_owner;
+        let initial_authority = if local_owner {
+            SettlementState {
+                local_owner: true,
+                epoch: 1,
+                session_start_idempotency_v1: true,
+                ..Default::default()
+            }
+        } else {
+            SettlementState::default()
+        };
+        let (settlement_tx, _) = tokio::sync::watch::channel(initial_authority);
         // A fail-closed fallback from an earlier hard stop is authoritative.
         // `try_load` refuses launch unless it can promote that snapshot and
         // durably remove the fallback, preventing a stale snapshot from
@@ -34,6 +45,7 @@ impl Daemon {
             roster,
             sessions: HashMap::new(),
             latest_session_generations: HashMap::new(),
+            opening_sessions: HashMap::new(),
             watches: HashMap::new(),
             terminals: HashMap::new(),
             terminal_delivery_blockers: terminal_delivery_blockers.clone(),
@@ -189,14 +201,30 @@ impl Daemon {
         // a disconnection destroys nothing; reconnecting just swaps in another socket and
         // keeps taking from the same queue.
         let link_stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let link_task = {
+        let link_task = if local_owner {
+            #[cfg(unix)]
+            {
+                let listener = crate::rc::local::listen()?;
+                d.lock().await.online = true;
+                let local_events = link_ev_tx.clone();
+                let controller = crate::rc::peers::controller()?;
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        crate::rc::endpoint::serve(listener, out_rx, local_events, controller).await
+                    {
+                        eprintln!("agitd: local transport stopped: {error:#}");
+                    }
+                })
+            }
+            #[cfg(not(unix))]
+            return Err(anyhow::anyhow!("local authority requires Unix"));
+        } else {
             let d = d.clone();
             let link_ev_tx = link_ev_tx.clone();
             let settlement = settlement_tx.clone();
             let stopping = link_stopping.clone();
             tokio::spawn(async move {
-                let mut backoff = link::BACKOFF_MIN_MS;
-                let mut attempt: u64 = 0;
+                let mut backoff = link::ReconnectBackoff::default();
                 let mut connection_epoch: u64 = 0;
                 loop {
                     if stopping.load(std::sync::atomic::Ordering::Acquire) {
@@ -211,6 +239,8 @@ impl Daemon {
                     let socket_epoch = connection_epoch;
                     let settlement_on_register = settlement.clone();
                     let stopping_on_register = stopping.clone();
+                    let mut registered_at = None;
+                    let registration_clock = &mut registered_at;
                     let why = l
                         .run_once(
                             socket_epoch,
@@ -221,6 +251,7 @@ impl Daemon {
                                 if stopping_on_register.load(std::sync::atomic::Ordering::Acquire) {
                                     return;
                                 }
+                                *registration_clock = Some(tokio::time::Instant::now());
                                 let (identity_acked, start_idempotency_acked) =
                                     accepted_connection_features(result);
                                 set_connection_features(
@@ -232,6 +263,8 @@ impl Daemon {
                             },
                         )
                         .await;
+                    let retry_delay =
+                        backoff.after_disconnect(registered_at.map(|at| at.elapsed()));
                     // Do not wait for the daemon's global mutex: it may be in a
                     // slow RPC dispatch. Settlement authorization belongs to
                     // the socket lifetime and must disappear as soon as that
@@ -251,9 +284,7 @@ impl Daemon {
                     // must not wedge the reconnect loop behind the same queue.
                     let _ =
                         link::deliver_event(&link_ev_tx, link::LinkEvent::Disconnected(why)).await;
-                    attempt += 1;
-                    backoff = link::next_backoff(backoff, attempt.wrapping_mul(2654435761));
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    tokio::time::sleep(retry_delay).await;
                 }
             })
         };
@@ -432,6 +463,29 @@ impl Daemon {
                     }
                     if !stopping { match ev {
                         link::LinkEvent::Frame { epoch, frame }
+                            if matches!(frame.method(), method::SESSION_START | method::SESSION_RESUME) =>
+                        {
+                            if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
+                            let Some(id) = frame.id.clone() else { continue };
+                            if session_rpc_tasks.len() >= 32 {
+                                let _ = out_tx.send(Frame::error_response(id, RpcError::new(
+                                    ErrorCode::SessionBusy, "session opening is busy; retry shortly")));
+                                continue;
+                            }
+                            let prepared = {
+                                let mut g = d.lock().await;
+                                if !connection_epoch_is_current(&g.settlement, epoch) { continue; }
+                                g.prepare_opening(&frame, &frames_tx)
+                            };
+                            match prepared {
+                                Ok(opening) => { session_rpc_tasks.spawn(opening.serve(
+                                    d.clone(), out_tx.clone(), id, session_rpc_stop_tx.subscribe(),
+                                )); }
+                                Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
+                            }
+                        }
+
+                        link::LinkEvent::Frame { epoch, frame }
                             if matches!(frame.method(), method::SESSION_WATCH | method::SESSION_UNWATCH) =>
                         {
                             if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
@@ -480,37 +534,6 @@ impl Daemon {
                                         let response = match result {
                                             Ok(value) => Frame::response(id, value),
                                             Err(error) => Frame::error_response(id, error),
-                                        };
-                                        let _ = out.send(response);
-                                    });
-                                }
-                                Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
-                            }
-                        }
-                        link::LinkEvent::Frame { epoch, frame }
-                            if frame.method() == method::SESSION_ENQUEUE =>
-                        {
-                            if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
-                            let Some(id) = frame.id.clone() else { continue };
-                            if session_rpc_tasks.len() >= 32 {
-                                let _ = out_tx.send(Frame::error_response(id, RpcError::new(ErrorCode::SessionBusy, "native inbox is busy; retry this client message id")));
-                                continue;
-                            }
-                            let prepared = {
-                                let g = d.lock().await;
-                                if !connection_epoch_is_current(&g.settlement, epoch) { continue; }
-                                g.prepare_native_inbox(&frame)
-                            };
-                            match prepared {
-                                Ok(prepared) => {
-                                    let out = out_tx.clone();
-                                    let settlement = settlement_tx.clone();
-                                    session_rpc_tasks.spawn(async move {
-                                        if !connection_epoch_is_current(&settlement, epoch) { return; }
-                                        let result = prepared.deliver().await;
-                                        let response = match result {
-                                            Ok(value) => Frame::response(id, value),
-                                            Err(error) => Frame::error_response(id, RpcError::new(ErrorCode::Internal, error.to_string())),
                                         };
                                         let _ = out.send(response);
                                     });
@@ -611,6 +634,7 @@ impl Daemon {
                     // tick is already firing, and the test must run under the same lock as
                     // "add a viewer" — see `reap_idle_watches`.
                     g.reap_idle_watches();
+                    g.reconcile_finished_sessions(&frames_tx);
                     g.journal.flush();
                     // Grants are changed by **a person on this machine** with `agit rc grant`,
                     // editing that file on disk; the daemon gets no notification. So reread it on
@@ -720,7 +744,8 @@ impl Daemon {
     }
 
     pub(super) fn settlement_feature(&self) -> bool {
-        self.settlement.borrow().agent_identity_v1
+        let state = self.settlement.borrow();
+        state.agent_identity_v1 || state.local_owner
     }
 
     pub(super) fn start_idempotency_feature(&self) -> bool {

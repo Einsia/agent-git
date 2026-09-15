@@ -1197,6 +1197,7 @@ async fn one_shot_approval_unknown_retires_without_inventing_a_plan() {
             decision: ApprovalDecision::Allow,
             scope: ApprovalScope::Once,
             message: None,
+            answers: None,
             by: Some("owner".into()),
         },
     );
@@ -1257,6 +1258,7 @@ async fn late_one_shot_approval_unknown_uses_the_same_generation_retirement() {
             decision: ApprovalDecision::Allow,
             scope: ApprovalScope::Once,
             message: None,
+            answers: None,
             by: Some("owner".into()),
         },
     );
@@ -1339,6 +1341,7 @@ fn successful_session_approval_persists_its_trusted_mode_before_ack() {
                         decision: ApprovalDecision::Allow,
                         scope: ApprovalScope::Session,
                         message: None,
+                        answers: None,
                         by: Some("owner".into()),
                     },
                 );
@@ -1422,6 +1425,7 @@ fn explicit_session_approval_refusal_retains_the_card_and_rolls_back_its_arm() {
                         decision: ApprovalDecision::Allow,
                         scope: ApprovalScope::Session,
                         message: None,
+                        answers: None,
                         by: Some("owner".into()),
                     },
                 );
@@ -1498,6 +1502,7 @@ fn unknown_session_approval_waits_for_late_receipt_and_durable_plan() {
                         decision: ApprovalDecision::Allow,
                         scope: ApprovalScope::Session,
                         message: None,
+                        answers: None,
                         by: Some("owner".into()),
                     },
                 );
@@ -1578,6 +1583,7 @@ async fn codex_session_scope_without_an_exact_mode_never_reaches_the_driver() {
             decision: ApprovalDecision::Allow,
             scope: ApprovalScope::Session,
             message: None,
+            answers: None,
             by: Some("owner".into()),
         },
     );
@@ -1632,6 +1638,7 @@ fn an_applied_approval_mode_must_match_the_trusted_suggestion_exactly() {
                         decision: ApprovalDecision::Allow,
                         scope: ApprovalScope::Session,
                         message: None,
+                        answers: None,
                         by: Some("owner".into()),
                     },
                 );
@@ -1720,4 +1727,28 @@ async fn message_attribution_comes_from_the_caller_claim_not_request_params() {
         );
         assert_eq!(attribution.client_msg_id.as_deref(), Some("message-a"));
     }
+}
+
+#[tokio::test]
+async fn runtime_commands_require_owner_and_the_live_session_workspace() {
+    let (tx, _rx) = mpsc::channel(1);
+    let daemon = rpc_test_daemon(
+        [(
+            "session".into(),
+            rpc_test_live("session", 1, tx, crate::protocol::PermissionMode::Default),
+        )]
+        .into_iter()
+        .collect(),
+        Roster::default(),
+    );
+    let mut frame = Frame::request(
+        method::SESSION_COMMAND,
+        serde_json::json!({"session_id":"session","name":"goal.set","arguments":{"objective":"Finish"}}),
+    );
+    for (role, workspace) in [("viewer", "ws-a"), ("operator", "ws-a"), ("owner", "ws-b")] {
+        frame.caller = Some(claim(role, workspace));
+        assert!(daemon.lock().await.prepare_session_rpc(&frame).is_err());
+    }
+    frame.caller = Some(claim("owner", "ws-a"));
+    assert!(daemon.lock().await.prepare_session_rpc(&frame).is_ok());
 }

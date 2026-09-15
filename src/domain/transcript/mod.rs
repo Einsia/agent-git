@@ -243,11 +243,11 @@ pub fn needs_bootstrap(view_text: &str, runtime: &str) -> bool {
     if adapter::get(runtime).map(|a| a.format()).ok() != Some("codex") {
         return false;
     }
-    !view_text
+    view_text
         .lines()
         .find(|l| !l.trim().is_empty())
         .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .is_some_and(|v| v.get("type").and_then(|x| x.as_str()) == Some("session_meta"))
+        .is_none_or(|v| v.get("type").and_then(|x| x.as_str()) != Some("session_meta"))
 }
 
 /// Give the LOG's first-line `session_meta` back to a codex text that opens at a compact

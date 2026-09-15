@@ -33,8 +33,18 @@ use std::path::{Path, PathBuf};
 pub struct ClaudeCode;
 
 pub(crate) fn projects_dir() -> Result<PathBuf> {
-    let home = crate::infra::config::user_home().context("the user home is not set")?;
-    Ok(home.join(".claude").join("projects"))
+    projects_dir_from(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        crate::infra::config::user_home().as_deref(),
+    )
+}
+
+fn projects_dir_from(config: Option<&std::ffi::OsStr>, home: Option<&Path>) -> Result<PathBuf> {
+    let root = match config.filter(|value| !value.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => home.context("the user home is not set")?.join(".claude"),
+    };
+    Ok(root.join("projects"))
 }
 
 #[cfg(feature = "cli")]
@@ -1765,5 +1775,25 @@ mod tests {
         for w in recs.windows(2) {
             assert_eq!(w[1]["parentUuid"], w[0]["uuid"]);
         }
+    }
+}
+
+#[cfg(test)]
+mod config_directory_tests {
+    use super::*;
+    #[test]
+    fn configured_harness_directory_owns_transcript_discovery() {
+        assert_eq!(
+            projects_dir_from(
+                Some(std::ffi::OsStr::new("/isolated/claude")),
+                Some(Path::new("/home/person"))
+            )
+            .unwrap(),
+            PathBuf::from("/isolated/claude/projects")
+        );
+        assert_eq!(
+            projects_dir_from(None, Some(Path::new("/home/person"))).unwrap(),
+            PathBuf::from("/home/person/.claude/projects")
+        );
     }
 }

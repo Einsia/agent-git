@@ -442,6 +442,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
             .block_on(async {
                 let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
                 let mut state = daemon.lock().await;
+                state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
                     session_id: "agit-danger-start".into(),
@@ -749,6 +750,7 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
         start_id.into(),
         roster::StartIntent {
             spec: roster::StartSpec {
+                model: None,
                 workspace_id: "ws-a".into(),
                 project_id: "project-a".into(),
                 runtime: "codex".into(),
@@ -772,6 +774,7 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
     let replayed = state
         .start_session(
             SessionStart {
+                model: None,
                 start_id: Some(start_id.into()),
                 workspace_id: "ws-a".into(),
                 project_id: "project-a".into(),
@@ -826,6 +829,7 @@ fn a_prewrite_failure_before_launch_releases_the_start_reservation() {
                 let error = state
                     .start_session(
                         SessionStart {
+                            model: None,
                             start_id: Some(start_id.into()),
                             workspace_id: "ws-a".into(),
                             project_id: "project-a".into(),
@@ -927,6 +931,7 @@ fn a_missing_harness_binary_releases_the_start_reservation_for_a_retry() {
                 set_connection_features(&state.settlement, 1, false, true);
 
                 let params = || SessionStart {
+                    model: None,
                     start_id: Some(start_id.into()),
                     workspace_id: "ws-a".into(),
                     project_id: "project-a".into(),
@@ -1049,6 +1054,7 @@ fn a_harness_binary_without_an_execute_bit_releases_the_start_reservation_for_a_
                 set_connection_features(&state.settlement, 1, false, true);
 
                 let params = || SessionStart {
+                    model: None,
                     start_id: Some(start_id.into()),
                     workspace_id: "ws-a".into(),
                     project_id: "project-a".into(),
@@ -1140,6 +1146,56 @@ fn a_harness_binary_without_an_execute_bit_releases_the_start_reservation_for_a_
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn revoked_authority_before_native_launch_releases_the_unexecuted_reservation() {
+    struct Toggle(Arc<std::sync::RwLock<bool>>);
+    impl crate::rc::authority::Authority for Toggle {
+        fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool {
+            let allowed = self.0.read().unwrap();
+            *allowed && accept()
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+                let (frames, _frames_rx) = mpsc::channel(64);
+                let mut state = daemon.lock().await;
+                state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
+                set_connection_features(&state.settlement, 1, false, true);
+                let allowed = Arc::new(std::sync::RwLock::new(true));
+                let mut frame = Frame::request(
+                    method::SESSION_START,
+                    serde_json::json!({
+                        "workspace_id":"ws-a", "project_id":"project-a", "runtime":"claude-code",
+                        "start_id":uuid::Uuid::new_v4().to_string(), "permission_mode":"plan",
+                    }),
+                );
+                frame.caller = Some(claim("owner", "ws-a"));
+                frame.authority = crate::rc::authority::Guard::new(Toggle(allowed.clone()));
+                let opening = state.prepare_opening(&frame, &frames).unwrap();
+                assert!(!state.roster.starts.is_empty());
+                *allowed.write().unwrap() = false;
+                let _program = crate::rc::harness::proc::override_harness_program(
+                    home.path()
+                        .join("not-a-harness")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                let error = opening.run_inline(&mut state).await.unwrap_err();
+                assert!(error.is(ErrorCode::Forbidden));
+                assert!(state.roster.starts.is_empty());
+                assert!(state.sessions.is_empty());
+                assert!(Roster::load().starts.is_empty());
+            });
+    });
+}
+
 /// The **other side** of the boundary: `Command::spawn` succeeded (this machine really does have
 /// one more process), and the handshake write after it produced no proof of success. This case is
 /// still accounted for as having crossed the materialization boundary — the tombstone stays
@@ -1171,6 +1227,7 @@ fn a_launch_that_crossed_os_spawn_keeps_the_start_pending_for_inspection() {
                 set_connection_features(&state.settlement, 1, false, true);
 
                 let params = || SessionStart {
+                    model: None,
                     start_id: Some(start_id.into()),
                     workspace_id: "ws-a".into(),
                     project_id: "project-a".into(),
@@ -1940,6 +1997,7 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         replay_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
         outbound: None,
         opts: Options {
+            local_owner: false,
             hub: "https://hub.invalid".into(),
             token: "test".into(),
             connection_id: None,
@@ -1949,6 +2007,7 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         roster: Roster::default(),
         sessions: HashMap::new(),
         latest_session_generations: HashMap::new(),
+        opening_sessions: HashMap::new(),
         watches: HashMap::new(),
         terminals: HashMap::new(),
         terminal_delivery_blockers: Default::default(),
@@ -2556,4 +2615,39 @@ async fn discovery_reply_refreshes_supervision_after_the_scan() {
     assert!(result.local.is_empty());
     assert_eq!(result.sessions.len(), 1);
     assert_eq!(result.sessions[0].session_id, "live-new");
+}
+
+/// A missing Ended note must not leave a dead command channel advertised as writable.
+#[tokio::test]
+async fn finished_supervisor_is_reconciled_without_releasing_an_accepted_rpc() {
+    let (tx, _commands) = mpsc::channel(1);
+    let live = rpc_test_live("session-a", 7, tx, crate::protocol::PermissionMode::Default);
+    let lease = live.rpc_gate.clone().lock_owned().await;
+    let daemon = rpc_test_daemon(
+        HashMap::from([("session-a".into(), live)]),
+        Roster::default(),
+    );
+    tokio::task::yield_now().await;
+    let (frames, mut received) = mpsc::channel(1);
+    let mut state = daemon.lock().await;
+    state.reconcile_finished_sessions(&frames);
+    let live = state
+        .sessions
+        .get("session-a")
+        .expect("accepted RPC still owns this generation");
+    assert!(live.ended);
+    assert_eq!(live.info.status, SessionStatus::Ended);
+    let event = received.try_recv().unwrap();
+    assert_eq!(event.method(), method::SESSION_STATUS);
+    state.reconcile_finished_sessions(&frames);
+    assert!(
+        received.try_recv().is_err(),
+        "reconciliation must not flood terminal events"
+    );
+    drop(lease);
+    state.on_session_note(SessionNote::Ended {
+        session_id: "session-a".into(),
+        generation: 7,
+    });
+    assert!(!state.sessions.contains_key("session-a"));
 }

@@ -33,6 +33,21 @@ agit rc revoke conn_123
 agit rc stop
 ```
 
+`start` reports that it is connecting before printing workspace navigation. With
+`--detach`, success means the spawned daemon has confirmed Hub registration through
+its local control channel. Startup waits at most 45 seconds after spawning. If
+readiness is not confirmed, the command exits unsuccessfully and reports that the
+process has not exited; it keeps reconnecting in the background. Use `rc status`
+to check it or `rc stop` to end it before starting another daemon.
+
+Each detached launch prints its private diagnostic log path under `~/.agit/rc/`
+(or `$AGIT_HOME/rc/`). Startup errors and later connection diagnostics stay in that
+file. Logs remain after stopping; remove old logs when they are no longer needed.
+
+Reconnect failures use bounded exponential backoff. A connection that stays
+registered for at least 30 seconds resets the next retry to the initial delay;
+brief connections retain the accumulated backoff.
+
 With `AGIT_RC=1`, the daemon may commit/push at turn boundaries. That is supervisor behavior, not a normal CLI guarantee; shared-workspace approvals go to the workspace owner.
 
 ## Proxy connections

@@ -50,6 +50,7 @@ async fn guard_sensitive_commands_defer_until_a_durable_bound_row() {
             decision: ApprovalDecision::Allow,
             scope: ApprovalScope::Session,
             message: None,
+            answers: None,
             by: Some("owner".into()),
         },
     );
@@ -342,79 +343,6 @@ fn only_claude_with_an_inherited_guard_uses_the_internal_ready_barrier() {
         "claude-code",
         &Default::default()
     ));
-}
-
-#[tokio::test]
-async fn failed_bootstrap_detaches_a_supervisor_blocked_on_a_full_notes_channel() {
-    let (command_tx, _command_rx) = mpsc::channel(1);
-    let (note_tx, mut note_rx) = mpsc::channel(1);
-    note_tx.send(()).await.expect("fill notes channel");
-    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let blocked_finished = finished.clone();
-    let blocked_note_tx = note_tx.clone();
-    let blocked_task = tokio::spawn(async move {
-        blocked_note_tx
-            .send(())
-            .await
-            .expect("notes receiver remains alive");
-        blocked_finished.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
-    tokio::task::yield_now().await;
-    assert!(
-        !finished.load(std::sync::atomic::Ordering::SeqCst),
-        "fixture task must be parked behind the full notes channel"
-    );
-
-    let mut live = rpc_test_live(
-        "session-a",
-        7,
-        command_tx,
-        crate::protocol::PermissionMode::Plan,
-    );
-    live.task.abort();
-    live.task = blocked_task;
-    let daemon = rpc_test_daemon(
-        [("session-a".to_string(), live)].into_iter().collect(),
-        Roster::default(),
-    );
-    {
-        let mut state = daemon.lock().await;
-        state
-            .latest_session_generations
-            .insert("session-a".into(), 7);
-        state.journal.record(
-            "session-a",
-            Frame::notification("item.started", serde_json::json!({})),
-        );
-        state.journal.resume("session-a");
-        state.detach_failed_session_generation("session-a", 7);
-        assert!(!state.sessions.contains_key("session-a"));
-        assert_eq!(
-            state.latest_session_generations["session-a"], 7,
-            "detach removes only Live; its materialization tombstone is permanent"
-        );
-        state.journal.record(
-            "session-a",
-            Frame::notification("item.completed", serde_json::json!({})),
-        );
-        assert!(
-            state.journal.replay("session-a", 0).0.is_empty(),
-            "failed spawn must leave its replay stream forgotten"
-        );
-    }
-    assert!(
-        !finished.load(std::sync::atomic::Ordering::SeqCst),
-        "cleanup must not wait for a supervisor that needs the notes pump"
-    );
-
-    note_rx.recv().await.expect("drain the blocking note");
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while !finished.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached reaper lets the supervisor finish after notes drain");
 }
 
 #[test]

@@ -1,0 +1,187 @@
+//! Owner-authenticated local RPC and the byte-preserving SSH bridge.
+//!
+//! This listener is never enabled by a Hub daemon. Peer credentials establish
+//! authority; wire caller claims cannot widen it. Disconnecting a viewer leaves
+//! supervised processes and their durable start receipts in the daemon.
+
+use anyhow::{Context, ensure};
+use clap::{Args as ClapArgs, Subcommand};
+use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+use tokio::net::UnixListener;
+
+pub use super::endpoint::{MAX_FRAME, WORKSPACE};
+
+#[derive(ClapArgs)]
+pub struct Args {
+    #[command(subcommand)]
+    action: Action,
+}
+#[derive(Subcommand)]
+enum Action {
+    /// Read Hub catalog data using this device's existing Agit credentials.
+    Catalog,
+    /// Start the independent local owner daemon.
+    Start {
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Bridge stdin/stdout to local RPC; suitable for a persistent SSH channel.
+    Bridge {
+        #[arg(long)]
+        ensure: bool,
+    },
+    /// Inspect the local daemon.
+    Status,
+    /// Stop the local daemon and its supervised sessions.
+    Stop,
+}
+
+pub fn run(args: Args) -> crate::commands::CmdResult {
+    super::select_local_authority();
+    match args.action {
+        Action::Catalog => {
+            use std::io::Read;
+            let mut input = String::new();
+            std::io::stdin().take(65537).read_to_string(&mut input)?;
+            ensure!(input.len() <= 65536, "Catalog request is too large");
+            let request = serde_json::from_str(&input)?;
+            let client = crate::hub::Client::from_env();
+            let result = match client.catalog_read(request) {
+                Ok(value) => serde_json::json!({"ok":true,"value":value}),
+                Err(error) => serde_json::json!({"ok":false,"error":error.to_string()}),
+            };
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        Action::Start { detach } => {
+            if detach {
+                spawn_daemon()?;
+            } else {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(super::daemon::Daemon::run(super::daemon::Options {
+                    local_owner: true,
+                    hub: "local-owner".into(),
+                    token: String::new(),
+                    connection_id: None,
+                }))?;
+            }
+        }
+        Action::Bridge { ensure } => bridge(ensure)?,
+        Action::Status => println!(
+            "{}",
+            serde_json::to_string(&super::control::ask(&super::control::Request::Status)?)?
+        ),
+        Action::Stop => println!(
+            "{}",
+            serde_json::to_string(&super::control::ask(&super::control::Request::Stop)?)?
+        ),
+    }
+    Ok(crate::ExitCode::Ok)
+}
+
+fn rpc_path() -> crate::Result<PathBuf> {
+    Ok(super::control::socket_path()?.with_extension("rpc"))
+}
+
+fn spawn_daemon() -> crate::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let log = tempfile::Builder::new()
+        .prefix("agitd-")
+        .suffix(".log")
+        .tempfile_in(super::rc_dir()?)?;
+    let (log, path) = log.keep()?;
+    eprintln!("agitd: startup diagnostics: {}", path.display());
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(["rc", "local", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    // Detachment is process ownership, not a promise made by the SSH channel.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn bridge(ensure_daemon: bool) -> crate::Result<()> {
+    use std::os::unix::net::UnixStream as StdStream;
+    let path = rpc_path()?;
+    let mut socket = match StdStream::connect(&path) {
+        Ok(socket) => socket,
+        Err(first) if ensure_daemon => {
+            if super::control::running_pid().is_none() {
+                spawn_daemon()?;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                match StdStream::connect(&path) {
+                    Ok(socket) => break socket,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(50))
+                    }
+                    Err(_) => {
+                        return Err(first).context(format!(
+                            "local daemon did not become ready; inspect agitd-*.log in {}",
+                            super::rc_dir()?.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Err(error) => return Err(error).context("start the local daemon or pass --ensure"),
+    };
+    let mut input = socket.try_clone()?;
+    // The output owner exits on socket closure even while stdin has no data.
+    std::thread::spawn(move || {
+        let _ = copy_flushed(&mut std::io::stdin().lock(), &mut input);
+        let _ = input.shutdown(std::net::Shutdown::Write);
+    });
+    copy_flushed(&mut socket, &mut std::io::stdout().lock())?;
+    Ok(())
+}
+
+fn copy_flushed(
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let mut bytes = [0; 32768];
+    loop {
+        let count = match reader.read(&mut bytes) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Ok(());
+        }
+        writer.write_all(&bytes[..count])?;
+        // Interactive protocol bytes must be visible before the next input arrives.
+        writer.flush()?;
+    }
+}
+
+pub fn listen() -> crate::Result<UnixListener> {
+    // The control listener already holds exclusive daemon ownership.
+    let path = rpc_path()?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        use std::os::unix::fs::FileTypeExt;
+        ensure!(
+            metadata.file_type().is_socket(),
+            "local RPC path is not a socket"
+        );
+        std::fs::remove_file(&path)?;
+    }
+    let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}

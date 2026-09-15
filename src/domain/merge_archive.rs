@@ -1049,7 +1049,11 @@ fn checked_carrier(
         let forbidden = if private { 0o077 } else { 0o022 };
         ensure!(
             metadata.mode() & forbidden == 0 && metadata.uid() == unsafe { libc::geteuid() },
-            "archive state carrier is not controlled by its owner"
+            "archive state carrier is not controlled by its owner: {} (mode {:o}, uid {}, expected uid {})",
+            path.display(),
+            metadata.mode() & 0o777,
+            metadata.uid(),
+            unsafe { libc::geteuid() }
         );
         validate_unix_ancestors(path)?;
     }
@@ -1086,7 +1090,8 @@ fn validate_unix_ancestors(path: &Path) -> Result<()> {
             metadata.file_type().is_symlink()
                 || metadata.mode() & 0o022 == 0
                 || metadata.mode() & 0o1000 != 0,
-            "archive authority ancestor permits replacement by another user"
+            "archive authority ancestor permits replacement by another user: {}",
+            ancestor.display()
         );
     }
     Ok(())

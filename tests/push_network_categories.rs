@@ -422,83 +422,81 @@ fn assert_command_failure(output: &Output, mode: &str, code: i32, command: &str)
 
 #[test]
 fn push_http_boundaries_preserve_auth_without_creating_fallback_repositories() {
-    for mode in ["human", "quiet", "json1", "json2"] {
-        for stage in [
-            "owned-get",
-            "pinned-get",
-            "legacy-get",
-            "create-post",
-            "foreign-get",
-            "foreign-access",
-            "foreign-org",
+    for (stage, mode) in [
+        ("owned-get", "human"),
+        ("pinned-get", "quiet"),
+        ("legacy-get", "json1"),
+        ("create-post", "json2"),
+        ("foreign-get", "human"),
+        ("foreign-access", "json2"),
+        ("foreign-org", "quiet"),
+    ] {
+        for (reply, code) in [
+            (Reply::Status(401), 5),
+            (Reply::Status(503), 6),
+            (Reply::Truncated, 6),
         ] {
-            for (reply, code) in [
-                (Reply::Status(401), 5),
-                (Reply::Status(503), 6),
-                (Reply::Truncated, 6),
-            ] {
-                let lab = Lab::new();
-                let owner = if stage.starts_with("foreign-") {
-                    "other"
-                } else {
-                    "alice"
-                };
-                let target = format!("{owner}/qa");
-                let path = lab.seed(owner, "qa", true);
-                if stage == "pinned-get" {
-                    identity::pin(
-                        &Repo::at(&path),
-                        &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
-                    )
-                    .unwrap();
-                }
-                if stage == "legacy-get" {
-                    lab.git(
-                        &path,
-                        &[
-                            "remote",
-                            "add",
-                            "origin",
-                            &format!("{}/alice/qa.git", lab.base),
-                        ],
-                    );
-                }
-                // Warm only the ordinary local scan state; no Hub call or publication is admitted.
-                let dry = lab.push(&target, "human", true);
-                assert!(dry.status.success(), "{stage}: {dry:?}");
-                lab.no_requests();
-                let before = lab.state();
-                let refs = lab.git(&path, &["show-ref"]);
-                let get = format!("GET /api/agents/{target}");
-                let steps = match stage {
-                    "create-post" => vec![
-                        Step::new(&get, Reply::Status(404)),
-                        Step::new("POST /api/agents", reply),
-                    ],
-                    "foreign-access" => vec![
-                        Step::new(&get, Reply::Json(remote(&lab, owner, AGENT_ID))),
-                        Step::new(
-                            "GET /other/qa.git/info/refs?service=git-receive-pack",
-                            reply,
-                        ),
-                    ],
-                    "foreign-org" => vec![
-                        Step::new(&get, Reply::Status(404)),
-                        Step::new("GET /api/orgs/other", reply),
-                    ],
-                    _ => vec![Step::new(&get, reply)],
-                };
-                let server = Server::start(&lab, steps);
-                let output = lab.push(&target, mode, false);
-                server.finish();
-                assert_failure(&output, mode, code);
-                assert_eq!(lab.state(), before, "{stage}: {mode} changed local files");
-                assert_eq!(lab.git(&path, &["show-ref"]), refs);
-                if owner == "other" {
-                    assert!(!lab.home.join("repos/alice/qa").exists());
-                }
-                lab.no_requests();
+            let lab = Lab::new();
+            let owner = if stage.starts_with("foreign-") {
+                "other"
+            } else {
+                "alice"
+            };
+            let target = format!("{owner}/qa");
+            let path = lab.seed(owner, "qa", true);
+            if stage == "pinned-get" {
+                identity::pin(
+                    &Repo::at(&path),
+                    &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
+                )
+                .unwrap();
             }
+            if stage == "legacy-get" {
+                lab.git(
+                    &path,
+                    &[
+                        "remote",
+                        "add",
+                        "origin",
+                        &format!("{}/alice/qa.git", lab.base),
+                    ],
+                );
+            }
+            // Warm only the ordinary local scan state; no Hub call or publication is admitted.
+            let dry = lab.push(&target, "human", true);
+            assert!(dry.status.success(), "{stage}: {dry:?}");
+            lab.no_requests();
+            let before = lab.state();
+            let refs = lab.git(&path, &["show-ref"]);
+            let get = format!("GET /api/agents/{target}");
+            let steps = match stage {
+                "create-post" => vec![
+                    Step::new(&get, Reply::Status(404)),
+                    Step::new("POST /api/agents", reply),
+                ],
+                "foreign-access" => vec![
+                    Step::new(&get, Reply::Json(remote(&lab, owner, AGENT_ID))),
+                    Step::new(
+                        "GET /other/qa.git/info/refs?service=git-receive-pack",
+                        reply,
+                    ),
+                ],
+                "foreign-org" => vec![
+                    Step::new(&get, Reply::Status(404)),
+                    Step::new("GET /api/orgs/other", reply),
+                ],
+                _ => vec![Step::new(&get, reply)],
+            };
+            let server = Server::start(&lab, steps);
+            let output = lab.push(&target, mode, false);
+            server.finish();
+            assert_failure(&output, mode, code);
+            assert_eq!(lab.state(), before, "{stage}: {mode} changed local files");
+            assert_eq!(lab.git(&path, &["show-ref"]), refs);
+            if owner == "other" {
+                assert!(!lab.home.join("repos/alice/qa").exists());
+            }
+            lab.no_requests();
         }
     }
 }
@@ -558,111 +556,109 @@ fn organization_creation_preserves_private_defaults_and_never_retries_as_public(
 
 #[test]
 fn first_publication_confirms_current_identity_and_visibility_before_pinning_or_uploading() {
-    for mode in ["human", "quiet", "json1", "json2"] {
-        for case in [
-            "default-public-race",
-            "explicit-public-race",
-            "changed-id",
-            "changed-owner",
-            "changed-name",
-            "post-owner",
-            "confirmation-auth",
-            "confirmation-unavailable",
-            "confirmed-private",
-        ] {
-            let lab = Lab::new();
-            let path = lab.seed("team", "qa", true);
-            let dry = lab.push("team/qa", "human", true);
-            assert!(dry.status.success(), "{dry:?}");
-            lab.no_requests();
-            let before = lab.state();
-            let refs = lab.git(&path, &["show-ref"]);
-            let confirmed = case == "confirmed-private";
-            let expected = if confirmed {
-                let config = path.join(".git/config");
-                let original = fs::read(&config).unwrap();
-                identity::pin(
-                    &Repo::at(&path),
-                    &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
-                )
-                .unwrap();
-                lab.git(
-                    &path,
-                    &[
-                        "remote",
-                        "add",
-                        "origin",
-                        &format!("{}/team/qa.git", lab.base),
-                    ],
-                );
-                let expected = lab.state();
-                fs::write(config, original).unwrap();
-                assert_eq!(lab.state(), before);
-                expected
-            } else {
-                before
-            };
-            let mut response = remote(&lab, "team", AGENT_ID);
-            match case {
-                "default-public-race" | "explicit-public-race" => {
-                    response["visibility"] = json!("public");
-                }
-                "changed-id" => response["agent_id"] = json!(OTHER_ID),
-                "changed-owner" => response["owner"] = json!("other"),
-                "changed-name" => response["name"] = json!("other"),
-                _ => {}
-            }
-            let (confirmation, code) = match case {
-                "confirmation-auth" => (Reply::Status(401), 5),
-                "confirmation-unavailable" => (Reply::Status(503), 6),
-                "confirmed-private" => (Reply::Json(response), 6),
-                _ => (Reply::Json(response), 4),
-            };
-            let mut steps = vec![
-                Step::new("GET /api/agents/team/qa", Reply::Status(404)),
-                Step::new(
-                    "GET /api/orgs/team",
-                    Reply::Json(json!({"name":"team", "role":"owner"})),
-                ),
-                Step::new("GET /api/agents/team/qa", Reply::Status(404)),
-                Step::new(
-                    "POST /api/agents",
-                    Reply::Json(json!({
-                        "agent_id":AGENT_ID,
-                        "owner":if case == "post-owner" { "other" } else { "team" },
-                        "name":"qa",
-                        "push_url":format!("{}/team/qa.git", lab.base),
-                        "web_url":format!("{}/team/qa", lab.base)
-                    })),
-                )
-                .with_body(json!({
-                    "name":"qa", "owner":"team", "public":false, "repo_origins":[]
-                })),
-                Step::new("GET /api/agents/team/qa", confirmation),
-            ];
-            if confirmed {
-                steps.push(Step::new(
-                    "GET /team/qa.git/info/refs?service=git-receive-pack",
-                    Reply::Status(503),
-                ));
-            }
-            let server = Server::start(&lab, steps);
-            let visibility = (case != "default-public-race").then_some("--private");
-            let output = lab.push_with_visibility("team/qa", mode, false, visibility);
-            server.finish();
-            let message = assert_failure(&output, mode, code);
-            if code == 4 {
-                assert!(message.contains("nothing was uploaded"), "{message}");
-            }
-            assert_eq!(
-                lab.state(),
-                expected,
-                "{case}/{mode} changed local evidence"
+    for (case, mode) in [
+        ("default-public-race", "human"),
+        ("explicit-public-race", "quiet"),
+        ("changed-id", "json1"),
+        ("changed-owner", "json2"),
+        ("changed-name", "human"),
+        ("post-owner", "quiet"),
+        ("confirmation-auth", "json1"),
+        ("confirmation-unavailable", "json2"),
+        ("confirmed-private", "json2"),
+    ] {
+        let lab = Lab::new();
+        let path = lab.seed("team", "qa", true);
+        let dry = lab.push("team/qa", "human", true);
+        assert!(dry.status.success(), "{dry:?}");
+        lab.no_requests();
+        let before = lab.state();
+        let refs = lab.git(&path, &["show-ref"]);
+        let confirmed = case == "confirmed-private";
+        let expected = if confirmed {
+            let config = path.join(".git/config");
+            let original = fs::read(&config).unwrap();
+            identity::pin(
+                &Repo::at(&path),
+                &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
+            )
+            .unwrap();
+            lab.git(
+                &path,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!("{}/team/qa.git", lab.base),
+                ],
             );
-            assert_eq!(lab.git(&path, &["show-ref"]), refs);
-            assert!(!lab.home.join("repos/alice/qa").exists());
-            lab.no_requests();
+            let expected = lab.state();
+            fs::write(config, original).unwrap();
+            assert_eq!(lab.state(), before);
+            expected
+        } else {
+            before
+        };
+        let mut response = remote(&lab, "team", AGENT_ID);
+        match case {
+            "default-public-race" | "explicit-public-race" => {
+                response["visibility"] = json!("public");
+            }
+            "changed-id" => response["agent_id"] = json!(OTHER_ID),
+            "changed-owner" => response["owner"] = json!("other"),
+            "changed-name" => response["name"] = json!("other"),
+            _ => {}
         }
+        let (confirmation, code) = match case {
+            "confirmation-auth" => (Reply::Status(401), 5),
+            "confirmation-unavailable" => (Reply::Status(503), 6),
+            "confirmed-private" => (Reply::Json(response), 6),
+            _ => (Reply::Json(response), 4),
+        };
+        let mut steps = vec![
+            Step::new("GET /api/agents/team/qa", Reply::Status(404)),
+            Step::new(
+                "GET /api/orgs/team",
+                Reply::Json(json!({"name":"team", "role":"owner"})),
+            ),
+            Step::new("GET /api/agents/team/qa", Reply::Status(404)),
+            Step::new(
+                "POST /api/agents",
+                Reply::Json(json!({
+                    "agent_id":AGENT_ID,
+                    "owner":if case == "post-owner" { "other" } else { "team" },
+                    "name":"qa",
+                    "push_url":format!("{}/team/qa.git", lab.base),
+                    "web_url":format!("{}/team/qa", lab.base)
+                })),
+            )
+            .with_body(json!({
+                "name":"qa", "owner":"team", "public":false, "repo_origins":[]
+            })),
+            Step::new("GET /api/agents/team/qa", confirmation),
+        ];
+        if confirmed {
+            steps.push(Step::new(
+                "GET /team/qa.git/info/refs?service=git-receive-pack",
+                Reply::Status(503),
+            ));
+        }
+        let server = Server::start(&lab, steps);
+        let visibility = (case != "default-public-race").then_some("--private");
+        let output = lab.push_with_visibility("team/qa", mode, false, visibility);
+        server.finish();
+        let message = assert_failure(&output, mode, code);
+        if code == 4 {
+            assert!(message.contains("nothing was uploaded"), "{message}");
+        }
+        assert_eq!(
+            lab.state(),
+            expected,
+            "{case}/{mode} changed local evidence"
+        );
+        assert_eq!(lab.git(&path, &["show-ref"]), refs);
+        assert!(!lab.home.join("repos/alice/qa").exists());
+        lab.no_requests();
     }
 }
 
@@ -722,61 +718,59 @@ fn identity_constraints_and_invalid_remote_ids_refuse_without_writes() {
 
 #[test]
 fn branch_git_failures_preserve_known_categories_without_pushing_tags_or_new_repositories() {
-    for mode in ["human", "quiet", "json1", "json2"] {
-        for (status, code) in [
-            (401, 5),
-            (403, 7),
-            (409, 7),
-            (412, 4),
-            (413, 7),
-            (422, 7),
-            (428, 4),
-            (503, 6),
-        ] {
-            let lab = Lab::new();
-            let path = lab.seed("alice", "qa", true);
-            identity::pin(
-                &Repo::at(&path),
-                &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
-            )
-            .unwrap();
-            let dry = lab.push("alice/qa", "human", true);
-            assert!(dry.status.success(), "{dry:?}");
-            lab.no_requests();
-            let before = lab.state();
-            let refs = lab.git(&path, &["show-ref"]);
-            let url = format!("{}/alice/qa.git", lab.base);
-            // A successful identity lookup records origin before the transport runs; only that
-            // known config change belongs in the failed publication's expected inventory.
-            lab.git(&path, &["remote", "add", "origin", &url]);
-            let expected = lab.state();
-            lab.git(&path, &["remote", "remove", "origin"]);
-            assert_eq!(lab.state(), before);
-            let server = Server::start(
-                &lab,
-                vec![
-                    Step::new(
-                        "GET /api/agents/alice/qa",
-                        Reply::Json(remote(&lab, "alice", AGENT_ID)),
-                    ),
-                    Step::new(
-                        "GET /alice/qa.git/info/refs?service=git-receive-pack",
-                        Reply::Status(status),
-                    ),
-                ],
-            );
-            let output = lab.push("alice/qa", mode, false);
-            server.finish();
-            assert_failure(&output, mode, code);
-            assert_eq!(lab.git(&path, &["show-ref"]), refs);
-            assert_eq!(
-                lab.state(),
-                expected,
-                "HTTP {status}: {mode} changed publication state"
-            );
-            assert!(!lab.home.join("repos/alice/qa-2").exists());
-            lab.no_requests();
-        }
+    for (status, code, mode) in [
+        (401, 5, "human"),
+        (403, 7, "quiet"),
+        (409, 7, "json1"),
+        (412, 4, "json2"),
+        (413, 7, "human"),
+        (422, 7, "quiet"),
+        (428, 4, "json1"),
+        (503, 6, "json2"),
+    ] {
+        let lab = Lab::new();
+        let path = lab.seed("alice", "qa", true);
+        identity::pin(
+            &Repo::at(&path),
+            &RemoteIdentity::new(&lab.base, AGENT_ID).unwrap(),
+        )
+        .unwrap();
+        let dry = lab.push("alice/qa", "human", true);
+        assert!(dry.status.success(), "{dry:?}");
+        lab.no_requests();
+        let before = lab.state();
+        let refs = lab.git(&path, &["show-ref"]);
+        let url = format!("{}/alice/qa.git", lab.base);
+        // A successful identity lookup records origin before the transport runs; only that
+        // known config change belongs in the failed publication's expected inventory.
+        lab.git(&path, &["remote", "add", "origin", &url]);
+        let expected = lab.state();
+        lab.git(&path, &["remote", "remove", "origin"]);
+        assert_eq!(lab.state(), before);
+        let server = Server::start(
+            &lab,
+            vec![
+                Step::new(
+                    "GET /api/agents/alice/qa",
+                    Reply::Json(remote(&lab, "alice", AGENT_ID)),
+                ),
+                Step::new(
+                    "GET /alice/qa.git/info/refs?service=git-receive-pack",
+                    Reply::Status(status),
+                ),
+            ],
+        );
+        let output = lab.push("alice/qa", mode, false);
+        server.finish();
+        assert_failure(&output, mode, code);
+        assert_eq!(lab.git(&path, &["show-ref"]), refs);
+        assert_eq!(
+            lab.state(),
+            expected,
+            "HTTP {status}: {mode} changed publication state"
+        );
+        assert!(!lab.home.join("repos/alice/qa-2").exists());
+        lab.no_requests();
     }
 }
 

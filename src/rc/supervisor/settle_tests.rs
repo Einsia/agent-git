@@ -113,6 +113,7 @@ async fn the_guarded_subprocess_feeds_a_real_head_to_the_settlement_predicate() 
     };
 
     let (_tx, mut rx) = tokio::sync::watch::channel(SettlementState {
+        local_owner: false,
         epoch: 1,
         agent_identity_v1: true,
         session_start_idempotency_v1: false,
@@ -190,6 +191,7 @@ async fn session_end_runs_a_final_settlement_for_the_pending_push() {
         SessionStatus::Idle,
     );
     let lease = SettlementState {
+        local_owner: false,
         epoch: 3,
         agent_identity_v1: true,
         session_start_idempotency_v1: false,
@@ -275,6 +277,7 @@ async fn exit_flush_drains_transcript_lines_written_after_the_last_turn() {
 #[tokio::test]
 async fn local_queueing_is_not_connection_delivery() {
     let lease = SettlementState {
+        local_owner: false,
         epoch: 7,
         agent_identity_v1: true,
         session_start_idempotency_v1: false,
@@ -346,6 +349,7 @@ async fn identity_ack_is_a_dynamic_kill_switch_for_commit_and_push() {
     let (tx, mut rx) = tokio::sync::watch::channel(SettlementState::default());
 
     let unacked = SettlementState {
+        local_owner: false,
         epoch: 0,
         agent_identity_v1: true,
         session_start_idempotency_v1: false,
@@ -452,6 +456,7 @@ async fn windows_job_kills_a_settlement_grandchild_before_guard_release() {
     let ready = dir.path().join("descendant-ready");
     let marker = dir.path().join("descendant-write");
     let (state_tx, mut state_rx) = tokio::sync::watch::channel(SettlementState {
+        local_owner: false,
         epoch: 1,
         agent_identity_v1: true,
         session_start_idempotency_v1: false,
@@ -692,6 +697,7 @@ impl SettlementFixture {
             SessionStatus::Idle,
         );
         let lease = SettlementState {
+            local_owner: false,
             epoch: 1,
             agent_identity_v1: true,
             session_start_idempotency_v1: false,
@@ -1133,6 +1139,7 @@ async fn a_settlement_whose_notification_was_never_acked_is_redelivered_after_a_
     // And the git side has nothing left to say — after a successful push it only answers "the
     // hub took it".
     let lease = SettlementState {
+        local_owner: false,
         epoch: 1,
         agent_identity_v1: true,
         session_start_idempotency_v1: false,
@@ -1238,6 +1245,7 @@ async fn a_backlogged_delivery_does_not_swallow_the_final_settlement() {
             SessionStatus::Idle,
         );
         let lease = SettlementState {
+            local_owner: false,
             epoch: 7,
             agent_identity_v1: true,
             session_start_idempotency_v1: false,

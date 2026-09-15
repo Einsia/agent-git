@@ -25,9 +25,11 @@ pub(super) struct PreparedWatch {
     runtime: String,
     cwd: PathBuf,
     source: WatchSource,
+    seed: Option<Frame>,
     from_line: u64,
     total_lines: u64,
     absolute_lines: bool,
+    before_cursor: u64,
 }
 
 enum WatchSource {
@@ -111,15 +113,39 @@ impl WatchScan {
                 absolute,
             )
         };
+        let before_cursor = match &source {
+            WatchSource::File { path, offset, .. } => {
+                #[cfg(unix)]
+                if runtime == "codex" {
+                    crate::rc::local_history::watch_cursor(path, *offset).map_err(|error| {
+                        RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string())
+                    })?
+                } else {
+                    *offset
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    *offset
+                }
+            }
+            WatchSource::Native { .. } => 0,
+        };
+        let seed = match &source {
+            WatchSource::File { path, offset, .. } => watch_seed_event(&runtime, path, *offset),
+            WatchSource::Native { .. } => None,
+        };
         Ok(PreparedWatch {
             request,
             roots,
             runtime,
             cwd,
             source,
+            seed,
             from_line,
             total_lines,
             absolute_lines,
+            before_cursor,
         })
     }
 }
@@ -156,9 +182,11 @@ impl Daemon {
             runtime,
             cwd,
             source,
+            seed,
             from_line,
             total_lines,
             absolute_lines,
+            before_cursor,
         } = prepared;
         if request != p {
             return Err(RpcError::new(
@@ -214,7 +242,7 @@ impl Daemon {
             runtime: runtime.clone(),
             agent: None,
             branch: None,
-            status: SessionStatus::Running,
+            status: SessionStatus::Idle,
             last_seq: 0,
             gist: None,
             // Watching is read-only, but this field records what this session **has
@@ -312,6 +340,12 @@ impl Daemon {
                     // the journal's ring, and a viewer replays them with a
                     // `session.subscribe`.
                     tokio::time::sleep(WATCH_RESPONSE_HEADSTART).await;
+                    if let Some(mut frame) = seed {
+                        frame.stream = Some(stream.clone());
+                        if frames.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
                     let mut native_records =
                         crate::rc::supervisor::native_records::NativeRecords::default();
                     loop {
@@ -383,15 +417,26 @@ impl Daemon {
                             // A read-only follow has no session identity, and
                             // `secret.detected` is a session-level alert: this only
                             // guarantees the content is redacted.
-                            let (items, _registered_ids) =
-                                crate::rc::supervisor::items_from_lines_with_mode(
-                                    &rt, &redactor, &lines, mode,
+                            for line in &lines {
+                                if let Some(mut frame) = watch_turn_event(&rt, &line.text) {
+                                    frame.stream = Some(stream.clone());
+                                    if frames.send(frame).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                let (items, _) = crate::rc::supervisor::items_from_lines_with_mode(
+                                    &rt,
+                                    &redactor,
+                                    std::slice::from_ref(line),
+                                    mode,
                                 );
-                            for item in items {
-                                let mut fr = Frame::notification(method::ITEM_COMPLETED, item);
-                                fr.stream = Some(stream.clone());
-                                if frames.send(fr).await.is_err() {
-                                    return;
+                                for item in items {
+                                    let mut frame =
+                                        Frame::notification(method::ITEM_COMPLETED, item);
+                                    frame.stream = Some(stream.clone());
+                                    if frames.send(frame).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -424,12 +469,18 @@ impl Daemon {
         }
 
         Ok(serde_json::to_value(SessionWatchResult {
-            session: self.stamped(info),
+            before_cursor,
+            session: self.stamped(
+                self.watches
+                    .get(&watch_id)
+                    .map(|watch| watch.info.clone())
+                    .unwrap_or(info),
+            ),
             from_line,
             total_lines,
             absolute_lines,
             read_only: true,
-            native_inbox: (runtime == "codex").then(|| "codex_queue".into()),
+            native_inbox: None,
         })
         .unwrap())
     }
@@ -612,3 +663,107 @@ impl WatchRpcTicket {
 #[cfg(test)]
 #[path = "tests/watch_rpc.rs"]
 mod tests;
+
+/// Transcript lifecycle markers describe external turns without claiming their control channel.
+fn watch_turn_event(runtime: &str, line: &str) -> Option<Frame> {
+    let raw: serde_json::Value = serde_json::from_str(line).ok()?;
+    let payload = raw.get("payload")?;
+    if runtime != "codex" || raw["type"] != "event_msg" {
+        return None;
+    }
+    let id = payload
+        .get("turn_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match payload.get("type")?.as_str()? {
+        "task_started" => Some(Frame::notification(
+            "turn.started",
+            serde_json::json!({"turn_id":id}),
+        )),
+        "task_complete" | "turn_aborted" => Some(Frame::notification(
+            "turn.completed",
+            serde_json::json!({"turn_id":id,"outcome":if payload["type"] == "turn_aborted" { "interrupted" } else { "ok" }}),
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod watch_activity_tests {
+    use super::*;
+    #[test]
+    fn native_turn_markers_do_not_treat_content_or_quiet_as_completion() {
+        for (kind, method) in [
+            ("task_started", "turn.started"),
+            ("task_complete", "turn.completed"),
+            ("turn_aborted", "turn.completed"),
+        ] {
+            let line =
+                serde_json::json!({"type":"event_msg", "payload":{"type":kind,"turn_id":"turn-a"}})
+                    .to_string();
+            let frame = watch_turn_event("codex", &line).unwrap();
+            assert_eq!(frame.method.as_deref(), Some(method));
+        }
+        assert!(watch_turn_event("codex", r#"{"type":"event_msg","payload":{"type":"agent_message","message":"task_complete"}}"#).is_none());
+        assert!(watch_turn_event("codex", "").is_none());
+    }
+}
+
+/// Recover lifecycle state before the display window without retaining transcript contents.
+fn watch_seed_event(runtime: &str, path: &std::path::Path, before: u64) -> Option<Frame> {
+    use std::io::{BufRead, Read};
+    if runtime != "codex" || before == 0 {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file.take(before));
+    let mut last = None;
+    let mut skipping = false;
+    loop {
+        let mut bytes = Vec::new();
+        let count = reader
+            .by_ref()
+            .take(65537)
+            .read_until(b'\n', &mut bytes)
+            .ok()?;
+        if count == 0 {
+            break;
+        }
+        let complete = bytes.last() == Some(&b'\n');
+        if !skipping
+            && complete
+            && let Ok(line) = std::str::from_utf8(&bytes)
+            && let Some(frame) = watch_turn_event(runtime, line)
+        {
+            last = Some(frame);
+        }
+        skipping = !complete;
+    }
+    last
+}
+
+#[cfg(test)]
+mod watch_seed_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn opening_inside_a_long_turn_recovers_the_marker_outside_the_display_window() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"long-turn\"}}}}").unwrap();
+        writeln!(file, "{}", "x".repeat(200_000)).unwrap();
+        for _ in 0..WATCH_BACKFILL_LINES + 1 {
+            writeln!(file, "{{\"type\":\"token_usage_record\"}}").unwrap();
+        }
+        let before = file.as_file().metadata().unwrap().len();
+        writeln!(file, "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"long-turn\"}}}}").unwrap();
+        let event = watch_seed_event("codex", file.path(), before).unwrap();
+        assert_eq!(event.method(), "turn.started");
+        let event = watch_seed_event(
+            "codex",
+            file.path(),
+            file.as_file().metadata().unwrap().len(),
+        )
+        .unwrap();
+        assert_eq!(event.method(), "turn.completed");
+    }
+}

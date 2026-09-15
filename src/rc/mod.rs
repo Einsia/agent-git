@@ -17,18 +17,19 @@
 //!
 //! # Topology
 //!
+//! The standard CLI composes a controller and local executor. The controller
+//! depends only on the tunnel client contract; it can be built without this
+//! module for a cloud entry service.
+//!
 //! ```text
-//!   ┌──────────── machine ─────────────┐        ┌── hub ──┐        ┌ viewers ┐
-//!   │ harness ⇄ agitd ──(WSS, outbound)─┼──────▶│  relay  │◀──────▶│ web/app │
-//!   │  (claude / codex)   ▲             │        │ project │        └─────────┘
-//!   │      transcript ────┘ (tail)      │        └─────────┘
-//!   └──────────────────────────────────┘
+//! UI -> owner RPC -> controller -> tunnel worker -> remote owner RPC -> executor
+//!             \-> local executor -> harness subprocesses
 //! ```
 //!
-//! * `agitd` connects **out** to the hub (WSS 443). The hub never connects in.
-//!   Users' machines sit behind NAT and corporate firewalls; asking them to open
-//!   an inbound port is asking them to configure a router, and then nobody uses
-//!   the feature.
+//! The Hub protocol adapter retains registration, replay, and authorization
+//! negotiation while its WebSocket I/O runs in an independent tunnel worker.
+//! Connection policy belongs to the controller or Hub adapter, never the worker.
+//!
 //! * The **trust boundary is on the machine**. The hub is a relay and a
 //!   projection, not a source of authority. `agitd` re-checks every instruction
 //!   it receives: does the target workspace belong to this connection, is the
@@ -65,6 +66,9 @@
 //! end-to-end hole-detection contract — a dropped frame at any hop is
 //! *detected*, not silently lost. The hub's only job is to reject holes.
 
+pub(crate) mod authority;
+#[cfg(unix)]
+pub mod cloud;
 pub(crate) mod codex_history;
 #[cfg(unix)]
 pub mod control;
@@ -73,23 +77,37 @@ pub mod control;
 pub mod control;
 mod control_protocol;
 pub mod daemon;
+#[cfg(unix)]
+mod diagnostics;
+#[cfg(unix)]
+mod endpoint;
 pub mod grants;
 pub mod harness;
 pub mod identity;
 pub mod journal;
 pub mod lineage;
 pub mod link;
+#[cfg(unix)]
+pub mod local;
+#[cfg(unix)]
+pub mod local_goal;
+#[cfg(unix)]
+pub mod local_history;
+#[cfg(unix)]
+pub mod local_repository;
 pub mod mirror;
 pub(crate) mod native_inbox;
 pub(crate) mod navigation;
 pub mod outbound;
+#[cfg(unix)]
+pub mod peers;
 pub mod policy;
 pub mod roster;
 pub mod supervisor;
 pub mod tail;
 pub mod terminal;
 pub mod ticket;
-mod transport;
+pub mod tunnel;
 #[cfg(windows)]
 pub(crate) mod windows_job;
 #[cfg(windows)]
@@ -97,7 +115,14 @@ use crate::infra::windows_security;
 
 use std::path::PathBuf;
 
-/// `~/.agit/rc/` — everything the daemon persists.
+static LOCAL_AUTHORITY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Select the owner-only namespace before starting any worker.
+pub fn select_local_authority() {
+    LOCAL_AUTHORITY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// The selected daemon namespace.
 pub fn rc_dir() -> crate::Result<PathBuf> {
     #[cfg(test)]
     let home = test_agit_home_override()
@@ -107,7 +132,13 @@ pub fn rc_dir() -> crate::Result<PathBuf> {
     let home = crate::infra::config::agit_home()?;
     #[cfg(windows)]
     windows_security::validate_path(&home, true, false)?;
-    let d = home.join("rc");
+    let d = home.join(
+        if LOCAL_AUTHORITY.load(std::sync::atomic::Ordering::Acquire) {
+            "desktop-rc"
+        } else {
+            "rc"
+        },
+    );
     #[cfg(windows)]
     windows_security::private_directory(&d)?;
     #[cfg(not(windows))]

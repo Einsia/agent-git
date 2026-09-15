@@ -750,3 +750,72 @@ fn assert_offline_adoption_hint(from_commit: bool) {
     let log = lab.run(&["log", "me/qa@saved", "--oneline"]);
     assert_eq!(turn_subjects(&log), vec!["preserve offline work"]);
 }
+
+/// Inherited supervisor routing cannot make a runtime helper own the parent branch.
+#[test]
+fn supervised_start_hooks_leave_native_registration_to_the_supervisor() {
+    let lab = Lab::new();
+    lab.run(&["init", "qa"]);
+    let before = lab.local_state();
+    let mut child = lab
+        .agit(&["hooks", "ingest", "--runtime", "codex"])
+        .env("AGIT_SESSION", "me/qa@s1")
+        .env(agit::rc::harness::SUPERVISED_HOOK_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(serde_json::json!({"session_id":B,"source":"startup","cwd":lab.home.join(".codex/memories"),"hook_event_name":"SessionStart"}).to_string().as_bytes()).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success(), "{result:?}");
+    assert!(result.stdout.is_empty());
+    assert_eq!(lab.local_state(), before);
+}
+
+/// An exact supervisor key selects its own transcript while branch-only callers stay ambiguous.
+#[test]
+fn supervisor_settles_its_exact_native_link_and_checks_the_branch() {
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "A turn 1", "A answer 1"));
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+    let path = lab
+        .agit_home
+        .join("store/claude-code")
+        .join(format!("{B}.json"));
+    fs::write(&path, serde_json::json!({"cwd":lab.home.join(".codex/memories"),"owner":"me","agent":"qa","branch":"s1"}).to_string()).unwrap();
+    lab.append(A, &lab.turn(A, 2, "A turn 2", "A answer 2"));
+    let native = serde_json::json!({"runtime":"claude-code","session_id":A}).to_string();
+    let before = lab.local_state();
+    let wrong = lab
+        .agit(&["commit", "--from-supervisor"])
+        .env("AGIT_SESSION", "me/qa@wrong")
+        .env("AGIT_SETTLEMENT_NATIVE", &native)
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success(), "{wrong:?}");
+    assert_eq!(lab.local_state(), before);
+    let ambiguous = lab.agit(&["commit", "me/qa@s1"]).output().unwrap();
+    assert!(!ambiguous.status.success());
+    let settled = lab
+        .agit(&["commit", "--from-supervisor"])
+        .env("AGIT_SESSION", "me/qa@s1")
+        .env("AGIT_SETTLEMENT_NATIVE", &native)
+        .output()
+        .unwrap();
+    assert!(settled.status.success(), "{settled:?}");
+    assert_eq!(
+        turn_subjects(&lab.run(&["log", "me/qa@s1", "--oneline"])),
+        vec!["A turn 1", "A turn 2"]
+    );
+    assert!(path.exists(), "Unrelated native evidence must be retained");
+}

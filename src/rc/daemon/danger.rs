@@ -27,12 +27,12 @@
 //! * [`TranscriptDanger`]'s fields are private, and this module is a **sibling** submodule of
 //!   `daemon` (`sessions` / `dispatch` / `guard` cannot reach private fields), so only the three
 //!   constructors in this module produce one;
-//! * [`Daemon::spawn_session`](super::Daemon::spawn_session) refuses to launch without one and
+//! * [`Daemon::prepare_spawn`](super::Daemon::prepare_spawn) refuses to launch without one and
 //!   stamps `SessionInfo.dangerous` **itself** — the judged bit no longer depends on the caller
 //!   remembering to copy it across;
 //! * the other two constructors cannot launch a session:
 //!   [`TranscriptDanger::fresh_transcript`] ("this run resumes no transcript") and [`judge`]
-//!   (read-only following; it judges no caller). `spawn_session` confronts the slip with
+//!   (read-only following; it judges no caller). `prepare_spawn` confronts the slip with
 //!   `spec.resume_from` on the spot, and either of those two together with `--resume` is
 //!   refused there rather than quietly let through.
 //!
@@ -65,8 +65,8 @@ impl TranscriptDanger {
     /// `resume_from == None`).
     ///
     /// Only here is there no history to judge — a freshly started conversation context is empty
-    /// (the gate on the starting mode is `require_owner_to_loosen`, in `start_session`). Using
-    /// this slip together with `--resume` is refused on the spot by `spawn_session`.
+    /// (the gate on the starting mode is `require_owner_to_loosen`, in `prepare_start_session`). Using
+    /// this slip together with `--resume` is refused on the spot by `prepare_spawn`.
     pub(super) fn fresh_transcript() -> Self {
         Self {
             judged: None,
@@ -80,7 +80,7 @@ impl TranscriptDanger {
     }
 
     /// Whether this slip really asked about a transcript and judged whether this caller may
-    /// drive it. `spawn_session` confronts it with `spec.resume_from`.
+    /// drive it. `prepare_spawn` confronts it with `spec.resume_from`.
     pub(super) fn cleared_a_transcript(self) -> bool {
         self.judged.is_some() && self.authorized
     }
@@ -90,7 +90,7 @@ impl TranscriptDanger {
 /// but the warning marker in the web interface says "what this session **has done**", and
 /// hardcoding false hides it exactly where it most needs to show.
 ///
-/// **The slip it produces cannot launch a session** (`spawn_session` takes only [`authorize`]'s):
+/// **The slip it produces cannot launch a session** (`prepare_spawn` takes only [`authorize`]'s):
 /// handing a transcript into a session that can be driven is another matter, and that step
 /// judges the caller too.
 pub(super) fn judge(
@@ -136,7 +136,7 @@ pub(super) fn authorize(
 /// **Monotonic**: an `info.dangerous` that is already true (a session freshly started with
 /// bypass, say) is never washed out by the verdict.
 ///
-/// `spawn_session` calls this in one place instead of letting every path copy the bit into
+/// `prepare_spawn` calls this in one place instead of letting every path copy the bit into
 /// `SessionInfo` itself: a path that misses the copy reports a session that ran unchecked as
 /// clean, and then the `Need::Drive` gate in `session_channel` counts for nothing against it —
 /// the gate and the marker must come from the same verdict.

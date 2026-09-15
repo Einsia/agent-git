@@ -51,6 +51,7 @@ use crate::domain::store::Store;
 use crate::domain::transcript::{self, Continuity};
 use crate::infra::credentials;
 use crate::{ExitCode, ui};
+use anyhow::Context as _;
 use clap::Args as ClapArgs;
 use std::path::Path;
 
@@ -288,6 +289,8 @@ fn run_inner(args: Args) -> CmdResult {
                 .as_ref()
                 .and_then(|input| input.runtime.as_deref()),
         )?
+    } else if args.from_supervisor && std::env::var_os(archive::NATIVE_ENV).is_some() {
+        archive::process_link(&store)?
     } else {
         let explicit = args.target.as_deref().filter(|target| {
             crate::domain::merge_archive::RuntimeLinkKey {
@@ -328,6 +331,22 @@ fn run_inner(args: Args) -> CmdResult {
     }
     let target = if payload_id.is_some() {
         selected.and_then(hook_link_target)
+    } else if args.from_supervisor && std::env::var_os(archive::NATIVE_ENV).is_some() {
+        let native = selected.context("supervisor settlement requires its exact native link")?;
+        let (slug, branch) = super::context::from_session_env()
+            .context("supervisor settlement requires an explicit session branch")?;
+        let (owner, name) = super::parse_slug(&slug)?;
+        anyhow::ensure!(
+            native.is_active() && link::claims_branch(&native, &owner, &name, &branch),
+            "supervisor native identity does not own the selected session branch"
+        );
+        anyhow::ensure!(
+            args.target.as_deref().is_none_or(|target| {
+                target == "@" || target == format!("{slug}@{branch}") || target == native.session_id
+            }),
+            "supervisor target conflicts with its exact native identity"
+        );
+        hook_link_target(native)
     } else {
         resolve_target(&store, &args, quiet)?
     };
@@ -358,6 +377,16 @@ fn run_inner(args: Args) -> CmdResult {
             link,
             via,
         } => {
+            #[cfg(unix)]
+            if let Ok(expected) = std::env::var("AGIT_LOCAL_AGENT_ID") {
+                anyhow::ensure!(
+                    std::env::var_os(crate::hub::identity::EXPECTED_AGENT_ID_ENV).is_none(),
+                    "mixed settlement authority is forbidden"
+                );
+                crate::rc::select_local_authority();
+                let lineage = crate::rc::lineage::AgitSession::new(&slug, &expected, &branch)?;
+                crate::rc::local_repository::require(&lineage)?;
+            }
             if std::env::var_os(crate::hub::identity::EXPECTED_AGENT_ID_ENV).is_some() {
                 let repo = Repo::open(&repo_dir).ok_or_else(|| {
                     anyhow::anyhow!(
@@ -511,6 +540,19 @@ pub(crate) fn delegated_settlement(from_hook: bool) -> crate::Result<Option<Exit
 
 /// The account name a recorded version needs. Under `quiet` (from_hook) it returns None silently.
 pub fn owner_for_recording(quiet: bool) -> crate::Result<Option<String>> {
+    #[cfg(unix)]
+    if let Ok(expected) = std::env::var("AGIT_LOCAL_AGENT_ID") {
+        anyhow::ensure!(
+            std::env::var_os(crate::hub::identity::EXPECTED_AGENT_ID_ENV).is_none(),
+            "mixed settlement authority is forbidden"
+        );
+        crate::rc::select_local_authority();
+        let route = std::env::var("AGIT_SESSION")?;
+        let lineage = crate::rc::lineage::AgitSession::parse(&route, &expected)?;
+        crate::rc::local_repository::require(&lineage)?;
+        return Ok(Some(lineage.owner().to_owned()));
+    }
+
     let c = crate::hub::Client::from_env();
     if !c.has_token() {
         if !quiet {
@@ -1349,7 +1391,7 @@ fn settle(
     let before = super::auto_push::branch_tip(repo_dir, branch);
     let quiet = opts.quiet;
     let result = settle_local(store, repo_dir, slug, branch, lk, owner, opts);
-    if matches!(result, Ok(ExitCode::Ok)) {
+    if matches!(result, Ok(ExitCode::Ok)) && std::env::var_os("AGIT_LOCAL_AGENT_ID").is_none() {
         super::auto_push::after_settlement(repo_dir, slug, branch, before.as_deref(), quiet);
     }
     result

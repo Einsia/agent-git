@@ -11,6 +11,8 @@ use crate::rc::identity;
 use crate::{ExitCode, infra::config, ui};
 use clap::{Args as ClapArgs, Subcommand};
 
+mod startup;
+
 #[derive(ClapArgs)]
 pub struct Args {
     #[command(subcommand)]
@@ -19,8 +21,17 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Action {
+    /// Carry transport packets for the supervising daemon.
+    #[command(hide = true)]
+    Tunnel,
     /// Pair this machine (first run) and start the daemon.
     Start(StartArgs),
+    /// Owner-only local daemon and SSH stdio bridge, independent of Hub pairing.
+    #[cfg(unix)]
+    Local(crate::rc::local::Args),
+    /// Enroll a cloud peer and manage executor resource permissions.
+    #[cfg(unix)]
+    Cloud(crate::rc::cloud::Args),
     /// Connection state, uptime and live sessions.
     Status,
     /// Stop the daemon. Sessions running under it end with it.
@@ -65,6 +76,9 @@ pub struct GrantsArgs {
 
 #[derive(ClapArgs)]
 pub struct LandArgs {
+    /// Use pinned local repository authority without contacting a Hub.
+    #[arg(long)]
+    pub local_owner: bool,
     /// `owner/name` of the agent repo this session settles into.
     #[arg(long, value_name = "owner/name")]
     pub slug: String,
@@ -124,7 +138,7 @@ pub fn land_argv(
 
 #[derive(ClapArgs)]
 pub struct StartArgs {
-    /// Run in the background instead of holding the terminal.
+    /// Run in the background; wait for Hub readiness before reporting success.
     #[arg(long)]
     pub detach: bool,
     /// Name shown in the web UI (default: this machine's hostname).
@@ -141,7 +155,21 @@ pub struct RevokeArgs {
 
 pub fn run(args: Args) -> CmdResult {
     let result = match args.action {
+        Action::Tunnel => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(agit_tunnel::worker::run(
+                tokio::io::BufReader::new(tokio::io::stdin()),
+                tokio::io::stdout(),
+            ))?;
+            Ok(ExitCode::Ok)
+        }
         Action::Start(a) => start(a),
+        #[cfg(unix)]
+        Action::Local(a) => crate::rc::local::run(a),
+        #[cfg(unix)]
+        Action::Cloud(a) => crate::rc::cloud::run(a),
         Action::Status => status(),
         Action::Stop => stop(),
         Action::List => list(),
@@ -272,6 +300,10 @@ fn grants(args: GrantsArgs) -> CmdResult {
 ///
 /// Idempotent on purpose — the daemon calls it on every session start/resume.
 fn land(args: LandArgs) -> CmdResult {
+    #[cfg(unix)]
+    if args.local_owner {
+        return land_local(args);
+    }
     // **These two fields come from the hub; this machine did not produce them.**
     //
     // They are joined into `~/.agit/repos/<owner>/<name>` and handed to clone / open_or_init. An
@@ -420,6 +452,35 @@ fn land(args: LandArgs) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
+#[cfg(unix)]
+fn land_local(args: LandArgs) -> CmdResult {
+    crate::rc::select_local_authority();
+    let lineage = crate::rc::lineage::AgitSession::new(&args.slug, &args.agent_id, &args.branch)?;
+    let repo = crate::rc::local_repository::require(&lineage)?;
+    let history_update = super::migration::begin_startup_recovery_for_path(
+        &lineage.repo_dir()?,
+        "local-land-history",
+    )?;
+    let store = crate::domain::store::Store::open_or_init()?;
+    let _branch_guard = crate::domain::link::lock_branch(&store, &args.slug, &args.branch)?;
+    let _link_guard = crate::domain::link::lock(&store, &args.runtime, &args.session)?;
+    let link = landed_link(&store, &args, lineage.name())?;
+    anyhow::ensure!(
+        link.merge_archive.is_none(),
+        "local landing cannot replace an Archive role"
+    );
+    if repo.commit_count() == 0 {
+        super::import::create_main_file_line(&repo, lineage.owner(), &link)?;
+    }
+    let created = materialize_branch(&repo, &args.branch)?;
+    super::migration::finish_external_history_update(&repo, history_update)?;
+    if created {
+        super::import::declare_session_line(&repo, &args.branch, &link)?;
+    }
+    crate::domain::link::write(&store, &link)?;
+    Ok(ExitCode::Ok)
+}
+
 /// Makes the branch the hub allocated exist locally. `true` means this call actually created it
 /// (the caller then declares the session line).
 ///
@@ -528,43 +589,12 @@ fn start(args: StartArgs) -> CmdResult {
     ui::section("agit rc");
     println!("  machine   {}", ui::accent(&id.display_name));
     println!("  hub       {hub}");
-    println!(
-        "  workspaces {}",
-        crate::rc::navigation::workspaces_url(&opts.hub)
-    );
     println!("  runtimes  {}", runtimes_line());
+    println!("  connection  starting; waiting for Hub registration");
     println!();
 
     if args.detach {
-        // Re-exec ourselves without --detach, fully detached from this terminal.
-        let exe = std::env::current_exe()?;
-        let mut command = std::process::Command::new(exe);
-        command
-            .args(["rc", "start"])
-            .env("AGIT_HUB_URL", &hub)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            use windows_sys::Win32::System::Threading::{
-                CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
-            };
-            command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-        }
-        let child = command.spawn()?;
-        println!(
-            "  {} daemon running in the background (pid {})",
-            ui::ok("✓"),
-            child.id()
-        );
-        println!();
-        println!(
-            "  {}",
-            ui::dim("`agit rc status` to check it, `agit rc stop` to stop it")
-        );
-        return Ok(ExitCode::Ok);
+        return startup::detach(&hub);
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -593,6 +623,7 @@ fn daemon_options(
         .split_once("://")
         .ok_or_else(|| anyhow::anyhow!("Hub address must use HTTP or HTTPS"))?;
     Ok(crate::rc::daemon::Options {
+        local_owner: false,
         hub: format!(
             "{}://{}",
             scheme.to_ascii_lowercase(),
@@ -1226,6 +1257,7 @@ mod tests {
         resumed.materialized_from = Some("a".repeat(40));
         link::write(&store, &resumed).unwrap();
         let mut args = super::LandArgs {
+            local_owner: false,
             slug: "alice/photo".into(),
             agent_id: AGENT_ID.into(),
             branch: "work".into(),

@@ -66,6 +66,8 @@ use tokio::sync::mpsc;
 /// in-flight operation that was authorized by the previous connection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SettlementState {
+    /// A same-user local daemon owns settlement without a network lease.
+    pub local_owner: bool,
     pub epoch: u64,
     pub agent_identity_v1: bool,
     /// Kept in the same connection-epoch state even though the supervisor does
@@ -78,14 +80,14 @@ fn settlement_lease(
     state: &tokio::sync::watch::Receiver<SettlementState>,
 ) -> Option<SettlementState> {
     let state = *state.borrow();
-    state.agent_identity_v1.then_some(state)
+    (state.agent_identity_v1 || state.local_owner).then_some(state)
 }
 
 fn settlement_lease_is_current(
     state: &tokio::sync::watch::Receiver<SettlementState>,
     lease: SettlementState,
 ) -> bool {
-    *state.borrow() == lease && lease.agent_identity_v1
+    *state.borrow() == lease && (lease.agent_identity_v1 || lease.local_owner)
 }
 
 const SETTLEMENT_DELIVERY_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
@@ -911,6 +913,15 @@ impl DangerAuthorization {
 
 /// What the daemon asks a session to do.
 pub enum Command {
+    Runtime {
+        name: String,
+        arguments: serde_json::Value,
+        reply: Ticket<serde_json::Value>,
+    },
+    Model {
+        model: Option<String>,
+        reply: Ticket<serde_json::Value>,
+    },
     /// Internal startup barrier for a resumed Claude generation whose launch
     /// argv was forced to Plan by inherited ambiguous turn guards.
     ///
@@ -986,6 +997,7 @@ fn accept(c: &Command) -> bool {
     match c {
         Command::ClaudeRestartGuardReady => true,
         Command::InitialTurn { .. } => true,
+        Command::Model { reply, .. } | Command::Runtime { reply, .. } => reply.accept(),
         Command::Turn { reply, .. } => reply.accept(),
         Command::Steer { reply, .. } => reply.accept(),
         Command::Interrupt { reply } => reply.accept(),
@@ -1157,7 +1169,10 @@ impl Session {
         // The test must not be a time-sensitive observation, but the **intent** of this
         // launch.
         let resuming = spec.resume_from.is_some();
-        let driver = AnyDriver::launch(&info.runtime, spec).await?;
+        let mut driver = AnyDriver::launch(&info.runtime, spec).await?;
+        if let AnyDriver::Codex(codex) = &mut driver {
+            codex.confirm_opening().await?;
+        }
         let mut s = Session {
             agit_session,
             cwd,
@@ -1191,19 +1206,8 @@ impl Session {
             generation,
             resuming,
         };
-        // claude-code's id is one we chose ourselves and is known at this moment — so
-        // **announce** it right away rather than waiting for `Ready` (which arrives only after
-        // the first user message). codex takes the Ready path.
-        //
-        // Announce only, **do not land**: `land()` spawns a subprocess for an HTTP `get_agent`
-        // and a `git clone`, while `Session::launch` is awaited inside `Daemon::dispatch` — all
-        // of which holds the daemon's global lock, inside the main select loop. One clone can
-        // freeze every RPC on this machine, and the **event pump** with them, for tens of
-        // seconds.
-        //
-        // Landing happens at the top of `run()`, out of the lock and in its own task. It is
-        // retryable anyway (another attempt before every settlement), so arriving later costs
-        // nothing else.
+        // Announce only during launch. Native binding is repeated after the daemon
+        // registers this generation, before repository landing and settlement.
         s.announce_binding_without_waiting().await;
         Ok(s)
     }
@@ -1233,19 +1237,8 @@ impl Session {
         let _ = self.notes.send(note).await;
     }
 
-    /// The same announcement, but it **never waits** for room in the channel. For
-    /// `Session::launch` only.
-    ///
-    /// `notes` is a bounded channel whose only consumer is the `notes_rx.recv()` branch of the
-    /// daemon's main select loop — while `launch` runs, that loop is awaiting this very
-    /// `launch` under the global lock and takes no further frame. So once the channel fills,
-    /// `send().await` waits on a queue **nobody will ever drain**: the daemon deadlocks
-    /// together with the event pump, and it cannot be broken — draining the queue needs the
-    /// lock released, and releasing the lock needs this send to return.
-    ///
-    /// Dropping this one does no harm, so `try_send` is enough here: `Bound` is idempotent,
-    /// `bind_if_known()` at the top of `run_inner()` sends it again as soon as the lock is out,
-    /// and every settlement sends it again after that.
+    /// Launch does not wait for note delivery: the generation may not be registered yet.
+    /// The supervisor repeats the binding before landing and every settlement.
     async fn announce_binding_without_waiting(&mut self) {
         let Some(note) = self.binding_note() else {
             return;
@@ -1255,9 +1248,8 @@ impl Session {
 
     /// Announce, then land the local lineage. Idempotent, callable repeatedly.
     ///
-    /// **Do not call this from `Session::launch`** — see the comment there: landing spawns
-    /// subprocesses for the network and a git clone, while launch is awaited under the daemon's
-    /// global lock inside the main select loop.
+    /// Keep repository landing in the registered supervisor: landing spawns
+    /// network and Git subprocesses only after the daemon can supervise this generation.
     async fn bind_if_known(&mut self) {
         if self.publication.is_some() {
             self.announce_binding().await;
@@ -1277,7 +1269,18 @@ impl Session {
     fn settlement_exe(&self) -> Option<PathBuf> {
         match &self.settlement_child {
             Some(child) => Some(child.exe.clone()),
-            None => std::env::current_exe().ok(),
+            None => {
+                // Pin subprocesses to the running daemon's executable inode.
+                // An atomic installation can unlink its original pathname.
+                #[cfg(target_os = "linux")]
+                {
+                    Some(PathBuf::from(format!("/proc/{}/exe", std::process::id())))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    std::env::current_exe().ok()
+                }
+            }
         }
     }
 
@@ -1321,7 +1324,7 @@ impl Session {
         // renaming a flag has exactly one site to change, and a test really parses this argv.
         // Built by hand here, one rename becomes a subprocess call that always fails and only
         // mutters about it in the log.
-        let args = crate::commands::rc::land_argv(
+        let mut args = crate::commands::rc::land_argv(
             &agit_session.slug(),
             agit_session.agent_id(),
             agit_session.branch(),
@@ -1329,12 +1332,18 @@ impl Session {
             thread_id,
             &self.cwd.to_string_lossy(),
         );
+        if lease.local_owner {
+            args.push("--local-owner".into());
+        }
         let out = if let Some(exe) = self.settlement_exe() {
             let mut command = tokio::process::Command::new(exe);
             command.args(&args).env(
                 crate::hub::identity::EXPECTED_AGENT_ID_ENV,
                 agit_session.agent_id(),
             );
+            if lease.local_owner {
+                command.env_remove(crate::hub::identity::EXPECTED_AGENT_ID_ENV);
+            }
             command
                 .env_remove(crate::commands::commit::archive::NATIVE_ENV)
                 .env_remove(crate::commands::commit::archive::ROLE_ENV);
@@ -2370,6 +2379,13 @@ impl Session {
                                 return;
                             }
                         }
+                        Some(Command::Runtime { name, arguments, reply }) => {
+                            let result = self.driver.runtime_command(&name, arguments).await.map(|value|self.redactor.scrub_json(&value).value);
+                            reply.finish(result);
+                        }
+                        Some(Command::Model { model, reply }) => {
+                            reply.finish(self.driver.model_control(model.as_deref()).await);
+                        }
                         Some(Command::SetPermissionMode {
                             mode,
                             by,
@@ -2656,10 +2672,9 @@ impl Session {
             }
             HarnessEvent::ItemCompleted { item_id } => {
                 self.flush_delta(&item_id).await;
-                // Intentionally ignored: the authoritative `item.completed`
-                // comes from the transcript file, with its object hash. Emitting
-                // one here too would put two different records of the same item
-                // on the wire.
+                // Stream completion is separate from the authoritative transcript record.
+                self.emit("item.finished", serde_json::json!({"item_id":item_id}))
+                    .await;
             }
             HarnessEvent::TurnCompleted {
                 turn_id,
@@ -2848,6 +2863,17 @@ impl Session {
             }
             HarnessEvent::Notice { text } => {
                 tracing_note(&format!("[{}] {text}", self.info.session_id));
+            }
+            HarnessEvent::GoalUpdated { goal } => {
+                self.emit(
+                    "session.goal",
+                    serde_json::json!({"goal":self.redactor.scrub_json(&goal).value}),
+                )
+                .await;
+            }
+            HarnessEvent::Progress { text } => {
+                self.emit("session.progress", serde_json::json!({"text":text}))
+                    .await;
             }
             HarnessEvent::ProtocolInvariant {
                 message,
@@ -3077,6 +3103,11 @@ impl Session {
                 // session and inherited that outer harness marker. Its own
                 // fenced subprocess is the supervisor writer, not a Stop hook.
                 .env_remove(crate::rc::harness::SUPERVISED_HOOK_ENV);
+            if lease.local_owner {
+                command
+                    .env_remove(crate::hub::identity::EXPECTED_AGENT_ID_ENV)
+                    .env("AGIT_LOCAL_AGENT_ID", &expected_agent_id);
+            }
             command
         };
 
@@ -3192,6 +3223,14 @@ impl Session {
         ) {
             Ok(candidate) => candidate,
             Err(reason) => {
+                if lease.local_owner {
+                    let detail = format!(
+                        "{reason}: {}",
+                        String::from_utf8_lossy(&commit.stderr).trim()
+                    );
+                    let scrubbed = self.redactor.scrub(&detail);
+                    self.emit("commit.failed", serde_json::json!({"session_id":self.info.session_id,"error":scrubbed.text})).await;
+                }
                 tracing_note(&format!(
                     "strict RC settlement stopped ({reason}): {}",
                     String::from_utf8_lossy(&commit.stderr).trim()
@@ -3209,12 +3248,14 @@ impl Session {
         // "pushed" and "receipt written", which is exactly the window to close. A receipt left
         // behind by a failed push causes no false positive: it is accepted only while it points
         // at the current HEAD, and that turn is due for a re-push anyway.
-        record_unacked_settlement(&receipt_path, &sha, &branch);
-        self.pending_settlement = Some(PendingSettlement {
-            sha: sha.clone(),
-            delivery: None,
-            receipt: Some(receipt_path),
-        });
+        if !lease.local_owner {
+            record_unacked_settlement(&receipt_path, &sha, &branch);
+            self.pending_settlement = Some(PendingSettlement {
+                sha: sha.clone(),
+                delivery: None,
+                receipt: Some(receipt_path),
+            });
+        }
 
         let mut notification = Frame::notification(
             method::COMMIT_SETTLED,
@@ -3230,6 +3271,12 @@ impl Session {
             },
         );
         notification.settlement_boundary = journal_boundary.clone();
+        if lease.local_owner {
+            self.pending_settlement = None;
+            // Local Git is authoritative; a disconnected viewer can rediscover HEAD.
+            let _ = self.out.send(notification).await;
+            return;
+        }
         let publish = publish_settlement(
             self.settlement.clone(),
             lease,
@@ -3479,14 +3526,28 @@ fn cap_raw(v: serde_json::Value) -> (serde_json::Value, bool) {
     if s.len() <= RAW_LINE_CAP {
         return (v, false);
     }
-    (
-        serde_json::json!({
-            "_truncated": true,
-            "_bytes": s.len(),
-            "_note": "full line is in the committed transcript; open the session to read it"
-        }),
-        true,
-    )
+    let mut capped = serde_json::json!({
+        "_truncated": true,
+        "_bytes": s.len(),
+        "_note": "full line is in the committed transcript; open the session to read it"
+    });
+    // Native identities must survive payload caps so pages reconcile with live rows.
+    for key in ["type", "uuid"] {
+        if let Some(value) = v[key].as_str().filter(|value| value.len() <= 128) {
+            capped[key] = serde_json::json!(value);
+        }
+    }
+    if let Some(ordinal) = v["ordinal"].as_u64() {
+        capped["ordinal"] = serde_json::json!(ordinal);
+    }
+    // Replacement history can dwarf the summary that identifies a compaction reply.
+    if v["type"] == "compacted" {
+        let payload = serde_json::json!({"message":v["payload"]["message"]});
+        if serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() < RAW_LINE_CAP / 2) {
+            capped["payload"] = payload;
+        }
+    }
+    (capped, true)
 }
 
 /// The daemon logs to stderr; this crate has no tracing dependency and the CLI's

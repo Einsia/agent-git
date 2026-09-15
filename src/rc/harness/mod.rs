@@ -32,6 +32,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod models;
 pub mod opencode;
 pub mod proc;
 
@@ -293,6 +294,9 @@ pub enum HarnessEvent {
         effective_mode: Option<PermissionMode>,
     },
     Approval(ApprovalRequest),
+    GoalUpdated {
+        goal: Value,
+    },
     /// The harness process exited.
     Exited {
         code: Option<i32>,
@@ -313,6 +317,10 @@ pub enum HarnessEvent {
     },
     /// Something we could not parse or a stderr line worth surfacing.
     Notice {
+        text: String,
+    },
+    /// A runtime status composed from protocol fields, without stderr content.
+    Progress {
         text: String,
     },
 }
@@ -631,6 +639,22 @@ impl AnyDriver {
 
     /// Change how much the agent may do unattended. Returns when the change
     /// takes effect — see [`PermissionApply`].
+    pub async fn runtime_command(&mut self, name: &str, arguments: Value) -> crate::Result<Value> {
+        match self {
+            Self::Codex(driver) => driver.runtime_command(name, arguments).await,
+            Self::ClaudeCode(driver) => driver.runtime_command(name, arguments).await,
+            _ => anyhow::bail!("This command is not available through the runtime control channel"),
+        }
+    }
+
+    pub async fn model_control(&mut self, model: Option<&str>) -> crate::Result<Value> {
+        match self {
+            Self::Codex(d) => d.model_control(model).await,
+            Self::ClaudeCode(d) => d.model_control(model).await,
+            _ => anyhow::bail!("this runtime does not support model control"),
+        }
+    }
+
     pub async fn set_permission_mode(
         &mut self,
         mode: PermissionMode,

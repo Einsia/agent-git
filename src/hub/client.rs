@@ -304,7 +304,7 @@ impl Client {
         format!("{}/{}", self.base, path.trim_start_matches('/'))
     }
 
-    fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+    pub(super) fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         self.with_retry(path, |t| {
             let mut req = self.agent.get(self.url(path));
             if let Some(t) = t {

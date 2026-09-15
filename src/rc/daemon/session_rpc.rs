@@ -88,6 +88,78 @@ impl Daemon {
         }
 
         let (operation, guard_sensitive) = match f.method() {
+            method::SESSION_COMMANDS | method::SESSION_COMMAND => {
+                let p: crate::protocol::SessionSubscribe = f.params_as()?;
+                let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
+                let name = if f.method() == method::SESSION_COMMANDS {
+                    "commands".to_string()
+                } else {
+                    f.params
+                        .as_ref()
+                        .and_then(|p| p["name"].as_str())
+                        .filter(|name| !name.is_empty() && name.len() <= 128)
+                        .ok_or_else(|| {
+                            RpcError::new(ErrorCode::MalformedFrame, "A command name is required")
+                        })?
+                        .to_string()
+                };
+                let arguments = f
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("arguments"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
+                (
+                    SessionRpcOperation::Value {
+                        tx: d.tx,
+                        command: Command::Runtime {
+                            name,
+                            arguments,
+                            reply: ticket,
+                        },
+                        reply: SessionReceipt(reply),
+                    },
+                    false,
+                )
+            }
+            method::SESSION_MODEL | method::SESSION_SET_MODEL => {
+                let p: crate::protocol::SessionSubscribe = f.params_as()?;
+                let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
+                let model = if f.method() == method::SESSION_SET_MODEL {
+                    let value = f
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("model"))
+                        .and_then(|m| m.as_str())
+                        .filter(|m| {
+                            !m.trim().is_empty()
+                                && m.len() <= 256
+                                && !m.chars().any(char::is_control)
+                        })
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                ErrorCode::MalformedFrame,
+                                "model must be a nonempty model identifier",
+                            )
+                        })?;
+                    Some(value.to_string())
+                } else {
+                    None
+                };
+                let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
+                (
+                    SessionRpcOperation::Value {
+                        tx: d.tx,
+                        command: Command::Model {
+                            model,
+                            reply: ticket,
+                        },
+                        reply: SessionReceipt(reply),
+                    },
+                    false,
+                )
+            }
             method::TURN_START => {
                 let p: TurnStart = f.params_as()?;
                 // `Drive`: adding model input spends the session's capability.
@@ -97,7 +169,7 @@ impl Daemon {
                 // a late exact response, every crash restarts as Plan until
                 // this exact opaque token is resolved.
                 let guard_attempt = self.prearm_turn_guard_attempt(&p.session_id)?;
-                let (ticket, reply) = crate::rc::ticket::ticket();
+                let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 (
                     SessionRpcOperation::Turn {
                         tx: d.tx,
@@ -120,7 +192,7 @@ impl Daemon {
             method::TURN_STEER => {
                 let p: TurnSteer = f.params_as()?;
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
-                let (ticket, reply) = crate::rc::ticket::ticket();
+                let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 (
                     SessionRpcOperation::Steer {
                         tx: d.tx,
@@ -180,7 +252,7 @@ impl Daemon {
                         .get(&p.session_id)
                         .map(|entry| &entry.guard_attempts),
                 );
-                let (ticket, reply) = crate::rc::ticket::ticket();
+                let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 (
                     SessionRpcOperation::SetPermissionMode {
                         tx: d.tx,
@@ -203,7 +275,7 @@ impl Daemon {
                 // Interrupt is a brake: a dangerous session must remain
                 // stoppable by an operator.
                 let d = self.session_channel(&p.session_id, &caller, Need::Brake)?;
-                let (ticket, reply) = crate::rc::ticket::ticket();
+                let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 (
                     SessionRpcOperation::Interrupt {
                         tx: d.tx,
@@ -260,7 +332,7 @@ impl Daemon {
                     DangerAuthorization::NotRequired
                 };
                 let approval_id = p.approval_id.clone();
-                let (ticket, reply) = crate::rc::ticket::ticket();
+                let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 (
                     SessionRpcOperation::Approve {
                         tx: d.tx,
@@ -748,6 +820,10 @@ impl PendingSessionRpc {
             operation,
         } = self;
         let completion = match operation {
+            PendingSessionRpcOperation::Value(mut reply) => {
+                let _ = reply.wait_until_closed().await;
+                SessionRpcCompletion::None
+            }
             PendingSessionRpcOperation::Steer(mut reply) => {
                 let _ = reply.wait_until_closed().await;
                 SessionRpcCompletion::None
@@ -1001,6 +1077,47 @@ impl PreparedSessionRpc {
                         )
                         .await
                     }
+                }
+            }
+            SessionRpcOperation::Value {
+                tx,
+                command,
+                mut reply,
+            } => {
+                if let Err(error) = enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await
+                {
+                    return finish_prepared_session_rpc(
+                        daemon,
+                        session_id,
+                        generation,
+                        serial,
+                        SessionRpcCompletion::None,
+                        Err(error),
+                    )
+                    .await;
+                }
+                match reply_within_state(reply.get_mut(), stop).await {
+                    ReplyWait::Done(result) => {
+                        let response = result;
+                        finish_prepared_session_rpc(
+                            daemon,
+                            session_id,
+                            generation,
+                            serial,
+                            SessionRpcCompletion::None,
+                            response,
+                        )
+                        .await
+                    }
+                    ReplyWait::InFlight(error) => ExecutedSessionRpc {
+                        response: Err(error),
+                        pending: Some(PendingSessionRpc {
+                            session_id,
+                            generation,
+                            serial,
+                            operation: PendingSessionRpcOperation::Value(reply),
+                        }),
+                    },
                 }
             }
             SessionRpcOperation::Steer {

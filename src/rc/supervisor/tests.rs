@@ -1,5 +1,18 @@
 use super::*;
 
+#[test]
+fn oversized_native_compactions_keep_summary_evidence_and_page_identity() {
+    let native = serde_json::json!({"type":"compacted","ordinal":42,"uuid":"native-row","payload":{"message":"Compaction summary","replacement_history":"x".repeat(RAW_LINE_CAP)}});
+    let (out, cut) = cap_raw(native);
+    assert!(cut);
+    assert_eq!(out["type"], "compacted");
+    assert_eq!(out["ordinal"], 42);
+    assert_eq!(out["uuid"], "native-row");
+    assert_eq!(out["payload"]["message"], "Compaction summary");
+    assert!(out["payload"].get("replacement_history").is_none());
+    assert!(serde_json::to_vec(&out).unwrap().len() < RAW_LINE_CAP);
+}
+
 fn harness_test_session(driver: AnyDriver, runtime: &str, status: SessionStatus) -> Session {
     harness_test_session_with_channels(driver, runtime, status).0
 }
@@ -1327,6 +1340,7 @@ async fn run_ambiguous_claude_approval(
                 decision: crate::protocol::ApprovalDecision::Allow,
                 scope,
                 message: None,
+                answers: None,
                 by: Some("owner".into()),
             },
             caller_is_owner: true,
@@ -1886,6 +1900,7 @@ fn a_non_owner_cannot_smuggle_text_in_through_a_denial() {
         decision: ApprovalDecision::Deny,
         scope: ApprovalScope::Session,
         message: Some(attack.into()),
+        answers: None,
         by: Some("mallory".into()),
     };
 

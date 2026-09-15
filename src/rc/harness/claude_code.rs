@@ -35,6 +35,8 @@
 //!   [`Delivery::AtToolBoundary`]: the UI must show "queued", or on a weak
 //!   network the user assumes it was lost and sends it three more times.
 
+mod commands;
+
 use super::proc::{LaunchError, Line, Proc, Pushback};
 use super::{
     ApprovalOutcome, HarnessEvent, LaunchSpec, PermissionModeChangeError,
@@ -281,6 +283,7 @@ fn permission_mode_response(
 /// One outstanding `can_use_tool` request.
 struct PendingApproval {
     request_id: String,
+    question_input: Option<Value>,
     /// Verbatim `permission_suggestions` from the request, if it carried any.
     suggestions: Vec<Value>,
 }
@@ -292,6 +295,10 @@ pub struct ClaudeCodeDriver {
     /// Turn id we synthesize. claude-code has no turn id of its own on the
     /// stream, so we mint one per user message and close it on `result`.
     current_turn: Option<String>,
+    /// An interrupt echo precedes its terminal result. Do not admit new input
+    /// until that result drains or it can close the next turn by mistake.
+    interrupt_draining: bool,
+    stream_items: std::collections::HashMap<u64, String>,
     /// `tool_use_id` → the control `request_id` we must answer with, plus the
     /// `permission_suggestions` that came with it.
     ///
@@ -304,6 +311,7 @@ pub struct ClaudeCodeDriver {
     /// Current permission mode, kept so viewers joining late render the right
     /// control without asking the harness.
     mode: PermissionMode,
+    model: Option<String>,
     /// Set once the first `system/init` arrives.
     ready_sent: bool,
     /// Slash commands the CLI advertised in its handshake. Surfaced to viewers
@@ -331,6 +339,7 @@ pub struct ClaudeCodeDriver {
     /// stdin, so only the head of the queue is compared against.
     awaiting_echoes: std::collections::VecDeque<String>,
     pub(super) next_prompt_id: Option<String>,
+    goal_query_pending: bool,
 }
 
 /// The exact command line `launch` runs, minus the spawn.
@@ -410,13 +419,17 @@ impl ClaudeCodeDriver {
             session_id,
             cwd: spec.cwd,
             current_turn: None,
+            interrupt_draining: false,
+            stream_items: Default::default(),
             pending_approvals: Default::default(),
             mode,
+            model: spec.model,
             ready_sent: false,
             commands: vec![],
             pushback: Default::default(),
             awaiting_echoes: Default::default(),
             next_prompt_id: None,
+            goal_query_pending: false,
         })
     }
 
@@ -424,18 +437,25 @@ impl ClaudeCodeDriver {
         Some(&self.session_id)
     }
 
-    /// `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Known up front
-    /// because we chose the session id — no waiting, no globbing.
+    /// Use the adapter's configuration root so live output and settlement
+    /// resolve the same transcript, including custom CLAUDE_CONFIG_DIR values.
     pub fn transcript_path(&self) -> Option<PathBuf> {
-        let home = crate::infra::config::user_home()?;
         Some(
-            home.join(".claude/projects")
+            crate::adapter::claude_code::projects_dir()
+                .ok()?
                 .join(crate::adapter::claude_code::slug_for(&self.cwd))
                 .join(format!("{}.jsonl", self.session_id)),
         )
     }
 
     pub async fn start_turn(&mut self, message: &str) -> super::TurnStartOutcome {
+        if self.interrupt_draining {
+            return super::TurnStartOutcome::RetryableNotAccepted {
+                message:
+                    "the interrupted Claude turn is still closing; retry after its result drains"
+                        .into(),
+            };
+        }
         // A running turn is refused, not silently overwritten into `current_turn`. Overwriting
         // orphans the running turn's id: its `result` closes the **new** id and the old turn
         // never gets its own `turn.completed` — that turn spins forever in the web interface,
@@ -562,6 +582,16 @@ impl ClaudeCodeDriver {
         let body = match r.decision {
             ApprovalDecision::Allow => {
                 let mut body = json!({"behavior":"allow"});
+                if let Some(mut input) = pending.question_input.clone() {
+                    let answers = r.answers.clone().unwrap_or_default();
+                    input["answers"] = json!(
+                        answers
+                            .into_iter()
+                            .map(|(key, value)| (key, value.join(", ")))
+                            .collect::<std::collections::BTreeMap<_, _>>()
+                    );
+                    body["updatedInput"] = input;
+                }
                 // "Allow, and stop asking" = echo the suggestions the CLI
                 // attached to this very request: answering with
                 // `updatedPermissions: [{"type":"setMode","mode":"acceptEdits",
@@ -670,6 +700,44 @@ impl ClaudeCodeDriver {
         }
     }
 
+    pub async fn model_control(&mut self, model: Option<&str>) -> crate::Result<Value> {
+        if let Some(model) = model {
+            let id = uuid::Uuid::new_v4().to_string();
+            self.proc
+                .write_line(&json!({"type":"control_request", "request_id":id,
+                "request":{"subtype":"set_model", "model":model}}))
+                .await?;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while let Some(line) = self.proc.next().await {
+                    if let Line::Json(v) = line.line()
+                        && v.pointer("/response/request_id").and_then(Value::as_str)
+                            == Some(id.as_str())
+                    {
+                        anyhow::ensure!(
+                            v.pointer("/response/subtype").and_then(Value::as_str)
+                                == Some("success"),
+                            "Claude refused model change: {}",
+                            v["response"]
+                        );
+                        return Ok(());
+                    }
+                    self.pushback.push(line);
+                }
+                anyhow::bail!("Claude exited before confirming the model change")
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => self.model = Some(model.to_string()),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    self.model = None;
+                    anyhow::bail!("Model change outcome is unknown; reconnect before retrying");
+                }
+            }
+        }
+        Ok(json!({"model":self.model, "applied":"immediate"}))
+    }
+
     pub fn permission_mode(&self) -> PermissionMode {
         self.mode
     }
@@ -713,8 +781,44 @@ impl ClaudeCodeDriver {
     fn classify(&mut self, v: Value) -> Option<HarnessEvent> {
         let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
         match ty {
+            "assistant" if v.get("local_command_source").is_some() => {
+                let text = v["message"]["content"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                commands::goal_from_text(&text).map(|goal| HarnessEvent::GoalUpdated { goal })
+            }
             "system" => {
                 let sub = v.get("subtype").and_then(|x| x.as_str()).unwrap_or("");
+                if sub == "api_retry" {
+                    let attempt = v.get("attempt").and_then(Value::as_u64).unwrap_or(0);
+                    let seconds = v
+                        .get("retry_delay_ms")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0)
+                        / 1000.0;
+                    return Some(HarnessEvent::Progress {
+                        text: format!(
+                            "Retrying model connection (attempt {attempt}, {:.0}s)",
+                            seconds.ceil()
+                        ),
+                    });
+                }
+                if sub == "status" && v.get("status").and_then(Value::as_str) == Some("compacting")
+                {
+                    return Some(HarnessEvent::Progress {
+                        text: "Compacting conversation".into(),
+                    });
+                }
+                if sub == "init" {
+                    self.model = v
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or(self.model.clone());
+                }
                 if sub == "init" && !self.ready_sent {
                     self.ready_sent = true;
                     if let Some(sid) = v.get("session_id").and_then(|x| x.as_str()) {
@@ -732,25 +836,43 @@ impl ClaudeCodeDriver {
             "control_response" => {
                 let r = v.get("response")?.get("response")?;
                 let arr = r.get("commands")?.as_array()?;
-                let harvested = machine_commands(
-                    arr.iter()
-                        .filter_map(|c| {
-                            let description = c
-                                .get("description")
+                let mut harvested: Vec<crate::protocol::SlashCommand> = arr
+                    .iter()
+                    .filter_map(|c| {
+                        let description = c
+                            .get("description")
+                            .and_then(|x| x.as_str())
+                            .map(String::from);
+                        Some(crate::protocol::SlashCommand {
+                            name: c.get("name")?.as_str()?.to_string(),
+                            description,
+                            argument_hint: c
+                                .get("argumentHint")
                                 .and_then(|x| x.as_str())
-                                .map(String::from);
-                            Some(crate::protocol::SlashCommand {
-                                name: c.get("name")?.as_str()?.to_string(),
-                                description,
-                                argument_hint: c
-                                    .get("argumentHint")
-                                    .and_then(|x| x.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .map(String::from),
-                            })
+                                .filter(|s| !s.is_empty())
+                                .map(String::from),
                         })
-                        .collect(),
-                );
+                    })
+                    .collect();
+                for command in arr {
+                    for alias in command["aliases"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                    {
+                        if !harvested.iter().any(|entry| entry.name == alias) {
+                            harvested.push(crate::protocol::SlashCommand {
+                                name: alias.to_string(),
+                                description: command["description"].as_str().map(String::from),
+                                argument_hint: command["argumentHint"]
+                                    .as_str()
+                                    .filter(|value| !value.is_empty())
+                                    .map(String::from),
+                            });
+                        }
+                    }
+                }
                 // Save a copy so **the next** `rc.register` can report it.
                 //
                 // Capabilities are reported at the moment of registration, while the catalogue
@@ -762,7 +884,8 @@ impl ClaudeCodeDriver {
                 // A failed write does not matter: the next handshake asks again, and the cost
                 // is completion appearing one session later.
                 if !harvested.is_empty() && harvested != self.commands {
-                    let _ = crate::rc::save_json(COMMAND_CACHE, &harvested);
+                    let _ =
+                        crate::rc::save_json(COMMAND_CACHE, &machine_commands(harvested.clone()));
                 }
                 self.commands = harvested;
                 None
@@ -799,6 +922,7 @@ impl ClaudeCodeDriver {
                     approval_id.clone(),
                     PendingApproval {
                         request_id,
+                        question_input: (tool == "AskUserQuestion").then(|| input.clone()),
                         suggestions,
                     },
                 );
@@ -856,6 +980,12 @@ impl ClaudeCodeDriver {
                                 ),
                                 _ => (ItemKind::Other, None),
                             };
+                        let id = cb
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        self.stream_items.insert(idx, id);
                         Some(HarnessEvent::ItemStarted {
                             item_id: self.item_id(idx),
                             kind,
@@ -899,12 +1029,22 @@ impl ClaudeCodeDriver {
                         .and_then(|b| b.get("text").and_then(|x| x.as_str()).map(String::from)),
                     _ => None,
                 }?;
+                // Native control acknowledgements use replayed user-shaped records,
+                // but they have no model result and cannot open a turn. A matching
+                // submitted prompt still owns its echo even if it contains this markup.
+                if v.get("isReplay").and_then(Value::as_bool) == Some(true)
+                    && text.starts_with("<local-command-stdout>")
+                    && self.awaiting_echoes.front() != Some(&text)
+                {
+                    return None;
+                }
                 if text.starts_with("[Request interrupted") {
                     // No open turn = this interrupt closed nothing (the turn ended on its
                     // own and the interrupt's echo arrived a step late). Sending
                     // `turn.completed` here is **forbidden**: see the ghost-turn argument in
                     // the `result` branch below.
                     let turn = self.current_turn.take()?;
+                    self.interrupt_draining = true;
                     return Some(HarnessEvent::TurnCompleted {
                         turn_id: turn,
                         outcome: TurnOutcome::Interrupted,
@@ -946,7 +1086,16 @@ impl ClaudeCodeDriver {
                 })
             }
 
+            "result" if self.goal_query_pending && v["local_command"] == "goal" => {
+                self.goal_query_pending = false;
+                commands::goal_from_text(v["result"].as_str().unwrap_or_default())
+                    .map(|goal| HarnessEvent::GoalUpdated { goal })
+            }
             "result" => {
+                if self.interrupt_draining {
+                    self.interrupt_draining = false;
+                    return None;
+                }
                 // **With no open turn, nothing is closed.**
                 //
                 // After an interrupt the CLI still sends a `result` for that turn, and a
@@ -1003,7 +1152,10 @@ impl ClaudeCodeDriver {
 
     /// Block index → a stable item id within the current turn.
     fn item_id(&self, index: u64) -> String {
-        format!("{}:{index}", self.current_turn.as_deref().unwrap_or("t"))
+        self.stream_items
+            .get(&index)
+            .cloned()
+            .unwrap_or_else(|| format!("{}:{index}", self.current_turn.as_deref().unwrap_or("t")))
     }
 
     pub async fn shutdown(&mut self) -> crate::Result<()> {
@@ -1017,13 +1169,17 @@ impl ClaudeCodeDriver {
             session_id: "test-session".into(),
             cwd: PathBuf::from("/"),
             current_turn: Some("test-turn".into()),
+            interrupt_draining: false,
+            stream_items: Default::default(),
             pending_approvals: Default::default(),
+            model: None,
             mode: PermissionMode::Default,
             ready_sent: true,
             commands: vec![],
             pushback: Default::default(),
             awaiting_echoes: Default::default(),
             next_prompt_id: None,
+            goal_query_pending: false,
         }
     }
 
@@ -1051,6 +1207,7 @@ impl ClaudeCodeDriver {
             approval_id.into(),
             PendingApproval {
                 request_id: "native-request".into(),
+                question_input: None,
                 suggestions,
             },
         );
@@ -1208,20 +1365,110 @@ mod tests {
 
     /// A driver that exists only to feed `classify()`: `cat` stands in for `Proc`, and these
     /// tests never read its output.
+    #[tokio::test]
+    async fn native_question_answers_preserve_input_and_request_identity() {
+        let mut driver = probe();
+        let input = json!({"questions":[{"question":"Choose a label", "options":[{"label":"Blue"},{"label":"Green"}], "multiSelect":false}]});
+        let event = driver.classify(json!({"type":"control_request","request_id":"native-question", "request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"q1","input":input}}));
+        assert!(matches!(event, Some(HarnessEvent::Approval(_))));
+        let response = ApprovalResponse {
+            approval_id: "q1".into(),
+            session_id: "test".into(),
+            decision: ApprovalDecision::Allow,
+            scope: ApprovalScope::Once,
+            message: None,
+            by: None,
+            answers: Some(std::collections::BTreeMap::from([(
+                "Choose a label".into(),
+                vec!["Blue".into()],
+            )])),
+        };
+        assert!(matches!(
+            driver.answer_approval(&response).await,
+            ApprovalOutcome::Applied { .. }
+        ));
+        let line = driver.proc.next().await.unwrap().into_line();
+        let Line::Json(value) = line else {
+            panic!("expected native response")
+        };
+        assert_eq!(value["response"]["request_id"], "native-question");
+        assert_eq!(
+            value["response"]["response"]["updatedInput"]["questions"],
+            input["questions"]
+        );
+        assert_eq!(
+            value["response"]["response"]["updatedInput"]["answers"]["Choose a label"],
+            "Blue"
+        );
+        driver.shutdown().await.unwrap();
+    }
+
     fn probe() -> ClaudeCodeDriver {
         ClaudeCodeDriver {
             proc: Proc::spawn("cat", &[], &PathBuf::from("/"), &[]).unwrap(),
             session_id: "sid".into(),
             cwd: PathBuf::from("/"),
             current_turn: None,
+            interrupt_draining: false,
+            stream_items: Default::default(),
             pending_approvals: Default::default(),
+            model: None,
             mode: PermissionMode::Default,
             ready_sent: true,
             commands: vec![],
             pushback: Default::default(),
             awaiting_echoes: Default::default(),
             next_prompt_id: None,
+            goal_query_pending: false,
         }
+    }
+
+    #[tokio::test]
+    async fn replayed_model_control_output_does_not_open_a_phantom_turn() {
+        let mut driver = probe();
+        let text = "<local-command-stdout>Set model to example</local-command-stdout>";
+        let record =
+            json!({"type":"user","isReplay":true,"message":{"role":"user","content":text}});
+        assert!(driver.classify(record.clone()).is_none());
+        assert!(driver.current_turn.is_none());
+        driver.awaiting_echoes.push_back(text.into());
+        assert!(matches!(
+            driver.classify(record),
+            Some(HarnessEvent::TurnStarted { .. })
+        ));
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_control_waits_for_native_ack_and_preserves_interleaved_events() {
+        let mut driver = probe();
+        driver.proc.shutdown().await.unwrap();
+        let script = r#"import sys,json
+for line in sys.stdin:
+    v=json.loads(line)
+    assert v['request']['subtype']=='set_model'
+    print(json.dumps({'type':'system','subtype':'status','status':'compacting'}),flush=True)
+    print(json.dumps({'type':'control_response','response':{'request_id':v['request_id'],'subtype':'error' if v['request']['model']=='refuse' else 'success','response':{}}}),flush=True)
+"#;
+        driver.proc = Proc::spawn(
+            "python3",
+            &["-u".into(), "-c".into(), script.into()],
+            &PathBuf::from("/"),
+            &[],
+        )
+        .unwrap();
+        let response = driver.model_control(Some("native-alias")).await.unwrap();
+        assert_eq!(response["model"], "native-alias");
+        assert_eq!(response["applied"], "immediate");
+        assert!(
+            matches!(driver.pushback.pop_front(), Some(Line::Json(value)) if value["status"] == "compacting")
+        );
+        assert!(driver.model_control(Some("refuse")).await.is_err());
+        assert_eq!(
+            driver.model_control(None).await.unwrap()["model"],
+            "native-alias"
+        );
+        driver.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1273,6 +1520,31 @@ mod tests {
     fn interrupted_line() -> Value {
         json!({"type":"user","message":{"role":"user",
                "content":[{"type":"text","text":"[Request interrupted by user]"}]}})
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_result_must_drain_before_a_new_prompt_is_admitted() {
+        let mut driver = probe();
+        driver.current_turn = Some("interrupted-turn".into());
+        assert!(driver.classify(interrupted_line()).is_some());
+        assert!(matches!(
+            driver.start_turn("next prompt").await,
+            super::super::TurnStartOutcome::RetryableNotAccepted { .. }
+        ));
+        assert!(driver.current_turn.is_none());
+        assert!(
+            driver
+                .classify(json!({"type":"result","is_error":true}))
+                .is_none()
+        );
+        assert!(matches!(
+            driver.start_turn("next prompt").await,
+            super::super::TurnStartOutcome::Accepted { .. }
+        ));
+        let current = driver.current_turn.clone().unwrap();
+        assert!(
+            matches!(driver.classify(json!({"type":"result","is_error":false})), Some(HarnessEvent::TurnCompleted { turn_id, .. }) if turn_id == current)
+        );
     }
 
     /// One interrupt draws one end line.
@@ -1358,6 +1630,7 @@ mod tests {
             decision: ApprovalDecision::Allow,
             scope: ApprovalScope::Once,
             message: None,
+            answers: None,
             by: Some("owner".into()),
         };
         assert!(matches!(
@@ -1377,6 +1650,7 @@ mod tests {
             decision: ApprovalDecision::Allow,
             scope: ApprovalScope::Session,
             message: None,
+            answers: None,
             by: Some("owner".into()),
         }
     }
@@ -1386,6 +1660,7 @@ mod tests {
             "approval-1".into(),
             PendingApproval {
                 request_id: "native-request-1".into(),
+                question_input: None,
                 suggestions: vec![json!({
                     "type": "setMode",
                     "mode": "acceptEdits",

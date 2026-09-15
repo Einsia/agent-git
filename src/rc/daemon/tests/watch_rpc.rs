@@ -43,6 +43,7 @@ fn prepared(scan: WatchScan, cwd: PathBuf) -> PreparedWatch {
         request: scan.request,
         roots: scan.snapshot.roots,
         runtime: "codex".into(),
+        seed: None,
         source: WatchSource::File {
             path: cwd.join("history.jsonl"),
             offset: 0,
@@ -52,6 +53,7 @@ fn prepared(scan: WatchScan, cwd: PathBuf) -> PreparedWatch {
         from_line: 0,
         total_lines: 0,
         absolute_lines: true,
+        before_cursor: 0,
     }
 }
 

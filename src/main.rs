@@ -271,6 +271,13 @@ impl Startup {
 
 fn startup_for(command: &Commands) -> Startup {
     match command {
+        Commands::Rc(args) if matches!(args.action, commands::rc::Action::Tunnel) => {
+            Startup::ToolDispatcher
+        }
+        #[cfg(unix)]
+        Commands::Rc(args) if matches!(args.action, commands::rc::Action::Local(_)) => {
+            Startup::ToolDispatcher
+        }
         Commands::Status(_) => Startup::Inspect,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
@@ -431,6 +438,17 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
 mod startup_tests {
     use super::*;
     use clap::Parser;
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_protocol_commands_do_not_migrate_unrelated_repositories() {
+        for action in ["start", "status", "bridge", "catalog"] {
+            let cli = Cli::try_parse_from(["agit", "rc", "local", action]).unwrap();
+            let startup = startup_for(&cli.command.unwrap());
+            assert_eq!(startup, Startup::ToolDispatcher);
+            assert!(!startup.allows_nudge());
+        }
+    }
 
     #[test]
     fn audited_push_defers_storage_and_never_admits_an_update_nudge() {

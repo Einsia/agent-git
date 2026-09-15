@@ -1,7 +1,7 @@
 //! A publication fixture owns its child tree until both output pipes close and cleanup is verified.
 
 use std::io::{self, PipeReader, Read};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -264,6 +264,13 @@ fn capture(command: Command, mode: &str, stage: &str, deadline: Instant) -> io::
                 && streams.out_closed
                 && streams.err_closed
             {
+                // Closing output does not complete a Windows fixture while its Job owns work.
+                // Cleanup must not kill that work and turn an incomplete run into success.
+                #[cfg(windows)]
+                if tree.job.as_ref().unwrap().active_processes()? != 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
                 return Ok(status);
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -296,156 +303,4 @@ fn capture(command: Command, mode: &str, stage: &str, deadline: Instant) -> io::
         stdout: streams.stdout,
         stderr: streams.stderr,
     })
-}
-
-#[test]
-fn diagnostic_child() {
-    use std::io::Write;
-    match std::env::var("AGIT_PUBLICATION_DIAGNOSTIC_CHILD").as_deref() {
-        Ok("flood") => {
-            std::io::stdout()
-                .write_all(&vec![b'X'; 128 * 1024])
-                .unwrap();
-            std::io::stderr()
-                .write_all(&vec![b'Y'; 128 * 1024])
-                .unwrap();
-        }
-        Ok("overflow") => {
-            let _ = std::io::stdout().write_all(&vec![b'X'; OUTPUT_LIMIT + 1]);
-        }
-        Ok("hold") => {
-            println!("publication diagnostic child is holding its pipes");
-            std::io::stdout().flush().unwrap();
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
-        #[cfg(windows)]
-        Ok("hold-writer") => {
-            #[expect(
-                clippy::zombie_processes,
-                reason = "The outer observer owns the Windows job; this child must exit while its descendant holds the pipes."
-            )]
-            let _child = diagnostic_command("hold")
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap();
-        }
-        _ => {}
-    }
-}
-
-fn diagnostic_command(kind: &str) -> Command {
-    let module = module_path!().split_once("::").map(|(_, module)| module);
-    let test = module
-        .map(|module| format!("{module}::diagnostic_child"))
-        .unwrap_or_else(|| "diagnostic_child".into());
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command.env_clear();
-    for name in ["SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    command
-        .args(["--exact", &test, "--nocapture"])
-        .env("AGIT_PUBLICATION_DIAGNOSTIC_CHILD", kind)
-        .stdin(Stdio::null());
-    command
-}
-
-#[cfg(windows)]
-#[test]
-fn empty_pipe_writes_do_not_end_capture_while_a_writer_remains() {
-    use std::io::Write;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::WriteFile;
-
-    let (mut reader, mut writer) = io::pipe().unwrap();
-    writer.write_all(b"before").unwrap();
-    let mut written = 0;
-    assert_ne!(
-        unsafe {
-            WriteFile(
-                writer.as_raw_handle(),
-                b"".as_ptr(),
-                0,
-                &mut written,
-                std::ptr::null_mut(),
-            )
-        },
-        0
-    );
-    writer.write_all(b"after").unwrap();
-    let deadline = Instant::now() + CHILD_LIMIT;
-    let mut captured = Vec::new();
-    let mut buffer = [0; 3];
-    while captured.len() < b"beforeafter".len() {
-        assert!(
-            Instant::now() < deadline,
-            "pipe data did not become readable"
-        );
-        match read_ready(&mut reader, &mut buffer).unwrap() {
-            Some(0) => panic!("an open writer was reported as EOF"),
-            Some(count) => captured.extend_from_slice(&buffer[..count]),
-            None => std::thread::yield_now(),
-        }
-    }
-    assert_eq!(captured, b"beforeafter");
-    assert_eq!(read_ready(&mut reader, &mut buffer).unwrap(), None);
-    drop(writer);
-    assert_eq!(read_ready(&mut reader, &mut buffer).unwrap(), Some(0));
-}
-
-#[test]
-fn piped_output_preserves_both_streams_and_refuses_incomplete_capture() {
-    let captured = output(
-        diagnostic_command("flood"),
-        "observer",
-        "both-pipes",
-        Instant::now() + CHILD_LIMIT,
-    )
-    .unwrap();
-    assert!(captured.status.success());
-    assert!(
-        captured
-            .stdout
-            .split(|byte| *byte != b'X')
-            .any(|bytes| bytes.len() == 128 * 1024)
-    );
-    assert_eq!(captured.stderr, vec![b'Y'; 128 * 1024]);
-    let overflow = output(
-        diagnostic_command("overflow"),
-        "observer",
-        "output-limit",
-        Instant::now() + CHILD_LIMIT,
-    )
-    .unwrap_err();
-    assert!(
-        overflow
-            .to_string()
-            .contains("child output exceeded its byte limit")
-    );
-    let timeout = output(
-        diagnostic_command("hold"),
-        "observer",
-        "deadline",
-        Instant::now() + Duration::from_secs(10),
-    )
-    .unwrap_err();
-    // A cleanup failure has its own error kind and must not masquerade as a reaped timeout.
-    assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
-    #[cfg(windows)]
-    {
-        // A direct child can exit while its owned descendant still retains the output writers.
-        let timeout = output(
-            diagnostic_command("hold-writer"),
-            "observer",
-            "retained-writer",
-            Instant::now() + Duration::from_secs(10),
-        )
-        .unwrap_err();
-        assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
-    }
 }

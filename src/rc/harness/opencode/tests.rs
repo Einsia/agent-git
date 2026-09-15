@@ -136,6 +136,7 @@ async fn approval_scope_is_single_use_and_native_request_identity_is_not_recycle
         decision: ApprovalDecision::Allow,
         scope: ApprovalScope::Session,
         message: None,
+        answers: None,
         by: None,
     };
     assert!(matches!(
@@ -416,6 +417,7 @@ async fn native_exit_captures_durable_incomplete_turns() {
                             decision: ApprovalDecision::Allow,
                             scope: ApprovalScope::Once,
                             message: None,
+                            answers: None,
                             by: None,
                         })
                         .await,
@@ -493,6 +495,7 @@ async fn native_cancelled_approval_does_not_block_the_next_turn() {
                                     decision: ApprovalDecision::Deny,
                                     scope: ApprovalScope::Once,
                                     message: None,
+                                    answers: None,
                                     by: None,
                                 })
                                 .await,
@@ -591,7 +594,8 @@ async fn native_opencode_smoke() {
                                 decision,
                                 scope: ApprovalScope::Once,
                                 message: None,
-                                by: None
+                                by: None,
+                                answers: None,
                             })
                             .await,
                         ApprovalOutcome::Applied { .. }

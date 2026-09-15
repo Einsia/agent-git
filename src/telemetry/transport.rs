@@ -352,11 +352,11 @@ mod tests {
     fn queue_bounds_remove_expired_generations_and_keep_stable_event_ids() {
         let now = chrono::Utc::now().timestamp_millis();
         let mut queue = Queue::default();
-        for index in 0..1100 {
+        for index in 0..=MAX_EVENTS {
             queue.entries.push(Entry {
                 route: "synthetic".into(),
                 generation: 1,
-                event: event(now - index),
+                event: event(now - index as i64),
             });
         }
         let last = queue.entries.last().unwrap().event.uuid;
@@ -371,14 +371,23 @@ mod tests {
             event: event(now - TTL_MS - 1),
         });
         prune(&mut queue, 1, now);
-        assert!(queue.entries.len() <= MAX_EVENTS);
+        assert_eq!(queue.entries.len(), MAX_EVENTS);
+        assert!(queue.entries.iter().all(|entry| entry.generation == 1
+            && now - entry.event.timestamp.timestamp_millis() <= TTL_MS));
         assert_eq!(queue.entries.last().unwrap().event.uuid, last);
+        let padding_bytes = MAX_EVENT_BYTES / 2;
+        let byte_limit_entries = MAX_QUEUE_BYTES as usize / padding_bytes + 1;
+        queue
+            .entries
+            .drain(..queue.entries.len() - byte_limit_entries);
         for entry in &mut queue.entries {
-            entry.event.properties.insert(
-                "synthetic_padding".into(),
-                json!("x".repeat(MAX_EVENT_BYTES)),
-            );
+            entry
+                .event
+                .properties
+                .insert("synthetic_padding".into(), json!("x".repeat(padding_bytes)));
+            assert!(serde_json::to_vec(&entry.event).unwrap().len() <= MAX_EVENT_BYTES);
         }
+        assert!(serde_json::to_vec(&queue).unwrap().len() as u64 > MAX_QUEUE_BYTES);
         prune(&mut queue, 1, now);
         assert!(serde_json::to_vec(&queue).unwrap().len() as u64 <= MAX_QUEUE_BYTES);
         assert_eq!(queue.entries.last().unwrap().event.uuid, last);

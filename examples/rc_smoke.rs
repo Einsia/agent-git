@@ -90,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let (_settlement_tx, settlement_rx) =
         tokio::sync::watch::channel(agit::rc::supervisor::SettlementState {
             epoch: 1,
+            local_owner: false,
             // The smoke harness has no hub negotiation and no repository
             // lineage, so settlement remains disabled.
             agent_identity_v1: false,
@@ -177,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
                             agit::protocol::ApprovalDecision::Allow
                         },
                         scope: agit::protocol::ApprovalScope::Once,
+                        answers: None,
                         message: deny_tools.then(|| "This smoke test permits no tool use.".into()),
                         by: Some("smoke".into()),
                     },

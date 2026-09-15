@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "crates/agit-tunnel", "crates/agit-controller", "crates/agit-peer"]
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "agit"
 # This number is at once the version of the npm package @einsia/agent-git, the
@@ -87,15 +92,17 @@ cli = [
 # The protocol *types* (`crate::protocol`) are deliberately NOT gated — the hub
 # compiles against them.
 rc = [
+    "dep:agit-peer",
+    "dep:agit-controller",
+    "dep:agit-tunnel",
+    "dep:url",
+    "dep:shlex",
     "secret-vault",
     "dep:tokio",
     "dep:tokio-tungstenite",
     "dep:futures-util",
     "dep:portable-pty",
     "dep:base64",
-    "dep:hyper-util",
-    "dep:httparse",
-    "dep:tower-service",
 ]
 
 # The device-local vault for low-entropy secrets. A backend reusing domain with
@@ -110,6 +117,9 @@ secret-vault = [
 ]
 
 [dependencies]
+agit-peer = { path = "crates/agit-peer", optional = true, features = ["cloud-client"] }
+agit-controller = { path = "crates/agit-controller", optional = true }
+agit-tunnel = { path = "crates/agit-tunnel", optional = true, features = ["worker"] }
 # Object construction is in-process; ref publication remains an expected-old transaction.
 gix = { version = "0.87.1", default-features = false, features = ["sha1", "sha256"], optional = true }
 # ── CLI ─────────────────────────────────────────────────────────────────
@@ -226,15 +236,15 @@ libc = "0.2"
 # ── rc (agitd) ───────────────────────────────────────────────────────────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net", "fs", "signal"], optional = true }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
-hyper-util = { version = "0.1.20", default-features = false, features = ["client-legacy", "client-proxy", "tokio"], optional = true }
-httparse = { version = "1.10", optional = true }
-tower-service = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 # The terminal needs a real PTY: without one `vim`, `top` and anything that checks
 # isatty do not work, and the whole point of that bottom-right pane is "run real
 # interactive commands". The session path deliberately does **not** use a PTY (see
 # rc/harness/mod.rs); the two want opposite things.
 portable-pty = { version = "0.9", optional = true }
+
+shlex = { version = "2", optional = true }
+url = { version = "2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3.7", optional = true }
@@ -261,6 +271,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+agit-tunnel = { path = "crates/agit-tunnel", features = ["test-support"] }
 shlex = "2"
 # `test-util` makes `#[tokio::test(start_paused = true)]` usable: the tests for
 # timeout semantics wait on the session timeout, and waiting on it in real time

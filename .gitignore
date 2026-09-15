@@ -16,3 +16,6 @@
 # workspace. Ignore it so the next `git add -A` does not commit a dead machine/repo binding
 # asset into the source tree again — which has already happened once.
 .agit.toml
+
+__pycache__/
+*.pyc

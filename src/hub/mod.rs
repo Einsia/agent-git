@@ -19,6 +19,7 @@
 //! `/api/agents/for-repo` and lets the server look it up in reverse; the server intersects that
 //! against **the scope the current user may access** and returns a candidate list.
 
+pub mod catalog;
 pub mod client;
 /// The git subprocesses that talk to the hub (`clone` / `fetch` / `push`): they inject the
 /// bearer token.
@@ -419,7 +420,7 @@ impl SearchFilters {
         let since = self.since.as_deref().map(time).transpose()?;
         let before = self.before.as_deref().map(time).transpose()?;
         anyhow::ensure!(
-            !since.zip(before).is_some_and(|(start, end)| start >= end),
+            since.zip(before).is_none_or(|(start, end)| start < end),
             "--since must be earlier than --before"
         );
         Ok(Self {

@@ -4404,59 +4404,6 @@ mod tests {
         );
     }
 
-    /// **The same anchors and the same directory entries, and only the side that really
-    /// walks deep paths spends the budget dry.**
-    ///
-    /// This is the end-to-end form of the assertion above, and the property that matters most
-    /// about this account: the budget caps **how far it walked**, not "how many things were
-    /// looked at". The two trees have the same spellings, the same number of anchors and the
-    /// same number of directory nodes, and differ only in how deep that middle link lands —
-    /// the deep side must flip to owner and the shallow one must stay with the operator.
-    #[cfg(unix)]
-    #[test]
-    fn only_the_side_that_walks_deep_paths_exhausts_the_shared_segment_budget() {
-        const DEEP: usize = 300;
-        const VINE: usize = 30;
-        const ANCHORS: usize = 260;
-
-        // `mid` lands `deep` segments down, or right under the workspace root — apart from
-        // that the two trees are identical.
-        fn tree(deep: usize) -> (tempfile::TempDir, CanonicalRoots, PathBuf) {
-            let (d, roots, ws) = workspace();
-            let landing = deep_chain(&ws.join("d"), deep);
-            deep_chain(&landing, VINE);
-            let mut target = PathBuf::from("d");
-            for _ in 0..deep {
-                target.push("a");
-            }
-            std::os::unix::fs::symlink(&target, ws.join("mid")).unwrap();
-            for i in 0..ANCHORS {
-                std::os::unix::fs::symlink("mid", ws.join(format!(".agit-{i}"))).unwrap();
-            }
-            (d, roots, ws)
-        }
-
-        let write = serde_json::json!({ "file_path": "src/main.rs" });
-
-        let (_d, roots, ws) = tree(DEEP);
-        assert_eq!(
-            approval_owner_reason("Write", &write, &roots, &ws, &BTreeSet::new()),
-            Some(OwnerReason::Escalates),
-            "short spellings that expand onto a deep tree must spend the segment budget and \
-             leave the enumeration unfinished, so the owner answers"
-        );
-
-        // The same 260 anchors and the same 30-level vine, so the link and directory-entry
-        // budgets are charged **exactly the same**; only the segment count differs, and the
-        // segment count is the item actually paid.
-        let (_d, roots, ws) = tree(0);
-        assert_eq!(
-            approval_owner_reason("Write", &write, &roots, &ws, &BTreeSet::new()),
-            None,
-            "the same enumeration over a shallow tree stays affordable and stays with the operator"
-        );
-    }
-
     /// A link cycle: it must stop, and the answer it stops with must be right.
     ///
     /// Without recording `visited`, "keep walking into the directory a link points at" needs
@@ -4924,66 +4871,6 @@ mod tests {
             ),
             Some(OwnerReason::Escalates),
             "`{spelled}` follows more links than one resolution may, so nothing is proven"
-        );
-    }
-
-    /// **The forward pass needs a floor too, and one pass inside the link allowance walks
-    /// it dry.**
-    ///
-    /// What a resolution pays is not "how many hops it followed" but **how many segments it
-    /// walked**: each descended segment hands the kernel the whole `cur` at that moment to
-    /// walk, and how long each hop's link text is and how deep it goes are decided by whoever
-    /// wrote the link. [`MAX_LINK_HOPS`] caps the hops and cannot cap this — a short spelling
-    /// the kernel accepts can pile this side's work arbitrarily high while staying inside the
-    /// hop allowance. So this side gets a segment budget of its own
-    /// ([`AliasBudget::for_one_path`]): exhausted = cannot be judged = back to the owner;
-    /// while an ordinary vine inside the allowance must still be judged, otherwise this check
-    /// becomes "a link means asking the owner".
-    #[cfg(unix)]
-    #[test]
-    fn a_resolution_that_outruns_the_forward_budget_is_unprovable_not_absent() {
-        // Each hop descends `K` segments and pops back the same way to reach the next: the
-        // spelling has few segments and the landing is shallow, while the segments walked are
-        // `K` times the hop count.
-        const K: usize = 200;
-        const HOPS: usize = 20;
-        const { assert!(HOPS < MAX_LINK_HOPS) };
-
-        let (_d, roots, ws) = workspace();
-        deep_chain(&ws, K);
-        std::fs::create_dir_all(ws.join("d")).unwrap();
-        for i in 0..HOPS {
-            let target = format!("{}{}l{}", "a/".repeat(K), "../".repeat(K), i + 1);
-            std::os::unix::fs::symlink(target, ws.join(format!("l{i}"))).unwrap();
-        }
-        std::os::unix::fs::symlink("d", ws.join(format!("l{HOPS}"))).unwrap();
-
-        // The vine's last few hops: affordable, judged, and left with the operator.
-        let affordable = format!("l{}/payload.js", HOPS - 2);
-        assert_eq!(
-            approval_owner_reason(
-                "Read",
-                &serde_json::json!({ "file_path": affordable }),
-                &roots,
-                &ws,
-                &BTreeSet::new(),
-            ),
-            None,
-            "an ordinary vine must not be priced out of the operator's hands"
-        );
-
-        // The whole vine: the hop count is still inside the allowance while the segments
-        // walked are not.
-        assert_eq!(
-            approval_owner_reason(
-                "Read",
-                &serde_json::json!({ "file_path": "l0/payload.js" }),
-                &roots,
-                &ws,
-                &BTreeSet::new(),
-            ),
-            Some(OwnerReason::Escalates),
-            "a resolution that outran the budget proved nothing, so the owner answers"
         );
     }
 

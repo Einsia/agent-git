@@ -43,6 +43,7 @@ const ABANDONED: u8 = 2;
 
 /// The executor's half of the receipt; it travels into the queue with the `Command`.
 pub struct Ticket<T> {
+    authority: super::authority::Guard,
     state: Arc<AtomicU8>,
     done: oneshot::Sender<crate::Result<T>>,
 }
@@ -65,10 +66,15 @@ pub enum Abandon {
 }
 
 pub fn ticket<T>() -> (Ticket<T>, Receipt<T>) {
+    ticket_authorized(super::authority::Guard::default())
+}
+
+pub(crate) fn ticket_authorized<T>(authority: super::authority::Guard) -> (Ticket<T>, Receipt<T>) {
     let state = Arc::new(AtomicU8::new(QUEUED));
     let (tx, rx) = oneshot::channel();
     (
         Ticket {
+            authority,
             state: state.clone(),
             done: tx,
         },
@@ -80,9 +86,18 @@ impl<T> Ticket<T> {
     /// Called once on dequeue. `false` = the caller has already abandoned it, **do not
     /// execute**.
     pub fn accept(&self) -> bool {
-        self.state
-            .compare_exchange(QUEUED, TAKEN, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        if self.authority.admit(|| {
+            self.state
+                .compare_exchange(QUEUED, TAKEN, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }) {
+            true
+        } else {
+            let _ =
+                self.state
+                    .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire);
+            false
+        }
     }
 
     /// Execution is done; hand the result back. The caller may no longer be listening (the

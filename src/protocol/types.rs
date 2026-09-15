@@ -515,6 +515,9 @@ pub struct TerminalExited {
 /// launches the harness headless under `agitd`'s supervision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionStart {
+    /// Explicit model selection is part of the immutable launch intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Stable UUID for this launch intent. Required only after both peers have
     /// negotiated `session_start_idempotency_v1`; omitted by legacy hubs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -750,6 +753,9 @@ pub struct SessionWatch {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionWatchResult {
+    /// Exclusive byte boundary for loading history preceding this watch.
+    #[serde(default)]
+    pub before_cursor: u64,
     pub session: SessionInfo,
     /// The first transcript line the live stream will replay from.
     pub from_line: u64,
@@ -1212,6 +1218,9 @@ pub struct ApprovalResponse {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// Answers keyed by native question id; only user-input requests consume them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 #[cfg(test)]

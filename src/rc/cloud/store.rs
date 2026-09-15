@@ -1,0 +1,317 @@
+//! Private endpoint credentials and executor policy stay in the daemon namespace.
+
+use agit_peer::{
+    Identity,
+    access::{Access, Policy, Resource, Rule},
+    client::Client,
+    cloud::DeviceCredential,
+};
+use anyhow::{Context, ensure};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+};
+
+const MAX_RECORD: u64 = 128 * 1024;
+const POLICY_FILE: &str = "cloud-access.json";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Stored {
+    version: u32,
+    credential: DeviceCredential,
+    private_key: Vec<u8>,
+    #[serde(default)]
+    inbound_enabled: Option<bool>,
+}
+
+pub struct Enrollment {
+    pub credential: DeviceCredential,
+    pub identity: Identity,
+    pub inbound_enabled: bool,
+}
+
+fn filename(hub: &str) -> crate::Result<String> {
+    let client = Client::new(hub)?;
+    Ok(format!(
+        "cloud-device-{}.json",
+        hex::encode(Sha256::digest(client.origin().as_bytes()))
+    ))
+}
+
+pub fn enrollment_lock(hub: &str) -> crate::Result<std::fs::File> {
+    let path = super::super::rc_dir()?
+        .join(filename(hub)?)
+        .with_extension("lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    fs2::FileExt::try_lock_exclusive(&file).context("cloud enrollment is being updated")?;
+    Ok(file)
+}
+
+fn read<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> crate::Result<Option<T>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("cannot open private cloud state"),
+    };
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0
+            && metadata.len() <= limit,
+        "cloud state must be a bounded private file owned by this user"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= limit,
+        "cloud state exceeds its size limit"
+    );
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid private cloud state"))
+}
+
+fn write(path: &Path, value: &impl Serialize) -> crate::Result<()> {
+    let directory = path.parent().context("cloud state directory is missing")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    let bytes = serde_json::to_vec_pretty(value)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+pub fn load(hub: &str) -> crate::Result<Option<Enrollment>> {
+    load_in(&super::super::rc_dir()?, hub)
+}
+
+fn load_in(directory: &Path, hub: &str) -> crate::Result<Option<Enrollment>> {
+    let Some(stored) = read::<Stored>(&directory.join(filename(hub)?), MAX_RECORD)? else {
+        return Ok(None);
+    };
+    ensure!(
+        matches!(stored.version, 1 | 2)
+            && (stored.version == 1 || stored.inbound_enabled.is_some())
+            && stored.credential.device.owner.issuer == Client::new(hub)?.origin(),
+        "cloud enrollment origin or version mismatch"
+    );
+    let identity = Identity::from_der(
+        stored.credential.device.certificate.as_der().to_vec(),
+        stored.private_key,
+    )?;
+    Ok(Some(Enrollment {
+        credential: stored.credential,
+        identity,
+        inbound_enabled: stored.inbound_enabled.unwrap_or(true),
+    }))
+}
+
+pub fn save(enrollment: &Enrollment) -> crate::Result<()> {
+    save_in(&super::super::rc_dir()?, enrollment)
+}
+
+fn save_in(directory: &Path, enrollment: &Enrollment) -> crate::Result<()> {
+    ensure!(
+        enrollment.credential.device.certificate == *enrollment.identity.certificate(),
+        "cloud enrollment certificate does not match its identity"
+    );
+    write(
+        &directory.join(filename(&enrollment.credential.device.owner.issuer)?),
+        &Stored {
+            version: 2,
+            credential: enrollment.credential.clone(),
+            private_key: enrollment.identity.private_key_der().to_vec(),
+            inbound_enabled: Some(enrollment.inbound_enabled),
+        },
+    )
+}
+
+pub fn origins() -> crate::Result<Vec<String>> {
+    origins_in(&super::super::rc_dir()?)
+}
+
+fn origins_in(directory: &Path) -> crate::Result<Vec<String>> {
+    let mut origins = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("cloud-device-") || !name.ends_with(".json") {
+            continue;
+        }
+        ensure!(origins.len() < 64, "too many cloud enrollments");
+        let stored: Stored =
+            read(&entry.path(), MAX_RECORD)?.context("cloud enrollment disappeared")?;
+        ensure!(
+            name == filename(&stored.credential.device.owner.issuer)?,
+            "cloud enrollment filename does not match its origin"
+        );
+        let hub = stored.credential.device.owner.issuer;
+        if load_in(directory, &hub)?.is_some_and(|enrollment| enrollment.inbound_enabled) {
+            origins.push(hub);
+        }
+    }
+    Ok(origins)
+}
+
+pub fn status(hub: &str) -> crate::Result<serde_json::Value> {
+    let enrollment = load(hub)?;
+    Ok(serde_json::json!({
+        "inbound_enabled": enrollment.as_ref().is_some_and(|value| value.inbound_enabled),
+        "device": enrollment.map(|value| value.credential.device),
+    }))
+}
+
+pub fn policy() -> crate::Result<Policy> {
+    Ok(read(&super::super::rc_dir()?.join(POLICY_FILE), 4 * 1024 * 1024)?.unwrap_or_default())
+}
+
+pub fn save_policy(policy: &Policy) -> crate::Result<()> {
+    policy.validate()?;
+    write(&super::super::rc_dir()?.join(POLICY_FILE), policy)
+}
+
+fn policy_lock() -> crate::Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(super::super::rc_dir()?.join("cloud-access.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&file).context("cloud resource policy is being updated")?;
+    Ok(file)
+}
+
+pub fn grant(rule: Rule) -> crate::Result<Policy> {
+    let _lock = policy_lock()?;
+    grant_unlocked(rule)
+}
+
+fn grant_unlocked(rule: Rule) -> crate::Result<Policy> {
+    let old = policy()?;
+    let mut rules = old.rules().to_vec();
+    rules.retain(|existing| {
+        existing.principal != rule.principal || existing.resource != rule.resource
+    });
+    rules.push(rule);
+    let policy = Policy::new(
+        old.revision()
+            .checked_add(1)
+            .context("cloud policy revision exhausted")?,
+        rules,
+    )?;
+    save_policy(&policy)?;
+    Ok(policy)
+}
+
+pub fn grant_enrolling_owner(enrollment: &Enrollment) -> crate::Result<()> {
+    let _lock = policy_lock()?;
+    let owner = &enrollment.credential.device.owner;
+    let current = policy()?;
+    if !current
+        .rules()
+        .iter()
+        .any(|rule| &rule.principal == owner && rule.resource == Resource::Machine)
+    {
+        grant_unlocked(Rule {
+            principal: owner.clone(),
+            resource: Resource::Machine,
+            access: Access::Admin,
+        })?;
+    }
+    Ok(())
+}
+
+pub fn directory() -> crate::Result<PathBuf> {
+    super::super::rc_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agit_peer::{
+        access::Principal,
+        cloud::{Device, Secret},
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cloud_identity_roundtrips_privately_and_rejects_exposed_or_substituted_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = Identity::generate().unwrap();
+        let hub = "https://cloud.example";
+        let enrollment = Enrollment {
+            credential: DeviceCredential {
+                device: Device {
+                    id: "device".into(),
+                    owner: Principal {
+                        issuer: hub.into(),
+                        account_id: "account".into(),
+                    },
+                    machine_id: "machine".into(),
+                    display_name: "machine".into(),
+                    certificate: identity.certificate().clone(),
+                    credential_epoch: 1,
+                },
+                token: Secret::new(uuid::Uuid::new_v4().to_string()),
+            },
+            identity,
+            inbound_enabled: false,
+        };
+        save_in(directory.path(), &enrollment).unwrap();
+        let loaded = load_in(directory.path(), hub).unwrap().unwrap();
+        assert!(!loaded.inbound_enabled);
+        assert!(origins_in(directory.path()).unwrap().is_empty());
+        assert_eq!(
+            loaded.identity.certificate(),
+            enrollment.identity.certificate()
+        );
+        assert_eq!(
+            loaded.credential.token.expose(),
+            enrollment.credential.token.expose()
+        );
+        let path = directory.path().join(filename(hub).unwrap());
+        let mut enabled = loaded;
+        enabled.inbound_enabled = true;
+        save_in(directory.path(), &enabled).unwrap();
+        assert_eq!(origins_in(directory.path()).unwrap(), vec![hub]);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["version"] = serde_json::json!(1);
+        legacy.as_object_mut().unwrap().remove("inbound_enabled");
+        write(&path, &legacy).unwrap();
+        assert!(
+            load_in(directory.path(), hub)
+                .unwrap()
+                .unwrap()
+                .inbound_enabled
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_in(directory.path(), hub).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let target = directory.path().join("another-file");
+        std::fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(load_in(directory.path(), hub).is_err());
+    }
+}

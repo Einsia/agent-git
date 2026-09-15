@@ -268,6 +268,11 @@ fn ingest(runtime: Option<&str>) -> CmdResult {
 }
 
 fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
+    // The supervisor lands its exact native identity. Runtime helper processes
+    // inherit its environment but cannot claim its conversation branch.
+    if crate::rc::harness::settlement_is_delegated() {
+        return None;
+    }
     let ev = read_event(runtime)?;
     let env_session = super::context::from_session_env();
 

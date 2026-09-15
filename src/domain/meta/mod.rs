@@ -944,8 +944,8 @@ pub fn sanitize_git_origin(origin: &str) -> Option<String> {
             None => authority.to_owned(),
         };
         let host_port = authority.rsplit('@').next().unwrap_or_default();
-        if !(scheme.eq_ignore_ascii_case("file") && host_port.is_empty())
-            && !safe_remote_authority(host_port)
+        if !(safe_remote_authority(host_port)
+            || scheme.eq_ignore_ascii_case("file") && host_port.is_empty())
         {
             return None;
         }

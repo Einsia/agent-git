@@ -32,7 +32,7 @@ fn rc_link_child() {
         return;
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let link = Link::new(&url, "rc-test-token");
+        let link = Link::new(&url, "rc-test-token").with_worker(env!("CARGO_BIN_EXE_agit"));
         let (outbound_tx, mut outbound) = agit::rc::outbound::channel();
         for epoch in 1..=2 {
             let (events, mut receiver) = tokio::sync::mpsc::channel(4);
@@ -172,8 +172,13 @@ async fn environment_proxy_selection_registers_and_reconnects() {
                                 let frame = Frame::from_json(&text).unwrap();
                                 assert!(frame.is_notification());
                                 if frame.method.as_deref() == Some(REGISTERED) {
-                                    assert_eq!(frame.params.unwrap()["epoch"], epoch);
-                                    break;
+                                    // A peer close can precede the worker receipt for an observed frame.
+                                    let observed = frame.params.unwrap()["epoch"].as_u64().unwrap();
+                                    assert!(observed > 0 && observed <= epoch);
+                                    if observed == epoch {
+                                        break;
+                                    }
+                                    continue;
                                 }
                                 assert_eq!(frame.method.as_deref(), Some(method::RC_HEARTBEAT));
                             }

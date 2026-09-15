@@ -54,6 +54,19 @@ agit rc revoke <id>        # revoke one: disconnects immediately and takes no fu
 agit rc stop
 ```
 
+Starting the process does not establish a Hub connection. Foreground startup reports
+when it is connecting and prints workspace guidance after registration. Detached
+startup waits up to 45 seconds after spawning for the local control channel to confirm
+that its child is registered. It reports success only then. On timeout it returns an
+unsuccessful exit status and leaves the daemon reconnecting; check `agit rc status`
+or stop it with `agit rc stop` before starting again.
+
+Detached startup prints a private log path under `$AGIT_HOME/rc/` (by default
+`~/.agit/rc/`). The file retains startup and connection diagnostics after the command
+returns. Each launch has its own log; old logs can be removed after stopping their
+daemon. Reconnect backoff resets after a connection stays registered for at least
+30 seconds, while brief connections continue to back off.
+
 **The quota is 5 machines per person.** The count covers only what has not been revoked: an
 offline machine still holds its slot (the workspace is still there and it can come back at any
 time), and only a revoke frees one. The same machine reconnecting over and over always lands on

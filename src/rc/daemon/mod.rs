@@ -63,6 +63,8 @@ use tokio::sync::{Mutex, mpsc};
 mod danger;
 mod dispatch;
 mod guard;
+mod opening;
+use opening::{LaunchReservation, OpeningReply, PreparedSpawn, SessionOpening};
 mod projection;
 mod pump;
 mod session_rpc;
@@ -92,7 +94,7 @@ struct LocatedLocal {
     likely_active: bool,
 }
 
-/// The one extra fact `Daemon::spawn_session` has to carry out on failure: whether this failure
+/// The one extra fact `Daemon::prepare_spawn` has to carry out on failure: whether this failure
 /// **crossed** the materialization boundary — the line in `Proc::spawn` that actually calls
 /// `Command::spawn`.
 ///
@@ -113,6 +115,7 @@ struct LocatedLocal {
 struct SpawnFailure {
     error: RpcError,
     reached_launch: bool,
+    release_reservation: bool,
 }
 
 impl SpawnFailure {
@@ -120,6 +123,7 @@ impl SpawnFailure {
         Self {
             error,
             reached_launch: false,
+            release_reservation: true,
         }
     }
 
@@ -127,6 +131,7 @@ impl SpawnFailure {
         Self {
             error,
             reached_launch: true,
+            release_reservation: false,
         }
     }
 }
@@ -138,6 +143,7 @@ impl From<SpawnFailure> for RpcError {
 }
 
 pub struct Options {
+    pub local_owner: bool,
     pub hub: String,
     pub token: String,
     pub connection_id: Option<String>,
@@ -150,6 +156,7 @@ fn set_connection_features(
     session_start_idempotency_v1: bool,
 ) {
     settlement.send_modify(|state| {
+        state.local_owner = false;
         state.epoch = epoch;
         state.agent_identity_v1 = agent_identity_v1;
         state.session_start_idempotency_v1 = session_start_idempotency_v1;
@@ -631,6 +638,11 @@ impl<T> Drop for SessionReceipt<T> {
 }
 
 enum SessionRpcOperation {
+    Value {
+        tx: mpsc::Sender<Command>,
+        command: Command,
+        reply: SessionReceipt<serde_json::Value>,
+    },
     Turn {
         tx: mpsc::Sender<Command>,
         command: Command,
@@ -735,6 +747,7 @@ struct PendingSessionRpc {
 }
 
 enum PendingSessionRpcOperation {
+    Value(SessionReceipt<serde_json::Value>),
     Steer(SessionReceipt<crate::protocol::Delivery>),
     Interrupt(SessionReceipt<()>),
     Approve {
@@ -1079,6 +1092,8 @@ pub struct Daemon {
     /// retain this fence so a delayed frame from that generation cannot become
     /// current again after a newer generation has materialized and ended.
     latest_session_generations: HashMap<String, u64>,
+    /// Reserved logical and native identities remain exclusive while a harness opens.
+    opening_sessions: HashMap<String, LaunchReservation>,
     /// Read-only watch (`session.watch`) tail tasks, registered by watch stream id.
     /// `info` is kept so `session.subscribe` can subscribe to a watch stream too (replaying its
     /// ring).
@@ -1532,7 +1547,11 @@ enum Role {
 fn min_role(method_name: &str) -> Role {
     match method_name {
         // Read-only: see what is on this machine.
-        method::WORKSPACE_LIST | method::SESSION_LIST | method::SESSION_SUBSCRIBE => Role::Viewer,
+        method::WORKSPACE_LIST
+        | method::SESSION_LIST
+        | method::SESSION_SUBSCRIBE
+        | method::SESSION_COMMANDS
+        | method::SESSION_MODEL => Role::Viewer,
         // A read-only watch **is a read**: it tails a transcript and writes back not one byte.
         // The hub deliberately keeps these two verbs outside the operator gate (its comment says
         // that blocking a viewer only turns "that session is open" into a guessing game). Calling
@@ -1550,6 +1569,7 @@ fn min_role(method_name: &str) -> Role {
         | method::TURN_STEER
         | method::TURN_INTERRUPT
         | method::APPROVAL_DECIDE
+        | method::SESSION_SET_MODEL
         | method::SESSION_SET_PERMISSION_MODE
         | method::FS_READ_FILE => Role::Operator,
         // Native processes keep permission state outside the daemon's supervision.
@@ -1573,6 +1593,10 @@ fn is_queued_session_rpc(method_name: &str) -> bool {
         method_name,
         method::TURN_START
             | method::TURN_STEER
+            | method::SESSION_COMMANDS
+            | method::SESSION_COMMAND
+            | method::SESSION_MODEL
+            | method::SESSION_SET_MODEL
             | method::SESSION_SET_PERMISSION_MODE
             | method::TURN_INTERRUPT
             | method::APPROVAL_DECIDE
@@ -1588,6 +1612,12 @@ fn needs_claude_restart_guard_barrier(
 
 fn queued_session_id(f: &Frame) -> Result<String, RpcError> {
     match f.method() {
+        method::SESSION_COMMANDS
+        | method::SESSION_COMMAND
+        | method::SESSION_MODEL
+        | method::SESSION_SET_MODEL => Ok(f
+            .params_as::<crate::protocol::SessionSubscribe>()?
+            .session_id),
         method::TURN_START => Ok(f.params_as::<TurnStart>()?.session_id),
         method::TURN_STEER => Ok(f.params_as::<TurnSteer>()?.session_id),
         method::SESSION_SET_PERMISSION_MODE => Ok(f
@@ -1842,6 +1872,7 @@ async fn reply_within<T>(r: &mut crate::rc::ticket::Receipt<T>) -> Result<T, Rpc
 /// An unstamped frame is always refused. A missing claim must not be read as a wildcard —
 /// `caller == None` skipping the ownership check is exactly that.
 fn caller_scope(f: &Frame) -> Result<crate::protocol::CallerClaim, RpcError> {
+    f.authority.check()?;
     let Some(caller) = f.caller.as_ref() else {
         return Err(RpcError::new(
             ErrorCode::Unauthenticated,
@@ -1903,7 +1934,7 @@ fn no_such_session(session_id: &str) -> RpcError {
 ///
 /// The cost is two tails when two workspaces watch the same transcript at once. A reader breaks
 /// nothing; the cost is one redundant poll, with `WATCH_IDLE_STOP` as the backstop.
-fn watch_stream_id(workspace_id: &str, session_id: &str) -> String {
+pub(crate) fn watch_stream_id(workspace_id: &str, session_id: &str) -> String {
     format!("agit-watch-{workspace_id}-{session_id}")
 }
 

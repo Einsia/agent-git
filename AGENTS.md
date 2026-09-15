@@ -64,3 +64,14 @@ the comment lines a branch adds relative to its merge base and flags numbers wit
 ratios, counts of tests or table entries, and phrasing that points at another version or
 review round. It judges shapes; deciding what a sentence was trying to say, and rewriting it
 as the invariant, is still yours. It is not a CI gate.
+
+## Tests and CI stay focused
+
+- Add a test only when it protects a user-visible behavior, a protocol contract, or a failure
+  boundary that a plausible implementation could break.
+- Prefer one representative end-to-end check over duplicated fixtures and broad combinations
+  that exercise the same code path.
+- Keep CI fast: run the smallest relevant test target, avoid redundant builds and matrices,
+  and do not add nonessential checks to required jobs.
+- A local exploratory check can remain outside CI when it does not protect a maintained
+  contract.

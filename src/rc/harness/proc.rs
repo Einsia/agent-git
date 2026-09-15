@@ -40,6 +40,7 @@ mod pipe_input;
 pub struct LaunchError {
     error: anyhow::Error,
     spawned: bool,
+    external_writer: bool,
 }
 
 impl LaunchError {
@@ -52,6 +53,7 @@ impl LaunchError {
         Self {
             error,
             spawned: false,
+            external_writer: false,
         }
     }
 
@@ -64,7 +66,22 @@ impl LaunchError {
         Self {
             error,
             spawned: true,
+            external_writer: false,
         }
+    }
+
+    /// The native resume rejected an existing writer and its child tree has been reaped.
+    /// This releases only the resume reservation; the process-spawn fact remains true.
+    pub(super) fn external_writer(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            spawned: true,
+            external_writer: true,
+        }
+    }
+
+    pub fn is_external_writer(&self) -> bool {
+        self.external_writer
     }
 
     /// Did this failure cross the OS spawn? `false` appears only where it is provable that it
@@ -295,6 +312,19 @@ pub struct Proc {
     /// Test-only view of the same budget owned by both pipe readers.
     #[cfg(test)]
     byte_budget: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        // Cancellation must terminate descendants as well as Tokio's direct child.
+        // Successful tree cleanup clears the group before this fallback runs.
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.take() {
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
 }
 
 pub(crate) struct QueuedLine {
@@ -1159,6 +1189,37 @@ mod tests {
                     libc::killpg(self.pgid, libc::SIGKILL);
                 }
             }
+        }
+    }
+
+    /// Dropping a cancelled owner must not leave a descendant consuming the same transcript.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_proc_kills_the_owned_process_group() {
+        let mut proc = Proc::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "(trap '' TERM HUP; while :; do /bin/sleep 10; done) & echo ready; wait".into(),
+            ],
+            &std::env::current_dir().unwrap(),
+            &[],
+        )
+        .unwrap();
+        let pgid = proc.pgid.unwrap();
+        let _guard = ProcessGroupGuard { pgid, armed: true };
+        tokio::time::timeout(std::time::Duration::from_secs(5), proc.next())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(proc);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_group_exists(pgid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancelled harness left a live process group"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 

@@ -35,6 +35,37 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const BACKOFF_MIN_MS: u64 = 1_000;
 pub const BACKOFF_MAX_MS: u64 = 30_000;
+pub(crate) const STABLE_CONNECTION: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) struct ReconnectBackoff {
+    delay_ms: u64,
+    attempt: u64,
+}
+
+impl Default for ReconnectBackoff {
+    fn default() -> Self {
+        Self {
+            delay_ms: BACKOFF_MIN_MS,
+            attempt: 0,
+        }
+    }
+}
+
+impl ReconnectBackoff {
+    pub(crate) fn after_disconnect(
+        &mut self,
+        registered_for: Option<std::time::Duration>,
+    ) -> std::time::Duration {
+        // Only sustained registration clears failure history; rapid reconnects retain backoff.
+        if registered_for.is_some_and(|elapsed| elapsed >= STABLE_CONNECTION) {
+            *self = Self::default();
+        }
+        self.attempt = self.attempt.wrapping_add(1);
+        self.delay_ms = next_backoff(self.delay_ms, self.attempt.wrapping_mul(2654435761));
+        std::time::Duration::from_millis(self.delay_ms)
+    }
+}
+
 /// The socket pump is the only task polling Close/Pong/liveness. It may wait a
 /// little for the daemon to drain an instruction, but never long enough for a
 /// full internal queue to pin the current connection feature lease forever.
@@ -192,6 +223,7 @@ async fn deliver_registration_within(
 pub struct Link {
     hub: String,
     token: String,
+    worker: Option<std::path::PathBuf>,
 }
 
 impl Link {
@@ -199,7 +231,14 @@ impl Link {
         Link {
             hub: hub.to_string(),
             token: token.to_string(),
+            worker: None,
         }
+    }
+
+    /// Embedders name the worker executable independently of their own process.
+    pub fn with_worker(mut self, executable: impl Into<std::path::PathBuf>) -> Self {
+        self.worker = Some(executable.into());
+        self
     }
 
     /// Connect once, register, then pump frames in both directions until the
@@ -264,11 +303,11 @@ impl Link {
             Err(e) => return format!("bad hub url {url}: {e}"),
         };
 
-        let stream = match super::transport::connect(req).await {
+        let (mut sink, mut source) = match super::tunnel::connect(req, self.worker.as_deref()).await
+        {
             Ok(x) => x,
             Err(e) => return format!("cannot reach the hub at {url}: {e:#}"),
         };
-        let (mut sink, mut source) = stream.split();
 
         // Register first; nothing else is valid before it.
         let reg_frame = Frame::request(method::RC_REGISTER, &register);
@@ -586,6 +625,35 @@ pub fn sequence_gap(stream: &str, expected: u64, got: u64) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_backoff_resets_only_after_sustained_registration() {
+        let mut backoff = ReconnectBackoff::default();
+        let mut failed = ReconnectBackoff::default();
+        let short = STABLE_CONNECTION - std::time::Duration::from_nanos(1);
+        for _ in 0..12 {
+            assert_eq!(
+                backoff.after_disconnect(Some(short)),
+                failed.after_disconnect(None)
+            );
+        }
+        let mut fresh = ReconnectBackoff::default();
+        assert_eq!(
+            backoff.after_disconnect(Some(STABLE_CONNECTION)),
+            fresh.after_disconnect(None)
+        );
+        assert_eq!(backoff.after_disconnect(None), fresh.after_disconnect(None));
+    }
+
+    #[test]
+    fn reconnect_failures_stay_bounded_without_erasing_failure_history() {
+        let mut backoff = ReconnectBackoff::default();
+        for _ in 0..100 {
+            let delay = backoff.after_disconnect(None).as_millis();
+            assert!((u128::from(BACKOFF_MIN_MS)..=u128::from(BACKOFF_MAX_MS)).contains(&delay));
+        }
+        assert!(backoff.after_disconnect(None).as_millis() > u128::from(BACKOFF_MIN_MS));
+    }
 
     fn registration() -> RcRegisterResult {
         RcRegisterResult {

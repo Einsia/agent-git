@@ -22,7 +22,14 @@
 //! Method names below were read out of `codex app-server generate-ts` on the
 //! installed binary (codex-cli 0.147.0), not from documentation.
 
+mod commands;
+mod guardian;
+mod prompts;
+
 use super::proc::{LaunchError, Line, Proc, Pushback};
+
+#[path = "codex_opening.rs"]
+mod opening;
 use super::{
     ApprovalOutcome, BoundedTurnIds, HarnessEvent, LaunchSpec, PermissionModeChangeResult,
     TurnGuardAttempt, TurnOutcome, TurnStartConfirmation, TurnStartDispatch, TurnStartOutcome,
@@ -307,7 +314,11 @@ pub struct CodexDriver {
     cwd: PathBuf,
     resume_from: Option<String>,
     model: Option<String>,
+    turn_options: serde_json::Map<String, Value>,
     started: bool,
+    command_requests: std::collections::HashSet<i64>,
+    token_usage: Option<Value>,
+    guardian_denials: guardian::Denials,
     /// The handshake-chain request still awaiting its response: `(request id, method name)`.
     ///
     /// A usable session has to get through `initialize` → `thread/start`|`thread/resume`.
@@ -320,6 +331,7 @@ pub struct CodexDriver {
     /// `codex app-server` child, with nobody told. So remember this request's id, to
     /// recognize its error and treat it as fatal.
     handshake_request: Option<(i64, &'static str)>,
+    opening_ready: Option<HarnessEvent>,
     /// Current permission mode, and the one to apply at the next `turn/start`.
     ///
     /// Two fields because codex's switch is not live: a viewer can ask for
@@ -382,8 +394,13 @@ impl CodexDriver {
             cwd: spec.cwd.clone(),
             resume_from: spec.resume_from.clone(),
             model: spec.model.clone(),
+            turn_options: Default::default(),
             started: false,
             handshake_request: None,
+            opening_ready: None,
+            command_requests: Default::default(),
+            token_usage: None,
+            guardian_denials: Default::default(),
             mode: spec.effective_mode(),
             pending_mode: None,
             pending_turn_start: None,
@@ -538,8 +555,21 @@ impl CodexDriver {
             "threadId": tid,
             "input": [{"type":"text","text": message, "text_elements": []}]
         });
+        if let Some(model) = &self.model {
+            params["model"] = json!(model);
+        }
         if let Some(prompt_id) = prompt_id {
             params["clientUserMessageId"] = json!(prompt_id);
+        }
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(self.turn_options.clone());
+        let effective_mode = staged_mode.unwrap_or(self.mode);
+        if (effective_mode == PermissionMode::Plan || self.mode == PermissionMode::Plan)
+            && let Some(model) = &self.model
+        {
+            params["collaborationMode"] = json!({"mode":if effective_mode == PermissionMode::Plan {"plan"} else {"default"},"settings":{"model":model,"reasoning_effort":null,"developer_instructions":null}});
         }
         // A queued mode change lands here, because this is the only place codex
         // lets it land. The override is sticky ("this turn and subsequent
@@ -663,6 +693,13 @@ impl CodexDriver {
     ) -> PermissionModeChangeResult {
         self.pending_mode = Some(mode);
         Ok(PermissionApply::NextTurn)
+    }
+
+    pub async fn model_control(&mut self, model: Option<&str>) -> crate::Result<Value> {
+        if let Some(model) = model {
+            self.model = Some(model.to_string());
+        }
+        Ok(json!({"model": self.model, "applied": "next_turn"}))
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -849,6 +886,29 @@ impl CodexDriver {
         // `["permissions"]`). We were answering every method with
         // `{"decision": …}`, which for this one is a malformed response — the
         // request then never resolves and the turn hangs.
+        if method == "item/tool/requestUserInput" {
+            let answers = if r.decision == ApprovalDecision::Allow {
+                r.answers.clone().unwrap_or_default()
+            } else {
+                Default::default()
+            };
+            let answers = answers
+                .into_iter()
+                .map(|(key, value)| (key, json!({"answers":value})))
+                .collect::<serde_json::Map<_, _>>();
+            return match self
+                .send(&json!({"id":req_id,"result":{"answers":answers}}))
+                .await
+            {
+                Ok(()) => ApprovalOutcome::Applied {
+                    effective_mode: None,
+                },
+                Err(error) => ApprovalOutcome::Unknown {
+                    message: format!("codex answer delivery is unknown: {error}"),
+                    attempted_mode: None,
+                },
+            };
+        }
         if method.starts_with("item/permissions/") {
             let body = match r.decision {
                 // **Grant the profile from the request unchanged.**
@@ -909,6 +969,9 @@ impl CodexDriver {
     }
 
     pub async fn next_event(&mut self) -> Option<HarnessEvent> {
+        if let Some(ready) = self.opening_ready.take() {
+            return Some(ready);
+        }
         loop {
             // Release what was held while waiting for the `turn/steer` response first,
             // then read new lines — the order is the stream's order.
@@ -1045,6 +1108,14 @@ impl CodexDriver {
         }
 
         if v.get("method").is_none()
+            && v["id"]
+                .as_i64()
+                .is_some_and(|id| self.command_requests.remove(&id))
+        {
+            return None;
+        }
+
+        if v.get("method").is_none()
             && let Some(request_id) = v.get("id").and_then(Value::as_i64)
             && let Some(retired) = self.retired_turn_starts.take(request_id)
         {
@@ -1090,6 +1161,12 @@ impl CodexDriver {
                 && v.get("id").and_then(Value::as_i64) == Some(id)
             {
                 self.handshake_request = None;
+                if method != "initialize" && self.model.is_none() {
+                    self.model = v
+                        .pointer("/result/model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
                 if let Some(error) = v.get("error") {
                     return Some(HarnessEvent::ProtocolInvariant {
                         message: format!(
@@ -1123,6 +1200,10 @@ impl CodexDriver {
                     .and_then(|t| t.get("id"))
                     .and_then(|x| x.as_str())
                 {
+                    self.model = res["model"]
+                        .as_str()
+                        .map(String::from)
+                        .or(self.model.clone());
                     if self.thread_id.as_deref() == Some(t) {
                         return None; // already announced by thread/started
                     }
@@ -1172,6 +1253,27 @@ impl CodexDriver {
         }
 
         match method {
+            "item/autoApprovalReview/completed"
+                if self.thread_id.is_some()
+                    && params["threadId"].as_str() == self.thread_id.as_deref() =>
+            {
+                self.guardian_denials.observe(&params);
+                None
+            }
+            "thread/tokenUsage/updated"
+                if params["threadId"].as_str() == self.thread_id.as_deref() =>
+            {
+                self.token_usage = Some(params["tokenUsage"].clone());
+                None
+            }
+            "thread/goal/updated" if params["threadId"].as_str() == self.thread_id.as_deref() => {
+                Some(HarnessEvent::GoalUpdated {
+                    goal: params["goal"].clone(),
+                })
+            }
+            "thread/goal/cleared" if params["threadId"].as_str() == self.thread_id.as_deref() => {
+                Some(HarnessEvent::GoalUpdated { goal: Value::Null })
+            }
             "thread/started" => {
                 let t = params
                     .get("threadId")
@@ -1372,6 +1474,7 @@ impl CodexDriver {
             "item/commandExecution/requestApproval" => ApprovalKind::Exec,
             "item/fileChange/requestApproval" => ApprovalKind::FileChange,
             "item/permissions/requestApproval" => ApprovalKind::PermissionEscalation,
+            "item/tool/requestUserInput" => ApprovalKind::Exec,
             _ => return None,
         };
         let Some(turn_id) = params
@@ -1450,10 +1553,14 @@ impl CodexDriver {
             session_id: String::new(),
             turn_id: turn_id.to_string(),
             kind,
-            tool: match kind {
-                ApprovalKind::Exec => "shell".into(),
-                ApprovalKind::FileChange => "apply_patch".into(),
-                ApprovalKind::PermissionEscalation => "permissions".into(),
+            tool: if method == "item/tool/requestUserInput" {
+                "request_user_input".into()
+            } else {
+                match kind {
+                    ApprovalKind::Exec => "shell".into(),
+                    ApprovalKind::FileChange => "apply_patch".into(),
+                    ApprovalKind::PermissionEscalation => "permissions".into(),
+                }
             },
             input: params.clone(),
             summary,
@@ -1513,8 +1620,13 @@ impl CodexDriver {
             cwd,
             resume_from: None,
             model: None,
+            turn_options: Default::default(),
             started: thread_id.is_some(),
             handshake_request: None,
+            opening_ready: None,
+            command_requests: Default::default(),
+            token_usage: None,
+            guardian_denials: Default::default(),
             mode: PermissionMode::Default,
             pending_mode: None,
             pending_turn_start: None,
@@ -1578,6 +1690,41 @@ fn item_kind(item: &Value) -> (ItemKind, Option<String>) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn native_question_answers_use_the_server_request_schema() {
+        let mut driver = probe();
+        let event = driver.classify_server_request("item/tool/requestUserInput", &json!({"turnId":"turn-1","itemId":"q1","questions":[{"id":"label","question":"Choose a label"}]}), json!(42));
+        let Some(HarnessEvent::Approval(request)) = event else {
+            panic!("expected question request")
+        };
+        assert_eq!(request.tool, "request_user_input");
+        let response = ApprovalResponse {
+            approval_id: request.approval_id,
+            session_id: "test".into(),
+            decision: ApprovalDecision::Allow,
+            scope: ApprovalScope::Once,
+            message: None,
+            by: None,
+            answers: Some(std::collections::BTreeMap::from([(
+                "label".into(),
+                vec!["Blue".into()],
+            )])),
+        };
+        assert!(matches!(
+            driver.answer_approval(&response).await,
+            ApprovalOutcome::Applied { .. }
+        ));
+        let line = driver.proc.next().await.unwrap().into_line();
+        let Line::Json(value) = line else {
+            panic!("expected native response")
+        };
+        assert_eq!(
+            value,
+            json!({"id":42,"result":{"answers":{"label":{"answers":["Blue"]}}}})
+        );
+        driver.shutdown().await.unwrap();
+    }
+
     fn probe() -> CodexDriver {
         let cwd = PathBuf::from("/");
         CodexDriver {
@@ -1590,8 +1737,13 @@ mod tests {
             cwd,
             resume_from: None,
             model: None,
+            turn_options: Default::default(),
             started: false,
             handshake_request: None,
+            opening_ready: None,
+            command_requests: Default::default(),
+            token_usage: None,
+            guardian_denials: Default::default(),
             mode: PermissionMode::Default,
             pending_mode: None,
             pending_turn_start: None,
@@ -1619,6 +1771,42 @@ mod tests {
             matches!(driver.classify(json!({
             "method": "turn/completed", "params": {"turn": {"id":"next-turn", "status":"completed"}}
         })).await, Some(HarnessEvent::TurnCompleted { outcome: TurnOutcome::Ok, error: None, .. }))
+        );
+        driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn selected_options_and_plan_mode_are_sent_on_the_next_native_turn() {
+        let mut driver = probe();
+        driver.thread_id = Some("thread".into());
+        let result = driver
+            .model_control(Some("selected-native-model"))
+            .await
+            .unwrap();
+        assert_eq!(result["applied"], "next_turn");
+        driver
+            .turn_options
+            .insert("personality".into(), json!("friendly"));
+        driver
+            .turn_options
+            .insert("serviceTier".into(), json!("fast"));
+        driver.mode = PermissionMode::Plan;
+        assert!(matches!(
+            driver.start_turn("hello", false, None).await,
+            TurnStartDispatch::Awaiting
+        ));
+        let line = driver.proc.next().await.unwrap();
+        let Line::Json(request) = line.line() else {
+            panic!("expected native JSON");
+        };
+        assert_eq!(request["method"], "turn/start");
+        assert_eq!(request["params"]["model"], "selected-native-model");
+        assert_eq!(request["params"]["personality"], "friendly");
+        assert_eq!(request["params"]["serviceTier"], "fast");
+        assert_eq!(request["params"]["collaborationMode"]["mode"], "plan");
+        assert_eq!(
+            request["params"]["collaborationMode"]["settings"]["model"],
+            "selected-native-model"
         );
         driver.shutdown().await.unwrap();
     }
@@ -1924,6 +2112,7 @@ mod tests {
                     decision: ApprovalDecision::Deny,
                     scope: ApprovalScope::Once,
                     message: None,
+                    answers: None,
                     by: Some("operator".into()),
                 })
                 .await,
@@ -3394,6 +3583,7 @@ mod tests {
             decision: ApprovalDecision::Allow,
             scope: ApprovalScope::Once,
             message: None,
+            answers: None,
             by: Some("owner".into()),
         };
         assert!(matches!(

@@ -54,6 +54,7 @@ pub(super) fn rpc_test_daemon(
         replay_slots: Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
         outbound: None,
         opts: Options {
+            local_owner: false,
             hub: "https://hub.invalid".into(),
             token: "test".into(),
             connection_id: None,
@@ -63,6 +64,7 @@ pub(super) fn rpc_test_daemon(
         roster,
         sessions,
         latest_session_generations: HashMap::new(),
+        opening_sessions: HashMap::new(),
         watches: HashMap::new(),
         terminals: HashMap::new(),
         terminal_delivery_blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -180,4 +182,51 @@ fn frame_with(caller: Option<crate::protocol::CallerClaim>, params: serde_json::
     let mut f = Frame::request(method::SESSION_LIST, params);
     f.caller = caller;
     f
+}
+
+impl Daemon {
+    pub(super) async fn resume_session(
+        &mut self,
+        p: SessionResume,
+        caller: &crate::protocol::CallerClaim,
+        frames: &mpsc::Sender<Frame>,
+    ) -> Result<serde_json::Value, RpcError> {
+        let prepared = self.prepare_resume_session(p, caller, frames)?;
+        prepared.run_inline(self).await
+    }
+
+    pub(super) async fn take_over_local_session(
+        &mut self,
+        local: LocatedLocal,
+        p: SessionResume,
+        caller: &crate::protocol::CallerClaim,
+        frames: &mpsc::Sender<Frame>,
+    ) -> Result<serde_json::Value, RpcError> {
+        let prepared = self.prepare_local_takeover(local, p, caller, frames)?;
+        prepared.run_inline(self).await
+    }
+
+    pub(super) async fn start_session(
+        &mut self,
+        p: SessionStart,
+        caller: &crate::protocol::CallerClaim,
+        frames: &mpsc::Sender<Frame>,
+    ) -> Result<serde_json::Value, RpcError> {
+        let prepared = self.prepare_start_session(p, caller, frames)?;
+        prepared.run_inline(self).await
+    }
+
+    pub(super) async fn spawn_session(
+        &mut self,
+        info: SessionInfo,
+        spec: LaunchSpec,
+        danger: danger::TranscriptDanger,
+        frames: &mpsc::Sender<Frame>,
+        prompt: Option<String>,
+        attribution: MessageAttribution,
+    ) -> Result<SessionInfo, SpawnFailure> {
+        let prepared = self.prepare_spawn(info, spec, danger, frames, prompt, attribution)?;
+        let result = prepared.execute().await;
+        self.finish_spawn(prepared, result)
+    }
 }

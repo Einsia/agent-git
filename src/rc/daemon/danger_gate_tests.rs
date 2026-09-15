@@ -250,6 +250,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     replay_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
                     outbound: None,
                     opts: Options {
+                        local_owner: false,
                         hub: "https://hub.invalid".into(),
                         token: "test".into(),
                         connection_id: None,
@@ -259,6 +260,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     roster,
                     sessions: [("session-1".to_string(), live)].into_iter().collect(),
                     latest_session_generations: HashMap::new(),
+                    opening_sessions: HashMap::new(),
                     watches: HashMap::new(),
                     terminals: HashMap::new(),
                     terminal_delivery_blockers: blockers,
@@ -282,6 +284,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                         decision: crate::protocol::ApprovalDecision::Allow,
                         scope: crate::protocol::ApprovalScope::Session,
                         message: None,
+                        answers: None,
                         by: Some("owner".into()),
                     })
                     .unwrap(),

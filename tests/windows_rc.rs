@@ -97,6 +97,63 @@ struct FakeHub {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
+fn serve_registration(mut stream: std::net::TcpStream, headers: &str, stop: &AtomicBool) {
+    use agit::protocol::{Frame, RcRegisterResult, method};
+    use tokio_tungstenite::tungstenite::{
+        Message, WebSocket, handshake::server::create_response, protocol::Role,
+    };
+
+    let mut request = http::Request::builder().method("GET").uri("/rc/ws");
+    for header in headers.lines().skip(1) {
+        if let Some((name, value)) = header.split_once(':') {
+            request = request.header(name.trim(), value.trim());
+        }
+    }
+    let response = create_response(&request.body(()).unwrap()).unwrap();
+    write!(stream, "HTTP/1.1 101 Switching Protocols\r\n").unwrap();
+    for (name, value) in response.headers() {
+        write!(stream, "{name}: {}\r\n", value.to_str().unwrap()).unwrap();
+    }
+    write!(stream, "\r\n").unwrap();
+    let mut socket = WebSocket::from_raw_socket(stream, Role::Server, None);
+    let register = socket.read().unwrap();
+    let register = Frame::from_json(register.to_text().unwrap()).unwrap();
+    assert_eq!(register.method(), method::RC_REGISTER);
+    socket
+        .send(Message::Text(
+            Frame::response(
+                register.id.unwrap(),
+                RcRegisterResult {
+                    connection_id: "windows-fixture".into(),
+                    accepted_features: vec![],
+                    workspaces: vec![],
+                    persisted_seq: Default::default(),
+                    server_time: "2026-09-15T00:00:00Z".into(),
+                },
+            )
+            .to_json()
+            .into(),
+        ))
+        .unwrap();
+    while !stop.load(Ordering::SeqCst) {
+        match socket.read() {
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(_)) => {
+                if socket.flush().is_err() {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(tokio_tungstenite::tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+}
+
 struct DaemonCleanup<'a> {
     home: &'a Path,
     hub: &'a str,
@@ -226,6 +283,10 @@ impl FakeHub {
                     request.push(byte[0]);
                 }
                 let request = String::from_utf8_lossy(&request);
+                if request.starts_with("GET /rc/ws ") {
+                    serve_registration(stream, &request, &stopping);
+                    continue;
+                }
                 let paired = request.starts_with("POST /api/rc/connections ");
                 let length = request
                     .lines()
@@ -420,6 +481,35 @@ fn hub_credentials_are_private_under_inherited_public_read(home: &Path) {
         .collect();
     entries.sort();
     assert_eq!(entries, ["legacy.json", "private.identity", "private.json"]);
+}
+
+#[test]
+fn daemon_logs_have_explicit_private_ownership_and_remain_readable_while_open() {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GENERIC_READ};
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().join("logs");
+    security::private_directory(&directory).unwrap();
+    let mut log = security::private_tempfile(&directory, "agitd-", ".log").unwrap();
+    log.write_all(b"synthetic connection diagnostic").unwrap();
+    security::validate_path(log.path(), false, true).unwrap();
+    assert_eq!(
+        std::fs::read(log.path()).unwrap(),
+        b"synthetic connection diagnostic"
+    );
+    assert_eq!(
+        restricted_open(log.path(), GENERIC_READ)
+            .err()
+            .unwrap()
+            .raw_os_error(),
+        Some(ERROR_ACCESS_DENIED as i32)
+    );
+    let (mut writer, path) = log.keep().unwrap();
+    writer.write_all(b" after startup").unwrap();
+    security::validate_path(&path, false, true).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"synthetic connection diagnostic after startup"
+    );
 }
 
 #[test]

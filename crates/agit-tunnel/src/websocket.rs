@@ -24,19 +24,7 @@ pub(super) async fn connect(request: Request) -> crate::Result<Socket> {
     } else {
         Matcher::from_env()
     };
-    #[cfg(feature = "cli")]
-    crate::telemetry::allow_uploads();
-    #[cfg(feature = "cli")]
-    let started = std::time::Instant::now();
-    let result = connect_with(request, &proxies, CONNECT_TIMEOUT).await;
-    #[cfg(feature = "cli")]
-    crate::telemetry::operation(
-        crate::telemetry::Operation::RcConnect,
-        result.is_ok(),
-        started.elapsed(),
-        None,
-    );
-    result
+    connect_with(request, &proxies, CONNECT_TIMEOUT).await
 }
 
 fn proxy_destination(uri: &Uri) -> crate::Result<Uri> {
@@ -141,10 +129,18 @@ async fn connect_with(
                 .into_inner(),
         };
         // Keep the original hub URI for SNI, certificate validation and Host.
-        let (socket, _) =
-            tokio_tungstenite::client_async_tls_with_config(request, stream, None, None)
-                .await
-                .context("hub TLS/WebSocket handshake failed")?;
+        let (socket, _) = tokio_tungstenite::client_async_tls_with_config(
+            request,
+            stream,
+            Some(
+                tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .max_message_size(Some(super::protocol::MAX_PAYLOAD))
+                    .max_frame_size(Some(super::protocol::MAX_PAYLOAD)),
+            ),
+            None,
+        )
+        .await
+        .context("hub TLS/WebSocket handshake failed")?;
         Ok::<_, anyhow::Error>(socket)
     })
     .await

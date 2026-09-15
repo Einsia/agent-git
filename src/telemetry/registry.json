@@ -57,9 +57,23 @@
     "pull": {"aliases":[],"args":{"all":{"action":"SetTrue","policy":"boolean"},"branch":{"action":"Append","policy":"count"},"prune":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"}}},
     "push": {"aliases":[],"args":{"audit":{"action":"SetTrue","policy":"boolean"},"agent":{"action":"Set","policy":"presence"},"all":{"action":"SetTrue","policy":"boolean"},"allow_secrets":{"action":"SetTrue","policy":"boolean"},"branch":{"action":"Append","policy":"count"},"dry_run":{"action":"SetTrue","policy":"boolean"},"private":{"action":"SetTrue","policy":"boolean"},"public":{"action":"SetTrue","policy":"boolean"}}},
     "rc": {"aliases":[],"args":{}},
+    "rc cloud": {"aliases":[],"args":{}},
+    "rc cloud devices": {"aliases":[],"args":{"after":{"action":"Set","policy":"presence"},"hub":{"action":"Set","policy":"presence"}}},
+    "rc cloud enroll": {"aliases":[],"args":{"hub":{"action":"Set","policy":"presence"},"name":{"action":"Set","policy":"presence"}}},
+    "rc cloud inbound": {"aliases":[],"args":{"hub":{"action":"Set","policy":"presence"},"enabled":{"action":"Set","policy":"enum","values":["true","false"]}}},
+    "rc cloud grant": {"aliases":[],"args":{"access":{"action":"Set","policy":"enum","values":["deny","read","control","admin"]},"account":{"action":"Set","policy":"presence"},"hub":{"action":"Set","policy":"presence"},"resource":{"action":"Set","policy":"presence"}}},
+    "rc cloud policy": {"aliases":[],"args":{}},
+    "rc cloud status": {"aliases":[],"args":{"hub":{"action":"Set","policy":"presence"}}},
+    "rc local": {"aliases":[],"args":{}},
+    "rc local bridge": {"aliases":[],"args":{"ensure":{"action":"SetTrue","policy":"boolean"}}},
+    "rc local catalog": {"aliases":[],"args":{}},
+    "rc local start": {"aliases":[],"args":{"detach":{"action":"SetTrue","policy":"boolean"}}},
+    "rc local status": {"aliases":[],"args":{}},
+    "rc tunnel": {"aliases":[],"args":{}},
+    "rc local stop": {"aliases":[],"args":{}},
     "rc grant": {"aliases":[],"args":{"command":{"action":"Set","policy":"presence"},"workspace":{"action":"Set","policy":"presence"}}},
     "rc grants": {"aliases":[],"args":{"workspace":{"action":"Set","policy":"presence"}}},
-    "rc land": {"aliases":[],"args":{"agent_id":{"action":"Set","policy":"presence"},"branch":{"action":"Set","policy":"presence"},"cwd":{"action":"Set","policy":"presence"},"runtime":{"action":"Set","policy":"enum","values":["claude-code","codex","cursor","claude-desktop","opencode","claude","cc","openclaw","hermes","workbuddy"]},"session":{"action":"Set","policy":"presence"},"slug":{"action":"Set","policy":"presence"}}},
+    "rc land": {"aliases":[],"args":{"local_owner":{"action":"SetTrue","policy":"boolean"},"agent_id":{"action":"Set","policy":"presence"},"branch":{"action":"Set","policy":"presence"},"cwd":{"action":"Set","policy":"presence"},"runtime":{"action":"Set","policy":"enum","values":["claude-code","codex","cursor","claude-desktop","opencode","claude","cc","openclaw","hermes","workbuddy"]},"session":{"action":"Set","policy":"presence"},"slug":{"action":"Set","policy":"presence"}}},
     "rc list": {"aliases":[],"args":{}},
     "rc pair": {"aliases":[],"args":{}},
     "rc revoke": {"aliases":[],"args":{"connection":{"action":"Set","policy":"presence"}}},
@@ -112,6 +126,6 @@
     "whoami": {"aliases":[],"args":{"check":{"action":"SetTrue","policy":"boolean"}}}
   }
 ,
-  "rc_methods": {"rc.register":"ignore","rc.heartbeat":"ignore","commit.settled":"ignore","workspace.list":"capture","project.bind":"capture","project.unbind":"capture","fs.readDirectory":"capture","fs.readFile":"capture","terminal.open":"capture","terminal.input":"capture","terminal.resize":"capture","terminal.close":"capture","terminal.output":"ignore","terminal.exited":"ignore","session.start":"capture","session.resume":"capture","session.list":"capture","session.subscribe":"capture","session.watch":"capture","session.enqueue":"capture","session.unwatch":"capture","session.setPermissionMode":"capture","approval.decide":"capture","session.permissionMode":"ignore","turn.start":"capture","turn.steer":"capture","turn.interrupt":"capture","item.started":"ignore","item.delta":"ignore","item.completed":"ignore","turn.started":"ignore","turn.steered":"ignore","turn.completed":"ignore","session.status":"ignore","secret.detected":"ignore","approval.request":"ignore"},
+  "rc_methods": {"rc.register":"ignore","rc.heartbeat":"ignore","commit.settled":"ignore","workspace.list":"capture","project.bind":"capture","project.unbind":"capture","fs.readDirectory":"capture","fs.readFile":"capture","terminal.open":"capture","terminal.input":"capture","terminal.resize":"capture","terminal.close":"capture","terminal.output":"ignore","terminal.exited":"ignore","session.start":"capture","session.resume":"capture","session.command":"capture","session.commands":"capture","session.model":"capture","session.setModel":"capture","session.list":"capture","session.subscribe":"capture","session.watch":"capture","session.enqueue":"capture","session.unwatch":"capture","session.setPermissionMode":"capture","approval.decide":"capture","session.permissionMode":"ignore","turn.start":"capture","turn.steer":"capture","turn.interrupt":"capture","item.started":"ignore","item.delta":"ignore","item.completed":"ignore","turn.started":"ignore","turn.steered":"ignore","turn.completed":"ignore","session.status":"ignore","secret.detected":"ignore","approval.request":"ignore"},
   "mcp_tools": {"search":["author","before","here","limit","local","owner","page","path","queries","query","repo","runtime","scope","scopes","since","sort","tool","type"],"show":["ref"],"view":["ref"],"status":[],"commit":["milestone"],"rc_status":[],"rc_list":[]}
 }

@@ -320,6 +320,7 @@ impl Daemon {
                 Ok(serde_json::json!({}))
             }
 
+            #[cfg(test)]
             method::SESSION_START => {
                 let p: SessionStart = f.params_as()?;
                 self.start_session(p, &caller, frames).await
@@ -352,10 +353,13 @@ impl Daemon {
                 .unwrap())
             }
 
+            #[cfg(test)]
             method::SESSION_RESUME => {
                 let p: SessionResume = f.params_as()?;
                 self.resume_session(p, &caller, frames).await
             }
+
+            method::SESSION_ENQUEUE => self.reject_native_inbox(f),
 
             method::SESSION_WATCH => {
                 let prepared = self.prepare_watch_scan(f)?.run()?;
@@ -519,6 +523,7 @@ mod tests {
             replay_slots: Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
             outbound: None,
             opts: Options {
+                local_owner: false,
                 hub: "https://hub.invalid".into(),
                 token: "test".into(),
                 connection_id: None,
@@ -528,6 +533,7 @@ mod tests {
             roster: Roster::default(),
             sessions: HashMap::new(),
             latest_session_generations: HashMap::new(),
+            opening_sessions: HashMap::new(),
             watches: HashMap::new(),
             terminals: HashMap::new(),
             terminal_delivery_blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -546,8 +552,8 @@ mod tests {
     }
 
     #[test]
-    fn native_inbox_checks_scope_and_role_before_locating_a_transcript() {
-        let daemon = watching_daemon();
+    fn native_inbox_cannot_bypass_external_read_only_policy() {
+        let mut daemon = watching_daemon();
         let mut frame = Frame::request(
             method::SESSION_ENQUEUE,
             serde_json::json!({
@@ -562,7 +568,7 @@ mod tests {
             workspace_id: "ws-a".into(),
         });
         assert_eq!(
-            daemon.prepare_native_inbox(&frame).err().unwrap().code,
+            daemon.reject_native_inbox(&frame).err().unwrap().code,
             ErrorCode::Forbidden as i32
         );
         frame.caller.as_mut().unwrap().role = "operator".into();
@@ -579,20 +585,25 @@ mod tests {
             .ever_dangerous()
         );
         assert_eq!(
-            daemon.prepare_native_inbox(&frame).err().unwrap().code,
+            daemon.reject_native_inbox(&frame).err().unwrap().code,
             ErrorCode::Forbidden as i32,
             "an unregistered native process may have full access outside the daemon's ledger"
         );
         frame.caller.as_mut().unwrap().role = "owner".into();
         frame.caller.as_mut().unwrap().workspace_id = "ws-b".into();
         assert_eq!(
-            daemon.prepare_native_inbox(&frame).err().unwrap().code,
+            daemon.reject_native_inbox(&frame).err().unwrap().code,
             ErrorCode::WorkspaceNotFound as i32
         );
         frame.caller.as_mut().unwrap().workspace_id = "ws-a".into();
+        let project = tempfile::tempdir().unwrap();
+        daemon
+            .mirror
+            .bind("ws-a", "project", project.path())
+            .unwrap();
         assert_eq!(
-            daemon.prepare_native_inbox(&frame).err().unwrap().code,
-            ErrorCode::SessionNotFound as i32
+            daemon.reject_native_inbox(&frame).err().unwrap().code,
+            ErrorCode::SessionBusy as i32
         );
     }
 

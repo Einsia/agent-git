@@ -32,6 +32,13 @@ impl Daemon {
             "only a new session event needs projection and numbering"
         );
         let stream = frame.stream.clone().unwrap_or_default();
+        if let Some(watch) = self.watches.get_mut(&stream) {
+            match frame.method() {
+                method::TURN_STARTED => watch.info.status = SessionStatus::Running,
+                method::TURN_COMPLETED => watch.info.status = SessionStatus::Idle,
+                _ => {}
+            }
+        }
 
         // A synthetic hard-stop token is the sole source of truth for the
         // monotonic Plan floor. A delayed supervisor mode frame belongs to the
@@ -105,21 +112,25 @@ impl Daemon {
         if frame.method() == method::COMMIT_SETTLED
             && let Some(obj) = frame.params.as_mut().and_then(|p| p.as_object_mut())
         {
-            let delivery = frame.connection_delivery.as_ref()?;
             let settlement = *self.settlement.borrow();
-            if delivery.feature() != crate::protocol::ConnectionFeature::AgentIdentityV1
-                || delivery.epoch() != settlement.epoch
-                || !settlement.agent_identity_v1
-            {
-                delivery.invalidate();
-                return None;
+            if !(self.opts.local_owner && settlement.local_owner) {
+                let delivery = frame.connection_delivery.as_ref()?;
+                if delivery.feature() != crate::protocol::ConnectionFeature::AgentIdentityV1
+                    || delivery.epoch() != settlement.epoch
+                    || !settlement.agent_identity_v1
+                {
+                    delivery.invalidate();
+                    return None;
+                }
             }
             let through_seq = frame.settlement_boundary.as_ref().map_or_else(
                 || self.journal.last_seq(&stream),
                 |boundary| boundary.load(std::sync::atomic::Ordering::Acquire),
             );
             if through_seq > self.journal.last_seq(&stream) {
-                delivery.invalidate();
+                if let Some(delivery) = frame.connection_delivery.as_ref() {
+                    delivery.invalidate();
+                }
                 return None;
             }
             obj.insert("through_seq".into(), serde_json::json!(through_seq));
@@ -514,6 +525,35 @@ impl Daemon {
         info
     }
 
+    /// A task may end without its final note if an adapter panics or the task is cancelled.
+    /// Keep the per-session receipt gate until accepted instructions finish projecting.
+    pub(super) fn reconcile_finished_sessions(&mut self, frames: &mpsc::Sender<Frame>) {
+        let finished: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, live)| live.task.is_finished() && !live.ended)
+            .map(|(id, live)| (id.clone(), live.generation))
+            .collect();
+        for (session_id, generation) in finished {
+            let mut frame = Frame::notification(
+                method::SESSION_STATUS,
+                serde_json::json!({
+                    "session_id": session_id, "status": SessionStatus::Ended,
+                }),
+            );
+            tag_session_frame(&mut frame, &session_id, generation);
+            // Backpressure keeps the live record for the next reconciliation pass.
+            // Retiring it before queueing the terminal state would strand observers.
+            if frames.try_send(frame).is_err() {
+                continue;
+            }
+            self.on_session_note(SessionNote::Ended {
+                session_id,
+                generation,
+            });
+        }
+    }
+
     pub(super) fn remove_session_generation(&mut self, session_id: &str, generation: u64) {
         if self
             .sessions
@@ -525,34 +565,6 @@ impl Daemon {
             self.sessions.remove(session_id);
             self.journal.forget(session_id);
         }
-    }
-
-    /// Retire a generation whose post-launch bootstrap command could not reach
-    /// its supervisor without waiting for that task under the daemon mutex.
-    ///
-    /// A supervisor always ends by sending `SessionNote::Ended`. That send may
-    /// itself be parked behind a full notes channel whose consumer needs this
-    /// mutex, so joining here would deadlock the entire daemon. Detach a tiny
-    /// reaper instead and pair the earlier `journal.resume()` immediately with
-    /// `forget`; the eventual generation-fenced Ended note is then a no-op.
-    pub(super) fn detach_failed_session_generation(&mut self, session_id: &str, generation: u64) {
-        let matches = self
-            .sessions
-            .get(session_id)
-            .is_some_and(|live| live.generation == generation);
-        if !matches {
-            return;
-        }
-        let live = self
-            .sessions
-            .remove(session_id)
-            .expect("failed generation was checked above");
-        self.journal.forget(session_id);
-        let Live { task, tx, .. } = live;
-        drop(tx);
-        tokio::spawn(async move {
-            let _ = task.await;
-        });
     }
 
     /// This workspace's confinement **right now**, as a subscription a session
@@ -759,6 +771,7 @@ mod bound_lineage_tests {
                         )),
                         outbound: None,
                         opts: Options {
+                            local_owner: false,
                             hub: "https://hub.invalid".into(),
                             token: "test".into(),
                             connection_id: None,
@@ -768,6 +781,7 @@ mod bound_lineage_tests {
                         roster,
                         sessions: [("agit-S".to_string(), live)].into_iter().collect(),
                         latest_session_generations: HashMap::new(),
+                        opening_sessions: HashMap::new(),
                         watches: HashMap::new(),
                         terminals: HashMap::new(),
                         terminal_delivery_blockers: std::sync::Arc::new(

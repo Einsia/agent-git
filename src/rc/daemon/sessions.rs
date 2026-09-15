@@ -82,12 +82,12 @@ impl Daemon {
     /// `--resume`), content untouched, id unchanged. The slow path (across harnesses,
     /// materializing a new id) is not done in RC — that changes something on the user's machine
     /// without being asked.
-    pub(super) async fn resume_session(
+    pub(super) fn prepare_resume_session(
         &mut self,
         p: SessionResume,
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
-    ) -> Result<serde_json::Value, RpcError> {
+    ) -> Result<SessionOpening, RpcError> {
         if !self.mirror.has_workspace(&p.workspace_id) {
             return Err(RpcError::new(
                 ErrorCode::WorkspaceNotFound,
@@ -118,10 +118,12 @@ impl Daemon {
             ));
         }
         if let Some(info) = self.supervised_in(&p.session_id, caller) {
-            return Ok(serde_json::to_value(SessionResumeResult {
-                session: self.stamped(info),
-            })
-            .unwrap());
+            return Ok(SessionOpening::Ready(
+                serde_json::to_value(SessionResumeResult {
+                    session: self.stamped(info),
+                })
+                .unwrap(),
+            ));
         }
 
         // The durable mapping for logical ids (the main path after a daemon restart): the web
@@ -164,7 +166,7 @@ impl Daemon {
                 &p.workspace_id,
                 &entry.cwd,
             )?;
-            // The danger pre-write row from `spawn_session` may carry an empty thread id (the
+            // The danger pre-write row from `prepare_spawn` may carry an empty thread id (the
             // harness crashed before reporting a native id). An empty string is not a resumable
             // address: feeding it to `--resume` starts a **brand new** conversation wearing the
             // old session's logical identity and permission mode. Refuse honestly; the
@@ -228,7 +230,7 @@ impl Daemon {
                 status: SessionStatus::Idle,
                 last_seq: 0,
                 gist: None,
-                // The monotonic bit is stamped by `spawn_session` from the slip above; it is
+                // The monotonic bit is stamped by `prepare_spawn` from the slip above; it is
                 // not inferred back from the current permission mode and not copied again here.
                 dangerous: false,
                 permission_mode: entry.restart_permission_mode(),
@@ -239,22 +241,28 @@ impl Daemon {
                 cwd,
                 resume_from: Some(entry.thread_id.clone()),
                 agit_session: lineage,
-                model: None,
+                model: self.roster.starts.values().find_map(|intent| {
+                    let session = match &intent.state {
+                        roster::StartState::Pending { session } => session,
+                        roster::StartState::Completed { result } => &result.session,
+                    };
+                    (session.session_id == p.session_id)
+                        .then(|| intent.spec.model.clone())
+                        .flatten()
+                }),
                 dangerous: false,
                 // Resume brings back the guard it ran under.
                 permission_mode: entry.restart_permission_mode(),
             };
-            let session = self
-                .spawn_session(
-                    info,
-                    spec,
-                    danger,
-                    frames,
-                    p.prompt,
-                    MessageAttribution::from_caller(caller, p.by, None),
-                )
-                .await?;
-            return Ok(serde_json::to_value(SessionResumeResult { session }).unwrap());
+            let spawn = self.prepare_spawn(
+                info,
+                spec,
+                danger,
+                frames,
+                p.prompt,
+                MessageAttribution::from_caller(caller, p.by, None),
+            )?;
+            return Ok(SessionOpening::launch(spawn, OpeningReply::Resume));
         }
 
         // **One** scan yields both the liveness bit and the launch coordinates. Asking
@@ -262,7 +270,7 @@ impl Daemon {
         // puts both passes under the daemon's global mutex and opens the same Claude transcripts
         // for a gist twice. The internal locate needs no gist at all.
         let local = self.locate_local(&p.workspace_id, &p.session_id)?;
-        self.take_over_local_session(local, p, caller, frames).await
+        self.prepare_local_takeover(local, p, caller, frames)
     }
 
     /// Take over a session on this machine that was **opened in a terminal** — the half
@@ -278,13 +286,13 @@ impl Daemon {
     /// that edit turns no test red. The looser phrasing cannot leave the `roster` module (see
     /// [`Roster::transcript_ever_dangerous`](crate::rc::roster::Roster::transcript_ever_dangerous)),
     /// and the test itself comes from [`danger`](super::danger).
-    pub(super) async fn take_over_local_session(
+    pub(super) fn prepare_local_takeover(
         &mut self,
         local: LocatedLocal,
         p: SessionResume,
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
-    ) -> Result<serde_json::Value, RpcError> {
+    ) -> Result<SessionOpening, RpcError> {
         // A live session cannot be taken over: `--resume` opens a second writer on the same
         // transcript file, and once the two streams of appends interleave both histories are
         // destroyed. This is data corruption, not an experience problem, so it is blocked here
@@ -408,7 +416,7 @@ impl Daemon {
             status: SessionStatus::Idle,
             last_seq: 0,
             gist: None,
-            // The judged bit is stamped by `spawn_session` — copying it here is one more place
+            // The judged bit is stamped by `prepare_spawn` — copying it here is one more place
             // that has to be right.
             dangerous: false,
             permission_mode: Some(inherited_mode),
@@ -427,17 +435,15 @@ impl Daemon {
             // takeover.
             permission_mode: Some(inherited_mode),
         };
-        let session = self
-            .spawn_session(
-                info,
-                spec,
-                danger,
-                frames,
-                p.prompt,
-                MessageAttribution::from_caller(caller, p.by, None),
-            )
-            .await?;
-        Ok(serde_json::to_value(SessionResumeResult { session }).unwrap())
+        let spawn = self.prepare_spawn(
+            info,
+            spec,
+            danger,
+            frames,
+            p.prompt,
+            MessageAttribution::from_caller(caller, p.by, None),
+        )?;
+        Ok(SessionOpening::launch(spawn, OpeningReply::Resume))
     }
 
     /// Local session → (runtime, cwd, project_id).
@@ -451,81 +457,56 @@ impl Daemon {
         })
     }
 
-    pub(super) fn prepare_native_inbox(
-        &self,
-        frame: &Frame,
-    ) -> Result<crate::rc::native_inbox::Prepared, RpcError> {
+    pub(super) fn reject_native_inbox(&self, frame: &Frame) -> Result<serde_json::Value, RpcError> {
         let caller = caller_scope(frame)?;
         require_role(&caller, method::SESSION_ENQUEUE)?;
         let request: crate::rc::native_inbox::Request = frame.params_as()?;
         request
             .validate()
             .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
-        let local = self.locate_local(&request.workspace_id, &request.session_id)?;
-        if local.runtime != "codex" {
+        if !self.mirror.has_workspace(&request.workspace_id) {
             return Err(RpcError::new(
-                ErrorCode::RuntimeUnavailable,
-                "this runtime does not offer a native inbox",
+                ErrorCode::WorkspaceNotFound,
+                "workspace is not bound on this machine",
             ));
         }
-        let cwd = policy::require_within(&local.cwd, &self.mirror.roots(&request.workspace_id))
-            .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
-        let transcript = {
-            use crate::adapter::Adapter;
-            crate::adapter::codex::Codex
-                .resolve(&request.session_id, Some(&cwd))
-                .ok_or_else(|| {
-                    RpcError::new(
-                        ErrorCode::SessionNotFound,
-                        "cannot locate this Codex transcript",
-                    )
-                })?
-        };
-        let codex = crate::adapter::which("codex")
-            .and_then(|path| path.canonicalize().ok())
-            .ok_or_else(|| {
-                RpcError::new(ErrorCode::RuntimeUnavailable, "Codex CLI is unavailable")
-            })?;
-        let receipts = crate::rc::rc_dir()
-            .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))?
-            .join("native-inbox");
-        Ok(crate::rc::native_inbox::Prepared {
-            request,
-            transcript,
-            cwd,
-            codex,
-            receipts,
-            hub: self.opts.hub.clone(),
-            connection: self.opts.connection_id.clone().unwrap_or_default(),
-            account: caller
-                .account_id
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    RpcError::new(
-                        ErrorCode::Unauthenticated,
-                        "native messages require an authenticated account",
-                    )
-                })?,
-            username: caller
-                .username
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    RpcError::new(
-                        ErrorCode::Unauthenticated,
-                        "native messages require an authenticated username",
-                    )
-                })?,
-        })
+        Err(RpcError::new(
+            ErrorCode::SessionBusy,
+            "native inbox delivery is unavailable: external and unknown sessions are read-only",
+        )
+        .with_hint("use the controlling application, or acquire the session through a supported native handoff"))
     }
 
-    pub(super) async fn start_session(
+    pub(super) fn prepare_start_session(
         &mut self,
         p: SessionStart,
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
-    ) -> Result<serde_json::Value, RpcError> {
+    ) -> Result<SessionOpening, RpcError> {
         let start_id =
             negotiated_start_id(self.start_idempotency_feature(), p.start_id.as_deref())?;
+        #[cfg(unix)]
+        let mut p = p;
+        #[cfg(unix)]
+        if self.opts.local_owner
+            && p.agent.is_none()
+            && p.expected_agent_id.is_none()
+            && p.branch.is_none()
+        {
+            let project = self
+                .mirror
+                .project_path(&p.workspace_id, &p.project_id)
+                .ok_or_else(|| RpcError::new(ErrorCode::PathNotAllowed, "project is not bound"))?;
+            let repository =
+                crate::rc::local_repository::ensure_repository(&p.project_id, &project)
+                    .map_err(|e| RpcError::new(ErrorCode::Internal, e.to_string()))?;
+            p.agent = Some(repository.slug);
+            p.expected_agent_id = Some(repository.agent_id);
+            p.branch = Some(format!(
+                "desktop-{}",
+                start_id.as_deref().unwrap_or_default()
+            ));
+        }
         let mode = p
             .permission_mode
             .unwrap_or(crate::protocol::PermissionMode::Default);
@@ -545,6 +526,7 @@ impl Daemon {
             && let Some(intent) = self.roster.starts.get(start_id).cloned()
         {
             let retry_spec = roster::StartSpec {
+                model: p.model.clone(),
                 workspace_id: p.workspace_id.clone(),
                 project_id: p.project_id.clone(),
                 runtime: p.runtime.clone(),
@@ -563,6 +545,7 @@ impl Daemon {
             match intent.state {
                 roster::StartState::Completed { result } => {
                     return serde_json::to_value(result)
+                        .map(SessionOpening::Ready)
                         .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()));
                 }
                 roster::StartState::Pending { session }
@@ -574,6 +557,7 @@ impl Daemon {
                     };
                     self.persist_completed_start(start_id, result.clone())?;
                     return serde_json::to_value(result)
+                        .map(SessionOpening::Ready)
                         .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()));
                 }
                 roster::StartState::Pending { session } => {
@@ -648,7 +632,7 @@ impl Daemon {
             cwd: cwd.clone(),
             resume_from: None,
             agit_session: agit_session.clone(),
-            model: None,
+            model: p.model.clone(),
             dangerous: mode.is_dangerous(),
             permission_mode: Some(mode),
         };
@@ -657,24 +641,19 @@ impl Daemon {
             // Rolling compatibility: an old hub on an unnegotiated socket may
             // still launch exactly as before. It cannot send or receive keyed
             // semantics until the feature is explicitly ACKed.
-            let session = self
-                .spawn_session(
-                    info,
-                    spec,
-                    danger::TranscriptDanger::fresh_transcript(),
-                    frames,
-                    p.prompt,
-                    MessageAttribution::from_caller(caller, p.by, None),
-                )
-                .await?;
-            return Ok(serde_json::to_value(SessionStartResult {
-                start_id: None,
-                session,
-            })
-            .unwrap());
+            let spawn = self.prepare_spawn(
+                info,
+                spec,
+                danger::TranscriptDanger::fresh_transcript(),
+                frames,
+                p.prompt,
+                MessageAttribution::from_caller(caller, p.by, None),
+            )?;
+            return Ok(SessionOpening::launch(spawn, OpeningReply::Start(None)));
         };
 
         let start_spec = roster::StartSpec {
+            model: p.model.clone(),
             workspace_id: p.workspace_id.clone(),
             project_id: p.project_id.clone(),
             runtime: p.runtime.clone(),
@@ -691,6 +670,7 @@ impl Daemon {
         match self.roster.claim_start(&start_id, start_spec, info.clone()) {
             roster::StartClaim::Completed(result) => {
                 return serde_json::to_value(result)
+                    .map(SessionOpening::Ready)
                     .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()));
             }
             roster::StartClaim::Pending(session) => {
@@ -704,6 +684,7 @@ impl Daemon {
                     };
                     self.persist_completed_start(&start_id, result.clone())?;
                     return serde_json::to_value(result)
+                        .map(SessionOpening::Ready)
                         .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()));
                 }
                 return Err(pending_start_error(&start_id, &session.session_id));
@@ -722,8 +703,8 @@ impl Daemon {
             .with_hint("nothing was launched; retry in a moment with the same start_id"));
         }
 
-        let launched = match self
-            .spawn_session(
+        let spawn = self
+            .prepare_spawn(
                 info,
                 spec,
                 danger::TranscriptDanger::fresh_transcript(),
@@ -731,55 +712,14 @@ impl Daemon {
                 p.prompt,
                 MessageAttribution::from_caller(caller, p.by, None),
             )
-            .await
-        {
-            Ok(value) => value,
-            Err(failure) if !failure.reached_launch => {
-                // The failure is before `Session::launch`, so **no process provably started**.
-                // This case must release the reservation: keeping it parks this start_id in
-                // Pending forever, and Pending is durable — one pure persistence failure would
-                // scrap this launch permanently, past saving even once the disk is writable
-                // again. The reservation-persist failure path above judges the same class of
-                // thing.
-                self.roster.forget_start(&start_id);
-                if let Err(error) = self.roster.save() {
-                    // Release the in-memory copy even when the release cannot be persisted:
-                    // **this process** knows nothing started, so an immediate retry with the
-                    // same start_id is safe. The Pending row on disk speaks again only after a
-                    // restart, and it fails closed then — better that than scrapping in memory
-                    // too a start_id that provably never ran.
-                    eprintln!(
-                        "agitd: released session.start {start_id} in memory but could not persist it: {error:#}"
-                    );
-                }
-                return Err(failure.error);
-            }
-            Err(failure) => {
-                // The launch crossed the OS spawn boundary (or its outcome is
-                // unknown): a native process may be running right now. Keep
-                // Pending forever rather than guessing a second launch is safe.
-                return Err(RpcError::new(
-                    ErrorCode::SessionBusy,
-                    format!(
-                        "session.start was durably reserved but launch completion is unknown: {}",
-                        failure.error.message
-                    ),
-                )
-                .with_hint(format!(
-                    "no second launch will be attempted for {start_id}; inspect this machine and retry the same start_id after recovery"
-                )));
-            }
-        };
-        let result = SessionStartResult {
-            start_id: Some(start_id.clone()),
-            session: launched,
-        };
-        self.persist_completed_start(&start_id, result.clone())?;
-        serde_json::to_value(result)
-            .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))
+            .map_err(|failure| self.failed_start(&start_id, failure))?;
+        Ok(SessionOpening::launch(
+            spawn,
+            OpeningReply::Start(Some(start_id)),
+        ))
     }
 
-    fn persist_completed_start(
+    pub(super) fn persist_completed_start(
         &mut self,
         start_id: &str,
         result: SessionStartResult,
@@ -820,7 +760,7 @@ impl Daemon {
     ///
     /// Failure comes back as [`SpawnFailure`]: keyed `session.start` needs `reached_launch` to
     /// tell "provably nothing happened" apart from "a native process may already be running".
-    pub(super) async fn spawn_session(
+    pub(super) fn prepare_spawn(
         &mut self,
         mut info: SessionInfo,
         spec: LaunchSpec,
@@ -828,7 +768,7 @@ impl Daemon {
         frames: &mpsc::Sender<Frame>,
         prompt: Option<String>,
         attribution: MessageAttribution,
-    ) -> Result<SessionInfo, SpawnFailure> {
+    ) -> Result<PreparedSpawn, SpawnFailure> {
         // **Resuming a transcript requires having judged it and having judged whoever asks for
         // it.**
         //
@@ -845,6 +785,15 @@ impl Daemon {
                 "this launch resumes a harness transcript that was never cleared for this caller",
             )));
         }
+        #[cfg(unix)]
+        if self.opts.local_owner
+            && let Some(lineage) = &spec.agit_session
+        {
+            crate::rc::local_repository::require(lineage).map_err(|e| {
+                SpawnFailure::before_launch(RpcError::new(ErrorCode::PathNotAllowed, e.to_string()))
+            })?;
+        }
+        self.require_launch_slot(&info, &spec)?;
         danger::stamp(&mut info, danger);
         let session_id = info.session_id.clone();
         // Capture only ambiguity inherited by this new harness generation.
@@ -959,151 +908,35 @@ impl Daemon {
                 ));
             }
         }
-        // This stream is alive again: reopen the replay buffer.
-        //
-        // `SessionNote::Ended` closes it (a finished session holding up to 8192 frames nobody
-        // picks up), and a logical session can come back to life — without reopening, for the
-        // whole lifetime of this resumed stretch `session.subscribe` backfills nothing, and
-        // every viewer reconnect depends on it.
-        self.journal.resume(&session_id);
-        let cwd = spec.cwd.clone();
-        let agit_session = spec.agit_session.clone();
-        let resume_from = spec.resume_from.clone();
-
-        // Allocate provenance before the bridge exists: no frame may enter the
-        // shared daemon queue without the exact generation that produced it.
-        // A failed launch consumes the number but never materializes its
-        // tombstone, so any frame it managed to enqueue is rejected later.
         self.session_generation += 1;
         let generation = self.session_generation;
-
-        // Stamp every frame this session emits with the stream id and the local generation.
-        // Both are overwritten unconditionally: the supervisor does not own the logical stream,
-        // and the JSON does not own generation provenance.
-        let (tagged_tx, mut tagged_rx) = mpsc::channel::<Frame>(1024);
-        {
-            let frames = frames.clone();
-            let sid = session_id.clone();
-            tokio::spawn(async move {
-                while let Some(mut f) = tagged_rx.recv().await {
-                    tag_session_frame(&mut f, &sid, generation);
-                    if frames.send(f).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-
-        let confinement = self.confinement_for(&info.workspace_id);
-        let session = Session::launch(
-            info.clone(),
-            spec,
-            tagged_tx,
-            self.notes.clone(),
-            confinement,
-            self.settlement.subscribe(),
-            generation,
-            self.secret_filter.clone(),
-        )
-        .await
-        .map_err(|failure| {
-            // The spawn boundary **is not this line**: `Session::launch` goes all the way down
-            // to `Proc::spawn` before it really calls `Command::spawn`, and before that it
-            // returns just as well for "the executable is not on PATH", "no execute bit", "the
-            // cwd does not exist", "the process-tree fence cannot be built" — each of which
-            // proves not one harness started. Accounting for all of them as "crossed" parks a
-            // request carrying a start key in Pending forever: a retry gets
-            // `pending_start_error`, and the Pending row on disk outlives a daemon restart while
-            // no process exists on the machine at all.
-            //
-            // So the answer comes from the layer that really crosses that boundary
-            // ([`harness::proc::LaunchError`]); this only translates it.
-            let reached_spawn = failure.reached_spawn();
-            let error = RpcError::new(ErrorCode::RuntimeUnavailable, failure.to_string());
-            if reached_spawn {
-                SpawnFailure::after_launch(error)
-            } else {
-                SpawnFailure::before_launch(error.with_hint(
-                    "nothing was launched on this machine; fix the runtime and retry the same start_id",
-                ))
-            }
-        })?;
-        // A completed `Session::launch` is proof the native harness exists.
-        // Never register a generation that failed to create one, and never
-        // erase this entry when its `Live` handle later ends.
-        self.latest_session_generations
-            .insert(session_id.clone(), generation);
-
-        // The harness's own id and the local lineage registration **are not done here**.
-        //
-        // A codex thread id does not exist until `thread/started`, so reading it at this moment
-        // is necessarily `None` — taking that as the answer permanently skips landing, the
-        // roster and the double-writer guard for every new codex session, and a conversation
-        // held on the web settles no commit. The supervisor reports it through
-        // `SessionNote::Bound` at the moment the id is knowable (launch for claude, Ready for
-        // codex), retrying before every turn settlement on failure. This keeps only the one
-        // resume already knows, as the initial value.
-        let runtime_thread_id = resume_from;
-        let _ = &cwd;
-        let _ = &agit_session;
-
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
-        let task = tokio::spawn(session.run(cmd_rx));
-
-        let bootstrap_tx = cmd_tx.clone();
-        let claude_restart_guard_barrier =
-            needs_claude_restart_guard_barrier(&info.runtime, &restart_guard_attempts);
-
-        self.sessions.insert(
-            session_id.clone(),
-            Live {
+        self.opening_sessions.insert(
+            session_id,
+            LaunchReservation {
                 generation,
-                task,
-                danger_arm: 0,
-                pending_mode: None,
-                approval_session_modes: HashMap::new(),
-                rpc_gate: Arc::new(Mutex::new(())),
-                rpc_guard_sensitive: false,
-                confirmed_turn_guards: Default::default(),
-                inflight_turn_guard: None,
-                restart_guard_attempts,
-                restart_guard_mode,
-                ended: false,
-                info: info.clone(),
-                tx: cmd_tx,
-                runtime_thread_id,
+                runtime: info.runtime.clone(),
+                native_id: spec.resume_from.clone(),
             },
         );
-
-        // Queue Claude's recovery evidence only after the generation is in
-        // `Live`. The supervisor consumes this marker from inside its command
-        // loop and waits for the ACKed durable save before it can consume the
-        // following creation prompt or any later viewer command. Codex keeps
-        // using its native Ready notification instead.
-        if claude_restart_guard_barrier
-            && bootstrap_tx
-                .send(Command::ClaudeRestartGuardReady)
-                .await
-                .is_err()
-        {
-            self.detach_failed_session_generation(&session_id, generation);
-            return Err(SpawnFailure::after_launch(RpcError::new(
-                ErrorCode::RuntimeUnavailable,
-                "the Claude recovery supervisor ended before its Plan barrier",
-            )));
-        }
-        if let Some(prompt) = prompt {
-            let _ = bootstrap_tx
-                .send(Command::InitialTurn {
-                    message: prompt,
-                    attribution,
-                })
-                .await;
-        }
-        // Stamp the current seq watermark. See [`Daemon::stamped`]: the web needs it to order a
-        // response carrying no seq against the event stream, or an `ended` from yesterday locks
-        // the input box forever.
-        Ok(self.stamped(info))
+        let confinement = self.confinement_for(&info.workspace_id);
+        Ok(PreparedSpawn {
+            authority: Default::default(),
+            epoch: self.settlement.borrow().epoch,
+            #[cfg(test)]
+            launch_pause: None,
+            info,
+            spec,
+            generation,
+            restart_guard_attempts,
+            restart_guard_mode,
+            frames: frames.clone(),
+            notes: self.notes.clone(),
+            confinement,
+            settlement: self.settlement.subscribe(),
+            secret_filter: self.secret_filter.clone(),
+            prompt,
+            attribution,
+        })
     }
 }
 

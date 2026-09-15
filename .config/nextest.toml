@@ -5,8 +5,3 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.windows.junit]
 path = "junit.xml"
-
-# Git deadline fixtures and process-wide audit fixtures need the whole test pool.
-[[profile.windows.overrides]]
-filter = 'binary(=status_branch_sync) | binary(=status_session_details) | test(~commands::scan::) | test(~commands::push::audit)'
-threads-required = "num-test-threads"

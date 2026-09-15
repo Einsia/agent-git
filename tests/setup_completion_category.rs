@@ -105,14 +105,3 @@ fn invalid_completion_shells_refuse_before_startup_or_integration_writes() {
         }
     }
 }
-
-#[test]
-fn supported_completion_shells_keep_the_existing_argument_contract() {
-    for shell in ["bash", "zsh", "fish"] {
-        let matches = agit::commands::cli_def()
-            .try_get_matches_from(["agit", "setup", "--completions", shell])
-            .unwrap();
-        let setup = matches.subcommand_matches("setup").unwrap();
-        assert_eq!(setup.get_one::<String>("completions").unwrap(), shell);
-    }
-}

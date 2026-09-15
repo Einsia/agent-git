@@ -378,4 +378,33 @@ mod tests {
                 .contains("private-canary")
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloud_telemetry_keeps_permission_enums_without_endpoint_or_resource_values() {
+        for args in [
+            vec!["enroll", "--name", "private-canary"],
+            vec!["devices", "--after", "private-canary"],
+            vec!["status"],
+            vec![
+                "grant",
+                "--account",
+                "private-canary",
+                "--resource",
+                "session:private-canary",
+                "--access",
+                "read",
+            ],
+        ] {
+            let mut argv = vec!["agit", "rc", "cloud"];
+            argv.extend(args.iter().copied());
+            argv.extend(["--hub", "https://private-canary"]);
+            let value = capture(&argv);
+            assert_eq!(value["command_path"], format!("rc cloud {}", args[0]));
+            assert!(!value.to_string().contains("private-canary"));
+            if args[0] == "grant" {
+                assert_eq!(value["arg_access"], "read");
+            }
+        }
+    }
 }
