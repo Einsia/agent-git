@@ -4,6 +4,17 @@ The cloud service must provide the peer relay API. This implementation targets a
 single combined dev backend; it does not enable relay routing in staging or
 across backend replicas. Desktop and the executor need compatible CLI builds.
 
+Cloud adapters with a narrower role than the signed-in account can send
+`access_ceiling` in executor RPC parameters: `read`, `control`, or `admin`.
+`machine.describe` advertises support with `access_ceiling: true`. An adapter must
+require that capability before forwarding restricted writes to an executor.
+The executor intersects this ceiling with its own resource policy, removes the
+parameter before harness dispatch, and retains the resulting caller role through
+queue admission and the final session permission checks. A ceiling never grants
+access. Omitting it preserves the account's executor policy. This lets a Web
+workspace operator stay an operator even if the account also administers the
+machine and another controller changes the session's dangerous mode.
+
 On the execution machine, sign in, enroll its daemon identity, and start the
 owner daemon:
 

@@ -157,6 +157,62 @@ fn a_session_that_was_ever_dangerous_stays_owner_only() {
     assert!(require_owner_to_drive(Some(&claim("owner")), true).is_ok());
 }
 
+/// The executor's current danger state must dominate a controller's cached safe snapshot.
+#[cfg(unix)]
+#[tokio::test]
+async fn cloud_admin_with_operator_ceiling_cannot_drive_a_newly_dangerous_session() {
+    use agit_peer::access::{Access, Policy, Principal, Resource, Rule};
+    use serde_json::json;
+    let principal = Principal {
+        issuer: "https://cloud.example".into(),
+        account_id: "admin".into(),
+    };
+    let registry = crate::rc::cloud::ingress::Registry::fixed(
+        Policy::new(
+            1,
+            vec![Rule {
+                principal: principal.clone(),
+                resource: Resource::Machine,
+                access: Access::Admin,
+            }],
+        )
+        .unwrap(),
+    );
+    let client = registry.client(principal, i64::MAX);
+    let list = Frame::request("session.list", json!({}));
+    client.authorize(list.clone()).unwrap();
+    client
+        .project(
+            &Frame::response(
+                list.id.unwrap(),
+                json!({
+                    "local":[{"runtime_session_id":"native","runtime":"codex","cwd":"/project"}]
+                }),
+            )
+            .to_json(),
+        )
+        .unwrap();
+    let limited = client
+        .authorize(Frame::request(
+            "turn.start",
+            json!({
+                "session_id":"native","access_ceiling":"control"
+            }),
+        ))
+        .unwrap();
+    assert!(require_owner_to_drive(limited.caller.as_ref(), false).is_ok());
+    assert!(require_owner_to_drive(limited.caller.as_ref(), true).is_err());
+    let owner = client
+        .authorize(Frame::request(
+            "turn.start",
+            json!({
+                "session_id":"native"
+            }),
+        ))
+        .unwrap();
+    assert!(require_owner_to_drive(owner.caller.as_ref(), true).is_ok());
+}
+
 /// With no caller claim, the caller is treated as the **weakest** one.
 ///
 /// An older hub does not send this field. Missing credentials must never read as permission —

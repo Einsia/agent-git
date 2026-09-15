@@ -176,53 +176,32 @@ impl Connector for Route {
     }
     fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a> {
         Box::pin(async move {
-            let mut token = super::account_token(self.api.origin(), false).await?;
-            let mut after = None;
-            let mut target = None;
-            for page in 0..64 {
-                let found = match self.api.devices(&token, after.as_deref()).await {
+            let source = super::commands::controller(self.api.origin()).await?;
+            let identity = Arc::new(source.identity);
+            let mut refresh = false;
+            loop {
+                let credentials = Arc::new(agit_controller::cloud::Credentials {
+                    identity: identity.clone(),
+                    device: source.credential.clone(),
+                    account: super::account_token(self.api.origin(), refresh).await?,
+                });
+                let route = agit_controller::cloud::Route::new(
+                    self.api.clone(),
+                    credentials,
+                    self.target.clone(),
+                )?;
+                match route.open(worker).await {
                     Err(error)
-                        if page == 0
+                        if !refresh
                             && error
                                 .downcast_ref::<agit_peer::client::HttpFailure>()
                                 .is_some_and(|error| error.status == 401) =>
                     {
-                        token = super::account_token(self.api.origin(), true).await?;
-                        self.api.devices(&token, after.as_deref()).await?
+                        refresh = true;
                     }
-                    result => result?,
-                };
-                target = found
-                    .devices
-                    .into_iter()
-                    .map(|entry| entry.device)
-                    .find(|device| device.id == self.target.id);
-                if target.is_some() || found.next_cursor.is_none() {
-                    break;
+                    result => return result,
                 }
-                after = found.next_cursor;
             }
-            let target = target.context("cloud target is no longer available to this account")?;
-            ensure!(
-                target.owner == self.target.owner && target.certificate == self.target.certificate,
-                "cloud target identity changed; verify and reconnect the device"
-            );
-            let source = super::commands::controller(self.api.origin()).await?;
-            let dialed = self
-                .api
-                .connect(&token, &source.credential.device, &target)
-                .await?;
-            let raw = worker
-                .open(self.api.data_config(&source.credential)?)
-                .await?;
-            let raw = join_data(raw, &dialed.link_id, dialed.ticket).await?;
-            authenticate(
-                raw,
-                &source.identity,
-                &dialed.connection.grant.target.certificate,
-                Role::Controller,
-            )
-            .await
         })
     }
 }

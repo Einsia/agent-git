@@ -43,6 +43,7 @@ pub(super) async fn run(
     mut requests: mpsc::Receiver<Request>,
     status: watch::Sender<Status>,
     events: broadcast::Sender<Event>,
+    shared_budget: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     let mut backoff = Duration::from_millis(250);
     loop {
@@ -106,7 +107,15 @@ pub(super) async fn run(
                             s.error = None;
                         });
                         backoff = Duration::from_millis(250);
-                        online(sink, source, &mut requests, &status, &events).await
+                        online(
+                            sink,
+                            source,
+                            &mut requests,
+                            &status,
+                            &events,
+                            shared_budget.clone(),
+                        )
+                        .await
                     }
                     Err(error) => Err(error),
                 }
@@ -202,6 +211,7 @@ async fn online(
     requests: &mut mpsc::Receiver<Request>,
     status: &watch::Sender<Status>,
     events: &broadcast::Sender<Event>,
+    shared_budget: Option<Arc<tokio::sync::Semaphore>>,
 ) -> anyhow::Result<()> {
     let (writes, mut queued) = mpsc::channel::<Write>(MAX_PENDING);
     let (failed, mut failure) = oneshot::channel();
@@ -282,8 +292,9 @@ async fn online(
                     } else {
                         ensure!(frame["method"].is_string() && frame.get("result").is_none() && frame.get("error").is_none(), "peer notification is malformed");
                         let permit = event_budget.clone().try_acquire_many_owned(bytes).context("peer event byte budget exhausted; reconnect and replay")?;
+                        let shared = shared_budget.as_ref().map(|budget| budget.clone().try_acquire_many_owned(bytes)).transpose().context("host event byte budget exhausted; reconnect and replay")?;
                         let current = status.borrow();
-                        let _ = events.send(Event::Frame { peer_id: current.peer_id.clone(), route_id: current.route_id.clone(), generation: current.generation, frame: Arc::new(frame), budget: Arc::new(permit) });
+                        let _ = events.send(Event::Frame { peer_id: current.peer_id.clone(), route_id: current.route_id.clone(), generation: current.generation, frame: Arc::new(frame), budget: Arc::new(permit), shared_budget: shared.map(Arc::new) });
                     }
                 }
                 _ = &mut failure => anyhow::bail!("tunnel could not confirm a write"),
@@ -337,6 +348,51 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn independent_routes_share_retained_event_budget() {
+        let packet = serde_json::json!({"jsonrpc":"2.0","method":"item.completed","params":{"text":"content"}}).to_string();
+        let budget = Arc::new(tokio::sync::Semaphore::new(packet.len()));
+        let send = || async {
+            let sink = futures_util::sink::drain().sink_map_err(|never| match never {});
+            let source = futures_util::stream::iter([Ok(Packet::Text(packet.clone()))]);
+            let (_sender, mut requests) = mpsc::channel(1);
+            let (status, _) = watch::channel(Status {
+                peer_id: "peer".into(),
+                route_id: uuid::Uuid::new_v4().to_string(),
+                generation: 1,
+                state: State::Online,
+                description: None,
+                worker_pid: None,
+                error: None,
+            });
+            let (events, mut receiver) = broadcast::channel(1);
+            let error = online(
+                Box::pin(sink),
+                Box::pin(source),
+                &mut requests,
+                &status,
+                &events,
+                Some(budget.clone()),
+            )
+            .await
+            .unwrap_err();
+            (receiver.try_recv().ok(), error)
+        };
+        let (first, _) = send().await;
+        assert!(matches!(first, Some(Event::Frame { .. })));
+        assert_eq!(budget.available_permits(), 0);
+        let (second, error) = send().await;
+        assert!(second.is_none());
+        assert!(
+            error
+                .to_string()
+                .contains("host event byte budget exhausted")
+        );
+        drop(first);
+        assert_eq!(budget.available_permits(), packet.len());
+        assert!(matches!(send().await.0, Some(Event::Frame { .. })));
+    }
+
+    #[tokio::test]
     async fn an_expired_queued_mutation_never_reaches_the_transport() {
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let sent = calls.clone();
@@ -379,6 +435,7 @@ mod tests {
                 &mut queued,
                 &status,
                 &events,
+                None,
             )
             .await
         });

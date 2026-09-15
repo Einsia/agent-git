@@ -107,10 +107,29 @@ impl Client {
         account: &Secret,
         enrollment: &Enrollment,
     ) -> anyhow::Result<DeviceCredential> {
+        self.register(account, enrollment, "/api/peer/devices")
+            .await
+    }
+
+    pub async fn register_controller(
+        &self,
+        account: &Secret,
+        enrollment: &Enrollment,
+    ) -> anyhow::Result<DeviceCredential> {
+        self.register(account, enrollment, "/api/peer/controllers")
+            .await
+    }
+
+    async fn register(
+        &self,
+        account: &Secret,
+        enrollment: &Enrollment,
+        path: &str,
+    ) -> anyhow::Result<DeviceCredential> {
         let credential: DeviceCredential = self
             .request(
                 Method::POST,
-                "/api/peer/devices",
+                path,
                 account,
                 Some(serde_json::to_value(enrollment)?),
             )
@@ -122,6 +141,25 @@ impl Client {
             "cloud enrollment identity mismatch"
         );
         Ok(credential)
+    }
+
+    pub async fn renew_controller(&self, device: &DeviceCredential) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .request(Method::PUT, "/api/peer/controllers/me", &device.token, None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn revoke(&self, account: &Secret, device: &Device) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                Method::DELETE,
+                &format!("/api/peer/devices/{}", device.id),
+                account,
+                None,
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn devices(

@@ -118,7 +118,7 @@ secret-vault = [
 
 [dependencies]
 agit-peer = { path = "crates/agit-peer", optional = true, features = ["cloud-client"] }
-agit-controller = { path = "crates/agit-controller", optional = true }
+agit-controller = { path = "crates/agit-controller", features = ["cloud"], optional = true }
 agit-tunnel = { path = "crates/agit-tunnel", optional = true, features = ["worker"] }
 # Object construction is in-process; ref publication remains an expected-old transaction.
 gix = { version = "0.87.1", default-features = false, features = ["sha1", "sha256"], optional = true }

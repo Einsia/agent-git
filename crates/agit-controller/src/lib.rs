@@ -3,6 +3,10 @@
 //! Hosts authenticate callers before using this API. A tunnel transports packets;
 //! it neither grants authority nor proves that a remote operation executed.
 
+#[cfg(feature = "cloud")]
+pub mod cloud;
+#[cfg(feature = "host")]
+pub mod host;
 mod peer;
 mod route;
 pub use route::{Authority, Connector, Opening};
@@ -90,6 +94,8 @@ pub enum Event {
         frame: Arc<Value>,
         #[serde(skip)]
         budget: Arc<tokio::sync::OwnedSemaphorePermit>,
+        #[serde(skip)]
+        shared_budget: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     },
 }
 impl Event {
@@ -154,6 +160,7 @@ impl Drop for Peer {
 
 pub struct Controller {
     worker: Worker,
+    event_budget: Option<Arc<tokio::sync::Semaphore>>,
     peers: Mutex<HashMap<String, Arc<Peer>>>,
     events: broadcast::Sender<Event>,
 }
@@ -171,9 +178,19 @@ impl Drop for Controller {
 }
 impl Controller {
     pub fn new(worker: Worker) -> Self {
+        Self::build(worker, None)
+    }
+
+    /// Hosts can bound retained event bytes across independently owned controllers.
+    pub fn with_event_budget(worker: Worker, budget: Arc<tokio::sync::Semaphore>) -> Self {
+        Self::build(worker, Some(budget))
+    }
+
+    fn build(worker: Worker, event_budget: Option<Arc<tokio::sync::Semaphore>>) -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         Self {
             worker,
+            event_budget,
             peers: Mutex::new(HashMap::new()),
             events,
         }
@@ -252,6 +269,7 @@ impl Controller {
             receiver,
             status_tx,
             events,
+            self.event_budget.clone(),
         ));
         peers.insert(
             id,

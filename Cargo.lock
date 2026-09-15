@@ -95,6 +95,7 @@ dependencies = [
 name = "agit-controller"
 version = "0.1.0"
 dependencies = [
+ "agit-peer",
  "agit-tunnel",
  "anyhow",
  "futures-util",

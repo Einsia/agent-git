@@ -3,7 +3,18 @@ name = "agit-controller"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+cloud = ["dep:agit-peer"]
+host = ["cloud", "agit-tunnel/worker", "tokio/io-std", "tokio/rt-multi-thread"]
+
+[[bin]]
+name = "agitd-controller"
+path = "src/bin/agitd-controller.rs"
+required-features = ["host"]
+
 [dependencies]
+agit-peer = { path = "../agit-peer", features = ["cloud-client"], optional = true }
 agit-tunnel = { path = "../agit-tunnel" }
 anyhow = "1"
 serde = { version = "1", features = ["derive", "rc"] }

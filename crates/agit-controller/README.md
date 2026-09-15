@@ -10,11 +10,10 @@ A host constructs `Controller` with a `Worker` executable and arguments. Calling
 unchanged configuration reuses that peer. Dropping a UI subscription does not
 disconnect it; `disconnect` and dropping the controller do.
 
-The current peer dialect is the owner RPC protocol (`machine.describe`, version
-1). Hosts must authorize access before invoking this API. The SSH composition in
-the CLI relies on the remote account and owner socket credentials. Generic cloud
-caller delegation is an additional protocol requirement, not something granted
-by constructing a WebSocket transport.
+The peer handshake (`machine.describe`) carries the route authority. The SSH
+composition relies on the remote account and owner socket credentials. Cloud
+routes authenticate endpoints with peer TLS and preserve the connection grant
+principal; the executor filters resources and operations for that principal.
 
 Requests use fresh wire IDs carrying a stable operation ID prefix. Responses and
 events stay scoped to their peer; each successful handshake advances its
@@ -32,10 +31,24 @@ IDs inside an envelope containing the peer ID and generation; it does not merge
 streams belonging to different machines.
 
 Connection state and pending correlation are in memory. Durable operation
-receipts, delegated grants, executor ownership handoff, and cloud relay routing
-remain separate integration work tracked by the RFC.
+receipts and session policy remain executor responsibilities. Cloud admission
+and the opaque relay do not interpret those runtime records.
+
+The optional `cloud` feature provides the shared authenticated Cloud connector.
+The `host` feature builds `agitd-controller`, a private stdio process for Web
+adapters. Initialization supplies the Cloud origin and browser account token over
+stdin. A leased outbound identity is renewed while the host is running and revoked
+on shutdown. The Cloud identity service expires abandoned leases. Tokens and
+private keys never appear in arguments or diagnostic records.
+
+The host accepts Cloud peer methods only, bounds pending requests and bytes, and
+preserves structured executor errors and transport outcomes. A slow output or lost
+event cursor ends the attachment so clients can reconnect and reconcile. Each
+connection uses a separate tunnel worker process, running the same executable with
+the `tunnel` argument. Neither process contains an executor or starts a harness.
 
 ```sh
 cargo check -p agit-controller --no-default-features
-cargo test -p agit-controller
+cargo test -p agit-controller --features host
+cargo build -p agit-controller --features host --bin agitd-controller
 ```

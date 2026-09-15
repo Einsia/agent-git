@@ -261,6 +261,7 @@ impl Client {
                 && let Some(result) = frame.result.as_mut()
             {
                 result["authority"] = serde_json::json!("cloud-principal");
+                result["access_ceiling"] = serde_json::json!(true);
                 if let Some(result) = result.as_object_mut() {
                     result.remove("diagnostic_log");
                 }
@@ -394,6 +395,49 @@ mod tests {
                 .is_ok()
         );
         assert!(queued.authority.check().is_err());
+    }
+
+    #[tokio::test]
+    async fn request_ceiling_survives_queue_admission_without_elevating_policy() {
+        let rule = |access| Rule {
+            principal: principal(),
+            resource: Resource::Session("visible".into()),
+            access,
+        };
+        let registry = Registry::fixed(Policy::new(1, vec![rule(Access::Admin)]).unwrap());
+        let client = registry.client(principal(), i64::MAX);
+        registry.state.write().unwrap().resources.observe(
+            "session.list",
+            &json!({"local":[{"runtime_session_id":"visible","runtime":"codex","cwd":"/trusted"}]}),
+        );
+        let request = |ceiling| {
+            Frame::request(
+                "turn.start",
+                json!({"session_id":"visible","access_ceiling":ceiling}),
+            )
+        };
+        let queued = client.authorize(request("control")).unwrap();
+        assert_eq!(queued.caller.as_ref().unwrap().role, "operator");
+        assert!(
+            queued
+                .params
+                .as_ref()
+                .unwrap()
+                .get("access_ceiling")
+                .is_none()
+        );
+        assert!(queued.authority.check().is_ok());
+        assert!(client.authorize(request("read")).is_err());
+        assert!(client.authorize(request("invalid")).is_err());
+
+        registry.state.write().unwrap().policy =
+            Policy::new(2, vec![rule(Access::Control)]).unwrap();
+        assert!(queued.authority.check().is_ok());
+        let bounded = client.authorize(request("admin")).unwrap();
+        assert_eq!(bounded.caller.as_ref().unwrap().role, "operator");
+        registry.state.write().unwrap().policy = Policy::new(3, vec![rule(Access::Read)]).unwrap();
+        assert!(queued.authority.check().is_err());
+        assert!(bounded.authority.check().is_err());
     }
 
     #[tokio::test]

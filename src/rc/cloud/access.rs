@@ -24,6 +24,7 @@ pub struct Permit {
     pub method: String,
     target: Target,
     need: Need,
+    ceiling: Access,
     start_id: Option<String>,
 }
 
@@ -62,7 +63,7 @@ impl Permit {
     }
 
     fn access(&self, policy: &Policy, principal: &Principal) -> Access {
-        match &self.target {
+        let access = match &self.target {
             Target::Catalog => {
                 if policy.access(principal, None, None).is_admin() {
                     Access::Admin
@@ -73,6 +74,13 @@ impl Permit {
             Target::Machine => policy.access(principal, None, None),
             Target::Project(project) => policy.access(principal, None, Some(project)),
             Target::Session(session) => session.access(policy, principal),
+        };
+        // A controller can narrow its own authority, never widen executor policy.
+        match (access, self.ceiling) {
+            (Access::Deny, _) | (_, Access::Deny) => Access::Deny,
+            (Access::Read, _) | (_, Access::Read) => Access::Read,
+            (Access::Control, _) | (_, Access::Control) => Access::Control,
+            _ => Access::Admin,
         }
     }
 
@@ -134,6 +142,13 @@ pub fn authorize(
     super::super::endpoint::validate_request(&frame)?;
     let method = frame.method().to_owned();
     let params = frame.params.get_or_insert_with(|| serde_json::json!({}));
+    let ceiling = params
+        .as_object_mut()
+        .and_then(|params| params.remove("access_ceiling"))
+        .map(serde_json::from_value::<Access>)
+        .transpose()
+        .map_err(|_| RpcError::new(ErrorCode::MalformedFrame, "invalid cloud access ceiling"))?
+        .unwrap_or(Access::Admin);
     let mut start_id = None;
     let selection = match method.as_str() {
         "machine.describe" | "workspace.list" | "session.list" => (Target::Catalog, Need::Read),
@@ -222,6 +237,7 @@ pub fn authorize(
         method,
         target: selection.0,
         need: selection.1,
+        ceiling,
         start_id,
     };
     if !permit.allowed(policy, principal) {
