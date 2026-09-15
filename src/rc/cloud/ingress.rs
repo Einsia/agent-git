@@ -235,12 +235,20 @@ pub enum Rejection {
 }
 
 impl Client {
+    fn current(&self) -> bool {
+        *self
+            .live
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            && self.lease.current()
+    }
+
     pub(crate) fn lease(&self) -> Lease {
         self.lease.clone()
     }
 
     pub fn authorize(&self, frame: Frame) -> Result<Frame, Rejection> {
-        if !self.lease.current() {
+        if !self.current() {
             return Err(Rejection::Close);
         }
         let mut permits = self
@@ -275,7 +283,7 @@ impl Client {
     }
 
     pub fn project(&self, record: &str) -> crate::Result<Option<String>> {
-        if !self.lease.current() {
+        if !self.current() {
             return Ok(None);
         }
         let mut frame: Frame =

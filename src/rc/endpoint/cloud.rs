@@ -102,6 +102,8 @@ pub(super) fn attach(
             _ = stopped.changed() => "output_capacity",
             _ = lifetime.changed() => "enrollment_stopped",
         };
+        // Revocation must precede cleanup that can wait for capacity in the shared input queue.
+        drop(projection);
         if let Some(log) = log {
             log.record(
                 "cloud.client_closed",

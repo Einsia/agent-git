@@ -207,3 +207,101 @@ async fn exhausted_cloud_output_closes_only_its_client_without_waiting() {
     );
     stopped.changed().await.unwrap();
 }
+
+#[tokio::test]
+async fn renewal_refusal_revokes_queued_work_before_a_full_input_queue_can_close() {
+    use crate::rc::ticket::ticket_authorized;
+    use agit_peer::cloud::{DeviceCredential, Secret};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (refused, refusal) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut line = String::new();
+        socket.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("POST /api/peer/grants/renew "));
+        socket
+            .get_mut()
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        refused.send(()).unwrap();
+    });
+    let principal = Principal {
+        issuer: origin.clone(),
+        account_id: "operator".into(),
+    };
+    let identity = Identity::generate().unwrap();
+    let device = Device {
+        id: "executor".into(),
+        machine_id: "executor".into(),
+        display_name: "executor".into(),
+        owner: principal.clone(),
+        certificate: identity.certificate().clone(),
+        credential_epoch: 1,
+    };
+    let grant = ConnectionGrant {
+        id: "test-grant".into(),
+        caller: principal.clone(),
+        source: device.clone(),
+        target: device.clone(),
+        expires_at_ms: chrono::Utc::now().timestamp_millis() + 2_000,
+    };
+    let registry = ingress::Registry::fixed(Policy::default());
+    let guard = registry.client(principal, grant.expires_at_ms);
+    let frame = guard
+        .authorize(Frame::request("session.list", json!({})))
+        .unwrap();
+    let authority = frame.authority.clone();
+    assert!(authority.admit(|| true));
+    let (ticket, _receipt) = ticket_authorized::<()>(authority.clone());
+    let lease = guard.lease();
+    let (input, _pending) = mpsc::channel(1);
+    assert!(input.try_send(Incoming::Closed(99)).is_ok());
+    let (_peer, executor) = tokio::io::duplex(1024);
+    let (_lifetime, stopped) = watch::channel(());
+    let client = attach(
+        host::Authenticated {
+            connection: framed(0, executor),
+            grant,
+            stopped,
+            renewal: Some(host::Renewal {
+                api: agit_peer::client::Client::new(&origin).unwrap(),
+                credential: DeviceCredential {
+                    device,
+                    token: Secret::new("test-device-token".into()),
+                },
+                token: Secret::new("test-grant-token".into()),
+            }),
+        },
+        guard,
+        1,
+        input,
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(5), refusal)
+        .await
+        .expect("executor must request renewal")
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while authority.admit(|| true) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("renewal refusal must revoke authority before waiting for input capacity");
+    assert!(lease.deadline() > tokio::time::Instant::now());
+    assert!(!client.task.is_finished());
+    assert!(!ticket.accept());
+    assert!(
+        client
+            .cloud
+            .as_ref()
+            .unwrap()
+            .authorize(Frame::request("session.list", json!({})))
+            .is_err()
+    );
+    server.await.unwrap();
+}
