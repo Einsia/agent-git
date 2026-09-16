@@ -8,7 +8,11 @@ use agit_peer::{
     transport::{Role, authenticate},
 };
 use anyhow::{Context, ensure};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, watch};
 
 pub struct Authenticated {
@@ -87,6 +91,29 @@ fn record(log: &Option<super::super::diagnostics::Log>, event: &str, metadata: s
     }
 }
 
+async fn verified_transport<G, T, V, O, F>(
+    verification: V,
+    mut open: O,
+) -> anyhow::Result<(G, T, bool)>
+where
+    V: std::future::Future<Output = anyhow::Result<G>>,
+    O: FnMut() -> F,
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    // A speculative socket must retain headroom for the relay's first-frame deadline.
+    let opening = async {
+        let transport = open().await?;
+        Ok::<_, anyhow::Error>((transport, tokio::time::Instant::now()))
+    };
+    let (grant, (transport, started)) = tokio::try_join!(verification, opening)?;
+    if started.elapsed() >= Duration::from_secs(5) {
+        drop(transport);
+        Ok((grant, open().await?, true))
+    } else {
+        Ok((grant, transport, false))
+    }
+}
+
 async fn run_executor(
     hub: String,
     worker: Worker,
@@ -118,27 +145,47 @@ async fn run_executor(
                             record(&log, "cloud.offer_capacity", serde_json::json!({"hub":hub,"link_id":link_id}));
                             continue;
                         };
-                        let (hub, worker, incoming, log, stopped) = (hub.clone(), worker.clone(), incoming.clone(), log.clone(), stopped.clone());
+                        let started = Instant::now();
+                        let (hub, worker, incoming, log, stopped, api) = (hub.clone(), worker.clone(), incoming.clone(), log.clone(), stopped.clone(), api.clone());
                         children.spawn(async move {
                             let _permit = permit;
+                            let mut phase = "enrollment";
                             let accepted = async {
                                 let origin = hub.clone();
                                 let enrollment = tokio::task::spawn_blocking(move || store::load(&origin)).await??
                                     .context("cloud enrollment is missing")?;
                                 ensure!(enrollment.inbound_enabled, "inbound cloud connections are disabled");
-                                let api = Client::new(&hub)?;
-                                let grant = api.verify(&enrollment.credential, &grant_token).await?;
-                                ensure!(grant.source.id == source_id, "cloud offer source does not match its grant");
-                                let raw = worker.open(api.data_config(&enrollment.credential)?).await?;
+                                let enrollment_ms = started.elapsed().as_secs_f64() * 1000.0;
+                                phase = "admission";
+                                let config = api.data_config(&enrollment.credential)?;
+                                let verification = async {
+                                    let started = Instant::now();
+                                    let grant = api.verify(&enrollment.credential, &grant_token).await?;
+                                    ensure!(grant.source.id == source_id, "cloud offer source does not match its grant");
+                                    Ok::<_, anyhow::Error>((grant, started.elapsed().as_secs_f64() * 1000.0))
+                                };
+                                let transport = || async {
+                                    let started = Instant::now();
+                                    let raw = worker.open(config.clone()).await?;
+                                    Ok::<_, anyhow::Error>((raw, started.elapsed().as_secs_f64() * 1000.0))
+                                };
+                                // Raw transport carries no executor authority before grant validation and endpoint TLS.
+                                let ((grant, verification_ms), (raw, transport_ms), transport_reopened) = verified_transport(verification, transport).await?;
+                                phase = "relay_pair";
+                                let paired = Instant::now();
                                 let raw = join_data(raw, &link_id, ticket).await?;
+                                let pairing_ms = paired.elapsed().as_secs_f64() * 1000.0;
+                                phase = "endpoint_tls";
+                                let authenticated = Instant::now();
                                 let connection = authenticate(raw, &enrollment.identity, &grant.source.certificate, Role::Executor).await?;
-                                record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid}));
+                                record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid,"enrollment_ms":enrollment_ms,"verification_ms":verification_ms,"transport_ms":transport_ms,"transport_reopened":transport_reopened,"pairing_ms":pairing_ms,"tls_ms":authenticated.elapsed().as_secs_f64()*1000.0,"total_ms":started.elapsed().as_secs_f64()*1000.0}));
                                 let renewal = Some(Renewal { api, credential: enrollment.credential, token: grant_token });
+                                phase = "ingress";
                                 incoming.try_send(Authenticated { connection, grant, stopped, renewal })
                                     .map_err(|_| anyhow::anyhow!("executor ingress is full or stopped"))?;
                                 Ok::<_, anyhow::Error>(())
                             }.await;
-                            if accepted.is_err() { record(&log, "cloud.endpoint_rejected", serde_json::json!({"hub":hub,"link_id":link_id,"source_id":source_id})); }
+                            if accepted.is_err() { record(&log, "cloud.endpoint_rejected", serde_json::json!({"hub":hub,"link_id":link_id,"source_id":source_id,"phase":phase,"total_ms":started.elapsed().as_secs_f64()*1000.0})); }
                         });
                     }
                 }
@@ -212,5 +259,93 @@ impl Connector for Route {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct SocketOwner(Arc<AtomicUsize>);
+    impl Drop for SocketOwner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_preserves_join_deadline_and_drops_unaccepted_transports() {
+        for (delay, opening_delay, reject, expected_opens) in [
+            (1, 0, false, 1),
+            (12, 0, false, 2),
+            (1, 8, false, 1),
+            (12, 0, true, 1),
+        ] {
+            let granted = Arc::new(AtomicBool::new(false));
+            let opened = AtomicUsize::new(0);
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let verification = async {
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                ensure!(!reject, "grant rejected");
+                granted.store(true, Ordering::SeqCst);
+                Ok(())
+            };
+            let open = || {
+                opened.fetch_add(1, Ordering::SeqCst);
+                let granted = granted.clone();
+                let owner = SocketOwner(dropped.clone());
+                async move {
+                    tokio::time::sleep(Duration::from_secs(opening_delay)).await;
+                    let connected = tokio::time::Instant::now();
+                    let (tx, rx) = mpsc::channel(1);
+                    let sink = futures_util::sink::unfold(
+                        (connected, owner, tx, granted),
+                        |(connected, owner, tx, granted), packet| async move {
+                            ensure!(
+                                granted.load(Ordering::SeqCst),
+                                "join before grant verification"
+                            );
+                            ensure!(
+                                connected.elapsed() < Duration::from_secs(10),
+                                "relay first-frame deadline expired"
+                            );
+                            let agit_tunnel::Packet::Text(value) = packet else {
+                                anyhow::bail!("expected relay join");
+                            };
+                            let _: agit_peer::cloud::DataJoin = serde_json::from_str(&value)?;
+                            tx.send(Ok(agit_tunnel::Packet::Text(serde_json::to_string(
+                                &agit_peer::cloud::DataReady {
+                                    link_id: "test-link".into(),
+                                },
+                            )?)))
+                            .await?;
+                            Ok::<_, anyhow::Error>((connected, owner, tx, granted))
+                        },
+                    );
+                    let source = futures_util::stream::unfold(rx, |mut rx| async {
+                        rx.recv().await.map(|packet| (packet, rx))
+                    });
+                    Ok(agit_tunnel::Connection::from_parts(
+                        0,
+                        Box::pin(sink),
+                        Box::pin(source),
+                    ))
+                }
+            };
+            let admitted = verified_transport(verification, open).await;
+            if reject {
+                assert!(admitted.is_err());
+            } else {
+                let ((), connection, reopened) = admitted.unwrap();
+                assert_eq!(reopened, delay == 12);
+                let paired = join_data(connection, "test-link", Secret::new("ticket".into()))
+                    .await
+                    .unwrap();
+                drop(paired);
+            }
+            assert_eq!(opened.load(Ordering::SeqCst), expected_opens);
+            assert_eq!(dropped.load(Ordering::SeqCst), expected_opens);
+        }
     }
 }
