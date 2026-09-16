@@ -61,9 +61,15 @@ fn run_json(
         }
     }
 
+    let refreshed = client.credential_snapshot();
+    let report_credential = if check.authenticated == Some(true) {
+        refreshed.as_ref().unwrap_or(cred)
+    } else {
+        cred
+    };
     println!(
         "{}",
-        serde_json::to_string(&json_report(hub, cred, args.check, &check))?
+        serde_json::to_string(&json_report(hub, report_credential, args.check, &check))?
     );
     Ok(result_code)
 }
@@ -180,6 +186,25 @@ fn run_human(
     cred: &credentials::HubCredential,
     client: &crate::hub::Client,
 ) -> CmdResult {
+    let mut code = ExitCode::Ok;
+    let mut authenticated = false;
+    if args.check {
+        if cred.refresh_expired() {
+            ui::error("the refresh token is expired — decidable locally, no round-trip needed.");
+            ui::hint("next: sign in again with `agit login`");
+            code = ExitCode::Auth;
+        } else {
+            let (check, result) = verify_online(hub, client, true);
+            authenticated = check.authenticated == Some(true);
+            code = result;
+        }
+    }
+    let refreshed = client.credential_snapshot();
+    let cred = if authenticated {
+        refreshed.as_ref().unwrap_or(cred)
+    } else {
+        cred
+    };
     println!("hub   {hub}");
     println!("account  {}", cred.username);
     if let Some(email) = &cred.email {
@@ -190,17 +215,7 @@ fn run_human(
         state(&cred.access_expires_at),
         state(&cred.refresh_expires_at),
     );
-
-    if args.check {
-        if cred.refresh_expired() {
-            ui::error("the refresh token is expired — decidable locally, no round-trip needed.");
-            ui::hint("next: sign in again with `agit login`");
-            return Ok(ExitCode::Auth);
-        }
-        let (_, code) = verify_online(hub, client, true);
-        return Ok(code);
-    }
-    Ok(ExitCode::Ok)
+    Ok(code)
 }
 
 fn parsed_state(expires_at: &chrono::DateTime<chrono::FixedOffset>) -> &'static str {

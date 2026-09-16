@@ -591,11 +591,10 @@ impl MessageAttribution {
         let sender = caller
             .account_id
             .as_ref()
-            .zip(caller.username.as_ref())
-            .filter(|(account_id, username)| !account_id.is_empty() && !username.is_empty())
-            .map(|(account_id, username)| crate::protocol::MessageSender {
+            .filter(|account_id| !account_id.is_empty())
+            .map(|account_id| crate::protocol::MessageSender {
                 account_id: account_id.clone(),
-                username: username.clone(),
+                username: caller.username.clone().unwrap_or_default(),
             });
         Self {
             by: caller.username.clone().or(legacy_by),

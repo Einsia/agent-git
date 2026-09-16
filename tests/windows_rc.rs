@@ -3,10 +3,6 @@
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::time::{Duration, Instant};
 
 use agit::rc::control::{self, Reply, Request};
@@ -81,90 +77,6 @@ fn command_input(home: &Path, hub: &str, args: &[&str], input: Option<&str>) -> 
     output
 }
 
-fn success(home: &Path, hub: &str, args: &[&str]) -> Output {
-    let output = command(home, hub, args);
-    assert!(
-        output.status.success(),
-        "{args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-struct FakeHub {
-    url: String,
-    stop: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-fn serve_registration(mut stream: std::net::TcpStream, headers: &str, stop: &AtomicBool) {
-    use agit::protocol::{Frame, RcRegisterResult, method};
-    use tokio_tungstenite::tungstenite::{
-        Message, WebSocket, handshake::server::create_response, protocol::Role,
-    };
-
-    let mut request = http::Request::builder().method("GET").uri("/rc/ws");
-    for header in headers.lines().skip(1) {
-        if let Some((name, value)) = header.split_once(':') {
-            request = request.header(name.trim(), value.trim());
-        }
-    }
-    let response = create_response(&request.body(()).unwrap()).unwrap();
-    write!(stream, "HTTP/1.1 101 Switching Protocols\r\n").unwrap();
-    for (name, value) in response.headers() {
-        write!(stream, "{name}: {}\r\n", value.to_str().unwrap()).unwrap();
-    }
-    write!(stream, "\r\n").unwrap();
-    let mut socket = WebSocket::from_raw_socket(stream, Role::Server, None);
-    let register = socket.read().unwrap();
-    let register = Frame::from_json(register.to_text().unwrap()).unwrap();
-    assert_eq!(register.method(), method::RC_REGISTER);
-    socket
-        .send(Message::Text(
-            Frame::response(
-                register.id.unwrap(),
-                RcRegisterResult {
-                    connection_id: "windows-fixture".into(),
-                    accepted_features: vec![],
-                    workspaces: vec![],
-                    persisted_seq: Default::default(),
-                    server_time: "2026-09-15T00:00:00Z".into(),
-                },
-            )
-            .to_json()
-            .into(),
-        ))
-        .unwrap();
-    while !stop.load(Ordering::SeqCst) {
-        match socket.read() {
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(_)) => {
-                if socket.flush().is_err() {
-                    break;
-                }
-            }
-            Ok(_) => {}
-            Err(tokio_tungstenite::tungstenite::Error::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(_) => break,
-        }
-    }
-}
-
-struct DaemonCleanup<'a> {
-    home: &'a Path,
-    hub: &'a str,
-}
-
-impl Drop for DaemonCleanup<'_> {
-    fn drop(&mut self) {
-        let _ = command(self.home, self.hub, &["rc", "stop"]);
-    }
-}
-
 struct VaultCleanup<'a>(&'a Path);
 
 impl Drop for VaultCleanup<'_> {
@@ -181,6 +93,7 @@ impl Drop for VaultCleanup<'_> {
 }
 
 fn secret_commands_reload_live_matcher(home: &Path) {
+    agit::rc::select_local_authority();
     use agit::domain::secret_filter::MatcherHandle;
     let matcher = MatcherHandle::load_default().unwrap();
     let live = matcher.clone();
@@ -244,104 +157,6 @@ fn secret_commands_reload_live_matcher(home: &Path) {
     assert_eq!(after_add.find("windows-fixture-secret").len(), 1);
     assert!(after_remove.find("windows-fixture-secret").is_empty());
     assert!(after_remove.generation() > after_add.generation());
-}
-
-impl FakeHub {
-    fn start() -> Self {
-        Self::with_pair_status("200 OK")
-    }
-
-    fn with_pair_status(pair_status: &'static str) -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = stop.clone();
-        let worker = std::thread::spawn(move || {
-            while !stopping.load(Ordering::SeqCst) {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(pair) => pair,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("fake Hub accept: {error}"),
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut byte = [0];
-                while request.len() < 65536 && !request.ends_with(b"\r\n\r\n") {
-                    if stream.read_exact(&mut byte).is_err() {
-                        break;
-                    }
-                    request.push(byte[0]);
-                }
-                let request = String::from_utf8_lossy(&request);
-                if request.starts_with("GET /rc/ws ") {
-                    serve_registration(stream, &request, &stopping);
-                    continue;
-                }
-                let paired = request.starts_with("POST /api/rc/connections ");
-                let length = request
-                    .lines()
-                    .find_map(|line| {
-                        let (key, value) = line.split_once(':')?;
-                        key.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if length > 65536 {
-                    continue;
-                }
-                let mut body = vec![0; length];
-                if stream.read_exact(&mut body).is_err() {
-                    continue;
-                }
-                if paired {
-                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    assert!(body["platform"].as_str().unwrap().starts_with("windows"));
-                    assert!(!body["machine_fingerprint"].as_str().unwrap().is_empty());
-                }
-                let (status, body) = if paired && pair_status == "200 OK" {
-                    (
-                        pair_status,
-                        r#"{"connection_id":"windows-fixture","token":"synthetic-rc-fixture"}"#,
-                    )
-                } else if paired {
-                    (
-                        pair_status,
-                        r#"{"error":"synthetic HTTP 401 wording","kind":"unauthorized","fix":[{"kind":"authenticate"}]}"#,
-                    )
-                } else {
-                    ("503 Service Unavailable", "{}")
-                };
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
-        Self {
-            url,
-            stop,
-            worker: Some(worker),
-        }
-    }
-}
-
-impl Drop for FakeHub {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        self.worker.take().unwrap().join().unwrap();
-    }
 }
 
 fn restricted_open(path: &Path, access: u32) -> std::io::Result<security::Handle> {
@@ -484,36 +299,7 @@ fn hub_credentials_are_private_under_inherited_public_read(home: &Path) {
 }
 
 #[test]
-fn daemon_logs_have_explicit_private_ownership_and_remain_readable_while_open() {
-    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GENERIC_READ};
-    let temporary = tempfile::tempdir().unwrap();
-    let directory = temporary.path().join("logs");
-    security::private_directory(&directory).unwrap();
-    let mut log = security::private_tempfile(&directory, "agitd-", ".log").unwrap();
-    log.write_all(b"synthetic connection diagnostic").unwrap();
-    security::validate_path(log.path(), false, true).unwrap();
-    assert_eq!(
-        std::fs::read(log.path()).unwrap(),
-        b"synthetic connection diagnostic"
-    );
-    assert_eq!(
-        restricted_open(log.path(), GENERIC_READ)
-            .err()
-            .unwrap()
-            .raw_os_error(),
-        Some(ERROR_ACCESS_DENIED as i32)
-    );
-    let (mut writer, path) = log.keep().unwrap();
-    writer.write_all(b" after startup").unwrap();
-    security::validate_path(&path, false, true).unwrap();
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        b"synthetic connection diagnostic after startup"
-    );
-}
-
-#[test]
-fn native_pipe_permissions_and_daemon_lifecycle() {
+fn native_pipe_permissions_and_unsupported_executor_boundary() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("home");
     security::private_directory(&home).unwrap();
@@ -585,130 +371,11 @@ fn native_pipe_permissions_and_daemon_lifecycle() {
 
     secret_commands_reload_live_matcher(&home);
 
-    let refused = FakeHub::with_pair_status("503 Service Unavailable");
-    agit::infra::credentials::save(
-        &refused.url,
-        &agit::infra::credentials::HubCredential {
-            account_id: None,
-            username: "windows-fixture".into(),
-            email: None,
-            hub: Some(refused.url.clone()),
-            access_token: "synthetic-user-fixture".into(),
-            refresh_token: "synthetic-refresh-fixture".into(),
-            access_expires_at: "2099-01-01T00:00:00Z".into(),
-            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
-        },
-    )
-    .unwrap();
-    let credential_path = agit::infra::config::credentials_path(&refused.url).unwrap();
-    let credential_before = std::fs::read(&credential_path).unwrap();
-    let fingerprint_before = agit::rc::identity::identity().unwrap().machine_fingerprint;
-    for flags in [
-        vec![],
-        vec!["--quiet"],
-        vec!["--json", "--json-version", "1"],
-        vec!["--json", "--json-version", "2"],
-    ] {
-        for operation in [vec!["rc", "pair"], vec!["rc", "start", "--detach"]] {
-            let mut args = flags.clone();
-            args.extend(operation);
-            let output = command(&home, &refused.url, &args);
-            assert_eq!(output.status.code(), Some(6), "{args:?}: {output:?}");
-            if flags.contains(&"--json") {
-                assert!(output.stderr.is_empty(), "{output:?}");
-                let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-                assert_eq!(value["command"], "rc");
-                assert_eq!(value["exit_code"], 6);
-                assert_eq!(value["ok"], false);
-                assert_eq!(
-                    value["schema_version"],
-                    flags.last().unwrap().parse::<u32>().unwrap()
-                );
-                if flags.last() == Some(&"1") {
-                    assert!(value.get("fix").is_none());
-                } else {
-                    assert_eq!(value["fix"], serde_json::json!([]));
-                }
-            } else {
-                assert!(
-                    String::from_utf8_lossy(&output.stderr).contains("synthetic HTTP 401 wording")
-                );
-                assert!(output.stdout.is_empty(), "{output:?}");
-            }
-            assert_eq!(std::fs::read(&credential_path).unwrap(), credential_before);
-            assert_eq!(
-                agit::rc::identity::identity().unwrap().machine_fingerprint,
-                fingerprint_before
-            );
-            assert!(
-                agit::rc::identity::connection(&refused.url)
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(control::presence(), control::Presence::Absent);
-            for secret in ["synthetic-user-fixture", "synthetic-refresh-fixture"] {
-                assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
-                assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
-            }
-        }
-    }
-    drop(refused);
-
-    let hub = FakeHub::start();
-    agit::infra::credentials::save(
-        &hub.url,
-        &agit::infra::credentials::HubCredential {
-            account_id: None,
-            username: "windows-fixture".into(),
-            email: None,
-            hub: Some(hub.url.clone()),
-            access_token: "synthetic-user-fixture".into(),
-            refresh_token: "synthetic-refresh-fixture".into(),
-            access_expires_at: "2099-01-01T00:00:00Z".into(),
-            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
-        },
-    )
-    .unwrap();
-    success(&home, &hub.url, &["rc", "pair"]);
-    let _cleanup = DaemonCleanup {
-        home: &home,
-        hub: &hub.url,
-    };
-    let fingerprint = agit::rc::identity::identity().unwrap().machine_fingerprint;
-    for _ in 0..2 {
-        success(&home, &hub.url, &["rc", "start", "--detach"]);
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if matches!(control::presence(), control::Presence::Running(_)) {
-                break;
-            }
-            assert!(Instant::now() < deadline, "detached daemon did not start");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        success(&home, &hub.url, &["rc", "status"]);
-        assert!(
-            !command(&home, &hub.url, &["rc", "start", "--detach"])
-                .status
-                .success()
-        );
-        assert!(matches!(
-            control::ask(&Request::ReloadSecrets).unwrap(),
-            Reply::SecretsReloaded { .. }
-        ));
-        success(&home, &hub.url, &["rc", "stop"]);
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while control::presence() != control::Presence::Absent {
-            assert!(Instant::now() < deadline, "daemon pipe survived shutdown");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(!rc.join("agitd.pid").exists());
-        assert_eq!(
-            fingerprint,
-            agit::rc::identity::identity().unwrap().machine_fingerprint
-        );
-    }
-    assert!(!command(&home, &hub.url, &["rc", "status"]).status.success());
-    security::validate_path(&rc.join("identity.json"), false, true).unwrap();
+    let hub = "http://127.0.0.1:9";
+    let unsupported = command(&home, hub, &["rc", "start", "--detach"]);
+    assert!(!unsupported.status.success());
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("WSL"));
+    assert!(!command(&home, hub, &["rc", "pair"]).status.success());
     assert!(security::require_process_user(std::process::id(), "S-1-5-21-0-0-0-9999").is_err());
 
     let hostile = temporary.path().join("hostile");
@@ -723,7 +390,7 @@ fn native_pipe_permissions_and_daemon_lifecycle() {
     assert!(acl.status.success());
     assert!(security::validate_path(&hostile_rc, true, true).is_err());
     assert!(
-        !command(&hostile, &hub.url, &["rc", "start", "--detach"])
+        !command(&hostile, hub, &["rc", "start", "--detach"])
             .status
             .success()
     );
@@ -744,7 +411,7 @@ fn native_pipe_permissions_and_daemon_lifecycle() {
         "private RC files must not inherit access for other users"
     );
     assert!(
-        !command(&inheritable_home, &hub.url, &["rc", "start", "--detach"])
+        !command(&inheritable_home, hub, &["rc", "start", "--detach"])
             .status
             .success()
     );
@@ -765,7 +432,7 @@ fn native_pipe_permissions_and_daemon_lifecycle() {
         "a private leaf cannot override destructive access to its ancestors"
     );
     assert!(
-        !command(&nested_home, &hub.url, &["rc", "start", "--detach"])
+        !command(&nested_home, hub, &["rc", "start", "--detach"])
             .status
             .success()
     );

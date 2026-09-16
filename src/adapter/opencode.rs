@@ -1270,6 +1270,13 @@ fn tool_part(
             Some(p) => serde_json::json!({ "filePath": p }),
             None => serde_json::json!({}),
         });
+    let input = match input {
+        value @ serde_json::Value::Object(_) => value,
+        serde_json::Value::String(patch) if name == "apply_patch" => {
+            serde_json::json!({ "patchText": patch })
+        }
+        value => serde_json::json!({ "input": value }),
+    };
     let output = detail.and_then(|d| d.output.clone()).unwrap_or_default();
     let failed = detail.is_some_and(|d| d.error);
     let mut part = serde_json::json!({
@@ -2750,6 +2757,24 @@ mod tests {
         assert_eq!(part["type"], "tool");
         assert_eq!(part["state"]["input"]["command"], "ls");
         assert_eq!(part["state"]["output"], "total 0");
+        let mut patch = s.events[0].clone();
+        patch.tool = Some("apply_patch".into());
+        let source = "*** Begin Patch\n*** End Patch";
+        let part = tool_part(
+            &patch,
+            "ses_x",
+            "msg_x",
+            0,
+            Some(&ToolDetail {
+                input: Some(serde_json::json!(source)),
+                output: Some("Done".into()),
+                error: false,
+            }),
+        );
+        assert_eq!(
+            part["state"]["input"],
+            serde_json::json!({ "patchText": source })
+        );
     }
 
     /// Shaped by role, the tool part's state.metadata, and the key dropped when there is no

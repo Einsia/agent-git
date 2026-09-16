@@ -1027,6 +1027,66 @@ mod unix {
     }
 
     #[test]
+    fn whoami_reports_the_credential_renewed_by_its_online_check() {
+        for json_mode in [true, false] {
+            let lab = Lab::new();
+            let hub = Hub::new(|_| {
+                vec![
+                    Step::error(
+                        "GET",
+                        "/api/auth/me",
+                        authentication_error("expired access"),
+                    ),
+                    Step {
+                        method: "POST",
+                        target: "/api/auth/refresh".into(),
+                        bearer: None,
+                        status: 200,
+                        response: json!({"access_token": NEW_ACCESS, "refresh_token": NEW_REFRESH,
+                        "access_expires_at": "2099-02-01T00:00:00Z", "refresh_expires_at": "2099-03-01T00:00:00Z"}),
+                        after_response: None,
+                    },
+                    Step {
+                        method: "GET",
+                        target: "/api/auth/me".into(),
+                        bearer: Some(NEW_ACCESS),
+                        status: 200,
+                        response: json!({"username": "me"}),
+                        after_response: None,
+                    },
+                ]
+            });
+            let mut expired = credential(&hub.base, true);
+            expired.access_expires_at = "2000-01-01T00:00:00Z".into();
+            save_at(&lab.credential_path(&hub.base), &expired).unwrap();
+            if json_mode {
+                let value = lab.json(&hub.base, &["--json", "whoami", "--check"], 0);
+                let report = &value["result"]["value"];
+                assert_eq!(report["check"]["authenticated"], true);
+                assert_eq!(report["tokens"]["access"]["state"], "valid");
+                assert_eq!(
+                    report["tokens"]["access"]["expires_at"],
+                    "2099-02-01T00:00:00Z"
+                );
+                assert_eq!(
+                    report["tokens"]["refresh"]["expires_at"],
+                    "2099-03-01T00:00:00Z"
+                );
+            } else {
+                let output = run_bounded(lab.command(&hub.base, &["whoami", "--check"]));
+                assert!(output.status.success(), "{output:?}");
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(
+                    text.contains("access valid (2099-02-01T00:00:00Z)"),
+                    "{text}"
+                );
+                assert!(!text.contains("access expired"), "{text}");
+            }
+            assert_eq!(hub.finish().len(), 3);
+        }
+    }
+
+    #[test]
     fn whoami_preserves_its_check_payload_and_uses_the_refresh_failure() {
         for status in [401, 503] {
             let lab = Lab::new();

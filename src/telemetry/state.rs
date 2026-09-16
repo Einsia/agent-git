@@ -104,7 +104,7 @@ pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 pub(crate) fn gate(dir: &Path, wait: bool) -> Result<File> {
-    std::fs::create_dir_all(dir)?;
+    crate::infra::config::create_state_dir(dir)?;
     ensure!(
         std::fs::symlink_metadata(dir)?.is_dir(),
         "invalid telemetry directory"

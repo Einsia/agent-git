@@ -41,7 +41,7 @@ impl Store {
     /// "Create when missing" is deliberate: `agit import` may be the user's first agit command.
     pub fn open_or_init() -> Result<Store> {
         let root = crate::infra::config::store_root()?;
-        std::fs::create_dir_all(&root)
+        crate::infra::config::create_state_dir(&root)
             .with_context(|| format!("cannot create store directory {}", root.display()))?;
         Ok(Store::at(root))
     }
@@ -107,6 +107,48 @@ mod tests {
         assert!(
             !root.join(".git").exists(),
             "the store is a plain directory and must not contain a git repo"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_state_carriers_remain_owner_controlled_with_a_shared_shell_umask() {
+        const CHILD: &str = "AGIT_TEST_PRIVATE_STATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "domain::store::tests::new_state_carriers_remain_owner_controlled_with_a_shared_shell_umask", "--nocapture"])
+                .env(CHILD, "1").env("AGIT_HOME", temp.path().join("state"))
+                .output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        unsafe {
+            libc::umask(0o002);
+        }
+        let store = Store::open_or_init().unwrap();
+        let home = store.root().parent().unwrap();
+        let repo = crate::domain::repo::Repo::init(&home.join("repos/me/test")).unwrap();
+        let link = crate::domain::link::Link::new("codex", "private-fixture", None);
+        let path = crate::domain::link::write(&store, &link).unwrap();
+        for directory in [
+            home.to_path_buf(),
+            store.root().to_path_buf(),
+            path.parent().unwrap().to_path_buf(),
+            repo.root().to_path_buf(),
+            repo.root().join(".git"),
+        ] {
+            assert!(crate::domain::merge_archive::authority_directory_exists(&directory).unwrap());
+        }
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+            0
         );
     }
 

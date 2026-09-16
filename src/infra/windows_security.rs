@@ -334,47 +334,6 @@ pub(crate) fn open_private_control(path: &Path) -> io::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_handle(raw) })
 }
 
-#[cfg(feature = "rc")]
-pub(crate) fn private_tempfile(
-    parent: &Path,
-    prefix: &str,
-    suffix: &str,
-) -> io::Result<tempfile::NamedTempFile> {
-    use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    validate_path(parent, true, false)?;
-    let sid = current_sid()?;
-    // Elevated tokens can default to a group owner even inside a private directory.
-    let descriptor = private_descriptor(&sid, false)?;
-    let attributes = attributes(&descriptor);
-    let temporary = tempfile::Builder::new()
-        .prefix(prefix)
-        .suffix(suffix)
-        .make_in(parent, |candidate| {
-            let name = wide(candidate)?;
-            let handle = Handle::new(unsafe {
-                CreateFileW(
-                    name.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    &attributes,
-                    CREATE_NEW,
-                    FILE_FLAG_OPEN_REPARSE_POINT,
-                    std::ptr::null_mut(),
-                )
-            })?;
-            let raw = handle.0;
-            std::mem::forget(handle);
-            Ok(unsafe { std::fs::File::from_raw_handle(raw) })
-        })?;
-    validate_acl(temporary.as_file().as_raw_handle(), &sid, true, false)?;
-    Ok(temporary)
-}
-
 pub(crate) fn write_private_file(path: &Path, body: &[u8]) -> io::Result<()> {
     write_private_file_impl(path, body, true)
 }

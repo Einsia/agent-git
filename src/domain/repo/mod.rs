@@ -156,6 +156,17 @@ fn git_command() -> Command {
     let mut cmd = crate::infra::git_runtime::command();
     // Global option slot — must come **before** the subcommand; git rejects it after.
     cmd.arg("--no-replace-objects");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Git creates authority files inside Agit repositories; harness subprocesses keep their own umask.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+    }
     // Checkout preserves pointers; explicit LFS reads choose and authenticate their remote.
     cmd.env("GIT_LFS_SKIP_SMUDGE", "1");
 
@@ -770,7 +781,7 @@ impl Repo {
     /// mentions the git version. So old git falls back to "init first, then move HEAD" — the same
     /// result, one step more.
     pub fn init(root: &Path) -> Result<Repo> {
-        std::fs::create_dir_all(root)
+        crate::infra::config::create_state_dir(root)
             .with_context(|| format!("cannot create {}", root.display()))?;
         let out = git_command()
             .args(["init", "--initial-branch=main"])
@@ -1153,7 +1164,7 @@ impl Repo {
     /// Create a linked worktree for a branch that already exists.
     pub fn add_worktree(&self, path: &Path, branch: &str) -> Result<Repo> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            crate::infra::config::create_state_dir(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
         let path_arg = path.to_string_lossy().into_owned();
@@ -1171,7 +1182,7 @@ impl Repo {
     /// Move a linked worktree's directory.
     pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
         if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)
+            crate::infra::config::create_state_dir(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
         let from_arg = from.to_string_lossy().into_owned();

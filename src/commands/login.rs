@@ -110,7 +110,13 @@ pub fn run(args: Args) -> CmdResult {
 /// A separate function so any other command that needs to "make sure we are signed in" reuses it.
 pub fn login() -> crate::Result<Option<String>> {
     let hub = config::hub_url();
-    Ok(login_interactive(&hub)?.map(|(_, who)| who))
+    let Some((credential, who)) = login_interactive(&hub)? else {
+        return Ok(None);
+    };
+    crate::telemetry::acquisition::save_login(&hub, &credential)?;
+    crate::telemetry::observe(crate::telemetry::Observation::Authentication(true));
+    crate::telemetry::account_saved(&hub, credential.account_id.as_deref());
+    Ok(Some(who))
 }
 
 fn login_interactive(hub: &str) -> crate::Result<Option<(HubCredential, String)>> {

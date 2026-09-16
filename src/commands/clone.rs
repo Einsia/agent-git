@@ -15,10 +15,10 @@
 //! - **Open-source collaboration**: `agit clone org/project-agent`, then "where do I start on this
 //!   issue".
 //!
-//! # Read-only by default; your own copy has to be asked for
+//! # Preserve the source namespace unless a copy is requested
 //!
 //! ```text
-//! agit clone alice/photo           read it, carry on; origin is alice's and push is refused
+//! agit clone alice/photo           origin stays with alice; publishing follows Hub permissions
 //! agit clone alice/photo --mine    the hub creates yours; origin is yours, upstream is alice
 //! agit clone me/photo              carry on with your own from another machine
 //! ```
@@ -109,8 +109,8 @@ pub struct Args {
 
     /// Make it yours: the hub creates a copy under your namespace you can `agit push` to
     ///
-    /// without it this is a read-only checkout — origin points upstream and push is refused,
-    /// but local commits work fine (committing in a clone you can’t push to is normal git).
+    /// Without it, origin points to the source and publishing follows your Hub permissions.
+    /// Local commits are allowed independently of publishing access.
     #[arg(long)]
     pub mine: bool,
 
@@ -569,54 +569,22 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         Some(Ref::Version(_)) => None,
         None => store.current_branch(),
     };
-    let on_file_line = head
-        .as_deref()
-        .is_some_and(|b| meta::is_file_line_at(&store, &format!("refs/heads/{b}")));
-    #[cfg(windows)]
-    use crate::ui::quote_powershell_argument as quote_arg;
-    #[cfg(not(windows))]
-    use crate::ui::session::shell_arg as quote_arg;
-    match (&head, plan.writable, on_file_line) {
-        // Your own session line: carry straight on.
-        (Some(b), true, false) => progress.line(format_args!(
-            "  {}",
-            ui::accent(&format!(
-                "agit resume {}",
-                quote_arg(&format!("{slug}@{b}"))
-            ))
-        )),
-        // main is the file line and is never resumed — start a new session off it, inheriting
-        // memory/skills.
-        (Some(_), true, true) => progress.line(format_args!(
-            "  {}",
-            ui::accent(&format!("agit new {} -b <name>", quote_arg(&slug)))
-        )),
-        // Someone else's: running it necessarily forks off a line you can write to.
-        (Some(b), false, _) => progress.line(format_args!(
-            "  {}",
-            ui::accent(&format!(
-                "agit run {} -b <name>",
-                quote_arg(&format!("{slug}@{b}"))
-            ))
-        )),
-        (None, _, _) => {
-            let selected = store.git(&["rev-parse", "--verify", "HEAD"])?;
-            progress.line(format_args!(
-                "  {}",
-                ui::accent(&format!(
-                    "agit run {} -b <name>",
-                    quote_arg(&format!("{slug}@{}", selected.trim()))
-                ))
-            ));
-        }
-    }
+    progress.line(format_args!(
+        "  {}",
+        ui::accent(&continuation_command(
+            &store,
+            &slug,
+            head.as_deref(),
+            plan.writable
+        )?)
+    ));
     progress.line(format_args!(
         "{}",
         ui::dim(&if plan.writable {
             "  fetched only — that command materializes it into a runtime and continues".to_string()
         } else {
             format!(
-                "  fetched only, and read-only: local commits work, publishing needs your own copy
+                "  fetched only; publishing requires write access. To work in your own copy:
   \
                  agit clone {src_owner}/{src_name} --mine"
             )
@@ -628,6 +596,39 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
 /// Change the active checkout only after proving that a v1 target cannot claim user-owned v0
 /// paths. `reset_branch` implements clone's explicit `-B <branch> <remote>` form; tags and an
 /// already-created local branch use an ordinary detached/branch checkout.
+fn continuation_command(
+    store: &Repo,
+    slug: &str,
+    head: Option<&str>,
+    writable: bool,
+) -> crate::Result<String> {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+    if meta::is_file_line_at(store, head.unwrap_or("HEAD")) {
+        return Ok(if writable {
+            format!("agit new {} -b <name>", quote_arg(slug))
+        } else {
+            format!("agit branch --repo {}", quote_arg(slug))
+        });
+    }
+    Ok(match (head, writable) {
+        (Some(branch), true) => format!("agit resume {}", quote_arg(&format!("{slug}@{branch}"))),
+        (Some(branch), false) => format!(
+            "agit run {} -b <name>",
+            quote_arg(&format!("{slug}@{branch}"))
+        ),
+        (None, _) => {
+            let sha = store.git(&["rev-parse", "--verify", "HEAD"])?;
+            format!(
+                "agit run {} -b <name>",
+                quote_arg(&format!("{slug}@{}", sha.trim()))
+            )
+        }
+    })
+}
+
 fn checkout_target(repo: &Repo, target: &str, reset_branch: Option<&str>) -> crate::Result<()> {
     super::plumbing::ensure_safe_checkout(repo, target)?;
     match reset_branch {
@@ -798,7 +799,7 @@ impl Plan {
             return;
         }
         progress.line(format_args!(
-            "  {} read-only: origin is {} — you can’t push to it",
+            "  {} origin is {}; write access is not confirmed",
             ui::dim(s.node),
             ui::bold(&format!("{src_owner}/{src_name}"))
         ));
@@ -878,13 +879,17 @@ fn plan(
     let source_identity = RemoteIdentity::new(client.base(), &source.agent_id)?;
 
     if mode == Mode::ReadOnly {
+        let writable = matches!(
+            client.push_access(src_owner, src_name, &source.agent_id),
+            Ok(crate::hub::PushAccess::Writable)
+        );
         return Ok(Some(Plan {
             owner: source.owner,
             name: source.name,
             origin: source.clone_url,
             identity: source_identity,
             upstream: None,
-            writable: false,
+            writable,
             promoted_in_place: false,
         }));
     }
@@ -1622,6 +1627,39 @@ mod tests {
     fn your_own_agent_is_never_a_copy() {
         assert_eq!(mode_of(Some("me"), "me", false), Mode::Own);
         assert_eq!(mode_of(Some("me"), "me", true), Mode::Own);
+    }
+
+    #[test]
+    fn detached_file_line_guidance_never_resumes_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(dir.path()).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        meta::write(repo.root(), &Meta::new_file_line()).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("shared files").unwrap();
+        let file_line = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        repo.git(&["checkout", "-b", "topic"]).unwrap();
+        meta::write(
+            repo.root(),
+            &Meta::new_session_line("codex".into(), "/work".into()),
+        )
+        .unwrap();
+        repo.add_all().unwrap();
+        repo.commit("session").unwrap();
+        repo.git(&["checkout", "--detach", file_line.trim()])
+            .unwrap();
+        assert_eq!(
+            super::continuation_command(&repo, "me/qa", Some("topic"), true).unwrap(),
+            "agit resume me/qa@topic"
+        );
+        assert_eq!(
+            super::continuation_command(&repo, "me/qa", None, true).unwrap(),
+            "agit new me/qa -b <name>"
+        );
+        assert_eq!(
+            super::continuation_command(&repo, "me/qa", None, false).unwrap(),
+            "agit branch --repo me/qa"
+        );
     }
 
     #[test]

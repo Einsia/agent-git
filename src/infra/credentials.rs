@@ -277,7 +277,7 @@ fn save_refreshed_at(
 }
 
 fn mutation_guard(dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(dir).context("cannot create credential directory")?;
+    super::config::create_state_dir(dir).context("cannot create credential directory")?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
@@ -300,7 +300,7 @@ pub(crate) fn refresh_guard(hub: &str) -> Result<std::fs::File> {
 
     let authority = HubAuthority::parse(hub)?;
     let dir = crate::infra::config::credentials_dir()?;
-    std::fs::create_dir_all(&dir).context("cannot create credential directory")?;
+    super::config::create_state_dir(&dir).context("cannot create credential directory")?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
@@ -329,7 +329,7 @@ pub(crate) fn refresh_guard(hub: &str) -> Result<std::fs::File> {
 
 pub fn save_at(path: &Path, cred: &HubCredential) -> Result<()> {
     if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
+        super::config::create_state_dir(d)?;
     }
     let body = format!("{}\n", serde_json::to_string_pretty(cred)?);
     #[cfg(windows)]
@@ -543,6 +543,46 @@ fn set_private(_p: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::infra::config::hub_host_key;
+
+    #[cfg(all(unix, feature = "cli"))]
+    #[test]
+    fn first_state_writers_create_private_home() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        const CHILD: &str = "AGIT_TEST_PRIVATE_STATE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "infra::credentials::tests::first_state_writers_create_private_home",
+                ])
+                .env(CHILD, "1");
+            unsafe {
+                child.pre_exec(|| {
+                    libc::umask(0o002);
+                    Ok(())
+                });
+            }
+            assert!(child.status().unwrap().success());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        for name in ["credentials", "telemetry"] {
+            let home = root.path().join(name);
+            let directory = home.join(name);
+            let _guard = if name == "credentials" {
+                mutation_guard(&directory).unwrap()
+            } else {
+                crate::telemetry::state::gate(&directory, true).unwrap()
+            };
+            for path in [&home, &directory] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
+    }
 
     fn cred(access_exp: &str, refresh_exp: &str) -> HubCredential {
         HubCredential {

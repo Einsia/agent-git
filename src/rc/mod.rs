@@ -22,19 +22,16 @@
 //! module for a cloud entry service.
 //!
 //! ```text
-//! UI -> owner RPC -> controller -> tunnel worker -> remote owner RPC -> executor
-//!             \-> local executor -> harness subprocesses
+//! UI -> controller -> tunnel worker -> peer admission -> executor -> harness
+//!       owner RPC -> local executor
 //! ```
 //!
-//! The Hub protocol adapter retains registration, replay, and authorization
-//! negotiation while its WebSocket I/O runs in an independent tunnel worker.
-//! Connection policy belongs to the controller or Hub adapter, never the worker.
+//! The standard installation contains controller and executor modules, while a
+//! Web host can embed only the controller. SSH and Cloud are independent tunnel
+//! transports. Cloud admission grants connectivity; executor resource policy
+//! independently decides which sessions and operations a principal can access.
+//! No Hub-paired execution transport is selected for an unassigned workspace.
 //!
-//! * The **trust boundary is on the machine**. The hub is a relay and a
-//!   projection, not a source of authority. `agitd` re-checks every instruction
-//!   it receives: does the target workspace belong to this connection, is the
-//!   path inside the allowlist, does the action need an approval. If the hub is
-//!   compromised, the blast radius is capped by `agitd`'s local policy.
 //! * The harness's **own transcript file** is the source of truth for completed
 //!   items. `agitd` tails it and runs each new line through the same
 //!   `adapter::parse` that `agit show` uses, so the live stream is
@@ -45,14 +42,14 @@
 //!
 //! | module | job |
 //! |---|---|
-//! | [`identity`]  | machine fingerprint + per-hub connection token (`~/.agit/rc/`) |
-//! | [`mirror`]    | local mirror of hub workspace definitions → the path allowlist |
+//! | [`identity`]  | machine fingerprint and display name |
+//! | [`mirror`]    | local workspace definitions and path allowlist |
 //! | [`policy`]    | allowlist enforcement (canonical paths, no `..`, no symlink escapes) |
 //! | [`journal`]   | per-session `seq` allocation, ring buffer, durable watermark |
 //! | [`tail`]      | transcript file tailer → `(lineno, raw_line)` |
 //! | [`harness`]   | drivers: `claude_code` (stream-json), `codex` (app-server JSON-RPC) |
 //! | [`supervisor`]| session registry; turns harness events + tailed lines into protocol frames |
-//! | [`link`]      | the WSS link to the hub: register, heartbeat, backoff, replay |
+//! | [`cloud`]     | owner enrollment, admission and independent tunnel retries |
 //! | [`control`]   | local unix socket for `agit rc status` / `stop` |
 //! | [`daemon`]    | wires it all up; the thing `agit rc start` runs |
 //!
@@ -64,7 +61,7 @@
 //! the hub is unreachable, so on reconnect it can say "I'm at 5000, you have
 //! 4200, here's the gap"; (3) producer-side numbering gives every consumer an
 //! end-to-end hole-detection contract — a dropped frame at any hop is
-//! *detected*, not silently lost. The hub's only job is to reject holes.
+//! *detected*, not silently lost. Controllers reconcile replay gaps against executor history.
 
 pub(crate) mod authority;
 #[cfg(unix)]
@@ -97,6 +94,7 @@ pub mod local_history;
 pub mod local_repository;
 pub mod mirror;
 pub(crate) mod native_inbox;
+#[cfg(unix)]
 pub(crate) mod navigation;
 pub mod outbound;
 #[cfg(unix)]
@@ -142,7 +140,7 @@ pub fn rc_dir() -> crate::Result<PathBuf> {
     #[cfg(windows)]
     windows_security::private_directory(&d)?;
     #[cfg(not(windows))]
-    std::fs::create_dir_all(&d)?;
+    crate::infra::config::create_state_dir(&d)?;
     Ok(d)
 }
 

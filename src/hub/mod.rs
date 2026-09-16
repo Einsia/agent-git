@@ -542,30 +542,6 @@ pub struct CliVersion {
     pub stale: bool,
 }
 
-/// One paired machine (`agit rc list`).
-#[derive(Debug, Deserialize)]
-pub struct RcConnection {
-    pub id: String,
-    pub display_name: String,
-    pub platform: String,
-    pub agit_version: String,
-    /// The server computes online state from heartbeats and never persists it — it changes
-    /// every 15 seconds.
-    pub online: bool,
-    #[serde(default)]
-    pub last_seen_at: Option<String>,
-}
-
-/// The response to pairing this machine: an **RC-only** token.
-///
-/// Separate from the account's API token, so it can be revoked on its own, and its scope covers
-/// only the RC surface.
-#[derive(Debug, Deserialize)]
-pub struct RcPairResponse {
-    pub connection_id: String,
-    pub token: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

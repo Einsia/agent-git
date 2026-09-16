@@ -992,14 +992,7 @@ fn rc_category_fixture_child() {
         return;
     }
     assert_eq!(action, "seed");
-    let hub = std::env::var("AGIT_HUB_URL").unwrap();
-    agit::rc::identity::save_connection(&agit::rc::identity::Connection {
-        connection_id: "synthetic-connection".into(),
-        token: "agit_rc_synthetic-category-token".into(),
-        hub,
-        created_at: "2026-01-01T00:00:00Z".into(),
-    })
-    .unwrap();
+    agit::rc::select_local_authority();
     agit::rc::identity::identity().unwrap();
 }
 
@@ -1010,7 +1003,7 @@ fn foreground_rc_preserves_unusable_local_roster_evidence_and_refuses_before_net
             let lab = Lab::new();
             let seed = run_bounded(rc_fixture_command(&lab, "seed"));
             assert!(seed.status.success(), "{seed:?}");
-            let fallback = lab.home.join("rc/sessions.fail-closed.json");
+            let fallback = lab.home.join("desktop-rc/sessions.fail-closed.json");
             if directory {
                 fs::create_dir(&fallback).unwrap();
             } else {
@@ -1033,7 +1026,7 @@ fn foreground_rc_preserves_unusable_local_roster_evidence_and_refuses_before_net
                 assert!(text.contains("fail-closed roster snapshot"), "{text}");
             }
             assert!(!text.contains("not signed in"), "{text}");
-            assert!(!lab.home.join("rc/agitd.pid").exists());
+            assert!(!lab.home.join("desktop-rc/agitd.pid").exists());
             assert_eq!(lab.state(), before);
             lab.no_requests();
         }
@@ -1042,6 +1035,7 @@ fn foreground_rc_preserves_unusable_local_roster_evidence_and_refuses_before_net
 
 fn serve_rc_status(action: &str) {
     use agit::rc::control::{self, Reply, Request, Status};
+    agit::rc::select_local_authority();
     assert!(matches!(action, "serve-busy" | "serve-offline"));
     let listener = control::listen().unwrap();
     control::write_pidfile().unwrap();
@@ -1140,7 +1134,7 @@ fn rc_busy_status_is_precondition_but_offline_and_idempotent_stop_remain_success
                 text.contains(if action == "serve-busy" {
                     "daemon is busy"
                 } else {
-                    "offline (retrying)"
+                    "local RPC unavailable"
                 }),
                 "{text}"
             );

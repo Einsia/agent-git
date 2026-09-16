@@ -31,12 +31,12 @@
 use crate::protocol::{
     ErrorCode, FILE_PREVIEW_CAP, Frame, FsReadDirectory, FsReadDirectoryResult, FsReadFile,
     FsReadFileResult, LIKELY_ACTIVE_SECS, LOCAL_GIST_BUDGET, LocalSession, ProjectBind,
-    ProjectBindResult, RcRegister, RpcError, SessionInfo, SessionList, SessionListResult,
-    SessionResume, SessionResumeResult, SessionStart, SessionStartResult, SessionStatus,
-    SessionSubscribe, SessionSubscribeResult, SessionWatch, SessionWatchResult, TerminalClose,
-    TerminalExited, TerminalInput, TerminalOpen, TerminalOpenResult, TerminalOutput,
-    TerminalResize, TurnInterrupt, TurnInterruptResult, TurnStart, TurnStartResult, TurnSteer,
-    TurnSteerResult, VERSION, WorkspaceListResult, method,
+    ProjectBindResult, RpcError, SessionInfo, SessionList, SessionListResult, SessionResume,
+    SessionResumeResult, SessionStart, SessionStartResult, SessionStatus, SessionSubscribe,
+    SessionSubscribeResult, SessionWatch, SessionWatchResult, TerminalClose, TerminalExited,
+    TerminalInput, TerminalOpen, TerminalOpenResult, TerminalOutput, TerminalResize, TurnInterrupt,
+    TurnInterruptResult, TurnStart, TurnStartResult, TurnSteer, TurnSteerResult,
+    WorkspaceListResult, method,
 };
 use crate::rc::harness::{
     ApprovalOutcome, LaunchSpec, PermissionModeOutcome, TurnStartConfirmation, TurnStartOutcome,
@@ -47,7 +47,7 @@ use crate::rc::supervisor::{
     Command, DangerAuthorization, MessageAttribution, Session, SessionNote,
 };
 use crate::rc::terminal::{Terminal, TerminalEvent};
-use crate::rc::{control, identity, journal::Journal, link, mirror::Mirror, policy};
+use crate::rc::{control, journal::Journal, link, mirror::Mirror, policy};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -161,26 +161,6 @@ fn set_connection_features(
         state.agent_identity_v1 = agent_identity_v1;
         state.session_start_idempotency_v1 = session_start_idempotency_v1;
     });
-}
-
-fn accepted_connection_features(result: &crate::protocol::RcRegisterResult) -> (bool, bool) {
-    let accepted = |wanted: &str| {
-        result
-            .accepted_features
-            .iter()
-            .any(|feature| feature == wanted)
-    };
-    (
-        accepted(crate::protocol::feature::AGENT_IDENTITY_V1),
-        accepted(crate::protocol::feature::SESSION_START_IDEMPOTENCY_V1),
-    )
-}
-
-fn advertised_connection_features() -> Vec<String> {
-    vec![
-        crate::protocol::feature::AGENT_IDENTITY_V1.to_string(),
-        crate::protocol::feature::SESSION_START_IDEMPOTENCY_V1.to_string(),
-    ]
 }
 
 fn connection_epoch_is_current(

@@ -1,4 +1,4 @@
-//! Login and RC pairing distinguish remote refusal, local persistence, and interactive admission.
+//! Login distinguishes remote refusal, local persistence, and interactive admission.
 
 use agit::infra::credentials::{HubCredential, save_at};
 use serde_json::{Value, json};
@@ -77,9 +77,9 @@ impl Hub {
                     .unwrap();
                     continue;
                 }
-                let reply = replies
-                    .get(requests.len())
-                    .expect("unexpected request replay");
+                let reply = replies.get(requests.len()).unwrap_or_else(|| {
+                    panic!("unexpected request: {} {}", request.method, request.target)
+                });
                 requests.push(request);
                 let (status, body) = match reply {
                     Reply::Status(status) => (
@@ -708,145 +708,6 @@ fn pending_device_authorization_can_complete_without_exposing_the_token_pair() {
     }
 }
 
-#[test]
-fn pairing_storage_refusals_preserve_local_evidence_and_the_request_boundary() {
-    for flags in modes() {
-        for stage in [
-            "identity",
-            "paired-identity",
-            "connection",
-            "malformed-connection",
-            "credentials-directory",
-            "credentials-malformed",
-            "missing-credentials",
-        ] {
-            let mut replies = vec![Reply::Json(json!({
-                "connection_id":"existing-connection", "token":ACCESS
-            }))];
-            if stage == "connection" {
-                replies.push(Reply::Json(json!({
-                    "connection_id":"replacement-connection", "token":REFRESH
-                })));
-            }
-            let hub = Hub::new(replies);
-            let lab = Lab::new(&hub.base);
-            lab.seed(&hub.base);
-            let seeded = lab.run(&hub.base, &[], &["rc", "pair"], None);
-            assert_command_output(&seeded, &[], "rc", 0);
-            let identity = lab.store.join("rc/identity.json");
-            let machine: Value = serde_json::from_slice(&fs::read(&identity).unwrap()).unwrap();
-            let connection = lab.store.join("rc/connections").join(format!(
-                "{}.json",
-                agit::infra::config::hub_host_key(&hub.base).unwrap()
-            ));
-            let credentials = lab.credential_path(&hub.base);
-            let carrier = match stage {
-                "identity" | "paired-identity" => &identity,
-                "connection" | "malformed-connection" => &connection,
-                _ => &credentials,
-            };
-            fs::rename(carrier, carrier.with_extension("saved")).unwrap();
-            match stage {
-                "malformed-connection" | "credentials-malformed" => {
-                    fs::write(carrier, format!("{{\"token\":\"{ACCESS}\", invalid")).unwrap();
-                }
-                "missing-credentials" => {}
-                _ => {
-                    fs::create_dir(carrier).unwrap();
-                    fs::write(carrier.join("retained-entry"), b"owned local evidence").unwrap();
-                }
-            }
-            if matches!(
-                stage,
-                "identity"
-                    | "credentials-directory"
-                    | "credentials-malformed"
-                    | "missing-credentials"
-            ) {
-                fs::rename(&connection, connection.with_extension("saved")).unwrap();
-            }
-            let before = lab.state();
-            let prepare_identity = "cannot prepare the local RC machine identity";
-            let read_connection = "cannot read the local RC connection";
-            let operations = match stage {
-                "identity" => vec![
-                    (vec!["rc", "pair"], prepare_identity),
-                    (vec!["rc", "start", "--detach"], prepare_identity),
-                    (
-                        vec!["rc", "start", "--detach", "--name", "changed-name"],
-                        "cannot save the local RC machine name",
-                    ),
-                ],
-                "paired-identity" => vec![(vec!["rc", "start", "--detach"], prepare_identity)],
-                "connection" => vec![
-                    (vec!["rc", "start", "--detach"], read_connection),
-                    (vec!["rc", "pair"], "cannot save the local RC connection"),
-                ],
-                "malformed-connection" => vec![(vec!["rc", "start", "--detach"], read_connection)],
-                _ => {
-                    let diagnostic = if stage == "missing-credentials" {
-                        "pairing a machine needs an account"
-                    } else {
-                        "cannot read the saved Hub credentials"
-                    };
-                    vec![
-                        (vec!["rc", "pair"], diagnostic),
-                        (vec!["rc", "start", "--detach"], diagnostic),
-                    ]
-                }
-            };
-            for (operation, diagnostic) in operations {
-                let output = lab.run(&hub.base, &flags, &operation, None);
-                let code = if stage == "missing-credentials" { 5 } else { 4 };
-                let value = assert_command_output(&output, &flags, "rc", code);
-                let text = if let Some(value) = value {
-                    if flags.last() == Some(&"2") {
-                        assert_eq!(value["fix"], json!([]));
-                    }
-                    value["diagnostics"]["stderr"].to_string()
-                } else {
-                    assert!(output.stdout.is_empty(), "{output:?}");
-                    String::from_utf8(output.stderr).unwrap()
-                };
-                assert!(text.contains(diagnostic), "{stage}: {text}");
-                assert_eq!(
-                    lab.state(),
-                    before,
-                    "{stage}: refusal changed local evidence"
-                );
-                assert!(!lab.store.join("rc/agitd.pid").exists());
-            }
-            if stage == "identity" {
-                for operation in [
-                    vec!["rc", "pair"],
-                    vec!["rc", "start", "--detach", "--name", "changed-name"],
-                ] {
-                    let output = lab.run("invalid", &flags, &operation, None);
-                    assert_command_output(&output, &flags, "rc", 2);
-                    assert_eq!(lab.state(), before);
-                    assert!(!lab.store.join("rc/agitd.pid").exists());
-                }
-            }
-            let requests = hub.finish();
-            assert_eq!(requests.len(), if stage == "connection" { 2 } else { 1 });
-            for request in requests {
-                assert_eq!(request.method, "POST");
-                assert_eq!(request.target, "/api/rc/connections");
-                assert_eq!(request.authorization, format!("Bearer {OLD_ACCESS}"));
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&request.body).unwrap(),
-                    json!({
-                        "machine_fingerprint":machine["machine_fingerprint"],
-                        "display_name":machine["display_name"],
-                        "platform":agit::rc::platform(),
-                        "agit_version":env!("CARGO_PKG_VERSION")
-                    })
-                );
-            }
-        }
-    }
-}
-
 fn run_bounded(mut command: Command) -> Output {
     let mut child = command
         .stdout(Stdio::piped())
@@ -924,12 +785,57 @@ fn invalid_terminal_choice_can_be_corrected_without_restarting_login() {
 }
 
 #[cfg(unix)]
+#[test]
+fn rc_first_sign_in_persists_credentials_before_background_enrollment() {
+    #[path = "support/startup_cache.rs"]
+    mod startup_cache;
+    let mut login = session();
+    login["account_id"] = json!("00000000-0000-4000-8000-000000000001");
+    let hub = Hub::new(vec![
+        device(120),
+        Reply::Json(login),
+        Reply::Status(503),
+        Reply::Status(503),
+        Reply::Status(503),
+    ]);
+    let lab = Lab::new(&hub.base);
+    startup_cache::seed(&lab.store);
+    let (status, output) = terminal_command(&lab, &hub.base, "2\r", &["rc", "start", "--detach"]);
+    let stop = || lab.run(&hub.base, &[], &["rc", "stop"], None);
+    if status.exit_code() != 0 {
+        let _ = stop();
+        panic!("{output}");
+    }
+    let saved: HubCredential =
+        serde_json::from_slice(&fs::read(lab.credential_path(&hub.base)).unwrap()).unwrap();
+    assert_eq!(saved.access_token, ACCESS);
+    thread::sleep(Duration::from_millis(500));
+    assert!(stop().status.success());
+    let requests = hub.finish();
+    assert_eq!(requests.last().unwrap().target, "/api/peer/devices");
+    assert_eq!(
+        requests.last().unwrap().authorization,
+        format!("Bearer {ACCESS}")
+    );
+}
+
+#[cfg(unix)]
 fn terminal_login(lab: &Lab, base: &str, input: &str) -> (portable_pty::ExitStatus, String) {
+    terminal_command(lab, base, input, &["login"])
+}
+
+#[cfg(unix)]
+fn terminal_command(
+    lab: &Lab,
+    base: &str,
+    input: &str,
+    args: &[&str],
+) -> (portable_pty::ExitStatus, String) {
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize::default())
         .unwrap();
     let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
-    command.arg("login");
+    command.args(args);
     command.env_clear();
     command.env("PATH", std::env::var_os("PATH").unwrap_or_default());
     command.env("HOME", &lab.home);

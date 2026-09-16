@@ -2373,14 +2373,16 @@ async fn the_launch_time_binding_announce_never_waits_on_a_full_notes_channel() 
 }
 
 #[test]
-fn legacy_caller_metadata_does_not_invent_an_authenticated_sender() {
+fn authenticated_account_without_username_preserves_sender_identity() {
     let caller: crate::protocol::CallerClaim = serde_json::from_value(serde_json::json!({
         "account_id": "account-a", "role": "operator", "workspace_id": "workspace-a",
     }))
     .unwrap();
     let attribution = MessageAttribution::from_caller(&caller, Some("legacy-handle".into()), None);
     assert_eq!(attribution.by.as_deref(), Some("legacy-handle"));
-    assert!(attribution.sender.is_none());
+    let sender = attribution.sender.unwrap();
+    assert_eq!(sender.account_id, "account-a");
+    assert!(sender.username.is_empty());
     let legacy: TurnStarted = serde_json::from_value(serde_json::json!({
         "turn_id": "turn-a", "source": "remote", "by": "legacy-handle", "prompt": "inspect",
     }))

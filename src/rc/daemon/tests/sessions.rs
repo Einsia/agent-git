@@ -686,22 +686,6 @@ fn a_session_that_crashed_before_binding_cannot_be_resumed_by_logical_id() {
 
 #[test]
 fn session_start_idempotency_is_an_explicit_per_socket_feature() {
-    assert!(
-        advertised_connection_features()
-            .iter()
-            .any(|feature| feature == crate::protocol::feature::SESSION_START_IDEMPOTENCY_V1)
-    );
-    let mut result = crate::protocol::RcRegisterResult {
-        connection_id: "conn".into(),
-        accepted_features: vec![],
-        workspaces: vec![],
-        persisted_seq: Default::default(),
-        server_time: "now".into(),
-    };
-    assert_eq!(accepted_connection_features(&result), (false, false));
-    result.accepted_features = vec![crate::protocol::feature::SESSION_START_IDEMPOTENCY_V1.into()];
-    assert_eq!(accepted_connection_features(&result), (false, true));
-
     assert_eq!(negotiated_start_id(false, None).unwrap(), None);
     assert!(negotiated_start_id(false, Some("018f47cb-60ff-7e31-aec9-02d2e39d3114")).is_err());
     assert!(negotiated_start_id(true, None).is_err());

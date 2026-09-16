@@ -127,7 +127,21 @@ pub(super) async fn enroll(hub: &str, name: Option<String>) -> crate::Result<ser
     store::grant_enrolling_owner(&enrollment)?;
     enrollment.inbound_enabled = true;
     store::save(&enrollment)?;
+    store::clear_inbound_request(api.origin())?;
     store::status(api.origin())
+}
+
+pub(super) async fn enroll_pending(hub: &str) -> crate::Result<()> {
+    let api = Client::new(hub)?;
+    let _lock = store::enrollment_lock(api.origin())?;
+    if !store::inbound_pending(api.origin())? {
+        return Ok(());
+    }
+    let mut enrollment = register(&api, None).await?;
+    store::grant_enrolling_owner(&enrollment)?;
+    enrollment.inbound_enabled = true;
+    store::save(&enrollment)?;
+    store::clear_inbound_request(api.origin())
 }
 
 pub(super) async fn controller(hub: &str) -> crate::Result<store::Enrollment> {
@@ -141,6 +155,7 @@ pub(super) async fn inbound(hub: &str, enabled: bool) -> crate::Result<serde_jso
         return enroll(hub, None).await;
     }
     let _lock = store::enrollment_lock(hub)?;
+    store::clear_inbound_request(hub)?;
     if let Some(mut enrollment) = store::load(hub)? {
         enrollment.inbound_enabled = false;
         store::save(&enrollment)?;
@@ -150,6 +165,8 @@ pub(super) async fn inbound(hub: &str, enabled: bool) -> crate::Result<serde_jso
 
 async fn register(api: &Client, name: Option<String>) -> crate::Result<store::Enrollment> {
     if let Some(enrollment) = store::load(api.origin())? {
+        let owner = enrollment.credential.device.owner.clone();
+        tokio::task::spawn_blocking(move || store::verify_signed_in_owner(&owner)).await??;
         return Ok(enrollment);
     }
     let machine = super::super::identity::identity()?;

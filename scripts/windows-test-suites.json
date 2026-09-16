@@ -18,7 +18,6 @@
   "integration": [
     "windows_rc",
     "windows_json_capture",
-    "rc_proxy",
     "rc_startup",
     "hub_credential_binding",
     "session_files",

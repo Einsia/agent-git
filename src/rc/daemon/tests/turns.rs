@@ -1726,6 +1726,12 @@ async fn message_attribution_comes_from_the_caller_claim_not_request_params() {
             })
         );
         assert_eq!(attribution.client_msg_id.as_deref(), Some("message-a"));
+        let mut cloud = frame.caller.clone().unwrap();
+        cloud.username = None;
+        let attributed = MessageAttribution::from_caller(&cloud, None, None);
+        let sender = attributed.sender.expect("authenticated Cloud sender");
+        assert_eq!(sender.account_id, "a");
+        assert!(sender.username.is_empty());
     }
 }
 

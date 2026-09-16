@@ -99,6 +99,7 @@ async fn run_executor(
     let mut children = tokio::task::JoinSet::new();
     loop {
         let attempt = async {
+            super::commands::enroll_pending(&hub).await?;
             let origin = hub.clone();
             let enrollment = tokio::task::spawn_blocking(move || store::load(&origin)).await??
                 .context("cloud enrollment is missing")?;

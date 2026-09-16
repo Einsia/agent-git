@@ -567,11 +567,12 @@ pub fn run(mut args: Args) -> CmdResult {
     // `/settings`. One character short is a link that 404s, and this link is precisely what the
     // user sends a teammate.
     let web = format!("{}/@{owner}/{name}", client.base());
-    // A version is HEAD's commit SHA (with the `agit-` prefix).
-    let id = repo
-        .git_opt(&["rev-parse", "HEAD"])
-        .map(|sha| meta::id_from_sha(sha.trim()))
-        .unwrap_or_default();
+    let published = published_versions(&repo, &branches);
+    let id = if published.len() == 1 {
+        published[0].1.as_str()
+    } else {
+        ""
+    };
     println!(
         "\n{} {} {}",
         ui::ok(s.check),
@@ -579,6 +580,9 @@ pub fn run(mut args: Args) -> CmdResult {
         id
     );
     let mut kv: Vec<(&str, String)> = vec![("branches", refs.join(", "))];
+    for (branch, version) in &published {
+        kv.push((branch, version.clone()));
+    }
     if !tags.is_empty() {
         kv.push(("versions", tags.len().to_string()));
     }
@@ -1296,6 +1300,16 @@ fn plan_branches(
     }
 }
 
+fn published_versions(repo: &Repo, branches: &[String]) -> Vec<(String, String)> {
+    branches
+        .iter()
+        .filter_map(|branch| {
+            repo.git_opt(&["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+                .map(|sha| (branch.clone(), meta::id_from_sha(sha.trim())))
+        })
+        .collect()
+}
+
 /// Publish the main file line alongside the session branches. Bare repositories default HEAD to
 /// `main`; omitting it leaves an otherwise healthy clone with a misleading "remote HEAD refers to
 /// nonexistent ref" warning.
@@ -1834,6 +1848,19 @@ mod tests {
         let got = tags_to_push(&repo, &["main".to_string(), "ghost".to_string()]);
         assert!(got.contains(&"agit-ghost-three".to_string()), "{got:?}");
         assert!(!got.contains(&"agit-refund-two".to_string()), "{got:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn published_version_follows_the_selected_branch_instead_of_checkout_head() {
+        let (dir, repo) = fixture("published-version");
+        repo.git(&["checkout", "main"]).unwrap();
+        let sha = repo.git(&["rev-parse", "refs/heads/refund-fix"]).unwrap();
+        let versions = published_versions(&repo, &["refund-fix".into()]);
+        assert_eq!(
+            versions,
+            vec![("refund-fix".into(), meta::id_from_sha(sha.trim()))]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

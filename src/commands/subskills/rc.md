@@ -1,91 +1,35 @@
 ---
 name: agit-rc
-description: Pair the local agitd daemon and observe or drive supervised sessions from the web interface.
+description: Start and manage owner-authorized remote agent sessions.
 ---
 
-# agit rc
+# Remote control
 
-## Concepts
+Run this on the machine where your code and agent runtime are installed:
 
-`rc` manages the remote-control daemon (`agitd`). The “web interface” is the Hub-connected control UI: it can observe live sessions on paired machines and send permitted actions. It is not another Git repo for the project directory. Workspace bindings and web pairing are separate metadata.
-
-## Subcommands
-
-| Subcommand | Purpose | Arguments |
-|---|---|---|
-| `start` | Pair and start the daemon | `--detach`, `--name <name>` |
-| `status` | Connection state, uptime, and live sessions | none |
-| `stop` | Stop the daemon; its sessions end | none |
-| `list` | List registered machines for the account | none |
-| `revoke <connection>` | Revoke a machine immediately; it cannot auto-register again | connection id |
-| `pair` | Print a new pairing code | none |
-
-All subcommands support common global options; `--json` emits the unified CLI JSON envelope.
-
-## Examples
-
-```bash
-agit rc start --name laptop --detach
-agit rc status
-agit rc pair
-agit rc list
-agit rc revoke conn_123
-agit rc stop
+```sh
+agit rc start
 ```
 
-`start` reports that it is connecting before printing workspace navigation. With
-`--detach`, success means the spawned daemon has confirmed Hub registration through
-its local control channel. Startup waits at most 45 seconds after spawning. If
-readiness is not confirmed, the command exits unsuccessfully and reports that the
-process has not exited; it keeps reconnecting in the background. Use `rc status`
-to check it or `rc stop` to end it before starting another daemon.
+On first use, follow the sign-in prompt. The command starts agitd, registers a Cloud device,
+and enables inbound control for your own account. Open the printed Workspaces URL with the
+same account, choose the device and a project folder, and start a conversation. No pairing
+code, separate enrollment command, or configuration edit is required.
 
-Each detached launch prints its private diagnostic log path under `~/.agit/rc/`
-(or `$AGIT_HOME/rc/`). Startup errors and later connection diagnostics stay in that
-file. Logs remain after stopping; remove old logs when they are no longer needed.
+Other users need explicit device admission and executor access grants. Workspace membership
+alone does not grant access to a device. Authentication and authorization remain independent
+of tunnel transport.
 
-Reconnect failures use bounded exponential backoff. A connection that stays
-registered for at least 30 seconds resets the next retry to the initial delay;
-brief connections retain the accumulated backoff.
+Use `agit rc start --detach` to run in the background. Local and SSH access stay available
+while Cloud registration or networking retries. Inspect `agit rc status` and the printed
+private daemon log when a device is not online. `agit rc stop` stops that daemon and its sessions.
 
-With `AGIT_RC=1`, the daemon may commit/push at turn boundaries. That is supervisor behavior, not a normal CLI guarantee; shared-workspace approvals go to the workspace owner.
+`agit rc local start --detach` is the outgoing controller startup used by Desktop. It does
+not enable inbound Cloud access. `agit rc cloud inbound --hub <origin> --enabled false`
+disables inbound access independently of outgoing control.
 
-## Proxy connections
+Advanced device management: `agit rc list`, `agit rc revoke <device-id>`, and `agit rc cloud
+status --hub <origin>`. `cloud enroll` is an explicit registration tool; ordinary startup
+performs registration automatically. SSH uses `agit rc local bridge --ensure`.
 
-The daemon reads proxy settings when it connects or reconnects. `wss://` uses
-`https_proxy` / `HTTPS_PROXY`; `ws://` uses `http_proxy` / `HTTP_PROXY`.
-`all_proxy` / `ALL_PROXY` is the fallback. Uppercase variables take precedence.
-`no_proxy` / `NO_PROXY` bypasses the proxy for matching domains, IP addresses,
-IP subnets, or `*` (all hosts).
-
-Proxy URLs must use `http://` for an HTTP CONNECT proxy; optional URL credentials
-are sent only to the proxy. TLS still verifies the original hub hostname and
-certificate inside the tunnel. HTTPS and SOCKS proxy URLs produce an explicit
-unsupported-proxy error instead of silently falling back to a direct connection.
-
-```bash
-HTTPS_PROXY=http://proxy.example.com:8888 agit rc start --detach
-```
-
-DNS, TCP connection, CONNECT, TLS and WebSocket negotiation share a 30-second
-deadline. Connection errors identify whether the attempt was direct or through
-a proxy. Set the environment in the shell that starts the daemon; changing a
-different shell does not change the environment of an already running process.
-
-## Messages to a session open in Codex
-
-Full-access workspace members can follow an existing Codex conversation and send messages through
-its native inbox. This uses `codex queue --thread <UUID> --message <text>` and keeps
-the existing Codex process in control of its transcript. Install a Codex CLI that
-supports `codex queue` on the machine running `agit rc`.
-
-The web composer reports "Queued" when the native inbox accepts a message. Codex
-processes queued messages at a turn boundary. Permission modes, interruptions, and
-approvals for that native process remain in Codex; the workspace terminal and other
-workspace actions continue to follow the member's normal role.
-
-The Hub authenticates the member and stamps their identity. The daemon checks the
-workspace, full-access role, bound folder, and exact native session before
-delivery. Reusing a client message identifier returns its saved receipt instead of
-enqueuing another message. An uncertain delivery must be checked with the same
-identifier.
+The peer executor currently supports Linux and macOS. On Windows, run it inside WSL; native Windows RC does not fall back to the removed pairing transport.

@@ -144,8 +144,71 @@ fn save_in(directory: &Path, enrollment: &Enrollment) -> crate::Result<()> {
     )
 }
 
+fn intent_path(hub: &str) -> crate::Result<PathBuf> {
+    Ok(super::super::rc_dir()?.join(filename(hub)?.replace("cloud-device-", "cloud-inbound-")))
+}
+
+pub(super) fn verify_signed_in_owner(owner: &agit_peer::access::Principal) -> crate::Result<()> {
+    let credential = crate::infra::credentials::load_checked(&owner.issuer)?
+        .context("Sign in to the device owner's account before enabling Cloud access")?;
+    let account = match credential.account_id {
+        Some(ref account) => account.clone(),
+        None => crate::hub::Client::for_credential(&owner.issuer, &credential)
+            .me()?
+            .account_id
+            .context("Cloud did not return an account identity")?,
+    };
+    ensure!(
+        account == owner.account_id,
+        "This daemon is enrolled to another account. Sign in as its owner or use a separate AGIT_HOME for the new account"
+    );
+    Ok(())
+}
+
+pub fn request_inbound(hub: &str) -> crate::Result<()> {
+    let api = Client::new(hub)?;
+    let _lock = enrollment_lock(api.origin())?;
+    if let Some(mut enrollment) = load(api.origin())? {
+        verify_signed_in_owner(&enrollment.credential.device.owner)?;
+        grant_enrolling_owner(&enrollment)?;
+        enrollment.inbound_enabled = true;
+        save(&enrollment)?;
+        return clear_inbound_request(api.origin());
+    }
+    write(&intent_path(api.origin())?, &api.origin())
+}
+
+pub(super) fn inbound_pending(hub: &str) -> crate::Result<bool> {
+    Ok(read::<String>(&intent_path(hub)?, MAX_RECORD)?.is_some())
+}
+
+pub(super) fn clear_inbound_request(hub: &str) -> crate::Result<()> {
+    match std::fs::remove_file(intent_path(hub)?) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
 pub fn origins() -> crate::Result<Vec<String>> {
-    origins_in(&super::super::rc_dir()?)
+    let directory = super::super::rc_dir()?;
+    let mut origins = origins_in(&directory)?;
+    for entry in std::fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("cloud-inbound-") && name.ends_with(".json") {
+            let hub: String =
+                read(&entry.path(), MAX_RECORD)?.context("inbound request disappeared")?;
+            ensure!(
+                entry.path() == intent_path(&hub)?,
+                "inbound request origin mismatch"
+            );
+            if !origins.contains(&hub) {
+                origins.push(hub);
+            }
+            ensure!(origins.len() <= 64, "too many cloud origins");
+        }
+    }
+    Ok(origins)
 }
 
 fn origins_in(directory: &Path) -> crate::Result<Vec<String>> {
@@ -175,6 +238,7 @@ fn origins_in(directory: &Path) -> crate::Result<Vec<String>> {
 pub fn status(hub: &str) -> crate::Result<serde_json::Value> {
     let enrollment = load(hub)?;
     Ok(serde_json::json!({
+        "enrollment_pending": inbound_pending(hub)?,
         "inbound_enabled": enrollment.as_ref().is_some_and(|value| value.inbound_enabled),
         "device": enrollment.map(|value| value.credential.device),
     }))

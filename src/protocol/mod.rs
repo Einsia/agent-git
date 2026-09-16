@@ -156,6 +156,7 @@ impl ConnectionDelivery {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_delivered(&self) {
         let _ = self.state.compare_exchange(
             Self::PENDING,

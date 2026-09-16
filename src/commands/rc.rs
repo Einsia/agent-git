@@ -1,4 +1,4 @@
-//! `agit rc` — pair this machine, run the daemon, inspect and revoke it.
+//! `agit rc` — start the peer executor and manage device access.
 //!
 //! The commands are thin on purpose: everything real lives in [`crate::rc`].
 //! This file only parses arguments, talks to the local control socket, and
@@ -7,11 +7,10 @@
 
 use super::CmdResult;
 use crate::rc::control;
-use crate::rc::identity;
-use crate::{ExitCode, infra::config, ui};
+use crate::{ExitCode, ui};
+#[cfg(unix)]
+use crate::{infra::config, rc::identity};
 use clap::{Args as ClapArgs, Subcommand};
-
-mod startup;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -24,7 +23,7 @@ pub enum Action {
     /// Carry transport packets for the supervising daemon.
     #[command(hide = true)]
     Tunnel,
-    /// Pair this machine (first run) and start the daemon.
+    /// Start agitd and allow your signed-in account to control this device.
     Start(StartArgs),
     /// Owner-only local daemon and SSH stdio bridge, independent of Hub pairing.
     #[cfg(unix)]
@@ -40,8 +39,6 @@ pub enum Action {
     List,
     /// Revoke a machine — it disconnects at once and cannot re-register.
     Revoke(RevokeArgs),
-    /// Print a fresh pairing code for this machine.
-    Pair,
     /// (internal) Prepare the local lineage for an RC-born session: repo,
     /// main file line, session branch, store link. Called by the daemon.
     #[command(hide = true)]
@@ -138,7 +135,7 @@ pub fn land_argv(
 
 #[derive(ClapArgs)]
 pub struct StartArgs {
-    /// Run in the background; wait for Hub readiness before reporting success.
+    /// Run in the background; wait for local RPC readiness.
     #[arg(long)]
     pub detach: bool,
     /// Name shown in the web UI (default: this machine's hostname).
@@ -148,13 +145,14 @@ pub struct StartArgs {
 
 #[derive(ClapArgs)]
 pub struct RevokeArgs {
-    /// Connection id from `agit rc list`.
-    #[arg(value_name = "connection")]
+    /// Device id from `agit rc list`.
+    #[arg(value_name = "device")]
     pub connection: String,
 }
 
 pub fn run(args: Args) -> CmdResult {
-    let result = match args.action {
+    crate::rc::select_local_authority();
+    match args.action {
         Action::Tunnel => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -174,18 +172,10 @@ pub fn run(args: Args) -> CmdResult {
         Action::Stop => stop(),
         Action::List => list(),
         Action::Revoke(a) => revoke(a),
-        Action::Pair => pair(),
         Action::Land(a) => land(a),
         Action::Grant(a) => grant(a),
         Action::Ungrant(a) => revoke_grant(a),
         Action::Grants(a) => grants(a),
-    };
-    match result {
-        Err(error) if error.is::<LocalStateFailure>() => {
-            ui::error(&format!("{error:#}"));
-            Ok(ExitCode::Precondition)
-        }
-        result => result,
     }
 }
 
@@ -550,91 +540,54 @@ fn landed_link(
     Ok(lk)
 }
 
+#[cfg(unix)]
 fn start(args: StartArgs) -> CmdResult {
-    if let Some(pid) = control::running_pid() {
-        ui::error(&format!(
-            "a daemon is already running on this machine (pid {pid})."
-        ));
-        ui::hint("`agit rc status` to see it, `agit rc stop` to replace it");
-        return Ok(ExitCode::Precondition);
-    }
+    crate::rc::select_local_authority();
     let hub = config::hub_url();
     crate::input_argument(crate::infra::hub_authority::HubAuthority::parse(&hub))?;
-    if let Some(n) = &args.name {
-        identity::set_display_name(n).map_err(|error| {
-            error.context(LocalStateFailure("cannot save the local RC machine name"))
-        })?;
+    if let Err(error) = crate::rc::roster::Roster::try_load() {
+        ui::error(&format!("{error:#}"));
+        return Ok(ExitCode::Precondition);
     }
-
-    let conn = match identity::connection(&hub)
-        .map_err(|error| error.context(LocalStateFailure("cannot read the local RC connection")))?
-    {
-        Some(c) => c,
-        None => {
-            // First run: pair through the existing device-code flow rather than
-            // inventing a second credential system.
-            match pair_interactive(&hub)? {
-                Some(c) => c,
-                None => return Ok(ExitCode::Auth),
-            }
+    if let Some(name) = &args.name {
+        identity::set_display_name(name)?;
+    }
+    if crate::infra::credentials::load_checked(&hub)?.is_none() {
+        ui::hint("Sign in to allow your account to control this device through Cloud.");
+        if super::login::login()?.is_none() {
+            ui::hint(
+                "Run `agit login` to finish Cloud sign-in; local and SSH access remain available.",
+            );
         }
-    };
-    let opts = daemon_options(&hub, conn)?;
-
-    let id = identity::identity().map_err(|error| {
-        error.context(LocalStateFailure(
-            "cannot prepare the local RC machine identity",
-        ))
-    })?;
+    }
+    crate::rc::cloud::store::request_inbound(&hub)?;
     ui::section("agit rc");
-    println!("  machine   {}", ui::accent(&id.display_name));
+    println!("  machine   {}", identity::identity()?.display_name);
     println!("  hub       {hub}");
     println!("  runtimes  {}", runtimes_line());
-    println!("  connection  starting; waiting for Hub registration");
-    println!();
-
-    if args.detach {
-        return startup::detach(&hub);
+    println!("  inbound   enabled for your account; other users require explicit access grants");
+    println!("  cloud     registration and connection retry independently in the background");
+    println!(
+        "  workspace {}",
+        crate::rc::navigation::workspaces_url(&hub)
+    );
+    ui::hint("`agit rc cloud inbound --hub <hub> --enabled false` disables Cloud inbound access.");
+    if control::running_pid().is_some() || args.detach {
+        crate::rc::local::ensure_daemon()?;
+        ui::success("agitd is ready; Cloud connection status is recorded in the daemon log.");
+        return Ok(ExitCode::Ok);
     }
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    match rt.block_on(crate::rc::daemon::Daemon::run(opts)) {
-        Ok(()) => Ok(ExitCode::Ok),
-        Err(e) => {
-            ui::error(&format!("{e:#}"));
-            Ok(ExitCode::Precondition)
-        }
-    }
+    crate::rc::local::start_foreground()?;
+    Ok(ExitCode::Ok)
 }
 
-fn daemon_options(
-    hub: &str,
-    connection: identity::Connection,
-) -> crate::Result<crate::rc::daemon::Options> {
-    let authority = crate::input_argument(crate::infra::hub_authority::HubAuthority::parse(hub))?;
-    anyhow::ensure!(
-        authority.matches(&connection.hub),
-        "the saved RC connection belongs to a different Hub"
-    );
-    let (scheme, routing) = hub
-        .trim()
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("Hub address must use HTTP or HTTPS"))?;
-    Ok(crate::rc::daemon::Options {
-        local_owner: false,
-        hub: format!(
-            "{}://{}",
-            scheme.to_ascii_lowercase(),
-            routing.trim_end_matches('/')
-        ),
-        token: connection.token,
-        connection_id: Some(connection.connection_id),
-    })
+#[cfg(not(unix))]
+fn start(_args: StartArgs) -> CmdResult {
+    anyhow::bail!("The peer executor requires Unix; use WSL on Windows")
 }
 
 fn status() -> CmdResult {
+    crate::rc::select_local_authority();
     match control::ask(&control::Request::Status) {
         Ok(control::Reply::Status(s)) => {
             ui::section("agit rc");
@@ -643,9 +596,9 @@ fn status() -> CmdResult {
             println!(
                 "  state      {}",
                 if s.online {
-                    ui::ok("connected")
+                    ui::ok("local RPC ready")
                 } else {
-                    ui::warn_text("offline (retrying)")
+                    ui::warn_text("local RPC unavailable")
                 }
             );
             if let Some(c) = &s.connection_id {
@@ -691,6 +644,7 @@ fn status() -> CmdResult {
 /// offline, busy or unreadable daemon is conservatively shown as offline; `agit rc status` keeps
 /// the detailed three-way diagnosis.
 pub(crate) fn tui_online() -> bool {
+    crate::rc::select_local_authority();
     const BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
     matches!(
         control::ask_with_timeout(&control::Request::Status, BUDGET),
@@ -760,6 +714,7 @@ fn stop_verdict(p: control::Presence) -> (String, String, ExitCode) {
 }
 
 fn stop() -> CmdResult {
+    crate::rc::select_local_authority();
     match control::ask(&control::Request::Stop) {
         Ok(_) => {
             println!("  {} stopped", ui::ok("✓"));
@@ -783,133 +738,53 @@ fn stop() -> CmdResult {
 }
 
 fn list() -> CmdResult {
-    let c = crate::hub::Client::from_env();
-    if !c.has_token() {
-        ui::error(&format!("sign in to {} first.", c.base()));
-        ui::hint("`agit login`");
-        return Ok(ExitCode::Auth);
+    #[cfg(unix)]
+    {
+        crate::rc::select_local_authority();
+        let runtime = tokio::runtime::Runtime::new()?;
+        let value = runtime.block_on(crate::rc::cloud::manage(
+            crate::rc::cloud::OwnerRequest::Devices {
+                hub: config::hub_url(),
+                after: None,
+            },
+        ))?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        Ok(ExitCode::Ok)
     }
-    match c.rc_connections() {
-        Ok(rows) if rows.is_empty() => {
-            println!("  {}", ui::dim("no machines paired yet"));
-            println!("  {}", ui::dim("`agit rc start` on a machine to pair it"));
-            Ok(ExitCode::Ok)
-        }
-        Ok(rows) => {
-            ui::section("machines");
-            for r in &rows {
-                let state = if r.online {
-                    ui::ok("online")
-                } else {
-                    ui::dim(r.last_seen_at.as_deref().unwrap_or("never seen"))
-                };
-                println!("  {:36} {:20} {}", r.id, r.display_name, state);
+    #[cfg(not(unix))]
+    anyhow::bail!("Cloud peer commands require Unix")
+}
+
+fn revoke(_args: RevokeArgs) -> CmdResult {
+    #[cfg(unix)]
+    {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let hub = config::hub_url();
+            let token = crate::rc::cloud::account_token(&hub, false).await?;
+            let api = agit_peer::client::Client::new(&hub)?;
+            let mut after = None;
+            loop {
+                let page = api.devices(&token, after.as_deref()).await?;
+                if let Some(entry) = page
+                    .devices
+                    .iter()
+                    .find(|entry| entry.device.id == _args.connection)
+                {
+                    break api.revoke(&token, &entry.device).await;
+                }
+                after = page.next_cursor;
+                anyhow::ensure!(after.is_some(), "no such device");
             }
-            println!();
-            println!(
-                "  {}",
-                ui::dim("`agit rc revoke <connection>` to remove one")
-            );
-            Ok(ExitCode::Ok)
-        }
-        Err(e) => {
-            super::fix::register_terminal_api_error(&e);
-            ui::error(&format!("{e}"));
-            Ok(super::terminal_error_code(&e, ExitCode::Network))
-        }
+        })?;
+        ui::success("Device Cloud access revoked.");
+        Ok(ExitCode::Ok)
     }
+    #[cfg(not(unix))]
+    anyhow::bail!("Cloud peer commands require Unix")
 }
 
-fn revoke(args: RevokeArgs) -> CmdResult {
-    let c = crate::hub::Client::from_env();
-    if !c.has_token() {
-        ui::error(&format!("sign in to {} first.", c.base()));
-        ui::hint("`agit login`");
-        return Ok(ExitCode::Auth);
-    }
-    match c.rc_revoke(&args.connection) {
-        Ok(()) => {
-            println!("  {} revoked {}", ui::ok("✓"), args.connection);
-            println!(
-                "  {}",
-                ui::dim("its workspaces are kept and marked disconnected; nothing was deleted")
-            );
-            Ok(ExitCode::Ok)
-        }
-        Err(e) => {
-            super::fix::register_terminal_api_error(&e);
-            ui::error(&format!("{e}"));
-            Ok(super::terminal_error_code(&e, ExitCode::Network))
-        }
-    }
-}
-
-fn pair() -> CmdResult {
-    let hub = config::hub_url();
-    match pair_interactive(&hub)? {
-        Some(_) => Ok(ExitCode::Ok),
-        None => Ok(ExitCode::Auth),
-    }
-}
-
-/// Pair by exchanging the user's session token for an RC-scoped one.
-///
-/// Reuses the existing login rather than inventing a credential system: if the
-/// user is not signed in we send them through `agit login`, then ask the hub for
-/// a connection token bound to this machine's fingerprint. The RC token is
-/// separate from the API token so it can be revoked on its own.
-fn pair_interactive(hub: &str) -> crate::Result<Option<identity::Connection>> {
-    crate::input_argument(crate::infra::hub_authority::HubAuthority::parse(hub))?;
-    let c = match crate::infra::credentials::load_checked(hub).map_err(|error| {
-        error.context(LocalStateFailure("cannot read the saved Hub credentials"))
-    })? {
-        Some(credential) => crate::hub::Client::for_credential(hub, &credential),
-        None => crate::hub::Client::for_hub(hub),
-    };
-    if !c.has_token() {
-        ui::error(&format!(
-            "sign in to {hub} first — pairing a machine needs an account."
-        ));
-        ui::hint("`agit login`");
-        return Ok(None);
-    }
-    let id = identity::identity().map_err(|error| {
-        error.context(LocalStateFailure(
-            "cannot prepare the local RC machine identity",
-        ))
-    })?;
-    let res = super::remote_request(c.rc_pair(
-        &id.machine_fingerprint,
-        &id.display_name,
-        &crate::rc::platform(),
-    ))?;
-    let conn = identity::Connection {
-        connection_id: res.connection_id,
-        token: res.token,
-        hub: hub.to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-    identity::save_connection(&conn)
-        .map_err(|error| error.context(LocalStateFailure("cannot save the local RC connection")))?;
-    println!(
-        "  {} paired as {}",
-        ui::ok("✓"),
-        ui::accent(&id.display_name)
-    );
-    Ok(Some(conn))
-}
-
-#[derive(Debug)]
-struct LocalStateFailure(&'static str);
-
-impl std::fmt::Display for LocalStateFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.0)
-    }
-}
-
-impl std::error::Error for LocalStateFailure {}
-
+#[cfg(unix)]
 fn runtimes_line() -> String {
     crate::rc::harness::drivable()
         .into_iter()
@@ -935,42 +810,6 @@ fn human_secs(s: u64) -> String {
 #[cfg(test)]
 mod tests {
     const AGENT_ID: &str = "00000000-0000-0000-0000-000000000001";
-
-    #[test]
-    fn daemon_options_bind_the_token_to_the_captured_hub() {
-        let connection = crate::rc::identity::Connection {
-            connection_id: "synthetic-connection".into(),
-            token: "synthetic-rc-token".into(),
-            hub: "http://NODE.test:8177/previous-route".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-        };
-        let options =
-            super::daemon_options("hTtPs://node.test:8177/current-route/", connection.clone())
-                .unwrap();
-        assert_eq!(options.hub, "https://node.test:8177/current-route");
-        assert_eq!(options.token, connection.token);
-        assert_eq!(
-            options.connection_id.as_deref(),
-            Some("synthetic-connection")
-        );
-        assert_eq!(
-            crate::rc::link::ws_url(&options.hub),
-            "wss://node.test:8177/current-route/rc/ws"
-        );
-        for hub in [
-            "HTTP://node.test:8178",
-            "https://node.test",
-            "https://foreign.test:8177",
-            "https://user:secret@node.test:8177",
-        ] {
-            assert!(super::daemon_options(hub, connection.clone()).is_err());
-        }
-        let invalid_connection = crate::rc::identity::Connection {
-            hub: "HTTP://node.test:invalid".into(),
-            ..connection
-        };
-        assert!(super::daemon_options("http://node.test:8177", invalid_connection).is_err());
-    }
 
     /// `agit rc land`'s slug and branch name **come from the hub**; this machine does not produce
     /// them.
@@ -1073,7 +912,10 @@ mod tests {
     fn only_one_probe_per_stop() {
         let src = include_str!("rc.rs");
         let body = src
-            .split_once("\nfn stop() -> CmdResult {")
+            .split_once(
+                "\nfn stop() -> CmdResult {
+    crate::rc::select_local_authority();",
+            )
             .expect("stop() not found; this test no longer pins anything")
             .1
             .split_once("\n}\n")
@@ -1137,7 +979,6 @@ mod tests {
             vec!["x", "stop"],
             vec!["x", "list"],
             vec!["x", "revoke", "conn-123"],
-            vec!["x", "pair"],
         ] {
             assert!(
                 Probe::try_parse_from(&argv).is_ok(),

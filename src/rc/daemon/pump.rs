@@ -14,16 +14,11 @@ impl Daemon {
         let (notes_tx, mut notes_rx) = mpsc::channel::<SessionNote>(256);
         let terminal_delivery_blockers =
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let local_owner = opts.local_owner;
-        let initial_authority = if local_owner {
-            SettlementState {
-                local_owner: true,
-                epoch: 1,
-                session_start_idempotency_v1: true,
-                ..Default::default()
-            }
-        } else {
-            SettlementState::default()
+        let initial_authority = SettlementState {
+            local_owner: true,
+            epoch: 1,
+            session_start_idempotency_v1: true,
+            ..Default::default()
         };
         let (settlement_tx, _) = tokio::sync::watch::channel(initial_authority);
         // A fail-closed fallback from an earlier hard stop is authoritative.
@@ -139,7 +134,7 @@ impl Daemon {
         // Outbound splits in two: one lane for replies, one for replayable stream events.
         // The test is "can it be recovered once lost", and on the taking side replies come
         // first — see `rc::outbound`.
-        let (out_tx, mut out_rx) = crate::rc::outbound::channel();
+        let (out_tx, _out_rx) = crate::rc::outbound::channel();
         d.lock().await.outbound = Some(out_tx.clone());
         // **The tail of frames still owed.**
         //
@@ -171,7 +166,7 @@ impl Daemon {
         let mut flush = tokio::time::interval(std::time::Duration::from_millis(
             crate::rc::journal::WATERMARK_DEBOUNCE_MS,
         ));
-        let (link_ev_tx, mut link_ev_rx) = mpsc::channel::<link::LinkEvent>(256);
+        let (_link_ev_tx, mut link_ev_rx) = mpsc::channel::<link::LinkEvent>(256);
 
         // **Ctrl-C needs someone waiting on it the whole time, not a fresh one built each
         // select round.**
@@ -197,97 +192,26 @@ impl Daemon {
             });
         }
 
-        // The reconnect loop. `out_rx` is held by this task and reused across reconnects —
-        // a disconnection destroys nothing; reconnecting just swaps in another socket and
-        // keeps taking from the same queue.
+        // The local endpoint owns outbound delivery independently of individual peer attachments.
         let link_stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let link_task = if local_owner {
-            #[cfg(unix)]
-            {
-                let listener = crate::rc::local::listen()?;
-                d.lock().await.online = true;
-                let local_events = link_ev_tx.clone();
-                let controller = crate::rc::peers::controller()?;
-                tokio::spawn(async move {
-                    if let Err(error) =
-                        crate::rc::endpoint::serve(listener, out_rx, local_events, controller).await
-                    {
-                        eprintln!("agitd: local transport stopped: {error:#}");
-                    }
-                })
-            }
-            #[cfg(not(unix))]
-            return Err(anyhow::anyhow!("local authority requires Unix"));
-        } else {
-            let d = d.clone();
-            let link_ev_tx = link_ev_tx.clone();
-            let settlement = settlement_tx.clone();
-            let stopping = link_stopping.clone();
+        #[cfg(unix)]
+        let link_task = {
+            let listener = crate::rc::local::listen()?;
+            d.lock().await.online = true;
+            let local_events = _link_ev_tx.clone();
+            let controller = crate::rc::peers::controller()?;
             tokio::spawn(async move {
-                let mut backoff = link::ReconnectBackoff::default();
-                let mut connection_epoch: u64 = 0;
-                loop {
-                    if stopping.load(std::sync::atomic::Ordering::Acquire) {
-                        break;
-                    }
-                    let (hub, token, register) = {
-                        let g = d.lock().await;
-                        (g.opts.hub.clone(), g.opts.token.clone(), g.register_frame())
-                    };
-                    let l = link::Link::new(&hub, &token);
-                    connection_epoch = connection_epoch.wrapping_add(1);
-                    let socket_epoch = connection_epoch;
-                    let settlement_on_register = settlement.clone();
-                    let stopping_on_register = stopping.clone();
-                    let mut registered_at = None;
-                    let registration_clock = &mut registered_at;
-                    let why = l
-                        .run_once(
-                            socket_epoch,
-                            register,
-                            &mut out_rx,
-                            link_ev_tx.clone(),
-                            move |result| {
-                                if stopping_on_register.load(std::sync::atomic::Ordering::Acquire) {
-                                    return;
-                                }
-                                *registration_clock = Some(tokio::time::Instant::now());
-                                let (identity_acked, start_idempotency_acked) =
-                                    accepted_connection_features(result);
-                                set_connection_features(
-                                    &settlement_on_register,
-                                    socket_epoch,
-                                    identity_acked,
-                                    start_idempotency_acked,
-                                );
-                            },
-                        )
-                        .await;
-                    let retry_delay =
-                        backoff.after_disconnect(registered_at.map(|at| at.elapsed()));
-                    // Do not wait for the daemon's global mutex: it may be in a
-                    // slow RPC dispatch. Settlement authorization belongs to
-                    // the socket lifetime and must disappear as soon as that
-                    // socket does.
-                    connection_epoch = connection_epoch.wrapping_add(1);
-                    set_connection_features(&settlement, connection_epoch, false, false);
-                    {
-                        let mut g = d.lock().await;
-                        g.online = false;
-                    }
-                    if stopping.load(std::sync::atomic::Ordering::Acquire) {
-                        break;
-                    }
-                    // A slow dispatch may also leave the internal queue full.
-                    // Disconnection reporting is diagnostic, not authority:
-                    // the lease above is already revoked, and this bounded send
-                    // must not wedge the reconnect loop behind the same queue.
-                    let _ =
-                        link::deliver_event(&link_ev_tx, link::LinkEvent::Disconnected(why)).await;
-                    tokio::time::sleep(retry_delay).await;
+                if let Err(error) =
+                    crate::rc::endpoint::serve(listener, _out_rx, local_events, controller).await
+                {
+                    eprintln!("agitd: local transport stopped: {error:#}");
                 }
             })
         };
+        #[cfg(not(unix))]
+        let link_task = tokio::spawn(async {
+            Err::<(), _>(anyhow::anyhow!("The peer executor requires Unix"))
+        });
 
         // Whether the outbound queue is backed up. Only used to collapse that warning into one.
         let mut outbound_full = false;
@@ -724,25 +648,6 @@ impl Daemon {
         }
     }
 
-    fn register_frame(&self) -> RcRegister {
-        let id = identity::identity().unwrap_or_else(|_| identity::Identity {
-            machine_fingerprint: "unknown".into(),
-            display_name: crate::rc::hostname(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-        });
-        RcRegister {
-            protocol_version: VERSION,
-            machine_fingerprint: id.machine_fingerprint,
-            display_name: id.display_name,
-            agit_version: env!("CARGO_PKG_VERSION").to_string(),
-            platform: crate::rc::platform(),
-            capabilities: crate::rc::harness::drivable(),
-            features: advertised_connection_features(),
-            workspaces: self.mirror.to_local(),
-            last_seq: self.journal.all_last_seq(),
-        }
-    }
-
     pub(super) fn settlement_feature(&self) -> bool {
         let state = self.settlement.borrow();
         state.agent_identity_v1 || state.local_owner
@@ -754,42 +659,6 @@ impl Daemon {
 
     async fn on_link_event(&mut self, ev: link::LinkEvent, frames: &mpsc::Sender<Frame>) {
         match ev {
-            link::LinkEvent::Connected { epoch, result: res }
-                if connection_epoch_is_current(&self.settlement, epoch) =>
-            {
-                self.online = true;
-                self.connection_id = Some(res.connection_id.clone());
-                // The hub's watermark only ever raises ours; see Journal.
-                self.journal.adopt_persisted(&res.persisted_seq);
-                for (ws, proj, path, why) in self.mirror.adopt(&res.workspaces) {
-                    // Say so when one is refused: silently dropping a folder the user did
-                    // bind shows up as "the folder is still there in the web interface but
-                    // the agent says it has no permission", with nowhere to start looking.
-                    eprintln!(
-                        "agitd: refusing the folder {path} that the hub says is bound to workspace {ws} (project {proj}): {why}"
-                    );
-                }
-                let _ = self.mirror.save();
-                // The hub has just said what the workspaces look like now. The confinement a
-                // running session holds must follow — otherwise a folder that was just unbound
-                // stays the operator's pass until that session ends.
-                self.refresh_confinement();
-                eprintln!(
-                    "agitd: connected to {} as {} ({} workspace(s))",
-                    self.opts.hub,
-                    res.connection_id,
-                    res.workspaces.len()
-                );
-                for line in
-                    crate::rc::navigation::connected_guidance(&self.opts.hub, &res.workspaces)
-                {
-                    eprintln!("{line}");
-                }
-            }
-            link::LinkEvent::Disconnected(why) => {
-                self.online = false;
-                eprintln!("agitd: disconnected — {why}; retrying");
-            }
             link::LinkEvent::Frame { epoch, frame }
                 if connection_epoch_is_current(&self.settlement, epoch) =>
             {
@@ -798,7 +667,7 @@ impl Daemon {
             // The daemon may be busy in one slow dispatch while the link
             // disconnects and registers a newer socket. Never let an old
             // queued instruction borrow that newer socket's feature ACK.
-            link::LinkEvent::Connected { .. } | link::LinkEvent::Frame { .. } => {}
+            link::LinkEvent::Frame { .. } => {}
         }
     }
 

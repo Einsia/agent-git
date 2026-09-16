@@ -53,6 +53,18 @@ pub fn agit_home() -> Result<PathBuf> {
     Ok(home.join(".agit"))
 }
 
+/// New authority directories must not inherit a group-writable shell umask.
+pub(crate) fn create_state_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 /// The local store: `$AGIT_HOME/store/`.
 ///
 /// **The MVP has one local store**, not a directory per agent. Naming is deferred to `push` —

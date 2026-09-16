@@ -14,13 +14,37 @@ const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 #[derive(Debug)]
 pub struct HttpFailure {
     pub status: u16,
+    pub reason: Option<&'static str>,
 }
 impl std::fmt::Display for HttpFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "cloud peer service returned HTTP {}", self.status)
+        write!(f, "cloud peer service returned HTTP {}", self.status)?;
+        if let Some(reason) = self.reason {
+            write!(f, ": {reason}")?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for HttpFailure {}
+
+fn error_reason(status: u16, bytes: &[u8]) -> Option<&'static str> {
+    let body = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    match (
+        status,
+        body.as_ref().and_then(|value| value["error"].as_str()),
+    ) {
+        (503, Some("cloud peer relay is disabled")) => {
+            Some("Cloud peer relay is not enabled on this Hub")
+        }
+        (503, Some("cloud peer relay is draining")) => {
+            Some("Cloud peer relay is restarting; retry shortly")
+        }
+        (503, _) => Some("Cloud device connection is temporarily unavailable; retry shortly"),
+        (401, _) => Some("sign in to this Hub again"),
+        (403, _) => Some("this account is not allowed to access the device"),
+        _ => None,
+    }
+}
 
 /// Transport failures and temporary service refusals do not revoke an unexpired lease.
 pub fn is_transient(error: &anyhow::Error) -> bool {
@@ -91,8 +115,17 @@ impl Client {
         }
         let mut response = request.send().await.context("cloud peer request failed")?;
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let mut bytes = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                if bytes.len() + chunk.len() > 16 * 1024 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
             return Err(HttpFailure {
-                status: response.status().as_u16(),
+                status,
+                reason: error_reason(status, &bytes),
             }
             .into());
         }
@@ -425,5 +458,20 @@ mod tests {
             "https://cloud.example"
         );
         assert!(Client::new("http://127.0.0.1:8177").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    #[test]
+    fn service_errors_expose_only_known_safe_diagnostics() {
+        assert_eq!(
+            super::error_reason(503, br#"{"error":"cloud peer relay is disabled"}"#),
+            Some("Cloud peer relay is not enabled on this Hub")
+        );
+        let unknown =
+            super::error_reason(503, br#"{"error":"database password=private"}"#).unwrap();
+        assert!(!unknown.contains("private"));
+        assert!(!unknown.contains("database"));
     }
 }

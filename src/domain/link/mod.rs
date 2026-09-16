@@ -295,7 +295,8 @@ pub fn link_path(store: &Store, source: &str, session_id: &str) -> PathBuf {
 pub fn lock(store: &Store, source: &str, session_id: &str) -> Result<std::fs::File> {
     use fs2::FileExt as _;
     let dir = store.root().join(source);
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    crate::infra::config::create_state_dir(&dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
     let lp = dir.join(format!("{session_id}.json.lock"));
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -311,9 +312,14 @@ pub fn lock(store: &Store, source: &str, session_id: &str) -> Result<std::fs::Fi
 
 pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
     let dir = store.root().join(&link.source);
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    crate::infra::config::create_state_dir(&dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
     let lp = link_path(store, &link.source, &link.session_id);
-    std::fs::write(&lp, format!("{}\n", link.to_json()?))
+    let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
+    use std::io::Write as _;
+    writeln!(temporary, "{}", link.to_json()?)?;
+    temporary
+        .persist(&lp)
         .with_context(|| format!("cannot write {}", lp.display()))?;
     Ok(lp)
 }
@@ -932,7 +938,8 @@ pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock
     digest.update([0]);
     digest.update(branch.as_bytes());
     let dir = store.root().join(".locks").join("branches");
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    crate::infra::config::create_state_dir(&dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
     let path = dir.join(format!("{}.lock", hex::encode(digest.finalize())));
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -958,7 +965,8 @@ fn lock_repository(store: &Store, slug: &str, exclusive: bool) -> Result<std::fs
     use sha2::Digest as _;
 
     let dir = store.root().join(".locks").join("repositories");
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    crate::infra::config::create_state_dir(&dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
     let path = dir.join(format!("{}.lock", hex::encode(sha2::Sha256::digest(slug))));
     let file = std::fs::OpenOptions::new()
         .create(true)

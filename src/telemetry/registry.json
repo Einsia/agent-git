@@ -75,7 +75,6 @@
     "rc grants": {"aliases":[],"args":{"workspace":{"action":"Set","policy":"presence"}}},
     "rc land": {"aliases":[],"args":{"local_owner":{"action":"SetTrue","policy":"boolean"},"agent_id":{"action":"Set","policy":"presence"},"branch":{"action":"Set","policy":"presence"},"cwd":{"action":"Set","policy":"presence"},"runtime":{"action":"Set","policy":"enum","values":["claude-code","codex","cursor","claude-desktop","opencode","claude","cc","openclaw","hermes","workbuddy"]},"session":{"action":"Set","policy":"presence"},"slug":{"action":"Set","policy":"presence"}}},
     "rc list": {"aliases":[],"args":{}},
-    "rc pair": {"aliases":[],"args":{}},
     "rc revoke": {"aliases":[],"args":{"connection":{"action":"Set","policy":"presence"}}},
     "rc start": {"aliases":[],"args":{"detach":{"action":"SetTrue","policy":"boolean"},"name":{"action":"Set","policy":"presence"}}},
     "rc status": {"aliases":[],"args":{}},

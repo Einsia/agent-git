@@ -54,17 +54,9 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
         }
         Action::Start { detach } => {
             if detach {
-                spawn_daemon()?;
+                ensure_daemon()?;
             } else {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(super::daemon::Daemon::run(super::daemon::Options {
-                    local_owner: true,
-                    hub: "local-owner".into(),
-                    token: String::new(),
-                    connection_id: None,
-                }))?;
+                start_foreground()?;
             }
         }
         Action::Bridge { ensure } => bridge(ensure)?,
@@ -82,6 +74,37 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
 
 fn rpc_path() -> crate::Result<PathBuf> {
     Ok(super::control::socket_path()?.with_extension("rpc"))
+}
+
+pub fn start_foreground() -> crate::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(super::daemon::Daemon::run(super::daemon::Options {
+        local_owner: true,
+        hub: "local-owner".into(),
+        token: String::new(),
+        connection_id: None,
+    }))
+}
+
+pub fn ensure_daemon() -> crate::Result<()> {
+    if super::control::running_pid().is_none() {
+        spawn_daemon()?;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Ok(socket) = std::os::unix::net::UnixStream::connect(rpc_path()?) {
+            authenticate_server(socket, unsafe { libc::geteuid() })?;
+            return Ok(());
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "agitd did not become ready; inspect agitd-*.log in {}",
+            super::rc_dir()?.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn spawn_daemon() -> crate::Result<()> {

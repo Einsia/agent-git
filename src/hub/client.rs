@@ -268,6 +268,11 @@ impl Client {
         self.token.borrow().is_some()
     }
 
+    /// Reports use the identity renewed by this client, not a concurrent account switch on disk.
+    pub(crate) fn credential_snapshot(&self) -> Option<credentials::HubCredential> {
+        self.cred.borrow().clone()
+    }
+
     /// Namespace shortcuts and request tokens must use the same loaded credential identity.
     pub(crate) fn credential_username(&self) -> Option<String> {
         self.cred
@@ -540,48 +545,6 @@ impl Client {
             std::thread::sleep(REFRESH_SETTLE_STEP);
         }
         false
-    }
-
-    /// A POST with no auth header.
-    ///
-    /// The login flow itself cannot carry a token (there is none yet). A separate method rather
-    /// than `post`
-    /// Pair this machine, exchanging for an RC-only token.
-    ///
-    /// No new credential system is invented: the caller must already have run `agit login`, and
-    /// this only trades the account identity for a long-lived token that can be revoked on its
-    /// own and is scoped to the RC surface.
-    pub fn rc_pair(
-        &self,
-        fingerprint: &str,
-        display_name: &str,
-        platform: &str,
-    ) -> Result<crate::hub::RcPairResponse> {
-        self.post(
-            "api/rc/connections",
-            &serde_json::json!({
-                "machine_fingerprint": fingerprint,
-                "display_name": display_name,
-                "platform": platform,
-                "agit_version": env!("CARGO_PKG_VERSION"),
-            }),
-        )
-    }
-
-    /// The machines under my account (offline ones included).
-    pub fn rc_connections(&self) -> Result<Vec<crate::hub::RcConnection>> {
-        self.get("api/rc/connections")
-    }
-
-    /// Revoke a machine: disconnect it at once and refuse further registration. The workspaces
-    /// under it are **not** deleted — a machine going away does not mean those directories and
-    /// session definitions should disappear.
-    pub fn rc_revoke(&self, connection: &str) -> Result<()> {
-        let _: serde_json::Value = self.post(
-            &format!("api/rc/connections/{connection}/revoke"),
-            &serde_json::json!({}),
-        )?;
-        Ok(())
     }
 
     /// The decision, so that "this call is deliberately unauthenticated" is visible in the code.

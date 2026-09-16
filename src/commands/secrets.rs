@@ -307,6 +307,7 @@ fn print_record(record: &RecordSummary) {
 /// A running daemon must switch to the new matcher before this command returns; one that is not
 /// running loads it on its next start.
 fn reload_daemon() -> crate::Result<()> {
+    crate::rc::select_local_authority();
     use crate::rc::control::{Presence, Reply, Request};
     match crate::rc::control::presence() {
         Presence::Absent => Ok(()),
