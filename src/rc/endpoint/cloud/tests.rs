@@ -209,26 +209,15 @@ async fn exhausted_cloud_output_closes_only_its_client_without_waiting() {
 }
 
 #[tokio::test]
-async fn renewal_refusal_revokes_queued_work_before_a_full_input_queue_can_close() {
+async fn renewal_recovers_transport_failure_but_refusal_revokes_before_queued_cleanup() {
     use crate::rc::ticket::ticket_authorized;
     use agit_peer::cloud::{DeviceCredential, Secret};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let (refused, refusal) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut socket = BufReader::new(socket);
-        let mut line = String::new();
-        socket.read_line(&mut line).await.unwrap();
-        assert!(line.starts_with("POST /api/peer/grants/renew "));
-        socket
-            .get_mut()
-            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        refused.send(()).unwrap();
-    });
+    let (recovered, recovery) = tokio::sync::oneshot::channel();
+    let (allow_refusal, allowed) = tokio::sync::oneshot::channel();
     let principal = Principal {
         issuer: origin.clone(),
         account_id: "operator".into(),
@@ -249,6 +238,61 @@ async fn renewal_refusal_revokes_queued_work_before_a_full_input_queue_can_close
         target: device.clone(),
         expires_at_ms: chrono::Utc::now().timestamp_millis() + 2_000,
     };
+    let renewed_grant = ConnectionGrant {
+        expires_at_ms: grant.expires_at_ms + 2_000,
+        ..grant.clone()
+    };
+    let expected_expiry = renewed_grant.expires_at_ms;
+    let server = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        for attempt in 0..3 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("POST /api/peer/grants/renew "));
+            let mut length = 0;
+            loop {
+                line.clear();
+                socket.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            socket.read_exact(&mut vec![0; length]).await.unwrap();
+            if attempt == 0 {
+                continue;
+            }
+            if attempt == 1 {
+                let body = serde_json::to_vec(&renewed_grant).unwrap();
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(&body).await.unwrap();
+            } else {
+                recovered.send(()).unwrap();
+                allowed.await.unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                refused.send(()).unwrap();
+                break;
+            }
+        }
+    });
     let registry = ingress::Registry::fixed(Policy::default());
     let guard = registry.client(principal, grant.expires_at_ms);
     let frame = guard
@@ -281,6 +325,13 @@ async fn renewal_refusal_revokes_queued_work_before_a_full_input_queue_can_close
         input,
         None,
     );
+    tokio::time::timeout(Duration::from_secs(5), recovery)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.expires_at_ms(), expected_expiry);
+    assert!(authority.admit(|| true));
+    allow_refusal.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), refusal)
         .await
         .expect("executor must request renewal")

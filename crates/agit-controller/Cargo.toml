@@ -27,3 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 agit-tunnel = { path = "../agit-tunnel", features = ["test-support"] }
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.26"
+
+[[example]]
+name = "cloud_probe"
+required-features = ["host"]

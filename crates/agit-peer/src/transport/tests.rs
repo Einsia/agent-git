@@ -98,3 +98,20 @@ async fn an_unapproved_endpoint_closes_the_transport_before_rpc_frames_are_accep
     assert!(left.is_err());
     assert!(right.is_err());
 }
+
+#[tokio::test]
+async fn tunnel_failure_reaches_the_idle_reader_without_becoming_tls_eof() {
+    let sink = futures_util::sink::drain().sink_map_err(|never| match never {});
+    let source =
+        futures_util::stream::once(async { Err(anyhow::anyhow!("relay heartbeat expired")) });
+    let connection = Connection::from_parts(41, Box::pin(sink), Box::pin(source));
+    let mut stream = ByteStream::new(connection);
+    let error = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut [0]))
+        .await
+        .expect("transport failure did not wake the endpoint")
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "peer tunnel receive failed: relay heartbeat expired"
+    );
+}

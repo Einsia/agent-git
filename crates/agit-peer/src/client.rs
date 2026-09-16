@@ -22,6 +22,16 @@ impl std::fmt::Display for HttpFailure {
 }
 impl std::error::Error for HttpFailure {}
 
+/// Transport failures and temporary service refusals do not revoke an unexpired lease.
+pub fn is_transient(error: &anyhow::Error) -> bool {
+    if let Some(http) = error.downcast_ref::<HttpFailure>() {
+        return matches!(http.status, 408 | 429 | 500..=599);
+    }
+    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+        error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+    })
+}
+
 #[derive(Clone)]
 pub struct Client {
     origin: String,

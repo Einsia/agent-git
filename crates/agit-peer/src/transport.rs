@@ -6,6 +6,7 @@ use anyhow::{Context, ensure};
 use futures_util::{SinkExt, StreamExt};
 use std::{
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -20,6 +21,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// Dropping the endpoint closes the pipe and cancels both transport pumps.
 pub struct ByteStream {
     stream: DuplexStream,
+    failure: Arc<Mutex<Option<String>>>,
     tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
@@ -37,51 +39,61 @@ impl ByteStream {
         let (stream, transport) = tokio::io::duplex(CHUNK_SIZE);
         let (mut input, mut output) = tokio::io::split(transport);
         let (controls, mut pending) = mpsc::channel(4);
-        let sending = async move {
-            let mut bytes = vec![0; CHUNK_SIZE];
-            loop {
-                let packet = tokio::select! {
-                    count = input.read(&mut bytes) => {
-                        let count = count?;
-                        if count == 0 { return Ok(()) }
-                        Packet::Binary(bytes[..count].to_vec())
-                    }
-                    Some(packet) = pending.recv() => packet,
-                };
-                tokio::time::timeout(IO_TIMEOUT, sink.send(packet)).await??;
-            }
-        };
-        let receiving = async move {
-            while let Some(packet) = source.next().await {
-                match packet? {
-                    Packet::Binary(bytes) => {
-                        ensure!(
-                            bytes.len() <= CHUNK_SIZE,
-                            "peer tunnel chunk exceeds its size limit"
-                        );
-                        tokio::time::timeout(IO_TIMEOUT, output.write_all(&bytes)).await??;
-                    }
-                    Packet::Ping(bytes) => {
-                        controls
-                            .try_send(Packet::Pong(bytes))
-                            .context("peer heartbeat queue is full")?;
-                    }
-                    Packet::Pong(_) => {}
-                    Packet::Close(_) => return Ok(()),
-                    _ => anyhow::bail!("peer tunnel accepts encrypted binary data only"),
-                }
-            }
-            Ok(())
-        };
-        // Both halves must close together or an idle writer can hide transport EOF.
+        let failure = Arc::new(Mutex::new(None));
+        let closed_with = failure.clone();
         let task = tokio::spawn(async move {
-            tokio::select! {
-                result = sending => result,
-                result = receiving => result,
+            let sending = async {
+                let mut bytes = vec![0; CHUNK_SIZE];
+                loop {
+                    let packet = tokio::select! {
+                        count = input.read(&mut bytes) => {
+                            let count = count?;
+                            if count == 0 { return Ok::<(), anyhow::Error>(()) }
+                            Packet::Binary(bytes[..count].to_vec())
+                        }
+                        Some(packet) = pending.recv() => packet,
+                    };
+                    tokio::time::timeout(IO_TIMEOUT, sink.send(packet)).await??;
+                }
+            };
+            let receiving = async {
+                while let Some(packet) = source.next().await {
+                    match packet? {
+                        Packet::Binary(bytes) => {
+                            ensure!(
+                                bytes.len() <= CHUNK_SIZE,
+                                "peer tunnel chunk exceeds its size limit"
+                            );
+                            tokio::time::timeout(IO_TIMEOUT, output.write_all(&bytes)).await??;
+                        }
+                        Packet::Ping(bytes) => {
+                            controls
+                                .try_send(Packet::Pong(bytes))
+                                .context("peer heartbeat queue is full")?;
+                        }
+                        Packet::Pong(_) => {}
+                        Packet::Close(_) => return Ok(()),
+                        _ => anyhow::bail!("peer tunnel accepts encrypted binary data only"),
+                    }
+                }
+                Ok(())
+            };
+            // Publish the cause before dropping either pipe half and waking its reader.
+            let result = tokio::select! {
+                result = sending => result.context("peer tunnel send failed"),
+                result = receiving => result.context("peer tunnel receive failed"),
+            };
+            if let Err(error) = &result {
+                *closed_with
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(format!("{error:#}"));
             }
+            result
         });
         Self {
             stream,
+            failure,
             tasks: vec![task],
         }
     }
@@ -93,7 +105,22 @@ impl AsyncRead for ByteStream {
         context: &mut TaskContext<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(context, buffer)
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let filled = buffer.filled().len();
+        let result = Pin::new(&mut self.stream).poll_read(context, buffer);
+        if matches!(result, Poll::Ready(Ok(())))
+            && buffer.filled().len() == filled
+            && let Some(message) = self
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+        {
+            return Poll::Ready(Err(std::io::Error::other(message.clone())));
+        }
+        result
     }
 }
 

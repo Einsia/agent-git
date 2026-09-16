@@ -52,3 +52,16 @@ cargo check -p agit-controller --no-default-features
 cargo test -p agit-controller --features host
 cargo build -p agit-controller --features host --bin agitd-controller
 ```
+
+For read-only phase timings against an existing Cloud executor, build the optional
+probe with `cargo build -p agit-controller --features host --example cloud_probe`.
+Pass one JSON line on stdin containing `hub`, `account_token`, `device_id`,
+`samples` (1–20), and `idle_seconds` (0–3600). Read credentials from a private file
+or credential helper; do not place tokens in shell arguments or paste them into
+logs. The probe creates a disposable outbound controller, measures discovery,
+grant creation, worker/WebSocket establishment, relay pairing, endpoint TLS,
+executor RPCs and idle retention, then revokes its controller identity. It does
+not create sessions, send prompts or change executor files. Standard output is
+JSON Lines with phase durations and connection IDs for matching relay logs;
+response bodies and credentials are omitted. A failed cleanup requires checking
+the temporary controller lease. This is an exploratory diagnostic, not a CI gate.
