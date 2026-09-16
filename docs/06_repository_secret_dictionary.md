@@ -66,11 +66,8 @@ this device — without faking Git's identity model.
 
 ## 3. Module boundary
 
-Both chains live in the one `domain::secret_filter` domain module because they share four
-security primitives:
+Both chains live in the `domain::secret_filter` domain module and share these primitives:
 
-- the KEK in the configured keystore (05, §3.2): the OS credential store, or the opt-in file
-  keystore on a machine that has none;
 - AES-256-GCM envelope encryption that fails closed on an authentication failure;
 - linear Aho–Corasick matching over arbitrary UTF-8 literals;
 - semantic traversal over JSON string values: serialized bytes carrying `\"`, `\\` or `\n`
@@ -96,10 +93,32 @@ Each repository's dictionary lives at:
 ```
 
 It sits inside Git metadata, so `git add`, push, an ordinary workspace scan and shared-file
-export never carry it away. The file reuses the global vault's envelope encryption; the KEK
-lives only in the configured keystore, and the vault file holds only the wrapped DEK and
-per-record AEAD ciphertext. Copying the repository directory without the matching keystore
-entry must fail explicitly; an absent keystore entry is never read as an empty dictionary.
+export never carry it away. The file retains envelope encryption, but its KEK is created automatically at
+`<repo>/.git/agit/secret-dictionary/keys/<vault-id>.key`. Repository storage does not
+consult `secrets.keystore` or create Keychain entries. On Unix the key file is owner-only
+(`0600`) in a private directory (`0700`). On Windows the key directory and temporary key file
+receive an explicit current-user private ACL before key bytes are written; existing key files
+are checked for private ownership and permissions through the handle used to read them.
+A local backup containing this directory includes both the encrypted mappings and their key.
+Treat it as sensitive data. Neither file is part of Git history or uploaded by push.
+
+The global registration vault remains separate and uses the user's configured keystore.
+Its configuration does not change when a repository dictionary is created or migrated.
+
+Dictionaries without the `key_storage` marker use their existing configured keystore until
+a locked operation successfully authenticates every record. That operation durably installs
+the repository key and atomically marks the dictionary `repository-local-v1`. The vault id,
+record ids, ciphertext and placeholders remain unchanged; the previous key is retained.
+A retry accepts an identical local key but rejects a conflicting one. Strict read-only
+inspection can read the existing storage without migrating it. Once marked local, missing
+or corrupt local keys fail explicitly and never fall back to the global keystore.
+
+On macOS, reading the previous key may require authorization once during migration. After
+migration, repository protection and hydration no longer access Keychain. For manually
+registered global secrets, select "Always Allow" to retain authorization for the same signed
+executable. "Allow" grants a single access. Rebuilding an ad-hoc-signed executable or changing
+its signing identity may require authorization again; the CLI does not weaken Keychain ACLs
+or suppress an authorization decision.
 
 A random record id is generated the first time a secret is met in that repository; the same
 secret in the same repository reuses one record, and another repository generates a different
@@ -176,19 +195,23 @@ unresolved count is reported.
 
 ## 7. Security boundary
 
-This design protects against a leak of the remote, the logs, an ordinary backup or the vault
-file on its own; it does not defend against an attacker who already controls the local
-process, the keystore (the system credential store — or, with the file keystore, the user's
-files) or the runtime files.
+This design protects secret values replaced by placeholders in published Git history and
+protects the encrypted vault file on its own. It does not protect a complete local dictionary
+directory backup: new and migrated dictionaries keep the key beside the ciphertext (§4), so
+that backup carries the ability to decrypt every mapping. Treat repository copies containing
+Git metadata, backups of `$AGIT_HOME/repos`, and offline disks containing these files as
+sensitive. Git push excludes this local metadata, but filesystem backups do not.
 
-With the file keystore (05, §3.2) the dictionary and its key live in two places: the
-dictionary under the checkout's `.git` (§4), the key under `$AGIT_HOME/keystore/`. A backup of
-the repository alone carries the dictionary and not the key; a backup of `$AGIT_HOME` alone
-carries the key and not the dictionary — unlike the global vault, which sits under
-`$AGIT_HOME` beside its key (05, §2). Only a backup or an offline disk that holds both
-decrypts the dictionary; whoever plans backup isolation plans it around that pair. A decrypted secret lives briefly in
-process memory during materialization, and once it reaches the runtime it falls under the
-runtime's own plaintext-transcript security boundary.
+Only an unmigrated dictionary uses the legacy keystore layout. With the legacy file keystore
+(05, §3.2), its key is under `$AGIT_HOME/keystore/`; with the OS backend, the key remains in
+the system credential store. Such a dictionary requires both its encrypted file and access
+to the legacy key. A backup of `$AGIT_HOME` can already include both the repository and its
+file-keystore key, so even that legacy layout does not imply backup isolation.
+
+The design does not defend against an attacker who controls the local process, can read the
+local key and ciphertext, has access to the legacy keystore, or controls the runtime files.
+A decrypted secret lives briefly in process memory during materialization, and once it
+reaches the runtime it falls under the runtime's own plaintext-transcript security boundary.
 
 A collaborator who knows a valid placeholder can replay it within the same remote history. v1
 treats such a token as a repository-internal capability: it resolves only when the user

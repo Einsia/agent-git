@@ -26,6 +26,8 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_os = "macos")]
 mod os_keychain;
 mod repository;
+mod repository_keys;
+pub use repository_keys::RepositoryKeyStore;
 
 pub(crate) use repository::HydrationBudgetExceeded;
 #[cfg(any(feature = "cli", test))]
@@ -68,6 +70,8 @@ fn legacy_projection_version() -> u32 {
 struct VaultFile {
     version: u32,
     key_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_storage: Option<String>,
     #[serde(default = "legacy_schema_version")]
     schema_version: u32,
     #[serde(default = "legacy_projection_version")]
@@ -173,6 +177,31 @@ pub trait KeyStore: Send + Sync {
     }
     fn set(&self, vault_id: &str, key: &[u8]) -> crate::Result<()>;
     fn delete(&self, vault_id: &str) -> crate::Result<()>;
+
+    fn storage_id(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn get_for_storage(
+        &self,
+        vault_id: &str,
+        storage: Option<&str>,
+        bounded: bool,
+    ) -> crate::Result<Zeroizing<Vec<u8>>> {
+        anyhow::ensure!(
+            storage == self.storage_id(),
+            "the vault uses a different key store"
+        );
+        if bounded {
+            self.get_bounded(vault_id)
+        } else {
+            self.get(vault_id)
+        }
+    }
+
+    fn migrate_key(&self, _vault_id: &str, _key: &[u8]) -> crate::Result<()> {
+        bail!("this key store does not support migration")
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -206,7 +235,7 @@ impl OsKeyStore {
         #[cfg(target_os = "macos")]
         if os_keychain::requires_authorization(&error) {
             return anyhow::Error::new(error).context(format!(
-                "{operation}; macOS Keychain requires user authorization; rerun this command from a terminal in your macOS login session and approve Keychain access, then retry automation; keep the current keystore so the existing vault key remains accessible"
+                "{operation}; macOS Keychain requires user authorization; rerun this command from a terminal in your macOS login session and choose Always Allow to retain Keychain access for this signed executable, then retry automation; a rebuilt ad-hoc-signed binary may require authorization again; keep the current keystore so the existing vault key remains accessible"
             ));
         }
         if Self::is_unavailable(&error) {
@@ -894,6 +923,7 @@ impl<K: KeyStore> VaultStore<K> {
             file: VaultFile {
                 version: VAULT_VERSION,
                 key_version: KEY_VERSION,
+                key_storage: self.keys.storage_id().map(str::to_owned),
                 schema_version: CURRENT_SCHEMA_VERSION,
                 projection_version: CURRENT_PROJECTION_VERSION,
                 vault_id,
@@ -910,7 +940,7 @@ impl<K: KeyStore> VaultStore<K> {
         self.unlock_file(file, false)
     }
 
-    fn unlock_file(&self, file: VaultFile, bounded: bool) -> crate::Result<Unlocked> {
+    fn unlock_file(&self, mut file: VaultFile, bounded: bool) -> crate::Result<Unlocked> {
         if file.version != VAULT_VERSION {
             bail!(
                 "unsupported secret-filter vault version {} (this build supports {VAULT_VERSION})",
@@ -935,17 +965,26 @@ impl<K: KeyStore> VaultStore<K> {
                 file.projection_version
             );
         }
-        let kek = if bounded {
-            self.keys.get_bounded(&file.vault_id)?
-        } else {
-            self.keys.get(&file.vault_id)?
-        };
+        let kek =
+            self.keys
+                .get_for_storage(&file.vault_id, file.key_storage.as_deref(), bounded)?;
         let dek = open(
             &kek,
             &file.wrapped_dek,
             &vault_aad(&file.vault_id, file.version, file.key_version),
         )?;
         validate_key(&dek, "DEK")?;
+        if !bounded
+            && file.key_storage.is_none()
+            && let Some(storage) = self.keys.storage_id()
+        {
+            // Authenticate the complete dictionary before changing its key route. The local
+            // key is durable before the atomic metadata write makes it authoritative.
+            decrypt_records(&file, &dek)?;
+            self.keys.migrate_key(&file.vault_id, &kek)?;
+            file.key_storage = Some(storage.to_owned());
+            write_vault(&self.path, &file)?;
+        }
         Ok(Unlocked { file, dek })
     }
 
@@ -1477,7 +1516,14 @@ fn decrypt_records(file: &VaultFile, dek: &[u8]) -> crate::Result<Vec<DecryptedR
         let mut plain = decode_padded(&plaintext)
             .with_context(|| format!("cannot decode registered secret {}", stored.id))?;
         validate_name(&plain.name)?;
-        validate_stored_secret(&plain.secret, true)?;
+        if plain.origins.contains(&RecordOrigin::Heuristic) {
+            anyhow::ensure!(
+                !plain.secret.is_empty() && plain.secret.len() <= MAX_REPOSITORY_SECRET_BYTES,
+                "stored heuristic secret has an invalid length"
+            );
+        } else {
+            validate_stored_secret(&plain.secret, true)?;
+        }
         let secret = Zeroizing::new(std::mem::take(&mut plain.secret));
         out.push(DecryptedRecord {
             id: stored.id.clone(),

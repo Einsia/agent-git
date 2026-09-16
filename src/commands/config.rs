@@ -32,7 +32,7 @@ pub const KEYS: [(&str, &str); 7] = [
     ),
     (
         config::SecretKeystore::KEY,
-        "where the secret-filter key lives: os (system credential store) | file (private file under AGIT_HOME/keystore; AGIT_SECRETS_KEYSTORE takes priority)",
+        "where the global registration key lives: os (system credential store) | file (private file under AGIT_HOME/keystore; AGIT_SECRETS_KEYSTORE takes priority)",
     ),
 ];
 

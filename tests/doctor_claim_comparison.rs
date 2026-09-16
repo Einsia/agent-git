@@ -473,6 +473,11 @@ fn doctor_hydrates_existing_secrets_without_mutating_the_dictionary() {
     assert_eq!(fs::read(&lab.link).unwrap(), claim);
     assert!(!lock.exists());
     fs::rename(lab.store.join("keystore"), lab.store.join("keystore-saved")).unwrap();
+    lab.assert_status("clean");
+    assert_eq!(fs::read(&dictionary).unwrap(), before);
+    assert!(!lock.exists());
+    let directory = dictionary.parent().unwrap();
+    fs::rename(directory.join("keys"), directory.join("keys-saved")).unwrap();
     assert!(
         lab.assert_status("unavailable")
             .contains("repository secret reconstruction is unavailable")

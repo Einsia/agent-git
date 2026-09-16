@@ -10,7 +10,9 @@
     "domain::repo::tests::legacy_inspection_",
     "adapter::cursor::tests::windows_cwd_",
     "infra::local_git::tests",
+    "infra::windows_security::tests",
     "domain::secret_filter::repository::tests::bounded_",
+    "domain::secret_filter::repository_keys::tests",
     "rc::transport::tests"
   ],
   "integration": [

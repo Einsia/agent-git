@@ -376,6 +376,16 @@ pub(crate) fn private_tempfile(
 }
 
 pub(crate) fn write_private_file(path: &Path, body: &[u8]) -> io::Result<()> {
+    write_private_file_impl(path, body, true)
+}
+
+/// Keys are installed once; replacing an existing file can strand encrypted state.
+#[cfg(any(feature = "secret-vault", test))]
+pub(crate) fn create_private_file(path: &Path, body: &[u8]) -> io::Result<()> {
+    write_private_file_impl(path, body, false)
+}
+
+fn write_private_file_impl(path: &Path, body: &[u8], replace: bool) -> io::Result<()> {
     use std::io::Write;
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::GENERIC_WRITE;
@@ -403,7 +413,7 @@ pub(crate) fn write_private_file(path: &Path, body: &[u8]) -> io::Result<()> {
                 let handle = Handle::new(unsafe {
                     CreateFileW(
                         name.as_ptr(),
-                        GENERIC_WRITE,
+                        GENERIC_WRITE | READ_CONTROL,
                         FILE_SHARE_READ | FILE_SHARE_DELETE,
                         &attributes,
                         CREATE_NEW,
@@ -418,8 +428,38 @@ pub(crate) fn write_private_file(path: &Path, body: &[u8]) -> io::Result<()> {
     validate_acl(temporary.as_file().as_raw_handle(), &sid, true, false)?;
     temporary.write_all(body)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
+    if replace {
+        temporary.persist(path).map_err(|error| error.error)?;
+    } else {
+        temporary
+            .persist_noclobber(path)
+            .map_err(|error| error.error)?;
+    }
     Ok(())
+}
+
+/// Validate the same handle that supplies secret bytes, denying writes and replacement.
+#[cfg(any(feature = "secret-vault", test))]
+pub(crate) fn open_private_read(path: &Path) -> io::Result<std::fs::File> {
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | READ_CONTROL)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(denied("Private secret state must be an ordinary file"));
+    }
+    validate_acl(file.as_raw_handle(), &current_sid()?, true, false)?;
+    validate_path(path, false, true)?;
+    Ok(file)
 }
 
 pub(crate) fn private_directory(path: &Path) -> io::Result<()> {
@@ -434,4 +474,40 @@ pub(crate) fn private_directory(path: &Path) -> io::Result<()> {
         }
     }
     validate_path(path, true, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn private_file_creation_excludes_inherited_readers_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        validate_path(dir.path(), true, false).unwrap();
+        assert!(validate_path(dir.path(), true, true).is_err());
+        let path = dir.path().join("key");
+        create_private_file(&path, b"private fixture").unwrap();
+        validate_path(&path, false, true).unwrap();
+        let mut bytes = Vec::new();
+        open_private_read(&path)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"private fixture");
+        assert!(create_private_file(&path, b"replacement").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"private fixture");
+
+        let exposed = dir.path().join("inherited-key");
+        std::fs::write(&exposed, b"readable fixture").unwrap();
+        assert!(open_private_read(&exposed).is_err());
+        assert!(create_private_file(&exposed, b"replacement").is_err());
+        assert_eq!(std::fs::read(exposed).unwrap(), b"readable fixture");
+    }
 }

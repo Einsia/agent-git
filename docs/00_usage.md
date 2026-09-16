@@ -881,10 +881,10 @@ keys, values, `--unset`, `--list`, pipes, CI and agent sessions retain the comma
 
 `hub.url` · `runtime.default` · `push.visibility` · `commit.auto` · `memory.track` (`session | off`,
 whether the runtime's project memory is collected into the session branch, see 3.7) ·
-`secrets.keystore` (`os | file`, where the secret-filter key lives: the system credential store,
+`secrets.keystore` (`os | file`, where the global registration key lives: the system credential store,
 or a private file under `~/.agit/keystore/` for a machine with no desktop session such as an SSH
 login or a CI runner — Unix only, and a backup of `~/.agit` then carries the key along with the
-global vault, while a repository's dictionary in its `.git` takes both backups to decrypt;
+global vault; repository dictionaries keep their own local keys beside the mappings in `.git`;
 `AGIT_SECRETS_KEYSTORE` overrides it, and `agit doctor` reports whether the chosen store
 answers).
 `push.visibility` governs the first publish only: push's `--private`/`--public` overrides it, and so
