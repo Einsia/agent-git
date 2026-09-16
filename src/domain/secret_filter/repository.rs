@@ -1493,7 +1493,11 @@ mod tests {
                 Ok(text)
             })
             .unwrap();
-        assert!(!protected.contains("abc"));
+        let value: serde_json::Value = serde_json::from_str(&protected).unwrap();
+        let message = value["message"].as_str().unwrap();
+        let placeholders = token_segments(message).collect::<Vec<_>>();
+        assert_eq!(placeholders.len(), 1);
+        assert_eq!(message, format!("fixture: {}", placeholders[0].2));
         assert_eq!(dictionary.hydrate_jsonl(&protected).unwrap().text, input);
         assert_eq!(
             dictionary

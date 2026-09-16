@@ -326,9 +326,8 @@ pub fn resolve(repo: &crate::domain::repo::Repo, spec: &RefSpec) -> Result<Resol
                     .current_branch()
                     .ok_or_else(|| anyhow::anyhow!("HEAD is detached and no ref was given"))?,
             };
-            let sha = resolve_base(repo, &name)?;
-            let branch = repo.has_ref(&format!("refs/heads/{name}")).then_some(name);
-            (sha, branch)
+            let (sha, is_local_branch) = resolve_base(repo, &name)?;
+            (sha, is_local_branch.then_some(name))
         }
     };
 
@@ -558,10 +557,11 @@ pub fn version_alias(repo: &crate::domain::repo::Repo, name: &str) -> Option<Str
     }
 }
 
-fn resolve_base(repo: &crate::domain::repo::Repo, name: &str) -> Result<String> {
+fn resolve_base(repo: &crate::domain::repo::Repo, name: &str) -> Result<(String, bool)> {
     let mut hits: Vec<(String, String)> = Vec::new();
     let branch_ref = format!("refs/heads/{name}");
-    if ref_exists(repo, &branch_ref)? {
+    let is_local_branch = ref_exists(repo, &branch_ref)?;
+    if is_local_branch {
         hits.push((format!("branch {name}"), peel_to_commit(repo, &branch_ref)?));
     }
     let tag_ref = format!("refs/tags/{name}");
@@ -576,9 +576,7 @@ fn resolve_base(repo: &crate::domain::repo::Repo, name: &str) -> Result<String> 
     //   **does not count**, or every resolve is ambiguous for anyone who has pushed once (a
     //   branch's natural shadow).
     // - With no local branch and several remotes carrying the name, the user must say which.
-    if !hits
-        .iter()
-        .any(|(what, _)| what == &format!("branch {name}"))
+    if !is_local_branch
         && let Some(list) = repo.git_opt(&[
             "for-each-ref",
             "--format=%(refname)",
@@ -637,7 +635,7 @@ fn resolve_base(repo: &crate::domain::repo::Repo, name: &str) -> Result<String> 
     }
     match hits.as_slice() {
         [] => Err(NotFound(name.to_string()).into()),
-        [(_, sha)] => Ok(sha.clone()),
+        [(_, sha)] => Ok((sha.clone(), is_local_branch)),
         many => {
             let list = many
                 .iter()
@@ -1278,6 +1276,7 @@ mod tests {
         let spec = parse("exp").unwrap();
         let r = resolve(&crepo, &spec).unwrap();
         assert_eq!(r.sha, repo.git(&["rev-parse", "HEAD"]).unwrap().trim());
+        assert_eq!(r.branch, None);
         // The shadow case: once a local branch of the same name exists, the one under
         // refs/remotes is a mirror of the same thing and must not count as another candidate —
         // otherwise every resolve is ambiguous for anyone who has pushed once.
@@ -1286,6 +1285,7 @@ mod tests {
             .unwrap();
         let r2 = resolve(&crepo, &spec).unwrap();
         assert_eq!(r2.sha, r.sha);
+        assert_eq!(r2.branch.as_deref(), Some("exp"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1461,7 +1461,7 @@ mod version_id_tests {
             "f1 and s1 share one session declaration, so no line can be picked for the user"
         );
         assert_eq!(
-            resolve_base(&r, &format!("agit-{tip}")).unwrap(),
+            resolve_base(&r, &format!("agit-{tip}")).unwrap().0,
             tip,
             "a version id resolves as an object once the prefix is stripped"
         );
@@ -1481,7 +1481,11 @@ mod version_id_tests {
             .to_string();
         let vid = format!("agit-{tip}");
         r.git(&["tag", &vid, &tip]).unwrap();
-        assert_eq!(resolve_base(&r, &vid).unwrap(), tip, "agreement is one hit");
+        assert_eq!(
+            resolve_base(&r, &vid).unwrap().0,
+            tip,
+            "agreement is one hit"
+        );
         r.git(&["tag", "-d", &vid]).unwrap();
         r.git(&["tag", &vid, "refs/heads/s1"]).unwrap();
         let err = resolve_base(&r, &vid).unwrap_err();
