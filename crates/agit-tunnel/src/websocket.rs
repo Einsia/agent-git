@@ -108,6 +108,7 @@ async fn connect_with(
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
         connector.set_connect_timeout(Some(timeout));
+        connector.set_nodelay(true);
         let stream = match proxy {
             Some(proxy) => {
                 // Only proxy credentials belong on CONNECT. For WSS, the RC

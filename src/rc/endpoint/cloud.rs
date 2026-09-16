@@ -85,7 +85,25 @@ pub(super) fn attach(
         let write = async {
             while let Some((record, _permit)) = messages.recv().await {
                 if let Some(text) = projection.project(&record)? {
-                    sink.send(Packet::Text(text)).await?;
+                    let frame_bytes = text.len();
+                    let started = std::time::Instant::now();
+                    if frame_bytes >= 16 * 1024
+                        && let Some(log) = &log
+                    {
+                        log.record(
+                            "cloud.write_started",
+                            serde_json::json!({"client_id":client,"frame_bytes":frame_bytes}),
+                        );
+                    }
+                    let result = sink.send(Packet::Text(text)).await;
+                    if (frame_bytes >= 16 * 1024
+                        || result.is_err()
+                        || started.elapsed() >= std::time::Duration::from_secs(1))
+                        && let Some(log) = &log
+                    {
+                        log.record("cloud.write_completed", serde_json::json!({"client_id":client,"frame_bytes":frame_bytes,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"succeeded":result.is_ok()}));
+                    }
+                    result?;
                 }
             }
             Ok::<_, anyhow::Error>(())

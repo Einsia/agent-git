@@ -85,13 +85,17 @@ pub(super) fn read(runtime: &str, native: &str, cwd: &str, params: &Value) -> cr
                 (page, start)
             }
         } else {
-            let (lines, next, mode) = page_segments(&mut entry.parts, before)?;
+            let (mut lines, next, mode) = page_segments(&mut entry.parts, before)?;
             validate_records(runtime, &lines)?;
+            let context = select_view(&mut lines, runtime, params);
             let redactor = crate::domain::redact::Redactor::try_this_machine()?;
             let (items, _) = super::super::supervisor::items_from_lines_with_mode(
                 runtime, &redactor, &lines, mode,
             );
             (items.into_iter().map(|mut item| {
+            if runtime == "codex" && params["view"] == "conversation" {
+                project_context(&mut item, &context);
+            }
             item.event.line = None;
             json!({"item_id":format!("history:{}",item.item_id),"source_id":item.source_id,
                 "event":item.event,"raw":item.raw})

@@ -379,7 +379,9 @@ async fn serve_described(
                             });
                         }
                         Ok(frame) if frame.method() == "machine.describe" => {
-                            if peer.output.send_timeout(Frame::response(original_id, description.clone()).to_json(), std::time::Duration::from_secs(2)).await.is_err() { clients.remove(&client); }
+                            let response = Frame::response(original_id, description.clone());
+                            if let Some(log) = &diagnostics { log.response(client, &response); }
+                            if peer.output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await.is_err() { clients.remove(&client); }
                         }
                         Ok(frame) if matches!(frame.method(), "runtime.models" | "session.goal.read") => {
                             let output = peer.output.clone();
@@ -412,6 +414,8 @@ async fn serve_described(
                                 continue;
                             };
                             let output = peer.output.clone();
+                            let diagnostics = diagnostics.clone();
+                            let started = std::time::Instant::now();
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
                                     let _permit = permit;
@@ -423,6 +427,10 @@ async fn serve_described(
                                     Ok(Err(error)) => Frame::error_response(original_id,super::local_history::rpc_error(error)),
                                     Err(_) => Frame::error_response(original_id,RpcError::new(ErrorCode::RuntimeUnavailable,"History reader stopped unexpectedly")),
                                 };
+                                if let Some(log) = &diagnostics {
+                                    log.response(client, &response);
+                                    log.record("history.read_completed", serde_json::json!({"client_id":client,"request_id":response.id,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0}));
+                                }
                                 let _ = output.send_timeout(response.to_json(),std::time::Duration::from_secs(2)).await;
                             });
                         }

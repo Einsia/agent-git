@@ -3,6 +3,7 @@ mod snapshot;
 
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 
 pub fn read(params: Value) -> crate::Result<Value> {
@@ -114,6 +115,49 @@ pub(crate) fn validate_records(
         }
     }
     Ok(())
+}
+
+fn select_view(
+    lines: &mut Vec<super::tail::TailedLine>,
+    runtime: &str,
+    params: &Value,
+) -> HashSet<u64> {
+    let mut context = HashSet::new();
+    if runtime != "codex" || params["view"] != "conversation" {
+        return context;
+    }
+    // Filter after pagination so native byte cursors and retained item identities stay stable.
+    lines.retain(|line| {
+        let Ok(raw) = serde_json::from_str::<Value>(&line.text) else {
+            return true;
+        };
+        // Classify source records before raw payload caps remove their message roles.
+        if raw["type"] == "response_item"
+            && raw["payload"]["type"] == "message"
+            && matches!(
+                raw["payload"]["role"].as_str(),
+                Some("system" | "developer")
+            )
+        {
+            context.insert(line.lineno);
+        }
+        match raw["type"].as_str() {
+            Some("session_meta" | "turn_context" | "world_state" | "token_usage_record") => false,
+            Some("event_msg") => raw["payload"]["type"] != "token_count",
+            _ => true,
+        }
+    });
+    context
+}
+
+fn project_context(item: &mut crate::protocol::ItemCompleted, context: &HashSet<u64>) {
+    if item.event.kind == crate::adapter::EventKind::Other && context.contains(&item.line) {
+        // Keep message boundaries and native IDs for compaction and live reconciliation.
+        item.event.text = None;
+        if let Some(content) = item.raw.pointer_mut("/payload/content") {
+            *content = json!([]);
+        }
+    }
 }
 
 struct Segment {
@@ -344,6 +388,101 @@ fn page_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conversation_view_preserves_native_pages_and_presentable_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let mut records = vec![
+            json!({"type":"session_meta","payload":{"id":"fixture","history_mode":"model"}}),
+            json!({"type":"event_msg","payload":{"type":"token_count"}}),
+            json!({"type":"world_state","payload":{"context":"Context"}}),
+            json!({"type":"token_usage_record","payload":{"tokens":1}}),
+        ];
+        let visible = vec![
+            json!({"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"Context"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"system","content":[{"type":"input_text","text":"X".repeat(300 * 1024)}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Question"}]}}),
+            json!({"type":"response_item","payload":{"type":"reasoning","summary":[{"text":"Thinking"}]}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call","output":"Done"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer"}]}}),
+            json!({"type":"compacted","payload":{"message":"Summary"}}),
+            json!({"type":"future_record","payload":{"text":"Preserved"}}),
+        ];
+        records.extend(visible.clone());
+        records.extend((0..100).map(|_| json!({"type":"turn_context","payload":{}})));
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let (mut tail, before, _) = page(&path, None).unwrap();
+        select_view(&mut tail, "codex", &json!({"view":"conversation"}));
+        assert!(tail.is_empty());
+        assert!(before > 0);
+        let (mut earlier, before, mode) = page(&path, Some(before)).unwrap();
+        assert_eq!(before, 0);
+        let original: Vec<_> = earlier
+            .iter()
+            .map(|line| (line.lineno, line.text.clone()))
+            .collect();
+        select_view(&mut earlier, "codex", &json!({}));
+        assert_eq!(earlier.len(), original.len());
+        select_view(&mut earlier, "claude-code", &json!({"view":"conversation"}));
+        assert_eq!(earlier.len(), original.len());
+        let redactor =
+            crate::domain::redact::Redactor::new(crate::domain::redact::Persona::default());
+        let (full, _) = super::super::supervisor::items_from_lines_with_mode(
+            "codex", &redactor, &earlier, mode,
+        );
+        let context = select_view(&mut earlier, "codex", &json!({"view":"conversation"}));
+        assert_eq!(
+            earlier
+                .iter()
+                .map(|line| serde_json::from_str::<Value>(&line.text).unwrap())
+                .collect::<Vec<_>>(),
+            visible
+        );
+        let (projected, _) = super::super::supervisor::items_from_lines_with_mode(
+            "codex", &redactor, &earlier, mode,
+        );
+        assert!(!projected.is_empty());
+        for mut item in projected {
+            let expected = full
+                .iter()
+                .find(|original| original.item_id == item.item_id)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&item).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            project_context(&mut item, &context);
+            if context.contains(&expected.line) {
+                assert!(item.event.text.is_none());
+                let mut raw = expected.raw.clone();
+                if let Some(content) = raw.pointer_mut("/payload/content") {
+                    *content = json!([]);
+                } else {
+                    assert!(expected.raw_truncated);
+                    assert_eq!(expected.event.text.as_ref().unwrap().len(), 300 * 1024);
+                }
+                assert_eq!(item.raw, raw);
+                assert_eq!(item.item_id, expected.item_id);
+                assert_eq!(item.object_hash, expected.object_hash);
+                assert_eq!(item.source_id, expected.source_id);
+                assert_eq!(item.raw_truncated, expected.raw_truncated);
+            } else {
+                assert_eq!(
+                    serde_json::to_value(item).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
+        }
+    }
+
     #[test]
     fn launch_receipts_do_not_prove_that_missing_history_is_pending() {
         let session = json!({"session_id":"logical","workspace_id":"local-owner","runtime":"claude-code","status":"idle","last_seq":0,"created_at":"now","updated_at":"now"});

@@ -61,6 +61,7 @@ impl Client {
             "cloud peer origin cannot contain credentials, a path, or a query"
         );
         let http = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(30))
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
