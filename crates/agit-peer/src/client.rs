@@ -59,40 +59,63 @@ pub fn is_transient(error: &anyhow::Error) -> bool {
 #[derive(Clone)]
 pub struct Client {
     origin: String,
+    transport_origin: String,
+    direct: bool,
     http: reqwest::Client,
 }
 
 impl Client {
     pub fn new(origin: &str) -> anyhow::Result<Self> {
+        let origin = Self::parse_origin(origin, false)?;
+        Ok(Self {
+            transport_origin: origin.clone(),
+            direct: false,
+            origin,
+            http: Self::http_client(false)?,
+        })
+    }
+
+    /// A trusted host may route admission and tunnel traffic internally without changing the issuer.
+    /// The caller selects this endpoint from deployment configuration, never a peer-supplied URL.
+    pub fn with_trusted_transport_origin(mut self, origin: &str) -> anyhow::Result<Self> {
+        self.transport_origin = Self::parse_origin(origin, true)?;
+        self.direct = true;
+        self.http = Self::http_client(true)?;
+        Ok(self)
+    }
+
+    fn parse_origin(origin: &str, allow_internal: bool) -> anyhow::Result<String> {
         let url = url::Url::parse(origin).context("invalid cloud peer origin")?;
-        let loopback = url.host_str().is_some_and(|host| {
+        let local = url.host_str().is_some_and(|host| {
             host == "localhost"
                 || host
                     .trim_matches(['[', ']'])
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|ip| ip.is_loopback())
+                || (allow_internal && host.ends_with(".svc.cluster.local"))
         });
         ensure!(
-            url.scheme() == "https" || (url.scheme() == "http" && loopback),
+            url.scheme() == "https" || (url.scheme() == "http" && local),
             "cloud peer origin requires HTTPS"
         );
         ensure!(
-            url.username().is_empty()
+            url.host_str().is_some()
+                && url.username().is_empty()
                 && url.password().is_none()
                 && url.query().is_none()
                 && url.fragment().is_none()
                 && url.path() == "/",
             "cloud peer origin cannot contain credentials, a path, or a query"
         );
-        let http = reqwest::Client::builder()
+        Ok(url.as_str().trim_end_matches('/').into())
+    }
+
+    fn http_client(direct: bool) -> anyhow::Result<reqwest::Client> {
+        let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(30))
             .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        Ok(Self {
-            origin: url.as_str().trim_end_matches('/').into(),
-            http,
-        })
+            .redirect(reqwest::redirect::Policy::none());
+        Ok(if direct { client.no_proxy() } else { client }.build()?)
     }
 
     pub fn origin(&self) -> &str {
@@ -108,7 +131,7 @@ impl Client {
     ) -> anyhow::Result<T> {
         let mut request = self
             .http
-            .request(method, format!("{}{path}", self.origin))
+            .request(method, format!("{}{path}", self.transport_origin))
             .bearer_auth(token.expose());
         if let Some(body) = body {
             request = request.json(&body);
@@ -320,13 +343,14 @@ impl Client {
             device.device.owner.issuer == self.origin,
             "cloud device issuer mismatch"
         );
-        let mut url = url::Url::parse(&self.origin)?;
+        let mut url = url::Url::parse(&self.transport_origin)?;
         let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
         url.set_scheme(scheme)
             .map_err(|_| anyhow::anyhow!("invalid cloud socket scheme"))?;
         url.set_path(path);
         Ok(Config::WebSocket {
             url: url.into(),
+            direct: self.direct,
             headers: vec![(
                 "Authorization".into(),
                 format!("Bearer {}", device.token.expose()),
@@ -442,6 +466,101 @@ impl Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn trusted_transport_routes_requests_without_changing_device_authority() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let issuer = "https://public-hub.example";
+        let device = Device {
+            id: "executor".into(),
+            owner: crate::access::Principal {
+                issuer: issuer.into(),
+                account_id: "owner".into(),
+            },
+            machine_id: "machine".into(),
+            display_name: "Executor".into(),
+            certificate: crate::Identity::generate().unwrap().certificate().clone(),
+            credential_epoch: 1,
+        };
+        let server_device = device.clone();
+        let server = tokio::spawn(async move {
+            for incorrect_issuer in [false, true] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "GET /api/peer/devices HTTP/1.1\r\n");
+                loop {
+                    line.clear();
+                    socket.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut device = server_device.clone();
+                if incorrect_issuer {
+                    device.owner.issuer = format!("http://{address}");
+                }
+                let body = serde_json::to_string(&DevicePage {
+                    devices: vec![DevicePresence {
+                        device,
+                        online: true,
+                    }],
+                    next_cursor: None,
+                })
+                .unwrap();
+                socket.get_mut().write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let client = Client::new(issuer)
+            .unwrap()
+            .with_trusted_transport_origin(&format!("http://{address}"))
+            .unwrap();
+        assert_eq!(client.origin(), issuer);
+        let token = Secret::new("fixture-token".into());
+        assert_eq!(
+            client.devices(&token, None).await.unwrap().devices[0]
+                .device
+                .owner
+                .issuer,
+            issuer
+        );
+        assert!(
+            client
+                .devices(&token, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("issuer mismatch")
+        );
+        let Config::WebSocket { url, direct, .. } = client
+            .data_config(&DeviceCredential { device, token })
+            .unwrap()
+        else {
+            panic!("cloud transport must remain a WebSocket");
+        };
+        assert_eq!(url, format!("ws://{address}/api/peer/data"));
+        assert!(direct);
+        server.await.unwrap();
+        assert!(
+            Client::new(issuer)
+                .unwrap()
+                .with_trusted_transport_origin("http://public.example")
+                .is_err()
+        );
+        assert!(Client::new("http://relay.default.svc.cluster.local").is_err());
+        assert!(
+            Client::new(issuer)
+                .unwrap()
+                .with_trusted_transport_origin("http://relay.default.svc.cluster.local")
+                .is_ok()
+        );
+    }
 
     #[test]
     fn credentials_cannot_be_sent_to_insecure_remote_origins_or_url_paths() {

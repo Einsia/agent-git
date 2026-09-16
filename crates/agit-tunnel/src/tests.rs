@@ -63,6 +63,7 @@ async fn websocket_worker_preserves_messages_and_write_receipts() {
     let connection = Connection::in_process(Config::WebSocket {
         url: format!("ws://{address}"),
         headers: vec![],
+        direct: false,
     })
     .await
     .unwrap();

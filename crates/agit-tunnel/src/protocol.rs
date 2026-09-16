@@ -16,6 +16,8 @@ pub enum Config {
     WebSocket {
         url: String,
         headers: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        direct: bool,
     },
     Ssh {
         host: String,
@@ -26,7 +28,7 @@ pub enum Config {
 impl Config {
     pub fn validate(&self) -> crate::Result<()> {
         match self {
-            Self::WebSocket { url, headers } => {
+            Self::WebSocket { url, headers, .. } => {
                 let url = url::Url::parse(url).context("invalid tunnel URL")?;
                 ensure!(
                     matches!(url.scheme(), "ws" | "wss"),

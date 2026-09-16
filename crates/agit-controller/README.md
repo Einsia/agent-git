@@ -65,3 +65,16 @@ not create sessions, send prompts or change executor files. Standard output is
 JSON Lines with phase durations and connection IDs for matching relay logs;
 response bodies and credentials are omitted. A failed cleanup requires checking
 the temporary controller lease. This is an exploratory diagnostic, not a CI gate.
+
+For a controlled routing comparison, optional `transport_origin` selects a trusted
+relay endpoint while `hub` remains the public issuer. HTTPS, loopback, and cluster
+service origins are supported. The library exposes the same separation through
+`Client::with_trusted_transport_origin`; it changes HTTP and WebSocket routing,
+preserves device and grant issuer checks, and bypasses environment proxies only
+for the explicitly configured trusted transport. Do not derive this origin from
+an executor response or browser request.
+
+Trusted WebSocket routes carry an optional direct-transport flag to the bundled
+worker. Default CLI routes omit it and retain environment-proxy behavior. Deploy
+the host and its bundled worker together when enabling an internal route; the
+executor protocol does not change.

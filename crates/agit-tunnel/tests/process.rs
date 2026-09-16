@@ -24,6 +24,7 @@ async fn echo() -> (Config, tokio::task::JoinHandle<()>) {
         Config::WebSocket {
             url: format!("ws://{address}"),
             headers: vec![],
+            direct: false,
         },
         task,
     )

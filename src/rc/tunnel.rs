@@ -30,6 +30,7 @@ pub async fn connect(
 ) -> crate::Result<(SocketSink, SocketSource)> {
     let config = Config::WebSocket {
         url: request.uri().to_string(),
+        direct: false,
         headers: request
             .headers()
             .iter()

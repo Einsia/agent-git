@@ -28,6 +28,7 @@ async fn endpoint() -> (Config, mpsc::Receiver<Socket>, tokio::task::JoinHandle<
         Config::WebSocket {
             url,
             headers: vec![],
+            direct: false,
         },
         rx,
         task,

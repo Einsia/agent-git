@@ -84,7 +84,11 @@ where
 
 async fn connect(config: Config) -> crate::Result<(PacketSink, PacketSource)> {
     match config {
-        Config::WebSocket { url, headers } => {
+        Config::WebSocket {
+            url,
+            headers,
+            direct,
+        } => {
             let mut request = url
                 .into_client_request()
                 .context("invalid WebSocket tunnel request")?;
@@ -95,7 +99,7 @@ async fn connect(config: Config) -> crate::Result<(PacketSink, PacketSource)> {
                     http::HeaderValue::from_str(&value).context("invalid tunnel header value")?,
                 );
             }
-            let socket = super::websocket::connect(request).await?;
+            let socket = super::websocket::connect(request, direct).await?;
             let (sink, source) = socket.split();
             let sink = sink
                 .with(|packet| async move { Ok::<_, anyhow::Error>(to_websocket(packet)) })

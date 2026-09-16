@@ -18,6 +18,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 #[serde(deny_unknown_fields)]
 struct Input {
     hub: String,
+    #[serde(default)]
+    transport_origin: Option<String>,
     account_token: Secret,
     device_id: String,
     samples: usize,
@@ -166,7 +168,10 @@ async fn main() -> anyhow::Result<()> {
         (1..=20).contains(&input.samples) && input.idle_seconds <= 3600,
         "probe budget is out of range"
     );
-    let api = Client::new(&input.hub)?;
+    let mut api = Client::new(&input.hub)?;
+    if let Some(origin) = &input.transport_origin {
+        api = api.with_trusted_transport_origin(origin)?;
+    }
     let identity = Identity::generate()?;
     let device = phase(
         "controller_registration",

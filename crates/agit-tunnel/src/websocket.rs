@@ -15,11 +15,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONNECT_HEADERS: usize = 8192;
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-pub(super) async fn connect(request: Request) -> crate::Result<Socket> {
+pub(super) async fn connect(request: Request, direct: bool) -> crate::Result<Socket> {
     let no_proxy = std::env::var("NO_PROXY")
         .or_else(|_| std::env::var("no_proxy"))
         .unwrap_or_default();
-    let proxies = if no_proxy.split(',').any(|host| host.trim() == "*") {
+    let proxies = if direct || no_proxy.split(',').any(|host| host.trim() == "*") {
         Matcher::builder().build()
     } else {
         Matcher::from_env()
