@@ -583,7 +583,7 @@ fn name_it(slug: &str, row: Option<&Row>) -> Option<String> {
             crate::ui::error(&crate::commands::terminal_error_message(&error));
             continue;
         }
-        match std::process::Command::new("git")
+        match crate::infra::git_runtime::command()
             .args(["check-ref-format", "--branch", &branch])
             .stdin(std::process::Stdio::null())
             .output()

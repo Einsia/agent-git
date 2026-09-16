@@ -1650,7 +1650,7 @@ fn record_supervisor_result(commit_sha: &str) -> crate::Result<()> {
 /// warnings for broken refs); filtering its result ourselves also avoids confusing `main` with
 /// `main/child`. Once found, the object must still peel to a commit.
 fn optional_branch_commit(repo: &Repo, branch_ref: &str) -> crate::Result<Option<String>> {
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -1725,7 +1725,7 @@ fn unborn_worktree_tree(repo: &Repo) -> crate::Result<String> {
         }
     }
     let run = |args: &[&str]| -> crate::Result<String> {
-        let output = std::process::Command::new("git")
+        let output = crate::infra::git_runtime::command()
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(repo.root())
@@ -2741,7 +2741,7 @@ fn run_file_commit_hook(repo: &Repo, name: &str, args: &[&std::ffi::OsStr]) -> c
     }
     let index = file_commit_git_path(repo, "index")?;
     let git_dir = repo.git(&["rev-parse", "--absolute-git-dir"])?;
-    let mut command = std::process::Command::new("git");
+    let mut command = crate::infra::git_runtime::command();
     command
         .arg("--no-replace-objects")
         .arg("-c")
@@ -2785,7 +2785,7 @@ enum FileCommitCleanup {
 /// edited, so it has whitespace behavior here. Read through `git config` rather than parsing files
 /// so includes, scope precedence and command-environment overrides stay native.
 fn file_commit_cleanup(repo: &Repo, initial_message: &str) -> crate::Result<FileCommitCleanup> {
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -2855,7 +2855,7 @@ fn parse_file_commit_git_version(output: &[u8]) -> crate::Result<FileCommitGitVe
 }
 
 fn file_commit_git_version() -> crate::Result<FileCommitGitVersion> {
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--version")
         .output()?;
     anyhow::ensure!(
@@ -2898,7 +2898,7 @@ fn auto_comment_char_from_config(
 
 fn file_commit_uses_auto_comment_char(repo: &Repo) -> crate::Result<bool> {
     let version = file_commit_git_version()?;
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -3571,7 +3571,7 @@ fn code_commit(cwd: &str, what: &str) -> crate::Result<Option<(String, Completen
         // agent has just been writing to. One line written into `.git/hooks/pre-commit` and the
         // next `agit commit --code` executes it for the agent, with no approval at all. See
         // `meta::GIT_SAFE`.
-        let out = std::process::Command::new("git")
+        let out = crate::infra::git_runtime::command()
             .args(crate::domain::meta::GIT_SAFE)
             .args(["add", "-A"])
             .current_dir(p)
@@ -3584,7 +3584,7 @@ fn code_commit(cwd: &str, what: &str) -> crate::Result<Option<(String, Completen
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        let out = std::process::Command::new("git")
+        let out = crate::infra::git_runtime::command()
             .args(crate::domain::meta::GIT_SAFE)
             .args(["commit", "-m", &msg])
             .current_dir(p)
@@ -3625,7 +3625,7 @@ fn code_repo_dirty(cwd: &Path) -> bool {
     }
     // This runs inside **the user's own code repo**, which the agent has just written to.
     // `git status` executes `core.fsmonitor` — see `meta::GIT_SAFE`.
-    std::process::Command::new("git")
+    crate::infra::git_runtime::command()
         .args(crate::domain::meta::GIT_SAFE)
         .args(["status", "--porcelain"])
         .current_dir(cwd)

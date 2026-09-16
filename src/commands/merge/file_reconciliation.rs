@@ -113,7 +113,7 @@ fn parse(status: Option<i32>, bytes: &[u8], width: usize) -> Result<Draft> {
 }
 
 fn command(repo: &Repo) -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::infra::git_runtime::command();
     // Frozen commit identities require raw parents even if graph overlays change during capture.
     command
         .arg("--no-replace-objects")

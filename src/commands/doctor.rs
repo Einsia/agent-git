@@ -104,10 +104,21 @@ pub fn run(args: Args) -> CmdResult {
     checks.extend(skill_installation_checks());
 
     // ── git ──
-    match std::process::Command::new("git").arg("--version").output() {
+    match crate::infra::git_runtime::command()
+        .arg("--version")
+        .output()
+    {
         Ok(o) if o.status.success() => checks.push((
             "git".into(),
-            Check::Ok(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+            Check::Ok(format!(
+                "{} ({})",
+                String::from_utf8_lossy(&o.stdout).trim(),
+                if crate::infra::git_runtime::is_bundled() {
+                    "bundled"
+                } else {
+                    "system"
+                }
+            )),
         )),
         _ => {
             fatal = true;
@@ -116,6 +127,27 @@ pub fn run(args: Args) -> CmdResult {
                 Check::Err("unavailable — agit depends on git".into()),
             ));
         }
+    }
+
+    match crate::infra::git_runtime::command()
+        .args(["lfs", "version"])
+        .output()
+    {
+        Ok(output) if output.status.success() => checks.push((
+            "git-lfs".into(),
+            Check::Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned()),
+        )),
+        _ if crate::infra::git_runtime::is_bundled() => {
+            fatal = true;
+            checks.push((
+                "git-lfs".into(),
+                Check::Err("bundled Git LFS is unavailable; reinstall the CLI".into()),
+            ));
+        }
+        _ => checks.push((
+            "git-lfs".into(),
+            Check::Warn("install Git LFS to manage large files with this source build".into()),
+        )),
     }
 
     // ── store ──

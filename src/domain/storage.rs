@@ -1325,7 +1325,7 @@ fn resolve_commit(repo_root: &Path, git_ref: &str) -> Result<String> {
 }
 
 fn read_command(repo_root: &Path, policy: ReadPolicy) -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::infra::git_runtime::command();
     command.arg("--no-replace-objects").arg("-C").arg(repo_root);
     policy.apply_at_root(&mut command);
     #[cfg(feature = "cli")]
@@ -1979,7 +1979,7 @@ fn git_blob_first_line(
 ) -> Result<Option<String>> {
     use std::io::Read as _;
     let spec = format!("{git_ref}:{path}");
-    let mut child = Command::new("git")
+    let mut child = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo_root)

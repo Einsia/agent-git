@@ -1314,7 +1314,7 @@ fn legacy_storage_checkout_paths_dirty_with_policy(
         );
         return Ok(!output.stdout.is_empty());
     }
-    let mut command = Command::new("git");
+    let mut command = crate::infra::git_runtime::command();
     policy.apply(&mut command);
     let output = command
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -1372,7 +1372,7 @@ fn current_branch_ref_with_policy(repo: &Repo, policy: ReadPolicy) -> Result<Opt
     let output = if repo.is_local_inspection() {
         repo.inspection_output(&["symbolic-ref", "-q", "HEAD"], 64 * 1024)?
     } else {
-        let mut command = Command::new("git");
+        let mut command = crate::infra::git_runtime::command();
         policy.apply(&mut command);
         command
             .arg("--no-replace-objects")
@@ -1420,7 +1420,7 @@ fn optional_ref_with_policy(repo: &Repo, name: &str, policy: ReadPolicy) -> Resu
     let output = if repo.is_local_inspection() {
         repo.inspection_output(&["rev-parse", "--verify", "--quiet", name], 64 * 1024)?
     } else {
-        let mut command = Command::new("git");
+        let mut command = crate::infra::git_runtime::command();
         policy.apply(&mut command);
         command
             .arg("--no-replace-objects")
@@ -1929,7 +1929,7 @@ fn hash_spooled_blobs(
     index_info: &mut impl Write,
     metrics: &mut MigrationMetrics,
 ) -> Result<()> {
-    let mut command = Command::new("git");
+    let mut command = crate::infra::git_runtime::command();
     command.arg("--no-replace-objects").args([
         "hash-object",
         "-w",
@@ -2074,7 +2074,7 @@ fn run_index_git(
     let index = Path::new(".git")
         .join(spool.verified_name(repo)?)
         .join("migration.index");
-    let output = Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .args(args)
         .current_dir(repo.root())

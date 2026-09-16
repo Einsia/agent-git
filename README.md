@@ -81,8 +81,10 @@ The Linux artifact is **musl static-linked**, so no minimum glibc — the
 release pipeline runs every Linux binary inside an Alpine / Amazon Linux /
 Debian / Ubuntu container matrix before publishing.
 
-You also need **git >= 2.28** (repo init uses `git init --initial-branch`).
-Ubuntu 20.04 ships 2.25 — the installer prints a warning.
+Prebuilt binaries include Git and Git LFS, extracted into a private cache on first
+use. Your shell PATH and global Git configuration stay unchanged. Source builds
+use system Git; `AGIT_USE_SYSTEM_GIT=1` selects it in a prebuilt binary too.
+See [runtime configuration and source prerequisites](docs/01_setup.md).
 
 > Do not install `@einsia/agentgit` (no hyphen) — that is the pre-rewrite
 > CLI; its protocol does not match this branch and it will not work.

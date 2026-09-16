@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
 & (Join-Path $PSScriptRoot 'bootstrap-windows-rust.ps1')
+& (Join-Path $PSScriptRoot 'bootstrap-windows-python.ps1')
 foreach ($tool in @('cargo', 'node', 'git', 'tar')) {
     Get-Command $tool -ErrorAction Stop | Out-Null
 }
@@ -14,7 +15,12 @@ $target = 'x86_64-pc-windows-msvc'
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-Ctarget-feature=+crt-static'
 & rustup target add $target
 if ($LASTEXITCODE -ne 0) { throw 'Rust target installation failed' }
-& cargo build --locked --release --target $target --bin agit
+& python scripts/prepare-git-runtime.py $target .cache/git-runtime/payload.tar.gz
+if ($LASTEXITCODE -ne 0) { throw 'Git runtime preparation failed' }
+$env:AGIT_GIT_RUNTIME_ARCHIVE = (Resolve-Path '.cache/git-runtime/payload.tar.gz').Path
+& cargo build --locked --release --features bundled-git --target $target --bin agit
+if ($LASTEXITCODE -ne 0) { throw 'Bundled CLI build failed' }
+& cargo test --locked --release --features bundled-git --target $target --test bundled_git
 if ($LASTEXITCODE -ne 0) { throw 'Windows CLI build failed' }
 $binary = "target/$target/release/agit.exe"
 & node scripts/verify-windows-cli.mjs $binary

@@ -26,6 +26,13 @@ the platform sub-package matching your `os`/`cpu` via `optionalDependencies`
 that execs that binary with argv/stdio/exit-code forwarded, and `postinstall`
 runs `agit setup` once to wire skills, hooks, MCP and AGENTS.md.
 
+The executable contains Git and Git LFS. On first use it extracts them under
+`$AGIT_HOME/git-runtime` (default `~/.agit/git-runtime`), with no runtime download.
+Only AgentGit's child processes use that private runtime; your shell PATH and
+global Git configuration are unchanged. Copying or upgrading the single executable
+also carries its Git runtime. External credential helpers and extensions may still
+need your local tools; `AGIT_USE_SYSTEM_GIT=1` uses your system Git installation.
+
 pnpm (v10+) blocks dependency install scripts unless approved, so under pnpm
 the automatic `agit setup` does not run — run it once yourself after
 installing (or `pnpm approve-builds -g` and reinstall).
@@ -68,6 +75,7 @@ Unsupported operating system and architecture pairs get no prebuilt binary: runn
 | `AGIT_FORCE_INSTALL` | Also run postinstall inside the source checkout (CI smoke tests). |
 | `AGIT_HUB_URL`   | Point the CLI at another hub (default `https://agent-git.com`).  |
 | `AGIT_NPM_REGISTRY` | Registry `agit upgrade` downloads platform packages from.        |
+| `AGIT_USE_SYSTEM_GIT` | Set to `1` to use system Git and Git LFS instead of the bundled runtime. |
 
 ## Upgrading
 

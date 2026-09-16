@@ -88,7 +88,7 @@ pub(crate) fn looks_like_auth_failure(stderr: &str) -> bool {
 /// Authentication classification reads Git's diagnostics, so transport subprocesses use a
 /// stable diagnostic language without changing the caller's environment.
 fn transport_command() -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::infra::git_runtime::command();
     command.env("LC_ALL", "C").env("LANGUAGE", "C");
     command.env("GIT_LFS_SKIP_SMUDGE", "1");
     command

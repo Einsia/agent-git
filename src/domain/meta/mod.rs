@@ -1003,7 +1003,7 @@ fn safe_remote_authority(authority: &str) -> bool {
 /// Query the repository-level filter configuration; where a filter exists, status capture must
 /// keep away from `git status`.
 pub(crate) fn configured_clean_filters(cwd: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = crate::infra::git_runtime::command()
         .args(GIT_SAFE)
         .args([
             "config",
@@ -1029,7 +1029,7 @@ pub(crate) fn configured_clean_filters(cwd: &Path) -> Option<String> {
 fn read_worktree_status(
     cwd: &Path,
 ) -> Option<(WorktreeStatus, u32, u32, u32, u32, Option<String>)> {
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::infra::git_runtime::command()
         .args(GIT_SAFE)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(cwd)
@@ -1153,7 +1153,7 @@ pub(crate) const GIT_SAFE: &[&str] = &[
 ];
 
 fn git_field(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = crate::infra::git_runtime::command()
         .args(GIT_SAFE)
         .args(args)
         .current_dir(dir)

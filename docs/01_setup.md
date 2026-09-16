@@ -21,9 +21,18 @@ hand after installing. What the npm package itself does is in
 Do not install `@einsia/agentgit` (no hyphen) — that is a different CLI from
 before the rewrite, and its protocol does not match this branch.
 
-Whichever path you take, you also need **git >= 2.28**: store initialization uses `git init
---initial-branch=main`, a flag that arrives in 2.28. Ubuntu 20.04 ships 2.25, so first
-`sudo add-apt-repository ppa:git-core/ppa && sudo apt update && sudo apt install git`.
+Prebuilt distribution binaries include Git and Git LFS. The CLI extracts its private
+runtime under `$AGIT_HOME/git-runtime` (by default `~/.agit/git-runtime`) on first
+use, without downloading additional files. Your shell PATH and global Git profile
+are unchanged. User and repository Git configuration still apply; AgentGit's own
+repository settings continue to control its internal commits and LFS filters.
+
+Source builds use system Git by default and require **Git >= 2.28**; lineage
+inspection needs Git >= 2.36 and LFS operations need **Git LFS >= 3.7.1**.
+`AGIT_USE_SYSTEM_GIT=1` also selects system Git in a distribution build, including
+when a custom credential helper or extension requires your local Git installation.
+Run `agit doctor` to see the selected Git and LFS versions. See
+[the bundled runtime guide](bundled-git.md) for packaging and cache details.
 
 ### The Linux artifact is musl-static
 
@@ -38,6 +47,10 @@ The musl artifact is static-pie with no glibc floor: every environment above
 plus Alpine runs it. Before building the Release, the release pipeline puts
 every Linux artifact into an alpine / amazonlinux / debian / ubuntu container
 matrix and actually runs it there (the smoke-test step of `release.yml`).
+
+The embedded Linux Git runtime carries its own musl loader and shared libraries.
+It invokes that loader explicitly and uses the host's `/bin/sh`, so Git does not
+introduce a host glibc requirement into the static CLI distribution.
 
 `setup.sh` checks the toolchain before building; when something is missing it
 tells you which command to type instead of an error from deep inside cargo. For

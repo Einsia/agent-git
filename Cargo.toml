@@ -52,6 +52,8 @@ path = "src/lib.rs"
 
 [features]
 default = ["cli"]
+# Distribution builds carry a private Git toolchain; source builds use PATH.
+bundled-git = ["cli", "dep:flate2", "dep:tar"]
 
 # The terminal half.
 #
@@ -117,6 +119,8 @@ secret-vault = [
 ]
 
 [dependencies]
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
 agit-peer = { path = "crates/agit-peer", optional = true, features = ["cloud-client"] }
 agit-controller = { path = "crates/agit-controller", features = ["cloud"], optional = true }
 agit-tunnel = { path = "crates/agit-tunnel", optional = true, features = ["worker"] }

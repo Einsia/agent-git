@@ -253,7 +253,7 @@ pub fn code_of(cwd: &Path) -> Option<String> {
 }
 
 fn git_field(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = crate::infra::git_runtime::command()
         .args(args)
         .current_dir(dir)
         .output()

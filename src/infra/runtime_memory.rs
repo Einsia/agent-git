@@ -86,7 +86,7 @@ fn auto_memory_directory(settings: &Path) -> Option<PathBuf> {
 /// Memory belongs to a project root: the main checkout of the git repo holding cwd, or cwd itself
 /// when it is outside a repo.
 fn project_root(cwd: &Path) -> PathBuf {
-    let common = std::process::Command::new("git")
+    let common = crate::infra::git_runtime::command()
         .arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--git-common-dir"])

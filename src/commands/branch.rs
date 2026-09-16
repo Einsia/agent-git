@@ -232,7 +232,7 @@ fn with_temp_index(repo: &Repo, head: &str, blob: &str) -> crate::Result<String>
     let idx = repo.git_path("agit-seal-index")?;
     let _ = std::fs::remove_file(&idx);
     let run = |args: &[&str]| -> crate::Result<String> {
-        let out = std::process::Command::new("git")
+        let out = crate::infra::git_runtime::command()
             .args(args)
             .current_dir(repo.root())
             .env("GIT_INDEX_FILE", &idx)
@@ -261,7 +261,7 @@ fn with_temp_index(repo: &Repo, head: &str, blob: &str) -> crate::Result<String>
 /// A git call with optional stdin (for `hash-object --stdin` / `commit-tree`).
 fn raw_git(repo: &Repo, args: &[&str], stdin: Option<&str>) -> crate::Result<String> {
     use std::io::Write as _;
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::infra::git_runtime::command()
         .args(args)
         .current_dir(repo.root())
         .stdin(if stdin.is_some() {

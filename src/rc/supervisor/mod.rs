@@ -497,7 +497,7 @@ async fn unpushed_local_head(
     head: &str,
 ) -> Option<String> {
     let remotes = format!("--remotes={}", crate::domain::repo::ORIGIN);
-    let mut rev = tokio::process::Command::new("git");
+    let mut rev = crate::infra::git_runtime::async_command();
     rev.args(crate::domain::meta::GIT_SAFE)
         .args(["-C", repo_dir, "rev-list", "--max-count=1", head, "--not"])
         .arg(&remotes)
@@ -3116,7 +3116,7 @@ impl Session {
         // so HEAD is identical before and after while the branch has moved on.
         let watermark_ref = settlement_watermark_ref(&branch);
         let read_head = |repo_dir: &str| {
-            let mut head = tokio::process::Command::new("git");
+            let mut head = crate::infra::git_runtime::async_command();
             head.args(crate::domain::meta::GIT_SAFE)
                 .args([
                     "-C",

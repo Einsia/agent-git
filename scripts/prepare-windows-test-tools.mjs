@@ -32,8 +32,12 @@ export async function prepareArchive(tool, root, fetchArchive = fetch) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const tools = JSON.parse(await readFile(new URL('./windows-test-tools.json', import.meta.url), 'utf8'));
+  tools.python = JSON.parse(await readFile(new URL('./windows-build-python.json', import.meta.url), 'utf8'));
   const root = resolve(process.argv[2] || '.');
-  await Promise.all(Object.values(tools).map(async (tool) => {
+  const requested = process.argv[3];
+  if (requested && !tools[requested]) throw new Error(`Unknown Windows tool: ${requested}`);
+  const selected = requested ? [tools[requested]] : Object.values(tools);
+  await Promise.all(selected.map(async (tool) => {
     console.log(`Verified ${await prepareArchive(tool, root)}`);
   }));
 }

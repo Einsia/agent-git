@@ -393,6 +393,7 @@ impl Execution {
             .env("LANGUAGE", "C")
             .arg("--no-replace-objects")
             .current_dir(&self.root);
+        crate::infra::git_runtime::configure(&mut command);
         command
     }
 }
@@ -593,6 +594,7 @@ impl Source {
             .arg("-C")
             .arg(&self.root)
             .args(["--git-dir", self.gitdir, "-c", "core.fsmonitor=false"]);
+        crate::infra::git_runtime::configure(&mut command);
         command
     }
 

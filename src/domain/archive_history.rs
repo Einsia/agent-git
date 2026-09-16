@@ -12,7 +12,9 @@ use crate::domain::{meta, repo::Repo, storage};
 use anyhow::{Context, ensure};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 const MAX_CHAIN_EDGES: usize = 256;
 const MAX_OBJECT_BYTES: usize = storage::MAX_EVENT_BYTES;
@@ -1070,7 +1072,7 @@ struct ObjectReader {
 
 impl ObjectReader {
     fn new(repo: &Repo) -> Result<Self> {
-        let mut command = Command::new("git");
+        let mut command = crate::infra::git_runtime::command();
         command
             .arg("--no-replace-objects")
             .arg("-C")

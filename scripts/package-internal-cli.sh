@@ -16,7 +16,10 @@ test -n "$base_version"
 short_sha="${AGIT_BUILD_SHA:0:12}"
 export AGIT_BUILD_VERSION="${base_version}-${AGIT_RELEASE_CHANNEL}+${short_sha}"
 
-cargo build --locked --release --bin agit
+python3 scripts/prepare-git-runtime.py "$AGIT_ARTIFACT_TARGET" .cache/git-runtime/payload.tar.gz
+export AGIT_GIT_RUNTIME_ARCHIVE="$PWD/.cache/git-runtime/payload.tar.gz"
+cargo build --locked --release --features bundled-git --bin agit
+python3 scripts/smoke-git-runtime.py "$AGIT_GIT_RUNTIME_ARCHIVE"
 
 binary="target/release/agit"
 test -x "$binary"

@@ -46,6 +46,14 @@ retain their startup exclusions.
 
 Upgrading the CLI does not migrate or delete `~/.agit/repos`. Run `agit doctor` afterwards to verify runtime integrations.
 
+Prebuilt binaries carry Git and Git LFS inside the executable, so replacing that
+single file upgrades the bundled runtime even through an older self-updater.
+The runtime is extracted into `$AGIT_HOME/git-runtime` (default
+`~/.agit/git-runtime`) on first use and reused by content hash. Different payloads
+keep separate caches so existing processes can finish. Upgrades do not change
+your global Git profile or shell PATH. `AGIT_USE_SYSTEM_GIT=1` selects your system
+Git and Git LFS instead.
+
 After installing the CLI, `upgrade` runs the new executable's
 `setup --skill --installed-only` to refresh existing Skills and remove versioned
 legacy manuals, including `~/AGENTS.md`. This also runs when the CLI is already

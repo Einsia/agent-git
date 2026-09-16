@@ -201,7 +201,7 @@ fn shared_paths(repo: &Repo, tree: &str) -> Result<Vec<String>> {
         ],
         vec!["ls-files", "--others", "--exclude-standard", "-z", "--"],
     ] {
-        let mut command = std::process::Command::new("git");
+        let mut command = crate::infra::git_runtime::command();
         command
             .arg("--no-replace-objects")
             .arg("-C")

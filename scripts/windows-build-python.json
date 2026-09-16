@@ -1,0 +1,7 @@
+{
+  "version": "3.14.7",
+  "archive": "python-3.14.7-embed-amd64.zip",
+  "sha256": "d297e5ff019966817ad8502465176139f2d3d840fa4ed84b13bed399a6ab1f15",
+  "url": "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embed-amd64.zip",
+  "cacheDirectory": ".cache/test-python"
+}

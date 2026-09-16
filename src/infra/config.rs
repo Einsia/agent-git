@@ -334,7 +334,7 @@ pub fn list_global() -> Result<std::collections::BTreeMap<String, String>> {
 /// Returns None instead of erroring: many commands work outside a repo (`agit log`,
 /// `agit clone owner/x`). A command that needs a repo decides for itself.
 pub fn repo_root() -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
+    let out = crate::infra::git_runtime::command()
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .ok()?;
@@ -352,7 +352,7 @@ pub fn repo_root() -> Option<PathBuf> {
 /// in this repo".
 pub fn repo_origin() -> Option<String> {
     let root = repo_root()?;
-    let out = std::process::Command::new("git")
+    let out = crate::infra::git_runtime::command()
         .args(["remote", "get-url", "origin"])
         .current_dir(&root)
         .output()

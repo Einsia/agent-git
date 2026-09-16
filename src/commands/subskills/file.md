@@ -52,8 +52,10 @@ repository's remote first.
 
 ## Large binary deliverables
 
-Use Git LFS for videos and large or frequently revised binary files. Install Git
-LFS from [git-lfs.com](https://git-lfs.com/) and use a version at least 3.7.1.
+Use Git LFS for videos and large or frequently revised binary files. Prebuilt
+AgentGit binaries include Git LFS. Source builds and `AGIT_USE_SYSTEM_GIT=1` use
+the system installation; install Git LFS from [git-lfs.com](https://git-lfs.com/)
+and use a version at least 3.7.1. `agit doctor` reports the selected runtime.
 
 ```bash
 agit file add --lfs /absolute/path/demo.mp4

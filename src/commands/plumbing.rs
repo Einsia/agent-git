@@ -70,7 +70,7 @@ pub fn regular_blob_text_at(repo: &Repo, treeish: &str, path: &str) -> Result<Op
 
 /// A git call with optional stdin.
 pub fn raw_git(repo: &Repo, args: &[&str], stdin: Option<&str>) -> Result<String> {
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .args(args)
         .current_dir(repo.root())
@@ -115,7 +115,7 @@ pub fn tree_with(
     let _ = std::fs::remove_file(&idx);
     let result = (|| -> Result<String> {
         let run = |args: &[&str]| -> Result<String> {
-            let out = std::process::Command::new("git")
+            let out = crate::infra::git_runtime::command()
                 .arg("--no-replace-objects")
                 .args(args)
                 .current_dir(repo.root())
@@ -163,7 +163,7 @@ pub fn tree_apply(
     let _ = std::fs::remove_file(&idx);
     let result = (|| -> Result<String> {
         let run = |args: &[&str]| -> Result<String> {
-            let out = std::process::Command::new("git")
+            let out = crate::infra::git_runtime::command()
                 .arg("--no-replace-objects")
                 .args(args)
                 .current_dir(repo.root())
@@ -1109,7 +1109,7 @@ fn validate_checkout_journal(
         "invalid checkout transaction branch {:?}",
         journal.branch
     );
-    let checked = std::process::Command::new("git")
+    let checked = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -1183,7 +1183,7 @@ fn canonical_commit(repo: &Repo, commit: &str) -> Result<String> {
 }
 
 fn optional_ref_commit(repo: &Repo, refname: &str) -> Result<Option<String>> {
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -2216,7 +2216,7 @@ fn checkout_git_output(repo: &Repo, args: &[&str]) -> Result<std::process::Outpu
 
 fn checkout_git_command(repo: &Repo) -> std::process::Command {
     record_checkout_git_process();
-    let mut command = std::process::Command::new("git");
+    let mut command = crate::infra::git_runtime::command();
     command
         .arg("--no-replace-objects")
         .arg("-C")
@@ -2386,7 +2386,7 @@ fn reject_path_topology_changes(paths: &[String]) -> Result<()> {
 }
 
 fn tree_file(repo: &Repo, commit: &str, path: &str) -> Result<Option<TreeFile>> {
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -2829,7 +2829,7 @@ fn index_matches_tree(index: Option<&IndexFile>, tree: Option<&TreeEntry>) -> bo
 }
 
 fn git_bytes_checked(repo: &Repo, args: &[&str]) -> Result<Vec<u8>> {
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -3393,7 +3393,7 @@ pub fn tree_overlay_worktree(repo: &Repo, base_treeish: &str, paths: &[String]) 
     let _ = std::fs::remove_file(&idx);
     let result = (|| -> Result<String> {
         let run = |args: &[&str]| -> Result<String> {
-            let out = std::process::Command::new("git")
+            let out = crate::infra::git_runtime::command()
                 .arg("--no-replace-objects")
                 .args(args)
                 .current_dir(repo.root())
@@ -3448,7 +3448,7 @@ pub fn commit_tree(repo: &Repo, tree: &str, parents: &[&str], message: &str) -> 
 /// are part of the storage protocol, not ambient repository configuration. Reusing the parent date
 /// preserves relative branch recency instead of making every migrated session appear equally old.
 pub fn storage_migration_commit(repo: &Repo, tree: &str, parent: &str) -> Result<String> {
-    let date_output = std::process::Command::new("git")
+    let date_output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .args([
             "-c",
@@ -3473,7 +3473,7 @@ pub fn storage_migration_commit(repo: &Repo, tree: &str, parent: &str) -> Result
         !parent_date.is_empty() && !parent_date.contains(['\n', '\r']),
         "git returned an invalid migration parent date"
     );
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .args([
             "-c",
@@ -3540,7 +3540,7 @@ pub fn import_commit_graph(target: &Repo, source: &Repo, commit: &str) -> Result
     // graph.  Feed it straight to `index-pack --stdin`, which installs the objects but updates no
     // refs.  Disable replace-object resolution on both sides: the imported parent must be the real
     // graph that the source ref names, not a local replacement that would disappear later.
-    let mut pack = std::process::Command::new("git")
+    let mut pack = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(source.root())
@@ -3553,7 +3553,7 @@ pub fn import_commit_graph(target: &Repo, source: &Repo, commit: &str) -> Result
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("git pack-objects has no stdout"))?;
-    let mut index = match std::process::Command::new("git")
+    let mut index = match crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(target.root())
@@ -3616,7 +3616,7 @@ pub fn import_commit_graph(target: &Repo, source: &Repo, commit: &str) -> Result
 }
 
 fn verify_commit_connectivity(repo: &Repo, commit: &str) -> Result<()> {
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())
@@ -3764,7 +3764,7 @@ fn update_branch_cas_with_scope(
 }
 
 fn checked_out_branch(repo: &Repo) -> Result<Option<String>> {
-    let output = std::process::Command::new("git")
+    let output = crate::infra::git_runtime::command()
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo.root())

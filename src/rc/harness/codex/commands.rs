@@ -130,7 +130,7 @@ impl CodexDriver {
             return Ok(json!({"text":format!("{}: {}. Applies to the next message.",name,value)}));
         }
         if name == "diff" {
-            let mut command = std::process::Command::new("git");
+            let mut command = crate::infra::git_runtime::command();
             command
                 .args(["diff", "HEAD", "--no-ext-diff", "--no-textconv", "--"])
                 .current_dir(&self.cwd);

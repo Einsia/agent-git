@@ -83,6 +83,19 @@ The Windows build prerequisites follow the [AWS LC Windows build requirements](h
 The archive **root** holds `agit.exe` on Windows and `agit` on other platforms,
 with no wrapping directory. Run the executable directly after extraction.
 
+Distribution builds enable `bundled-git` and embed a compressed private Git/LFS
+runtime in that executable. The one-file archive contract also covers older
+installers and self-updaters that copy only `agit` or `agit.exe`. Runtime assembly
+requires Python 3.9 or newer and checksum-verified upstream downloads pinned in
+`scripts/git-runtime-lock.json`. `scripts/prepare-git-runtime.py` writes the payload
+and target marker used by `build.rs`; the build refuses a mismatched target.
+
+Linux payloads include their musl loader and dependency libraries; the outer CLI
+remains static. macOS payloads use dugite-native Git, and Windows payloads use
+MinGit. Every payload includes Git LFS, a dependency manifest, license texts, and
+source references. See [the runtime guide](../docs/bundled-git.md) for the build
+recipe, validation, and compatibility boundaries.
+
 (The archive carries no `agit-hub`: the server side is a separate repository and
 does not ship with the client.)
 

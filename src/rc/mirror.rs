@@ -267,7 +267,7 @@ pub fn git_origin(dir: &Path) -> Option<String> {
     }
     // This runs git inside a directory the agent can write to — `.git/config` is an execution
     // channel; see `meta::GIT_SAFE`.
-    let out = std::process::Command::new("git")
+    let out = crate::infra::git_runtime::command()
         .args(crate::domain::meta::GIT_SAFE)
         .arg("-C")
         .arg(dir)

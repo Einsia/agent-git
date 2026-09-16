@@ -101,9 +101,8 @@ jobs:
       # only the x86_64 one. zig carries musl headers and libc for every
       # architecture, so one recipe covers both targets.
       - uses: actions/setup-python@v5
-        if: contains(matrix.target, 'linux-musl')
         with:
-          python-version: '3.x'
+          python-version: '3.12'
       - name: Install zig + cargo-zigbuild (linux musl)
         if: contains(matrix.target, 'linux-musl')
         # zig comes from pip: cargo-zigbuild takes `python -m ziglang`, so no
@@ -117,6 +116,19 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - uses: actions/cache@v4
+        with:
+          path: .cache/git-runtime
+          key: git-runtime-v1-${{ matrix.target }}-${{ hashFiles('scripts/git-runtime-lock.json', 'scripts/prepare-git-runtime.py') }}
+
+      - name: Prepare bundled Git and Git LFS
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python scripts/prepare-git-runtime.py "$TARGET" .cache/git-runtime/payload.tar.gz
+          python -c 'import os,pathlib; p=pathlib.Path(".cache/git-runtime/payload.tar.gz").resolve(); open(os.environ["GITHUB_ENV"], "a").write("AGIT_GIT_RUNTIME_ARCHIVE=" + str(p) + "\n")'
+
       - name: Build agit (release)
         shell: bash
         env:
@@ -124,8 +136,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$TARGET" in
-            *linux-musl) cargo zigbuild --locked --release --target "$TARGET" --bin agit ;;
-            *)           cargo build    --locked --release --target "$TARGET" --bin agit ;;
+            *linux-musl) cargo zigbuild --locked --release --features bundled-git --target "$TARGET" --bin agit ;;
+            *)           cargo build    --locked --release --features bundled-git --target "$TARGET" --bin agit ;;
           esac
 
       # The binary must be the architecture it claims, and the two linux ones must
@@ -172,7 +184,7 @@ jobs:
         run: |
           cargo check --locked --release --no-default-features --target ${{ matrix.target }} --lib
           if ($LASTEXITCODE -ne 0) { throw "Windows library without RC failed to compile" }
-          cargo test --locked --release --target ${{ matrix.target }} --test windows_rc -- --nocapture
+          cargo test --locked --release --features bundled-git --target ${{ matrix.target }} --test windows_rc -- --nocapture
           if ($LASTEXITCODE -ne 0) { throw "Windows native RC integration tests failed" }
           node scripts/verify-windows-cli.mjs "target/${{ matrix.target }}/release/agit.exe"
           if ($LASTEXITCODE -ne 0) { throw "Windows executable verification failed" }
@@ -200,8 +212,26 @@ jobs:
           esac
           for img in alpine:3 amazonlinux:2 debian:11 ubuntu:24.04; do
             echo "── $img ($PLAT)"
-            docker run --rm --platform "$PLAT" -v "$BIN:/agit:ro" "$img" /agit --version
+            docker run --rm --platform "$PLAT" -v "$BIN:/agit:ro" "$img" /bin/sh -c '
+              /agit --version &&
+              { /agit --json doctor > /tmp/doctor.json || true; } &&
+              cat /tmp/doctor.json &&
+              grep -q "git version" /tmp/doctor.json &&
+              grep -q "git-lfs/" /tmp/doctor.json
+            '
+
           done
+
+      - name: Verify native bundled CLI
+        if: matrix.target == 'aarch64-apple-darwin' || runner.os == 'Windows' || matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          case "$TARGET" in
+            *linux-musl) cargo-zigbuild test --locked --release --features bundled-git --target "$TARGET" --test bundled_git ;;
+            *) cargo test --locked --release --features bundled-git --target "$TARGET" --test bundled_git ;;
+          esac
 
       - name: Package
         shell: bash

@@ -31,6 +31,20 @@ fn main() {
     }
 
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Err(error) = agit::infra::git_runtime::initialize() {
+        let code = agit::ExitCode::Precondition.as_i32();
+        if raw_args.iter().any(|arg| arg == "--json") {
+            exit(commands::json::emit_rejection_version(
+                &commands::json::command_from_argv(&raw_args),
+                commands::json::Version::from_argv(&raw_args),
+                code,
+                &format!("{error:#}"),
+                Vec::new(),
+            ));
+        }
+        eprintln!("{error:#}");
+        exit(code);
+    }
     let telemetry_restart = std::env::var(agit::telemetry::RESTART_ENV).ok();
     // Consume invocation state before helpers or the requested command can inherit it.
     unsafe { std::env::remove_var(agit::telemetry::RESTART_ENV) };

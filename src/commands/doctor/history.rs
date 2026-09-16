@@ -100,7 +100,7 @@ impl Default for Limits {
 }
 
 fn command(root: &Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::infra::git_runtime::command();
     command
         .arg("--no-replace-objects")
         .arg("-C")

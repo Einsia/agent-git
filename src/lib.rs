@@ -162,6 +162,7 @@ pub mod infra {
     pub mod config;
     /// Credential storage: where the token is kept, and how expiry is decided.
     pub mod credentials;
+    pub mod git_runtime;
     /// Canonical host-and-port binding shared by API and RC credentials.
     pub mod hub_authority;
     #[cfg(feature = "cli")]
