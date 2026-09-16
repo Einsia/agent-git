@@ -147,7 +147,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
- "tower-service",
  "url",
  "windows-sys 0.61.2",
 ]

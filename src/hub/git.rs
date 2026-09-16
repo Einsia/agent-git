@@ -1820,6 +1820,7 @@ mod git_credential_lifecycle_tests {
                 "AGIT_EXPECTED_AGENT_ID",
                 "AGIT_QUIET",
                 "GIT_CONFIG",
+                "GIT_CONFIG_COUNT",
                 "GIT_CONFIG_PARAMETERS",
                 "GIT_DIR",
                 "GIT_COMMON_DIR",
@@ -1843,7 +1844,6 @@ mod git_credential_lifecycle_tests {
             .collect();
             settings.extend([
                 ("AGIT_HOME".into(), Some(home.path().as_os_str().into())),
-                ("GIT_CONFIG_COUNT".into(), Some("0".into())),
                 ("GIT_CONFIG_NOSYSTEM".into(), Some("1".into())),
                 (
                     "GIT_CONFIG_GLOBAL".into(),

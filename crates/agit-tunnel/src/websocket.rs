@@ -2,14 +2,12 @@
 
 use anyhow::{Context, bail};
 use http::Uri;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::proxy::matcher::Matcher;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tower_service::Service;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONNECT_HEADERS: usize = 8192;
@@ -105,29 +103,21 @@ async fn connect_with(
 
     // One deadline covers DNS, TCP, CONNECT, TLS and WebSocket negotiation.
     tokio::time::timeout(timeout, async {
-        let mut connector = HttpConnector::new();
-        connector.enforce_http(false);
-        connector.set_connect_timeout(Some(timeout));
-        connector.set_nodelay(true);
         let stream = match proxy {
             Some(proxy) => {
                 // Only proxy credentials belong on CONNECT. For WSS, the RC
                 // bearer token stays inside the hub's TLS tunnel.
-                let mut stream = connector
-                    .call(proxy.uri().clone())
+                let mut stream = super::tcp::connect(proxy.uri())
                     .await
-                    .context("proxy TCP connection failed")?
-                    .into_inner();
+                    .context("proxy TCP connection failed")?;
                 establish_tunnel(&mut stream, &destination, proxy.basic_auth())
                     .await
                     .context("proxy CONNECT failed")?;
                 stream
             }
-            None => connector
-                .call(destination)
+            None => super::tcp::connect(&destination)
                 .await
-                .context("TCP connection failed")?
-                .into_inner(),
+                .context("TCP connection failed")?,
         };
         // Keep the original hub URI for SNI, certificate validation and Host.
         let (socket, _) = tokio_tungstenite::client_async_tls_with_config(

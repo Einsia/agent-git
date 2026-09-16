@@ -3,6 +3,8 @@
 mod process;
 pub mod protocol;
 #[cfg(feature = "worker")]
+mod tcp;
+#[cfg(feature = "worker")]
 mod websocket;
 #[cfg(windows)]
 pub mod windows_job;

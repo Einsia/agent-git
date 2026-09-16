@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-worker = ["dep:tokio-tungstenite", "dep:http", "dep:hyper-util", "dep:httparse", "dep:tower-service"]
+worker = ["dep:tokio-tungstenite", "dep:http", "dep:hyper-util", "dep:httparse"]
 test-support = ["worker"]
 
 [[bin]]
@@ -22,9 +22,8 @@ futures-util = { version = "0.3", features = ["sink"] }
 url = "2"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
 http = { version = "1", optional = true }
-hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "tokio"], optional = true }
+hyper-util = { version = "0.1", features = ["client-proxy"], optional = true }
 httparse = { version = "1", optional = true }
-tower-service = { version = "0.3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
