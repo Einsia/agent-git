@@ -222,14 +222,14 @@ fn form_loop(
             KeyCode::Char('e') if form.field == Field::Name => form.editing = true,
             KeyCode::Char(' ') => match form.field {
                 Field::Bind => form.bind = !form.bind,
-                Field::Seed => form.seed = !form.seed,
+                Field::Seed => toggle_file_import(form, asset_count),
                 Field::AutoPush => form.auto_push = cycle_auto_push(form.auto_push),
                 _ => {}
             },
             KeyCode::Enter => match form.field {
                 Field::Name => form.editing = true,
                 Field::Bind => form.bind = !form.bind,
-                Field::Seed => form.seed = !form.seed,
+                Field::Seed => toggle_file_import(form, asset_count),
                 Field::AutoPush => form.auto_push = cycle_auto_push(form.auto_push),
                 Field::Create => match validate_name(&form.name) {
                     Ok(()) => return Ok(FormOutcome::Submit),
@@ -241,6 +241,18 @@ fn form_loop(
             },
             _ => {}
         }
+    }
+}
+
+fn toggle_file_import(form: &mut Form, asset_count: usize) {
+    if asset_count == 0 {
+        form.seed = false;
+        form.notice = Some(
+            "No instructions or skills were found in this folder. See Details for supported locations."
+                .into(),
+        );
+    } else {
+        form.seed = !form.seed;
     }
 }
 
@@ -335,36 +347,51 @@ fn draw_form(
     } else {
         format!("{}{}", form.name, if form.editing { "_" } else { "" })
     };
+    let folder_choice = if form.bind {
+        crate::ui::tilde(cwd)
+    } else {
+        "do not link".to_string()
+    };
+    let import_choice = if asset_count == 0 {
+        "no supported files found".to_string()
+    } else if form.seed {
+        format!("review {asset_count} instructions/skills")
+    } else {
+        format!("skip {asset_count} instructions/skills")
+    };
     let items = vec![
-        ListItem::new(format!("name    {name}")),
+        ListItem::new(Line::styled(
+            "Review these choices before creating the repo.",
+            theme::muted(),
+        )),
+        ListItem::new(format!("repo name        {name}")),
         ListItem::new(format!(
-            "bind    {}  {}",
+            "link folder      {}  {folder_choice}",
             checkbox(form.bind),
-            crate::ui::tilde(cwd)
         )),
         ListItem::new(format!(
-            "seed    {}  inspect {asset_count} adoptable assets",
-            checkbox(form.seed)
+            "import files     {}  {import_choice}",
+            checkbox(form.seed && asset_count > 0)
         )),
         ListItem::new(format!(
-            "push    {}",
+            "auto push        {}",
             match form.auto_push {
-                Some(true) => "[x] automatically push settled turns",
-                Some(false) => "[ ] keep settled turns local",
-                None if form.user_auto_push => "[-] inherit user preference: on",
-                None => "[-] inherit user preference: off",
+                Some(true) => "on  [x] push settled turns",
+                Some(false) => "off [ ] keep turns local",
+                None if form.user_auto_push => "on  [-] user preference",
+                None => "off [-] user preference",
             }
         )),
         ListItem::new(
             if owner == "local" && form.auto_push.unwrap_or(form.user_auto_push) {
-                "create  sign in, then create"
+                "create repo      sign in, then create"
             } else {
-                "create  continue"
+                "create repo      continue"
             },
         ),
     ];
     let mut state = ListState::default();
-    state.select(Some(form.field.index()));
+    state.select(Some(form.field.index() + 1));
     frame.render_stateful_widget(
         List::new(items)
             .block(widgets::pane("new agent repo"))
@@ -379,9 +406,9 @@ fn draw_form(
             detail.push_str(notice);
             detail.push_str("\n\n");
         }
-        detail.push_str(&format!("owner  {owner}\n"));
+        detail.push_str(&format!("owner       {owner}\n"));
         detail.push_str(&format!(
-            "repo   {owner}/{}\n",
+            "agent repo  {owner}/{}\n",
             if form.name.trim().is_empty() {
                 "<name>"
             } else {
@@ -389,27 +416,27 @@ fn draw_form(
             }
         ));
         detail.push_str(&format!(
-            "bind   {}\n",
+            "folder link {}\n",
             if form.bind {
                 crate::ui::tilde(cwd)
             } else {
-                "do not bind this directory".to_string()
+                "disabled".to_string()
             }
         ));
         detail.push_str(&format!(
-            "seed   {}\n\n",
-            if form.seed {
-                "review each asset next"
+            "file import {}\n\n",
+            if asset_count == 0 {
+                "no supported files found".to_string()
+            } else if form.seed {
+                format!("review {asset_count} files next")
             } else {
-                "do not inspect project assets"
+                format!("skip {asset_count} found files")
             }
         ));
-        detail.push_str(
-            "The directory name is a suggestion only; typing the repo name makes the choice explicit.\n\nSeed choices begin empty because project instructions and skills may contain private memory.",
-        );
+        detail.push_str(&field_detail(form, asset_count));
         frame.render_widget(
             Paragraph::new(detail)
-                .block(widgets::pane("summary"))
+                .block(widgets::pane("details"))
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -425,6 +452,19 @@ fn draw_form(
     );
 }
 
+fn field_detail(form: &Form, asset_count: usize) -> String {
+    match form.field {
+        Field::Name => "Creates an Agent repo for conversation history and shared instructions. This does not create or rename the project's code repo. The folder name is only a suggestion; type the repo name you want.".into(),
+        Field::Bind if form.bind => "Links this folder to the Agent repo as the destination for new sessions. Existing sessions still need an explicit target. Files in the folder are not changed.".into(),
+        Field::Bind => "Does not link this folder. You will need to name the Agent repo explicitly in later agit commands.".into(),
+        Field::Seed if asset_count == 0 => "No importable files were found here. agit checks AGENTS.md, CLAUDE.md, and .claude/skills/<name>/SKILL.md inside this folder.".into(),
+        Field::Seed if form.seed => "After Create, review the found instructions and skills one by one. Only the files you select will be copied into the Agent repo.".into(),
+        Field::Seed => "Enable this to review instructions and skills from this folder before copying selected files into the Agent repo.".into(),
+        Field::AutoPush => "Choose whether settled turns are pushed automatically or kept local. Inherit uses your user preference. Automatic push requires signing in and still checks content before publishing.".into(),
+        Field::Create => "Creates the Agent repo and its main line of shared instructions and skills using the choices above. This does not start an agent session.".into(),
+    }
+}
+
 fn draw_assets(
     frame: &mut Frame,
     assets: &[(PathBuf, PathBuf)],
@@ -436,7 +476,7 @@ fn draw_assets(
         frame,
         panes.status,
         &widgets::Status {
-            title: "agit init · seed".into(),
+            title: "agit init · import files".into(),
             identity: crate::infra::credentials::current_user()
                 .map(|user| format!("{user} @ {}", crate::infra::config::hub_url())),
             rc_online: None,
@@ -457,7 +497,9 @@ fn draw_assets(
         .collect();
     frame.render_stateful_widget(
         List::new(items)
-            .block(widgets::pane("assets · none selected by default"))
+            .block(widgets::pane(
+                "instructions and skills · none selected by default",
+            ))
             .highlight_style(theme::selected())
             .highlight_symbol("▸ "),
         panes.list,
@@ -466,7 +508,7 @@ fn draw_assets(
     widgets::render_footer(
         frame,
         panes.footer,
-        "↑↓ asset   space toggle   a all/none   enter confirm   esc back   q quit",
+        "↑↓ file   space toggle   a all/none   enter confirm   esc back   q quit",
     );
 }
 
@@ -501,15 +543,16 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_shows_the_explicit_name_bind_and_seed_decisions() {
+    fn the_frame_explains_the_repo_folder_link_and_file_import_choices() {
         use ratatui::backend::TestBackend;
         let cwd = Path::new("/Projects/agent-git");
         let form = Form {
             name: "work-memory".into(),
             seed: true,
+            field: Field::Seed,
             ..Default::default()
         };
-        let mut terminal = Terminal::new(TestBackend::new(110, 14)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(160, 16)).unwrap();
         terminal
             .draw(|frame| draw_form(frame, &form, "agent-git", "nana", cwd, 3))
             .unwrap();
@@ -524,10 +567,14 @@ mod tests {
             .join("\n");
         for expected in [
             "agit init",
+            "Review these choices before creating the repo.",
             "work-memory",
             "nana/work-memory",
             "/Projects/agent-git",
-            "inspect 3 adoptable asset",
+            "link folder",
+            "import files",
+            "review 3 instructions/skills",
+            "After Create, review the found instructions and skills one by one.",
         ] {
             assert!(
                 text.contains(expected),
@@ -543,6 +590,7 @@ mod tests {
         let form = Form {
             name: "work-memory".into(),
             bind: false,
+            field: Field::Bind,
             ..Default::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(110, 14)).unwrap();
@@ -559,8 +607,79 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("bind   do not bind this directory"),
-            "the summary must match the no-bind execution path: {text}"
+            text.contains("folder link disabled"),
+            "the details must match the unlinked execution path: {text}"
         );
+        assert!(text.contains("Does not link this folder."));
+    }
+
+    #[test]
+    fn inherited_push_values_remain_visible_in_a_standard_terminal() {
+        use ratatui::backend::TestBackend;
+        for enabled in [false, true] {
+            let form = Form {
+                name: "work-memory".into(),
+                field: Field::AutoPush,
+                user_auto_push: enabled,
+                ..Default::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(120, 16)).unwrap();
+            terminal
+                .draw(|frame| draw_form(frame, &form, "project", "nana", Path::new("/project"), 0))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            let value = if enabled { "on " } else { "off" };
+            assert!(
+                text.contains(&format!("auto push        {value} [-]")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_import_cannot_be_enabled_when_nothing_is_found() {
+        let mut form = Form {
+            seed: true,
+            field: Field::Seed,
+            ..Default::default()
+        };
+
+        toggle_file_import(&mut form, 0);
+
+        assert!(!form.seed);
+        assert_eq!(
+            form.notice.as_deref(),
+            Some(
+                "No instructions or skills were found in this folder. See Details for supported locations."
+            )
+        );
+        assert!(field_detail(&form, 0).contains(".claude/skills/<name>/SKILL.md"));
+    }
+
+    #[test]
+    fn the_review_screen_names_the_files_explicitly() {
+        use ratatui::backend::TestBackend;
+        let assets = [(PathBuf::from("AGENTS.md"), PathBuf::from("/p/AGENTS.md"))];
+        let selected = [false];
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+
+        terminal
+            .draw(|frame| draw_assets(frame, &assets, &selected, &mut state))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let text = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("agit init · import files"));
+        assert!(text.contains("instructions and skills · none selected by default"));
     }
 }
