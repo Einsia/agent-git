@@ -211,7 +211,7 @@ impl Client {
         self.validate_grant(&dialed.connection.grant)?;
         ensure!(
             same_device(&dialed.connection.grant.source, source)
-                && same_device(&dialed.connection.grant.target, target),
+                && same_endpoint(&dialed.connection.grant.target, target),
             "cloud connection identity changed; refresh device enrollment"
         );
         Ok(dialed)
@@ -309,12 +309,15 @@ impl Client {
     }
 }
 
-fn same_device(left: &Device, right: &Device) -> bool {
+fn same_endpoint(left: &Device, right: &Device) -> bool {
     left.id == right.id
         && left.owner == right.owner
         && left.machine_id == right.machine_id
-        && left.credential_epoch == right.credential_epoch
         && left.certificate == right.certificate
+}
+
+fn same_device(left: &Device, right: &Device) -> bool {
+    same_endpoint(left, right) && left.credential_epoch == right.credential_epoch
 }
 
 async fn text(sink: &mut PacketSink, source: &mut PacketSource) -> anyhow::Result<String> {

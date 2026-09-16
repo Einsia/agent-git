@@ -7,7 +7,7 @@ use agit_peer::{
     cloud::{Device, DeviceCredential, Secret},
     transport::{Role, authenticate},
 };
-use anyhow::{Context, ensure};
+use anyhow::ensure;
 use std::sync::Arc;
 
 pub struct Credentials {
@@ -48,37 +48,13 @@ impl Connector for Route {
     }
     fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a> {
         Box::pin(async move {
-            let mut after = None;
-            let mut target = None;
-            for _ in 0..64 {
-                let page = self
-                    .api
-                    .devices(&self.credentials.account, after.as_deref())
-                    .await?;
-                target = page
-                    .devices
-                    .into_iter()
-                    .map(|row| row.device)
-                    .find(|device| device.id == self.target.id);
-                if target.is_some() || page.next_cursor.is_none() {
-                    break;
-                }
-                after = page.next_cursor;
-            }
-            let target = target.context("cloud target is no longer available")?;
-            ensure!(
-                target.owner == self.target.owner
-                    && target.machine_id == self.target.machine_id
-                    && target.certificate == self.target.certificate,
-                "cloud target identity changed; approve the new identity before reconnecting"
-            );
             dial(
                 &self.api,
                 worker,
                 &self.credentials.account,
                 &self.credentials.device,
                 &self.credentials.identity,
-                &target,
+                &self.target,
             )
             .await
         })
