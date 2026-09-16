@@ -3,7 +3,7 @@
 use crate::{Authority, Connector, Opening, Worker};
 use agit_peer::{
     Identity,
-    client::{Client, join_data},
+    client::{Client, join_data, verified_transport},
     cloud::{Device, DeviceCredential, Secret},
     transport::{Role, authenticate},
 };
@@ -69,8 +69,11 @@ pub async fn dial(
     identity: &Identity,
     target: &Device,
 ) -> anyhow::Result<agit_tunnel::Connection> {
-    let dialed = api.connect(account, &source.device, target).await?;
-    let raw = worker.open(api.data_config(source)?).await?;
+    let config = api.data_config(source)?;
+    let (dialed, raw, _) = verified_transport(api.connect(account, &source.device, target), || {
+        worker.open(config.clone())
+    })
+    .await?;
     let raw = join_data(raw, &dialed.link_id, dialed.ticket).await?;
     authenticate(
         raw,

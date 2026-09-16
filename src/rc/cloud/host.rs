@@ -3,7 +3,7 @@
 use super::store;
 use agit_controller::{Authority, Connector, Opening, Worker};
 use agit_peer::{
-    client::{Client, Presence, join_data},
+    client::{Client, Presence, join_data, verified_transport},
     cloud::{ConnectionGrant, Device, DeviceCredential, PresenceEvent, Secret},
     transport::{Role, authenticate},
 };
@@ -88,29 +88,6 @@ impl Service {
 fn record(log: &Option<super::super::diagnostics::Log>, event: &str, metadata: serde_json::Value) {
     if let Some(log) = log {
         log.record(event, metadata);
-    }
-}
-
-async fn verified_transport<G, T, V, O, F>(
-    verification: V,
-    mut open: O,
-) -> anyhow::Result<(G, T, bool)>
-where
-    V: std::future::Future<Output = anyhow::Result<G>>,
-    O: FnMut() -> F,
-    F: std::future::Future<Output = anyhow::Result<T>>,
-{
-    // A speculative socket must retain headroom for the relay's first-frame deadline.
-    let opening = async {
-        let transport = open().await?;
-        Ok::<_, anyhow::Error>((transport, tokio::time::Instant::now()))
-    };
-    let (grant, (transport, started)) = tokio::try_join!(verification, opening)?;
-    if started.elapsed() >= Duration::from_secs(5) {
-        drop(transport);
-        Ok((grant, open().await?, true))
-    } else {
-        Ok((grant, transport, false))
     }
 }
 
@@ -259,93 +236,5 @@ impl Connector for Route {
                 }
             }
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    struct SocketOwner(Arc<AtomicUsize>);
-    impl Drop for SocketOwner {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn admission_preserves_join_deadline_and_drops_unaccepted_transports() {
-        for (delay, opening_delay, reject, expected_opens) in [
-            (1, 0, false, 1),
-            (12, 0, false, 2),
-            (1, 8, false, 1),
-            (12, 0, true, 1),
-        ] {
-            let granted = Arc::new(AtomicBool::new(false));
-            let opened = AtomicUsize::new(0);
-            let dropped = Arc::new(AtomicUsize::new(0));
-            let verification = async {
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-                ensure!(!reject, "grant rejected");
-                granted.store(true, Ordering::SeqCst);
-                Ok(())
-            };
-            let open = || {
-                opened.fetch_add(1, Ordering::SeqCst);
-                let granted = granted.clone();
-                let owner = SocketOwner(dropped.clone());
-                async move {
-                    tokio::time::sleep(Duration::from_secs(opening_delay)).await;
-                    let connected = tokio::time::Instant::now();
-                    let (tx, rx) = mpsc::channel(1);
-                    let sink = futures_util::sink::unfold(
-                        (connected, owner, tx, granted),
-                        |(connected, owner, tx, granted), packet| async move {
-                            ensure!(
-                                granted.load(Ordering::SeqCst),
-                                "join before grant verification"
-                            );
-                            ensure!(
-                                connected.elapsed() < Duration::from_secs(10),
-                                "relay first-frame deadline expired"
-                            );
-                            let agit_tunnel::Packet::Text(value) = packet else {
-                                anyhow::bail!("expected relay join");
-                            };
-                            let _: agit_peer::cloud::DataJoin = serde_json::from_str(&value)?;
-                            tx.send(Ok(agit_tunnel::Packet::Text(serde_json::to_string(
-                                &agit_peer::cloud::DataReady {
-                                    link_id: "test-link".into(),
-                                },
-                            )?)))
-                            .await?;
-                            Ok::<_, anyhow::Error>((connected, owner, tx, granted))
-                        },
-                    );
-                    let source = futures_util::stream::unfold(rx, |mut rx| async {
-                        rx.recv().await.map(|packet| (packet, rx))
-                    });
-                    Ok(agit_tunnel::Connection::from_parts(
-                        0,
-                        Box::pin(sink),
-                        Box::pin(source),
-                    ))
-                }
-            };
-            let admitted = verified_transport(verification, open).await;
-            if reject {
-                assert!(admitted.is_err());
-            } else {
-                let ((), connection, reopened) = admitted.unwrap();
-                assert_eq!(reopened, delay == 12);
-                let paired = join_data(connection, "test-link", Secret::new("ticket".into()))
-                    .await
-                    .unwrap();
-                drop(paired);
-            }
-            assert_eq!(opened.load(Ordering::SeqCst), expected_opens);
-            assert_eq!(dropped.load(Ordering::SeqCst), expected_opens);
-        }
     }
 }

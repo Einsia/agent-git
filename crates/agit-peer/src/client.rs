@@ -1,5 +1,8 @@
 //! Cloud admission and rendezvous are independent of local session execution.
 
+mod admission;
+pub use admission::verified_transport;
+
 use crate::cloud::*;
 use agit_tunnel::{Config, Connection, Packet, PacketSink, PacketSource};
 use anyhow::{Context, ensure};
