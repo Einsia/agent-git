@@ -17,10 +17,18 @@
 //! blank and unparseable lines still consume a number, so the coordinate can be
 //! used to seek back into the file.
 
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+pub(crate) fn record_source(path: &Path, offset: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let carrier = path.file_name().unwrap_or_default().to_string_lossy();
+    format!("native:{:x}:{offset}", Sha256::digest(carrier.as_bytes()))
+}
+
 pub struct Tailer {
+    reset: bool,
+    modified: Option<std::time::SystemTime>,
     path: PathBuf,
     /// Coordinates and buffered fragments belong to the open source, not its pathname.
     source: Option<same_file::Handle>,
@@ -40,6 +48,7 @@ pub struct Tailer {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TailedLine {
+    pub source: Option<String>,
     pub lineno: u64,
     pub text: String,
 }
@@ -66,6 +75,10 @@ impl Tailer {
                 .unwrap_or_default()
         };
         Tailer {
+            reset: false,
+            modified: source
+                .as_ref()
+                .and_then(|source| source.as_file().metadata().ok()?.modified().ok()),
             path,
             #[cfg(unix)]
             source_identity: source.as_ref().and_then(|handle| {
@@ -106,6 +119,10 @@ impl Tailer {
             (0, 0)
         };
         Tailer {
+            reset: false,
+            modified: source
+                .as_ref()
+                .and_then(|source| source.as_file().metadata().ok()?.modified().ok()),
             path: path.into(),
             #[cfg(unix)]
             source_identity: source.as_ref().and_then(|handle| {
@@ -138,6 +155,14 @@ impl Tailer {
     /// them again double-counts.
     pub fn consumed(&self) -> u64 {
         self.offset
+    }
+
+    pub(crate) fn take_reset(&mut self) -> bool {
+        std::mem::take(&mut self.reset)
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     pub fn path(&self) -> &Path {
@@ -182,7 +207,9 @@ impl Tailer {
         #[cfg(unix)]
         if let Some(identity) = self.source_identity
             && std::fs::metadata(&self.path).is_ok_and(|metadata| {
-                metadata.len() == self.offset && file_identity(&metadata) == identity
+                metadata.len() == self.offset
+                    && file_identity(&metadata) == identity
+                    && metadata.modified().ok() == self.modified
             })
         {
             return Ok(vec![]);
@@ -192,8 +219,16 @@ impl Tailer {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
             Err(error) => return Err(error),
         };
-        let mut source = same_file::Handle::from_file(file)?;
+        let source = same_file::Handle::from_file(file)?;
         let metadata = source.as_file().metadata()?;
+        self.poll_source(source, metadata)
+    }
+
+    fn poll_source(
+        &mut self,
+        mut source: same_file::Handle,
+        metadata: std::fs::Metadata,
+    ) -> std::io::Result<Vec<TailedLine>> {
         let len = metadata.len();
         #[cfg(unix)]
         {
@@ -203,9 +238,12 @@ impl Tailer {
             .source
             .as_ref()
             .is_some_and(|previous| previous != &source);
-        if replaced || len < self.offset || self.source.is_none() {
+        let rewritten = len == self.offset && metadata.modified().ok() != self.modified;
+        self.modified = metadata.modified().ok();
+        if replaced || rewritten || len < self.offset || self.source.is_none() {
+            self.reset = true;
             let (offset, line) = self.replay_window.map_or((0, 0), |want| {
-                let (offset, line, _, _) = window_start(source.as_file_mut(), want);
+                let (offset, line, _, _) = window_start_bounded(source.as_file_mut(), want, len);
                 (offset, line)
             });
             self.offset = offset;
@@ -219,7 +257,8 @@ impl Tailer {
         }
         let f = source.as_file_mut();
         f.seek(SeekFrom::Start(self.offset))?;
-        let mut reader = BufReader::new(f);
+        // Bytes appended after the metadata sample belong to the next poll, including its mtime.
+        let mut reader = BufReader::new(f.take(len - self.offset));
         let mut out = vec![];
         loop {
             let mut buf = String::new();
@@ -227,11 +266,13 @@ impl Tailer {
             if n == 0 {
                 break;
             }
+            let start = self.offset.saturating_sub(self.pending.len() as u64);
             self.offset += n as u64;
             if buf.ends_with('\n') {
                 let mut line = std::mem::take(&mut self.pending);
                 line.push_str(buf.trim_end_matches(['\n', '\r']));
                 out.push(TailedLine {
+                    source: Some(record_source(&self.path, start)),
                     lineno: self.lineno,
                     text: line,
                 });
@@ -251,19 +292,22 @@ impl Tailer {
 
 /// Select a bounded replay window on the same open file the tailer will consume.
 pub(super) fn window_start(f: &mut std::fs::File, want: u64) -> (u64, u64, u64, bool) {
+    let len = f.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    window_start_bounded(f, want, len)
+}
+
+fn window_start_bounded(f: &mut std::fs::File, want: u64, len: u64) -> (u64, u64, u64, bool) {
     let want = want.max(1) as usize;
 
     // A bounded scan prevents large transcripts from monopolizing the daemon.
     const SCAN_CAP: u64 = 32 * 1024 * 1024;
     let mut base_off: u64 = 0;
-    if let Ok(meta) = f.metadata()
-        && meta.len() > SCAN_CAP
-    {
-        base_off = meta.len() - SCAN_CAP;
+    if len > SCAN_CAP {
+        base_off = len - SCAN_CAP;
         if f.seek(SeekFrom::Start(base_off)).is_ok() {
             // Align to the next newline; never start in the middle of a line.
             let mut skip = Vec::with_capacity(8192);
-            let mut r = BufReader::new(&mut *f);
+            let mut r = BufReader::new((&mut *f).take(len - base_off));
             if let Ok(n) = r.read_until(b'\n', &mut skip) {
                 base_off += n as u64;
             }
@@ -273,7 +317,7 @@ pub(super) fn window_start(f: &mut std::fs::File, want: u64) -> (u64, u64, u64, 
         }
     }
     let mut starts: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
-    let mut reader = BufReader::new(f);
+    let mut reader = BufReader::new(f.take(len - base_off));
     let mut offset: u64 = base_off;
     let mut lineno: u64 = 0;
     let mut buf = Vec::with_capacity(8192);
@@ -325,6 +369,77 @@ fn count_to_end(file: &mut std::fs::File) -> std::io::Result<(u64, u64)> {
 mod tests {
 
     #[test]
+    fn appends_after_sampling_wait_for_the_next_poll_without_resetting_history() {
+        for replacement in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.jsonl");
+            std::fs::write(&path, "old\n").unwrap();
+            let mut tailer = Tailer::new(&path, false);
+            tailer.replay_window = Some(2);
+            if replacement {
+                let next = dir.path().join("replacement.jsonl");
+                std::fs::write(&next, "first\npart").unwrap();
+                std::fs::rename(next, &path).unwrap();
+            } else {
+                let mut writer = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                write!(writer, "first\npart").unwrap();
+            }
+            let source = same_file::Handle::from_path(&path).unwrap();
+            let metadata = source.as_file().metadata().unwrap();
+            let sampled_len = metadata.len();
+            let mut writer = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(writer, "ial").unwrap();
+            writer
+                .set_modified(metadata.modified().unwrap() + std::time::Duration::from_secs(1))
+                .unwrap();
+
+            let first = tailer.poll_source(source, metadata).unwrap();
+            assert_eq!(
+                first
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["first"]
+            );
+            assert_eq!(tailer.consumed(), sampled_len);
+            assert!(tailer.has_pending());
+            assert_eq!(tailer.take_reset(), replacement);
+            let appended = tailer.poll().unwrap();
+            assert_eq!(
+                appended,
+                vec![TailedLine {
+                    source: Some(record_source(&path, sampled_len - 4)),
+                    lineno: first[0].lineno + 1,
+                    text: "partial".into(),
+                }]
+            );
+            assert!(!tailer.take_reset());
+            assert!(!tailer.has_pending());
+            assert!(tailer.poll().unwrap().is_empty());
+            assert!(!tailer.take_reset());
+
+            let modified = writer.metadata().unwrap().modified().unwrap();
+            let contents = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("partial", "changed");
+            std::fs::write(&path, contents).unwrap();
+            writer
+                .set_modified(modified + std::time::Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(tailer.poll().unwrap().last().unwrap().text, "changed");
+            assert!(tailer.take_reset());
+            assert!(tailer.poll().unwrap().is_empty());
+            assert!(!tailer.take_reset());
+        }
+    }
+
+    #[test]
     fn replacement_restarts_coordinates_even_when_the_source_does_not_shrink() {
         for contents in ["new\n", "new\nmore\n"] {
             let dir = tempfile::tempdir().unwrap();
@@ -340,6 +455,14 @@ mod tests {
                 .lines()
                 .enumerate()
                 .map(|(line, text)| TailedLine {
+                    source: Some(record_source(
+                        &path,
+                        contents
+                            .lines()
+                            .take(line)
+                            .map(|s| s.len() as u64 + 1)
+                            .sum(),
+                    )),
                     lineno: line as u64,
                     text: text.into(),
                 })
@@ -362,6 +485,7 @@ mod tests {
         assert_eq!(
             tailer.poll().unwrap(),
             vec![TailedLine {
+                source: Some(record_source(&path, 0)),
                 lineno: 0,
                 text: "replacement-complete".into(),
             }]
@@ -380,6 +504,7 @@ mod tests {
         assert_eq!(
             tailer.poll().unwrap(),
             vec![TailedLine {
+                source: Some(record_source(&path, 0)),
                 lineno: 0,
                 text: "replacement".into(),
             }]
@@ -450,14 +575,17 @@ mod tests {
             got,
             vec![
                 TailedLine {
+                    source: Some(record_source(&p, 4)),
                     lineno: 2,
                     text: "c".into()
                 },
                 TailedLine {
+                    source: Some(record_source(&p, 6)),
                     lineno: 3,
                     text: String::new()
                 },
                 TailedLine {
+                    source: Some(record_source(&p, 7)),
                     lineno: 4,
                     text: "e".into()
                 },
@@ -485,6 +613,7 @@ mod tests {
         assert_eq!(
             t.poll().unwrap(),
             vec![TailedLine {
+                source: Some(record_source(&p, 0)),
                 lineno: 0,
                 text: "{\"partial\":true}".into()
             }]
@@ -501,6 +630,7 @@ mod tests {
         assert_eq!(
             t.poll().unwrap(),
             vec![TailedLine {
+                source: Some(record_source(&p, 0)),
                 lineno: 0,
                 text: "x".into()
             }]

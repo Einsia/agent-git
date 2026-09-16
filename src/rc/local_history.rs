@@ -1,4 +1,6 @@
 //! Read-only pages addressed by native transcript byte boundaries.
+mod snapshot;
+
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom};
@@ -18,8 +20,8 @@ fn read_with_roster(params: Value, roster: &super::roster::Roster) -> crate::Res
         .context("Runtime is required")?;
     let native = entry.map(|e| e.thread_id.as_str()).unwrap_or(session);
     ensure!(
-        matches!(runtime, "codex" | "claude-code"),
-        "History paging is not supported for this runtime"
+        matches!(runtime, "codex" | "claude-code" | "opencode"),
+        Failure::Unsupported
     );
     ensure!(
         !native.is_empty()
@@ -32,33 +34,91 @@ fn read_with_roster(params: Value, roster: &super::roster::Roster) -> crate::Res
         .map(|e| e.cwd.as_str())
         .or_else(|| params["cwd"].as_str())
         .context("Working directory is required")?;
-    let adapter = crate::adapter::get(runtime)?;
-    let path = adapter.resolve(native, Some(std::path::Path::new(cwd)));
-    let path = path.context("Native transcript is unavailable")?;
-    let (lines, before, mode) = if runtime == "codex" {
-        lineage_page(&path, params["before"].as_u64())?
-    } else {
-        page(&path, params["before"].as_u64())?
+    snapshot::read(runtime, native, cwd, &params)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Failure {
+    #[error("Native transcript is unavailable")]
+    Missing,
+    #[error("Native history ends in an incomplete record; retry after the writer finishes")]
+    Incomplete,
+    #[error("This runtime does not support history paging")]
+    Unsupported,
+    #[error("History reader is busy; retry shortly")]
+    Busy,
+    #[error("History snapshot expired; reload history")]
+    Expired,
+    #[error("Invalid history cursor; reload history")]
+    InvalidCursor,
+    #[error("History exceeds the bounded read budget")]
+    Limit,
+    #[error("Native history changed during capture; retry")]
+    Changed,
+    #[error("Native history contains an invalid record")]
+    Corrupt,
+}
+
+pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
+    use crate::protocol::{ErrorCode, RpcError};
+    let (kind, retryable, restart) = match error.downcast_ref::<Failure>() {
+        Some(Failure::Missing) => ("source_missing", false, true),
+        Some(Failure::Incomplete) => ("incomplete_record", true, false),
+        Some(Failure::Unsupported) => ("unsupported", false, false),
+        Some(Failure::Busy) => ("busy", true, false),
+        Some(Failure::Expired | Failure::InvalidCursor) => ("cursor_expired", false, true),
+        Some(Failure::Limit) => ("resource_limit", false, false),
+        Some(Failure::Changed) => ("source_changed", true, true),
+        Some(Failure::Corrupt) => ("invalid_record", false, false),
+        None if error
+            .downcast_ref::<crate::adapter::native_snapshot::Unavailable>()
+            .is_some() =>
+        {
+            use crate::adapter::native_snapshot::Unavailable;
+            match error.downcast_ref::<Unavailable>().unwrap() {
+                Unavailable::NotFound => ("source_missing", false, true),
+                Unavailable::Unsupported => ("unsupported", false, false),
+                Unavailable::BudgetExceeded => ("resource_limit", false, false),
+                Unavailable::Incomplete => ("incomplete_record", true, false),
+                Unavailable::Changed => ("source_changed", true, true),
+                _ => ("read_failed", true, false),
+            }
+        }
+        None => match error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+        {
+            Some(std::io::ErrorKind::NotFound) => ("source_missing", false, true),
+            Some(std::io::ErrorKind::PermissionDenied) => ("source_unreadable", false, false),
+            _ => ("read_failed", true, false),
+        },
     };
-    let redactor = crate::domain::redact::Redactor::try_this_machine()?;
-    let (mut items, _) =
-        super::supervisor::items_from_lines_with_mode(runtime, &redactor, &lines, mode);
-    let items: Vec<Value> = items
-        .iter_mut()
-        .map(|item| {
-            item.event.line = None;
-            json!({"item_id":format!("history:{}",item.item_id),"event":item.event,"raw":item.raw})
-        })
-        .collect();
-    let result = json!({"items":items,"before":before,"has_more":before>0});
-    ensure!(
-        serde_json::to_vec(&result)?.len() < super::local::MAX_FRAME - 1024,
-        "This native history record exceeds the desktop response limit"
+    // Native paths and parser excerpts are not part of the remote error contract.
+    let mut result = RpcError::new(
+        ErrorCode::RuntimeUnavailable,
+        format!("History read failed ({kind})"),
     );
-    Ok(result)
+    result.data = Some(json!({"kind":kind,"retryable":retryable,"restart":restart}));
+    result
+}
+
+pub(crate) fn validate_records(
+    runtime: &str,
+    lines: &[super::tail::TailedLine],
+) -> crate::Result<()> {
+    let adapter = crate::adapter::get(runtime)?;
+    for line in lines.iter().filter(|line| !line.text.trim().is_empty()) {
+        serde_json::from_str::<Value>(&line.text).map_err(|_| Failure::Corrupt)?;
+        if runtime != "codex" {
+            adapter.parse(&line.text).map_err(|_| Failure::Corrupt)?;
+        }
+    }
+    Ok(())
 }
 
 struct Segment {
+    source: std::path::PathBuf,
+    version: std::fs::Metadata,
     file: std::fs::File,
     end: u64,
 }
@@ -89,7 +149,8 @@ fn lineage_from(
             "Native history lineage is cyclic or too deep"
         );
         let mut file = std::fs::File::open(&current)?;
-        let length = file.metadata()?.len();
+        let version = file.metadata()?;
+        let length = version.len();
         let end = boundary.map(|(bytes, _)| bytes).unwrap_or(length);
         ensure!(end <= length, "Native parent history is incomplete");
         let mut header = String::new();
@@ -123,7 +184,12 @@ fn lineage_from(
                 "Native parent history boundary changed"
             );
         }
-        segments.push(Segment { file, end });
+        segments.push(Segment {
+            version,
+            file,
+            end,
+            source: current.clone(),
+        });
         let Some(value) = value else {
             ensure!(boundary.is_none(), "Native parent header is invalid");
             break;
@@ -164,18 +230,6 @@ pub(crate) fn watch_cursor(path: &std::path::Path, offset: u64) -> crate::Result
         })
 }
 
-fn lineage_page(
-    path: &std::path::Path,
-    before: Option<u64>,
-) -> crate::Result<(
-    Vec<super::tail::TailedLine>,
-    u64,
-    super::codex_history::HistoryMode,
-)> {
-    let mut segments = lineage(path)?;
-    page_segments(&mut segments, before)
-}
-
 fn page_segments(
     segments: &mut [Segment],
     before: Option<u64>,
@@ -189,10 +243,7 @@ fn page_segments(
             .context("Native history is too large")
     })?;
     let before = before.unwrap_or(total);
-    ensure!(
-        before <= total,
-        "Native history changed; reopen the conversation"
-    );
+    ensure!(before <= total, Failure::InvalidCursor);
     let mut base = total;
     for part in segments.iter_mut().rev() {
         base -= part.end;
@@ -201,6 +252,7 @@ fn page_segments(
         }
         let (mut lines, next, mode) = page_file(&mut part.file, Some(before - base))?;
         for line in &mut lines {
+            line.source = Some(super::tail::record_source(&part.source, line.lineno));
             line.lineno += base;
         }
         return Ok((lines, base + next, mode));
@@ -208,6 +260,7 @@ fn page_segments(
     Ok((vec![], 0, super::codex_history::HistoryMode::Model))
 }
 
+#[cfg(test)]
 fn page(
     path: &std::path::Path,
     before: Option<u64>,
@@ -236,6 +289,12 @@ fn page_file(
         end <= length,
         "Transcript changed; reopen the conversation to reload history"
     );
+    if before.is_some() && end > 0 {
+        file.seek(SeekFrom::Start(end - 1))?;
+        let mut delimiter = [0];
+        file.read_exact(&mut delimiter)?;
+        ensure!(delimiter == *b"\n", Failure::Changed);
+    }
     if end == 0 {
         return Ok((vec![], 0, mode));
     }
@@ -272,6 +331,7 @@ fn page_file(
     let mut lines = vec![];
     for range in boundaries[first..].windows(2) {
         lines.push(super::tail::TailedLine {
+            source: None,
             lineno: start + range[0] as u64,
             text: std::str::from_utf8(&bytes[range[0]..range[1]])?
                 .trim_end_matches('\n')

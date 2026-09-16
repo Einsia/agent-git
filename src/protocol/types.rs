@@ -931,6 +931,9 @@ pub struct ItemDelta {
 /// so the live stream and the settled history cannot disagree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemCompleted {
+    /// Shared native record identity across history pages and live projections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     pub item_id: String,
     pub turn_id: String,
     /// Correlation from a canonical native user record, after the local secret filter.
@@ -1286,6 +1289,7 @@ mod tests {
         let raw = serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}});
         let hash = crate::domain::transcript::object_hash(&raw);
         let ic = ItemCompleted {
+            source_id: None,
             item_id: "i1".into(),
             turn_id: "t1".into(),
             native_prompt_id: None,

@@ -260,7 +260,7 @@ pub async fn serve(
             .collect::<std::collections::BTreeMap<_, _>>()
     })
     .await?;
-    let description = serde_json::json!({"protocol_version":1,"authority":"local-owner","machine":identity,"instance_id":instance,"epoch":1,"workspace_id":WORKSPACE,"capabilities":capabilities,"max_frame_bytes":MAX_FRAME});
+    let description = serde_json::json!({"protocol_version":1,"authority":"local-owner","machine":identity,"instance_id":instance,"epoch":1,"workspace_id":WORKSPACE,"capabilities":capabilities,"max_frame_bytes":MAX_FRAME,"history":{"version":2,"runtimes":["codex","claude-code","opencode"],"snapshot":true}});
     let mut description = description;
     description["diagnostic_log"] = serde_json::json!(diagnostics.as_ref().map(|log| log.path()));
     let cloud = cloud::Ingress::start(diagnostics.clone())?;
@@ -287,6 +287,7 @@ async fn serve_described(
 ) -> crate::Result<()> {
     let (input, mut incoming) = mpsc::channel::<Incoming>(256);
     let mut clients = HashMap::<u64, Client>::new();
+    let history_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     let mut pending = HashMap::<RequestId, (u64, RequestId, Option<String>)>::new();
     let mut receipts = HashMap::<String, MessageReceipt>::new();
     let mut serial = 0_u64;
@@ -405,15 +406,21 @@ async fn serve_described(
                             });
                         }
                         Ok(frame) if frame.method() == "session.history" => {
+                            let Ok(permit) = history_slots.clone().try_acquire_owned() else {
+                                let response = Frame::error_response(original_id, super::local_history::rpc_error(super::local_history::Failure::Busy.into()));
+                                let _ = peer.output.send_timeout(response.to_json(), std::time::Duration::from_secs(2)).await;
+                                continue;
+                            };
                             let output = peer.output.clone();
                             tokio::spawn(async move {
                                 let result = tokio::task::spawn_blocking(move || {
+                                    let _permit = permit;
                                     frame.authority.check().map_err(|error| anyhow::anyhow!(error.message))?;
                                     super::local_history::read(frame.params.unwrap_or_default())
                                 }).await;
                                 let response = match result {
                                     Ok(Ok(value)) => Frame::response(original_id,value),
-                                    Ok(Err(error)) => Frame::error_response(original_id,RpcError::new(ErrorCode::RuntimeUnavailable,error.to_string())),
+                                    Ok(Err(error)) => Frame::error_response(original_id,super::local_history::rpc_error(error)),
                                     Err(_) => Frame::error_response(original_id,RpcError::new(ErrorCode::RuntimeUnavailable,"History reader stopped unexpectedly")),
                                 };
                                 let _ = output.send_timeout(response.to_json(),std::time::Duration::from_secs(2)).await;

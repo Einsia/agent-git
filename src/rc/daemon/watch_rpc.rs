@@ -103,6 +103,12 @@ impl WatchScan {
                     )
                 })?;
             let (offset, from, total, absolute, handle) = tail_window(&path, WATCH_BACKFILL_LINES);
+            if handle.is_none() {
+                return Err(RpcError::new(
+                    ErrorCode::RuntimeUnavailable,
+                    "Native history cannot be read",
+                ));
+            }
             (
                 WatchSource::File {
                     path,
@@ -352,6 +358,7 @@ impl Daemon {
                     }
                     let mut native_records =
                         crate::rc::supervisor::native_records::NativeRecords::default();
+                    let mut initial = true;
                     loop {
                         if let Some(source) = &native_source {
                             let bytes = if let Some(bytes) = initial_snapshot.take() {
@@ -364,6 +371,13 @@ impl Daemon {
                                     )
                                     .await
                                 else {
+                                    history_status(
+                                        &frames,
+                                        &stream,
+                                        "failed",
+                                        Some("source_unreadable"),
+                                    )
+                                    .await;
                                     break;
                                 };
                                 bytes
@@ -371,6 +385,8 @@ impl Daemon {
                             let Ok((items, _)) =
                                 native_records.project_window(&bytes, false, &redactor, from_line)
                             else {
+                                history_status(&frames, &stream, "failed", Some("invalid_record"))
+                                    .await;
                                 break;
                             };
                             if !items.is_empty() {
@@ -386,6 +402,10 @@ impl Daemon {
                                     return;
                                 }
                             }
+                            if initial {
+                                history_status(&frames, &stream, "complete", None).await;
+                                initial = false;
+                            }
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             continue;
                         }
@@ -395,17 +415,34 @@ impl Daemon {
                             break;
                         };
                         if !tailer.path().exists() {
+                            history_status(&frames, &stream, "failed", Some("source_missing"))
+                                .await;
                             break;
                         }
-                        let (mode, lines) = if rt == "codex" {
-                            let batch = tailer.poll_codex().unwrap_or_default();
-                            (batch.mode, batch.lines)
+                        let batch = if rt == "codex" {
+                            tailer.poll_codex().map(|batch| (batch.mode, batch.lines))
                         } else {
-                            (
-                                crate::rc::codex_history::HistoryMode::Model,
-                                tailer.poll().unwrap_or_default(),
-                            )
+                            tailer
+                                .poll()
+                                .map(|lines| (crate::rc::codex_history::HistoryMode::Model, lines))
                         };
+                        let Ok((mode, lines)) = batch else {
+                            history_status(&frames, &stream, "failed", Some("source_unreadable"))
+                                .await;
+                            break;
+                        };
+                        if tailer.take_reset() {
+                            history_status(&frames, &stream, "reset", None).await;
+                            initial = true;
+                        }
+                        if lines.iter().any(|line| {
+                            !line.text.trim().is_empty()
+                                && serde_json::from_str::<serde_json::Value>(&line.text).is_err()
+                        }) {
+                            history_status(&frames, &stream, "failed", Some("invalid_record"))
+                                .await;
+                            break;
+                        }
                         if lines.is_empty() {
                             // Quiet decides nothing here: reaping is judged by the
                             // daemon (`reap_idle_watches`) because it has to sit
@@ -443,6 +480,10 @@ impl Daemon {
                                     }
                                 }
                             }
+                        }
+                        if initial && !tailer.has_pending() {
+                            history_status(&frames, &stream, "complete", None).await;
+                            initial = false;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(
                             crate::rc::supervisor::TAIL_POLL_MS,
@@ -771,4 +812,18 @@ mod watch_seed_tests {
         .unwrap();
         assert_eq!(event.method(), "turn.completed");
     }
+}
+
+async fn history_status(
+    frames: &mpsc::Sender<Frame>,
+    stream: &str,
+    status: &str,
+    error: Option<&str>,
+) {
+    let mut frame = Frame::notification(
+        "session.history.status",
+        serde_json::json!({"status":status,"error":error}),
+    );
+    frame.stream = Some(stream.to_string());
+    let _ = frames.send(frame).await;
 }

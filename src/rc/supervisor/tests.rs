@@ -1959,6 +1959,7 @@ fn a_transcript_line_is_scrubbed_without_ever_losing_its_json_shape() {
         hostname: None,
     });
     let line = crate::rc::tail::TailedLine {
+            source: None,
             lineno: 1,
             text: r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"/Users/ab","x":"1"}]},"sessionId":"s"}"#.into(),
         };
@@ -2187,6 +2188,7 @@ fn transcript_item_paths_leave_the_machine_scrubbed_like_their_text() {
         hostname: None,
     });
     let line = crate::rc::tail::TailedLine {
+        source: None,
         lineno: 1,
         text: r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/Users/alice/secret/src/main.rs"}}]},"sessionId":"s1","uuid":"u1"}"#.into(),
     };

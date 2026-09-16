@@ -164,6 +164,7 @@ fn resumed_tails_and_late_sources_read_their_own_header_before_projecting_new_re
     std::fs::write(&path, metadata(Some(json!("paginated")))).unwrap();
     assert_eq!(late.poll_codex().unwrap().mode, HistoryMode::Paginated);
     let mut resumed = Tailer::new(&path, false);
+    let offset = resumed.consumed();
     std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -175,6 +176,7 @@ fn resumed_tails_and_late_sources_read_their_own_header_before_projecting_new_re
     assert_eq!(
         batch.lines,
         vec![TailedLine {
+            source: Some(crate::rc::tail::record_source(&path, offset)),
             lineno: 1,
             text: "new".into()
         }]
@@ -265,6 +267,7 @@ fn correlation_survives_raw_capping_but_never_bypasses_secret_redaction() {
             &"x".repeat(crate::protocol::RAW_LINE_CAP * 2),
         );
         let line = TailedLine {
+            source: None,
             lineno: 41,
             text: raw.to_string(),
         };

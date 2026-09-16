@@ -15,6 +15,7 @@ fn replacement_between_window_selection_and_watch_start_invalidates_the_window()
     assert_eq!(
         tailer.poll().unwrap(),
         vec![crate::rc::tail::TailedLine {
+            source: Some(crate::rc::tail::record_source(&path, 0)),
             lineno: 0,
             text: "replacement".into(),
         }]

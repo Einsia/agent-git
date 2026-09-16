@@ -811,8 +811,10 @@ mod tests {
         assert_eq!(ORIGIN_TIMEOUT, Duration::from_secs(5));
         let root = tempfile::tempdir().unwrap();
         let mut git = Git::new().unwrap();
-        let deadline = git.deadline;
         let complete = root.path().join("complete");
+        // The success case checks deadline retention independently of process startup latency.
+        git.deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = git.deadline;
         assert!(
             git.run(child("complete", &complete), MAX_OUTPUT)
                 .unwrap()

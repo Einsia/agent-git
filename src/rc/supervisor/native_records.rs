@@ -102,6 +102,10 @@ impl NativeRecords {
                 .ok_or_else(|| anyhow::anyhow!("native event record has no identity"))?;
             let index = indices.entry(line).or_default();
             let item_id = format!("opencode:{native_id}#{index}");
+            let source_id = format!(
+                "opencode:{}:{native_id}#{index}",
+                raw["session_id"].as_str().unwrap_or_default()
+            );
             *index += 1;
             // Event content can change through its host message without changing this raw row.
             let mut content = event.clone();
@@ -133,6 +137,7 @@ impl NativeRecords {
                 })
                 .collect();
             items.push(ItemCompleted {
+                source_id: Some(source_id),
                 item_id,
                 turn_id: String::new(),
                 native_prompt_id: None,

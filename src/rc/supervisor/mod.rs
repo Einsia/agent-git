@@ -3485,6 +3485,10 @@ pub(crate) fn items_from_lines_with_mode(
                 .collect();
             event.line = Some(line.lineno as usize);
             out.push(ItemCompleted {
+                source_id: line
+                    .source
+                    .as_ref()
+                    .map(|source| format!("{source}:{object_hash}#{i}")),
                 item_id: format!("{}#{i}", line.lineno),
                 turn_id: String::new(),
                 native_prompt_id: native_prompt_id.clone(),
