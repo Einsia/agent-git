@@ -383,18 +383,17 @@ pub fn command_from_argv(args: &[std::ffi::OsString]) -> String {
 
 #[cfg(unix)]
 fn capture_unix(command: &str, version: Version, f: impl FnOnce() -> i32) -> i32 {
-    use std::os::fd::RawFd;
+    use std::os::fd::{IntoRawFd, RawFd};
     use std::thread;
 
     fn pipe() -> (RawFd, RawFd) {
-        let mut fds = [0; 2];
-        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(rc, 0, "creating a JSON capture pipe failed");
-        (fds[0], fds[1])
+        let (read, write) = std::io::pipe().expect("creating a JSON capture pipe failed");
+        (read.into_raw_fd(), write.into_raw_fd())
     }
 
     fn duplicate(fd: RawFd) -> RawFd {
-        let copy = unsafe { libc::dup(fd) };
+        // Saved streams must close on exec or detached helpers keep the caller's pipes open.
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
         assert!(copy >= 0, "duplicating a standard stream failed");
         copy
     }

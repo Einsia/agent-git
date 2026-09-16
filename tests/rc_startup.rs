@@ -85,7 +85,7 @@ impl Drop for Cleanup<'_> {
 }
 
 #[tokio::test]
-async fn detached_start_waits_for_registration_and_retains_private_diagnostics() {
+async fn detached_json_start_releases_caller_pipes_after_registration() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("home");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -94,11 +94,11 @@ async fn detached_start_waits_for_registration_and_retains_private_diagnostics()
     let _cleanup = Cleanup(home.as_path(), &hub);
     let mut start = tokio::process::Command::from(command(home.as_path(), &hub));
     start
-        .args(["rc", "start", "--detach"])
+        .args(["rc", "start", "--detach", "--json"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    let output = captured_output(start);
+    let output = start.output();
     tokio::pin!(output);
     let (stream, _) = tokio::select! {
         result = &mut output => {
@@ -141,12 +141,22 @@ async fn detached_start_waits_for_registration_and_retains_private_diagnostics()
         .await
         .unwrap()
         .unwrap();
-    let stdout = String::from_utf8(result.stdout).unwrap();
     assert!(
         result.status.success(),
-        "{stdout}\n{}",
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+    assert!(result.stderr.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(document["ok"], true);
+    let stdout = document["result"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(stdout.contains("Hub registered; remote control ready"));
     assert!(stdout.contains(&format!("{hub}/workspaces")));
     let logs: Vec<_> = std::fs::read_dir(home.as_path().join("rc"))
