@@ -1132,6 +1132,7 @@ mod tests {
     }
     fn session_ref(id: &str, at: u64) -> SessionRef {
         SessionRef {
+            title: None,
             id: id.into(),
             path: Path::new("/nonexistent").join(id),
             runtime: "claude-code",

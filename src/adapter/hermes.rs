@@ -102,6 +102,7 @@ fn list_at(path: &Path, cwd: Option<&Path>) -> Result<Vec<SessionRef>> {
             "invalid Hermes session timestamp"
         );
         result.push(SessionRef {
+            title: None,
             path: db::cache_path("hermes", &id)?,
             id,
             runtime: "hermes",

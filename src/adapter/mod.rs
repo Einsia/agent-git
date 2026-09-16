@@ -30,6 +30,7 @@ pub mod codex;
 pub mod codex_index;
 #[cfg(feature = "cli")]
 pub(crate) mod codex_provider;
+mod codex_titles;
 pub mod cursor;
 pub mod detail;
 pub mod enrich;
@@ -394,6 +395,8 @@ pub struct SessionRef {
     /// the number of sessions. Claude Code has no equivalent index, so it stays `None` there and
     /// the caller decides whether to pay for it, and for how many.
     pub gist: Option<String>,
+    /// A bounded native display name, independent of the opening prompt.
+    pub title: Option<String>,
 }
 
 /// A tool call that was issued but has no paired output in the transcript yet.

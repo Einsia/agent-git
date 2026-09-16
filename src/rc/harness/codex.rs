@@ -1838,6 +1838,19 @@ mod tests {
                 assert_eq!(request["params"]["model"].as_str(), model);
                 assert_eq!(request["params"].get("model").is_some(), model.is_some());
                 assert_eq!(request["params"]["threadId"].as_str(), resume);
+                if resume.is_some() && model.is_none() {
+                    driver.classify(json!({"id":request["id"],"result":{"thread":{"id":"existing-thread"},"model":"current-native-model-b"}})).await;
+                    assert_eq!(driver.model.as_deref(), Some("current-native-model-b"));
+                    assert!(matches!(
+                        driver.start_turn("continue", false, None).await,
+                        TurnStartDispatch::Awaiting
+                    ));
+                    let queued = driver.proc.next().await.unwrap();
+                    let Line::Json(turn) = queued.line() else {
+                        panic!("expected native turn request");
+                    };
+                    assert_eq!(turn["params"]["model"], "current-native-model-b");
+                }
                 driver.shutdown().await.unwrap();
             }
         }

@@ -12,19 +12,6 @@ fn read_with_roster(params: Value, roster: &super::roster::Roster) -> crate::Res
         .as_str()
         .context("Session id is required")?;
     let entry = roster.get(session);
-    let starting = roster.starts.values().any(|intent| match &intent.state {
-        super::roster::StartState::Pending { session: info } => info.session_id == session,
-        super::roster::StartState::Completed { result } => result.session.session_id == session,
-    });
-    // A registered launch can be subscribed before the native thread exists.
-    // Its first records arrive on that subscription after initialization.
-    if entry.is_some_and(|entry| entry.thread_id.is_empty()) || (entry.is_none() && starting) {
-        ensure!(
-            params["before"].as_u64().unwrap_or(0) == 0,
-            "Native history is not ready for paging"
-        );
-        return Ok(json!({"items":[],"before":0,"has_more":false,"pending":true}));
-    }
     let runtime = entry
         .map(|e| e.runtime.as_str())
         .or_else(|| params["runtime"].as_str())
@@ -47,11 +34,6 @@ fn read_with_roster(params: Value, roster: &super::roster::Roster) -> crate::Res
         .context("Working directory is required")?;
     let adapter = crate::adapter::get(runtime)?;
     let path = adapter.resolve(native, Some(std::path::Path::new(cwd)));
-    // Some runtimes materialize a registered thread only on its first turn.
-    // An existing page cursor still requires its original transcript.
-    if path.is_none() && starting && params["before"].is_null() {
-        return Ok(json!({"items":[],"before":0,"has_more":false,"pending":true}));
-    }
     let path = path.context("Native transcript is unavailable")?;
     let (lines, before, mode) = if runtime == "codex" {
         lineage_page(&path, params["before"].as_u64())?
@@ -303,9 +285,9 @@ fn page_file(
 mod tests {
     use super::*;
     #[test]
-    fn registered_launch_history_waits_for_its_native_identity() {
-        let session = json!({"session_id":"logical","workspace_id":"local-owner","runtime":"codex","status":"idle","last_seq":0,"created_at":"now","updated_at":"now"});
-        let spec = json!({"workspace_id":"local-owner","project_id":"project","runtime":"codex","cwd":"/fixture","permission_mode":"default"});
+    fn launch_receipts_do_not_prove_that_missing_history_is_pending() {
+        let session = json!({"session_id":"logical","workspace_id":"local-owner","runtime":"claude-code","status":"idle","last_seq":0,"created_at":"now","updated_at":"now"});
+        let spec = json!({"workspace_id":"local-owner","project_id":"project","runtime":"claude-code","cwd":"/fixture","permission_mode":"default"});
         for state in [
             json!({"state":"pending","session":session}),
             json!({"state":"completed","result":{"session":session}}),
@@ -313,40 +295,78 @@ mod tests {
             let mut roster: super::super::roster::Roster =
                 serde_json::from_value(json!({"starts":{"launch":{"spec":spec,"state":state}}}))
                     .unwrap();
-            let page = read_with_roster(json!({"session_id":"logical"}), &roster).unwrap();
-            assert_eq!(
-                page,
-                json!({"items":[],"before":0,"has_more":false,"pending":true})
-            );
-            assert!(read_with_roster(json!({"session_id":"unknown"}), &roster).is_err());
             assert!(
-                read_with_roster(json!({"session_id":"logical","before":100}), &roster).is_err()
+                read_with_roster(
+                    json!({"session_id":"logical","runtime":"claude-code","cwd":"/fixture"}),
+                    &roster
+                )
+                .is_err()
             );
-            roster.sessions.insert("logical".into(), serde_json::from_value(json!({"runtime":"codex","thread_id":"","cwd":"/fixture","workspace_id":"local-owner"})).unwrap());
-            assert_eq!(
-                read_with_roster(json!({"session_id":"logical"}), &roster).unwrap(),
-                page
-            );
-            roster.sessions.get_mut("logical").unwrap().thread_id = "invalid/id".into();
-            assert!(
-                read_with_roster(json!({"session_id":"logical"}), &roster)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Invalid native session id")
-            );
-            let entry = roster.sessions.get_mut("logical").unwrap();
-            entry.runtime = "claude-code".into();
-            entry.thread_id = uuid::Uuid::new_v4().to_string();
-            assert_eq!(
-                read_with_roster(json!({"session_id":"logical"}), &roster).unwrap(),
-                page
-            );
-            assert!(
-                read_with_roster(json!({"session_id":"logical","before":10}), &roster).is_err()
-            );
-            roster.starts.clear();
-            assert!(read_with_roster(json!({"session_id":"logical"}), &roster).is_err());
+            for native in [String::new(), uuid::Uuid::new_v4().to_string()] {
+                roster.sessions.insert("logical".into(), serde_json::from_value(json!({"runtime":"claude-code","thread_id":native,"cwd":"/fixture","workspace_id":"local-owner"})).unwrap());
+                for before in [Value::Null, json!(100)] {
+                    assert!(
+                        read_with_roster(json!({"session_id":"logical","before":before}), &roster)
+                            .is_err()
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn completed_launch_reports_history_removed_after_restart() {
+        const CHILD: &str = "AGIT_TEST_REMOVED_NATIVE_HISTORY";
+        let Some(root) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "rc::local_history::tests::completed_launch_reports_history_removed_after_restart", "--nocapture"])
+                .env(CHILD, directory.path())
+                .env("AGIT_HOME", directory.path().join("agit"))
+                .env("CLAUDE_CONFIG_DIR", directory.path().join("claude"))
+                .output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(directory.path().join("completed").exists());
+            return;
+        };
+        let native = uuid::Uuid::new_v4().to_string();
+        let project = crate::adapter::claude_code::projects_dir()
+            .unwrap()
+            .join(crate::adapter::claude_code::slug_for(&root));
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join(format!("{native}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":"Existing native history"}})
+            ),
+        )
+        .unwrap();
+        let session = json!({"session_id":"logical","workspace_id":"local-owner","runtime":"claude-code","status":"idle","last_seq":0,"created_at":"now","updated_at":"now"});
+        let roster: super::super::roster::Roster = serde_json::from_value(json!({
+            "sessions":{"logical":{"runtime":"claude-code","thread_id":native,"cwd":root,"workspace_id":"local-owner"}},
+            "starts":{"launch":{"spec":{"workspace_id":"local-owner","project_id":"project","runtime":"claude-code","cwd":root,"permission_mode":"default"},"state":{"state":"completed","result":{"session":session}}}}
+        })).unwrap();
+        let params = json!({"session_id":"logical"});
+        assert!(
+            !read_with_roster(params.clone(), &roster).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        roster.save().unwrap();
+        drop(roster);
+        let restarted = super::super::roster::Roster::try_load().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            read_with_roster(params, &restarted)
+                .unwrap_err()
+                .to_string(),
+            "Native transcript is unavailable"
+        );
+        assert!(!restarted.starts.is_empty());
+        std::fs::write(root.join("completed"), []).unwrap();
     }
 
     #[test]

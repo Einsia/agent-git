@@ -2593,6 +2593,7 @@ async fn discovery_reply_refreshes_supervision_after_the_scan() {
     );
     let snapshot = state.prepare_session_list(&frame).unwrap();
     let local = LocalSession {
+        title: None,
         runtime_session_id: "native-new".into(),
         runtime: "codex".into(),
         cwd: root.path().to_string_lossy().into(),
@@ -2650,4 +2651,128 @@ async fn finished_supervisor_is_reconciled_without_releasing_an_accepted_rpc() {
         generation: 7,
     });
     assert!(!state.sessions.contains_key("session-a"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_titles_reach_session_list_without_replacing_gist_or_reading_rollouts() {
+    use std::os::unix::fs::PermissionsExt;
+    const CHILD: &str = "AGIT_NATIVE_TITLE_TEST_CHILD";
+    let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let executable = bin.join("codex");
+        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "rc::daemon::tests::sessions::native_titles_reach_session_list_without_replacing_gist_or_reading_rollouts", "--nocapture"])
+            .env(CHILD, directory.path())
+            .env("CODEX_HOME", directory.path().join("codex"))
+            .env("AGIT_HOME", directory.path().join("agit"))
+            .env("HOME", directory.path().join("home"))
+            .env("PATH", bin)
+            .output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(directory.path().join("completed").exists());
+        return;
+    };
+    let cwd = root.join("project");
+    std::fs::create_dir(&cwd).unwrap();
+    let cwd = cwd.canonicalize().unwrap();
+    let native = root.join("codex/sessions");
+    std::fs::create_dir_all(&native).unwrap();
+    let index = root.join("codex/state_1.sqlite");
+    let database = rusqlite::Connection::open(&index).unwrap();
+    database.execute_batch("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER, source TEXT, title TEXT);").unwrap();
+    let ids = [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+    ];
+    for (id, title) in ids.iter().zip(["Indexed native title", "  "]) {
+        database.execute("INSERT INTO threads VALUES (?1, ?2, ?3, 'Keep the opening prompt', 'user', 100, 0, '\"cli\"', ?4)", rusqlite::params![id, native.join(format!("{id}.jsonl")).to_str().unwrap(), cwd.to_str().unwrap(), title]).unwrap();
+    }
+    let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+    let mut state = daemon.lock().await;
+    state.mirror.bind("ws-a", "project", &cwd).unwrap();
+    let frame = frame_with(
+        Some(claim("viewer", "ws-a")),
+        serde_json::json!({"workspace_id":"ws-a", "include_local":true}),
+    );
+    let names = root.join("codex/session_index.jsonl");
+    for (phase, expected) in [
+        (0, Some("Indexed native title")),
+        (1, Some("Latest renamed title")),
+        (2, None),
+    ] {
+        if phase == 1 {
+            let entries = ["Older renamed title", "Latest renamed title"].map(|name| serde_json::json!({"id":ids[0], "thread_name":name, "updated_at":"2026-09-16T00:00:00Z"}).to_string()).join("\n");
+            std::fs::write(&names, format!("{entries}\n")).unwrap();
+        } else if phase == 2 {
+            std::fs::remove_file(&names).unwrap();
+            database
+                .execute_batch("ALTER TABLE threads DROP COLUMN title;")
+                .unwrap();
+        }
+        let before = std::fs::read(&index).unwrap();
+        let snapshot = state.prepare_session_list(&frame).unwrap();
+        let listed = snapshot.clone().scan(LocalSessionScan::Listing);
+        let value = state
+            .finish_session_list(&frame, &snapshot.roots, listed)
+            .unwrap();
+        let result: SessionListResult = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(result.local.len(), 2);
+        for id in ids {
+            let item = result
+                .local
+                .iter()
+                .find(|item| item.runtime_session_id == id)
+                .unwrap();
+            assert_eq!(item.gist.as_deref(), Some("Keep the opening prompt"));
+            assert_eq!(
+                item.title.as_deref(),
+                if id == ids[0] { expected } else { None }
+            );
+            let serialized = value["local"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["runtime_session_id"] == id)
+                .unwrap();
+            if item.title.is_none() {
+                assert!(serialized.get("title").is_none());
+            }
+        }
+        assert_eq!(std::fs::read(&index).unwrap(), before);
+        assert_eq!(std::fs::read_dir(&native).unwrap().count(), 0);
+    }
+    std::fs::write(root.join("completed"), "verified").unwrap();
+}
+
+#[test]
+fn resumed_launch_does_not_replay_the_initial_model() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let cwd = home.path().canonicalize().unwrap();
+            let session = serde_json::json!({"session_id":"logical", "workspace_id":"ws", "runtime":"codex", "status":"idle", "last_seq":0, "created_at":"now", "updated_at":"now"});
+            let roster: Roster = serde_json::from_value(serde_json::json!({
+                "sessions":{"logical":{"runtime":"codex", "thread_id":"native-model-changed", "cwd":cwd, "workspace_id":"ws"}},
+                "starts":{"launch":{"spec":{"workspace_id":"ws", "project_id":"project", "runtime":"codex", "cwd":cwd, "model":"initial-model-a", "permission_mode":"default"}, "state":{"state":"completed", "result":{"session":session}}}}
+            })).unwrap();
+            roster.save().unwrap();
+            let daemon = rpc_test_daemon(HashMap::new(), Roster::try_load().unwrap());
+            let mut state = daemon.lock().await;
+            state.mirror.bind("ws", "project", &cwd).unwrap();
+            let (frames, _receiver) = mpsc::channel(1);
+            let opening = state.prepare_resume_session(SessionResume {
+                workspace_id:"ws".into(), session_id:"logical".into(), prompt:None,
+                by:None, agent:None, expected_agent_id:None, branch:None,
+            }, &claim("owner", "ws"), &frames).unwrap();
+            let SessionOpening::Launch(spawn, _) = opening else { panic!("expected a native resume"); };
+            assert_eq!(spawn.spec.resume_from.as_deref(), Some("native-model-changed"));
+            assert_eq!(spawn.spec.model, None);
+            assert_eq!(state.roster.starts["launch"].spec.model.as_deref(), Some("initial-model-a"));
+        });
+    });
 }

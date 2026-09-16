@@ -1463,6 +1463,7 @@ fn local_session_wire_previews_bound_indexed_and_parsed_prompts() {
         .into_iter()
         .enumerate()
         .map(|(index, gist)| LocalSession {
+            title: None,
             runtime_session_id: format!("native-{index}"),
             runtime: "codex".into(),
             cwd: "/fixture".into(),
@@ -1508,6 +1509,7 @@ fn resume_location_consumes_one_scan_and_opens_no_transcript_for_gist() {
     let gist_calls = std::cell::Cell::new(0usize);
     let scanned = finish_local_sessions(
         vec![LocalSession {
+            title: None,
             runtime_session_id: "native-thread".into(),
             runtime: "claude-code".into(),
             cwd: root.to_string_lossy().to_string(),

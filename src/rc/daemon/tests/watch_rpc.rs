@@ -54,6 +54,7 @@ fn prepared(scan: WatchScan, cwd: PathBuf) -> PreparedWatch {
         total_lines: 0,
         absolute_lines: true,
         before_cursor: 0,
+        history_error: None,
     }
 }
 
@@ -362,6 +363,7 @@ fn native_watch_reuses_readonly_snapshot_without_materializing_exports() {
     assert_eq!(refs.len(), 1);
     let cache = refs[0].path.clone();
     let local = LocalSession {
+        title: None,
         runtime_session_id: "ses_watch".into(),
         runtime: "opencode".into(),
         cwd: cwd.to_string_lossy().into_owned(),
@@ -431,4 +433,56 @@ fn native_watch_reuses_readonly_snapshot_without_materializing_exports() {
             );
         });
     std::fs::write(root.join("completed"), []).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn missing_parent_history_does_not_stop_live_watch() {
+    use std::io::Write;
+    let directory = tempfile::tempdir().unwrap();
+    let cwd = directory.path().canonicalize().unwrap();
+    let path = cwd.join("history.jsonl");
+    let header = serde_json::json!({"type":"session_meta", "payload":{"id":"native", "cwd":cwd, "history_mode":"paginated", "history_base":{"thread_id":uuid::Uuid::new_v4().to_string(), "end_byte_offset":100, "end_ordinal_exclusive":1}}});
+    std::fs::write(&path, format!("{header}\n")).unwrap();
+    let daemon = fixture(&cwd).await;
+    let frame = request(method::SESSION_WATCH, "ws", "native");
+    let mut waiting = prepared(daemon.lock().await.prepare_watch_scan(&frame).unwrap(), cwd);
+    (waiting.before_cursor, waiting.history_error) = history_cursor("codex", &path, 0);
+    assert!(waiting.history_error.is_some());
+    let (frames, mut received) = mpsc::channel(8);
+    let response = daemon
+        .lock()
+        .await
+        .finish_watch_scan(&frame, waiting, &frames)
+        .unwrap();
+    assert_eq!(response["before_cursor"], 0);
+    assert!(
+        response["history_error"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable")
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(file, "{}", serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Live output survives missing history"}]}})).unwrap();
+    ready(async {
+        loop {
+            let frame = received.recv().await.unwrap();
+            if frame.method() == method::ITEM_COMPLETED {
+                let item: crate::protocol::ItemCompleted = frame.params_as().unwrap();
+                if item.event.text.as_deref() == Some("Live output survives missing history") {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    daemon
+        .lock()
+        .await
+        .dispatch(&request(method::SESSION_UNWATCH, "ws", "native"), &frames)
+        .await
+        .unwrap();
 }

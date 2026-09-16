@@ -36,49 +36,77 @@ impl ClaudeCodeDriver {
             }
             return Ok(json!({"commands":self.commands}));
         }
-        let command = match name {
+        match name {
             "goal.get" => {
                 let path = self.transcript_path();
                 let goal =
                     tokio::task::spawn_blocking(move || read_goal(path.as_deref())).await??;
-                return Ok(json!({"goal":goal}));
+                Ok(json!({"goal":goal}))
             }
-            "goal.clear" => "/goal clear",
+            "goal.clear" => self.clear_goal(std::time::Duration::from_secs(10)).await,
             _ => anyhow::bail!("Send this Claude command through the conversation composer"),
-        };
+        }
+    }
+
+    async fn clear_goal(&mut self, timeout: std::time::Duration) -> crate::Result<Value> {
         ensure!(
-            self.current_turn.is_none(),
-            "Wait for Claude to finish before inspecting or clearing its goal"
+            self.current_turn.is_none()
+                && !self.interrupt_draining
+                && self.awaiting_echoes.is_empty(),
+            "Wait for Claude to finish before clearing its goal"
         );
         ensure!(
             !self.goal_query_pending,
             "A Claude goal query is still awaiting its response"
         );
         self.goal_query_pending = true;
-        self.proc.write_line(&json!({"type":"user","session_id":self.session_id,"message":{"role":"user","content":command},"parent_tool_use_id":null})).await?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let queued = tokio::time::timeout_at(deadline, self.proc.next())
-                .await
-                .context("Claude goal response timed out; refresh before retrying")?
-                .context("Claude exited before answering the goal command")?;
-            if let Line::Json(value) = queued.line() {
-                if value["type"] == "result" && value["local_command"] == "goal" {
-                    self.goal_query_pending = false;
-                    ensure!(value["is_error"] != true, "Claude refused the goal command");
-                    let goal = goal_from_text(value["result"].as_str().unwrap_or_default())
-                        .context("Claude returned an unrecognized goal response")?;
-                    return Ok(json!({"goal":goal}));
+        let mut completed = false;
+        let result = tokio::time::timeout(timeout, async {
+            self.proc.write_line(&json!({"type":"user","session_id":self.session_id,"message":{"role":"user","content":"/goal clear"},"parent_tool_use_id":null})).await?;
+            loop {
+                let queued = self.proc.next().await.context("Claude exited before answering the goal command")?;
+                if let Line::Json(value) = queued.line() {
+                    if goal_result(value, &self.session_id) {
+                        completed = true;
+                        ensure!(value["is_error"] != true, "Claude refused the goal command");
+                        let goal = goal_from_text(value["result"].as_str().unwrap_or_default())
+                            .context("Claude returned an unrecognized goal response")?;
+                        return Ok(json!({"goal":goal}));
+                    }
+                    if (value["type"] == "assistant" && value.get("local_command_source").is_some())
+                        || (value["type"] == "user" && value["message"]["content"] == "/goal clear") {
+                        continue;
+                    }
                 }
-                if value["type"] == "assistant" && value.get("local_command_source").is_some() {
-                    continue;
-                }
+                let eof = matches!(queued.line(), Line::Eof);
+                self.pushback.push(queued);
+                ensure!(!eof, "Claude exited before answering the goal command");
             }
-            let eof = matches!(queued.line(), Line::Eof);
-            self.pushback.push(queued);
-            ensure!(!eof, "Claude exited before answering the goal command");
+        }).await.context("Claude goal response timed out")
+            .and_then(|result| result);
+        if !completed {
+            // An uncorrelated late result must not close a subsequent conversation turn.
+            self.proc.shutdown().await.context(
+                "Claude goal recovery could not stop the runtime; restart the local daemon",
+            )?;
+        }
+        self.goal_query_pending = false;
+        if completed {
+            result
+        } else {
+            result.context("Resume this session to reconnect before retrying the goal command")
         }
     }
+}
+
+fn goal_result(value: &Value, session: &str) -> bool {
+    value["type"] == "result"
+        && value["session_id"].as_str().is_none_or(|id| id == session)
+        && (value["local_command"] == "goal"
+            || (value["subtype"] == "success"
+                && value["is_error"] != true
+                && goal_from_text(value["result"].as_str().unwrap_or_default())
+                    == Some(Value::Null)))
 }
 
 fn read_goal(path: Option<&std::path::Path>) -> crate::Result<Value> {
@@ -133,6 +161,104 @@ fn read_goal(path: Option<&std::path::Path>) -> crate::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_clear_accepts_tagged_and_unmarked_results_without_phantom_turns() {
+        for marked in [false, true] {
+            let mut driver = ClaudeCodeDriver::test_driver();
+            driver.clear_test_current_turn();
+            driver.shutdown().await.unwrap();
+            let mut response = json!({"type":"result", "subtype":"success", "is_error":false, "result":"No goal set"});
+            if marked {
+                response["local_command"] = json!("goal");
+            }
+            driver.proc = Proc::spawn(
+                "sh",
+                &[
+                    "-c".into(),
+                    "while IFS= read -r input; do printf '%s\\n' \"$input\" \"$1\"; done".into(),
+                    "goal-fixture".into(),
+                    response.to_string(),
+                ],
+                &PathBuf::from("/"),
+                &[],
+            )
+            .unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    driver
+                        .runtime_command("goal.clear", Value::Null)
+                        .await
+                        .unwrap(),
+                    json!({"goal":null})
+                );
+                assert!(!driver.goal_query_pending);
+                assert_eq!(driver.pushback.len(), 0);
+            }
+            driver.shutdown().await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_clear_timeout_and_write_failure_have_a_reconnect_path() {
+        let mut driver = ClaudeCodeDriver::test_driver();
+        driver.clear_test_current_turn();
+        let error = driver
+            .clear_goal(std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"));
+        assert!(error.to_string().contains("Resume this session"));
+        assert!(!driver.goal_query_pending);
+        assert!(matches!(
+            driver.next_event().await,
+            Some(HarnessEvent::Exited { .. })
+        ));
+        let error = driver
+            .runtime_command("goal.clear", Value::Null)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Resume this session"));
+        assert!(!driver.goal_query_pending);
+    }
+
+    #[test]
+    fn goal_results_reject_foreign_sessions_and_ordinary_turn_output() {
+        assert!(!goal_result(
+            &json!({"type":"result", "local_command":"goal", "session_id":"foreign"}),
+            "current"
+        ));
+        assert!(!goal_result(
+            &json!({"type":"result", "subtype":"success", "result":"ordinary output"}),
+            "current"
+        ));
+        assert!(!goal_result(
+            &json!({"type":"result", "subtype":"success", "is_error":true, "result":"No goal set"}),
+            "current"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_recovery_refuses_new_turns_until_the_process_is_stopped() {
+        let mut driver = ClaudeCodeDriver::test_driver();
+        driver.clear_test_current_turn();
+        driver.fail_test_shutdowns(1);
+        assert!(
+            driver
+                .clear_goal(std::time::Duration::from_millis(100))
+                .await
+                .is_err()
+        );
+        assert!(driver.goal_query_pending);
+        assert!(matches!(
+            driver.start_turn("new turn").await,
+            super::super::super::TurnStartOutcome::RetryableNotAccepted { .. }
+        ));
+        driver.shutdown().await.unwrap();
+    }
+
     #[test]
     fn native_goal_markers_restore_completion_without_injecting_query_messages() {
         let dir = tempfile::tempdir().unwrap();

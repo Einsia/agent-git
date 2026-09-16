@@ -130,22 +130,15 @@ impl CodexDriver {
             return Ok(json!({"text":format!("{}: {}. Applies to the next message.",name,value)}));
         }
         if name == "diff" {
-            let output = tokio::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            command
                 .args(["diff", "HEAD", "--no-ext-diff", "--no-textconv", "--"])
-                .current_dir(&self.cwd)
-                .output()
-                .await?;
-            ensure!(
-                output.status.success(),
-                "Git could not read the working tree diff"
-            );
-            ensure!(
-                output.stdout.len() <= 512 * 1024,
-                "The diff is too large to display; use the repository review panel"
-            );
-            return Ok(
-                json!({"text":format!("```diff\n{}\n```", String::from_utf8_lossy(&output.stdout))}),
-            );
+                .current_dir(&self.cwd);
+            return capture_diff(
+                command,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .await;
         }
         let thread = self
             .thread_id
@@ -333,6 +326,29 @@ impl CodexDriver {
     }
 }
 
+async fn capture_diff(
+    command: std::process::Command,
+    deadline: std::time::Instant,
+) -> crate::Result<Value> {
+    let output = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(crate::infra::local_git::output_until(
+                command,
+                512 * 1024,
+                deadline,
+            ))
+    })
+    .await?
+    .context("The diff could not be read within display limits; use the repository review panel")?;
+    ensure!(
+        output.status.success(),
+        "Git could not read the working tree diff"
+    );
+    Ok(json!({"text":format!("```diff\n{}\n```", String::from_utf8_lossy(&output.stdout))}))
+}
+
 fn feedback_params(thread: &str, arguments: &Value) -> crate::Result<Value> {
     ensure!(
         arguments["confirmed"] == true,
@@ -384,6 +400,44 @@ fn enabled_skills(value: &Value) -> impl Iterator<Item = &Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diff_capture_bounds_output_and_reaps_timed_out_children() {
+        use std::time::{Duration, Instant};
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf 'small diff'"]);
+        let result = capture_diff(command, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(result["text"].as_str().unwrap().contains("small diff"));
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "yes oversized"]);
+        let error = capture_diff(command, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds its limit"));
+        let directory = tempfile::tempdir().unwrap();
+        let pid = directory.path().join("child.pid");
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & echo $! > \"$1\"; wait", "diff-fixture"])
+            .arg(&pid);
+        let error = capture_diff(command, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("time limit"));
+        let child: i32 = std::fs::read_to_string(pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(child, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 
     #[tokio::test]
     async fn commands_wait_for_the_native_handshake_before_allocating_or_writing_a_request() {

@@ -443,6 +443,7 @@ fn thread_to_ref(t: super::codex_index::Thread) -> SessionRef {
         .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     SessionRef {
+        title: t.title,
         id: t.id,
         path: t.rollout_path,
         runtime: "codex",
@@ -484,6 +485,7 @@ fn scan_all_sessions(choices_only: bool) -> Result<Vec<SessionRef>> {
             .and_then(|m| m.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         out.push(SessionRef {
+            title: None,
             id,
             path: p,
             runtime: "codex",
@@ -581,11 +583,15 @@ impl Adapter for Codex {
     fn session_choices_for(&self, repo: &Path) -> Result<Vec<SessionRef>> {
         let want = repo.to_string_lossy();
         if let Some(threads) = super::codex_index::session_choices_for_cwd(&want) {
-            return Ok(threads
+            let mut sessions: Vec<_> = threads
                 .into_iter()
                 .filter(is_user_thread)
                 .map(thread_to_ref)
-                .collect());
+                .collect();
+            if let Ok(home) = codex_home() {
+                super::codex_titles::apply_names(&home.join("session_index.jsonl"), &mut sessions);
+            }
+            return Ok(sessions);
         }
         Ok(scan_all_sessions(true)?
             .into_iter()

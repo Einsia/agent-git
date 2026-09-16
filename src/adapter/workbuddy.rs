@@ -220,6 +220,7 @@ fn list_at(root: &Path, cwd: Option<&Path>) -> Result<Vec<SessionRef>> {
             continue;
         }
         sessions.push(SessionRef {
+            title: None,
             id: id.into(),
             path: entry.path().into(),
             runtime: "workbuddy",

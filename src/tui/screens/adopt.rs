@@ -1149,6 +1149,7 @@ mod tests {
         .into_iter()
         .map(|(runtime, path, worth_naming)| sessions::ProbedSession {
             session: crate::adapter::SessionRef {
+                title: None,
                 id: "same-id".into(),
                 runtime,
                 path: path.into(),

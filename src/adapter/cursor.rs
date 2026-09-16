@@ -304,6 +304,7 @@ fn collect_project(dir: &Path, cwd: Option<String>) -> Vec<SessionRef> {
 
 fn session_ref(id: String, path: PathBuf, cwd: Option<String>) -> SessionRef {
     SessionRef {
+        title: None,
         id,
         mtime: mtime_of(&path),
         path,

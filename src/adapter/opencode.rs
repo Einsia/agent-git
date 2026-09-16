@@ -243,6 +243,7 @@ fn list_all(con: &Connection) -> Option<Vec<Listed>> {
 
 fn to_ref(l: Listed, cache_root: &Path) -> SessionRef {
     SessionRef {
+        title: None,
         // The content is in the database, not at this file; the path is where the materialized
         // cache belongs. It exists only after a resolve (see the comment on [`cache_dir`]).
         path: cache_path_in(cache_root, &l.id),

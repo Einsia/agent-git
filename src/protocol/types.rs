@@ -634,6 +634,9 @@ pub struct LocalSession {
     /// `None` for the rest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gist: Option<String>,
+    /// A native display name; absent titles leave the opening preview available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Already adopted by agit (the store holds a link). Taking it over
     /// continues that lineage.
     #[serde(default)]
@@ -753,6 +756,9 @@ pub struct SessionWatch {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionWatchResult {
+    /// History paging can be unavailable while the live transcript remains readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_error: Option<String>,
     /// Exclusive byte boundary for loading history preceding this watch.
     #[serde(default)]
     pub before_cursor: u64,

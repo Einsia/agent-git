@@ -241,15 +241,8 @@ impl Daemon {
                 cwd,
                 resume_from: Some(entry.thread_id.clone()),
                 agit_session: lineage,
-                model: self.roster.starts.values().find_map(|intent| {
-                    let session = match &intent.state {
-                        roster::StartState::Pending { session } => session,
-                        roster::StartState::Completed { result } => &result.session,
-                    };
-                    (session.session_id == p.session_id)
-                        .then(|| intent.spec.model.clone())
-                        .flatten()
-                }),
+                // Native resume owns the current model; start receipts are immutable history.
+                model: None,
                 dangerous: false,
                 // Resume brings back the guard it ran under.
                 permission_mode: entry.restart_permission_mode(),
@@ -1026,6 +1019,7 @@ impl LocalSessionSnapshot {
                         continue;
                     }
                     out.push(LocalSession {
+                        title: r.title,
                         runtime_session_id: r.id.clone(),
                         runtime: r.runtime.to_string(),
                         cwd: r
@@ -1221,6 +1215,7 @@ mod discovery_preview_tests {
             .unwrap();
         assert_eq!(refs.len(), 1);
         let item = LocalSession {
+            title: None,
             runtime_session_id: refs[0].id.clone(),
             runtime: refs[0].runtime.to_owned(),
             cwd: refs[0].cwd.clone().unwrap(),
@@ -1287,6 +1282,7 @@ mod discovery_preview_tests {
             .into_iter()
             .enumerate()
             .map(|(index, gist)| LocalSession {
+                title: None,
                 runtime_session_id: format!("native-{index}"),
                 runtime: "codex".into(),
                 cwd: "/fixture".into(),

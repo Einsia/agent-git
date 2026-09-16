@@ -118,6 +118,7 @@ fn list_at(root: &Path, cwd: Option<&Path>) -> Result<Vec<SessionRef>> {
             let id: String = row.get(0)?;
             let updated: i64 = row.get(1)?;
             sessions.push(SessionRef {
+                title: None,
                 path: db::cache_path("openclaw", &id)?,
                 id,
                 runtime: "openclaw",

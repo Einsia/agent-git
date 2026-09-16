@@ -50,6 +50,8 @@ pub struct Thread {
     pub thread_source: Option<String>,
     pub source: Option<String>,
     pub updated_at_ms: Option<i64>,
+    /// A bounded native title; missing or blank metadata is absent.
+    pub title: Option<String>,
 }
 
 /// Find the newest state database.
@@ -115,10 +117,18 @@ fn select(con: &Connection) -> String {
     } else {
         "NULL"
     };
+    let title = if con.prepare("SELECT title FROM threads LIMIT 0").is_ok() {
+        format!(
+            "CASE WHEN typeof(title) = 'text' THEN substr(title, 1, {}) END",
+            GIST_SOURCE_CHARS + 1
+        )
+    } else {
+        "NULL".into()
+    };
     format!(
         "SELECT id, rollout_path, cwd, \
          CASE WHEN typeof(first_user_message) = 'text' THEN substr(first_user_message, 1, {}) END, thread_source, \
-         updated_at_ms, {source} FROM threads",
+         updated_at_ms, {source}, {title} FROM threads",
         GIST_SOURCE_CHARS + 1
     )
 }
@@ -142,6 +152,10 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         thread_source: r.get(4).ok(),
         updated_at_ms: r.get(5).ok(),
         source: r.get(6).ok(),
+        title: r
+            .get::<_, String>(7)
+            .ok()
+            .and_then(|title| super::codex_titles::preview(&title)),
     })
 }
 
@@ -445,6 +459,53 @@ mod tests {
     fn q_cwd(p: &Path, cwd: &str) -> Vec<Thread> {
         let con = open(p).unwrap();
         threads_for_cwd_at(&con, cwd, false).unwrap()
+    }
+
+    #[test]
+    fn titles_are_optional_bounded_text_without_changing_opening_previews() {
+        let (_directory, path) = fixture();
+        assert!(
+            q_cwd(&path, "/repo/one")
+                .iter()
+                .all(|row| row.title.is_none())
+        );
+        let con = Connection::open(&path).unwrap();
+        con.execute_batch("ALTER TABLE threads ADD COLUMN title;")
+            .unwrap();
+        let long = format!("{}TAIL", "t".repeat(GIST_SOURCE_CHARS * 2));
+        for title in [
+            rusqlite::types::Value::Text(long.clone()),
+            rusqlite::types::Value::Text("  \n  ".into()),
+            rusqlite::types::Value::Blob(b"not text".to_vec()),
+        ] {
+            con.execute("UPDATE threads SET title = ?1 WHERE id = 'id-a'", [&title])
+                .unwrap();
+            let sql = format!("{} WHERE id = 'id-a'", select(&con));
+            let projected: Option<String> = con.query_row(&sql, [], |row| row.get(7)).unwrap();
+            assert!(
+                projected
+                    .as_ref()
+                    .is_none_or(|text| text.chars().count() <= GIST_SOURCE_CHARS + 1)
+            );
+            let listed = q_cwd(&path, "/repo/one");
+            assert_eq!(listed[0].gist.as_deref(), Some("fix rotation"));
+            if title == rusqlite::types::Value::Text(long.clone()) {
+                let shown = listed[0].title.as_ref().unwrap();
+                assert_eq!(
+                    shown.chars().count(),
+                    super::super::preview::SESSION_PREVIEW_CHARS + 1
+                );
+                assert!(shown.ends_with('…'));
+            } else {
+                assert!(listed[0].title.is_none());
+            }
+            let stored: rusqlite::types::Value = con
+                .query_row("SELECT title FROM threads WHERE id = 'id-a'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(stored, title);
+        }
     }
 
     #[test]

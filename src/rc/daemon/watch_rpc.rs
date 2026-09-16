@@ -30,6 +30,7 @@ pub(super) struct PreparedWatch {
     total_lines: u64,
     absolute_lines: bool,
     before_cursor: u64,
+    history_error: Option<String>,
 }
 
 enum WatchSource {
@@ -113,23 +114,9 @@ impl WatchScan {
                 absolute,
             )
         };
-        let before_cursor = match &source {
-            WatchSource::File { path, offset, .. } => {
-                #[cfg(unix)]
-                if runtime == "codex" {
-                    crate::rc::local_history::watch_cursor(path, *offset).map_err(|error| {
-                        RpcError::new(ErrorCode::RuntimeUnavailable, error.to_string())
-                    })?
-                } else {
-                    *offset
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = path;
-                    *offset
-                }
-            }
-            WatchSource::Native { .. } => 0,
+        let (before_cursor, history_error) = match &source {
+            WatchSource::File { path, offset, .. } => history_cursor(&runtime, path, *offset),
+            WatchSource::Native { .. } => (0, None),
         };
         let seed = match &source {
             WatchSource::File { path, offset, .. } => watch_seed_event(&runtime, path, *offset),
@@ -146,8 +133,24 @@ impl WatchScan {
             total_lines,
             absolute_lines,
             before_cursor,
+            history_error,
         })
     }
+}
+
+fn history_cursor(runtime: &str, path: &Path, offset: u64) -> (u64, Option<String>) {
+    #[cfg(unix)]
+    if runtime == "codex" {
+        return match crate::rc::local_history::watch_cursor(path, offset) {
+            Ok(cursor) => (cursor, None),
+            Err(error) => (
+                0,
+                Some(format!("Native history paging is unavailable: {error}")),
+            ),
+        };
+    }
+    let _ = (runtime, path);
+    (offset, None)
 }
 
 impl Daemon {
@@ -187,6 +190,7 @@ impl Daemon {
             total_lines,
             absolute_lines,
             before_cursor,
+            history_error,
         } = prepared;
         if request != p {
             return Err(RpcError::new(
@@ -470,6 +474,7 @@ impl Daemon {
 
         Ok(serde_json::to_value(SessionWatchResult {
             before_cursor,
+            history_error,
             session: self.stamped(
                 self.watches
                     .get(&watch_id)

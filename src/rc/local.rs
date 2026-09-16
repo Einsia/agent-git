@@ -117,7 +117,7 @@ fn spawn_daemon() -> crate::Result<()> {
 fn bridge(ensure_daemon: bool) -> crate::Result<()> {
     use std::os::unix::net::UnixStream as StdStream;
     let path = rpc_path()?;
-    let mut socket = match StdStream::connect(&path) {
+    let socket = match StdStream::connect(&path) {
         Ok(socket) => socket,
         Err(first) if ensure_daemon => {
             if super::control::running_pid().is_none() {
@@ -141,6 +141,7 @@ fn bridge(ensure_daemon: bool) -> crate::Result<()> {
         }
         Err(error) => return Err(error).context("start the local daemon or pass --ensure"),
     };
+    let mut socket = authenticate_server(socket, unsafe { libc::geteuid() })?;
     let mut input = socket.try_clone()?;
     // The output owner exits on socket closure even while stdin has no data.
     std::thread::spawn(move || {
@@ -149,6 +150,43 @@ fn bridge(ensure_daemon: bool) -> crate::Result<()> {
     });
     copy_flushed(&mut socket, &mut std::io::stdout().lock())?;
     Ok(())
+}
+
+fn authenticate_server(
+    socket: std::os::unix::net::UnixStream,
+    owner: libc::uid_t,
+) -> crate::Result<std::os::unix::net::UnixStream> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
+    let _guard = runtime.enter();
+    socket.set_nonblocking(true)?;
+    let socket = tokio::net::UnixStream::from_std(socket)?;
+    ensure!(
+        socket.peer_cred()?.uid() == owner,
+        "Local RPC server belongs to another user"
+    );
+    let socket = socket.into_std()?;
+    socket.set_nonblocking(false)?;
+    Ok(socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn bridge_authenticates_server_before_forwarding_bytes() {
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let owner = unsafe { libc::geteuid() };
+        let error = authenticate_server(client, owner.wrapping_add(1)).unwrap_err();
+        assert!(error.to_string().contains("another user"));
+        assert_eq!(server.read(&mut [0; 1]).unwrap(), 0);
+
+        let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(authenticate_server(client, owner).is_ok());
+    }
 }
 
 fn copy_flushed(

@@ -858,6 +858,7 @@ fn collect_dir(dir: &Path, cwd: Option<String>) -> Result<Vec<SessionRef>> {
             continue;
         };
         out.push(SessionRef {
+            title: None,
             id: stem.to_string(),
             path: p,
             runtime: "claude-code",

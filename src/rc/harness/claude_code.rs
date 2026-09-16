@@ -449,6 +449,11 @@ impl ClaudeCodeDriver {
     }
 
     pub async fn start_turn(&mut self, message: &str) -> super::TurnStartOutcome {
+        if self.goal_query_pending {
+            return super::TurnStartOutcome::RetryableNotAccepted {
+                message: "Claude goal recovery is incomplete; restart the local daemon".into(),
+            };
+        }
         if self.interrupt_draining {
             return super::TurnStartOutcome::RetryableNotAccepted {
                 message:
