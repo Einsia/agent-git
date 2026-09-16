@@ -198,6 +198,40 @@ impl<K: KeyStore> RepositoryDictionary<K> {
         })
     }
 
+    /// Protect user-controlled observations without rewriting metadata schema or identity fields.
+    pub fn protect_metadata(
+        &self,
+        metadata: &mut crate::domain::meta::Meta,
+        global: &Matcher,
+    ) -> crate::Result<ProtectionReport> {
+        let fields = observation_fields(metadata);
+        let report = self.protect_jsonl(&serde_json::to_string(&fields)?, global)?;
+        let protected: Vec<String> = serde_json::from_str(&report.text)?;
+        for (field, value) in fields.into_iter().zip(protected) {
+            *field = value;
+        }
+        Ok(report)
+    }
+
+    /// Local comparison may recover observations without changing Git or the dictionary.
+    /// Unknown placeholders remain opaque; callers must not treat them as known identities.
+    pub fn hydrate_metadata_readonly(
+        &self,
+        metadata: &mut crate::domain::meta::Meta,
+    ) -> crate::Result<usize> {
+        let fields = observation_fields(metadata);
+        let input = serde_json::to_string(&fields)?;
+        if !input.contains(TOKEN_PREFIX) {
+            return Ok(0);
+        }
+        let (report, _) = self.hydrate_pair_readonly(&input, "")?;
+        let hydrated: Vec<String> = serde_json::from_str(&report.text)?;
+        for (field, value) in fields.into_iter().zip(hydrated) {
+            *field = value;
+        }
+        Ok(report.unresolved)
+    }
+
     /// Protect arbitrary text (currently used for the generated commit subject).
     pub fn protect_text(&self, text: &str, global: &Matcher) -> crate::Result<ProtectionReport> {
         self.store.with_lock(|| {
@@ -1150,6 +1184,17 @@ fn bump_and_write<K: KeyStore>(
     Ok(())
 }
 
+fn observation_fields(metadata: &mut crate::domain::meta::Meta) -> Vec<&mut String> {
+    let mut fields = vec![&mut metadata.cwd];
+    fields.extend(metadata.code.iter_mut());
+    fields.extend(metadata.milestone.iter_mut());
+    if let Some(state) = metadata.cwd_state.as_mut() {
+        fields.extend(state.origin.iter_mut());
+        fields.extend(state.branch.iter_mut());
+    }
+    fields
+}
+
 fn transform_jsonl(
     text: &str,
     mut transform: impl FnMut(&str) -> crate::Result<(String, usize)>,
@@ -1372,6 +1417,60 @@ mod tests {
             self.0.lock().unwrap().remove(vault_id);
             Ok(())
         }
+    }
+
+    /// A rule matching a structural word must only project user-controlled observations.
+    #[test]
+    fn metadata_projection_preserves_schema_and_identity() {
+        use crate::domain::meta::{self, Meta};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary =
+            RepositoryDictionary::new(dir.path().join("vault.json"), MemoryKeys::default());
+        let claim = format!("agit-{}", "a".repeat(40));
+        let mut metadata = Meta::new(claim.clone(), "codex".into(), "/turn/project".into());
+        metadata.turn = Some(1);
+        metadata.milestone = Some("turn with \"quotes\"".into());
+        let original = serde_json::to_value(&metadata).unwrap();
+        let report = dictionary
+            .protect_metadata(
+                &mut metadata,
+                &Matcher::for_test(&[("word", "turn"), ("escaped", "with \"quotes\"")]),
+            )
+            .unwrap();
+        assert!(report.replacements > 0);
+        meta::validate(&metadata).unwrap();
+        assert_eq!(metadata.session, claim);
+        assert_eq!(metadata.runtime, "codex");
+        assert_eq!(metadata.kind, meta::Kind::Turn);
+        assert_eq!(metadata.turn, Some(1));
+        assert!(!metadata.cwd.contains("turn"));
+        assert!(!metadata.milestone.as_ref().unwrap().contains("quotes"));
+        let protected = metadata.clone();
+        let vault_before = std::fs::read(dir.path().join("vault.json")).unwrap();
+        assert_eq!(
+            dictionary.hydrate_metadata_readonly(&mut metadata).unwrap(),
+            0
+        );
+        assert_eq!(serde_json::to_value(metadata).unwrap(), original);
+        assert_eq!(
+            std::fs::read(dir.path().join("vault.json")).unwrap(),
+            vault_before
+        );
+        let missing = dir.path().join("missing/vault.json");
+        let unavailable = RepositoryDictionary::new(missing.clone(), MemoryKeys::default());
+        let mut metadata = protected.clone();
+        assert!(
+            unavailable
+                .hydrate_metadata_readonly(&mut metadata)
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            serde_json::to_value(metadata).unwrap(),
+            serde_json::to_value(protected).unwrap()
+        );
+        assert!(!missing.parent().unwrap().exists());
     }
 
     #[test]

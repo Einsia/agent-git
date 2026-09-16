@@ -608,10 +608,10 @@ fn same_repo_branches(links: &[Adopted], now: SystemTime) -> Vec<SameRepo> {
         // the shape `docs/07_tui.md` §4.1 watches.
         let snaps = crate::domain::meta::at_refs(&repo, &refs);
         let committed = committed_at(&repo);
-        for (b, snap) in branches.iter().zip(snaps) {
+        let matches = crate::commands::resume::same_repo_matches(&repo, &snaps, &origin);
+        for ((b, snap), matches) in branches.iter().zip(snaps).zip(matches) {
             let Some(snap) = snap else { continue };
-            let Some(code) = &snap.code else { continue };
-            if !crate::commands::resume::same_repo_as(code, &origin) {
+            if !matches {
                 continue;
             }
             let slug = format!("{owner}/{name}");

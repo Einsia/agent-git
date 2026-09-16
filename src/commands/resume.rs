@@ -297,11 +297,12 @@ fn gather_candidates(cwd: &Path) -> Vec<Candidate> {
                 continue;
             };
             let committed = crate::tui::screens::sessions::committed_at(&repo);
-            for b in repo.branches() {
-                if let Some(snap) = meta::read_at_ref(&repo, &format!("refs/heads/{b}"))
-                    && let Some(code) = &snap.code
-                    && same_repo_as(code, &origin)
-                {
+            let branches = repo.branches();
+            let refs: Vec<_> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
+            let snapshots = meta::at_refs(&repo, &refs);
+            let matches = same_repo_matches(&repo, &snapshots, &origin);
+            for ((b, snap), matches) in branches.into_iter().zip(snapshots).zip(matches) {
+                if matches && let Some(snap) = snap {
                     let slug = format!("{owner}/{name}");
                     if out.iter().any(|c| c.slug == slug && c.branch == b) {
                         continue;
@@ -322,6 +323,55 @@ fn gather_candidates(cwd: &Path) -> Vec<Candidate> {
     }
     out.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_active));
     out
+}
+
+/// Candidate observations share a dictionary snapshot per repository, not per branch.
+pub(crate) fn same_repo_matches(
+    repo: &Repo,
+    snapshots: &[Option<meta::Meta>],
+    origin: &str,
+) -> Vec<bool> {
+    crate::domain::secret_filter::RepositoryDictionary::open(repo.root())
+        .and_then(|dictionary| same_repo_matches_in(&dictionary, snapshots, origin))
+        .unwrap_or_else(|_| vec![false; snapshots.len()])
+}
+
+fn same_repo_matches_in<K: crate::domain::secret_filter::KeyStore>(
+    dictionary: &crate::domain::secret_filter::RepositoryDictionary<K>,
+    snapshots: &[Option<meta::Meta>],
+    origin: &str,
+) -> crate::Result<Vec<bool>> {
+    let mut matches = vec![false; snapshots.len()];
+    let mut protected = Vec::new();
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        let Some(code) = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.code.as_ref())
+        else {
+            continue;
+        };
+        if code.contains("{{AGIT_SECRET_V1:") {
+            protected.push((index, serde_json::to_string(code)?));
+        } else {
+            matches[index] = same_repo_as(code, origin);
+        }
+    }
+    if protected.is_empty() {
+        return Ok(matches);
+    }
+    let inputs: Vec<_> = protected.iter().map(|(_, code)| code.as_str()).collect();
+    let Ok(reports) = dictionary.hydrate_batch_readonly_bounded(&inputs, 8 * 1024 * 1024) else {
+        return Ok(matches);
+    };
+    for ((index, _), report) in protected.into_iter().zip(reports) {
+        if let Ok(report) = report
+            && report.unresolved == 0
+            && let Ok(code) = serde_json::from_str::<String>(&report.text)
+        {
+            matches[index] = same_repo_as(&code, origin);
+        }
+    }
+    Ok(matches)
 }
 
 /// Candidate badges compare complete repository identities. Prefix matches would associate
@@ -470,6 +520,13 @@ enum CwdStateComparison {
 }
 
 fn compare_cwd_state(recorded: &meta::CwdState, current: &meta::CwdState) -> CwdStateComparison {
+    if [recorded.origin.as_deref(), recorded.branch.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|value| value.contains("{{AGIT_SECRET_V1:"))
+    {
+        return CwdStateComparison::Unknown;
+    }
     let recorded = recorded.sanitized();
     let current = current.sanitized();
     if recorded.origin != current.origin
@@ -495,10 +552,14 @@ fn compare_cwd_state(recorded: &meta::CwdState, current: &meta::CwdState) -> Cwd
 /// A missing snapshot is expected for sessions created before cwd-state persistence. A cwd
 /// outside Git is also not an error: there is no trustworthy state to compare, so resume warns
 /// and continues. A known, unequal pair and an uncomparable pair both need a user decision.
-fn cwd_resume_decision(snapshot: &meta::Meta, cwd: &Path) -> crate::Result<CwdResumeDecision> {
-    let Some(recorded) = snapshot.cwd_state.as_ref() else {
+fn cwd_resume_decision(
+    repo: &Repo,
+    snapshot: &meta::Meta,
+    cwd: &Path,
+) -> crate::Result<CwdResumeDecision> {
+    if snapshot.cwd_state.is_none() {
         return Ok(CwdResumeDecision::Continue);
-    };
+    }
     let Some(current) = meta::cwd_state_of(cwd) else {
         ui::warning(&format!(
             "resume cwd `{}` is not a Git repository; the recorded cwd state cannot be compared, so continuing without an environment notice",
@@ -507,6 +568,11 @@ fn cwd_resume_decision(snapshot: &meta::Meta, cwd: &Path) -> crate::Result<CwdRe
         ui::hint("use `agit resume --cwd <git-checkout>` to compare the recorded repository state");
         return Ok(CwdResumeDecision::Continue);
     };
+    let mut local_snapshot = snapshot.clone();
+    crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?
+        .hydrate_metadata_readonly(&mut local_snapshot)?;
+    let snapshot = &local_snapshot;
+    let recorded = snapshot.cwd_state.as_ref().expect("recorded state exists");
     let comparison = compare_cwd_state(recorded, &current);
     if comparison == CwdStateComparison::Equal {
         return Ok(CwdResumeDecision::Continue);
@@ -521,7 +587,7 @@ fn cwd_resume_decision(snapshot: &meta::Meta, cwd: &Path) -> crate::Result<CwdRe
                 "the resume cwd worktree state cannot be compared reliably; uncommitted changes may be missing",
             );
             ui::hint(
-                "the repository identity matches, but an unknown state does not prove that the worktrees are equal",
+                "missing local secret mappings or an unknown worktree state cannot prove equality",
             );
         }
         CwdStateComparison::Equal => unreachable!(),
@@ -733,7 +799,7 @@ pub(crate) fn archive_launch_context(
     let system_prompt = if file {
         None
     } else {
-        match cwd_resume_decision(&snapshot, &cwd)? {
+        match cwd_resume_decision(repo, &snapshot, &cwd)? {
             CwdResumeDecision::Continue => None,
             CwdResumeDecision::Inject(prompt) => Some(prompt),
             CwdResumeDecision::Cancel => return Ok(None),
@@ -883,7 +949,7 @@ fn resume_branch_for(
 
     // `cwd_state` is an observation, not a checkout instruction. Compare it before either
     // native reuse or VIEW materialization so both resume paths receive the same context.
-    let system_prompt = match cwd_resume_decision(&snap, &cwd)? {
+    let system_prompt = match cwd_resume_decision(repo, &snap, &cwd)? {
         CwdResumeDecision::Continue => None,
         CwdResumeDecision::Inject(prompt) => Some(prompt),
         CwdResumeDecision::Cancel => return Ok(None),
@@ -2042,6 +2108,71 @@ mod tests {
     use crate::domain::transcript;
     use std::path::Path;
 
+    /// Protected branches share key access and keep candidate order and stored metadata intact.
+    #[test]
+    fn protected_candidates_unlock_the_repository_dictionary_once() {
+        use crate::domain::secret_filter::{KeyStore, Matcher, RepositoryDictionary};
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use zeroize::Zeroizing;
+
+        struct Keys {
+            reads: Arc<AtomicUsize>,
+            key: Mutex<Option<Vec<u8>>>,
+        }
+        impl KeyStore for Keys {
+            fn get(&self, _: &str) -> crate::Result<Zeroizing<Vec<u8>>> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.key
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .map(Zeroizing::new)
+                    .ok_or_else(|| anyhow::anyhow!("missing fixture key"))
+            }
+            fn set(&self, _: &str, key: &[u8]) -> crate::Result<()> {
+                *self.key.lock().unwrap() = Some(key.to_vec());
+                Ok(())
+            }
+            fn delete(&self, _: &str) -> crate::Result<()> {
+                *self.key.lock().unwrap() = None;
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let dictionary = RepositoryDictionary::new(
+            dir.path().join("vault.json"),
+            Keys {
+                reads: reads.clone(),
+                key: Mutex::new(None),
+            },
+        );
+        let origin = "https://private-origin.example.test/repo.git";
+        let mut snapshot = meta::Meta::new(String::new(), "codex".into(), "/work".into());
+        snapshot.code = Some(format!("{origin}@abcdef01"));
+        dictionary
+            .protect_metadata(&mut snapshot, &Matcher::for_test(&[("origin", origin)]))
+            .unwrap();
+        let mut other = snapshot.clone();
+        other.code = Some("https://other.example.test/repo.git@abcdef01".into());
+        let candidates = vec![Some(snapshot.clone()), None, Some(other), Some(snapshot)];
+        let before = serde_json::to_value(&candidates).unwrap();
+        let vault = std::fs::read(dir.path().join("vault.json")).unwrap();
+        std::fs::remove_file(dir.path().join("vault.lock")).unwrap();
+        reads.store(0, Ordering::SeqCst);
+        assert_eq!(
+            super::same_repo_matches_in(&dictionary, &candidates, origin).unwrap(),
+            vec![true, false, false, true]
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(serde_json::to_value(&candidates).unwrap(), before);
+        assert_eq!(std::fs::read(dir.path().join("vault.json")).unwrap(), vault);
+        assert!(!dir.path().join("vault.lock").exists());
+    }
+
     #[test]
     fn candidate_identity_ignores_removed_transport_credentials() {
         let authenticated =
@@ -2689,7 +2820,7 @@ mod tests {
         });
 
         assert!(matches!(
-            super::cwd_resume_decision(&snapshot, dir.path()).unwrap(),
+            super::cwd_resume_decision(&Repo::at(dir.path()), &snapshot, dir.path()).unwrap(),
             super::CwdResumeDecision::Continue
         ));
     }
@@ -2829,6 +2960,15 @@ mod tests {
             super::CwdStateComparison::Different
         );
 
+        let mut unavailable = base.clone();
+        unavailable.origin = Some(format!(
+            "https://{{{{AGIT_SECRET_V1:00000000-0000-4000-8000-000000000001:sec_{}}}}}.invalid/repo.git",
+            "a".repeat(32)
+        ));
+        assert_eq!(
+            super::compare_cwd_state(&unavailable, &base),
+            super::CwdStateComparison::Unknown
+        );
         let snapshot = meta::Meta::new(String::new(), "codex".into(), "/work".into());
         let unknown_notice =
             super::cwd_state_notice(&snapshot, Path::new("/work"), &base, Some(&base)).unwrap();

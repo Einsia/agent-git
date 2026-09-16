@@ -1894,7 +1894,7 @@ fn settle_bytes(
         crate::domain::secret_filter::VaultStore::open_default()?.matcher()?
     };
     let secret_dictionary = crate::domain::secret_filter::RepositoryDictionary::open(repo.root())?;
-    let protected_full = if file_line {
+    let mut protected_full = if file_line {
         crate::domain::secret_filter::ProtectionReport {
             text: text.clone(),
             replacements: 0,
@@ -2319,6 +2319,30 @@ fn settle_bytes(
     if !quiet && total > 1 {
         ui::progress(format_args!("  preparing {total} turns"));
     }
+    let observed_code = code_anchor
+        .as_ref()
+        .map(|(code, _)| code.clone())
+        .or_else(|| meta::code_of(Path::new(&cwd)));
+    let mut observations = Meta::new(claim.clone(), source.to_string(), cwd.clone());
+    observations.code = observed_code.clone();
+    observations.cwd_state = cwd_state.clone();
+    observations.milestone = opts.milestone.clone();
+    let protected_observations =
+        secret_dictionary.protect_metadata(&mut observations, &global_secrets)?;
+    // A value learned from an observation can also occur in the transcript. Finish discovery
+    // before constructing content-addressed events so both surfaces use the same dictionary.
+    if protected_observations.new_heuristic_records > 0 {
+        let projected = secret_dictionary.protect_jsonl(&text, &global_secrets)?;
+        protected_full.text = projected.text;
+        protected_full.replacements = projected.replacements;
+        protected_full.new_records += projected.new_records;
+        protected_full.new_heuristic_records += projected.new_heuristic_records;
+        protected_full.intact = projected.intact;
+    }
+    protected_full.replacements += protected_observations.replacements;
+    protected_full.new_records += protected_observations.new_records;
+    protected_full.new_heuristic_records += protected_observations.new_heuristic_records;
+    protected_full.intact += protected_observations.intact;
     let mut native = if materialized_base.is_none() {
         Some(native::NativeSnapshots::new(
             &text,
@@ -2331,11 +2355,6 @@ fn settle_bytes(
     } else {
         None
     };
-    let observed_code = code_anchor
-        .as_ref()
-        .map(|(code, _)| code.clone())
-        .or_else(|| meta::code_of(Path::new(&cwd)));
-
     for (i, c) in new_chunks.iter().enumerate() {
         let turn_no = head_turn_base + 1 + i as u32;
         let absolute_end = region_start + c.end_byte;
@@ -2343,14 +2362,14 @@ fn settle_bytes(
             ui::progress(format_args!("  building turn {}/{}", i + 1, total));
         }
 
-        let mut snap = Meta::new(claim.clone(), source.to_string(), cwd.clone());
+        let mut snap = observations.clone();
         snap.kind = Kind::Turn;
         snap.turn = Some(turn_no);
         snap.baseline_bytes = Some(absolute_end as u64);
-        snap.code = observed_code.clone();
         let last = i + 1 == total;
-        if last {
-            snap.cwd_state = cwd_state.clone();
+        if !last {
+            snap.cwd_state = None;
+            snap.milestone = None;
         }
         // Historical imports cannot prove the workspace state at any captured turn. During
         // live settlement, only the last turn can use the workspace state observed now.
@@ -2367,9 +2386,6 @@ fn settle_bytes(
                 })
             })
         };
-        if last {
-            snap.milestone = opts.milestone.clone();
-        }
         let subject = {
             let one = c.gist.split_whitespace().collect::<Vec<_>>().join(" ");
             let s: String = one.chars().take(72).collect();

@@ -21,10 +21,21 @@ repository-scoped placeholder ── agit push ──► hub / other devices
 runtime plaintext
 ```
 
-v1 automatically protects only a session's `session/log.jsonl`, `session/VIEW` and the commit
-subject generated from that turn's user prompt. Shared files, arbitrary Git headers, tag
-messages and history that predates the feature are still refused by the existing push gate;
-the tool cannot claim to rewrite those objects without changing their commit IDs.
+Session settlement protects native event content and generated commit messages, together
+with user-controlled observations in `session/meta.json`: working directory, code origin,
+observed branch and milestone. Metadata schema, session identity, object hashes and enum
+values remain structural. Heuristic discovery completes before event objects are formed,
+so values learned from observations also protect matching transcript content.
+
+Shared files, arbitrary Git headers, tag messages and history that predates protection are
+still refused by the existing push gate; the tool cannot rewrite those objects without
+changing their commit IDs. Import and commit protect newly settled snapshots; push validates
+the entire outgoing history and never rewrites it.
+
+Local resume and same-repository discovery read observation placeholders through the local
+dictionary without rewriting stored metadata. A missing mapping cannot establish repository
+identity or equal worktree state. Shared/backend metadata reads retain placeholders; bounded
+status inspection reports unavailable evidence when its local dictionary cannot be read.
 
 Two kinds of candidate enter the dictionary automatically: literals the user registered
 explicitly in the global vault, and heuristic hits the built-in rules find in a session's

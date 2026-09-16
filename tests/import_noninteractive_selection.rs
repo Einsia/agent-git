@@ -1393,3 +1393,173 @@ fn legacy_import_onto_accepts_qualified_session_and_historic_commit_targets() {
         assert_eq!(fs::read(&lab.sources[0].1).unwrap(), source);
     }
 }
+
+/// Generated observations must use the same secret projection as the imported transcript.
+#[test]
+fn imported_and_live_metadata_remain_publishable() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let lab = Lab::new(1);
+    let secret = "SYNTHETIC-PRIVATE-ORIGIN";
+    let add_rule = |name: &str, value: &str| {
+        let mut child = lab
+            .command()
+            .args(["secrets", "add", name, "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(value.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    add_rule("origin", secret);
+    add_rule("workspace", lab.work.to_str().unwrap());
+    target_git(&lab, &lab.work, &["init", "-q", "--initial-branch=main"]);
+    target_git(
+        &lab,
+        &lab.work,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Fixture",
+        ],
+    );
+    target_git(
+        &lab,
+        &lab.work,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://{secret}.example.test/repo.git"),
+        ],
+    );
+    target_git(&lab, &lab.work, &["checkout", "-b", secret]);
+    let source = &lab.sources[0].1;
+    let original = fs::read(source).unwrap();
+    let imported = lab
+        .command()
+        .args([
+            "import",
+            &lab.sources[0].0,
+            "--from",
+            "claude-code",
+            "--into",
+            "me/qa@metadata",
+            "--independent",
+        ])
+        .output()
+        .unwrap();
+    assert!(imported.status.success(), "{imported:?}");
+    assert_eq!(fs::read(source).unwrap(), original);
+    let repo = lab.store.join("repos/me/qa");
+    let metadata = target_git(&lab, &repo, &["show", "metadata:session/meta.json"]);
+    assert!(
+        !metadata.contains(secret),
+        "Code observations must be protected"
+    );
+    let snapshot: agit::domain::meta::Meta = serde_json::from_str(&metadata).unwrap();
+    agit::domain::meta::validate(&snapshot).unwrap();
+    assert!(!snapshot.cwd.contains(lab.work.to_str().unwrap()));
+    assert_eq!(snapshot.runtime, "claude-code");
+    assert_eq!(snapshot.turn, Some(1));
+
+    let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
+    for value in [
+        serde_json::json!({"type":"user", "sessionId":lab.sources[0].0, "cwd":lab.work, "uuid":"metadata-user-next", "message":{"role":"user", "content":"Continue the fixture"}}),
+        serde_json::json!({"type":"assistant", "sessionId":lab.sources[0].0, "cwd":lab.work, "uuid":"metadata-assistant-next", "message":{"role":"assistant", "content":"Fixture complete"}}),
+    ] {
+        writeln!(file, "{value}").unwrap();
+    }
+    let live_bytes = fs::read(source).unwrap();
+    let milestone_secret = "AKIA4X7QZ2M5RT6VW3JH";
+    let milestone = format!("{secret} {milestone_secret}");
+    let committed = lab
+        .command()
+        .args(["commit", "me/qa@metadata", "--milestone", &milestone])
+        .output()
+        .unwrap();
+    assert!(committed.status.success(), "{committed:?}");
+    assert_eq!(fs::read(source).unwrap(), live_bytes);
+    let metadata = target_git(&lab, &repo, &["show", "metadata:session/meta.json"]);
+    assert!(
+        !metadata.contains(secret),
+        "Live observations and milestones must be protected"
+    );
+    let snapshot: agit::domain::meta::Meta = serde_json::from_str(&metadata).unwrap();
+    agit::domain::meta::validate(&snapshot).unwrap();
+    assert!(!metadata.contains(milestone_secret));
+    assert_eq!(snapshot.turn, Some(2));
+    assert!(snapshot.milestone.unwrap().contains("AGIT_SECRET_V1"));
+    assert!(
+        snapshot
+            .cwd_state
+            .unwrap()
+            .branch
+            .unwrap()
+            .contains("AGIT_SECRET_V1")
+    );
+    let scan = lab
+        .command()
+        .args(["scan", "--secrets", "me/qa@metadata", "--json"])
+        .output()
+        .unwrap();
+    assert!(scan.status.success(), "{scan:?}");
+    let resumed = lab
+        .command()
+        .args(["resume", "me/qa@metadata", "--no-launch", "--json"])
+        .output()
+        .unwrap();
+    assert!(resumed.status.success(), "{resumed:?}");
+    let other = lab.home.join("other-checkout");
+    target_git(
+        &lab,
+        &lab.work,
+        &["clone", lab.work.to_str().unwrap(), other.to_str().unwrap()],
+    );
+    target_git(
+        &lab,
+        &other,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &format!("https://{secret}.example.test/repo.git"),
+        ],
+    );
+    let candidates = lab
+        .command()
+        .current_dir(&other)
+        .args(["resume", "--no-launch", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(candidates.status.code(), Some(8), "{candidates:?}");
+    assert!(
+        String::from_utf8_lossy(&candidates.stdout).contains("same-repo  me/qa @ metadata"),
+        "{candidates:?}"
+    );
+    fs::remove_file(repo.join(".git/agit/secret-dictionary/vault.json")).unwrap();
+    let unavailable = lab
+        .command()
+        .args(["resume", "me/qa@metadata", "--no-launch", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(unavailable.status.code(), Some(8), "{unavailable:?}");
+    assert!(
+        String::from_utf8_lossy(&unavailable.stdout).contains("cannot be compared"),
+        "{unavailable:?}"
+    );
+}
