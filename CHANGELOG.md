@@ -6,6 +6,61 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.0] - 2026-09-16
+
+### Added
+
+- **Daemon peers and Cloud tunnels.** `agitd` manages local harness sessions while
+  independent SSH or Cloud tunnel workers transport peer messages. Controllers can
+  discover and operate sessions on another executor through the same peer protocol.
+  Peer hosting is available on Linux and macOS. Cloud connections require a Hub
+  with peer relay support enabled.
+- **Independent control and inbound access.** A local controller can connect to
+  another device while its own inbound access stays disabled. Cloud admission and
+  executor session permissions are enforced separately. Adapters can constrain
+  requests to a lower role, enforced by the executor when a queued write runs.
+- **More native conversation sources.** Discover and import OpenClaw, Hermes and
+  WorkBuddy sessions, with runtime-specific setup and transcript handling.
+- **Large session files.** Stage binary deliverables with `agit file add --lfs`;
+  verify payloads during upload and download before publishing or materializing them.
+- **Local and scoped search.** Search saved local history without Hub requests, or
+  limit remote session searches to an organization or the current code origin.
+- **Optional automatic publishing.** Configure `push.auto` per user or repository
+  to publish settled turns, while keeping explicit publication available.
+- **Usage statistics controls.** Inspect collection with `agit telemetry`, disable
+  it with `agit telemetry disable` or `DO_NOT_TRACK=1`, and preview the field policy.
+  Setup discloses the default-on choice; a recorded opt-out is preserved. See the
+  [collection and privacy details](docs/telemetry.md).
+
+### Changed
+
+- **Use `agit run` for saved sources.** `agit open` is removed. Update scripts to
+  use `agit run owner/repo@ref`; `agit resume` still continues a selected session.
+- Review a frozen publication in an interactive agent before pushing, including
+  explicit handling of credential findings.
+- Status includes bounded native session details, shared files, merge progress and
+  project metadata without unbounded transcript scans.
+- Interactive startup can offer to install an available update after confirmation.
+  Non-interactive update notices go to stderr and preserve JSON output.
+- Repository secret dictionaries keep their encryption keys in local Git metadata,
+  avoiding repeated Keychain prompts after migration. Neither the dictionary nor
+  its key is uploaded by push.
+
+### Fixed
+
+- Recover from expired CLI credentials and retry browser sign-in choices without
+  losing the selected Hub or repository.
+- Keep session discovery and native watch preparation responsive, hide internal
+  runtime sessions, and preserve transcript identity across polling and replay.
+- Correlate canonical Codex user history and prevent duplicate Claude prompts.
+- Preserve native Codex session titles and recover remote session history reliably.
+- Keep controller requests, tunnel failures and harness failures within their
+  ownership boundaries, with bounded queues and diagnostic logs for recovery.
+- Support Hub SOCKS proxies and preserve Windows browser launch, process ownership
+  and named-pipe behavior.
+- Scope installed AgentGit skills to explicit session operations and retire legacy
+  home-directory instructions without replacing unrelated user content.
+
 ## [0.1.2] - 2026-09-12
 
 ### Added
@@ -107,6 +162,7 @@ First public release.
   per-platform packages for Linux and macOS on x64 and arm64, and GitHub Release
   artifacts with `SHA256SUMS`.
 
+[0.2.0]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.2.0
 [0.1.2]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.1.2
 [0.1.1]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.1.1
 [0.1.0]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.1.0

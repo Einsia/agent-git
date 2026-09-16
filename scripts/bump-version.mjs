@@ -12,9 +12,9 @@
  * prepack; this script is what changes them all at once, and brings this package's own entry
  * in Cargo.lock along with it.
  *
- * The release flow from there is in README's Release section: commit →
- * `git tag agit-vX.Y.Z` → push the tag — release.yml builds the binaries, and on success the
- * npm publish workflow takes over and publishes the whole family.
+ * The release flow from there is in README's Release section. A tag must name the
+ * verified GitHub mirror commit; tagging the source commit bypasses the mirror's
+ * identity projection and does not trigger the GitHub release workflow.
  */
 
 import { spawnSync } from 'node:child_process'
@@ -112,7 +112,10 @@ const check = spawnSync('node', [join(root, 'scripts', 'check-version.js')], { c
 if (check.status !== 0) process.exit(check.status ?? 1)
 
 console.log(`
-version ${version} staged (the CHANGELOG.md section for it is the Release body). Next:
-  git add -A && git commit
-  git tag agit-v${version} && git push origin agit-v${version}
-  # release.yml builds the binaries; on success the "npm publish" workflow takes over and publishes the npm family.`)
+version ${version} prepared (the CHANGELOG.md section for it is the Release body). Next:
+  Commit and review the changed files, then merge after CI passes.
+  Wait for GitHub main synchronization and verify the mirrored files.
+  From the verified Einsia/agent-git GitHub mirror checkout:
+    git tag agit-v${version}
+    git push git@github.com:Einsia/agent-git.git refs/tags/agit-v${version}
+  release.yml builds the binaries; on success "npm publish" publishes the npm family.`)

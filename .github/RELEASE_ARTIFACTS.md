@@ -7,11 +7,14 @@ workflow produces changes, this document, `npm/publish.mjs` and
 
 ## Trigger
 
-Push an `agit-v*` tag:
+Wait for the source release commit to pass CI and synchronize to GitHub `main`.
+Verify the mirror's file tree, then create and push an `agit-v*` tag from that
+GitHub checkout. Mirror commit IDs can differ from source commit IDs, and the
+main-branch mirror does not copy tags.
 
 ```
 git tag agit-v0.1.0
-git push origin agit-v0.1.0
+git push git@github.com:Einsia/agent-git.git refs/tags/agit-v0.1.0
 ```
 
 `VERSION` is the tag name with the prefix stripped: `agit-v0.1.0` →

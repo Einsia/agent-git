@@ -160,10 +160,15 @@ The section becomes the GitHub Release body (`scripts/release-notes.mjs` extract
 `release.yml`, with repository-relative links pinned to the release tag) and ships inside
 the `@einsia/agent-git` package.
 
-Pushing the tag runs the whole chain — binaries first, npm right after:
+After the source release commit passes CI and is synchronized to GitHub `main`,
+verify the mirrored files and create the tag in that GitHub checkout. The mirror
+rewrites commit IDs, so the source repository's SHA is not the release SHA.
+Pushing the tag to GitHub runs the whole chain — binaries first, npm right after:
 
 ```sh
-git tag agit-v0.1.0 && git push origin agit-v0.1.0   # release.yml builds, smoke-tests, attaches artifacts
+# Run from the verified Einsia/agent-git GitHub mirror checkout.
+git tag agit-v0.1.0
+git push git@github.com:Einsia/agent-git.git refs/tags/agit-v0.1.0
 ```
 
 Distribution to users runs through the npm registry: each target ships as a
