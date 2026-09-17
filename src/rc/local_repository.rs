@@ -15,18 +15,39 @@ pub struct Repository {
 
 pub fn require(lineage: &AgitSession) -> crate::Result<Repo> {
     let repository = Repo::open(&lineage.repo_dir()?).context("local repository is missing")?;
-    let id = repository.git(&["config", "--local", "agit.desktopIdentity"])?;
-    let authority = repository.git(&["config", "--local", "agit.desktopAuthority"])?;
     let machine = super::identity::identity()?;
+    require_identity(
+        &repository,
+        lineage.agent_id(),
+        &machine.machine_fingerprint,
+    )?;
+    Ok(repository)
+}
+
+fn require_identity(repository: &Repo, agent_id: &str, machine_id: &str) -> crate::Result<()> {
+    let config = repository.git(&[
+        "config",
+        "--local",
+        "--null",
+        "--get-regexp",
+        r"^agit\.desktop(identity|authority)$",
+    ])?;
+    let mut id = None;
+    let mut authority = None;
+    // Git emits normalized keys and NUL-framed values; the last value wins.
+    for record in config.split('\0') {
+        match record.split_once('\n') {
+            Some(("agit.desktopidentity", value)) => id = Some(value.trim()),
+            Some(("agit.desktopauthority", value)) => authority = Some(value.trim()),
+            _ => {}
+        }
+    }
+    ensure!(id == Some(agent_id), "local repository identity changed");
     ensure!(
-        id.trim() == lineage.agent_id(),
-        "local repository identity changed"
-    );
-    ensure!(
-        authority.trim() == format!("local:{}", machine.machine_fingerprint),
+        authority == Some(format!("local:{machine_id}").as_str()),
         "repository belongs to a different local authority"
     );
-    Ok(repository)
+    Ok(())
 }
 
 pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Repository> {
@@ -51,11 +72,7 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
             repository.directory == directory,
             "project directory changed; select a new project identity"
         );
-        require(&AgitSession::new(
-            &repository.slug,
-            &repository.agent_id,
-            "main",
-        )?)?;
+        // The launch boundary validates repository authority before spawning.
         return Ok(repository.clone());
     }
     let machine = super::identity::identity()?;
@@ -78,4 +95,56 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
     repositories.insert(project_id.into(), repository.clone());
     super::save_json("repositories.json", &repositories)?;
     Ok(repository)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_identity_uses_last_values_without_accepting_embedded_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        repo.git(&["config", "--local", "agit.desktopIdentity", "retired"])
+            .unwrap();
+        repo.git(&[
+            "config",
+            "--local",
+            "--add",
+            "agit.desktopIdentity",
+            "agent",
+        ])
+        .unwrap();
+        repo.git(&[
+            "config",
+            "--local",
+            "agit.desktopAuthority",
+            "local:machine",
+        ])
+        .unwrap();
+        require_identity(&repo, "agent", "machine").unwrap();
+
+        repo.git(&["config", "--local", "agit.desktopAuthority", "local:other"])
+            .unwrap();
+        assert!(require_identity(&repo, "agent", "machine").is_err());
+        repo.git(&[
+            "config",
+            "--local",
+            "agit.desktopAuthority",
+            "local:machine",
+        ])
+        .unwrap();
+        repo.git(&[
+            "config",
+            "--local",
+            "--add",
+            "agit.desktopIdentity",
+            "agent\nagit.desktopauthority\nlocal:machine",
+        ])
+        .unwrap();
+        assert!(require_identity(&repo, "agent", "machine").is_err());
+        repo.git(&["config", "--local", "--unset-all", "agit.desktopIdentity"])
+            .unwrap();
+        assert!(require_identity(&repo, "agent", "machine").is_err());
+    }
 }

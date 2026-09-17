@@ -1170,9 +1170,13 @@ impl Session {
         // The test must not be a time-sensitive observation, but the **intent** of this
         // launch.
         let resuming = spec.resume_from.is_some();
+        let launching = std::time::Instant::now();
         let mut driver = AnyDriver::launch(&info.runtime, spec).await?;
+        trace_phase(&info.session_id, "native.launch", launching);
         if let AnyDriver::Codex(codex) = &mut driver {
+            let opening = std::time::Instant::now();
             codex.confirm_opening().await?;
+            trace_phase(&info.session_id, "native.opening", opening);
         }
         let mut s = Session {
             agit_session,
@@ -3432,6 +3436,17 @@ fn tracing_note(msg: &str) {
     eprintln!("agitd: {msg}");
 }
 
+fn trace_phase(session_id: &str, phase: &str, started: std::time::Instant) {
+    tracing_note(
+        &serde_json::json!({
+            "event": "session.phase", "phase": phase,
+            "time": chrono::Utc::now().to_rfc3339(), "session_id": session_id,
+            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        })
+        .to_string(),
+    );
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -3504,15 +3519,4 @@ mod approval_card_tests {
             "the operator's username left with the approval card: {wire}"
         );
     }
-}
-
-fn trace_phase(session_id: &str, phase: &str, started: std::time::Instant) {
-    tracing_note(
-        &serde_json::json!({
-            "event": "session.phase", "phase": phase,
-            "time": chrono::Utc::now().to_rfc3339(), "session_id": session_id,
-            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
-        })
-        .to_string(),
-    );
 }
