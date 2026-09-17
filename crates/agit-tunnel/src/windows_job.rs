@@ -20,7 +20,7 @@ use windows_sys::Win32::System::JobObjects::{
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
 };
 
 struct OwnedHandle(HANDLE);
@@ -87,7 +87,7 @@ impl Job {
     /// The suspended creation flag closes the spawn→assignment race. The
     /// child's first instruction runs only after [`attach_and_resume`] succeeds.
     pub fn configure(command: &mut tokio::process::Command) {
-        command.creation_flags(CREATE_SUSPENDED);
+        command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
     }
 
     pub fn attach_and_resume(&self, child: &tokio::process::Child) -> io::Result<()> {

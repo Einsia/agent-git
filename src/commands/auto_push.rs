@@ -3,7 +3,7 @@
 use crate::domain::repo::Repo;
 use crate::ui;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 pub(super) fn branch_tip(directory: &Path, branch: &str) -> Option<String> {
     Repo::open(directory)?
@@ -45,7 +45,7 @@ pub(super) fn after_settlement(
     // A child process isolates the noninteractive publish policy and its JSON output from the
     // settlement caller. It uses the ordinary identity, access, visibility and secret gates.
     let outcome = std::env::current_exe().and_then(|executable| {
-        Command::new(executable)
+        crate::infra::background::command(executable)
             .args(["--json", "push", &target])
             .current_dir(directory)
             .env("AGIT_SESSION", &target)

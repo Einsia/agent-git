@@ -1304,11 +1304,15 @@ mod tests {
                 return;
             }
             Ok("parent") => {
-                let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", TEST, "--nocapture"])
-                    .env(MODE, "grandchild")
-                    .spawn()
-                    .unwrap();
+                assert!(
+                    unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null()
+                );
+                let mut descendant =
+                    crate::infra::background::command(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST, "--nocapture"])
+                        .env(MODE, "grandchild")
+                        .spawn()
+                        .unwrap();
                 std::fs::write(
                     std::env::var_os(READY).unwrap(),
                     descendant.id().to_string(),

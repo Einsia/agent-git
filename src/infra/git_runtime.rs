@@ -23,7 +23,7 @@ pub fn is_bundled() -> bool {
 pub fn command() -> Command {
     #[cfg(feature = "bundled-git")]
     if let Some(runtime) = bundled::runtime() {
-        let mut command = Command::new(runtime.git());
+        let mut command = super::background::command(runtime.git());
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
         }
@@ -33,7 +33,7 @@ pub fn command() -> Command {
         runtime.configure(&mut command);
         return command;
     }
-    Command::new("git")
+    super::background::command("git")
 }
 
 /// Reapply private executable lookup after a caller clears the subprocess environment.

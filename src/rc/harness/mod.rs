@@ -720,7 +720,10 @@ pub fn drivable() -> Vec<RuntimeCapability> {
 
 /// `<cli> --version`, best effort, used for the capability report.
 pub fn probe_version(cli: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(cli).args(args).output().ok()?;
+    let out = crate::infra::background::command(cli)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

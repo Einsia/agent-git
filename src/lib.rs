@@ -158,6 +158,7 @@ pub mod domain {
 /// **Not** another junk drawer: only what every domain needs and what belongs to no single domain
 /// goes here (where $AGIT_HOME is, where the token is kept). What only one domain uses stays out.
 pub mod infra {
+    pub(crate) mod background;
     /// Path and environment-variable resolution. The single answer to every "where is it".
     pub mod config;
     /// Credential storage: where the token is kept, and how expiry is decided.

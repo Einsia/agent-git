@@ -117,6 +117,8 @@ async fn connect(config: Config) -> crate::Result<(PacketSink, PacketSource)> {
             command: remote,
         } => {
             let mut command = tokio::process::Command::new("ssh");
+            #[cfg(windows)]
+            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
             command
                 .args([
                     "-T",
