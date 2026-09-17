@@ -63,6 +63,12 @@ fn main() {
         let _ = agit::telemetry::acquisition::installed(raw_args.len() == 3);
         return;
     }
+    if raw_args.len() == 3 && raw_args[1] == "--internal-install-stage" {
+        if let Some(raw) = raw_args[2].to_str() {
+            let _ = agit::telemetry::installation::record(raw);
+        }
+        return;
+    }
     agit::telemetry::begin(&raw_args, telemetry_restart.as_deref());
     let code = run(raw_args);
     agit::telemetry::finish(code);

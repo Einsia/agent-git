@@ -102,6 +102,8 @@ pub(crate) enum EventName {
     Session,
     #[serde(rename = "cli_install_succeeded")]
     InstallSucceeded,
+    #[serde(rename = "cli_install_stage")]
+    InstallStage,
     #[serde(rename = "cli_acquisition_linked")]
     AcquisitionLinked,
     #[serde(rename = "cli_install_attributed")]
@@ -160,7 +162,7 @@ pub(crate) fn enqueue(event: Event, generation: u64, destination: &Destination) 
         &dir,
         matches!(
             event.event,
-            EventName::InstallSucceeded | EventName::InstallAttributed
+            EventName::InstallSucceeded | EventName::InstallAttributed | EventName::InstallStage
         ),
     )?;
     let mut preferences = state::read_at(&dir)?;
@@ -274,6 +276,14 @@ pub(crate) fn spawn_worker(hub: &str) {
 
 /// The gate remains held through the request, so disable can wait for the bounded request then purge.
 pub fn flush() -> Result<()> {
+    flush_inner(None)
+}
+
+pub(crate) fn flush_installation(attempt: uuid::Uuid) -> Result<()> {
+    flush_inner(Some(attempt))
+}
+
+fn flush_inner(installation_attempt: Option<uuid::Uuid>) -> Result<()> {
     if state::override_reason().is_some() || state::positive("AGIT_TELEMETRY_DEBUG") {
         return Ok(());
     }
@@ -283,7 +293,7 @@ pub fn flush() -> Result<()> {
         return Ok(());
     };
     let dir = state::directory()?;
-    let _guard = state::gate(&dir, false)?;
+    let _guard = state::gate(&dir, installation_attempt.is_some())?;
     let preferences = state::read_at(&dir)?;
     if !state::enabled(&preferences) {
         return Ok(());
@@ -291,10 +301,22 @@ pub fn flush() -> Result<()> {
     let mut queue = load(&dir)?;
     let now = chrono::Utc::now().timestamp_millis();
     prune(&mut queue, preferences.generation, now);
-    if queue.next_send > now {
+    let terminal = installation_attempt.and_then(|attempt| {
+        queue.entries.iter().find(|entry| {
+            entry.route == destination.route
+                && entry.event.event == EventName::InstallStage
+                && entry.event.properties.get("attempt_id") == Some(&json!(attempt))
+                && entry.event.properties.get("stage") == Some(&json!("finished"))
+        })
+    });
+    let terminal_installation = terminal
+        .and_then(|entry| entry.event.properties.get("installation_id"))
+        .cloned();
+    let terminal_drain = terminal.is_some() && queue.failures == 0;
+    if queue.next_send > now && !terminal_drain {
         return state::write_json(&dir.join("queue.json"), &queue);
     }
-    let batch = queue
+    let mut eligible = queue
         .entries
         .iter()
         .filter(|entry| {
@@ -302,6 +324,22 @@ pub fn flush() -> Result<()> {
                 && (entry.event.event != EventName::Integration
                     || now - entry.event.timestamp.timestamp_millis() >= 60_000)
         })
+        .collect::<Vec<_>>();
+    if terminal_drain {
+        eligible.sort_by_key(|entry| {
+            let same_attempt = installation_attempt.is_some_and(|attempt| {
+                entry.event.properties.get("attempt_id") == Some(&json!(attempt))
+            });
+            let receipt = matches!(
+                entry.event.event,
+                EventName::InstallSucceeded | EventName::InstallAttributed
+            ) && terminal_installation.is_some()
+                && entry.event.properties.get("installation_id") == terminal_installation.as_ref();
+            !(same_attempt || receipt)
+        });
+    }
+    let batch = eligible
+        .into_iter()
         .take(BATCH_SIZE)
         .map(|entry| entry.event.clone())
         .collect::<Vec<_>>();

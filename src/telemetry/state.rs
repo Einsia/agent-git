@@ -231,7 +231,7 @@ pub fn choose(
 }
 
 pub fn onboarding() -> Result<()> {
-    if override_reason().is_some() {
+    if override_reason().is_some() || positive("AGIT_INSTALLER_ONBOARDING_HANDLED") {
         return Ok(());
     }
     let current = read()?;

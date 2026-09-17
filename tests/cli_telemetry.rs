@@ -49,6 +49,7 @@ impl Fixture {
             "AGIT_MCP_TOOL",
             "AGIT_TELEMETRY_PARENT_ID",
             "AGIT_INSTALL_CHANNEL",
+            "AGIT_INSTALLER_ONBOARDING_HANDLED",
             "AGIT_ACQUISITION_ID",
             "AGIT_CAMPAIGN_URL",
             "AGIT_YES",
@@ -1082,4 +1083,225 @@ fn maximum_escaped_campaign_round_trips_pending_and_active_preferences() {
             .success()
     );
     assert!(fixture.run(&["telemetry", "status"]).status.success());
+}
+
+#[test]
+fn installer_stages_preserve_consent_and_do_not_claim_a_verified_install() {
+    let fixture = Fixture::new();
+    let attempt = uuid::Uuid::new_v4();
+    let acquisition = uuid::Uuid::new_v4();
+    let stage = |phase: &str, outcome: &str| {
+        json!({"attempt_id":attempt,"stage":phase,"outcome":outcome,
+            "elapsed_ms":100_000_000,"error_category":"filesystem"})
+        .to_string()
+    };
+    for override_name in [
+        "DO_NOT_TRACK",
+        "AGIT_TELEMETRY_DEFER",
+        "AGIT_TELEMETRY_DISABLED",
+    ] {
+        assert!(
+            fixture
+                .command()
+                .env(override_name, "1")
+                .args(["--internal-install-stage", &stage("started", "started")])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(!fixture.path("preferences.json").exists());
+    }
+    for (phase, outcome) in [
+        ("started", "started"),
+        ("binary_copy", "error"),
+        ("finished", "error"),
+    ] {
+        assert!(
+            fixture
+                .command()
+                .env("AGIT_INSTALLER_YES", "1")
+                .env("AGIT_ACQUISITION_ID", acquisition.to_string())
+                .args(["--internal-install-stage", &stage(phase, outcome)])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let events = fixture.events();
+    assert_eq!(events.len(), 3);
+    for event in &events {
+        assert_eq!(event["event"], "cli_install_stage");
+        assert_eq!(event["properties"]["attempt_id"], attempt.to_string());
+        assert_eq!(
+            event["properties"]["acquisition_id"],
+            acquisition.to_string()
+        );
+        assert_eq!(event["properties"]["elapsed_ms"], 86_400_000);
+        assert_eq!(
+            event["properties"]["coverage"],
+            "visible_installer_after_package_fetch"
+        );
+    }
+    let preferences: Value =
+        serde_json::from_slice(&std::fs::read(fixture.path("preferences.json")).unwrap()).unwrap();
+    assert_ne!(preferences["install_reported"], true);
+    assert_eq!(events[0]["distinct_id"], events[2]["distinct_id"]);
+    let invalid = stage("private-path-canary", "error");
+    fixture.run(&["--internal-install-stage", &invalid]);
+    assert_eq!(fixture.events().len(), events.len());
+    fixture.run(&["telemetry", "disable"]);
+    fixture.run(&["--internal-install-stage", &stage("started", "started")]);
+    assert!(fixture.events().is_empty());
+}
+
+#[test]
+fn installer_terminal_delivery_survives_a_successful_start_upload() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut fixture = Fixture::new();
+    fixture.sink = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            tx.send(receive(stream)).unwrap();
+        }
+    });
+    let attempt = uuid::Uuid::new_v4();
+    let record = |phase: &str, outcome: &str| {
+        let payload = json!({"attempt_id":attempt,"stage":phase,"outcome":outcome,
+            "elapsed_ms":1,"error_category":"filesystem"})
+        .to_string();
+        assert!(
+            fixture
+                .command()
+                .env("AGIT_INSTALLER_YES", "1")
+                .args(["--internal-install-stage", &payload])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    };
+    record("started", "started");
+    let first: Value =
+        serde_json::from_str(&rx.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
+    assert_eq!(first["batch"][0]["properties"]["stage"], "started");
+    record("binary_copy", "error");
+    record("finished", "error");
+    let final_batch: Value =
+        serde_json::from_str(&rx.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
+    let phases = final_batch["batch"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["properties"]["stage"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(phases, ["binary_copy", "finished"]);
+    assert!(fixture.events().is_empty());
+
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    closed.set_nonblocking(true).unwrap();
+    let mut delayed = Fixture::new();
+    delayed.sink = format!("http://{}", closed.local_addr().unwrap());
+    delayed.enable();
+    let mut queue = delayed.queue();
+    queue["failures"] = json!(1);
+    queue["next_send"] = json!(chrono::Utc::now().timestamp_millis() + 60_000);
+    std::fs::write(
+        delayed.path("queue.json"),
+        serde_json::to_vec(&queue).unwrap(),
+    )
+    .unwrap();
+    let payload = json!({"attempt_id":uuid::Uuid::new_v4(),"stage":"finished","outcome":"error",
+        "elapsed_ms":1,"error_category":"filesystem"})
+    .to_string();
+    delayed.run(&["--internal-install-stage", &payload]);
+    assert_eq!(
+        closed.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(!delayed.events().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_installer_onboarding_stays_unset_through_receipt_and_setup() {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    let fixture = Fixture::new();
+    let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+    let mut builder = CommandBuilder::new(BIN);
+    builder.env_clear();
+    for (key, value) in [
+        ("HOME", fixture.home.path().to_str().unwrap()),
+        (
+            "AGIT_HOME",
+            fixture.home.path().join("agit").to_str().unwrap(),
+        ),
+        ("AGIT_HUB_URL", fixture.hub.as_str()),
+        ("AGIT_TELEMETRY_HOST", fixture.sink.as_str()),
+        ("AGIT_TELEMETRY_KEY", "synthetic_project"),
+        ("TERM", "xterm"),
+    ] {
+        builder.env(key, value);
+    }
+    builder.cwd(fixture.home.path());
+    builder.args([
+        "--internal-install-stage",
+        &json!({"attempt_id":uuid::Uuid::new_v4(),
+        "stage":"started","outcome":"started","elapsed_ms":0,"error_category":"none"})
+        .to_string(),
+    ]);
+    let mut child = pair.slave.spawn_command(builder).unwrap();
+    drop(pair.slave);
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let (sender, chunks) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _master = pair.master;
+        let mut buffer = [0; 4096];
+        while let Ok(count) = reader.read(&mut buffer) {
+            if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut output = String::new();
+    while !output.contains("Enable usage statistics?") {
+        assert!(Instant::now() < deadline, "Prompt not shown: {output}");
+        if let Ok(chunk) = chunks.recv_timeout(Duration::from_millis(100)) {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+    writer.write_all(b"\x1b").unwrap();
+    writer.flush().unwrap();
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("Cancellation did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!fixture.path("preferences.json").exists());
+    for args in [
+        vec!["--internal-install-completed", "--defer-notice"],
+        vec!["setup", "--yes", "--quiet"],
+    ] {
+        let result = fixture
+            .command()
+            .env("AGIT_INSTALLER_ONBOARDING_HANDLED", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    assert!(!fixture.path("preferences.json").exists());
+    assert!(fixture.path("pending-install.json").exists());
+    assert!(fixture.events().is_empty());
 }

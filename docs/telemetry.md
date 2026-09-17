@@ -118,6 +118,7 @@ been persisted when the daemon exits may be lost.
 | `cli_integration_summary` | Aggregated hook completions or received RC requests |
 | `cli_onboarding_completed` | Setup established an enabled preference |
 | `cli_session_started` | Foreground telemetry activity started a new session |
+| `cli_install_stage` | Visible create-agit attempt start, durable copy, binary verification, integration setup and completion |
 | `cli_install_succeeded` | An installer copied the binary and verified it runs; once per consent generation |
 | `cli_install_attributed` | A tagged installer associates an installation with an anonymous website acquisition |
 | `cli_acquisition_linked` | The first successful CLI login saved an authoritative account ID |
@@ -247,3 +248,27 @@ per value; invalid or excess fields are ignored without blocking installation.
 The first context is retained across reinstalls, while the latest is updated.
 Existing consent and Hub/destination boundaries apply. Hidden npm installation
 can defer the receipt until consent; opting out deletes campaign context.
+
+### Visible installer stage coverage
+
+`cli_install_stage` uses the existing telemetry preference, environment overrides,
+route binding and bounded queue. The visible installer discloses its preference
+before copying. Hidden npm lifecycle scripts retain their existing deferred
+consent behavior. A stage does not set the verified-install flag or create a
+receipt. Repeated installs receive distinct random `attempt_id` values while
+retaining the consent-scoped installation identity.
+
+Stages are `started`, `binary_copy`, `verification`, `setup`, and `finished`.
+Outcomes are `started`, `ok`, `error`, `skipped`, and `partial`. The error
+classification is limited to `none`, `filesystem`, `binary`, or `integration`;
+raw errors, paths, command text, campaign URLs and runtime session values are
+never stage properties. `elapsed_ms` measures the stage, or the complete visible
+attempt for `finished`, and is capped at a day. The runtime label uses the same
+environment-name allowlist as ordinary command telemetry.
+
+`coverage=visible_installer_after_package_fetch` explicitly excludes npm package
+download time and failures before the bundled binary can run. An attempt with
+no terminal event is incomplete or unobserved, not an asserted installation
+failure. Setup failure produces a partial completion because the verified
+binary remains installed. Missing telemetry, including opt-outs and hidden
+lifecycles, must never be counted as installation failure.

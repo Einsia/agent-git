@@ -2,6 +2,7 @@
 
 pub mod acquisition;
 mod campaign;
+pub mod installation;
 mod rc;
 pub mod schema;
 pub mod state;

@@ -137,11 +137,35 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
       check('verified install retains the browser acquisition key', saved.install_reported === true && saved.acquisition_id === acquisitionId)
       check('installer retains URL campaign context locally', saved.campaign_first?.parameters.utm_creative_format?.[0] === 'video' && saved.campaign_latest?.parameters.gclid?.[0] === 'click' && !JSON.stringify(saved).includes('private-campaign-canary'))
       check('npm yes enables statistics after a visible notice', saved.preference === 'enabled' && saved.decision_source === 'create_agit_yes' && r.stderr.includes('agit telemetry disable'), r.stderr)
+      const stages = JSON.parse(readFileSync(join(home, '.agit', 'telemetry', 'queue.json'), 'utf8')).entries
+        .map(entry => entry.event).filter(event => event.event === 'cli_install_stage')
+      check('visible installer stages cover copy, verification, setup and completion',
+        stages.map(event => event.properties.stage).join(',') === 'started,binary_copy,verification,setup,finished')
+      check('installer stages share one attempt and retain acquisition without raw campaign values',
+        new Set(stages.map(event => event.properties.attempt_id)).size === 1 &&
+        stages.every(event => event.properties.acquisition_id === acquisitionId && event.properties.elapsed_ms >= 0) &&
+        !JSON.stringify(stages).includes('private-campaign-canary'))
       spawnSync(installed, ['telemetry', 'disable'], { env, encoding: 'utf8' })
       const again = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env, encoding: 'utf8', cwd: home })
       check('reinstallation with npm yes preserves an opt-out', again.status === 0 && JSON.parse(readFileSync(preferences, 'utf8')).preference === 'disabled', again.stderr)
     }
   }
+}
+
+// A filesystem failure is observable without claiming that a binary was installed.
+{
+  const failedHome = join(work, 'failed-copy-home')
+  mkdirSync(failedHome)
+  writeFileSync(join(failedHome, '.local'), 'block directory creation')
+  const failedEnv = { ...env, HOME: failedHome, USERPROFILE: failedHome, AGIT_HOME: join(failedHome, '.agit'),
+    AGIT_TELEMETRY_HOST: 'http://127.0.0.1:9', AGIT_TELEMETRY_KEY: 'synthetic' }
+  const result = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env: failedEnv, encoding: 'utf8', cwd: failedHome })
+  const queue = join(failedHome, '.agit', 'telemetry', 'queue.json')
+  const events = existsSync(queue) ? JSON.parse(readFileSync(queue, 'utf8')).entries.map(entry => entry.event) : []
+  check('failed durable copy emits a classified failure without an installation receipt', result.status === 1 &&
+    events.some(event => event.event === 'cli_install_stage' && event.properties.stage === 'binary_copy' && event.properties.outcome === 'error') &&
+    events.some(event => event.event === 'cli_install_stage' && event.properties.stage === 'finished' && event.properties.error_category === 'filesystem') &&
+    !events.some(event => event.event === 'cli_install_succeeded'), result.stderr)
 }
 
 // npm controls lifecycle visibility; running postinstall directly cannot exercise that boundary.
