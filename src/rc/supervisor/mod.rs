@@ -37,6 +37,7 @@
 //! advertised identity: keeping the original hash would hand the hub an offline
 //! oracle for guessing a low-entropy value. See [`projected_object_hash`].
 
+mod landing;
 pub(crate) mod native_records;
 
 use crate::domain::{redact, transcript};
@@ -717,6 +718,7 @@ pub struct Session {
     /// whether it landed leaves the link pointing forever at the transcript nobody appends to,
     /// and every later turn settles nothing.
     landed_thread: Option<String>,
+    landing: Option<landing::LandingTask>,
     /// Retained classification survives failed refreshes; only `landed_thread` grants fresh use.
     archive_handoff: Option<crate::commands::commit::archive::RcHandoff>,
     /// Tells the daemon the harness's own id. A separate channel rather than the event stream:
@@ -1187,6 +1189,7 @@ impl Session {
             pending: Default::default(),
             consumed_bytes: 0,
             landed_thread: None,
+            landing: None,
             archive_handoff: None,
             notes,
             confinement,
@@ -1245,25 +1248,6 @@ impl Session {
         let _ = self.notes.try_send(note);
     }
 
-    /// Announce, then land the local lineage. Idempotent, callable repeatedly.
-    ///
-    /// Keep repository landing in the registered supervisor: landing spawns
-    /// network and Git subprocesses only after the daemon can supervise this generation.
-    async fn bind_if_known(&mut self) {
-        if self.publication.is_some() {
-            self.announce_binding().await;
-            return;
-        }
-        self.announce_binding().await;
-        let Some(thread_id) = self.driver.runtime_thread_id() else {
-            return;
-        };
-        let Some(lease) = settlement_lease(&self.settlement) else {
-            return;
-        };
-        self.land(&thread_id, lease).await;
-    }
-
     /// The executable for settlement and landing subprocesses. See [`SettlementChild`].
     fn settlement_exe(&self) -> Option<PathBuf> {
         match &self.settlement_child {
@@ -1291,125 +1275,6 @@ impl Session {
         match &self.settlement_child {
             Some(child) => Some(child.repo_dir.clone()),
             None => agit_session.repo_dir().ok(),
-        }
-    }
-
-    /// Build where this session lands on this machine: the repo, the main file line, the
-    /// branch, the store link.
-    ///
-    /// Without it, the `agit commit --from-hook` the supervisor runs fails silently on "no such
-    /// repo / the branch was never born / no link" — the conversation on the web never settles
-    /// into a commit. So failure is not the end: `landed` stays false and the next settlement
-    /// tries again.
-    async fn land(&mut self, thread_id: &str, lease: SettlementState) {
-        if !settlement_lease_is_current(&self.settlement, lease) {
-            return;
-        }
-        // A previous success is not permanent authority: the slug can be
-        // deleted and reused while the session stays alive. Clear the cached
-        // proof before every network revalidation so failure cannot fall
-        // through to commit/push.
-        self.landed_thread = None;
-        let expected_archive = self.archive_handoff.clone();
-        let Some(agit_session) = self.agit_session.clone() else {
-            // Unmanaged (no project bound) means there is nowhere to land, which is not a
-            // failure.
-            if expected_archive.is_none() {
-                self.landed_thread = Some(thread_id.to_string());
-            }
-            return;
-        };
-        // `commands::rc::land_argv` builds the argv — it lives next to the clap definition, so
-        // renaming a flag has exactly one site to change, and a test really parses this argv.
-        // Built by hand here, one rename becomes a subprocess call that always fails and only
-        // mutters about it in the log.
-        let mut args = crate::commands::rc::land_argv(
-            &agit_session.slug(),
-            agit_session.agent_id(),
-            agit_session.branch(),
-            &self.info.runtime,
-            thread_id,
-            &self.cwd.to_string_lossy(),
-        );
-        if lease.local_owner {
-            args.push("--local-owner".into());
-        }
-        let out = if let Some(exe) = self.settlement_exe() {
-            let mut command = tokio::process::Command::new(exe);
-            command.args(&args).env(
-                crate::hub::identity::EXPECTED_AGENT_ID_ENV,
-                agit_session.agent_id(),
-            );
-            if lease.local_owner {
-                command.env_remove(crate::hub::identity::EXPECTED_AGENT_ID_ENV);
-            }
-            command
-                .env_remove(crate::commands::commit::archive::NATIVE_ENV)
-                .env_remove(crate::commands::commit::archive::ROLE_ENV);
-            if let Some(expected) = &expected_archive {
-                let (Ok(native), Ok(role)) = (
-                    serde_json::to_string(&expected.native),
-                    serde_json::to_string(&expected.role),
-                ) else {
-                    return;
-                };
-                command
-                    .env(crate::commands::commit::archive::NATIVE_ENV, native)
-                    .env(crate::commands::commit::archive::ROLE_ENV, role);
-            }
-            guarded_output(&mut self.settlement, lease, command).await
-        } else {
-            None
-        };
-        match out {
-            Some(o) if o.status.success() => {
-                let handoffs: Vec<_> = String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .filter_map(|line| {
-                        line.strip_prefix(crate::commands::commit::archive::RC_PREFIX)
-                    })
-                    .map(serde_json::from_str::<crate::commands::commit::archive::RcHandoff>)
-                    .collect();
-                if handoffs.is_empty() {
-                    if expected_archive.is_none() {
-                        self.landed_thread = Some(thread_id.to_string());
-                    } else {
-                        tracing_note("RC landing lost its retained Archive classification");
-                    }
-                } else if handoffs.len() == 1 {
-                    match handoffs.into_iter().next().unwrap() {
-                        Ok(handoff)
-                            if handoff.native.session_id == thread_id
-                                && crate::adapter::normalize(&self.info.runtime).ok()
-                                    == Some(handoff.native.runtime.as_str())
-                                && handoff.role.slug == agit_session.slug()
-                                && handoff.role.branch == agit_session.branch()
-                                && expected_archive
-                                    .as_ref()
-                                    .is_none_or(|expected| expected == &handoff)
-                                && handoff
-                                    .role
-                                    .validate(handoff.role.origin_head.len())
-                                    .is_ok() =>
-                        {
-                            self.archive_handoff = Some(handoff);
-                            self.landed_thread = Some(thread_id.to_string());
-                        }
-                        _ => tracing_note(
-                            "archive landing returned a different native identity or generation",
-                        ),
-                    }
-                } else {
-                    tracing_note("archive landing returned multiple authority handoffs");
-                }
-            }
-            Some(o) => tracing_note(&format!(
-                "lineage landing failed for {agit_session}: {} (will retry next turn)",
-                String::from_utf8_lossy(&o.stderr).trim()
-            )),
-            None => tracing_note(&format!(
-                "lineage landing could not run for {agit_session} (will retry next turn)"
-            )),
         }
     }
 
@@ -1692,6 +1557,7 @@ impl Session {
     }
 
     async fn begin_turn_start(&mut self, mut pending: PendingTurnCommand) {
+        let started = std::time::Instant::now();
         if self.pending_turn_command.is_some() {
             self.resolve_turn_start(
                 pending,
@@ -1711,6 +1577,7 @@ impl Session {
                 pending.guard_attempt.clone(),
             )
             .await;
+        trace_phase(&self.info.session_id, "native.turn_dispatch", started);
         match dispatch {
             TurnStartDispatch::Resolved(outcome) => {
                 self.resolve_turn_start(pending, outcome).await;
@@ -2001,14 +1868,20 @@ impl Session {
     }
 
     async fn run_inner(&mut self, commands: &mut mpsc::Receiver<Command>) {
-        // Out of the daemon's lock and in its own task, the slow work (HTTP + git clone) can
-        // happen now.
+        // Native ownership is announced before commands run; repository preparation is independent.
         self.bind_if_known().await;
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(TAIL_POLL_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut deferred_command = None;
         loop {
+            if self
+                .landing
+                .as_ref()
+                .is_some_and(|task| task.0.is_finished())
+            {
+                self.finish_landing().await;
+            }
             tokio::select! {
                 biased;
                 cmd = async {
@@ -3631,4 +3504,15 @@ mod approval_card_tests {
             "the operator's username left with the approval card: {wire}"
         );
     }
+}
+
+fn trace_phase(session_id: &str, phase: &str, started: std::time::Instant) {
+    tracing_note(
+        &serde_json::json!({
+            "event": "session.phase", "phase": phase,
+            "time": chrono::Utc::now().to_rfc3339(), "session_id": session_id,
+            "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        })
+        .to_string(),
+    );
 }

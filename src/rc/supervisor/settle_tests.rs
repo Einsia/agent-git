@@ -1466,3 +1466,93 @@ async fn incoming_control_preserves_an_owned_git_reference_transaction() {
     assert!(!fixture.receipt().exists());
     session.driver.shutdown().await.unwrap();
 }
+
+/// Native input and Ready must progress while repository preparation waits. Settlement
+/// must still join that worker before it starts a repository writer of its own.
+#[cfg(unix)]
+#[tokio::test]
+async fn repository_preparation_does_not_block_native_input_or_ready() {
+    let fixture = SettlementFixture::new(true);
+    let started = fixture.exe.with_extension("started");
+    let release = fixture.exe.with_extension("release");
+    let script = std::fs::read_to_string(&fixture.exe).unwrap();
+    std::fs::write(&fixture.exe, script.replace(
+        "case \"$1\" in",
+        &format!("if test \"$1\" = rc; then touch '{}'; while ! test -e '{}'; do sleep 0.02; done; fi\ncase \"$1\" in", started.display(), release.display()),
+    )).unwrap();
+    let (mut session, mut out, _notes, _tx, _lease) = fixture.session();
+    if let AnyDriver::ClaudeCode(driver) = &mut session.driver {
+        driver.clear_test_current_turn();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), session.bind_if_known())
+        .await
+        .expect("binding must not wait for Git");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("preparation subprocess started");
+    let ready = HarnessEvent::Ready {
+        runtime_thread_id: session.driver.runtime_thread_id().unwrap(),
+        transcript_path: None,
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        session.on_harness_event(ready),
+    )
+    .await
+    .expect("Ready must not wait for repository preparation");
+    let (ticket, mut receipt) = crate::rc::ticket::ticket();
+    assert!(ticket.accept());
+    session
+        .begin_turn_start(PendingTurnCommand {
+            message: "start while Git waits".into(),
+            attribution: MessageAttribution::default(),
+            reply: Some(ticket),
+            initial: false,
+            guard_attempt: None,
+        })
+        .await;
+    let result = receipt
+        .wait(std::time::Duration::from_secs(2))
+        .await
+        .expect("native input is acknowledged")
+        .expect("receipt stays open")
+        .unwrap();
+    assert!(matches!(result, TurnStartOutcome::Accepted { .. }));
+    assert!(
+        session
+            .landing
+            .as_ref()
+            .is_some_and(|task| !task.0.is_finished())
+    );
+    let head = fixture.head();
+    let mut settling = Box::pin(settle_draining(
+        &mut session,
+        &mut out,
+        SettlementBoundary::Turn,
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut settling)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fixture.head(),
+        head,
+        "settlement must wait for the preparation writer"
+    );
+    std::fs::write(release, "continue").unwrap();
+    let frames = tokio::time::timeout(std::time::Duration::from_secs(5), settling)
+        .await
+        .expect("settlement completes after preparation");
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.method() == method::COMMIT_SETTLED)
+    );
+    assert_ne!(fixture.head(), head);
+    session.driver.shutdown().await.unwrap();
+}
