@@ -307,7 +307,9 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Search(_) => Startup::RemoteSearch,
         Commands::Mcp(_) | Commands::Telemetry(_) => Startup::ToolDispatcher,
         Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
-        Commands::Doctor(args) if args.repo.is_some() => Startup::ScopedDoctor,
+        Commands::Doctor(args) if args.repo.is_some() || args.repair_permissions.is_some() => {
+            Startup::ScopedDoctor
+        }
         Commands::Doctor(_) => Startup::Inspect,
         Commands::Show(args)
             if args.raw

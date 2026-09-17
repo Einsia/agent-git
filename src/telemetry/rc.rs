@@ -144,43 +144,35 @@ mod tests {
         counters.drain(|_, count| assert_eq!(count, u64::MAX));
     }
 
-    struct TestEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-    impl TestEnvironment {
-        fn new(home: &std::path::Path) -> Self {
-            let names = [
-                "AGIT_HOME",
-                "AGIT_TELEMETRY_DISABLED",
-                "AGIT_TELEMETRY_DEFER",
-                "DO_NOT_TRACK",
-            ];
-            let previous = names.map(|name| (name, std::env::var_os(name)));
-            for name in names {
-                unsafe { std::env::remove_var(name) };
-            }
-            unsafe { std::env::set_var("AGIT_HOME", home) };
-            Self(previous.into())
-        }
-    }
-
-    impl Drop for TestEnvironment {
-        fn drop(&mut self) {
-            for (name, value) in &self.0 {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(name, value),
-                        None => std::env::remove_var(name),
-                    }
-                }
-            }
-        }
-    }
-
     #[test]
     fn delayed_counts_merge_and_cannot_survive_disable_or_a_new_consent_generation() {
-        let _lock = crate::infra::config::env_lock();
-        let home = tempfile::tempdir().unwrap();
-        let _env = TestEnvironment::new(home.path());
+        const CHILD: &str = "AGIT_TEST_RC_TELEMETRY_CHILD";
+        const COMPLETE: &str = "delayed RC telemetry verified";
+        if std::env::var_os(CHILD).is_none() {
+            // Concurrent test forks can inherit the gate and make a later nonblocking enqueue fail.
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "telemetry::rc::tests::delayed_counts_merge_and_cannot_survive_disable_or_a_new_consent_generation",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("AGIT_HOME", home.path())
+                .env_remove("AGIT_TELEMETRY_DISABLED")
+                .env_remove("AGIT_TELEMETRY_DEFER")
+                .env_remove("DO_NOT_TRACK")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETE));
+            return;
+        }
         let preferences = state::choose(
             state::Preference::Enabled,
             state::DecisionSource::ExplicitEnable,
@@ -245,5 +237,6 @@ mod tests {
         counters.persist(&context);
         assert!(!queue.exists());
         assert!(!counters.drain(|_, _| panic!("stale counts must be discarded")));
+        println!("{COMPLETE}");
     }
 }

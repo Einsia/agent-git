@@ -12,7 +12,7 @@
     "config": {"aliases":[],"args":{"global":{"action":"SetTrue","policy":"boolean"},"key":{"action":"Set","policy":"enum","values":["hub.url","runtime.default","push.visibility","push.auto","commit.auto","memory.track","secrets.keystore"]},"list":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"},"unset":{"action":"SetTrue","policy":"boolean"},"value":{"action":"Set","policy":"presence"}}},
     "diff": {"aliases":[],"args":{"files":{"action":"SetTrue","policy":"boolean"},"range":{"action":"Set","policy":"presence"},"turns":{"action":"SetTrue","policy":"boolean"},"view":{"action":"SetTrue","policy":"boolean"}}},
     "distill": {"aliases":[],"args":{"into":{"action":"Set","policy":"presence"},"paths":{"action":"Append","policy":"count"}}},
-    "doctor": {"aliases":[],"args":{"check_backend":{"action":"SetTrue","policy":"boolean"},"deep":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"}}},
+    "doctor": {"aliases":[],"args":{"check_backend":{"action":"SetTrue","policy":"boolean"},"deep":{"action":"SetTrue","policy":"boolean"},"repair_permissions":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"}}},
     "export": {"aliases":[],"args":{"format":{"action":"Set","policy":"enum","values":["jsonl","ir","markdown","claude-code","codex"]},"out":{"action":"Set","policy":"presence"},"redact":{"action":"SetTrue","policy":"boolean"},"target":{"action":"Set","policy":"presence"},"view_only":{"action":"SetTrue","policy":"boolean"}}},
     "fetch": {"aliases":[],"args":{"all":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"}}},
     "file": {"aliases":[],"args":{"into":{"action":"Set","policy":"presence"}}},

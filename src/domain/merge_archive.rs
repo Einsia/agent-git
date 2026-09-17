@@ -269,7 +269,7 @@ struct Recovery {
     next: ArchiveJournal,
 }
 
-fn checked_generation(generation: &str) -> Result<()> {
+pub(crate) fn checked_generation(generation: &str) -> Result<()> {
     let parsed = uuid::Uuid::parse_str(generation).context("invalid archive generation")?;
     ensure!(
         parsed.get_version() == Some(uuid::Version::SortRand)
@@ -1049,11 +1049,12 @@ fn checked_carrier(
         let forbidden = if private { 0o077 } else { 0o022 };
         ensure!(
             metadata.mode() & forbidden == 0 && metadata.uid() == unsafe { libc::geteuid() },
-            "archive state carrier is not controlled by its owner: {} (mode {:o}, uid {}, expected uid {})",
+            "archive state carrier is not controlled by its owner: {} (mode {:04o}, uid {}, required uid {} and mode & {:04o} == 0); for Agit-managed state, use agit doctor --repair-permissions PATH",
             path.display(),
             metadata.mode() & 0o777,
             metadata.uid(),
-            unsafe { libc::geteuid() }
+            unsafe { libc::geteuid() },
+            forbidden
         );
         validate_unix_ancestors(path)?;
     }
@@ -1063,7 +1064,7 @@ fn checked_carrier(
 }
 
 #[cfg(unix)]
-fn validate_unix_ancestors(path: &Path) -> Result<()> {
+pub(crate) fn validate_unix_ancestors(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let absolute = std::path::absolute(path)?;
@@ -1083,15 +1084,21 @@ fn validate_unix_ancestors(path: &Path) -> Result<()> {
         ensure!(
             (metadata.uid() == current_user || metadata.uid() == 0)
                 && (metadata.is_dir() || metadata.file_type().is_symlink()),
-            "archive authority has an uncontrolled ancestor"
+            "archive authority has an uncontrolled ancestor: {} (mode {:04o}, uid {}, required uid {} or root and a directory or symlink); have its owner secure it before retrying",
+            ancestor.display(),
+            metadata.mode() & 0o7777,
+            metadata.uid(),
+            current_user
         );
         // A sticky ancestor protects owned children even when other users may create siblings.
         ensure!(
             metadata.file_type().is_symlink()
                 || metadata.mode() & 0o022 == 0
                 || metadata.mode() & 0o1000 != 0,
-            "archive authority ancestor permits replacement by another user: {}",
-            ancestor.display()
+            "archive authority ancestor permits replacement by another user: {} (mode {:04o}, uid {}; required mode & 0022 == 0 or a sticky directory); for Agit-managed state, use agit doctor --repair-permissions PATH; otherwise have its owner secure it",
+            ancestor.display(),
+            metadata.mode() & 0o7777,
+            metadata.uid()
         );
     }
     Ok(())

@@ -20,6 +20,8 @@
 //! Every conclusion points straight at the next action.
 
 mod history;
+#[cfg(unix)]
+mod permissions;
 mod transaction;
 
 use super::CmdResult;
@@ -38,6 +40,10 @@ use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
 pub struct Args {
+    /// Repair permissions of one named Agit state carrier and its managed ancestors (Unix only)
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["repo", "check_backend", "deep"])]
+    pub repair_permissions: Option<PathBuf>,
+
     /// Restrict repository and adopted-session checks to this local owner/repo
     #[arg(long, value_name = "OWNER/REPO", value_parser = parse_repo)]
     pub repo: Option<String>,
@@ -71,6 +77,16 @@ enum Check {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    if let Some(path) = args.repair_permissions.as_deref() {
+        #[cfg(unix)]
+        return permissions::run(path);
+        #[cfg(not(unix))]
+        anyhow::bail!(
+            "permission repair is only supported on Unix: {}",
+            path.display()
+        );
+    }
+
     let selected = if let Some(slug) = args.repo.as_deref() {
         parse_repo(slug).map_err(anyhow::Error::msg)?;
         let (owner, name) = super::parse_slug(slug)?;

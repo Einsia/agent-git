@@ -65,6 +65,19 @@ pub(crate) fn create_state_dir(path: &std::path::Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+/// New local state files exclude other users at creation without changing the caller's umask.
+pub(crate) fn state_file_options() -> std::fs::OpenOptions {
+    let options = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    let options = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = options;
+        options.mode(0o600);
+        options
+    };
+    options
+}
+
 /// The local store: `$AGIT_HOME/store/`.
 ///
 /// **The MVP has one local store**, not a directory per agent. Naming is deferred to `push` —
@@ -312,7 +325,7 @@ pub fn set_global(key: &str, value: Option<&str>) -> Result<()> {
         }
     }
     if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
+        create_state_dir(d)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(&map)?)?;
     Ok(())
@@ -491,6 +504,75 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn state_creation_respects_umask_and_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AGIT_TEST_STATE_CREATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "infra::config::tests::state_creation_respects_umask_and_existing_permissions",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        unsafe {
+            libc::umask(0);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("state/nested");
+        create_state_dir(&directory).unwrap();
+        for path in [directory.parent().unwrap(), directory.as_path()] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let path = directory.join("control");
+        let file = state_file_options()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(unsafe { libc::umask(0) }, 0);
+        file.set_permissions(std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        state_file_options().read(true).open(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o400);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        create_state_dir(&directory).unwrap();
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        unsafe {
+            libc::umask(0o777);
+        }
+        let restricted = state_file_options()
+            .create_new(true)
+            .write(true)
+            .open(directory.join("restricted"))
+            .unwrap();
+        assert_eq!(
+            restricted.metadata().unwrap().permissions().mode() & 0o777,
+            0
+        );
+        assert_eq!(unsafe { libc::umask(0o777) }, 0o777);
+    }
 
     /// A pure-function form, so no process-global environment variable is touched (parallel
     /// tests overwrite each other).

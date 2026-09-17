@@ -106,7 +106,7 @@ fn lock_repo_migration(repo: &Repo) -> Result<(File, PathBuf)> {
             });
         }
     }
-    let lock = OpenOptions::new()
+    let lock = crate::infra::config::state_file_options()
         .create(true)
         .truncate(false)
         .read(true)
@@ -381,9 +381,9 @@ fn begin_startup_recovery_at(
         return Ok(None);
     }
 
-    std::fs::create_dir_all(home)?;
+    crate::infra::config::create_state_dir(home)?;
     let lock_path = home.join("layout-v1.lock");
-    let startup_lock = OpenOptions::new()
+    let startup_lock = crate::infra::config::state_file_options()
         .create(true)
         .truncate(false)
         .read(true)
@@ -394,7 +394,7 @@ fn begin_startup_recovery_at(
         .with_context(|| format!("cannot share migration lock {}", lock_path.display()))?;
 
     let directory = home.join(STARTUP_RECOVERY_DIR);
-    std::fs::create_dir_all(&directory).with_context(|| {
+    crate::infra::config::create_state_dir(&directory).with_context(|| {
         format!(
             "cannot create startup recovery directory {}",
             directory.display()
@@ -408,7 +408,11 @@ fn begin_startup_recovery_at(
             "{STARTUP_RECOVERY_PREFIX}{operation}-{}-{sequence}",
             std::process::id()
         ));
-        match OpenOptions::new().create_new(true).write(true).open(&path) {
+        match crate::infra::config::state_file_options()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
             Ok(evidence) => break (path, evidence),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -543,7 +547,7 @@ fn collect_startup_recovery_evidence(
 
 fn synchronized_recovery_snapshot(home: &Path) -> Result<Vec<PathBuf>> {
     let lock_path = home.join("layout-v1.lock");
-    let lock = OpenOptions::new()
+    let lock = crate::infra::config::state_file_options()
         .create(true)
         .truncate(false)
         .read(true)
@@ -791,7 +795,7 @@ fn recovery_evidence_repo(path: &Path) -> Result<PathBuf> {
 }
 
 pub(super) fn migrate_startup_at(home: &Path, repos: &Path) -> Result<Report> {
-    std::fs::create_dir_all(home)?;
+    crate::infra::config::create_state_dir(home)?;
     let mut recovery_snapshot = startup_recovery_evidence(home)?;
     if recovery_snapshot.is_empty() && startup_migration_complete(home)? {
         return Ok(Report::default());

@@ -298,7 +298,7 @@ pub fn lock(store: &Store, source: &str, session_id: &str) -> Result<std::fs::Fi
     crate::infra::config::create_state_dir(&dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
     let lp = dir.join(format!("{session_id}.json.lock"));
-    let f = std::fs::OpenOptions::new()
+    let f = crate::infra::config::state_file_options()
         .create(true)
         .truncate(false)
         .read(true)
@@ -941,7 +941,7 @@ pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock
     crate::infra::config::create_state_dir(&dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
     let path = dir.join(format!("{}.lock", hex::encode(digest.finalize())));
-    let file = std::fs::OpenOptions::new()
+    let file = crate::infra::config::state_file_options()
         .create(true)
         .truncate(false)
         .read(true)
@@ -968,7 +968,7 @@ fn lock_repository(store: &Store, slug: &str, exclusive: bool) -> Result<std::fs
     crate::infra::config::create_state_dir(&dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
     let path = dir.join(format!("{}.lock", hex::encode(sha2::Sha256::digest(slug))));
-    let file = std::fs::OpenOptions::new()
+    let file = crate::infra::config::state_file_options()
         .create(true)
         .truncate(false)
         .read(true)

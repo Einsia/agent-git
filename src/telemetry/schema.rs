@@ -344,6 +344,12 @@ mod tests {
             ],
             vec!["agit", "pr", "show", "123456789"],
             vec!["agit", "config", "hub.url", "https://private-canary"],
+            vec![
+                "agit",
+                "doctor",
+                "--repair-permissions",
+                "/private-canary/state",
+            ],
         ] {
             let output = capture(&argv).to_string();
             for canary in [
@@ -363,6 +369,19 @@ mod tests {
         assert_eq!(value["arg_limit"], "21-100");
         assert_eq!(value["arg_local"], true);
         assert_eq!(value["arg_scope"], "mine");
+        assert_eq!(
+            capture(&[
+                "agit",
+                "doctor",
+                "--repair-permissions",
+                "/private-canary/state"
+            ])["arg_repair_permissions"],
+            true
+        );
+        assert_eq!(
+            capture(&["agit", "doctor"])["arg_repair_permissions"],
+            false
+        );
     }
 
     #[test]

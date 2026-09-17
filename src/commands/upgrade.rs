@@ -468,7 +468,7 @@ fn save_cache(latest: &str) {
         .unwrap_or(0);
     let body = serde_json::json!({"checked_at": now, "latest": latest});
     if let Some(d) = p.parent() {
-        let _ = std::fs::create_dir_all(d);
+        let _ = crate::infra::config::create_state_dir(d);
     }
     let _ = std::fs::write(p, serde_json::to_string(&body).unwrap());
 }

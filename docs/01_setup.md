@@ -191,6 +191,9 @@ a valid Hub address cannot establish which destination may receive their tokens.
 
 ## Troubleshooting
 
+For owner-controlled-state or ancestor-permission failures after using a shared
+shell umask, see [bounded local permission recovery](state-permissions.md).
+
 | Symptom | Cause |
 |---|---|
 | `cannot connect to the backend ...` | the backend is not running, or `AGIT_HUB_URL` has the wrong port |
