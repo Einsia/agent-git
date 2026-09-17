@@ -6,6 +6,45 @@ Every notable change to agit, the AgentGit CLI, by release. The format follows
 its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 `@einsia/agent-git` npm package ships this file.
 
+## [0.2.1] - 2026-09-17
+
+### Added
+
+- **Native Windows peer remote control.** Windows supports the same controller,
+  executor and Cloud tunnel protocol as Linux and macOS, using a current-user
+  named pipe for local owner RPC.
+- **Bundled Git and Git LFS.** Official distribution binaries include their Git
+  runtime, so session version control does not require a separate Git installation.
+
+### Changed
+
+- **Owner-only Cloud access by default.** Run `agit login`, then
+  `agit rc start --detach`. Startup registers the device and enables remote control
+  for the signed-in owner, without a separate enrollment command. Use the same Hub
+  account in Web Workspaces or the desktop app. This does not grant public access.
+- **Remove the paired RC transport.** Startup and device management use peer/Cloud
+  only. Users of the paired default in 0.2.0 must upgrade; the existing Linux 0.2.0
+  peer/Cloud protocol remains supported. Server retirement follows verification of
+  the new Windows and Linux release artifacts.
+- Reuse Cloud HTTP connections, overlap admission checks with tunnel setup, and
+  race resolved TCP addresses to avoid waiting on a slow address before trying another.
+- Reduce repeated repository checks and keep repository preparation and background
+  metadata work off the native session command loop. Record startup phase timings
+  without logging prompt contents.
+
+### Fixed
+
+- Prevent detached Windows daemon helpers from opening console windows; release
+  inherited caller pipes when starting in the background.
+- Preserve tunnel failure details and renew Cloud authority without repeatedly
+  reconnecting healthy idle sessions.
+- Recover a revoked device registration when its owner explicitly starts RC again;
+  background reconnects do not undo revocation.
+- Read history and goals from fresh Codex sessions before a transcript file exists,
+  and isolate history readers from snapshot capture and session control.
+- Preserve native history identity and snapshot consistency, and protect generated
+  session observations with repository secret rules before settlement.
+
 ## [0.2.0] - 2026-09-16
 
 ### Added
@@ -162,6 +201,7 @@ First public release.
   per-platform packages for Linux and macOS on x64 and arm64, and GitHub Release
   artifacts with `SHA256SUMS`.
 
+[0.2.1]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.2.1
 [0.2.0]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.2.0
 [0.1.2]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.1.2
 [0.1.1]: https://github.com/Einsia/agent-git/releases/tag/agit-v0.1.1
