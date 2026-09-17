@@ -26,7 +26,10 @@ impl CodexDriver {
                 {"name":"apps","description":"Show available connected apps"}
             ]});
             match self
-                .command_request("skills/list", json!({"cwds":[self.cwd],"forceReload":true}))
+                .command_request(
+                    "skills/list",
+                    json!({"cwds":[self.cwd],"forceReload":false}),
+                )
                 .await
             {
                 Ok(skills) => {

@@ -19,7 +19,8 @@
     "rc::local::windows::tests",
     "rc::cloud::store::tests",
     "rc::diagnostics::tests",
-    "adapter::executable_tests"
+    "adapter::executable_tests",
+    "rc::daemon::tests::metadata"
   ],
   "integration": [
     "windows_rc",

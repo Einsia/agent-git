@@ -88,21 +88,18 @@ impl Daemon {
         }
 
         let (operation, guard_sensitive) = match f.method() {
-            method::SESSION_COMMANDS | method::SESSION_COMMAND => {
+            method::SESSION_COMMAND => {
                 let p: crate::protocol::SessionSubscribe = f.params_as()?;
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
-                let name = if f.method() == method::SESSION_COMMANDS {
-                    "commands".to_string()
-                } else {
-                    f.params
-                        .as_ref()
-                        .and_then(|p| p["name"].as_str())
-                        .filter(|name| !name.is_empty() && name.len() <= 128)
-                        .ok_or_else(|| {
-                            RpcError::new(ErrorCode::MalformedFrame, "A command name is required")
-                        })?
-                        .to_string()
-                };
+                let name = f
+                    .params
+                    .as_ref()
+                    .and_then(|p| p["name"].as_str())
+                    .filter(|name| !name.is_empty() && name.len() <= 128)
+                    .ok_or_else(|| {
+                        RpcError::new(ErrorCode::MalformedFrame, "A command name is required")
+                    })?
+                    .to_string();
                 let arguments = f
                     .params
                     .as_ref()
@@ -123,10 +120,10 @@ impl Daemon {
                     false,
                 )
             }
-            method::SESSION_MODEL | method::SESSION_SET_MODEL => {
+            method::SESSION_SET_MODEL => {
                 let p: crate::protocol::SessionSubscribe = f.params_as()?;
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
-                let model = if f.method() == method::SESSION_SET_MODEL {
+                let model = {
                     let value = f
                         .params
                         .as_ref()
@@ -144,8 +141,6 @@ impl Daemon {
                             )
                         })?;
                     Some(value.to_string())
-                } else {
-                    None
                 };
                 let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 (

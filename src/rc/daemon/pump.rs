@@ -461,6 +461,37 @@ impl Daemon {
                             }
                         }
                         link::LinkEvent::Frame { epoch, frame }
+                            if super::session_metadata::is_session_metadata(frame.method()) =>
+                        {
+                            if !connection_epoch_is_current(&settlement_tx, epoch) { continue; }
+                            let Some(id) = frame.id.clone() else { continue };
+                            if session_rpc_tasks.len() >= 32 {
+                                let _ = out_tx.send(Frame::error_response(id, RpcError::new(ErrorCode::SessionBusy, "session metadata is busy; retry shortly")));
+                                continue;
+                            }
+                            let prepared = {
+                                let state = d.lock().await;
+                                if !connection_epoch_is_current(&state.settlement, epoch) { continue; }
+                                state.prepare_session_metadata(&frame)
+                            };
+                            match prepared {
+                                Ok(prepared) => {
+                                    let daemon = d.clone();
+                                    let outbound = out_tx.clone();
+                                    let mut stop = session_rpc_stop_tx.subscribe();
+                                    session_rpc_tasks.spawn(async move {
+                                        let result = prepared.execute(daemon, &mut stop).await;
+                                        let frame = match result {
+                                            Ok(value) => Frame::response(id, value),
+                                            Err(error) => Frame::error_response(id, error),
+                                        };
+                                        let _ = outbound.send(frame);
+                                    });
+                                }
+                                Err(error) => { let _ = out_tx.send(Frame::error_response(id, error)); }
+                            }
+                        }
+                        link::LinkEvent::Frame { epoch, frame }
                             if is_queued_session_rpc(frame.method()) =>
                         {
                             // Queueing a command and waiting for its receipt can

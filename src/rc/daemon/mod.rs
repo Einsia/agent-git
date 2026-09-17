@@ -67,6 +67,7 @@ mod opening;
 use opening::{LaunchReservation, OpeningReply, PreparedSpawn, SessionOpening};
 mod projection;
 mod pump;
+mod session_metadata;
 mod session_rpc;
 mod sessions;
 mod watch_rpc;
@@ -1573,9 +1574,7 @@ fn is_queued_session_rpc(method_name: &str) -> bool {
         method_name,
         method::TURN_START
             | method::TURN_STEER
-            | method::SESSION_COMMANDS
             | method::SESSION_COMMAND
-            | method::SESSION_MODEL
             | method::SESSION_SET_MODEL
             | method::SESSION_SET_PERMISSION_MODE
             | method::TURN_INTERRUPT
