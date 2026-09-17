@@ -1983,8 +1983,6 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         opts: Options {
             local_owner: false,
             hub: "https://hub.invalid".into(),
-            token: "test".into(),
-            connection_id: None,
         },
         journal: Journal::new(),
         mirror,
@@ -1997,7 +1995,6 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         terminal_delivery_blockers: Default::default(),
         term_tx: None,
         online: false,
-        connection_id: None,
         secret_filter: Default::default(),
         settlement,
         started_at: std::time::Instant::now(),

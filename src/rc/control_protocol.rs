@@ -24,7 +24,6 @@ pub struct Status {
     pub pid: u32,
     pub hub: String,
     pub online: bool,
-    pub connection_id: Option<String>,
     pub uptime_secs: u64,
     pub agit_version: String,
     pub sessions: Vec<SessionLine>,

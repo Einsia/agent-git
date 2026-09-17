@@ -97,7 +97,7 @@ fn is_plugin_scoped(name: &str, description: &str) -> bool {
 /// that repository's own `.claude/settings.json` (`--scope` is user / **project** / local), so
 /// those commands exist only inside that repository. No field in the catalogue says which scope
 /// an entry has, so a plugin command never enters the machine cache: if one does, that
-/// repository's command names and descriptions ride along with `rc.register` to the viewers of
+/// repository's command names and descriptions ride along with machine discovery to the viewers of
 /// every workspace on this machine, where they cannot be used at all.
 fn machine_commands(
     commands: Vec<crate::protocol::SlashCommand>,
@@ -134,18 +134,8 @@ pub fn capability() -> RuntimeCapability {
         approvals: true,
         partial_messages: true,
         resume: true,
-        // The catalogue is **not** asked for here; it is what an earlier session asked for
-        // and stored.
-        //
-        // Capabilities are reported at the moment of `rc.register` — no session has started
-        // yet, and the catalogue comes from the harness's `initialize` reply in each session.
-        // Asking here leaves this field empty forever, and slash completion in the web
-        // interface **never has any data** (`cap?.commands` is always `[]`).
-        //
-        // Save a copy to disk and report it next time: the first connection after an install
-        // is still empty, and once a session has run it stays, across restarts too. The
-        // degradation is honest (no data, no completion) rather than passing an empty array
-        // off as "this runtime has no slash commands".
+        // Discovery reads cached commands because the harness provides its catalog only
+        // after session initialization. Project commands must stay out of this shared view.
         commands: cached_machine_commands(),
         // All five map onto native `--permission-mode` values, and the switch
         // is live: a `set_permission_mode` control request is answered
@@ -878,16 +868,8 @@ impl ClaudeCodeDriver {
                         }
                     }
                 }
-                // Save a copy so **the next** `rc.register` can report it.
-                //
-                // Capabilities are reported at the moment of registration, while the catalogue
-                // is known only once this session has finished its handshake — the two are one
-                // session apart by construction. Writing it down is the cheapest way to close
-                // that gap: the first connection after an install has no completion, and once
-                // a session has run it stays, across restarts too.
-                //
-                // A failed write does not matter: the next handshake asks again, and the cost
-                // is completion appearing one session later.
+                // Cache only machine-scoped commands for discovery outside this session.
+                // A failed cache write does not invalidate the session's live catalog.
                 if !harvested.is_empty() && harvested != self.commands {
                     let _ =
                         crate::rc::save_json(COMMAND_CACHE, &machine_commands(harvested.clone()));
@@ -1238,7 +1220,7 @@ mod tests {
 
     /// **A project-scoped command never enters the machine-level catalogue.**
     ///
-    /// The catalogue rides along with `rc.register` to every workspace on this machine, while
+    /// The catalogue rides along with machine discovery to every workspace on this machine, while
     /// a command under `.claude/commands` belongs to the current project alone. Taking every
     /// entry as offered lets the last project to complete a handshake write its own commands
     /// into the machine-wide cache — one project's command names and descriptions leak to the
@@ -1265,7 +1247,7 @@ mod tests {
     /// A plugin can be enabled per repository (`claude plugin install -s project` writes that
     /// repository's own `.claude/settings.json`), and no field in the handshake catalogue says
     /// which scope an entry has. Letting one in sends that repository's plugin command names
-    /// and descriptions along with `rc.register` to the viewers of every workspace on this
+    /// and descriptions along with machine discovery to the viewers of every workspace on this
     /// machine — exactly the cross-workspace leak this filter claims to prevent, and they
     /// cannot use them there anyway.
     ///
@@ -1304,9 +1286,8 @@ mod tests {
         );
     }
 
-    /// The first `rc.register` after an upgrade happens before any new session handshake, so
-    /// what it reads is whatever the disk cache already holds. Filtering must happen again at
-    /// the read entry point; it cannot wait for some future harvest.
+    /// Discovery may read the persisted cache before a session handshake. The read path
+    /// must filter project commands even when the cache contains them.
     #[test]
     fn a_polluted_legacy_cache_is_filtered_before_registration_and_migrated() {
         let home = tempfile::tempdir().unwrap();

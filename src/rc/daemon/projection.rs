@@ -773,8 +773,6 @@ mod bound_lineage_tests {
                         opts: Options {
                             local_owner: false,
                             hub: "https://hub.invalid".into(),
-                            token: "test".into(),
-                            connection_id: None,
                         },
                         journal: Journal::new(),
                         mirror: Mirror::default(),
@@ -789,7 +787,6 @@ mod bound_lineage_tests {
                         ),
                         term_tx: None,
                         online: false,
-                        connection_id: None,
                         secret_filter: Default::default(),
                         settlement,
                         started_at: std::time::Instant::now(),

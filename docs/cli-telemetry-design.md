@@ -381,7 +381,7 @@ The root canonical `command` remains the actual top-level command.
 | `doctor` | Deep/check-backend, scoped/unscoped; fixed check IDs, passed/warned/failed categories; no rendered findings |
 | `hooks` default/`ingest`/`settle` | Known runtime and hook action, accepted/ignored/unmanaged/deferred/failed; aggregate normal high-frequency activity |
 | `mcp` | Server lifecycle; per-tool execution as described below; no request/response bodies |
-| `rc start`, `status`, `stop`, `list`, `revoke`, `pair`, hidden `land`, `grant`, `ungrant`, `grants` | Detach, known runtime, ownership/actor category, lifecycle/pairing/authorization outcomes; connection and workspace count buckets; never machine name, pairing code, connection/workspace IDs, or the external command named in a grant |
+| `rc start`, `status`, `stop`, `list`, `revoke`, `cloud`, hidden `land`, `grant`, `ungrant`, `grants` | Detach, known runtime, ownership/actor category, lifecycle/enrollment/authorization outcomes; connection and workspace count buckets; never machine name, enrollment credentials, connection/workspace IDs, or the external command named in a grant |
 | Bare `agit`, help, version, invalid arguments | Actual TUI/help behavior; display-help/version or fixed parser error kind; only known command path components |
 | Proposed `telemetry` controls | Local control operations; status/schema/preview/disable are excluded from upload and active-user metrics |
 

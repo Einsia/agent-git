@@ -146,8 +146,6 @@ impl From<SpawnFailure> for RpcError {
 pub struct Options {
     pub local_owner: bool,
     pub hub: String,
-    pub token: String,
-    pub connection_id: Option<String>,
 }
 
 fn set_connection_features(
@@ -1088,7 +1086,6 @@ pub struct Daemon {
     /// Where terminal bytes flow back. Built when the first terminal opens.
     term_tx: Option<mpsc::Sender<TerminalEvent>>,
     online: bool,
-    connection_id: Option<String>,
     /// Shared by every live session; a control socket reload builds the replacement in full and
     /// swaps it in at once.
     secret_filter: crate::domain::secret_filter::MatcherHandle,

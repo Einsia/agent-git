@@ -484,10 +484,10 @@ Deliver small changes on the existing RFC/implementation review line:
 4. Controller-only cloud host with backend authentication, scoped subscriptions,
    durable origin recovery, and projection adapters. Move Web control to it using
    the same relay and remote executor; verify shared-session behavior with Desktop.
-5. Cut over by machine/workspace cohort after reconciliation. Keep legacy RC only
-   for compatibility and rollback. Each target has one active control adapter
-   per cutover epoch; never let old and new paths dispatch the same pending work.
-   If state cannot be translated, keep it unresolved rather than resubmitting.
+5. Publish and verify Windows/Linux peer startup artifacts before retiring the paired
+   CLI, Hub, and Web paths. Keep Linux 0.2.0 peer/Cloud communication supported; its
+   old default startup requires an upgrade. Workspaces without a peer device display
+   No device. Never fall back to paired execution or resubmit historical pending work.
 
 Cloud changes use the companion backend and deployment MRs; Desktop changes use
 the companion Desktop MR. Deploy the backend with the relay disabled before

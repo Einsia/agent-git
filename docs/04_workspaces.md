@@ -25,53 +25,31 @@ So every message sent from the web interface still lands as a turn commit, throu
 automatic hooks settlement — **no new commit path**. Otherwise a gap opens between "talked to it
 on the web" and "not in `agit log`", and that is the one gap this product cannot have.
 
-## 2. Start a daemon
+## 2. Start an executor
 
 ```bash
-agit login                 # workspaces belong to the account, so sign in first
-agit rc start              # pairs automatically the first time, then stays resident
+agit login
+agit rc start --detach
 ```
 
-`rc start` does three things:
+Startup enables inbound Cloud control for the signed-in owner, registers a peer device,
+and starts independent presence and tunnel workers. The daemon supervises harness sessions
+locally. Controllers on Web and Desktop use the same peer session RPC; the Cloud relay
+forwards opaque endpoint traffic. SSH authenticates through the machine's SSH service.
 
-1. **Pair** — trade the account credentials for a **dedicated token** that starts with
-   `agit_rc_`. It is separate from the account's API token, can be revoked on its own, and is
-   scoped to the RC surface alone.
-2. **Register** — report the machine fingerprint, the platform, the agit version, and each
-   harness's **capability matrix** (whether it can interrupt, whether a mid-turn steer is
-   delivered immediately or at a tool boundary, which slash commands it has).
-3. **Stay resident** — an outbound WSS long connection, a 15s heartbeat, exponential backoff on
-   reconnect.
+Cloud registration retries in the background without holding local daemon startup or session
+execution. A ready local RPC endpoint does not imply Cloud presence is online. Use
+`agit rc status`, `agit rc cloud status --hub <origin>`, and the private daemon logs to
+inspect the local process and enrollment, then verify Online in the Cloud device list.
 
-The connection direction is **outbound only**. A user's machine sits behind NAT, inside a company
-firewall, changes IP, and may be a laptop that sleeps the moment the lid closes; demanding an
-inbound port is demanding a router be configured, and then nobody uses this feature.
+The device's owner can create a workspace without another enrollment command. Other accounts
+need explicit device admission and executor permissions. Reconnect preserves the existing
+peer identity; it does not consume another device slot. Revocation removes remote access.
 
-```bash
-agit rc status             # connected or not, how many live sessions, the seq each is at
-agit rc list               # every machine under your name (offline ones included)
-agit rc revoke <id>        # revoke one: disconnects immediately and takes no further registration
-agit rc stop
-```
-
-Starting the process does not establish a Hub connection. Foreground startup reports
-when it is connecting and prints workspace guidance after registration. Detached
-startup waits up to 45 seconds after spawning for the local control channel to confirm
-that its child is registered. It reports success only then. On timeout it returns an
-unsuccessful exit status and leaves the daemon reconnecting; check `agit rc status`
-or stop it with `agit rc stop` before starting again.
-
-Detached startup prints a private log path under `$AGIT_HOME/rc/` (by default
-`~/.agit/rc/`). The file retains startup and connection diagnostics after the command
-returns. Each launch has its own log; old logs can be removed after stopping their
-daemon. Reconnect backoff resets after a connection stays registered for at least
-30 seconds, while brief connections continue to back off.
-
-**The quota is 5 machines per person.** The count covers only what has not been revoked: an
-offline machine still holds its slot (the workspace is still there and it can come back at any
-time), and only a revoke frees one. The same machine reconnecting over and over always lands on
-the same row — through the unique index on `(account_id, machine_fingerprint)`; without it, five
-restarts exhaust the quota and the page shows five machines with the same name.
+Desktop's `agit rc local start --detach` starts outgoing control independently of inbound
+access. `agit rc cloud inbound --hub <origin> --enabled false` disables incoming Cloud control.
+The standard peer startup works on native Windows, Linux, and macOS. Linux 0.2.0's existing
+peer enrollment remains supported; its default paired startup requires upgrading.
 
 ## 3. Binding a project = creating a private repo
 
@@ -151,7 +129,7 @@ A web session, like a terminal session, can tighten or loosen the guard at any t
 What runs on the wire is this **neutral vocabulary**, not either side's native values — the two
 shapes are fundamentally different (claude-code has one scalar, codex has two axes,
 approvalPolicy × sandbox), and passing native values makes the web interface speak one harness's
-dialect and then mistranslate the other. Every runtime reports at `rc.register` which modes it
+dialect and then mistranslate the other. Every runtime reports during machine discovery which modes it
 can **actually express** (`capabilities[].permission_modes`), and the page renders only the ones
 reported. Offering codex an `accept_edits` gets the user asked anyway after they pick it — better
 not to offer it.
@@ -219,23 +197,18 @@ the tool allowlist, and enters no session's history.
 
 ## 6. Driving rights
 
-A soft lock by default: anyone can watch, one driver at a time. A message from a non-driver is
-queued behind the notice "X is driving"; only pressing "Take over" seizes it, and the one it was
-taken from is notified. The lease runs 90 seconds, renewed by activity.
-
-The reason for a soft lock rather than free concurrency is not concurrency safety, it is
-**context quality**: three people stuffing text into one agent's context at once produce a
-session nobody can read — and that session is exactly the asset agit keeps for the long term and
-hands to the next person to inherit.
+The executor serializes session mutations and enforces native writer ownership. A session
+controlled by another runtime remains read-only until that owner releases it. Local and
+remote controllers share the same ownership checks. Background catalog reads do not acquire
+or clear the writer gate. Conflicting writes must not start a second native turn.
 
 ## 7. Command table
 
 ```text
-agit rc start [--detach] [--name <machine>]   start the daemon (pairs automatically the first time)
+agit rc start [--detach] [--name <machine>]   start the daemon and enable owner Cloud access
 agit rc status                                connection state, uptime, active sessions
 agit rc list                                  every machine under your name
-agit rc revoke <connection>                   revoke one machine
-agit rc pair                                  pair again
+agit rc revoke <device-id>                    revoke one Cloud device
 agit rc stop                                  stop the daemon
 ```
 
@@ -249,7 +222,7 @@ current one.
 | Symptom | Cause | What to do |
 |---|---|---|
 | `path must be shorter than SUN_LEN` | `$AGIT_HOME` is too deep; a unix socket path caps at 108 bytes | it already falls back to `$XDG_RUNTIME_DIR`; if that still fails, move `AGIT_HOME` somewhere shallower |
-| `rc start` says it is already running, but `rc status` says it is not | a stale socket file / pidfile | the test is **whether the socket connects**; on older versions, delete the sock and the pid under `~/.agit/rc/` by hand |
-| the page says the machine is offline, but `rc status` says connected | presence reads Redis, instruction forwarding reads this Pod's registry | under a multi-Pod deployment an instruction has to be routed to the Pod its machine is on; with one Pod it does not happen |
+| `rc start` says it is already running, but `rc status` says it is not | a stale socket file / pidfile | the test is **whether the socket connects**; inspect the private daemon log and use `agit rc stop` before restarting |
+| the page says the machine is offline, but local RPC is ready | Cloud enrollment or presence has not completed | check the selected Hub, device enrollment, and timestamped Cloud logs |
 | taking over a session is refused with still open in a terminal | that session is open right now, and taking it over destroys both histories | quit in that terminal, then take over |
 | binding a folder is refused | the path does not exist, or it is a system root | use a real project directory |

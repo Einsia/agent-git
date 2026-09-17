@@ -246,7 +246,7 @@ agit push <owner/repo> -b main                         # publish the file line
 | `pr` | Create, inspect, fetch, and merge Hub pull requests |
 | `share` | Create or revoke read-only sharing links |
 | `search` | Search the AgentGit corpus visible to the current identity |
-| `rc` | Pair and manage the `agitd` remote-control daemon and web connection |
+| `rc` | Start and manage the `agitd` remote-control daemon and peer/Cloud connections |
 
 ### Export, integration, and diagnostics
 

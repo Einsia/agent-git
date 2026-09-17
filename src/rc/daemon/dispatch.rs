@@ -525,8 +525,6 @@ mod tests {
             opts: Options {
                 local_owner: false,
                 hub: "https://hub.invalid".into(),
-                token: "test".into(),
-                connection_id: None,
             },
             journal: Journal::new(),
             mirror: Mirror::default(),
@@ -539,7 +537,6 @@ mod tests {
             terminal_delivery_blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             term_tx: None,
             online: true,
-            connection_id: Some("conn".into()),
             secret_filter: Default::default(),
             settlement,
             started_at: std::time::Instant::now(),

@@ -1,63 +1,13 @@
-//! Wire protocol shared by `agitd` (the machine-side daemon), the hub (backend),
-//! and viewers (web / mobile / a future local TUI).
+//! Session RPC shared by peer controllers and the executor.
 //!
-//! # Why this lives in the `agit` crate and is not feature-gated
+//! The backend imports these serde types without the CLI feature so Web and Desktop
+//! use the same harness-neutral requests and events. Transport, peer admission, and
+//! endpoint authentication belong to the peer/controller/tunnel crates.
 //!
-//! The backend already imports this crate with `default-features = false` to get
-//! the IR (`adapter`) and the turn chain (`domain::turn`), so that the web
-//! transcript is byte-for-byte what `agit show` renders. The RC protocol has the
-//! same requirement one level up: `agitd` produces frames, the hub relays and
-//! persists them, viewers render them. Three hand-synced schemas would drift.
-//! One definition compiled into both binaries cannot.
-//!
-//! This module depends only on `serde` / `serde_json` and re-exports the IR
-//! types it carries. No tokio, no sockets — those are the daemon's business
-//! (`crate::rc`, behind the `rc` feature).
-//!
-//! # Shape
-//!
-//! Three layers, kept independent so that "swap harness", "swap transport", and
-//! "add multi-user" never touch each other:
-//!
-//! * **transport** — WSS, bidirectional, heartbeat 15s / dead at 45s, exponential
-//!   backoff with jitter. Not modeled here; see `rc::link`.
-//! * **frame** — JSON-RPC 2.0 request / response / notification, plus two
-//!   extension fields: [`Frame::seq`] (monotonic, gap-free per stream) and
-//!   [`Frame::stream`] (which session the frame belongs to). Clients reconnect
-//!   with `after_seq` and the server fills the gap.
-//!
-//!   **One exception, written here rather than left to be discovered: terminal streams
-//!   (`term:<workspace_id>`) get no such gap fill.** Sequence numbers are still assigned (the
-//!   hub dedupes by `(stream, seq)`), but those bytes enter no replay buffer, and
-//!   `session.subscribe` does not accept such a stream.
-//!
-//!   They **are not a record, they are a stream**: PTY output means something only at the
-//!   moment it is written, replaying a stretch of bytes away from the screen state of that
-//!   moment means nothing (cursor position, alternate screen and color state all fail to line
-//!   up), and keeping them costs 8192 frames of memory per stream — a high-frequency buffer
-//!   that never goes anywhere.
-//!
-//!   The cost is that **what is dropped is gone**. So when a stalled link drops terminal bytes,
-//!   the machine writes a visible mark into that terminal (see the outbound branch in
-//!   `rc::daemon`) instead of letting the screen silently lose a stretch. Session events are
-//!   unaffected: what they owe still gets filled.
-//! * **domain** — harness-neutral verbs, named to stay close to codex
-//!   app-server (`turn.steer`, `turn.interrupt`, `item.delta`) because that
-//!   vocabulary has already been validated by a real client (the VS Code
-//!   extension). See [`method`].
-//!
-//! # The four ids — never conflate them
-//!
-//! | id | allocated by | lifetime |
-//! |---|---|---|
-//! | `connection_id` | hub, at register | stable across reconnects/reboots until revoked |
-//! | `workspace_id`  | hub, at create   | until the user deletes it |
-//! | `session_id`    | agit (= logical session = branch) | as long as the branch |
-//! | `runtime_thread_id` | the harness | changes on every materialization |
-//!
-//! Only the first three ever appear on the wire. `runtime_thread_id` stays in
-//! `agitd`'s private map so that "continue on another machine" and "continue in
-//! another harness" are invisible to viewers.
+//! Frames use JSON-RPC requests, responses, and notifications. Session streams carry
+//! sequence numbers for replay; terminal output is transient and is never replayed.
+//! Device IDs identify admitted endpoints, workspace IDs scope project access, and
+//! session IDs identify logical conversations. Harness thread IDs remain executor state.
 
 pub mod types;
 
@@ -70,16 +20,10 @@ use std::sync::Arc;
 #[cfg(feature = "rc")]
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Protocol version. Sent in `rc.register`; the hub rejects a mismatch with
-/// [`ErrorCode::ProtocolMismatch`] and a hint to upgrade.
+/// Version of the shared session RPC contract.
 pub const VERSION: u32 = 1;
 
-/// Additive protocol features negotiated during `rc.register`.
-///
-/// A daemon may only rely on a feature after the hub echoes it in
-/// [`RcRegisterResult::accepted_features`]. Advertising is not an ACK, and an
-/// unknown/old peer deserializing either list as empty keeps protocol v1
-/// rolling-compatible.
+/// Session capabilities advertised by a controller or executor.
 pub mod feature {
     /// RC session lineage is fenced by the repository's immutable `agent_id`.
     pub const AGENT_IDENTITY_V1: &str = "agent_identity_v1";
@@ -87,11 +31,6 @@ pub mod feature {
     /// both the pre-launch intent and the exact successful response.
     pub const SESSION_START_IDEMPOTENCY_V1: &str = "session_start_idempotency_v1";
 }
-
-/// Heartbeat cadence and liveness threshold (seconds). Both sides use these
-/// numbers; putting them here keeps them from drifting apart.
-pub const HEARTBEAT_SECS: u64 = 15;
-pub const DEAD_AFTER_SECS: u64 = 45;
 
 /// A JSON-RPC 2.0 frame with the two RC extension fields.
 ///
@@ -595,8 +534,6 @@ impl Frame {
 /// literal string.
 pub mod method {
     // ── agitd → hub ──
-    pub const RC_REGISTER: &str = "rc.register";
-    pub const RC_HEARTBEAT: &str = "rc.heartbeat";
     pub const COMMIT_SETTLED: &str = "commit.settled";
 
     // ── hub / viewer → agitd (relayed) ──
@@ -792,7 +729,6 @@ mod tests {
     /// Method names are a cross-repository string contract; renaming one changes the wire.
     #[test]
     fn method_names_are_the_wire_contract() {
-        assert_eq!(method::RC_REGISTER, "rc.register");
         assert_eq!(method::ITEM_COMPLETED, "item.completed");
         assert_eq!(method::TURN_STEER, "turn.steer");
         assert_eq!(method::APPROVAL_REQUEST, "approval.request");
@@ -802,36 +738,6 @@ mod tests {
         assert_eq!(
             feature::SESSION_START_IDEMPOTENCY_V1,
             "session_start_idempotency_v1"
-        );
-    }
-
-    /// Feature negotiation is additive inside protocol v1. An old peer sends
-    /// neither list; that must mean "nothing ACKed", never implicit support.
-    #[test]
-    fn an_old_register_peer_acks_no_features() {
-        let old_register = serde_json::json!({
-            "protocol_version": 1,
-            "machine_fingerprint": "machine-1",
-            "display_name": "laptop",
-            "agit_version": "0.1.0",
-            "platform": "macos-aarch64",
-            "capabilities": [],
-            "workspaces": [],
-            "last_seq": {}
-        });
-        let register: RcRegister = serde_json::from_value(old_register).unwrap();
-        assert!(register.features.is_empty());
-
-        let old_result = serde_json::json!({
-            "connection_id": "conn-1",
-            "workspaces": [],
-            "persisted_seq": {},
-            "server_time": "2026-08-22T00:00:00Z"
-        });
-        let result: RcRegisterResult = serde_json::from_value(old_result).unwrap();
-        assert!(
-            result.accepted_features.is_empty(),
-            "missing ACK list must fail closed"
         );
     }
 

@@ -112,8 +112,6 @@ pub fn start_foreground() -> crate::Result<()> {
     rt.block_on(super::daemon::Daemon::run(super::daemon::Options {
         local_owner: true,
         hub: "local-owner".into(),
-        token: String::new(),
-        connection_id: None,
     }))
 }
 

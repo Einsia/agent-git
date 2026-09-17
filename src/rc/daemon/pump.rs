@@ -46,7 +46,6 @@ impl Daemon {
             terminal_delivery_blockers: terminal_delivery_blockers.clone(),
             term_tx: None,
             online: false,
-            connection_id: None,
             secret_filter: secret_filter.clone(),
             settlement: settlement_tx.clone(),
             started_at: std::time::Instant::now(),
@@ -655,10 +654,6 @@ impl Daemon {
             pid: std::process::id(),
             hub: self.opts.hub.clone(),
             online: self.online,
-            connection_id: self
-                .connection_id
-                .clone()
-                .or_else(|| self.opts.connection_id.clone()),
             uptime_secs: self.started_at.elapsed().as_secs(),
             agit_version: env!("CARGO_PKG_VERSION").to_string(),
             sessions: self

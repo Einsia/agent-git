@@ -1380,7 +1380,7 @@ pub enum Commands {
     #[command(hide = true)]
     Mcp(mcp::Args),
 
-    /// Remote control: pair this machine and drive its sessions from the web.
+    /// Remote control: manage this device and its peer/Cloud connections.
     Rc(rc::Args),
 }
 

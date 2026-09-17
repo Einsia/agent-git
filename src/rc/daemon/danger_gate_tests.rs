@@ -308,8 +308,6 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     opts: Options {
                         local_owner: false,
                         hub: "https://hub.invalid".into(),
-                        token: "test".into(),
-                        connection_id: None,
                     },
                     journal: Journal::new(),
                     mirror: Mirror::default(),
@@ -322,7 +320,6 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     terminal_delivery_blockers: blockers,
                     term_tx: None,
                     online: false,
-                    connection_id: None,
                     secret_filter: Default::default(),
                     settlement,
                     started_at: std::time::Instant::now(),

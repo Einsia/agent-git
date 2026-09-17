@@ -24,7 +24,7 @@ pub enum Action {
     Tunnel,
     /// Start agitd and allow your signed-in account to control this device.
     Start(StartArgs),
-    /// Owner-only local daemon and SSH stdio bridge, independent of Hub pairing.
+    /// Owner-only local daemon and SSH stdio bridge, independent of Cloud admission.
     Local(crate::rc::local::Args),
     /// Enroll a cloud peer and manage executor resource permissions.
     Cloud(crate::rc::cloud::Args),
@@ -34,7 +34,7 @@ pub enum Action {
     Stop,
     /// Machines registered to your account.
     List,
-    /// Revoke a machine — it disconnects at once and cannot re-register.
+    /// Revoke a Cloud device until its owner explicitly enables it again.
     Revoke(RevokeArgs),
     /// (internal) Prepare the local lineage for an RC-born session: repo,
     /// main file line, session branch, store link. Called by the daemon.
@@ -42,11 +42,7 @@ pub enum Action {
     Land(LandArgs),
     /// Let operators of a workspace answer approvals for one command themselves.
     Grant(GrantArgs),
-    /// Take a granted command back.
-    ///
-    /// Not `revoke`: that name already belongs to revoking a machine, and the two consequences
-    /// are far apart — one is "this command asks me again", the other is "this machine
-    /// disconnects at once and cannot re-register".
+    /// Require owner approval again for a previously granted command.
     Ungrant(GrantArgs),
     /// What operators of a workspace may currently answer on their own.
     Grants(GrantsArgs),
@@ -144,7 +140,7 @@ pub struct StartArgs {
 pub struct RevokeArgs {
     /// Device id from `agit rc list`.
     #[arg(value_name = "device")]
-    pub connection: String,
+    pub device: String,
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -588,9 +584,6 @@ fn status() -> CmdResult {
                     ui::warn_text("local RPC unavailable")
                 }
             );
-            if let Some(c) = &s.connection_id {
-                println!("  connection {c}");
-            }
             println!("  uptime     {}", human_secs(s.uptime_secs));
             println!("  version    {}", s.agit_version);
             println!();
@@ -737,7 +730,7 @@ fn list() -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
-fn revoke(_args: RevokeArgs) -> CmdResult {
+fn revoke(args: RevokeArgs) -> CmdResult {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let hub = config::hub_url();
@@ -749,7 +742,7 @@ fn revoke(_args: RevokeArgs) -> CmdResult {
             if let Some(entry) = page
                 .devices
                 .iter()
-                .find(|entry| entry.device.id == _args.connection)
+                .find(|entry| entry.device.id == args.device)
             {
                 break api.revoke(&token, &entry.device).await;
             }

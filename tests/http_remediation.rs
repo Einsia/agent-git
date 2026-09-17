@@ -857,7 +857,6 @@ mod unix {
                 6,
             ),
             (vec!["share", "list"], "/api/shares", 6),
-            (vec!["rc", "list"], "/api/rc/connections", 6),
         ] {
             for status in [401, 403, 404, 500] {
                 let lab = Lab::new();
@@ -1254,91 +1253,6 @@ mod unix {
     }
 
     #[test]
-    fn pairing_and_first_start_keep_remote_failure_categories_without_saving_a_connection() {
-        for flags in [
-            vec![],
-            vec!["--quiet"],
-            vec!["--json", "--json-version", "1"],
-            vec!["--json", "--json-version", "2"],
-        ] {
-            for operation in [vec!["rc", "pair"], vec!["rc", "start", "--detach"]] {
-                for (status, code) in [(401, 5), (503, 6), (500, 6), (200, 6)] {
-                    let lab = Lab::new();
-                    let hub = Hub::new(|_| {
-                        let mut step = Step::error(
-                            "POST",
-                            "/api/rc/connections",
-                            authentication_error("synthetic HTTP 401 wording"),
-                        );
-                        step.status = status;
-                        vec![step]
-                    });
-                    assert!(
-                        run_bounded(lab.command(&hub.base, &["config", "--list"]))
-                            .status
-                            .success()
-                    );
-                    lab.seed_credentials(&hub.base, false);
-                    let identity = lab.store.join("rc/identity.json");
-                    fs::create_dir_all(identity.parent().unwrap()).unwrap();
-                    let identity_bytes = br#"{"machine_fingerprint":"synthetic-machine","display_name":"synthetic-machine","created_at":"2026-01-01T00:00:00Z"}"#;
-                    fs::write(&identity, identity_bytes).unwrap();
-                    let credentials = fs::read(lab.credential_path(&hub.base)).unwrap();
-                    let mut args = flags.clone();
-                    args.extend(operation.iter().copied());
-                    let output = run_bounded(lab.command(&hub.base, &args));
-                    assert_eq!(output.status.code(), Some(code), "{args:?}: {output:?}");
-                    if flags.contains(&"--json") {
-                        assert!(output.stderr.is_empty(), "{output:?}");
-                        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-                        assert_eq!(value["command"], "rc");
-                        assert_eq!(value["exit_code"], code);
-                        assert_eq!(value["ok"], false);
-                        assert_eq!(
-                            value["schema_version"],
-                            flags.last().unwrap().parse::<u32>().unwrap()
-                        );
-                        if flags.last() == Some(&"1") {
-                            assert!(value.get("fix").is_none());
-                        } else if code == 5 {
-                            lab.assert_login(&value, &hub.base);
-                        } else {
-                            assert_eq!(value["fix"], json!([]));
-                        }
-                    } else {
-                        assert!(!output.stderr.is_empty());
-                        assert!(output.stdout.is_empty(), "{output:?}");
-                    }
-                    for token in [OLD_ACCESS, OLD_REFRESH] {
-                        assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
-                        assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
-                    }
-                    assert_eq!(fs::read(&identity).unwrap(), identity_bytes);
-                    assert_eq!(
-                        fs::read(lab.credential_path(&hub.base)).unwrap(),
-                        credentials
-                    );
-                    assert!(
-                        !lab.store
-                            .join("rc/connections")
-                            .join(format!(
-                                "{}.json",
-                                agit::infra::config::hub_host_key(&hub.base).unwrap()
-                            ))
-                            .exists()
-                    );
-                    assert!(!lab.store.join("rc/agitd.pid").exists());
-                    let requests = hub.finish();
-                    assert_eq!(requests.len(), 1);
-                    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-                    assert_eq!(body["machine_fingerprint"], "synthetic-machine");
-                    assert_eq!(body["display_name"], "synthetic-machine");
-                }
-            }
-        }
-    }
-
-    #[test]
     fn rc_land_remote_refusals_preserve_lineage_and_native_evidence() {
         for flags in [
             vec![],
@@ -1499,24 +1413,6 @@ mod unix {
                 vec!["--json", "fetch", "me/qa"],
                 "GET",
                 "/api/agents/me/qa",
-                5,
-            ),
-            (
-                vec!["--json", "rc", "list"],
-                "GET",
-                "/api/rc/connections",
-                5,
-            ),
-            (
-                vec!["--json", "rc", "revoke", "synthetic"],
-                "POST",
-                "/api/rc/connections/synthetic/revoke",
-                5,
-            ),
-            (
-                vec!["--json", "rc", "pair"],
-                "POST",
-                "/api/rc/connections",
                 5,
             ),
         ] {

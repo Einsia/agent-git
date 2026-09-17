@@ -10,7 +10,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 pub use crate::adapter::{Event as IrEvent, EventKind as IrEventKind};
 
@@ -160,7 +159,7 @@ pub enum PermissionApply {
     NextTurn,
 }
 
-/// What one harness on one machine can do under RC. Reported in `rc.register`;
+/// What one harness on one machine can do under RC. Reported in the machine catalog;
 /// the frontend renders controls from it (no interrupt button for a harness
 /// that cannot interrupt).
 ///
@@ -245,75 +244,6 @@ pub struct LocalProject {
     pub exists: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_origin: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RcRegister {
-    pub protocol_version: u32,
-    /// Generated once at first pairing, stored under `~/.agit/rc/identity`.
-    /// Stable across reconnects and reboots; changes only on reinstall. The hub
-    /// upserts on `(account_id, machine_fingerprint)` so reconnecting never
-    /// consumes a second quota slot.
-    pub machine_fingerprint: String,
-    pub display_name: String,
-    pub agit_version: String,
-    /// `linux-x86_64`, `macos-aarch64`, …
-    pub platform: String,
-    pub capabilities: Vec<RuntimeCapability>,
-    /// Additive protocol features this daemon understands. The hub must echo a
-    /// feature in [`RcRegisterResult::accepted_features`] before either side
-    /// uses it for security-sensitive wire semantics.
-    #[serde(default)]
-    pub features: Vec<String>,
-    #[serde(default)]
-    pub workspaces: Vec<LocalWorkspace>,
-    /// Highest seq `agitd` has emitted per stream. Lets the hub detect a gap
-    /// or a regression on the very first frame after reconnect.
-    #[serde(default)]
-    pub last_seq: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RcRegisterResult {
-    pub connection_id: String,
-    /// Intersection of the daemon's advertised features and the hub's
-    /// supported features. Missing means an old hub and therefore ACKs
-    /// nothing.
-    #[serde(default)]
-    pub accepted_features: Vec<String>,
-    /// Hub's view of the workspaces bound to this connection. `agitd` reconciles
-    /// its local mirror against this.
-    #[serde(default)]
-    pub workspaces: Vec<HubWorkspace>,
-    /// Highest seq the hub has durably persisted per stream.
-    ///
-    /// **This raises agitd's local watermark; it does not trigger a replay.**
-    /// Reconnecting is not a replay: agitd resumes numbering above whatever the
-    /// hub already has so a restarted daemon never re-issues a seq that is
-    /// already durable. Backfilling history is a *viewer*-driven act — it
-    /// happens only when someone sends `session.subscribe(after_seq)`.
-    ///
-    /// The earlier wording ("agitd replays anything above this") described a
-    /// behaviour that has never existed. A client written against it would sit
-    /// waiting for frames nobody is going to send.
-    #[serde(default)]
-    pub persisted_seq: BTreeMap<String, u64>,
-    pub server_time: String,
-}
-
-/// A workspace as the hub knows it (definition state, Aurora truth).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HubWorkspace {
-    pub workspace_id: String,
-    pub name: String,
-    #[serde(default)]
-    pub projects: Vec<HubProject>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HubProject {
-    pub project_id: String,
-    pub local_path: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1307,14 +1237,5 @@ mod tests {
         assert_eq!(back.event.line, Some(12));
         assert_eq!(back.object_hash, hash);
         assert_eq!(hash.len(), 40);
-    }
-
-    #[test]
-    fn older_peer_tolerates_missing_optional_fields() {
-        // A register frame from a build that predates `last_seq` / `workspaces`.
-        let j = r#"{"protocol_version":1,"machine_fingerprint":"f","display_name":"d","agit_version":"0.9","platform":"linux","capabilities":[]}"#;
-        let r: RcRegister = serde_json::from_str(j).unwrap();
-        assert!(r.workspaces.is_empty());
-        assert!(r.last_seq.is_empty());
     }
 }
