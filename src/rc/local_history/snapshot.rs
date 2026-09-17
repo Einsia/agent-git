@@ -3,9 +3,11 @@ use super::*;
 use std::{
     collections::HashMap,
     io::Write,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
@@ -13,52 +15,108 @@ const MAX_SNAPSHOTS: usize = 8;
 const LIFETIME: Duration = Duration::from_secs(600);
 
 struct Snapshot {
-    scope: String,
     parts: Vec<Segment>,
     native_items: Option<Vec<Value>>,
     bytes: u64,
+    _budget: OwnedSemaphorePermit,
+}
+
+struct CachedSnapshot {
+    scope: String,
+    snapshot: Arc<Mutex<Snapshot>>,
     touched: Instant,
 }
 
-static SNAPSHOTS: OnceLock<Mutex<HashMap<String, Snapshot>>> = OnceLock::new();
+struct Cache {
+    entries: Mutex<HashMap<String, CachedSnapshot>>,
+    bytes: Arc<Semaphore>,
+}
 
-pub(super) fn read(runtime: &str, native: &str, cwd: &str, params: &Value) -> crate::Result<Value> {
-    let mut cache = SNAPSHOTS
-        .get_or_init(Default::default)
-        .try_lock()
-        .map_err(|_| Failure::Busy)?;
-    cache.retain(|_, entry| entry.touched.elapsed() < LIFETIME);
-    let scope = json!([runtime, native, cwd]).to_string();
-    ensure!(
-        params.get("before").is_none() || params.get("snapshot").is_some(),
-        Failure::InvalidCursor
-    );
-    let token = if let Some(token) = params.get("snapshot") {
-        let token = token.as_str().context(Failure::InvalidCursor)?;
-        ensure!(
-            cache.get(token).is_some_and(|entry| entry.scope == scope),
-            Failure::Expired
-        );
-        token.to_string()
-    } else {
-        let (token, snapshot) = capture(runtime, native, cwd, scope)?;
-        while !cache.contains_key(&token)
-            && (cache.len() >= MAX_SNAPSHOTS
-                || cache.values().map(|entry| entry.bytes).sum::<u64>() + snapshot.bytes
-                    > MAX_TOTAL_BYTES)
-        {
-            let oldest = cache
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            bytes: Arc::new(Semaphore::new(MAX_TOTAL_BYTES as usize)),
+        }
+    }
+}
+
+impl Cache {
+    fn snapshot(
+        &self,
+        scope: String,
+        token: Option<&str>,
+        capture: impl FnOnce() -> crate::Result<Snapshot>,
+    ) -> crate::Result<(String, Arc<Mutex<Snapshot>>)> {
+        let mut entries = self.entries.lock().map_err(|_| Failure::Busy)?;
+        entries.retain(|_, entry| entry.touched.elapsed() < LIFETIME);
+        if let Some(token) = token {
+            let entry = entries.get_mut(token).context(Failure::Expired)?;
+            ensure!(entry.scope == scope, Failure::Expired);
+            entry.touched = Instant::now();
+            return Ok((token.into(), entry.snapshot.clone()));
+        }
+        drop(entries);
+        let snapshot = Arc::new(Mutex::new(capture()?));
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut entries = self.entries.lock().map_err(|_| Failure::Busy)?;
+        while entries.len() >= MAX_SNAPSHOTS {
+            let oldest = entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.touched)
                 .map(|(key, _)| key.clone())
                 .context(Failure::Limit)?;
-            cache.remove(&oldest);
+            entries.remove(&oldest);
         }
-        cache.insert(token.clone(), snapshot);
-        token
-    };
-    let entry = cache.get_mut(&token).context(Failure::Expired)?;
-    entry.touched = Instant::now();
+        entries.insert(
+            token.clone(),
+            CachedSnapshot {
+                scope,
+                snapshot: snapshot.clone(),
+                touched: Instant::now(),
+            },
+        );
+        Ok((token, snapshot))
+    }
+
+    fn reserve(&self, bytes: u32) -> crate::Result<OwnedSemaphorePermit> {
+        if let Ok(permit) = self.bytes.clone().try_acquire_many_owned(bytes) {
+            return Ok(permit);
+        }
+        let mut entries = self.entries.lock().map_err(|_| Failure::Busy)?;
+        // A live reader owns its byte reservation even after its cache entry is evicted.
+        loop {
+            if let Ok(permit) = self.bytes.clone().try_acquire_many_owned(bytes) {
+                return Ok(permit);
+            }
+            let oldest = entries
+                .iter()
+                .filter(|(_, entry)| Arc::strong_count(&entry.snapshot) == 1)
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(key, _)| key.clone())
+                .context(Failure::Busy)?;
+            entries.remove(&oldest);
+        }
+    }
+}
+
+static SNAPSHOTS: OnceLock<Cache> = OnceLock::new();
+
+pub(super) fn read(runtime: &str, native: &str, cwd: &str, params: &Value) -> crate::Result<Value> {
+    ensure!(
+        params.get("before").is_none() || params.get("snapshot").is_some(),
+        Failure::InvalidCursor
+    );
+    let token = params
+        .get("snapshot")
+        .map(|value| value.as_str().context(Failure::InvalidCursor))
+        .transpose()?;
+    let scope = json!([runtime, native, cwd]).to_string();
+    let cache = SNAPSHOTS.get_or_init(Default::default);
+    let (token, snapshot) =
+        cache.snapshot(scope, token, || capture(runtime, native, cwd, cache))?;
+    // Only readers of the same immutable snapshot share file cursor positions.
+    let mut entry = snapshot.lock().map_err(|_| Failure::Busy)?;
     let before = params
         .get("before")
         .map(|value| value.as_u64().context(Failure::InvalidCursor))
@@ -110,20 +168,15 @@ pub(super) fn read(runtime: &str, native: &str, cwd: &str, params: &Value) -> cr
     Ok(result)
 }
 
-fn capture(
-    runtime: &str,
-    native: &str,
-    cwd: &str,
-    scope: String,
-) -> crate::Result<(String, Snapshot)> {
+fn capture(runtime: &str, native: &str, cwd: &str, cache: &Cache) -> crate::Result<Snapshot> {
     let mut snapshot = Snapshot {
-        scope,
+        _budget: cache.reserve(0)?,
         parts: vec![],
         native_items: None,
         bytes: 0,
-        touched: Instant::now(),
     };
     if runtime == "opencode" {
+        snapshot._budget.merge(cache.reserve(MAX_BYTES as u32)?);
         use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};
         let source = OpenCode.lookup_native_readonly(native, Limits::default())?;
         let bytes = super::super::supervisor::native_records::read_watch_snapshot_blocking(
@@ -140,6 +193,11 @@ fn capture(
             .collect::<Result<Vec<_>, _>>()?;
         snapshot.bytes += serde_json::to_vec(&items)?.len() as u64;
         ensure!(snapshot.bytes <= MAX_BYTES, Failure::Limit);
+        drop(
+            snapshot
+                ._budget
+                .split((MAX_BYTES - snapshot.bytes) as usize),
+        );
         snapshot.native_items = Some(items);
     } else {
         let path = crate::adapter::get(runtime)?
@@ -162,6 +220,7 @@ fn capture(
                 .checked_add(part.end)
                 .context(Failure::Limit)?;
             ensure!(snapshot.bytes <= MAX_BYTES, Failure::Limit);
+            snapshot._budget.merge(cache.reserve(part.end as u32)?);
             if part.end > 0 {
                 part.file.seek(SeekFrom::Start(part.end - 1))?;
                 let mut delimiter = [0];
@@ -192,5 +251,59 @@ fn capture(
             });
         }
     }
-    Ok((uuid::Uuid::new_v4().to_string(), snapshot))
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captures_and_readers_do_not_lock_unrelated_history_or_release_live_bytes() {
+        let cache = Cache::default();
+        let make = || {
+            Ok(Snapshot {
+                parts: vec![],
+                native_items: None,
+                bytes: 1,
+                _budget: cache.reserve(1)?,
+            })
+        };
+        let (token, first) = cache
+            .snapshot("first".into(), None, || {
+                let (_, other) = cache.snapshot("other".into(), None, make)?;
+                assert_eq!(other.lock().unwrap().bytes, 1);
+                make()
+            })
+            .unwrap();
+        let reading = first.lock().unwrap();
+        let (_, second) = cache.snapshot("second".into(), None, make).unwrap();
+        assert_eq!(second.lock().unwrap().bytes, 1);
+        assert!(
+            cache
+                .snapshot("another scope".into(), Some(&token), make)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &first,
+            &cache
+                .snapshot("first".into(), Some(&token), make)
+                .unwrap()
+                .1
+        ));
+        cache.entries.lock().unwrap().clear();
+        assert_eq!(
+            cache.bytes.available_permits(),
+            MAX_TOTAL_BYTES as usize - 2
+        );
+        drop(reading);
+        drop(first);
+        drop(second);
+        assert_eq!(cache.bytes.available_permits(), MAX_TOTAL_BYTES as usize);
+        assert!(cache.snapshot("first".into(), Some(&token), make).is_err());
+        let full = cache.reserve(MAX_TOTAL_BYTES as u32).unwrap();
+        assert!(cache.reserve(1).is_err());
+        drop(full);
+        assert!(cache.reserve(1).is_ok());
+    }
 }
