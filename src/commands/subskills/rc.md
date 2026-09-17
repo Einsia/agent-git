@@ -36,3 +36,8 @@ performs registration automatically. SSH uses `agit rc local bridge --ensure`.
 The peer executor supports native Windows, Linux and macOS. Windows uses a current-user local
 named pipe for owner RPC; Unix systems use a current-user local socket. Cloud peers use the
 same transport and session protocol on all three platforms.
+
+After revoking a device, sign in as its owner and run `agit rc start --detach` on that
+machine to reconnect intentionally. Startup replaces a revoked registration while keeping
+the device identity used by its workspaces. Healthy registrations keep their credentials;
+background connection retries cannot undo revocation.

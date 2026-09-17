@@ -18,6 +18,7 @@
     "rc::harness::proc::tests::windows_shutdown_reaps_the_harness_job_before_returning",
     "rc::local::windows::tests",
     "rc::cloud::store::tests",
+    "rc::cloud::commands::tests",
     "rc::diagnostics::tests",
     "adapter::executable_tests",
     "rc::daemon::tests::metadata"

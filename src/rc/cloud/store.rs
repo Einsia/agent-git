@@ -199,7 +199,6 @@ pub fn request_inbound(hub: &str) -> crate::Result<()> {
         grant_enrolling_owner(&enrollment)?;
         enrollment.inbound_enabled = true;
         save(&enrollment)?;
-        return clear_inbound_request(api.origin());
     }
     write(&intent_path(api.origin())?, &api.origin())
 }

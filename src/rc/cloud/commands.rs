@@ -2,7 +2,7 @@ use super::store;
 use agit_peer::{
     access::{Access, Principal, Resource, Rule},
     client::Client,
-    cloud::Enrollment,
+    cloud::{Device, Enrollment, Secret},
 };
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 
@@ -123,7 +123,7 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
 pub(super) async fn enroll(hub: &str, name: Option<String>) -> crate::Result<serde_json::Value> {
     let api = Client::new(hub)?;
     let _lock = store::enrollment_lock(api.origin())?;
-    let mut enrollment = register(&api, name).await?;
+    let (mut enrollment, _) = register(&api, name, Registration::Validate).await?;
     store::grant_enrolling_owner(&enrollment)?;
     enrollment.inbound_enabled = true;
     store::save(&enrollment)?;
@@ -131,23 +131,29 @@ pub(super) async fn enroll(hub: &str, name: Option<String>) -> crate::Result<ser
     store::status(api.origin())
 }
 
-pub(super) async fn enroll_pending(hub: &str) -> crate::Result<()> {
+pub(super) async fn enroll_pending(hub: &str) -> crate::Result<bool> {
     let api = Client::new(hub)?;
     let _lock = store::enrollment_lock(api.origin())?;
     if !store::inbound_pending(api.origin())? {
-        return Ok(());
+        return Ok(false);
     }
-    let mut enrollment = register(&api, None).await?;
+    let (mut enrollment, changed) = register(&api, None, Registration::Validate).await?;
     store::grant_enrolling_owner(&enrollment)?;
     enrollment.inbound_enabled = true;
     store::save(&enrollment)?;
-    store::clear_inbound_request(api.origin())
+    store::clear_inbound_request(api.origin())?;
+    Ok(changed)
 }
 
 pub(super) async fn controller(hub: &str) -> crate::Result<store::Enrollment> {
     let api = Client::new(hub)?;
+    if let Some(enrollment) = store::load(api.origin())? {
+        let owner = enrollment.credential.device.owner.clone();
+        tokio::task::spawn_blocking(move || store::verify_signed_in_owner(&owner)).await??;
+        return Ok(enrollment);
+    }
     let _lock = store::enrollment_lock(api.origin())?;
-    register(&api, None).await
+    Ok(register(&api, None, Registration::Reuse).await?.0)
 }
 
 pub(super) async fn inbound(hub: &str, enabled: bool) -> crate::Result<serde_json::Value> {
@@ -163,20 +169,46 @@ pub(super) async fn inbound(hub: &str, enabled: bool) -> crate::Result<serde_jso
     store::status(hub)
 }
 
-async fn register(api: &Client, name: Option<String>) -> crate::Result<store::Enrollment> {
-    if let Some(enrollment) = store::load(api.origin())? {
+enum Registration {
+    Reuse,
+    Validate,
+}
+
+async fn register(
+    api: &Client,
+    name: Option<String>,
+    mode: Registration,
+) -> crate::Result<(store::Enrollment, bool)> {
+    let saved = store::load(api.origin())?;
+    if let Some(enrollment) = &saved {
         let owner = enrollment.credential.device.owner.clone();
         tokio::task::spawn_blocking(move || store::verify_signed_in_owner(&owner)).await??;
-        return Ok(enrollment);
+        if matches!(mode, Registration::Reuse) {
+            return Ok((saved.unwrap(), false));
+        }
     }
-    let machine = super::super::identity::identity()?;
+    let token = super::account_token(api.origin(), false).await?;
+    if let Some(enrollment) = &saved
+        && registered(api, &token, &enrollment.credential.device).await?
+    {
+        return Ok((saved.unwrap(), false));
+    }
+    let (machine_id, display_name) = match &saved {
+        Some(enrollment) => {
+            let device = &enrollment.credential.device;
+            (device.machine_id.clone(), device.display_name.clone())
+        }
+        None => {
+            let machine = super::super::identity::identity()?;
+            (machine.machine_fingerprint, machine.display_name)
+        }
+    };
     let identity = agit_peer::Identity::generate()?;
     let request = Enrollment {
-        machine_id: machine.machine_fingerprint,
-        display_name: name.unwrap_or(machine.display_name),
+        machine_id,
+        display_name: name.unwrap_or(display_name),
         certificate: identity.certificate().clone(),
     };
-    let token = super::account_token(api.origin(), false).await?;
     let credential = api.enroll(&token, &request).await?;
     let enrollment = store::Enrollment {
         credential,
@@ -184,7 +216,35 @@ async fn register(api: &Client, name: Option<String>) -> crate::Result<store::En
         inbound_enabled: false,
     };
     store::save(&enrollment)?;
-    Ok(enrollment)
+    Ok((enrollment, true))
+}
+
+async fn registered(api: &Client, token: &Secret, saved: &Device) -> crate::Result<bool> {
+    let mut after = None;
+    loop {
+        let page = api.devices(token, after.as_deref()).await?;
+        if let Some(entry) = page
+            .devices
+            .iter()
+            .find(|entry| entry.device.id == saved.id)
+        {
+            let device = &entry.device;
+            return Ok(device.owner == saved.owner
+                && device.machine_id == saved.machine_id
+                && device.certificate == saved.certificate
+                && device.credential_epoch == saved.credential_epoch);
+        }
+        match page.next_cursor {
+            Some(next) => {
+                anyhow::ensure!(
+                    after.as_ref().is_none_or(|after| &next > after),
+                    "cloud device cursor did not advance"
+                );
+                after = Some(next);
+            }
+            None => return Ok(false),
+        }
+    }
 }
 
 fn parse_resource(resource: &str) -> crate::Result<Resource> {
@@ -197,3 +257,6 @@ fn parse_resource(resource: &str) -> crate::Result<Resource> {
         _ => anyhow::bail!("resource must be machine, project:<id>, or session:<id>"),
     }
 }
+
+#[cfg(test)]
+mod tests;

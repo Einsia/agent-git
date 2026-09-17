@@ -37,10 +37,17 @@ impl Drop for Service {
     }
 }
 
-struct Task(tokio::task::JoinHandle<()>);
+struct Task {
+    presence: tokio::task::JoinHandle<()>,
+    enrollment: Option<tokio::task::JoinHandle<()>>,
+    changed: watch::Sender<()>,
+}
 impl Drop for Task {
     fn drop(&mut self) {
-        self.0.abort();
+        self.presence.abort();
+        if let Some(enrollment) = &self.enrollment {
+            enrollment.abort();
+        }
     }
 }
 
@@ -57,27 +64,72 @@ impl Service {
             refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 refresh.tick().await;
-                let origins = match tokio::task::spawn_blocking(store::origins).await {
+                let origins = match tokio::task::spawn_blocking(|| {
+                    store::origins()?
+                        .into_iter()
+                        .map(|hub| {
+                            let pending = store::inbound_pending(&hub)?;
+                            Ok((hub, pending))
+                        })
+                        .collect::<crate::Result<Vec<_>>>()
+                })
+                .await
+                {
                     Ok(Ok(origins)) => origins,
                     _ => {
                         record(&log, "cloud.enrollment_read_failed", serde_json::json!({}));
                         continue;
                     }
                 };
-                tasks.retain(|hub, _| origins.contains(hub));
-                for hub in origins {
-                    if tasks.get(&hub).is_some_and(|task| !task.0.is_finished()) {
-                        continue;
+                tasks.retain(|hub, _| origins.iter().any(|(origin, _)| origin == hub));
+                for (hub, pending) in origins {
+                    let task = tasks.entry(hub.clone()).or_insert_with(|| {
+                        let (changed, receiver) = watch::channel(());
+                        Task {
+                            presence: tokio::spawn(run_executor(
+                                hub.clone(),
+                                worker.clone(),
+                                incoming.clone(),
+                                slots.clone(),
+                                log.clone(),
+                                receiver,
+                            )),
+                            enrollment: None,
+                            changed,
+                        }
+                    });
+                    if task.presence.is_finished() {
+                        task.presence = tokio::spawn(run_executor(
+                            hub.clone(),
+                            worker.clone(),
+                            incoming.clone(),
+                            slots.clone(),
+                            log.clone(),
+                            task.changed.subscribe(),
+                        ));
                     }
-                    let (worker, incoming, log, slots) =
-                        (worker.clone(), incoming.clone(), log.clone(), slots.clone());
-                    let origin = hub.clone();
-                    tasks.insert(
-                        hub,
-                        Task(tokio::spawn(async move {
-                            run_executor(origin, worker, incoming, slots, log).await;
-                        })),
-                    );
+                    if pending && task.enrollment.as_ref().is_none_or(|job| job.is_finished()) {
+                        let (changed, log) = (task.changed.clone(), log.clone());
+                        task.enrollment = Some(tokio::spawn(async move {
+                            match super::commands::enroll_pending(&hub).await {
+                                Ok(replaced) => {
+                                    record(
+                                        &log,
+                                        "cloud.enrollment_ready",
+                                        serde_json::json!({"hub":hub,"credential_changed":replaced}),
+                                    );
+                                    if replaced {
+                                        changed.send_replace(());
+                                    }
+                                }
+                                Err(error) => record(
+                                    &log,
+                                    "cloud.enrollment_failed",
+                                    serde_json::json!({"hub":hub,"http_status":error.downcast_ref::<agit_peer::client::HttpFailure>().map(|error| error.status)}),
+                                ),
+                            }
+                        }));
+                    }
                 }
             }
         });
@@ -97,13 +149,13 @@ async fn run_executor(
     incoming: mpsc::Sender<Authenticated>,
     slots: Arc<tokio::sync::Semaphore>,
     log: Option<super::super::diagnostics::Log>,
+    mut changed: watch::Receiver<()>,
 ) {
-    let (_lifetime, stopped) = watch::channel(());
+    let (lifetime, mut stopped) = watch::channel(());
     let mut backoff = Duration::from_millis(250);
     let mut children = tokio::task::JoinSet::new();
     loop {
         let attempt = async {
-            super::commands::enroll_pending(&hub).await?;
             let origin = hub.clone();
             let enrollment = tokio::task::spawn_blocking(move || store::load(&origin)).await??
                 .context("cloud enrollment is missing")?;
@@ -115,6 +167,12 @@ async fn run_executor(
             backoff = Duration::from_millis(250);
             loop {
                 tokio::select! {
+                    _ = changed.changed() => {
+                        lifetime.send_replace(());
+                        stopped.borrow_and_update();
+                        children.abort_all();
+                        return Ok(());
+                    }
                     Some(_) = children.join_next(), if !children.is_empty() => {},
                     offer = presence.next() => {
                         let PresenceEvent::Offer { link_id, source_id, ticket, grant_token } = offer? else { continue };
@@ -175,8 +233,21 @@ async fn run_executor(
             "cloud.presence_disconnected",
             serde_json::json!({"hub":hub,"failed":attempt.is_err(),"retry_ms":backoff.as_millis()}),
         );
+        if attempt.is_ok() {
+            backoff = Duration::from_millis(250);
+            continue;
+        }
         let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]);
-        tokio::time::sleep(backoff + Duration::from_millis(jitter)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff + Duration::from_millis(jitter)) => {}
+            _ = changed.changed() => {
+                lifetime.send_replace(());
+                stopped.borrow_and_update();
+                children.abort_all();
+                backoff = Duration::from_millis(250);
+                continue;
+            }
+        }
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
