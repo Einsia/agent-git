@@ -198,7 +198,15 @@ and the failure operation ID to inspect connection failures and uncertain writes
 Controller stderr also records `controller.cloud_connect` with the source,
 target, and relay link IDs. Its phase durations separate admission, transport
 opening, relay pairing, and peer TLS. Admission and transport opening overlap;
-their durations must not be added to calculate the connection total.
+their durations must not be added to calculate the connection total. The controller
+sends TLS ClientHello immediately after its relay join. It validates the expected
+relay ready frame before delivering received bytes to TLS and authenticates the
+executor certificate before any RPC. Pairing keeps its own deadline; the TLS
+allowance starts when pairing completes. Executors use the existing join/ready
+sequence, including released Linux 0.2.0 peers.
+`pairing_tls_ms` measures this overlapping phase, `pairing_ms` ends at validated
+relay readiness, and `peer_tls_after_ready_ms` measures the remaining TLS wait.
+Do not add `pairing_ms` to `pairing_tls_ms`.
 `controller.peer_handshake` associates the route and worker with transport and
 `machine.describe` durations. Failed attempts include their completion state;
 neither record includes credentials, certificates, or message contents.

@@ -3,9 +3,8 @@
 use crate::{Authority, Connector, Opening, Worker};
 use agit_peer::{
     Identity,
-    client::{Client, join_data, verified_transport},
+    client::{Client, join_controller, verified_transport},
     cloud::{Device, DeviceCredential, Secret},
-    transport::{Role, authenticate},
 };
 use anyhow::ensure;
 use std::{sync::Arc, time::Instant};
@@ -92,28 +91,26 @@ pub async fn dial(
         phases.insert("admission_ms".into(), admission_ms.into());
         phases.insert("transport_ms".into(), transport_ms.into());
         phases.insert("transport_reopened".into(), reopened.into());
-        phase = "relay_pairing";
-        let pairing = Instant::now();
-        let paired = join_data(raw, &dialed.link_id, dialed.ticket).await;
-        phases.insert(
-            "pairing_ms".into(),
-            (pairing.elapsed().as_secs_f64() * 1000.0).into(),
-        );
-        let raw = paired?;
-        phase = "peer_tls";
-        let tls = Instant::now();
-        let authenticated = authenticate(
+        phase = "relay_pairing_peer_tls";
+        let pairing_tls = Instant::now();
+        let authenticated = join_controller(
             raw,
+            &dialed.link_id,
+            dialed.ticket,
             identity,
             &dialed.connection.grant.target.certificate,
-            Role::Controller,
         )
         .await;
+        let elapsed_ms = pairing_tls.elapsed().as_secs_f64() * 1000.0;
+        phases.insert("pairing_tls_ms".into(), elapsed_ms.into());
+        let (connection, pairing) = authenticated?;
+        let pairing_ms = pairing.as_secs_f64() * 1000.0;
+        phases.insert("pairing_ms".into(), pairing_ms.into());
         phases.insert(
-            "peer_tls_ms".into(),
-            (tls.elapsed().as_secs_f64() * 1000.0).into(),
+            "peer_tls_after_ready_ms".into(),
+            (elapsed_ms - pairing_ms).max(0.0).into(),
         );
-        authenticated
+        Ok(connection)
     }
     .await;
     crate::diagnostics::record(serde_json::json!({

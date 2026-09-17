@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const SERVER_NAME: &str = "agit-peer";
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CERTIFICATE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,14 +121,23 @@ impl Identity {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.connecting(peer, stream)?)
+            .await
+            .context("peer authentication timed out")?
+            .context("peer authentication failed")
+    }
+
+    // Callers bound relay readiness separately and start the TLS deadline after readiness.
+    pub(crate) fn connecting<S>(
+        &self,
+        peer: &PeerCertificate,
+        stream: S,
+    ) -> anyhow::Result<tokio_rustls::Connect<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let connector = TlsConnector::from(Arc::new(self.client_config(peer)?));
-        tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            connector.connect(ServerName::try_from(SERVER_NAME)?, stream),
-        )
-        .await
-        .context("peer authentication timed out")?
-        .context("peer authentication failed")
+        Ok(connector.connect(ServerName::try_from(SERVER_NAME)?, stream))
     }
 
     pub async fn accept<S>(
