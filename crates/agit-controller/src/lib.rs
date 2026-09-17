@@ -5,6 +5,7 @@
 
 #[cfg(feature = "cloud")]
 pub mod cloud;
+mod diagnostics;
 #[cfg(feature = "host")]
 pub mod host;
 mod peer;

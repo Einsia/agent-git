@@ -8,7 +8,7 @@ use agit_peer::{
     transport::{Role, authenticate},
 };
 use anyhow::ensure;
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 pub struct Credentials {
     pub identity: Arc<Identity>,
@@ -70,16 +70,61 @@ pub async fn dial(
     target: &Device,
 ) -> anyhow::Result<agit_tunnel::Connection> {
     let config = api.data_config(source)?;
-    let (dialed, raw, _) = verified_transport(api.connect(account, &source.device, target), || {
-        worker.open(config.clone())
-    })
-    .await?;
-    let raw = join_data(raw, &dialed.link_id, dialed.ticket).await?;
-    authenticate(
-        raw,
-        identity,
-        &dialed.connection.grant.target.certificate,
-        Role::Controller,
-    )
-    .await
+    let started = Instant::now();
+    let mut phase = "admission_transport";
+    let mut phases = serde_json::Map::new();
+    let mut link_id = None;
+    let result = async {
+        let ((dialed, admission_ms), (raw, transport_ms), reopened) = verified_transport(
+            async {
+                let started = Instant::now();
+                let dialed = api.connect(account, &source.device, target).await?;
+                Ok((dialed, started.elapsed().as_secs_f64() * 1000.0))
+            },
+            || async {
+                let started = Instant::now();
+                let raw = worker.open(config.clone()).await?;
+                Ok((raw, started.elapsed().as_secs_f64() * 1000.0))
+            },
+        )
+        .await?;
+        link_id = Some(dialed.link_id.clone());
+        phases.insert("admission_ms".into(), admission_ms.into());
+        phases.insert("transport_ms".into(), transport_ms.into());
+        phases.insert("transport_reopened".into(), reopened.into());
+        phase = "relay_pairing";
+        let pairing = Instant::now();
+        let paired = join_data(raw, &dialed.link_id, dialed.ticket).await;
+        phases.insert(
+            "pairing_ms".into(),
+            (pairing.elapsed().as_secs_f64() * 1000.0).into(),
+        );
+        let raw = paired?;
+        phase = "peer_tls";
+        let tls = Instant::now();
+        let authenticated = authenticate(
+            raw,
+            identity,
+            &dialed.connection.grant.target.certificate,
+            Role::Controller,
+        )
+        .await;
+        phases.insert(
+            "peer_tls_ms".into(),
+            (tls.elapsed().as_secs_f64() * 1000.0).into(),
+        );
+        authenticated
+    }
+    .await;
+    crate::diagnostics::record(serde_json::json!({
+        "event": "controller.cloud_connect",
+        "source_id": source.device.id,
+        "target_id": target.id,
+        "link_id": link_id,
+        "succeeded": result.is_ok(),
+        "phase": phase,
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+        "phases": phases,
+    }));
+    result
 }

@@ -195,6 +195,17 @@ Request bodies, response bodies, and transcript content are excluded. Use the
 daemon instance and request ID to follow a local call, then peer route/generation
 and the failure operation ID to inspect connection failures and uncertain writes.
 
+Controller stderr also records `controller.cloud_connect` with the source,
+target, and relay link IDs. Its phase durations separate admission, transport
+opening, relay pairing, and peer TLS. Admission and transport opening overlap;
+their durations must not be added to calculate the connection total.
+`controller.peer_handshake` associates the route and worker with transport and
+`machine.describe` durations. Failed attempts include their completion state;
+neither record includes credentials, certificates, or message contents.
+These controller records use a bounded, nonblocking queue and a dedicated stderr
+writer thread. A stalled consumer drops excess diagnostics without delaying
+connection readiness or cancellation; process exit does not wait to flush them.
+
 The writer runs off the request loop with a bounded queue. Its structured files
 rotate at 4 MiB and retain three backups per daemon instance; each file is
 owner-readable/writable only. Sequence gaps and a cumulative dropped counter

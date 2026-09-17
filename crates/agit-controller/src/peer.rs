@@ -51,6 +51,7 @@ pub(super) async fn run(
             s.state = State::Connecting;
             s.worker_pid = None;
         });
+        let opening = std::time::Instant::now();
         let connecting = route.open(&worker);
         tokio::pin!(connecting);
         let connected = loop {
@@ -64,8 +65,10 @@ pub(super) async fn run(
         };
         let result = match connected {
             Ok(connection) => {
+                let transport_ms = opening.elapsed().as_secs_f64() * 1000.0;
                 let pid = connection.worker_pid;
                 let (mut sink, mut source) = connection.split();
+                let describing = std::time::Instant::now();
                 let description = {
                     let handshake = tokio::time::timeout(
                         HANDSHAKE,
@@ -82,6 +85,19 @@ pub(super) async fn run(
                         }
                     }
                 };
+                {
+                    let current = status.borrow();
+                    crate::diagnostics::record(serde_json::json!({
+                        "event": "controller.peer_handshake",
+                        "peer_id": current.peer_id,
+                        "route_id": current.route_id,
+                        "worker_pid": pid,
+                        "succeeded": description.is_ok(),
+                        "transport_ms": transport_ms,
+                        "describe_ms": describing.elapsed().as_secs_f64() * 1000.0,
+                        "elapsed_ms": opening.elapsed().as_secs_f64() * 1000.0,
+                    }));
+                }
                 match description {
                     Ok(description) => {
                         let actual = description["machine"]["machine_fingerprint"]
