@@ -245,6 +245,16 @@ pub fn tree_apply_owned(
         repo.root(),
         gix::open::Options::default().config_overrides(["core.useReplaceRefs=false"]),
     )?;
+    #[cfg(windows)]
+    {
+        // Object persistence uses Win32 paths directly. Resolve the shared directory so linked
+        // worktree parent components cannot exceed the path limit or enter a verbatim path.
+        let common = std::fs::canonicalize(objects.common_dir())?;
+        objects = gix::open_opts(
+            common,
+            gix::open::Options::default().config_overrides(["core.useReplaceRefs=false"]),
+        )?;
+    }
     objects.objects.ignore_replacements = true;
     let base_id = gix::ObjectId::from_hex(base_tree.as_bytes())?;
     let mut editor = objects.edit_tree(base_id)?;
@@ -3933,6 +3943,41 @@ mod tests {
         assert_eq!(cat_blob(&repo, &tree, "events/00004e1f"), b"event 19999\n");
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
         assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owned_tree_apply_persists_from_a_long_linked_worktree() {
+        use std::os::windows::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path().as_os_str().encode_wide().count() + 1;
+        let padding = 170usize.saturating_sub(prefix).max(1);
+        let repo = Repo::init(&directory.path().join("r".repeat(padding))).unwrap();
+        repo.git(&["commit", "--allow-empty", "-m", "base"])
+            .unwrap();
+        let branch = format!("desktop-{}", uuid::Uuid::new_v4());
+        let worktree = directory.path().join(&branch);
+        repo.git(&["worktree", "add", "-b", &branch, worktree.to_str().unwrap()])
+            .unwrap();
+        let linked = Repo::open(&worktree).unwrap();
+        let head = linked.git(&["rev-parse", "HEAD"]).unwrap();
+        let unresolved = gix::open(linked.root())
+            .unwrap()
+            .common_dir()
+            .join("objects")
+            .join("ab")
+            .join("c".repeat(38));
+        assert!(unresolved.as_os_str().encode_wide().count() >= 260);
+
+        let tree = tree_apply_owned(
+            &linked,
+            &head,
+            vec![("events/reply".into(), Some(b"persisted reply".to_vec()))],
+        )
+        .unwrap();
+        assert_eq!(cat_blob(&repo, &tree, "events/reply"), b"persisted reply");
+        assert_eq!(linked.git(&["rev-parse", "HEAD"]).unwrap(), head);
+        assert!(linked.git(&["status", "--porcelain"]).unwrap().is_empty());
     }
 
     #[test]

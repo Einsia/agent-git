@@ -347,3 +347,18 @@ The full [RFC](rfc-rc-daemon-peer-transports.md) remains open. In particular:
 
 The controller and tunnel split is an implementation milestone, not completion
 of these remaining executor and cloud requirements.
+
+## Grants on the presence channel
+
+Executors request `X-Agit-Peer-Offer: grant-v1` on their authenticated presence
+WebSocket. A supporting Hub attaches the verified connection grant to the offer,
+avoiding a separate executor HTTP verification round trip. The executor validates
+the issuer, expiry, exact target credential and source identity before endpoint
+TLS. The relay still rechecks live authority before `DataReady`, and the executor
+still applies its resource policy to every admitted operation.
+
+The offer's optional `grant` field is sent only to an executor that requests it.
+Linux 0.2.0 presence messages retain their existing shape. A new executor can use
+the existing peer verification endpoint when a Hub does not attach a grant; this
+is peer protocol negotiation and does not restore paired RC. Diagnostics record
+`verification_source` as `presence` or `http` for actual rollout verification.

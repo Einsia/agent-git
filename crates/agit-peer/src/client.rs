@@ -118,6 +118,8 @@ impl Client {
     fn http_client(direct: bool) -> anyhow::Result<reqwest::Client> {
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(30))
+            // Dialing an unreachable address must leave time to join the relay offer.
+            .connect_timeout(Duration::from_secs(3))
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none());
         Ok(if direct { client.no_proxy() } else { client }.build()?)
@@ -292,12 +294,37 @@ impl Client {
                 Some(serde_json::json!({"token":token})),
             )
             .await?;
-        self.validate_grant(&grant)?;
+        self.validate_executor_grant(executor, &grant)?;
+        Ok(grant)
+    }
+
+    /// Presence grants come from the authenticated Hub channel, before relay admission and peer TLS.
+    pub async fn offered_grant(
+        &self,
+        executor: &DeviceCredential,
+        token: &Secret,
+        grant: Option<ConnectionGrant>,
+    ) -> anyhow::Result<ConnectionGrant> {
+        match grant {
+            Some(grant) => {
+                self.validate_executor_grant(executor, &grant)?;
+                Ok(grant)
+            }
+            None => self.verify(executor, token).await,
+        }
+    }
+
+    fn validate_executor_grant(
+        &self,
+        executor: &DeviceCredential,
+        grant: &ConnectionGrant,
+    ) -> anyhow::Result<()> {
+        self.validate_grant(grant)?;
         ensure!(
             same_device(&grant.target, &executor.device),
             "cloud grant addresses another executor"
         );
-        Ok(grant)
+        Ok(())
     }
 
     pub async fn renew(
@@ -364,7 +391,11 @@ impl Client {
     }
 
     pub fn presence_config(&self, device: &DeviceCredential) -> anyhow::Result<Config> {
-        self.socket_config(device, "/api/peer/presence")
+        let mut config = self.socket_config(device, "/api/peer/presence")?;
+        if let Config::WebSocket { headers, .. } = &mut config {
+            headers.push(("X-Agit-Peer-Offer".into(), "grant-v1".into()));
+        }
+        Ok(config)
     }
 
     pub fn data_config(&self, device: &DeviceCredential) -> anyhow::Result<Config> {
@@ -471,6 +502,54 @@ impl Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn presence_grant_retains_executor_binding_without_an_http_round_trip() {
+        let issuer = "http://127.0.0.1:0";
+        let client = Client::new(issuer).unwrap();
+        let device = Device {
+            id: "executor".into(),
+            owner: crate::access::Principal {
+                issuer: issuer.into(),
+                account_id: "owner".into(),
+            },
+            machine_id: "machine".into(),
+            display_name: "Executor".into(),
+            certificate: crate::Identity::generate().unwrap().certificate().clone(),
+            credential_epoch: 1,
+        };
+        let executor = DeviceCredential {
+            device: device.clone(),
+            token: Secret::new("executor-token".into()),
+        };
+        let token = Secret::new("grant-token".into());
+        let grant = ConnectionGrant {
+            id: "offered-grant".into(),
+            caller: device.owner.clone(),
+            source: Device {
+                id: "controller".into(),
+                ..device.clone()
+            },
+            target: device,
+            expires_at_ms: i64::MAX,
+        };
+        assert_eq!(
+            client
+                .offered_grant(&executor, &token, Some(grant.clone()))
+                .await
+                .unwrap()
+                .id,
+            grant.id
+        );
+        let mut stale = grant;
+        stale.target.credential_epoch += 1;
+        assert!(
+            client
+                .offered_grant(&executor, &token, Some(stale))
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn trusted_transport_routes_requests_without_changing_device_authority() {

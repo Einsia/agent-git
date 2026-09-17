@@ -100,6 +100,8 @@ pub enum PresenceEvent {
         source_id: String,
         ticket: Secret,
         grant_token: Secret,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant: Option<Box<ConnectionGrant>>,
     },
 }
 

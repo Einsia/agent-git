@@ -175,7 +175,7 @@ async fn run_executor(
                     }
                     Some(_) = children.join_next(), if !children.is_empty() => {},
                     offer = presence.next() => {
-                        let PresenceEvent::Offer { link_id, source_id, ticket, grant_token } = offer? else { continue };
+                        let PresenceEvent::Offer { link_id, source_id, ticket, grant_token, grant } = offer? else { continue };
                         let Ok(permit) = slots.clone().try_acquire_owned() else {
                             record(&log, "cloud.offer_capacity", serde_json::json!({"hub":hub,"link_id":link_id}));
                             continue;
@@ -193,9 +193,10 @@ async fn run_executor(
                                 let enrollment_ms = started.elapsed().as_secs_f64() * 1000.0;
                                 phase = "admission";
                                 let config = api.data_config(&enrollment.credential)?;
+                                let verification_source = if grant.is_some() { "presence" } else { "http" };
                                 let verification = async {
                                     let started = Instant::now();
-                                    let grant = api.verify(&enrollment.credential, &grant_token).await?;
+                                    let grant = api.offered_grant(&enrollment.credential, &grant_token, grant.map(|grant| *grant)).await?;
                                     ensure!(grant.source.id == source_id, "cloud offer source does not match its grant");
                                     Ok::<_, anyhow::Error>((grant, started.elapsed().as_secs_f64() * 1000.0))
                                 };
@@ -213,7 +214,7 @@ async fn run_executor(
                                 phase = "endpoint_tls";
                                 let authenticated = Instant::now();
                                 let connection = authenticate(raw, &enrollment.identity, &grant.source.certificate, Role::Executor).await?;
-                                record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid,"enrollment_ms":enrollment_ms,"verification_ms":verification_ms,"transport_ms":transport_ms,"transport_reopened":transport_reopened,"pairing_ms":pairing_ms,"tls_ms":authenticated.elapsed().as_secs_f64()*1000.0,"total_ms":started.elapsed().as_secs_f64()*1000.0}));
+                                record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid,"enrollment_ms":enrollment_ms,"verification_source":verification_source,"verification_ms":verification_ms,"transport_ms":transport_ms,"transport_reopened":transport_reopened,"pairing_ms":pairing_ms,"tls_ms":authenticated.elapsed().as_secs_f64()*1000.0,"total_ms":started.elapsed().as_secs_f64()*1000.0}));
                                 let renewal = Some(Renewal { api, credential: enrollment.credential, token: grant_token });
                                 phase = "ingress";
                                 incoming.try_send(Authenticated { connection, grant, stopped, renewal })
