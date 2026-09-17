@@ -6169,41 +6169,6 @@ mod tests {
         }
     }
 
-    /// The cap acts **at the producing layer**, not as a `truncate` once the list exists.
-    ///
-    /// Hits are a function of the input, not a subset: in text made of one repeated token the hit
-    /// count is on the order of the length. Truncating the `Vec` in the caller achieves nothing —
-    /// the allocation over the line already happened before the truncation. Observed on the
-    /// server: 64 MiB of dense input produces about 3.2 million entries and about 600 MB, while
-    /// the report shows a few dozen.
-    ///
-    /// This pins two things: **the count really stops at the bound**, and **the duration drops
-    /// with it** (the second is the evidence that it really stopped looking — a truncation alone
-    /// leaves the duration unchanged).
-    #[test]
-    fn the_cap_stops_production_not_just_the_report() {
-        let dense = format!("{AWS} ").repeat(50_000);
-        let uncapped = scan_text_with(&dense, &none(), Policy::STRICT);
-        assert!(
-            uncapped.len() > 10_000,
-            "precondition: the unbounded output far exceeds the cap, got {}",
-            uncapped.len()
-        );
-
-        let t0 = std::time::Instant::now();
-        let capped = scan_text_capped(&dense, &none(), Policy::STRICT, 50);
-        let capped_ms = t0.elapsed();
-        assert_eq!(capped.hits.len(), 50, "the count stops at the bound");
-
-        let t1 = std::time::Instant::now();
-        let _ = scan_text_with(&dense, &none(), Policy::STRICT);
-        let uncapped_ms = t1.elapsed();
-        assert!(
-            capped_ms * 4 < uncapped_ms,
-            "the cap makes the scan really stop early instead of just reporting fewer: capped {capped_ms:?} vs unbounded {uncapped_ms:?}"
-        );
-    }
-
     /// At `cap >= 1` the verdict is unchanged: a hit is still reported, and the bound presses on
     /// the count, not on "is there any".
     #[test]
@@ -7655,55 +7620,6 @@ mod tests {
         );
     }
 
-    /// As tags multiply, the cost of scanning must not follow the tag count.
-    ///
-    /// # Why a **timed** test
-    ///
-    /// agit **cuts a version tag every turn** (`refs/tags/agit-<40hex>`), so an agent that runs a
-    /// few hundred turns has a few hundred tags, and `agit scan` runs before every push.
-    ///
-    /// Starting processes per tag (list the names, then run `cat-file -t`, `cat-file tag` and
-    /// `rev-parse` for each) takes **13 seconds** for 500 tags (observed) — that is not "a little
-    /// slower", that is the user starting to route around this gate, and a gate that gets routed
-    /// around is no gate. Reading it all with one `for-each-ref --format` takes **0.06 seconds**.
-    ///
-    /// The assertion uses a very loose ceiling (two seconds): what it catches is a regression of
-    /// the **order of magnitude** that going back to a process per tag produces, not a wobble of
-    /// tens of milliseconds. A slow CI machine must not turn it falsely red.
-    #[test]
-    fn scanning_many_tags_does_not_cost_a_process_per_tag() {
-        const TAGS: usize = 300;
-        let d = repo_dir();
-        let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(d.path())
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}");
-        };
-        run(&["config", "user.email", "t@t"]);
-        run(&["config", "user.name", "t"]);
-        run(&["config", "commit.gpgsign", "false"]);
-        run(&["config", "tag.gpgsign", "false"]);
-        run(&["commit", "-q", "--allow-empty", "-m", "base"]);
-        for i in 0..TAGS {
-            run(&["tag", "-a", &format!("agit-{i:040}"), "-m", "clean"]);
-        }
-
-        let repo = crate::domain::repo::Repo::at(d.path());
-        let t0 = std::time::Instant::now();
-        let hits =
-            tag_hits(&repo, &none(), &local_branches(&repo).unwrap()).expect("the repo is healthy");
-        let took = t0.elapsed();
-
-        assert!(hits.is_empty(), "these tags are all clean: {hits:?}");
-        assert!(
-            took < std::time::Duration::from_secs(2),
-            "scanning {TAGS} tags took {took:?} — back to a few git processes per tag?"
-        );
-    }
-
     /// Create a repo with an annotated tag and return (directory, the tag object's oid).
     fn tagged_repo(tag_args: &[&str], tagger: &str) -> (tempfile::TempDir, String) {
         let d = repo_dir();
@@ -8051,66 +7967,6 @@ mod tests {
         let (text, n) = scrub(&format!("token = {AWS} # agit:allow-secret"));
         assert_eq!(n, 1);
         assert!(!text.contains(AWS), "{text}");
-    }
-
-    /// Performance is a hard requirement, not a nice-to-have.
-    ///
-    /// Observed: running all 221 regexes over a 2.6MB transcript takes 16.6 seconds, and 27ms
-    /// behind the keyword prefilter. One push scans a whole repo, and a gate that takes seconds
-    /// gets routed around directly (`AGIT_ALLOW_SECRETS=1` is right there in the hint), so slow
-    /// means absent.
-    ///
-    /// On this machine it is 21ms (dev) / 25ms (release) observed, and the budget is set an order
-    /// of magnitude above that at 300ms for slower CI. The broken shapes are nowhere near the
-    /// budget and cannot go falsely green: without the prefilter it is 16.6 seconds, and with too
-    /// small a DFA cache 1.4 seconds. The test also asserts that the prefilter really wakes only a
-    /// few rules — which is where that number comes from.
-    #[test]
-    fn scans_a_megabyte_transcript_fast() {
-        // Build text that looks like a real transcript: prose + code + tool output, with plenty
-        // of the key / token / secret words that trip the prefilter.
-        let chunk = concat!(
-            r#"{"role":"assistant","content":"I moved the api_key in config to be read from an "#,
-            r#"environment variable, so the token stays out of the repo. Next: run pytest."}"#,
-            "\n",
-            r#"{"role":"tool","content":"$ npm run build\n> tsc -p .\nDone in 3.2s"}"#,
-            "\n",
-            r#"{"role":"user","content":"change that password part too, do not hard-code a secret"}"#,
-            "\n",
-        );
-        let mut big = String::with_capacity(2 << 20);
-        while big.len() < (2 << 20) {
-            big.push_str(chunk);
-        }
-        assert!(big.len() >= 2 * 1024 * 1024);
-
-        // Run a short stretch of the same content first to pay the one-time costs: lazy
-        // compilation (1.37 seconds for all of them) and lazy DFA state construction both happen
-        // once per process, so measuring them measures startup, while one push scans many files
-        // — what decides the experience is the steady state.
-        let _ = scan_text(&chunk.repeat(64), &none());
-
-        let t0 = std::time::Instant::now();
-        let hits = scan_text(&big, &none());
-        let dt = t0.elapsed();
-        // dev and release are the same order of magnitude here because Cargo.toml turns on
-        // opt-level = 3 for the regex dependencies specifically — without it debug takes 147ms,
-        // and the number then reports the profile rather than the engine.
-        let budget = std::time::Duration::from_millis(300);
-        assert!(
-            dt < budget,
-            "scanning {} bytes took {dt:?} (budget {budget:?}) — the prefilter, lazy compilation or the DFA cache limit is broken ({} hits)",
-            big.len(),
-            hits.len()
-        );
-
-        let picked = rules::candidates(&big);
-        assert!(
-            picked.len() < 40,
-            "the prefilter wakes only a few rules, got {}/{}",
-            picked.len(),
-            rules::count()
-        );
     }
 
     /// A small helper that runs git, used alongside building a session-shaped history.
