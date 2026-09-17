@@ -31,7 +31,6 @@ async fn response(proc: &mut Proc, id: Value, claude: bool) -> crate::Result<Val
     anyhow::bail!("Runtime exited during model discovery")
 }
 
-#[cfg(unix)]
 pub(crate) async fn codex_goal(cwd: PathBuf, thread: &str) -> crate::Result<Value> {
     let mut proc = Proc::spawn("codex", &["app-server".into()], &cwd, &[])?;
     let result = tokio::time::timeout(std::time::Duration::from_secs(25), async {

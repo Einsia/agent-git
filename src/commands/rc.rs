@@ -8,7 +8,6 @@
 use super::CmdResult;
 use crate::rc::control;
 use crate::{ExitCode, ui};
-#[cfg(unix)]
 use crate::{infra::config, rc::identity};
 use clap::{Args as ClapArgs, Subcommand};
 
@@ -26,10 +25,8 @@ pub enum Action {
     /// Start agitd and allow your signed-in account to control this device.
     Start(StartArgs),
     /// Owner-only local daemon and SSH stdio bridge, independent of Hub pairing.
-    #[cfg(unix)]
     Local(crate::rc::local::Args),
     /// Enroll a cloud peer and manage executor resource permissions.
-    #[cfg(unix)]
     Cloud(crate::rc::cloud::Args),
     /// Connection state, uptime and live sessions.
     Status,
@@ -164,9 +161,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Action::Start(a) => start(a),
-        #[cfg(unix)]
         Action::Local(a) => crate::rc::local::run(a),
-        #[cfg(unix)]
         Action::Cloud(a) => crate::rc::cloud::run(a),
         Action::Status => status(),
         Action::Stop => stop(),
@@ -290,7 +285,6 @@ fn grants(args: GrantsArgs) -> CmdResult {
 ///
 /// Idempotent on purpose — the daemon calls it on every session start/resume.
 fn land(args: LandArgs) -> CmdResult {
-    #[cfg(unix)]
     if args.local_owner {
         return land_local(args);
     }
@@ -442,7 +436,6 @@ fn land(args: LandArgs) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
-#[cfg(unix)]
 fn land_local(args: LandArgs) -> CmdResult {
     crate::rc::select_local_authority();
     let lineage = crate::rc::lineage::AgitSession::new(&args.slug, &args.agent_id, &args.branch)?;
@@ -540,7 +533,6 @@ fn landed_link(
     Ok(lk)
 }
 
-#[cfg(unix)]
 fn start(args: StartArgs) -> CmdResult {
     crate::rc::select_local_authority();
     let hub = config::hub_url();
@@ -579,11 +571,6 @@ fn start(args: StartArgs) -> CmdResult {
     }
     crate::rc::local::start_foreground()?;
     Ok(ExitCode::Ok)
-}
-
-#[cfg(not(unix))]
-fn start(_args: StartArgs) -> CmdResult {
-    anyhow::bail!("The peer executor requires Unix; use WSL on Windows")
 }
 
 fn status() -> CmdResult {
@@ -738,53 +725,42 @@ fn stop() -> CmdResult {
 }
 
 fn list() -> CmdResult {
-    #[cfg(unix)]
-    {
-        crate::rc::select_local_authority();
-        let runtime = tokio::runtime::Runtime::new()?;
-        let value = runtime.block_on(crate::rc::cloud::manage(
-            crate::rc::cloud::OwnerRequest::Devices {
-                hub: config::hub_url(),
-                after: None,
-            },
-        ))?;
-        println!("{}", serde_json::to_string_pretty(&value)?);
-        Ok(ExitCode::Ok)
-    }
-    #[cfg(not(unix))]
-    anyhow::bail!("Cloud peer commands require Unix")
+    crate::rc::select_local_authority();
+    let runtime = tokio::runtime::Runtime::new()?;
+    let value = runtime.block_on(crate::rc::cloud::manage(
+        crate::rc::cloud::OwnerRequest::Devices {
+            hub: config::hub_url(),
+            after: None,
+        },
+    ))?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(ExitCode::Ok)
 }
 
 fn revoke(_args: RevokeArgs) -> CmdResult {
-    #[cfg(unix)]
-    {
-        let runtime = tokio::runtime::Runtime::new()?;
-        runtime.block_on(async {
-            let hub = config::hub_url();
-            let token = crate::rc::cloud::account_token(&hub, false).await?;
-            let api = agit_peer::client::Client::new(&hub)?;
-            let mut after = None;
-            loop {
-                let page = api.devices(&token, after.as_deref()).await?;
-                if let Some(entry) = page
-                    .devices
-                    .iter()
-                    .find(|entry| entry.device.id == _args.connection)
-                {
-                    break api.revoke(&token, &entry.device).await;
-                }
-                after = page.next_cursor;
-                anyhow::ensure!(after.is_some(), "no such device");
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let hub = config::hub_url();
+        let token = crate::rc::cloud::account_token(&hub, false).await?;
+        let api = agit_peer::client::Client::new(&hub)?;
+        let mut after = None;
+        loop {
+            let page = api.devices(&token, after.as_deref()).await?;
+            if let Some(entry) = page
+                .devices
+                .iter()
+                .find(|entry| entry.device.id == _args.connection)
+            {
+                break api.revoke(&token, &entry.device).await;
             }
-        })?;
-        ui::success("Device Cloud access revoked.");
-        Ok(ExitCode::Ok)
-    }
-    #[cfg(not(unix))]
-    anyhow::bail!("Cloud peer commands require Unix")
+            after = page.next_cursor;
+            anyhow::ensure!(after.is_some(), "no such device");
+        }
+    })?;
+    ui::success("Device Cloud access revoked.");
+    Ok(ExitCode::Ok)
 }
 
-#[cfg(unix)]
 fn runtimes_line() -> String {
     crate::rc::harness::drivable()
         .into_iter()

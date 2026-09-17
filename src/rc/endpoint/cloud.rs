@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
 pub(super) struct Ingress {
@@ -32,7 +32,7 @@ impl Ingress {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn fixed(
         incoming: mpsc::Receiver<host::Authenticated>,
         registry: ingress::Registry,

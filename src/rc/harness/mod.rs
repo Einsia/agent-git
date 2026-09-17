@@ -720,7 +720,8 @@ pub fn drivable() -> Vec<RuntimeCapability> {
 
 /// `<cli> --version`, best effort, used for the capability report.
 pub fn probe_version(cli: &str, args: &[&str]) -> Option<String> {
-    let out = crate::infra::background::command(cli)
+    let executable = crate::adapter::which(cli)?;
+    let out = crate::infra::background::command(executable)
         .args(args)
         .output()
         .ok()?;

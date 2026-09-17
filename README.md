@@ -69,9 +69,10 @@ picks the platform sub-package matching your `os`/`cpu`; on platforms with no
 prebuilt binary (e.g. FreeBSD) running `agit` prints the source-build recipe.
 Details and environment variables: [`npm/README.md`](npm/README.md).
 
-Windows x64 packages include the local RC daemon. Its control channel uses a local named
-pipe restricted to the current Windows user. RC state requires a private, user-owned
-directory; shared or redirected RC paths are rejected.
+Windows x64 packages include the native peer RC daemon. On Windows, Linux and macOS, run
+`agit login` followed by `agit rc start --detach` to register the device and allow your own
+account to control it from Workspaces. Windows owner RPC uses a local named pipe restricted
+to the current user. RC state requires a private, user-owned directory.
 
 pnpm (v10+) does not run dependency install scripts by default, so the
 automatic `agit setup` is skipped there — run `agit setup` once yourself

@@ -2,12 +2,12 @@
 
 mod cloud;
 
+use super::local::{Listener, Stream};
 use crate::protocol::{CallerClaim, ErrorCode, Frame, RequestId, RpcError};
 use anyhow::{Context, ensure};
 use std::{collections::HashMap, path::PathBuf};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
     sync::mpsc,
 };
 
@@ -162,12 +162,12 @@ impl ClientOutput {
 }
 
 fn attach(
-    socket: UnixStream,
+    socket: Stream,
     client: u64,
     input: mpsc::Sender<Incoming>,
     controller: &agit_controller::Controller,
 ) -> Client {
-    let (reader, mut writer) = socket.into_split();
+    let (reader, mut writer) = tokio::io::split(socket);
     let (sender, mut messages) =
         mpsc::channel::<(String, tokio::sync::OwnedSemaphorePermit)>(CLIENT_QUEUE);
     let output = ClientOutput {
@@ -233,7 +233,7 @@ fn attach(
 }
 
 pub async fn serve(
-    listener: UnixListener,
+    listener: Listener,
     outbound: super::outbound::OutboundRx,
     events: mpsc::Sender<super::link::LinkEvent>,
     controller: std::sync::Arc<agit_controller::Controller>,
@@ -277,7 +277,7 @@ pub async fn serve(
 }
 
 async fn serve_described(
-    listener: UnixListener,
+    #[allow(unused_mut)] mut listener: Listener,
     mut outbound: super::outbound::OutboundRx,
     events: mpsc::Sender<super::link::LinkEvent>,
     description: serde_json::Value,
@@ -320,8 +320,7 @@ async fn serve_described(
                 let (socket, _) = accepted?;
                 // A peer can disappear before its credentials are read. Reject
                 // that connection without terminating the shared listener.
-                let Ok(credentials) = socket.peer_cred() else { continue };
-                if credentials.uid() != unsafe { libc::geteuid() } || clients.values().filter(|client| client.cloud.is_none()).count() >= MAX_CLIENTS { continue; }
+                if super::local::authenticate_client(&socket).is_err() || clients.values().filter(|client| client.cloud.is_none()).count() >= MAX_CLIENTS { continue; }
                 serial = serial.checked_add(1).context("local client identity exhausted")?;
                 clients.insert(serial, attach(socket, serial, input.clone(), &controller));
             }
@@ -524,9 +523,10 @@ async fn serve_described(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use tokio::net::{UnixListener, UnixStream};
     #[tokio::test]
     async fn a_peer_closed_before_authentication_cannot_stop_other_clients() {
         let root = tempfile::tempdir().unwrap();

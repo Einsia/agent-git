@@ -4,10 +4,39 @@
 //! authority; wire caller claims cannot widen it. Disconnecting a viewer leaves
 //! supervised processes and their durable start receipts in the daemon.
 
-use anyhow::{Context, ensure};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::ensure;
 use clap::{Args as ClapArgs, Subcommand};
-use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+#[cfg(unix)]
 use tokio::net::UnixListener;
+#[cfg(windows)]
+#[path = "local_windows.rs"]
+mod windows;
+#[cfg(windows)]
+use windows::bridge;
+#[cfg(windows)]
+pub use windows::ensure_daemon;
+#[cfg(windows)]
+pub(super) use windows::{Listener, Stream, authenticate_client, listen};
+#[cfg(unix)]
+pub(super) type Listener = tokio::net::UnixListener;
+#[cfg(unix)]
+pub(super) type Stream = tokio::net::UnixStream;
+
+#[cfg(unix)]
+pub(super) fn authenticate_client(socket: &Stream) -> std::io::Result<()> {
+    if socket.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Local RPC client belongs to another user",
+        ));
+    }
+    Ok(())
+}
 
 pub use super::endpoint::{MAX_FRAME, WORKSPACE};
 
@@ -88,6 +117,7 @@ pub fn start_foreground() -> crate::Result<()> {
     }))
 }
 
+#[cfg(unix)]
 pub fn ensure_daemon() -> crate::Result<()> {
     if super::control::running_pid().is_none() {
         spawn_daemon()?;
@@ -108,6 +138,7 @@ pub fn ensure_daemon() -> crate::Result<()> {
 }
 
 fn spawn_daemon() -> crate::Result<()> {
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     let log = tempfile::Builder::new()
         .prefix("agitd-")
@@ -115,28 +146,37 @@ fn spawn_daemon() -> crate::Result<()> {
         .tempfile_in(super::rc_dir()?)?;
     let (log, path) = log.keep()?;
     eprintln!("agitd: startup diagnostics: {}", path.display());
-    let mut command = std::process::Command::new(std::env::current_exe()?);
-    command
-        .args(["rc", "local", "start"])
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    // Detachment is process ownership, not a promise made by the SSH channel.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    #[cfg(windows)]
+    {
+        windows::spawn_daemon(log)
     }
-    let mut child = command.spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    #[cfg(unix)]
+    {
+        let mut command = crate::infra::background::command(std::env::current_exe()?);
+        command
+            .args(["rc", "local", "start"])
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log);
+        // Detachment is process ownership, not a promise made by the SSH channel.
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    }
 }
 
+#[cfg(unix)]
 fn bridge(ensure_daemon: bool) -> crate::Result<()> {
     use std::os::unix::net::UnixStream as StdStream;
     let path = rpc_path()?;
@@ -175,6 +215,7 @@ fn bridge(ensure_daemon: bool) -> crate::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn authenticate_server(
     socket: std::os::unix::net::UnixStream,
     owner: libc::uid_t,
@@ -194,6 +235,7 @@ fn authenticate_server(
     Ok(socket)
 }
 
+#[cfg(unix)]
 fn copy_flushed(
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
@@ -213,6 +255,7 @@ fn copy_flushed(
     }
 }
 
+#[cfg(unix)]
 pub fn listen() -> crate::Result<UnixListener> {
     // The control listener already holds exclusive daemon ownership.
     let path = rpc_path()?;
@@ -229,7 +272,7 @@ pub fn listen() -> crate::Result<UnixListener> {
     Ok(listener)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Read;

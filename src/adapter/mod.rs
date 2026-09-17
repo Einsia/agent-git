@@ -838,10 +838,64 @@ pub fn is_lossy_conversion(from: &str, to: &str) -> bool {
 
 /// Find an executable on PATH. Implemented here to drop a dependency.
 pub fn which(cmd: &str) -> Option<PathBuf> {
+    if std::path::Path::new(cmd).is_absolute() {
+        return executable_at(PathBuf::from(cmd));
+    }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(cmd))
-        .find(|p| p.is_file())
+    std::env::split_paths(&path).find_map(|directory| executable_at(directory.join(cmd)))
+}
+
+fn executable_at(path: PathBuf) -> Option<PathBuf> {
+    if (!cfg!(windows) || path.extension().is_some()) && path.is_file() {
+        return Some(path);
+    }
+    #[cfg(windows)]
+    for extension in ["exe", "com", "cmd", "bat"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".");
+        name.push(extension);
+        let candidate = PathBuf::from(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(all(test, windows))]
+mod executable_tests {
+    #[test]
+    fn native_executables_and_npm_shims_resolve_in_paths_with_spaces() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("runtime binaries");
+        std::fs::create_dir(&directory).unwrap();
+        for name in ["native.exe", "shim.cmd"] {
+            std::fs::write(directory.join(name), b"").unwrap();
+        }
+        std::fs::write(directory.join("shim"), b"#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::write(directory.join("shim.cmd"), b"@echo native-windows-shim\r\n").unwrap();
+        for (command, filename) in [
+            ("native", "native.exe"),
+            ("shim", "shim.cmd"),
+            ("shim.cmd", "shim.cmd"),
+        ] {
+            assert_eq!(
+                super::which(&directory.join(command).to_string_lossy()),
+                Some(directory.join(filename))
+            );
+        }
+        assert!(super::which(&directory.join("missing").to_string_lossy()).is_none());
+        let executable = super::which(&directory.join("shim").to_string_lossy()).unwrap();
+        let output = crate::infra::background::command(executable)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "native-windows-shim"
+        );
+    }
 }
 
 /// Take the session id out of a transcript filename.

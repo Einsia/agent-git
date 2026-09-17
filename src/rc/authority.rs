@@ -21,7 +21,6 @@ impl std::fmt::Debug for Guard {
 }
 
 impl Guard {
-    #[cfg(unix)]
     pub fn new(authority: impl Authority + 'static) -> Self {
         Self(Some(Arc::new(authority)))
     }

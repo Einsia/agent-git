@@ -15,7 +15,11 @@
     "domain::secret_filter::repository_keys::tests",
     "rc::transport::tests",
     "infra::background::tests::helper_has_no_console_window_and_keeps_output",
-    "rc::harness::proc::tests::windows_shutdown_reaps_the_harness_job_before_returning"
+    "rc::harness::proc::tests::windows_shutdown_reaps_the_harness_job_before_returning",
+    "rc::local::windows::tests",
+    "rc::cloud::store::tests",
+    "rc::diagnostics::tests",
+    "adapter::executable_tests"
   ],
   "integration": [
     "windows_rc",

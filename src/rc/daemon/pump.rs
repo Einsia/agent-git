@@ -194,7 +194,6 @@ impl Daemon {
 
         // The local endpoint owns outbound delivery independently of individual peer attachments.
         let link_stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        #[cfg(unix)]
         let link_task = {
             let listener = crate::rc::local::listen()?;
             d.lock().await.online = true;
@@ -208,10 +207,6 @@ impl Daemon {
                 }
             })
         };
-        #[cfg(not(unix))]
-        let link_task = tokio::spawn(async {
-            Err::<(), _>(anyhow::anyhow!("The peer executor requires Unix"))
-        });
 
         // Whether the outbound queue is backed up. Only used to collapse that warning into one.
         let mut outbound_full = false;

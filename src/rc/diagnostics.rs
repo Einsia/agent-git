@@ -1,10 +1,11 @@
 //! Bounded owner-service diagnostics contain routing metadata, never RPC payloads.
 
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -132,11 +133,11 @@ fn request_id(id: Option<&crate::protocol::RequestId>) -> Value {
 }
 
 fn private_file(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
 }
 
 fn drain(
@@ -172,6 +173,7 @@ fn drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -194,6 +196,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(files.len(), BACKUPS + 1);
         for file in files {
+            #[cfg(unix)]
             assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
             let contents = std::fs::read_to_string(file).unwrap();
             assert!(!contents.contains("SYNTHETIC-PRIVATE-CONTENT"));

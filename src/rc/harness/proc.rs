@@ -755,7 +755,11 @@ impl Proc {
         // it does not leak into the next launch on the same thread.
         #[cfg(test)]
         let injected_write_failures = LAUNCH_WRITE_FAILURES.with(|slot| slot.replace(0));
-        let mut cmd = tokio::process::Command::new(program);
+        #[cfg(windows)]
+        let executable = crate::adapter::which(program).unwrap_or_else(|| program.into());
+        #[cfg(not(windows))]
+        let executable = program;
+        let mut cmd = tokio::process::Command::new(executable);
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())

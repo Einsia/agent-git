@@ -478,9 +478,7 @@ impl Daemon {
     ) -> Result<SessionOpening, RpcError> {
         let start_id =
             negotiated_start_id(self.start_idempotency_feature(), p.start_id.as_deref())?;
-        #[cfg(unix)]
         let mut p = p;
-        #[cfg(unix)]
         if self.opts.local_owner
             && p.agent.is_none()
             && p.expected_agent_id.is_none()
@@ -778,7 +776,6 @@ impl Daemon {
                 "this launch resumes a harness transcript that was never cleared for this caller",
             )));
         }
-        #[cfg(unix)]
         if self.opts.local_owner
             && let Some(lineage) = &spec.agit_session
         {

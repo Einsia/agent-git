@@ -299,7 +299,7 @@ fn hub_credentials_are_private_under_inherited_public_read(home: &Path) {
 }
 
 #[test]
-fn native_pipe_permissions_and_unsupported_executor_boundary() {
+fn native_pipe_permissions_and_state_boundaries() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("home");
     security::private_directory(&home).unwrap();
@@ -372,15 +372,12 @@ fn native_pipe_permissions_and_unsupported_executor_boundary() {
     secret_commands_reload_live_matcher(&home);
 
     let hub = "http://127.0.0.1:9";
-    let unsupported = command(&home, hub, &["rc", "start", "--detach"]);
-    assert!(!unsupported.status.success());
-    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("WSL"));
     assert!(!command(&home, hub, &["rc", "pair"]).status.success());
     assert!(security::require_process_user(std::process::id(), "S-1-5-21-0-0-0-9999").is_err());
 
     let hostile = temporary.path().join("hostile");
     security::private_directory(&hostile).unwrap();
-    let hostile_rc = hostile.join("rc");
+    let hostile_rc = hostile.join("desktop-rc");
     security::private_directory(&hostile_rc).unwrap();
     let acl = Command::new("icacls")
         .arg(&hostile_rc)
@@ -398,7 +395,7 @@ fn native_pipe_permissions_and_unsupported_executor_boundary() {
 
     let inheritable_home = temporary.path().join("inheritable-home");
     security::private_directory(&inheritable_home).unwrap();
-    let inheritable_rc = inheritable_home.join("rc");
+    let inheritable_rc = inheritable_home.join("desktop-rc");
     security::private_directory(&inheritable_rc).unwrap();
     let acl = Command::new("icacls")
         .arg(&inheritable_rc)
@@ -436,5 +433,62 @@ fn native_pipe_permissions_and_unsupported_executor_boundary() {
             .status
             .success()
     );
-    assert!(!nested_home.join("rc").exists());
+    assert!(!nested_home.join("desktop-rc").exists());
+}
+
+struct DaemonCleanup<'a>(Option<&'a Path>);
+
+impl Drop for DaemonCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(home) = self.0 {
+            let _ = Command::new(env!("CARGO_BIN_EXE_agit"))
+                .args(["--quiet", "rc", "stop"])
+                .env("AGIT_HOME", home)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+#[test]
+fn native_peer_executor_starts_without_cloud_and_stops() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    security::private_directory(&home).unwrap();
+    let _vault_cleanup = VaultCleanup(&home);
+    let hub = "http://127.0.0.1:9";
+    let mut cleanup = DaemonCleanup(Some(&home));
+    let started = command(&home, hub, &["rc", "start", "--detach"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(matches!(
+        control::presence_in(&home.join("desktop-rc")),
+        control::Presence::Running(_)
+    ));
+    let status = command(&home, hub, &["rc", "status"]);
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("local RPC ready"));
+    assert!(
+        std::fs::read_dir(home.join("desktop-rc"))
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cloud-inbound-")
+            })
+    );
+    assert!(command(&home, hub, &["rc", "stop"]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while control::presence_in(&home.join("desktop-rc")) != control::Presence::Absent {
+        assert!(Instant::now() < deadline, "daemon did not finish stopping");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    cleanup.0 = None;
 }

@@ -10,10 +10,15 @@ use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::OpenOptions,
-    io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    io::Read,
     path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
 };
 
 const MAX_RECORD: u64 = 128 * 1024;
@@ -47,35 +52,51 @@ pub fn enrollment_lock(hub: &str) -> crate::Result<std::fs::File> {
     let path = super::super::rc_dir()?
         .join(filename(hub)?)
         .with_extension("lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let file = private_lock(&path)?;
     fs2::FileExt::try_lock_exclusive(&file).context("cloud enrollment is being updated")?;
     Ok(file)
 }
 
+fn private_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        crate::infra::windows_security::open_private_control(path)
+    }
+    #[cfg(unix)]
+    {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+}
+
 fn read<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> crate::Result<Option<T>> {
-    let file = match OpenOptions::new()
+    #[cfg(unix)]
+    let opened = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
+        .open(path);
+    #[cfg(windows)]
+    let opened = crate::infra::windows_security::open_private_read(path);
+    let file = match opened {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("cannot open private cloud state"),
     };
     let metadata = file.metadata()?;
     ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0
-            && metadata.len() <= limit,
+        metadata.is_file() && metadata.len() <= limit,
         "cloud state must be a bounded private file owned by this user"
+    );
+    #[cfg(unix)]
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+        "cloud state must be a private file owned by this user"
     );
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes)?;
@@ -89,13 +110,18 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> crate::Resul
 }
 
 fn write(path: &Path, value: &impl Serialize) -> crate::Result<()> {
-    let directory = path.parent().context("cloud state directory is missing")?;
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     let bytes = serde_json::to_vec_pretty(value)?;
-    temporary.write_all(&bytes)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    std::fs::File::open(directory)?.sync_all()?;
+    #[cfg(windows)]
+    crate::infra::windows_security::write_private_file(path, &bytes)?;
+    #[cfg(unix)]
+    {
+        let directory = path.parent().context("cloud state directory is missing")?;
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        std::fs::File::open(directory)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -254,14 +280,7 @@ pub fn save_policy(policy: &Policy) -> crate::Result<()> {
 }
 
 fn policy_lock() -> crate::Result<std::fs::File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(super::super::rc_dir()?.join("cloud-access.lock"))?;
+    let file = private_lock(&super::super::rc_dir()?.join("cloud-access.lock"))?;
     fs2::FileExt::try_lock_exclusive(&file).context("cloud resource policy is being updated")?;
     Ok(file)
 }
@@ -317,6 +336,7 @@ mod tests {
         access::Principal,
         cloud::{Device, Secret},
     };
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -370,12 +390,15 @@ mod tests {
                 .unwrap()
                 .inbound_enabled
         );
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(load_in(directory.path(), hub).is_err());
-        std::fs::remove_file(&path).unwrap();
-        let target = directory.path().join("another-file");
-        std::fs::write(&target, "{}").unwrap();
-        std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert!(load_in(directory.path(), hub).is_err());
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(load_in(directory.path(), hub).is_err());
+            std::fs::remove_file(&path).unwrap();
+            let target = directory.path().join("another-file");
+            std::fs::write(&target, "{}").unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(load_in(directory.path(), hub).is_err());
+        }
     }
 }

@@ -64,7 +64,6 @@
 //! *detected*, not silently lost. Controllers reconcile replay gaps against executor history.
 
 pub(crate) mod authority;
-#[cfg(unix)]
 pub mod cloud;
 pub(crate) mod codex_history;
 #[cfg(unix)]
@@ -74,9 +73,7 @@ pub mod control;
 pub mod control;
 mod control_protocol;
 pub mod daemon;
-#[cfg(unix)]
 mod diagnostics;
-#[cfg(unix)]
 mod endpoint;
 pub mod grants;
 pub mod harness;
@@ -84,20 +81,14 @@ pub mod identity;
 pub mod journal;
 pub mod lineage;
 pub mod link;
-#[cfg(unix)]
 pub mod local;
-#[cfg(unix)]
 pub mod local_goal;
-#[cfg(unix)]
 pub mod local_history;
-#[cfg(unix)]
 pub mod local_repository;
 pub mod mirror;
 pub(crate) mod native_inbox;
-#[cfg(unix)]
 pub(crate) mod navigation;
 pub mod outbound;
-#[cfg(unix)]
 pub mod peers;
 pub mod policy;
 pub mod roster;

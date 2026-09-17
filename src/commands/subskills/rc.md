@@ -8,10 +8,11 @@ description: Start and manage owner-authorized remote agent sessions.
 Run this on the machine where your code and agent runtime are installed:
 
 ```sh
-agit rc start
+agit login
+agit rc start --detach
 ```
 
-On first use, follow the sign-in prompt. The command starts agitd, registers a Cloud device,
+Sign in to the same Hub account you use in Workspaces. Startup runs agitd, registers a Cloud device,
 and enables inbound control for your own account. Open the printed Workspaces URL with the
 same account, choose the device and a project folder, and start a conversation. No pairing
 code, separate enrollment command, or configuration edit is required.
@@ -32,4 +33,6 @@ Advanced device management: `agit rc list`, `agit rc revoke <device-id>`, and `a
 status --hub <origin>`. `cloud enroll` is an explicit registration tool; ordinary startup
 performs registration automatically. SSH uses `agit rc local bridge --ensure`.
 
-The peer executor currently supports Linux and macOS. On Windows, run it inside WSL; native Windows RC does not fall back to the removed pairing transport.
+The peer executor supports native Windows, Linux and macOS. Windows uses a current-user local
+named pipe for owner RPC; Unix systems use a current-user local socket. Cloud peers use the
+same transport and session protocol on all three platforms.

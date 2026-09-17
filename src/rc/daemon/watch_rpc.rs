@@ -145,7 +145,6 @@ impl WatchScan {
 }
 
 fn history_cursor(runtime: &str, path: &Path, offset: u64) -> (u64, Option<String>) {
-    #[cfg(unix)]
     if runtime == "codex" {
         return match crate::rc::local_history::watch_cursor(path, offset) {
             Ok(cursor) => (cursor, None),

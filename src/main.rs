@@ -299,7 +299,6 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Rc(args) if matches!(args.action, commands::rc::Action::Tunnel) => {
             Startup::ToolDispatcher
         }
-        #[cfg(unix)]
         Commands::Rc(args) if matches!(args.action, commands::rc::Action::Local(_)) => {
             Startup::ToolDispatcher
         }
@@ -464,7 +463,6 @@ mod startup_tests {
     use super::*;
     use clap::Parser;
 
-    #[cfg(unix)]
     #[test]
     fn desktop_protocol_commands_do_not_migrate_unrelated_repositories() {
         for action in ["start", "status", "bridge", "catalog"] {
