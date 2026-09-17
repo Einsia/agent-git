@@ -96,6 +96,15 @@ impl CodexDriver {
                 )));
             }
             self.thread_id = Some(native.to_owned());
+            if method == "thread/start"
+                && result
+                    .pointer("/thread/turns")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+                && let Some(path) = result.pointer("/thread/path").and_then(Value::as_str)
+            {
+                self.fresh_history = fresh::FreshCodex::new(native, &self.cwd, PathBuf::from(path));
+            }
             self.model = result
                 .get("model")
                 .and_then(Value::as_str)
@@ -144,6 +153,63 @@ mod tests {
             matches!(driver.next_event().await, Some(HarnessEvent::GoalUpdated { goal }) if goal["text"] == "fixture goal")
         );
         driver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_history_is_empty_only_until_native_input_or_creator_exit() {
+        let root = tempfile::tempdir().unwrap();
+        for resume in [false, true] {
+            let native = uuid::Uuid::new_v4().to_string();
+            let mut driver = driver(
+                resume.then_some(native.as_str()),
+                &[
+                    json!({"id":1,"result":{}}),
+                    json!({"id":2,"result":{"thread":{"id":native,"turns":[],"path":root.path().join("absent.jsonl")}}}),
+                    json!({"id":3,"result":{"data":[]}}),
+                ],
+            ).await;
+            driver.cwd = root.path().to_owned();
+            driver.confirm_opening().await.unwrap();
+            driver.runtime_command("commands", json!({})).await.unwrap();
+            let params = json!({"session_id":native,"runtime":"codex","cwd":root.path()});
+            let read = crate::rc::local_history::read(params.clone());
+            if resume {
+                assert!(
+                    read.is_err(),
+                    "Resume cannot prove missing history is empty"
+                );
+            } else {
+                let page = read.unwrap();
+                assert_eq!(page["items"], json!([]));
+                assert_eq!(page["status"], "complete");
+                let mut invalid = params.clone();
+                invalid["snapshot"] = json!("expired");
+                assert!(crate::rc::local_history::read(invalid).is_err());
+                assert!(matches!(
+                    driver.start_turn("hello", false, None).await,
+                    TurnStartDispatch::Awaiting
+                ));
+                assert!(crate::rc::local_history::read(params.clone()).is_err());
+                let mut retained = params.clone();
+                retained["snapshot"] = page["snapshot"].clone();
+                assert_eq!(
+                    crate::rc::local_history::read(retained).unwrap()["items"],
+                    json!([])
+                );
+            }
+            driver.shutdown().await.unwrap();
+        }
+        let native = uuid::Uuid::new_v4().to_string();
+        let mut driver = driver(None, &[
+            json!({"id":1,"result":{}}),
+            json!({"id":2,"result":{"thread":{"id":native,"turns":[],"path":root.path().join("absent.jsonl")}}}),
+        ]).await;
+        driver.cwd = root.path().to_owned();
+        driver.confirm_opening().await.unwrap();
+        let params = json!({"session_id":native,"runtime":"codex","cwd":root.path()});
+        assert!(crate::rc::local_history::read(params.clone()).is_ok());
+        driver.shutdown().await.unwrap();
+        assert!(crate::rc::local_history::read(params).is_err());
     }
 
     #[tokio::test]
