@@ -15,7 +15,11 @@ $target = 'x86_64-pc-windows-msvc'
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-Ctarget-feature=+crt-static'
 & rustup target add $target
 if ($LASTEXITCODE -ne 0) { throw 'Rust target installation failed' }
-& python scripts/prepare-git-runtime.py $target .cache/git-runtime/payload.tar.gz
+foreach ($tool in @('git', 'bundledLfs')) {
+    & node scripts/prepare-windows-test-tools.mjs . $tool
+    if ($LASTEXITCODE -ne 0) { throw "Git runtime download failed: $tool" }
+}
+& python scripts/prepare-git-runtime.py $target .cache/git-runtime/payload.tar.gz --cache .cache/test-lfs
 if ($LASTEXITCODE -ne 0) { throw 'Git runtime preparation failed' }
 $env:AGIT_GIT_RUNTIME_ARCHIVE = (Resolve-Path '.cache/git-runtime/payload.tar.gz').Path
 & cargo build --locked --release --features bundled-git --target $target --bin agit
