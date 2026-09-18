@@ -637,6 +637,8 @@ pub struct SessionInfo {
     pub last_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Started with permission checks disabled (`--dangerously-skip-permissions`,
     /// codex `dangerFullAccess`). Sharing such a session is handing out an
     /// unsupervised root shell; the hub locks it to the owner.

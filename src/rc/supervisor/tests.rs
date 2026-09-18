@@ -38,6 +38,7 @@ pub(super) fn harness_test_session_with_channels(
             status,
             last_seq: 0,
             gist: None,
+            title: None,
             dangerous: false,
             permission_mode: Some(PermissionMode::Default),
             created_at: "now".into(),

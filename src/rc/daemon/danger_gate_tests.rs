@@ -253,6 +253,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     status: SessionStatus::AwaitingApproval,
                     last_seq: 0,
                     gist: None,
+                    title: None,
                     dangerous: false,
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
                     created_at: "now".into(),

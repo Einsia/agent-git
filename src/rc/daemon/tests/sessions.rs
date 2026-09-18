@@ -145,6 +145,8 @@ fn an_operator_cannot_take_over_an_unaccounted_dangerous_transcript() {
                 let (frames, _frames_rx) = mpsc::channel(1);
 
                 let located = |workspace: &str| LocatedLocal {
+                    title: Some("Native title".into()),
+                    gist: Some("Opening prompt".into()),
                     runtime: "unsupported-test-runtime".into(),
                     cwd: cwd.clone(),
                     project_id: Some(format!("project-{workspace}")),
@@ -248,6 +250,8 @@ fn a_bound_dangerous_transcript_stays_owner_only_from_a_second_workspace_sharing
                 let (frames, _frames_rx) = mpsc::channel(1);
 
                 let located = |workspace: &str| LocatedLocal {
+                    title: Some("Native title".into()),
+                    gist: Some("Opening prompt".into()),
                     runtime: "unsupported-test-runtime".into(),
                     cwd: cwd.clone(),
                     project_id: Some(format!("project-{workspace}")),
@@ -454,6 +458,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                     status: SessionStatus::Idle,
                     last_seq: 0,
                     gist: None,
+                    title: None,
                     dangerous: true,
                     permission_mode: Some(crate::protocol::PermissionMode::Bypass),
                     created_at: now.clone(),
@@ -534,6 +539,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     status: SessionStatus::Idle,
                     last_seq: 0,
                     gist: None,
+                    title: None,
                     dangerous: false,
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
                     created_at: now.clone(),
@@ -596,6 +602,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     status: SessionStatus::Idle,
                     last_seq: 0,
                     gist: None,
+                    title: None,
                     dangerous: false,
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
                     created_at: "now".into(),
@@ -720,6 +727,7 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
         status: SessionStatus::Idle,
         last_seq: 0,
         gist: None,
+        title: None,
         dangerous: false,
         permission_mode: Some(crate::protocol::PermissionMode::Default),
         created_at: "now".into(),
@@ -1700,6 +1708,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
             status: SessionStatus::Running,
             last_seq: 0,
             gist: None,
+            title: None,
             dangerous: false,
             permission_mode: Some(crate::protocol::PermissionMode::Auto),
             created_at: "now".into(),
@@ -1916,6 +1925,7 @@ fn a_viewer_joining_at_the_last_moment_keeps_the_tail_alive() {
             status: SessionStatus::Running,
             last_seq: 0,
             gist: None,
+            title: None,
             dangerous: false,
             permission_mode: None,
             created_at: String::new(),
@@ -2436,6 +2446,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         status: SessionStatus::Idle,
         last_seq: 0,
         gist: None,
+        title: None,
         dangerous: false,
         permission_mode: Some(crate::protocol::PermissionMode::Plan),
         created_at: "now".into(),
@@ -2575,12 +2586,12 @@ async fn discovery_reply_refreshes_supervision_after_the_scan() {
     );
     let snapshot = state.prepare_session_list(&frame).unwrap();
     let local = LocalSession {
-        title: None,
+        title: Some("Native title".into()),
         runtime_session_id: "native-new".into(),
         runtime: "codex".into(),
         cwd: root.path().to_string_lossy().into(),
         modified_at: "now".into(),
-        gist: None,
+        gist: Some("Opening prompt".into()),
         adopted: false,
         agent: None,
         likely_active: false,
@@ -2598,6 +2609,15 @@ async fn discovery_reply_refreshes_supervision_after_the_scan() {
     assert!(result.local.is_empty());
     assert_eq!(result.sessions.len(), 1);
     assert_eq!(result.sessions[0].session_id, "live-new");
+    assert_eq!(result.sessions[0].title.as_deref(), Some("Native title"));
+    assert_eq!(result.sessions[0].gist.as_deref(), Some("Opening prompt"));
+    let refreshed: SessionListResult = serde_json::from_value(
+        state
+            .finish_session_list(&frame, &snapshot.roots, vec![])
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(refreshed.sessions[0].title, result.sessions[0].title);
 }
 
 /// A missing Ended note must not leave a dead command channel advertised as writable.
@@ -2728,6 +2748,40 @@ async fn native_titles_reach_session_list_without_replacing_gist_or_reading_roll
         assert_eq!(std::fs::read(&index).unwrap(), before);
         assert_eq!(std::fs::read_dir(&native).unwrap().count(), 0);
     }
+    std::fs::write(
+        &names,
+        format!(
+            "{}\n",
+            serde_json::json!({"id":ids[0], "thread_name":"Managed native title"})
+        ),
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::channel(1);
+    let mut managed = rpc_test_live("managed", 1, tx, crate::protocol::PermissionMode::Default);
+    managed.runtime_thread_id = Some(ids[0].into());
+    state.sessions.insert("managed".into(), managed);
+    let snapshot = state.prepare_session_list(&frame).unwrap();
+    let listed = snapshot.clone().scan(LocalSessionScan::Listing);
+    let result: SessionListResult = serde_json::from_value(
+        state
+            .finish_session_list(&frame, &snapshot.roots, listed)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        result.sessions[0].title.as_deref(),
+        Some("Managed native title")
+    );
+    assert_eq!(
+        result.sessions[0].gist.as_deref(),
+        Some("Keep the opening prompt")
+    );
+    assert!(
+        result
+            .local
+            .iter()
+            .all(|row| row.runtime_session_id != ids[0])
+    );
     std::fs::write(root.join("completed"), "verified").unwrap();
 }
 

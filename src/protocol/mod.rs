@@ -783,6 +783,7 @@ mod tests {
             status: SessionStatus::Idle,
             last_seq: 0,
             gist: None,
+            title: None,
             dangerous: false,
             permission_mode: Some(PermissionMode::Default),
             created_at: "now".into(),

@@ -475,7 +475,7 @@ impl Daemon {
                                         let scanned = tokio::task::spawn_blocking(move || {
                                             if include_local { snapshot.scan(LocalSessionScan::Listing) } else { vec![] }
                                         }).await;
-                                        let g = d.lock().await;
+                                        let mut g = d.lock().await;
                                         if !connection_epoch_is_current(&g.settlement, epoch) { return; }
                                         let result = scanned.map_err(|_| RpcError::new(ErrorCode::Internal, "session discovery worker failed"))
                                             .and_then(|local| g.finish_session_list(&frame, &roots, local));

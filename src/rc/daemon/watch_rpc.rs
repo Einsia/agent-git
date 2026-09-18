@@ -254,6 +254,7 @@ impl Daemon {
             status: SessionStatus::Idle,
             last_seq: 0,
             gist: None,
+            title: None,
             // Watching is read-only, but this field records what this session **has
             // done**, not what you can do now. Hard-coding false hides that warning on
             // the web interface for a session that ran with no approval — exactly when it

@@ -47,7 +47,7 @@ impl Daemon {
     }
 
     pub(super) fn finish_session_list(
-        &self,
+        &mut self,
         frame: &Frame,
         roots: &policy::CanonicalRoots,
         local: Vec<LocalSession>,
@@ -61,6 +61,27 @@ impl Daemon {
                 ErrorCode::WorkspaceNotFound,
                 "workspace folders changed during discovery; refresh the list",
             ));
+        }
+        // Native metadata belongs to the managed row once supervision takes over.
+        let native: std::collections::HashMap<_, _> = local
+            .iter()
+            .map(|row| ((row.runtime.as_str(), row.runtime_session_id.as_str()), row))
+            .collect();
+        for session in self
+            .sessions
+            .values_mut()
+            .filter(|session| session.info.workspace_id == caller.workspace_id)
+        {
+            if let Some(row) = session
+                .runtime_thread_id
+                .as_deref()
+                .and_then(|id| native.get(&(session.info.runtime.as_str(), id)))
+            {
+                session.info.title = row.title.clone();
+                if row.gist.is_some() {
+                    session.info.gist = row.gist.clone();
+                }
+            }
         }
         let snapshot = self.local_session_scan(&caller.workspace_id);
         let local = local
@@ -230,6 +251,7 @@ impl Daemon {
                 status: SessionStatus::Idle,
                 last_seq: 0,
                 gist: None,
+                title: None,
                 // The monotonic bit is stamped by `prepare_spawn` from the slip above; it is
                 // not inferred back from the current permission mode and not copied again here.
                 dangerous: false,
@@ -298,6 +320,8 @@ impl Daemon {
         // or a takeover amounts to bypassing that allowlist to start an agent in an arbitrary
         // directory.
         let LocatedLocal {
+            title,
+            gist,
             runtime,
             cwd,
             project_id,
@@ -408,7 +432,8 @@ impl Daemon {
             branch: agit_session.as_ref().map(|l| l.branch().to_string()),
             status: SessionStatus::Idle,
             last_seq: 0,
-            gist: None,
+            gist,
+            title,
             // The judged bit is stamped by `prepare_spawn` — copying it here is one more place
             // that has to be right.
             dangerous: false,
@@ -613,6 +638,7 @@ impl Daemon {
             status: SessionStatus::Idle,
             last_seq: 0,
             gist: None,
+            title: None,
             dangerous: mode.is_dangerous(),
             permission_mode: Some(mode),
             created_at: now.clone(),
@@ -1005,8 +1031,8 @@ impl LocalSessionSnapshot {
                 refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
                 refs.truncate(PER_PROJECT_LIMIT);
                 for r in refs {
-                    // A session already under supervision is no longer listed as "takeable".
-                    if self.supervised.contains(&r.id) {
+                    // Listing retains native metadata until it is joined to managed sessions.
+                    if purpose == LocalSessionScan::Locate && self.supervised.contains(&r.id) {
                         continue;
                     }
                     let link = store

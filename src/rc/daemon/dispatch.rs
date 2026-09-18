@@ -330,26 +330,14 @@ impl Daemon {
                     workspace_id: String::new(),
                     include_local: false,
                 });
-                // Report only the live sessions of **this workspace**. Listing the whole
-                // `self.sessions` table hands every member of A the session ids, gists and
-                // danger bits of the other workspaces this machine serves at the same time — and
-                // that id is how every session verb below addresses its target.
-                let live: Vec<SessionInfo> = self
-                    .sessions
-                    .values()
-                    .filter(|l| l.info.workspace_id == caller.workspace_id)
-                    .map(|l| self.stamped(l.info.clone()))
-                    .collect();
+                let snapshot = self.prepare_session_list(f)?;
+                let roots = snapshot.roots.clone();
                 let local = if p.include_local {
-                    self.local_sessions(&p.workspace_id, LocalSessionScan::Listing)
+                    snapshot.scan(LocalSessionScan::Listing)
                 } else {
                     vec![]
                 };
-                Ok(serde_json::to_value(SessionListResult {
-                    sessions: live,
-                    local,
-                })
-                .unwrap())
+                self.finish_session_list(f, &roots, local)
             }
 
             #[cfg(test)]
@@ -616,6 +604,7 @@ mod tests {
                 status: SessionStatus::Running,
                 last_seq: 0,
                 gist: None,
+                title: None,
                 dangerous: false,
                 permission_mode: None,
                 created_at: String::new(),

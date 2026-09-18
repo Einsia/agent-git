@@ -90,6 +90,8 @@ enum LocalSessionScan {
 }
 
 struct LocatedLocal {
+    title: Option<String>,
+    gist: Option<String>,
     runtime: String,
     cwd: PathBuf,
     project_id: Option<String>,
@@ -2347,6 +2349,8 @@ fn locate_local_with(
             .map(|(id, _)| id.clone())
     });
     Ok(LocatedLocal {
+        title: cand.title,
+        gist: cand.gist,
         runtime: cand.runtime,
         cwd,
         project_id,

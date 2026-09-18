@@ -737,6 +737,7 @@ mod bound_lineage_tests {
                         status: SessionStatus::Running,
                         last_seq: 0,
                         gist: None,
+                        title: None,
                         dangerous: false,
                         permission_mode: Some(crate::protocol::PermissionMode::Default),
                         created_at: "now".into(),
