@@ -1038,6 +1038,7 @@ fn serve_rc_status(action: &str) {
     agit::rc::select_local_authority();
     assert!(matches!(action, "serve-busy" | "serve-offline"));
     let listener = control::listen().unwrap();
+    #[cfg(windows)]
     control::write_pidfile().unwrap();
     fs::write(
         std::env::var_os("AGIT_RC_CATEGORY_READY").unwrap(),
@@ -1063,6 +1064,7 @@ fn serve_rc_status(action: &str) {
             break;
         }
     }
+    #[cfg(windows)]
     control::clear_pidfile();
 }
 

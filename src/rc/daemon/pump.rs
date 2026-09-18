@@ -59,22 +59,9 @@ impl Daemon {
         // Control socket on a blocking thread: `agit rc status` must work even
         // if the async side is wedged talking to an unreachable hub.
         let ctl = control::listen()?;
-        // The pidfile is written **only after the socket is in hand**.
-        //
-        // Written before `listen()`: when `listen()` fails (the socket is held by someone
-        // else, or the peer's liveness cannot be told) this function returns Err straight
-        // away and the `clear_pidfile()` at the end never runs — so the pidfile is left
-        // holding the pid of this **just-failed** process, overwriting the pid of the
-        // daemon that is actually running.
-        //
-        // The damage is permanent: `running_pid_in` requires the socket to answer **and**
-        // the pid in the pidfile to still be alive; with a dead pid in there it returns
-        // None forever — `agit rc start` can no longer report "a daemon is already running
-        // on this machine (pid N)". Worse, once the system reuses that pid,
-        // `process_alive` turns true again and it reports a completely unrelated process.
-        //
-        // The pidfile means "which pid is behind this socket", so writing it before the
-        // socket exists is meaningless.
+        // Unix publication and lifetime ownership belong to the listener. Its worker retains
+        // the lock until process exit; no shutdown unlink can erase a replacement's state.
+        #[cfg(windows)]
         control::write_pidfile()?;
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         {
@@ -645,6 +632,7 @@ impl Daemon {
         // to start resends it from there. Anyone who changes settlement's "delivered" test
         // back to inferring it from git reachability loses this whole argument again.
         g.shutdown().await;
+        #[cfg(windows)]
         control::clear_pidfile();
         Ok(())
     }

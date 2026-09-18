@@ -89,10 +89,21 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
             }
         }
         Action::Bridge { ensure } => bridge(ensure)?,
-        Action::Status => println!(
-            "{}",
-            serde_json::to_string(&super::control::ask(&super::control::Request::Status)?)?
-        ),
+        Action::Status => {
+            use super::control::{self, Presence};
+            let reply = control::ask(&control::Request::Status).map_err(|error| {
+                match control::presence() {
+                    Presence::Absent => anyhow::anyhow!("no local daemon is running"),
+                    Presence::Running(pid) => anyhow::anyhow!(
+                        "local daemon (pid {pid}) did not answer the status request: {error}"
+                    ),
+                    Presence::Unclear(why) => anyhow::anyhow!(
+                        "cannot establish local daemon state: {why}; status request failed: {error}"
+                    ),
+                }
+            })?;
+            println!("{}", serde_json::to_string(&reply)?);
+        }
         Action::Stop => println!(
             "{}",
             serde_json::to_string(&super::control::ask(&super::control::Request::Stop)?)?
@@ -117,9 +128,7 @@ pub fn start_foreground() -> crate::Result<()> {
 
 #[cfg(unix)]
 pub fn ensure_daemon() -> crate::Result<()> {
-    if super::control::running_pid().is_none() {
-        spawn_daemon()?;
-    }
+    spawn_if_absent()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         if let Ok(socket) = std::os::unix::net::UnixStream::connect(rpc_path()?) {
@@ -132,6 +141,17 @@ pub fn ensure_daemon() -> crate::Result<()> {
             super::rc_dir()?.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn spawn_if_absent() -> crate::Result<()> {
+    match super::control::presence() {
+        super::control::Presence::Running(_) => Ok(()),
+        super::control::Presence::Absent => spawn_daemon(),
+        super::control::Presence::Unclear(why) => {
+            anyhow::bail!("cannot establish local daemon state: {why}")
+        }
     }
 }
 
@@ -181,9 +201,7 @@ fn bridge(ensure_daemon: bool) -> crate::Result<()> {
     let socket = match StdStream::connect(&path) {
         Ok(socket) => socket,
         Err(first) if ensure_daemon => {
-            if super::control::running_pid().is_none() {
-                spawn_daemon()?;
-            }
+            spawn_if_absent()?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 match StdStream::connect(&path) {

@@ -1,6 +1,6 @@
 //! Local control socket — how `agit rc status` / `stop` reach the daemon.
 //!
-//! A unix socket at `~/.agit/rc/control.sock` plus a pidfile beside it. Not a
+//! A unix socket at `~/.agit/rc/control.sock` plus a lifetime lock beside it. Not a
 //! TCP port: this channel can stop the daemon, and a localhost port is reachable
 //! by every process and container on the machine, whereas the socket carries
 //! filesystem permissions (0600, in a directory only the user can read).
@@ -12,6 +12,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+
+mod ownership;
+use ownership::Ownership;
 
 pub use super::control_protocol::{Reply, Request, SessionLine, Status};
 
@@ -69,9 +72,8 @@ pub fn pid_path() -> crate::Result<PathBuf> {
 
 /// The pid of a daemon that is actually alive, if any.
 ///
-/// A stale pidfile (crash, reboot) must not look like a running daemon — that
-/// is the failure where `agit rc start` refuses forever and the user has no
-/// idea why. So we verify the process exists before believing the file.
+/// Only the socket's status response supplies a PID. Numeric pidfiles cannot distinguish
+/// daemon lifetimes across process exit, reboot or PID namespaces.
 pub fn running_pid() -> Option<u32> {
     let rc = super::rc_dir().ok()?;
     running_pid_in(&rc)
@@ -127,52 +129,10 @@ pub fn presence() -> Presence {
 /// The pure kernel of [`presence`] (the path is passed in explicitly, to be testable; see
 /// [`socket_path_for`]).
 pub fn presence_in(rc_dir: &std::path::Path) -> Presence {
-    // Ask the socket first: only an answer from the far side proves a daemon is really there. The
-    // pidfile only answers "then which pid is it" — pids get reused, and reading it alone mistakes
-    // an unrelated process for the daemon.
     match probe_socket(&socket_path_for(rc_dir), rc_dir) {
-        Liveness::Live => match read_pid(rc_dir).filter(|p| process_alive(*p)) {
-            Some(pid) => Presence::Running(pid),
-            // Something answered, but the pidfile cannot say who. It **is** running (it just
-            // answered), so this is not "there is none"; there is simply no pid to give.
-            None => Presence::Unclear(
-                "something answered on the control socket but the pidfile does not name a live \
-                 process"
-                    .into(),
-            ),
-        },
+        Liveness::Live(pid) => Presence::Running(pid),
         Liveness::Stale => Presence::Absent,
         Liveness::Unknown(why) => Presence::Unclear(why),
-    }
-}
-
-fn read_pid(rc_dir: &std::path::Path) -> Option<u32> {
-    std::fs::read_to_string(rc_dir.join("agitd.pid"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    // signal 0 checks for existence without delivering anything.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
-    false
-}
-
-pub fn write_pidfile() -> crate::Result<()> {
-    std::fs::write(pid_path()?, std::process::id().to_string())?;
-    Ok(())
-}
-
-pub fn clear_pidfile() {
-    if let Ok(p) = pid_path() {
-        let _ = std::fs::remove_file(p);
     }
 }
 
@@ -192,7 +152,7 @@ pub(crate) fn ask_with_timeout(
     // `agit rc status` / `agit rc stop` send their requests on — bounding the probe but not this
     // leaves the commands wedged on the same kernel-level wait.
     let stream = connect_within(&path, timeout)
-        .map_err(|e| anyhow::anyhow!("no daemon listening at {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("cannot connect to daemon at {}: {e}", path.display()))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let mut w = stream.try_clone()?;
@@ -212,18 +172,9 @@ pub(crate) fn ask_with_timeout(
 #[derive(Debug, PartialEq, Eq)]
 enum Liveness {
     /// A daemon is on the far side, and it **answered**.
-    Live,
-    /// Nobody is on the far side, for certain: `connect` was refused **and** the process named in
-    /// the pidfile is gone too. The file is safe to remove.
-    ///
-    /// **Neither condition alone is enough.** ECONNREFUSED does not prove there is no listener: a
-    /// live listener refuses new connections just the same once its accept queue is full (observed
-    /// past the backlog limit; see [`refused_connect_verdict`]). Reading it alone removes the
-    /// socket of a daemon that is still running.
-    ///
-    /// **Only a `connect` failure can produce this verdict.** Anything that goes wrong after the
-    /// connection is established (EOF, reset, timeout) does not count — those prove this one
-    /// connection died, not that there is no listener.
+    Live(u32),
+    /// No socket exists and no instance holds ownership, or a refused socket has matching
+    /// ownership evidence and its lifetime lock is released. Refusal alone is insufficient.
     Stale,
     /// Cannot tell: the connection goes through but nothing answers, or permissions or fds get in
     /// the way.
@@ -239,7 +190,7 @@ enum Liveness {
 /// **This step must be bounded too.** `set_read_timeout` / `set_write_timeout` govern reads and
 /// writes **after** the connection is established; they do not reach `connect`. And when a blocking
 /// connect meets a listener whose accept queue is full, the two platforms part ways: macOS refuses
-/// outright with ECONNREFUSED (see [`refused_connect_verdict`]), **Linux waits indefinitely** —
+/// outright with ECONNREFUSED (see [`ownership_verdict`]), **Linux waits indefinitely** —
 /// observed with `listen(fd, 1)` squeezing the backlog down to 1 and then filling it: the second
 /// connect does not return.
 ///
@@ -449,56 +400,31 @@ fn connect_timed_out() -> std::io::Error {
     )
 }
 
-/// Whether anyone is on the far side of the socket.
-///
-/// # The test is an answer coming back, not `connect().is_ok()`
-///
-/// That one line collapses three states into two, and is wrong at both ends:
-///
-/// * **Not connecting ≠ stale.** Exhausted fds, wrong permissions and a signal interruption all
-///   make `connect` fail, and `listen()` then removes the socket of a **live** daemon.
-/// * **Connecting ≠ alive.** On a listener that has just been closed, `connect` can still succeed
-///   by luck — the race does happen under concurrency (running that case alone does not reproduce
-///   it).
-///
-/// So an answer is required: a real daemon replies to [`Request::Status`].
-///
-/// # Why the probe runs twice
-///
-/// "connected but nothing answered" has two causes, and they need **opposite** treatment:
-///
-/// * nobody is really there (the socket is a leftover, and the first connect was a lucky win in the
-///   race) → clean it up;
-/// * a live daemon that is busy or wedged is there → never clean it up.
-///
-/// One probe cannot separate them. **Connecting again** moves one step forward: a second connect on
-/// a leftover is refused.
-///
-/// Refusal is not yet a conclusion — ECONNREFUSED does not prove there is no listener (see
-/// [`refused_connect_verdict`]) — so a refusal is followed by "is the process in the pidfile still
-/// there", and only both conditions together give `Stale`.
-///
-/// Only a second connection that still goes through and still does not answer lands on `Unknown` —
-/// refuse to start, fail loudly.
-///
-/// # Why the rc directory is passed in explicitly
-///
-/// The owner question reads `<rc_dir>/agitd.pid`, and deriving the rc directory back out of the
-/// socket path is brittle: when `$AGIT_HOME` is too deep the socket falls back to a short path
-/// under `$XDG_RUNTIME_DIR` (see [`socket_path_for`]), and then the two have no parent-child
-/// relation at all.
+/// Probe the socket and, on refusal, its independent lifetime evidence. A second connection
+/// distinguishes a listener that exited during the exchange from an unresponsive live peer.
+/// Ownership always comes from `rc_dir`, even when the socket uses the short-path fallback.
 fn probe_socket(path: &std::path::Path, rc_dir: &std::path::Path) -> Liveness {
-    match probe_once(path, rc_dir) {
-        Liveness::Live => Liveness::Live,
+    probe_with_owner(path, rc_dir, None)
+}
+
+fn probe_with_owner(
+    path: &std::path::Path,
+    rc_dir: &std::path::Path,
+    owner: Option<&Ownership>,
+) -> Liveness {
+    match probe_once(path, rc_dir, owner) {
+        live @ Liveness::Live(_) => live,
         Liveness::Stale => Liveness::Stale,
         // Connect through the bounded path (see [`connect_within`]): against a full backlog a
         // blocking connect waits indefinitely on Linux, and probing twice would wedge twice.
         Liveness::Unknown(why) => match connect_within(path, CONNECT_TIMEOUT) {
-            // The file is gone: "no listener" is what this error **means**, so the owner question
-            // is unnecessary.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Liveness::Stale,
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                refused_connect_verdict(rc_dir)
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                ownership_verdict(path, rc_dir, owner)
             }
             // Everything else that fails to connect (a connect timeout included) falls back to
             // `Unknown` — only the two above are enough for a verdict.
@@ -507,52 +433,48 @@ fn probe_socket(path: &std::path::Path, rc_dir: &std::path::Path) -> Liveness {
     }
 }
 
-/// Whether a refused `connect` is enough to call the socket a leftover.
-///
-/// # ECONNREFUSED does not prove there is no listener
-///
-/// A **live** listener refuses new connections just the same once its accept queue is full.
-/// Observed on Darwin: `UnixListener::bind` uses backlog=128, and on a listener that binds and then
-/// never accepts, the first 128 connects all succeed, the 129th returns ECONNREFUSED, and the
-/// listener is alive throughout.
-///
-/// **The same shape does not take this path on Linux**: there a blocking connect against a full
-/// backlog is not refused but waits indefinitely (observed; see [`CONNECT_TIMEOUT`]), so this
-/// verdict function is never reached on Linux and a connect timeout → [`Liveness::Unknown`] takes
-/// its place. Both paths land in the same place: neither removes the socket.
-///
-/// The shape is reachable: the control thread **accepts serially**, and the `Request::Status`
-/// handler gives itself 2 seconds to take `try_lock` (see `daemon.rs`). A script polling
-/// `agit rc status` fills the queue. Calling that `Stale` makes [`listen`] remove the socket and
-/// bind over it — the daemon keeps running, nobody can reach it any more, and the failure is
-/// silent.
-///
-/// So "safe to remove" carries a **necessary condition**: the process in the pidfile is gone too. A
-/// live owner lands on `Unknown` — nothing removed, loud failure.
-fn refused_connect_verdict(rc_dir: &std::path::Path) -> Liveness {
-    if owner_process_alive(rc_dir) {
-        return Liveness::Unknown(
-            "the socket refused the connection, but the process in its pidfile is still alive \
-             — its accept queue may be full, or it may be wedged"
-                .into(),
-        );
+/// A full accept queue may refuse connections. Only a released lifetime lock with a matching
+/// socket record proves exit; PID existence and missing legacy metadata cannot prove it.
+fn ownership_verdict(
+    path: &std::path::Path,
+    rc_dir: &std::path::Path,
+    owner: Option<&Ownership>,
+) -> Liveness {
+    let evidence = (|| -> crate::Result<()> {
+        let acquired;
+        let owner = match owner {
+            Some(owner) => Some(owner),
+            None => {
+                acquired = Ownership::acquire(rc_dir, false)?;
+                acquired.as_ref()
+            }
+        };
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+            Ok(_) => owner
+                .ok_or_else(|| anyhow::anyhow!("no daemon lifetime ownership record exists"))?
+                .verify_stale(path),
+        }
+    })();
+    match evidence {
+        Ok(()) => Liveness::Stale,
+        Err(error) => Liveness::Unknown(format!(
+            "cannot establish ownership of {}: {error:#}; retry if a daemon is starting or busy. \
+             For legacy or incomplete state, stop all daemons sharing this AGIT_HOME before \
+             manually removing this socket; keep agitd.lock in place",
+            path.display()
+        )),
     }
-    Liveness::Stale
-}
-
-/// Whether the process recorded in the pidfile is still alive.
-///
-/// Only meaningful on the **affirmative** side: the owner counts as alive only when the pid reads
-/// back and that process still exists. A missing file, an unreadable one and an unparseable one all
-/// count as not alive — a daemon that is really running has written this file (see
-/// [`write_pidfile`]), so "no pidfile" is not "cannot tell".
-fn owner_process_alive(rc_dir: &std::path::Path) -> bool {
-    read_pid(rc_dir).is_some_and(process_alive)
 }
 
 /// One probe: connect, and ask for an answer.
 ///
-fn probe_once(path: &std::path::Path, rc_dir: &std::path::Path) -> Liveness {
+fn probe_once(
+    path: &std::path::Path,
+    rc_dir: &std::path::Path,
+    owner: Option<&Ownership>,
+) -> Liveness {
     use std::io::{BufRead, BufReader};
 
     // `connect` **itself** needs a cap, see [`CONNECT_TIMEOUT`]: the two read/write timeouts below
@@ -561,13 +483,13 @@ fn probe_once(path: &std::path::Path, rc_dir: &std::path::Path) -> Liveness {
     // of the budgets below ever apply.
     let mut stream = match connect_within(path, CONNECT_TIMEOUT) {
         Ok(s) => s,
-        // The file is gone: that is "no listener" itself.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Liveness::Stale,
-        // A refusal **is not** "no listener" — a live listener with a full backlog answers the
-        // same way. Ask once more whether the owner is still there; see
-        // [`refused_connect_verdict`].
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            return refused_connect_verdict(rc_dir);
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return ownership_verdict(path, rc_dir, owner);
         }
         // A timeout lands here too: not getting a connection does not say "nobody is there", only
         // "this attempt did not connect". Calling it `Stale` removes the socket of a daemon that
@@ -575,24 +497,9 @@ fn probe_once(path: &std::path::Path, rc_dir: &std::path::Path) -> Liveness {
         Err(e) => return Liveness::Unknown(format!("connect failed: {e}")),
     };
 
-    // The timeouts are mandatory: without them a peer that connects and never answers wedges
-    // `agit rc start` forever.
-    //
-    // **What has to be covered is not one handler run alone, but the queueing in front of it.** The
-    // `Request::Status` handler gives itself 2 seconds to take `try_lock` (see `daemon.rs`), and on
-    // timeout still replies `Reply::Error{"the daemon is busy..."}` — that is **an answer** too, so
-    // `Live`. And the control thread **accepts serially**: this probe may first queue in the
-    // backlog behind another connection being handled (up to about 2 seconds), then wait on its own
-    // handler (up to about 2 seconds). A budget covering only the handler and not the queueing
-    // judges a **live** daemon `Unknown`.
-    //
-    // 5 seconds = the handler's own 2-second budget × 2 (one queued, one our own) + margin.
-    //
-    // **Raising it to infinity is not the answer**: the cap exists so that nothing wedges forever —
-    // a peer that connects and never answers would wedge `agit rc status` / `agit rc start`, and
-    // that failure has no way out. So the number has to cover the known worst-case queueing, rather
-    // than not exist.
-    let t = std::time::Duration::from_secs(5);
+    // The budget covers both queuing and the status handler. An error reply or timeout cannot
+    // supply a daemon PID, but must still preserve the socket as unknown.
+    let t = CONNECT_TIMEOUT;
     if stream.set_read_timeout(Some(t)).is_err() || stream.set_write_timeout(Some(t)).is_err() {
         return Liveness::Unknown("cannot set socket timeouts".into());
     }
@@ -620,11 +527,6 @@ fn probe_once(path: &std::path::Path, rc_dir: &std::path::Path) -> Liveness {
     // its socket and bind over it — it keeps running, and nobody can reach it any more. That
     // failure is silent.
     //
-    // The common self-healing path is unaffected: once a killed daemon's process is gone, `connect`
-    // gets ECONNREFUSED outright and the pid in the pidfile is gone too — both conditions hold, so
-    // the verdict is still `Stale` and the file is cleaned up. (The first condition alone is not
-    // enough: a live listener with a full backlog also refuses connections.)
-    //
     // The cost is that "connects but does not answer" makes `agit rc start` refuse to start instead
     // of cleaning up on its own. That is a **loud** failure whose error says what to do; removing a
     // live daemon's socket by mistake is a quiet one.
@@ -632,7 +534,10 @@ fn probe_once(path: &std::path::Path, rc_dir: &std::path::Path) -> Liveness {
     match BufReader::new(&stream).read_line(&mut reply) {
         Ok(0) => Liveness::Unknown("connected but the peer closed without answering".into()),
         Ok(_) => match serde_json::from_str::<Reply>(&reply) {
-            Ok(_) => Liveness::Live,
+            Ok(Reply::Status(status)) if status.pid > 0 => Liveness::Live(status.pid),
+            Ok(_) => {
+                Liveness::Unknown("the control socket answered without a daemon status".into())
+            }
             // Something is answering, we just cannot read it — that must never be taken as
             // "nobody is there" and its socket removed.
             Err(e) => Liveness::Unknown(format!("unrecognised reply: {e}")),
@@ -644,48 +549,53 @@ fn probe_once(path: &std::path::Path, rc_dir: &std::path::Path) -> Liveness {
     }
 }
 
-/// Bind the control socket, removing a stale one first.
-pub fn listen() -> crate::Result<UnixListener> {
-    // The rc directory is kept separately: the staleness verdict also reads `<rc_dir>/agitd.pid`,
-    // and a socket path that would be too deep falls back elsewhere, so it cannot be derived back
-    // (see [`socket_path_for`] and [`probe_socket`]).
-    let rc_dir = super::rc_dir()?;
-    let path = socket_path_for(&rc_dir);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+/// The socket closes before ownership is released. Do not expose an independently clonable
+/// listener: a clone that outlives the lock would invalidate stale-socket recovery.
+pub struct Listener {
+    socket: UnixListener,
+    _owner: Ownership,
+}
+
+impl Listener {
+    pub fn incoming(&self) -> std::os::unix::net::Incoming<'_> {
+        self.socket.incoming()
     }
-    // A killed daemon leaves the socket file behind, and bind then gets EADDRINUSE. Removing it is
-    // safe **only when nobody is on the far side for certain**, so the three states take three
-    // paths:
-    if path.exists() {
-        match probe_socket(&path, &rc_dir) {
-            // Certainly nobody: remove it, so the bind below does not get EADDRINUSE.
-            Liveness::Stale => {
-                let _ = std::fs::remove_file(&path);
-            }
-            // Something answers: this is not a stale socket, it is "a daemon already exists".
-            // Letting bind report EADDRINUSE is far better than removing its socket here.
-            Liveness::Live => {}
-            // Cannot tell: **do nothing**. Removing it may orphan a live daemon, and that failure
-            // is silent — it keeps running, and nobody can reach it any more.
-            Liveness::Unknown(why) => {
-                return Err(anyhow::anyhow!(
-                    "cannot tell whether a daemon is already listening on {} ({why}); \
-                     refusing to remove it. if you are sure no daemon is running, \
-                     remove the file and retry",
-                    path.display()
-                ));
-            }
+}
+
+/// Bind and publish under exclusive lifetime ownership, removing only a proven stale socket.
+pub fn listen() -> crate::Result<Listener> {
+    listen_in(&super::rc_dir()?)
+}
+
+fn listen_in(rc_dir: &std::path::Path) -> crate::Result<Listener> {
+    let mut owner = Ownership::acquire(rc_dir, true)?
+        .expect("creating an ownership lock must return a descriptor");
+    let path = socket_path_for(rc_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match probe_with_owner(&path, rc_dir, Some(&owner)) {
+        Liveness::Stale => match std::fs::symlink_metadata(&path) {
+            Ok(_) => owner.remove_stale(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        },
+        Liveness::Live(pid) => {
+            anyhow::bail!("a daemon already answers at {} (pid {pid})", path.display())
+        }
+        Liveness::Unknown(why) => {
+            anyhow::bail!("{why}; refusing to replace the control socket");
         }
     }
     let l = UnixListener::bind(&path)
         .map_err(|e| anyhow::anyhow!("cannot bind {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(l)
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    owner.publish(&path)?;
+    Ok(Listener {
+        socket: l,
+        _owner: owner,
+    })
 }
 
 /// Read one request from an accepted connection and write back a reply.
@@ -727,7 +637,12 @@ mod tests {
             for _ in 0..n {
                 match l.accept() {
                     Ok((mut s, _)) => {
-                        let _ = serve_one(&mut s, |_req| Reply::Stopping);
+                        let _ = serve_one(&mut s, |_req| {
+                            Reply::Status(Status {
+                                pid: std::process::id(),
+                                ..Default::default()
+                            })
+                        });
                     }
                     Err(_) => break,
                 }
@@ -735,25 +650,183 @@ mod tests {
         })
     }
 
-    /// A stale verdict needs **two** conditions: nobody serving, and no live owner. So this rc
-    /// directory deliberately has no pidfile — writing one that points at this process would supply
-    /// a live owner, and the verdict would (correctly) land on `Unknown`.
+    #[test]
+    fn ownership_covers_bind_before_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = tmp.path();
+        let owner = Ownership::acquire(rc, true).unwrap().unwrap();
+        assert!(matches!(presence_in(rc), Presence::Unclear(_)));
+        assert!(listen_in(rc).is_err());
+
+        let path = socket_path_for(rc);
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(!rc.join("agitd.pid").exists());
+        assert!(matches!(
+            ownership_verdict(&path, rc, None),
+            Liveness::Unknown(_)
+        ));
+        assert!(listen_in(rc).is_err());
+        assert!(path.exists());
+        drop(listener);
+        drop(owner);
+        // Exit before publication leaves incomplete evidence, requiring operator recovery.
+        assert!(matches!(presence_in(rc), Presence::Unclear(_)));
+        assert!(listen_in(rc).is_err());
+    }
+
+    #[test]
+    fn concurrent_starters_serialize_stale_cleanup_and_publication() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::Barrier;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = tmp.path();
+        drop(listen_in(rc).unwrap());
+        let lock_inode = std::fs::metadata(rc.join("agitd.lock")).unwrap().ino();
+        let barrier = Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let start = || {
+                barrier.wait();
+                listen_in(rc)
+            };
+            let first = scope.spawn(start);
+            let second = scope.spawn(start);
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(socket_path_for(rc).exists());
+        assert_eq!(
+            std::fs::metadata(rc.join("agitd.lock")).unwrap().ino(),
+            lock_inode
+        );
+        assert!(Ownership::acquire(rc, false).is_err());
+        drop(results);
+        assert_eq!(presence_in(rc), Presence::Absent);
+        // Teardown leaves no deferred unlink that could erase the next owner's publication.
+        let replacement = listen_in(rc).unwrap();
+        assert!(rc.join("agitd.pid").exists());
+        assert!(socket_path_for(rc).exists());
+        drop(replacement);
+    }
+
+    #[test]
+    fn ownership_is_rooted_in_each_namespace_with_short_socket_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("deep-home-".repeat(15));
+        let rc = home.join("rc");
+        let desktop = home.join("desktop-rc");
+        std::fs::create_dir_all(&rc).unwrap();
+        std::fs::create_dir_all(&desktop).unwrap();
+        let rc_socket = socket_path_for(&rc);
+        let desktop_socket = socket_path_for(&desktop);
+        assert_ne!(rc_socket.parent(), Some(rc.as_path()));
+        assert_ne!(desktop_socket, rc_socket);
+        let first = listen_in(&rc).unwrap();
+        let second = listen_in(&desktop).unwrap();
+        assert!(rc.join("agitd.lock").exists());
+        assert!(desktop.join("agitd.lock").exists());
+        drop(first);
+        assert_eq!(presence_in(&rc), Presence::Absent);
+        let replacement = listen_in(&rc).unwrap();
+        assert!(listen_in(&desktop).is_err());
+        drop(replacement);
+        drop(second);
+        std::fs::remove_file(rc_socket).unwrap();
+        std::fs::remove_file(desktop_socket).unwrap();
+    }
+
+    #[test]
+    fn stale_evidence_cannot_remove_a_replacement_socket() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = tmp.path();
+        drop(listen_in(rc).unwrap());
+        let path = socket_path_for(rc);
+        let owner = Ownership::acquire(rc, false).unwrap().unwrap();
+        owner.verify_stale(&path).unwrap();
+        // Retain the old inode so replacement cannot accidentally reuse its identity.
+        let retired = rc.join("retired.sock");
+        std::fs::rename(&path, retired).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        assert!(owner.remove_stale(&path).is_err());
+        drop(owner);
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        drop(replacement);
+        assert!(matches!(presence_in(rc), Presence::Unclear(_)));
+        assert!(listen_in(rc).is_err());
+    }
+
+    #[test]
+    fn legacy_and_incomplete_records_fail_closed_without_rewriting_pidfiles() {
+        let cases = [
+            (Some("1"), None),
+            (None, Some("")),
+            (Some("invalid PID"), Some("{\"version\":")),
+        ];
+        for (pid, record) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let rc = tmp.path();
+            let path = socket_path_for(rc);
+            drop(UnixListener::bind(&path).unwrap());
+            if let Some(pid) = pid {
+                std::fs::write(rc.join("agitd.pid"), pid).unwrap();
+            }
+            if let Some(record) = record {
+                std::fs::write(rc.join("agitd.lock"), record).unwrap();
+            }
+            assert!(matches!(presence_in(rc), Presence::Unclear(_)));
+            let error = listen_in(rc)
+                .err()
+                .expect("unproven ownership must refuse startup");
+            assert!(
+                error
+                    .to_string()
+                    .contains("stop all daemons sharing this AGIT_HOME")
+            );
+            assert!(path.exists());
+            assert_eq!(
+                std::fs::read_to_string(rc.join("agitd.pid"))
+                    .ok()
+                    .as_deref(),
+                pid
+            );
+        }
+    }
+
+    #[test]
+    fn uninspectable_ownership_is_unknown_even_without_a_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("unrelated");
+        std::fs::write(&target, "leave unchanged").unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("agitd.lock")).unwrap();
+        assert!(matches!(presence_in(tmp.path()), Presence::Unclear(_)));
+        assert!(listen_in(tmp.path()).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "leave unchanged");
+    }
+
+    /// A released lifetime lock and its socket record establish staleness independently of PIDs.
     #[test]
     fn a_socket_file_with_nobody_listening_is_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let rc = tmp.path();
         let p = rc.join("dead.sock");
+        let mut owner = Ownership::acquire(rc, true).unwrap().unwrap();
         // Start one that really answers, then let it exit — the file stays, but nobody serves.
         let h = answering_daemon(&p, 1);
+        owner.publish(&p).unwrap();
         assert_eq!(
             probe_socket(&p, rc),
-            Liveness::Live,
+            Liveness::Live(std::process::id()),
             "something answering must count as live"
         );
         // join: the thread returns once it has served that one request, and the listener closes
         // with it. `drop(JoinHandle)` cannot do this — it only stops waiting; the thread and the
         // listener both stay.
         h.join().expect("the fake daemon must not panic");
+        drop(owner);
+        std::fs::write(rc.join("agitd.pid"), "incomplete PID").unwrap();
 
         assert!(
             p.exists(),
@@ -767,16 +840,7 @@ mod tests {
         );
     }
 
-    /// A socket that is **bound but never accepted on** is not alive.
-    ///
-    /// `connect().is_ok()` is timing-dependent: under a fully parallel run, "the listener is
-    /// already dropped and connect still succeeds" does happen, while running that case alone does
-    /// not reproduce it. Rather than guess at that timing, the test **does not depend on timing**
-    /// at all: ask for an answer.
-    ///
-    /// A socket bound with nobody accepting is exactly the shape inside that race window: it
-    /// connects, it does not answer. It must be judged stale, or `listen()` never cleans it up and
-    /// `bind` immediately gets EADDRINUSE.
+    /// Connecting without a status reply cannot establish which daemon is running.
     #[test]
     fn a_socket_that_accepts_but_never_answers_is_not_live() {
         let tmp = tempfile::tempdir().unwrap();
@@ -785,7 +849,7 @@ mod tests {
         let _l = UnixListener::bind(&p).unwrap();
         assert_ne!(
             probe_socket(&p, tmp.path()),
-            Liveness::Live,
+            Liveness::Live(std::process::id()),
             "connecting without answering must not count as live — that is the shape inside the \
              race window"
         );
@@ -912,7 +976,7 @@ mod tests {
     /// `set_read_timeout` / `set_write_timeout` only govern reads and writes **after** the
     /// connection is established. Against a listener whose accept queue is full:
     ///
-    /// * macOS refuses outright with ECONNREFUSED (via [`refused_connect_verdict`]);
+    /// * macOS refuses outright with ECONNREFUSED (via [`ownership_verdict`]);
     /// * on Linux a blocking connect **waits indefinitely** — observed by squeezing the backlog to
     ///   1, filling it, and watching the second connect not return.
     ///
@@ -930,19 +994,15 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let rc = tmp.path();
-        let p = rc.join("wedged.sock");
-        // The owner is alive (this process): the macOS ECONNREFUSED path needs that to land on
-        // `Unknown`, or `refused_connect_verdict` (correctly) returns `Stale` and the test pins
-        // something else.
-        std::fs::write(rc.join("agitd.pid"), std::process::id().to_string()).unwrap();
-
-        // Bound but **never accepted on**: the queue only fills.
-        let l = UnixListener::bind(&p).unwrap();
+        let p = socket_path_for(rc);
+        let l = listen_in(rc).unwrap();
+        // The lifetime lock protects a listener even if its diagnostic PID file is missing.
+        std::fs::remove_file(rc.join("agitd.pid")).unwrap();
         // `UnixListener::bind` uses backlog=128, and Linux allows even more to queue — filling
         // that takes hundreds of connections and "is it actually full" stays uncertain. Squeezed to
         // 1, a full queue is certain and a few connections reach it.
         assert_eq!(
-            unsafe { libc::listen(l.as_raw_fd(), 1) },
+            unsafe { libc::listen(l.socket.as_raw_fd(), 1) },
             0,
             "squeezing the backlog to 1 failed: {}",
             std::io::Error::last_os_error()
@@ -971,6 +1031,8 @@ mod tests {
             "an unclear reason for not connecting (only a full queue) must never be judged stale \
              and remove another process's socket: {verdict:?}"
         );
+        assert!(listen_in(rc).is_err());
+        assert!(p.exists(), "failed startup must preserve the busy listener");
         // Release only after probing; only then does the listener finish.
         drop(held);
         drop(l);
@@ -987,35 +1049,24 @@ mod tests {
         // The whole point of the `Unknown` variant is that it does not equal `Stale`.
         let unknown = Liveness::Unknown("fd exhausted".into());
         assert_ne!(unknown, Liveness::Stale);
-        assert_ne!(unknown, Liveness::Live);
+        assert!(!matches!(unknown, Liveness::Live(_)));
     }
 
-    /// A pidfile **alone** is not evidence that a daemon is running.
-    ///
-    /// Checking only the pidfile inverts the answer: a file left behind by a SIGKILLed daemon makes
-    /// `agit rc start` refuse to start forever while `agit rc status` says there is no daemon — two
-    /// contradictory messages, and the user has nowhere to go. Asking the socket for an answer
-    /// settles it.
-    ///
-    /// "the process in the pidfile is still alive" is elsewhere a necessary condition for **not**
-    /// removing the socket (see [`refused_connect_verdict`]), but it is never evidence of running:
-    /// here that pid is alive (it is this process) while the socket does not exist at all.
+    /// A PID file cannot supply a running daemon's identity; only its status response can.
     #[test]
     fn a_pidfile_alone_is_not_evidence_that_a_daemon_is_running() {
         let tmp = tempfile::tempdir().unwrap();
         let rc = tmp.path();
-        std::fs::write(rc.join("agitd.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(rc.join("agitd.pid"), "1").unwrap();
 
-        // The pid is alive (this process), but nobody listens on the socket.
+        // No socket means no daemon, regardless of the diagnostic PID file.
         assert_eq!(
             running_pid_in(rc),
             None,
             "with no socket nothing counts as running"
         );
 
-        // Only an **answer** counts, and the pid reported is the one in the pidfile. The test is
-        // that something answers, not that something bound, so this needs a fake daemon that
-        // really answers.
+        // The reply's PID must win over the unrelated PID in the legacy file.
         let sock = socket_path_for(rc);
         let h = answering_daemon(&sock, 1);
         assert_eq!(running_pid_in(rc), Some(std::process::id()));
