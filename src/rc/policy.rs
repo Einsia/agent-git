@@ -1884,12 +1884,23 @@ fn resolve_existing_ancestor(p: &Path) -> Option<PathBuf> {
 /// in [`names_along_resolution`]. This check may err only toward asking once more.
 fn resolve_ancestor(p: &Path, mut work: Option<&mut AliasBudget>) -> Option<PathBuf> {
     use std::path::Component;
+    enum Step {
+        Prefix(std::ffi::OsString),
+        Root,
+        Current,
+        Parent,
+        Name(std::ffi::OsString),
+    }
+    let own = |component: Component<'_>| match component {
+        Component::Prefix(prefix) => Step::Prefix(prefix.as_os_str().to_owned()),
+        Component::RootDir => Step::Root,
+        Component::CurDir => Step::Current,
+        Component::ParentDir => Step::Parent,
+        Component::Normal(name) => Step::Name(name.to_owned()),
+    };
     let mut cur = PathBuf::new();
     // The segments not yet walked, each carrying "did this come out of a link's text".
-    let mut rest: std::collections::VecDeque<(std::ffi::OsString, bool)> = p
-        .components()
-        .map(|c| (c.as_os_str().to_os_string(), false))
-        .collect();
+    let mut rest: std::collections::VecDeque<_> = p.components().map(|c| (own(c), false)).collect();
     // How many link hops this pass has followed so far. The kernel's `MAXSYMLINKS` is the
     // allowance of **one resolution**, and one resolution is exactly this whole path walked
     // from start to end here: when the kernel walks `a/b/c`, the links followed on `a`, `b`
@@ -1899,15 +1910,21 @@ fn resolve_ancestor(p: &Path, mut work: Option<&mut AliasBudget>) -> Option<Path
     // by whoever writes the approval message.
     let mut hops = 0usize;
     while let Some((seg, spliced)) = rest.pop_front() {
-        match Path::new(&seg).components().next() {
-            Some(Component::Prefix(x)) => cur.push(x.as_os_str()),
-            Some(Component::RootDir) => cur.push(std::path::MAIN_SEPARATOR_STR),
-            Some(Component::CurDir) | None => {}
+        match seg {
+            Step::Prefix(prefix) => cur.push(prefix),
+            Step::Root => cur.push(std::path::MAIN_SEPARATOR_STR),
+            Step::Current => {}
             // Up one level **from the resolved location**.
-            Some(Component::ParentDir) => {
+            Step::Parent => {
                 cur.pop();
             }
-            Some(Component::Normal(name)) => {
+            Step::Name(name) => {
+                // Verbatim Windows components cannot contain a forward slash. Re-parsing
+                // such a component loses its tail and can authorize a different directory.
+                #[cfg(windows)]
+                if name.to_string_lossy().contains('/') {
+                    return None;
+                }
                 cur.push(name);
                 // Charge before handing it over: the kernel looks it up segment by segment
                 // from the start, and how many lookups that is is this path's depth right
@@ -1943,7 +1960,7 @@ fn resolve_ancestor(p: &Path, mut work: Option<&mut AliasBudget>) -> Option<Path
                             cur = PathBuf::new();
                         }
                         for (i, c) in target.components().enumerate() {
-                            rest.insert(i, (c.as_os_str().to_os_string(), true));
+                            rest.insert(i, (own(c), true));
                         }
                     }
                     // Not a link, or this segment does not exist yet, or it cannot be asked
@@ -2665,6 +2682,20 @@ pub fn require_dir_under(target: &Path, home: &Path) -> Result<PathBuf, PolicyEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_requests_never_truncate_verbatim_path_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project spaces");
+        let child = root.join("collaboration-playground");
+        std::fs::create_dir_all(&child).unwrap();
+        let root = root.canonicalize().unwrap();
+        let child = child.canonicalize().unwrap();
+        assert_eq!(require_dir_under(&child, &root).unwrap(), child);
+        let malformed = PathBuf::from(format!("{}/collaboration-playground", root.display()));
+        assert!(require_dir_under(&malformed, &root).is_err());
+    }
 
     /// The denylist must not be defeated by a **symlink**.
     ///
