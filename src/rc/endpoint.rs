@@ -423,7 +423,9 @@ async fn serve_described(
                                     } else if let Some(response) = &entry.response {
                                         response.clone()
                                     } else {
-                                        Frame::error_response(original_id.clone(), RpcError::new(ErrorCode::SessionBusy, "message acceptance is pending; retry with the same message ID"))
+                                        let mut error = RpcError::new(ErrorCode::SessionBusy, "message acceptance is pending; retry with the same message ID");
+                                        error.data = Some(serde_json::json!({"outcome":"unknown"}));
+                                        Frame::error_response(original_id.clone(), error)
                                     };
                                     response.id = Some(original_id);
                                     if peer.output.send_work(response.to_json(), std::time::Duration::from_secs(2), work).await.is_err() { clients.remove(&client); }
@@ -463,9 +465,18 @@ async fn serve_described(
                             log.response(client, &response);
                         }
                         if let Some(key) = key {
-                            // A busy response certifies no native write. Allow the same
-                            // intent to try again once the harness is ready.
-                            if frame.error.as_ref().is_some_and(|error| error.is(ErrorCode::SessionBusy)) {
+                            // Daemon busy replies certify no native write unless they explicitly
+                            // retain uncertainty. An uncertain receipt keeps its operation identity.
+                            let not_sent = if let Some(error) = frame.error.as_mut().filter(|error| error.is(ErrorCode::SessionBusy)) {
+                                let data = error.data.get_or_insert_with(|| serde_json::json!({}));
+                                if let Some(object) = data.as_object_mut() {
+                                    object.entry("outcome").or_insert_with(|| serde_json::json!("not_sent"));
+                                }
+                                data.get("outcome").and_then(serde_json::Value::as_str) == Some("not_sent")
+                            } else {
+                                false
+                            };
+                            if not_sent {
                                 receipts.remove(&key);
                             } else if let Some(entry) = receipts.get_mut(&key) {
                                 entry.response = Some(frame.clone());
@@ -662,6 +673,58 @@ mod tests {
         let Some(super::super::link::LinkEvent::Frame { frame, .. }) = requests.recv().await else {
             panic!("missing dispatch")
         };
+        let mut pending_peer = BufReader::new(UnixStream::connect(&path).await.unwrap());
+        pending_peer
+            .get_mut()
+            .write_all(format!("{}\n", request.to_json()).as_bytes())
+            .await
+            .unwrap();
+        let mut pending_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pending_peer.read_line(&mut pending_line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pending_error = serde_json::from_str::<Frame>(&pending_line)
+            .unwrap()
+            .error
+            .unwrap();
+        assert!(pending_error.is(ErrorCode::SessionBusy));
+        assert_eq!(pending_error.data.unwrap()["outcome"], "unknown");
+        assert!(requests.try_recv().is_err());
+        out.send(Frame::error_response(
+            frame.id.clone().unwrap(),
+            RpcError::new(ErrorCode::SessionBusy, "native admission is occupied")
+                .with_hint("retry"),
+        ));
+        let mut rejected_line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            first.read_line(&mut rejected_line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let rejected_error = serde_json::from_str::<Frame>(&rejected_line)
+            .unwrap()
+            .error
+            .unwrap();
+        assert_eq!(rejected_error.data.as_ref().unwrap()["outcome"], "not_sent");
+        assert_eq!(rejected_error.data.unwrap()["hint"], "retry");
+        first
+            .get_mut()
+            .write_all(format!("{}\n", request.to_json()).as_bytes())
+            .await
+            .unwrap();
+        let Some(super::super::link::LinkEvent::Frame { frame, .. }) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("missing retry dispatch")
+        };
         drop(first);
         out.send(Frame::response(
             frame.id.clone().unwrap(),
@@ -704,6 +767,45 @@ mod tests {
                 .contains("different content")
         );
         assert!(requests.try_recv().is_err());
+        let uncertain = Frame::request(
+            "turn.start",
+            serde_json::json!({"session_id":"session-a","client_msg_id":"uncertain-message","message":"retain"}),
+        );
+        second
+            .get_mut()
+            .write_all(format!("{}\n", uncertain.to_json()).as_bytes())
+            .await
+            .unwrap();
+        let Some(super::super::link::LinkEvent::Frame { frame, .. }) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("missing uncertain dispatch")
+        };
+        let mut error = RpcError::new(ErrorCode::SessionBusy, "acceptance is uncertain");
+        error.data = Some(serde_json::json!({"outcome":"unknown"}));
+        out.send(Frame::error_response(frame.id.unwrap(), error));
+        for replay in [false, true] {
+            if replay {
+                second
+                    .get_mut()
+                    .write_all(format!("{}\n", uncertain.to_json()).as_bytes())
+                    .await
+                    .unwrap();
+            }
+            line.clear();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                second.read_line(&mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let error = serde_json::from_str::<Frame>(&line).unwrap().error.unwrap();
+            assert_eq!(error.data.unwrap()["outcome"], "unknown");
+            assert!(requests.try_recv().is_err());
+        }
         server.abort();
     }
 }

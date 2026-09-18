@@ -91,6 +91,8 @@ impl Fixture {
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("AGIT_HOME", &self.home)
+            .env("AGIT_HUB_URL", "http://127.0.0.1:9")
+            .env("AGIT_TELEMETRY_DISABLED", "1")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("CI", "1")
