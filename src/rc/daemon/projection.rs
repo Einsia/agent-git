@@ -522,6 +522,15 @@ impl Daemon {
     /// make that comparison.
     pub(super) fn stamped(&self, mut info: SessionInfo) -> SessionInfo {
         info.last_seq = self.journal.last_seq(&info.session_id);
+        if let Some(live) = self.sessions.get(&info.session_id) {
+            info.runtime_session_id = live.runtime_thread_id.clone();
+        } else if let Some(entry) = self.roster.get(&info.session_id)
+            && entry.workspace_id == info.workspace_id
+            && entry.runtime == info.runtime
+        {
+            info.runtime_session_id = Some(entry.thread_id.clone());
+        }
+        info.runtime_session_id = info.runtime_session_id.filter(|id| !id.is_empty());
         info
     }
 
@@ -729,6 +738,7 @@ mod bound_lineage_tests {
                     let (cmd_tx, _cmd_rx) = mpsc::channel(1);
                     let info = SessionInfo {
                         session_id: "agit-S".into(),
+                        runtime_session_id: None,
                         workspace_id: "ws1".into(),
                         project_id: Some("project-1".into()),
                         runtime: "claude-code".into(),

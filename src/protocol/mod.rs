@@ -775,6 +775,7 @@ mod tests {
 
         let session = SessionInfo {
             session_id: "agit-one".into(),
+            runtime_session_id: None,
             workspace_id: "ws-1".into(),
             project_id: Some("p-1".into()),
             runtime: "codex".into(),
@@ -789,11 +790,18 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
         };
+        assert!(
+            serde_json::to_value(&session)
+                .unwrap()
+                .get("runtime_session_id")
+                .is_none()
+        );
         let old_result: SessionStartResult = serde_json::from_value(serde_json::json!({
             "session": session
         }))
         .unwrap();
         assert!(old_result.start_id.is_none());
+        assert!(old_result.session.runtime_session_id.is_none());
         let keyed = SessionStartResult {
             start_id: Some("018f47cb-60ff-7e31-aec9-02d2e39d3114".into()),
             session: old_result.session,

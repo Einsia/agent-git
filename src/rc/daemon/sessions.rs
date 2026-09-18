@@ -243,6 +243,7 @@ impl Daemon {
             let now = chrono::Utc::now().to_rfc3339();
             let info = SessionInfo {
                 session_id: p.session_id.clone(),
+                runtime_session_id: None,
                 workspace_id: p.workspace_id.clone(),
                 project_id: entry.project_id.clone(),
                 runtime: entry.runtime.clone(),
@@ -425,6 +426,7 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             session_id: logical,
+            runtime_session_id: None,
             workspace_id: p.workspace_id.clone(),
             project_id,
             runtime: runtime.clone(),
@@ -634,6 +636,7 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             session_id: session_id.clone(),
+            runtime_session_id: None,
             workspace_id: p.workspace_id.clone(),
             project_id: Some(p.project_id.clone()),
             runtime: p.runtime.clone(),

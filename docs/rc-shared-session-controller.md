@@ -14,6 +14,16 @@ generation, and an access ceiling. The granting account must own the target devi
 The existing grant binds the source certificate, target device epoch, Hub identity,
 and expiry. Renewal may extend expiry but cannot change the delegated scope.
 
+Managed `SessionInfo` rows expose an optional `runtime_session_id` from the
+executor's live harness or durable roster. Watch replies carry the watched native
+identity as well. The backend uses this mapping with `runtime` to address the same
+canonical session before and after takeover; the logical `session_id` continues to
+address RPCs and events. An absent native identity means the harness has not yet
+reported it. The controller retains the successful start receipt and refreshes the
+project catalog while initialization completes; it must not create a second session
+or mint a shared owner from an unverified logical ID. Personal clients can ignore
+this optional response field, and responses from 0.2.1 remain readable.
+
 The executor intersects the delegation with its current local owner policy. A
 session delegation cannot read another session or obtain file, terminal, project
 binding, or machine control authority. Catalog projection obeys the same scope.

@@ -246,6 +246,7 @@ impl Daemon {
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             session_id: watch_id.clone(),
+            runtime_session_id: Some(p.session_id.clone()),
             workspace_id: p.workspace_id.clone(),
             project_id,
             runtime: runtime.clone(),

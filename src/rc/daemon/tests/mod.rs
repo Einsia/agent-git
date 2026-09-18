@@ -14,6 +14,7 @@ pub(super) fn rpc_test_live(
         generation,
         info: SessionInfo {
             session_id: session_id.into(),
+            runtime_session_id: None,
             workspace_id: "ws-a".into(),
             project_id: None,
             runtime: "codex".into(),

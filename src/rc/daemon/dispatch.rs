@@ -596,6 +596,7 @@ mod tests {
         WatchLive {
             info: SessionInfo {
                 session_id: stream.into(),
+                runtime_session_id: None,
                 workspace_id: "ws-a".into(),
                 project_id: None,
                 runtime: "claude-code".into(),

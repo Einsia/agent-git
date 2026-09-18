@@ -204,7 +204,24 @@ impl Resources {
         if row["workspace_id"].as_str() != Some(super::super::endpoint::WORKSPACE) {
             return;
         }
-        if self.sessions.contains_key(id) {
+        if let Some(mut session) = self.sessions.get(id).cloned() {
+            if let Some(native_id) = row["runtime_session_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                && row["runtime"].as_str() == Some(session.runtime.as_str())
+                && session.native_id != native_id
+            {
+                session.native_id = native_id.into();
+                // Watch and native aliases retain the same logical permission boundary.
+                for known in self
+                    .sessions
+                    .values_mut()
+                    .filter(|known| known.id == session.id)
+                {
+                    *known = session.clone();
+                }
+                self.insert(session);
+            }
             return;
         }
         let project = row["project_id"].as_str().map(str::to_owned);
@@ -215,7 +232,10 @@ impl Resources {
             .unwrap_or_default();
         self.insert(Session {
             id: id.into(),
-            native_id: String::new(),
+            native_id: row["runtime_session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .into(),
             runtime: row["runtime"].as_str().unwrap_or_default().into(),
             cwd,
             project,
@@ -306,14 +326,17 @@ mod tests {
         resources
             .projects
             .insert("project".into(), PathBuf::from("/workspace/project"));
-        resources.insert(Session {
-            id: "hidden-logical".into(),
-            native_id: "hidden-native".into(),
-            runtime: "codex".into(),
-            cwd: "/workspace/project".into(),
-            project: Some("project".into()),
-        });
-        let mut result = json!({"sessions":[{"session_id":"hidden-logical","workspace_id":"local-owner","project_id":"project","runtime":"codex"}],
+        resources.observe("session.start", &json!({"session": {
+            "session_id":"hidden-logical", "workspace_id":"local-owner", "project_id":"project", "runtime":"codex"
+        }}));
+        assert!(
+            resources
+                .session("hidden-logical")
+                .unwrap()
+                .native_id
+                .is_empty()
+        );
+        let mut result = json!({"sessions":[{"session_id":"hidden-logical","runtime_session_id":"hidden-native","workspace_id":"local-owner","project_id":"project","runtime":"codex"}],
             "local":[{"runtime_session_id":"visible","runtime":"codex","cwd":"/workspace/project"}, {"runtime_session_id":"foreign","runtime":"codex","cwd":"/private/other"}]});
         resources.observe("session.list", &result);
         resources.filter("session.list", &mut result, &policy, &principal);

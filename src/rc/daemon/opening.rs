@@ -423,6 +423,7 @@ mod tests {
         let cwd = state.mirror.bind("ws", "project", dir.path()).unwrap();
         let info = SessionInfo {
             session_id: "agit-opening".into(),
+            runtime_session_id: None,
             workspace_id: "ws".into(),
             project_id: Some("project".into()),
             runtime: "unsupported-test-runtime".into(),

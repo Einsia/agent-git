@@ -30,6 +30,7 @@ pub(super) fn harness_test_session_with_channels(
     let session = Session {
         info: SessionInfo {
             session_id: "session-turn-test".into(),
+            runtime_session_id: None,
             workspace_id: "workspace-test".into(),
             project_id: None,
             runtime: runtime.into(),

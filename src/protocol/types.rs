@@ -624,6 +624,9 @@ pub enum SessionStatus {
 pub struct SessionInfo {
     /// Logical session id (`agit-…`) = branch. Never the harness's thread id.
     pub session_id: String,
+    /// Executor-owned native identity, absent until the harness reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_session_id: Option<String>,
     pub workspace_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,

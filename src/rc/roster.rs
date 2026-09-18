@@ -1307,6 +1307,7 @@ mod tests {
     fn start_info() -> crate::protocol::SessionInfo {
         crate::protocol::SessionInfo {
             session_id: "agit-started".into(),
+            runtime_session_id: None,
             workspace_id: "ws-1".into(),
             project_id: Some("project-1".into()),
             runtime: "codex".into(),

@@ -450,6 +450,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
                     session_id: "agit-danger-start".into(),
+                    runtime_session_id: None,
                     workspace_id: "ws-a".into(),
                     project_id: Some("project-a".into()),
                     runtime: "unsupported-test-runtime".into(),
@@ -531,6 +532,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 let now = chrono::Utc::now().to_rfc3339();
                 let info = SessionInfo {
                     session_id: "agit-unjudged".into(),
+                    runtime_session_id: None,
                     workspace_id: "ws-a".into(),
                     project_id: Some("project-a".into()),
                     runtime: "unsupported-test-runtime".into(),
@@ -594,6 +596,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 // owner-only gate.
                 let info = SessionInfo {
                     session_id: "agit-unauthorized".into(),
+                    runtime_session_id: None,
                     workspace_id: "ws-a".into(),
                     project_id: Some("project-a".into()),
                     runtime: "unsupported-test-runtime".into(),
@@ -719,6 +722,7 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
     let start_id = "018f47cb-60ff-7e31-aec9-02d2e39d3114";
     let session = SessionInfo {
         session_id: "agit-existing".into(),
+        runtime_session_id: None,
         workspace_id: "ws-a".into(),
         project_id: Some("project-a".into()),
         runtime: "codex".into(),
@@ -1700,6 +1704,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         generation: 1,
         info: SessionInfo {
             session_id: "s-1".into(),
+            runtime_session_id: None,
             workspace_id: "ws-1".into(),
             project_id: None,
             runtime: "codex".into(),
@@ -1917,6 +1922,7 @@ fn a_viewer_joining_at_the_last_moment_keeps_the_tail_alive() {
     let mk = |last_active: u64| WatchLive {
         info: SessionInfo {
             session_id: "s".into(),
+            runtime_session_id: None,
             workspace_id: "ws".into(),
             project_id: None,
             runtime: "claude-code".into(),
@@ -2438,6 +2444,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         .insert("session-a".into(), 1);
     let info = SessionInfo {
         session_id: "session-a".into(),
+        runtime_session_id: None,
         workspace_id: "ws-a".into(),
         project_id: None,
         runtime: "unsupported-test-runtime".into(),
@@ -2609,6 +2616,10 @@ async fn discovery_reply_refreshes_supervision_after_the_scan() {
     assert!(result.local.is_empty());
     assert_eq!(result.sessions.len(), 1);
     assert_eq!(result.sessions[0].session_id, "live-new");
+    assert_eq!(
+        result.sessions[0].runtime_session_id.as_deref(),
+        Some("native-new")
+    );
     assert_eq!(result.sessions[0].title.as_deref(), Some("Native title"));
     assert_eq!(result.sessions[0].gist.as_deref(), Some("Opening prompt"));
     let refreshed: SessionListResult = serde_json::from_value(
