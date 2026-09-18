@@ -180,6 +180,15 @@ work remains separate from controller/tunnel architecture acceptance.
 
 ## Operational diagnostics
 
+Cloud `session.list` accepts an optional `resolve_session` logical or native ID.
+Its `resolved_session` field contains executor-owned session, native, runtime,
+workspace and project coordinates, or null when no readable native mapping is
+available. Resolution uses the resource registry, including durable roster
+entries, so the conversation need not appear in the active session catalog.
+The connection's current read authority still applies when the response leaves
+the executor. The field describes identity only; it does not start a harness or
+claim that the session is active. Ordinary catalog requests remain unchanged.
+
 Local owner daemons retain structured metadata at
 `$AGIT_HOME/desktop-rc/diagnostics-<instance-id>.jsonl` (normally under `~/.agit`).
 `machine.describe` returns the exact path as `diagnostic_log`; it is null if the

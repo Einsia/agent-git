@@ -26,6 +26,7 @@ pub struct Permit {
     need: Need,
     ceiling: Access,
     start_id: Option<String>,
+    resolve_session: Option<String>,
 }
 
 fn denied() -> RpcError {
@@ -125,6 +126,23 @@ impl Permit {
                 return Frame::error_response(frame.id.clone().unwrap(), denied());
             }
             resources.filter(&self.method, result, policy, principal);
+            if let Some(id) = &self.resolve_session {
+                result["resolved_session"] = resources
+                    .session(id)
+                    .filter(|session| {
+                        !session.native_id.is_empty()
+                            && session.access(policy, principal).can_read()
+                    })
+                    .map_or(serde_json::Value::Null, |session| {
+                        serde_json::json!({
+                            "session_id":session.id,
+                            "runtime_session_id":session.native_id,
+                            "runtime":session.runtime,
+                            "project_id":session.project,
+                            "workspace_id":super::super::endpoint::WORKSPACE,
+                        })
+                    });
+            }
             if let Some(start_id) = &self.start_id {
                 result["start_id"] = serde_json::json!(start_id);
             }
@@ -142,6 +160,9 @@ pub fn authorize(
     super::super::endpoint::validate_request(&frame)?;
     let method = frame.method().to_owned();
     let params = frame.params.get_or_insert_with(|| serde_json::json!({}));
+    let resolve_session = (method == "session.list")
+        .then(|| params["resolve_session"].as_str().map(str::to_owned))
+        .flatten();
     let ceiling = params
         .as_object_mut()
         .and_then(|params| params.remove("access_ceiling"))
@@ -239,6 +260,7 @@ pub fn authorize(
         need: selection.1,
         ceiling,
         start_id,
+        resolve_session,
     };
     if !permit.allowed(policy, principal) {
         return Err(denied());
@@ -286,6 +308,61 @@ mod tests {
     use super::*;
     use agit_peer::access::{Resource, Rule};
     use serde_json::json;
+
+    #[test]
+    fn saved_identity_resolution_uses_executor_records_and_current_read_authority() {
+        let principal = Principal {
+            issuer: "https://cloud.example".into(),
+            account_id: "operator".into(),
+        };
+        let policy = Policy::new(
+            1,
+            vec![Rule {
+                principal: principal.clone(),
+                resource: Resource::Project("project".into()),
+                access: Access::Read,
+            }],
+        )
+        .unwrap();
+        let mut resources = Resources::default();
+        resources
+            .projects
+            .insert("project".into(), "/trusted".into());
+        resources.observe(
+            "session.list",
+            &json!({"sessions":[{
+                "session_id":"saved", "runtime_session_id":"native", "runtime":"codex",
+                "project_id":"project", "workspace_id":"local-owner",
+            }]}),
+        );
+        let (request, permit) = authorize(
+            Frame::request(
+                "session.list",
+                json!({
+                    "resolve_session":"saved", "runtime_session_id":"untrusted",
+                }),
+            ),
+            &principal,
+            &policy,
+            &mut resources,
+        )
+        .unwrap();
+        let response = Frame::response(request.id.unwrap(), json!({"sessions":[], "local":[]}));
+        let result = permit
+            .response(response.clone(), &resources, &policy, &principal)
+            .result
+            .unwrap();
+        assert_eq!(result["sessions"], json!([]));
+        assert_eq!(
+            result["resolved_session"],
+            json!({
+                "session_id":"saved", "runtime_session_id":"native", "runtime":"codex",
+                "project_id":"project", "workspace_id":"local-owner",
+            })
+        );
+        let revoked = permit.response(response, &resources, &Policy::default(), &principal);
+        assert!(revoked.result.unwrap()["resolved_session"].is_null());
+    }
 
     #[test]
     fn launch_receipts_are_principal_scoped_and_echo_the_client_intent() {
