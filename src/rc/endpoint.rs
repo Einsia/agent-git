@@ -510,6 +510,9 @@ async fn serve_described(
                     let record = frame.to_json();
                     let mut closed = Vec::new();
                     for (id, peer) in &clients {
+                        if peer.cloud.as_ref().is_some_and(|guard| !guard.accepts_notification(&frame)) {
+                            continue;
+                        }
                         // Subscription replay stays in its requester's writer. Only live
                         // notifications consume each client's event queue here.
                         if peer.output.send_timeout(record.clone(), std::time::Duration::from_secs(2)).await.is_err() {

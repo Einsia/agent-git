@@ -72,7 +72,7 @@ pub(super) async fn run(
                 let description = {
                     let handshake = tokio::time::timeout(
                         HANDSHAKE,
-                        describe(&mut sink, &mut source, route.authority()),
+                        describe(&mut sink, &mut source, route.as_ref()),
                     );
                     tokio::pin!(handshake);
                     loop {
@@ -166,11 +166,14 @@ pub(super) async fn run(
 async fn describe(
     sink: &mut PacketSink,
     source: &mut PacketSource,
-    authority: Authority,
+    route: &dyn Connector,
 ) -> anyhow::Result<Value> {
     let id = uuid::Uuid::new_v4().to_string();
-    let frame =
+    let mut frame =
         serde_json::json!({"jsonrpc":"2.0","id":id,"method":"machine.describe","params":{}});
+    if !route.session_events() {
+        frame["params"]["session_events"] = Value::Bool(false);
+    }
     sink.send(Packet::Text(frame.to_string())).await?;
     loop {
         let packet = source
@@ -189,7 +192,8 @@ async fn describe(
             .context("peer omitted its description")?
             .clone();
         ensure!(
-            description["protocol_version"] == 1 && description["authority"] == authority.as_str(),
+            description["protocol_version"] == 1
+                && description["authority"] == route.authority().as_str(),
             "unsupported peer executor protocol"
         );
         ensure!(

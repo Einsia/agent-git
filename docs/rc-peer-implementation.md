@@ -178,6 +178,23 @@ native session and both continued accepting input. Agit-only reservations do
 not establish exclusion against such external applications. Further ownership
 work remains separate from controller/tunnel architecture acceptance.
 
+## Utility connection event selection
+
+An authenticated Cloud connection can include `session_events: false` in
+`machine.describe` parameters. The executor then omits session notifications on
+that connection while retaining RPC replies and authorized terminal events.
+Other connections keep their own event selection and resource permissions.
+Omitting the parameter leaves the selection unchanged; new connections default
+to receiving authorized session events. The authenticated description includes
+the current `session_events` value and advertises `session-events-v1`.
+
+The Web utility route uses `Route::without_session_events()` to include this
+preference in the existing handshake on every reconnect. Shared session routes
+keep their event stream enabled. This removes duplicate transcript traffic before
+it enters the tunnel, without adding a serial discovery request. Released 0.2.1
+executors ignore the optional parameter and keep their personal peer/Cloud path;
+their descriptions do not advertise delegated session services or event selection.
+
 ## Operational diagnostics
 
 Cloud `session.list` accepts an optional `resolve_session` logical or native ID.

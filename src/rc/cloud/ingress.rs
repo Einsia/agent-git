@@ -11,7 +11,10 @@ use agit_peer::access::{Policy, Principal};
 use anyhow::Context;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -111,6 +114,7 @@ impl Registry {
             state: self.state.clone(),
             permits: Default::default(),
             live: Arc::new(RwLock::new(true)),
+            session_events: Arc::new(AtomicBool::new(true)),
             log: self.log.clone(),
         }
     }
@@ -208,6 +212,7 @@ pub struct Client {
     state: Arc<RwLock<State>>,
     permits: Arc<Mutex<HashMap<RequestId, Option<Permit>>>>,
     live: Arc<RwLock<bool>>,
+    session_events: Arc<AtomicBool>,
     log: Option<crate::rc::diagnostics::Log>,
 }
 
@@ -303,6 +308,30 @@ impl Client {
         self.lease.clone()
     }
 
+    pub fn accepts_notification(&self, frame: &Frame) -> bool {
+        if !self.current()
+            || self
+                .controller
+                .as_ref()
+                .is_some_and(|controller| !controller.has_session_stream())
+            || (!self.session_events.load(Ordering::Relaxed)
+                && !matches!(frame.method(), "terminal.output" | "terminal.exited"))
+        {
+            return false;
+        }
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let effective = delegation::policy(
+            self.controller.as_ref(),
+            &state.policy,
+            &state.resources,
+            &self.principal,
+        );
+        access::event_allowed(frame, &state.resources, &effective, &self.principal)
+    }
+
     pub fn authorize(&self, frame: Frame) -> Result<Frame, Rejection> {
         if !self.current() {
             return Err(Rejection::Close);
@@ -341,6 +370,14 @@ impl Client {
                 ))
             })?;
         }
+        if frame.method() == "machine.describe"
+            && let Some(enabled) = frame
+                .params
+                .as_ref()
+                .and_then(|params| params["session_events"].as_bool())
+        {
+            self.session_events.store(enabled, Ordering::Relaxed);
+        }
         frame.authority = crate::rc::authority::Guard::new(ExecutionAuthority {
             controller: self.controller.clone(),
             principal: self.principal.clone(),
@@ -357,11 +394,15 @@ impl Client {
     }
 
     pub fn project(&self, record: &str) -> crate::Result<Option<String>> {
+        let mut frame: Frame =
+            serde_json::from_str(record).context("executor produced an invalid frame")?;
+        if frame.id.is_none() {
+            // Queued events must still be readable when their writer reaches them.
+            return Ok(self.accepts_notification(&frame).then(|| frame.to_json()));
+        }
         if !self.current() {
             return Ok(None);
         }
-        let mut frame: Frame =
-            serde_json::from_str(record).context("executor produced an invalid frame")?;
         let permit = frame.id.as_ref().and_then(|id| {
             self.permits
                 .lock()
@@ -396,30 +437,21 @@ impl Client {
                         .map_or("cloud-principal", |controller| controller.authority())
                 );
                 result["access_ceiling"] = serde_json::json!(true);
-                result["controller_delegation"] =
-                    serde_json::json!(["session-v1", "project-v1", "watch-v1"]);
+                result["controller_delegation"] = serde_json::json!([
+                    "session-v1",
+                    "project-v1",
+                    "watch-v1",
+                    "session-events-v1"
+                ]);
+                result["session_events"] =
+                    serde_json::json!(self.session_events.load(Ordering::Relaxed));
                 if let Some(result) = result.as_object_mut() {
                     result.remove("diagnostic_log");
                 }
             }
             return Ok(Some(frame.to_json()));
         }
-        if frame.id.is_some() {
-            return Ok(matches!(permit, Some(None)).then(|| frame.to_json()));
-        }
-        if self
-            .controller
-            .as_ref()
-            .is_some_and(|controller| !controller.has_session_stream())
-        {
-            return Ok(None);
-        }
-        let effective =
-            delegation::policy(self.controller.as_ref(), policy, resources, &self.principal);
-        Ok(
-            access::event_allowed(&frame, resources, &effective, &self.principal)
-                .then(|| frame.to_json()),
-        )
+        Ok(matches!(permit, Some(None)).then(|| frame.to_json()))
     }
 
     pub fn receipt_key(&self, key: String, frame: &Frame) -> String {
@@ -678,7 +710,7 @@ mod tests {
         assert_eq!(result["authority"], "cloud-principal");
         assert_eq!(
             result["controller_delegation"],
-            json!(["session-v1", "project-v1", "watch-v1"])
+            json!(["session-v1", "project-v1", "watch-v1", "session-events-v1"])
         );
         assert!(result.get("diagnostic_log").is_none());
         assert!(client.project(&response.to_json()).unwrap().is_none());
@@ -696,6 +728,77 @@ mod tests {
         let denial = Frame::error_response(rejected.id.unwrap(), error);
         assert!(client.project(&denial.to_json()).unwrap().is_some());
         client.authorize(replacement).unwrap();
+    }
+
+    #[tokio::test]
+    async fn utility_connections_mute_only_their_own_session_events() {
+        let registry = Registry::fixed(
+            Policy::new(
+                1,
+                vec![Rule {
+                    principal: principal(),
+                    resource: Resource::Machine,
+                    access: Access::Admin,
+                }],
+            )
+            .unwrap(),
+        );
+        registry.state.write().unwrap().resources.observe(
+            "session.list",
+            &json!({"local":[{"runtime_session_id":"visible","runtime":"codex","cwd":"/trusted"}]}),
+        );
+        let utility = registry.client(principal(), i64::MAX);
+        let interactive = registry.client(principal(), i64::MAX);
+        let mut event = Frame::notification("item.completed", json!({}));
+        event.stream = Some("visible".into());
+        let event = event.to_json();
+        assert!(utility.project(&event).unwrap().is_some());
+        let describe = |params| {
+            let request = utility
+                .authorize(Frame::request("machine.describe", params))
+                .unwrap();
+            let response = Frame::response(request.id.unwrap(), json!({}));
+            serde_json::from_str::<Frame>(&utility.project(&response.to_json()).unwrap().unwrap())
+                .unwrap()
+                .result
+                .unwrap()
+        };
+        assert_eq!(
+            describe(json!({"session_events":false}))["session_events"],
+            false
+        );
+        assert!(utility.project(&event).unwrap().is_none());
+        assert!(interactive.project(&event).unwrap().is_some());
+        assert_eq!(describe(json!({}))["session_events"], false);
+        for method in ["terminal.output", "terminal.exited"] {
+            let terminal = Frame::notification(method, json!({})).to_json();
+            assert!(utility.project(&terminal).unwrap().is_some());
+        }
+        let history = utility
+            .authorize(Frame::request(
+                "session.history",
+                json!({"session_id":"visible"}),
+            ))
+            .unwrap();
+        let reply = Frame::response(history.id.unwrap(), json!({"items":[]}));
+        assert!(utility.project(&reply.to_json()).unwrap().is_some());
+        registry.state.write().unwrap().policy = Policy::default();
+        assert!(
+            utility
+                .project(&Frame::notification("terminal.output", json!({})).to_json())
+                .unwrap()
+                .is_none()
+        );
+        *utility.live.write().unwrap() = false;
+        assert!(
+            utility
+                .authorize(Frame::request(
+                    "machine.describe",
+                    json!({"session_events":true})
+                ))
+                .is_err()
+        );
+        assert!(!utility.session_events.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

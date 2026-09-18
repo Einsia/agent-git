@@ -32,6 +32,10 @@ pub trait Connector: Send + Sync {
     /// A stable key names configuration without retaining one-use tickets.
     fn key(&self) -> &str;
     fn authority(&self) -> Authority;
+    /// Utility routes can opt out of session events while retaining RPC and terminal traffic.
+    fn session_events(&self) -> bool {
+        true
+    }
     fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a>;
 }
 

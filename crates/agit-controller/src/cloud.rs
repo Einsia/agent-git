@@ -22,6 +22,7 @@ pub struct Route {
     pub credentials: Arc<Credentials>,
     pub target: Device,
     key: String,
+    session_events: bool,
 }
 
 impl Route {
@@ -36,7 +37,14 @@ impl Route {
             credentials,
             target,
             key,
+            session_events: true,
         })
+    }
+
+    pub fn without_session_events(mut self) -> Self {
+        self.key = serde_json::json!([self.target, "without-session-events"]).to_string();
+        self.session_events = false;
+        self
     }
 }
 
@@ -46,6 +54,9 @@ impl Connector for Route {
     }
     fn authority(&self) -> Authority {
         Authority::CloudPrincipal
+    }
+    fn session_events(&self) -> bool {
+        self.session_events
     }
     fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a> {
         Box::pin(async move {
