@@ -294,7 +294,11 @@ impl Daemon {
             // Someone is already watching (and that tail really is alive): add a
             // subscriber rather than start a second one.
             Some(w) => {
-                *w.viewers.entry(caller_key(&caller)).or_insert(0) += 1;
+                if let Some(owner) = frame.authority.watch_owner() {
+                    w.shared_viewers.insert(owner, frame.authority.clone());
+                } else {
+                    *w.viewers.entry(caller_key(&caller)).or_insert(0) += 1;
+                }
                 // Renew the lease. This runs under **the same lock** as the reaping
                 // decision (see `reap_idle_watches`), so there is no gap between "a
                 // viewer just joined" and "it is about to exit".
@@ -507,7 +511,17 @@ impl Daemon {
                         info: info.clone(),
                         handle,
                         active: active_at,
-                        viewers: [(caller_key(&caller), 1usize)].into_iter().collect(),
+                        viewers: if frame.authority.watch_owner().is_none() {
+                            [(caller_key(&caller), 1usize)].into_iter().collect()
+                        } else {
+                            Default::default()
+                        },
+                        shared_viewers: frame
+                            .authority
+                            .watch_owner()
+                            .map(|owner| (owner, frame.authority.clone()))
+                            .into_iter()
+                            .collect(),
                         generation,
                     },
                 );

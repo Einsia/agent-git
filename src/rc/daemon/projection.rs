@@ -629,7 +629,18 @@ impl Daemon {
     /// tab, `session.unwatch` then never arrives, and every session anyone has
     /// watched leaves a poll behind that never stops.
     pub(super) fn reap_idle_watches(&mut self) {
-        for k in stale_watches(&self.watches, now_secs()) {
+        let mut expired = Vec::new();
+        for (id, watch) in &mut self.watches {
+            let had_shared = !watch.shared_viewers.is_empty();
+            watch
+                .shared_viewers
+                .retain(|_, authority| authority.check().is_ok());
+            if had_shared && watch.shared_viewers.is_empty() && watch.viewers.is_empty() {
+                expired.push(id.clone());
+            }
+        }
+        expired.extend(stale_watches(&self.watches, now_secs()));
+        for k in expired {
             if let Some(w) = self.take_watch(&k) {
                 w.handle.abort();
             }

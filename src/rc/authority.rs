@@ -7,6 +7,10 @@ pub(crate) trait Authority: Send + Sync {
     /// Hold the authority's read lease while invoking the nonblocking acceptance step.
     fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool;
 
+    fn watch_owner(&self) -> Option<String> {
+        None
+    }
+
     fn project(&self) -> Option<(&str, &std::path::Path)> {
         None
     }
@@ -34,6 +38,12 @@ impl Guard {
             Some(authority) => authority.admit(&mut accept),
             None => accept(),
         }
+    }
+
+    pub fn watch_owner(&self) -> Option<String> {
+        self.0
+            .as_ref()
+            .and_then(|authority| authority.watch_owner())
     }
 
     pub fn check(&self) -> Result<(), RpcError> {

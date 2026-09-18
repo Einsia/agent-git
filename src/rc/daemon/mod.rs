@@ -318,7 +318,9 @@ fn stale_watches(watches: &HashMap<String, WatchLive>, now: u64) -> Vec<String> 
     watches
         .iter()
         .filter(|(_, w)| {
-            now.saturating_sub(w.active.load(std::sync::atomic::Ordering::Acquire)) >= idle_secs
+            w.shared_viewers.is_empty()
+                && now.saturating_sub(w.active.load(std::sync::atomic::Ordering::Acquire))
+                    >= idle_secs
         })
         .map(|(k, _)| k.clone())
         .collect()
@@ -416,6 +418,8 @@ struct WatchLive {
     /// Bucketed counting holds them at once: a person's tabs each count, and they can **only
     /// decrement their own**.
     viewers: std::collections::BTreeMap<String, usize>,
+    /// Service references are idempotent and expire with their authenticated transport authority.
+    shared_viewers: HashMap<String, crate::rc::authority::Guard>,
     /// Which generation this is on the same key.
     ///
     /// A tail task sends a `WatchEnded` note back when it ends, and while that note waits in the

@@ -1948,6 +1948,7 @@ fn a_viewer_joining_at_the_last_moment_keeps_the_tail_alive() {
         },
         active: std::sync::Arc::new(AtomicU64::new(last_active)),
         viewers: Default::default(),
+        shared_viewers: Default::default(),
         generation: 1,
     };
 

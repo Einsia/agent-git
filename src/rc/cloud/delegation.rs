@@ -190,6 +190,21 @@ fn pin_owner(path: &Path, owner: &Owner) -> anyhow::Result<()> {
 }
 
 impl Controller {
+    pub fn watch_owner(&self) -> Option<String> {
+        let Scope::Session(scope) = &self.scope else {
+            return None;
+        };
+        Some(
+            serde_json::json!([
+                scope.runtime,
+                scope.session_id,
+                self.owner.generation,
+                self.owner.source
+            ])
+            .to_string(),
+        )
+    }
+
     pub fn project(&self) -> Option<(&str, &Path)> {
         match &self.scope {
             Scope::Project(scope) => Some((&scope.project_id, Path::new(&scope.local_path))),
@@ -308,6 +323,8 @@ impl Controller {
                         | "session.history"
                         | "session.goal.read"
                         | "session.subscribe"
+                        | "session.watch"
+                        | "session.unwatch"
                         | "session.commands"
                         | "session.model"
                 ),
@@ -577,6 +594,21 @@ mod tests {
             }),
         };
         let policy = controller.policy(&base, &resources, &principal);
+        let watch_owner = controller.watch_owner().unwrap();
+        assert_eq!(watch_owner, controller.clone().watch_owner().unwrap());
+        let mut replacement = controller.clone();
+        replacement.owner.generation += 1;
+        assert_ne!(watch_owner, replacement.watch_owner().unwrap());
+        for method in ["session.watch", "session.unwatch"] {
+            let (mut frame, _) = access::authorize(
+                Frame::request(method, json!({"session_id":"shared"})),
+                &principal,
+                &policy,
+                &mut resources,
+            )
+            .unwrap();
+            controller.actor(&mut frame, &principal).unwrap();
+        }
         let (mut command, _) = access::authorize(Frame::request("turn.start", json!({"session_id":"shared","controller_actor":{"issuer":"https://cloud.example","account_id":"operator"}})), &principal, &policy, &mut resources).unwrap();
         controller.actor(&mut command, &principal).unwrap();
         assert_eq!(command.caller.as_ref().unwrap().role, "operator");

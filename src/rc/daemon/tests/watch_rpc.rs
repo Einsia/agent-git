@@ -314,6 +314,60 @@ async fn installation_rechecks_identity_supervision_and_viewer_counts() {
     assert!(state.watches.is_empty());
 }
 
+struct WatchAuthority {
+    owner: String,
+    live: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::rc::authority::Authority for WatchAuthority {
+    fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool {
+        self.live.load(std::sync::atomic::Ordering::Acquire) && accept()
+    }
+
+    fn watch_owner(&self) -> Option<String> {
+        Some(self.owner.clone())
+    }
+}
+
+#[tokio::test]
+async fn controller_watch_retries_share_a_lease_without_consuming_personal_viewers() {
+    let directory = tempfile::tempdir().unwrap();
+    let cwd = directory.path().canonicalize().unwrap();
+    let daemon = fixture(&cwd).await;
+    let (frames, _received) = mpsc::channel(8);
+    let mut state = daemon.lock().await;
+    let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut shared = request(method::SESSION_WATCH, "ws", "native");
+    shared.authority = crate::rc::authority::Guard::new(WatchAuthority {
+        owner: "service".into(),
+        live: live.clone(),
+    });
+    for _ in 0..3 {
+        let prepared = prepared(state.prepare_watch_scan(&shared).unwrap(), cwd.clone());
+        state.finish_watch_scan(&shared, prepared, &frames).unwrap();
+    }
+    let stream = watch_stream_id("ws", "native");
+    assert_eq!(state.watches[&stream].shared_viewers.len(), 1);
+    assert!(state.watches[&stream].viewers.is_empty());
+    assert!(stale_watches(&state.watches, u64::MAX).is_empty());
+    let personal = request(method::SESSION_WATCH, "ws", "native");
+    let prepared = prepared(state.prepare_watch_scan(&personal).unwrap(), cwd);
+    state
+        .finish_watch_scan(&personal, prepared, &frames)
+        .unwrap();
+    live.store(false, std::sync::atomic::Ordering::Release);
+    state.reap_idle_watches();
+    assert!(state.watches[&stream].shared_viewers.is_empty());
+    assert_eq!(state.watches[&stream].viewers["viewer"], 1);
+    state
+        .dispatch(&request(method::SESSION_UNWATCH, "ws", "native"), &frames)
+        .await
+        .unwrap();
+    assert!(state.watches.is_empty());
+    let decoded: Frame = serde_json::from_str(&shared.to_json()).unwrap();
+    assert!(decoded.authority.watch_owner().is_none());
+}
+
 #[test]
 fn native_watch_reuses_readonly_snapshot_without_materializing_exports() {
     const CHILD: &str = "AGIT_RC_WATCH_SNAPSHOT_TEST_CHILD";

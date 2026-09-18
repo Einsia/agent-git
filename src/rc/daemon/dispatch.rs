@@ -361,13 +361,15 @@ impl Daemon {
                 if let Some(w) = self.watches.get_mut(&watch_id) {
                     // Only **your own** count comes off. See `WatchLive::viewers`.
                     let key = caller_key(&caller);
-                    if let Some(n) = w.viewers.get_mut(&key) {
+                    if let Some(owner) = f.authority.watch_owner() {
+                        w.shared_viewers.remove(&owner);
+                    } else if let Some(n) = w.viewers.get_mut(&key) {
                         *n -= 1;
                         if *n == 0 {
                             w.viewers.remove(&key);
                         }
                     }
-                    if w.viewers.is_empty()
+                    if w.viewers.is_empty() && w.shared_viewers.is_empty()
                         && let Some(w) = self.take_watch(&watch_id)
                     {
                         w.handle.abort();
@@ -615,6 +617,7 @@ mod tests {
             handle: tokio::spawn(std::future::ready(())),
             active: Arc::new(std::sync::atomic::AtomicU64::new(now_secs())),
             viewers: [("acct-1".to_string(), 1usize)].into_iter().collect(),
+            shared_viewers: Default::default(),
             generation: 1,
         }
     }

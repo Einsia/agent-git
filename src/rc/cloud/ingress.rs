@@ -233,6 +233,12 @@ struct ExecutionAuthority {
 }
 
 impl crate::rc::authority::Authority for ExecutionAuthority {
+    fn watch_owner(&self) -> Option<String> {
+        self.controller
+            .as_ref()
+            .and_then(|controller| controller.watch_owner())
+    }
+
     fn project(&self) -> Option<(&str, &std::path::Path)> {
         self.controller
             .as_ref()
@@ -390,7 +396,8 @@ impl Client {
                         .map_or("cloud-principal", |controller| controller.authority())
                 );
                 result["access_ceiling"] = serde_json::json!(true);
-                result["controller_delegation"] = serde_json::json!(["session-v1", "project-v1"]);
+                result["controller_delegation"] =
+                    serde_json::json!(["session-v1", "project-v1", "watch-v1"]);
                 if let Some(result) = result.as_object_mut() {
                     result.remove("diagnostic_log");
                 }
@@ -671,7 +678,7 @@ mod tests {
         assert_eq!(result["authority"], "cloud-principal");
         assert_eq!(
             result["controller_delegation"],
-            json!(["session-v1", "project-v1"])
+            json!(["session-v1", "project-v1", "watch-v1"])
         );
         assert!(result.get("diagnostic_log").is_none());
         assert!(client.project(&response.to_json()).unwrap().is_none());
